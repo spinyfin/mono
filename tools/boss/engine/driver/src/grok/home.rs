@@ -226,7 +226,8 @@ pub struct GrokRuntimeState {
     pub workspace_path: PathBuf,
     /// `grokVersion` observed from `grok inspect --json` at provision time
     /// (`None` when the live posture assert was skipped — test-only, via
-    /// [`GROK_SKIP_POSTURE_ASSERT_ENV`]). Recorded so drift is visible after
+    /// [`GROK_SKIP_POSTURE_ASSERT_ENV`] — or when inspect omits, blanks, or
+    /// changes the value to a non-string). Recorded so drift is visible after
     /// the fact even though it no longer gates provisioning; see
     /// [`LAST_CHARACTERISED_GROK_VERSION`].
     pub grok_version: Option<String>,
@@ -572,18 +573,19 @@ pub fn provision_grok_home(workspace: &Path, prompt_text: &str, run_id: &str) ->
     fs::write(config_dir.join(".gitignore"), "*\n")
         .with_context(|| format!("writing gitignore under {}", config_dir.display()))?;
 
-    // Assert posture with live `grok inspect --json` (fail closed on checks
-    // 2-5; the observed grokVersion is recorded below, never gated).
+    // Assert posture with live `grok inspect --json`: folder trust, the
+    // compat-cell matrix, hooks inventory, and permission-source isolation
+    // all fail closed. The observed grokVersion is recorded below, never gated.
     let grok_version = assert_grok_posture(&grok_home, &process_home, workspace)?;
 
-    Ok(GrokRuntimeState {
-        grok_home,
-        process_home,
-        auth_source_path: auth_source,
-        session_id,
-        workspace_path: workspace_abs,
-        grok_version,
-    })
+    Ok(GrokRuntimeState::builder()
+        .grok_home(grok_home)
+        .process_home(process_home)
+        .auth_source_path(auth_source)
+        .session_id(session_id)
+        .workspace_path(workspace_abs)
+        .maybe_grok_version(grok_version)
+        .build())
 }
 
 // ---------------------------------------------------------------------------
@@ -601,10 +603,11 @@ fn skip_posture_assert() -> bool {
 }
 
 /// Run `grok inspect --json` under the provisioned home and fail loudly on
-/// bad posture (checks 2-5 of [`assert_inspect_json_posture`] — never
-/// downgraded to a warning). Returns the observed `grokVersion` (`None` when
-/// the assert was skipped, so no live inspect ran) so the caller can persist
-/// it on the execution record — see [`GrokRuntimeState::grok_version`].
+/// bad posture — folder trust, compat cells, hooks, and permission-source
+/// isolation are never downgraded to a warning. Returns the observed
+/// `grokVersion` (`None` when the assert was skipped, or inspect supplied no
+/// string value) so the caller can persist it on the execution record — see
+/// [`GrokRuntimeState::grok_version`].
 pub fn assert_grok_posture(grok_home: &Path, process_home: &Path, workspace: &Path) -> anyhow::Result<Option<String>> {
     if skip_posture_assert() {
         tracing::warn!(
@@ -677,15 +680,20 @@ pub fn assert_inspect_json_posture(
     workspace: &Path,
 ) -> anyhow::Result<()> {
     // Version: observed and logged, never gated (Grok auto-updates itself).
-    let version = inspect.get("grokVersion").and_then(|v| v.as_str()).unwrap_or("");
-    if !version.is_empty() && !version.starts_with(LAST_CHARACTERISED_GROK_VERSION) {
-        tracing::warn!(
-            grok_version = version,
-            last_characterised_grok_version = LAST_CHARACTERISED_GROK_VERSION,
-            "grok CLI version has drifted from the last characterised version; \
-             re-run the `--trust` / `grok models` / `grok inspect --json` posture checks \
-             and bump LAST_CHARACTERISED_GROK_VERSION once re-characterised"
-        );
+    match inspect.get("grokVersion").and_then(|value| value.as_str()) {
+        Some(version) if !version.is_empty() && !version.starts_with(LAST_CHARACTERISED_GROK_VERSION) => {
+            tracing::warn!(
+                grok_version = version,
+                last_characterised_grok_version = LAST_CHARACTERISED_GROK_VERSION,
+                "grok CLI version has drifted from the last characterised version; \
+                 re-run the `--trust` / `grok models` / `grok inspect --json` posture checks \
+                 and bump LAST_CHARACTERISED_GROK_VERSION once re-characterised"
+            );
+        }
+        Some("") | None => {
+            tracing::warn!("grok inspect reported no grokVersion; the version-drift signal is now dark");
+        }
+        Some(_) => {}
     }
 
     // Folder trust.
@@ -909,6 +917,37 @@ mod tests {
             let t = l.trim();
             !t.starts_with('#') && t.contains("permissions")
         }));
+    }
+
+    #[test]
+    fn grok_runtime_state_decodes_pre_version_payload() {
+        let state = crate::DriverRuntimeState::new(serde_json::json!({
+            "grok_home": "/tmp/grok-home",
+            "process_home": "/tmp/process-home",
+            "auth_source_path": "/tmp/auth.json",
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "workspace_path": "/tmp/workspace",
+        }));
+
+        let decoded = GrokRuntimeState::from_driver_runtime_state(&state)
+            .expect("pre-version runtime state must remain decodable");
+        assert_eq!(decoded.grok_version, None);
+    }
+
+    #[test]
+    fn grok_runtime_state_round_trips_observed_version() {
+        let state = GrokRuntimeState::builder()
+            .grok_home(PathBuf::from("/tmp/grok-home"))
+            .process_home(PathBuf::from("/tmp/process-home"))
+            .auth_source_path(PathBuf::from("/tmp/auth.json"))
+            .session_id("11111111-1111-4111-8111-111111111111")
+            .workspace_path(PathBuf::from("/tmp/workspace"))
+            .grok_version("0.2.117")
+            .build();
+
+        let decoded = GrokRuntimeState::from_driver_runtime_state(&state.to_driver_runtime_state())
+            .expect("runtime state must round-trip");
+        assert_eq!(decoded.grok_version.as_deref(), Some("0.2.117"));
     }
 
     /// Minimal inspect JSON with every expected compat cell disabled and a
