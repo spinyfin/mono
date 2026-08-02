@@ -39,9 +39,9 @@ mod turn_end_recovery;
 
 pub use home::{
     COMPAT_SURFACES, COMPAT_VENDORS, GROK_AUTH_SOURCE_ENV, GROK_HOMES_ENV_TEST_LOCK, GROK_HOMES_ROOT_ENV,
-    GROK_SKIP_POSTURE_ASSERT_ENV, GrokRuntimeState, PINNED_GROK_VERSION, assert_grok_home_safe_to_delete,
-    assert_inspect_json_posture, grok_home_for_run, grok_homes_root, process_home_for_run, reclaim_grok_home,
-    render_base_config_toml, resolve_gh_config_dir, trust_path_variants,
+    GROK_SKIP_POSTURE_ASSERT_ENV, GrokRuntimeState, assert_grok_home_safe_to_delete, assert_inspect_json_posture,
+    grok_home_for_run, grok_homes_root, process_home_for_run, reclaim_grok_home, render_base_config_toml,
+    resolve_gh_config_dir, trust_path_variants,
 };
 
 use classify_error::classify_grok_error;

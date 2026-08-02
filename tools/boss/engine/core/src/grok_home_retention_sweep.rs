@@ -209,6 +209,7 @@ mod tests {
             auth_source_path: PathBuf::from("/tmp/source-auth.json"),
             session_id: "11111111-1111-4111-8111-111111111111".into(),
             workspace_path: PathBuf::from("/tmp/ws"),
+            grok_version: None,
         }
         .to_driver_runtime_state();
         db.set_driver_runtime_state(&execution.id, Some(&state)).unwrap();

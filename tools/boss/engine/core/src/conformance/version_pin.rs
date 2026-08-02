@@ -28,7 +28,6 @@ use crate::conformance::fixtures::{
     codex_shaped_driver, decode_jsonl,
 };
 use crate::conformance::{require_codex_cli, require_grok_cli, which};
-use crate::driver::grok::PINNED_GROK_VERSION;
 use crate::driver::{AgentDriver, GrokDriver};
 
 /// Parse `codex-cli X.Y.Z` (or `codex X.Y.Z`) stdout from `codex --version`.
@@ -375,10 +374,15 @@ fn error_item_as_operational_warning_is_not_silently_a_turn_failure() {
     );
 }
 
-// ─── Grok live-CLI version + posture pin ────────────────────────────────────
+// ─── Grok live-CLI posture pin ──────────────────────────────────────────────
 //
-// Mirrors the Codex convention above, but with two distinct tiers rather
-// than one blanket skip:
+// No version pin: `grokVersion` is observed (and, on drift from
+// `LAST_CHARACTERISED_GROK_VERSION`, logged) by
+// `grok::home::assert_inspect_json_posture`, but it never gates — Grok
+// auto-updates itself, and a hard pin turned every automatic bump into a
+// fail-closed provisioning outage. What remains pinned here is two
+// independent live-CLI surfaces, mirroring the Codex convention above but
+// with two distinct tiers rather than one blanket skip:
 //   - Soft-skip when `grok` is not on PATH, or (for auth-gated assertions)
 //     when the CLI is present but not logged in — `grok models` and `grok
 //     inspect --json` both require auth per the pane-viability spike's
@@ -387,9 +391,8 @@ fn error_item_as_operational_warning_is_not_silently_a_turn_failure() {
 //     established: a removed flag or subcommand on an otherwise-working
 //     installation must panic, not degrade to a silent skip.
 // Set `BOSS_REQUIRE_GROK_CLI=1` to require the binary and a successful
-// invocation, failing instead of skipping — use this on hosts that claim
-// the live Grok pin (dev machines re-running the pane-viability spike /
-// re-capturing fixtures).
+// invocation, failing instead of skipping — use this on hosts re-running the
+// pane-viability spike / re-capturing fixtures.
 //
 // The hidden `--trust` flag (design D-3: absent from `--help`) and the
 // `grok models` menu are asserted here rather than folded into a `--help`
@@ -448,38 +451,6 @@ fn run_live_grok(args: &[&str]) -> Option<std::process::Output> {
             None
         }
     }
-}
-
-#[test]
-fn pinned_grok_version_constant_is_semver_shaped() {
-    let parts: Vec<_> = PINNED_GROK_VERSION.split('.').collect();
-    assert!(
-        parts.len() >= 3 && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())),
-        "PINNED_GROK_VERSION must be X.Y.Z, got {PINNED_GROK_VERSION}",
-    );
-}
-
-#[test]
-fn installed_grok_matches_pinned_version_when_present() {
-    // `grok inspect --json` reports the version and the resolved config in
-    // one call — the design's stated source, rather than a separate
-    // `--version` parse.
-    let Some(output) = run_live_grok(&["inspect", "--json"]) else {
-        return;
-    };
-    let inspect: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
-        panic!(
-            "parsing `grok inspect --json` stdout ({e}): {}",
-            String::from_utf8_lossy(&output.stdout)
-        )
-    });
-    let version = inspect.get("grokVersion").and_then(|v| v.as_str()).unwrap_or("");
-    assert!(
-        version.starts_with(PINNED_GROK_VERSION),
-        "installed grok reports grokVersion={version:?}, but the conformance harness is pinned \
-         to {PINNED_GROK_VERSION}. Re-run the pane-viability spike, update fixtures, and bump \
-         PINNED_GROK_VERSION deliberately — do not silently absorb drift.",
-    );
 }
 
 #[test]

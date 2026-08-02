@@ -14,15 +14,19 @@
 //! 3. **Boundary equivalence** — (a) every transport produces equal `TurnEnd`
 //!    via `turn_boundary`; (b) the decoded `WorkerEvent` sequence drives the
 //!    live-worker activity machine to Idle. See `boundary_equivalence`.
-//! 4. **Version pinning** — fixtures and the installed agent CLI must match
-//!    the pinned Codex / Grok versions; Codex's `--json` stream has no schema
-//!    version of its own, so this harness is the only defence against silent
-//!    drift. Live `codex --version` / `grok inspect --json` are soft-skip
-//!    without the binary (or on any live-check failure, e.g. not logged in);
-//!    set `BOSS_REQUIRE_CODEX_CLI=1` / `BOSS_REQUIRE_GROK_CLI=1` to require
-//!    them instead. The Grok pin additionally asserts the hidden `--trust`
-//!    flag still parses and that `grok models` still matches the pinned
-//!    descriptor's single-SKU menu — see `version_pin`.
+//! 4. **Version pinning** — fixtures and the installed Codex CLI must match
+//!    the pinned Codex version; Codex's `--json` stream has no schema version
+//!    of its own, so this harness is the only defence against silent drift.
+//!    Live `codex --version` is soft-skip without the binary (or on any
+//!    live-check failure); set `BOSS_REQUIRE_CODEX_CLI=1` to require it
+//!    instead. Grok carries no version pin — the CLI auto-updates itself and
+//!    a hard pin turned every automatic bump into a fail-closed provisioning
+//!    outage (the observed `grokVersion` is now only logged on drift, never
+//!    gated; see `grok::home::assert_inspect_json_posture`). The harness
+//!    still pins two version-independent live-CLI surfaces for Grok: the
+//!    hidden `--trust` flag still parses, and `grok models` still matches the
+//!    pinned descriptor's single-SKU menu; set `BOSS_REQUIRE_GROK_CLI=1` to
+//!    require the binary instead of soft-skipping — see `version_pin`.
 //! 5. **Native-dialect transcript normalize** — every registry slug has a
 //!    fixture in that driver's on-disk dialect, and normalizing it surfaces a
 //!    `[blocked]` marker. Fails closed when a driver is registered without a

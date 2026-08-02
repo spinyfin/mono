@@ -35,13 +35,15 @@ pub static GROK_HOMES_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::ne
 /// Default leaf under the system temp when [`GROK_HOMES_ROOT_ENV`] is unset.
 const GROK_HOMES_DIR_NAME: &str = "boss-grok-homes";
 
-/// Pinned Grok CLI version characterised by the design + investigations.
-/// `grok inspect --json` reports this as `grokVersion`. `--trust`, `grok
-/// models`, and `grok inspect --json` posture are all verified against this
-/// version by the conformance version-pin tests in
-/// `tools/boss/engine/core/src/conformance/version_pin.rs`; re-run them and
-/// re-characterise before changing this value.
-pub const PINNED_GROK_VERSION: &str = "0.2.114";
+/// Most recent Grok CLI version actually characterised by the design +
+/// investigations. Documentation only — Grok auto-updates itself on its own
+/// schedule, so `assert_inspect_json_posture` does not gate on this: a
+/// mismatch only logs a `tracing::warn!` (see there). Update this value (and
+/// re-run `--trust` / `grok models` / `grok inspect --json` posture
+/// by hand) after actually re-characterising against a newer release —
+/// bumping it without re-characterising just relabels the drift as
+/// "known".
+const LAST_CHARACTERISED_GROK_VERSION: &str = "0.2.114";
 
 /// Filename of the Boss-assigned session UUID under `GROK_HOME`.
 const SESSION_ID_FILENAME: &str = "boss-session-id";
@@ -214,13 +216,20 @@ fn resolve_login_keychain_source() -> Option<PathBuf> {
 // ---------------------------------------------------------------------------
 
 /// Opaque payload persisted on the execution as [`crate::DriverRuntimeState`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct GrokRuntimeState {
     pub grok_home: PathBuf,
     pub process_home: PathBuf,
     pub auth_source_path: PathBuf,
     pub session_id: String,
     pub workspace_path: PathBuf,
+    /// `grokVersion` observed from `grok inspect --json` at provision time
+    /// (`None` when the live posture assert was skipped — test-only, via
+    /// [`GROK_SKIP_POSTURE_ASSERT_ENV`]). Recorded so drift is visible after
+    /// the fact even though it no longer gates provisioning; see
+    /// [`LAST_CHARACTERISED_GROK_VERSION`].
+    pub grok_version: Option<String>,
 }
 
 impl GrokRuntimeState {
@@ -563,8 +572,9 @@ pub fn provision_grok_home(workspace: &Path, prompt_text: &str, run_id: &str) ->
     fs::write(config_dir.join(".gitignore"), "*\n")
         .with_context(|| format!("writing gitignore under {}", config_dir.display()))?;
 
-    // Assert posture with live `grok inspect --json` (fail closed).
-    assert_grok_posture(&grok_home, &process_home, workspace)?;
+    // Assert posture with live `grok inspect --json` (fail closed on checks
+    // 2-5; the observed grokVersion is recorded below, never gated).
+    let grok_version = assert_grok_posture(&grok_home, &process_home, workspace)?;
 
     Ok(GrokRuntimeState {
         grok_home,
@@ -572,6 +582,7 @@ pub fn provision_grok_home(workspace: &Path, prompt_text: &str, run_id: &str) ->
         auth_source_path: auth_source,
         session_id,
         workspace_path: workspace_abs,
+        grok_version,
     })
 }
 
@@ -590,14 +601,17 @@ fn skip_posture_assert() -> bool {
 }
 
 /// Run `grok inspect --json` under the provisioned home and fail loudly on
-/// bad posture. Never downgraded to a warning.
-pub fn assert_grok_posture(grok_home: &Path, process_home: &Path, workspace: &Path) -> anyhow::Result<()> {
+/// bad posture (checks 2-5 of [`assert_inspect_json_posture`] — never
+/// downgraded to a warning). Returns the observed `grokVersion` (`None` when
+/// the assert was skipped, so no live inspect ran) so the caller can persist
+/// it on the execution record — see [`GrokRuntimeState::grok_version`].
+pub fn assert_grok_posture(grok_home: &Path, process_home: &Path, workspace: &Path) -> anyhow::Result<Option<String>> {
     if skip_posture_assert() {
         tracing::warn!(
             grok_home = %grok_home.display(),
             "skipping grok inspect posture assert ({GROK_SKIP_POSTURE_ASSERT_ENV} set; test-only)"
         );
-        return Ok(());
+        return Ok(None);
     }
 
     let output = Command::new("grok")
@@ -634,7 +648,9 @@ pub fn assert_grok_posture(grok_home: &Path, process_home: &Path, workspace: &Pa
         )
     })?;
 
-    assert_inspect_json_posture(&inspect, grok_home, process_home, workspace)
+    assert_inspect_json_posture(&inspect, grok_home, process_home, workspace)?;
+
+    Ok(inspect.get("grokVersion").and_then(|v| v.as_str()).map(str::to_owned))
 }
 
 /// Validate a captured / live `grok inspect --json` document against the
@@ -642,26 +658,33 @@ pub fn assert_grok_posture(grok_home: &Path, process_home: &Path, workspace: &Pa
 /// behaviour without a live `grok` binary.
 ///
 /// Fail-closed rules:
-/// - `grokVersion` must start with [`PINNED_GROK_VERSION`]
 /// - `projectTrusted` must be true
 /// - every (`COMPAT_VENDORS` × `COMPAT_SURFACES`) cell must be present with
 ///   `enabled == false` (missing cell = failure; schema drift is not silent)
 /// - hooks inventory must be non-empty (canary or full T-09 set)
 /// - operator-home Claude permission sources must not appear under scoped HOME
+///
+/// `grokVersion` is observed but never gated: Grok auto-updates itself, and a
+/// hard version pin here turned every automatic bump into a fail-closed
+/// provisioning outage with no worker even attempted. A drift from
+/// [`LAST_CHARACTERISED_GROK_VERSION`] only logs a `tracing::warn!`; the
+/// caller (`assert_grok_posture`) is responsible for persisting the observed
+/// version onto the execution record so the drift is not silently discarded.
 pub fn assert_inspect_json_posture(
     inspect: &serde_json::Value,
     grok_home: &Path,
     process_home: &Path,
     workspace: &Path,
 ) -> anyhow::Result<()> {
-    // Version pin.
+    // Version: observed and logged, never gated (Grok auto-updates itself).
     let version = inspect.get("grokVersion").and_then(|v| v.as_str()).unwrap_or("");
-    // Accept exact pin or a longer inspect string that starts with the pin
-    // (defensive if grokVersion ever gains a build suffix).
-    if !version.starts_with(PINNED_GROK_VERSION) {
-        bail!(
-            "grok version pin mismatch: inspect reports grokVersion={version:?}, \
-             expected {PINNED_GROK_VERSION}. Re-characterise before upgrading the pin."
+    if !version.is_empty() && !version.starts_with(LAST_CHARACTERISED_GROK_VERSION) {
+        tracing::warn!(
+            grok_version = version,
+            last_characterised_grok_version = LAST_CHARACTERISED_GROK_VERSION,
+            "grok CLI version has drifted from the last characterised version; \
+             re-run the `--trust` / `grok models` / `grok inspect --json` posture checks \
+             and bump LAST_CHARACTERISED_GROK_VERSION once re-characterised"
         );
     }
 
@@ -911,7 +934,7 @@ mod tests {
             "source": "default",
         }));
         serde_json::json!({
-            "grokVersion": PINNED_GROK_VERSION,
+            "grokVersion": LAST_CHARACTERISED_GROK_VERSION,
             "projectTrusted": true,
             "hooks": [{
                 "event": "session_start",
@@ -997,20 +1020,16 @@ mod tests {
     }
 
     #[test]
-    fn assert_inspect_json_fails_on_version_mismatch() {
+    fn assert_inspect_json_posture_does_not_gate_on_version_mismatch() {
         let mut inspect = good_inspect_fixture();
-        inspect["grokVersion"] = serde_json::json!("0.0.0-not-the-pin");
-        let err = assert_inspect_json_posture(
+        inspect["grokVersion"] = serde_json::json!("9.9.9-not-characterised");
+        assert_inspect_json_posture(
             &inspect,
             Path::new("/tmp/h"),
             Path::new("/tmp/ph"),
             Path::new("/tmp/ws"),
         )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("version pin"),
-            "expected version failure, got {err}"
-        );
+        .expect("a grokVersion drift must only warn, never fail closed");
     }
 
     #[test]

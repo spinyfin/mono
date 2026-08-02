@@ -2,7 +2,7 @@
 
 - **Date:** 2026-07-29
 - **Kind:** empirical post-integration characterisation — findings + throwaway harness; the only production change is a comment/test correction plus **no** capability declaration
-- **Version under test:** `grok 0.2.114 (0c785038798)` — **newer than the driver's `PINNED_GROK_VERSION` (`0.2.112`)**, see [Version drift](#version-drift-the-driver-would-currently-refuse-to-provision)
+- **Version under test:** `grok 0.2.114 (0c785038798)` — at the time newer than the driver's then-current `PINNED_GROK_VERSION` (`0.2.112`); the version pin was removed 2026-08-01 (operator decision), see [Version drift](#version-drift-the-driver-would-currently-refuse-to-provision)
 - **Host:** macOS aarch64
 - **Related:** design [G-13](../designs/grok-as-a-first-class-interactive-agent-driver.md) / T-24 (a) and [OQ-4](../designs/grok-as-a-first-class-interactive-agent-driver.md) / T-27 (b); [`grok-pretooluse-decision-vocabulary-and-tool-name-map.md`](./grok-pretooluse-decision-vocabulary-and-tool-name-map.md); [`grok-tui-liveness-markers-under-ghosttykit.md`](./grok-tui-liveness-markers-under-ghosttykit.md)
 - **Artifacts:** [`grok-notification-and-leader-artifacts/`](./grok-notification-and-leader-artifacts/)
@@ -179,6 +179,8 @@ Not measured further (it was not this run's question, and reproducing it means r
 `assert_inspect_json_posture` hard-fails unless `grokVersion` starts with `PINNED_GROK_VERSION` (`0.2.112`, `home.rs:40`, `:653`). The host runs **`0.2.114`**, so Grok provisioning would abort with _"Re-characterise before upgrading the pin."_
 
 This investigation re-characterised **two** surfaces (Notification, leader) — not the whole posture (pane markers, decision vocabulary, permission isolation, sandbox grammar were all measured against `0.2.112`). Bumping the pin asserts a re-characterisation that has not happened, so **the pin is deliberately left alone** and this is surfaced as its own piece of work.
+
+**Superseded 2026-08-01.** This predicted failure mode materialised for real: Grok auto-updated 0.2.114 → 0.2.117 on 2026-07-31 and every Grok execution died in provisioning, exactly as described above, except now with no re-characterisation available to unblock it (Grok updates itself; there is no "hold the upgrade until the harness passes" step to gate). The operator's call was to remove the version pin rather than keep re-chasing it: `assert_inspect_json_posture` no longer gates on `grokVersion` at all — it only observes the value and logs a `tracing::warn!` when it drifts from `LAST_CHARACTERISED_GROK_VERSION`. The other four posture checks this investigation did not touch (`projectTrusted`, the compat-cell matrix, the hooks inventory, and operator-`$HOME` permission-source isolation) are unaffected and still fail closed.
 
 ## What this changes in the driver
 
