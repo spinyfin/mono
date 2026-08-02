@@ -476,6 +476,7 @@ mod query_ensure;
 mod review_verdicts;
 mod revise_doc;
 mod revision_helpers;
+mod run_rows;
 mod schema_init;
 mod task_targets;
 #[cfg(test)]
