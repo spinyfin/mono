@@ -544,6 +544,13 @@ pub(crate) fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
         driver_runtime_state: row
             .get::<_, Option<String>>(25)?
             .and_then(|raw| serde_json::from_str::<boss_protocol::DriverRuntimeState>(&raw).ok()),
+        driver: row.get::<_, Option<String>>(26)?.filter(|s| !s.is_empty()),
+        model: row.get::<_, Option<String>>(27)?.filter(|s| !s.is_empty()),
+        effort_level: row
+            .get::<_, Option<String>>(28)?
+            .filter(|s| !s.is_empty())
+            .map(|raw| parse_text_column(28, &raw))
+            .transpose()?,
     })
 }
 

@@ -21,6 +21,32 @@ final class TranscriptViewTests: XCTestCase {
 
     // MARK: - Wire decode
 
+    func testExecutionRuntimeDecodePreservesRecordedAndUnknownStates() {
+        let client = EngineClient(socketPath: "/tmp/boss-transcript-runtime-test.sock")
+        let recorded = client.parseExecutionVM([
+            "id": "exec-recorded",
+            "work_item_id": "task-recorded",
+            "kind": "task_implementation",
+            "status": "waiting_human",
+            "driver": "codex",
+            "model": "gpt-5.5-codex",
+            "effort_level": "large",
+        ])
+        XCTAssertEqual(recorded?.driver, "codex")
+        XCTAssertEqual(recorded?.model, "gpt-5.5-codex")
+        XCTAssertEqual(recorded?.effortLevel, "large")
+
+        let unknown = client.parseExecutionVM([
+            "id": "exec-legacy",
+            "work_item_id": "task-legacy",
+            "kind": "task_implementation",
+            "status": "completed",
+        ])
+        XCTAssertNil(unknown?.driver, "missing driver must remain not-recorded, never default to Claude")
+        XCTAssertNil(unknown?.model)
+        XCTAssertNil(unknown?.effortLevel)
+    }
+
     func testSegmentDecodesThinkingWithCollapseFlags() throws {
         let json = """
         {

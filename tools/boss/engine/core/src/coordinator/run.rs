@@ -193,6 +193,20 @@ impl ExecutionCoordinator {
                 } else {
                     run
                 };
+                if let Some(spawn) = spawn_config_for_event.as_ref()
+                    && let Err(err) = self.work_db.record_execution_launch_config(
+                        &execution.id,
+                        &spawn.driver,
+                        &spawn.model,
+                        spawn.effort_level,
+                    )
+                {
+                    tracing::error!(
+                        ?err,
+                        execution_id = %execution.id,
+                        "failed to persist resolved worker launch configuration"
+                    );
+                }
                 if let Err(err) = self
                     .record_run_completion(&execution, &run, &lease, &worker_id, outcome, &adapter)
                     .await

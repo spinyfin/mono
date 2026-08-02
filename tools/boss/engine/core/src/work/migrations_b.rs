@@ -2708,6 +2708,21 @@ pub(crate) fn migrate_driver_traffic_split_from_codex_percentage(conn: &Connecti
     Ok(())
 }
 
+/// Add the immutable launch tuple to each execution. The routing-decision
+/// table remains the source of truth for driver selection; these columns are
+/// the resolved values that reached the spawned worker, including its model
+/// and the effort level at that instant. Existing rows deliberately remain
+/// NULL so callers can render them as not recorded rather than guessing.
+pub(crate) fn migrate_work_executions_launch_config(conn: &Connection) -> Result<()> {
+    for column in ["driver", "model", "effort_level"] {
+        if !work_executions_has_column(conn, column)? {
+            let ddl = format!("ALTER TABLE work_executions ADD COLUMN {column} TEXT");
+            conn.execute(&ddl, [])?;
+        }
+    }
+    Ok(())
+}
+
 /// One-time backfill: auto-resolve any still-`open`
 /// `pr_review_died_without_findings` attention item (see
 /// `crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND`) whose work

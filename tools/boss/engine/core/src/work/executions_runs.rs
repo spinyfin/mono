@@ -651,7 +651,7 @@ impl WorkDb {
                     we.created_at, we.started_at, we.finished_at, \
                     we.pre_start_failure_count, we.dispatch_not_before, we.pr_url, we.pr_head_before, \
                     we.prefer_is_soft, we.worker_branch_prefix, we.transient_failure_count, we.allow_dirty, we.branch_naming, \
-                    we.dispatch_wait_reason, we.dispatch_wait_since, we.driver_runtime_state \
+                    we.dispatch_wait_reason, we.dispatch_wait_since, we.driver_runtime_state, we.driver, we.model, we.effort_level \
              FROM work_executions we \
              LEFT JOIN tasks t ON t.id = we.work_item_id \
              WHERE we.status = 'ready' \
@@ -679,7 +679,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level
              FROM work_executions
              WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND cube_lease_id IS NOT NULL
@@ -709,7 +709,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level
              FROM work_executions
              WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND workspace_path IS NOT NULL
@@ -744,7 +744,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level
                  FROM work_executions
                  WHERE work_item_id = ?1
                    AND kind = 'revision_implementation'
@@ -1139,7 +1139,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level
              FROM work_executions
              WHERE driver_runtime_state IS NOT NULL
                AND driver_runtime_state != ''
@@ -2842,6 +2842,27 @@ mod event_bus_tests {
             )
             .unwrap();
         create_ready_chore_execution(db, chore.id)
+    }
+
+    #[test]
+    fn launch_config_is_frozen_per_execution_without_backfilling_unrecorded_rows() {
+        let (_dir, db) = open_db();
+        let execution = ready_execution(&db);
+
+        assert_eq!(execution.driver, None, "newly queued work has not launched yet");
+        let recorded = db
+            .record_execution_launch_config(&execution.id, "codex", "gpt-5.5-codex", Some(EffortLevel::Large))
+            .unwrap();
+        assert_eq!(recorded.driver.as_deref(), Some("codex"));
+        assert_eq!(recorded.model.as_deref(), Some("gpt-5.5-codex"));
+        assert_eq!(recorded.effort_level, Some(EffortLevel::Large));
+
+        let reloaded = db
+            .record_execution_launch_config(&execution.id, "claude", "opus", Some(EffortLevel::Small))
+            .unwrap();
+        assert_eq!(reloaded.driver.as_deref(), Some("codex"));
+        assert_eq!(reloaded.model.as_deref(), Some("gpt-5.5-codex"));
+        assert_eq!(reloaded.effort_level, Some(EffortLevel::Large));
     }
 
     #[tokio::test]

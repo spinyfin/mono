@@ -710,6 +710,10 @@ impl WorkDb {
         // equivalent three-way split and drop the legacy key. Data-only,
         // self-idempotent — see the function doc comment.
         migrate_driver_traffic_split_from_codex_percentage(conn)?;
+        // Resolved driver/model/effort values frozen only after a worker has
+        // actually spawned. NULL on earlier rows means not recorded, never a
+        // guessed default.
+        migrate_work_executions_launch_config(conn)?;
         // `pr_review_verdicts`: durable per-pass review-verdict ledger, written
         // atomically with `record_worker_pr_completion` so a `pr_review` pass
         // can never reach `completed` without a verdict row. Additive,
