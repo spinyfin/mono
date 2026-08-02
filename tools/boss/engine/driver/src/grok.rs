@@ -2176,12 +2176,13 @@ mod tests {
         fs::create_dir_all(&output_dir).unwrap();
         let result_path =
             boss_engine_structured_output::path_for(&output_dir, run_id, StructuredOutputKind::ReviewResult);
+        let _result_cleanup = FileCleanup(result_path.clone());
         let _ = fs::remove_file(&result_path);
 
         let probe_write = workspace.join("probe_write.txt");
         let _ = fs::remove_file(&probe_write);
 
-        let review_json = r#"{"pr_url":"https://github.com/example/repo/pull/1","head_sha":"deadbeefcafe","summary":"Live round-trip probe: no real findings.","revision_warranted":false,"findings":[]}"#;
+        let review_json = r#"{"pr_url":"https://github.com/example/repo/pull/1","head_sha":"deadbeefcafe","summary":"Live round-trip probe: one regression finding.","revision_warranted":true,"findings":[{"severity":"high","category":"regression","file":"src/lib.rs","title":"Live round-trip probe finding","detail":"Probe-only finding used to exercise enum + regression_check derivation.","confidence":"high"}],"regression_check":{"performed":true,"suspected_deletions":[]}}"#;
         let prompt = format!(
             "Do exactly two things, in order, then stop.\n\
              1. Try to create a file named probe_write.txt in the current directory with content \
@@ -2220,10 +2221,15 @@ mod tests {
             panic!("ReviewResult artifact must round-trip through the real parser: {err}\n{written}")
         });
         assert_eq!(parsed.pr_url, "https://github.com/example/repo/pull/1");
-        assert!(!parsed.revision_warranted);
-        assert!(parsed.findings.is_empty());
-
-        let _ = fs::remove_file(&result_path);
+        assert!(parsed.revision_warranted);
+        assert_eq!(parsed.findings.len(), 1);
+        assert_eq!(parsed.findings[0].severity, boss_pr_review::ReviewFindingSeverity::High);
+        assert_eq!(
+            parsed.findings[0].category,
+            boss_pr_review::ReviewFindingCategory::Regression
+        );
+        assert!(parsed.regression_check.performed);
+        assert_eq!(parsed.regression_check.suspected_deletions.len(), 1);
     }
 
     /// design T-23 acceptance (part 2/2, Phase 3 — conflict-resolution
@@ -2323,6 +2329,18 @@ mod tests {
     impl Drop for ScratchCleanup {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Removes a single file on drop, on every exit path including a mid-test
+    /// panic. Needed for artifacts written into the real, machine-wide
+    /// `boss_engine_structured_output::default_dir()` — unlike a scratch root
+    /// under our own `ScratchCleanup`, that directory is shared with live
+    /// engine runs, so a leaked file there is not test-local cleanup debt.
+    struct FileCleanup(PathBuf);
+    impl Drop for FileCleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
         }
     }
 
