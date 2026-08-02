@@ -1825,7 +1825,27 @@ async fn resolve_pr_description(
         }
     }
 
-    // Level 3: no PR number from env — detect the current branch and look up
+    // Level 3a: a GitHub merge-queue build's branch is a synthetic value
+    // (`gh-readonly-queue/<target>/pr-<N>-<sha>`) that encodes the PR number
+    // directly. It is not a real head branch a branch→PR API lookup could
+    // resolve (see `detect_current_branch`'s filter below), so recover the
+    // number from the branch name itself and skip straight to fetching that
+    // PR's description — this is what makes bypass directives declared in
+    // the PR body reachable on the one CI context that otherwise drops them.
+    if let Some(pr_number) = env
+        .buildkite_branch
+        .as_deref()
+        .and_then(pr_number_from_merge_queue_branch)
+    {
+        info!(
+            repository = repository,
+            pr_number = pr_number,
+            "resolved PR number from merge-queue branch name"
+        );
+        return github_pull_request_description(repository, &pr_number, github_token.as_deref()).await;
+    }
+
+    // Level 3b: no PR number from env — detect the current branch and look up
     // the open PR via the GitHub API. Best-effort: missing token, no open PR,
     // or any network failure all silently yield None.
     let branch = detect_current_branch(env, vcs)?;
@@ -1844,7 +1864,10 @@ async fn resolve_pr_description(
     github_pull_request_description(repository, &pr_number, github_token.as_deref()).await
 }
 
-/// Detect the name of the current branch for Level 3 PR lookup.
+/// Detect the name of the current branch for Level 3b PR lookup (branch→PR
+/// API search). Only reached after [`resolve_pr_description`]'s Level 3a has
+/// already tried and failed to recover a PR number directly from a
+/// merge-queue synthetic branch via [`pr_number_from_merge_queue_branch`].
 ///
 /// Sources tried in order:
 /// 1. Buildkite: `BUILDKITE_BRANCH` (always set, already the branch name).
@@ -1852,7 +1875,10 @@ async fn resolve_pr_description(
 ///    parsed from `GITHUB_REF` (push events).
 /// 3. VCS fallback: `git branch --show-current` / jj bookmark.
 fn detect_current_branch(env: &CiEnvironment, vcs: &Vcs) -> Option<String> {
-    // Buildkite always exposes the branch; skip merge-queue synthetic branches.
+    // Buildkite always exposes the branch; skip merge-queue synthetic
+    // branches — they are not a real head branch a branch→PR API search
+    // could ever match, so a real PR number (if any) must have already been
+    // recovered by pr_number_from_merge_queue_branch before this is reached.
     if let Some(branch) = env
         .buildkite_branch
         .as_deref()
@@ -1880,6 +1906,25 @@ fn detect_current_branch(env: &CiEnvironment, vcs: &Vcs) -> Option<String> {
 
     // VCS fallback for local runs and any CI not covered above.
     normalize_optional_description(vcs.current_branch().ok())
+}
+
+/// Extract the PR number encoded in a GitHub merge-queue synthetic branch
+/// name, e.g. `gh-readonly-queue/main/pr-2621-3f022644be91...` -> `"2621"`.
+///
+/// Mirrors the target-branch extraction in
+/// `change_detection::default_branch::resolve_default_branch`, which pulls
+/// the *target* segment out of the same synthetic name; this pulls the
+/// trailing `pr-<N>-<sha>` segment instead — taken from the *last* `/` so a
+/// target branch that itself contains slashes (e.g. `release/2026-01`)
+/// doesn't throw off the split. Returns `None` for anything that isn't a
+/// merge-queue branch, or whose `pr-<N>` segment doesn't parse as a number.
+fn pr_number_from_merge_queue_branch(branch: &str) -> Option<String> {
+    let rest = branch.strip_prefix("gh-readonly-queue/")?;
+    let tail = rest.rsplit('/').next()?;
+    let pr_part = tail.strip_prefix("pr-")?;
+    let number_str = pr_part.split('-').next()?;
+    number_str.parse::<u64>().ok()?;
+    Some(number_str.to_owned())
 }
 
 fn init_tracing(verbose: u8, log_level: Option<LogLevel>, log_file: Option<PathBuf>) -> Result<()> {
@@ -1988,8 +2033,11 @@ async fn attempt_sarif_upload(sarif: &serde_json::Value, env: &CiEnvironment, vc
 ///
 /// 1. GHA: `GITHUB_REF` (already a full ref: `refs/heads/...` or `refs/pull/.../merge`).
 /// 2. Buildkite PR build: `BUILDKITE_PULL_REQUEST` → `refs/pull/{N}/merge`.
-/// 3. Buildkite push build: `BUILDKITE_BRANCH` → `refs/heads/{branch}`.
-/// 4. VCS fallback: current branch → `refs/heads/{branch}`.
+/// 3. Buildkite merge-queue build: PR number recovered from the synthetic
+///    `BUILDKITE_BRANCH` (`gh-readonly-queue/<target>/pr-<N>-<sha>`) →
+///    `refs/pull/{N}/merge`.
+/// 4. Buildkite push build: `BUILDKITE_BRANCH` → `refs/heads/{branch}`.
+/// 5. VCS fallback: current branch → `refs/heads/{branch}`.
 fn resolve_ref_for_upload(env: &CiEnvironment, vcs: &Vcs) -> Option<String> {
     // GHA: GITHUB_REF is already a full ref.
     if let Some(github_ref) = env.github_ref.as_deref().filter(|r| !r.is_empty()) {
@@ -2004,6 +2052,16 @@ fn resolve_ref_for_upload(env: &CiEnvironment, vcs: &Vcs) -> Option<String> {
         && pr.parse::<u64>().is_ok()
     {
         return Some(format!("refs/pull/{pr}/merge"));
+    }
+
+    // Buildkite merge-queue build: recover the PR number from the synthetic
+    // branch name rather than treating it as a real head branch.
+    if let Some(pr_number) = env
+        .buildkite_branch
+        .as_deref()
+        .and_then(pr_number_from_merge_queue_branch)
+    {
+        return Some(format!("refs/pull/{pr_number}/merge"));
     }
 
     // Buildkite push build: BUILDKITE_BRANCH is the branch name.

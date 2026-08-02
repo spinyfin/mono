@@ -42,7 +42,7 @@ bypass_name = "BYPASS_NO_USFA_TYPO"
 
 ## Directive format
 
-Use a single-line directive in commit or PR description:
+Use a single-line directive in the commit description or the PR description. **The commit description is the durable surface** — it is read in every CI context with no network dependency. The PR description is a best-effort convenience surface: reading it requires resolving which PR the current build belongs to and making an authenticated GitHub API call, both of which can fail or be unavailable depending on CI context (see [CI/environment context](#cienvironment-context) below). Prefer the commit description for anything you need to be certain survives to the build that actually gates a merge.
 
 ```text
 BYPASS_<CHECK_NAME>=<specific legitimate reason>
@@ -110,6 +110,11 @@ If policy fails and bypass is enabled but no directive exists:
 - normal policy failure is emitted
 - remediation text includes bypass instructions and warns against convenience bypasses
 
+This case has two different underlying situations, and the remediation text tells you which one you're in:
+
+- **PR description resolved, no directive found in either surface** — the standard remediation above; a directive genuinely wasn't declared.
+- **PR description could not be resolved in this environment** (no GitHub API access, no open PR found, etc.) — a distinct remediation states that only the commit description was checked, and that a directive declared only in the PR description would not be visible to this run. Treat this as "unknown", not "no bypass declared": if you see this message and expect a bypass to be in effect, move the directive to the commit description.
+
 ## Legacy config compatibility
 
 During migration, some checks still honor `allow_bypass` / `bypass_name` under `[checks.config]`. Prefer `[checks.policy]` for all new or updated configuration.
@@ -123,9 +128,10 @@ The checks CLI resolves PR description context using a layered fallback:
 3. **CI-native env** — resolved automatically, no harness wiring needed:
    - Buildkite: `BUILDKITE_PULL_REQUEST` (used when not `"false"`; present on PR builds).
    - GitHub Actions: `GITHUB_REF` parsed as `refs/pull/{N}/merge` (present on `pull_request` events).
-4. **Branch→PR lookup** — when no PR number is available, checkleft detects the current branch (from `BUILDKITE_BRANCH`, `GITHUB_HEAD_REF`, `refs/heads/{branch}` in `GITHUB_REF`, or VCS) and queries the GitHub API for an open PR on that branch. This is what enables bypass directives in the PR description on push-triggered builds (this repo's normal CI flow) without any CI script changes.
+4. **PR-number recovery from a GitHub merge-queue branch** — a merge-queue build's `BUILDKITE_BRANCH` is a synthetic value (`gh-readonly-queue/<target>/pr-<N>-<sha>`) rather than a real head branch; checkleft parses the PR number `N` directly out of it and fetches that PR's description. This is what makes bypass directives in the PR description reachable on the one CI context — the merge queue — where a branch→PR API search would otherwise find nothing to search for, because the synthetic branch was never a real PR head branch to begin with.
+5. **Branch→PR lookup** — when no PR number is available and the branch isn't a merge-queue synthetic one, checkleft detects the current branch (from `BUILDKITE_BRANCH`, `GITHUB_HEAD_REF`, `refs/heads/{branch}` in `GITHUB_REF`, or VCS) and queries the GitHub API for an open PR on that branch. This is what enables bypass directives in the PR description on push-triggered builds (this repo's normal CI flow, and merge-queue builds via level 4 above) without any CI script changes.
 
-All network-based resolution (levels 3–4) is best-effort: if no GitHub token is available or no open PR is found, checkleft falls back to commit-description directives only — no error is raised.
+All network-based resolution (levels 3–5) is best-effort: if no GitHub token is available or no open PR is found, checkleft falls back to commit-description directives only — no error is raised. **This is exactly why the commit description is the durable surface**: PR-description resolution depends on network access, an available token, and (until level 4 above) on the branch being a real, searchable head branch — none of which the commit description needs.
 
 ### GitHub auth resolution order
 

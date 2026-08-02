@@ -12,9 +12,9 @@ use super::{
     ColorLevel, ExternalProviderMode, FixCheckPlan, FixPlan, OutputStyle, TRUNCATE_HEAD_LINES, TRUNCATE_MAX_LINE_LEN,
     TRUNCATE_TAIL_LINES, ci_from_env, compute_fix_plan, distinct_applied_files, github_auth_unavailable_warning,
     invocation_root_from, normalize_optional_description, parse_external_provider_mode, parse_github_ref_pr_number,
-    render_fix_results, render_human_footer, render_human_results, render_no_checks_ran,
-    resolve_github_token_from_sources, should_show_progress, sort_results_for_output, still_failing_from_verify,
-    truncate_tool_output,
+    pr_number_from_merge_queue_branch, render_fix_results, render_human_footer, render_human_results,
+    render_no_checks_ran, resolve_github_token_from_sources, resolve_ref_for_upload, should_show_progress,
+    sort_results_for_output, still_failing_from_verify, truncate_tool_output,
 };
 
 #[test]
@@ -572,20 +572,93 @@ fn detect_current_branch_uses_buildkite_branch() {
 fn detect_current_branch_skips_merge_queue_branch() {
     let env = CiEnvironment {
         buildkite: true,
-        buildkite_branch: Some("gh-readonly-queue/main/pr-42".to_owned()),
+        buildkite_branch: Some("gh-readonly-queue/main/pr-42-3f022644be91".to_owned()),
         github_head_ref: Some("feature-branch".to_owned()),
         ..Default::default()
     };
-    // The merge-queue branch should be filtered out; next source is github_head_ref.
-    // We can test this purely by calling detect_current_branch with a stub Vcs
-    // only if Vcs is constructible without real FS. Since it's not, we validate
-    // the intermediate logic by inspecting the filter predicate directly.
+    // detect_current_branch is only reached for Level 3b (branch→PR API
+    // search) after Level 3a in resolve_pr_description has already tried and
+    // failed to recover a PR number directly from the synthetic branch — see
+    // pr_number_from_merge_queue_branch_extracts_pr_number below. It must
+    // still filter the synthetic branch out here: it is never a real head
+    // branch a branch→PR API search could match.
     let bk_branch = env
         .buildkite_branch
         .as_deref()
         .filter(|b| !b.starts_with("gh-readonly-queue/"))
         .map(|b| b.to_owned());
     assert_eq!(bk_branch, None, "merge-queue branch should be filtered out");
+}
+
+// --- pr_number_from_merge_queue_branch ---
+
+#[test]
+fn pr_number_from_merge_queue_branch_extracts_pr_number() {
+    assert_eq!(
+        pr_number_from_merge_queue_branch("gh-readonly-queue/main/pr-2621-3f022644be91"),
+        Some("2621".to_owned())
+    );
+}
+
+#[test]
+fn pr_number_from_merge_queue_branch_handles_multi_segment_target() {
+    // Target segments can themselves contain slashes in principle; the PR
+    // number always sits in the final segment.
+    assert_eq!(
+        pr_number_from_merge_queue_branch("gh-readonly-queue/release/2026-01/pr-7-abc123"),
+        Some("7".to_owned())
+    );
+}
+
+#[test]
+fn pr_number_from_merge_queue_branch_returns_none_for_non_merge_queue_branch() {
+    assert_eq!(pr_number_from_merge_queue_branch("boss/exec_abc123"), None);
+}
+
+#[test]
+fn pr_number_from_merge_queue_branch_returns_none_when_pr_segment_missing() {
+    assert_eq!(
+        pr_number_from_merge_queue_branch("gh-readonly-queue/main/notapr-42"),
+        None
+    );
+}
+
+#[test]
+fn pr_number_from_merge_queue_branch_returns_none_for_non_numeric_pr_segment() {
+    assert_eq!(
+        pr_number_from_merge_queue_branch("gh-readonly-queue/main/pr-abc-sha"),
+        None
+    );
+}
+
+// --- resolve_ref_for_upload merge-queue recovery ---
+
+#[test]
+fn resolve_ref_for_upload_recovers_pr_ref_from_merge_queue_branch() {
+    use checkleft::vcs::Vcs;
+
+    let env = CiEnvironment {
+        buildkite: true,
+        buildkite_branch: Some("gh-readonly-queue/main/pr-2621-3f022644be91".to_owned()),
+        buildkite_pull_request: Some("false".to_owned()),
+        ..Default::default()
+    };
+    // The merge-queue branch alone resolves a ref before any VCS fallback is
+    // consulted, matching the same `refs/pull/{N}/merge` shape a regular
+    // Buildkite PR build resolves. Still need a real (empty) repo on disk
+    // since `Vcs` has no other public constructor.
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(temp.path())
+        .output()
+        .expect("git init");
+    let vcs = Vcs::detect(temp.path()).expect("detect vcs");
+
+    assert_eq!(
+        resolve_ref_for_upload(&env, &vcs),
+        Some("refs/pull/2621/merge".to_owned())
+    );
 }
 
 #[test]
