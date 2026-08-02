@@ -833,3 +833,458 @@ fn status_check_constraint_rejects_out_of_enum_values_on_both_tables() {
     );
     let _ = std::fs::remove_file(path);
 }
+
+// ── status-CHECK table rebuild: FK children, recovery, rollback ─────────
+//
+// `migrate_projects_tasks_status_check` rebuilds `projects` and `tasks`,
+// and both are foreign-key parents with live children. The fixtures below
+// stand up a legacy schema whose `tasks.project_id` genuinely declares
+// `REFERENCES projects(id)` (the builder's baseline `tasks` does not) plus
+// the two chain-created child tables that can be seeded before the chain
+// runs, so the rebuild is exercised against a database shaped like a real
+// one rather than one whose parent tables happen to have no children.
+//
+// `automation_runs.produced_task_id` and
+// `automation_dedup_suppressions.surviving_task_id` are the other two
+// `tasks` children; they are not seeded here because their own parent
+// tables (`automations`) are chain-created and pre-creating them in the
+// fixture would freeze a stale copy of a table ~20 columns wide. Under
+// enforced foreign keys any one referencing row is enough to abort the
+// `DROP`, and `attention_groups` and `task_targets` supply that for both
+// parents.
+
+/// `tasks` as a pre-migration database really has it: the baseline
+/// columns, but with the `project_id` foreign key the `LegacySchema`
+/// builder's baseline omits — plus
+/// `investigation_doc_repo_remote_url`, which
+/// `e8936cb5 "derive investigation-doc repo from task"` stopped adding to
+/// new databases without ever dropping it from existing ones ("existing
+/// DBs retain the dead column; new DBs never get it"). It is invisible in
+/// today's source and was missing from the shipped rebuild's column list,
+/// so a rebuild would have taken it and its contents with it.
+const TASKS_WITH_PROJECT_FK_DDL: &str = "CREATE TABLE tasks (
+     id TEXT PRIMARY KEY,
+     product_id TEXT NOT NULL REFERENCES products(id),
+     project_id TEXT REFERENCES projects(id),
+     kind TEXT NOT NULL,
+     name TEXT NOT NULL,
+     description TEXT NOT NULL DEFAULT '',
+     status TEXT NOT NULL,
+     ordinal INTEGER,
+     pr_url TEXT,
+     deleted_at TEXT,
+     created_at TEXT NOT NULL,
+     updated_at TEXT NOT NULL,
+     autostart INTEGER NOT NULL DEFAULT 1,
+     last_status_actor TEXT NOT NULL DEFAULT 'human',
+     priority TEXT NOT NULL DEFAULT 'medium',
+     investigation_doc_repo_remote_url TEXT
+ );";
+
+/// `projects` extras for a database old enough to still carry the
+/// pre-pointer design-doc storage. Like the `tasks` column above, no
+/// migration ever dropped these, they are invisible in today's source,
+/// and the shipped rebuild's column list omitted them.
+const PROJECTS_LEGACY_DESIGN_DOC_COLUMNS: &str = "last_status_actor TEXT NOT NULL DEFAULT 'human',
+     design_doc TEXT, design_doc_updated_at TEXT, design_doc_draft TEXT";
+
+/// `attention_groups` verbatim from `migrate_attentions` — a child of
+/// both `projects` and `tasks`. The chain's own `CREATE TABLE IF NOT
+/// EXISTS` sees it already present and later migrations `ALTER` it as
+/// usual.
+const ATTENTION_GROUPS_FK_CHILD_DDL: &str = "CREATE TABLE attention_groups (
+     id                         TEXT PRIMARY KEY,
+     product_id                 TEXT NOT NULL REFERENCES products(id),
+     short_id                   INTEGER,
+     kind                       TEXT NOT NULL,
+     association_project_id     TEXT REFERENCES projects(id),
+     association_task_id        TEXT REFERENCES tasks(id),
+     source_kind                TEXT NOT NULL,
+     source_task_id             TEXT,
+     source_run_id              TEXT,
+     source_doc_path            TEXT,
+     source_doc_repo_remote_url TEXT,
+     source_doc_branch          TEXT,
+     grouping_key               TEXT NOT NULL,
+     generation                 INTEGER NOT NULL DEFAULT 0,
+     state                      TEXT NOT NULL DEFAULT 'open',
+     produced_artifact_kind     TEXT,
+     produced_artifact_ref      TEXT,
+     created_at                 TEXT NOT NULL,
+     actioned_at                TEXT,
+     dismissed_at               TEXT,
+     CHECK (
+         (association_project_id IS NOT NULL AND association_task_id IS NULL)
+         OR (association_project_id IS NULL  AND association_task_id IS NOT NULL)
+     )
+ );";
+
+/// `task_targets` verbatim from `migrate_task_targets_table` — a second
+/// child of `tasks`.
+const TASK_TARGETS_FK_CHILD_DDL: &str = "CREATE TABLE task_targets (
+     id         TEXT PRIMARY KEY,
+     task_id    TEXT NOT NULL REFERENCES tasks(id),
+     kind       TEXT NOT NULL CHECK (kind IN ('file', 'symbol')),
+     value      TEXT NOT NULL,
+     created_at TEXT NOT NULL
+ );";
+
+/// Stand up a legacy database with real foreign-key children of both
+/// `projects` and `tasks`, plus any `extra` DDL the caller wants (the
+/// half-migrated fixture uses it to plant an orphaned `projects_v2`).
+fn seed_legacy_db_with_fk_children(path: &std::path::Path, extra_ddl: &[&str]) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let mut schema = LegacySchema::new(4)
+        .products(NO_EXTRA_COLUMNS)
+        .projects(PROJECTS_LEGACY_DESIGN_DOC_COLUMNS)
+        .ddl(TASKS_WITH_PROJECT_FK_DDL)
+        .ddl(ATTENTION_GROUPS_FK_CHILD_DDL)
+        .ddl(TASK_TARGETS_FK_CHILD_DDL);
+    for ddl in extra_ddl {
+        schema = schema.ddl(ddl);
+    }
+    schema
+        .seed(&legacy_product_seed("prod_legacy", "Legacy", "legacy"))
+        .seed(&legacy_project_seed("proj_one", "prod_legacy", "One", "one"))
+        .seed(&legacy_project_seed("proj_two", "prod_legacy", "Two", "two"))
+        .seed(
+            "UPDATE projects
+                SET design_doc = 'the whole design, inline',
+                    design_doc_updated_at = '1700000009',
+                    design_doc_draft = 'an unpublished draft'
+              WHERE id = 'proj_one';",
+        )
+        // Two tasks under proj_one and one project-less chore, so both a
+        // set and a NULL are exercised on the FK column itself. Each
+        // project also gets its design task up front, so
+        // `migrate_backfill_project_design_tasks` is a no-op and the row
+        // counts these tests assert on stay exact.
+        .seed(
+            "INSERT INTO tasks(id, product_id, project_id, kind, name, description, status, ordinal,
+                               pr_url, created_at, updated_at, investigation_doc_repo_remote_url)
+             VALUES ('task_one', 'prod_legacy', 'proj_one', 'project_task', 'First', 'body one', 'in_review', 3,
+                     'https://github.com/spinyfin/mono/pull/1', '1700000000', '1700000000',
+                     'git@github.com:spinyfin/mono.git');",
+        )
+        .seed(
+            "INSERT INTO tasks(id, product_id, project_id, kind, name, description, status, created_at, updated_at)
+             VALUES ('task_two', 'prod_legacy', 'proj_one', 'project_task', 'Second', '', 'todo', '1700000000', '1700000000');",
+        )
+        .seed(
+            "INSERT INTO tasks(id, product_id, kind, name, description, status, created_at, updated_at)
+             VALUES ('chore_one', 'prod_legacy', 'chore', 'Chore', '', 'done', '1700000000', '1700000000');",
+        )
+        .seed(
+            "INSERT INTO tasks(id, product_id, project_id, kind, name, description, status, created_at, updated_at)
+             VALUES ('design_one', 'prod_legacy', 'proj_one', 'design', 'Design', '', 'done', '1700000000', '1700000000');",
+        )
+        .seed(
+            "INSERT INTO tasks(id, product_id, project_id, kind, name, description, status, created_at, updated_at)
+             VALUES ('design_two', 'prod_legacy', 'proj_two', 'design', 'Design', '', 'done', '1700000000', '1700000000');",
+        )
+        .seed(
+            "INSERT INTO attention_groups(id, product_id, kind, association_project_id, source_kind,
+                                          grouping_key, created_at)
+             VALUES ('attn_proj', 'prod_legacy', 'review', 'proj_one', 'review', 'k1', '1700000000');",
+        )
+        .seed(
+            "INSERT INTO attention_groups(id, product_id, kind, association_task_id, source_kind,
+                                          grouping_key, created_at)
+             VALUES ('attn_task', 'prod_legacy', 'review', 'task_one', 'review', 'k2', '1700000000');",
+        )
+        .seed(
+            "INSERT INTO task_targets(id, task_id, kind, value, created_at)
+             VALUES ('tt_one', 'task_one', 'file', 'tools/boss/engine/core/src/work.rs', '1700000000');",
+        )
+        .create(&conn);
+    drop(conn);
+}
+
+/// Ids in a table, sorted — for asserting a rebuild moved every row and
+/// invented none.
+fn sorted_ids(conn: &rusqlite::Connection, table: &str) -> Vec<String> {
+    let mut stmt = conn.prepare(&format!("SELECT id FROM {table} ORDER BY id")).unwrap();
+    stmt.query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<String>>>()
+        .unwrap()
+}
+
+fn table_present(conn: &rusqlite::Connection, table: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get::<_, bool>(0),
+    )
+    .unwrap()
+}
+
+fn table_ddl(conn: &rusqlite::Connection, table: &str) -> String {
+    conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |row| row.get::<_, String>(0),
+    )
+    .unwrap()
+}
+
+/// The regression test for the boot loop `boss-v1.0.485` shipped.
+///
+/// `migrate_projects_tasks_status_check` rebuilds `projects` and `tasks`
+/// by `DROP TABLE` + rename. Both are foreign-key parents, and
+/// `schema_init` turns `PRAGMA foreign_keys = ON` on every connection, so
+/// under enforced foreign keys `DROP TABLE projects` runs an implicit
+/// `DELETE FROM projects` that aborts on the first referencing `tasks`
+/// row. The pre-fix migration issued the rebuild as one bare
+/// `execute_batch` with foreign keys enabled and no enclosing
+/// transaction, so on any real database it committed `projects_v2` and
+/// its copy, aborted on the `DROP`, and wedged every later startup on
+/// `table projects_v2 already exists` — the engine could not open its
+/// database at all.
+///
+/// The existing coverage missed this because
+/// `migration_repairs_out_of_enum_project_status` seeds a project with no
+/// referencing rows, and
+/// `status_check_constraint_rejects_out_of_enum_values_on_both_tables`
+/// opens a *fresh* database, which takes the
+/// `apply_final_schema_template` fast path and never runs the rebuild.
+/// This test seeds children of both parents, so the `DROP` has something
+/// to violate.
+#[test]
+fn status_check_migration_rebuilds_tables_that_have_foreign_key_children() {
+    let (_dir, path) = disk_db_path("status-check-fk-children");
+    seed_legacy_db_with_fk_children(&path, &[]);
+
+    // The whole point: this open must succeed. Against the shipped
+    // migration it fails with `FOREIGN KEY constraint failed`.
+    let db = WorkDb::open(path.clone()).expect("engine must be able to open a database with FK children");
+    let conn = db.connect().unwrap();
+
+    assert!(
+        table_ddl(&conn, "projects").contains("CHECK (status IN"),
+        "projects must end up constrained: {}",
+        table_ddl(&conn, "projects")
+    );
+    assert!(
+        table_ddl(&conn, "tasks").contains("CHECK (status IN"),
+        "tasks must end up constrained: {}",
+        table_ddl(&conn, "tasks")
+    );
+    assert!(
+        !table_present(&conn, "projects_v2") && !table_present(&conn, "tasks_v2"),
+        "the rebuild must leave no scratch table behind"
+    );
+
+    // Every row moved, none invented.
+    assert_eq!(sorted_ids(&conn, "projects"), vec!["proj_one", "proj_two"]);
+    assert_eq!(
+        sorted_ids(&conn, "tasks"),
+        vec!["chore_one", "design_one", "design_two", "task_one", "task_two"]
+    );
+
+    // The two column families that exist only on old databases — no
+    // migration ever dropped them, and neither appears in today's source —
+    // must survive the rebuild with their contents. The shipped column
+    // list omitted all four, so the rebuild would have discarded them.
+    let (design_doc, design_doc_updated_at, design_doc_draft): (Option<String>, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT design_doc, design_doc_updated_at, design_doc_draft FROM projects WHERE id = 'proj_one'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(design_doc.as_deref(), Some("the whole design, inline"));
+    assert_eq!(design_doc_updated_at.as_deref(), Some("1700000009"));
+    assert_eq!(design_doc_draft.as_deref(), Some("an unpublished draft"));
+
+    let investigation_doc_repo: Option<String> = conn
+        .query_row(
+            "SELECT investigation_doc_repo_remote_url FROM tasks WHERE id = 'task_one'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        investigation_doc_repo.as_deref(),
+        Some("git@github.com:spinyfin/mono.git")
+    );
+
+    // Non-trivial column values survive the copy, including a NULL and
+    // the foreign key itself — a row count alone would not catch a
+    // column list that had drifted out of alignment.
+    let (project_id, description, ordinal, pr_url, deleted_at, status): (
+        Option<String>,
+        String,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        String,
+    ) = conn
+        .query_row(
+            "SELECT project_id, description, ordinal, pr_url, deleted_at, status FROM tasks WHERE id = 'task_one'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(project_id.as_deref(), Some("proj_one"));
+    assert_eq!(description, "body one");
+    assert_eq!(ordinal, Some(3));
+    assert_eq!(pr_url.as_deref(), Some("https://github.com/spinyfin/mono/pull/1"));
+    assert_eq!(deleted_at, None, "a NULL must stay NULL across the rebuild");
+    assert_eq!(status, "in_review");
+
+    let chore_project_id: Option<String> = conn
+        .query_row("SELECT project_id FROM tasks WHERE id = 'chore_one'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(chore_project_id, None, "a NULL foreign key must stay NULL");
+
+    // The children still exist and their references still resolve.
+    assert_eq!(sorted_ids(&conn, "attention_groups"), vec!["attn_proj", "attn_task"]);
+    assert_eq!(sorted_ids(&conn, "task_targets"), vec!["tt_one"]);
+    let violations: i64 = conn
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(violations, 0, "the rebuild must not orphan any child row");
+
+    // Step 12: foreign key enforcement is back on for the rest of this
+    // connection's life, not left off by the migration.
+    let foreign_keys_on: bool = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0)).unwrap();
+    assert!(
+        foreign_keys_on,
+        "foreign key enforcement must be restored after the rebuild"
+    );
+
+    // Idempotent: a second open must not try to rebuild again.
+    drop(conn);
+    drop(db);
+    let db2 = WorkDb::open(path.clone()).expect("a second open must be a no-op, not a second rebuild");
+    let conn2 = db2.connect().unwrap();
+    assert_eq!(
+        sorted_ids(&conn2, "tasks"),
+        vec!["chore_one", "design_one", "design_two", "task_one", "task_two"]
+    );
+    assert!(!table_present(&conn2, "tasks_v2"));
+
+    drop(conn2);
+    let _ = std::fs::remove_file(path);
+}
+
+/// The operator's exact situation after running `boss-v1.0.485`: the
+/// pre-fix migration committed `CREATE TABLE projects_v2` and its copy,
+/// then aborted on `DROP TABLE projects`, leaving `projects`
+/// unconstrained and a `projects_v2` orphan behind. Every subsequent
+/// start then failed one statement earlier, on `table projects_v2 already
+/// exists`, so the engine could never open its database again. A fixed
+/// build has to recover that database, not just avoid creating it.
+#[test]
+fn status_check_migration_recovers_a_database_left_half_migrated() {
+    let (_dir, path) = disk_db_path("status-check-half-migrated");
+    // The orphan exactly as the failed rebuild left it: the constrained
+    // shape, already carrying a copy of the rows.
+    let orphan_ddl = "CREATE TABLE projects_v2 (
+         id TEXT PRIMARY KEY,
+         product_id TEXT NOT NULL REFERENCES products(id),
+         name TEXT NOT NULL,
+         slug TEXT NOT NULL,
+         description TEXT NOT NULL DEFAULT '',
+         goal TEXT NOT NULL DEFAULT '',
+         status TEXT NOT NULL CHECK (status IN ('planned', 'active', 'blocked', 'done', 'archived')),
+         priority TEXT NOT NULL,
+         created_at TEXT NOT NULL,
+         updated_at TEXT NOT NULL,
+         last_status_actor TEXT NOT NULL DEFAULT 'human'
+     );";
+    seed_legacy_db_with_fk_children(&path, &[orphan_ddl]);
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects_v2 (id, product_id, name, slug, description, goal, status, priority,
+                                      created_at, updated_at, last_status_actor)
+             SELECT id, product_id, name, slug, description, goal, status, priority,
+                    created_at, updated_at, last_status_actor FROM projects;",
+        )
+        .unwrap();
+    }
+
+    let db = WorkDb::open(path.clone()).expect("a fixed build must recover a half-migrated database");
+    let conn = db.connect().unwrap();
+
+    assert!(
+        !table_present(&conn, "projects_v2"),
+        "the orphaned scratch table must be cleared, not adopted"
+    );
+    assert!(table_ddl(&conn, "projects").contains("CHECK (status IN"));
+    assert!(table_ddl(&conn, "tasks").contains("CHECK (status IN"));
+    assert_eq!(sorted_ids(&conn, "projects"), vec!["proj_one", "proj_two"]);
+    assert_eq!(
+        sorted_ids(&conn, "tasks"),
+        vec!["chore_one", "design_one", "design_two", "task_one", "task_two"]
+    );
+
+    drop(conn);
+    let _ = std::fs::remove_file(path);
+}
+
+/// The transaction is the thing standing between a botched rebuild and
+/// unrecoverable data loss, so it is asserted directly rather than
+/// assumed. The staged copy of `tasks` is sabotaged after the `INSERT`
+/// and before the `DROP`, which trips the row-count assertion — by which
+/// point `projects` has already been dropped and renamed *inside the
+/// same transaction*. Afterwards both original tables must still be
+/// there, whole and unconstrained, with no scratch table left behind.
+#[test]
+fn status_check_migration_rolls_back_intact_when_a_staged_copy_is_short() {
+    let (_dir, path) = disk_db_path("status-check-rollback");
+    seed_legacy_db_with_fk_children(&path, &[]);
+
+    SABOTAGE_STAGED_COPY_FOR_TABLE.with(|cell| cell.set(Some("tasks")));
+    let opened = WorkDb::open(path.clone());
+    SABOTAGE_STAGED_COPY_FOR_TABLE.with(|cell| cell.set(None));
+
+    let err = opened
+        .err()
+        .expect("an incomplete staged copy must fail the migration loudly");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("staged 4 of 5 row(s)") && message.contains("refusing to drop"),
+        "the failure must name the shortfall it refused to act on, got: {message}"
+    );
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    assert!(
+        table_present(&conn, "projects") && table_present(&conn, "tasks"),
+        "a failed rebuild must leave both original tables in place"
+    );
+    assert!(
+        !table_present(&conn, "projects_v2") && !table_present(&conn, "tasks_v2"),
+        "a failed rebuild must leave no scratch table behind"
+    );
+    assert_eq!(
+        sorted_ids(&conn, "projects"),
+        vec!["proj_one", "proj_two"],
+        "every project row must survive a failed rebuild"
+    );
+    assert_eq!(
+        sorted_ids(&conn, "tasks"),
+        vec!["chore_one", "design_one", "design_two", "task_one", "task_two"],
+        "every task row must survive a failed rebuild"
+    );
+    assert!(
+        !table_ddl(&conn, "projects").contains("CHECK (status IN"),
+        "the rollback must undo the projects rebuild that had already completed inside the transaction"
+    );
+
+    drop(conn);
+    let _ = std::fs::remove_file(path);
+}
