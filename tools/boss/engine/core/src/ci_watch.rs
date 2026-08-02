@@ -1219,6 +1219,17 @@ async fn on_queue_side_failure_detected(
         }
     };
 
+    // A freshly-inserted attempt means this is a genuinely new Trunk
+    // eviction episode (the `Ok(None)` idempotent-no-op branch above already
+    // returned for a repeat). Clear the Merging-lane columns here so the
+    // card leaves the queue display regardless of which way the episode
+    // resolves below (a `fix` revision spawned, or straight to budget
+    // exhaustion) — see [`retire_exhausted_trunk_intent`] for the exhausted
+    // sibling clear this mirrors.
+    if failure_kind == "trunk_queue_eviction" {
+        clear_trunk_eviction_merge_queue_state(work_db, candidate);
+    }
+
     let task_result =
         work_db.mark_chore_blocked_ci_failure(&candidate.work_item_id, &candidate.pr_url, Some(&attempt.id));
     let task_transitioned = match task_result {
@@ -1331,6 +1342,28 @@ async fn on_queue_side_failure_detected(
         true
     } else {
         false
+    }
+}
+
+/// Clear the Merging-lane columns for a freshly-detected `trunk_queue_eviction`
+/// episode. Called from [`on_queue_side_failure_detected`] regardless of
+/// whether the episode goes on to spawn a `fix` revision or exhaust the
+/// budget (the latter's own intent-retirement clear in
+/// [`retire_exhausted_trunk_intent`] then becomes a same-value no-op via
+/// [`WorkDb::set_task_merge_queue_state`]'s change-guard).
+///
+/// Not called for a `merge_queue_rebounce` (GitHub-native) episode: a
+/// trunk-mechanism task is the only one whose regular PR probe preserves
+/// these columns (`preserve_merge_queue_state`) rather than self-healing
+/// them from the live GitHub merge-queue state on the next ordinary sweep.
+fn clear_trunk_eviction_merge_queue_state(work_db: &WorkDb, candidate: &PendingMergeCheck) {
+    if let Err(err) = work_db.set_task_merge_queue_state(&candidate.work_item_id, None, None) {
+        tracing::warn!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            ?err,
+            "ci_watch: failed to clear merge-queue columns for a fresh trunk eviction episode",
+        );
     }
 }
 
