@@ -2202,9 +2202,13 @@ fn render_run_scope_line(plan: &ChangePlan, file_count: usize, style: OutputStyl
 }
 
 /// The trailing summary the interactive path prints after finalizing the status
-/// block. The per-finding bodies already streamed into the log area, so for the
-/// has-findings case this is only the summary line; the no-findings and
-/// no-checks cases match [`render_human_results`] exactly.
+/// block. The per-finding bodies already streamed into the log area — which on
+/// a long run (or a non-interactive consumer like a CI log) can be tens of
+/// thousands of lines above this point — so on a run with any error-severity
+/// finding this also re-renders just those findings as a recap, ahead of the
+/// summary line. That keeps `tail` on a CI log landing on the actual failure
+/// rather than on progress repaints. The no-findings and no-checks cases match
+/// [`render_human_results`] exactly.
 ///
 /// Callers that know the change-set size and observe zero results with a
 /// non-empty scope should prefer [`render_no_checks_ran`] so the developer
@@ -2237,12 +2241,33 @@ fn render_human_footer(results: &[CheckResult], style: OutputStyle, elapsed: Dur
         }
     }
 
-    let mut out = format!(
+    let mut out = String::new();
+    if errors > 0 {
+        out.push_str(&render_error_recap(results, style));
+    }
+    out.push_str(&format!(
         "{}: {errors} error(s), {warnings} warning(s), {infos} info finding(s)\n",
         style.paint_bold("summary")
-    );
+    ));
     if let Some(hint) = fixability_hint(results, total_findings, style) {
         out.push_str(&hint);
+    }
+    out
+}
+
+/// Re-renders every error-severity finding across `results`, for the recap
+/// [`render_human_footer`] prints after the progress UI tears down. Findings
+/// already streamed into the progress log area once; this repeats only the
+/// errors so a reader who lands at the end of the log (or a tool that reads
+/// the tail) sees the failure without scrolling back through repaint noise.
+fn render_error_recap(results: &[CheckResult], style: OutputStyle) -> String {
+    let mut out = String::new();
+    for result in results {
+        for finding in &result.findings {
+            if finding.severity == Severity::Error {
+                out.push_str(&render_finding(result, finding, style));
+            }
+        }
     }
     out
 }
