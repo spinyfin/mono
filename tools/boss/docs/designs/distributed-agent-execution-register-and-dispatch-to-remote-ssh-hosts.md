@@ -200,6 +200,10 @@ A `local` host row is created on first run with `ssh_target = NULL` and capabili
 
 `source` is `auto` or `user`. Auto-discovered tags are recomputed on registration and on the heartbeat tick (see "Reachability"); user tags persist.
 
+**Implementation note (2026-07-31).** The Phase 1 implementation of "auto-discovered" was local-only: the probe shelled out to local `uname` / `gh auth status` subprocesses and the write hard-coded `host_id = 'local'`. Nothing ever produced an `auto` row for a remote host, so a host registered with `bossctl hosts add` reported zero capabilities indefinitely unless the operator supplied `--tag`s by hand — the state host `anaplian` was found in. Discovery for a remote host now runs the same probes over the host's SSH control master at registration time (`boss_engine::host_capability_probe`), and the tag spelling is shared between the two probes so a local and a remote macOS host describe themselves identically — capability matching is exact string equality, so `os=Darwin` vs `os=macos` is a silent mismatch, not a near miss.
+
+Note what an empty capability set does and does not mean today. `work_capability_requirements` is normally empty, so the filter is a no-op and a zero-capability host stays eligible for everything; that is why `anaplian` was dispatched to at all. It is not a stable position: one requirement recorded against any product, project, or chore makes every host that discovered nothing categorically ineligible, permanently, because nothing else would ever populate its rows.
+
 #### Required capabilities for a chore
 
 Required tags live as `work_capability_requirements` rows keyed by `(subject_kind, subject_id)` for `product`, `project`, and `chore`. Precedence (most-specific wins): **chore > project > product**. The scheduler unions the lowest-precedence non-empty set with any overrides above it — a chore inherits product-level "os=macos" unless the chore explicitly relaxes it.
@@ -468,6 +472,10 @@ Outcome: a stable adapter seam. The diff is mechanical and reviewable on its own
 - Land the wrapper script source at `tools/boss/engine/remote/boss-remote-run.sh`, bundle it into the engine via `include_str!`, and implement the eager-push at `bossctl hosts add` plus the lazy `--version` check at dispatch (see "Wrapper Distribution"). `host_wrapper_push_failed` becomes a real run-failure reason in the same PR.
 
 Outcome: the user installs cube + claude + gh on zakalwe, runs `bossctl hosts add zakalwe …`, and Boss pushes its wrapper automatically as part of registration. A capability-matching chore lands on zakalwe. PR is created identically to a local run. UI shows the host badge.
+
+**Implementation note (2026-07-31) — remote cube call budgets.** `SshHostAdapter` originally ran every cube subcommand through one generic `SSH_COMMAND_TIMEOUT` (30s). The dispatcher, meanwhile, budgets provisioning-class cube calls separately — 90s for `workspace lease`, 60s for `repo ensure` — and the 90s exists _because_ 30s had already proven too tight for the `jj workspace add` + setup-step path locally. Because the transport's bound was the inner one, it always fired first and the dispatcher's budget was unreachable on a remote host: a first lease on host `anaplian` was killed at 30s and recorded as `deadline has elapsed`. Those budgets now live in `boss_engine::cube_op_budget` and the SSH transport honours the caller's (`SshTransport::run_within`), sitting a grace margin inside the dispatcher's outer backstop so the better-attributed error wins. Both bounds still exist and still fire; a remote lease is not unbounded, it is bounded by the same number a local one is.
+
+The general rule for this transport: a bound belongs to whoever knows what the operation costs. A transport that substitutes its own for the caller's is not being conservative, it is silently rewriting policy.
 
 ### Phase 4: Probe / Interrupt / Stop Over SSH
 

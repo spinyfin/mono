@@ -43,8 +43,9 @@ pub(crate) async fn hosts_add(
         print_host_detail(&host, &caps);
         if let Some(outcome) = push_outcome.as_ref() {
             match outcome {
-                EagerPushOutcome::Ok { version } => {
+                EagerPushOutcome::Ok { version, capabilities } => {
                     println!("wrapper push: ok (version {version})");
+                    println!("capability discovery: {}", capabilities.join(", "));
                 }
                 EagerPushOutcome::Skipped { reason } => {
                     println!("wrapper push: skipped ({reason})");
@@ -67,6 +68,8 @@ pub(crate) async fn hosts_add(
 enum EagerPushOutcome {
     Ok {
         version: String,
+        /// Capabilities discovered on the host during registration.
+        capabilities: Vec<String>,
     },
     Skipped {
         reason: String,
@@ -79,75 +82,39 @@ enum EagerPushOutcome {
     },
 }
 
+/// Provision a freshly-registered host and record the result on its row.
+///
+/// The remote sequence itself — control master, wrapper push, `cube`
+/// probe, capability discovery — lives in
+/// [`boss_engine::host_provisioning`] and is shared verbatim with the
+/// engine's `AddHost` RPC, so registering a host through the CLI and
+/// through the app cannot diverge. This function only maps the outcome to
+/// the CLI's reporting shape and performs the DB writes it implies.
 async fn eager_push_wrapper(db: &WorkDb, host_id: &str, ssh_target: &str) -> EagerPushOutcome {
+    use boss_engine::host_provisioning::{RemoteProvisionOutcome, provision_remote_host};
     use boss_engine::remote_wrapper::expected_version;
-    use boss_engine::ssh_transport::{SshTransport, default_control_socket_dir};
-    use boss_engine::wrapper_distribution::{CubeProbeOutcome, push_wrapper, subclass_label, verify_cube_invocable};
 
-    let Some(socket_dir) = default_control_socket_dir() else {
-        return EagerPushOutcome::Skipped {
-            reason: "HOME unset; cannot determine control-socket dir".to_owned(),
-        };
-    };
-    let transport = SshTransport::new(host_id, ssh_target, &socket_dir);
-
-    if let Err(err) = transport.open_control_master().await {
-        let detail = format!("opening ssh control master: {err:#}");
-        let _ = db.set_host_enabled(host_id, false);
-        return EagerPushOutcome::Failed {
-            kind: "connection_lost".to_owned(),
-            detail,
-        };
-    }
-
-    let outcome = push_wrapper(&transport).await;
-    let outcome = match outcome {
-        Ok(o) => o,
-        Err(err) => {
-            let _ = db.set_host_enabled(host_id, false);
-            return EagerPushOutcome::Failed {
-                kind: "unclassified".to_owned(),
-                detail: format!("wrapper push errored: {err:#}"),
-            };
-        }
-    };
-    match outcome {
-        boss_engine::wrapper_distribution::WrapperPushOutcome::Ok => {
-            // The wrapper script itself is present and runs — but that
-            // says nothing about whether the separate `cube` binary it
-            // (and every dispatch-time `ssh <host> cube ...` call) depends
-            // on is actually on the remote's non-interactive PATH. Catch
-            // that gap here, at registration time, instead of leaving a
-            // registered-but-broken host to fail every future dispatch
-            // silently (the anaplian incident).
-            match verify_cube_invocable(&transport).await {
-                Ok(CubeProbeOutcome::Ok) => EagerPushOutcome::Ok {
-                    version: expected_version(),
-                },
-                Ok(CubeProbeOutcome::Failed(detail)) => {
-                    let msg = format!("cube not invocable via non-interactive ssh: {detail}");
-                    let _ = db.set_host_enabled(host_id, false);
-                    let _ = db.set_host_last_error(host_id, Some(&msg));
-                    EagerPushOutcome::Failed {
-                        kind: "unclassified".to_owned(),
-                        detail: msg,
-                    }
-                }
-                Err(err) => {
-                    let msg = format!("probing cube invocability errored: {err:#}");
-                    let _ = db.set_host_enabled(host_id, false);
-                    let _ = db.set_host_last_error(host_id, Some(&msg));
-                    EagerPushOutcome::Failed {
-                        kind: "unclassified".to_owned(),
-                        detail: msg,
-                    }
-                }
+    match provision_remote_host(host_id, ssh_target).await {
+        RemoteProvisionOutcome::Ok { capabilities } => {
+            let _ = db.set_host_last_error(host_id, None);
+            if let Err(err) = db.replace_auto_host_capabilities(host_id, &capabilities) {
+                eprintln!("bossctl: warning: failed to persist discovered capabilities for {host_id}: {err:#}");
+            }
+            EagerPushOutcome::Ok {
+                version: expected_version(),
+                capabilities,
             }
         }
-        boss_engine::wrapper_distribution::WrapperPushOutcome::Failed(kind, detail) => {
+        RemoteProvisionOutcome::Skipped { reason } => EagerPushOutcome::Skipped { reason },
+        RemoteProvisionOutcome::Failed { kind, detail } => {
+            // Both writes, on every failure arm. Previously the
+            // wrapper-push arm disabled the host without recording *why*,
+            // so `hosts show` reported a disabled host with an empty
+            // `last_error` and nothing to act on.
             let _ = db.set_host_enabled(host_id, false);
+            let _ = db.set_host_last_error(host_id, Some(&detail));
             EagerPushOutcome::Failed {
-                kind: subclass_label(&kind).to_owned(),
+                kind: kind.to_owned(),
                 detail,
             }
         }

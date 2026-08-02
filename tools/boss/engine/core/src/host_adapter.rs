@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -329,11 +330,20 @@ impl SshHostAdapter {
     /// to the shared `cube_commands` helpers via the
     /// [`CubeJsonTransport`](crate::cube_commands::CubeJsonTransport) impl
     /// below.
-    async fn run_cube_json_raw(&self, args: &[&str]) -> Result<serde_json::Value> {
+    async fn run_cube_json_raw(&self, args: &[&str], budget: Option<Duration>) -> Result<serde_json::Value> {
         let mut full: Vec<&str> = Vec::with_capacity(args.len() + 1);
         full.push("cube");
         full.extend_from_slice(args);
-        let output = match self.transport.run(&full).await {
+        // `None` means the caller had no opinion, so the transport's generic
+        // fast-command bound applies. A provisioning-class caller passes its
+        // own budget instead — without that, this transport silently clamped
+        // every cube call to 30s regardless of what the dispatcher had
+        // budgeted (the anaplian first-lease timeout).
+        let result = match budget {
+            Some(budget) => self.transport.run_within(&full, budget).await,
+            None => self.transport.run(&full).await,
+        };
+        let output = match result {
             Ok(output) => output,
             Err(err) => {
                 self.record_host_health_failure(&format!("{err:#}"));
@@ -540,7 +550,15 @@ impl Drop for StagedFile {
 #[async_trait]
 impl crate::cube_commands::CubeJsonTransport for SshHostAdapter {
     async fn run_cube_json(&self, args: &[&str]) -> Result<serde_json::Value> {
-        self.run_cube_json_raw(args).await
+        self.run_cube_json_raw(args, None).await
+    }
+
+    /// Overridden because this transport bounds its own calls. The default
+    /// impl drops `budget` on the floor, which is correct only for a
+    /// transport that imposes no bound of its own — here it would leave
+    /// every cube call pinned to the generic 30s ssh bound.
+    async fn run_cube_json_within(&self, args: &[&str], budget: Duration) -> Result<serde_json::Value> {
+        self.run_cube_json_raw(args, Some(budget)).await
     }
 }
 

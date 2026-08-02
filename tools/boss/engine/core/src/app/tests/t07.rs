@@ -38,9 +38,26 @@ impl HostProvisioner for FixedProvisioner {
     }
 }
 
-/// Shorthand for the common `FixedProvisioner(ProvisionOutcome::Ok)`.
+/// Shorthand for a clean provisioning that discovered no capabilities.
+/// Used by every test whose subject is tag or lifecycle semantics, so
+/// their capability assertions stay about the tags under test.
+///
+/// The "empty set means something went wrong" judgement lives in the real
+/// [`crate::host_provisioning::provision_remote_host`] seam, which this
+/// double stands in for rather than reimplements — the handler's job is
+/// only to persist whatever the provisioner reports.
 fn provision_ok() -> FixedProvisioner {
-    FixedProvisioner(ProvisionOutcome::Ok)
+    FixedProvisioner(ProvisionOutcome::Ok {
+        capabilities: Vec::new(),
+    })
+}
+
+/// A clean provisioning that discovered `capabilities` on the far end,
+/// as a real macOS host would.
+fn provision_ok_with(capabilities: &[&str]) -> FixedProvisioner {
+    FixedProvisioner(ProvisionOutcome::Ok {
+        capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
+    })
 }
 
 /// A [`FixedProvisioner`] reporting failure with `detail` as the
@@ -187,9 +204,9 @@ fn caps(host: &HostSnapshot) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Plant an `auto`-sourced capability row on `host_id`. No RPC creates
-/// one (the engine discovers them on its own heartbeat), so a test that
-/// needs a non-user capability to contrast against has to seed it.
+/// Plant an `auto`-sourced capability row on `host_id` directly, for a
+/// test that needs a non-user capability to contrast against without
+/// going through registration.
 fn seed_auto_capability(state: &Arc<ServerState>, host_id: &str, capability: &str) {
     crate::test_support::insert_host_capability(&state.work_db, host_id, capability, "auto");
 }
@@ -263,6 +280,98 @@ async fn list_hosts_reports_every_added_host_with_its_own_capabilities() {
         vec![("os=linux".to_owned(), "user".to_owned())]
     );
     assert_eq!(by_id("sleeper").pool_size, 1);
+}
+
+#[tokio::test]
+async fn capabilities_discovered_during_registration_land_as_auto_sourced() {
+    // The anaplian symptom: a remote host registered fine and then reported
+    // `caps=0` forever, because capability discovery only ever ran against
+    // the local machine — nothing wrote an `auto` row for a remote host at
+    // all. Registration must now persist what the far end reported, and
+    // must mark it `auto` so `RemoveHostTag` keeps refusing to delete it.
+    let (state, _dir) = test_server_state();
+
+    let added = expect_host_result(
+        add_host(
+            &state,
+            &provision_ok_with(&["os=macos", "arch=arm64", "gh-authed=true"]),
+            "zakalwe",
+            "user@zakalwe",
+            2,
+            &["role=builder"],
+        )
+        .await,
+    );
+    assert_eq!(
+        caps(&added),
+        vec![
+            ("arch=arm64".to_owned(), "auto".to_owned()),
+            ("gh-authed=true".to_owned(), "auto".to_owned()),
+            ("os=macos".to_owned(), "auto".to_owned()),
+            ("role=builder".to_owned(), "user".to_owned()),
+        ],
+        "discovered capabilities must be persisted as auto, alongside the operator's tags",
+    );
+
+    let fetched = expect_host_result(
+        call(
+            &state,
+            FrontendRequest::GetHost {
+                id: "zakalwe".to_owned(),
+            },
+        )
+        .await,
+    );
+    assert_eq!(
+        caps(&fetched),
+        caps(&added),
+        "discovery must be persisted, not just echoed"
+    );
+}
+
+#[tokio::test]
+async fn re_registering_a_host_converges_on_the_latest_discovery() {
+    // Discovery is a replace, not an append: a host whose `gh` credentials
+    // expired between registrations must not end up reporting both
+    // `gh-authed=true` and `gh-authed=false`. Driven through RemoveHost +
+    // AddHost because that is the only way an operator re-registers.
+    let (state, _dir) = test_server_state();
+    add_host(
+        &state,
+        &provision_ok_with(&["os=macos", "gh-authed=true"]),
+        "zakalwe",
+        "user@zakalwe",
+        2,
+        &[],
+    )
+    .await;
+    call(
+        &state,
+        FrontendRequest::RemoveHost {
+            id: "zakalwe".to_owned(),
+        },
+    )
+    .await;
+
+    let re_added = expect_host_result(
+        add_host(
+            &state,
+            &provision_ok_with(&["os=macos", "gh-authed=false"]),
+            "zakalwe",
+            "user@zakalwe",
+            2,
+            &[],
+        )
+        .await,
+    );
+    assert_eq!(
+        caps(&re_added),
+        vec![
+            ("gh-authed=false".to_owned(), "auto".to_owned()),
+            ("os=macos".to_owned(), "auto".to_owned()),
+        ],
+        "the stale gh-authed=true row must not survive re-discovery",
+    );
 }
 
 // ── Auto-disable on provisioning failure ─────────────────────────────────────

@@ -30,9 +30,23 @@ use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 use tokio::time::timeout;
 
-/// Time budget for one `ssh` invocation. Long enough for cube to lease
-/// a workspace (which can take a couple seconds on a cold cube pool)
-/// but tight enough that an unreachable host fails fast.
+/// Default time budget for one `ssh` invocation — the *fast-command*
+/// budget. Sized for probes and cheap cube reads (`repo list`,
+/// `workspace status`, `heartbeat`, `release`): tight enough that an
+/// unreachable host fails fast.
+///
+/// This is explicitly **not** the budget for a provisioning-class
+/// operation. `cube workspace lease` and `cube repo ensure` can legitimately
+/// run for far longer than this — cube's own lease path stacks a 5s health
+/// scan, a 5s quarantine-reclaim scan and ~6s of `jj workspace add` +
+/// setup-step provisioning (see `tools/cube/src/app/workspace.rs`), and the
+/// engine's dispatcher already budgets 90s / 60s for them
+/// (`boss_engine::cube_op_budget`). Applying this 30s default to those was
+/// the anaplian first-lease incident: the caller's 90s lease budget could
+/// never be reached because this inner bound always fired first, so the
+/// engine reported `deadline has elapsed` on a lease that had not actually
+/// been given its allotted time. Those callers pass their own budget via
+/// [`SshTransport::run_within`].
 pub const SSH_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Time budget for the initial `ControlMaster` open. Includes the
@@ -251,9 +265,22 @@ impl SshTransport {
     /// configured with the same `ControlPath` so they can capture pipes
     /// directly.
     pub async fn run(&self, argv: &[&str]) -> Result<SshOutput> {
+        self.run_within(argv, SSH_COMMAND_TIMEOUT).await
+    }
+
+    /// [`run`](Self::run) with an explicit wall-clock budget instead of the
+    /// [`SSH_COMMAND_TIMEOUT`] default.
+    ///
+    /// Use this for a remote operation whose cost is dominated by work on
+    /// the far end rather than by the round trip — `cube workspace lease`
+    /// and `cube repo ensure` are the two — so the transport stops imposing
+    /// a bound the caller never asked for and does not know about. The
+    /// budget still exists and still fires; it is just the caller's budget
+    /// rather than the generic one.
+    pub async fn run_within(&self, argv: &[&str], budget: Duration) -> Result<SshOutput> {
         let quoted: Vec<String> = argv.iter().map(|arg| shell_quote(arg)).collect();
         let quoted_refs: Vec<&str> = quoted.iter().map(String::as_str).collect();
-        self.run_tokens(&quoted_refs, argv).await
+        self.run_tokens(&quoted_refs, argv, budget).await
     }
 
     /// Like [`run`](Self::run), but quotes each `argv` element with
@@ -270,7 +297,7 @@ impl SshTransport {
     pub async fn run_with_remote_paths(&self, argv: &[&str]) -> Result<SshOutput> {
         let quoted: Vec<String> = argv.iter().map(|arg| quote_remote_path(arg)).collect();
         let quoted_refs: Vec<&str> = quoted.iter().map(String::as_str).collect();
-        self.run_tokens(&quoted_refs, argv).await
+        self.run_tokens(&quoted_refs, argv, SSH_COMMAND_TIMEOUT).await
     }
 
     /// Run a shell script on the remote via the master connection.
@@ -285,14 +312,16 @@ impl SshTransport {
     /// produce `sh -c <word1> <word2> …` on the remote and mis-parse a
     /// compound command. See [`run`] for the full quoting contract.
     pub async fn run_shell(&self, script: &str) -> Result<SshOutput> {
-        self.run_tokens(&[script], &[script]).await
+        self.run_tokens(&[script], &[script], SSH_COMMAND_TIMEOUT).await
     }
 
     /// Shared ssh-invocation body. `tokens` are the exact ssh command
     /// arguments (already quoted if quoting is wanted); `log_argv` is
     /// only used for the timeout error message, so callers can log the
-    /// original (pre-quoting) argv for readability.
-    async fn run_tokens(&self, tokens: &[&str], log_argv: &[&str]) -> Result<SshOutput> {
+    /// original (pre-quoting) argv for readability. `budget` is the
+    /// caller's wall-clock bound — [`SSH_COMMAND_TIMEOUT`] for everything
+    /// but the provisioning-class callers that pass their own.
+    async fn run_tokens(&self, tokens: &[&str], log_argv: &[&str], budget: Duration) -> Result<SshOutput> {
         let mut cmd = Command::new("ssh");
         cmd.args([
             "-o",
@@ -304,10 +333,33 @@ impl SshTransport {
         cmd.args(tokens);
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        // Without this, blowing the budget below drops the `output()` future
+        // and tokio *detaches* the ssh client rather than killing it, leaking
+        // one process and its pipes per timeout. The local cube client has
+        // always set it (`CommandCubeClient::run_json_in_dir`); this path
+        // never did.
+        //
+        // The honest limit: killing the local client does not kill the
+        // command already running on the far end — ssh has no controlling
+        // tty here — so a timed-out `cube workspace lease` may still go on to
+        // grant a lease the engine never learns the id of. Nothing in the
+        // engine reclaims that one: `remote_lease_reconcile` is driven by
+        // `work_runs` rows, and a lease the engine never received produced no
+        // row. Cube's own 24h lease TTL is the only backstop, which is
+        // precisely why the budget being right (`boss_engine::cube_op_budget`)
+        // matters more than the cleanup after it is blown.
+        cmd.kill_on_drop(true);
 
-        let output = timeout(SSH_COMMAND_TIMEOUT, cmd.output())
+        let output = timeout(budget, cmd.output())
             .await
-            .with_context(|| format!("ssh run timed out for host {} cmd {:?}", self.host_id, log_argv))?
+            .with_context(|| {
+                format!(
+                    "ssh run timed out after {}s for host {} cmd {:?}",
+                    budget.as_secs(),
+                    self.host_id,
+                    log_argv
+                )
+            })?
             .with_context(|| format!("ssh run io error for host {}", self.host_id))?;
 
         Ok(SshOutput {
@@ -334,6 +386,9 @@ impl SshTransport {
         ]);
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        // Same leak as `run_tokens`: without this a timed-out scp is detached
+        // rather than killed.
+        cmd.kill_on_drop(true);
 
         let output = timeout(SCP_PUSH_TIMEOUT, cmd.output())
             .await
@@ -387,6 +442,8 @@ impl SshTransport {
         ]);
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        // Same leak as `run_tokens`.
+        cmd.kill_on_drop(true);
 
         let output = timeout(CONTROL_COMMAND_TIMEOUT, cmd.output())
             .await

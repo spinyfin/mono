@@ -204,7 +204,8 @@ enum Command {
     /// All subcommands read or write `state.db` directly — they work
     /// even when the engine is not running. The `local` host is
     /// auto-registered at engine first start with capabilities
-    /// discovered from the local machine.
+    /// discovered from the local machine; a remote host discovers its
+    /// capabilities over SSH when `hosts add` provisions it.
     Hosts {
         #[command(subcommand)]
         action: HostsAction,
@@ -940,11 +941,17 @@ enum MetricsAction {
 
 #[derive(Subcommand, Debug)]
 enum HostsAction {
-    /// Register a new remote host. The host is enabled immediately and
-    /// persisted to `state.db`. Phase 3 eagerly pushes the
-    /// `boss-remote-run` wrapper to the host as part of registration;
-    /// pass `--skip-wrapper-push` to suppress that (offline / dry-run /
-    /// test fixtures).
+    /// Register a new remote host. The host row is persisted to
+    /// `state.db`, then provisioned: push the `boss-remote-run` wrapper,
+    /// verify `cube` is invocable over non-interactive SSH, and discover
+    /// the host's capabilities (`os=`, `arch=`, `gh-authed=`) by probing
+    /// it. The host is left enabled only if all of that succeeds;
+    /// otherwise it is disabled with the reason on `last_error`.
+    ///
+    /// `--skip-wrapper-push` suppresses the whole provisioning step
+    /// (offline / dry-run / test fixtures). A host registered that way is
+    /// enabled but unverified and reports no discovered capabilities until
+    /// something provisions it.
     Add {
         /// Unique identifier for this host (e.g. `zakalwe`).
         id: String,
