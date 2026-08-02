@@ -255,7 +255,7 @@ allow_bypass = true
 }
 
 #[tokio::test]
-async fn runner_appends_standard_bypass_guidance_when_pr_description_resolved_but_missing_directive() {
+async fn runner_appends_standard_bypass_guidance_when_pr_description_is_empty() {
     let temp = tempdir().expect("create temp dir");
     fs::create_dir_all(temp.path().join("docs")).expect("create dirs");
     fs::write(temp.path().join("docs/file.md"), "hello\n").expect("write file");
@@ -287,9 +287,9 @@ allow_bypass = true
         Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
     );
 
-    // pr_description IS resolved here (unlike the test above) — it just
-    // doesn't contain the directive. The generic guidance is correct in this
-    // case since both surfaces were genuinely checked.
+    // An empty body still means the PR description was resolved (unlike the
+    // test above). The generic guidance is correct because both surfaces were
+    // genuinely checked, even though neither contained a directive.
     let results = runner
         .run_changeset(
             &ChangeSet::new(vec![ChangedFile {
@@ -297,7 +297,7 @@ allow_bypass = true
                 kind: ChangeKind::Modified,
                 old_path: None,
             }])
-            .with_pr_description(Some("no bypass directive in here".to_owned())),
+            .with_pr_description(Some(String::new())),
         )
         .await
         .expect("run checks");
@@ -309,6 +309,14 @@ allow_bypass = true
             .remediations
             .iter()
             .any(|r| r.contains("never use bypasses for convenience"))
+    );
+    assert!(
+        !results[0].findings[0]
+            .remediations
+            .iter()
+            .any(|r| r.contains("Could not resolve a PR description")),
+        "remediations: {:?}",
+        results[0].findings[0].remediations
     );
     assert!(
         results[0].findings[0]

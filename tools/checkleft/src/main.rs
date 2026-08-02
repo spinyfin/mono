@@ -12,6 +12,7 @@ use checkleft::annotate::sarif::{to_sarif, write_sarif};
 use checkleft::annotate::upload::{SarifUploadContext, upload_sarif};
 use checkleft::annotate::{Annotation, annotation_from_finding, cap_gha_annotations, format_gha_workflow_commands};
 use checkleft::change_detection::environment::{CiEnvironment, resolve_head_sha, resolve_owner_repo};
+use checkleft::change_detection::merge_queue::{is_merge_queue_branch, pr_numbers_from_branch};
 use checkleft::change_detection::scenario::Scenario;
 use checkleft::change_detection::{
     ChangeOverrides, ChangePlan, ChangesetUndetermined, base_revision_from_plan, resolve_change_plan,
@@ -1733,9 +1734,7 @@ async fn attach_description_context(
     };
     let change_id = resolve_change_id(env);
     let repository = resolve_repository(vcs);
-    let pr_description = normalize_optional_description(
-        resolve_pr_description(repository.as_deref(), change_id.as_deref(), env, vcs).await,
-    );
+    let pr_description = resolve_pr_description(repository.as_deref(), change_id.as_deref(), env, vcs).await;
     changeset
         .with_commit_description(tip_description)
         .with_bypass_commit_descriptions(bypass_commit_descriptions)
@@ -1832,17 +1831,22 @@ async fn resolve_pr_description(
     // number from the branch name itself and skip straight to fetching that
     // PR's description — this is what makes bypass directives declared in
     // the PR body reachable on the one CI context that otherwise drops them.
-    if let Some(pr_number) = env
-        .buildkite_branch
-        .as_deref()
-        .and_then(pr_number_from_merge_queue_branch)
-    {
+    let merge_queue_pr_numbers = pr_numbers_for_description(env);
+    if !merge_queue_pr_numbers.is_empty() {
         info!(
             repository = repository,
-            pr_number = pr_number,
-            "resolved PR number from merge-queue branch name"
+            pr_numbers = ?merge_queue_pr_numbers,
+            "resolved PR numbers from merge-queue branch name"
         );
-        return github_pull_request_description(repository, &pr_number, github_token.as_deref()).await;
+        let mut descriptions = Vec::new();
+        for pr_number in merge_queue_pr_numbers {
+            if let Some(description) =
+                github_pull_request_description(repository, &pr_number, github_token.as_deref()).await
+            {
+                descriptions.push(description);
+            }
+        }
+        return (!descriptions.is_empty()).then(|| descriptions.join("\n\n"));
     }
 
     // Level 3b: no PR number from env — detect the current branch and look up
@@ -1867,7 +1871,7 @@ async fn resolve_pr_description(
 /// Detect the name of the current branch for Level 3b PR lookup (branch→PR
 /// API search). Only reached after [`resolve_pr_description`]'s Level 3a has
 /// already tried and failed to recover a PR number directly from a
-/// merge-queue synthetic branch via [`pr_number_from_merge_queue_branch`].
+/// merge-queue synthetic branch.
 ///
 /// Sources tried in order:
 /// 1. Buildkite: `BUILDKITE_BRANCH` (always set, already the branch name).
@@ -1875,14 +1879,19 @@ async fn resolve_pr_description(
 ///    parsed from `GITHUB_REF` (push events).
 /// 3. VCS fallback: `git branch --show-current` / jj bookmark.
 fn detect_current_branch(env: &CiEnvironment, vcs: &Vcs) -> Option<String> {
+    branch_from_ci_env(env).or_else(|| normalize_optional_description(vcs.current_branch().ok()))
+}
+
+/// Resolve a branch name from CI variables only, without consulting VCS.
+fn branch_from_ci_env(env: &CiEnvironment) -> Option<String> {
     // Buildkite always exposes the branch; skip merge-queue synthetic
     // branches — they are not a real head branch a branch→PR API search
     // could ever match, so a real PR number (if any) must have already been
-    // recovered by pr_number_from_merge_queue_branch before this is reached.
+    // recovered directly from the merge-queue branch before this is reached.
     if let Some(branch) = env
         .buildkite_branch
         .as_deref()
-        .filter(|b| !b.starts_with("gh-readonly-queue/"))
+        .filter(|b| !is_merge_queue_branch(b))
         .and_then(|b| normalize_optional_description(Some(b.to_owned())))
     {
         return Some(branch);
@@ -1904,27 +1913,18 @@ fn detect_current_branch(env: &CiEnvironment, vcs: &Vcs) -> Option<String> {
         return Some(branch);
     }
 
-    // VCS fallback for local runs and any CI not covered above.
-    normalize_optional_description(vcs.current_branch().ok())
+    None
 }
 
-/// Extract the PR number encoded in a GitHub merge-queue synthetic branch
-/// name, e.g. `gh-readonly-queue/main/pr-2621-3f022644be91...` -> `"2621"`.
+/// Select the PRs whose descriptions can be fetched directly from CI context.
 ///
-/// Mirrors the target-branch extraction in
-/// `change_detection::default_branch::resolve_default_branch`, which pulls
-/// the *target* segment out of the same synthetic name; this pulls the
-/// trailing `pr-<N>-<sha>` segment instead — taken from the *last* `/` so a
-/// target branch that itself contains slashes (e.g. `release/2026-01`)
-/// doesn't throw off the split. Returns `None` for anything that isn't a
-/// merge-queue branch, or whose `pr-<N>` segment doesn't parse as a number.
-fn pr_number_from_merge_queue_branch(branch: &str) -> Option<String> {
-    let rest = branch.strip_prefix("gh-readonly-queue/")?;
-    let tail = rest.rsplit('/').next()?;
-    let pr_part = tail.strip_prefix("pr-")?;
-    let number_str = pr_part.split('-').next()?;
-    number_str.parse::<u64>().ok()?;
-    Some(number_str.to_owned())
+/// A merge queue may batch PRs, so retain every encoded number rather than
+/// silently treating the first PR body as the group's only bypass surface.
+fn pr_numbers_for_description(env: &CiEnvironment) -> Vec<String> {
+    env.buildkite_branch
+        .as_deref()
+        .map(pr_numbers_from_branch)
+        .unwrap_or_default()
 }
 
 fn init_tracing(verbose: u8, log_level: Option<LogLevel>, log_file: Option<PathBuf>) -> Result<()> {
@@ -2033,9 +2033,8 @@ async fn attempt_sarif_upload(sarif: &serde_json::Value, env: &CiEnvironment, vc
 ///
 /// 1. GHA: `GITHUB_REF` (already a full ref: `refs/heads/...` or `refs/pull/.../merge`).
 /// 2. Buildkite PR build: `BUILDKITE_PULL_REQUEST` → `refs/pull/{N}/merge`.
-/// 3. Buildkite merge-queue build: PR number recovered from the synthetic
-///    `BUILDKITE_BRANCH` (`gh-readonly-queue/<target>/pr-<N>-<sha>`) →
-///    `refs/pull/{N}/merge`.
+/// 3. Buildkite merge-queue build: the synthetic `BUILDKITE_BRANCH` is itself
+///    the ref containing Buildkite's synthetic commit.
 /// 4. Buildkite push build: `BUILDKITE_BRANCH` → `refs/heads/{branch}`.
 /// 5. VCS fallback: current branch → `refs/heads/{branch}`.
 fn resolve_ref_for_upload(env: &CiEnvironment, vcs: &Vcs) -> Option<String> {
@@ -2054,21 +2053,21 @@ fn resolve_ref_for_upload(env: &CiEnvironment, vcs: &Vcs) -> Option<String> {
         return Some(format!("refs/pull/{pr}/merge"));
     }
 
-    // Buildkite merge-queue build: recover the PR number from the synthetic
-    // branch name rather than treating it as a real head branch.
-    if let Some(pr_number) = env
+    // The synthetic merge-queue commit is on this branch, not on GitHub's
+    // independently computed refs/pull/{N}/merge ref.
+    if let Some(branch) = env
         .buildkite_branch
         .as_deref()
-        .and_then(pr_number_from_merge_queue_branch)
+        .filter(|branch| is_merge_queue_branch(branch))
     {
-        return Some(format!("refs/pull/{pr_number}/merge"));
+        return Some(format!("refs/heads/{branch}"));
     }
 
     // Buildkite push build: BUILDKITE_BRANCH is the branch name.
     if let Some(branch) = env
         .buildkite_branch
         .as_deref()
-        .filter(|b| !b.is_empty() && !b.starts_with("gh-readonly-queue/"))
+        .filter(|b| !b.is_empty() && !is_merge_queue_branch(b))
     {
         return Some(format!("refs/heads/{branch}"));
     }

@@ -100,7 +100,7 @@ pub fn bypass_unreachable_pr_description_guidance(bypass_name: &str) -> String {
          `{bypass_name}` (not found there). If the directive is declared only in the PR description, it is not \
          visible to this run — for example on a GitHub merge-queue build, or without GitHub API access. Declare \
          the bypass in the commit description instead — `{bypass_name}=<specific legitimate reason>` — which is \
-         read in every CI context."
+         read in every CI context. Only for a real exception or emergency - never use bypasses for convenience."
     )
 }
 
@@ -256,6 +256,7 @@ mod tests {
         assert!(guidance.contains("Could not resolve a PR description"));
         assert!(guidance.contains("BYPASS_CHANGE_FILE_COUNT=<specific legitimate reason>"));
         assert!(guidance.contains("commit description"));
+        assert!(guidance.contains("never use bypasses for convenience"));
     }
 
     #[test]

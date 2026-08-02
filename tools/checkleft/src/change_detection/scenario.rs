@@ -1,4 +1,5 @@
 use super::environment::CiEnvironment;
+use super::merge_queue::is_merge_queue_branch;
 
 /// The classified CI execution scenario. This is the single source of truth
 /// for the PR-vs-merge-queue distinction — the two cases use *opposite* base
@@ -42,11 +43,7 @@ pub fn classify(env: &CiEnvironment, default_branch: &str) -> Scenario {
     }
 
     // Rule 2 — Buildkite gh-readonly-queue branch.
-    if env
-        .buildkite_branch
-        .as_deref()
-        .is_some_and(|b| b.starts_with("gh-readonly-queue/"))
-    {
+    if env.buildkite_branch.as_deref().is_some_and(is_merge_queue_branch) {
         return Scenario::MergeQueue;
     }
 

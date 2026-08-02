@@ -1,6 +1,7 @@
 use tracing::warn;
 
 use super::environment::CiEnvironment;
+use super::merge_queue::target_from_branch;
 
 /// Injectable interface for probing whether a ref exists and for resolving
 /// symbolic refs. Abstracted so the resolution ladder is unit-testable without
@@ -43,8 +44,7 @@ pub fn resolve_default_branch(env: &CiEnvironment, prober: &dyn RefProber, overr
     // 2b. BK merge queue: target branch is encoded in the branch name as
     //     `gh-readonly-queue/<target>/…`.
     if let Some(bk_branch) = env.buildkite_branch.as_deref()
-        && let Some(rest) = bk_branch.strip_prefix("gh-readonly-queue/")
-        && let Some(target) = rest.split('/').next().filter(|s| !s.is_empty())
+        && let Some(target) = target_from_branch(bk_branch)
     {
         return target.to_owned();
     }
