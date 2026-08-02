@@ -229,49 +229,69 @@ struct BossTableStyle: StructuredText.TableStyle {
         // bare `ScrollView(.horizontal)` here would interfere with the
         // AppKit text-selection gestures the document view relies on.
         //
-        // Size the `Grid` with `minWidth`, never `maxWidth`. A bounded width
-        // proposal makes a `Grid` shrink its columns and under-report its
-        // size, so `Overflow`'s `ScrollView` would size its scroll extent to
-        // the container and clip the uncompressed content it still paints
-        // past that edge. `minWidth` only ever grows the box (centering a
-        // table narrower than the container) and never compresses a column,
-        // so a wide table keeps its natural width and stays fully reachable
-        // by scrolling.
+        // A `ScrollView(.horizontal)` proposes `nil` along its scroll axis
+        // (measured in `MarkdownTableOverflowTests`, not assumed). Neither
+        // stock `frame` bound gives a table the behaviour it needs under that
+        // proposal, which is why this style drives the width through
+        // `ProposeWidthLayout` instead:
+        //
+        // - `maxWidth` wraps cells but clamps its own reported width, so a
+        //   table that cannot compress paints past a scroll extent sized to
+        //   the clamp — a hard cut with nothing to scroll to.
+        // - `minWidth` never strands content, but under the `nil` proposal it
+        //   also never *bounds* the `Grid`, so every cell reports its full
+        //   single-line width. Ordinary prose in a wide table then runs off
+        //   the viewport instead of wrapping, and reading one sentence means
+        //   scrolling sideways.
+        //
+        // `ProposeWidthLayout` proposes the viewport width and adopts the
+        // `Grid`'s real answer: cells that can wrap do wrap (so a prose table
+        // fits, with no clipped text), and content that genuinely cannot
+        // compress reports wider than the viewport and gets a real scroll
+        // extent.
         //
         // The border/background chrome is applied to the `Grid` at its
-        // natural width, then the finished, chromed table is centered — so
-        // a narrow table's visible border sits on the same centered axis as
-        // the surrounding prose, rather than being stretched to the full
-        // container width.
-        Overflow { state in
-            configuration.label
-                .fixedSize(horizontal: false, vertical: true)
-                .textual.tableBackground { layout in
-                    Canvas { context, _ in
-                        for bounds in layout.stripedBodyRowBounds() {
-                            context.fill(
-                                Path(bounds.integral),
-                                with: .style(Self.stripeColor)
-                            )
+        // resolved width, then the finished, chromed table is centered — so
+        // a table narrower than the column sits on the same centered axis as
+        // the surrounding prose.
+        AvailableWidthReader { availableWidth in
+            Overflow { state in
+                // `Overflow`'s own container width is authoritative when the
+                // scroll view has reported geometry; `availableWidth` covers
+                // the first layout pass and offscreen hosts, where
+                // `.onScrollGeometryChange` never fires.
+                let viewportWidth = state.containerWidth ?? availableWidth
+                ProposeWidthLayout(width: viewportWidth) {
+                    configuration.label
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textual.tableBackground { layout in
+                            Canvas { context, _ in
+                                for bounds in layout.stripedBodyRowBounds() {
+                                    context.fill(
+                                        Path(bounds.integral),
+                                        with: .style(Self.stripeColor)
+                                    )
+                                }
+                            }
                         }
-                    }
-                }
-                .textual.tableOverlay { layout in
-                    Canvas { context, _ in
-                        for divider in layout.dividers() {
-                            context.fill(
-                                Path(divider),
-                                with: .style(Color(nsColor: .separatorColor).opacity(0.4))
-                            )
+                        .textual.tableOverlay { layout in
+                            Canvas { context, _ in
+                                for divider in layout.dividers() {
+                                    context.fill(
+                                        Path(divider),
+                                        with: .style(Color(nsColor: .separatorColor).opacity(0.4))
+                                    )
+                                }
+                            }
                         }
-                    }
+                        .padding(Self.borderWidth)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: Self.cornerRadius)
+                                .stroke(Color(nsColor: .separatorColor), lineWidth: Self.borderWidth)
+                        )
                 }
-                .padding(Self.borderWidth)
-                .overlay(
-                    RoundedRectangle(cornerRadius: Self.cornerRadius)
-                        .stroke(Color(nsColor: .separatorColor), lineWidth: Self.borderWidth)
-                )
-                .frame(minWidth: state.containerWidth, alignment: .center)
+                .frame(minWidth: viewportWidth, alignment: .center)
+            }
         }
         .textual.tableCellSpacing(
             horizontal: Self.borderWidth,
@@ -283,6 +303,38 @@ struct BossTableStyle: StructuredText.TableStyle {
 
 extension StructuredText.TableStyle where Self == BossTableStyle {
     static var boss: Self { .init() }
+}
+
+/// Reports the width available to a block *before* it enters a horizontal
+/// scroll container, and hands it to `content`.
+///
+/// `Overflow` derives its container width from `.onScrollGeometryChange`,
+/// which is `nil` until the scroll view has real scroll geometry — on the
+/// first layout pass, in `.wrap` mode (which has no scroll view at all), and
+/// for a view hosted in a bare offscreen `NSHostingView`, the shape this
+/// repo's screenshot harnesses use. Without a fallback the table style sees
+/// `nil` and lays the table out at its unbounded natural width, which is the
+/// layout those harnesses then photograph.
+///
+/// `.onGeometryChange` reports the block's own width, which is set by the
+/// enclosing document column, so it is available on the first pass wherever
+/// the view is hosted.
+///
+/// The measured view is pinned to `maxWidth: .infinity`, so that width comes
+/// from the document column and never from the table content it wraps — the
+/// measurement cannot feed back into itself and oscillate.
+private struct AvailableWidthReader<Content: View>: View {
+    @State private var availableWidth: CGFloat?
+    @ViewBuilder let content: (CGFloat?) -> Content
+
+    var body: some View {
+        content(availableWidth)
+            .frame(maxWidth: .infinity)
+            .onGeometryChange(for: CGFloat.self, of: \.size.width) { width in
+                guard width > 0 else { return }
+                availableWidth = width
+            }
+    }
 }
 
 extension StructuredText.TableLayout {

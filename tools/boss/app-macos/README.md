@@ -110,6 +110,16 @@ and bare binary launches remain blocked. The hard gate in
   capsule so it stays legible.
 - Agents-mode libghostty surfaces stay mounted at opacity 0 in Work mode;
   opacity-0 Metal layers do not blank the rest of the capture (measured).
+- A **bare offscreen `NSHostingView`** (one never installed in an `NSWindow`)
+  does not give its scroll views real scroll geometry: the nested scroll
+  view's document view stays zero-width, and SwiftUI's
+  `.onScrollGeometryChange` never fires, so any view that sizes itself from a
+  scroll container's width lays out differently than it does in the app.
+  Markdown tables are the case that bit us — see
+  `MarkdownTableOverflowTests`, which hosts every case in a real `NSWindow`
+  for exactly this reason. **Do not screenshot layout through a hand-rolled
+  offscreen host**; use the `--capture-to` route above, which captures a real
+  window, and if it fails say so rather than substituting an offscreen render.
 
 Do not commit capture PNGs to the branch. Read the image back and state in
 the PR body what you verified and what you could not.
