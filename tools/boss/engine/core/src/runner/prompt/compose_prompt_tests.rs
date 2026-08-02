@@ -2529,11 +2529,11 @@ fn design_directive_calibrates_breakdown_size_to_problem_size() {
 /// directives, not be duplicated as separate text in each.
 #[test]
 fn design_discipline_block_present_in_both_design_directives() {
-    let design = compose_design_directive(None);
+    let design = compose_design_directive(None, None);
     assert!(design.contains("Name the contested property up front"), "{design}");
     assert!(design.contains("Every rejection must be checkable"), "{design}");
 
-    let postmortem = compose_design_postmortem_directive(None, "/tmp/followups.json");
+    let postmortem = compose_design_postmortem_directive(None, "/tmp/followups.json", None);
     assert!(
         postmortem.contains("Name the contested property up front"),
         "{postmortem}"
@@ -2555,7 +2555,7 @@ fn design_directive_for_another_product_has_no_boss_repo_assumptions() {
         .updated_at("2026-05-15T00:00:00Z")
         .build();
 
-    let directive = compose_design_directive(Some(&project));
+    let directive = compose_design_directive(Some(&project), None);
     assert!(directive.contains("**Design discipline:**"), "{directive}");
     assert!(directive.contains("client, service, shared data model"), "{directive}");
     for repo_specific_text in [
