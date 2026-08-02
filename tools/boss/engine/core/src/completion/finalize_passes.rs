@@ -623,20 +623,38 @@ impl WorkerCompletionHandler {
                     // Include the specific serde error in the probe when we have one so
                     // the reviewer can correct the exact malformation rather than blindly
                     // rewriting the entire JSON.
+                    //
+                    // Driver-agnostic on purpose: the probe must not name a driver-specific
+                    // tool, and must not assume the artifact path is writable. A
+                    // `WorkerKind::Reviewer` Codex worker runs under `--sandbox read-only`
+                    // (`codex_sandbox_for_worker_kind`), which denies writes to every path
+                    // including the engine-owned artifact path outside the workspace;
+                    // `--add-dir` is itself rejected under `read-only` ("Switch to
+                    // workspace-write or danger-full-access to allow them"), so there is no
+                    // writable-root carve-out to grant. The probe therefore offers the
+                    // fenced-JSON-in-final-message channel that the primary prompt already
+                    // names as a fallback (`pr-review/src/render.rs`'s "Also (fallback)"
+                    // section) — `CodexDriver::structured_output_fallback` recovers that
+                    // fenced JSON on the next finalize pass (`driver/src/codex.rs`).
                     let probe = if let Some(ref parse_err) = parse_error {
                         format!(
                             "Your review did not produce a valid ReviewResult. The JSON was \
                              present but failed to parse:\n\n  {parse_err}\n\n\
-                             Correct the JSON so it matches the schema in your task prompt, \
-                             write it to this file with the Write tool, then stop — do NOT \
-                             change the PR:\n\n{}",
+                             Correct the JSON so it matches the schema in your task prompt. \
+                             Write it to this file:\n\n{}\n\n\
+                             If your sandbox does not allow writing that path, instead end \
+                             your reply with the corrected JSON in a fenced ```json block as \
+                             the last content in the message. Do NOT change the PR.",
                             output_path.display(),
                         )
                     } else {
                         format!(
                             "Your review did not produce a valid ReviewResult. Write the \
                              ReviewResult JSON (matching the schema in your task prompt) to \
-                             this file with the Write tool, then stop — do NOT change the PR:\n\n{}",
+                             this file:\n\n{}\n\n\
+                             If your sandbox does not allow writing that path, instead end \
+                             your reply with the JSON in a fenced ```json block as the last \
+                             content in the message. Do NOT change the PR.",
                             output_path.display(),
                         )
                     };
