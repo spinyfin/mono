@@ -2475,7 +2475,6 @@ fn design_directive_requires_the_scope_tag() {
     );
     assert!(directive.contains("rather than silently omitting them"), "{directive}");
 }
-
 /// The breakdown block must carry proportionality calibration, not just
 /// split rules: a named cost for over-splitting to balance the scheduler
 /// rejection named for under-splitting, anchor bands relating entry count
@@ -2512,4 +2511,49 @@ fn design_directive_calibrates_breakdown_size_to_problem_size() {
         "{directive}"
     );
     assert!(directive.contains("rather than fewer"), "{directive}");
+}
+
+/// The portable design-discipline block must appear in both design-family
+/// directives, not be duplicated as separate text in each.
+#[test]
+fn design_discipline_block_present_in_both_design_directives() {
+    let design = compose_design_directive(None);
+    assert!(design.contains("Name the contested property up front"), "{design}");
+    assert!(design.contains("Every rejection must be checkable"), "{design}");
+
+    let postmortem = compose_design_postmortem_directive(None, "/tmp/followups.json");
+    assert!(
+        postmortem.contains("Name the contested property up front"),
+        "{postmortem}"
+    );
+    assert!(postmortem.contains("Every rejection must be checkable"), "{postmortem}");
+}
+
+#[test]
+fn design_directive_for_another_product_has_no_boss_repo_assumptions() {
+    let project = crate::work::Project::builder()
+        .id("proj-other-product")
+        .product_id("product-other")
+        .name("External project")
+        .description("")
+        .goal("")
+        .status(crate::work::ProjectStatus::Active)
+        .slug("external-project")
+        .created_at("2026-05-15T00:00:00Z")
+        .updated_at("2026-05-15T00:00:00Z")
+        .build();
+
+    let directive = compose_design_directive(Some(&project));
+    assert!(directive.contains("**Design discipline:**"), "{directive}");
+    assert!(directive.contains("client, service, shared data model"), "{directive}");
+    for repo_specific_text in [
+        "tools/boss/",
+        "codex-driver-execution-shape-postmortem",
+        "engine + cli + protocol + app",
+    ] {
+        assert!(
+            !directive.contains(repo_specific_text),
+            "non-Boss design directive must not mention {repo_specific_text}:\n{directive}",
+        );
+    }
 }

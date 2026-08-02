@@ -24,6 +24,24 @@ pub(super) fn doc_structure_conventions_block() -> String {
     out
 }
 
+/// Design-discipline guidance distilled into lessons general enough to apply
+/// to any project. Shared by both design-family directives: an
+/// undocumented decision, an invariant pitched at the wrong level, or an
+/// unfalsifiable rejection costs the same whether the doc is being
+/// authored fresh or reconciled against what shipped.
+pub(super) fn design_discipline_block() -> String {
+    let mut out = String::new();
+    out.push_str("- **Design discipline:**\n");
+    out.push_str("  - **Name the contested property up front.** If this project's central bet is a property a reviewer could reasonably disagree with, put that property in the title or opening sentence — not bury it as an implementation detail nobody is ever asked about.\n");
+    out.push_str("  - **Silence is not neutral.** If you can't find a recorded reason for an existing decision, don't assume a reason once existed and was lost — the stronger and more common reading is that the decision was never made at all. Treat that as a finding, not something to paper over.\n");
+    out.push_str("  - **State invariants at the level of the property that is load-bearing, not the container that usually carries it.** If an implementation could satisfy the letter of a constraint while breaking everything downstream of it, the constraint is written at the wrong level. When you record two things as equivalent, name the dimension the equivalence holds on — an equivalence noted on one dimension gets read as holding on all of them.\n");
+    out.push_str("  - **Every rejection must be checkable, and must survive contact with existing practice.** A pejorative label is not an argument. If you reject an approach that this project (or a comparable one) already relies on, name that precedent and say why the reasoning doesn't apply to it — a rejection that would also disqualify an established approach isn't a rejection. Also check that each requirement used to reject an alternative is a real requirement, not an artifact of the option you'd already picked.\n");
+    out.push_str("  - **Decide whether a study is choosing between options or validating one, and say so before you run it.** A study that can only return \"the chosen approach works\" or \"it's broken\" will never surface that a different approach is better, however carefully it's run. Evidence gathered to verify a claim can't later stand in for a comparison it was never asked to make, and a hedge like \"fine, if that option were chosen\" is marking an unmade decision — escalate the decision instead of filing the hedge as a result.\n");
+    out.push_str("  - **A gate at the end of a phase has no authority over the phase it belongs to** — it can only block what comes after. And a hand-built reproduction of a real system is structurally unable to find integration bugs, because it's built from the same beliefs that produced the code; only the genuine end-to-end path finds those.\n");
+    out.push_str("  - **Don't let documents or tests harden drift into fact.** When a premise changes, make the change and everything downstream of it visible in the same diff — quietly folding an amendment in before anyone sees the contradiction just hides it. A test that pins a since-superseded requirement turns drift into a defended invariant, so sweep the tests that pin a premise in the same change that changes the premise. Separate a doc's durable reasoning from its perishable status/gaps/tasks so the latter can be refreshed without disturbing the former.\n");
+    out
+}
+
 /// Directive block for the synthetic `kind = 'design'` task that the
 /// engine auto-creates with every project. Without this block the
 /// `project_design` worker only sees the generic "draft or update a
@@ -66,6 +84,7 @@ pub(super) fn compose_design_directive(parent_project: Option<&Project>) -> Stri
     out.push_str("  - **Chosen approach** — the design itself, with enough detail that a follow-up implementation task can be filed against it.\n");
     out.push_str("  - **Risks / open questions** — anything the author wants a human reviewer to land on before implementation starts.\n");
     out.push_str("  - **Proposed implementation task breakdown** — this section is **required** and must be the final section of the doc. It is the machine-findable handoff to scheduling (see below).\n");
+    out.push_str(&design_discipline_block());
     out.push_str("- the **Proposed implementation task breakdown** section must:\n");
     out.push_str("  - use exactly that heading (`## Proposed implementation task breakdown`) so a downstream parser can locate it reliably.\n");
     out.push_str("  - list PR-sized tasks in dependency order, where each entry contains:\n");
@@ -75,7 +94,7 @@ pub(super) fn compose_design_directive(parent_project: Option<&Project>) -> Stri
     out.push_str("    - **explicit dependencies** — which other entries in this list gate this one (use the task names; \"none\" if it can start immediately).\n");
     out.push_str("    - a **scope tag** — exactly one of `Scope: in-scope` or `Scope: deferred (future / not a v1 blocker)`. Use this exact `Scope:` line (own line, this literal wording) on every entry — downstream scheduling keys off it verbatim, so free prose like \"this is a stretch goal\" instead of the tag will not be recognised. Tag an entry `deferred` when it is explicitly out of scope for v1, a stretch goal, or something you are deliberately not proposing for immediate implementation; follow the tag with a short inline reason (e.g. `Scope: deferred (future / not a v1 blocker) — needs the batch API landing in phase 2`).\n");
     out.push_str("  - **size each entry to one reviewable PR by one worker in one session.** This is the granularity scheduling materialises into tasks, so pre-split the work here — an oversize entry forces the scheduler to reject and re-plan it:\n");
-    out.push_str("    - keep each entry single-subsystem and single-PR. Scope that spans several subsystems (engine + cli + protocol + app + …) is several entries with dependency edges, not one.\n");
+    out.push_str("    - keep each entry single-subsystem and single-PR. Scope that spans several subsystems (for example, a client, service, shared data model, and user interface) is several entries with dependency edges, not one.\n");
     out.push_str("    - multi-phase scope (\"parse (i)… and (ii)… and emit… and validate…\") is several entries — list each phase separately with explicit dependencies, never one entry that does it all.\n");
     out.push_str("    - sweeps and validation campaigns (\"validate/sweep/migrate all N X\", an all-lists reconciliation, a corpus-wide fixture sweep) are separate dependent entries, listed after the implementation they validate — do not fold them into the implementer.\n");
     out.push_str("    - unknown-format discovery (study / dump / reverse-engineer / reconcile-against-source) is its own investigation entry, sequenced before the implementation that consumes its findings.\n");
@@ -91,7 +110,7 @@ pub(super) fn compose_design_directive(parent_project: Option<&Project>) -> Stri
     out.push_str("      - a genuinely large build-out — a new integration or subsystem reaching across most of the stack, with its own investigations and acceptance sweeps: **15+ entries**, and the count needs the justification below to earn it.\n");
     out.push_str("    - **state the count and defend it.** Open the section with a single line, before the first entry, of exactly this shape: `Breakdown size: N entries (M in-scope, K deferred) — <one sentence on why this problem needs N entries rather than fewer>`. Name the anchor band you are calibrating against, and if you land above it, say what makes this design bigger than that band. If you cannot justify N, the breakdown is miscalibrated — merge entries until you can. This line is prose about the section, not an entry: it has no name/scope/effort/dependency shape and is not a task.\n");
     out.push_str("  - note which tasks at the same dependency depth may run in parallel, so the task graph (not just a linear list) is expressible.\n");
-    out.push_str("  - when you mark tasks parallel, weigh **file** overlap, not just functional independence: two tasks can be independent in design yet edit the same file (e.g. a compact-view task and a detail-view task that both edit the same component/container). If two otherwise-parallel tasks are clearly and substantially likely to co-edit the same files, say so — give them a defined order and note that the later one must forward-port the earlier one's changes preservingly (integrate, never delete). Do not over-serialise: only flag clear, substantial overlap; incidental overlap stays parallel.\n");
+    out.push_str("  - when you mark tasks parallel, weigh **file** overlap, not just functional independence: two tasks can be independent in design yet edit the same shared integration surface. If two otherwise-parallel tasks are clearly and substantially likely to co-edit the same files, say so — give them a defined order and note that the later one must forward-port the earlier one's changes preservingly (integrate, never delete). Do not over-serialise: only flag clear, substantial overlap; incidental overlap stays parallel.\n");
     out.push_str("  - include items that are deferred or explicitly out of scope as their own entries (tagged `Scope: deferred (future / not a v1 blocker)`, see above) rather than silently omitting them — silent omissions force the coordinator to guess what was considered and rejected. Do not drop the entry just because it is deferred; the scope tag is what lets it stay visible without being auto-started.\n");
     out.push_str("  - This section is what the design doc's auto-populate step will consume to materialise dependent tasks with edges, so completeness matters.\n");
     out.push_str(&design_questions_manifest_block());
@@ -125,6 +144,7 @@ pub(super) fn compose_design_postmortem_directive(
         out.push_str(&path_line);
     }
     out.push_str(&doc_structure_conventions_block());
+    out.push_str(&design_discipline_block());
     out.push_str("- review each merged PR listed in the details above (`gh pr view`/`gh pr diff`) alongside the current doc, and update the doc to reflect **as-built reality**:\n");
     out.push_str("  - decisions that diverged from what the doc originally said, and why (as best you can tell from the PR/commit history).\n");
     out.push_str("  - scope that was added or dropped relative to the doc's plan.\n");
@@ -185,6 +205,6 @@ fn canonical_design_doc_path_line(parent_project: Option<&Project>) -> Option<St
         project.slug.trim()
     };
     Some(format!(
-        "- the project's `design_doc_path` pointer is not yet set. Place the doc at `docs/designs/{slug}.md` (the repo's convention; adjust to the product's docs layout if the repo already has one — e.g. `tools/boss/docs/designs/{slug}.md` for the Boss product). After you create the file, set the pointer with `boss project set-design-doc --project <id> --path <path>` so the next run resolves it directly.\n",
+        "- the project's `design_doc_path` pointer is not yet set. Place the doc at `docs/designs/{slug}.md`; if the repository already has an established design-doc layout, use that layout instead. After you create the file, set the pointer with `boss project set-design-doc --project <id> --path <path>` so the next run resolves it directly.\n",
     ))
 }
