@@ -1333,6 +1333,7 @@ pub(crate) async fn run_show_leaf(
     )
     .await?;
     let executions = list_executions_for_item(client, &item.id).await?;
+    let execution_runs = list_execution_runs(client, &executions).await?;
     let runtime = get_task_runtime(client, &item.id).await?;
     let attention_items = list_attention_items_for_work_item(client, &item.id).await?;
     let attention_groups = list_attention_groups(client, &product.id, None, Some(item.id.clone()), None, None).await?;
@@ -1347,7 +1348,7 @@ pub(crate) async fn run_show_leaf(
         );
         map.insert(
             "executions".to_owned(),
-            serde_json::to_value(&executions).map_err(CliError::internal)?,
+            serde_json::to_value(&execution_runs).map_err(CliError::internal)?,
         );
         map.insert(
             "attention_items".to_owned(),
@@ -1366,7 +1367,7 @@ pub(crate) async fn run_show_leaf(
         print_attention_groups_section(&attention_groups);
         print_runtime_section(&runtime);
         print_dependency_section(&detail);
-        print_executions_section(&executions);
+        print_executions_section(&execution_runs);
     })
 }
 
