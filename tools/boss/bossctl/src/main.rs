@@ -989,6 +989,13 @@ enum HostsAction {
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
+    /// Re-run remote provisioning and capability discovery for a host.
+    Probe {
+        id: String,
+        /// Override the Boss state-root directory.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
     /// Add or remove user-defined capability tags on a host.
     Tag {
         #[command(subcommand)]
@@ -1396,6 +1403,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Hosts {
             action: HostsAction::Show { id, state_root },
         } => hosts::hosts_show(cli.json, state_root, id),
+        Command::Hosts {
+            action: HostsAction::Probe { id, state_root },
+        } => hosts::hosts_probe(cli.json, state_root, id).await,
         Command::Hosts {
             action:
                 HostsAction::Tag {

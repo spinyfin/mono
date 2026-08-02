@@ -71,10 +71,7 @@ pub async fn provision_remote_host(host_id: &str, ssh_target: &str) -> RemotePro
     match push_wrapper(&transport).await {
         Ok(WrapperPushOutcome::Ok) => {}
         Ok(WrapperPushOutcome::Failed(kind, detail)) => {
-            return RemoteProvisionOutcome::Failed {
-                kind: subclass_label(&kind),
-                detail: format!("wrapper push failed ({}): {detail}", subclass_label(&kind)),
-            };
+            return wrapper_push_failed(kind, detail);
         }
         Err(err) => {
             return RemoteProvisionOutcome::Failed {
@@ -100,13 +97,22 @@ pub async fn provision_remote_host(host_id: &str, ssh_target: &str) -> RemotePro
         }
     }
 
-    match discover_remote_capabilities(&transport).await {
-        // An empty set here is not a legitimate "this host has no
-        // capabilities" — the `gh-authed=` tag is emitted unconditionally,
-        // so nothing coming back means every probe failed to run on a host
-        // that had just answered `cube --help`. Registering that as a
-        // healthy zero-capability host is precisely the state this fix
-        // exists to stop producing, so it fails loudly instead.
+    discovered_capabilities_outcome(discover_remote_capabilities(&transport).await)
+}
+
+fn wrapper_push_failed(kind: crate::ssh_transport::SshFailureKind, detail: String) -> RemoteProvisionOutcome {
+    let kind = subclass_label(&kind);
+    RemoteProvisionOutcome::Failed {
+        kind,
+        detail: format!("wrapper push failed ({kind}): {detail}"),
+    }
+}
+
+fn discovered_capabilities_outcome(result: anyhow::Result<Vec<String>>) -> RemoteProvisionOutcome {
+    match result {
+        // Today the `gh-authed=` probe makes this unreachable. Keep this
+        // defensive invariant so a future probe-set change cannot create an
+        // enabled host with zero discovered capabilities silently.
         Ok(capabilities) if capabilities.is_empty() => RemoteProvisionOutcome::Failed {
             kind: "unclassified",
             detail: "capability discovery returned nothing; host answered `cube --help` \
@@ -118,5 +124,35 @@ pub async fn provision_remote_host(host_id: &str, ssh_target: &str) -> RemotePro
             kind: "unclassified",
             detail: format!("capability discovery errored: {err:#}"),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_discovery_result_is_not_accepted_as_a_healthy_host() {
+        assert_eq!(
+            discovered_capabilities_outcome(Ok(vec![])),
+            RemoteProvisionOutcome::Failed {
+                kind: "unclassified",
+                detail: "capability discovery returned nothing; host answered `cube --help` but no probe produced a capability".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn wrapper_push_failure_uses_the_operator_facing_subclass_label() {
+        assert_eq!(
+            wrapper_push_failed(
+                crate::ssh_transport::SshFailureKind::PermissionDenied,
+                "remote directory is read-only".to_owned(),
+            ),
+            RemoteProvisionOutcome::Failed {
+                kind: "permission_denied",
+                detail: "wrapper push failed (permission_denied): remote directory is read-only".to_owned(),
+            }
+        );
     }
 }

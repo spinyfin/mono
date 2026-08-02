@@ -289,8 +289,7 @@ impl HostProvisioner for SshHostProvisioner {
 /// provision is disabled with `last_error_text` set; the caller reads the
 /// updated snapshot back, so the UI sees disabled + error text = add
 /// failed. A host we could provision gets its discovered capabilities
-/// persisted, so `bossctl hosts show` reports what the machine actually
-/// said rather than the empty set every remote host used to report.
+/// persisted, so `bossctl hosts show` reports what the machine actually said.
 ///
 /// The writes are best-effort, carried over verbatim from the
 /// `eager_push_wrapper_rpc` this was extracted from. Note that dropping
