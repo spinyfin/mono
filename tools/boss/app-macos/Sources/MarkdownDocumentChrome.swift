@@ -6,6 +6,81 @@ import Textual
 
 private let designDocTimingLog = Logger(subsystem: "com.boss.app", category: "DesignDocTiming")
 
+/// Selects how wide the document scroll column clamps to. Prose-only
+/// documents keep today's centered reading column (`readable`); documents
+/// containing a table widen the column (`wide`) so the table can use the
+/// freed-up margin space, while `BossMarkdownStyle`'s per-block prose clamp
+/// (not this container) is what keeps paragraphs at the readable measure
+/// inside the wider column. A pure function of the source text — no view
+/// state, no layout feedback — so widening never triggers a relayout loop.
+enum MarkdownDocumentMeasure {
+    /// The prose reading measure, matched by `BossMarkdownStyle`'s per-block
+    /// clamp so paragraphs stay this width even inside `wide` documents.
+    static let readable: CGFloat = 720
+    /// The document column width once a table is present.
+    static let wide: CGFloat = 1440
+
+    static func forSource(_ source: String) -> CGFloat {
+        containsTable(source) ? wide : readable
+    }
+
+    /// Detects a GitHub-flavored Markdown table via its delimiter row (e.g.
+    /// `| --- | --- |` or the equally legal `|-|-|`), not a bare `|`, since
+    /// prose and inline code routinely contain pipes without forming a
+    /// table. Skips fenced code blocks, since docs that show table syntax as
+    /// an example (this repo's own docs included) shouldn't widen the
+    /// column for it.
+    static func containsTable(_ source: String) -> Bool {
+        var previousRow: String? = nil
+        var inFencedCode = false
+        for line in source.components(separatedBy: "\n") {
+            if isFenceDelimiter(line) {
+                inFencedCode.toggle()
+                previousRow = nil
+                continue
+            }
+            guard !inFencedCode else { continue }
+            if let previousRow, isTableDelimiterRow(line, precedingRow: previousRow) {
+                return true
+            }
+            previousRow = line
+        }
+        return false
+    }
+
+    private static func isFenceDelimiter(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        return trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~")
+    }
+
+    /// A delimiter row is only a *table* delimiter row when it is pipe-
+    /// delimited and the row above it is a real, also pipe-delimited
+    /// content row with a matching cell count — that's what actually
+    /// distinguishes it from a thematic break (`---` alone on its own line)
+    /// or a setext heading underline (`Heading\n---`), neither of which
+    /// contains a `|`.
+    private static func isTableDelimiterRow(_ line: String, precedingRow: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard trimmed.contains("-"), trimmed.contains("|") else { return false }
+        let cells = trimmed
+            .trimmingCharacters(in: CharacterSet(charactersIn: "|"))
+            .components(separatedBy: "|")
+        guard !cells.isEmpty else { return false }
+        guard
+            cells.allSatisfy({ cell in
+                cell.range(of: #"^\s*:?-+:?\s*$"#, options: .regularExpression) != nil
+            })
+        else { return false }
+
+        let precedingTrimmed = precedingRow.trimmingCharacters(in: .whitespaces)
+        guard !precedingTrimmed.isEmpty, precedingTrimmed.contains("|") else { return false }
+        let precedingCells = precedingTrimmed
+            .trimmingCharacters(in: CharacterSet(charactersIn: "|"))
+            .components(separatedBy: "|")
+        return precedingCells.count == cells.count
+    }
+}
+
 /// The single reconciled chrome every in-app markdown document viewer renders
 /// through. Previously the app had one markdown render core
 /// (`StructuredText(...).bossMarkdown()`) wrapped in three independently
@@ -178,13 +253,24 @@ private struct MarkdownDocumentColumn: View {
             }
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
+                    // Chrome rows stay at the readable measure even when the
+                    // document column widens for a table, and are centered
+                    // on that same axis, so the title row and rule share the
+                    // prose's centered column instead of hugging the wide
+                    // document column's left edge.
                     header
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .frame(maxWidth: MarkdownDocumentMeasure.readable)
+                        .frame(maxWidth: .infinity, alignment: .center)
                     Divider()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .frame(maxWidth: MarkdownDocumentMeasure.readable)
+                        .frame(maxWidth: .infinity, alignment: .center)
                     documentBody
                 }
                 .padding(.horizontal, 24)
                 .padding(.vertical, 20)
-                .frame(maxWidth: 720)
+                .frame(maxWidth: MarkdownDocumentMeasure.forSource(source))
                 .frame(maxWidth: .infinity)
                 .background(MarkdownScrollViewCapture(controller: scrollController))
             }
@@ -303,6 +389,10 @@ private struct MarkdownDocumentColumn: View {
         } else {
             StructuredText(source, parser: markdownParser)
                 .bossMarkdown()
+                // Scoped to this document body only — the transcript viewer,
+                // comment sidebar, and release notes all call `.bossMarkdown()`
+                // bare and must keep rendering prose at its natural width.
+                .environment(\.markdownProseMeasure, MarkdownDocumentMeasure.readable)
                 .textual.textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 // Force StructuredText recreation when highlight state changes so

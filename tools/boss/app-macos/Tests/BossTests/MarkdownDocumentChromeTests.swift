@@ -36,6 +36,86 @@ final class MarkdownDocumentChromeTests: XCTestCase {
     - another top
     """
 
+    // MARK: - Document measure selection
+
+    /// A wide table gets the extra document width; the delimiter row (e.g.
+    /// `| -------- | -------- |`) is what's detected, not a bare `|`, which
+    /// also shows up in prose and inline code without forming a table.
+    func testMeasureWidensForDocumentsContainingATable() {
+        XCTAssertEqual(
+            MarkdownDocumentMeasure.forSource(Self.representative),
+            MarkdownDocumentMeasure.wide)
+        XCTAssertTrue(MarkdownDocumentMeasure.containsTable(Self.representative))
+    }
+
+    /// Prose-only documents keep today's centered reading column.
+    func testMeasureStaysReadableForProseOnlyDocuments() {
+        let prose = """
+        # Title
+
+        A paragraph with **bold** text and a | pipe | that is not a table.
+
+        - a list item
+        - another item
+
+        > a blockquote
+        """
+        XCTAssertEqual(MarkdownDocumentMeasure.forSource(prose), MarkdownDocumentMeasure.readable)
+        XCTAssertFalse(MarkdownDocumentMeasure.containsTable(prose))
+    }
+
+    /// A thematic break (`---`) alone must not be mistaken for a one-column
+    /// table delimiter row.
+    func testThematicBreakAloneIsNotATable() {
+        let prose = """
+        Some prose.
+
+        ---
+
+        More prose.
+        """
+        XCTAssertFalse(MarkdownDocumentMeasure.containsTable(prose))
+    }
+
+    /// GFM only requires one-or-more dashes per cell, not the three this
+    /// detector used to require — `|-|-|` is common generator output and is
+    /// a real table.
+    func testMinimalSingleDashDelimiterRowIsATable() {
+        let doc = """
+        | A | B |
+        |-|-|
+        | one | two |
+        """
+        XCTAssertTrue(MarkdownDocumentMeasure.containsTable(doc))
+    }
+
+    /// A legal single-column GFM table must be detected too.
+    func testSingleColumnTableIsATable() {
+        let doc = """
+        | A |
+        | --- |
+        | one |
+        """
+        XCTAssertTrue(MarkdownDocumentMeasure.containsTable(doc))
+    }
+
+    /// Table syntax shown as an example inside a fenced code block (common
+    /// in this repo's own docs) must not widen a prose-only document.
+    func testTableSyntaxInsideFencedCodeBlockIsNotATable() {
+        let doc = """
+        Some prose describing table syntax:
+
+        ```
+        | A | B |
+        |---|---|
+        | one | two |
+        ```
+
+        More prose.
+        """
+        XCTAssertFalse(MarkdownDocumentMeasure.containsTable(doc))
+    }
+
     // MARK: - Collapsed rail expand-reachability rule
 
     /// An engine-backed doc must always offer the expand button, even at zero
