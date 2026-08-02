@@ -357,7 +357,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::InterruptWorkerPane { .. }
         | FrontendRequest::ListEngineAttempts { .. }
         | FrontendRequest::ListFeatureFlags
-        | FrontendRequest::ListHuskPanes
+        | FrontendRequest::ListHostedPaneStatuses
         | FrontendRequest::ListLiveStatusDisabledSlots
         | FrontendRequest::ListWorkerLiveStates
         | FrontendRequest::MetricsListLive

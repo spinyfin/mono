@@ -167,7 +167,7 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::EngineRequest { .. }
         | FrontendEvent::WorkerLiveStatesList { .. }
         | FrontendEvent::PaneRetired { .. }
-        | FrontendEvent::HuskPanesList { .. }
+        | FrontendEvent::HostedPaneStatusList { .. }
         | FrontendEvent::RunTranscriptTail { .. }
         | FrontendEvent::ExecutionTranscriptResult { .. }
         | FrontendEvent::ExecutionTranscriptUnavailable { .. }

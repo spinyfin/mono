@@ -2,9 +2,10 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine_app::{EngineToAppRequest, EngineToAppResponse, HostedPaneEntry};
+use crate::engine_app::{EngineToAppRequest, EngineToAppResponse};
 use crate::health_wire::EngineHealthReport;
 use crate::host_registry_wire::HostSnapshot;
+use crate::hosted_pane_status::HostedPaneStatus;
 use crate::live_worker_state::LiveWorkerState;
 use crate::metrics_wire::MetricLiveEntry;
 use crate::types::{
@@ -1220,21 +1221,25 @@ pub enum FrontendRequest {
     /// Read-only; no side effects.
     ListFeatureFlags,
 
+    /// Read-only query: every slot the app currently hosts a session in,
+    /// classified against the engine's live registry AND its durable
+    /// state — live, "engine lost track of it but durable state still
+    /// corroborates a running process" (`LiveProcessNoRegistry`), or a
+    /// true husk. Powers `bossctl agents list --all` and worker-reference
+    /// resolution (crew name / slot id / run id) for every `agents` verb,
+    /// both of which are otherwise structurally blind to a pane the live
+    /// registry has dropped — `ListWorkerLiveStates` only reflects the
+    /// engine's own `LiveWorkerStateRegistry`, which by definition has no
+    /// entry for one. Replies with
+    /// [`FrontendEvent::HostedPaneStatusList`]; an empty list (not an
+    /// error) when no app session is registered or the app hosts
+    /// nothing.
+    ListHostedPaneStatuses,
+
     /// All registered hosts with their enabled state and capabilities.
     /// Includes the built-in `local` host. Replies with
     /// [`FrontendEvent::HostsList`].
     ListHosts,
-
-    /// Read-only query: which slots does the app currently host a
-    /// session in that the engine has NO live-tracked run for
-    /// ("husk" panes)? Powers `bossctl agents list --all`, which is
-    /// otherwise structurally blind to husks — `ListWorkerLiveStates`
-    /// only reflects the engine's own `LiveWorkerStateRegistry`, which
-    /// by definition has no entry for a husk. Replies with
-    /// [`FrontendEvent::HuskPanesList`]; an empty list (not an error)
-    /// when no app session is registered or the app reports nothing
-    /// the engine doesn't already track.
-    ListHuskPanes,
 
     /// Snapshot of which slots currently have the live-status
     /// summarizer disabled. The UI uses this to render the toggle
@@ -1858,19 +1863,24 @@ pub enum FrontendRequest {
     /// app's own bookkeeping — WITHOUT resolving through a run id.
     /// Exists for "husk" panes: a pane the app still hosts but the
     /// engine has no live-tracked run for (crash, terminal-fail path
-    /// bug, spawn-ack timeout). Neither `StopRun` nor `ReapRun` can
-    /// reach this case — both key off a run id the engine no longer
-    /// has a slot mapping for, so `bossctl agents stop` fails with "no
-    /// live worker matches" before it ever reaches the engine. Used by
-    /// `bossctl agents retire-pane <slot>`.
+    /// bug, spawn-ack timeout). `bossctl agents retire-pane` resolves a
+    /// crew name or run id to `slot_id` client-side (durable-state
+    /// resolution, same as every other `agents` verb); the wire request
+    /// itself stays slot-keyed since that is what actually identifies a
+    /// pane to the app.
     ///
     /// Refuses with `WorkError` when the engine's own
     /// `LiveWorkerStateRegistry` still shows a live (non-terminal) run
-    /// in `slot_id` — that pane is not a husk, and retiring it would
-    /// tear down a pane the engine still considers active; the caller
-    /// must use `agents stop` (or `agents reap`) instead. Idempotent
-    /// otherwise: a slot the app doesn't recognise (already released,
-    /// never allocated) still replies `PaneRetired`.
+    /// in `slot_id`, or shows a terminal entry contradicted by real
+    /// recent hook/tool activity — either way that pane is not safe to
+    /// tear down blind, and the caller must use `agents stop` instead.
+    /// When the registry has no entry at all but durable state
+    /// corroborates a still-running process for an inferred-terminal
+    /// execution (the shape a worker the engine lost track of takes),
+    /// this no longer refuses: it performs the same durable-state
+    /// teardown `agents stop` uses, then completes the retirement.
+    /// Idempotent otherwise: a slot the app doesn't recognise (already
+    /// released, never allocated) still replies `PaneRetired`.
     RetirePane {
         slot_id: u8,
     },

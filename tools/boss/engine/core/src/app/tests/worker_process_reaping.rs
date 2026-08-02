@@ -1,5 +1,6 @@
 use super::super::server::process_group_signal_target;
 use super::*;
+use crate::test_support::spawn_group_leader_sleeper;
 
 #[test]
 fn process_group_signal_target_negates_pgid_for_live_pid() {
@@ -27,27 +28,6 @@ fn reap_worker_process_tree_noop_for_unreported_pid() {
     // runtime required) rather than signal pid 0 / a negative pid.
     reap_worker_process_tree(0, Duration::from_secs(5));
     reap_worker_process_tree(-1, Duration::from_secs(5));
-}
-
-/// Spawn a long sleeper in its OWN process group, so a reap — which signals
-/// the process *group* — cannot touch the test runner's own group.
-fn spawn_group_leader_sleeper() -> std::process::Child {
-    use std::os::unix::process::CommandExt;
-    use std::process::Command;
-
-    unsafe {
-        Command::new("sleep")
-            .arg("300")
-            .pre_exec(|| {
-                // setpgid(0, 0): become our own process group leader.
-                if libc::setpgid(0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            })
-            .spawn()
-            .expect("spawn sleep child")
-    }
 }
 
 /// **`bossctl` must be able to stop a worker it can see in a pane.**

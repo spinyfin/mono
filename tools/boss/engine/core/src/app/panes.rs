@@ -295,28 +295,28 @@ pub(super) async fn handle_open_document(ctx: Dispatch, req: FrontendRequest) {
     }
 }
 
-pub(super) async fn handle_list_husk_panes(ctx: Dispatch, req: FrontendRequest) {
+pub(super) async fn handle_list_hosted_pane_statuses(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
         sink,
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::ListHuskPanes = req else {
+    let FrontendRequest::ListHostedPaneStatuses = req else {
         unreachable!()
     };
     {
-        match server_state.list_husk_panes().await {
+        match server_state.list_hosted_pane_statuses().await {
             Ok(panes) => {
-                send_response(&sink, &request_id, FrontendEvent::HuskPanesList { panes });
+                send_response(&sink, &request_id, FrontendEvent::HostedPaneStatusList { panes });
             }
             Err(err) => {
-                tracing::warn!(?err, "list_husk_panes failed");
+                tracing::warn!(?err, "list_hosted_pane_statuses failed");
                 send_response(
                     &sink,
                     &request_id,
                     FrontendEvent::WorkError {
-                        message: format!("list_husk_panes: {err}"),
+                        message: format!("list_hosted_pane_statuses: {err}"),
                     },
                 );
             }

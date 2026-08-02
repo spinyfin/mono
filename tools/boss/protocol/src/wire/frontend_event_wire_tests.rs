@@ -846,9 +846,9 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "pane_retired",
         },
         TagCase {
-            label: "HuskPanesList",
-            event: FrontendEvent::HuskPanesList { panes: vec![] },
-            expected_tag: "husk_panes_list",
+            label: "HostedPaneStatusList",
+            event: FrontendEvent::HostedPaneStatusList { panes: vec![] },
+            expected_tag: "hosted_pane_status_list",
         },
         // --- Transcripts ---
         TagCase {
@@ -1910,7 +1910,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::ExecutionCancelled { .. }
         | FrontendEvent::RunReaped { .. }
         | FrontendEvent::PaneRetired { .. }
-        | FrontendEvent::HuskPanesList { .. }
+        | FrontendEvent::HostedPaneStatusList { .. }
         | FrontendEvent::RunTranscriptTail { .. }
         | FrontendEvent::ExecutionTranscriptResult { .. }
         | FrontendEvent::ExecutionTranscriptUnavailable { .. }
