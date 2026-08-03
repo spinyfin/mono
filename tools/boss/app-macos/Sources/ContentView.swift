@@ -422,6 +422,7 @@ struct ContentView: View {
     /// healthy window's titlebar is untouched.
     private var hasChromeBanners: Bool {
         model.showConnectionLostBanner
+            || model.engineSupervisionState != .running
             || (model.isConnected && !model.engineHealthIssues.isEmpty)
     }
 
@@ -454,9 +455,10 @@ struct ContentView: View {
             // (reconnect backoff starts at 0.5s) never surfaces this at
             // all, so a brief blip reads as silent self-healing rather than
             // a user-visible connection error.
-            if model.showConnectionLostBanner {
+            if model.showConnectionLostBanner || model.engineSupervisionState != .running {
                 EngineUnreachableBanner(
                     isRestarting: model.isRestartingEngine,
+                    supervisionState: model.engineSupervisionState,
                     onRestart: { model.restartEngine() }
                 )
                 .transition(bannerTransition)
@@ -477,6 +479,7 @@ struct ContentView: View {
         // animating the body meant every health report re-animated the
         // AppKit-backed split view subtree, not just the bar.
         .animation(.easeInOut(duration: 0.15), value: model.showConnectionLostBanner)
+        .animation(.easeInOut(duration: 0.15), value: model.engineSupervisionState)
         .animation(.easeInOut(duration: 0.15), value: model.engineHealthIssues)
     }
 

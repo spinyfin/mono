@@ -2,30 +2,106 @@ import CryptoKit
 import Darwin
 import Foundation
 
+/// Bounded restart policy for an app-managed engine. The schedule is indexed
+/// from one, and stays at its final value when callers allow more attempts
+/// than explicit delays. Keeping this policy separate from process launching
+/// makes the operational limits straightforward to test and tune.
+struct EngineRestartPolicy: Equatable, Sendable {
+    static let `default` = EngineRestartPolicy(
+        backoffSchedule: [1, 2, 4, 8, 16, 30],
+        maximumAttempts: 6,
+        pollInterval: 1,
+        healthyResetInterval: 60
+    )
+
+    let backoffSchedule: [TimeInterval]
+    let maximumAttempts: Int
+    let pollInterval: TimeInterval
+    let healthyResetInterval: TimeInterval
+
+    init(
+        backoffSchedule: [TimeInterval],
+        maximumAttempts: Int,
+        pollInterval: TimeInterval = Self.default.pollInterval,
+        healthyResetInterval: TimeInterval = Self.default.healthyResetInterval
+    ) {
+        self.backoffSchedule = backoffSchedule.isEmpty ? Self.default.backoffSchedule : backoffSchedule
+        self.maximumAttempts = max(1, maximumAttempts)
+        self.pollInterval = max(0.1, pollInterval)
+        self.healthyResetInterval = max(0, healthyResetInterval)
+    }
+
+    func delay(forAttempt attempt: Int) -> TimeInterval {
+        backoffSchedule[min(max(0, attempt - 1), backoffSchedule.count - 1)]
+    }
+
+    static func fromEnvironment(_ environment: [String: String] = ProcessInfo.processInfo.environment) -> Self {
+        let schedule = environment["BOSS_ENGINE_RESTART_BACKOFF_SECONDS"]?
+            .split(separator: ",")
+            .compactMap { TimeInterval($0.trimmingCharacters(in: .whitespaces)) }
+            .filter { $0 > 0 && $0.isFinite }
+        let attempts = environment["BOSS_ENGINE_RESTART_MAX_ATTEMPTS"].flatMap(Int.init)
+        return Self(
+            backoffSchedule: schedule ?? [],
+            maximumAttempts: attempts.map { max(1, $0) } ?? Self.default.maximumAttempts
+        )
+    }
+}
+
+/// State sent to the app chrome while the controller is recovering from an
+/// unexpected engine exit. A manual restart resets the policy and returns to
+/// `.running` once a pid is observed.
+enum EngineSupervisionState: Equatable, Sendable {
+    case running
+    case restarting(attempt: Int, retryAfter: TimeInterval)
+    case gaveUp(attempts: Int)
+}
+
 final class EngineProcessController: @unchecked Sendable {
     private let paths: BossEnginePaths
     private let lockFilePath: String
     private let launchDirectory: String
     private let forceRestart: Bool
     private let stopOnExit: Bool
+    private let restartPolicy: EngineRestartPolicy
+    private let supervisionQueue = DispatchQueue(label: "Boss.EngineProcessController.supervision")
+    private var supervisionTimer: DispatchSourceTimer?
+    private var pendingRestart: DispatchWorkItem?
+    private var supervisor: EngineSupervisor
+    private var lastSupervisionState: EngineSupervisionState = .running
+    private let supervisionStopLock = NSLock()
+    private var supervisionStopped = false
 
     var onOutputLine: (@MainActor @Sendable (String) -> Void)?
+    var onSupervisionStateChange: (@MainActor @Sendable (EngineSupervisionState) -> Void)?
 
     init(
         paths: BossEnginePaths,
         launchDirectory: String = ProcessInfo.processInfo.environment["BUILD_WORKSPACE_DIRECTORY"]
             ?? FileManager.default.currentDirectoryPath,
         forceRestart: Bool = ProcessInfo.processInfo.environment["BOSS_ENGINE_FORCE_RESTART"] == "1",
-        stopOnExit: Bool = ProcessInfo.processInfo.environment["BOSS_ENGINE_STOP_ON_EXIT"] == "1"
+        stopOnExit: Bool = ProcessInfo.processInfo.environment["BOSS_ENGINE_STOP_ON_EXIT"] == "1",
+        restartPolicy: EngineRestartPolicy = .fromEnvironment()
     ) {
         self.paths = paths
         self.lockFilePath = "\(paths.pidPath).lock"
         self.launchDirectory = launchDirectory
         self.forceRestart = forceRestart
         self.stopOnExit = stopOnExit
+        self.restartPolicy = restartPolicy
+        self.supervisor = EngineSupervisor(policy: restartPolicy)
+    }
+
+    deinit {
+        supervisionTimer?.cancel()
+        pendingRestart?.cancel()
     }
 
     func start() throws {
+        try start(resetRestartBudget: true)
+    }
+
+    private func start(resetRestartBudget: Bool) throws {
         let socketPath = paths.socketPath
         try withStartLock {
             if forceRestart, let pid = currentEnginePID() {
@@ -77,7 +153,7 @@ final class EngineProcessController: @unchecked Sendable {
                     // a user investigating "did the version check fire?"
                     // can tell the query failed versus the check was a
                     // no-op for some other reason.
-                    emit("[engine version-check skipped: running engine did not respond to get_engine_version within 3s; likely pre-T460 binary] attaching to pid=\(pid)")
+                    emit("[engine version-check skipped: running engine did not respond to get_engine_version within 3s; likely an engine build predating the get_engine_version RPC] attaching to pid=\(pid)")
                     return
                 }
 
@@ -105,6 +181,12 @@ final class EngineProcessController: @unchecked Sendable {
                 emit("[engine launch] started but pid file not observed yet: \(paths.pidPath)")
             }
         }
+        // `disableSupervision()` may be called while a supervised relaunch is
+        // waiting on filesystem or socket I/O above. It sets this lock-backed
+        // flag without waiting for this queue, so do not reactivate polling
+        // after that cancellation has won.
+        guard !isSupervisionStopped else { return }
+        enableSupervision(resetRestartBudget: resetRestartBudget)
     }
 
     // MARK: - Version-check helpers
@@ -281,6 +363,7 @@ final class EngineProcessController: @unchecked Sendable {
     }
 
     func stop() {
+        disableSupervision()
         guard stopOnExit else {
             return
         }
@@ -306,6 +389,7 @@ final class EngineProcessController: @unchecked Sendable {
     /// engines fighting over the same socket. Safe to call when no
     /// engine is running — falls through to the launch step.
     func restart() throws {
+        disableSupervision()
         try withStartLock {
             if let pid = currentEnginePID() {
                 emit("[engine restart] terminating existing engine pid=\(pid)")
@@ -327,6 +411,85 @@ final class EngineProcessController: @unchecked Sendable {
             } else {
                 emit("[engine restart] started but pid file not observed yet: \(paths.pidPath)")
             }
+        }
+        enableSupervision(resetRestartBudget: true)
+    }
+
+    // MARK: - Unexpected-exit supervision
+
+    /// The engine is deliberately detached from the app so it survives an app
+    /// restart. That also means `Process.terminationHandler` cannot observe
+    /// it. Polling the PID file gives the controller the same answer without
+    /// making the engine an app child, and serializing this work prevents two
+    /// timer ticks from launching competing replacements.
+    private func enableSupervision(resetRestartBudget: Bool) {
+        // Set this before hopping onto the supervision queue so a later
+        // `stop()` always wins, even if this queued block has not run yet.
+        setSupervisionStopped(false)
+        supervisionQueue.async { [weak self] in
+            guard let self else { return }
+            if resetRestartBudget {
+                self.supervisor.reset()
+            }
+            if self.supervisionTimer == nil {
+                let timer = DispatchSource.makeTimerSource(queue: self.supervisionQueue)
+                timer.schedule(
+                    deadline: .now() + self.restartPolicy.pollInterval,
+                    repeating: self.restartPolicy.pollInterval
+                )
+                timer.setEventHandler { [weak self] in
+                    self?.checkEngineLiveness()
+                }
+                self.supervisionTimer = timer
+                timer.resume()
+            }
+            self.emitSupervisionState(.running)
+        }
+    }
+
+    private func disableSupervision() {
+        setSupervisionStopped(true)
+        supervisionQueue.async { [weak self] in
+            guard let self else { return }
+            pendingRestart?.cancel()
+            pendingRestart = nil
+            supervisionTimer?.cancel()
+            supervisionTimer = nil
+        }
+    }
+
+    private func checkEngineLiveness() {
+        guard !isSupervisionStopped, pendingRestart == nil else { return }
+        let action = supervisor.tick(isAlive: currentEnginePID() != nil, now: Date())
+        switch action {
+        case .running:
+            emitSupervisionState(.running)
+            return
+        case let .gaveUp(attempts):
+            emit("[engine supervision] gave up after \(attempts) restart attempts; use Restart engine to try again")
+            emitSupervisionState(.gaveUp(attempts: attempts))
+            return
+        case let .restart(attempt, delay):
+            emit("[engine supervision] engine exited; restart attempt \(attempt)/\(restartPolicy.maximumAttempts) in \(Int(delay))s")
+            emitSupervisionState(.restarting(attempt: attempt, retryAfter: delay))
+            let work = DispatchWorkItem { [weak self] in
+                self?.relaunchAfterUnexpectedExit()
+            }
+            pendingRestart = work
+            supervisionQueue.asyncAfter(deadline: .now() + delay, execute: work)
+        case .wait:
+            return
+        }
+    }
+
+    private func relaunchAfterUnexpectedExit() {
+        pendingRestart = nil
+        guard !isSupervisionStopped else { return }
+        do {
+            try start(resetRestartBudget: false)
+        } catch {
+            emit("[engine supervision] restart launch failed: \(error.localizedDescription)")
+            // The next timer tick applies the next backoff slot.
         }
     }
 
@@ -674,6 +837,27 @@ final class EngineProcessController: @unchecked Sendable {
     private func emit(_ line: String) {
         Task { @MainActor in
             self.onOutputLine?(line)
+        }
+    }
+
+    private var isSupervisionStopped: Bool {
+        supervisionStopLock.lock()
+        defer { supervisionStopLock.unlock() }
+        return supervisionStopped
+    }
+
+    private func setSupervisionStopped(_ stopped: Bool) {
+        supervisionStopLock.lock()
+        supervisionStopped = stopped
+        supervisionStopLock.unlock()
+    }
+
+    /// Must be called from `supervisionQueue`, which serializes state changes.
+    private func emitSupervisionState(_ state: EngineSupervisionState) {
+        guard state != lastSupervisionState else { return }
+        lastSupervisionState = state
+        Task { @MainActor in
+            self.onSupervisionStateChange?(state)
         }
     }
 }

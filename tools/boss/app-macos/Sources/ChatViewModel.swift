@@ -1116,6 +1116,10 @@ final class ChatViewModel: ObservableObject {
         processController.onOutputLine = { [weak self] line in
             self?.appendSystemMessage(line)
         }
+        processController.onSupervisionStateChange = { [weak self] state in
+            guard let self, self.engineSupervisionState != state else { return }
+            self.engineSupervisionState = state
+        }
 
         bindEngineEventStream()
 
@@ -1813,6 +1817,11 @@ final class ChatViewModel: ObservableObject {
     /// inverse so a second click can't queue another terminate +
     /// relaunch on top of the first one (issue #697).
     @Published private(set) var isRestartingEngine = false
+    /// App-managed engine recovery state. This is distinct from the socket
+    /// connection state: the latter says whether a listener is reachable,
+    /// while this says whether the app is actively replacing a dead listener
+    /// or has exhausted its bounded retry policy.
+    @Published private(set) var engineSupervisionState: EngineSupervisionState = .running
 
     /// User-initiated recovery from the unreachable banner. Terminates
     /// the engine the pid file points at (token-auth shutdown RPC

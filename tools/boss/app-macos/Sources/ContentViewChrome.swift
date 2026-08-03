@@ -161,6 +161,7 @@ class ResizeDividerView: NSView {
 
 struct EngineUnreachableBanner: View {
     let isRestarting: Bool
+    let supervisionState: EngineSupervisionState
     let onRestart: () -> Void
 
     var body: some View {
@@ -192,9 +193,17 @@ struct EngineUnreachableBanner: View {
     }
 
     private var headlineText: String {
-        isRestarting
-            ? "Restarting Boss engine…"
-            : "Boss engine is unreachable — reconnecting…"
+        if isRestarting {
+            return "Restarting Boss engine…"
+        }
+        switch supervisionState {
+        case .running:
+            return "Boss engine is unreachable — reconnecting…"
+        case .restarting(let attempt, let retryAfter):
+            return "Boss engine exited — restarting (attempt \(attempt) in \(Int(retryAfter))s)…"
+        case .gaveUp(let attempts):
+            return "Boss engine stopped after \(attempts) restart attempts."
+        }
     }
 }
 
