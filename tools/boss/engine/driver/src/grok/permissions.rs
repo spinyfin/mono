@@ -49,18 +49,18 @@ pub fn macos_seatbelt_profile_path(grok_home: &Path) -> std::path::PathBuf {
 /// Prefix a local macOS Grok command with the Boss-owned Seatbelt executor.
 /// Presence of the profile is the local/remote discriminator: remote
 /// permission provisioning deliberately never materialises this file.
-pub fn wrap_with_macos_seatbelt(command: &str, grok_home: &Path) -> String {
+pub fn wrap_with_macos_seatbelt(command: &str, grok_home: &Path) -> anyhow::Result<String> {
     let profile = macos_seatbelt_profile_path(grok_home);
     if !profile.exists() {
-        return command.to_owned();
+        return Ok(command.to_owned());
     }
     let Some(rest) = command.strip_prefix("grok") else {
-        return command.to_owned();
+        anyhow::bail!("refusing to launch Grok outside the Boss Seatbelt: command does not start with grok");
     };
-    format!(
+    Ok(format!(
         "{MACOS_SANDBOX_EXEC} -f {} grok{rest}",
         shell_quote(&profile.display().to_string())
-    )
+    ))
 }
 
 /// Render the macOS policy that replaces Grok's built-in Seatbelt profile.
@@ -156,13 +156,6 @@ fn boss_sandbox_profile_name(worker_kind: WorkerKind) -> &'static str {
 /// unresolvable `extends`/profile name is the documented behaviour — exactly
 /// the property we want for a genuinely bad config, but not what we want here).
 pub fn sandbox_profile_arg(worker_kind: WorkerKind, is_remote: bool) -> &'static str {
-    sandbox_profile_arg_for_platform(worker_kind, is_remote, cfg!(target_os = "macos"))
-}
-
-fn sandbox_profile_arg_for_platform(worker_kind: WorkerKind, is_remote: bool, is_macos: bool) -> &'static str {
-    if is_macos && !is_remote && worker_kind == WorkerKind::Standard {
-        return "off";
-    }
     if is_remote {
         sandbox_base_profile(worker_kind)
     } else {
@@ -170,24 +163,19 @@ fn sandbox_profile_arg_for_platform(worker_kind: WorkerKind, is_remote: bool, is
     }
 }
 
-/// Refuse a local macOS Standard launch before a pane is spawned if its
-/// resolved Grok profile would deny the IOKit power-management capability
-/// Bazel requires during client startup.
-pub fn ensure_build_tool_capability(
-    worker_kind: WorkerKind,
-    is_remote: bool,
-    sandbox_profile: &str,
-) -> anyhow::Result<()> {
-    ensure_build_tool_capability_for_platform(worker_kind, is_remote, sandbox_profile, cfg!(target_os = "macos"))
+/// Refuse a local macOS launch before a pane is spawned if the external
+/// Seatbelt selection did not disable Grok's built-in profile. That profile
+/// denies the IOKit power-management capability Bazel requires at startup.
+pub fn ensure_build_tool_capability(is_remote: bool, sandbox_profile: &str) -> anyhow::Result<()> {
+    ensure_build_tool_capability_for_platform(is_remote, sandbox_profile, cfg!(target_os = "macos"))
 }
 
 fn ensure_build_tool_capability_for_platform(
-    worker_kind: WorkerKind,
     is_remote: bool,
     sandbox_profile: &str,
     is_macos: bool,
 ) -> anyhow::Result<()> {
-    if is_macos && !is_remote && worker_kind == WorkerKind::Standard && sandbox_profile != "off" {
+    if is_macos && !is_remote && sandbox_profile != "off" {
         anyhow::bail!(
             "Grok worker preflight failed: macOS IOKit power-management access required by Bazel \
              is unavailable under sandbox profile {sandbox_profile:?}; refusing to spawn the worker"
@@ -312,35 +300,11 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn sandbox_profile_arg_local_macos_standard_is_off() {
-        assert_eq!(
-            sandbox_profile_arg_for_platform(WorkerKind::Standard, false, true),
-            "off"
-        );
-        assert_eq!(
-            sandbox_profile_arg_for_platform(WorkerKind::Reviewer, false, true),
-            "boss-read-only"
-        );
-    }
-
-    #[test]
-    fn sandbox_profile_arg_non_macos_keeps_custom_profiles() {
-        assert_eq!(
-            sandbox_profile_arg_for_platform(WorkerKind::Standard, false, false),
-            "boss-workspace"
-        );
-        assert_eq!(
-            sandbox_profile_arg_for_platform(WorkerKind::Reviewer, false, false),
-            "boss-read-only"
-        );
-        assert_eq!(
-            sandbox_profile_arg_for_platform(WorkerKind::Triage, false, false),
-            "boss-workspace"
-        );
-        assert_eq!(
-            sandbox_profile_arg_for_platform(WorkerKind::AnswerAgent, false, false),
-            "boss-workspace"
-        );
+    fn sandbox_profile_arg_local_uses_custom_profiles() {
+        assert_eq!(sandbox_profile_arg(WorkerKind::Standard, false), "boss-workspace");
+        assert_eq!(sandbox_profile_arg(WorkerKind::Reviewer, false), "boss-read-only");
+        assert_eq!(sandbox_profile_arg(WorkerKind::Triage, false), "boss-workspace");
+        assert_eq!(sandbox_profile_arg(WorkerKind::AnswerAgent, false), "boss-workspace");
     }
 
     #[test]
@@ -354,7 +318,7 @@ mod tests {
 
     #[test]
     fn build_tool_capability_diagnostic_names_iokit_and_bazel() {
-        let error = ensure_build_tool_capability_for_platform(WorkerKind::Standard, false, "boss-workspace", true)
+        let error = ensure_build_tool_capability_for_platform(false, "boss-workspace", true)
             .unwrap_err()
             .to_string();
         assert!(error.contains("IOKit power-management access"), "{error}");
@@ -364,7 +328,7 @@ mod tests {
 
     #[test]
     fn build_tool_capability_accepts_local_standard_off_profile() {
-        ensure_build_tool_capability_for_platform(WorkerKind::Standard, false, "off", true).unwrap();
+        ensure_build_tool_capability_for_platform(false, "off", true).unwrap();
     }
 
     #[test]
@@ -496,11 +460,22 @@ mod tests {
     fn macos_wrapper_activates_only_when_profile_exists() {
         let temp = tempfile::TempDir::new().unwrap();
         let command = "grok --model grok-4.5\n";
-        assert_eq!(wrap_with_macos_seatbelt(command, temp.path()), command);
+        assert_eq!(wrap_with_macos_seatbelt(command, temp.path()).unwrap(), command);
 
         std::fs::write(macos_seatbelt_profile_path(temp.path()), "(version 1)\n").unwrap();
-        let wrapped = wrap_with_macos_seatbelt(command, temp.path());
+        let wrapped = wrap_with_macos_seatbelt(command, temp.path()).unwrap();
         assert!(wrapped.starts_with("/usr/bin/sandbox-exec -f "), "{wrapped}");
         assert!(wrapped.ends_with(" grok --model grok-4.5\n"), "{wrapped}");
+    }
+
+    #[test]
+    fn macos_wrapper_refuses_unrecognised_command_when_profile_exists() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(macos_seatbelt_profile_path(temp.path()), "(version 1)\n").unwrap();
+
+        let error = wrap_with_macos_seatbelt("env grok --model grok-4.5", temp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("outside the Boss Seatbelt"), "{error}");
     }
 }

@@ -317,10 +317,22 @@ impl AgentDriver for GrokDriver {
         });
         let workspace_for_cwd = read_workspace_path_stamp(&grok_home).unwrap_or_else(|_| PathBuf::from("."));
 
-        let command = permissions::wrap_with_macos_seatbelt(
+        let command = match permissions::wrap_with_macos_seatbelt(
             &build_grok_pane_command(&request, &workspace_for_cwd, &session_id),
             &grok_home,
-        );
+        ) {
+            Ok(command) => command,
+            Err(error) => {
+                tracing::error!(run_id, error = %error, "refusing to spawn Grok worker outside the Boss Seatbelt");
+                return SpawnPlan {
+                    env: Vec::new(),
+                    command: format!(
+                        "echo {} >&2; exit 1\n",
+                        shell_quote(&format!("Grok worker Seatbelt setup failed: {error:#}"))
+                    ),
+                };
+            }
+        };
 
         // Defence-in-depth: never emit worktree flags (cube owns workspaces).
         debug_assert!(!command.contains("--worktree") && !command.contains(" -w ") && !command.contains("\t-w "));
@@ -458,6 +470,8 @@ impl AgentDriver for GrokDriver {
                 ),
             )
             .with_context(|| format!("writing {}", profile_path.display()))?;
+            fs::read_to_string(&profile_path)
+                .with_context(|| format!("verifying {} is readable", profile_path.display()))?;
             config_files.push(profile_path.clone());
 
             if !home::skip_posture_assert() {
@@ -478,7 +492,7 @@ impl AgentDriver for GrokDriver {
         let sandbox_profile = extra_args
             .get(1)
             .context("Grok permission rendering omitted the required --sandbox profile")?;
-        permissions::ensure_build_tool_capability(input.worker_kind, input.is_remote, sandbox_profile)?;
+        permissions::ensure_build_tool_capability(input.is_remote, sandbox_profile)?;
 
         Ok(PermissionArtifacts {
             config_files,
