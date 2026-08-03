@@ -11,14 +11,9 @@
 //! this module must not reproduce).
 //!
 //! Two independent enforcement layers, both written from here:
-//! - **Sandbox** (`--sandbox <profile>` + `$GROK_HOME/sandbox.toml`): a
-//!   kernel-level `deny` glob fencing the Boss data dir, layered on the
-//!   built-in `workspace` / `read-only` profile selected by worker kind.
-//!   Local macOS Standard workers are the exception: Grok's Seatbelt profile
-//!   denies IOKit power-management registration, which makes Bazel crash at
-//!   startup, so they explicitly use Grok's documented `off` profile. This
-//!   matches the unsandboxed posture of other local Standard drivers while
-//!   the structural deny rules and `PreToolUse` guards remain in force.
+//! - **Sandbox**: Grok's custom profile on non-macOS/remote workers; a
+//!   Boss-owned Seatbelt profile on local macOS, where Grok's built-in
+//!   template blocks the login-keychain IPC required by `gh`.
 //! - **Rule grammar** (`--deny 'Bash(...)'` / `'Read(...)'` / `'Edit(...)'`):
 //!   the structural deny set (Boss data dir belt, `rm -rf`, `sudo`,
 //!   `bossctl`) — command-pattern denies the sandbox's path-based `deny`
@@ -31,7 +26,106 @@
 
 use std::path::Path;
 
+use boss_ssh_transport::shell_quote;
+
 use crate::WorkerKind;
+
+pub const MACOS_SEATBELT_PROFILE_FILENAME: &str = "boss-seatbelt.sb";
+const MACOS_SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
+/// Grok's built-in macOS profiles omit the Security.framework mach services
+/// used by `gh` to read its login-keychain credential. Boss therefore owns
+/// the local macOS Seatbelt profile and runs Grok's internal sandbox in
+/// `off` mode inside it. Remote workers and non-macOS hosts retain Grok's
+/// native sandbox.
+pub fn uses_external_macos_sandbox(is_remote: bool) -> bool {
+    cfg!(target_os = "macos") && !is_remote
+}
+
+pub fn macos_seatbelt_profile_path(grok_home: &Path) -> std::path::PathBuf {
+    grok_home.join(MACOS_SEATBELT_PROFILE_FILENAME)
+}
+
+/// Prefix a local macOS Grok command with the Boss-owned Seatbelt executor.
+/// Presence of the profile is the local/remote discriminator: remote
+/// permission provisioning deliberately never materialises this file.
+pub fn wrap_with_macos_seatbelt(command: &str, grok_home: &Path) -> anyhow::Result<String> {
+    let profile = macos_seatbelt_profile_path(grok_home);
+    if !profile.exists() {
+        return Ok(command.to_owned());
+    }
+    let Some(rest) = command.strip_prefix("grok") else {
+        anyhow::bail!("refusing to launch Grok outside the Boss Seatbelt: command does not start with grok");
+    };
+    Ok(format!(
+        "{MACOS_SANDBOX_EXEC} -f {} grok{rest}",
+        shell_quote(&profile.display().to_string())
+    ))
+}
+
+/// Render the macOS policy that replaces Grok's built-in Seatbelt profile.
+///
+/// The built-in `workspace`/`devbox`/`read-only` profiles all prevent `gh`
+/// from reaching the login keychain. Starting from `allow default` preserves
+/// that mach-service access, then the file rules reconstruct the relevant
+/// workspace/read-only posture. More-specific path allows override the
+/// global write deny; the final workspace/Boss/hook denies remain the most
+/// specific rules for those paths.
+pub fn render_macos_seatbelt_profile(
+    worker_kind: WorkerKind,
+    workspace: &Path,
+    grok_home: &Path,
+    writable_roots: &[std::path::PathBuf],
+    boss_data_dir: Option<&Path>,
+) -> String {
+    let mut profile = String::from(
+        "; Boss-owned Grok sandbox. Keeps filesystem isolation while leaving\n\
+         ; macOS login-keychain services available to gh.\n\
+         (version 1)\n\
+         (allow default)\n\
+         (deny file-write*)\n\
+         (allow file-write*\n\
+           (literal \"/dev/null\")\n\
+           (literal \"/dev/tty\")\n",
+    );
+    for root in writable_roots {
+        profile.push_str(&format!("  (subpath {})\n", seatbelt_string(root)));
+    }
+    profile.push_str(")\n");
+
+    if worker_kind == WorkerKind::Reviewer {
+        profile.push_str(&format!(
+            "(deny file-write* (literal {path}) (subpath {path}))\n",
+            path = seatbelt_string(workspace)
+        ));
+    }
+    if let Some(dir) = boss_data_dir {
+        profile.push_str(&format!(
+            "(deny file-read* file-write* (literal {path}) (subpath {path}))\n",
+            path = seatbelt_string(dir)
+        ));
+    }
+
+    let hooks = grok_home.join("hooks");
+    let hooks_paths = grok_home.join("hooks-paths");
+    profile.push_str(&format!(
+        "(deny file-write* (literal {hooks}) (subpath {hooks}) (literal {hooks_paths}))\n",
+        hooks = seatbelt_string(&hooks),
+        hooks_paths = seatbelt_string(&hooks_paths),
+    ));
+    profile
+}
+
+fn seatbelt_string(path: &Path) -> String {
+    let escaped = path
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
+    format!("\"{escaped}\"")
+}
 
 /// Built-in sandbox profile `[profiles.NAME].extends` must name (never
 /// `off`/`none` — investigation §`sandbox.toml` schema). Reviewer is the only
@@ -62,13 +156,6 @@ fn boss_sandbox_profile_name(worker_kind: WorkerKind) -> &'static str {
 /// unresolvable `extends`/profile name is the documented behaviour — exactly
 /// the property we want for a genuinely bad config, but not what we want here).
 pub fn sandbox_profile_arg(worker_kind: WorkerKind, is_remote: bool) -> &'static str {
-    sandbox_profile_arg_for_platform(worker_kind, is_remote, cfg!(target_os = "macos"))
-}
-
-fn sandbox_profile_arg_for_platform(worker_kind: WorkerKind, is_remote: bool, is_macos: bool) -> &'static str {
-    if is_macos && !is_remote && worker_kind == WorkerKind::Standard {
-        return "off";
-    }
     if is_remote {
         sandbox_base_profile(worker_kind)
     } else {
@@ -76,24 +163,19 @@ fn sandbox_profile_arg_for_platform(worker_kind: WorkerKind, is_remote: bool, is
     }
 }
 
-/// Refuse a local macOS Standard launch before a pane is spawned if its
-/// resolved Grok profile would deny the IOKit power-management capability
-/// Bazel requires during client startup.
-pub fn ensure_build_tool_capability(
-    worker_kind: WorkerKind,
-    is_remote: bool,
-    sandbox_profile: &str,
-) -> anyhow::Result<()> {
-    ensure_build_tool_capability_for_platform(worker_kind, is_remote, sandbox_profile, cfg!(target_os = "macos"))
+/// Refuse a local macOS launch before a pane is spawned if the external
+/// Seatbelt selection did not disable Grok's built-in profile. That profile
+/// denies the IOKit power-management capability Bazel requires at startup.
+pub fn ensure_build_tool_capability(is_remote: bool, sandbox_profile: &str) -> anyhow::Result<()> {
+    ensure_build_tool_capability_for_platform(is_remote, sandbox_profile, cfg!(target_os = "macos"))
 }
 
 fn ensure_build_tool_capability_for_platform(
-    worker_kind: WorkerKind,
     is_remote: bool,
     sandbox_profile: &str,
     is_macos: bool,
 ) -> anyhow::Result<()> {
-    if is_macos && !is_remote && worker_kind == WorkerKind::Standard && sandbox_profile != "off" {
+    if is_macos && !is_remote && sandbox_profile != "off" {
         anyhow::bail!(
             "Grok worker preflight failed: macOS IOKit power-management access required by Bazel \
              is unavailable under sandbox profile {sandbox_profile:?}; refusing to spawn the worker"
@@ -195,7 +277,11 @@ pub fn permission_mode_for_worker_kind(worker_kind: WorkerKind) -> Option<&'stat
 pub fn extra_args(worker_kind: WorkerKind, boss_data_dir: Option<&Path>, is_remote: bool) -> Vec<String> {
     let mut args = vec![
         "--sandbox".to_owned(),
-        sandbox_profile_arg(worker_kind, is_remote).to_owned(),
+        if uses_external_macos_sandbox(is_remote) {
+            "off".to_owned()
+        } else {
+            sandbox_profile_arg(worker_kind, is_remote).to_owned()
+        },
     ];
     for rule in structural_deny_rules(boss_data_dir) {
         args.push("--deny".to_owned());
@@ -214,35 +300,11 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn sandbox_profile_arg_local_macos_standard_is_off() {
-        assert_eq!(
-            sandbox_profile_arg_for_platform(WorkerKind::Standard, false, true),
-            "off"
-        );
-        assert_eq!(
-            sandbox_profile_arg_for_platform(WorkerKind::Reviewer, false, true),
-            "boss-read-only"
-        );
-    }
-
-    #[test]
-    fn sandbox_profile_arg_non_macos_keeps_custom_profiles() {
-        assert_eq!(
-            sandbox_profile_arg_for_platform(WorkerKind::Standard, false, false),
-            "boss-workspace"
-        );
-        assert_eq!(
-            sandbox_profile_arg_for_platform(WorkerKind::Reviewer, false, false),
-            "boss-read-only"
-        );
-        assert_eq!(
-            sandbox_profile_arg_for_platform(WorkerKind::Triage, false, false),
-            "boss-workspace"
-        );
-        assert_eq!(
-            sandbox_profile_arg_for_platform(WorkerKind::AnswerAgent, false, false),
-            "boss-workspace"
-        );
+    fn sandbox_profile_arg_local_uses_custom_profiles() {
+        assert_eq!(sandbox_profile_arg(WorkerKind::Standard, false), "boss-workspace");
+        assert_eq!(sandbox_profile_arg(WorkerKind::Reviewer, false), "boss-read-only");
+        assert_eq!(sandbox_profile_arg(WorkerKind::Triage, false), "boss-workspace");
+        assert_eq!(sandbox_profile_arg(WorkerKind::AnswerAgent, false), "boss-workspace");
     }
 
     #[test]
@@ -256,7 +318,7 @@ mod tests {
 
     #[test]
     fn build_tool_capability_diagnostic_names_iokit_and_bazel() {
-        let error = ensure_build_tool_capability_for_platform(WorkerKind::Standard, false, "boss-workspace", true)
+        let error = ensure_build_tool_capability_for_platform(false, "boss-workspace", true)
             .unwrap_err()
             .to_string();
         assert!(error.contains("IOKit power-management access"), "{error}");
@@ -266,7 +328,7 @@ mod tests {
 
     #[test]
     fn build_tool_capability_accepts_local_standard_off_profile() {
-        ensure_build_tool_capability_for_platform(WorkerKind::Standard, false, "off", true).unwrap();
+        ensure_build_tool_capability_for_platform(false, "off", true).unwrap();
     }
 
     #[test]
@@ -337,7 +399,14 @@ mod tests {
         let dir = PathBuf::from("/boss-data");
         let args = extra_args(WorkerKind::AnswerAgent, Some(&dir), false);
         assert_eq!(args[0], "--sandbox");
-        assert_eq!(args[1], "boss-workspace");
+        assert_eq!(
+            args[1],
+            if cfg!(target_os = "macos") {
+                "off"
+            } else {
+                "boss-workspace"
+            }
+        );
         // Every --deny is immediately followed by its rule value.
         let mut i = 2;
         while args[i] == "--deny" {
@@ -360,5 +429,53 @@ mod tests {
             }
         );
         assert!(!args.contains(&"--permission-mode".to_owned()));
+    }
+
+    #[test]
+    fn macos_seatbelt_profile_allows_required_roots_and_denies_reviewer_workspace() {
+        let workspace = PathBuf::from("/cube/workspaces/worker");
+        let grok_home = PathBuf::from("/tmp/grok-home");
+        let roots = vec![workspace.clone(), PathBuf::from("/cube")];
+        let profile = render_macos_seatbelt_profile(
+            WorkerKind::Reviewer,
+            &workspace,
+            &grok_home,
+            &roots,
+            Some(Path::new("/boss-data")),
+        );
+
+        assert!(profile.contains("(allow default)"), "{profile}");
+        assert!(profile.contains("(deny file-write*)"), "{profile}");
+        assert!(profile.contains("(subpath \"/cube\")"), "{profile}");
+        assert!(
+            profile.contains("(deny file-write* (literal \"/cube/workspaces/worker\")"),
+            "{profile}"
+        );
+        assert!(profile.contains("file-read* file-write*"), "{profile}");
+        assert!(profile.contains("/tmp/grok-home/hooks"), "{profile}");
+        assert!(profile.contains("/tmp/grok-home/hooks-paths"), "{profile}");
+    }
+
+    #[test]
+    fn macos_wrapper_activates_only_when_profile_exists() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let command = "grok --model grok-4.5\n";
+        assert_eq!(wrap_with_macos_seatbelt(command, temp.path()).unwrap(), command);
+
+        std::fs::write(macos_seatbelt_profile_path(temp.path()), "(version 1)\n").unwrap();
+        let wrapped = wrap_with_macos_seatbelt(command, temp.path()).unwrap();
+        assert!(wrapped.starts_with("/usr/bin/sandbox-exec -f "), "{wrapped}");
+        assert!(wrapped.ends_with(" grok --model grok-4.5\n"), "{wrapped}");
+    }
+
+    #[test]
+    fn macos_wrapper_refuses_unrecognised_command_when_profile_exists() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(macos_seatbelt_profile_path(temp.path()), "(version 1)\n").unwrap();
+
+        let error = wrap_with_macos_seatbelt("env grok --model grok-4.5", temp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("outside the Boss Seatbelt"), "{error}");
     }
 }

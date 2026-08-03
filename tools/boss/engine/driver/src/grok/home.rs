@@ -1,9 +1,10 @@
 //! Boss-owned per-run `GROK_HOME` layout and pre-spawn posture checks.
 //!
 //! Parallel to Codex's `CODEX_HOME` isolation: never point a worker at the
-//! operator's interactive `~/.grok`. Auth is a **symlink** (not a copy) of the
-//! host credential. Permission isolation (T-01 findings) additionally scopes
-//! the worker process `HOME` so `~/.claude/settings.local.json` cannot load.
+//! operator's interactive `~/.grok`. Grok config/session state is isolated,
+//! while OAuth is delegated through `GROK_AUTH_PATH` to one shared host file
+//! and lock. Permission isolation (T-01 findings) additionally scopes the
+//! worker process `HOME` so `~/.claude/settings.local.json` cannot load.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -15,13 +16,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
+use super::environment::GrokProcessEnvironment;
+#[cfg(test)]
+use super::environment::resolve_gh_config_dir;
+#[cfg(test)]
+use super::environment::resolve_login_keychain_source;
+use super::preflight::run_worker_preflight;
+
 /// Env override for the root under which per-run `GROK_HOME` directories live.
 /// Tests set this so homes land in a disposable temp tree.
 pub const GROK_HOMES_ROOT_ENV: &str = "BOSS_GROK_HOMES_DIR";
 
-/// Env override for the auth.json *source* path (symlink target). Tests point
-/// this at a throwaway file so the interactive `~/.grok/auth.json` is never
-/// required.
+/// Env override for the one shared auth.json path. Tests point this at a
+/// throwaway file so the interactive `~/.grok/auth.json` is never required.
 pub const GROK_AUTH_SOURCE_ENV: &str = "BOSS_GROK_AUTH_SOURCE";
 
 /// When set to `1`/`true`, skip the live `grok inspect --json` assertion.
@@ -149,7 +156,7 @@ pub fn process_home_for_run(run_id: &str) -> anyhow::Result<PathBuf> {
     Ok(grok_run_container_for_run(run_id)?.join(PROCESS_HOME_LEAF))
 }
 
-/// Host credential path used as the `auth.json` symlink target.
+/// Host credential path used as the shared `GROK_AUTH_PATH`.
 pub fn resolve_grok_auth_source() -> PathBuf {
     if let Ok(path) = std::env::var(GROK_AUTH_SOURCE_ENV) {
         let path = path.trim();
@@ -161,54 +168,6 @@ pub fn resolve_grok_auth_source() -> PathBuf {
         Some(home) if !home.is_empty() => PathBuf::from(home).join(".grok").join("auth.json"),
         _ => PathBuf::from(".grok").join("auth.json"),
     }
-}
-
-/// Default leaf (relative to a real `HOME`) of `gh`'s config directory, used
-/// when neither `GH_CONFIG_DIR` nor `XDG_CONFIG_HOME` is set on the host —
-/// mirrors `gh`'s own resolution order (`gh help environment`).
-const GH_DEFAULT_CONFIG_LEAF: &str = ".config/gh";
-
-/// macOS login keychain leaf, relative to a real `HOME`. `gh auth login`
-/// stores the actual OAuth token here via the OS keyring, not in
-/// `~/.config/gh/hosts.yml` (which holds only non-secret metadata — host,
-/// username, git protocol). Keychain Services resolves this path from
-/// `$HOME`, so it goes dark under a scoped `HOME` the same way `~/.claude`
-/// does — confirmed empirically (`security find-generic-password` fails
-/// under a scoped `HOME` and succeeds once this file is bridged in).
-const LOGIN_KEYCHAIN_LEAF: &str = "Library/Keychains/login.keychain-db";
-
-/// Resolve the real host's `gh` config directory, honoring the exact
-/// precedence `gh` itself documents (`GH_CONFIG_DIR` > `XDG_CONFIG_HOME/gh` >
-/// `$HOME/.config/gh`). The worker's spawn env sets `GH_CONFIG_DIR` to this
-/// value directly — `gh` honors that var natively, so no filesystem bridge
-/// is needed for the config directory itself (only for the keychain-backed
-/// token; see [`resolve_login_keychain_source`]).
-///
-/// Must be called before `HOME` is overridden in the calling process's own
-/// env (i.e. from the engine process, not the spawned worker) so it resolves
-/// the operator's real config, not the scoped one.
-pub fn resolve_gh_config_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("GH_CONFIG_DIR").filter(|dir| !dir.is_empty()) {
-        return Some(PathBuf::from(dir));
-    }
-    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|dir| !dir.is_empty()) {
-        return Some(PathBuf::from(dir).join("gh"));
-    }
-    std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(|home| PathBuf::from(home).join(GH_DEFAULT_CONFIG_LEAF))
-}
-
-/// Resolve the real host's login keychain file, or `None` when it does not
-/// exist — e.g. a non-macOS host, or `gh` was never authenticated there.
-/// Bridging is then skipped rather than treated as fatal: unlike Grok's own
-/// `auth.json` (a hard requirement for the tool to run at all), this only
-/// affects `cube pr create`'s ability to authenticate later, which already
-/// fails loudly on its own when `gh` has no usable credential.
-fn resolve_login_keychain_source() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
-    let path = PathBuf::from(home).join(LOGIN_KEYCHAIN_LEAF);
-    path.exists().then_some(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -437,9 +396,9 @@ pub fn read_workspace_path_stamp(grok_home: &Path) -> anyhow::Result<PathBuf> {
 
 /// Create / refresh the Boss-owned per-run Grok home for `run_id`.
 ///
-/// Idempotent: rewrites config, trust, hooks canary, auth symlink, and prompt
-/// on every call so reused cube workspaces always get a compat-suppressing
-/// posture.
+/// Idempotent: rewrites config, trust, hooks canary, and prompt on every call
+/// so reused cube workspaces always get a compat-suppressing posture. OAuth
+/// remains outside this directory and is shared through `GROK_AUTH_PATH`.
 pub fn provision_grok_home(workspace: &Path, prompt_text: &str, run_id: &str) -> anyhow::Result<GrokRuntimeState> {
     let container = grok_run_container_for_run(run_id)?;
     let grok_home = container.join(GROK_HOME_LEAF);
@@ -463,37 +422,11 @@ pub fn provision_grok_home(workspace: &Path, prompt_text: &str, run_id: &str) ->
         })?;
     }
 
-    // Bridge the operator's real gh credential store into process-home so
-    // `cube pr create`'s `gh` calls (the only sanctioned PR-push path) can
-    // authenticate. `GH_CONFIG_DIR` (set on the worker's spawn env — see
-    // `spawn_invocation`) covers `~/.config/gh`'s non-secret metadata, but
-    // gh's actual OAuth token lives in the macOS login keychain, which
-    // Keychain Services resolves from `$HOME` — so it needs its own bridge.
-    // Symlink only the single keychain file (never copy, matching the
-    // auth.json pattern below), and never the whole `~/Library/Keychains`
-    // directory: that also holds the iCloud-synced "local items" keychain
-    // and other apps' entries unrelated to gh. Best-effort: skipped when
-    // the host has no login keychain (see `resolve_login_keychain_source`).
-    if let Some(keychain_source) = resolve_login_keychain_source() {
-        let keychain_dir = process_home.join("Library").join("Keychains");
-        fs::create_dir_all(&keychain_dir).with_context(|| format!("creating {}", keychain_dir.display()))?;
-        let keychain_dest = keychain_dir.join("login.keychain-db");
-        match fs::symlink_metadata(&keychain_dest) {
-            Ok(_) => fs::remove_file(&keychain_dest)
-                .with_context(|| format!("removing prior keychain link {}", keychain_dest.display()))?,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err).with_context(|| format!("stat {}", keychain_dest.display())),
-        }
-        std::os::unix::fs::symlink(&keychain_source, &keychain_dest).with_context(|| {
-            format!(
-                "symlinking login keychain from {} → {}",
-                keychain_source.display(),
-                keychain_dest.display()
-            )
-        })?;
-    }
-
-    // Auth: symlink only — never copy the credential into the run home.
+    // Auth remains at one shared host path. Grok places its refresh lock next
+    // to GROK_AUTH_PATH; using that path directly makes concurrent workers
+    // coordinate both reads and refresh writes. The old symlink scheme was
+    // unsafe because each per-run home had a different lock, and an atomic
+    // refresh replaced the symlink with a private regular file.
     let auth_source = resolve_grok_auth_source();
     if !auth_source.exists() {
         bail!(
@@ -509,24 +442,29 @@ pub fn provision_grok_home(workspace: &Path, prompt_text: &str, run_id: &str) ->
             bail!("refusing to use interactive ~/.grok as Boss-owned GROK_HOME");
         }
     }
-    let auth_dest = grok_home.join("auth.json");
-    // Replace any prior file/symlink so re-provision is idempotent.
-    match fs::symlink_metadata(&auth_dest) {
-        Ok(_) => {
-            fs::remove_file(&auth_dest).with_context(|| format!("removing prior auth link {}", auth_dest.display()))?
+    let legacy_auth_dest = grok_home.join("auth.json");
+    // Remove a legacy per-run file/symlink so a future CLI regression that
+    // ignores GROK_AUTH_PATH fails closed instead of reviving split auth.
+    match fs::symlink_metadata(&legacy_auth_dest) {
+        Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+            fs::remove_file(&legacy_auth_dest)
+                .with_context(|| format!("removing legacy per-run auth file {}", legacy_auth_dest.display()))?
         }
+        Ok(_) => bail!(
+            "refusing unexpected non-file legacy auth path {}",
+            legacy_auth_dest.display()
+        ),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => {
-            return Err(err).with_context(|| format!("stat {}", auth_dest.display()));
+            return Err(err).with_context(|| format!("stat {}", legacy_auth_dest.display()));
         }
     }
-    std::os::unix::fs::symlink(&auth_source, &auth_dest).with_context(|| {
-        format!(
-            "symlinking auth.json from {} → {}",
-            auth_source.display(),
-            auth_dest.display()
-        )
-    })?;
+
+    let process_environment = GrokProcessEnvironment::resolve(&grok_home, &process_home, &auth_source)
+        .context("resolving scoped Grok worker environment")?;
+    process_environment
+        .provision_home_delegates()
+        .context("delegating host tool state into scoped Grok worker HOME")?;
 
     // Config + trust + provisional hooks — overwrite every run.
     fs::write(grok_home.join("config.toml"), render_base_config_toml())
@@ -576,7 +514,12 @@ pub fn provision_grok_home(workspace: &Path, prompt_text: &str, run_id: &str) ->
     // Assert posture with live `grok inspect --json`: folder trust, the
     // compat-cell matrix, hooks inventory, and permission-source isolation
     // all fail closed. The observed grokVersion is recorded below, never gated.
-    let grok_version = assert_grok_posture(&grok_home, &process_home, workspace)?;
+    let grok_version =
+        assert_grok_posture_with_environment(&grok_home, &process_home, workspace, &process_environment)?;
+    if !skip_posture_assert() {
+        run_worker_preflight(workspace, &process_environment)
+            .context("running fail-fast Grok worker capability preflight")?;
+    }
 
     Ok(GrokRuntimeState::builder()
         .grok_home(grok_home)
@@ -592,7 +535,7 @@ pub fn provision_grok_home(workspace: &Path, prompt_text: &str, run_id: &str) ->
 // Posture assertion
 // ---------------------------------------------------------------------------
 
-fn skip_posture_assert() -> bool {
+pub(super) fn skip_posture_assert() -> bool {
     match std::env::var(GROK_SKIP_POSTURE_ASSERT_ENV) {
         Ok(v) => {
             let v = v.trim();
@@ -608,7 +551,19 @@ fn skip_posture_assert() -> bool {
 /// `grokVersion` (`None` when the assert was skipped, or inspect supplied no
 /// string value) so the caller can persist it on the execution record — see
 /// [`GrokRuntimeState::grok_version`].
+#[cfg(test)]
 pub fn assert_grok_posture(grok_home: &Path, process_home: &Path, workspace: &Path) -> anyhow::Result<Option<String>> {
+    let environment = GrokProcessEnvironment::resolve(grok_home, process_home, &resolve_grok_auth_source())
+        .context("resolving environment for grok inspect posture assertion")?;
+    assert_grok_posture_with_environment(grok_home, process_home, workspace, &environment)
+}
+
+fn assert_grok_posture_with_environment(
+    grok_home: &Path,
+    process_home: &Path,
+    workspace: &Path,
+    environment: &GrokProcessEnvironment,
+) -> anyhow::Result<Option<String>> {
     if skip_posture_assert() {
         tracing::warn!(
             grok_home = %grok_home.display(),
@@ -617,23 +572,17 @@ pub fn assert_grok_posture(grok_home: &Path, process_home: &Path, workspace: &Pa
         return Ok(None);
     }
 
-    let output = Command::new("grok")
-        .arg("inspect")
-        .arg("--json")
-        .current_dir(workspace)
-        .env("GROK_HOME", grok_home)
-        .env("HOME", process_home)
-        // Never inherit operator GROK_FOLDER_TRUST=0 (ungates project hooks/MCP).
-        .env_remove("GROK_FOLDER_TRUST")
-        .output()
-        .with_context(|| {
-            format!(
-                "running `grok inspect --json` with GROK_HOME={} HOME={} cwd={}",
-                grok_home.display(),
-                process_home.display(),
-                workspace.display()
-            )
-        })?;
+    let mut command = Command::new("grok");
+    command.arg("inspect").arg("--json").current_dir(workspace);
+    environment.apply_to_command(&mut command);
+    let output = command.output().with_context(|| {
+        format!(
+            "running `grok inspect --json` with GROK_HOME={} HOME={} cwd={}",
+            grok_home.display(),
+            process_home.display(),
+            workspace.display()
+        )
+    })?;
 
     if !output.status.success() {
         bail!(
@@ -852,10 +801,9 @@ pub fn assert_grok_home_safe_to_delete(grok_home: &Path) -> anyhow::Result<()> {
 /// [`crate::codex::reclaim_codex_home`] (`tools/boss/engine/driver/src/codex.rs:409`).
 ///
 /// Deletion never follows symlinks: `std::fs::remove_dir_all` unlinks a
-/// symlink entry it encounters instead of descending into (or deleting) its
-/// target, so the `auth.json` credential symlink under `grok-home/` is
-/// removed while the real credential file it points at (outside the homes
-/// root) is left untouched.
+/// symlink entry it encounters instead of descending into its target. This
+/// remains defense in depth for legacy homes provisioned with auth symlinks;
+/// current homes keep the shared credential entirely outside the container.
 pub fn reclaim_grok_home(container: &Path) -> anyhow::Result<()> {
     assert_grok_home_safe_to_delete(container)?;
     if !container.exists() {
@@ -1139,8 +1087,8 @@ mod tests {
         let real_auth = real_auth_dir.join("auth.json");
         fs::write(&real_auth, "super-secret-token").unwrap();
 
-        // Symlink inside GROK_HOME pointing at the real credential, exactly
-        // as provisioning wires it (see `provision_grok_home`).
+        // Legacy homes used an auth symlink. Retention must remain safe for
+        // those homes even though current provisioning uses GROK_AUTH_PATH.
         std::os::unix::fs::symlink(&real_auth, grok_home.join("auth.json")).unwrap();
 
         reclaim_grok_home(&container).unwrap();

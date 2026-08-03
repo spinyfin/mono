@@ -174,6 +174,10 @@ This is worth recording because `provision_grok_home` **symlinks** `$GROK_HOME/a
 
 Not measured further (it was not this run's question, and reproducing it means racing someone else's token refresh), so it is recorded as an observation rather than a finding, and no code change is proposed on this evidence alone.
 
+**Superseded 2026-08-02.** Concurrent production runs established the exact failure. Grok locks beside the resolved auth path, so per-home symlinks used different locks. A successful atomic refresh replaced one worker's symlink with a private regular file and left the host source stale; a concurrent worker then had its refresh token rejected, deleted its own credential, and fell through to an invalid inherited `XAI_API_KEY`. The driver now sets one shared `GROK_AUTH_PATH`, disables API-key fallback, and requires an affirmative OAuth preflight. Two concurrent CLI probes with separate homes and that shared path both authenticated through grok.com.
+
+The simultaneous gh failure had a separate kernel cause. Direct `gh auth status` with the scoped HOME and its login-keychain delegate reported `(keyring)`, while the same command launched as a Grok terminal tool under each non-off built-in macOS sandbox profile reported `(default)`. Granting read/write access to the keychain and Cube paths repaired Cube but not gh; only removing Grok's built-in Seatbelt template restored keychain IPC. The driver therefore runs local macOS Grok inside a Boss-owned Seatbelt profile that preserves Security.framework mach services and reconstructs the workspace/read-only filesystem policy. Its startup preflight executes under that exact profile.
+
 ## Version drift: the driver refused to provision (as of 2026-07-29)
 
 `assert_inspect_json_posture` hard-failed unless `grokVersion` started with `PINNED_GROK_VERSION` (`0.2.112`, `home.rs:40`, `:653`). The host ran **`0.2.114`**, so Grok provisioning would abort with _"Re-characterise before upgrading the pin."_
