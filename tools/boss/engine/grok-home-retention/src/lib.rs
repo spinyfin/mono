@@ -234,10 +234,9 @@ pub fn plan_reclaim(homes: &[OwnedGrokHome], now_epoch: i64, policy: &GrokHomeRe
 /// function itself only fails on a pre-plan hard error (none today).
 ///
 /// Deletion never follows symlinks: `std::fs::remove_dir_all` unlinks a
-/// symlink entry it encounters rather than descending into (or deleting)
-/// its target, so the `auth.json` credential symlink inside a reclaimed
-/// `GROK_HOME` is removed while the real credential file it points at
-/// (outside the homes root) is untouched.
+/// symlink entry it encounters rather than descending into its target. This
+/// remains important for legacy homes containing an auth symlink; current
+/// homes keep the shared `GROK_AUTH_PATH` outside the reclaimed container.
 pub fn execute_reclaim(
     homes: &[OwnedGrokHome],
     now_epoch: i64,
@@ -570,8 +569,7 @@ mod tests {
         // Real credential file living entirely outside the homes root.
         let real_auth = dir.path().join("real-auth.json");
         std::fs::write(&real_auth, "super-secret-token").unwrap();
-        // Symlink inside GROK_HOME pointing at the real credential, exactly
-        // as Grok home provisioning wires it.
+        // Legacy Grok home containing the old auth symlink shape.
         std::os::unix::fs::symlink(&real_auth, grok_home.join("auth.json")).unwrap();
 
         let now = 1_800_000_000i64;

@@ -126,7 +126,9 @@ fn codex_initial_input_stays_under_the_limit_with_reviewer_sandbox_extra_args() 
 /// MAX_CANON. Confirms the fix holds even here.
 #[test]
 fn grok_initial_input_stays_under_the_limit_with_long_workspace_path_and_full_deny_rule_set() {
-    use crate::driver::grok::{GROK_HOMES_ENV_TEST_LOCK, GROK_HOMES_ROOT_ENV, grok_home_for_run};
+    use crate::driver::grok::{
+        GROK_HOMES_ENV_TEST_LOCK, GROK_HOMES_ROOT_ENV, GROK_SKIP_POSTURE_ASSERT_ENV, grok_home_for_run,
+    };
 
     let workspace = TempDir::new().unwrap();
     let long_workspace_path = workspace
@@ -144,9 +146,16 @@ fn grok_initial_input_stays_under_the_limit_with_long_workspace_path_and_full_de
     // here only through `grok`'s public re-exports.
     let _lock = GROK_HOMES_ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let prior_homes_env = std::env::var_os(GROK_HOMES_ROOT_ENV);
+    let prior_skip_env = std::env::var_os(GROK_SKIP_POSTURE_ASSERT_ENV);
     let homes_root = TempDir::new().unwrap();
     // SAFETY: serialised by `_lock`, held for this whole test.
-    unsafe { std::env::set_var(GROK_HOMES_ROOT_ENV, homes_root.path()) };
+    unsafe {
+        std::env::set_var(GROK_HOMES_ROOT_ENV, homes_root.path());
+        // This command-length fixture stamps only the two files consumed by
+        // spawn; it deliberately does not provision a real Cube workspace or
+        // OAuth credential and therefore must not run the live preflight.
+        std::env::set_var(GROK_SKIP_POSTURE_ASSERT_ENV, "1");
+    }
     let run_id = "run-grok-length-1";
     let grok_home = grok_home_for_run(run_id).unwrap();
     std::fs::create_dir_all(&grok_home).unwrap();
@@ -248,5 +257,9 @@ fn grok_initial_input_stays_under_the_limit_with_long_workspace_path_and_full_de
     match prior_homes_env {
         Some(v) => unsafe { std::env::set_var(GROK_HOMES_ROOT_ENV, v) },
         None => unsafe { std::env::remove_var(GROK_HOMES_ROOT_ENV) },
+    }
+    match prior_skip_env {
+        Some(v) => unsafe { std::env::set_var(GROK_SKIP_POSTURE_ASSERT_ENV, v) },
+        None => unsafe { std::env::remove_var(GROK_SKIP_POSTURE_ASSERT_ENV) },
     }
 }

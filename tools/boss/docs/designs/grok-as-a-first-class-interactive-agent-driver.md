@@ -254,9 +254,11 @@ In a real Boss workspace the instruction surface is broader still — `grok insp
 
 ### Auth and coexistence
 
-Auth is `auth.json` **inside `GROK_HOME`** (grok.com OAuth on this host), not an environment variable. Same shape as Codex, same consequences:
+Auth is the host `auth.json` selected through `GROK_AUTH_PATH` (grok.com OAuth on this host). Grok config and session state remain inside the isolated `GROK_HOME`, but the credential path is deliberately shared:
 
-- A per-worker `GROK_HOME` must have `auth.json` present; symlinking the host credential is sufficient and avoids copying a secret per workspace.
+- Every worker must use the same explicit credential path. Grok places `auth.json.lock` beside that path, so this also gives concurrent workers one refresh lock. A per-home symlink is not sufficient: an atomic refresh replaces the symlink with a private file while each home still uses a different lock.
+- Boss disables API-key auth and removes an inherited `XAI_API_KEY`; an OAuth refresh failure must not silently switch credential families or endpoints.
+- The scoped process HOME delegates gh/Cube/jj/git state, while the local macOS process runs under Boss's own Seatbelt policy. Grok's built-in profiles block login-keychain IPC and make `gh` silently fall back to the invalid file credential; a keychain-file symlink alone cannot repair that kernel policy.
 - **No collision with `unset ANTHROPIC_API_KEY`** at the shared spawn wrapper — it is inert for Grok. It remains a Claude-ism in driver-generic code and belongs behind the driver.
 - `grok models` requires login, which makes it a cheap liveness check on the credential without an inference call.
 - **Concurrency is not entitlement-blocked at Boss's target scale**: the spike ran 16 concurrent sessions to completion, 16/16, ~12–16s each. That does not prove unlimited quota; it proves the design's premise is not immediately dead.
@@ -382,7 +384,7 @@ The shared wrapper at the pane spawn site still hardcodes `unset ANTHROPIC_API_K
 
 ### G-2 `WorkspaceProvisioning`
 
-Fits the current trait. The Grok driver writes `.grok/initial-prompt.txt`, its agent-rules file, a per-run `GROK_HOME` (config, hooks, `auth.json` symlink, `trusted_folders.toml` pre-stamped with **both** the `/tmp` and `/private/tmp` forms of the workspace path), and asserts the result with `grok inspect --json`.
+Fits the current trait. The Grok driver writes `.grok/initial-prompt.txt`, its agent-rules file, a per-run `GROK_HOME` (config, hooks, and `trusted_folders.toml` pre-stamped with **both** the `/tmp` and `/private/tmp` forms of the workspace path), delegates OAuth through the shared `GROK_AUTH_PATH`, and asserts the result with `grok inspect --json` plus live capability preflights.
 
 **The gap is not in the trait; it is in the driver-generic caller.** `core/src/worker_setup.rs:1702` calls `pre_trust_workspace(&input.workspace_path)` — which writes Claude's `~/.claude.json` — and `:1718` writes `CLAUDE_DIR_GITIGNORE`, both unconditionally, for every driver, from `write_workspace_files`. For a Grok worker these produce a Claude trust record for a workspace Claude will never run in, and a `.gitignore` inside a `.claude/` directory the driver did not create. Harmless today, incoherent, and it is exactly the residual coupling this project inherits. **Must fix**, not route around: [T-25](#t-25-make-pre-trust-and-config-dir-gitignore-driver-supplied).
 
@@ -392,7 +394,9 @@ Teardown remains unhooked on the trait, same as for Codex. Grok's per-run `GROK_
 
 Grok is the best-equipped of the three drivers here and simultaneously the only one with an isolation defect.
 
-`ClaudeDriver::write_permission_config` is still a **functional no-op** returning `PermissionArtifacts::default()` (`claude.rs:552-564`); the real Claude renderer remains in `core/src/worker_setup.rs`. `CodexDriver` implements the method for real (`codex.rs:1091-1131`), writing into its run-private home. **Grok follows Codex**: it writes `$GROK_HOME/config.toml`, `$GROK_HOME/hooks/boss.json`, `$GROK_HOME/sandbox.toml`, and `$GROK_HOME/trusted_folders.toml`, and returns `PermissionArtifacts { config_files, extra_args, env }` with `--sandbox` / `--deny` / `--allow` in `extra_args` and `GROK_HOME` in `env`.
+`ClaudeDriver::write_permission_config` is still a **functional no-op** returning `PermissionArtifacts::default()` (`claude.rs:552-564`); the real Claude renderer remains in `core/src/worker_setup.rs`. `CodexDriver` implements the method for real (`codex.rs:1091-1131`), writing into its run-private home. **Grok follows Codex**: it writes `$GROK_HOME/config.toml`, `$GROK_HOME/hooks/boss.json`, the platform sandbox policy, and `$GROK_HOME/trusted_folders.toml`, and returns `PermissionArtifacts { config_files, extra_args, env }` with `--sandbox` / `--deny` / `--allow` in `extra_args` and `GROK_HOME` in `env`.
+
+On local macOS workers the platform policy is a Boss-owned `sandbox-exec` profile and Grok itself runs with `--sandbox off` inside it. This is not a relaxation of the filesystem posture: the Boss profile reconstructs workspace/read-only writes, protects the Boss data directory and Grok's global hooks, and retains the CLI deny rules. It replaces Grok's built-in Seatbelt template because every non-off built-in profile blocks the Security.framework mach services `gh` needs to read its login-keychain credential; adding the keychain file as a writable path does not grant that IPC capability. Remote workers and non-macOS hosts continue to use Grok's built-in/custom `sandbox.toml` path.
 
 So Grok does **not** need the Claude extraction to land first. It routes around it. The extraction stays open, and the fact that a third driver has now routed around it is itself the argument for finishing it — filed as deferred rather than silently dropped ([T-28](#t-28-extract-claudes-permission-rendering-into-the-driver-crate)).
 
@@ -704,7 +708,7 @@ Design _for_, do not design _now_. Four attachment points, three shared with the
 
 ### Migration and coexistence
 
-- **Auth.** `auth.json` inside a per-run `GROK_HOME`, symlinked from a host credential. No env-var collision with Claude; `unset ANTHROPIC_API_KEY` in the shared wrapper is inert.
+- **Auth.** One host `auth.json` selected through `GROK_AUTH_PATH`, shared across per-run homes so refreshes use one adjacent lock. No env-var collision with Claude; `unset ANTHROPIC_API_KEY` in the shared wrapper is inert.
 - **Config collisions.** Solved by per-run `GROK_HOME` — except for Claude-compat permission discovery, which it does not solve (D-1).
 - **Workspace layout.** Grok uses `.grok/`; Claude uses `.claude/`. They do not collide by name, but Grok **actively reads** `.claude/` under compat, so a workspace that has run both drivers needs the compat block off, not merely different directories. Both config dirs must be engine-gitignored.
 - **Shared cube workspaces.** Workspaces are reused across runs and drivers. A workspace that ran a Claude worker yesterday still contains `.claude/CLAUDE.md` and a `.claude/settings.json` today. This is a normal, expected state, and it is precisely the state in which the compat hazard bites. Provisioning must be idempotent and compat-suppressing on every run, not only on a fresh workspace.
@@ -773,7 +777,8 @@ The gating spike's full harness, evidence tree and re-run instructions live in [
 # 1. Isolated home. Never point at the user's ~/.grok.
 export GROK_HOME=/tmp/grok-spike/home
 mkdir -p "$GROK_HOME"
-ln -sf ~/.grok/auth.json "$GROK_HOME/auth.json"    # symlink, don't copy the credential
+export GROK_AUTH_PATH="$HOME/.grok/auth.json"       # shared credential and refresh lock
+unset XAI_API_KEY                                   # OAuth only; no API-key fallback
 
 # 2. Compat off — otherwise Claude hooks, rules and agents load under Grok.
 cat > "$GROK_HOME/config.toml" <<'TOML'
@@ -871,7 +876,7 @@ The crate and struct: `DriverDescriptor` (slug `grok`, binary `grok`, config dir
 
 ### T-07 Grok config isolation and workspace provisioning
 
-Implement `provision_workspace`: a per-run Boss-owned `GROK_HOME` under the execution runtime dir, an `auth.json` symlink to the host credential, a `config.toml` carrying the full `[compat.claude]` and `[compat.cursor]` disable block plus whatever T-01 established, a `trusted_folders.toml` pre-stamped with both the `/tmp` and `/private/tmp` forms of the workspace path, `.grok/initial-prompt.txt`, and the agent-rules file. Assert the resulting posture with `grok inspect --json` before returning, failing loudly if compat is on, the folder is untrusted, or the version does not match the pin.
+Implement `provision_workspace`: a per-run Boss-owned `GROK_HOME` under the execution runtime dir, one shared host credential selected through `GROK_AUTH_PATH`, a `config.toml` carrying the full `[compat.claude]` and `[compat.cursor]` disable block plus whatever T-01 established, a `trusted_folders.toml` pre-stamped with both the `/tmp` and `/private/tmp` forms of the workspace path, `.grok/initial-prompt.txt`, and the agent-rules file. Assert the resulting posture with `grok inspect --json`, then require affirmative Grok OAuth, gh keyring, Cube workspace, and jj workspace/remote preflights before returning.
 
 - **Effort:** `medium`
 - **Depends on:** T-01, T-06
@@ -951,7 +956,7 @@ Characterise the two permission levers that only surface probes have touched. Fo
 
 ### T-17 `GrokDriver::write_permission_config`
 
-Render Grok's permission artifacts into the per-run home: the `--sandbox` profile selection (including reviewer read-only), any custom `sandbox.toml` profile, the `--deny` / `--allow` rule set expressing Boss's structural deny set, and the `--permission-mode` selection — returned as `PermissionArtifacts { config_files, extra_args, env }`. Follows the Codex driver's precedent of implementing the method for real rather than routing around it. Uses T-16's findings for both the profile names and the rule spelling.
+Render Grok's permission artifacts into the per-run home: the platform sandbox selection (including reviewer read-only), the `--deny` / `--allow` rule set expressing Boss's structural deny set, and the `--permission-mode` selection — returned as `PermissionArtifacts { config_files, extra_args, env }`. Non-macOS and remote workers use Grok's native profiles. Local macOS workers run inside a Boss-owned Seatbelt policy that preserves keychain IPC while enforcing the same filesystem posture. Follows the Codex driver's precedent of implementing the method for real rather than routing around it.
 
 - **Effort:** `medium`
 - **Depends on:** T-07, T-16
@@ -1049,7 +1054,7 @@ Characterise `grok leader` / `--leader-socket`: whether per-run `GROK_HOME` isol
 
 ### T-29 Remote/SSH dispatch for Grok
 
-The remote path hardcodes `ClaudeDriver.capabilities()` and the remote runner script is Claude-shaped end to end. Generalising it carries its own auth-distribution problem — `GROK_HOME` and its `auth.json` would need provisioning on each remote host.
+The remote path hardcodes `ClaudeDriver.capabilities()` and the remote runner script is Claude-shaped end to end. Generalising it carries its own auth-distribution problem — each remote host would need an isolated `GROK_HOME` plus a durable shared credential path and refresh lock.
 
 - **Effort:** `large`
 - **Depends on:** T-21

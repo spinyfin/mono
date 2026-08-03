@@ -29,10 +29,12 @@ use boss_ssh_transport::shell_quote;
 use serde_json::Value;
 
 mod classify_error;
+mod environment;
 mod home;
 mod hooks;
 mod model_menu;
 mod permissions;
+mod preflight;
 mod progress;
 mod transcript;
 mod turn_end_recovery;
@@ -41,17 +43,19 @@ pub use home::{
     COMPAT_SURFACES, COMPAT_VENDORS, GROK_AUTH_SOURCE_ENV, GROK_HOMES_ENV_TEST_LOCK, GROK_HOMES_ROOT_ENV,
     GROK_SKIP_POSTURE_ASSERT_ENV, GrokRuntimeState, assert_grok_home_safe_to_delete, assert_inspect_json_posture,
     grok_home_for_run, grok_homes_root, process_home_for_run, reclaim_grok_home, render_base_config_toml,
-    resolve_gh_config_dir, trust_path_variants,
+    trust_path_variants,
 };
 
 use classify_error::classify_grok_error;
-use home::{provision_grok_home, read_session_id, read_workspace_path_stamp};
+use environment::GrokProcessEnvironment;
+use home::{provision_grok_home, read_session_id, read_workspace_path_stamp, resolve_grok_auth_source};
+use preflight::run_worker_preflight_under_macos_seatbelt;
 use progress::GrokProgressSession;
 use transcript::GrokTranscriptSession;
 use turn_end_recovery::{is_cancelled_turn_end, prepare_snapshot};
 
 use super::{
-    AgentDriver, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, EnvDirective, HookWiringDestination,
+    AgentDriver, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, HookWiringDestination,
     InterruptDelivery, InterruptRecoverySnapshot, ModelMenu, PermissionArtifacts, PermissionInput, PrUrlCaptureFeed,
     ProbeDelivery, ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressObservationWiring,
     ProgressSessionNormalizer, ReapDelivery, SpawnPlan, SpawnRequest, StopDelivery, StructuredOutputArtifacts,
@@ -185,16 +189,6 @@ pub fn build_grok_pane_command(request: &SpawnRequest<'_>, workspace: &Path, ses
     cmd
 }
 
-/// `GH_CONFIG_DIR` env directive pointing at the real host's `gh` config
-/// dir, or empty when it cannot be resolved (no real `HOME` — should not
-/// happen on a Boss host, but a spawn must never panic on it). `gh` honors
-/// this var natively, so no filesystem bridge is needed for it — unlike the
-/// keychain-backed token, which `provision_grok_home` bridges via symlink
-/// (see the `HOME` directive comment in `spawn_invocation`).
-fn gh_config_dir_directive() -> Option<EnvDirective> {
-    resolve_gh_config_dir().map(|dir| EnvDirective::Set("GH_CONFIG_DIR".to_owned(), dir.display().to_string()))
-}
-
 #[async_trait]
 impl AgentDriver for GrokDriver {
     fn descriptor(&self) -> &DriverDescriptor {
@@ -300,6 +294,21 @@ impl AgentDriver for GrokDriver {
             grok_home_for_run(run_id).unwrap_or_else(|_| grok_homes_root().join("unknown-run").join("grok-home"));
         let process_home =
             process_home_for_run(run_id).unwrap_or_else(|_| grok_homes_root().join("unknown-run").join("process-home"));
+        let auth_source = resolve_grok_auth_source();
+
+        let environment = match GrokProcessEnvironment::resolve(&grok_home, &process_home, &auth_source) {
+            Ok(environment) => environment,
+            Err(error) => {
+                tracing::error!(run_id, error = %error, "refusing to spawn Grok worker with unresolved host tool environment");
+                return SpawnPlan {
+                    env: Vec::new(),
+                    command: format!(
+                        "echo {} >&2; exit 1\n",
+                        shell_quote(&format!("Grok worker environment resolution failed: {error:#}"))
+                    ),
+                };
+            }
+        };
 
         // Session id + workspace path written by provision_workspace.
         // Fallbacks are for fixtures that skip provision only.
@@ -308,50 +317,20 @@ impl AgentDriver for GrokDriver {
         });
         let workspace_for_cwd = read_workspace_path_stamp(&grok_home).unwrap_or_else(|_| PathBuf::from("."));
 
-        let command = build_grok_pane_command(&request, &workspace_for_cwd, &session_id);
+        let command = permissions::wrap_with_macos_seatbelt(
+            &build_grok_pane_command(&request, &workspace_for_cwd, &session_id),
+            &grok_home,
+        );
 
         // Defence-in-depth: never emit worktree flags (cube owns workspaces).
         debug_assert!(!command.contains("--worktree") && !command.contains(" -w ") && !command.contains("\t-w "));
 
         SpawnPlan {
-            env: vec![
-                EnvDirective::Set("GROK_HOME".to_owned(), grok_home.display().to_string()),
-                // T-01: scope HOME so operator ~/.claude settings cannot load.
-                // Auth stays under GROK_HOME (symlink), not under this HOME.
-                //
-                // Scoping HOME also hides ~/.ssh, ~/.config/gh, and the
-                // operator's macOS login keychain from the worker, which
-                // otherwise leaves the sanctioned `cube pr create` push path
-                // unable to authenticate (confirmed empirically — no Grok
-                // worker had ever pushed a PR before this was measured).
-                // ~/.ssh needs no bridge: OpenSSH resolves `~/.ssh/known_hosts`
-                // and identity files from the OS password-database home
-                // (`getpwuid`), not `$HOME`, and the ssh-agent socket is
-                // already reachable via `SSH_AUTH_SOCK` — unaffected by this
-                // override. `gh` is the credential that actually needs
-                // bridging: its non-secret config lives under
-                // `~/.config/gh`, restored via the narrower `GH_CONFIG_DIR`
-                // env var below (gh honors it natively, no filesystem bridge
-                // needed); its OAuth token lives in the macOS login
-                // keychain, restored by symlinking just that one file — see
-                // `home::provision_grok_home` and
-                // `home::resolve_login_keychain_source`. `~/.gitconfig` and
-                // jj's own config are not bridged: neither is needed by the
-                // push path (commit authorship already happened in an
-                // earlier turn), and `~/.local/share/cube` is not bridged
-                // either — `cube pr create` never reads it (verified against
-                // `tools/cube/src/app/pr.rs`), so bridging it would only
-                // widen exposure into cube's own lease/workspace registry
-                // for no benefit.
-                EnvDirective::Set("HOME".to_owned(), process_home.display().to_string()),
-                // Never inherit host GROK_FOLDER_TRUST=0 — that value ungates
-                // project hooks/MCP and undoes the config.toml disable block.
-                // Mirror the inspect path's env_remove on the pane shell.
-                EnvDirective::Unset("GROK_FOLDER_TRUST".to_owned()),
-            ]
-            .into_iter()
-            .chain(gh_config_dir_directive())
-            .collect(),
+            // `environment` preserves the T-01 HOME quarantine while
+            // delegating the host Cube/gh/jj/git stores and the one shared
+            // Grok OAuth path. Provisioning applied this exact same contract
+            // to the fail-fast capability checks before we reached spawn.
+            env: environment.directives(),
             command,
         }
     }
@@ -391,18 +370,12 @@ impl AgentDriver for GrokDriver {
     /// adapter. Overwrites the provisional canary `provision_workspace`
     /// wrote.
     ///
-    /// Also writes the full permission-policy artifacts (design T-17): a
-    /// Boss-owned `$GROK_HOME/sandbox.toml` custom profile (kernel-level deny
-    /// of the Boss data dir, layered on the worker kind's built-in
-    /// `workspace`/`read-only` base — omitted for remote workers, which have
-    /// no local data dir to fence), and `extra_args` carrying `--sandbox`,
-    /// one `--deny` per structural rule (Boss data dir, `rm -rf`, `sudo`,
-    /// `bossctl`), and `--permission-mode` when the worker kind forces one.
-    /// Local macOS Standard workers pass `--sandbox off`: Grok's Seatbelt
-    /// profile denies the IOKit power-management registration Bazel requires.
-    /// See [`permissions`] for the profile/rule rendering and
-    /// `grok-permission-isolation-2026-07-27.md` (T-16) for the grammar this
-    /// relies on.
+    /// Also writes the full permission-policy artifacts. Local macOS workers
+    /// use a Boss-owned Seatbelt profile because every Grok built-in profile
+    /// blocks the login-keychain service `gh` needs; other platforms retain
+    /// Grok's custom `sandbox.toml`. Both paths layer the Boss-data-dir fence
+    /// on the worker kind's workspace/read-only posture. CLI `--deny` rules
+    /// remain an independent belt for `rm -rf`, `sudo`, and `bossctl`.
     async fn write_permission_config(
         &self,
         input: &PermissionInput,
@@ -467,7 +440,31 @@ impl AgentDriver for GrokDriver {
             input.events_socket_path.parent().map(|p| p.to_path_buf())
         };
 
-        if !input.is_remote {
+        let uses_external_macos_sandbox = permissions::uses_external_macos_sandbox(input.is_remote);
+        if uses_external_macos_sandbox {
+            let process_home = process_home_for_run(&input.run_id)?;
+            let auth_source = resolve_grok_auth_source();
+            let environment = GrokProcessEnvironment::resolve(&grok_home, &process_home, &auth_source)
+                .context("resolving Grok environment for macOS Seatbelt policy")?;
+            let profile_path = permissions::macos_seatbelt_profile_path(&grok_home);
+            fs::write(
+                &profile_path,
+                permissions::render_macos_seatbelt_profile(
+                    input.worker_kind,
+                    &input.workspace_path,
+                    &grok_home,
+                    &environment.macos_writable_roots(&input.workspace_path),
+                    boss_data_dir.as_deref(),
+                ),
+            )
+            .with_context(|| format!("writing {}", profile_path.display()))?;
+            config_files.push(profile_path.clone());
+
+            if !home::skip_posture_assert() {
+                run_worker_preflight_under_macos_seatbelt(&input.workspace_path, &environment, &profile_path)
+                    .context("running fail-fast Grok capability preflight under macOS Seatbelt")?;
+            }
+        } else if !input.is_remote {
             let sandbox_toml_path = grok_home.join("sandbox.toml");
             fs::write(
                 &sandbox_toml_path,
@@ -789,6 +786,7 @@ fn grok_bash_output_text(tool_response: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::EnvDirective;
     use crate::{AbsenceDisposition, Capability, MidTurnPaneInput};
     use boss_protocol::{EffortLevel, ReasoningMode};
     use serde_json::json;
@@ -1280,6 +1278,30 @@ mod tests {
             plan.env
         );
         assert!(
+            plan.env.iter().any(|d| matches!(
+                d,
+                EnvDirective::Set(k, v) if k == "GROK_AUTH_PATH" && v == &auth.display().to_string()
+            )),
+            "must delegate OAuth to the shared host auth path: {:?}",
+            plan.env
+        );
+        assert!(
+            plan.env
+                .iter()
+                .any(|d| matches!(d, EnvDirective::Unset(k) if k == "XAI_API_KEY")),
+            "must disable inherited API-key fallback: {:?}",
+            plan.env
+        );
+        for key in ["GH_CONFIG_DIR", "CUBE_DATA_DIR", "CUBE_CONFIG_DIR"] {
+            assert!(
+                plan.env
+                    .iter()
+                    .any(|d| matches!(d, EnvDirective::Set(actual, _) if actual == key)),
+                "must delegate host {key}: {:?}",
+                plan.env
+            );
+        }
+        assert!(
             plan.env
                 .iter()
                 .any(|d| matches!(d, EnvDirective::Unset(k) if k == "GROK_FOLDER_TRUST")),
@@ -1326,7 +1348,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provision_workspace_creates_owned_home_symlink_auth_and_trust() {
+    async fn provision_workspace_creates_owned_home_with_shared_auth_and_trust() {
         let tmp = TempDir::new().unwrap();
         let homes = tmp.path().join("homes");
         let workspace = tmp.path().join("ws");
@@ -1335,7 +1357,7 @@ mod tests {
         write_fake_auth(&auth);
 
         // Skip live inspect: auth is fake and this host may not have network.
-        // Layout + symlink semantics are the unit under test; live inspect is
+        // Layout + shared-auth semantics are the unit under test; live inspect is
         // covered by provision_workspace_live_inspect_when_grok_present.
         let _guard = env_for_provision(&homes, &auth, true);
 
@@ -1351,12 +1373,17 @@ mod tests {
         assert!(runtime.process_home.starts_with(&homes));
         assert_ne!(runtime.grok_home, runtime.process_home);
 
-        // Auth is a symlink, never a copy.
+        // Auth must not exist per run. GROK_AUTH_PATH delegates directly to
+        // runtime.auth_source_path so refreshes share one credential + lock.
         let auth_dest = runtime.grok_home.join("auth.json");
-        let meta = fs::symlink_metadata(&auth_dest).unwrap();
-        assert!(meta.file_type().is_symlink(), "auth.json must be a symlink");
-        let target = fs::read_link(&auth_dest).unwrap();
-        assert_eq!(target, auth);
+        assert!(!auth_dest.exists(), "per-run auth.json must not be provisioned");
+        assert_eq!(runtime.auth_source_path, auth);
+        let plan = driver.spawn_invocation(spawn_request("grok-4.5", "run-prov-1"));
+        assert!(plan.env.iter().any(|directive| matches!(
+            directive,
+            EnvDirective::Set(key, value)
+                if key == "GROK_AUTH_PATH" && value == &runtime.auth_source_path.display().to_string()
+        )));
 
         let config = fs::read_to_string(runtime.grok_home.join("config.toml")).unwrap();
         assert!(config.contains("[compat.claude]"));
@@ -1491,8 +1518,11 @@ mod tests {
         let runtime = GrokRuntimeState::from_driver_runtime_state(&state).unwrap();
 
         assert!(
-            !runtime.process_home.join("Library").exists(),
-            "must not create a Library dir when the host has no login keychain to bridge"
+            !runtime
+                .process_home
+                .join("Library/Keychains/login.keychain-db")
+                .exists(),
+            "must not create a login-keychain bridge when the host has no source keychain"
         );
 
         match prior_home {
@@ -1554,8 +1584,8 @@ mod tests {
             eprintln!("grok not available; skipping live inspect provision test");
             return;
         }
-        // Need a real auth.json to satisfy symlink existence; use host only
-        // as *source* for the symlink, never as GROK_HOME.
+        // Need a real shared auth.json for the live OAuth preflight; it is
+        // passed as GROK_AUTH_PATH and never copied into GROK_HOME.
         let host_auth = dirs_home_grok_auth();
         if !host_auth.exists() {
             eprintln!("no host ~/.grok/auth.json; skipping live inspect provision test");
@@ -1567,17 +1597,25 @@ mod tests {
         let workspace = tmp.path().join("ws");
         fs::create_dir_all(&workspace).unwrap();
 
-        let _guard = env_for_provision(&homes, &host_auth, false);
-
         let driver = GrokDriver::default();
+        let layout_guard = env_for_provision(&homes, &host_auth, true);
         let state = driver
             .provision_workspace(&workspace, "live inspect prompt", "run-live-1")
             .await
-            .expect("live provision + inspect must succeed");
-        assert!(state.is_some());
+            .expect("provisioned layout must succeed")
+            .expect("Grok must return runtime state");
+        let runtime = GrokRuntimeState::from_driver_runtime_state(&state).unwrap();
+        drop(layout_guard);
+
+        let _inspect_guard = env_for_provision(&homes, &host_auth, false);
+        home::assert_grok_posture(&runtime.grok_home, &runtime.process_home, &workspace)
+            .expect("live grok inspect posture must succeed");
     }
 
     fn dirs_home_grok_auth() -> PathBuf {
+        if let Some(path) = std::env::var_os(GROK_AUTH_SOURCE_ENV).filter(|path| !path.is_empty()) {
+            return PathBuf::from(path);
+        }
         std::env::var_os("HOME")
             .map(|h| PathBuf::from(h).join(".grok").join("auth.json"))
             .unwrap_or_else(|| PathBuf::from(".grok/auth.json"))
@@ -1716,10 +1754,8 @@ mod tests {
         }
     }
 
-    /// design T-17 acceptance: `write_permission_config` must also render the
-    /// permission-policy artifacts — a Boss-owned `sandbox.toml` custom
-    /// profile and `extra_args` carrying `--sandbox` + the structural
-    /// `--deny` rule set — not leave `extra_args` empty.
+    /// `write_permission_config` must render the platform sandbox artifact
+    /// and CLI structural deny rules, never leave permission artifacts empty.
     #[tokio::test]
     async fn write_permission_config_renders_sandbox_and_deny_extra_args() {
         let tmp = TempDir::new().unwrap();
@@ -1753,19 +1789,38 @@ mod tests {
         let artifacts = driver.write_permission_config(&input, tmp.path()).await.unwrap();
 
         let grok_home = grok_home_for_run(run_id).unwrap();
-        let sandbox_toml_path = grok_home.join("sandbox.toml");
-        assert!(
-            artifacts.config_files.contains(&sandbox_toml_path),
-            "config_files must include sandbox.toml: {:?}",
-            artifacts.config_files
-        );
-        let sandbox_toml = fs::read_to_string(&sandbox_toml_path).unwrap();
-        assert!(sandbox_toml.contains("[profiles.boss-workspace]"), "{sandbox_toml}");
-        assert!(sandbox_toml.contains("extends = \"workspace\""), "{sandbox_toml}");
-        assert!(
-            sandbox_toml.contains(&boss_data_dir.display().to_string()),
-            "{sandbox_toml}"
-        );
+        if permissions::uses_external_macos_sandbox(false) {
+            let profile_path = permissions::macos_seatbelt_profile_path(&grok_home);
+            assert!(
+                artifacts.config_files.contains(&profile_path),
+                "{:?}",
+                artifacts.config_files
+            );
+            let profile = fs::read_to_string(profile_path).unwrap();
+            assert!(profile.contains("(allow default)"), "{profile}");
+            assert!(profile.contains("(deny file-write*)"), "{profile}");
+            assert!(profile.contains(&boss_data_dir.display().to_string()), "{profile}");
+            let spawn = driver.spawn_invocation(spawn_request("grok-4.5", run_id));
+            assert!(
+                spawn.command.starts_with("/usr/bin/sandbox-exec -f "),
+                "local macOS pane must run inside the rendered profile: {}",
+                spawn.command
+            );
+        } else {
+            let sandbox_toml_path = grok_home.join("sandbox.toml");
+            assert!(
+                artifacts.config_files.contains(&sandbox_toml_path),
+                "config_files must include sandbox.toml: {:?}",
+                artifacts.config_files
+            );
+            let sandbox_toml = fs::read_to_string(&sandbox_toml_path).unwrap();
+            assert!(sandbox_toml.contains("[profiles.boss-workspace]"), "{sandbox_toml}");
+            assert!(sandbox_toml.contains("extends = \"workspace\""), "{sandbox_toml}");
+            assert!(
+                sandbox_toml.contains(&boss_data_dir.display().to_string()),
+                "{sandbox_toml}"
+            );
+        }
 
         assert_eq!(artifacts.extra_args[0], "--sandbox");
         assert_eq!(
@@ -1813,9 +1868,8 @@ mod tests {
         assert!(!artifacts.extra_args.contains(&"--permission-mode".to_owned()));
     }
 
-    /// Reviewer worker kind must select the read-only sandbox posture, both
-    /// on the CLI (`--sandbox boss-read-only`) and in the custom profile's
-    /// `extends`.
+    /// Reviewer worker kind must select a read-only workspace posture in the
+    /// platform sandbox artifact.
     #[tokio::test]
     async fn write_permission_config_reviewer_selects_read_only_sandbox() {
         let tmp = TempDir::new().unwrap();
@@ -1847,12 +1901,27 @@ mod tests {
 
         let artifacts = driver.write_permission_config(&input, tmp.path()).await.unwrap();
         assert_eq!(artifacts.extra_args[0], "--sandbox");
-        assert_eq!(artifacts.extra_args[1], "boss-read-only");
+        assert_eq!(
+            artifacts.extra_args[1],
+            if cfg!(target_os = "macos") {
+                "off"
+            } else {
+                "boss-read-only"
+            }
+        );
 
         let grok_home = grok_home_for_run(run_id).unwrap();
-        let sandbox_toml = fs::read_to_string(grok_home.join("sandbox.toml")).unwrap();
-        assert!(sandbox_toml.contains("[profiles.boss-read-only]"), "{sandbox_toml}");
-        assert!(sandbox_toml.contains("extends = \"read-only\""), "{sandbox_toml}");
+        if permissions::uses_external_macos_sandbox(false) {
+            let profile = fs::read_to_string(permissions::macos_seatbelt_profile_path(&grok_home)).unwrap();
+            assert!(
+                profile.contains(&format!("(deny file-write* (literal \"{}\")", workspace.display())),
+                "{profile}"
+            );
+        } else {
+            let sandbox_toml = fs::read_to_string(grok_home.join("sandbox.toml")).unwrap();
+            assert!(sandbox_toml.contains("[profiles.boss-read-only]"), "{sandbox_toml}");
+            assert!(sandbox_toml.contains("extends = \"read-only\""), "{sandbox_toml}");
+        }
     }
 
     /// Remote workers get no local `sandbox.toml` (no Boss data dir to fence)
@@ -1956,7 +2025,7 @@ mod tests {
             return false;
         }
         if !dirs_home_grok_auth().exists() {
-            eprintln!("no host ~/.grok/auth.json; skipping live permission-enforcement test");
+            eprintln!("no Grok auth source; skipping live permission-enforcement test");
             return false;
         }
         true
@@ -2073,9 +2142,8 @@ mod tests {
         let process_home = scratch_root.join("process-home");
         fs::create_dir_all(&process_home).unwrap();
 
-        // No hooks/, no sandbox.toml: only auth + base config + trust, so
+        // No hooks/, no sandbox.toml: only base config + trust, so
         // the only lever in play is the `--deny` CLI flag under test.
-        std::os::unix::fs::symlink(dirs_home_grok_auth(), grok_home.join("auth.json")).unwrap();
         fs::write(grok_home.join("config.toml"), render_base_config_toml()).unwrap();
         fs::write(
             grok_home.join("trusted_folders.toml"),
@@ -2365,11 +2433,18 @@ mod tests {
         extra_args: &[String],
     ) -> std::process::Output {
         let session_id = home::new_session_uuid().unwrap();
-        let mut cmd = std::process::Command::new("grok");
-        cmd.env("GROK_HOME", grok_home)
-            .env("HOME", process_home)
-            .env_remove("GROK_FOLDER_TRUST")
-            .arg("-p")
+        let seatbelt_profile = permissions::macos_seatbelt_profile_path(grok_home);
+        let mut cmd = if seatbelt_profile.exists() {
+            let mut command = std::process::Command::new("/usr/bin/sandbox-exec");
+            command.arg("-f").arg(&seatbelt_profile).arg("grok");
+            command
+        } else {
+            std::process::Command::new("grok")
+        };
+        let environment = GrokProcessEnvironment::resolve(grok_home, process_home, &home::resolve_grok_auth_source())
+            .expect("live probe environment must resolve");
+        environment.apply_to_command(&mut cmd);
+        cmd.arg("-p")
             .arg(prompt)
             .arg("--always-approve")
             .arg("--trust")
