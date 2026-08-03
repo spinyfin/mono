@@ -531,18 +531,20 @@ impl WorkerCompletionHandler {
         execution: &crate::work::WorkExecution,
         bound_pr_url: &str,
     ) -> StopOutcome {
-        let descendant_count = self
+        let descendant_count = match self
             .background_activity_probe
             .live_delegated_descendant_count(&execution.id)
-            .unwrap_or_else(|reason| {
+        {
+            Ok(count) => count,
+            Err(reason) => {
                 tracing::debug!(
                     execution_id = %execution.id,
                     %reason,
-                    "run_done backstop: background-child probe indeterminate — treating as no live \
-                     descendants"
+                    "run_done backstop: background-child probe indeterminate — treating as no live descendants"
                 );
                 0
-            });
+            }
+        };
         let decision = crate::run_done_backstop::decide(
             &self.run_done_silence_tracker,
             &execution.id,
