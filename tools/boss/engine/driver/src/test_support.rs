@@ -154,6 +154,41 @@ impl Drop for GrokHomesOverride {
     }
 }
 
+/// RAII override of `HOME`, obtained from [`home_override`].
+///
+/// Holds [`crate::grok::GROK_HOMES_ENV_TEST_LOCK`] for its whole lifetime
+/// and restores the prior value of the variable on drop, so tests that
+/// redirect any driver home cannot interleave their process-global changes.
+pub struct HomeOverride {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prior: Option<std::ffi::OsString>,
+}
+
+/// Point `HOME` at `home` for as long as the returned guard lives.
+pub fn home_override(home: &Path) -> HomeOverride {
+    let lock = crate::grok::GROK_HOMES_ENV_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let prior = std::env::var_os("HOME");
+    // SAFETY: `lock` is held for the lifetime of the returned guard and
+    // is the process-wide gate on this key, so no other thread is
+    // reading or writing it concurrently. The prior value is restored
+    // in `Drop` before the lock is released.
+    unsafe { std::env::set_var("HOME", home) };
+    HomeOverride { _lock: lock, prior }
+}
+
+impl Drop for HomeOverride {
+    fn drop(&mut self) {
+        match self.prior.as_ref() {
+            // SAFETY: this override still owns the shared environment lock.
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            // SAFETY: this override still owns the shared environment lock.
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+}
+
 /// RAII override of both [`crate::codex::CODEX_HOMES_ROOT_ENV`] and
 /// [`crate::driver::codex::CODEX_AUTH_SOURCE_ENV`], obtained from
 /// [`codex_auth_source_override`].

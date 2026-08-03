@@ -1,8 +1,11 @@
 //! Startup validation for Boss's required local tmux runtime.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use boss_tmux::{MINIMUM_VERSION, Tmux, TmuxVersion};
+
+const TMUX_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Result of resolving and version-checking the one tmux executable the
 /// engine may use for its lifetime.
@@ -23,7 +26,12 @@ impl TmuxPreflight {
             }
         };
         let program = tmux.program().to_path_buf();
-        classify(program, tmux.version().await)
+        match tokio::time::timeout(TMUX_VERSION_PROBE_TIMEOUT, tmux.version()).await {
+            Ok(version) => classify(program, version),
+            Err(_) => Self::Unavailable {
+                reason: timeout_reason(&program),
+            },
+        }
     }
 
     pub fn unavailable_reason(&self) -> Option<&str> {
@@ -32,6 +40,14 @@ impl TmuxPreflight {
             Self::Unavailable { reason } => Some(reason),
         }
     }
+}
+
+fn timeout_reason(program: &std::path::Path) -> String {
+    format!(
+        "tmux at {} did not respond to `tmux -V` within {}s",
+        program.display(),
+        TMUX_VERSION_PROBE_TIMEOUT.as_secs(),
+    )
 }
 
 fn classify(program: PathBuf, version: anyhow::Result<TmuxVersion>) -> TmuxPreflight {
@@ -102,5 +118,12 @@ mod tests {
             ),
             TmuxPreflight::Unavailable { .. }
         ));
+    }
+
+    #[test]
+    fn timeout_reason_names_program_and_duration() {
+        let reason = timeout_reason(std::path::Path::new("/usr/local/bin/tmux"));
+        assert!(reason.contains("/usr/local/bin/tmux"));
+        assert!(reason.contains("within 3s"));
     }
 }

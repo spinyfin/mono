@@ -835,6 +835,7 @@ fn grok_bash_output_text(tool_response: &Value) -> String {
 mod tests {
     use super::*;
     use crate::EnvDirective;
+    use crate::test_support::home_override;
     use crate::{AbsenceDisposition, Capability, MidTurnPaneInput};
     use boss_protocol::{EffortLevel, ReasoningMode};
     use serde_json::json;
@@ -857,7 +858,10 @@ mod tests {
 
     /// Point homes + auth at a temp tree; skip live inspect when requested.
     struct EnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
+        // Present unless `HOME` is already guarded by `HomeOverride`.
+        // In either case, the environment remains serialised for this guard's
+        // lifetime.
+        _lock: Option<std::sync::MutexGuard<'static, ()>>,
         _transcript_store: crate::test_support::TranscriptStoreOverride,
         prior_homes: Option<std::ffi::OsString>,
         prior_auth: Option<std::ffi::OsString>,
@@ -866,7 +870,8 @@ mod tests {
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            // SAFETY: lock held for the lifetime of this guard.
+            // SAFETY: either this guard owns ENV_LOCK or the HomeOverride
+            // declared before it still owns that same lock.
             restore(GROK_HOMES_ROOT_ENV, self.prior_homes.as_ref());
             restore(GROK_AUTH_SOURCE_ENV, self.prior_auth.as_ref());
             restore(GROK_SKIP_POSTURE_ASSERT_ENV, self.prior_skip.as_ref());
@@ -882,6 +887,21 @@ mod tests {
 
     fn env_for_provision(homes: &Path, auth_src: &Path, skip_inspect: bool) -> EnvGuard {
         let lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        env_for_provision_with_lock(homes, auth_src, skip_inspect, Some(lock))
+    }
+
+    /// Configure provision-specific variables while `HOME` is guarded by
+    /// [`home_override`], which already owns `ENV_LOCK`.
+    fn env_for_provision_with_home_override(homes: &Path, auth_src: &Path, skip_inspect: bool) -> EnvGuard {
+        env_for_provision_with_lock(homes, auth_src, skip_inspect, None)
+    }
+
+    fn env_for_provision_with_lock(
+        homes: &Path,
+        auth_src: &Path,
+        skip_inspect: bool,
+        lock: Option<std::sync::MutexGuard<'static, ()>>,
+    ) -> EnvGuard {
         let prior_homes = std::env::var_os(GROK_HOMES_ROOT_ENV);
         let prior_auth = std::env::var_os(GROK_AUTH_SOURCE_ENV);
         let prior_skip = std::env::var_os(GROK_SKIP_POSTURE_ASSERT_ENV);
@@ -1504,8 +1524,6 @@ mod tests {
         fs::create_dir_all(&workspace).unwrap();
         let auth = tmp.path().join("source-auth.json");
         write_fake_auth(&auth);
-        let _guard = env_for_provision(&homes, &auth, true);
-
         // Fake real HOME with a fake login keychain — the actual macOS
         // credential store `gh auth login` writes the OAuth token to.
         let real_home = tmp.path().join("real-home");
@@ -1513,9 +1531,8 @@ mod tests {
         fs::create_dir_all(&keychain_dir).unwrap();
         let keychain_file = keychain_dir.join("login.keychain-db");
         fs::write(&keychain_file, b"fake-keychain-bytes").unwrap();
-        let prior_home = std::env::var_os("HOME");
-        // SAFETY: serialised by ENV_LOCK, held via _guard for this test's lifetime.
-        unsafe { std::env::set_var("HOME", &real_home) };
+        let _home = home_override(&real_home);
+        let _guard = env_for_provision_with_home_override(&homes, &auth, true);
 
         let driver = GrokDriver::default();
         let state = driver
@@ -1536,11 +1553,6 @@ mod tests {
             "login.keychain-db must be a symlink, never a copy"
         );
         assert_eq!(fs::read_link(&bridged).unwrap(), keychain_file);
-
-        match prior_home {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
     }
 
     #[tokio::test]
@@ -1551,14 +1563,11 @@ mod tests {
         fs::create_dir_all(&workspace).unwrap();
         let auth = tmp.path().join("source-auth.json");
         write_fake_auth(&auth);
-        let _guard = env_for_provision(&homes, &auth, true);
-
         // Real HOME exists but has no login keychain (e.g. a non-macOS host).
         let real_home = tmp.path().join("real-home-no-keychain");
         fs::create_dir_all(&real_home).unwrap();
-        let prior_home = std::env::var_os("HOME");
-        // SAFETY: serialised by ENV_LOCK, held via _guard for this test's lifetime.
-        unsafe { std::env::set_var("HOME", &real_home) };
+        let _home = home_override(&real_home);
+        let _guard = env_for_provision_with_home_override(&homes, &auth, true);
 
         let driver = GrokDriver::default();
         let state = driver
@@ -1575,11 +1584,6 @@ mod tests {
                 .exists(),
             "must not create a login-keychain bridge when the host has no source keychain"
         );
-
-        match prior_home {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
     }
 
     #[test]
