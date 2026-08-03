@@ -256,6 +256,9 @@ impl ExecutionCoordinator {
     /// the auto-dispatcher in a race, terminal, or unknown), or when
     /// the target pool is already at its hard cap with no idle slot.
     pub async fn force_dispatch(self: &Arc<Self>, execution_id: &str) -> Result<String> {
+        if let Some(reason) = self.dispatch_preflight_block_reason() {
+            return Err(anyhow!("local dispatch is unavailable: {reason}"));
+        }
         let execution = self
             .work_db
             .get_execution(execution_id)
@@ -734,6 +737,10 @@ impl ExecutionCoordinator {
     /// automation run at once. See [`crate::dispatch_spillover`] for the
     /// policy and its rationale.
     pub(super) async fn drain_ready_queue(self: &Arc<Self>) -> DrainOutcome {
+        if let Some(reason) = self.dispatch_preflight_block_reason() {
+            tracing::error!(%reason, "local dispatch held by startup preflight");
+            return DrainOutcome::QueueEmpty;
+        }
         // Global pause gate. `pr_review` executions are the lifecycle of a
         // change already in flight, not new work, so an operator-originated
         // pause exempts them — they keep draining into the review pool while

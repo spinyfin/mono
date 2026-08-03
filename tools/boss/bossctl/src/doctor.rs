@@ -19,6 +19,37 @@ use boss_engine::dispatch_reader::{self, DamagedLine, is_terminal_event};
 use serde::Serialize;
 use serde_json::Value;
 
+/// Run the same tmux preflight as engine startup so an operator can diagnose
+/// a blocked local dispatcher without first starting the app.
+pub async fn run_tmux_preflight(json: bool) -> Result<()> {
+    let preflight = boss_engine::tmux_preflight::TmuxPreflight::probe().await;
+    match preflight {
+        boss_engine::tmux_preflight::TmuxPreflight::Ready { program, version } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ready": true,
+                        "program": program,
+                        "version": format!("{}.{}", version.major, version.minor),
+                    })
+                );
+            } else {
+                println!("tmux ready: {} {}.{}", program.display(), version.major, version.minor);
+            }
+            Ok(())
+        }
+        boss_engine::tmux_preflight::TmuxPreflight::Unavailable { reason } => {
+            if json {
+                println!("{}", serde_json::json!({ "ready": false, "reason": reason }));
+            } else {
+                eprintln!("tmux unavailable: {reason}");
+            }
+            anyhow::bail!("tmux preflight failed")
+        }
+    }
+}
+
 /// Warn threshold for SIG-1 recomputed `worker_claimed` stalls (2 min).
 pub const SIG1_WARN_MS: u128 = 120_000;
 /// Critical / persistent-stall threshold (5 min) — matches

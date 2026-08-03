@@ -1946,6 +1946,11 @@ pub struct ExecutionCoordinator {
     /// `is_dispatch_paused()`-style call sites) to become `async`.
     #[builder(default)]
     dispatch_paused_reason: std::sync::Mutex<Option<String>>,
+    /// Startup capability gate for the local tmux runtime. Unlike the
+    /// operator/breaker pause state this is not user-resumable: a worker
+    /// cannot be dispatched until the engine has recorded a passing probe.
+    #[builder(default)]
+    dispatch_preflight_block_reason: std::sync::Mutex<Option<String>>,
     /// Global automation-pause flag — independent of `dispatch_paused`. When
     /// `true`: `drain_ready_queue` holds every execution bound for the
     /// automation pool (see [`Self::execution_targets_automation_pool`]),
