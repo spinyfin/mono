@@ -260,6 +260,23 @@ async fn send_keys_never_sends_a_standalone_semicolon_chunk() {
     assert!(calls.iter().flatten().all(|argument| argument != ";"));
 }
 
+#[tokio::test(start_paused = true)]
+async fn send_keys_escapes_a_standalone_semicolon() {
+    let (tmux, runner) = tmux([success(""), success("")]);
+    tmux.send_keys("boss-1", ";").await.unwrap();
+    let calls = runner.calls();
+    assert_eq!(calls[0].last().unwrap(), "\\;");
+    assert!(calls.iter().flatten().all(|argument| argument != ";"));
+}
+
+#[test]
+fn utf8_chunks_backtracks_to_a_character_boundary_before_a_trailing_semicolon() {
+    let text = format!("{}é;", "x".repeat(DEFAULT_SEND_CHUNK_BYTES - 2));
+    let chunks = utf8_chunks(&text, DEFAULT_SEND_CHUNK_BYTES);
+    assert_eq!(chunks.concat(), text);
+    assert!(chunks.iter().all(|chunk| *chunk != ";"));
+}
+
 #[tokio::test]
 async fn new_session_validation_rejections_do_not_run_tmux() {
     let cases = [

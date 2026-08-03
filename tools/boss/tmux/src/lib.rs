@@ -182,6 +182,7 @@ impl Tmux {
             bail!("tmux key input cannot contain NUL");
         }
         for chunk in utf8_chunks(text, DEFAULT_SEND_CHUNK_BYTES) {
+            let chunk = if chunk == ";" { "\\;" } else { chunk };
             let mut args = self.server_args();
             args.extend([
                 "send-keys".into(),
@@ -281,8 +282,11 @@ fn utf8_chunks(text: &str, max_bytes: usize) -> Vec<&str> {
         while !text.is_char_boundary(end) {
             end -= 1;
         }
-        if &text[end..] == ";" {
+        if end > start && &text[end..] == ";" {
             end -= 1;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
         }
         chunks.push(&text[start..end]);
         start = end;
