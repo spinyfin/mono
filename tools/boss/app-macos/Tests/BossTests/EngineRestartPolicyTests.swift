@@ -38,7 +38,7 @@ final class EngineRestartPolicyTests: XCTestCase {
         XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .restart(attempt: 1, delay: 1))
         XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .restart(attempt: 2, delay: 2))
         XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .gaveUp(attempts: 2))
-        XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .gaveUp(attempts: 2))
+        XCTAssertEqual(supervisor.tick(isAlive: false, now: now), .wait)
     }
 
     func testHealthyIntervalReplenishesExhaustedBudget() {

@@ -423,9 +423,11 @@ final class EngineProcessController: @unchecked Sendable {
     /// making the engine an app child, and serializing this work prevents two
     /// timer ticks from launching competing replacements.
     private func enableSupervision(resetRestartBudget: Bool) {
+        // Set this before hopping onto the supervision queue so a later
+        // `stop()` always wins, even if this queued block has not run yet.
+        setSupervisionStopped(false)
         supervisionQueue.async { [weak self] in
             guard let self else { return }
-            self.setSupervisionStopped(false)
             if resetRestartBudget {
                 self.supervisor.reset()
             }

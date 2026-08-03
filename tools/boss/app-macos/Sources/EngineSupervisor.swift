@@ -42,7 +42,7 @@ struct EngineSupervisor: Sendable {
 
         engineBecameHealthyAt = nil
         guard !restartBudgetExhausted else {
-            return .gaveUp(attempts: restartAttempts)
+            return .wait
         }
         let attempt = restartAttempts + 1
         guard attempt <= policy.maximumAttempts else {
