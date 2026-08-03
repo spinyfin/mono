@@ -521,6 +521,59 @@ impl WorkDb {
         Ok(updated > 0)
     }
 
+    /// Record the durable intent to create a tmux session for this execution's
+    /// current run. The tmux spawn path will call this before it invokes tmux,
+    /// making a session whose token is absent from the DB unambiguously leaked.
+    ///
+    /// No production path calls this yet; tmux identity is written only once
+    /// tmux-hosted spawning is enabled.
+    pub fn record_tmux_spawn_intent_for_execution(
+        &self,
+        execution_id: &str,
+        server_label: &str,
+        session_name: &str,
+        spawn_token: &str,
+    ) -> Result<bool> {
+        let conn = self.connect()?;
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
+            return Ok(false);
+        };
+        let updated = conn.execute(
+            "UPDATE work_runs
+             SET tmux_server_label = ?2,
+                 tmux_session_name = ?3,
+                 tmux_spawn_token = ?4,
+                 tmux_spawn_state = 'intended',
+                 tmux_pane_pid = NULL
+             WHERE id = ?1",
+            params![run_id, server_label, session_name, spawn_token],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Confirm that tmux created the session identified by `spawn_token` and
+    /// report the initial pane pid it returned. The token, rather than a fresh
+    /// resolution of `execution_id`, identifies the row that received the
+    /// intent write; an execution can acquire sibling run rows between the two
+    /// writes. Kept separate from intent persistence so a crash between the DB
+    /// commit and `tmux new-session` remains visible as
+    /// `tmux_spawn_state = 'intended'` to the adoption pass.
+    pub fn record_tmux_session_created_for_execution(
+        &self,
+        execution_id: &str,
+        spawn_token: &str,
+        pane_pid: i64,
+    ) -> Result<bool> {
+        let conn = self.connect()?;
+        let updated = conn.execute(
+            "UPDATE work_runs
+             SET tmux_spawn_state = 'created', tmux_pane_pid = ?3
+             WHERE execution_id = ?1 AND tmux_spawn_token = ?2",
+            params![execution_id, spawn_token, pane_pid],
+        )?;
+        Ok(updated > 0)
+    }
+
     /// Stamp `at` (ISO-8601 UTC) as the moment this execution's current run
     /// delivered a turn boundary — the durable "the worker produced a terminal
     /// result" record.
@@ -765,6 +818,48 @@ impl WorkDb {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Local, non-terminal worker runs whose tmux identity was durably
+    /// recorded. The startup adoption pass enumerates tmux separately and
+    /// performs an exact token match against this set; neither a session name
+    /// nor a pane pid is sufficient to adopt a process safely.
+    ///
+    /// A run remains eligible while its spawn state is `intended`, because a
+    /// crash after `tmux new-session` but before its confirmation write leaves
+    /// precisely that recoverable signature.
+    pub fn list_adoptable_tmux_runs(&self) -> Result<Vec<TmuxRunHandle>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT r.id, r.execution_id, r.agent_id, r.transcript_path,
+                    r.tmux_server_label, r.tmux_session_name, r.tmux_spawn_token,
+                    r.tmux_spawn_state, r.tmux_pane_pid
+             FROM work_runs r
+             JOIN work_executions e ON e.id = r.execution_id
+             WHERE r.status = 'active'
+               AND r.host_id = 'local'
+               AND r.tmux_spawn_token IS NOT NULL
+               AND r.tmux_server_label IS NOT NULL
+               AND r.tmux_session_name IS NOT NULL
+               AND r.tmux_spawn_state IS NOT NULL
+               AND e.status NOT IN
+                   ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+             ORDER BY r.created_at ASC, r.id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(TmuxRunHandle {
+                run_id: row.get(0)?,
+                execution_id: row.get(1)?,
+                agent_id: row.get(2)?,
+                transcript_path: row.get(3)?,
+                tmux_server_label: row.get(4)?,
+                tmux_session_name: row.get(5)?,
+                tmux_spawn_token: row.get(6)?,
+                tmux_spawn_state: row.get(7)?,
+                tmux_pane_pid: row.get(8)?,
+            })
+        })?;
+        collect_rows(rows)
     }
 
     /// Test-only helper: force `transcript_path` back to NULL on an

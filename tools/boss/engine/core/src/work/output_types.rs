@@ -61,6 +61,33 @@ pub struct RemoteRunHandle {
     pub remote_pid: Option<i64>,
 }
 
+/// One local, non-terminal worker run carrying the durable identity of a tmux
+/// session. [`WorkDb::list_adoptable_tmux_runs`] returns these rows for the
+/// boot-time adoption pass; callers must match sessions only by the full
+/// opaque `tmux_spawn_token`, never by the human-readable session name.
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct TmuxRunHandle {
+    /// `work_runs.id` (`run_*`).
+    pub run_id: String,
+    /// `work_runs.execution_id` (`exec_*`).
+    pub execution_id: String,
+    /// Pool worker identity used to reclaim the recorded slot.
+    pub agent_id: String,
+    /// Transcript to resume after re-adopting the live worker, if captured.
+    pub transcript_path: Option<String>,
+    /// Tmux server `-L` label recorded when the session was created.
+    pub tmux_server_label: String,
+    /// Human-readable tmux session name. Not an adoption key.
+    pub tmux_session_name: String,
+    /// Opaque, unique token used for exact-match adoption.
+    pub tmux_spawn_token: String,
+    /// Durable spawn phase: `intended` before creation, `created` after it.
+    pub tmux_spawn_state: String,
+    /// `#{pane_pid}` observed after tmux created the initial pane.
+    pub tmux_pane_pid: Option<i64>,
+}
+
 /// One non-terminal execution whose latest run landed on a host that is
 /// no longer eligible to run it — the host was disabled (operator
 /// `bossctl hosts disable` or the dispatch-health circuit breaker) or

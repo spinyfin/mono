@@ -478,6 +478,33 @@ pub(crate) fn migrate_work_runs_progress_ingress_checkpoint(conn: &Connection) -
     Ok(())
 }
 
+/// Tmux session identity for a single spawned worker run.
+///
+/// All fields stay nullable so legacy and in-flight app-hosted workers retain
+/// their existing reconciliation path. `tmux_spawn_token` is the opaque,
+/// exact-match adoption key; the partial unique index permits legacy NULL
+/// rows while rejecting two runs claiming the same live session.
+pub(crate) fn migrate_work_runs_tmux_columns(conn: &Connection) -> Result<()> {
+    for (column, sql_type) in [
+        ("tmux_server_label", "TEXT"),
+        ("tmux_session_name", "TEXT"),
+        ("tmux_spawn_token", "TEXT"),
+        ("tmux_spawn_state", "TEXT"),
+        ("tmux_pane_pid", "INTEGER"),
+    ] {
+        if !table_has_column(conn, "work_runs", column)? {
+            conn.execute(&format!("ALTER TABLE work_runs ADD COLUMN {column} {sql_type}"), [])?;
+        }
+    }
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS work_runs_tmux_spawn_token_idx
+         ON work_runs(tmux_spawn_token)
+         WHERE tmux_spawn_token IS NOT NULL",
+        [],
+    )?;
+    Ok(())
+}
+
 /// Raw per-run agent usage captured incrementally from transcript records.
 ///
 /// Cache-write tokens keep both the provider's total and its 5-minute /
