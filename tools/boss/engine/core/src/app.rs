@@ -102,6 +102,7 @@ mod sessions;
 mod subscriptions;
 #[cfg(test)]
 mod tests;
+mod tmux_teardown;
 mod trunk_auth;
 mod trust;
 mod work_items;
@@ -1584,6 +1585,10 @@ impl ServerState {
         // Idempotent with the app's reap: a process already gone just
         // yields `ESRCH`. The grace mirrors the app's `kill_grace_seconds`.
         reap_worker_process_tree(shell_pid, Duration::from_secs(5));
+        // tmux-hosted counterpart of the two steps above: a cheap no-op
+        // past one DB read for every run that isn't tmux-hosted (every run
+        // today). See `tmux_teardown` for the token-verified sequence.
+        self.reap_tmux_worker(run_id).await;
         // The engine's WorkerPool slot was held for the lifetime of
         // the libghostty pane (the coordinator deferred its release
         // when `run_execution` returned with `slot_id = Some(N)`).
@@ -1736,6 +1741,10 @@ impl ServerState {
             }
         }
         reap_worker_process_tree(shell_pid, Duration::from_secs(5));
+        // tmux-hosted counterpart, same as `release_worker_pane`'s slot-mapped
+        // path — reaches a tmux-hosted worker the engine lost track of just
+        // as the process-tree signal above does.
+        self.reap_tmux_worker(run_id).await;
         self.transcript_path_cache.forget(run_id);
         self.run_cost_capture.forget(run_id);
         // A live process was signalled, so this IS a reap: the caller may free

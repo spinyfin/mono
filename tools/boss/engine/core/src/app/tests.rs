@@ -205,6 +205,7 @@ mod t04;
 mod t05;
 mod t06;
 mod t07;
+mod tmux_teardown;
 mod trust_authorization;
 mod worker_pane_interaction;
 mod worker_pane_lifecycle;

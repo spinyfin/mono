@@ -885,6 +885,68 @@ impl WorkDb {
         .map_err(Into::into)
     }
 
+    /// The tmux session identity durably recorded for `execution_id`'s
+    /// current run — the read [`crate::app::ServerState::reap_tmux_worker`]
+    /// starts every tmux teardown from. Targets the same row
+    /// [`Self::record_tmux_spawn_intent_for_execution`] /
+    /// [`Self::record_tmux_session_created_for_execution`] wrote, via
+    /// [`resolve_run_id_for_execution_hooks`].
+    ///
+    /// Unlike [`Self::list_adoptable_tmux_runs`], this applies no status
+    /// filtering at all: teardown must find a run's tmux identity even
+    /// after its execution has already gone terminal, which is precisely
+    /// when most teardown calls happen. `None` covers both "never
+    /// tmux-hosted" and "an earlier teardown already cleared the columns" —
+    /// callers must treat both as nothing left to do.
+    pub fn tmux_identity_for_execution(&self, execution_id: &str) -> Result<Option<TmuxIdentity>> {
+        let conn = self.connect()?;
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
+            return Ok(None);
+        };
+        conn.query_row(
+            "SELECT tmux_session_name, tmux_spawn_token, tmux_pane_pid
+             FROM work_runs
+             WHERE id = ?1 AND tmux_session_name IS NOT NULL AND tmux_spawn_token IS NOT NULL",
+            params![run_id],
+            |row| {
+                Ok(TmuxIdentity {
+                    session_name: row.get(0)?,
+                    spawn_token: row.get(1)?,
+                    pane_pid: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Clear the tmux identity columns once teardown has verified and
+    /// destroyed the session — the durable counterpart of
+    /// [`Self::record_tmux_session_created_for_execution`]'s write. Scoped
+    /// to `(execution_id, spawn_token)`, matching that write's own scoping:
+    /// an execution that resumed onto a new run (and therefore a new
+    /// token) between a teardown starting and finishing must not have the
+    /// new run's identity wiped out from under it.
+    ///
+    /// Returns `false` when no row matched — an earlier teardown call
+    /// already cleared it, or the run resumed onto a new token in the
+    /// meantime; both are benign and callers must treat this as a no-op,
+    /// not an error.
+    pub fn clear_tmux_identity_for_execution(&self, execution_id: &str, spawn_token: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let updated = conn.execute(
+            "UPDATE work_runs
+             SET tmux_server_label = NULL,
+                 tmux_session_name = NULL,
+                 tmux_spawn_token = NULL,
+                 tmux_spawn_state = NULL,
+                 tmux_pane_pid = NULL
+             WHERE execution_id = ?1 AND tmux_spawn_token = ?2",
+            params![execution_id, spawn_token],
+        )?;
+        Ok(updated > 0)
+    }
+
     /// Test-only helper: force `transcript_path` back to NULL on an
     /// existing row. Used by the dispatcher regression test to model
     /// the production race where a SessionStart's payload-driven

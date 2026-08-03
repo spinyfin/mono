@@ -21,6 +21,73 @@ use tokio::time::sleep;
 
 use crate::types::validate_value;
 
+/// Environment variable carrying the durable spawn token that identifies
+/// which execution a session belongs to. The sole thing
+/// [`Tmux::kill_session_verified`] trusts to decide whether a session is
+/// the caller's to destroy.
+const BOSS_SPAWN_TOKEN_ENV: &str = "BOSS_SPAWN_TOKEN";
+
+/// Outcome of a successful [`Tmux::kill_session_verified`] call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KillSessionOutcome {
+    /// The session existed, its live token matched, and it has been
+    /// destroyed.
+    Killed,
+    /// No session by that name exists on the private server (or it carries
+    /// no `BOSS_SPAWN_TOKEN` at all) — treated as an already-completed
+    /// teardown, not an error, so repeated calls stay idempotent.
+    Absent,
+}
+
+/// Failure returned by [`Tmux::kill_session_verified`].
+#[derive(Debug)]
+pub enum KillSessionError {
+    /// A session by that name exists, but its live token does not match
+    /// `expected_token`. Refused: the session currently answering to that
+    /// name is not the one the caller recorded, most likely because the
+    /// original session was already destroyed and the name recycled onto a
+    /// different execution. Nothing was signalled or killed.
+    TokenMismatch {
+        session: String,
+        expected: String,
+        actual: String,
+    },
+    /// The underlying `tmux` invocation failed.
+    Tmux(anyhow::Error),
+}
+
+impl std::fmt::Display for KillSessionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TokenMismatch {
+                session,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "refusing to kill tmux session {session:?}: live token {actual:?} does not match the \
+                 expected {expected:?}",
+            ),
+            Self::Tmux(err) => write!(formatter, "{err:#}"),
+        }
+    }
+}
+
+impl std::error::Error for KillSessionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TokenMismatch { .. } => None,
+            Self::Tmux(err) => err.source(),
+        }
+    }
+}
+
+impl From<anyhow::Error> for KillSessionError {
+    fn from(err: anyhow::Error) -> Self {
+        Self::Tmux(err)
+    }
+}
+
 /// Handle for one resolved tmux executable and Boss's private server.
 #[derive(Clone)]
 pub struct Tmux {
@@ -208,8 +275,45 @@ impl Tmux {
         Ok(self.invoke(args).await?.stdout)
     }
 
-    /// Destroys exactly one named session on Boss's private server.
-    pub async fn kill_session(&self, session: &str) -> Result<()> {
+    /// Destroys `session` only after confirming its live `BOSS_SPAWN_TOKEN`
+    /// matches `expected_token` exactly — the sole sanctioned way to kill a
+    /// Boss-owned tmux session. This crate deliberately exposes no "kill by
+    /// name alone" entry point: a caller that has not durably recorded the
+    /// token it expects cannot destroy anything through this API.
+    ///
+    /// `Ok(Absent)` means the session was already gone (or never carried a
+    /// Boss token), which is treated as an idempotent success rather than
+    /// an error so repeated teardown calls stay safe.
+    /// `Err(KillSessionError::TokenMismatch)` means a session answers to
+    /// `session`, but with a *different* token: refuses to touch it, since
+    /// destroying it would tear down a worker this caller does not own —
+    /// this is the guard against a session name recycled onto a different
+    /// execution after the original session was destroyed.
+    pub async fn kill_session_verified(
+        &self,
+        session: &str,
+        expected_token: &str,
+    ) -> std::result::Result<KillSessionOutcome, KillSessionError> {
+        validate_value("session name", session)?;
+        validate_value("expected token", expected_token)?;
+        match self.show_environment(session, BOSS_SPAWN_TOKEN_ENV).await? {
+            None => Ok(KillSessionOutcome::Absent),
+            Some(actual) if actual == expected_token => {
+                self.kill_session_unchecked(session).await?;
+                Ok(KillSessionOutcome::Killed)
+            }
+            Some(actual) => Err(KillSessionError::TokenMismatch {
+                session: session.to_owned(),
+                expected: expected_token.to_owned(),
+                actual,
+            }),
+        }
+    }
+
+    /// Low-level `kill-session -t <name>`, with no identity verification.
+    /// Private: [`Self::kill_session_verified`] is this crate's only public
+    /// teardown entry point, by design — see its doc comment.
+    async fn kill_session_unchecked(&self, session: &str) -> Result<()> {
         validate_value("session name", session)?;
         let mut args = self.server_args();
         args.extend(["kill-session".into(), "-t".into(), session.into()]);
