@@ -200,7 +200,7 @@ mod apply_permission_extra_args_tests {
 
         let extra_args = vec![
             "--sandbox".to_owned(),
-            "boss-workspace".to_owned(),
+            "off".to_owned(),
             "--deny".to_owned(),
             "Bash(rm -rf *)".to_owned(),
         ];
@@ -209,7 +209,7 @@ mod apply_permission_extra_args_tests {
         // Every token — including flag names — comes back individually
         // shell-quoted (`boss_ssh_transport::shell_quote` applied per
         // element), not just values.
-        assert!(merged.contains("'--sandbox' 'boss-workspace'"), "{merged}");
+        assert!(merged.contains("'--sandbox' 'off'"), "{merged}");
         assert!(merged.contains("'--deny' 'Bash(rm -rf *)'"), "{merged}");
         assert_eq!(
             merged.matches('\n').count(),
