@@ -33,7 +33,8 @@ impl StubRunner {
 
 #[async_trait]
 impl CommandRunner for StubRunner {
-    async fn run(&self, program: &Path, args: &[OsString]) -> std::io::Result<CommandOutput> {
+    async fn run(&self, program: &Path, args: &[OsString], cwd: Option<&Path>) -> std::io::Result<CommandOutput> {
+        assert!(cwd.is_none(), "tmux commands must not change the process directory");
         self.calls.lock().unwrap().push((
             program.to_path_buf(),
             args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect(),
@@ -211,7 +212,7 @@ async fn standard_tmux_options_are_supported() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn send_keys_chunks_utf8_then_submits_in_a_separate_command() {
     let text = format!("{}é", "x".repeat(DEFAULT_SEND_CHUNK_BYTES));
     let (tmux, runner) = tmux([success(""), success(""), success("")]);
@@ -226,10 +227,101 @@ async fn send_keys_chunks_utf8_then_submits_in_a_separate_command() {
                 "-t",
                 "boss-1",
                 "-l",
+                "--",
                 "x".repeat(DEFAULT_SEND_CHUNK_BYTES).as_str()
             ],
-            vec!["-L", "boss", "send-keys", "-t", "boss-1", "-l", "é"],
+            vec!["-L", "boss", "send-keys", "-t", "boss-1", "-l", "--", "é"],
             vec!["-L", "boss", "send-keys", "-t", "boss-1", "C-m"],
         ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn send_keys_marks_dash_prefixed_literal_input_as_an_argument() {
+    let (tmux, runner) = tmux([success(""), success("")]);
+    tmux.send_keys("boss-1", "-R dashdash").await.unwrap();
+    assert_eq!(
+        runner.calls(),
+        vec![
+            vec!["-L", "boss", "send-keys", "-t", "boss-1", "-l", "--", "-R dashdash"],
+            vec!["-L", "boss", "send-keys", "-t", "boss-1", "C-m"],
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn send_keys_never_sends_a_standalone_semicolon_chunk() {
+    let text = format!("{};", "x".repeat(DEFAULT_SEND_CHUNK_BYTES));
+    let (tmux, runner) = tmux([success(""), success(""), success("")]);
+    tmux.send_keys("boss-1", &text).await.unwrap();
+    let calls = runner.calls();
+    assert_eq!(calls[0].last().unwrap(), &"x".repeat(DEFAULT_SEND_CHUNK_BYTES - 1));
+    assert_eq!(calls[1].last().unwrap(), "x;");
+    assert!(calls.iter().flatten().all(|argument| argument != ";"));
+}
+
+#[tokio::test]
+async fn new_session_validation_rejections_do_not_run_tmux() {
+    let cases = [
+        (
+            NewSession {
+                name: "boss-1".to_owned(),
+                environment: Default::default(),
+                working_directory: PathBuf::from("relative"),
+                command: "exec codex".to_owned(),
+            },
+            "working directory must be absolute",
+        ),
+        (
+            NewSession {
+                name: String::new(),
+                environment: Default::default(),
+                working_directory: PathBuf::from("/workspace"),
+                command: "exec codex".to_owned(),
+            },
+            "session name cannot be empty",
+        ),
+        (
+            NewSession {
+                name: "boss-1".to_owned(),
+                environment: Default::default(),
+                working_directory: PathBuf::from("/workspace"),
+                command: String::new(),
+            },
+            "session command cannot be empty",
+        ),
+        (
+            NewSession {
+                name: "boss-1".to_owned(),
+                environment: [("BAD=NAME".to_owned(), "value".to_owned())].into(),
+                working_directory: PathBuf::from("/workspace"),
+                command: "exec codex".to_owned(),
+            },
+            "environment name cannot contain '='",
+        ),
+    ];
+    for (session, expected_error) in cases {
+        let (tmux, runner) = tmux([]);
+        let error = tmux.new_session(&session).await.unwrap_err();
+        assert!(error.to_string().contains(expected_error), "error was: {error:#}");
+        assert!(runner.calls().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn command_failures_include_the_argv_and_stderr() {
+    let (tmux, _) = tmux([failure("session not found: boss-1")]);
+    let error = tmux.kill_session("boss-1").await.unwrap_err().to_string();
+    assert!(error.contains("kill-session"), "error was: {error}");
+    assert!(error.contains("session not found: boss-1"), "error was: {error}");
+}
+
+#[tokio::test]
+async fn show_environment_rejects_unexpected_output() {
+    let (tmux, _) = tmux([success("OTHER=value\n")]);
+    let error = tmux.show_environment("boss-1", "NAME").await.unwrap_err().to_string();
+    assert!(
+        error.contains("unexpected tmux environment output"),
+        "error was: {error}"
     );
 }

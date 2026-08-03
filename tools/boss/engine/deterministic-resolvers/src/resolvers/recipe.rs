@@ -209,6 +209,7 @@ mod tests {
         CommandOutput {
             success: true,
             code: Some(0),
+            stdout: String::new(),
             stderr: String::new(),
         }
     }
@@ -217,6 +218,7 @@ mod tests {
         CommandOutput {
             success: false,
             code: Some(1),
+            stdout: String::new(),
             stderr: stderr.to_owned(),
         }
     }

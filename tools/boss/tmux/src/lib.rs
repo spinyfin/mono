@@ -1,13 +1,12 @@
 //! Typed control surface for Boss's private tmux server.
 //!
-//! Every command is scoped to `tmux -L boss`; this crate never touches the
-//! operator's default tmux server. The process runner is injectable so callers
+//! Every command is scoped to `tmux -L boss`, so Boss's sessions are isolated
+//! from any tmux server running on the default socket. The process runner is injectable so callers
 //! can test command construction without a live tmux daemon.
 
-mod runner;
 mod types;
 
-pub use runner::{CommandOutput, CommandRunner, RealCommandRunner};
+pub use boss_command_runner::{CommandOutput, CommandRunner, RealCommandRunner};
 pub use types::{
     DEFAULT_SEND_CHUNK_BYTES, DEFAULT_SEND_CHUNK_DELAY, DisplayField, MINIMUM_VERSION, NewSession, SERVER_LABEL,
     Session, TmuxVersion,
@@ -141,7 +140,7 @@ impl Tmux {
     /// Sets a per-session tmux option such as `@boss_spawn_token`.
     pub async fn set_option(&self, session: &str, option: &str, value: &str) -> Result<()> {
         validate_value("session name", session)?;
-        validate_option(option)?;
+        validate_value("option name", option)?;
         validate_value("option value", value)?;
         let mut args = self.server_args();
         args.extend([
@@ -157,7 +156,7 @@ impl Tmux {
     /// Reads one per-session tmux option, returning `None` when it is unset.
     pub async fn show_option(&self, session: &str, option: &str) -> Result<Option<String>> {
         validate_value("session name", session)?;
-        validate_option(option)?;
+        validate_value("option name", option)?;
         let mut args = self.server_args();
         args.extend([
             "show-options".into(),
@@ -189,6 +188,7 @@ impl Tmux {
                 "-t".into(),
                 session.into(),
                 "-l".into(),
+                "--".into(),
                 chunk.into(),
             ]);
             self.invoke(args).await?;
@@ -244,7 +244,7 @@ impl Tmux {
 
     async fn run(&self, args: &[OsString]) -> Result<CommandOutput> {
         self.runner
-            .run(&self.program, args)
+            .run(&self.program, args, None)
             .await
             .with_context(|| format!("spawning tmux executable {:?}", self.program))
     }
@@ -259,11 +259,6 @@ fn parse_session(line: &str) -> Result<Session> {
         name: name.to_owned(),
         spawn_token: (!token.is_empty()).then(|| token.to_owned()),
     })
-}
-
-fn validate_option(option: &str) -> Result<()> {
-    validate_value("option name", option)?;
-    Ok(())
 }
 
 fn command_failed<T>(args: &[OsString], output: &CommandOutput) -> Result<T> {
@@ -284,6 +279,9 @@ fn utf8_chunks(text: &str, max_bytes: usize) -> Vec<&str> {
     while start < text.len() {
         let mut end = (start + max_bytes).min(text.len());
         while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if &text[end..] == ";" {
             end -= 1;
         }
         chunks.push(&text[start..end]);

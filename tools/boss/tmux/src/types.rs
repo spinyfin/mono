@@ -10,7 +10,7 @@ pub const SERVER_LABEL: &str = "boss";
 pub const MINIMUM_VERSION: TmuxVersion = TmuxVersion { major: 3, minor: 2 };
 /// A conservative literal-input size that remains below command-line limits.
 pub const DEFAULT_SEND_CHUNK_BYTES: usize = 900;
-/// Delay between literal chunks, preserving the observed reliable delivery shape.
+/// Delay between literal chunks, giving the pane's reader time to drain input so long pastes are not truncated.
 pub const DEFAULT_SEND_CHUNK_DELAY: Duration = Duration::from_millis(30);
 
 /// A tmux version's numeric compatibility components.

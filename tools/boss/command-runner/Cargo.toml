@@ -1,0 +1,9 @@
+[package]
+name = "boss-command-runner"
+version.workspace = true
+edition.workspace = true
+workspace = "../../.."
+
+[dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
