@@ -89,6 +89,7 @@ impl ExecutionCoordinator {
             dispatch_paused_since_epoch_s: AtomicU64::new(0),
             dispatch_pause_exempts_reviews: AtomicBool::new(false),
             dispatch_paused_reason: std::sync::Mutex::new(None),
+            dispatch_preflight_block_reason: std::sync::Mutex::new(None),
             automation_paused: AtomicBool::new(false),
             automation_paused_since_epoch_s: AtomicU64::new(0),
             automation_paused_reason: std::sync::Mutex::new(None),
@@ -465,6 +466,19 @@ impl ExecutionCoordinator {
     /// [`Self::pause_dispatch`] / [`Self::resume_dispatch`].
     pub fn dispatch_paused_reason(&self) -> Option<String> {
         self.dispatch_paused_reason.lock().unwrap().clone()
+    }
+
+    /// Block all local dispatch until the required startup capability is
+    /// available. This deliberately does not share the resumable dispatch
+    /// pause state: breaker recovery and an operator resume must not lift a
+    /// failed runtime preflight.
+    pub fn set_dispatch_preflight_block(&self, reason: Option<String>) {
+        *self.dispatch_preflight_block_reason.lock().unwrap() = reason;
+    }
+
+    /// The reason local dispatch is blocked by startup preflight, if any.
+    pub fn dispatch_preflight_block_reason(&self) -> Option<String> {
+        self.dispatch_preflight_block_reason.lock().unwrap().clone()
     }
 
     /// Pause automation-originated activity — independent of

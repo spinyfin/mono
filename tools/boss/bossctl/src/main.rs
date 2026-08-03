@@ -137,6 +137,11 @@ enum Command {
         #[command(subcommand)]
         action: LiveStatusAction,
     },
+    /// Run local runtime diagnostics that do not require an engine connection.
+    Doctor {
+        #[command(subcommand)]
+        action: DoctorAction,
+    },
     /// Pause one or more Boss systems in a single call. Defaults to every
     /// pausable system when no SYSTEMS are given — `bossctl pause` alone
     /// pauses everything the systems registry currently knows about, so
@@ -853,6 +858,13 @@ enum AgentsAction {
 }
 
 #[derive(Subcommand, Debug)]
+enum DoctorAction {
+    /// Verify that the tmux required for durable worker sessions is installed,
+    /// executable, and supports session environment variables.
+    Tmux,
+}
+
+#[derive(Subcommand, Debug)]
 enum WorkAction {
     /// Request the engine schedule a work item for execution.
     Start {
@@ -1370,6 +1382,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::LiveStatus {
             action: LiveStatusAction::Debug,
         } => live_status_debug(&cli.socket_path, cli.json).await,
+        Command::Doctor {
+            action: DoctorAction::Tmux,
+        } => doctor::run_tmux_preflight(cli.json).await,
         Command::Dispatch {
             action:
                 DispatchAction::Tail {

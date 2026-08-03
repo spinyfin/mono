@@ -23,25 +23,7 @@ impl TmuxPreflight {
             }
         };
         let program = tmux.program().to_path_buf();
-        match tmux.version().await {
-            Ok(version) if version >= MINIMUM_VERSION => Self::Ready { program, version },
-            Ok(version) => Self::Unavailable {
-                reason: format!(
-                    "Boss requires tmux {}.{} or newer, but {} is tmux {}.{}. Install it with `brew install tmux`.",
-                    MINIMUM_VERSION.major,
-                    MINIMUM_VERSION.minor,
-                    program.display(),
-                    version.major,
-                    version.minor,
-                ),
-            },
-            Err(error) => Self::Unavailable {
-                reason: format!(
-                    "Boss could not run tmux at {}: {error}. Install or repair it with `brew install tmux`.",
-                    program.display(),
-                ),
-            },
-        }
+        classify(program, tmux.version().await)
     }
 
     pub fn unavailable_reason(&self) -> Option<&str> {
@@ -49,6 +31,28 @@ impl TmuxPreflight {
             Self::Ready { .. } => None,
             Self::Unavailable { reason } => Some(reason),
         }
+    }
+}
+
+fn classify(program: PathBuf, version: anyhow::Result<TmuxVersion>) -> TmuxPreflight {
+    match version {
+        Ok(version) if version.supports_session_environment() => TmuxPreflight::Ready { program, version },
+        Ok(version) => TmuxPreflight::Unavailable {
+            reason: format!(
+                "Boss requires tmux {}.{} or newer, but {} is tmux {}.{}. Install it with `brew install tmux`.",
+                MINIMUM_VERSION.major,
+                MINIMUM_VERSION.minor,
+                program.display(),
+                version.major,
+                version.minor,
+            ),
+        },
+        Err(error) => TmuxPreflight::Unavailable {
+            reason: format!(
+                "Boss could not run tmux at {}: {error}. Install or repair it with `brew install tmux`.",
+                program.display(),
+            ),
+        },
     }
 }
 
@@ -68,5 +72,35 @@ mod tests {
         let reason = missing_tmux_reason("not found");
         assert!(reason.contains("3.2"));
         assert!(reason.contains("brew install tmux"));
+    }
+
+    #[test]
+    fn below_floor_version_is_unavailable_with_both_versions() {
+        let preflight = classify(
+            PathBuf::from("/usr/local/bin/tmux"),
+            Ok(TmuxVersion { major: 3, minor: 1 }),
+        );
+        let reason = preflight.unavailable_reason().expect("below floor is unavailable");
+        assert!(reason.contains("3.1"));
+        assert!(reason.contains("3.2"));
+    }
+
+    #[test]
+    fn floor_version_is_ready() {
+        assert!(matches!(
+            classify(PathBuf::from("/usr/local/bin/tmux"), Ok(MINIMUM_VERSION)),
+            TmuxPreflight::Ready { .. }
+        ));
+    }
+
+    #[test]
+    fn execution_failure_is_unavailable() {
+        assert!(matches!(
+            classify(
+                PathBuf::from("/usr/local/bin/tmux"),
+                Err(anyhow::anyhow!("permission denied")),
+            ),
+            TmuxPreflight::Unavailable { .. }
+        ));
     }
 }
