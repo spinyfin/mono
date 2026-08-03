@@ -214,9 +214,9 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     ),
     entry(
         crate::stale_worker_sweep::STALE_WORKER_ATTENTION_KIND,
-        ClearedBy::HumanDecision,
-        "Tmux can prove a worker is quiet but cannot prove why. The attention deliberately remains \
-         open until an operator inspects the retained session and decides whether to stop or resume it.",
+        ClearedBy::ProducerReconciles,
+        "The stale-worker sweep rechecks tmux evidence every pass and resolves this attention when the \
+         same worker resumes terminal activity or terminalizes.",
     ),
     // ── Cleared by a later completed pass of the same kind ──────────────
     entry(

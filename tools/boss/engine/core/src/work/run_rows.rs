@@ -862,6 +862,38 @@ impl WorkDb {
         collect_rows(rows)
     }
 
+    /// Return the newest active local tmux run for one execution.
+    pub fn tmux_run_for_execution(&self, execution_id: &str) -> Result<Option<TmuxRunHandle>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT r.id, r.execution_id, r.agent_id, r.transcript_path,
+                    r.tmux_server_label, r.tmux_session_name, r.tmux_spawn_token,
+                    r.tmux_spawn_state, r.tmux_pane_pid
+             FROM work_runs r JOIN work_executions e ON e.id = r.execution_id
+             WHERE r.execution_id = ?1 AND r.status = 'active' AND r.host_id = 'local'
+               AND r.tmux_spawn_token IS NOT NULL AND r.tmux_server_label IS NOT NULL
+               AND r.tmux_session_name IS NOT NULL AND r.tmux_spawn_state IS NOT NULL
+               AND e.status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+             ORDER BY r.created_at DESC, r.id DESC LIMIT 1",
+            params![execution_id],
+            |row| {
+                Ok(TmuxRunHandle {
+                    run_id: row.get(0)?,
+                    execution_id: row.get(1)?,
+                    agent_id: row.get(2)?,
+                    transcript_path: row.get(3)?,
+                    tmux_server_label: row.get(4)?,
+                    tmux_session_name: row.get(5)?,
+                    tmux_spawn_token: row.get(6)?,
+                    tmux_spawn_state: row.get(7)?,
+                    tmux_pane_pid: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// Resolve the execution id behind a tmux spawn token, independent of the
     /// execution's terminal status — unlike [`Self::list_adoptable_tmux_runs`],
     /// which only ever returns non-terminal candidates.

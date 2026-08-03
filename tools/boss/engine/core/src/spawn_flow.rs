@@ -23,6 +23,7 @@ use std::time::Duration as StdDuration;
 
 use anyhow::{Context, anyhow};
 use boss_protocol::WorkItemBinding;
+use boss_tmux::TMUX_SPAWN_TOKEN_ENV;
 use boss_tmux::{DisplayField, NewSession, SERVER_LABEL, Tmux};
 use thiserror::Error;
 use tokio::time::Duration;
@@ -116,7 +117,6 @@ const WORKER_XAI_API_KEY_NO_INTERACTIVE_AUTH: &str = "xai-boss-worker-no-interac
 /// Current environment contract for Boss-owned tmux sessions. Future
 /// adoption code rejects a session whose schema is newer than it knows.
 const TMUX_SESSION_SCHEMA: &str = "1";
-const TMUX_SPAWN_TOKEN_ENV: &str = "BOSS_SPAWN_TOKEN";
 const TMUX_SPAWN_TOKEN_OPTION: &str = "@boss_spawn_token";
 
 /// Durable writes surrounding a tmux session creation. Kept as a narrow

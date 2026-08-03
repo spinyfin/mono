@@ -10,7 +10,7 @@
 //! never written, the completion notification never arrives, and the
 //! worker waits forever. `activity` stays `working`, the PID stays alive,
 //! and the worker is indistinguishable from one doing real work. See
-//! issue #976 (Crusher / T781, exec `exec_18b4225cf4ee0df0_33d`).
+//! issue #976 (observed on a Crusher chore).
 //!
 //! [`crate::dead_pid_sweep`] cannot catch this: `kill(pid, 0)` reports
 //! the parked `claude` process as perfectly healthy. The distinguishing
@@ -21,23 +21,20 @@
 //! ## Algorithm
 //!
 //! 1. Snapshot [`crate::live_worker_state::LiveWorkerStateRegistry`].
-//! 2. For each slot:
-//!    1. Skip unless `activity == Working`. `Spawning` is still coming
-//!       up; `Idle`/`WaitingForInput` are handled by the completion and
-//!       transient-recovery paths; `Terminated`/`Errored` are done.
-//!    2. Skip if a tool is in flight (`current_tool.is_some()`). A
-//!       *foreground* `bazel build //...` on a cold cache legitimately
-//!       runs for many minutes with no intervening hook — reaping it
-//!       would be the regression we must not cause. The companion fix
-//!       (the pre-push gate's `timeout` guidance) bounds that case; this
-//!       sweep deliberately only targets the *idle-between-tools* wedge.
-//!    3. Skip if `last_event_at` is newer than the staleness threshold,
-//!       or absent (no hook has landed yet).
-//!    4. Age guard against the DB `started_at` (skip fresh dispatches).
-//! 3. For a confirmed-stale slot: mark the execution `orphaned`, append
-//!    an `[engine-reconcile]` audit line, release the pool slot, emit a
-//!    `stale_worker_reconcile` dispatch event, and kick the coordinator
-//!    so the orphan sweep redispatches the committed-but-stranded work.
+//! 2. For each working slot, consult tmux when the run has durable tmux
+//!    identity. A live pane with recent hook or pane activity is
+//!    `AliveAndWorking`; a live, quiet pane whose agent is foreground is
+//!    `AliveAndGenuinelyStuck` and files an inspection attention; an absent,
+//!    mismatched, or dead pane is `Dead` and is reaped through the pane-death
+//!    reconciliation path.
+//! 3. Runs without terminal evidence use the conservative cadence fallback:
+//!    1. Skip if a tool is in flight or the driver's progress fidelity is
+//!       exempt from cadence reaping.
+//!    2. Require a stale hook timestamp and an execution beyond its grace
+//!       period before reaping it.
+//! 4. For a confirmed cadence-stale slot: mark the execution `orphaned`,
+//!    append an audit line, release the pool slot, emit a dispatch event, and
+//!    kick the coordinator so stranded work is redispatched.
 //!
 //! ## False-positive guards
 //!
@@ -99,11 +96,17 @@ pub enum TerminalLiveness {
 }
 
 /// The three states a stale-worker pass can establish for a tmux-hosted run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerLiveness {
     AliveAndWorking,
-    AliveAndGenuinelyStuck,
-    Dead,
+    AliveAndGenuinelyStuck {
+        session_name: String,
+        window_activity_epoch_secs: i64,
+    },
+    Dead {
+        session_name: String,
+        pane_dead_status: Option<String>,
+    },
 }
 
 /// Classify hook and terminal evidence without assigning an unsafe meaning to
@@ -114,22 +117,33 @@ pub fn classify_worker_liveness(
     now_epoch_secs: i64,
     stale_threshold_secs: i64,
 ) -> WorkerLiveness {
-    let TerminalLiveness::Alive {
-        window_activity_epoch_secs,
-        agent_is_foreground,
-        ..
-    } = terminal
-    else {
-        return WorkerLiveness::Dead;
+    let (session_name, window_activity_epoch_secs, agent_is_foreground) = match terminal {
+        TerminalLiveness::Alive {
+            session_name,
+            window_activity_epoch_secs,
+            agent_is_foreground,
+        } => (session_name, *window_activity_epoch_secs, *agent_is_foreground),
+        TerminalLiveness::Dead {
+            session_name,
+            pane_dead_status,
+        } => {
+            return WorkerLiveness::Dead {
+                session_name: session_name.clone(),
+                pane_dead_status: pane_dead_status.clone(),
+            };
+        }
     };
 
     let stale_cutoff = iso8601_utc(now_epoch_secs - stale_threshold_secs);
     let hook_is_recent = last_event_at.is_some_and(|event| event >= stale_cutoff.as_str());
-    let output_is_recent = *window_activity_epoch_secs >= now_epoch_secs - stale_threshold_secs;
+    let output_is_recent = window_activity_epoch_secs >= now_epoch_secs - stale_threshold_secs;
     if hook_is_recent || output_is_recent || !agent_is_foreground {
         WorkerLiveness::AliveAndWorking
     } else {
-        WorkerLiveness::AliveAndGenuinelyStuck
+        WorkerLiveness::AliveAndGenuinelyStuck {
+            session_name: session_name.to_owned(),
+            window_activity_epoch_secs,
+        }
     }
 }
 
@@ -157,12 +171,7 @@ impl TmuxWorkerTerminalInspector {
 #[async_trait::async_trait]
 impl WorkerTerminalInspector for TmuxWorkerTerminalInspector {
     async fn inspect(&self, execution_id: &str) -> Result<Option<TerminalLiveness>> {
-        let Some(run) = self
-            .work_db
-            .list_adoptable_tmux_runs()?
-            .into_iter()
-            .find(|run| run.execution_id == execution_id)
-        else {
+        let Some(run) = self.work_db.tmux_run_for_execution(execution_id)? else {
             return Ok(None);
         };
 
@@ -179,10 +188,7 @@ impl WorkerTerminalInspector for TmuxWorkerTerminalInspector {
             }));
         }
 
-        let token = self
-            .tmux
-            .show_environment(&run.tmux_session_name, "BOSS_SPAWN_TOKEN")
-            .await?;
+        let token = crate::tmux_adoption::session_spawn_token(&self.tmux, &run.tmux_session_name).await?;
         if token.as_deref() != Some(run.tmux_spawn_token.as_str()) {
             return Ok(Some(TerminalLiveness::Dead {
                 session_name: run.tmux_session_name,
@@ -215,14 +221,35 @@ impl WorkerTerminalInspector for TmuxWorkerTerminalInspector {
             .tmux
             .display_message(&run.tmux_session_name, DisplayField::PaneCurrentCommand)
             .await?;
-        let driver = self
+        let driver_slug = self
             .work_db
             .get_execution_driver_slug(execution_id)?
             .unwrap_or_default();
+        let driver_binary = crate::driver::DriverRegistry::default()
+            .require(&driver_slug)
+            .map(|driver| driver.descriptor().binary.to_owned())
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    execution_id,
+                    driver_slug,
+                    ?err,
+                    "stale-worker sweep: unknown driver while inspecting tmux pane"
+                );
+                String::new()
+            });
+        if !driver_binary.is_empty() && current_command != driver_binary {
+            tracing::debug!(
+                execution_id,
+                driver_slug,
+                expected_binary = driver_binary,
+                observed_command = current_command,
+                "stale-worker sweep: pane foreground command differs from driver binary"
+            );
+        }
         Ok(Some(TerminalLiveness::Alive {
             session_name: run.tmux_session_name,
             window_activity_epoch_secs,
-            agent_is_foreground: !driver.is_empty() && current_command == driver,
+            agent_is_foreground: !driver_binary.is_empty() && current_command == driver_binary,
         }))
     }
 }
@@ -284,6 +311,7 @@ pub struct StaleWorkerSweepOutcome {
     /// Slots skipped because an operator placed an explicit hold on the
     /// execution via `bossctl agents hold` (see [`crate::hold_registry`]).
     pub held_skipped: usize,
+    pub fidelity_exempt_skipped: usize,
 }
 
 impl crate::sweep_loop::SweepOutcome for StaleWorkerSweepOutcome {
@@ -376,9 +404,8 @@ pub fn spawn_loop(
     })
 }
 
-/// Run a single legacy cadence-only stale-worker pass. Kept for app-hosted
-/// pools while they migrate; tmux-hosted production pools use
-/// [`run_one_pass_with_terminal`] through [`spawn_loop`].
+/// Test-only convenience wrapper for the cadence fallback.
+#[cfg(test)]
 pub async fn run_one_pass(
     work_db: &WorkDb,
     live_states: &LiveWorkerStateRegistry,
@@ -469,6 +496,11 @@ pub async fn run_one_pass_with_terminal(
             ) else {
                 continue;
             };
+            if execution.status.is_terminal() {
+                let _ =
+                    work_db.resolve_external_tracker_attention(&execution.work_item_id, STALE_WORKER_ATTENTION_KIND);
+                continue;
+            }
             let Some(started_epoch) = execution.started_epoch() else {
                 outcome.grace_skipped += 1;
                 continue;
@@ -486,17 +518,17 @@ pub async fn run_one_pass_with_terminal(
             ) {
                 WorkerLiveness::AliveAndWorking => {
                     outcome.alive_and_working += 1;
+                    if let Err(err) =
+                        work_db.resolve_external_tracker_attention(&execution.work_item_id, STALE_WORKER_ATTENTION_KIND)
+                    {
+                        tracing::warn!(execution_id = %state.run_id, ?err, "stale-worker sweep: failed to resolve recovered-worker attention");
+                    }
                 }
-                WorkerLiveness::AliveAndGenuinelyStuck => {
+                WorkerLiveness::AliveAndGenuinelyStuck {
+                    session_name,
+                    window_activity_epoch_secs,
+                } => {
                     outcome.genuinely_stuck += 1;
-                    let TerminalLiveness::Alive {
-                        session_name,
-                        window_activity_epoch_secs,
-                        ..
-                    } = terminal
-                    else {
-                        unreachable!("stuck classification requires a live pane");
-                    };
                     let body = format!(
                         "Worker execution `{}` has had no hook or pane output for more than {} seconds while its agent remains the foreground command. The session is still live, so Boss did not reap it.\n\nSession: `{session_name}`\n\nLast pane output: {}\n\nInspect it with:\n\n```sh\ntmux -L boss attach -t {session_name}\n```",
                         state.run_id,
@@ -516,15 +548,11 @@ pub async fn run_one_pass_with_terminal(
                         );
                     }
                 }
-                WorkerLiveness::Dead => {
+                WorkerLiveness::Dead {
+                    session_name,
+                    pane_dead_status,
+                } => {
                     outcome.dead += 1;
-                    let (session_name, pane_dead_status) = match terminal {
-                        TerminalLiveness::Dead {
-                            session_name,
-                            pane_dead_status,
-                        } => (session_name, pane_dead_status),
-                        TerminalLiveness::Alive { .. } => unreachable!("dead classification requires a dead pane"),
-                    };
                     let detail = match pane_dead_status.as_deref() {
                         Some(status) => {
                             format!("tmux session {session_name} reports pane_dead=1 (exit status {status})")
@@ -554,6 +582,14 @@ pub async fn run_one_pass_with_terminal(
             continue;
         }
 
+        let Some(effective_threshold_secs) = live_states
+            .progress_fidelity_for_slot(state.slot_id)
+            .stale_threshold_secs(stale_threshold_secs)
+        else {
+            outcome.fidelity_exempt_skipped += 1;
+            continue;
+        };
+
         // A tool in flight means the worker is legitimately busy — most
         // importantly a long foreground `bazel build`/`bazel test`,
         // which can run for many minutes with no intervening hook.
@@ -568,7 +604,7 @@ pub async fn run_one_pass_with_terminal(
         // can compare `last_event_at < stale_cutoff` lexicographically —
         // the format is the same one the registry stamps, so byte order
         // matches chronological order and no date parsing is needed.
-        let stale_cutoff = iso8601_utc(now_epoch_secs - stale_threshold_secs);
+        let stale_cutoff = iso8601_utc(now_epoch_secs - effective_threshold_secs);
 
         // No hook yet at all ⇒ nothing to judge staleness against; the
         // dead-PID / grace paths cover a truly stuck spawn.
@@ -769,6 +805,7 @@ mod tests {
     use super::*;
     use crate::coordinator::ExecutionCoordinator;
     use crate::dispatch_events::RecordingDispatchEventSink;
+    use crate::driver::ProgressFidelity;
     use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::test_support::*;
     use crate::work::ExecutionStatus;
@@ -811,7 +848,10 @@ mod tests {
     fn sustained_quiet_agent_pane_is_genuinely_stuck() {
         assert_eq!(
             classify_worker_liveness(None, &live_terminal(8_000, true), 10_000, 1_000),
-            WorkerLiveness::AliveAndGenuinelyStuck,
+            WorkerLiveness::AliveAndGenuinelyStuck {
+                session_name: "boss-worker-test".to_owned(),
+                window_activity_epoch_secs: 8_000,
+            },
         );
     }
 
@@ -827,7 +867,10 @@ mod tests {
                 10_000,
                 1_000,
             ),
-            WorkerLiveness::Dead,
+            WorkerLiveness::Dead {
+                session_name: "boss-worker-test".to_owned(),
+                pane_dead_status: Some("1".to_owned()),
+            },
         );
     }
 
@@ -1320,9 +1363,8 @@ mod tests {
         );
     }
 
-    /// The legacy fallback no longer grants a fidelity exemption: tmux-hosted
-    /// workers use terminal evidence, and legacy workers retain the same
-    /// conservative cadence threshold as every other worker.
+    /// The cadence fallback must not reap drivers whose hook fidelity cannot
+    /// safely establish a stall without terminal evidence.
     #[tokio::test]
     async fn coarse_fidelity_slot_uses_the_normal_staleness_threshold() {
         let (_dir, db) = open_db();
@@ -1333,6 +1375,7 @@ mod tests {
         let execution_id = create_old_execution(&db, &work_item_id);
         let live_states = Arc::new(LiveWorkerStateRegistry::new());
         register_slot(&live_states, 1, &execution_id, &work_item_id);
+        live_states.set_progress_fidelity(1, ProgressFidelity::Coarse);
         drive_to_working_idle(&live_states, 1);
 
         let coordinator = make_coordinator(db.clone(), 1);
@@ -1351,11 +1394,14 @@ mod tests {
         )
         .await;
 
-        assert_eq!(outcome.reaped, 1);
+        assert_eq!(outcome.reaped, 0);
+        assert_eq!(outcome.fidelity_exempt_skipped, 1);
+        assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Ready);
+        assert!(reaper.reaped().is_empty());
+        assert!(sink.events().await.is_empty());
     }
 
-    /// Minimal fidelity follows the same normal threshold; it receives the
-    /// full terminal classification after tmux migration.
+    /// Minimal fidelity receives the same cadence exemption.
     #[tokio::test]
     async fn minimal_fidelity_slot_uses_the_normal_staleness_threshold() {
         let (_dir, db) = open_db();
@@ -1366,6 +1412,7 @@ mod tests {
         let execution_id = create_old_execution(&db, &work_item_id);
         let live_states = Arc::new(LiveWorkerStateRegistry::new());
         register_slot(&live_states, 1, &execution_id, &work_item_id);
+        live_states.set_progress_fidelity(1, ProgressFidelity::Minimal);
         drive_to_working_idle(&live_states, 1);
 
         let coordinator = make_coordinator(db.clone(), 1);
@@ -1384,7 +1431,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(outcome.reaped, 1);
+        assert_eq!(outcome.reaped, 0);
+        assert_eq!(outcome.fidelity_exempt_skipped, 1);
+        assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Ready);
+        assert!(reaper.reaped().is_empty());
+        assert!(sink.events().await.is_empty());
     }
 
     /// A slot with no declared fidelity (the default, and every existing

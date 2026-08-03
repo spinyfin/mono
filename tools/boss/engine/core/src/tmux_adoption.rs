@@ -63,7 +63,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use boss_tmux::{DisplayField, Tmux};
+use boss_tmux::{DisplayField, TMUX_SPAWN_TOKEN_ENV, Tmux};
 
 use crate::coordinator::{ExecutionCoordinator, slot_id_from_worker_id};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
@@ -72,18 +72,20 @@ use crate::spawn_flow::WorkerSpawner;
 use crate::work::{TmuxRunHandle, WorkDb};
 use crate::worker_readoption::LiveWorkerConvergence;
 
-/// The tmux session environment variable carrying the durable spawn token.
-/// Mirrors [`crate::spawn_flow`]'s private constant of the same name — this
-/// module reads what that one writes, from a different process generation at
-/// boot, so it is redeclared rather than imported.
-const TMUX_SPAWN_TOKEN_ENV: &str = "BOSS_SPAWN_TOKEN";
-
 /// Trigger name recorded on the dispatch event and carried into
 /// [`LiveWorkerConvergence::converge_live_worker`] for a session whose token
 /// matched a terminal execution — the third trigger alongside
 /// `hook_after_terminal` and `redispatch_guard` (see
 /// [`crate::worker_readoption`]'s module doc).
 const TERMINAL_HANDOFF_TRIGGER: &str = "boot_tmux_adoption";
+
+/// Read the authoritative durable identity token for a tmux session. Callers
+/// deliberately choose their mismatch policy: boot adoption leaves foreign
+/// sessions alone, while the liveness sweep treats a durable run's mismatch as
+/// evidence that its pane is gone.
+pub async fn session_spawn_token(tmux: &Tmux, session_name: &str) -> anyhow::Result<Option<String>> {
+    tmux.show_environment(session_name, TMUX_SPAWN_TOKEN_ENV).await
+}
 
 /// What one pass did; the caller logs it.
 #[derive(Debug, Default, Clone)]
@@ -135,7 +137,7 @@ where
     // option mirror `list_sessions` also returns. See the module doc.
     let mut live_tokens: HashMap<String, String> = HashMap::new();
     for session in &sessions {
-        match tmux.show_environment(&session.name, TMUX_SPAWN_TOKEN_ENV).await {
+        match session_spawn_token(tmux, &session.name).await {
             Ok(Some(token)) => {
                 live_tokens.insert(token, session.name.clone());
             }
