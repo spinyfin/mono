@@ -18,6 +18,7 @@ boss-github-tracker = { path = "../../github_tracker" }
 boss-trunk-auth = { path = "../../trunk_auth" }
 boss-trunk-client = { path = "../../trunk_client" }
 boss-transcript-markdown = { path = "../transcript-markdown" }
+boss-tmux = { path = "../../tmux" }
 boss-engine-automation-dedup = { path = "../automation-dedup" }
 boss-engine-automation-schedule = { path = "../automation-schedule" }
 async-trait = { workspace = true }
@@ -58,7 +59,6 @@ boss-engine-utility-model = { path = "../utility-model" }
 boss-engine-utils = { path = "../utils" }
 boss-engine-worker-bin = { path = "../worker-bin" }
 boss-engine-worker-policy = { path = "../worker-policy" }
-boss-tmux = { path = "../../tmux" }
 boss-transcript-tail = { path = "../transcript-tail" }
 clap = { workspace = true, features = ["derive"] }
 fastrand = { workspace = true }

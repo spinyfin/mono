@@ -1037,6 +1037,7 @@ fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::Capability;
+    use crate::test_support::home_override;
     use tempfile::TempDir;
 
     #[test]
@@ -1593,21 +1594,11 @@ mod tests {
 
     #[tokio::test]
     async fn provision_workspace_writes_prompt_gitignore_and_pretrust() {
-        use tokio::sync::Mutex;
         // HOME must be redirected so pre_trust_workspace doesn't write to the
-        // developer's real ~/.claude.json. A tokio Mutex is used (not std) so the
-        // guard can be held across the `.await` below without tripping clippy's
-        // `await_holding_lock` — we genuinely need HOME serialized for the whole
-        // async section, not just the synchronous parts.
-        static HOME_LOCK: Mutex<()> = Mutex::const_new(());
-        let _guard = HOME_LOCK.lock().await;
-
+        // developer's real ~/.claude.json.
         let workspace = TempDir::new().unwrap();
         let fake_home = TempDir::new().unwrap();
-        let original_home = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", fake_home.path());
-        }
+        let _home = home_override(fake_home.path());
 
         let driver = ClaudeDriver;
         let runtime_state = driver
@@ -1639,12 +1630,6 @@ mod tests {
         let val: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&claude_json).unwrap()).unwrap();
         let key = workspace.path().display().to_string();
         assert_eq!(val["projects"][&key]["hasTrustDialogAccepted"], true);
-
-        // Restore HOME.
-        match original_home {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
     }
 
     #[tokio::test]
