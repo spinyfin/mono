@@ -296,7 +296,15 @@ pub fn override_applies_to(config: &toml::Value) -> Option<Result<Vec<String>>> 
     let mut globs = Vec::with_capacity(array.len());
     for (i, entry) in array.iter().enumerate() {
         match entry.as_str() {
-            Some(s) if !s.trim().is_empty() => globs.push(s.to_owned()),
+            Some(s) if !s.trim().is_empty() => {
+                if let Some(reason) = crate::glob_scope::structurally_empty_reason(s, false) {
+                    return Some(Err(anyhow::anyhow!(
+                        "`applies_to[{i}]` config override pattern `{s}` can never match any \
+                         changeset path: {reason}"
+                    )));
+                }
+                globs.push(s.to_owned())
+            }
             Some(_) => {
                 return Some(Err(anyhow::anyhow!(
                     "`applies_to[{i}]` config override entry must not be empty"
