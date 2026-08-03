@@ -398,6 +398,8 @@ impl AgentDriver for GrokDriver {
     /// no local data dir to fence), and `extra_args` carrying `--sandbox`,
     /// one `--deny` per structural rule (Boss data dir, `rm -rf`, `sudo`,
     /// `bossctl`), and `--permission-mode` when the worker kind forces one.
+    /// Local macOS Standard workers pass `--sandbox off`: Grok's Seatbelt
+    /// profile denies the IOKit power-management registration Bazel requires.
     /// See [`permissions`] for the profile/rule rendering and
     /// `grok-permission-isolation-2026-07-27.md` (T-16) for the grammar this
     /// relies on.
@@ -476,6 +478,10 @@ impl AgentDriver for GrokDriver {
         }
 
         let extra_args = permissions::extra_args(input.worker_kind, boss_data_dir.as_deref(), input.is_remote);
+        let sandbox_profile = extra_args
+            .get(1)
+            .context("Grok permission rendering omitted the required --sandbox profile")?;
+        permissions::ensure_build_tool_capability(input.worker_kind, input.is_remote, sandbox_profile)?;
 
         Ok(PermissionArtifacts {
             config_files,
@@ -1762,7 +1768,14 @@ mod tests {
         );
 
         assert_eq!(artifacts.extra_args[0], "--sandbox");
-        assert_eq!(artifacts.extra_args[1], "boss-workspace");
+        assert_eq!(
+            artifacts.extra_args[1],
+            if cfg!(target_os = "macos") {
+                "off"
+            } else {
+                "boss-workspace"
+            }
+        );
         assert!(
             artifacts
                 .extra_args
@@ -2239,8 +2252,8 @@ mod tests {
     /// which needs real write access to resolve the conflict. This is the
     /// positive-control complement to
     /// `write_permission_config_live_sandbox_denies_workspace_write` above:
-    /// proves the `boss-workspace` sandbox profile `write_permission_config`
-    /// selects for `Standard` genuinely *permits* a workspace write, so
+    /// proves the permission profile `write_permission_config` selects for
+    /// `Standard` genuinely *permits* a workspace write, so
     /// "conflict resolution has write access" is demonstrated rather than
     /// merely inferred from "it isn't Reviewer".
     #[tokio::test]
@@ -2314,7 +2327,7 @@ mod tests {
         assert!(
             probe_write.exists(),
             "conflict resolution's Standard worker kind must retain real workspace write access under its \
-             own sandbox profile: probe_write.txt was not created"
+             selected permission profile: probe_write.txt was not created"
         );
     }
 

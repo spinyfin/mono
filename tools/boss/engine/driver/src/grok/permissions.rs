@@ -14,6 +14,11 @@
 //! - **Sandbox** (`--sandbox <profile>` + `$GROK_HOME/sandbox.toml`): a
 //!   kernel-level `deny` glob fencing the Boss data dir, layered on the
 //!   built-in `workspace` / `read-only` profile selected by worker kind.
+//!   Local macOS Standard workers are the exception: Grok's Seatbelt profile
+//!   denies IOKit power-management registration, which makes Bazel crash at
+//!   startup, so they explicitly use Grok's documented `off` profile. This
+//!   matches the unsandboxed posture of other local Standard drivers while
+//!   the structural deny rules and `PreToolUse` guards remain in force.
 //! - **Rule grammar** (`--deny 'Bash(...)'` / `'Read(...)'` / `'Edit(...)'`):
 //!   the structural deny set (Boss data dir belt, `rm -rf`, `sudo`,
 //!   `bossctl`) — command-pattern denies the sandbox's path-based `deny`
@@ -57,11 +62,44 @@ fn boss_sandbox_profile_name(worker_kind: WorkerKind) -> &'static str {
 /// unresolvable `extends`/profile name is the documented behaviour — exactly
 /// the property we want for a genuinely bad config, but not what we want here).
 pub fn sandbox_profile_arg(worker_kind: WorkerKind, is_remote: bool) -> &'static str {
+    sandbox_profile_arg_for_platform(worker_kind, is_remote, cfg!(target_os = "macos"))
+}
+
+fn sandbox_profile_arg_for_platform(worker_kind: WorkerKind, is_remote: bool, is_macos: bool) -> &'static str {
+    if is_macos && !is_remote && worker_kind == WorkerKind::Standard {
+        return "off";
+    }
     if is_remote {
         sandbox_base_profile(worker_kind)
     } else {
         boss_sandbox_profile_name(worker_kind)
     }
+}
+
+/// Refuse a local macOS Standard launch before a pane is spawned if its
+/// resolved Grok profile would deny the IOKit power-management capability
+/// Bazel requires during client startup.
+pub fn ensure_build_tool_capability(
+    worker_kind: WorkerKind,
+    is_remote: bool,
+    sandbox_profile: &str,
+) -> anyhow::Result<()> {
+    ensure_build_tool_capability_for_platform(worker_kind, is_remote, sandbox_profile, cfg!(target_os = "macos"))
+}
+
+fn ensure_build_tool_capability_for_platform(
+    worker_kind: WorkerKind,
+    is_remote: bool,
+    sandbox_profile: &str,
+    is_macos: bool,
+) -> anyhow::Result<()> {
+    if is_macos && !is_remote && worker_kind == WorkerKind::Standard && sandbox_profile != "off" {
+        anyhow::bail!(
+            "Grok worker preflight failed: macOS IOKit power-management access required by Bazel \
+             is unavailable under sandbox profile {sandbox_profile:?}; refusing to spawn the worker"
+        );
+    }
+    Ok(())
 }
 
 /// Render `$GROK_HOME/sandbox.toml`: a Boss-owned custom profile extending
@@ -176,11 +214,35 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn sandbox_profile_arg_reviewer_is_read_only_others_workspace() {
-        assert_eq!(sandbox_profile_arg(WorkerKind::Reviewer, false), "boss-read-only");
-        assert_eq!(sandbox_profile_arg(WorkerKind::Standard, false), "boss-workspace");
-        assert_eq!(sandbox_profile_arg(WorkerKind::Triage, false), "boss-workspace");
-        assert_eq!(sandbox_profile_arg(WorkerKind::AnswerAgent, false), "boss-workspace");
+    fn sandbox_profile_arg_local_macos_standard_is_off() {
+        assert_eq!(
+            sandbox_profile_arg_for_platform(WorkerKind::Standard, false, true),
+            "off"
+        );
+        assert_eq!(
+            sandbox_profile_arg_for_platform(WorkerKind::Reviewer, false, true),
+            "boss-read-only"
+        );
+    }
+
+    #[test]
+    fn sandbox_profile_arg_non_macos_keeps_custom_profiles() {
+        assert_eq!(
+            sandbox_profile_arg_for_platform(WorkerKind::Standard, false, false),
+            "boss-workspace"
+        );
+        assert_eq!(
+            sandbox_profile_arg_for_platform(WorkerKind::Reviewer, false, false),
+            "boss-read-only"
+        );
+        assert_eq!(
+            sandbox_profile_arg_for_platform(WorkerKind::Triage, false, false),
+            "boss-workspace"
+        );
+        assert_eq!(
+            sandbox_profile_arg_for_platform(WorkerKind::AnswerAgent, false, false),
+            "boss-workspace"
+        );
     }
 
     #[test]
@@ -190,6 +252,21 @@ mod tests {
         // start (fail-closed on an unresolvable extends/profile).
         assert_eq!(sandbox_profile_arg(WorkerKind::Reviewer, true), "read-only");
         assert_eq!(sandbox_profile_arg(WorkerKind::Standard, true), "workspace");
+    }
+
+    #[test]
+    fn build_tool_capability_diagnostic_names_iokit_and_bazel() {
+        let error = ensure_build_tool_capability_for_platform(WorkerKind::Standard, false, "boss-workspace", true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("IOKit power-management access"), "{error}");
+        assert!(error.contains("Bazel"), "{error}");
+        assert!(error.contains("refusing to spawn"), "{error}");
+    }
+
+    #[test]
+    fn build_tool_capability_accepts_local_standard_off_profile() {
+        ensure_build_tool_capability_for_platform(WorkerKind::Standard, false, "off", true).unwrap();
     }
 
     #[test]
@@ -272,9 +349,16 @@ mod tests {
 
     #[test]
     fn extra_args_standard_has_no_permission_mode_tail() {
-        let args = extra_args(WorkerKind::Standard, None, true);
+        let args = extra_args(WorkerKind::Standard, None, false);
         assert_eq!(args[0], "--sandbox");
-        assert_eq!(args[1], "workspace");
+        assert_eq!(
+            args[1],
+            if cfg!(target_os = "macos") {
+                "off"
+            } else {
+                "boss-workspace"
+            }
+        );
         assert!(!args.contains(&"--permission-mode".to_owned()));
     }
 }
