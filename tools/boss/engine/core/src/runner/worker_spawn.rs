@@ -7,8 +7,8 @@ use std::path::Path;
 use boss_engine_gh_invocation::gh_output;
 use boss_gh_telemetry::{callers, scope as gh_scope};
 
-use crate::coordinator::{PoolDispatchPolicy, pool_dispatch_policy_for_worker_id};
-use crate::effort::{DriverResolutionSource, SpawnConfig, SpawnResolutionInput, resolve_spawn_config_in};
+use crate::coordinator::pool_dispatch_policy_for_worker_id;
+use crate::effort::{SpawnConfig, SpawnResolutionInput, resolve_spawn_config_in};
 use crate::structured_output::StructuredOutputKind;
 use crate::work::{REASON_ALLOCATION, REASON_LEGACY_PERCENTAGE, WorkDb, WorkExecution, WorkItem};
 use boss_protocol::ExecutionKind;
@@ -205,35 +205,6 @@ async fn fetch_pr_diff(pr_url: &str) -> Option<String> {
 /// A separate, standalone function for the same reason as
 /// [`check_model_driver_compatibility`]: testable without the full async
 /// prompt-composition machinery.
-fn effective_task_driver_for_worker(pool_policy: Option<PoolDispatchPolicy>, row_driver: Option<&str>) -> Option<&str> {
-    match pool_policy {
-        Some(policy) => Some(policy.driver),
-        None => row_driver,
-    }
-}
-
-fn resolved_driver_source(
-    pool_policy: Option<PoolDispatchPolicy>,
-    row_driver: Option<&str>,
-    product_default_driver: Option<&str>,
-    has_allocation: bool,
-) -> DriverResolutionSource {
-    if pool_policy.is_some() {
-        DriverResolutionSource::PoolPolicy
-    } else if row_driver.map(str::trim).is_some_and(|value| !value.is_empty()) {
-        DriverResolutionSource::TaskOverride
-    } else if product_default_driver
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
-    {
-        DriverResolutionSource::ProductDefault
-    } else if has_allocation {
-        DriverResolutionSource::TrafficAllocation
-    } else {
-        DriverResolutionSource::EngineDefault
-    }
-}
-
 /// Model/driver compatibility gate. Returns an error naming both the driver
 /// and the model when `model` is not one `driver_descriptor`'s
 /// [`crate::driver::ModelMenu::model_belongs_to_driver`] recognises as
@@ -662,25 +633,15 @@ pub(crate) async fn compose_worker_spawn(
     // `pool_dispatch_policy_for_worker_id`'s doc comment. `None` for
     // main-pool workers, which dispatch on the row's own `driver` column.
     let pool_policy = pool_dispatch_policy_for_worker_id(worker_id);
-    // The allocator decision occupies the final driver fallback position,
-    // behind both live pin levels. Keeping it separate until here lets the
-    // resolver log honest provenance instead of calling an allocation a
-    // product default.
-    let fallback_driver = product_default_driver.as_deref().or(allocated_driver.as_deref());
-    let driver_source = resolved_driver_source(
-        pool_policy,
-        row_driver.as_deref(),
-        product_default_driver.as_deref(),
-        allocated_driver.is_some(),
-    );
     let spawn_input = SpawnResolutionInput::builder()
         .maybe_effort_level(row_effort)
         .maybe_model_override(row_model_override.as_deref())
         .maybe_pool_model_override(pool_policy.map(|p| p.model_tier))
         .maybe_product_default_model(product_default_model.as_deref())
-        .maybe_task_driver(effective_task_driver_for_worker(pool_policy, row_driver.as_deref()))
-        .maybe_product_default_driver(fallback_driver)
-        .driver_source(driver_source)
+        .maybe_task_driver(row_driver.as_deref())
+        .maybe_product_default_driver(product_default_driver.as_deref())
+        .maybe_pool_policy_driver(pool_policy.map(|policy| policy.driver))
+        .maybe_allocated_driver(allocated_driver.as_deref())
         .maybe_kind(work_item_kind)
         .maybe_reasoning(row_reasoning)
         .build();
@@ -759,52 +720,21 @@ mod reviewer_pool_policy_tests {
     //! Verifies review/automation dispatch policy is decoupled from the
     //! reviewed/automated row's own `driver` column — the single resolution
     //! point is `crate::coordinator::pool_dispatch_policy_for_worker_id`,
-    //! and [`effective_task_driver_for_worker`] is what applies it ahead of
-    //! `resolve_spawn_config`.
-    use super::*;
-
+    //! and `SpawnResolutionInput::pool_policy_driver` applies it ahead of
+    //! row and product driver sources.
     #[test]
-    fn reviewer_effective_driver_ignores_the_reviewed_rows_driver_column() {
+    fn reviewer_policy_is_a_distinct_driver_source() {
         let policy =
             crate::coordinator::pool_dispatch_policy_for_worker_id("review-1").expect("review worker has a policy");
         for row_driver in [Some("codex"), Some("grok"), Some("claude"), None] {
-            assert_eq!(
-                effective_task_driver_for_worker(Some(policy), row_driver),
-                Some("claude"),
-                "reviewer driver must not vary with the reviewed row's driver column, got row_driver={row_driver:?}"
-            );
+            let input = crate::effort::SpawnResolutionInput::builder()
+                .maybe_task_driver(row_driver)
+                .pool_policy_driver(policy.driver)
+                .build();
+            let cfg = crate::effort::resolve_spawn_config(&input).unwrap();
+            assert_eq!(cfg.driver, "claude");
+            assert_eq!(cfg.driver_source, crate::effort::DriverResolutionSource::PoolPolicy);
         }
-    }
-
-    #[test]
-    fn main_pool_effective_driver_still_falls_through_to_row_driver() {
-        assert_eq!(effective_task_driver_for_worker(None, Some("codex")), Some("codex"));
-        assert_eq!(effective_task_driver_for_worker(None, None), None);
-    }
-
-    #[test]
-    fn driver_provenance_follows_the_same_precedence_as_driver_resolution() {
-        let pool = crate::coordinator::pool_dispatch_policy_for_worker_id("review-1");
-        assert_eq!(
-            resolved_driver_source(pool, Some("codex"), Some("grok"), true),
-            DriverResolutionSource::PoolPolicy,
-        );
-        assert_eq!(
-            resolved_driver_source(None, Some("codex"), Some("grok"), true),
-            DriverResolutionSource::TaskOverride,
-        );
-        assert_eq!(
-            resolved_driver_source(None, None, Some("grok"), true),
-            DriverResolutionSource::ProductDefault,
-        );
-        assert_eq!(
-            resolved_driver_source(None, None, None, true),
-            DriverResolutionSource::TrafficAllocation,
-        );
-        assert_eq!(
-            resolved_driver_source(None, None, None, false),
-            DriverResolutionSource::EngineDefault,
-        );
     }
 
     /// Resolves a review-pool spawn end to end (policy → effective driver →
@@ -814,9 +744,9 @@ mod reviewer_pool_policy_tests {
         let pool_policy = crate::coordinator::pool_dispatch_policy_for_worker_id("review-1").unwrap();
         let registry = crate::driver::DriverRegistry::default();
         let input = crate::effort::SpawnResolutionInput::builder()
-            .maybe_task_driver(effective_task_driver_for_worker(Some(pool_policy), row_driver))
+            .maybe_task_driver(row_driver)
+            .pool_policy_driver(pool_policy.driver)
             .maybe_pool_model_override(Some(pool_policy.model_tier))
-            .driver_source(DriverResolutionSource::PoolPolicy)
             .build();
         crate::effort::resolve_spawn_config_in(&registry, &input).unwrap()
     }

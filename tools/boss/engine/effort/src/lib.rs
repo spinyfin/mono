@@ -413,11 +413,8 @@ pub struct SpawnResolutionInput<'a> {
     pub product_default_model: Option<&'a str>,
     pub task_driver: Option<&'a str>,
     pub product_default_driver: Option<&'a str>,
-    /// Optional provenance override for callers whose resolved driver is
-    /// carried in one of the compatibility fields above (for example a
-    /// traffic-allocation decision occupying the product-default fallback
-    /// slot, or a fixed pool policy occupying the task-driver slot).
-    pub driver_source: Option<DriverResolutionSource>,
+    pub pool_policy_driver: Option<&'a str>,
+    pub allocated_driver: Option<&'a str>,
     pub kind: Option<&'a TaskKind>,
     pub reasoning: Option<ReasoningMode>,
 }
@@ -430,21 +427,19 @@ pub fn resolve_spawn_config_in(
     registry: &DriverRegistry,
     input: &SpawnResolutionInput,
 ) -> Result<SpawnConfig, SpawnResolutionError> {
-    let driver = resolve_driver(input.task_driver, input.product_default_driver);
-    let driver_source = input.driver_source.unwrap_or_else(|| {
-        if input.task_driver.map(str::trim).is_some_and(|value| !value.is_empty()) {
-            DriverResolutionSource::TaskOverride
-        } else if input
-            .product_default_driver
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty())
-        {
-            DriverResolutionSource::ProductDefault
+    let (mut driver, mut driver_source) =
+        if let Some(driver) = input.pool_policy_driver.map(str::trim).filter(|s| !s.is_empty()) {
+            (driver.to_owned(), DriverResolutionSource::PoolPolicy)
+        } else if let Some(driver) = input.task_driver.map(str::trim).filter(|s| !s.is_empty()) {
+            (driver.to_owned(), DriverResolutionSource::TaskOverride)
+        } else if let Some(driver) = input.product_default_driver.map(str::trim).filter(|s| !s.is_empty()) {
+            (driver.to_owned(), DriverResolutionSource::ProductDefault)
+        } else if let Some(driver) = input.allocated_driver.map(str::trim).filter(|s| !s.is_empty()) {
+            (driver.to_owned(), DriverResolutionSource::TrafficAllocation)
         } else {
-            DriverResolutionSource::EngineDefault
-        }
-    });
-    let menu = menu_for_driver_in(registry, &driver)?;
+            (ENGINE_DEFAULT_DRIVER.to_owned(), DriverResolutionSource::EngineDefault)
+        };
+    let mut menu = menu_for_driver_in(registry, &driver)?;
     let effort_level = input.effort_level;
 
     let (mut model, mut model_source) = if let Some(m) = input.model_override.map(str::trim).filter(|s| !s.is_empty()) {
@@ -492,6 +487,32 @@ pub fn resolve_spawn_config_in(
     if model_source == ModelResolutionSource::ProductDefault && !(menu.model_belongs_to_driver)(&model) {
         model = menu.engine_default.to_owned();
         model_source = ModelResolutionSource::DriverDefaultAfterProductDefaultMismatch;
+    }
+
+    // A traffic decision is a preference, not a row-level driver pin. A
+    // live task model pin may have been edited after that decision was
+    // recorded, so let an unpinned driver yield rather than deterministically
+    // failing the same bucket forever. Explicit task/product/pool drivers
+    // remain hard configuration errors below.
+    if model_source == ModelResolutionSource::TaskOverride
+        && !(menu.model_belongs_to_driver)(&model)
+        && matches!(
+            driver_source,
+            DriverResolutionSource::TrafficAllocation | DriverResolutionSource::EngineDefault
+        )
+    {
+        let replacement = registry
+            .slugs()
+            .filter_map(|slug| registry.get(slug).map(|driver| (slug, driver.descriptor().model_menu)))
+            .filter(|(_, candidate_menu)| (candidate_menu.model_belongs_to_driver)(&model))
+            .map(|(slug, _)| slug)
+            .min()
+            .map(str::to_owned);
+        if let Some(replacement) = replacement {
+            driver = replacement;
+            driver_source = DriverResolutionSource::EngineDefault;
+            menu = menu_for_driver_in(registry, &driver)?;
+        }
     }
 
     if !(menu.model_belongs_to_driver)(&model) {
@@ -1717,8 +1738,7 @@ mod tests {
     fn legacy_design_floor_resolves_through_the_selected_drivers_menu() {
         let cfg = resolve_spawn_config(
             &SpawnResolutionInput::builder()
-                .task_driver("codex")
-                .driver_source(DriverResolutionSource::TrafficAllocation)
+                .allocated_driver("codex")
                 .effort_level(EffortLevel::Medium)
                 .kind(&TaskKind::DesignPostmortem)
                 .build(),
@@ -1755,11 +1775,25 @@ mod tests {
     }
 
     #[test]
+    fn allocated_driver_yields_to_a_live_task_model_override() {
+        let cfg = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .allocated_driver("codex")
+                .model_override("opus")
+                .build(),
+        )
+        .unwrap();
+        assert_eq!(cfg.driver, "claude");
+        assert_eq!(cfg.model, "opus");
+        assert_eq!(cfg.driver_source, DriverResolutionSource::EngineDefault);
+        assert_eq!(cfg.model_source, ModelResolutionSource::TaskOverride);
+    }
+
+    #[test]
     fn incompatible_product_model_default_yields_to_the_selected_driver() {
         let cfg = resolve_spawn_config(
             &SpawnResolutionInput::builder()
                 .task_driver("codex")
-                .driver_source(DriverResolutionSource::TrafficAllocation)
                 .product_default_model("opus")
                 .build(),
         )

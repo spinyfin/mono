@@ -445,7 +445,7 @@ impl WorkDb {
     /// uses it to detect a pool-dispatched run (review/automation pool
     /// workers always run [`crate::coordinator::pool_dispatch_policy_for_worker_id`]'s
     /// fixed driver, overriding whatever `tasks.driver` the row carries,
-    /// exactly as `worker_spawn::effective_task_driver_for_worker` does at
+    /// exactly as `SpawnResolutionInput::pool_policy_driver` does at
     /// spawn time).
     ///
     /// Resolves the target run with the same preference order as
