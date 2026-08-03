@@ -868,8 +868,8 @@ fn parse_global_exclude_patterns(
             valid.push(pattern.clone());
         }
     }
-    let normalized = normalize_exclude_patterns(&valid, config_dir);
-    if let Err(err) = ExclusionMatcher::new(&normalized) {
+    let normalized = normalize_check_entry_patterns(&valid, config_dir);
+    if let Err(err) = PathScope::new(&[], &normalized) {
         diagnostics.push(config_file_diagnostic(
             CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
             source_path.to_path_buf(),
@@ -931,7 +931,7 @@ fn parse_per_check_exclude_patterns(
         .unwrap_or_default();
     let legacy_patterns = extract_legacy_config_excludes(check_id, config, config_dir, source_path)?;
     let all = [framework_patterns, legacy_patterns].concat();
-    if let Err(err) = ExclusionMatcher::new(&all) {
+    if let Err(err) = PathScope::new(&[], &all) {
         return Err(config_file_diagnostic(
             check_id.to_owned(),
             source_path.to_path_buf(),
@@ -1667,7 +1667,7 @@ fn apply_external_checks_file(resolved: &mut ResolvedChecks, external_checks_fil
                 external_checks_file.source_label
             );
         }
-        if let Err(err) = ExclusionMatcher::new(patterns) {
+        if let Err(err) = PathScope::new(&[], patterns) {
             bail!(
                 "invalid glob pattern in top-level `exclude` in {}: {err}",
                 external_checks_file.source_label
@@ -1720,7 +1720,7 @@ fn apply_external_checks_file(resolved: &mut ResolvedChecks, external_checks_fil
                 extract_legacy_config_excludes(&configured_id, &check.config, Path::new(""), Path::new(""))
                     .map_err(|diag| anyhow::anyhow!(diag.message))?,
             );
-            if let Err(err) = ExclusionMatcher::new(&all) {
+            if let Err(err) = PathScope::new(&[], &all) {
                 bail!(
                     "invalid glob pattern in `exclude` for check `{configured_id}` in {}: {err}",
                     external_checks_file.source_label
@@ -1730,7 +1730,7 @@ fn apply_external_checks_file(resolved: &mut ResolvedChecks, external_checks_fil
         } else {
             let patterns = extract_legacy_config_excludes(&configured_id, &check.config, Path::new(""), Path::new(""))
                 .map_err(|diag| anyhow::anyhow!(diag.message))?;
-            if let Err(err) = ExclusionMatcher::new(&patterns) {
+            if let Err(err) = PathScope::new(&[], &patterns) {
                 bail!(
                     "invalid glob pattern in legacy `config.exclude_files`/`config.exclude_globs` \
                      for check `{configured_id}` in {}: {err}",
