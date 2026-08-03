@@ -17,10 +17,13 @@
 //! This module is just the helper; the pane-driven runner that drives
 //! it lives in `runner::PaneSpawnRunner`.
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
 
+use anyhow::{Context, anyhow};
 use boss_protocol::WorkItemBinding;
+use boss_tmux::{DisplayField, NewSession, SERVER_LABEL, Tmux};
 use thiserror::Error;
 use tokio::time::Duration;
 
@@ -31,6 +34,7 @@ use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::protocol::{
     EngineToAppError, EngineToAppRequest, EngineToAppResponse, EnvVar, SpawnWorkerPaneInput, SpawnWorkerPaneResult,
 };
+use crate::work::WorkDb;
 use crate::worker_registry::WorkerRegistry;
 use crate::worker_setup::{WorkerKind, WorkerSetupInput, WrittenFiles, write_workspace_files};
 
@@ -109,6 +113,144 @@ const WORKER_EDITOR_NOOP: &str = "false";
 /// this var absent.
 const WORKER_XAI_API_KEY_NO_INTERACTIVE_AUTH: &str = "xai-boss-worker-no-interactive-auth-fallback";
 
+/// Current environment contract for Boss-owned tmux sessions. Future
+/// adoption code rejects a session whose schema is newer than it knows.
+const TMUX_SESSION_SCHEMA: &str = "1";
+const TMUX_SPAWN_TOKEN_ENV: &str = "BOSS_SPAWN_TOKEN";
+const TMUX_SPAWN_TOKEN_OPTION: &str = "@boss_spawn_token";
+
+/// Durable writes surrounding a tmux session creation. Kept as a narrow
+/// seam so the spawn-ordering test can exercise the real tmux command shape
+/// without requiring a SQLite fixture; [`WorkDb`] is the production store.
+pub trait TmuxSpawnStore: Send + Sync {
+    /// Persist the session identity before tmux receives any command.
+    fn record_tmux_spawn_intent(
+        &self,
+        execution_id: &str,
+        server_label: &str,
+        session_name: &str,
+        spawn_token: &str,
+    ) -> anyhow::Result<bool>;
+
+    /// Mark the pre-recorded session as created after its pane pid is known.
+    fn record_tmux_session_created(&self, execution_id: &str, spawn_token: &str, pane_pid: i64)
+    -> anyhow::Result<bool>;
+}
+
+impl TmuxSpawnStore for WorkDb {
+    fn record_tmux_spawn_intent(
+        &self,
+        execution_id: &str,
+        server_label: &str,
+        session_name: &str,
+        spawn_token: &str,
+    ) -> anyhow::Result<bool> {
+        self.record_tmux_spawn_intent_for_execution(execution_id, server_label, session_name, spawn_token)
+    }
+
+    fn record_tmux_session_created(
+        &self,
+        execution_id: &str,
+        spawn_token: &str,
+        pane_pid: i64,
+    ) -> anyhow::Result<bool> {
+        self.record_tmux_session_created_for_execution(execution_id, spawn_token, pane_pid)
+    }
+}
+
+/// The collaborators for the tmux-hosted branch of a single worker spawn.
+/// `None` on [`StartWorkerInput::tmux_host`] leaves the legacy app RPC
+/// entirely unchanged.
+#[derive(Clone)]
+pub struct TmuxWorkerHost {
+    tmux: Tmux,
+    spawn_store: Arc<dyn TmuxSpawnStore>,
+    session_name: String,
+}
+
+impl TmuxWorkerHost {
+    pub fn new(tmux: Tmux, spawn_store: Arc<dyn TmuxSpawnStore>, session_name: String) -> Self {
+        Self {
+            tmux,
+            spawn_store,
+            session_name,
+        }
+    }
+}
+
+/// Create one detached tmux session using the durable write ordering required
+/// for restart adoption. Once the intent write succeeds, every later failure
+/// deliberately leaves that `intended` record in place: it is the durable
+/// evidence a future reconciler needs to distinguish a never-created session
+/// from a session created just before a crash.
+async fn start_tmux_worker(
+    host: &TmuxWorkerHost,
+    execution_id: &str,
+    workspace_path: &Path,
+    command: &str,
+    env: &[EnvVar],
+) -> Result<i32, StartWorkerError> {
+    let spawn_token = crate::engine_control::generate_token();
+    let intent_recorded = host
+        .spawn_store
+        .record_tmux_spawn_intent(execution_id, SERVER_LABEL, &host.session_name, &spawn_token)
+        .context("recording tmux spawn intent")
+        .map_err(StartWorkerError::Tmux)?;
+    if !intent_recorded {
+        return Err(StartWorkerError::Tmux(anyhow!(
+            "no active run accepted tmux spawn intent for execution {execution_id}"
+        )));
+    }
+
+    let mut environment = env
+        .iter()
+        .map(|EnvVar { key, value }| (key.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    environment.insert(TMUX_SPAWN_TOKEN_ENV.to_owned(), spawn_token.clone());
+    environment.insert("BOSS_SESSION_SCHEMA".to_owned(), TMUX_SESSION_SCHEMA.to_owned());
+    // `BOSS_RUN_ID` is normally already in `env`; insert again here to make
+    // the session identity contract explicit and prevent a future env
+    // refactor from accidentally dropping it from the atomic `-e` set.
+    environment.insert("BOSS_RUN_ID".to_owned(), execution_id.to_owned());
+
+    host.tmux
+        .new_session(&NewSession {
+            name: host.session_name.clone(),
+            environment,
+            working_directory: workspace_path.to_path_buf(),
+            command: command.to_owned(),
+        })
+        .await
+        .context("creating detached tmux session")
+        .map_err(StartWorkerError::Tmux)?;
+    host.tmux
+        .set_option(&host.session_name, TMUX_SPAWN_TOKEN_OPTION, &spawn_token)
+        .await
+        .context("mirroring tmux spawn token in session option")
+        .map_err(StartWorkerError::Tmux)?;
+    let pane_pid = host
+        .tmux
+        .display_message(&host.session_name, DisplayField::PanePid)
+        .await
+        .context("reading tmux pane pid")
+        .map_err(StartWorkerError::Tmux)?
+        .parse::<i32>()
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| StartWorkerError::Tmux(anyhow!("tmux returned an invalid pane pid for {execution_id}")))?;
+    let created_recorded = host
+        .spawn_store
+        .record_tmux_session_created(execution_id, &spawn_token, i64::from(pane_pid))
+        .context("recording tmux session creation")
+        .map_err(StartWorkerError::Tmux)?;
+    if !created_recorded {
+        return Err(StartWorkerError::Tmux(anyhow!(
+            "tmux session was created but no intent row accepted its confirmation for execution {execution_id}"
+        )));
+    }
+    Ok(pane_pid)
+}
+
 // No `Debug` derive: `Arc<dyn AgentDriver>` is not `Debug`, and nothing
 // logs or asserts on a full `StartWorkerInput` dump.
 #[derive(Clone, bon::Builder)]
@@ -177,6 +319,9 @@ pub struct StartWorkerInput {
     /// method on the run goes through one object. Tests may pass any
     /// registered (or stub) driver.
     pub driver: Arc<dyn AgentDriver>,
+    /// Enables the direct tmux-hosted branch for this run. `None` preserves
+    /// the app-hosted `SpawnWorkerPane` flow byte-for-byte.
+    pub tmux_host: Option<TmuxWorkerHost>,
 }
 
 #[derive(Debug)]
@@ -210,6 +355,8 @@ pub enum StartWorkerError {
     ResponseKindMismatch,
     #[error("preparing progress ingress: {0}")]
     ProgressIngress(String),
+    #[error("tmux-hosted worker spawn: {0:#}")]
+    Tmux(#[source] anyhow::Error),
 }
 
 /// Public API for callers that want to wire pane-spawning into the
@@ -277,6 +424,14 @@ pub trait WorkerSpawner: Send + Sync {
     /// `workers.non_opus_permission_mode` setting. Default `false` (skip
     /// permissions) for tests; corp users set it to `true`.
     fn non_opus_auto_mode(&self) -> bool {
+        false
+    }
+
+    /// Whether the attributed pool should create this worker in a detached
+    /// tmux session. Defaults off so existing test spawners and production
+    /// installations retain the app-hosted path until an operator enables a
+    /// pool explicitly.
+    fn tmux_hosting_enabled_for(&self, _pool: &str) -> bool {
         false
     }
 
@@ -432,92 +587,89 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     }
 
     let claimed_slot = input.slot_id;
-    let send_outcome = spawner
-        .send_to_app_request(
-            EngineToAppRequest::SpawnWorkerPane(SpawnWorkerPaneInput {
-                run_id: input.run_id.clone(),
-                workspace_path: input.workspace_path.display().to_string(),
-                slot_id: claimed_slot,
-                initial_input: input.initial_input,
-                env,
-                summary: input.title_summary,
-                task_title: input.task_title,
-                // Driver-supplied screen-scrape markers for the app's
-                // pre-hook fallback status pill. None keeps Claude
-                // literals on the app side (older drivers / stubs).
-                // Boxed so the optional payload does not bloat the
-                // EngineToAppRequest enum when absent.
-                pane_monitor: input.driver.pane_monitor_spec().map(Box::new),
-            }),
-            Duration::from_secs(spawn_timeout.as_secs()),
+    let (slot_id, shell_pid, ack_timed_out) = if let Some(tmux_host) = input.tmux_host.as_ref() {
+        let shell_pid = match start_tmux_worker(
+            tmux_host,
+            &input.run_id,
+            &input.workspace_path,
+            &input.initial_input,
+            &env,
         )
-        .await;
-
-    // Resolve the spawn outcome into `(slot_id, shell_pid, ack_timed_out)`.
-    //
-    // The subtle case is an **ack timeout** (`SendToAppError::Timeout`):
-    // the request WAS delivered to the app, but no reply arrived within
-    // the window. This is *ambiguous* — the app may already have hosted
-    // the pane (seen previously: post-sleep the app's RPC queue drained
-    // slowly, the ack timed out, yet the `claude` process had started and
-    // kept working). Treating that as a spawn failure releases the cube
-    // lease out from under a live pane and re-dispatches a duplicate
-    // worker onto the same work item. Instead we register the slot
-    // PROVISIONALLY (shell_pid 0) so the pane's hook events correlate back
-    // to this run and the spawn-ack sweep can reconcile.
-    //
-    // What "confirms liveness" there is a *driver-originated* signal — a
-    // hook event or a `transcript_path` — and nothing else. A reported
-    // shell pid explicitly does NOT confirm it: `onSurfaceAttached` reads
-    // `ghostty_surface_foreground_pid`, which is the login shell when the
-    // driver was never exec'd, and treating it as proof is what let a
-    // driverless pane hold a slot and a cube lease indefinitely on
-    // 2026-07-30. Total silence past the grace window reaps the slot
-    // exactly as it does for a never-hooked `pane_spawned/ok`; a pane that
-    // came up with a live shell but no driver is reaped by the same
-    // module's driver-start pass on a longer window. See
-    // `crate::spawn_ack_sweep`.
-    //
-    // Every other error means the pane definitively did NOT spawn — the
-    // request was never delivered (`NotRegistered`/`SessionWedged`), the
-    // app answered with an explicit error (`AppError`), or the transport
-    // returned the wrong shape — so those stay hard failures.
-    let (slot_id, shell_pid, ack_timed_out) = match send_outcome {
-        Ok(EngineToAppResponse::SpawnWorkerPane { result }) => match result {
-            Ok(SpawnWorkerPaneResult { slot_id, shell_pid }) => (slot_id, shell_pid, false),
+        .await
+        {
+            Ok(shell_pid) => shell_pid,
             Err(err) => {
                 spawner.stop_progress_ingress(&input.run_id);
-                return Err(StartWorkerError::AppError(err));
+                return Err(err);
             }
-        },
-        Ok(
-            EngineToAppResponse::ReleaseWorkerPane { .. }
-            | EngineToAppResponse::SendToPane { .. }
-            | EngineToAppResponse::FocusWorkerPane { .. }
-            | EngineToAppResponse::InterruptWorkerPane { .. }
-            | EngineToAppResponse::RevealWorkItem { .. }
-            | EngineToAppResponse::OpenDocument { .. }
-            | EngineToAppResponse::ListHostedPanes { .. },
-        ) => {
-            spawner.stop_progress_ingress(&input.run_id);
-            return Err(StartWorkerError::ResponseKindMismatch);
-        }
-        Err(crate::app::SendToAppError::Timeout) => {
-            tracing::warn!(
-                run_id = %input.run_id,
-                slot_id = claimed_slot,
-                timeout_secs = spawn_timeout.as_secs(),
-                "spawn_flow: SpawnWorkerPane ack timed out — outcome is UNKNOWN (the app may have \
-                 hosted the pane anyway, e.g. a slow post-sleep RPC drain). Registering the slot \
-                 provisionally with shell_pid 0 and leaving the spawn-ack sweep to confirm liveness \
-                 (a hook/pid arrives) or reap on total silence. NOT failing the execution or \
-                 releasing the workspace lease, which would strand a live pane and duplicate dispatch.",
-            );
-            (claimed_slot, 0, true)
-        }
-        Err(err) => {
-            spawner.stop_progress_ingress(&input.run_id);
-            return Err(StartWorkerError::Send(err));
+        };
+        // Unlike the app RPC, `tmux new-session -d` returns a definite local
+        // outcome and the synchronous `#{pane_pid}` read is already the
+        // worker's real process identity. No provisional-ack state exists.
+        (claimed_slot, shell_pid, false)
+    } else {
+        let send_outcome = spawner
+            .send_to_app_request(
+                EngineToAppRequest::SpawnWorkerPane(SpawnWorkerPaneInput {
+                    run_id: input.run_id.clone(),
+                    workspace_path: input.workspace_path.display().to_string(),
+                    slot_id: claimed_slot,
+                    initial_input: input.initial_input,
+                    env,
+                    summary: input.title_summary,
+                    task_title: input.task_title,
+                    // Driver-supplied screen-scrape markers for the app's
+                    // pre-hook fallback status pill. None keeps Claude
+                    // literals on the app side (older drivers / stubs).
+                    // Boxed so the optional payload does not bloat the
+                    // EngineToAppRequest enum when absent.
+                    pane_monitor: input.driver.pane_monitor_spec().map(Box::new),
+                }),
+                Duration::from_secs(spawn_timeout.as_secs()),
+            )
+            .await;
+
+        // Resolve the app-hosted spawn outcome into
+        // `(slot_id, shell_pid, ack_timed_out)`. The timeout branch is
+        // deliberately legacy-only: a tmux creation is synchronous and
+        // therefore never has an unknown app-RPC outcome.
+        match send_outcome {
+            Ok(EngineToAppResponse::SpawnWorkerPane { result }) => match result {
+                Ok(SpawnWorkerPaneResult { slot_id, shell_pid }) => (slot_id, shell_pid, false),
+                Err(err) => {
+                    spawner.stop_progress_ingress(&input.run_id);
+                    return Err(StartWorkerError::AppError(err));
+                }
+            },
+            Ok(
+                EngineToAppResponse::ReleaseWorkerPane { .. }
+                | EngineToAppResponse::SendToPane { .. }
+                | EngineToAppResponse::FocusWorkerPane { .. }
+                | EngineToAppResponse::InterruptWorkerPane { .. }
+                | EngineToAppResponse::RevealWorkItem { .. }
+                | EngineToAppResponse::OpenDocument { .. }
+                | EngineToAppResponse::ListHostedPanes { .. },
+            ) => {
+                spawner.stop_progress_ingress(&input.run_id);
+                return Err(StartWorkerError::ResponseKindMismatch);
+            }
+            Err(crate::app::SendToAppError::Timeout) => {
+                tracing::warn!(
+                    run_id = %input.run_id,
+                    slot_id = claimed_slot,
+                    timeout_secs = spawn_timeout.as_secs(),
+                    "spawn_flow: SpawnWorkerPane ack timed out — outcome is UNKNOWN (the app may have \
+                     hosted the pane anyway, e.g. a slow post-sleep RPC drain). Registering the slot \
+                     provisionally with shell_pid 0 and leaving the spawn-ack sweep to confirm liveness \
+                     (a hook/pid arrives) or reap on total silence. NOT failing the execution or \
+                     releasing the workspace lease, which would strand a live pane and duplicate dispatch.",
+                );
+                (claimed_slot, 0, true)
+            }
+            Err(err) => {
+                spawner.stop_progress_ingress(&input.run_id);
+                return Err(StartWorkerError::Send(err));
+            }
         }
     };
 
@@ -601,6 +753,9 @@ mod tests {
     use super::*;
     use crate::app::SendToAppError;
     use crate::driver::test_support::codex_homes_override;
+    use boss_tmux::{CommandOutput, CommandRunner};
+    use std::ffi::OsString;
+    use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
@@ -670,7 +825,150 @@ mod tests {
             driver: crate::driver::DriverRegistry::default()
                 .require(crate::effort::ENGINE_DEFAULT_DRIVER)
                 .expect("engine default driver is always registered"),
+            tmux_host: None,
         }
+    }
+
+    #[derive(Default)]
+    struct RecordingTmuxStore {
+        steps: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl RecordingTmuxStore {
+        fn steps(&self) -> Vec<&'static str> {
+            self.steps.lock().unwrap().clone()
+        }
+    }
+
+    impl TmuxSpawnStore for RecordingTmuxStore {
+        fn record_tmux_spawn_intent(
+            &self,
+            _execution_id: &str,
+            _server_label: &str,
+            _session_name: &str,
+            _spawn_token: &str,
+        ) -> anyhow::Result<bool> {
+            self.steps.lock().unwrap().push("intent");
+            Ok(true)
+        }
+
+        fn record_tmux_session_created(
+            &self,
+            _execution_id: &str,
+            _spawn_token: &str,
+            _pane_pid: i64,
+        ) -> anyhow::Result<bool> {
+            self.steps.lock().unwrap().push("created");
+            Ok(true)
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingTmuxRunner {
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+        steps: Arc<RecordingTmuxStore>,
+    }
+
+    impl RecordingTmuxRunner {
+        fn new(steps: Arc<RecordingTmuxStore>) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                steps,
+            }
+        }
+
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CommandRunner for RecordingTmuxRunner {
+        async fn run(&self, _program: &Path, args: &[OsString], cwd: Option<&Path>) -> std::io::Result<CommandOutput> {
+            assert!(cwd.is_none());
+            let args = args
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            let (step, stdout) = match args.get(2).map(String::as_str) {
+                Some("new-session") => ("new-session", ""),
+                Some("set-option") => ("label", ""),
+                Some("display-message") => ("pane-pid", "4242\n"),
+                other => panic!("unexpected tmux command: {other:?}, args={args:?}"),
+            };
+            self.steps.steps.lock().unwrap().push(step);
+            self.calls.lock().unwrap().push(args);
+            Ok(CommandOutput {
+                success: true,
+                code: Some(0),
+                stdout: stdout.to_owned(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn tmux_hosted_spawn_commits_intent_before_creation_and_carries_env_with_e_flags() {
+        let workspace = TempDir::new().unwrap();
+        let registry = WorkerRegistry::new();
+        let spawner = StubSpawner {
+            registry: registry.clone(),
+            spawn_calls: Arc::new(AtomicUsize::new(0)),
+            last_request: std::sync::Mutex::new(None),
+            canned_response: Err(SendToAppError::NotRegistered),
+        };
+        let store = Arc::new(RecordingTmuxStore::default());
+        let runner = Arc::new(RecordingTmuxRunner::new(store.clone()));
+        let tmux = Tmux::with_runner("/opt/homebrew/bin/tmux", runner.clone()).unwrap();
+        let mut input = sample_input(&workspace);
+        input.tmux_host = Some(TmuxWorkerHost::new(tmux, store.clone(), "boss-3-run-test".to_owned()));
+
+        let started = start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
+
+        assert_eq!(started.shell_pid, 4242);
+        assert!(!started.ack_timed_out);
+        assert_eq!(registry.lookup(4242).as_deref(), Some("run-test"));
+        assert_eq!(
+            spawner.spawn_calls.load(Ordering::SeqCst),
+            0,
+            "tmux path must not call the app RPC"
+        );
+        assert_eq!(
+            store.steps(),
+            vec!["intent", "new-session", "label", "pane-pid", "created"]
+        );
+
+        let calls = runner.calls();
+        let create = &calls[0];
+        assert_eq!(&create[..5], ["-L", "boss", "new-session", "-d", "-s"]);
+        assert!(create.windows(2).any(|pair| pair == ["-e", "BOSS_RUN_ID=run-test"]));
+        assert!(create.windows(2).any(|pair| pair == ["-e", "BOSS_SESSION_SCHEMA=1"]));
+        assert!(
+            create
+                .windows(2)
+                .any(|pair| pair[0] == "-e" && pair[1].starts_with("BOSS_SPAWN_TOKEN="))
+        );
+        assert!(
+            create
+                .windows(2)
+                .any(|pair| pair == ["-e", "BOSS_EVENTS_SOCKET=/tmp/events.sock"])
+        );
+        assert_eq!(
+            &calls[1][..6],
+            ["-L", "boss", "set-option", "-t", "boss-3-run-test", "@boss_spawn_token"]
+        );
+        assert_eq!(
+            calls[2],
+            vec![
+                "-L",
+                "boss",
+                "display-message",
+                "-p",
+                "-t",
+                "boss-3-run-test",
+                "#{pane_pid}"
+            ]
+        );
     }
 
     #[tokio::test]

@@ -468,6 +468,7 @@ dependencies = [
  "boss-protocol",
  "boss-ssh-transport",
  "boss-timer-wheel",
+ "boss-tmux",
  "boss-transcript-markdown",
  "boss-transcript-tail",
  "boss-trunk-auth",

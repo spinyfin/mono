@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use crate::config::RuntimeConfig;
 use crate::coordinator::slot_id_from_worker_id;
 use crate::pane_summary;
-use crate::spawn_flow::{StartWorkerInput, start_worker};
+use crate::spawn_flow::{StartWorkerInput, TmuxWorkerHost, start_worker};
 use crate::work::{WorkDb, WorkExecution, WorkItem};
 use boss_protocol::{ExecutionKind, ExecutionStatus, WorkItemBinding};
 
@@ -325,6 +325,24 @@ impl PaneSpawnRunner {
                  Set BOSS_EVENT_BIN to the absolute boss-event path to fix this."
             )
         })
+    }
+
+    fn tmux_worker_host(&self, slot_id: u8, execution_id: &str) -> Result<TmuxWorkerHost> {
+        let short_execution_id: String = execution_id
+            .strip_prefix("exec_")
+            .unwrap_or(execution_id)
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .take(12)
+            .collect();
+        if short_execution_id.is_empty() {
+            anyhow::bail!("cannot derive tmux session name from empty execution id");
+        }
+        let session_name = format!("boss-{slot_id}-{short_execution_id}");
+        let tmux =
+            boss_tmux::Tmux::resolve().with_context(|| format!("resolving tmux for execution {execution_id}"))?;
+        let spawn_store: Arc<dyn crate::spawn_flow::TmuxSpawnStore> = self.work_db.clone();
+        Ok(TmuxWorkerHost::new(tmux, spawn_store, session_name))
     }
 }
 
@@ -899,6 +917,10 @@ impl ExecutionRunner for PaneSpawnRunner {
             Ok(Some(_))
         );
         let pool = crate::live_worker_state::attributed_pool_label(execution.kind.clone(), has_source_automation);
+        let tmux_host = spawner
+            .tmux_hosting_enabled_for(pool)
+            .then(|| self.tmux_worker_host(slot_id, &execution.id))
+            .transpose()?;
 
         let started = start_worker(
             spawner.as_ref(),
@@ -937,6 +959,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 // Same Arc resolved above for provision/spawn — settings
                 // wiring and live-state capability flags use it too.
                 driver: driver.clone(),
+                tmux_host,
             },
             StdDuration::from_secs(30),
         )
