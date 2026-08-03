@@ -405,6 +405,7 @@ pub async fn run_one_pass_observed(
         }
         sweep_one(
             work_db,
+            probe,
             &snapshot.results,
             publisher,
             (cube_client, completion_handler, remediation),
@@ -668,6 +669,7 @@ pub async fn reconcile_batch(
         }
         sweep_one(
             work_db,
+            probe,
             &probe_results,
             publisher,
             (cube_client, completion_handler, remediation),
@@ -1062,6 +1064,7 @@ pub(crate) async fn sweep_late_pr(
 
 pub(crate) async fn sweep_one(
     work_db: &WorkDb,
+    probe: &dyn MergeProbe,
     probe_results: &HashMap<String, std::result::Result<PrLifecycleProbe, String>>,
     publisher: &dyn ExecutionPublisher,
     // (cube_client, completion_handler, remediation) — bundled to keep the
@@ -1114,6 +1117,7 @@ pub(crate) async fn sweep_one(
             stop_active_revision_executions(work_db, completion_handler, &candidate.work_item_id, outcome).await;
         }
         PrLifecycleState::Open(open) => {
+            reap_superseded_merge_queue_attempt(work_db, probe, publisher, candidate, &probe_result).await;
             // Design §Q1: conflict pre-empts CI — the conflict-resolver
             // owns the slot first, and CI will be re-evaluated against
             // the new base once the rebase pushes. Both clean drives
@@ -1289,6 +1293,77 @@ pub(crate) async fn sweep_one(
             outcome.trunk_episodes_adopted += 1;
         }
     }
+}
+
+/// Reap an active GitHub merge-queue remediation once the synthetic queue
+/// commit no longer contains the PR's current head. This is deliberately
+/// independent of the current CI rollup: a failing run must not have to pass
+/// through a brief `InFlight` observation before the old attempt can retire.
+async fn reap_superseded_merge_queue_attempt(
+    work_db: &WorkDb,
+    probe: &dyn MergeProbe,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    probe_result: &PrLifecycleProbe,
+) {
+    let active = match work_db.active_ci_remediation_for_work_item(&candidate.work_item_id) {
+        Ok(Some(active)) if active.failure_kind.as_deref() == Some("merge_queue_rebounce") => active,
+        Ok(_) => return,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                ?err,
+                "merge poller: failed to inspect active merge-queue remediation",
+            );
+            return;
+        }
+    };
+    let Some(current_head_sha) = probe_result.head_ref_oid.as_deref() else {
+        ci_watch::record_declined_evaluation(candidate, &active, None, "merge_queue_reaper_missing_current_head");
+        return;
+    };
+    let Some(repo_slug) = repo_from_pr_url(&candidate.pr_url) else {
+        ci_watch::record_declined_evaluation(
+            candidate,
+            &active,
+            Some(current_head_sha),
+            "merge_queue_reaper_unparseable_pr_url",
+        );
+        return;
+    };
+    let relation = match probe
+        .compare_commits(repo_slug, current_head_sha, &active.head_sha_at_trigger)
+        .await
+    {
+        Ok(relation) => relation,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                attempt_id = %active.id,
+                head_sha_at_trigger = %active.head_sha_at_trigger,
+                current_head_sha,
+                ?err,
+                "merge poller: failed to compare merge-queue trigger with current PR head",
+            );
+            ci_watch::record_declined_evaluation(
+                candidate,
+                &active,
+                Some(current_head_sha),
+                "merge_queue_reaper_compare_unavailable",
+            );
+            return;
+        }
+    };
+    if matches!(relation, CommitRelation::Ahead | CommitRelation::Identical) {
+        ci_watch::record_declined_evaluation(
+            candidate,
+            &active,
+            Some(current_head_sha),
+            "merge_queue_trigger_still_contains_current_head",
+        );
+        return;
+    }
+    ci_watch::retire_superseded_merge_queue_attempt(work_db, publisher, candidate, &active, current_head_sha).await;
 }
 
 /// Reconcile a single stranded `blocked` parent (NULL scalar

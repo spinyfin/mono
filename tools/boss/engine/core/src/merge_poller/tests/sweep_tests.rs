@@ -2152,6 +2152,101 @@ async fn rebounce_settles_then_conflicting_base_rebuckets_via_sweep() {
     }
 }
 
+/// A GitHub queue commit is not part of the PR branch. Once a fix push makes
+/// the current PR head diverge from that synthetic commit, the old queue
+/// attempt must retire before failure detection evaluates the new head.
+#[tokio::test]
+async fn diverged_queue_attempt_retires_and_new_head_failure_mints_again() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/2650";
+    let (product_id, chore) = make_chore_in_review(&db, "C-queue-reaper", pr);
+    let publisher = Arc::new(RecordingPublisher::default());
+    let candidate = PendingMergeCheck {
+        work_item_id: chore.clone(),
+        product_id,
+        pr_url: pr.to_owned(),
+    };
+
+    assert!(
+        ci_watch::on_merge_queue_rebounce_detected(
+            &db,
+            publisher.as_ref(),
+            &candidate,
+            Some("feature-branch"),
+            "synthetic-queue-commit",
+            &[],
+            &[RequiredCheckFailure {
+                name: "ci/test".to_owned(),
+                conclusion: "FAILURE".to_owned(),
+                target_url: "https://buildkite.com/foo/bar/builds/1".to_owned(),
+                provider: CiProvider::Buildkite,
+                provider_job_id: Some("job-old".to_owned()),
+            }],
+        )
+        .await
+    );
+    let old_attempt = db
+        .active_ci_remediation_for_work_item(&chore)
+        .unwrap()
+        .expect("queue attempt");
+    let old_revision = old_attempt.revision_task_id.clone().expect("queue fix revision");
+
+    // The revision worker has finished its push. The attempt intentionally
+    // remains pending until the merge poller observes the new PR head.
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    conn.execute(
+        "UPDATE work_executions SET status = 'completed' WHERE work_item_id = ?1",
+        rusqlite::params![&old_revision],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+        rusqlite::params![&old_revision],
+    )
+    .unwrap();
+
+    let probe = StubProbe::new();
+    probe.set_with_base_head(
+        pr,
+        PrLifecycleState::Open(OpenPrStatus {
+            mergeability: OpenPrMergeability::Clean,
+            ci: OpenPrCiStatus::Failing {
+                failures: vec![RequiredCheckFailure {
+                    name: "ci/test".to_owned(),
+                    conclusion: "FAILURE".to_owned(),
+                    target_url: "https://buildkite.com/foo/bar/builds/2".to_owned(),
+                    provider: CiProvider::Buildkite,
+                    provider_job_id: Some("job-new".to_owned()),
+                }],
+            },
+        }),
+        "base-head",
+        "new-pr-head",
+    );
+    probe.set_commit_relation("new-pr-head", "synthetic-queue-commit", CommitRelation::Diverged);
+
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
+    assert_eq!(
+        outcome.ci_flagged, 1,
+        "the new failing head must mint another remediation"
+    );
+
+    let attempts = db.list_ci_remediations(None, &[], Some(&chore), None).unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert!(attempts.iter().any(|a| {
+        a.id == old_attempt.id
+            && a.status == "abandoned"
+            && a.failure_reason.as_deref() == Some("merge_queue_trigger_superseded")
+    }));
+    assert!(attempts.iter().any(|a| {
+        a.head_sha_at_trigger == "new-pr-head"
+            && a.failure_kind.as_deref() == Some("pr_branch_ci")
+            && a.status == "pending"
+    }));
+    assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 2);
+}
+
 /// The production wiring seam for Trunk queue adoption: `sweep_one` must
 /// actually call [`crate::trunk_queue_adopt::adopt_unattributed_trunk_queue_episode`]
 /// for an open PR and count what it adopted.
