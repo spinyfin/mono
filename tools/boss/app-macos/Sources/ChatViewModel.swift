@@ -1117,7 +1117,8 @@ final class ChatViewModel: ObservableObject {
             self?.appendSystemMessage(line)
         }
         processController.onSupervisionStateChange = { [weak self] state in
-            self?.engineSupervisionState = state
+            guard let self, self.engineSupervisionState != state else { return }
+            self.engineSupervisionState = state
         }
 
         bindEngineEventStream()
