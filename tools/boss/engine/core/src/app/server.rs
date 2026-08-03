@@ -212,27 +212,62 @@ impl crate::terminal_work_sweep::WorkerReaper for ServerState {
 }
 
 // Lets `Arc<ServerState>` be coerced to `Arc<dyn HuskPaneSweepSource>` for the
-// husk-pane reconciler (wired in `run` below). Delegates straight to the
-// existing `list_husk_panes` / `retire_pane` methods (the manual
-// `bossctl agents list --all` / `agents retire-pane` break-glass path) —
-// this sweep is what calls them automatically instead of waiting for an
-// operator to notice. (Defined here rather than in `app.rs` for the same
-// file-size-hygiene reason as the `WorkerReaper` impl above.)
+// tmux-session reconciler (wired in `run` below). The tmux server, not the
+// app's hosted-pane inventory, is authoritative now: the shared adoption pass
+// re-adopts non-terminal sessions and hands terminal contradictions to
+// `worker_readoption`, returning only DB-unknown sessions for two-pass reaping.
 #[async_trait::async_trait]
 impl crate::husk_pane_sweep::HuskPaneSweepSource for ServerState {
-    async fn list_husk_candidates(&self) -> Option<Vec<boss_protocol::HostedPaneEntry>> {
-        match self.list_husk_panes().await {
-            Ok(panes) => Some(panes),
+    async fn list_husk_candidates(&self) -> Option<Vec<crate::tmux_adoption::UntrackedTmuxSession>> {
+        let tmux = match boss_tmux::Tmux::resolve() {
+            Ok(tmux) => tmux,
             Err(err) => {
-                tracing::debug!(?err, "husk-pane sweep: list_husk_panes failed; skipping this pass",);
-                None
+                tracing::debug!(?err, "husk-pane sweep: tmux resolution failed; skipping this pass");
+                return None;
             }
-        }
+        };
+        Some(
+            crate::tmux_adoption::run_adoption_pass(
+                self.work_db.as_ref(),
+                &tmux,
+                self.execution_coordinator.as_ref(),
+                self,
+                self,
+                self.dispatch_events.as_ref(),
+            )
+            .await
+            .untracked_sessions,
+        )
     }
 
-    async fn retire_husk(&self, slot_id: u8) {
-        if let Err(err) = self.retire_pane(slot_id).await {
-            tracing::warn!(?err, slot_id, "husk-pane sweep: retire_pane failed");
+    async fn retire_husk(&self, session: &crate::tmux_adoption::UntrackedTmuxSession) {
+        match boss_tmux::Tmux::resolve() {
+            Ok(tmux) => {
+                match tmux
+                    .show_environment(&session.session_name, crate::tmux_adoption::TMUX_SPAWN_TOKEN_ENV)
+                    .await
+                {
+                    Ok(Some(token)) if token == session.spawn_token => {
+                        if let Err(err) = tmux.kill_session(&session.session_name).await {
+                            tracing::warn!(?err, session = %session.session_name, "husk-pane sweep: kill-session failed");
+                        }
+                    }
+                    Ok(current) => tracing::warn!(
+                        session = %session.session_name,
+                        expected_token = %session.spawn_token,
+                        current_token = ?current,
+                        "husk-pane sweep: session identity changed before reap; refusing kill-session",
+                    ),
+                    Err(err) => tracing::warn!(
+                        ?err,
+                        session = %session.session_name,
+                        "husk-pane sweep: could not verify session token before reap",
+                    ),
+                }
+            }
+            Err(err) => {
+                tracing::warn!(?err, session = %session.session_name, "husk-pane sweep: tmux resolution failed while reaping");
+            }
         }
     }
 }
@@ -1160,35 +1195,12 @@ pub async fn serve_with_merge_probe(
         crate::terminal_work_sweep::DEFAULT_INTERVAL,
     );
 
-    // Periodic husk-pane reconciler: the general backstop for a pane the app
-    // is STILL hosting for a slot the engine has already forgotten entirely
-    // (no live-state entry, no pool claim) — a "husk". Every sweep above is
-    // driven by the engine's OWN bookkeeping, which `release_worker_pane`
-    // clears unconditionally once it has asked the app to tear a pane down
-    // "successfully or not"; if that app RPC never actually lands (a timeout,
-    // an unreachable app session, an ack-timeout or other terminal-transition
-    // site that races the app round-trip), the engine's state goes clean
-    // while the real pane stays up — invisible to `terminal_work_sweep` /
-    // `pool_claim_sweep` (both iterate structures this leak already emptied)
-    // and to `bossctl agents list` (which reads the same emptied registry).
-    // This sweep instead asks the app what it hosts and diffs against the
-    // engine's live set — the same check `list_husk_panes` already performs
-    // for the manual `bossctl agents list --all` / `agents retire-pane`
-    // break-glass path — so it catches a husk regardless of which
-    // terminal-transition site produced it. Two-pass confirmation (mirroring
-    // `terminal_work_sweep`) guards against racing a fresh spawn whose
-    // live-state registration hasn't landed yet. This is the automated
-    // backstop for the 2026-07-14 pool-exhaustion incident (worker
-    // "O'Brien": twelve `request_recorded` → `worker_claimed=skipped` cycles
-    // while a stray husk pane held a slot the pool believed free). Runs every
-    // 60s.
-    // The DB goes in alongside the app source so the sweep can weigh each
-    // husk candidate against the engine's own execution row — a record the
-    // husk classification never reads and the 2026-07-26 `SessionEnd` burst
-    // could not corrupt. That is what lets a genuine mass-orphan event
-    // (every row already `orphaned`) reclaim its slots while the
-    // mass-retirement breaker stays tight for candidates the DB still
-    // considers live.
+    // Periodic husk-session reconciler: tmux is the physical inventory
+    // authority. Each pass shares the adoption classifier: non-terminal
+    // sessions re-enter adoption, terminal rows are converged by
+    // `worker_readoption`, and only sessions whose token has no DB row become
+    // leak candidates. Two-pass confirmation and the per-pass retirement
+    // breaker make the destructive final path conservative. Runs every 60s.
     let _husk_pane_sweep_handle = crate::husk_pane_sweep::spawn_loop(
         Arc::clone(&server_state) as Arc<dyn crate::husk_pane_sweep::HuskPaneSweepSource>,
         server_state.work_db.clone(),

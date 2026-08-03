@@ -178,7 +178,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use boss_protocol::{HostedPaneEntry, LiveWorkerState};
+use boss_protocol::LiveWorkerState;
 
 use crate::dead_pid_sweep::PidStatus;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
@@ -397,19 +397,15 @@ pub(crate) fn live_process_evidence_with(
 /// [`crate::app::ServerState`] in `app/server.rs`.
 #[async_trait::async_trait]
 pub trait HuskPaneSweepSource: Send + Sync {
-    /// List the slots the app currently hosts a session in that the engine
-    /// has no live-tracked run for (the same diff
-    /// [`crate::app::ServerState::list_husk_panes`] performs). `None` means
-    /// the lookup itself failed (e.g. no app session registered, transport
-    /// error) — treated as "skip this pass", never as "no husks", so a
-    /// transient app-side hiccup can't be misread as an all-clear.
-    async fn list_husk_candidates(&self) -> Option<Vec<HostedPaneEntry>>;
+    /// Enumerate the private tmux server and return sessions whose token has
+    /// no durable DB row. `None` means the inventory itself failed, so this
+    /// pass must be skipped rather than treating a transient tmux failure as
+    /// an empty server.
+    async fn list_husk_candidates(&self) -> Option<Vec<crate::tmux_adoption::UntrackedTmuxSession>>;
 
-    /// Retire the husk pane hosted in `slot_id` — the same teardown
-    /// [`crate::app::ServerState::retire_pane`] performs. Idempotent: a slot
-    /// the app already cleared (or that raced back to being live-tracked) is
-    /// a no-op there.
-    async fn retire_husk(&self, slot_id: u8);
+    /// Retire this exact leaked tmux session. The session name, not a pool
+    /// slot, is the tmux resource identity.
+    async fn retire_husk(&self, session: &crate::tmux_adoption::UntrackedTmuxSession);
 }
 
 /// Counts from one sweep pass; logged at `info` when any pane was retired.
@@ -464,7 +460,7 @@ impl crate::sweep_loop::SweepOutcome for HuskPaneSweepOutcome {
             pending_confirmation = self.pending_confirmation,
             breaker_tripped = ?self.breaker_tripped,
             escalated = self.escalated,
-            "husk-pane sweep: retired app-hosted pane(s) the engine no longer tracks",
+            "husk-pane sweep: retired leaked tmux session(s) with no durable token row",
         );
     }
 }
@@ -477,7 +473,8 @@ pub fn spawn_loop(
     dispatch_events: Arc<dyn DispatchEventSink>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
-    let seen_husks: Arc<tokio::sync::Mutex<HashSet<(u8, String)>>> = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+    let seen_husks: Arc<tokio::sync::Mutex<HashSet<(String, String)>>> =
+        Arc::new(tokio::sync::Mutex::new(HashSet::new()));
     crate::sweep_loop::spawn_sweep_loop(interval, move || {
         let source = Arc::clone(&source);
         let work_db = Arc::clone(&work_db);
@@ -506,7 +503,7 @@ pub async fn run_one_pass(
     source: &dyn HuskPaneSweepSource,
     work_db: &WorkDb,
     dispatch_events: &dyn DispatchEventSink,
-    seen_husks: &mut HashSet<(u8, String)>,
+    seen_husks: &mut HashSet<(String, String)>,
 ) -> HuskPaneSweepOutcome {
     let mut outcome = HuskPaneSweepOutcome::default();
 
@@ -524,13 +521,13 @@ pub async fn run_one_pass(
     };
 
     // Two-pass confirmation bookkeeping is shared with `terminal_work_sweep`.
-    // Key on `(slot_id, run_id)` so a slot whose husk run changes between
-    // passes never inherits a prior run's confirmation.
+    // Key on `(session_name, spawn_token)` so a newly-created session cannot
+    // inherit a prior leaked session's confirmation.
     let crate::sweep_loop::Confirmation { confirmed, pending } = crate::sweep_loop::confirm_two_pass(
         seen_husks,
         candidates
             .into_iter()
-            .map(|pane| ((pane.slot_id, pane.run_id.clone()), pane)),
+            .map(|session| ((session.session_name.clone(), session.spawn_token.clone()), session)),
     );
 
     outcome.pending_confirmation = pending.len();
@@ -541,11 +538,9 @@ pub async fn run_one_pass(
         // in practice, which is why a five-worker retirement could not be
         // traced back to what the engine believed one pass earlier.
         tracing::warn!(
-            slot_id = pane.slot_id,
-            run_id = %pane.run_id,
-            task_title = ?pane.task_title,
-            "husk-pane sweep: app-hosted pane with no engine-tracked run observed; \
-             awaiting next-pass confirmation before retiring (next pass WILL kill this pane's process)",
+            session = %pane.session_name,
+            "husk-pane sweep: tmux session with no durable spawn-token row observed; \
+             awaiting next-pass confirmation before destroying it",
         );
     }
 
@@ -553,10 +548,10 @@ pub async fn run_one_pass(
     // classification did NOT consult and the 2026-07-26 signal could not
     // corrupt: the work DB's own execution row. See the module docs for why
     // this separates a genuine mass-orphan event from engine amnesia.
-    let mut independently_dead: Vec<(HostedPaneEntry, HuskDeathEvidence)> = Vec::new();
-    let mut unconfirmed: Vec<(HostedPaneEntry, HuskDeathEvidence)> = Vec::new();
+    let mut independently_dead: Vec<(crate::tmux_adoption::UntrackedTmuxSession, HuskDeathEvidence)> = Vec::new();
+    let mut unconfirmed: Vec<(crate::tmux_adoption::UntrackedTmuxSession, HuskDeathEvidence)> = Vec::new();
     for pane in confirmed {
-        let evidence = death_evidence_from_db(work_db, &pane.run_id);
+        let evidence = death_evidence_from_db(work_db, &pane.spawn_token);
         if evidence.is_independently_confirmed() {
             independently_dead.push((pane, evidence));
         } else {
@@ -580,8 +575,8 @@ pub async fn run_one_pass(
             unconfirmed = unconfirmed.len(),
             max_per_pass = MAX_UNCONFIRMED_RETIREMENTS_PER_PASS,
             independently_confirmed = to_retire.len(),
-            slots = ?unconfirmed.iter().map(|(pane, _)| pane.slot_id).collect::<Vec<_>>(),
-            "husk-pane sweep: MASS-RETIREMENT CIRCUIT BREAKER TRIPPED — {} panes confirmed as husks in a single \
+            sessions = ?unconfirmed.iter().map(|(pane, _)| &pane.session_name).collect::<Vec<_>>(),
+            "husk-pane sweep: MASS-RETIREMENT CIRCUIT BREAKER TRIPPED — {} tmux sessions confirmed as leaks in a single \
              pass WITHOUT independent confirmation that their runs are over exceeds the \
              {MAX_UNCONFIRMED_RETIREMENTS_PER_PASS}-per-pass limit. Retiring none of them: a burst this size with \
              the engine's own execution rows still disagreeing is far better explained by engine bookkeeping that \
@@ -592,9 +587,7 @@ pub async fn run_one_pass(
         );
         for (pane, evidence) in &unconfirmed {
             tracing::error!(
-                slot_id = pane.slot_id,
-                run_id = %pane.run_id,
-                task_title = ?pane.task_title,
+                session = %pane.session_name,
                 death_evidence = evidence.label(),
                 evidence_detail = %evidence.detail(),
                 "husk-pane sweep: held back by the mass-retirement circuit breaker; pane NOT retired",
@@ -607,11 +600,9 @@ pub async fn run_one_pass(
         for (pane, evidence) in unconfirmed {
             dispatch_events
                 .emit(
-                    DispatchEvent::new(Stage::HuskPaneReconcile, Outcome::Skipped, pane.run_id.clone())
-                        .with_worker(crate::coordinator::worker_id_for_slot(pane.slot_id))
+                    DispatchEvent::new(Stage::HuskPaneReconcile, Outcome::Skipped, pane.spawn_token.clone())
                         .with_details(serde_json::json!({
-                            "slot_id": pane.slot_id,
-                            "task_title": pane.task_title,
+                            "tmux_session_name": pane.session_name,
                             "skipped_reason": "mass_retirement_circuit_breaker",
                             "max_per_pass": MAX_UNCONFIRMED_RETIREMENTS_PER_PASS,
                             "death_evidence": evidence.label(),
@@ -636,8 +627,8 @@ pub async fn run_one_pass(
     if confirmed_dead_count > MAX_UNCONFIRMED_RETIREMENTS_PER_PASS {
         tracing::warn!(
             independently_confirmed = confirmed_dead_count,
-            slots = ?to_retire.iter().map(|(pane, _)| pane.slot_id).collect::<Vec<_>>(),
-            "husk-pane sweep: reclaiming {confirmed_dead_count} panes in one pass — above the \
+            sessions = ?to_retire.iter().map(|(pane, _)| &pane.session_name).collect::<Vec<_>>(),
+            "husk-pane sweep: reclaiming {confirmed_dead_count} tmux sessions in one pass — above the \
              {MAX_UNCONFIRMED_RETIREMENTS_PER_PASS}-per-pass limit, but every one of them has an execution row the \
              engine itself already marked terminal, so this is a mass-orphan event and not the uniform-bookkeeping \
              failure the limit guards against.",
@@ -646,15 +637,13 @@ pub async fn run_one_pass(
 
     for (pane, evidence) in to_retire {
         tracing::warn!(
-            slot_id = pane.slot_id,
-            run_id = %pane.run_id,
-            task_title = ?pane.task_title,
+            session = %pane.session_name,
             death_evidence = evidence.label(),
             evidence_detail = %evidence.detail(),
-            "husk-pane sweep: app-hosted pane outlived engine tracking; retiring and freeing slot",
+            "husk-pane sweep: tmux session has no durable spawn-token row; destroying leaked session",
         );
 
-        source.retire_husk(pane.slot_id).await;
+        source.retire_husk(&pane).await;
         outcome.retired += 1;
         if evidence.is_independently_confirmed() {
             outcome.independently_confirmed += 1;
@@ -662,14 +651,13 @@ pub async fn run_one_pass(
 
         dispatch_events
             .emit(
-                DispatchEvent::new(Stage::HuskPaneReconcile, Outcome::Ok, pane.run_id.clone())
-                    .with_worker(crate::coordinator::worker_id_for_slot(pane.slot_id))
-                    .with_details(serde_json::json!({
-                        "slot_id": pane.slot_id,
-                        "task_title": pane.task_title,
+                DispatchEvent::new(Stage::HuskPaneReconcile, Outcome::Ok, pane.spawn_token.clone()).with_details(
+                    serde_json::json!({
+                        "tmux_session_name": pane.session_name,
                         "death_evidence": evidence.label(),
                         "evidence_detail": evidence.detail(),
-                    })),
+                    }),
+                ),
             )
             .await;
     }
@@ -686,13 +674,16 @@ pub async fn run_one_pass(
 /// held-back slot so the anchor choice costs no information. `held_back` is
 /// scanned in slot order so the anchor is stable across passes and
 /// `upsert_work_item_attention`'s open-item dedupe actually bites.
-fn file_breaker_attention(work_db: &WorkDb, held_back: &[(HostedPaneEntry, HuskDeathEvidence)]) -> bool {
-    let mut ordered: Vec<&(HostedPaneEntry, HuskDeathEvidence)> = held_back.iter().collect();
-    ordered.sort_by_key(|(pane, _)| (pane.slot_id, pane.run_id.clone()));
+fn file_breaker_attention(
+    work_db: &WorkDb,
+    held_back: &[(crate::tmux_adoption::UntrackedTmuxSession, HuskDeathEvidence)],
+) -> bool {
+    let mut ordered: Vec<&(crate::tmux_adoption::UntrackedTmuxSession, HuskDeathEvidence)> = held_back.iter().collect();
+    ordered.sort_by_key(|(pane, _)| (pane.session_name.clone(), pane.spawn_token.clone()));
 
     let Some(work_item_id) = ordered.iter().find_map(|(pane, _)| {
         work_db
-            .get_execution(&pane.run_id)
+            .get_execution(&pane.spawn_token)
             .ok()
             .map(|execution| execution.work_item_id)
     }) else {
@@ -706,23 +697,12 @@ fn file_breaker_attention(work_db: &WorkDb, held_back: &[(HostedPaneEntry, HuskD
 
     let slot_lines = ordered
         .iter()
-        .map(|(pane, evidence)| {
-            format!(
-                "- slot **{}** — run `{}`{} ({})",
-                pane.slot_id,
-                pane.run_id,
-                pane.task_title
-                    .as_deref()
-                    .map(|title| format!(" — {title}"))
-                    .unwrap_or_default(),
-                evidence.detail(),
-            )
-        })
+        .map(|(pane, evidence)| format!("- tmux session `{}` ({})", pane.session_name, evidence.detail(),))
         .collect::<Vec<_>>()
         .join("\n");
     let retire_lines = ordered
         .iter()
-        .map(|(pane, _)| format!("bossctl agents retire-pane {}", pane.slot_id))
+        .map(|(pane, _)| format!("tmux -L boss kill-session -t {}", pane.session_name))
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -731,7 +711,7 @@ fn file_breaker_attention(work_db: &WorkDb, held_back: &[(HostedPaneEntry, HuskD
         ordered.len()
     );
     let body = format!(
-        "The husk-pane sweep confirmed {count} app-hosted pane(s) that the engine no longer tracks, which is more \
+        "The husk-pane sweep confirmed {count} tmux session(s) with no durable token row, which is more \
          than the {MAX_UNCONFIRMED_RETIREMENTS_PER_PASS}-per-pass mass-retirement limit for candidates whose death \
          the engine cannot independently confirm. **It retired none of them**, and it will keep refusing every pass \
          until the condition clears.\n\n\
@@ -782,43 +762,41 @@ mod tests {
         open_db()
     }
 
-    fn husk(slot_id: u8, run_id: &str) -> HostedPaneEntry {
-        HostedPaneEntry {
-            slot_id,
-            run_id: run_id.to_owned(),
-            summary: None,
-            task_title: Some("test chore".to_owned()),
+    fn husk(slot_id: u8, run_id: &str) -> crate::tmux_adoption::UntrackedTmuxSession {
+        crate::tmux_adoption::UntrackedTmuxSession {
+            session_name: format!("boss-worker-{slot_id}"),
+            spawn_token: run_id.to_owned(),
         }
     }
 
     /// Test double that returns a scripted sequence of `list_husk_candidates`
     /// results (one per pass) and records every `retire_husk` call.
     struct ScriptedSource {
-        passes: Mutex<std::collections::VecDeque<Option<Vec<HostedPaneEntry>>>>,
-        retired: Mutex<Vec<u8>>,
+        passes: Mutex<std::collections::VecDeque<Option<Vec<crate::tmux_adoption::UntrackedTmuxSession>>>>,
+        retired: Mutex<Vec<String>>,
     }
 
     impl ScriptedSource {
-        fn new(passes: Vec<Option<Vec<HostedPaneEntry>>>) -> Self {
+        fn new(passes: Vec<Option<Vec<crate::tmux_adoption::UntrackedTmuxSession>>>) -> Self {
             Self {
                 passes: Mutex::new(passes.into()),
                 retired: Mutex::new(Vec::new()),
             }
         }
 
-        fn retired(&self) -> Vec<u8> {
+        fn retired(&self) -> Vec<String> {
             self.retired.lock().unwrap().clone()
         }
     }
 
     #[async_trait::async_trait]
     impl HuskPaneSweepSource for ScriptedSource {
-        async fn list_husk_candidates(&self) -> Option<Vec<HostedPaneEntry>> {
+        async fn list_husk_candidates(&self) -> Option<Vec<crate::tmux_adoption::UntrackedTmuxSession>> {
             self.passes.lock().unwrap().pop_front().flatten()
         }
 
-        async fn retire_husk(&self, slot_id: u8) {
-            self.retired.lock().unwrap().push(slot_id);
+        async fn retire_husk(&self, session: &crate::tmux_adoption::UntrackedTmuxSession) {
+            self.retired.lock().unwrap().push(session.session_name.clone());
         }
     }
 
@@ -839,14 +817,14 @@ mod tests {
 
         let second = run_one_pass(&source, &db, &sink, &mut seen).await;
         assert_eq!(second.retired, 1, "second pass must retire the confirmed husk");
-        assert_eq!(source.retired(), vec![7]);
+        assert_eq!(source.retired(), vec!["boss-worker-7"]);
 
         let events = sink.events().await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].stage, "husk_pane_reconcile");
         assert_eq!(events[0].outcome, "ok");
         assert_eq!(events[0].execution_id, "exec-a");
-        assert_eq!(events[0].details["slot_id"], 7);
+        assert_eq!(events[0].details["tmux_session_name"], "boss-worker-7");
     }
 
     /// A husk that disappears before confirmation (the registration landed,
@@ -890,7 +868,7 @@ mod tests {
             third.retired, 1,
             "the pre-blip observation must still count toward confirmation"
         );
-        assert_eq!(source.retired(), vec![5]);
+        assert_eq!(source.retired(), vec!["boss-worker-5"]);
     }
 
     /// No husks at all across several passes is simply quiet.
@@ -928,7 +906,7 @@ mod tests {
         assert_eq!(second.retired, 2);
         let mut retired = source.retired();
         retired.sort_unstable();
-        assert_eq!(retired, vec![1, 2]);
+        assert_eq!(retired, vec!["boss-worker-1", "boss-worker-2"]);
         assert_eq!(sink.events().await.len(), 2);
     }
 
@@ -966,7 +944,7 @@ mod tests {
             third.retired, 1,
             "the new run is retired once it, too, is confirmed across two passes"
         );
-        assert_eq!(source.retired(), vec![9]);
+        assert_eq!(source.retired(), vec!["boss-worker-9"]);
 
         let events = sink.events().await;
         assert_eq!(events.len(), 1);
@@ -980,7 +958,7 @@ mod tests {
     // behaviour the breaker shipped with, asserted unchanged; the tests below
     // the divider cover what the DB evidence adds on top.
 
-    fn husks(count: usize) -> Vec<HostedPaneEntry> {
+    fn husks(count: usize) -> Vec<crate::tmux_adoption::UntrackedTmuxSession> {
         (0..count).map(|i| husk(i as u8, &format!("exec-{i}"))).collect()
     }
 
@@ -1077,7 +1055,7 @@ mod tests {
         let third = run_one_pass(&source, &db, &sink, &mut seen).await;
         assert_eq!(third.breaker_tripped, None);
         assert_eq!(third.retired, 1, "a single husk is retired normally again");
-        assert_eq!(source.retired(), vec![0]);
+        assert_eq!(source.retired(), vec!["boss-worker-0"]);
     }
 
     // ─── independent death evidence ──────────────────────────────────────────
@@ -1178,7 +1156,7 @@ mod tests {
     #[tokio::test]
     async fn mass_orphan_burst_reclaims_every_slot_without_manual_intervention() {
         let fixture = EvidenceDb::new();
-        let batch: Vec<HostedPaneEntry> = (0..11)
+        let batch: Vec<crate::tmux_adoption::UntrackedTmuxSession> = (0..11)
             .map(|slot| husk(slot as u8, &fixture.orphaned_execution()))
             .collect();
         let source = ScriptedSource::new(vec![Some(batch.clone()), Some(batch)]);
@@ -1199,7 +1177,11 @@ mod tests {
 
         let mut retired = source.retired();
         retired.sort_unstable();
-        assert_eq!(retired, (0..11).collect::<Vec<u8>>(), "the whole pool comes back");
+        assert_eq!(
+            retired,
+            (0..11).map(|slot| format!("boss-worker-{slot}")).collect::<Vec<_>>(),
+            "the whole pool comes back"
+        );
 
         // Nothing to escalate: the engine resolved it.
         assert!(!second.escalated);
@@ -1229,7 +1211,7 @@ mod tests {
     #[tokio::test]
     async fn breaker_still_refuses_and_now_escalates_when_the_db_says_the_runs_are_live() {
         let fixture = EvidenceDb::new();
-        let batch: Vec<HostedPaneEntry> = (0..5)
+        let batch: Vec<crate::tmux_adoption::UntrackedTmuxSession> = (0..5)
             .map(|slot| husk(slot as u8, &fixture.running_execution()))
             .collect();
         let source = ScriptedSource::new(vec![Some(batch.clone()), Some(batch)]);
@@ -1278,7 +1260,7 @@ mod tests {
     #[tokio::test]
     async fn mixed_burst_reclaims_the_confirmed_dead_and_holds_back_the_rest() {
         let fixture = EvidenceDb::new();
-        let mut batch: Vec<HostedPaneEntry> = (0..6)
+        let mut batch: Vec<crate::tmux_adoption::UntrackedTmuxSession> = (0..6)
             .map(|slot| husk(slot as u8, &fixture.orphaned_execution()))
             .collect();
         batch.extend((6..10).map(|slot| husk(slot as u8, &fixture.running_execution())));
@@ -1294,7 +1276,10 @@ mod tests {
         assert_eq!(second.independently_confirmed, 6);
         let mut retired = source.retired();
         retired.sort_unstable();
-        assert_eq!(retired, (0..6).collect::<Vec<u8>>());
+        assert_eq!(
+            retired,
+            (0..6).map(|slot| format!("boss-worker-{slot}")).collect::<Vec<_>>()
+        );
         assert!(second.escalated);
     }
 
@@ -1305,7 +1290,7 @@ mod tests {
     #[tokio::test]
     async fn escalation_dedupes_while_the_burst_persists() {
         let fixture = EvidenceDb::new();
-        let batch: Vec<HostedPaneEntry> = (0..5)
+        let batch: Vec<crate::tmux_adoption::UntrackedTmuxSession> = (0..5)
             .map(|slot| husk(slot as u8, &fixture.running_execution()))
             .collect();
         let source = ScriptedSource::new(vec![
