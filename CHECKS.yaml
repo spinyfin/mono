@@ -47,9 +47,12 @@ checks:
   # (30) sits just above p95 of the last 100 mono PRs; the generic check
   # default is 50 for unconfigured consumers. Legitimate large surfaces
   # (coordinated renames, unsplittable generated trees) use
-  # BYPASS_CHANGE_FILE_COUNT=<specific legitimate reason> in the PR/commit
-  # description — not a silent higher default. Distinct from file/size, which
-  # limits lines per file, not file count.
+  # BYPASS_CHANGE_FILE_COUNT=<specific legitimate reason> in the commit
+  # description — not a silent higher default. The PR description also works
+  # but is a best-effort surface (it requires resolving the PR and GitHub API
+  # access); the commit description is read in every CI context, including
+  # the merge queue, with no network dependency. Distinct from file/size,
+  # which limits lines per file, not file count.
   - id: change/file-count
     config:
       max_files: 30

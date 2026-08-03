@@ -36,7 +36,8 @@
 //! stale-exclusion audit hooks below.
 //!
 //! For a one-off exception use `BYPASS_RUST_GIANT_STRUCTS_CREATE=<reason>` in the
-//! PR or commit description (requires `allow_bypass = true` in policy).
+//! commit description (read in every CI context) or PR description (best-effort;
+//! requires `allow_bypass = true` in policy).
 
 use checkleft_check_sdk::{ChangeKind, CheckInput, DeclaredExclusion, ExclusionStatus, Finding, check};
 use checkleft_rust_giant_structs_common::{has_cfg_test, strip_visibility, struct_declaration_line};

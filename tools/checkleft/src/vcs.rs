@@ -293,7 +293,10 @@ pub async fn github_pull_request_description(
 
     let response_bytes = response.bytes().await.ok()?;
     let payload: GithubPullRequestResponse = serde_json::from_slice(&response_bytes).ok()?;
-    normalize_non_empty(payload.body)
+    // A successful response with an empty body is still a resolved PR
+    // description. Callers need that distinction to avoid reporting that the
+    // PR description was unreachable.
+    Some(payload.body.unwrap_or_default())
 }
 
 /// Look up the open PR number for a branch via the GitHub API.
@@ -693,10 +696,6 @@ fn parse_repo_slug_from_remote_url(remote_url: &str) -> Option<String> {
     Some(format!("{}/{}", parts[0], parts[1]))
 }
 
-fn normalize_non_empty(value: Option<String>) -> Option<String> {
-    value.map(|text| text.trim().to_owned()).filter(|text| !text.is_empty())
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -704,8 +703,8 @@ mod tests {
     use crate::input::ChangeKind;
 
     use super::{
-        normalize_non_empty, parse_git_name_status, parse_git_status_porcelain_paths, parse_jj_diff_summary,
-        parse_jj_remote_list_url, parse_repo_root_output, parse_repo_slug_from_remote_url, parse_tracked_file_list,
+        parse_git_name_status, parse_git_status_porcelain_paths, parse_jj_diff_summary, parse_jj_remote_list_url,
+        parse_repo_root_output, parse_repo_slug_from_remote_url, parse_tracked_file_list,
         resolve_jj_repo_slug_from_remote_list, try_expand_brace_notation,
     };
 
@@ -1097,16 +1096,6 @@ R docs/old.md => docs/new.md
         let vcs = super::Vcs::detect(temp.path()).expect("detect vcs");
         assert_eq!(vcs.kind(), super::VcsKind::Jujutsu);
         assert_eq!(vcs.remote_repo_slug(), Some("example/flunge".to_owned()));
-    }
-
-    #[test]
-    fn normalize_non_empty_trims_and_filters_empty_values() {
-        assert_eq!(normalize_non_empty(None), None);
-        assert_eq!(normalize_non_empty(Some("".to_owned())), None);
-        assert_eq!(
-            normalize_non_empty(Some("  example/flunge  ".to_owned())),
-            Some("example/flunge".to_owned())
-        );
     }
 
     /// Verifies that `changeset_since` scopes to the PR's own changes only, not

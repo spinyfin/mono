@@ -196,7 +196,7 @@ allow_bypass = true
 }
 
 #[tokio::test]
-async fn runner_appends_bypass_guidance_when_enabled_and_missing() {
+async fn runner_appends_unreachable_pr_description_guidance_when_pr_description_unresolved() {
     let temp = tempdir().expect("create temp dir");
     fs::create_dir_all(temp.path().join("docs")).expect("create dirs");
     fs::write(temp.path().join("docs/file.md"), "hello\n").expect("write file");
@@ -228,6 +228,11 @@ allow_bypass = true
         Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
     );
 
+    // ChangeSet::new leaves pr_description as None, the same shape checkleft
+    // builds on a GitHub merge-queue build once branch-based PR-number
+    // recovery has genuinely found nothing to fetch. The generic
+    // "never use bypasses for convenience" guidance must NOT fire here — it
+    // wrongly implies the PR description was checked and found empty.
     let results = runner
         .run_changeset(&ChangeSet::new(vec![ChangedFile {
             path: Path::new("docs/file.md").to_path_buf(),
@@ -243,7 +248,81 @@ allow_bypass = true
         results[0].findings[0]
             .remediations
             .iter()
+            .any(|r| r.contains("Could not resolve a PR description")),
+        "remediations: {:?}",
+        results[0].findings[0].remediations
+    );
+}
+
+#[tokio::test]
+async fn runner_appends_standard_bypass_guidance_when_pr_description_is_empty() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("docs")).expect("create dirs");
+    fs::write(temp.path().join("docs/file.md"), "hello\n").expect("write file");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "policy-check"
+check = "static-finding"
+
+[checks.policy]
+allow_bypass = true
+"#,
+    )
+    .expect("write config");
+
+    let mut registry = CheckRegistry::new();
+    registry
+        .register(StaticFindingCheck {
+            id: "static-finding".to_owned(),
+            severity: Severity::Error,
+            remediation: Some("fix me".to_owned()),
+        })
+        .expect("register check");
+
+    let runner = Runner::new(
+        Arc::new(registry),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+
+    // An empty body still means the PR description was resolved (unlike the
+    // test above). The generic guidance is correct because both surfaces were
+    // genuinely checked, even though neither contained a directive.
+    let results = runner
+        .run_changeset(
+            &ChangeSet::new(vec![ChangedFile {
+                path: Path::new("docs/file.md").to_path_buf(),
+                kind: ChangeKind::Modified,
+                old_path: None,
+            }])
+            .with_pr_description(Some(String::new())),
+        )
+        .await
+        .expect("run checks");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].findings.len(), 1);
+    assert!(
+        results[0].findings[0]
+            .remediations
+            .iter()
             .any(|r| r.contains("never use bypasses for convenience"))
+    );
+    assert!(
+        !results[0].findings[0]
+            .remediations
+            .iter()
+            .any(|r| r.contains("Could not resolve a PR description")),
+        "remediations: {:?}",
+        results[0].findings[0].remediations
+    );
+    assert!(
+        results[0].findings[0]
+            .remediations
+            .iter()
+            .all(|r| !r.contains("Could not resolve a PR description"))
     );
 }
 

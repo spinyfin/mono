@@ -9,7 +9,10 @@ use tokio::task::JoinSet;
 
 use crate::progress::{NoopProgressReporter, ProgressReporter, files_failed_count};
 
-use crate::bypass::{bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id};
+use crate::bypass::{
+    bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id,
+    bypass_unreachable_pr_description_guidance,
+};
 use crate::check::{CheckRegistry, ConfiguredCheck};
 use crate::config::{CheckConfig, CheckConfigOrigin, CheckScope, ConfigDiagnostic, ConfigResolver};
 use crate::exclusion::ExclusionStatus;
@@ -1539,7 +1542,16 @@ fn apply_policy_to_result(
             return result;
         }
 
-        let guidance = bypass_failure_guidance(&policy.bypass_name);
+        // Distinguish "no bypass declared" from "a bypass may exist but this
+        // run could not resolve a PR description to check" — otherwise a
+        // directive declared only in the PR body (e.g. on a GitHub
+        // merge-queue build, which cannot fetch it) looks identical to no
+        // directive existing at all.
+        let guidance = if changeset.pr_description.is_none() {
+            bypass_unreachable_pr_description_guidance(&policy.bypass_name)
+        } else {
+            bypass_failure_guidance(&policy.bypass_name)
+        };
         for finding in &mut result.findings {
             finding.remediations.push(guidance.clone());
         }

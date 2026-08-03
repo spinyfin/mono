@@ -85,7 +85,7 @@ pub fn change_file_count_check(input: CheckInput) -> Vec<Finding> {
                 .to_owned(),
         )
         .with_remediation(
-            "If this large surface is intentional (coordinated rename, generated tree that cannot split, etc.), request a one-off exception with `BYPASS_CHANGE_FILE_COUNT=<specific legitimate reason>` in the PR or commit description."
+            "If this large surface is intentional (coordinated rename, generated tree that cannot split, etc.), request a one-off exception with `BYPASS_CHANGE_FILE_COUNT=<specific legitimate reason>` in the commit description (read in every CI context) or the PR description (best-effort)."
                 .to_owned(),
         ),
     ]

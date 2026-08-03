@@ -80,7 +80,27 @@ pub fn bypass_name_for_check_id(check_id: &str) -> String {
 
 pub fn bypass_failure_guidance(bypass_name: &str) -> String {
     format!(
-        "Request a one-off PR exception using `{bypass_name}=<specific legitimate reason>` in the PR or commit description. Only for a real exception or emergency - never use bypasses for convenience."
+        "Request a one-off exception using `{bypass_name}=<specific legitimate reason>` in the commit description (read in every CI context, including the merge queue) or the PR description (best-effort; not read on all CI contexts). Only for a real exception or emergency - never use bypasses for convenience."
+    )
+}
+
+/// Guidance used in place of [`bypass_failure_guidance`] when `allow_bypass`
+/// is set, no bypass directive resolved, *and* [`crate::input::ChangeSet::pr_description`]
+/// itself is `None` — meaning checkleft could not resolve a PR description at
+/// all in this environment, not merely find one without the directive.
+///
+/// Without this distinction, a bypass declared only in the PR description
+/// reads identically to no bypass having been declared at all: the standard
+/// guidance points authors at a surface ([`bypass_failure_guidance`]'s "PR
+/// description") that this run structurally could not read, giving no hint
+/// that the directive might already exist there.
+pub fn bypass_unreachable_pr_description_guidance(bypass_name: &str) -> String {
+    format!(
+        "Could not resolve a PR description in this environment, so only the commit description was checked for \
+         `{bypass_name}` (not found there). If the directive is declared only in the PR description, it is not \
+         visible to this run — for example on a GitHub merge-queue build, or without GitHub API access. Declare \
+         the bypass in the commit description instead — `{bypass_name}=<specific legitimate reason>` — which is \
+         read in every CI context. Only for a real exception or emergency - never use bypasses for convenience."
     )
 }
 
@@ -133,8 +153,9 @@ fn is_valid_bypass_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id, maybe_bypass_findings,
-        parse_bypass_directives, parse_bypass_directives_from_descriptions,
+        bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id,
+        bypass_unreachable_pr_description_guidance, maybe_bypass_findings, parse_bypass_directives,
+        parse_bypass_directives_from_descriptions,
     };
     use crate::input::{ChangeKind, ChangeSet, ChangedFile};
     use crate::output::{Location, Severity};
@@ -213,6 +234,28 @@ mod tests {
     fn bypass_failure_guidance_includes_strict_wording() {
         let guidance = bypass_failure_guidance("BYPASS_API_BREAKING_SURFACE");
         assert!(guidance.contains("BYPASS_API_BREAKING_SURFACE=<specific legitimate reason>"));
+        assert!(guidance.contains("never use bypasses for convenience"));
+    }
+
+    #[test]
+    fn bypass_failure_guidance_steers_to_commit_description_first() {
+        let guidance = bypass_failure_guidance("BYPASS_CHANGE_FILE_COUNT");
+        let commit_pos = guidance
+            .find("commit description")
+            .expect("mentions commit description");
+        let pr_pos = guidance.find("PR description").expect("mentions PR description");
+        assert!(
+            commit_pos < pr_pos,
+            "commit description must be presented before PR description: {guidance}"
+        );
+    }
+
+    #[test]
+    fn bypass_unreachable_pr_description_guidance_explains_why_and_names_directive() {
+        let guidance = bypass_unreachable_pr_description_guidance("BYPASS_CHANGE_FILE_COUNT");
+        assert!(guidance.contains("Could not resolve a PR description"));
+        assert!(guidance.contains("BYPASS_CHANGE_FILE_COUNT=<specific legitimate reason>"));
+        assert!(guidance.contains("commit description"));
         assert!(guidance.contains("never use bypasses for convenience"));
     }
 
