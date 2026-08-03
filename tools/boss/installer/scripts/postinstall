@@ -18,6 +18,8 @@ Required tools (Boss will not start without these):
   jj     Jujutsu VCS — used by workers for all repository operations
   gh     GitHub CLI — used by workers for PR / issue operations
   claude Claude Code CLI — the worker backend
+  tmux   tmux 3.2 or newer — durable worker and coordinator sessions
+         Install: brew install tmux
 
 Optional tools:
 

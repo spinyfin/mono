@@ -417,6 +417,21 @@ pub async fn serve_with_merge_probe(
         None,
         None,
     )?;
+    let tmux_preflight = crate::tmux_preflight::TmuxPreflight::probe().await;
+    if let Some(reason) = tmux_preflight.unavailable_reason() {
+        tracing::error!(%reason, "tmux preflight failed; refusing all new local dispatches");
+        server_state.execution_coordinator.pause_dispatch(
+            boss_engine_utils::epoch_time::now_epoch_secs() as u64,
+            crate::coordinator::DispatchPauseOrigin::Breaker,
+            boss_protocol::PauseReason::new(reason.to_owned())?,
+        );
+    } else if let crate::tmux_preflight::TmuxPreflight::Ready { program, version } = &tmux_preflight {
+        tracing::info!(tmux_program = %program.display(), tmux_version_major = version.major, tmux_version_minor = version.minor, "tmux preflight passed");
+    }
+    *server_state
+        .tmux_preflight
+        .write()
+        .expect("tmux preflight lock poisoned") = tmux_preflight;
 
     // GitHub API usage telemetry: install the process-wide sink and start
     // its batching writer.
