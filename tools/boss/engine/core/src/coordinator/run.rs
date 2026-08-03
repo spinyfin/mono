@@ -514,126 +514,127 @@ impl ExecutionCoordinator {
                         resolved_at: None,
                     });
 
-                 match self.work_db.finish_execution_run(
-                     FinishExecutionRunInput::builder()
-                         .execution_id(&execution.id)
-                         .run_id(&run.id)
-                         .execution_status(ExecutionStatus::Failed)
-                         .run_status("failed")
-                         .error_text(error_text.as_str())
-                         .clear_workspace_lease(released)
-                        .increment_pre_start_failure_count(!is_slot_busy)
-                         .maybe_attention(attention)
-                         .build(),
-                 ) {
-                     Ok((execution, _run, _)) => {
-                         // Driver teardown for this termination path already
-                         // ran unconditionally above, before the cube release.
-                         // The execution is now durably `failed` in the DB —
-                         // safe to have `pool_claim_sweep` own reclaiming this
-                         // slot instead of releasing it immediately (see the
-                         // `hold_slot_busy` declaration above and the tail of
-                         // this function).
-                         hold_slot_busy = is_slot_busy;
-                         tracing::warn!(
-                             execution_id = %execution.id,
-                             run_id = %run.id,
-                             worker_id = %worker_id,
-                             error = %err,
-                             released_workspace = released,
-                             "execution run failed"
-                         );
-                         let mut error_details = serde_json::json!({
-                             "run_id": run.id,
-                             "released_workspace": released,
-                             "slot_id": slot_id,
-                             "page": slot_id.and_then(worker_page_label),
-                             "pre_start_failure_count": execution.pre_start_failure_count,
-                             "transient_failure_count": execution.transient_failure_count,
-                         });
-                         // A `SlotBusy` spawn rejection means the engine and
-                         // the app disagree about slot occupancy — the
-                         // engine already knew which slot it requested
-                         // (`worker_id` above), but not which pane the app
-                         // reports as squatting it. Surface both explicitly
-                         // so `dispatch.jsonl` is self-diagnosing instead of
-                         // requiring a coordinator to cross-reference the
-                         // husk pane by hand.
-                         if let Some(occupying_run_id) = slot_busy_occupant(&err) {
-                             error_details["slot_busy"] = serde_json::json!({
-                                 "slot_id": slot_id,
-                                 "occupying_run_id": occupying_run_id,
-                             });
-                         }
-                         self.dispatch_events
-                             .emit(
-                                 DispatchEvent::new(Stage::PaneSpawned, DispatchOutcome::Error, &execution.id)
-                                     .with_work_item(&execution.work_item_id)
-                                     .with_worker(&worker_id)
-                                     .with_cube_lease(&lease.lease_id)
-                                     .with_cube_workspace(&lease.workspace_id)
-                                     .with_error(&err)
-                                     .with_details(error_details),
-                             )
-                             .await;
-                         // Clear the card out of `active`. The run is
-                         // already recorded `failed` and the workspace
-                         // released, but the work item itself stays
-                         // `active` — so the kanban keeps the green
-                         // "Doing" card and the orphan-active sweep
-                         // re-dispatches the same doomed spawn every
-                         // cycle. Demote it back to To-Do so the failure
-                         // (already surfaced as a `pane_spawn_failed`
-                         // attention item) is recoverable rather than a
-                         // silent green-flicker strand.
-                         //
-                         // Exception: PrReview spawn failures are engine
-                         // infrastructure bugs (e.g. slot-range mismatch),
-                         // not task regressions. Demoting the work item
-                         // here would silently move a reviewed PR back to
-                         // To-Do, erasing the review context. Leave the
-                         // task in place — the attention item already
-                         // surfaces the failure for the operator.
-                         //
-                         // Exception: a `SlotBusy` rejection is likewise an
-                         // engine-side infrastructure issue (see `is_slot_busy`
-                         // above), not a real dispatch failure of the task
-                         // itself — demoting to To-Do would require a human to
-                         // notice and manually re-drag the card. Leaving the
-                         // item `active` lets the tail of this function's
-                         // rescan (`rescan_active_dispatch_after_release`)
-                         // queue a fresh execution automatically, so the item
-                         // stays in Doing and dispatches onto the next free
-                         // slot exactly like a plain pool-exhaustion wait.
-                         if execution.kind != ExecutionKind::PrReview && !is_slot_busy {
-                            match self.work_db.bounce_dispatch_failed_to_backlog(
-                                &execution.work_item_id,
-                                "pane_spawn_failed",
-                                error_text.as_str(),
-                            ) {
-                                 Ok(true) => {
-                                     tracing::info!(
-                                         execution_id = %execution.id,
-                                         work_item_id = %execution.work_item_id,
-                                         "demoted work item to todo after pane-spawn failure",
-                                     );
-                                     self.dispatch_events
-                                         .emit(
-                                             DispatchEvent::new(
-                                                 Stage::StatusTransition,
-                                                 DispatchOutcome::Ok,
-                                                 &execution.id,
-                                             )
-                                             .with_work_item(&execution.work_item_id)
-                                             .with_worker(&worker_id)
-                                             .with_details(
-                                                 serde_json::json!({
-                                                    "from_status": "active",
-                                                    "to_status": "todo",
-                                                    "did_dispatch": false,
-                                                    "reason": "pane_spawn_failure",
-                                                    "failed_execution_id": execution.id,
-                                                })),
+                    match self.work_db.finish_execution_run(
+                        FinishExecutionRunInput::builder()
+                            .execution_id(&execution.id)
+                            .run_id(&run.id)
+                            .execution_status(ExecutionStatus::Failed)
+                            .run_status("failed")
+                            .error_text(error_text.as_str())
+                            .clear_workspace_lease(released)
+                            .increment_pre_start_failure_count(!is_slot_busy)
+                            .maybe_attention(attention)
+                            .build(),
+                    ) {
+                        Ok((execution, _run, _)) => {
+                            // Driver teardown for this termination path already
+                            // ran unconditionally above, before the cube release.
+                            // The execution is now durably `failed` in the DB —
+                            // safe to have `pool_claim_sweep` own reclaiming this
+                            // slot instead of releasing it immediately (see the
+                            // `hold_slot_busy` declaration above and the tail of
+                            // this function).
+                            hold_slot_busy = is_slot_busy;
+                            tracing::warn!(
+                                execution_id = %execution.id,
+                                run_id = %run.id,
+                                worker_id = %worker_id,
+                                error = %err,
+                                released_workspace = released,
+                                "execution run failed"
+                            );
+                            let mut error_details = serde_json::json!({
+                                "run_id": run.id,
+                                "released_workspace": released,
+                                "slot_id": slot_id,
+                                "page": slot_id.and_then(worker_page_label),
+                                "pre_start_failure_count": execution.pre_start_failure_count,
+                                "transient_failure_count": execution.transient_failure_count,
+                            });
+                            // A `SlotBusy` spawn rejection means the engine and
+                            // the app disagree about slot occupancy — the
+                            // engine already knew which slot it requested
+                            // (`worker_id` above), but not which pane the app
+                            // reports as squatting it. Surface both explicitly
+                            // so `dispatch.jsonl` is self-diagnosing instead of
+                            // requiring a coordinator to cross-reference the
+                            // husk pane by hand.
+                            if let Some(occupying_run_id) = slot_busy_occupant(&err) {
+                                error_details["slot_busy"] = serde_json::json!({
+                                    "slot_id": slot_id,
+                                    "occupying_run_id": occupying_run_id,
+                                });
+                            }
+                            self.dispatch_events
+                                .emit(
+                                    DispatchEvent::new(Stage::PaneSpawned, DispatchOutcome::Error, &execution.id)
+                                        .with_work_item(&execution.work_item_id)
+                                        .with_worker(&worker_id)
+                                        .with_cube_lease(&lease.lease_id)
+                                        .with_cube_workspace(&lease.workspace_id)
+                                        .with_error(&err)
+                                        .with_details(error_details),
+                                )
+                                .await;
+                            // Clear the card out of `active`. The run is
+                            // already recorded `failed` and the workspace
+                            // released, but the work item itself stays
+                            // `active` — so the kanban keeps the green
+                            // "Doing" card and the orphan-active sweep
+                            // re-dispatches the same doomed spawn every
+                            // cycle. Demote it back to To-Do so the failure
+                            // (already surfaced as a `pane_spawn_failed`
+                            // attention item) is recoverable rather than a
+                            // silent green-flicker strand.
+                            //
+                            // Exception: PrReview spawn failures are engine
+                            // infrastructure bugs (e.g. slot-range mismatch),
+                            // not task regressions. Demoting the work item
+                            // here would silently move a reviewed PR back to
+                            // To-Do, erasing the review context. Leave the
+                            // task in place — the attention item already
+                            // surfaces the failure for the operator.
+                            //
+                            // Exception: a `SlotBusy` rejection is likewise an
+                            // engine-side infrastructure issue (see `is_slot_busy`
+                            // above), not a real dispatch failure of the task
+                            // itself — demoting to To-Do would require a human to
+                            // notice and manually re-drag the card. Leaving the
+                            // item `active` lets the tail of this function's
+                            // rescan (`rescan_active_dispatch_after_release`)
+                            // queue a fresh execution automatically, so the item
+                            // stays in Doing and dispatches onto the next free
+                            // slot exactly like a plain pool-exhaustion wait.
+                            if execution.kind != ExecutionKind::PrReview && !is_slot_busy {
+                                match self.work_db.bounce_dispatch_failed_to_backlog(
+                                    &execution.work_item_id,
+                                    "pane_spawn_failed",
+                                    error_text.as_str(),
+                                ) {
+                                    Ok(true) => {
+                                        tracing::info!(
+                                            execution_id = %execution.id,
+                                            work_item_id = %execution.work_item_id,
+                                            "demoted work item to todo after pane-spawn failure",
+                                        );
+                                        self.dispatch_events
+                                            .emit(
+                                                DispatchEvent::new(
+                                                    Stage::StatusTransition,
+                                                    DispatchOutcome::Ok,
+                                                    &execution.id,
+                                                )
+                                                .with_work_item(&execution.work_item_id)
+                                                .with_worker(&worker_id)
+                                                .with_details(
+                                                    serde_json::json!({
+                                                        "from_status": "active",
+                                                        "to_status": "todo",
+                                                        "did_dispatch": false,
+                                                        "reason": "pane_spawn_failure",
+                                                        "failed_execution_id": execution.id,
+                                                    }),
+                                                ),
                                             )
                                             .await;
                                     }
