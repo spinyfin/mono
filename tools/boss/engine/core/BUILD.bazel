@@ -1,6 +1,7 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load(":engine_binary.bzl", "ENGINE_BINARY_NAME")
 
 rust_library(
     name = "engine_lib",
@@ -103,7 +104,7 @@ rust_library(
 )
 
 rust_binary(
-    name = "engine",
+    name = ENGINE_BINARY_NAME,
     srcs = ["src/main.rs"],
     # Ship the boss-event hook shim alongside the engine binary so
     # PaneSpawnRunner can resolve it via runfiles at runtime. Without

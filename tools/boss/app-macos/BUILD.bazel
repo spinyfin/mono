@@ -1,5 +1,13 @@
 load("@build_bazel_rules_apple//apple:macos.bzl", "macos_application", "macos_unit_test")
 load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
+load(
+    "//tools/boss/engine/core:engine_binary.bzl",
+    "ENGINE_BINARY_BAZEL_OUTPUT_FRAGMENT",
+    "ENGINE_BINARY_BAZEL_RUN_COMMAND",
+    "ENGINE_BINARY_BUNDLE_FRAGMENT",
+    "ENGINE_BINARY_NAME",
+    "ENGINE_BINARY_TARGET",
+)
 load("//tools/boss/installer:pkg.bzl", "boss_short_version_plist")
 load("//tools/test-sandbox:defs.bzl", "XCODE_TEST_ENV")
 
@@ -12,6 +20,19 @@ _COVERAGE_LINKOPTS = select({
     ":coverage_enabled": ["-fprofile-instr-generate"],
     "//conditions:default": [],
 })
+
+_ENGINE_BINARY_SWIFT_SOURCE = """enum BossEngineBinary {
+    static let executableName = \"%s\"
+    static let bazelRunCommand = \"%s\"
+    static let bazelOutputPathFragment = \"%s\"
+    static let bundlePathFragment = \"%s\"
+}
+""" % (
+    ENGINE_BINARY_NAME,
+    ENGINE_BINARY_BAZEL_RUN_COMMAND,
+    ENGINE_BINARY_BAZEL_OUTPUT_FRAGMENT,
+    ENGINE_BINARY_BUNDLE_FRAGMENT,
+)
 
 package(default_visibility = ["//visibility:private"])
 
@@ -29,7 +50,7 @@ swift_library(
     srcs = glob(
         ["Sources/**/*.swift"],
         exclude = ["Sources/CrashWatchdog/**/*.swift"],
-    ),
+    ) + [":engine_binary_name_swift"],
     copts = [
         # Mirror the swiftSettings define in Package.swift so @inlinable
         # Textual APIs (e.g. .textual.textSelection) expand correctly here.
@@ -51,6 +72,13 @@ swift_library(
         "@ghostty_kit//:GhosttyKit",
         "@swiftpkg_textual//:Textual",
     ],
+)
+
+genrule(
+    name = "engine_binary_name_swift",
+    outs = ["EngineBinaryName.swift"],
+    cmd = "cat > $@ <<'EOF'\n%sEOF" % _ENGINE_BINARY_SWIFT_SOURCE,
+    visibility = ["//visibility:private"],
 )
 
 # BossTests is sharded across four independent macos_unit_test targets so
@@ -253,7 +281,7 @@ macos_application(
     # Workers run inside Ghostty terminal panes and inherit the user's shell PATH,
     # so they continue to resolve cube (and jj, gh, claude, etc.) from PATH.
     additional_contents = {
-        "//tools/boss/engine/core:engine": "Resources/bin",
+        ENGINE_BINARY_TARGET: "Resources/bin",
         "//tools/boss/cli:boss": "Resources/bin",
         "//tools/boss/bossctl:bossctl": "Resources/bin",
         "//tools/boss/event-shim:boss-event": "Resources/bin",
