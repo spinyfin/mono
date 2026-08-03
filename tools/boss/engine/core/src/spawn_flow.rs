@@ -25,6 +25,7 @@ use std::time::Duration as StdDuration;
 
 use anyhow::{Context, anyhow};
 use boss_protocol::WorkItemBinding;
+use boss_tmux::TMUX_SPAWN_TOKEN_ENV;
 use boss_tmux::{DisplayField, NewSession, SERVER_LABEL, Tmux};
 use thiserror::Error;
 use tokio::time::Duration;

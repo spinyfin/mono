@@ -6,6 +6,8 @@ use anyhow::{Result, bail};
 
 /// The private tmux server used exclusively by Boss.
 pub const SERVER_LABEL: &str = "boss";
+/// Environment variable carrying the durable identity token for a Boss worker pane.
+pub const TMUX_SPAWN_TOKEN_ENV: &str = "BOSS_SPAWN_TOKEN";
 /// tmux 3.2 introduced `new-session -e`, required for atomic token carriage.
 pub const MINIMUM_VERSION: TmuxVersion = TmuxVersion { major: 3, minor: 2 };
 /// A conservative literal-input size that remains below command-line limits.

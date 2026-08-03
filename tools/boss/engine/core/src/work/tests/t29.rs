@@ -113,13 +113,10 @@ fn upsert_work_item_attention_creates_a_distinct_item_per_kind() {
     assert!(kinds.contains(&"dead_pid".to_owned()));
 }
 
-/// Folding into an open item leaves its text at the first trip's wording.
-/// This pins the deliberate asymmetry with
-/// `upsert_external_tracker_attention`, which *does* refresh — a caller that
-/// wants the operator-visible text to track the latest trip must use that
-/// verb, not this one.
+/// Folding into an open item refreshes the operator-visible details while
+/// retaining the same durable attention item.
 #[test]
-fn upsert_work_item_attention_keeps_the_original_title_and_body_on_a_fold() {
+fn upsert_work_item_attention_refreshes_title_and_body_on_a_fold() {
     let (db, _product, chore) = chore_fixture("upsert-wi-text");
 
     db.upsert_work_item_attention(&chore, "transient_recovery", "First title", "first body")
@@ -129,8 +126,8 @@ fn upsert_work_item_attention_keeps_the_original_title_and_body_on_a_fold() {
         .unwrap();
 
     let item = db.get_attention_item(&id).unwrap();
-    assert_eq!(item.title, "First title");
-    assert_eq!(item.body_markdown, "first body");
+    assert_eq!(item.title, "Second title");
+    assert_eq!(item.body_markdown, "second body");
 }
 
 /// Dedupe only suppresses against an *open* item: once the prior item is
