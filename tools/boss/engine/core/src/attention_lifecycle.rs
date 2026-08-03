@@ -233,6 +233,12 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          for that question proves the queue wait ended; the scheduler also refreshes this signal while \
          the execution remains ready so an operator can distinguish an active wait from stale history.",
     ),
+    entry(
+        crate::stale_worker_sweep::STALE_WORKER_ATTENTION_KIND,
+        ClearedBy::HumanDecision,
+        "Tmux can prove a worker is quiet but cannot prove why. The attention deliberately remains \
+         open until an operator inspects the retained session and decides whether to stop or resume it.",
+    ),
     // ── Cleared by a later completed pass of the same kind ──────────────
     entry(
         crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND,
@@ -571,6 +577,7 @@ mod tests {
             crate::completion::MID_TURN_REAP_ATTENTION_KIND,
             crate::coordinator::PANE_SPAWN_FAILED_ATTENTION_KIND,
             crate::coordinator::ANSWER_AGENT_READY_AGE_ATTENTION_KIND,
+            crate::stale_worker_sweep::STALE_WORKER_ATTENTION_KIND,
             crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND,
             crate::worker_escalation::WORKER_ESCALATION_ATTENTION_KIND,
             crate::worker_escalation::WORKER_BLOCKED_ATTENTION_KIND,
