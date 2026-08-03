@@ -516,11 +516,11 @@ pub(crate) enum ReapCause<'a> {
     /// failure, because silently requeueing a cause we cannot name is how a
     /// real defect turns into an infinite retry.
     AppNack { reason: &'a str, environmental: bool },
-+    /// The app reported the worker pane died (`WorkerPaneDied`), but the
-+    /// slot had never shown any proof of life — see [`slot_never_started`].
-+    /// The pane never came up, so this is a never-started spawn wearing a
-+    /// death report's clothing, and it is reaped as one.
-+    PaneDiedBeforeStart { detail: &'a str },
+    /// The app reported the worker pane died (`WorkerPaneDied`), but the
+    /// slot had never shown any proof of life — see [`slot_never_started`].
+    /// The pane never came up, so this is a never-started spawn wearing a
+    /// death report's clothing, and it is reaped as one.
+    PaneDiedBeforeStart { detail: &'a str },
     /// A pane came up — possibly with a live shell pid — but no
     /// driver-originated signal ever arrived, so the driver binary never
     /// executed. Unlike the two above, this one also raises a
