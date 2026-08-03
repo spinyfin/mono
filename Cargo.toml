@@ -63,6 +63,7 @@ members = [
   "tools/boss/engine/utils",
   "tools/boss/trunk_auth",
   "tools/boss/trunk_client",
+  "tools/boss/tmux",
   "tools/hood",
   "tools/checkleft",
   "tools/checkleft/sdk",

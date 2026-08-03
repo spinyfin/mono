@@ -916,6 +916,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-tmux"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "tokio",
+ "which",
+]
+
+[[package]]
 name = "boss-transcript-markdown"
 version = "0.1.0"
 dependencies = [
