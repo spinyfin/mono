@@ -7,8 +7,9 @@
 //!    self-excluding `.gitignore`) plus the worker settings file —
 //!    which lives *outside* the workspace tree — from the templates in
 //!    [`crate::worker_setup`].
-//! 2. Send `SpawnWorkerPane` to the registered app session via the
-//!    engine→app dispatch on `ServerState`.
+//! 2. Send `SpawnWorkerPane` (legacy) or `AttachWorkerPane` (tmux-hosted)
+//!    to the registered app session via the engine→app dispatch on
+//!    `ServerState`.
 //! 3. Register the returned shell pid in the
 //!    [`crate::worker_registry::WorkerRegistry`] so subsequent hook
 //!    events from the boss-event shim can be correlated back to the
@@ -32,7 +33,8 @@ use std::sync::Arc;
 use crate::driver::{AgentDriver, Capability, ProgressIngress, ProgressObservationConfig};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::protocol::{
-    EngineToAppError, EngineToAppRequest, EngineToAppResponse, EnvVar, SpawnWorkerPaneInput, SpawnWorkerPaneResult,
+    AttachWorkerPaneInput, EngineToAppError, EngineToAppRequest, EngineToAppResponse, EnvVar, SpawnWorkerPaneInput,
+    SpawnWorkerPaneResult,
 };
 use crate::work::WorkDb;
 use crate::worker_registry::WorkerRegistry;
@@ -189,6 +191,10 @@ impl TmuxWorkerHost {
             spawn_store,
             session_name,
         }
+    }
+
+    fn session_name(&self) -> &str {
+        &self.session_name
     }
 }
 
@@ -601,6 +607,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     }
 
     let claimed_slot = input.slot_id;
+    let tmux_hosted = input.tmux_host.is_some();
     let (slot_id, shell_pid, ack_timed_out) = if let Some(tmux_host) = input.tmux_host.as_ref() {
         let shell_pid = match start_tmux_worker(
             tmux_host,
@@ -617,6 +624,48 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
                 return Err(err);
             }
         };
+        // The detached tmux session is now the worker's owner. Attaching a
+        // Ghostty surface is best-effort presentation only: an app restart or
+        // a missing app session must not turn a successfully-created worker
+        // into a failed spawn.
+        match spawner
+            .send_to_app_request(
+                EngineToAppRequest::AttachWorkerPane(AttachWorkerPaneInput {
+                    run_id: input.run_id.clone(),
+                    slot_id: claimed_slot,
+                    session_name: tmux_host.session_name().to_owned(),
+                    summary: input.title_summary.clone(),
+                    task_title: input.task_title.clone(),
+                }),
+                spawn_timeout,
+            )
+            .await
+        {
+            Ok(EngineToAppResponse::AttachWorkerPane { result: Ok(_) }) => {
+                tracing::info!(
+                    run_id = %input.run_id,
+                    slot_id = claimed_slot,
+                    session_name = tmux_host.session_name(),
+                    "attached tmux-hosted worker pane",
+                );
+            }
+            Ok(response) => {
+                tracing::warn!(
+                    run_id = %input.run_id,
+                    slot_id = claimed_slot,
+                    ?response,
+                    "tmux worker started but app did not attach its viewer surface",
+                );
+            }
+            Err(err) => {
+                tracing::debug!(
+                    run_id = %input.run_id,
+                    slot_id = claimed_slot,
+                    ?err,
+                    "tmux worker started without an app viewer surface",
+                );
+            }
+        }
         // Unlike the app RPC, `tmux new-session -d` returns a definite local
         // outcome and the synchronous `#{pane_pid}` read is already the
         // worker's real process identity. No provisional-ack state exists.
@@ -657,6 +706,8 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
             },
             Ok(
                 EngineToAppResponse::ReleaseWorkerPane { .. }
+                | EngineToAppResponse::AttachWorkerPane { .. }
+                | EngineToAppResponse::DetachWorkerPane { .. }
                 | EngineToAppResponse::SendToPane { .. }
                 | EngineToAppResponse::FocusWorkerPane { .. }
                 | EngineToAppResponse::InterruptWorkerPane { .. }
@@ -703,9 +754,15 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     //    spawned shell back to this run, and remember the slot id so
     //    follow-up `SendToPane` requests (e.g., probe injection) can
     //    route by run id.
-    spawner
-        .worker_registry()
-        .register_run_slot(input.run_id.clone(), slot_id);
+    if tmux_hosted {
+        spawner
+            .worker_registry()
+            .register_tmux_run_slot(input.run_id.clone(), slot_id);
+    } else {
+        spawner
+            .worker_registry()
+            .register_run_slot(input.run_id.clone(), slot_id);
+    }
     if shell_pid > 0 {
         spawner.worker_registry().register(shell_pid, input.run_id.clone());
     } else {
@@ -944,9 +1001,17 @@ mod tests {
         assert_eq!(registry.lookup(4242).as_deref(), Some("run-test"));
         assert_eq!(
             spawner.spawn_calls.load(Ordering::SeqCst),
-            0,
-            "tmux path must not call the app RPC"
+            1,
+            "tmux path must attach an app viewer surface after creating the session"
         );
+        match spawner.last_request.lock().unwrap().clone() {
+            Some(EngineToAppRequest::AttachWorkerPane(request)) => {
+                assert_eq!(request.run_id, "run-test");
+                assert_eq!(request.slot_id, 3);
+                assert_eq!(request.session_name, "boss-3-run-test");
+            }
+            other => panic!("expected AttachWorkerPane request, got {other:?}"),
+        }
         assert_eq!(
             store.steps(),
             vec!["intent", "new-session", "label", "pane-pid", "created"]
