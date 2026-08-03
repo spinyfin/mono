@@ -618,6 +618,23 @@ pub enum Stage {
     /// new-session` and its confirmation write — and this pass durably
     /// confirmed it before rebuilding the live state).
     TmuxWorkerAdopted,
+    /// The boot-time tmux adoption pass found a live session whose token
+    /// matched a non-terminal `work_runs` row, but refused to adopt it and
+    /// reaped it instead — a version-skew guard, not a contradiction
+    /// [`crate::worker_readoption`] resolves. The session's
+    /// `BOSS_SESSION_SCHEMA` was missing, unparseable, or newer than this
+    /// engine's own contract (`tools/boss/engine/core/src/spawn_flow.rs`'s
+    /// `TMUX_SESSION_SCHEMA`), meaning the session was written by a build
+    /// this engine cannot safely assume compatibility with — the session's
+    /// command line, environment, and injected settings could all differ
+    /// from what this engine would have written. Refusing-then-reaping
+    /// (rather than refusing and leaving the session alive) prevents two
+    /// live workers ever sharing one cube workspace. `details` carries
+    /// `session_name`, `reason`, and `schema_guard_failure` (`missing` /
+    /// `unparseable` / `too_new`) plus the raw and supported schema values
+    /// where applicable. The execution itself is left for the normal
+    /// dead-worker reconcilers to redispatch.
+    TmuxAdoptionRefused,
 }
 
 impl Stage {
@@ -672,6 +689,7 @@ impl Stage {
             Stage::LiveWorkerReadopted => "live_worker_readopted",
             Stage::RedispatchBlockedLiveProcess => "redispatch_blocked_live_process",
             Stage::TmuxWorkerAdopted => "tmux_worker_adopted",
+            Stage::TmuxAdoptionRefused => "tmux_adoption_refused",
         }
     }
 }
@@ -1440,6 +1458,7 @@ mod tests {
             "redispatch_blocked_live_process"
         );
         assert_eq!(Stage::TmuxWorkerAdopted.as_str(), "tmux_worker_adopted");
+        assert_eq!(Stage::TmuxAdoptionRefused.as_str(), "tmux_adoption_refused");
     }
 
     /// `Outcome::as_str` strings are the on-disk outcome identifiers;

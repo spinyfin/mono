@@ -113,9 +113,21 @@ const WORKER_EDITOR_NOOP: &str = "false";
 /// this var absent.
 const WORKER_XAI_API_KEY_NO_INTERACTIVE_AUTH: &str = "xai-boss-worker-no-interactive-auth-fallback";
 
-/// Current environment contract for Boss-owned tmux sessions. Future
-/// adoption code rejects a session whose schema is newer than it knows.
-const TMUX_SESSION_SCHEMA: &str = "1";
+/// Current environment contract for Boss-owned tmux sessions.
+/// [`crate::tmux_adoption`] imports this directly (rather than
+/// redeclaring it, unlike the env var names below) because it is a fact
+/// about *this* engine build's own contract, not an echo of something a
+/// different process generation wrote — importing means a version bump
+/// here is automatically enforced there with no second edit to keep in
+/// sync. That module rejects adopting a session whose schema is missing,
+/// unparseable, or newer than this value.
+pub(crate) const TMUX_SESSION_SCHEMA: &str = "1";
+/// Name of the environment variable [`TMUX_SESSION_SCHEMA`] is carried in.
+/// Redeclared in [`crate::tmux_adoption`] rather than imported, matching
+/// [`TMUX_SPAWN_TOKEN_ENV`]'s rationale: adoption reads what this constant
+/// names from a different process generation's live session, not from
+/// this module's own state.
+pub(crate) const TMUX_SESSION_SCHEMA_ENV: &str = "BOSS_SESSION_SCHEMA";
 const TMUX_SPAWN_TOKEN_ENV: &str = "BOSS_SPAWN_TOKEN";
 const TMUX_SPAWN_TOKEN_OPTION: &str = "@boss_spawn_token";
 
@@ -207,7 +219,7 @@ async fn start_tmux_worker(
         .map(|EnvVar { key, value }| (key.clone(), value.clone()))
         .collect::<BTreeMap<_, _>>();
     environment.insert(TMUX_SPAWN_TOKEN_ENV.to_owned(), spawn_token.clone());
-    environment.insert("BOSS_SESSION_SCHEMA".to_owned(), TMUX_SESSION_SCHEMA.to_owned());
+    environment.insert(TMUX_SESSION_SCHEMA_ENV.to_owned(), TMUX_SESSION_SCHEMA.to_owned());
     // `BOSS_RUN_ID` is normally already in `env`; insert again here to make
     // the session identity contract explicit and prevent a future env
     // refactor from accidentally dropping it from the atomic `-e` set.

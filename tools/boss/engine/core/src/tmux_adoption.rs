@@ -60,15 +60,44 @@
 //! logged and that session (or the whole pass) is skipped. The caller is
 //! responsible for resolving [`Tmux`] itself and deciding what a resolve
 //! failure means (see `app/server.rs`).
+//!
+//! ## Two guards ahead of every adoption decision
+//!
+//! Before a token match is ever handed to [`adopt_one`], two independent
+//! questions are answered, because either one being wrong turns "adopt" into
+//! "double-adopt":
+//!
+//! 1. **Is this engine process the only one adopting from this tmux server
+//!    right now?** [`claim_or_detect_conflicting_owner`] stamps the
+//!    server-scoped `@boss_engine_owner` option with this process's pid, or
+//!    detects that a *different*, still-live engine process already holds
+//!    it. A positive conflict refuses the entire pass — not just one
+//!    session — because the property being protected (no two engines ever
+//!    control the same worker) has nothing to do with which particular
+//!    session is at issue. See the design doc's "Two engines briefly running
+//!    at once" failure mode.
+//! 2. **Was this session written by a build this engine can trust?** Every
+//!    session this engine creates carries `BOSS_SESSION_SCHEMA`
+//!    ([`crate::spawn_flow::TMUX_SESSION_SCHEMA`]) atomically at creation.
+//!    [`check_session_schema`] rejects a session whose schema is missing,
+//!    unparseable, or newer than this engine's own contract — "unknown"
+//!    schemas are always version skew, even when the actual number happens
+//!    to be smaller, because a schema this engine has never heard of is not
+//!    evidence of anything. A session that fails this guard is refused
+//!    *and reaped* by [`refuse_and_reap`]: refusing to adopt while leaving
+//!    the session alive would let a redispatch put a second live worker in
+//!    the same cube workspace, which is exactly what every other guard in
+//!    this module exists to prevent.
 
 use std::collections::{HashMap, HashSet};
 
 use boss_tmux::{DisplayField, Tmux};
 
 use crate::coordinator::{ExecutionCoordinator, slot_id_from_worker_id};
+use crate::dead_pid_sweep::{PidStatus, probe_pid};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::{LiveSpawnRouting, ReadoptionEvidence, attributed_pool_label};
-use crate::spawn_flow::WorkerSpawner;
+use crate::spawn_flow::{TMUX_SESSION_SCHEMA, WorkerSpawner};
 use crate::work::{TmuxRunHandle, WorkDb};
 use crate::worker_readoption::LiveWorkerConvergence;
 
@@ -77,6 +106,27 @@ use crate::worker_readoption::LiveWorkerConvergence;
 /// module reads what that one writes, from a different process generation at
 /// boot, so it is redeclared rather than imported.
 const TMUX_SPAWN_TOKEN_ENV: &str = "BOSS_SPAWN_TOKEN";
+
+/// The tmux session environment variable carrying [`TMUX_SESSION_SCHEMA`].
+/// Redeclared rather than imported for the same reason as
+/// [`TMUX_SPAWN_TOKEN_ENV`] — this names what a different process
+/// generation wrote, not this module's own state.
+const TMUX_SESSION_SCHEMA_ENV: &str = "BOSS_SESSION_SCHEMA";
+
+/// Server-scoped tmux user option recording which engine process currently
+/// owns Boss's private tmux server, set with `set-option -s` at the top of
+/// every boot-time adoption pass. Orthogonal to `@boss_spawn_token`: that
+/// option answers "is this session ours"; this one answers "is this process
+/// the only engine currently adopting from this server". See the design
+/// doc's "Two engines briefly running at once" failure mode.
+const ENGINE_OWNER_OPTION: &str = "@boss_engine_owner";
+
+/// `work_attention_items.kind` filed when [`refuse_and_reap`] reaps a
+/// version-skewed session. Registered in [`crate::attention_lifecycle`] as
+/// [`crate::attention_lifecycle::ClearedBy::WorkResumed`] — a later run
+/// starting on the same work item is direct evidence the item is moving
+/// again, the same shape as [`crate::dead_pid_sweep::PANE_DEATH_ATTENTION_KIND`].
+pub const TMUX_ADOPTION_SCHEMA_SKEW_ATTENTION_KIND: &str = "tmux_adoption_schema_skew";
 
 /// Trigger name recorded on the dispatch event and carried into
 /// [`LiveWorkerConvergence::converge_live_worker`] for a session whose token
@@ -99,6 +149,14 @@ pub struct TmuxAdoptionOutcome {
     /// Live sessions handed off to [`crate::worker_readoption`] because their
     /// token resolved to a terminal execution.
     pub terminal_handoffs: usize,
+    /// Live sessions refused and reaped by [`refuse_and_reap`] because their
+    /// `BOSS_SESSION_SCHEMA` failed [`check_session_schema`].
+    pub refused_schema_skew: usize,
+    /// `true` when this pass refused to run at all because a different,
+    /// still-live engine process already holds `@boss_engine_owner` — see
+    /// [`claim_or_detect_conflicting_owner`]. When `true`, every other field
+    /// is zero/empty: nothing was enumerated.
+    pub owner_conflict: bool,
 }
 
 /// Run one boot-time adoption pass. See the module doc for the full
@@ -116,6 +174,29 @@ where
     S: WorkerSpawner + ?Sized,
 {
     let mut outcome = TmuxAdoptionOutcome::default();
+
+    match claim_or_detect_conflicting_owner(tmux).await {
+        Ok(EngineOwnershipOutcome::Claimed) => {}
+        Ok(EngineOwnershipOutcome::Conflict { other_pid }) => {
+            tracing::error!(
+                other_pid,
+                this_pid = std::process::id(),
+                "tmux boot adoption: refusing to adopt anything — a different engine process \
+                 still holds @boss_engine_owner on the private tmux server and is still alive; \
+                 double-adoption would risk two engines controlling the same worker sessions",
+            );
+            outcome.owner_conflict = true;
+            return outcome;
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                "tmux boot adoption: failed to claim/verify @boss_engine_owner; proceeding with \
+                 adoption anyway (best-effort — a set-option/show-options failure here is not \
+                 evidence of a real conflict)",
+            );
+        }
+    }
 
     let sessions = match tmux.list_sessions().await {
         Ok(sessions) => sessions,
@@ -173,6 +254,33 @@ where
             continue;
         };
         claimed_tokens.insert(handle.tmux_spawn_token.clone());
+
+        let session_schema = match tmux.show_environment(session_name, TMUX_SESSION_SCHEMA_ENV).await {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = handle.execution_id.as_str(),
+                    session = session_name.as_str(),
+                    error = %format!("{err:#}"),
+                    "tmux boot adoption: could not read BOSS_SESSION_SCHEMA; leaving this run for \
+                     a later sweep to resolve",
+                );
+                continue;
+            }
+        };
+        if let Err(failure) = check_session_schema(session_schema.as_deref()) {
+            tracing::error!(
+                execution_id = handle.execution_id.as_str(),
+                session = session_name.as_str(),
+                failure = %failure.describe(),
+                "tmux boot adoption: refusing to adopt a session with an unsupported \
+                 BOSS_SESSION_SCHEMA; reaping it",
+            );
+            refuse_and_reap(work_db, tmux, dispatch_events, handle, session_name, &failure).await;
+            outcome.refused_schema_skew += 1;
+            continue;
+        }
+
         adopt_one(
             work_db,
             tmux,
@@ -400,6 +508,208 @@ async fn hand_off_if_terminal(
     outcome.terminal_handoffs += 1;
 }
 
+/// What [`claim_or_detect_conflicting_owner`] decided.
+enum EngineOwnershipOutcome {
+    /// No conflicting live owner was found; this process's pid is now
+    /// stamped on [`ENGINE_OWNER_OPTION`].
+    Claimed,
+    /// A different engine process's pid is recorded and still alive.
+    Conflict { other_pid: i32 },
+}
+
+/// Claim server-scoped tmux ownership for this engine process, or detect
+/// that a different, still-live engine already holds it.
+///
+/// The recorded value is this process's pid — sufficient for the liveness
+/// check the design calls for (`kill(pid, 0)` via [`probe_pid`]) without any
+/// extra bookkeeping, and adequate for the single-user-desktop threat model
+/// this guard is explicitly scoped to (see the design doc's risk section):
+/// it is not a distributed lock, only a loud refusal when two engine
+/// processes are plainly both alive at once.
+///
+/// A mechanical failure to read the option (e.g. the private tmux server has
+/// never been started) is not evidence of a conflict — it is reported as
+/// `Err` and the caller proceeds with adoption anyway, matching this
+/// module's best-effort posture everywhere else.
+async fn claim_or_detect_conflicting_owner(tmux: &Tmux) -> anyhow::Result<EngineOwnershipOutcome> {
+    let current_pid = std::process::id();
+    let existing = match tmux.show_server_option(ENGINE_OWNER_OPTION).await {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                "tmux boot adoption: could not read @boss_engine_owner (treating as unset)",
+            );
+            None
+        }
+    };
+    if let Some(raw) = existing
+        && let Some(other_pid) = raw.trim().parse::<i32>().ok().filter(|pid| *pid != current_pid as i32)
+        && matches!(probe_pid(other_pid), PidStatus::Alive | PidStatus::PermissionDenied)
+    {
+        // `EPERM` means alive, per the liveness contract: a process we
+        // cannot signal due to permissions unambiguously still exists.
+        return Ok(EngineOwnershipOutcome::Conflict { other_pid });
+    }
+    tmux.set_server_option(ENGINE_OWNER_OPTION, &current_pid.to_string())
+        .await?;
+    Ok(EngineOwnershipOutcome::Claimed)
+}
+
+/// Why a live session's `BOSS_SESSION_SCHEMA` failed the adoption guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SchemaGuardFailure {
+    /// No `BOSS_SESSION_SCHEMA` in the session environment at all — predates
+    /// the contract, or was written by a build that never set it.
+    Missing,
+    /// Present but not a value this engine can parse as a schema number.
+    Unparseable(String),
+    /// A schema number newer than [`TMUX_SESSION_SCHEMA`].
+    TooNew(u32),
+}
+
+impl SchemaGuardFailure {
+    fn describe(&self) -> String {
+        match self {
+            Self::Missing => "the session carries no BOSS_SESSION_SCHEMA at all".to_owned(),
+            Self::Unparseable(raw) => {
+                format!("BOSS_SESSION_SCHEMA={raw:?} is not a number this engine can parse")
+            }
+            Self::TooNew(schema) => format!(
+                "BOSS_SESSION_SCHEMA={schema} is newer than this engine's contract (currently {TMUX_SESSION_SCHEMA})"
+            ),
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Unparseable(_) => "unparseable",
+            Self::TooNew(_) => "too_new",
+        }
+    }
+
+    fn details(&self) -> serde_json::Value {
+        let mut details = serde_json::json!({ "schema_guard_failure": self.kind() });
+        let serde_json::Value::Object(map) = &mut details else {
+            unreachable!("details is always constructed as an object")
+        };
+        match self {
+            Self::Missing => {}
+            Self::Unparseable(raw) => {
+                map.insert("session_schema".to_owned(), serde_json::json!(raw));
+            }
+            Self::TooNew(schema) => {
+                map.insert("session_schema".to_owned(), serde_json::json!(schema));
+                map.insert("supported_schema".to_owned(), serde_json::json!(TMUX_SESSION_SCHEMA));
+            }
+        }
+        details
+    }
+}
+
+/// Checks a live session's `BOSS_SESSION_SCHEMA` (already read via
+/// `show-environment`, never the absent-by-default option mirror) against
+/// what this engine understands. `None` means the variable was unset.
+///
+/// Only "unknown" (missing/unparseable) or "newer than this engine's own
+/// contract" fail — a schema this engine has never seen cannot be assumed
+/// compatible, but nothing yet says an older, still-recognized schema is
+/// incompatible, so that case is left open rather than guessed at.
+fn check_session_schema(raw: Option<&str>) -> Result<(), SchemaGuardFailure> {
+    let raw = raw.ok_or(SchemaGuardFailure::Missing)?;
+    let schema: u32 = raw
+        .trim()
+        .parse()
+        .map_err(|_| SchemaGuardFailure::Unparseable(raw.to_owned()))?;
+    let current: u32 = TMUX_SESSION_SCHEMA
+        .parse()
+        .expect("TMUX_SESSION_SCHEMA must always parse as u32");
+    if schema > current {
+        return Err(SchemaGuardFailure::TooNew(schema));
+    }
+    Ok(())
+}
+
+/// Kill a live session this engine refuses to adopt, and make the refusal
+/// loud: a dispatch event on the execution it belonged to, plus an
+/// attention item on the work item so an operator sees it without reading
+/// engine logs. The execution row itself is left untouched — the reap makes
+/// its recorded `shell_pid` genuinely dead, so the normal dead-worker
+/// reconcilers pick it up and redispatch exactly as they would for any other
+/// vanished session.
+async fn refuse_and_reap(
+    work_db: &WorkDb,
+    tmux: &Tmux,
+    dispatch_events: &dyn DispatchEventSink,
+    handle: &TmuxRunHandle,
+    session_name: &str,
+    failure: &SchemaGuardFailure,
+) {
+    let execution_id = handle.execution_id.as_str();
+
+    if let Err(err) = tmux.kill_session(session_name).await {
+        tracing::error!(
+            execution_id,
+            session = session_name,
+            error = %format!("{err:#}"),
+            "tmux boot adoption: failed to reap a refused session; it may still be live",
+        );
+    }
+
+    let execution = match work_db.get_execution(execution_id) {
+        Ok(execution) => execution,
+        Err(err) => {
+            tracing::error!(
+                execution_id,
+                error = %format!("{err:#}"),
+                "tmux boot adoption: refused a session but could not load its execution to file \
+                 the attention item",
+            );
+            return;
+        }
+    };
+
+    let mut details = failure.details();
+    if let serde_json::Value::Object(map) = &mut details {
+        map.insert("session_name".to_owned(), serde_json::json!(session_name));
+        map.insert("reason".to_owned(), serde_json::json!(failure.describe()));
+    }
+    dispatch_events
+        .emit(
+            DispatchEvent::new(Stage::TmuxAdoptionRefused, Outcome::Ok, execution_id)
+                .with_work_item(&execution.work_item_id)
+                .with_details(details),
+        )
+        .await;
+
+    let title = "Tmux worker session refused on adoption (version skew)".to_owned();
+    let body = format!(
+        "The engine found this execution's tmux session alive on restart but refused to adopt \
+         it and reaped it instead: {}.\n\n\
+         This is expected after an engine upgrade that changed the tmux session contract — the \
+         session was written by a build this engine no longer trusts to attach to safely, so it \
+         was killed rather than left running unattended (leaving it alive would risk a second \
+         worker landing in the same cube workspace once the work is redispatched).\n\n\
+         Execution `{execution_id}` was left for the normal dead-worker reconcilers, which will \
+         redispatch the work. No PR or code changes are lost — only the in-progress turn.\n\n\
+         This item is informational; dismiss it once you've confirmed the chore resumed.",
+        failure.describe(),
+    );
+    if let Err(err) = work_db.upsert_work_item_attention(
+        &execution.work_item_id,
+        TMUX_ADOPTION_SCHEMA_SKEW_ATTENTION_KIND,
+        &title,
+        &body,
+    ) {
+        tracing::warn!(
+            execution_id,
+            ?err,
+            "tmux boot adoption: failed to file schema-skew attention item (non-fatal)",
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,9 +732,11 @@ mod tests {
     use crate::worker_registry::WorkerRegistry;
 
     /// A fake `boss` tmux server: scripted answers for `list-sessions`,
-    /// `show-environment BOSS_SPAWN_TOKEN`, and `display-message
-    /// #{pane_pid}`, keyed by session name. Panics on any other command —
-    /// this pass never calls `new-session`/`set-option`/anything else.
+    /// `show-environment`, and `display-message #{pane_pid}`, keyed by
+    /// session name, plus a mutable server-option store and a kill log for
+    /// `set-option -s` / `show-options -s` / `kill-session`. Panics on any
+    /// other command shape — this pass never calls `new-session` or a
+    /// session-scoped `set-option`/`show-options`.
     #[derive(Default)]
     struct FakeTmuxServer {
         /// Session names `list-sessions` should report.
@@ -433,8 +745,26 @@ mod tests {
         /// entries answer "unknown variable" (unset), matching a session
         /// with no Boss identity.
         tokens: HashMap<String, String>,
+        /// `show-environment BOSS_SESSION_SCHEMA` answer per session. Absent
+        /// entries answer "unknown variable" (unset).
+        schemas: HashMap<String, String>,
         /// `display-message #{pane_pid}` answer per session.
         pane_pids: HashMap<String, String>,
+        /// Server-scoped option store, seeded before the call and mutated by
+        /// `set-option -s` during it. `None` means the option starts unset.
+        server_options: StdMutex<HashMap<String, String>>,
+        /// Session names `kill-session -t <name>` was invoked for, in order.
+        killed_sessions: StdMutex<Vec<String>>,
+    }
+
+    impl FakeTmuxServer {
+        fn with_engine_owner(mut self, value: impl Into<String>) -> Self {
+            self.server_options
+                .get_mut()
+                .unwrap()
+                .insert(ENGINE_OWNER_OPTION.trim_start_matches('@').to_owned(), value.into());
+            self
+        }
     }
 
     fn ok_output(stdout: String) -> CommandOutput {
@@ -463,14 +793,21 @@ mod tests {
                 Some("show-environment") => {
                     assert_eq!(args[3], "-t");
                     let session = &args[4];
-                    assert_eq!(args[5], TMUX_SPAWN_TOKEN_ENV);
-                    match self.tokens.get(session) {
-                        Some(token) => Ok(ok_output(format!("{TMUX_SPAWN_TOKEN_ENV}={token}\n"))),
+                    let var = args[5].as_str();
+                    let table = if var == TMUX_SPAWN_TOKEN_ENV {
+                        &self.tokens
+                    } else if var == TMUX_SESSION_SCHEMA_ENV {
+                        &self.schemas
+                    } else {
+                        panic!("unexpected show-environment variable in test: {var:?}");
+                    };
+                    match table.get(session) {
+                        Some(value) => Ok(ok_output(format!("{var}={value}\n"))),
                         None => Ok(CommandOutput {
                             success: false,
                             code: Some(1),
                             stdout: String::new(),
-                            stderr: "unknown variable: BOSS_SPAWN_TOKEN".to_owned(),
+                            stderr: format!("unknown variable: {var}"),
                         }),
                     }
                 }
@@ -480,13 +817,51 @@ mod tests {
                     let pid = self.pane_pids.get(session).cloned().unwrap_or_else(|| "0".to_owned());
                     Ok(ok_output(format!("{pid}\n")))
                 }
+                Some("show-options") => {
+                    assert_eq!(args[3], "-s", "tmux boot adoption never reads a session-scoped option");
+                    assert_eq!(args[4], "-v");
+                    let option = args[5].trim_start_matches('@');
+                    match self.server_options.lock().unwrap().get(option) {
+                        Some(value) => Ok(ok_output(format!("{value}\n"))),
+                        None => Ok(CommandOutput {
+                            success: false,
+                            code: Some(1),
+                            stdout: String::new(),
+                            stderr: format!("invalid option: {option}"),
+                        }),
+                    }
+                }
+                Some("set-option") => {
+                    assert_eq!(args[3], "-s", "tmux boot adoption never sets a session-scoped option");
+                    let option = args[4].trim_start_matches('@').to_owned();
+                    let value = args[5].clone();
+                    self.server_options.lock().unwrap().insert(option, value);
+                    Ok(ok_output(String::new()))
+                }
+                Some("kill-session") => {
+                    assert_eq!(args[3], "-t");
+                    self.killed_sessions.lock().unwrap().push(args[4].clone());
+                    Ok(ok_output(String::new()))
+                }
                 other => panic!("unexpected tmux command in test: {other:?} (full args={args:?})"),
             }
         }
     }
 
-    fn fake_tmux(server: FakeTmuxServer) -> Tmux {
-        Tmux::with_runner("/opt/homebrew/bin/tmux", Arc::new(server)).unwrap()
+    fn fake_tmux(server: FakeTmuxServer) -> (Tmux, Arc<FakeTmuxServer>) {
+        let server = Arc::new(server);
+        (
+            Tmux::with_runner("/opt/homebrew/bin/tmux", Arc::clone(&server) as Arc<dyn CommandRunner>).unwrap(),
+            server,
+        )
+    }
+
+    /// A session env map seeded with the current, supported
+    /// `BOSS_SESSION_SCHEMA` — the shape every adoption-success test wants,
+    /// so the schema guard added alongside the token/pid checks never
+    /// changes what those tests are asserting about.
+    fn supported_schema(session: &str) -> HashMap<String, String> {
+        HashMap::from([(session.to_owned(), TMUX_SESSION_SCHEMA.to_owned())])
     }
 
     /// Request-and-start a local, `worker-N`-attributed execution: the exact
@@ -567,7 +942,7 @@ mod tests {
     #[tokio::test]
     async fn no_live_sessions_is_a_cheap_noop() {
         let (_dir, db) = open_db_arc();
-        let tmux = fake_tmux(FakeTmuxServer::default());
+        let (tmux, _tmux_server) = fake_tmux(FakeTmuxServer::default());
         let coordinator = coordinator_with_one_slot(db.clone());
         let spawner = RecordingSpawner::default();
         let sink = RecordingDispatchEventSink::new();
@@ -600,10 +975,12 @@ mod tests {
                 .unwrap()
         );
 
-        let tmux = fake_tmux(FakeTmuxServer {
+        let (tmux, _tmux_server) = fake_tmux(FakeTmuxServer {
             sessions: vec!["boss-worker-1".to_owned()],
             tokens: HashMap::from([("boss-worker-1".to_owned(), "tok-1".to_owned())]),
+            schemas: supported_schema("boss-worker-1"),
             pane_pids: HashMap::from([("boss-worker-1".to_owned(), "4321".to_owned())]),
+            ..Default::default()
         });
         let coordinator = coordinator_with_one_slot(db.clone());
         let spawner = RecordingSpawner::default();
@@ -618,6 +995,7 @@ mod tests {
             "the run was already 'created', not 'intended'"
         );
         assert_eq!(outcome.terminal_handoffs, 0);
+        assert_eq!(outcome.refused_schema_skew, 0);
 
         assert_eq!(spawner.registry.lookup(4321).as_deref(), Some(execution_id.as_str()));
         let live_state = spawner.live_states.get(1).expect("slot 1 must be registered");
@@ -656,10 +1034,12 @@ mod tests {
                 .unwrap()
         );
 
-        let tmux = fake_tmux(FakeTmuxServer {
+        let (tmux, _tmux_server) = fake_tmux(FakeTmuxServer {
             sessions: vec!["boss-worker-1".to_owned()],
             tokens: HashMap::from([("boss-worker-1".to_owned(), "tok-intended".to_owned())]),
+            schemas: supported_schema("boss-worker-1"),
             pane_pids: HashMap::from([("boss-worker-1".to_owned(), "5555".to_owned())]),
+            ..Default::default()
         });
         let coordinator = coordinator_with_one_slot(db.clone());
         let spawner = RecordingSpawner::default();
@@ -703,10 +1083,11 @@ mod tests {
         db.mark_execution_orphaned(&execution_id, "test: engine wrongly inferred death")
             .unwrap();
 
-        let tmux = fake_tmux(FakeTmuxServer {
+        let (tmux, _tmux_server) = fake_tmux(FakeTmuxServer {
             sessions: vec!["boss-worker-1".to_owned()],
             tokens: HashMap::from([("boss-worker-1".to_owned(), "tok-term".to_owned())]),
             pane_pids: HashMap::from([("boss-worker-1".to_owned(), "111".to_owned())]),
+            ..Default::default()
         });
         let coordinator = coordinator_with_one_slot(db.clone());
         let spawner = RecordingSpawner::default();
@@ -733,10 +1114,10 @@ mod tests {
     #[tokio::test]
     async fn unmatched_leaked_session_is_left_alone() {
         let (_dir, db) = open_db_arc();
-        let tmux = fake_tmux(FakeTmuxServer {
+        let (tmux, _tmux_server) = fake_tmux(FakeTmuxServer {
             sessions: vec!["boss-worker-9".to_owned()],
             tokens: HashMap::from([("boss-worker-9".to_owned(), "tok-unknown".to_owned())]),
-            pane_pids: HashMap::new(),
+            ..Default::default()
         });
         let coordinator = coordinator_with_one_slot(db.clone());
         let spawner = RecordingSpawner::default();
@@ -757,10 +1138,9 @@ mod tests {
     #[tokio::test]
     async fn session_without_a_spawn_token_is_ignored() {
         let (_dir, db) = open_db_arc();
-        let tmux = fake_tmux(FakeTmuxServer {
+        let (tmux, _tmux_server) = fake_tmux(FakeTmuxServer {
             sessions: vec!["boss-coordinator".to_owned()],
-            tokens: HashMap::new(),
-            pane_pids: HashMap::new(),
+            ..Default::default()
         });
         let coordinator = coordinator_with_one_slot(db.clone());
         let spawner = RecordingSpawner::default();
@@ -771,5 +1151,185 @@ mod tests {
 
         assert!(outcome.adopted_execution_ids.is_empty());
         assert_eq!(outcome.terminal_handoffs, 0);
+    }
+
+    #[test]
+    fn check_session_schema_pure_cases() {
+        assert!(check_session_schema(Some(TMUX_SESSION_SCHEMA)).is_ok());
+        assert_eq!(check_session_schema(None), Err(SchemaGuardFailure::Missing));
+        assert_eq!(
+            check_session_schema(Some("not-a-number")),
+            Err(SchemaGuardFailure::Unparseable("not-a-number".to_owned()))
+        );
+        let too_new = TMUX_SESSION_SCHEMA.parse::<u32>().unwrap() + 1;
+        assert_eq!(
+            check_session_schema(Some(&too_new.to_string())),
+            Err(SchemaGuardFailure::TooNew(too_new))
+        );
+    }
+
+    /// A live session whose token matches a non-terminal row but carries no
+    /// `BOSS_SESSION_SCHEMA` at all must be refused and reaped, not adopted
+    /// — an unknown schema is always version skew, never assumed
+    /// compatible, no matter how small its number would parse to.
+    #[tokio::test]
+    async fn missing_schema_is_refused_and_reaped() {
+        let (_dir, db) = open_db_arc();
+        let execution_id = start_local_run(&db, "worker-1");
+        assert!(
+            db.record_tmux_spawn_intent_for_execution(&execution_id, "boss", "boss-worker-1", "tok-noschema")
+                .unwrap()
+        );
+        assert!(
+            db.record_tmux_session_created_for_execution(&execution_id, "tok-noschema", 4242)
+                .unwrap()
+        );
+        let work_item_id = db.get_execution(&execution_id).unwrap().work_item_id;
+
+        let (tmux, tmux_server) = fake_tmux(FakeTmuxServer {
+            sessions: vec!["boss-worker-1".to_owned()],
+            tokens: HashMap::from([("boss-worker-1".to_owned(), "tok-noschema".to_owned())]),
+            pane_pids: HashMap::from([("boss-worker-1".to_owned(), "4321".to_owned())]),
+            ..Default::default()
+        });
+        let coordinator = coordinator_with_one_slot(db.clone());
+        let spawner = RecordingSpawner::default();
+        let sink = RecordingDispatchEventSink::new();
+
+        let outcome =
+            run_boot_time_adoption(&db, &tmux, &coordinator, &spawner, &NoopLiveWorkerConvergence, &sink).await;
+
+        assert!(outcome.adopted_execution_ids.is_empty());
+        assert_eq!(outcome.refused_schema_skew, 1);
+        assert!(
+            spawner.live_states.snapshot().is_empty(),
+            "a refused session must never be adopted into live state",
+        );
+        assert_eq!(
+            tmux_server.killed_sessions.lock().unwrap().as_slice(),
+            &["boss-worker-1".to_owned()]
+        );
+
+        let events = sink.events_for(&execution_id).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].stage, Stage::TmuxAdoptionRefused.as_str());
+        assert_eq!(events[0].details["schema_guard_failure"], serde_json::json!("missing"));
+
+        let attentions = db.list_attention_items_for_work_item(&work_item_id).unwrap();
+        assert_eq!(attentions.len(), 1);
+        assert_eq!(attentions[0].kind, TMUX_ADOPTION_SCHEMA_SKEW_ATTENTION_KIND);
+        assert_eq!(attentions[0].status, "open");
+    }
+
+    /// A schema newer than this engine's own contract is refused and reaped
+    /// the same way as a missing one — "unknown" and "too new" are both
+    /// version skew.
+    #[tokio::test]
+    async fn newer_schema_is_refused_and_reaped() {
+        let (_dir, db) = open_db_arc();
+        let execution_id = start_local_run(&db, "worker-1");
+        assert!(
+            db.record_tmux_spawn_intent_for_execution(&execution_id, "boss", "boss-worker-1", "tok-newschema")
+                .unwrap()
+        );
+        assert!(
+            db.record_tmux_session_created_for_execution(&execution_id, "tok-newschema", 4242)
+                .unwrap()
+        );
+
+        let too_new = TMUX_SESSION_SCHEMA.parse::<u32>().unwrap() + 1;
+        let (tmux, tmux_server) = fake_tmux(FakeTmuxServer {
+            sessions: vec!["boss-worker-1".to_owned()],
+            tokens: HashMap::from([("boss-worker-1".to_owned(), "tok-newschema".to_owned())]),
+            schemas: HashMap::from([("boss-worker-1".to_owned(), too_new.to_string())]),
+            pane_pids: HashMap::from([("boss-worker-1".to_owned(), "4321".to_owned())]),
+            ..Default::default()
+        });
+        let coordinator = coordinator_with_one_slot(db.clone());
+        let spawner = RecordingSpawner::default();
+        let sink = RecordingDispatchEventSink::new();
+
+        let outcome =
+            run_boot_time_adoption(&db, &tmux, &coordinator, &spawner, &NoopLiveWorkerConvergence, &sink).await;
+
+        assert!(outcome.adopted_execution_ids.is_empty());
+        assert_eq!(outcome.refused_schema_skew, 1);
+        assert_eq!(
+            tmux_server.killed_sessions.lock().unwrap().as_slice(),
+            &["boss-worker-1".to_owned()]
+        );
+
+        let events = sink.events_for(&execution_id).await;
+        assert_eq!(events[0].details["schema_guard_failure"], serde_json::json!("too_new"));
+        assert_eq!(events[0].details["session_schema"], serde_json::json!(too_new));
+        assert_eq!(
+            events[0].details["supported_schema"],
+            serde_json::json!(TMUX_SESSION_SCHEMA)
+        );
+    }
+
+    /// Server-scoped ownership conflict: a different, still-live engine
+    /// process already holds `@boss_engine_owner`. The whole pass must
+    /// refuse rather than adopting anything, even though a perfectly valid
+    /// matching session/token/schema is present.
+    #[tokio::test]
+    async fn conflicting_live_owner_refuses_the_whole_pass() {
+        let (_dir, db) = open_db_arc();
+        let execution_id = start_local_run(&db, "worker-1");
+        assert!(
+            db.record_tmux_spawn_intent_for_execution(&execution_id, "boss", "boss-worker-1", "tok-1")
+                .unwrap()
+        );
+        assert!(
+            db.record_tmux_session_created_for_execution(&execution_id, "tok-1", 4242)
+                .unwrap()
+        );
+
+        // pid 1 (init/launchd) is always alive but is never this test
+        // process; `kill(1, 0)` from a non-root process returns EPERM,
+        // which the liveness contract treats as "alive" — exactly the case
+        // this guard must refuse on.
+        let (tmux, tmux_server) = fake_tmux(
+            FakeTmuxServer {
+                sessions: vec!["boss-worker-1".to_owned()],
+                tokens: HashMap::from([("boss-worker-1".to_owned(), "tok-1".to_owned())]),
+                schemas: supported_schema("boss-worker-1"),
+                pane_pids: HashMap::from([("boss-worker-1".to_owned(), "4321".to_owned())]),
+                ..Default::default()
+            }
+            .with_engine_owner("1"),
+        );
+        let coordinator = coordinator_with_one_slot(db.clone());
+        let spawner = RecordingSpawner::default();
+        let sink = RecordingDispatchEventSink::new();
+
+        let outcome =
+            run_boot_time_adoption(&db, &tmux, &coordinator, &spawner, &NoopLiveWorkerConvergence, &sink).await;
+
+        assert!(outcome.owner_conflict);
+        assert!(outcome.adopted_execution_ids.is_empty());
+        assert_eq!(outcome.refused_schema_skew, 0);
+        assert!(
+            sink.events().await.is_empty(),
+            "a refused pass must not touch any execution"
+        );
+        assert!(tmux_server.killed_sessions.lock().unwrap().is_empty());
+    }
+
+    /// A server option already stamped with *this* process's own pid is not
+    /// a conflict — the pass proceeds normally.
+    #[tokio::test]
+    async fn owner_option_matching_this_process_is_not_a_conflict() {
+        let (_dir, db) = open_db_arc();
+        let (tmux, _tmux_server) =
+            fake_tmux(FakeTmuxServer::default().with_engine_owner(std::process::id().to_string()));
+        let coordinator = coordinator_with_one_slot(db.clone());
+        let spawner = RecordingSpawner::default();
+        let sink = RecordingDispatchEventSink::new();
+
+        let outcome =
+            run_boot_time_adoption(&db, &tmux, &coordinator, &spawner, &NoopLiveWorkerConvergence, &sink).await;
+
+        assert!(!outcome.owner_conflict);
     }
 }
