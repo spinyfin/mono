@@ -464,7 +464,7 @@ fn chore_with_bound_pr_fixture(
             workspace_path.to_str().unwrap(),
         )
         .unwrap();
-    finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned worker pane"));
+    finish_run_worker_pane_alive(&db, &execution.id, &run.id, Some("spawned worker pane"));
     db.set_execution_pr_head_before(&execution.id, head_before).unwrap();
     (dir, db, chore.id, execution.id)
 }
@@ -533,7 +533,7 @@ async fn an_undeclared_run_is_not_finalized_on_bound_pr_health() {
     let exec = db.get_execution(&execution_id).unwrap();
     assert_eq!(
         exec.status,
-        ExecutionStatus::WaitingHuman,
+        ExecutionStatus::Running,
         "the execution must stay live; got {:?}",
         exec.status,
     );
