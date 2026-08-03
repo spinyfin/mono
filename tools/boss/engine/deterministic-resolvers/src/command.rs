@@ -1,22 +1,18 @@
-//! Process-spawning seam. Resolvers depend on the [`CommandRunner`] trait
+//! Command execution helpers. Resolvers depend on the [`CommandRunner`] trait
 //! rather than calling `tokio::process::Command` directly, so their
 //! decline/resolve logic can be unit-tested without spawning a real
 //! `cargo`/`bazel` process.
 
+use std::ffi::OsString;
 use std::path::Path;
 
+#[cfg(test)]
 use async_trait::async_trait;
+#[cfg(test)]
+pub(crate) use boss_command_runner::CommandOutput;
+pub(crate) use boss_command_runner::{CommandRunner, RealCommandRunner};
 
 use crate::ResolveOutcome;
-
-/// Minimal captured shape of a finished child process — just enough for a
-/// resolver to decide success/failure and report a reason.
-#[derive(Debug, Clone)]
-pub(crate) struct CommandOutput {
-    pub(crate) success: bool,
-    pub(crate) code: Option<i32>,
-    pub(crate) stderr: String,
-}
 
 /// Runs one command, mapping a spawn failure or non-zero exit to a
 /// [`ResolveOutcome::Failed`] outcome — the shared "run a command, decide
@@ -39,7 +35,9 @@ pub(crate) async fn run_or_fail(
     args: &[&str],
     reason_prefix: &str,
 ) -> Result<(), ResolveOutcome> {
-    let output = match runner.run(program, args, dir).await {
+    let program_path = Path::new(program);
+    let command_args: Vec<OsString> = args.iter().map(OsString::from).collect();
+    let output = match runner.run(program_path, &command_args, Some(dir)).await {
         Ok(output) => output,
         Err(e) => {
             return Err(ResolveOutcome::Failed {
@@ -66,29 +64,6 @@ pub(crate) async fn run_or_fail(
     Ok(())
 }
 
-#[async_trait]
-pub(crate) trait CommandRunner: Send + Sync {
-    async fn run(&self, program: &str, args: &[&str], cwd: &Path) -> std::io::Result<CommandOutput>;
-}
-
-pub(crate) struct RealCommandRunner;
-
-#[async_trait]
-impl CommandRunner for RealCommandRunner {
-    async fn run(&self, program: &str, args: &[&str], cwd: &Path) -> std::io::Result<CommandOutput> {
-        let output = tokio::process::Command::new(program)
-            .args(args)
-            .current_dir(cwd)
-            .output()
-            .await?;
-        Ok(CommandOutput {
-            success: output.status.success(),
-            code: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        })
-    }
-}
-
 #[cfg(test)]
 pub(crate) struct FakeCommandRunner {
     /// Outcomes returned in order, one per call. A resolver that issues
@@ -109,6 +84,7 @@ impl FakeCommandRunner {
         Self::with_outcome(Ok(CommandOutput {
             success: true,
             code: Some(0),
+            stdout: String::new(),
             stderr: String::new(),
         }))
     }
@@ -125,6 +101,7 @@ impl FakeCommandRunner {
         Self::with_outcome(Ok(CommandOutput {
             success: false,
             code: Some(1),
+            stdout: String::new(),
             stderr: stderr.to_owned(),
         }))
     }
@@ -152,11 +129,11 @@ impl FakeCommandRunner {
 #[cfg(test)]
 #[async_trait]
 impl CommandRunner for FakeCommandRunner {
-    async fn run(&self, program: &str, args: &[&str], cwd: &Path) -> std::io::Result<CommandOutput> {
+    async fn run(&self, program: &Path, args: &[OsString], cwd: Option<&Path>) -> std::io::Result<CommandOutput> {
         self.calls.lock().unwrap().push((
-            program.to_owned(),
-            args.iter().map(|s| s.to_string()).collect(),
-            cwd.to_path_buf(),
+            program.to_string_lossy().into_owned(),
+            args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect(),
+            cwd.expect("resolvers always supply a working directory").to_path_buf(),
         ));
         let outcome = self
             .outcomes
@@ -167,7 +144,10 @@ impl CommandRunner for FakeCommandRunner {
         if let (Ok(output), Some((filename, contents))) = (&outcome, &self.writes_file)
             && output.success
         {
-            std::fs::write(cwd.join(filename), contents)?;
+            std::fs::write(
+                cwd.expect("resolvers always supply a working directory").join(filename),
+                contents,
+            )?;
         }
         outcome
     }

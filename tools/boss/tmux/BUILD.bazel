@@ -4,34 +4,26 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 exports_files(["Cargo.toml"])
 
 rust_library(
-    name = "deterministic-resolvers",
+    name = "tmux",
     srcs = glob(["src/**/*.rs"]),
-    crate_name = "boss_deterministic_resolvers",
+    crate_name = "boss_tmux",
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    visibility = [
-        "//tools/boss/engine/core:__pkg__",
-    ],
-    deps = [
-        "//tools/boss/command-runner",
-        "//tools/boss/engine/conflict-diagnosis",
-    ] + all_crate_deps(normal = True),
+    visibility = ["//tools/boss/engine:__subpackages__"],
+    deps = ["//tools/boss/command-runner"] + all_crate_deps(normal = True),
 )
 
 rust_test(
-    name = "deterministic-resolvers_test",
+    name = "tmux_test",
     size = "small",
-    crate = ":deterministic-resolvers",
+    crate = ":tmux",
     edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
     ),
-    deps = [
-        "//tools/boss/command-runner",
-        "//tools/boss/engine/conflict-diagnosis",
-    ] + all_crate_deps(
+    deps = ["//tools/boss/command-runner"] + all_crate_deps(
         normal = True,
         normal_dev = True,
     ),

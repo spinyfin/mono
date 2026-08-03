@@ -1,0 +1,15 @@
+[package]
+name = "boss-tmux"
+version.workspace = true
+edition.workspace = true
+workspace = "../../.."
+
+[dependencies]
+anyhow = { workspace = true }
+boss-command-runner = { path = "../command-runner" }
+tokio = { workspace = true, features = ["process", "time"] }
+which = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

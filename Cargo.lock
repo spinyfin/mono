@@ -325,6 +325,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-command-runner"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "tokio",
+]
+
+[[package]]
 name = "boss-comment-anchor"
 version = "0.1.0"
 dependencies = [
@@ -356,6 +364,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "boss-command-runner",
  "boss-conflict-diagnosis",
  "globset",
  "serde",
@@ -913,6 +922,17 @@ version = "0.1.0"
 dependencies = [
  "boss-event-bus",
  "tokio",
+]
+
+[[package]]
+name = "boss-tmux"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "boss-command-runner",
+ "tokio",
+ "which",
 ]
 
 [[package]]
