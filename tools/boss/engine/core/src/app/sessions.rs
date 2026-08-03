@@ -323,7 +323,7 @@ pub(super) async fn handle_worker_pane_died(ctx: Dispatch, req: FrontendRequest)
     let Dispatch {
         server_state, peer_pid, ..
     } = ctx;
-    let FrontendRequest::WorkerPaneDied { run_id } = req else {
+    let FrontendRequest::WorkerPaneDied { run_id, reason } = req else {
         unreachable!()
     };
     if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
@@ -341,7 +341,7 @@ pub(super) async fn handle_worker_pane_died(ctx: Dispatch, req: FrontendRequest)
             server_state.execution_coordinator.clone(),
             server_state.dispatch_events.as_ref(),
             &run_id,
-            "app reported the worker pane died (surface failed to attach or child process exited)",
+            reason,
         )
         .await;
         if reaped {

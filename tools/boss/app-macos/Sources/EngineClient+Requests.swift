@@ -647,10 +647,11 @@ extension EngineClient {
     /// its shell process exited. The engine reaps the backing execution
     /// immediately instead of waiting for the next dead-pid sweep pass
     /// (up to 60s later) or an app restart.
-    func sendWorkerPaneDied(runId: String) {
+    func sendWorkerPaneDied(runId: String, reason: WorkerPaneDeathReason) {
         sendLine([
             "type": "worker_pane_died",
             "run_id": runId,
+            "reason": reason.rawValue,
         ])
     }
 

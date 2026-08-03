@@ -36,14 +36,16 @@
 //!
 //! ## What it does
 //!
-//! It closes the gap by making pane liveness **durable and restart-robust**.
+//! It closes both sides of the gap by making pane liveness **durable and
+//! restart-robust**.
 //! The app reports the real shell pid via `UpdateWorkerShellPid`, which the
 //! engine now persists to `work_runs.shell_pid` (see
 //! [`crate::work::WorkDb::set_run_shell_pid_for_execution`]). This sweep reads
 //! that DB pid — NOT the in-memory registry — and probes it with the same
-//! `kill(pid, 0)` primitive [`crate::dead_pid_sweep`] uses. A non-terminal
-//! LOCAL execution whose durable shell pid reports `ESRCH` ("no such process")
-//! is finalized through the proper terminal path
+//! `kill(pid, 0)` primitive [`crate::dead_pid_sweep`] uses.
+//!
+//! A non-terminal LOCAL execution whose durable shell pid reports `ESRCH`
+//! ("no such process") is finalized through the proper terminal path
 //! ([`crate::work::WorkDb::mark_execution_orphaned`], which stamps
 //! `finished_at` and orphans its runs, deliberately **preserving** the cube
 //! lease + workspace so the redispatch can resume the interrupted work in
@@ -51,14 +53,22 @@
 //! `lost_workspace_sweep` does, and a `pane_death_reconcile` trace event is
 //! emitted.
 //!
+//! The inverse contradiction is a terminal execution whose recent durable pid
+//! is still alive. Terminalization has already removed that run from the live
+//! registry, so this same durable scan hands it to
+//! [`crate::worker_readoption::LiveWorkerConvergence`]. Inferred terminal state
+//! is re-adopted while the work item is still active; deliberate terminal state,
+//! superseded runs, and inferred runs whose work item has closed are fully
+//! released through the canonical pane/process/pool/workspace teardown.
+//!
 //! The same [`reconcile_if_pane_dead`] routine is called inline by the
 //! redundant-spawn guard so a dead-pane zombie never blocks a spawn even
 //! between sweep passes.
 //!
-//! ## Safety — only ever acts on positive evidence of death
+//! ## Safety — only ever acts on positive process evidence
 //!
-//! Every reap requires a `kill(pid, 0) == ESRCH` result on a pid the app
-//! actually reported. It never reaps on absence of information:
+//! Every action requires a definitive probe result on a pid the app actually
+//! reported. It never acts on absence of information:
 //!
 //! - **Host safety**: [`crate::work::WorkDb::latest_local_shell_pid_for_execution`]
 //!   returns a pid ONLY for a `host_id = 'local'` run — a local pid probe is
@@ -66,10 +76,11 @@
 //!   never touched here.
 //! - **No pid → skip**: an execution whose pid was never reported (surface
 //!   never attached, or a pre-fix spawn) yields `None` and is left alone.
-//! - **Alive / not-ours / probe-error → skip**: only `Dead` (ESRCH) reaps;
-//!   `EPERM` (alive, not ours) and any other errno are treated conservatively
-//!   as alive. Pid recycling can therefore only ever cause a *missed* reap
-//!   (self-healing on a later pass), never a false one against a live worker.
+//! - **Non-terminal rows require death**: only `Gone` (ESRCH) enters the orphan
+//!   path; every ambiguous result is skipped.
+//! - **Terminal rows require recent liveness**: only `Alive`, from a run inside
+//!   the bounded pid-trust window, enters two-way convergence. The reap half
+//!   repeats that bounded probe before signalling the process group.
 //! - **Grace window** ([`PANE_DEATH_GRACE_SECS`]): an execution whose
 //!   `started_at` is within the grace (or unset) is skipped, so a
 //!   just-dispatched worker whose pid is still settling is never raced.
@@ -90,6 +101,7 @@ use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEventSink, Stage};
 use crate::durable_liveness::WorkerProcess;
 use crate::work::WorkDb;
+use crate::worker_readoption::LiveWorkerConvergence;
 
 /// Cadence for the periodic pass. Fires immediately on boot, then every
 /// interval — fast enough that a pane killed mid-run is cleared and its work
@@ -107,15 +119,22 @@ pub const PANE_DEATH_GRACE_SECS: i64 = 60;
 #[derive(Debug, Default)]
 pub struct PaneDeathSweepOutcome {
     pub reaped: usize,
+    /// Terminal executions whose live durable process was handed to the
+    /// two-way re-adopt/reap convergence policy.
+    pub terminal_handoffs: usize,
 }
 
 impl crate::sweep_loop::SweepOutcome for PaneDeathSweepOutcome {
     fn has_activity(&self) -> bool {
-        self.reaped > 0
+        self.reaped > 0 || self.terminal_handoffs > 0
     }
 
     fn log(&self) {
-        tracing::info!(reaped = self.reaped, "pane-death sweep: pass complete");
+        tracing::info!(
+            reaped = self.reaped,
+            terminal_handoffs = self.terminal_handoffs,
+            "pane-death sweep: pass complete",
+        );
     }
 }
 
@@ -125,25 +144,36 @@ pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: Arc<dyn DispatchEventSink>,
+    convergence: Arc<dyn LiveWorkerConvergence>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
-    crate::sweep_loop::spawn_work_sweep_loop(
-        work_db,
-        coordinator,
-        dispatch_events,
-        interval,
-        |work_db, coordinator, dispatch_events| Box::pin(run_one_pass(work_db, coordinator, dispatch_events)),
-    )
+    crate::sweep_loop::spawn_sweep_loop(interval, move || {
+        let work_db = Arc::clone(&work_db);
+        let coordinator = Arc::clone(&coordinator);
+        let dispatch_events = Arc::clone(&dispatch_events);
+        let convergence = Arc::clone(&convergence);
+        async move {
+            run_one_pass(
+                work_db.as_ref(),
+                coordinator,
+                dispatch_events.as_ref(),
+                convergence.as_ref(),
+            )
+            .await
+        }
+    })
 }
 
-/// Run a single pane-death reconciliation pass over every non-terminal
-/// execution that recorded a workspace path (the live-with-a-pane set).
+/// Reconcile both durable contradictions: non-terminal executions whose pane
+/// process is gone, and recent terminal executions whose process is alive.
 pub async fn run_one_pass(
     work_db: &WorkDb,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: &dyn DispatchEventSink,
+    convergence: &dyn LiveWorkerConvergence,
 ) -> PaneDeathSweepOutcome {
     let mut outcome = PaneDeathSweepOutcome::default();
+    let now_epoch_secs = boss_engine_utils::epoch_time::now_epoch_secs();
 
     let candidates = match work_db.list_non_terminal_executions_with_workspace() {
         Ok(rows) => rows,
@@ -156,11 +186,52 @@ pub async fn run_one_pass(
         }
     };
 
-    let now_epoch_secs = boss_engine_utils::epoch_time::now_epoch_secs();
     for execution in candidates {
         if reconcile_if_pane_dead(work_db, dispatch_events, &execution, now_epoch_secs).await {
             outcome.reaped += 1;
         }
+    }
+
+    // A terminal row with a live process is the opposite contradiction: the
+    // engine declared the run over, but the OS still sees its worker. Scan
+    // durable state rather than the live registry (which terminalization
+    // clears), and hand the fact to the existing two-way policy. A bounded
+    // probe is mandatory because convergence may signal the recorded process
+    // group; an old recycled pid is not evidence.
+    let terminal_candidates = match work_db.list_recent_terminal_executions_with_local_shell_pid(
+        crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
+        now_epoch_secs,
+    ) {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                "pane-death sweep: failed to list terminal executions with recent pids; skipping terminal convergence",
+            );
+            Vec::new()
+        }
+    };
+    for execution in terminal_candidates {
+        let process = crate::durable_liveness::probe_execution_worker_within(
+            work_db,
+            &execution.id,
+            crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
+            now_epoch_secs,
+        );
+        if !process.is_alive() {
+            continue;
+        }
+        tracing::warn!(
+            execution_id = %execution.id,
+            work_item_id = %execution.work_item_id,
+            execution_status = %execution.status,
+            shell_pid = process.alive_pid(),
+            "pane-death sweep: terminal execution still has a live worker; handing off to convergence",
+        );
+        convergence
+            .converge_live_worker(&execution.id, "durable_state_scan")
+            .await;
+        outcome.terminal_handoffs += 1;
     }
 
     if outcome.reaped > 0 {

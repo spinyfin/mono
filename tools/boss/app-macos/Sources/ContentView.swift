@@ -168,8 +168,8 @@ struct ContentView: View {
             // shell process exited) to the engine immediately so it can
             // reap the backing execution instead of waiting for the
             // periodic dead-pid sweep.
-            workersWorkspace.onPaneDied = { [model] runId in
-                model.workerPaneDied(runId: runId)
+            workersWorkspace.onPaneDied = { [model] runId, reason in
+                model.workerPaneDied(runId: runId, reason: reason)
             }
             // Report sleep/wake recovery to the engine so a worker-pane
             // spawn stranded by the sleep redispatches immediately

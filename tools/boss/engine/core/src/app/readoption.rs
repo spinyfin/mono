@@ -117,7 +117,23 @@ impl ServerState {
             .ok()
             .flatten()
             .map(|live| live.id);
-        let verdict = classify_contradiction(&execution.status, other_live.as_deref());
+        let work_item_terminal = match self.work_db.get_work_item(&execution.work_item_id) {
+            Ok(boss_protocol::WorkItem::Task(task) | boss_protocol::WorkItem::Chore(task)) => task.status.is_terminal(),
+            Ok(boss_protocol::WorkItem::Product(_) | boss_protocol::WorkItem::Project(_)) => false,
+            Err(item_err) => match self.work_db.work_item_row_missing(&execution.work_item_id) {
+                Ok(true) => true,
+                Ok(false) | Err(_) => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        error = %format!("{item_err:#}"),
+                        "readopt: could not establish whether the bound work item is closed; retrying convergence later",
+                    );
+                    return "work_item_lookup_failed";
+                }
+            },
+        };
+        let verdict = classify_contradiction(&execution.status, work_item_terminal, other_live.as_deref());
         match verdict {
             ContradictionVerdict::NoContradiction => "no_contradiction",
             ContradictionVerdict::Readopt => {
@@ -471,10 +487,10 @@ impl ServerState {
     /// Tear down a surviving worker whose execution is terminal for a reason
     /// the engine must not reverse.
     ///
-    /// Goes through [`ServerState::release_worker_pane`], which since the
-    /// durable-pid fallback landed can reach a worker with no slot mapping —
-    /// exactly the shape every worker in this state has, because the teardown
-    /// that terminalized it cleared the mapping on its way out.
+    /// Goes through [`WorkerCompletionHandler::force_release`], whose pane
+    /// half can reach a worker with no slot mapping through durable state and
+    /// whose lease half atomically clears and releases its workspace. Exactly
+    /// the same complete teardown is used for an explicit stop.
     async fn reap_contradicting_worker(
         &self,
         execution: &WorkExecution,
@@ -489,10 +505,10 @@ impl ServerState {
             status = %execution.status,
             reason = reason.as_str(),
             other_live_execution = ?other_live,
-            "[engine-reconcile] reaping a worker that outlived its execution — the terminal status \
-             is authoritative here, so the surviving process is what must stop",
+            "[engine-reconcile] reaping a worker that outlived authoritative terminal state — \
+             the surviving process is what must stop",
         );
-        let outcome = self.release_worker_pane(run_id).await;
+        let outcome = self.completion_handler.force_release(run_id).await;
         self.dispatch_events
             .emit(
                 crate::dispatch_events::DispatchEvent::new(
@@ -507,7 +523,7 @@ impl ServerState {
                     "reason": reason.as_str(),
                     "execution_status": execution.status.to_string(),
                     "other_live_execution": other_live,
-                    "pane_release_outcome": format!("{outcome:?}"),
+                    "resource_release_outcome": format!("{outcome:?}"),
                 })),
             )
             .await;

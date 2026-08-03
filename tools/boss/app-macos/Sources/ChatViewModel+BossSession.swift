@@ -34,9 +34,9 @@ extension ChatViewModel {
     /// or its child process exits. Reports the death to the engine so it
     /// can reap the backing execution immediately rather than waiting for
     /// the next dead-pid sweep pass or an app restart.
-    func workerPaneDied(runId: String) {
+    func workerPaneDied(runId: String, reason: WorkerPaneDeathReason) {
         guard isAppSessionRegistered else { return }
-        engine.sendWorkerPaneDied(runId: runId)
+        engine.sendWorkerPaneDied(runId: runId, reason: reason)
     }
 
     /// Called by ContentView when `GhosttyRuntime` observes the system's

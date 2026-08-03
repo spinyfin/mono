@@ -1196,7 +1196,7 @@ pub async fn serve_with_merge_probe(
         crate::lost_workspace_sweep::DEFAULT_INTERVAL,
     );
 
-    // Periodic pane-death sweep: the restart-robust companion to
+    // Periodic durable pane/process convergence: the restart-robust companion to
     // `dead_pid_sweep`. That sweep probes the shell pid too, but reads it from
     // the in-memory live-worker registry, which is EMPTY after an engine
     // restart — so an app relaunch that killed live panes AND restarted the
@@ -1205,11 +1205,15 @@ pub async fn serve_with_merge_probe(
     // with its host app is reconciled (and its work resumed) on the next boot,
     // even though the cube lease is still green and the workspace dir survives
     // (which is why the heartbeat auto-reap and lost-workspace sweep both miss
-    // it). Fires immediately on boot, covering startup recovery.
+    // it). The inverse scan also finds recent terminal rows whose durable pid
+    // is still alive and hands them to the shared re-adopt/reap policy, which
+    // is how a hosted pane survives neither a false terminalization nor an
+    // explicit stop. Fires immediately on boot, covering startup recovery.
     let _dead_pane_sweep_handle = crate::dead_pane_sweep::spawn_loop(
         server_state.work_db.clone(),
         server_state.execution_coordinator.clone(),
         server_state.dispatch_events.clone(),
+        server_state.clone(),
         crate::dead_pane_sweep::DEFAULT_INTERVAL,
     );
 

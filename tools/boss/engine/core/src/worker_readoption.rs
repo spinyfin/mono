@@ -47,9 +47,9 @@
 //!   [`crate::work::WorkDb::readopt_inferred_terminal_execution`]).
 //! - **Reap** otherwise. Either the terminal status was a *decision*
 //!   (`cancelled` / `completed` / `failed` — an operator stopped it, or it
-//!   finished), or the row already has a different live execution. In both
-//!   cases the surviving process must not keep running: the record is right
-//!   and the process is wrong.
+//!   finished), the row already has a different live execution, or its work
+//!   item has since closed. In each case the surviving process must not keep
+//!   running: the authoritative record is right and the process is wrong.
 //!
 //! The asymmetry is deliberate and is the whole safety argument. Re-adoption
 //! rewrites a record and is cheap to get wrong in the recoverable direction (a
@@ -116,6 +116,10 @@ pub enum ReapReason {
     /// guess. Reversing it would resurrect a run a human or the worker itself
     /// ended.
     TerminalByDecision,
+    /// The execution status was inferred, but the owning work item has since
+    /// reached a terminal state. Re-adopting would resurrect a worker for work
+    /// that is already closed.
+    WorkItemTerminal,
     /// A different execution for the same work item is already live. Only one
     /// worker may own a row; the newer one wins because it holds the current
     /// workspace lease and the older one's record is already terminal.
@@ -126,6 +130,7 @@ impl ReapReason {
     pub fn as_str(self) -> &'static str {
         match self {
             ReapReason::TerminalByDecision => "terminal_by_decision",
+            ReapReason::WorkItemTerminal => "work_item_terminal",
             ReapReason::SupersededByLiveExecution => "superseded_by_live_execution",
         }
     }
@@ -144,15 +149,20 @@ impl ContradictionVerdict {
 
 /// Decide what to do about a worker that has proven itself alive.
 ///
-/// `status` is the execution's current DB status. `other_live_execution` is
-/// the id of any OTHER `running`/`waiting_human` execution on the same work
+/// `status` is the execution's current DB status. `work_item_terminal` says an
+/// authoritative owner has already closed the bound work. `other_live_execution`
+/// is the id of any OTHER `running`/`waiting_human` execution on the same work
 /// item, if one exists.
 ///
 /// Pure, so the policy is unit-testable without a DB, an app session, or a
 /// real process — and so the policy lives in exactly one place rather than
 /// being re-derived at each call site the way the pre-existing liveness checks
 /// were.
-pub fn classify_contradiction(status: &ExecutionStatus, other_live_execution: Option<&str>) -> ContradictionVerdict {
+pub fn classify_contradiction(
+    status: &ExecutionStatus,
+    work_item_terminal: bool,
+    other_live_execution: Option<&str>,
+) -> ContradictionVerdict {
     if !status.is_terminal() {
         return ContradictionVerdict::NoContradiction;
     }
@@ -163,6 +173,11 @@ pub fn classify_contradiction(status: &ExecutionStatus, other_live_execution: Op
     if other_live_execution.is_some() {
         return ContradictionVerdict::Reap {
             reason: ReapReason::SupersededByLiveExecution,
+        };
+    }
+    if work_item_terminal {
+        return ContradictionVerdict::Reap {
+            reason: ReapReason::WorkItemTerminal,
         };
     }
     match status {
@@ -188,7 +203,7 @@ mod tests {
             ExecutionStatus::Ready,
         ] {
             assert_eq!(
-                classify_contradiction(&status, None),
+                classify_contradiction(&status, false, None),
                 ContradictionVerdict::NoContradiction,
                 "{status} is live; engine and worker already agree",
             );
@@ -201,7 +216,7 @@ mod tests {
     fn inferred_terminals_are_readopted() {
         for status in [ExecutionStatus::Orphaned, ExecutionStatus::Abandoned] {
             assert_eq!(
-                classify_contradiction(&status, None),
+                classify_contradiction(&status, false, None),
                 ContradictionVerdict::Readopt,
                 "{status} is an inference from missing signal, not a decision",
             );
@@ -218,7 +233,7 @@ mod tests {
             ExecutionStatus::Failed,
         ] {
             assert_eq!(
-                classify_contradiction(&status, None),
+                classify_contradiction(&status, false, None),
                 ContradictionVerdict::Reap {
                     reason: ReapReason::TerminalByDecision
                 },
@@ -234,10 +249,21 @@ mod tests {
     #[test]
     fn a_live_replacement_outranks_an_otherwise_readoptable_survivor() {
         assert_eq!(
-            classify_contradiction(&ExecutionStatus::Orphaned, Some("exec_newer")),
+            classify_contradiction(&ExecutionStatus::Orphaned, false, Some("exec_newer")),
             ContradictionVerdict::Reap {
                 reason: ReapReason::SupersededByLiveExecution
             },
+        );
+    }
+
+    #[test]
+    fn a_closed_work_item_outranks_an_inferred_terminal_status() {
+        assert_eq!(
+            classify_contradiction(&ExecutionStatus::Orphaned, true, None),
+            ContradictionVerdict::Reap {
+                reason: ReapReason::WorkItemTerminal,
+            },
+            "closed work must not be resurrected merely because the execution's own status was inferred",
         );
     }
 }
