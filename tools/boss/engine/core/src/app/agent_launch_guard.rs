@@ -159,7 +159,11 @@ impl std::fmt::Display for AgentLaunchRefusal {
         writeln!(f)?;
         writeln!(
             f,
-            "\x20   env -u BOSS_EVENTS_SOCKET bazel run //tools/boss/engine:engine -- --socket-path /tmp/boss-test-<id>.sock"
+            "\x20   env -u BOSS_EVENTS_SOCKET {} -- --socket-path /tmp/boss-test-<id>.sock",
+            // Sourced from //tools/boss/engine/core:engine_binary.bzl at build
+            // time so this advice can't drift from the real bazel target label
+            // the way the pre-crate-split `//tools/boss/engine:engine` string did.
+            env!("BOSS_ENGINE_BAZEL_RUN_COMMAND"),
         )?;
         writeln!(f)?;
         writeln!(
@@ -691,7 +695,7 @@ mod tests {
         let message = refusal.to_string();
         for expected in [
             "--socket-path",
-            "//tools/boss/engine:engine",
+            "//tools/boss/engine/core:engine",
             "BOSS_EVENTS_SOCKET",
             "BOSS_RUN_ID",
             "events socket",

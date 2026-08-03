@@ -1,5 +1,14 @@
 load("@build_bazel_rules_apple//apple:macos.bzl", "macos_application", "macos_unit_test")
 load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load(
+    "//tools/boss/engine/core:engine_binary.bzl",
+    "ENGINE_BINARY_BAZEL_OUTPUT_FRAGMENT",
+    "ENGINE_BINARY_BAZEL_RUN_COMMAND",
+    "ENGINE_BINARY_BUNDLE_FRAGMENT",
+    "ENGINE_BINARY_NAME",
+    "ENGINE_BINARY_TARGET",
+)
 load("//tools/boss/installer:pkg.bzl", "boss_short_version_plist")
 load("//tools/test-sandbox:defs.bzl", "XCODE_TEST_ENV")
 
@@ -12,6 +21,19 @@ _COVERAGE_LINKOPTS = select({
     ":coverage_enabled": ["-fprofile-instr-generate"],
     "//conditions:default": [],
 })
+
+_ENGINE_BINARY_SWIFT_SOURCE = """enum BossEngineBinary {
+    static let executableName = \"%s\"
+    static let bazelRunCommand = \"%s\"
+    static let bazelOutputPathFragment = \"%s\"
+    static let bundlePathFragment = \"%s\"
+}
+""" % (
+    ENGINE_BINARY_NAME,
+    ENGINE_BINARY_BAZEL_RUN_COMMAND,
+    ENGINE_BINARY_BAZEL_OUTPUT_FRAGMENT,
+    ENGINE_BINARY_BUNDLE_FRAGMENT,
+)
 
 package(default_visibility = ["//visibility:private"])
 
@@ -26,10 +48,20 @@ swift_library(
     # CrashWatchdog is excluded so it is only ever compiled as its own module
     # (matching Package.swift's `exclude:`); leaving it in the glob would give
     # the app a second, shadowing copy of the type it imports.
+    #
+    # Sources/EngineBinaryName.swift is excluded too: it's a checked-in copy
+    # of the genrule output below, kept in the tree only so SwiftPM/Xcode
+    # (which never see bazel genrules) can compile it. Bazel itself keeps
+    # compiling the genrule's output as the single source of truth; the
+    # checked-in copy is verified byte-identical to it by
+    # :engine_binary_name_swift_up_to_date_test.
     srcs = glob(
         ["Sources/**/*.swift"],
-        exclude = ["Sources/CrashWatchdog/**/*.swift"],
-    ),
+        exclude = [
+            "Sources/CrashWatchdog/**/*.swift",
+            "Sources/EngineBinaryName.swift",
+        ],
+    ) + [":engine_binary_name_swift"],
     copts = [
         # Mirror the swiftSettings define in Package.swift so @inlinable
         # Textual APIs (e.g. .textual.textSelection) expand correctly here.
@@ -50,6 +82,32 @@ swift_library(
         "//tools/boss/app-macos/Sources/UpdateCore",
         "@ghostty_kit//:GhosttyKit",
         "@swiftpkg_textual//:Textual",
+    ],
+)
+
+genrule(
+    name = "engine_binary_name_swift",
+    outs = ["EngineBinaryName.swift"],
+    cmd = "cat > $@ <<'EOF'\n%sEOF" % _ENGINE_BINARY_SWIFT_SOURCE,
+    visibility = ["//visibility:private"],
+)
+
+# Guards the checked-in Sources/EngineBinaryName.swift (needed so
+# SwiftPM/Xcode builds resolve `BossEngineBinary` — they never see bazel
+# genrules) against drifting from the genrule above, which stays the single
+# source of truth for bazel builds. Fails the moment the two disagree, e.g.
+# because ENGINE_BINARY_NAME or another engine_binary.bzl constant changed
+# without the checked-in copy being regenerated.
+sh_test(
+    name = "engine_binary_name_swift_up_to_date_test",
+    srcs = ["engine_binary_name_swift_up_to_date_test.sh"],
+    args = [
+        "$(location Sources/EngineBinaryName.swift)",
+        "$(location :engine_binary_name_swift)",
+    ],
+    data = [
+        "Sources/EngineBinaryName.swift",
+        ":engine_binary_name_swift",
     ],
 )
 
@@ -253,7 +311,7 @@ macos_application(
     # Workers run inside Ghostty terminal panes and inherit the user's shell PATH,
     # so they continue to resolve cube (and jj, gh, claude, etc.) from PATH.
     additional_contents = {
-        "//tools/boss/engine/core:engine": "Resources/bin",
+        ENGINE_BINARY_TARGET: "Resources/bin",
         "//tools/boss/cli:boss": "Resources/bin",
         "//tools/boss/bossctl:bossctl": "Resources/bin",
         "//tools/boss/event-shim:boss-event": "Resources/bin",

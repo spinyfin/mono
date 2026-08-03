@@ -1,5 +1,11 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load(
+    "//tools/boss/engine/core:engine_binary.bzl",
+    "ENGINE_BINARY_BAZEL_RELPATH",
+    "ENGINE_BINARY_NAME",
+    "ENGINE_BINARY_TARGET",
+)
 
 exports_files(["Cargo.toml"])
 
@@ -10,6 +16,11 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
+    rustc_env = {
+        "BOSS_ENGINE_BINARY_BAZEL_RELPATH": ENGINE_BINARY_BAZEL_RELPATH,
+        "BOSS_ENGINE_BINARY_NAME": ENGINE_BINARY_NAME,
+        "BOSS_ENGINE_BINARY_TARGET": ENGINE_BINARY_TARGET,
+    },
     visibility = [
         "//tools/boss:__subpackages__",
     ],

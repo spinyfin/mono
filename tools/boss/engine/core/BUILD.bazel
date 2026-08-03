@@ -1,6 +1,7 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load(":engine_binary.bzl", "ENGINE_BINARY_BAZEL_RUN_COMMAND", "ENGINE_BINARY_NAME", "ENGINE_BINARY_TARGET")
 
 rust_library(
     name = "engine_lib",
@@ -42,6 +43,12 @@ rust_library(
         # source file's compile-time path is rooted under bazel-out, not the
         # real source tree, so `../../../CHECKS.yaml` doesn't resolve there.
         "BOSS_CHECKS_YAML": "$(execpath //:CHECKS.yaml)",
+        # Canonical `bazel run` command for the engine target, so worker-facing
+        # guidance (worker_setup.rs, agent_launch_guard.rs) can't drift from
+        # the real target label the way the pre-split `//tools/boss/engine:engine`
+        # string did.
+        "BOSS_ENGINE_BAZEL_RUN_COMMAND": ENGINE_BINARY_BAZEL_RUN_COMMAND,
+        "BOSS_ENGINE_BAZEL_TARGET": ENGINE_BINARY_TARGET,
     },
     visibility = [
         "//tools/boss/bossctl:__pkg__",
@@ -104,7 +111,7 @@ rust_library(
 )
 
 rust_binary(
-    name = "engine",
+    name = ENGINE_BINARY_NAME,
     srcs = ["src/main.rs"],
     # Ship the boss-event hook shim alongside the engine binary so
     # PaneSpawnRunner can resolve it via runfiles at runtime. Without

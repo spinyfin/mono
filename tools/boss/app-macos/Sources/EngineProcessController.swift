@@ -195,7 +195,7 @@ final class EngineProcessController: @unchecked Sendable {
     /// Returns `nil` in dev/bazel-run mode where no bundle engine exists.
     private func bundledEnginePath() -> String? {
         guard let resourcePath = Bundle.main.resourcePath else { return nil }
-        let path = "\(resourcePath)/bin/engine"
+        let path = "\(resourcePath)/bin/\(BossEngineBinary.executableName)"
         guard FileManager.default.fileExists(atPath: path) else { return nil }
         return path
     }
@@ -343,7 +343,7 @@ final class EngineProcessController: @unchecked Sendable {
     ///   1. BOSS_ENGINE_CMD env override — wins unconditionally so a dev
     ///      running `bazel run //tools/boss/app-macos:Boss` against a custom
     ///      engine still works.
-    ///   2. Bundle-relative path: `<Bundle.main.resourcePath>/bin/engine` —
+    ///   2. Bundle-relative path: `<Bundle.main.resourcePath>/bin/<engine>` —
     ///      the installed app path; BOSS_BIN_DIR is set to the bin/ dir so
     ///      the engine can resolve its sibling CLIs.
     ///   3. `bazel run` fallback — dev mode for when the bundle lacks the
@@ -353,13 +353,13 @@ final class EngineProcessController: @unchecked Sendable {
             return (override, nil)
         }
         if let resourcePath = Bundle.main.resourcePath {
-            let enginePath = "\(resourcePath)/bin/engine"
+            let enginePath = "\(resourcePath)/bin/\(BossEngineBinary.executableName)"
             if FileManager.default.fileExists(atPath: enginePath) {
                 let bossBinDir = "\(resourcePath)/bin"
                 return ("\(enginePath) --socket-path \(socketPath)", bossBinDir)
             }
         }
-        return ("bazel run //tools/boss/engine:engine -- --socket-path \(socketPath)", nil)
+        return ("\(BossEngineBinary.bazelRunCommand) -- --socket-path \(socketPath)", nil)
     }
 
     func stop() {
@@ -632,9 +632,9 @@ final class EngineProcessController: @unchecked Sendable {
             return false
         }
 
-        return command.contains("/tools/boss/engine/engine")
-            || command.contains("bazel run //tools/boss/engine:engine")
-            || command.contains("Contents/Resources/bin/engine")
+        return command.contains(BossEngineBinary.bazelOutputPathFragment)
+            || command.contains(BossEngineBinary.bazelRunCommand)
+            || command.contains(BossEngineBinary.bundlePathFragment)
     }
 
     private func commandLine(for pid: pid_t) -> String? {

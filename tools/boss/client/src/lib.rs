@@ -3,7 +3,7 @@
 //! `BossClient` opens a Unix-domain connection to the engine and provides a
 //! correlated request/response API on top of the framed JSON protocol defined
 //! in [`boss_protocol`]. Engine discovery (socket path resolution + optional
-//! autostart of `boss-engine`) lives behind [`Discovery`] so the CLI, tests,
+//! autostart of the engine binary) lives behind [`Discovery`] so the CLI, tests,
 //! and future TUI/web frontends share one set of rules.
 
 use std::path::{Path, PathBuf};
@@ -28,7 +28,7 @@ pub struct EngineCommand {
     pub args: Vec<String>,
     /// Short label describing how `program` was resolved. Surfaced in
     /// error messages so a failed autostart names the source it picked
-    /// (e.g. `BOSS_ENGINE_BIN`, `bazel-bin/tools/boss/engine/engine`,
+    /// (e.g. `BOSS_ENGINE_BIN`, a `bazel-bin` lookup,
     /// `PATH lookup`).
     pub source: String,
     /// Ordered list of every resolution step the resolver tried. The
@@ -362,7 +362,7 @@ fn start_engine_process(discovery: &Discovery) -> Result<()> {
         .spawn()
         .with_context(|| {
             format!(
-                "failed to start engine using `{}` (resolved via {}).\nResolution chain (highest priority first):\n{}\nSet BOSS_ENGINE_BIN to an explicit engine binary path, or run `bazel build //tools/boss/engine:engine` so the bazel-bin lookup succeeds.",
+                "failed to start engine using `{}` (resolved via {}).\nResolution chain (highest priority first):\n{}\nSet BOSS_ENGINE_BIN to an explicit engine binary path, or run `bazel build {ENGINE_BINARY_TARGET}` so the bazel-bin lookup succeeds.",
                 format_engine_command(&discovery.engine.program, &discovery.engine.args),
                 discovery.engine.source,
                 format_resolution_chain(&discovery.engine.attempted),
@@ -378,8 +378,12 @@ fn resolve_launch_directory() -> Result<PathBuf> {
     std::env::current_dir().context("failed to resolve current directory")
 }
 
-/// Relative path of the bazel-built engine binary inside a workspace.
-const BAZEL_ENGINE_RELPATH: &str = "bazel-bin/tools/boss/engine/engine";
+/// The engine's output identity comes from the same Bazel definition that
+/// names and bundles the executable. This prevents the resolver from drifting
+/// from the filename installed in `Boss.app`.
+const ENGINE_BINARY_NAME: &str = env!("BOSS_ENGINE_BINARY_NAME");
+const BAZEL_ENGINE_RELPATH: &str = env!("BOSS_ENGINE_BINARY_BAZEL_RELPATH");
+const ENGINE_BINARY_TARGET: &str = env!("BOSS_ENGINE_BINARY_TARGET");
 
 fn resolve_engine_command(socket_path: &str) -> Result<EngineCommand> {
     let input = EngineResolverInput {
@@ -396,10 +400,10 @@ fn resolve_engine_command(socket_path: &str) -> Result<EngineCommand> {
 /// Resolution order (highest priority first):
 ///   1. `BOSS_ENGINE_CMD` — full custom command (shell-split).
 ///   2. `BOSS_ENGINE_BIN` — explicit binary path; default args appended.
-///   3. `bazel-bin/tools/boss/engine/engine` under the workspace root.
-///   4. A `boss-engine` (or `engine/engine`) sibling next to the running
-///      executable — covers `bazel run` runfiles layouts.
-///   5. Bare `boss-engine` on `$PATH` (current default; fails loudly if
+///   3. The Bazel-built engine under the workspace root.
+///   4. The engine sibling next to the running executable — covers the
+///      installed app bundle and `bazel run` runfiles layouts.
+///   5. Bare engine executable on `$PATH` (current default; fails loudly if
 ///      the binary isn't installed).
 pub fn resolve_engine_command_with(socket_path: &str, input: &EngineResolverInput) -> Result<EngineCommand> {
     let mut attempted = Vec::new();
@@ -442,7 +446,7 @@ pub fn resolve_engine_command_with(socket_path: &str, input: &EngineResolverInpu
             });
         }
         attempted.push(format!(
-            "bazel-bin lookup miss at {} (run `bazel build //tools/boss/engine:engine`)",
+            "bazel-bin lookup miss at {} (run `bazel build {ENGINE_BINARY_TARGET}`)",
             candidate.display()
         ));
     } else {
@@ -464,11 +468,11 @@ pub fn resolve_engine_command_with(socket_path: &str, input: &EngineResolverInpu
         attempted.push("sibling-of-exe skipped (current_exe unavailable)".to_owned());
     }
 
-    attempted.push("PATH lookup of `boss-engine`".to_owned());
+    attempted.push(format!("PATH lookup of `{ENGINE_BINARY_NAME}`"));
     Ok(EngineCommand {
-        program: "boss-engine".to_owned(),
+        program: ENGINE_BINARY_NAME.to_owned(),
         args: default_engine_args(socket_path),
-        source: "PATH lookup of `boss-engine`".to_owned(),
+        source: format!("PATH lookup of `{ENGINE_BINARY_NAME}`"),
         attempted,
     })
 }
@@ -489,14 +493,11 @@ fn default_engine_args(socket_path: &str) -> Vec<String> {
 
 fn sibling_engine_binary(exe: &Path) -> Option<(String, PathBuf)> {
     let dir = exe.parent()?;
-    let mut candidates = vec![dir.join("boss-engine")];
-    if let Some(boss_dir) = dir.parent() {
-        candidates.push(boss_dir.join("engine").join("engine"));
-    }
-    candidates
-        .into_iter()
-        .find(|candidate: &PathBuf| candidate.is_file())
-        .map(|candidate| (candidate.to_string_lossy().into_owned(), candidate))
+    let candidate = dir.join(ENGINE_BINARY_NAME);
+    candidate.is_file().then(|| {
+        let path_str = candidate.to_string_lossy().into_owned();
+        (path_str, candidate)
+    })
 }
 
 fn locate_bazel_workspace_root() -> Option<PathBuf> {
@@ -553,9 +554,9 @@ mod tests {
     fn make_workspace_with_engine(tmp: &tempfile::TempDir) -> PathBuf {
         let root = tmp.path();
         std::fs::write(root.join("MODULE.bazel"), "module(name = \"test\")\n").unwrap();
-        let engine_dir = root.join("bazel-bin/tools/boss/engine");
-        std::fs::create_dir_all(&engine_dir).unwrap();
-        let engine_bin = engine_dir.join("engine");
+        let engine_bin = root.join(BAZEL_ENGINE_RELPATH);
+        let engine_dir = engine_bin.parent().unwrap();
+        std::fs::create_dir_all(engine_dir).unwrap();
         std::fs::write(&engine_bin, b"#!/bin/sh\nexit 0\n").unwrap();
         engine_bin
     }
@@ -614,7 +615,7 @@ mod tests {
     #[test]
     fn falls_back_to_path_when_engine_not_built() {
         let tmp = tempfile::tempdir().unwrap();
-        // Workspace exists but no bazel-bin/tools/boss/engine/engine yet.
+        // Workspace exists but the Bazel engine has not been built yet.
         std::fs::write(tmp.path().join("MODULE.bazel"), "module(name = \"x\")\n").unwrap();
         let input = EngineResolverInput {
             env_cmd: None,
@@ -623,8 +624,8 @@ mod tests {
             current_exe: None,
         };
         let cmd = resolve_engine_command_with("/tmp/sock", &input).unwrap();
-        assert_eq!(cmd.program, "boss-engine");
-        assert_eq!(cmd.source, "PATH lookup of `boss-engine`");
+        assert_eq!(cmd.program, ENGINE_BINARY_NAME);
+        assert_eq!(cmd.source, format!("PATH lookup of `{ENGINE_BINARY_NAME}`"));
         // The chain must mention that bazel-bin was attempted but missed,
         // so the error message guides the user to `bazel build`.
         let chain_text = cmd.attempted.join("\n");
@@ -644,8 +645,8 @@ mod tests {
             current_exe: None,
         };
         let cmd = resolve_engine_command_with("/tmp/sock", &input).unwrap();
-        assert_eq!(cmd.program, "boss-engine");
-        assert_eq!(cmd.source, "PATH lookup of `boss-engine`");
+        assert_eq!(cmd.program, ENGINE_BINARY_NAME);
+        assert_eq!(cmd.source, format!("PATH lookup of `{ENGINE_BINARY_NAME}`"));
     }
 
     #[test]
@@ -707,16 +708,17 @@ mod tests {
     }
 
     #[test]
-    fn sibling_of_exe_resolves_boss_engine_next_to_current_exe() {
-        // current_exe lives in a dir that also contains a `boss-engine`
-        // sibling; no env vars set and the workspace's bazel-bin engine
-        // does not exist, so resolution should fall through to the sibling.
+    fn sibling_of_exe_resolves_engine_from_installed_app_bundle() {
+        // Model the installed bundle layout rather than a Bazel runfiles
+        // tree: a bundled `boss` lives beside the engine in Resources/bin.
+        // The resolver and `macos_application` consume the same Bazel source
+        // for ENGINE_BINARY_NAME, so renaming the build output changes both.
         let tmp = tempfile::tempdir().unwrap();
-        let exe_dir = tmp.path().join("runfiles");
+        let exe_dir = tmp.path().join("Boss.app/Contents/Resources/bin");
         std::fs::create_dir_all(&exe_dir).unwrap();
         let fake_exe = exe_dir.join("boss");
         std::fs::write(&fake_exe, b"#!/bin/sh\nexit 0\n").unwrap();
-        let sibling = exe_dir.join("boss-engine");
+        let sibling = exe_dir.join(ENGINE_BINARY_NAME);
         std::fs::write(&sibling, b"#!/bin/sh\nexit 0\n").unwrap();
 
         // Workspace root with NO bazel-bin engine built.
@@ -740,36 +742,6 @@ mod tests {
     }
 
     #[test]
-    fn sibling_of_exe_resolves_parent_engine_engine_candidate() {
-        // The `boss-engine` sibling is absent, but a `../engine/engine`
-        // relative to the exe's dir exists — the second sibling candidate.
-        let tmp = tempfile::tempdir().unwrap();
-        let exe_dir = tmp.path().join("boss").join("bin");
-        std::fs::create_dir_all(&exe_dir).unwrap();
-        let fake_exe = exe_dir.join("boss");
-        std::fs::write(&fake_exe, b"#!/bin/sh\nexit 0\n").unwrap();
-        // Second candidate: exe_dir.parent()/engine/engine == tmp/boss/engine/engine
-        let engine_dir = tmp.path().join("boss").join("engine");
-        std::fs::create_dir_all(&engine_dir).unwrap();
-        let engine_bin = engine_dir.join("engine");
-        std::fs::write(&engine_bin, b"#!/bin/sh\nexit 0\n").unwrap();
-
-        let input = EngineResolverInput {
-            env_cmd: None,
-            env_bin: None,
-            workspace_root: None,
-            current_exe: Some(fake_exe.clone()),
-        };
-        let cmd = resolve_engine_command_with("/tmp/sock", &input).unwrap();
-        assert_eq!(cmd.program, engine_bin.to_string_lossy());
-        assert!(
-            cmd.source.starts_with("sibling of"),
-            "expected sibling source, got {}",
-            cmd.source
-        );
-    }
-
-    #[test]
     fn bazel_bin_miss_falls_through_to_sibling_before_path() {
         // Ordering guarantee: with a workspace whose bazel-bin engine is
         // NOT built and a valid sibling next to the exe, the sibling wins
@@ -780,7 +752,7 @@ mod tests {
         std::fs::create_dir_all(&exe_dir).unwrap();
         let fake_exe = exe_dir.join("boss");
         std::fs::write(&fake_exe, b"#!/bin/sh\nexit 0\n").unwrap();
-        let sibling = exe_dir.join("boss-engine");
+        let sibling = exe_dir.join(ENGINE_BINARY_NAME);
         std::fs::write(&sibling, b"#!/bin/sh\nexit 0\n").unwrap();
 
         let ws = tempfile::tempdir().unwrap();
@@ -794,7 +766,7 @@ mod tests {
         };
         let cmd = resolve_engine_command_with("/tmp/sock", &input).unwrap();
         assert_eq!(cmd.program, sibling.to_string_lossy());
-        assert_ne!(cmd.program, "boss-engine", "must not fall through to PATH");
+        assert_ne!(cmd.program, ENGINE_BINARY_NAME, "must not fall through to PATH");
 
         let chain_text = cmd.attempted.join("\n");
         assert!(
@@ -869,7 +841,7 @@ mod tests {
             "/x/engine --a --b"
         );
         // No args -> just the program, no trailing space.
-        assert_eq!(format_engine_command("boss-engine", &[]), "boss-engine");
+        assert_eq!(format_engine_command(ENGINE_BINARY_NAME, &[]), ENGINE_BINARY_NAME);
     }
 
     #[test]

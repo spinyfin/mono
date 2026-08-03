@@ -1,5 +1,6 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("//tools/boss/engine/core:engine_binary.bzl", "ENGINE_BINARY_BAZEL_RUN_COMMAND")
 
 exports_files(["Cargo.toml"])
 
@@ -11,6 +12,13 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
+    rustc_env = {
+        # Canonical `bazel run` command for the engine target, sourced from
+        # engine_binary.bzl so the PreToolUse guard advice text embedded in
+        # BOSS_LAUNCH_GUARD_COMMAND can't drift from the real target label
+        # the way the pre-crate-split `//tools/boss/engine:engine` string did.
+        "BOSS_ENGINE_BAZEL_RUN_COMMAND": ENGINE_BINARY_BAZEL_RUN_COMMAND,
+    },
     visibility = [
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/effort:__pkg__",
