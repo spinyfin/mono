@@ -1,0 +1,37 @@
+[
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Who should own the coordinator session once it is tmux-hosted? Moving it engine-side keeps re-adoption logic out of Swift (the design's recommendation), but it relocates a launch path that has lived in the app since day one.",
+    "choices": [
+      "Engine-launched; the app only attaches (recommended)",
+      "App-launched but tmux-hosted; the app keeps the launch, the engine keeps the singleton record",
+      "Leave the coordinator app-owned and non-tmux for now; workers only"
+    ],
+    "anchor": "4-the-coordinator"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "What should happen to a worker classified alive-and-genuinely-stuck (session live, pane not dead, no hook AND no pane output AND the agent binary in the foreground, sustained past the threshold)? Today's behaviour is an unconditional reap at 1800s, which is what destroyed complete-but-unpushed work in the motivating incident.",
+    "choices": [
+      "Escalate to an attention item only; never auto-reap (recommended)",
+      "Escalate, then auto-reap after a second much longer window with the reason recorded",
+      "Keep today's behaviour: auto-reap at the single threshold"
+    ],
+    "anchor": "5-liveness-and-reaping-redefined"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Should `remain-on-exit on` be the default for worker sessions? It preserves a dead pane's final screen and exit status for post-mortem (information the system does not have today), at the cost of every exited worker leaving a session the cleanup sweep must reclaim.",
+    "anchor": "3-what-the-app-becomes"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Is the proposed two-engine guard sufficient? The design pairs the existing pid-file start lock with a server-scoped `@boss_engine_owner` tmux option that makes a second engine refuse to adopt. It is adequate for a single-user desktop but is not general mutual exclusion.",
+    "choices": [
+      "Sufficient; ship it as designed",
+      "Sufficient for v1, but file a follow-up to harden it",
+      "Not sufficient; design a real mutual-exclusion mechanism before implementation starts"
+    ],
+    "anchor": "7-failure-modes-and-the-behaviour-chosen-for-each"
+  }
+]
