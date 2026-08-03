@@ -1500,7 +1500,7 @@ impl ServerState {
         // have probes queued against it too (`dispatch_probe_if_idle` leaves
         // them there when no slot is mapped yet).
         self.abandon_pending_probes_for_terminated_run(run_id, "worker pane released");
-        let Some(slot_id) = self.worker_registry.take_slot_for_run(run_id) else {
+        let Some(pane) = self.worker_registry.take_worker_pane_for_run(run_id) else {
             // No slot mapping does not imply no process. The registry is
             // in-memory and is cleared unconditionally at the end of this very
             // function ("successfully or not"), while the durable
@@ -1518,7 +1518,8 @@ impl ServerState {
             // worker is about to occupy.
             return self.reap_untracked_worker_process(run_id).await;
         };
-        // Between the drain above and `take_slot_for_run` just now, the slot
+        let slot_id = pane.slot_id;
+        // Between the drain above and `take_worker_pane_for_run` just now, the slot
         // mapping still read `Some`: a concurrent probe insert guarded on
         // `slot_for_run(...).is_none()` (`requeue_probe_front`,
         // `handle_probe_run`'s post-insert re-check) could have passed that
@@ -1536,13 +1537,20 @@ impl ServerState {
             .get(slot_id)
             .map(|state| state.shell_pid)
             .unwrap_or(0);
-        let request = EngineToAppRequest::ReleaseWorkerPane(ReleaseWorkerPaneInput {
-            slot_id,
-            kill_grace_seconds: 5,
-        });
+        let request = if pane.tmux_hosted {
+            EngineToAppRequest::DetachWorkerPane(crate::protocol::DetachWorkerPaneInput { slot_id })
+        } else {
+            EngineToAppRequest::ReleaseWorkerPane(ReleaseWorkerPaneInput {
+                slot_id,
+                kill_grace_seconds: 5,
+            })
+        };
         match self.send_to_app(request, Duration::from_secs(5)).await {
             Ok(EngineToAppResponse::ReleaseWorkerPane { result: Ok(_) }) => {
                 tracing::info!(run_id, slot_id, "released worker pane");
+            }
+            Ok(EngineToAppResponse::DetachWorkerPane { result: Ok(_) }) => {
+                tracing::info!(run_id, slot_id, "detached tmux-hosted worker pane");
             }
             Ok(EngineToAppResponse::ReleaseWorkerPane {
                 result: Err(EngineToAppError::UnknownSlot),
@@ -1551,6 +1559,15 @@ impl ServerState {
                     run_id,
                     slot_id,
                     "release_worker_pane: app reports unknown slot — already released",
+                );
+            }
+            Ok(EngineToAppResponse::DetachWorkerPane {
+                result: Err(EngineToAppError::UnknownSlot),
+            }) => {
+                tracing::debug!(
+                    run_id,
+                    slot_id,
+                    "release_worker_pane: app reports tmux viewer already detached",
                 );
             }
             Ok(other) => {
@@ -1583,7 +1600,9 @@ impl ServerState {
         // process tree goes down even when the app path can't reach it.
         // Idempotent with the app's reap: a process already gone just
         // yields `ESRCH`. The grace mirrors the app's `kill_grace_seconds`.
-        reap_worker_process_tree(shell_pid, Duration::from_secs(5));
+        if !pane.tmux_hosted {
+            reap_worker_process_tree(shell_pid, Duration::from_secs(5));
+        }
         // The engine's WorkerPool slot was held for the lifetime of
         // the libghostty pane (the coordinator deferred its release
         // when `run_execution` returned with `slot_id = Some(N)`).

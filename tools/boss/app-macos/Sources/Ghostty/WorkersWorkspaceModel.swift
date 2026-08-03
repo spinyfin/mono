@@ -133,6 +133,36 @@ final class WorkersWorkspaceModel: ObservableObject {
     ///    a session (engine and app disagree about what's free —
     ///    the engine should reconcile rather than retry blindly).
     func spawnWorkerPane(_ request: EngineSpawnRequest) -> EngineSpawnResult {
+        hostWorkerPane(request, reportsWorkerLifecycle: true)
+    }
+
+    /// Attach a Ghostty surface to an already-running tmux worker. The app
+    /// supplies neither the worker's environment nor its working directory:
+    /// those were fixed when the engine created the detached tmux session.
+    /// Closing this surface must therefore not report a worker death.
+    func attachWorkerPane(_ request: EngineAttachRequest) -> EngineAttachResult {
+        let launch = EngineSpawnRequest(
+            runId: request.runId,
+            workspacePath: FileManager.default.homeDirectoryForCurrentUser.path,
+            slotId: request.slotId,
+            initialInput: "exec tmux -L boss attach-session -t \(request.sessionName)\n",
+            env: [],
+            summary: request.summary,
+            taskTitle: request.taskTitle,
+            paneMonitor: .claudeDefault
+        )
+        switch hostWorkerPane(launch, reportsWorkerLifecycle: false) {
+        case .success:
+            return .success
+        case .failure(let error):
+            return .failure(error)
+        }
+    }
+
+    private func hostWorkerPane(
+        _ request: EngineSpawnRequest,
+        reportsWorkerLifecycle: Bool
+    ) -> EngineSpawnResult {
         let requestedSlot = request.slotId
         let isAutomation = Self.automationSlotRange.contains(Int(requestedSlot))
         let isReview = reviewSlotRange.contains(Int(requestedSlot))
@@ -162,11 +192,13 @@ final class WorkersWorkspaceModel: ObservableObject {
         // request — logged BEFORE the asynchronous surface creation so a spawn
         // that never progresses to an attached surface or a failure is still
         // visible app-side (the gap the 2026-07-05 post-wake incident hit).
-        SpawnDiagnosticsLog.shared.spawnRequested(
-            runId: request.runId,
-            slotId: slotId,
-            workspacePath: request.workspacePath
-        )
+        if reportsWorkerLifecycle {
+            SpawnDiagnosticsLog.shared.spawnRequested(
+                runId: request.runId,
+                slotId: slotId,
+                workspacePath: request.workspacePath
+            )
+        }
 
         let launchSpec = TerminalLaunchSpec(
             fontSize: 10.0,
@@ -204,55 +236,64 @@ final class WorkersWorkspaceModel: ObservableObject {
         // then forward it to the engine via update_worker_shell_pid.
         let capturedRunId = request.runId
         let capturedSlotId = slotId
-        session.onSurfaceAttached = { [weak self, weak session] in
-            guard let self = self else { return }
-            let pid = session?.shellPid ?? 0
-            if pid > 0 {
-                SpawnDiagnosticsLog.shared.surfaceAttached(runId: capturedRunId, slotId: capturedSlotId, shellPid: pid)
-                self.onShellPidAvailable?(capturedRunId, pid)
-            } else {
-                // Shell may not have called tcsetpgrp yet — retry after a
-                // short delay to let it become the foreground process group.
-                Task { @MainActor [weak self, weak session] in
-                    try? await Task.sleep(nanoseconds: 250_000_000) // 250ms
-                    guard let self = self else { return }
-                    let retryPid = session?.shellPid ?? 0
-                    guard retryPid > 0 else { return }
-                    SpawnDiagnosticsLog.shared.surfaceAttached(
-                        runId: capturedRunId,
-                        slotId: capturedSlotId,
-                        shellPid: retryPid
-                    )
-                    self.onShellPidAvailable?(capturedRunId, retryPid)
+        if reportsWorkerLifecycle {
+            session.onSurfaceAttached = { [weak self, weak session] in
+                guard let self = self else { return }
+                let pid = session?.shellPid ?? 0
+                if pid > 0 {
+                    SpawnDiagnosticsLog.shared.surfaceAttached(runId: capturedRunId, slotId: capturedSlotId, shellPid: pid)
+                    self.onShellPidAvailable?(capturedRunId, pid)
+                } else {
+                    // Shell may not have called tcsetpgrp yet — retry after a
+                    // short delay to let it become the foreground process group.
+                    Task { @MainActor [weak self, weak session] in
+                        try? await Task.sleep(nanoseconds: 250_000_000) // 250ms
+                        guard let self = self else { return }
+                        let retryPid = session?.shellPid ?? 0
+                        guard retryPid > 0 else { return }
+                        SpawnDiagnosticsLog.shared.surfaceAttached(
+                            runId: capturedRunId,
+                            slotId: capturedSlotId,
+                            shellPid: retryPid
+                        )
+                        self.onShellPidAvailable?(capturedRunId, retryPid)
+                    }
                 }
             }
-        }
-        // Report the pane's death to the engine the moment the app itself
-        // observes it — the shell process exited — instead of waiting for the
-        // periodic dead-pid sweep (up to 60s) or an app restart to notice.
-        // A surface that never came up is NOT reported here: it never had a
-        // shell to exit, and it goes down the spawn-failure path below.
-        session.onChildExited = { [weak self, weak session] in
-            // A close callback can arrive while libghostty is still creating
-            // the surface, or after an engine-driven release has begun.
-            // Neither is evidence that this run's attached child exited.
-            guard let session,
-                  session.terminalReady,
-                  !session.isReleased,
-                  session.claimPaneDeathReport()
-            else { return }
-            self?.onPaneDied?(capturedRunId, .childProcessExited)
-        }
-        // Fail-fast NACK: if the libghostty surface never comes up (the
-        // post-sleep "no active display" condition), tell the engine at once
-        // instead of leaving it to time out after 60s. Also mirror the failure
-        // into the durable spawn diagnostics keyed by execution id.
-        session.onSurfaceCreationFailed = { [weak self] reason in
-            SpawnDiagnosticsLog.shared.surfaceFailed(runId: capturedRunId, reason: reason)
-            self?.onSpawnFailed?(capturedRunId, reason)
+            // Report the pane's death to the engine the moment the app itself
+            // observes it — the shell process exited — instead of waiting for the
+            // periodic dead-pid sweep (up to 60s) or an app restart to notice.
+            // A surface that never came up is NOT reported here: it never had a
+            // shell to exit, and it goes down the spawn-failure path below.
+            session.onChildExited = { [weak self, weak session] in
+                // A close callback can arrive while libghostty is still creating
+                // the surface, or after an engine-driven release has begun.
+                // Neither is evidence that this run's attached child exited.
+                guard let session,
+                      session.terminalReady,
+                      !session.isReleased,
+                      session.claimPaneDeathReport()
+                else { return }
+                self?.onPaneDied?(capturedRunId, .childProcessExited)
+            }
+            // Fail-fast NACK: if the libghostty surface never comes up (the
+            // post-sleep "no active display" condition), tell the engine at once
+            // instead of leaving it to time out after 60s. Also mirror the failure
+            // into the durable spawn diagnostics keyed by execution id.
+            session.onSurfaceCreationFailed = { [weak self] reason in
+                SpawnDiagnosticsLog.shared.surfaceFailed(runId: capturedRunId, reason: reason)
+                self?.onSpawnFailed?(capturedRunId, reason)
+            }
         }
 
         return .success(slotId: slotId, shellPid: 0)
+    }
+
+    /// Detach a tmux viewer surface. Unlike `releaseWorkerPane`, this does
+    /// not inspect or signal the foreground process because that process is
+    /// owned by the detached tmux session, not by Ghostty.
+    func detachWorkerPane(slotId: Int) -> EngineReleaseResult {
+        clearWorkerPane(slotId: slotId, captureForegroundPid: false).0
     }
 
     /// Release a previously allocated slot.
@@ -284,17 +325,35 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// default, which would itself blow the engine's 5s round-trip
     /// budget).
     func releaseWorkerPane(slotId: Int, killGraceSeconds: UInt32) -> EngineReleaseResult {
+        let (result, foregroundPid) = clearWorkerPane(slotId: slotId, captureForegroundPid: true)
+        guard case .success = result else { return result }
+
+        if let pid = foregroundPid {
+            Task.detached(priority: .userInitiated) {
+                await WorkerProcessKiller.killForegroundProcessTree(
+                    pid: pid,
+                    graceSeconds: killGraceSeconds
+                )
+            }
+        }
+        return .success
+    }
+
+    private func clearWorkerPane(
+        slotId: Int,
+        captureForegroundPid: Bool
+    ) -> (EngineReleaseResult, pid_t?) {
         let isAutomation = Self.automationSlotRange.contains(slotId)
         let isReview = reviewSlotRange.contains(slotId)
         var targetSlots = isReview ? reviewSlots : (isAutomation ? automationSlots : slots)
         guard let index = targetSlots.firstIndex(where: { $0.slotId == slotId }) else {
-            return .failure(.unknownSlot)
+            return (.failure(.unknownSlot), nil)
         }
         guard let session = targetSlots[index].session else {
-            return .failure(.unknownSlot)
+            return (.failure(.unknownSlot), nil)
         }
 
-        let foregroundPid = foregroundPid(for: session)
+        let foregroundPid = captureForegroundPid ? foregroundPid(for: session) : nil
         // Mark released before nil-ing the slot so a display-change retry
         // racing this release (see `GhosttyTerminalHostView.attemptSurfaceCreation`)
         // can't create a fresh surface and spawn a duplicate `claude` for the
@@ -316,16 +375,7 @@ final class WorkersWorkspaceModel: ObservableObject {
         } else {
             slots = targetSlots
         }
-
-        if let pid = foregroundPid {
-            Task.detached(priority: .userInitiated) {
-                await WorkerProcessKiller.killForegroundProcessTree(
-                    pid: pid,
-                    graceSeconds: killGraceSeconds
-                )
-            }
-        }
-        return .success
+        return (.success, foregroundPid)
     }
 
     /// Report every slot currently hosting a session, across all three

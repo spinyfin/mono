@@ -56,6 +56,19 @@ enum EngineReleaseResult: Sendable {
     case failure(EngineReleaseError)
 }
 
+struct EngineAttachRequest: Sendable {
+    let runId: String
+    let slotId: Int
+    let sessionName: String
+    let summary: String?
+    let taskTitle: String?
+}
+
+enum EngineAttachResult: Sendable {
+    case success
+    case failure(EngineSpawnError)
+}
+
 enum EngineSendError: Sendable {
     case unknownSlot
     case internalFailure(String)
@@ -117,6 +130,8 @@ struct EngineHostedPaneEntry: Sendable {
 enum EngineRequestKind: Sendable {
     case spawnWorkerPane(EngineSpawnRequest)
     case releaseWorkerPane(slotId: Int, killGraceSeconds: UInt32)
+    case attachWorkerPane(EngineAttachRequest)
+    case detachWorkerPane(slotId: Int)
     case sendToPane(slotId: Int, text: String)
     case focusWorkerPane(slotId: Int)
     case interruptWorkerPane(slotId: Int)

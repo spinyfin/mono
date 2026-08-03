@@ -407,6 +407,25 @@ final class EngineClient: @unchecked Sendable {
                         requestId: requestId,
                         request: .releaseWorkerPane(slotId: slotId, killGraceSeconds: killGrace)
                     ))
+                case "attach_worker_pane":
+                    let runId = request["run_id"] as? String ?? ""
+                    let slotId = (request["slot_id"] as? NSNumber)?.intValue ?? 0
+                    let sessionName = request["session_name"] as? String ?? ""
+                    let summary = request["summary"] as? String
+                    let taskTitle = request["task_title"] as? String
+                    emit(.engineRequest(
+                        requestId: requestId,
+                        request: .attachWorkerPane(EngineAttachRequest(
+                            runId: runId,
+                            slotId: slotId,
+                            sessionName: sessionName,
+                            summary: summary,
+                            taskTitle: taskTitle
+                        ))
+                    ))
+                case "detach_worker_pane":
+                    let slotId = (request["slot_id"] as? NSNumber)?.intValue ?? 0
+                    emit(.engineRequest(requestId: requestId, request: .detachWorkerPane(slotId: slotId)))
                 case "send_to_pane":
                     let slotId = (request["slot_id"] as? NSNumber)?.intValue ?? 0
                     let text = request["text"] as? String ?? ""

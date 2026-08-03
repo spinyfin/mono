@@ -3,6 +3,43 @@ import XCTest
 
 @MainActor
 final class WorkersWorkspaceModelSendTests: XCTestCase {
+    func testAttachUsesTmuxClientCommandWithoutWorkerEnvironment() {
+        let model = WorkersWorkspaceModel()
+        let result = model.attachWorkerPane(EngineAttachRequest(
+            runId: "run-tmux",
+            slotId: 1,
+            sessionName: "boss-1-run-tmux",
+            summary: nil,
+            taskTitle: nil
+        ))
+        guard case .success = result else {
+            XCTFail("expected tmux pane attach to succeed, got \(result)")
+            return
+        }
+
+        let session = model.slots.first(where: { $0.slotId == 1 })?.session
+        XCTAssertEqual(session?.launchSpec.initialInput, "exec tmux -L boss attach-session -t boss-1-run-tmux\n")
+        XCTAssertTrue(session?.launchSpec.env.isEmpty ?? false)
+    }
+
+    func testDetachRemovesTmuxViewerSurface() {
+        let model = WorkersWorkspaceModel()
+        _ = model.attachWorkerPane(EngineAttachRequest(
+            runId: "run-tmux",
+            slotId: 1,
+            sessionName: "boss-1-run-tmux",
+            summary: nil,
+            taskTitle: nil
+        ))
+
+        let result = model.detachWorkerPane(slotId: 1)
+        guard case .success = result else {
+            XCTFail("expected tmux pane detach to succeed, got \(result)")
+            return
+        }
+        XCTAssertNil(model.slots.first(where: { $0.slotId == 1 })?.session)
+    }
+
     func testSendToUnknownSlotReturnsUnknownSlot() {
         // Mirrors `focusWorkerPane` / `interruptWorkerPane`: a
         // `SendToPane` for a slot that the workers grid does not host
