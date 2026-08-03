@@ -8,7 +8,7 @@ use boss_engine_gh_invocation::gh_output;
 use boss_gh_telemetry::{callers, scope as gh_scope};
 
 use crate::coordinator::{PoolDispatchPolicy, pool_dispatch_policy_for_worker_id};
-use crate::effort::{SpawnConfig, SpawnResolutionInput, resolve_spawn_config_in};
+use crate::effort::{DriverResolutionSource, SpawnConfig, SpawnResolutionInput, resolve_spawn_config_in};
 use crate::structured_output::StructuredOutputKind;
 use crate::work::{REASON_ALLOCATION, REASON_LEGACY_PERCENTAGE, WorkDb, WorkExecution, WorkItem};
 use boss_protocol::ExecutionKind;
@@ -212,6 +212,28 @@ fn effective_task_driver_for_worker(pool_policy: Option<PoolDispatchPolicy>, row
     }
 }
 
+fn resolved_driver_source(
+    pool_policy: Option<PoolDispatchPolicy>,
+    row_driver: Option<&str>,
+    product_default_driver: Option<&str>,
+    has_allocation: bool,
+) -> DriverResolutionSource {
+    if pool_policy.is_some() {
+        DriverResolutionSource::PoolPolicy
+    } else if row_driver.map(str::trim).is_some_and(|value| !value.is_empty()) {
+        DriverResolutionSource::TaskOverride
+    } else if product_default_driver
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+    {
+        DriverResolutionSource::ProductDefault
+    } else if has_allocation {
+        DriverResolutionSource::TrafficAllocation
+    } else {
+        DriverResolutionSource::EngineDefault
+    }
+}
+
 /// Model/driver compatibility gate. Returns an error naming both the driver
 /// and the model when `model` is not one `driver_descriptor`'s
 /// [`crate::driver::ModelMenu::model_belongs_to_driver`] recognises as
@@ -350,6 +372,7 @@ pub(crate) async fn compose_worker_spawn(
         product_dispatch_preamble,
         row_driver,
         product_default_driver,
+        allocated_driver,
         row_reasoning,
     ) = match work_item {
         WorkItem::Task(task) | WorkItem::Chore(task) => {
@@ -358,6 +381,12 @@ pub(crate) async fn compose_worker_spawn(
             let product_default_model = product.as_ref().and_then(|p| p.default_model.clone());
             let product_default_driver = product.as_ref().and_then(|p| p.default_driver.clone());
             let dispatch_preamble = product.and_then(|p| p.dispatch_preamble).filter(|s| !s.is_empty());
+            let allocated_driver = work_db
+                .get_execution_driver_decision(&execution.id)
+                .ok()
+                .flatten()
+                .filter(|decision| matches!(decision.reason, REASON_ALLOCATION | REASON_LEGACY_PERCENTAGE))
+                .and_then(|decision| decision.driver);
             (
                 editorial_rules,
                 task.effort_level,
@@ -365,28 +394,12 @@ pub(crate) async fn compose_worker_spawn(
                 product_default_model,
                 dispatch_preamble,
                 task.driver.clone(),
-                // `resolve_spawn_config` applies `row driver → this → engine
-                // default`, so slotting the recorded traffic-allocation
-                // decision in behind the product default gives the same
-                // precedence `work::driver_lookup` resolves with: a live
-                // explicit pin at either level wins, and only a row that
-                // pinned nothing reaches its allocation. Executions predating
-                // this feature carry no decision row and resolve exactly as
-                // before. `explicit` decisions are skipped deliberately —
-                // they record a pin that is read live just above, so
-                // honouring them here would resurrect a removed pin.
-                product_default_driver.or_else(|| {
-                    work_db
-                        .get_execution_driver_decision(&execution.id)
-                        .ok()
-                        .flatten()
-                        .filter(|d| matches!(d.reason, REASON_ALLOCATION | REASON_LEGACY_PERCENTAGE))
-                        .and_then(|d| d.driver)
-                }),
+                product_default_driver,
+                allocated_driver,
                 task.reasoning,
             )
         }
-        _ => (None, None, None, None, None, None, None, None),
+        _ => (None, None, None, None, None, None, None, None, None),
     };
     // Load the PR template for editorial-rules prompt injection.
     let pr_template_product_id = match work_item {
@@ -639,8 +652,8 @@ pub(crate) async fn compose_worker_spawn(
     };
     // Products and projects do not have a TaskKind; only Task/Chore rows
     // carry one. Threaded into `resolve_spawn_config` so design-family kinds
-    // (`Design` / `DesignPostmortem` / `Investigation`) floor to Opus
-    // regardless of effort level *on rows that predate the `reasoning`
+    // (`Design` / `DesignPostmortem` / `Investigation`) floor to the selected
+    // driver's investigation tier *on rows that predate the `reasoning`
     // column* — newer rows reach the same place through `row_reasoning`,
     // which the resolver consults first. Reused below for the capability gate.
     let work_item_kind = work_item_task_kind_enum(work_item);
@@ -649,29 +662,46 @@ pub(crate) async fn compose_worker_spawn(
     // `pool_dispatch_policy_for_worker_id`'s doc comment. `None` for
     // main-pool workers, which dispatch on the row's own `driver` column.
     let pool_policy = pool_dispatch_policy_for_worker_id(worker_id);
+    // The allocator decision occupies the final driver fallback position,
+    // behind both live pin levels. Keeping it separate until here lets the
+    // resolver log honest provenance instead of calling an allocation a
+    // product default.
+    let fallback_driver = product_default_driver.as_deref().or(allocated_driver.as_deref());
+    let driver_source = resolved_driver_source(
+        pool_policy,
+        row_driver.as_deref(),
+        product_default_driver.as_deref(),
+        allocated_driver.is_some(),
+    );
     let spawn_input = SpawnResolutionInput::builder()
         .maybe_effort_level(row_effort)
         .maybe_model_override(row_model_override.as_deref())
         .maybe_pool_model_override(pool_policy.map(|p| p.model_tier))
         .maybe_product_default_model(product_default_model.as_deref())
         .maybe_task_driver(effective_task_driver_for_worker(pool_policy, row_driver.as_deref()))
-        .maybe_product_default_driver(product_default_driver.as_deref())
+        .maybe_product_default_driver(fallback_driver)
+        .driver_source(driver_source)
         .maybe_kind(work_item_kind)
         .maybe_reasoning(row_reasoning)
         .build();
     let spawn_config = resolve_spawn_config_in(&registry, &spawn_input)
         .map_err(|e| anyhow::anyhow!("effort/model resolution: {e}"))?;
 
+    tracing::info!(
+        execution_id = %execution.id,
+        driver = %spawn_config.driver,
+        model = %spawn_config.model,
+        driver_source = spawn_config.driver_source.as_str(),
+        model_source = spawn_config.model_source.as_str(),
+        "resolved worker model/driver pair",
+    );
+
     // Model/driver compatibility gate: fail closed before the pane spawns
     // when the resolved model does not belong to the resolved driver's
-    // vocabulary. `resolve_spawn_config_in` can hand back a model from
-    // several sources (an explicit override, a pool override, the
-    // reasoning/effort tables, a product default) and nothing upstream of
-    // this gate guarantees that value names a model the resolved driver's
-    // CLI actually accepts — without it, a mismatch (e.g. a Claude family
-    // alias like `"opus"` reaching a non-Claude driver) is passed through
-    // verbatim and only surfaces as an opaque HTTP 400 after the worker has
-    // already spawned and burned a slot.
+    // vocabulary. `resolve_spawn_config_in` now guarantees this invariant;
+    // the independent gate deliberately remains as defence in depth so a
+    // future resolver regression or hand-built config still fails closed
+    // before any CLI is launched.
     //
     // `spawn_config.driver` was already validated against this same
     // `registry` by `resolve_spawn_config_in` above (it returns
@@ -752,6 +782,31 @@ mod reviewer_pool_policy_tests {
         assert_eq!(effective_task_driver_for_worker(None, None), None);
     }
 
+    #[test]
+    fn driver_provenance_follows_the_same_precedence_as_driver_resolution() {
+        let pool = crate::coordinator::pool_dispatch_policy_for_worker_id("review-1");
+        assert_eq!(
+            resolved_driver_source(pool, Some("codex"), Some("grok"), true),
+            DriverResolutionSource::PoolPolicy,
+        );
+        assert_eq!(
+            resolved_driver_source(None, Some("codex"), Some("grok"), true),
+            DriverResolutionSource::TaskOverride,
+        );
+        assert_eq!(
+            resolved_driver_source(None, None, Some("grok"), true),
+            DriverResolutionSource::ProductDefault,
+        );
+        assert_eq!(
+            resolved_driver_source(None, None, None, true),
+            DriverResolutionSource::TrafficAllocation,
+        );
+        assert_eq!(
+            resolved_driver_source(None, None, None, false),
+            DriverResolutionSource::EngineDefault,
+        );
+    }
+
     /// Resolves a review-pool spawn end to end (policy → effective driver →
     /// `resolve_spawn_config`) for a row whose own `driver` column is
     /// `row_driver`, mirroring exactly what `compose_worker_spawn` does.
@@ -761,6 +816,7 @@ mod reviewer_pool_policy_tests {
         let input = crate::effort::SpawnResolutionInput::builder()
             .maybe_task_driver(effective_task_driver_for_worker(Some(pool_policy), row_driver))
             .maybe_pool_model_override(Some(pool_policy.model_tier))
+            .driver_source(DriverResolutionSource::PoolPolicy)
             .build();
         crate::effort::resolve_spawn_config_in(&registry, &input).unwrap()
     }

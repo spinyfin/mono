@@ -38,6 +38,98 @@ impl fmt::Display for UnknownDriverError {
 
 impl std::error::Error for UnknownDriverError {}
 
+/// Provenance for the driver half of a resolved spawn pair. The precedence is
+/// intentionally driver-first: once one of these sources selects a driver,
+/// every driver-relative model source is resolved through that driver's menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverResolutionSource {
+    TaskOverride,
+    ProductDefault,
+    PoolPolicy,
+    TrafficAllocation,
+    EngineDefault,
+}
+
+impl DriverResolutionSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TaskOverride => "task_override",
+            Self::ProductDefault => "product_default",
+            Self::PoolPolicy => "pool_policy",
+            Self::TrafficAllocation => "traffic_allocation",
+            Self::EngineDefault => "engine_default",
+        }
+    }
+}
+
+/// Provenance for the model half of a resolved spawn pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelResolutionSource {
+    TaskOverride,
+    PoolStrongTier,
+    Reasoning,
+    LegacyKindFloor,
+    LegacyEffortTable,
+    ProductDefault,
+    DriverDefaultAfterProductDefaultMismatch,
+    DriverDefault,
+}
+
+impl ModelResolutionSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TaskOverride => "task_override",
+            Self::PoolStrongTier => "pool_strong_tier",
+            Self::Reasoning => "reasoning",
+            Self::LegacyKindFloor => "legacy_kind_floor",
+            Self::LegacyEffortTable => "legacy_effort_table",
+            Self::ProductDefault => "product_default",
+            Self::DriverDefaultAfterProductDefaultMismatch => "driver_default_after_product_default_mismatch",
+            Self::DriverDefault => "driver_default",
+        }
+    }
+}
+
+/// Spawn resolution refuses to construct an invalid model/driver pair. The
+/// later spawn-time compatibility gate remains a separate defence in depth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpawnResolutionError {
+    UnknownDriver(UnknownDriverError),
+    IncompatibleModel {
+        driver: String,
+        driver_source: DriverResolutionSource,
+        model: String,
+        model_source: ModelResolutionSource,
+    },
+}
+
+impl fmt::Display for SpawnResolutionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownDriver(err) => err.fmt(f),
+            Self::IncompatibleModel {
+                driver,
+                driver_source,
+                model,
+                model_source,
+            } => write!(
+                f,
+                "model {model:?} from {} is not valid for driver {driver:?} from {}; refusing to resolve an incompatible spawn pair",
+                model_source.as_str(),
+                driver_source.as_str(),
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SpawnResolutionError {}
+
+impl From<UnknownDriverError> for SpawnResolutionError {
+    fn from(value: UnknownDriverError) -> Self {
+        Self::UnknownDriver(value)
+    }
+}
+
 /// Resolved dispatch knobs for one worker spawn. The dispatcher
 /// builds this once from the row's `effort_level` / `model_override`,
 /// the parent product's `default_model`, and the engine default, then
@@ -72,10 +164,16 @@ pub struct SpawnConfig {
     /// `--model <slug>` even for the engine-default fall-through so
     /// the choice is visible on the dispatch stream.
     pub model: String,
+    /// Which precedence branch selected [`Self::model`].
+    pub model_source: ModelResolutionSource,
     /// Resolved driver slug (agent-driver design §Mix-and-match).
-    /// Precedence: `tasks.driver` → `products.default_driver` → `ENGINE_DEFAULT_DRIVER`.
+    /// Production precedence: fixed pool policy → `tasks.driver` →
+    /// `products.default_driver` → recorded traffic allocation →
+    /// `ENGINE_DEFAULT_DRIVER`.
     /// Always present so the spawn path always knows which agent CLI to invoke.
     pub driver: String,
+    /// Which precedence branch selected [`Self::driver`].
+    pub driver_source: DriverResolutionSource,
     /// Per-level prompt addendum to prepend to `.claude/initial-prompt.txt`.
     /// `None` when the level has no addendum (or no level is set).
     pub prompt_addendum: Option<&'static str>,
@@ -205,8 +303,9 @@ fn menu_for_driver_in(
 }
 
 /// True iff `kind` belongs to the design family — `Design`, `DesignPostmortem`,
-/// or `Investigation` — which [`resolve_spawn_config`] floors to Opus at every
-/// effort level, independent of the effort-level table. These three kinds are
+/// or `Investigation` — which [`resolve_spawn_config`] floors to the selected
+/// driver's investigation tier at every effort level, independent of the
+/// effort-level table. These three kinds are
 /// non-review, non-answer-agent design/investigation work (see
 /// `work_item_task_kind_enum` callers in `engine/core`'s `runner.rs`); they
 /// share the same floor because they share the same failure mode — a
@@ -249,14 +348,15 @@ pub fn is_design_family_kind(kind: &TaskKind) -> bool {
 ///    is big, not hard. Steps 4-6 below are reached only by rows where this is
 ///    `None`.
 /// 4. Design-family kind floor — `kind` is `Design`, `DesignPostmortem`, or
-///    `Investigation` ([`is_design_family_kind`]) → `"opus"`, regardless of
-///    `effort_level`. This is a genuine model floor, not an effort bump: a
-///    `medium`-effort design_postmortem must not fall through to the
-///    effort-level table's Sonnet row. An explicit `tasks.model_override`
-///    (step 1) still wins over the floor — it is the sanctioned escape
-///    hatch, mirroring how the pool override composes.
+///    `Investigation` ([`is_design_family_kind`]) → the selected driver's
+///    investigation tier, regardless of `effort_level`. This is a genuine
+///    model floor, not an effort bump: a medium-effort design postmortem must
+///    not fall through to the effort-level table's ordinary tier. An explicit
+///    `tasks.model_override` (step 1) still wins over the floor.
 /// 5. Effort-level default — from the selected driver's model menu.
-/// 6. `products.default_model` (when non-empty after trim).
+/// 6. `products.default_model` (when non-empty after trim). Because it is a
+///    default rather than a row pin, it yields to step 7 when the selected
+///    driver does not recognise it; the provenance records that substitution.
 /// 7. Driver's engine-default model (from [`boss_engine_driver::ModelMenu::engine_default`]).
 ///
 /// Steps 4 and 5 are the pre-`reasoning` behaviour, preserved verbatim for
@@ -273,10 +373,10 @@ pub fn is_design_family_kind(kind: &TaskKind) -> bool {
 /// the worker gets, and `effort_level` moves the runway without touching the
 /// model.
 ///
-/// Returns [`UnknownDriverError`] when the resolved driver slug (step 0,
-/// [`resolve_driver`]) is not registered in [`DriverRegistry`], rather than
-/// silently resolving against the Claude menu.
-pub fn resolve_spawn_config(input: &SpawnResolutionInput) -> Result<SpawnConfig, UnknownDriverError> {
+/// Returns [`SpawnResolutionError`] when the resolved driver is unregistered,
+/// a row-level model override is incompatible with it, or a driver's own menu
+/// produces an invalid model. No incompatible [`SpawnConfig`] is returned.
+pub fn resolve_spawn_config(input: &SpawnResolutionInput) -> Result<SpawnConfig, SpawnResolutionError> {
     resolve_spawn_config_in(&DriverRegistry::default(), input)
 }
 
@@ -313,6 +413,11 @@ pub struct SpawnResolutionInput<'a> {
     pub product_default_model: Option<&'a str>,
     pub task_driver: Option<&'a str>,
     pub product_default_driver: Option<&'a str>,
+    /// Optional provenance override for callers whose resolved driver is
+    /// carried in one of the compatibility fields above (for example a
+    /// traffic-allocation decision occupying the product-default fallback
+    /// slot, or a fixed pool policy occupying the task-driver slot).
+    pub driver_source: Option<DriverResolutionSource>,
     pub kind: Option<&'a TaskKind>,
     pub reasoning: Option<ReasoningMode>,
 }
@@ -324,38 +429,88 @@ pub struct SpawnResolutionInput<'a> {
 pub fn resolve_spawn_config_in(
     registry: &DriverRegistry,
     input: &SpawnResolutionInput,
-) -> Result<SpawnConfig, UnknownDriverError> {
+) -> Result<SpawnConfig, SpawnResolutionError> {
     let driver = resolve_driver(input.task_driver, input.product_default_driver);
+    let driver_source = input.driver_source.unwrap_or_else(|| {
+        if input.task_driver.map(str::trim).is_some_and(|value| !value.is_empty()) {
+            DriverResolutionSource::TaskOverride
+        } else if input
+            .product_default_driver
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        {
+            DriverResolutionSource::ProductDefault
+        } else {
+            DriverResolutionSource::EngineDefault
+        }
+    });
     let menu = menu_for_driver_in(registry, &driver)?;
     let effort_level = input.effort_level;
 
-    let model = if let Some(m) = input.model_override.map(str::trim).filter(|s| !s.is_empty()) {
-        m.to_owned()
+    let (mut model, mut model_source) = if let Some(m) = input.model_override.map(str::trim).filter(|s| !s.is_empty()) {
+        (m.to_owned(), ModelResolutionSource::TaskOverride)
     } else if let Some(PoolModelTier::Strong) = input.pool_model_override {
         // Resolved against the selected driver's menu, same lever as step 3
         // below — never a literal model slug from another driver's vocabulary.
-        (menu.model_for_reasoning)(ReasoningMode::Investigation).to_owned()
+        (
+            (menu.model_for_reasoning)(ReasoningMode::Investigation).to_owned(),
+            ModelResolutionSource::PoolStrongTier,
+        )
     } else if let Some(reasoning) = input.reasoning {
         // The capability lever. Note what is NOT consulted here: `effort_level`
         // plays no part, in either direction. That is the whole point — see
         // this function's doc comment, step 3.
-        (menu.model_for_reasoning)(reasoning).to_owned()
+        (
+            (menu.model_for_reasoning)(reasoning).to_owned(),
+            ModelResolutionSource::Reasoning,
+        )
     } else if input.kind.is_some_and(is_design_family_kind) {
-        "opus".to_owned()
+        // The legacy floor is a tier, not a Claude model alias. Resolve it
+        // through the already-selected driver's menu so an allocated Codex
+        // or Grok row cannot inherit Claude's `opus` vocabulary.
+        (
+            (menu.model_for_reasoning)(ReasoningMode::Investigation).to_owned(),
+            ModelResolutionSource::LegacyKindFloor,
+        )
     } else if let Some(level) = effort_level {
-        (menu.default_model_for_level)(level).to_owned()
+        (
+            (menu.default_model_for_level)(level).to_owned(),
+            ModelResolutionSource::LegacyEffortTable,
+        )
     } else if let Some(pd) = input.product_default_model.map(str::trim).filter(|s| !s.is_empty()) {
-        pd.to_owned()
+        (pd.to_owned(), ModelResolutionSource::ProductDefault)
     } else {
-        menu.engine_default.to_owned()
+        (menu.engine_default.to_owned(), ModelResolutionSource::DriverDefault)
     };
+
+    // A product model is a default, not a row-level pin. When traffic
+    // allocation or a live driver pin selects a driver with a different
+    // model vocabulary, the driver takes precedence and supplies its own
+    // default. This substitution is explicit in `model_source` and therefore
+    // in spawn-resolution logs/events. A task-level model override remains a
+    // hard configuration error instead of being silently discarded.
+    if model_source == ModelResolutionSource::ProductDefault && !(menu.model_belongs_to_driver)(&model) {
+        model = menu.engine_default.to_owned();
+        model_source = ModelResolutionSource::DriverDefaultAfterProductDefaultMismatch;
+    }
+
+    if !(menu.model_belongs_to_driver)(&model) {
+        return Err(SpawnResolutionError::IncompatibleModel {
+            driver,
+            driver_source,
+            model,
+            model_source,
+        });
+    }
 
     Ok(SpawnConfig {
         effort_level,
         reasoning: input.reasoning,
         effort_value: effort_level.and_then(|l| (menu.effort_value_for_level)(l)),
         model,
+        model_source,
         driver,
+        driver_source,
         prompt_addendum: effort_level.and_then(|l| (menu.prompt_addendum_for_level)(l)),
     })
 }
@@ -862,7 +1017,12 @@ mod tests {
                 .build(),
         )
         .unwrap_err();
-        assert_eq!(err.driver_slug, "copilot");
+        assert_eq!(
+            err,
+            SpawnResolutionError::UnknownDriver(UnknownDriverError {
+                driver_slug: "copilot".to_owned(),
+            })
+        );
     }
 
     #[test]
@@ -1097,7 +1257,9 @@ mod tests {
                     reasoning: None,
                     effort_value: None,
                     model: model.to_owned(),
+                    model_source: ModelResolutionSource::TaskOverride,
                     driver: ENGINE_DEFAULT_DRIVER.to_owned(),
+                    driver_source: DriverResolutionSource::EngineDefault,
                     prompt_addendum: None,
                 };
                 let inv = cfg.claude_invocation(non_opus_auto_mode, None);
@@ -1122,7 +1284,9 @@ mod tests {
                 reasoning: None,
                 effort_value: None,
                 model: model.to_owned(),
+                model_source: ModelResolutionSource::TaskOverride,
                 driver: ENGINE_DEFAULT_DRIVER.to_owned(),
+                driver_source: DriverResolutionSource::EngineDefault,
                 prompt_addendum: None,
             };
             let inv = cfg.claude_invocation(false, None);
@@ -1146,7 +1310,9 @@ mod tests {
                 reasoning: None,
                 effort_value: None,
                 model: model.to_owned(),
+                model_source: ModelResolutionSource::TaskOverride,
                 driver: ENGINE_DEFAULT_DRIVER.to_owned(),
+                driver_source: DriverResolutionSource::EngineDefault,
                 prompt_addendum: None,
             };
             let inv = cfg.claude_invocation(true, None);
@@ -1204,7 +1370,9 @@ mod tests {
                     reasoning: None,
                     effort_value: None,
                     model: model.to_owned(),
+                    model_source: ModelResolutionSource::TaskOverride,
                     driver: "claude".to_owned(),
+                    driver_source: DriverResolutionSource::EngineDefault,
                     prompt_addendum: None,
                 };
                 let inv = cfg.claude_invocation(non_opus_auto_mode, None);
@@ -1543,6 +1711,115 @@ mod tests {
         assert_eq!(cfg.model, "opus");
         assert_eq!(cfg.effort_value, Some("high"));
         assert!(cfg.prompt_addendum.unwrap().starts_with("Sketch"));
+    }
+
+    #[test]
+    fn legacy_design_floor_resolves_through_the_selected_drivers_menu() {
+        let cfg = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .task_driver("codex")
+                .driver_source(DriverResolutionSource::TrafficAllocation)
+                .effort_level(EffortLevel::Medium)
+                .kind(&TaskKind::DesignPostmortem)
+                .build(),
+        )
+        .unwrap();
+
+        assert_eq!(cfg.driver, "codex");
+        assert_eq!(cfg.driver_source, DriverResolutionSource::TrafficAllocation);
+        assert_eq!(cfg.model_source, ModelResolutionSource::LegacyKindFloor);
+        let registry = DriverRegistry::default();
+        let codex = registry.get("codex").expect("codex is registered");
+        assert!((codex.descriptor().model_menu.model_belongs_to_driver)(&cfg.model));
+        assert_ne!(cfg.model, "opus");
+    }
+
+    #[test]
+    fn incompatible_task_model_override_fails_during_resolution() {
+        let input = SpawnResolutionInput::builder()
+            .task_driver("codex")
+            .model_override("opus")
+            .build();
+        let err = resolve_spawn_config(&input).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SpawnResolutionError::IncompatibleModel {
+                    ref driver,
+                    ref model,
+                    ..
+                } if driver == "codex" && model == "opus"
+            ),
+            "expected an incompatible codex/opus resolution error, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn incompatible_product_model_default_yields_to_the_selected_driver() {
+        let cfg = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .task_driver("codex")
+                .driver_source(DriverResolutionSource::TrafficAllocation)
+                .product_default_model("opus")
+                .build(),
+        )
+        .unwrap();
+        let registry = DriverRegistry::default();
+        let codex = registry.get("codex").expect("codex is registered");
+        assert!((codex.descriptor().model_menu.model_belongs_to_driver)(&cfg.model));
+        assert_eq!(
+            cfg.model_source,
+            ModelResolutionSource::DriverDefaultAfterProductDefaultMismatch,
+        );
+    }
+
+    #[test]
+    fn every_driver_relative_model_source_preserves_compatibility() {
+        let registry = DriverRegistry::default();
+        for driver_slug in registry.slugs() {
+            let driver = registry.get(driver_slug).expect("registry slug resolves");
+            let menu = driver.descriptor().model_menu;
+            let inputs = [
+                SpawnResolutionInput::builder().task_driver(driver_slug).build(),
+                SpawnResolutionInput::builder()
+                    .task_driver(driver_slug)
+                    .pool_model_override(PoolModelTier::Strong)
+                    .build(),
+                SpawnResolutionInput::builder()
+                    .task_driver(driver_slug)
+                    .reasoning(ReasoningMode::Standard)
+                    .build(),
+                SpawnResolutionInput::builder()
+                    .task_driver(driver_slug)
+                    .reasoning(ReasoningMode::Investigation)
+                    .build(),
+                SpawnResolutionInput::builder()
+                    .task_driver(driver_slug)
+                    .kind(&TaskKind::DesignPostmortem)
+                    .build(),
+                SpawnResolutionInput::builder()
+                    .task_driver(driver_slug)
+                    .effort_level(EffortLevel::Medium)
+                    .build(),
+                SpawnResolutionInput::builder()
+                    .task_driver(driver_slug)
+                    .model_override(menu.engine_default)
+                    .build(),
+                SpawnResolutionInput::builder()
+                    .task_driver(driver_slug)
+                    .product_default_model("model-from-another-driver")
+                    .build(),
+            ];
+            for input in inputs {
+                let cfg = resolve_spawn_config_in(&registry, &input).unwrap();
+                assert!(
+                    (menu.model_belongs_to_driver)(&cfg.model),
+                    "source {:?} resolved incompatible pair {driver_slug}/{:?}",
+                    cfg.model_source,
+                    cfg.model,
+                );
+            }
+        }
     }
 
     #[test]

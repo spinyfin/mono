@@ -252,6 +252,9 @@ impl ExecutionCoordinator {
                         // legacy kind-floor / effort-table path chose instead.
                         "reasoning": spawn.reasoning.map(|mode| mode.as_str()),
                         "model": spawn.model,
+                        "model_source": spawn.model_source.as_str(),
+                        "driver": spawn.driver,
+                        "driver_source": spawn.driver_source.as_str(),
                         "prompt_addendum_applied": spawn.prompt_addendum.is_some(),
                     });
                 }
@@ -422,6 +425,7 @@ impl ExecutionCoordinator {
                         .run_status("failed")
                         .error_text(error_text.as_str())
                         .clear_workspace_lease(released)
+                        .increment_pre_start_failure_count(true)
                         .maybe_attention(attention)
                         .build(),
                 ) {
@@ -447,6 +451,8 @@ impl ExecutionCoordinator {
                             "released_workspace": released,
                             "slot_id": slot_id,
                             "page": slot_id.and_then(worker_page_label),
+                            "pre_start_failure_count": execution.pre_start_failure_count,
+                            "transient_failure_count": execution.transient_failure_count,
                         });
                         // A `SlotBusy` spawn rejection means the engine and
                         // the app disagree about slot occupancy — the
@@ -504,11 +510,33 @@ impl ExecutionCoordinator {
                         // slot exactly like a plain pool-exhaustion wait.
                         if execution.kind != ExecutionKind::PrReview && !is_slot_busy {
                             match self.work_db.demote_active_work_item_to_todo(&execution.work_item_id) {
-                                Ok(true) => tracing::info!(
-                                    execution_id = %execution.id,
-                                    work_item_id = %execution.work_item_id,
-                                    "demoted work item to todo after pane-spawn failure",
-                                ),
+                                Ok(true) => {
+                                    tracing::info!(
+                                        execution_id = %execution.id,
+                                        work_item_id = %execution.work_item_id,
+                                        "demoted work item to todo after pane-spawn failure",
+                                    );
+                                    self.dispatch_events
+                                        .emit(
+                                            DispatchEvent::new(
+                                                Stage::StatusTransition,
+                                                DispatchOutcome::Ok,
+                                                &execution.id,
+                                            )
+                                            .with_work_item(&execution.work_item_id)
+                                            .with_worker(&worker_id)
+                                            .with_details(
+                                                serde_json::json!({
+                                                    "from_status": "active",
+                                                    "to_status": "todo",
+                                                    "did_dispatch": false,
+                                                    "reason": "pane_spawn_failure",
+                                                    "failed_execution_id": execution.id,
+                                                }),
+                                            ),
+                                        )
+                                        .await;
+                                }
                                 Ok(false) => {}
                                 Err(demote_err) => tracing::error!(
                                     ?demote_err,

@@ -300,6 +300,12 @@ pub struct FinishExecutionRunInput {
     /// this.
     #[builder(default)]
     pub clear_workspace_lease: bool,
+    /// Increment the durable count of failures that occurred before a worker
+    /// process became live. Pane-spawn and spawn-config failures happen after
+    /// the run row starts, but still belong in this counter because no worker
+    /// ever received the prompt.
+    #[builder(default)]
+    pub increment_pre_start_failure_count: bool,
     pub attention: Option<CreateAttentionItemInput>,
 }
 
