@@ -45,6 +45,19 @@ fn chore_with_pr(pr_url: &str) -> WorkItem {
     }
 }
 
+/// A `kind = 'design'` task, wrapped as `WorkItem::Task` (design tasks are
+/// never `Chore`s — see `task_to_item`), for tests that need
+/// `ExecutionKind::ProjectDesign` to reach `compose_design_directive`.
+fn design_task() -> WorkItem {
+    match chore_without_pr() {
+        WorkItem::Chore(mut task) => {
+            task.kind = TaskKind::Design;
+            WorkItem::Task(task)
+        }
+        other => other,
+    }
+}
+
 #[test]
 fn acceptance_criterion_names_the_pr_url_artifact_and_keeps_the_final_line() {
     // Both acceptance-criterion variants (fresh PR, resumed PR) must carry
@@ -2463,7 +2476,7 @@ fn editorial_controls_flag_on_preserves_existing_behavior() {
 /// items instead of proposing them as ordinary startable work.
 #[test]
 fn design_directive_requires_the_scope_tag() {
-    let directive = compose_design_directive(None);
+    let directive = compose_design_directive(None, None);
     assert!(directive.contains("Scope: in-scope"), "{directive}");
     assert!(
         directive.contains("Scope: deferred (future / not a v1 blocker)"),
@@ -2484,7 +2497,7 @@ fn design_directive_requires_the_scope_tag() {
 /// for the measured distribution that motivated this.
 #[test]
 fn design_directive_calibrates_breakdown_size_to_problem_size() {
-    let directive = compose_design_directive(None);
+    let directive = compose_design_directive(None, None);
     // The split rules this calibration must not displace.
     assert!(directive.contains("keep each entry single-subsystem"), "{directive}");
     assert!(
@@ -2512,16 +2525,15 @@ fn design_directive_calibrates_breakdown_size_to_problem_size() {
     );
     assert!(directive.contains("rather than fewer"), "{directive}");
 }
-
 /// The portable design-discipline block must appear in both design-family
 /// directives, not be duplicated as separate text in each.
 #[test]
 fn design_discipline_block_present_in_both_design_directives() {
-    let design = compose_design_directive(None);
+    let design = compose_design_directive(None, None);
     assert!(design.contains("Name the contested property up front"), "{design}");
     assert!(design.contains("Every rejection must be checkable"), "{design}");
 
-    let postmortem = compose_design_postmortem_directive(None, "/tmp/followups.json");
+    let postmortem = compose_design_postmortem_directive(None, "/tmp/followups.json", None);
     assert!(
         postmortem.contains("Name the contested property up front"),
         "{postmortem}"
@@ -2543,7 +2555,7 @@ fn design_directive_for_another_product_has_no_boss_repo_assumptions() {
         .updated_at("2026-05-15T00:00:00Z")
         .build();
 
-    let directive = compose_design_directive(Some(&project));
+    let directive = compose_design_directive(Some(&project), None);
     assert!(directive.contains("**Design discipline:**"), "{directive}");
     assert!(directive.contains("client, service, shared data model"), "{directive}");
     for repo_specific_text in [
@@ -2556,4 +2568,99 @@ fn design_directive_for_another_product_has_no_boss_repo_assumptions() {
             "non-Boss design directive must not mention {repo_specific_text}:\n{directive}",
         );
     }
+}
+
+/// `products.design_guidance` renders inside the design directive, wrapped
+/// in visible `[product-design-guidance]…[/product-design-guidance]`
+/// markers — mirrors `[product-preamble]`'s transcript-visibility contract.
+#[test]
+fn design_guidance_block_wraps_configured_text_in_design_directive() {
+    let mut execution = base_execution();
+    execution.kind = ExecutionKind::ProjectDesign;
+    let work_item = design_task();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&execution)
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .design_guidance("Prefer terse prose; cite prior art.")
+            .build(),
+    );
+    assert!(
+        prompt.contains("[product-design-guidance]\nPrefer terse prose; cite prior art.\n[/product-design-guidance]"),
+        "design guidance must render wrapped in visible markers:\n{prompt}",
+    );
+}
+
+/// `None` / unset `design_guidance` renders no block at all — today's
+/// behaviour, unchanged.
+#[test]
+fn design_guidance_block_absent_when_not_configured() {
+    let mut execution = base_execution();
+    execution.kind = ExecutionKind::ProjectDesign;
+    let work_item = design_task();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&execution)
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        !prompt.contains("[product-design-guidance]"),
+        "no design guidance configured; block must not render:\n{prompt}",
+    );
+}
+
+/// The `design_postmortem` directive renders the same shared block —
+/// `compose_design_directive` and `compose_design_postmortem_directive`
+/// must not maintain two copies of this render logic.
+#[test]
+fn design_guidance_block_present_in_postmortem_directive_too() {
+    let mut execution = base_execution();
+    execution.kind = ExecutionKind::ProjectDesign;
+    let work_item = match design_task() {
+        WorkItem::Task(mut t) => {
+            t.kind = TaskKind::DesignPostmortem;
+            WorkItem::Task(t)
+        }
+        other => other,
+    };
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&execution)
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .design_guidance("Match house style.")
+            .build(),
+    );
+    assert!(
+        prompt.contains("[product-design-guidance]\nMatch house style.\n[/product-design-guidance]"),
+        "postmortem directive must render the shared guidance block too:\n{prompt}",
+    );
+}
+
+/// `design_guidance` must not leak into an unrelated execution kind — it is
+/// injected only into the design-family directive, unlike `dispatch_preamble`
+/// which every kind receives (rendered separately in `worker_spawn.rs`).
+#[test]
+fn design_guidance_absent_from_non_design_execution_kind() {
+    let execution = base_execution();
+    let work_item = chore_without_pr();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&execution)
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .design_guidance("Should never appear here.")
+            .build(),
+    );
+    assert!(
+        !prompt.contains("[product-design-guidance]"),
+        "a chore_implementation execution must not render the design guidance block:\n{prompt}",
+    );
 }

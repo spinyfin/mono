@@ -2831,3 +2831,17 @@ pub(crate) fn migrate_pr_review_verdicts_table(conn: &Connection) -> Result<()> 
     )?;
     Ok(())
 }
+
+/// Add `products.design_guidance` — an optional markdown block injected
+/// into the `[product-design-guidance]` section of the `kind = 'design'` /
+/// `kind = 'design_postmortem'` prompt directive only. `NULL` / empty → no
+/// injection (existing behaviour). Distinct from `dispatch_preamble` (every
+/// execution kind on the product) and `editorial_rules.instructions`
+/// (GitHub-visible-surface rules) — see
+/// `editorial-controls-for-agent-authored-prs-and-github-comments.md` R11.
+pub(crate) fn migrate_products_design_guidance(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "products", "design_guidance")? {
+        conn.execute("ALTER TABLE products ADD COLUMN design_guidance TEXT", [])?;
+    }
+    Ok(())
+}

@@ -51,6 +51,7 @@ pub(crate) async fn run_product_command(command: ProductCommand, ctx: &RunContex
                 design_repo: args.design_repo,
                 docs_repo: args.docs_repo,
                 dispatch_preamble: args.dispatch_preamble,
+                design_guidance: args.design_guidance,
                 worker_branch_prefix: args.worker_branch_prefix,
                 ..WorkItemPatch::default()
             };

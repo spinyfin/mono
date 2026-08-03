@@ -1939,6 +1939,69 @@ async fn product_dispatch_preamble_round_trip() -> Result<()> {
     Ok(())
 }
 
+/// `design_guidance` round-trip: set, verify, update, clear. Mirrors
+/// `product_dispatch_preamble_round_trip` — same empty-string-clears
+/// semantics, distinct column.
+#[tokio::test]
+async fn product_design_guidance_round_trip() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = create_product(&mut client, CreateProductInput::builder().name("guidance-test").build()).await?;
+    assert!(product.design_guidance.is_none(), "new product has no design_guidance");
+
+    // Set guidance via product update.
+    let updated = expect_product(
+        update_work_item(
+            &mut client,
+            &product.id,
+            WorkItemPatch {
+                design_guidance: Some("Every design doc must list a rollback plan.".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .await?,
+    )?;
+    assert_eq!(
+        updated.design_guidance.as_deref(),
+        Some("Every design doc must list a rollback plan."),
+        "guidance should be stored verbatim",
+    );
+
+    // Update to a different value.
+    let updated2 = expect_product(
+        update_work_item(
+            &mut client,
+            &product.id,
+            WorkItemPatch {
+                design_guidance: Some("Cite at least two alternatives considered.".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .await?,
+    )?;
+    assert_eq!(
+        updated2.design_guidance.as_deref(),
+        Some("Cite at least two alternatives considered."),
+    );
+
+    // Clear via empty string.
+    let cleared = expect_product(
+        update_work_item(
+            &mut client,
+            &product.id,
+            WorkItemPatch {
+                design_guidance: Some(String::new()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .await?,
+    )?;
+    assert!(cleared.design_guidance.is_none(), "empty string clears the guidance",);
+
+    Ok(())
+}
+
 /// Helper: create a chore, expecting a `WorkItemDuplicateBlocked` response.
 async fn create_chore_expect_duplicate(
     client: &mut BossClient,

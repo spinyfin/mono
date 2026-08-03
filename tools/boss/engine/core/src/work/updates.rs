@@ -133,6 +133,7 @@ impl WorkDb {
         apply_optional_string_patch(&mut product.default_model, patch.default_model);
         apply_optional_string_patch(&mut product.default_driver, patch.default_driver);
         apply_optional_string_patch(&mut product.dispatch_preamble, patch.dispatch_preamble);
+        apply_optional_string_patch(&mut product.design_guidance, patch.design_guidance);
         apply_optional_string_patch(&mut product.worker_branch_prefix, patch.worker_branch_prefix);
         // Re-canonicalise so a patched (or pre-existing) prefix always
         // carries its trailing `/`; idempotent on already-canonical
@@ -143,7 +144,7 @@ impl WorkDb {
 
         tx.execute(
             "UPDATE products
-             SET name = ?2, slug = ?3, description = ?4, repo_remote_url = ?5, status = ?6, updated_at = ?7, default_model = ?8, dispatch_preamble = ?9, design_repo = ?10, worker_branch_prefix = ?11, docs_repo = ?12, default_driver = ?13
+             SET name = ?2, slug = ?3, description = ?4, repo_remote_url = ?5, status = ?6, updated_at = ?7, default_model = ?8, dispatch_preamble = ?9, design_repo = ?10, worker_branch_prefix = ?11, docs_repo = ?12, default_driver = ?13, design_guidance = ?14
              WHERE id = ?1",
             params![
                 product.id,
@@ -159,6 +160,7 @@ impl WorkDb {
                 product.worker_branch_prefix,
                 product.docs_repo,
                 product.default_driver,
+                product.design_guidance,
             ],
         )?;
 

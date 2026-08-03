@@ -2520,6 +2520,7 @@ pub(crate) fn ensure_patch_present(patch: &WorkItemPatch, message: &str) -> Resu
         || patch.driver.is_some()
         || patch.default_model.is_some()
         || patch.dispatch_preamble.is_some()
+        || patch.design_guidance.is_some()
         || patch.worker_branch_prefix.is_some()
         || patch.autostart.is_some()
         || patch.deferred.is_some()

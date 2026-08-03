@@ -363,49 +363,69 @@ pub(crate) async fn compose_worker_spawn(
         None
     };
     // Fetch the product before composing the prompt so we can pass
-    // editorial_rules and the PR template set into compose_execution_prompt.
-    let (
-        product_editorial_rules,
-        row_effort,
-        row_model_override,
-        product_default_model,
-        product_dispatch_preamble,
-        row_driver,
-        product_default_driver,
-        allocated_driver,
-        row_reasoning,
-    ) = match work_item {
-        WorkItem::Task(task) | WorkItem::Chore(task) => {
-            let product = work_db.get_product(&task.product_id).ok().flatten();
-            let editorial_rules = product.as_ref().and_then(|p| p.editorial_rules.clone());
-            let product_default_model = product.as_ref().and_then(|p| p.default_model.clone());
-            let product_default_driver = product.as_ref().and_then(|p| p.default_driver.clone());
-            let dispatch_preamble = product.and_then(|p| p.dispatch_preamble).filter(|s| !s.is_empty());
-            let allocated_driver = work_db
-                .get_execution_driver_decision(&execution.id)
-                .ok()
-                .flatten()
-                .filter(|decision| matches!(decision.reason, REASON_ALLOCATION | REASON_LEGACY_PERCENTAGE))
-                .and_then(|decision| decision.driver);
-            (
-                editorial_rules,
-                task.effort_level,
-                task.model_override.clone(),
-                product_default_model,
-                dispatch_preamble,
-                task.driver.clone(),
-                product_default_driver,
-                allocated_driver,
-                task.reasoning,
-            )
-        }
-        _ => (None, None, None, None, None, None, None, None, None),
+    // editorial_rules, dispatch_preamble, and design_guidance into
+    // compose_execution_prompt. Derived via `WorkItem::product_id()` — which
+    // covers every variant, not just Task/Chore — so a `ProductDesign`
+    // execution (whose work item IS the product) resolves its own product
+    // row instead of silently losing it to a `_ => None` fallthrough. A DB
+    // error reading the row propagates via `?` rather than being swallowed
+    // into "no product": a genuine read failure must be loud, never
+    // rendered as an empty preamble/guidance block.
+    let product = work_db.get_product(work_item.product_id())?;
+    // `default_model` / `default_driver` / `editorial_rules` apply only to
+    // Task/Chore executions. They determine the model, driver, and
+    // PR-surface rules for ordinary work-item executions; Product-/
+    // Project-scoped runs must not inherit them. Only `dispatch_preamble`
+    // and `design_guidance` reach every execution kind on the product.
+    let is_task_or_chore = matches!(work_item, WorkItem::Task(_) | WorkItem::Chore(_));
+    let product_editorial_rules = if is_task_or_chore {
+        product.as_ref().and_then(|p| p.editorial_rules.clone())
+    } else {
+        None
     };
-    // Load the PR template for editorial-rules prompt injection.
-    let pr_template_product_id = match work_item {
-        WorkItem::Task(task) | WorkItem::Chore(task) => task.product_id.as_str(),
-        _ => "",
+    let product_default_model = if is_task_or_chore {
+        product.as_ref().and_then(|p| p.default_model.clone())
+    } else {
+        None
     };
+    let product_default_driver = if is_task_or_chore {
+        product.as_ref().and_then(|p| p.default_driver.clone())
+    } else {
+        None
+    };
+    let allocated_driver = if is_task_or_chore {
+        work_db
+            .get_execution_driver_decision(&execution.id)
+            .ok()
+            .flatten()
+            .filter(|decision| matches!(decision.reason, REASON_ALLOCATION | REASON_LEGACY_PERCENTAGE))
+            .and_then(|decision| decision.driver)
+    } else {
+        None
+    };
+    let product_dispatch_preamble = product
+        .as_ref()
+        .and_then(|p| p.dispatch_preamble.clone())
+        .filter(|s| !s.is_empty());
+    let product_design_guidance = product
+        .as_ref()
+        .and_then(|p| p.design_guidance.clone())
+        .filter(|s| !s.is_empty());
+    let (row_effort, row_model_override, row_driver, row_reasoning) = match work_item {
+        WorkItem::Task(task) | WorkItem::Chore(task) => (
+            task.effort_level,
+            task.model_override.clone(),
+            task.driver.clone(),
+            task.reasoning,
+        ),
+        _ => (None, None, None, None),
+    };
+    // Load the PR template for editorial-rules prompt injection. Uses
+    // `WorkItem::product_id()` (total over every variant) rather than a
+    // Task/Chore-only match, so a Product-/Project-scoped execution (e.g.
+    // `ProductDesign`) resolves its product's PR template set instead of
+    // always loading an empty one.
+    let pr_template_product_id = work_item.product_id();
     let pr_template_lease_id = execution.cube_lease_id.as_deref().unwrap_or("");
     let pr_template_set = crate::pr_template::load(pr_template_product_id, pr_template_lease_id, workspace_path);
     // Maint task 6: an `automation_triage` execution renders the triage
@@ -487,6 +507,7 @@ pub(crate) async fn compose_worker_spawn(
                         .maybe_conflict_attempt(conflict_attempt.as_ref())
                         .maybe_ci_attempt(ci_attempt.as_ref())
                         .maybe_editorial_rules(product_editorial_rules.as_ref())
+                        .maybe_design_guidance(product_design_guidance.as_deref())
                         .pr_template_set(&pr_template_set)
                         .editorial_enabled(editorial_enabled)
                         .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
@@ -520,6 +541,7 @@ pub(crate) async fn compose_worker_spawn(
                     .maybe_conflict_attempt(conflict_attempt.as_ref())
                     .maybe_ci_attempt(ci_attempt.as_ref())
                     .maybe_editorial_rules(product_editorial_rules.as_ref())
+                    .maybe_design_guidance(product_design_guidance.as_deref())
                     .pr_template_set(&pr_template_set)
                     .editorial_enabled(editorial_enabled)
                     .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
@@ -641,6 +663,7 @@ pub(crate) async fn compose_worker_spawn(
                 .maybe_conflict_attempt(conflict_attempt.as_ref())
                 .maybe_ci_attempt(ci_attempt.as_ref())
                 .maybe_editorial_rules(product_editorial_rules.as_ref())
+                .maybe_design_guidance(product_design_guidance.as_deref())
                 .pr_template_set(&pr_template_set)
                 .editorial_enabled(editorial_enabled)
                 .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
@@ -1113,6 +1136,68 @@ mod compose_worker_spawn_tests {
             !composed.prompt_text.contains("expected branch name"),
             "reviewer prompt must not include the expected branch name directive:\n{}",
             composed.prompt_text,
+        );
+    }
+
+    /// A `Product`-scoped execution picks up the product's
+    /// `dispatch_preamble` but not its `default_model` / `default_driver` /
+    /// `editorial_rules`, which stay scoped to Task/Chore executions.
+    #[tokio::test]
+    async fn product_scoped_execution_gets_preamble_but_not_default_model_or_driver() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        let product = db
+            .create_product(
+                crate::work::CreateProductInput::builder()
+                    .name("Widget Co")
+                    .repo_remote_url("git@github.com:org/widget.git")
+                    .build(),
+            )
+            .unwrap();
+        let patch = crate::work::WorkItemPatch::builder()
+            .default_model("sonnet")
+            .default_driver("codex")
+            .dispatch_preamble("house style: terse commit messages")
+            .build();
+        db.update_product(&product.id, patch).unwrap();
+        let product = db.get_product(&product.id).unwrap().expect("product exists");
+        assert_eq!(product.default_model.as_deref(), Some("sonnet"));
+
+        let execution = WorkExecution::builder()
+            .id("exec_prod123_01")
+            .work_item_id(product.id.clone())
+            .kind(ExecutionKind::ProductDesign)
+            .status(boss_protocol::ExecutionStatus::Running)
+            .repo_remote_url("git@github.com:org/widget.git")
+            .workspace_path("/tmp/workspace")
+            .created_at("2026-05-15T00:00:00Z")
+            .build();
+        let work_item = WorkItem::Product(product);
+
+        let composed = compose_worker_spawn(
+            &db,
+            "worker-1",
+            &execution,
+            &work_item,
+            workspace.path(),
+            None,
+            WorkerSpawnOpts::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            composed.prompt_text.contains("house style: terse commit messages"),
+            "product-scoped execution must still receive dispatch_preamble:\n{}",
+            composed.prompt_text,
+        );
+        assert_ne!(
+            composed.spawn_config.model, "sonnet",
+            "product's default_model must not apply to a Product-scoped execution"
+        );
+        assert_ne!(
+            composed.spawn_config.driver, "codex",
+            "product's default_driver must not apply to a Product-scoped execution"
         );
     }
 }

@@ -42,6 +42,20 @@ pub(super) fn design_discipline_block() -> String {
     out
 }
 
+/// Render `products.design_guidance` (per-product, design-directive-only
+/// prompt text — see [`crate::work::Product::design_guidance`]), wrapped in
+/// visible `[product-design-guidance]…[/product-design-guidance]` markers so
+/// a human reading a transcript can see exactly what the engine injected —
+/// mirrors the `[product-preamble]` convention `worker_spawn.rs` uses for
+/// `dispatch_preamble`. `None` / empty → no block, today's behaviour. Shared
+/// by [`compose_design_directive`] and [`compose_design_postmortem_directive`]
+/// so the guidance text is rendered from exactly one place.
+fn design_guidance_block(design_guidance: Option<&str>) -> String {
+    let Some(guidance) = design_guidance.filter(|s| !s.is_empty()) else {
+        return String::new();
+    };
+    format!("[product-design-guidance]\n{guidance}\n[/product-design-guidance]\n\n")
+}
 /// Directive block for the synthetic `kind = 'design'` task that the
 /// engine auto-creates with every project. Without this block the
 /// `project_design` worker only sees the generic "draft or update a
@@ -68,8 +82,9 @@ pub(super) fn design_discipline_block() -> String {
 /// count to scope, an explicit "the rules add, they do not multiply", and a
 /// required `Breakdown size:` line that makes the author defend N. No cap:
 /// a design that genuinely needs twenty entries may still propose twenty.
-pub(super) fn compose_design_directive(parent_project: Option<&Project>) -> String {
+pub(super) fn compose_design_directive(parent_project: Option<&Project>, design_guidance: Option<&str>) -> String {
     let mut out = String::new();
+    out.push_str(&design_guidance_block(design_guidance));
     out.push_str("Expected outcome for this run:\n");
     out.push_str("- the deliverable is a **design document**, not an implementation. Do not edit code, do not start prototyping, do not open partial implementation PRs.\n");
     out.push_str("- the PR for this run contains **only the design doc** (one new or updated markdown file). If you find yourself touching `.rs`, `.ts`, `.swift`, build files, or anything else, stop — you are out of scope.\n");
@@ -131,8 +146,10 @@ pub(super) fn compose_design_directive(parent_project: Option<&Project>) -> Stri
 pub(super) fn compose_design_postmortem_directive(
     parent_project: Option<&Project>,
     structured_output_path: &str,
+    design_guidance: Option<&str>,
 ) -> String {
     let mut out = String::new();
+    out.push_str(&design_guidance_block(design_guidance));
     out.push_str("Expected outcome for this run:\n");
     out.push_str(
         "- the deliverable is an **update to the project's existing design document**, not a new document and not an implementation. Do not edit code, do not start prototyping, do not open partial implementation PRs.\n",
