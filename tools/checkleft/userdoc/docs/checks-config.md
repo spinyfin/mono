@@ -228,15 +228,15 @@ Each entry is a glob string using globset syntax. `**` matches across directory 
 
 An empty list is rejected — use `enabled: false` to disable a check entirely.
 
-### Precedence vs `applies_to`
+### Precedence vs `include`
 
-Excludes are **subtractive and always win**: they apply as a second stage after positive file selection (`applies_to` for declarative checks; the intrinsic changed-file set for other check kinds). Whatever the positive selection produces, the effective file set subtracts any excluded paths.
+Excludes are **subtractive and always win**: they apply as a second stage after positive file selection (`include` for declarative checks; the intrinsic changed-file set for other check kinds). Whatever the positive selection produces, the effective file set subtracts any excluded paths.
 
 ```
 effective(check, file) = positive(check, file) AND NOT excluded(check, file)
 ```
 
-Because exclusion is a separate key from `applies_to`, a per-repo `applies_to` override — which replaces the definition's positive list entirely — cannot accidentally erase the repo's excludes, and the excludes cannot be defeated by a retarget.
+Because exclusion is a separate key from `include`, a per-repo `include` override — which replaces the definition's positive list entirely — cannot accidentally erase the repo's excludes, and the excludes cannot be defeated by a retarget.
 
 ### Inheritance through the `CHECKS` hierarchy
 
@@ -266,24 +266,24 @@ Together these guarantees mean excluded paths:
 
 **`exclude` vs tool-native ignore files** (`.prettierignore`, `.gitignore`): the framework `exclude` is the authoritative mechanism. Because checkleft passes files explicitly to declarative check tools, whether a tool honors its own ignore file for explicitly-passed arguments is tool-specific and not guaranteed. Framework excludes work uniformly regardless of which tool a check wraps and do not depend on any ignore file on disk.
 
-## Overriding `applies_to` for declarative checks
+## Overriding `include` for declarative checks
 
-Declarative checks (format/bazel, format/rust, format/prettier, lint/js, lint/rust, etc.) declare which files they run on via an `applies_to` glob list in their check definition. A consuming repo can restrict or retarget that file set from its CHECKS.yaml without forking the definition — by setting `applies_to` inside the per-check `config` block.
+Declarative checks (format/bazel, format/rust, format/prettier, lint/js, lint/rust, etc.) declare which files they run on via an `include` glob list in their check definition. A consuming repo can restrict or retarget that file set from its CHECKS.yaml without forking the definition — by setting `include` inside the per-check `config` block.
 
-**Semantics:** the repo's `applies_to` list **replaces** the definition's list entirely (it does not merge or extend). This is the simplest model and matches the word "override": whatever the definition declared, the repo wins. There is one `applies_to` vocabulary (positive globs) used in both the definition and the override.
+**Semantics:** the repo's `include` list **replaces** the definition's list entirely (it does not merge or extend). This is the simplest model and matches the word "override": whatever the definition declared, the repo wins. There is one `include` vocabulary (positive globs) used in both the definition and the override.
 
 ```yaml
 checks:
   # Run format/prettier only on frontend source, not on the whole repo.
   - id: format/prettier
     config:
-      applies_to:
+      include:
         - "frontend/**"
 
   # Run format/rust only under the tools/ subtree.
   - id: format/rust
     config:
-      applies_to:
+      include:
         - "tools/**/*.rs"
         - "lib/**/*.rs"
 ```
@@ -291,8 +291,8 @@ checks:
 Rules:
 
 - The override must be a non-empty list of glob strings. An empty list is rejected — use `enabled: false` to disable the check entirely.
-- Each glob uses the same syntax as the check definition's `applies_to` (globset patterns; `**` matches across directory boundaries).
-- When no `applies_to` key appears in `config`, the definition's own list is used unchanged.
+- Each glob uses the same syntax as the check definition's `include` (globset patterns; `**` matches across directory boundaries).
+- When no `include` key appears in `config`, the definition's own list is used unchanged.
 - The override applies to all declarative checks uniformly — it is a framework feature, not specific to any one check.
 
 ## Pattern: First-party (bundled) check — zero install

@@ -3,7 +3,9 @@
 //! shape, and malformed manifests (unknown transform kind, unknown binary,
 //! missing exit default, declarative fields in component mode) are rejected.
 
-use crate::external::{parse_declarative_check_manifest, parse_external_check_package_manifest};
+use crate::external::{
+    ExternalCheckPackageImplementation, parse_declarative_check_manifest, parse_external_check_package_manifest,
+};
 
 use super::tests_common::{BUILDIFIER_MANIFEST, parse_lint_bazel_package, parse_package, tool};
 use super::{ExitOutcome, InvocationMode};
@@ -30,6 +32,28 @@ fn lint_bazel_manifest_parses_single_lint_invocation() {
     assert!(package.needs.contains_key("buildifier"));
     assert_eq!(package.invocations[0].exit.classify(Some(0)), ExitOutcome::Findings);
     assert_eq!(package.invocations[0].exit.classify(Some(1)), ExitOutcome::Error);
+}
+
+#[test]
+fn manifest_accepts_canonical_include() {
+    assert!(parse_declarative_check_manifest(BUILDIFIER_MANIFEST).is_ok());
+}
+
+#[test]
+fn manifest_accepts_shipped_applies_to_alias() {
+    let manifest = BUILDIFIER_MANIFEST.replacen("include:", "applies_to:", 1);
+    let package = parse_declarative_check_manifest(&manifest).expect("aliased manifest parses");
+    let ExternalCheckPackageImplementation::Declarative(package) = package.implementation else {
+        panic!("expected declarative package");
+    };
+    assert_eq!(package.applies_to, parse_package().applies_to);
+}
+
+#[test]
+fn manifest_rejects_both_include_spellings() {
+    let manifest = BUILDIFIER_MANIFEST.replacen("include:\n", "include:\n  - \"**/*.bzl\"\napplies_to:\n", 1);
+    let err = parse_declarative_check_manifest(&manifest).expect_err("duplicate spellings must fail");
+    assert!(format!("{err:#}").contains("duplicate field"), "unexpected: {err:#}");
 }
 
 #[test]
@@ -147,7 +171,7 @@ runtime = "component-v1"
 api_version = "v1"
 artifact_path = "bin/x.wasm"
 artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-applies_to = ["**/*.bzl"]
+include = ["**/*.bzl"]
 "#;
     let err = parse_external_check_package_manifest(manifest).unwrap_err();
     assert!(

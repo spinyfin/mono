@@ -519,7 +519,7 @@ async fn builtin_check_is_narrowed_by_applies_to() {
         r#"
 [[checks]]
 id = "capture"
-applies_to = ["backend/**"]
+include = ["backend/**"]
 "#,
     )
     .expect("write config");
@@ -586,7 +586,7 @@ id = "capture"
         r#"
 [[checks]]
 id = "capture"
-applies_to = ["**"]
+include = ["**"]
 "#,
     )
     .expect("write backend config");

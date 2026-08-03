@@ -1486,7 +1486,7 @@ exclude = ["vendor/**"]
 [[checks]]
 id = "format/oxc"
 exclude = ["testdata/**"]
-applies_to = ["src/**"]
+include = ["src/**"]
 "#,
     )
     .expect("write config");
@@ -1512,11 +1512,11 @@ applies_to = ["src/**"]
     );
     assert!(
         matcher.is_included(Path::new("src/lib.ts")),
-        "applies_to pattern must include matching files"
+        "include pattern must include matching files"
     );
     assert!(
         !matcher.is_included(Path::new("docs/readme.md")),
-        "applies_to pattern must exclude non-matching files from the positive side"
+        "include pattern must exclude non-matching files from the positive side"
     );
 }
 
@@ -1845,17 +1845,17 @@ whatever_the_check_wants = 1
     );
 }
 
-// ── applies_to (include side) ───────────────────────────────────────────────
+// ── include (include side) ───────────────────────────────────────────────
 
 #[test]
-fn per_check_applies_to_are_stored_on_check_config() {
+fn per_check_include_are_stored_on_check_config() {
     let temp = tempdir().expect("create temp dir");
     fs::write(
         temp.path().join("CHECKS.toml"),
         r#"
 [[checks]]
 id = "format/oxc"
-applies_to = ["frontend/**/*.ts"]
+include = ["frontend/**/*.ts"]
 "#,
     )
     .expect("write config");
@@ -1870,7 +1870,7 @@ applies_to = ["frontend/**/*.ts"]
 }
 
 #[test]
-fn per_check_applies_to_from_subdirectory_are_normalized() {
+fn per_check_include_from_subdirectory_are_normalized() {
     let temp = tempdir().expect("create temp dir");
     fs::create_dir_all(temp.path().join("frontend")).expect("create frontend dir");
 
@@ -1879,7 +1879,7 @@ fn per_check_applies_to_from_subdirectory_are_normalized() {
         r#"
 [[checks]]
 id = "format/oxc"
-applies_to = ["src/**"]
+include = ["src/**"]
 "#,
     )
     .expect("write config");
@@ -1895,14 +1895,14 @@ applies_to = ["src/**"]
 }
 
 #[test]
-fn empty_per_check_applies_to_list_produces_diagnostic_and_skips_check() {
+fn empty_per_check_include_list_produces_diagnostic_and_skips_check() {
     let temp = tempdir().expect("create temp dir");
     fs::write(
         temp.path().join("CHECKS.toml"),
         r#"
 [[checks]]
 id = "format/oxc"
-applies_to = []
+include = []
 "#,
     )
     .expect("write config");
@@ -1915,16 +1915,16 @@ applies_to = []
         diagnostics
             .iter()
             .any(|d| d.message.contains("must not be an empty list")),
-        "expected diagnostic about empty per-check applies_to list; got {diagnostics:?}"
+        "expected diagnostic about empty per-check include list; got {diagnostics:?}"
     );
     assert!(
         checks.get("format/oxc").is_none(),
-        "check with invalid applies_to should be absent"
+        "check with invalid include should be absent"
     );
 }
 
 #[test]
-fn legacy_config_applies_to_is_merged_into_per_check_applies_to() {
+fn legacy_config_include_is_merged_into_per_check_include() {
     let temp = tempdir().expect("create temp dir");
     fs::write(
         temp.path().join("CHECKS.toml"),
@@ -1934,7 +1934,7 @@ id = "file/size"
 
 [checks.config]
 max_lines = 500
-applies_to = ["**/*.rs", "**/*.toml"]
+include = ["**/*.rs", "**/*.toml"]
 "#,
     )
     .expect("write config");
@@ -1954,24 +1954,24 @@ applies_to = ["**/*.rs", "**/*.toml"]
     assert!(
         diagnostics
             .iter()
-            .any(|d| d.severity == Severity::Warning && d.message.contains("legacy `config.applies_to`")),
+            .any(|d| d.severity == Severity::Warning && d.message.contains("legacy `config.include`")),
         "expected a deprecation warning for the legacy position; got {diagnostics:?}"
     );
 }
 
 #[test]
-fn framework_level_and_legacy_applies_to_are_merged() {
+fn framework_level_and_legacy_include_are_merged() {
     let temp = tempdir().expect("create temp dir");
     fs::write(
         temp.path().join("CHECKS.toml"),
         r#"
 [[checks]]
 id = "file/size"
-applies_to = ["**/*.generated.rs"]
+include = ["**/*.generated.rs"]
 
 [checks.config]
 max_lines = 500
-applies_to = ["**/*.md"]
+include = ["**/*.md"]
 "#,
     )
     .expect("write config");
@@ -1987,7 +1987,7 @@ applies_to = ["**/*.md"]
 }
 
 #[test]
-fn legacy_config_applies_to_scalar_produces_diagnostic_and_skips_check() {
+fn legacy_config_include_scalar_produces_diagnostic_and_skips_check() {
     let temp = tempdir().expect("create temp dir");
     fs::write(
         temp.path().join("CHECKS.toml"),
@@ -1996,7 +1996,7 @@ fn legacy_config_applies_to_scalar_produces_diagnostic_and_skips_check() {
 id = "file/size"
 
 [checks.config]
-applies_to = "**/*.rs"
+include = "**/*.rs"
 "#,
     )
     .expect("write config");
@@ -2007,16 +2007,16 @@ applies_to = "**/*.rs"
     let diagnostics: Vec<_> = checks.diagnostics().collect();
     assert!(
         diagnostics.iter().any(|d| d.message.contains("not a scalar")),
-        "expected diagnostic about scalar config.applies_to; got {diagnostics:?}"
+        "expected diagnostic about scalar config.include; got {diagnostics:?}"
     );
     assert!(
         checks.get("file/size").is_none(),
-        "check with malformed legacy applies_to should be absent"
+        "check with malformed legacy include should be absent"
     );
 }
 
 #[test]
-fn legacy_config_applies_to_empty_list_produces_diagnostic_and_skips_check() {
+fn legacy_config_include_empty_list_produces_diagnostic_and_skips_check() {
     let temp = tempdir().expect("create temp dir");
     fs::write(
         temp.path().join("CHECKS.toml"),
@@ -2025,7 +2025,7 @@ fn legacy_config_applies_to_empty_list_produces_diagnostic_and_skips_check() {
 id = "file/size"
 
 [checks.config]
-applies_to = []
+include = []
 "#,
     )
     .expect("write config");
@@ -2038,13 +2038,13 @@ applies_to = []
         diagnostics
             .iter()
             .any(|d| d.message.contains("must not be an empty list")),
-        "expected diagnostic about empty legacy config.applies_to; got {diagnostics:?}"
+        "expected diagnostic about empty legacy config.include; got {diagnostics:?}"
     );
     assert!(checks.get("file/size").is_none());
 }
 
 #[test]
-fn legacy_config_applies_to_non_string_entry_produces_diagnostic_and_skips_check() {
+fn legacy_config_include_non_string_entry_produces_diagnostic_and_skips_check() {
     let temp = tempdir().expect("create temp dir");
     fs::write(
         temp.path().join("CHECKS.toml"),
@@ -2053,7 +2053,7 @@ fn legacy_config_applies_to_non_string_entry_produces_diagnostic_and_skips_check
 id = "file/size"
 
 [checks.config]
-applies_to = ["**/*.rs", 42]
+include = ["**/*.rs", 42]
 "#,
     )
     .expect("write config");
@@ -2064,7 +2064,7 @@ applies_to = ["**/*.rs", 42]
     let diagnostics: Vec<_> = checks.diagnostics().collect();
     assert!(
         diagnostics.iter().any(|d| d.message.contains("must be a string")),
-        "expected diagnostic about non-string legacy applies_to entry; got {diagnostics:?}"
+        "expected diagnostic about non-string legacy include entry; got {diagnostics:?}"
     );
     assert!(checks.get("file/size").is_none());
 }
