@@ -4,11 +4,11 @@ This document states a contract that had never been written down. Three layers e
 
 ## The three layers
 
-| Layer                   | Lives in                                                                  | Lifetime                                                                                    | What it actually knows                                                                                    |
-| ----------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| **Durable state**       | `work_executions.status`, `work_runs.shell_pid`, `work_runs.host_id`      | Survives engine restart, survives the execution going terminal                              | The recorded facts: what status the engine last wrote, and what pid the app reported for the pane's shell |
-| **Derived bookkeeping** | `LiveWorkerStateRegistry`, `WorkerPool` claims, `WorkerRegistry` slot map | In-memory; empty after any engine restart; cleared unconditionally by `release_worker_pane` | The engine's _belief_ about what is running                                                               |
-| **Presentation**        | `LiveWorkerState` on the wire → `AgentActivityState` in the macOS app     | Per broadcast                                                                               | Whatever the layer above told it                                                                          |
+| Layer                   | Lives in                                                                  | Lifetime                                                                                                                                                                                                                                                                                      | What it actually knows                                                                                    |
+| ----------------------- | ------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| **Durable state**       | `work_executions.status`, `work_runs.shell_pid`, `work_runs.host_id`      | Survives engine restart, survives the execution going terminal                                                                                                                                                                                                                                | The recorded facts: what status the engine last wrote, and what pid the app reported for the pane's shell |
+| **Derived bookkeeping** | `LiveWorkerStateRegistry`, `WorkerPool` claims, `WorkerRegistry` slot map | In-memory; empty after any engine restart; cleared unconditionally by `release_worker_pane`. For a tmux-hosted worker it is rebuilt at boot (see below) before anything else gets a turn; for an app-hosted pane it stays empty until the worker hooks or the app is asked what it's hosting. | The engine's _belief_ about what is running                                                               |
+| **Presentation**        | `LiveWorkerState` on the wire → `AgentActivityState` in the macOS app     | Per broadcast                                                                                                                                                                                                                                                                                 | Whatever the layer above told it                                                                          |
 
 ## The contract
 
@@ -59,6 +59,24 @@ Both funnel into `ServerState::converge_terminal_execution`, serialized per run.
 | `redispatch_blocked_live_process`                     | A duplicate worker was prevented. `details.blocking_execution_status` is normally TERMINAL — that is the point, since a terminal row is what every bookkeeping-based guard reads as "safe to redispatch". |
 
 Plus one greppable trace line per direction: `execution terminalized: …` and `execution re-adopted: inferred death disproven by a live worker`.
+
+### Boot-time tmux adoption: the other half of "empty after restart"
+
+`worker_readoption` resolves a live-vs-terminal contradiction whenever it is
+detected — a hook, or the redispatch guard. It never runs unprompted, so a
+tmux-hosted worker whose execution is still **non-terminal** (the row was
+never wrong) would otherwise sit invisible to `bossctl agents list` from the
+moment the engine restarts until it happens to hook. `engine/core/src/tmux_adoption.rs`
+closes that gap, once, at boot, before `run_reconcile` gets a turn: it
+enumerates the private `boss` tmux server, exact-matches each live session's
+authoritative `BOSS_SPAWN_TOKEN` (`show-environment`, never the
+`@boss_spawn_token` option mirror) against the non-terminal tmux-tracked
+`work_runs` rows, and rebuilds the pool slot claim, `WorkerRegistry` entry,
+`LiveWorkerState` entry, and live-status summarizer for every match. A
+session whose token instead resolves to a **terminal** execution is handed to
+`worker_readoption` exactly as above, via the trigger `boot_tmux_adoption`,
+and emits `tmux_worker_adopted` (rebuilt) or the usual `live_worker_readopted`
+/ `husk_pane_reconcile` events (handed off) accordingly.
 
 ## Rules of thumb for future work here
 

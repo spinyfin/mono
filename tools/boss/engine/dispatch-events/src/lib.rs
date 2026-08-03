@@ -602,6 +602,22 @@ pub enum Stage {
     /// `blocking_execution_id`, its `blocking_execution_status` (normally a
     /// TERMINAL one — that is the whole point), and the probed `shell_pid`.
     RedispatchBlockedLiveProcess,
+    /// The boot-time tmux adoption pass matched a live tmux session's
+    /// authoritative `BOSS_SPAWN_TOKEN` against a non-terminal `work_runs`
+    /// row and rebuilt the derived bookkeeping an engine restart always
+    /// empties: the pool slot claim, the `WorkerRegistry` pid/slot map, the
+    /// `LiveWorkerState` entry, and the live-status summarizer task.
+    ///
+    /// Distinct from `live_worker_readopted`: that event reverses a
+    /// TERMINAL execution status the engine now believes was a wrong guess.
+    /// This one never touches the execution's status at all — the row was
+    /// correct the whole time, the engine's in-memory belief about it was
+    /// just empty. `details` carries `slot_id`, `shell_pid`,
+    /// `tmux_session_name`, and `repaired_intent` (`true` when the run's
+    /// `tmux_spawn_state` was still `intended` — a crash between `tmux
+    /// new-session` and its confirmation write — and this pass durably
+    /// confirmed it before rebuilding the live state).
+    TmuxWorkerAdopted,
 }
 
 impl Stage {
@@ -655,6 +671,7 @@ impl Stage {
             Stage::AbandonedBranchPrRecovery => "abandoned_branch_pr_recovery",
             Stage::LiveWorkerReadopted => "live_worker_readopted",
             Stage::RedispatchBlockedLiveProcess => "redispatch_blocked_live_process",
+            Stage::TmuxWorkerAdopted => "tmux_worker_adopted",
         }
     }
 }
@@ -1417,6 +1434,12 @@ mod tests {
         assert_eq!(Stage::DispatchPaused.as_str(), "dispatch_paused");
         assert_eq!(Stage::DispatchResumed.as_str(), "dispatch_resumed");
         assert_eq!(Stage::AutomationPreempted.as_str(), "automation_preempted");
+        assert_eq!(Stage::LiveWorkerReadopted.as_str(), "live_worker_readopted");
+        assert_eq!(
+            Stage::RedispatchBlockedLiveProcess.as_str(),
+            "redispatch_blocked_live_process"
+        );
+        assert_eq!(Stage::TmuxWorkerAdopted.as_str(), "tmux_worker_adopted");
     }
 
     /// `Outcome::as_str` strings are the on-disk outcome identifiers;

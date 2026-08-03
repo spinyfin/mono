@@ -717,6 +717,48 @@ pub async fn serve_with_merge_probe(
         );
     }
 
+    // Adopt tmux-hosted workers that survived the restart before the
+    // cube-probe reconcile below gets a turn: enumerate the private `boss`
+    // tmux server, exact-match each live session's authoritative
+    // `BOSS_SPAWN_TOKEN` against the durably-recorded non-terminal runs, and
+    // rebuild the slot claim / `WorkerRegistry` / `LiveWorkerState` /
+    // live-status summarizer this restart just emptied. A live session whose
+    // token belongs to an execution the engine already terminalized is
+    // handed to `crate::worker_readoption` instead. See
+    // `crate::tmux_adoption` for the full algorithm.
+    //
+    // Best-effort: a host with no `tmux` on PATH (or one that never enabled
+    // tmux hosting) simply skips this pass, exactly like every other
+    // best-effort startup reconciler above.
+    let tmux_adoption_report = match boss_tmux::Tmux::resolve() {
+        Ok(tmux) => {
+            crate::tmux_adoption::run_boot_time_adoption(
+                server_state.work_db.as_ref(),
+                &tmux,
+                server_state.execution_coordinator.as_ref(),
+                server_state.as_ref(),
+                server_state.as_ref(),
+                server_state.dispatch_events.as_ref(),
+            )
+            .await
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                "engine startup: tmux not resolvable; skipping the boot-time tmux worker adoption pass (best-effort)",
+            );
+            crate::tmux_adoption::TmuxAdoptionOutcome::default()
+        }
+    };
+    if !tmux_adoption_report.adopted_execution_ids.is_empty() || tmux_adoption_report.terminal_handoffs > 0 {
+        tracing::info!(
+            adopted = tmux_adoption_report.adopted_execution_ids.len(),
+            repaired_intents = tmux_adoption_report.repaired_intents,
+            terminal_handoffs = tmux_adoption_report.terminal_handoffs,
+            "engine startup: tmux boot-time adoption pass complete",
+        );
+    }
+
     // Rehydrate dispatch for any work items that were in "Doing"
     // (status=active) when the engine last shut down but whose
     // executions ended without being moved out of the column. See
@@ -738,8 +780,16 @@ pub async fn serve_with_merge_probe(
     // events socket is intentionally NOT consulted (it can be the
     // first thing to break on a crash). See `crate::run_reconcile`
     // for the verdict rules.
+    //
+    // Runs the tmux adoption pass above already claimed are excluded here —
+    // tmux already proved them alive more directly than a cube lease
+    // snapshot can, so `run_reconcile` covers only what adoption did not
+    // claim.
     let in_flight = match server_state.work_db.list_in_flight_executions() {
-        Ok(rows) => rows,
+        Ok(rows) => rows
+            .into_iter()
+            .filter(|execution| !tmux_adoption_report.adopted_execution_ids.contains(&execution.id))
+            .collect(),
         Err(err) => {
             tracing::error!(
                 ?err,
@@ -771,7 +821,12 @@ pub async fn serve_with_merge_probe(
         }
         report
     };
-    let skip_dispatch_ids: HashSet<String> = probe_report.skip_dispatch_ids().map(|s| s.to_owned()).collect();
+    // Union, not just the probe's own verdicts: a tmux-adopted execution was
+    // filtered out of `in_flight` above (so it never got a cube-probe
+    // verdict at all) but must still never be treated as stale — tmux
+    // already proved it alive.
+    let mut skip_dispatch_ids: HashSet<String> = probe_report.skip_dispatch_ids().map(|s| s.to_owned()).collect();
+    skip_dispatch_ids.extend(tmux_adoption_report.adopted_execution_ids.iter().cloned());
 
     // Re-adopt still-live leases across the restart. The periodic
     // heartbeat sweep keys off the in-memory live-worker registry, which

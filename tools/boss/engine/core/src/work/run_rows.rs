@@ -862,6 +862,29 @@ impl WorkDb {
         collect_rows(rows)
     }
 
+    /// Resolve the execution id behind a tmux spawn token, independent of the
+    /// execution's terminal status — unlike [`Self::list_adoptable_tmux_runs`],
+    /// which only ever returns non-terminal candidates.
+    ///
+    /// The boot-time tmux adoption pass uses this for a live session whose
+    /// token matched none of those candidates: the token is durable and
+    /// unique (`work_runs_tmux_spawn_token_idx`), so a miss there means either
+    /// the execution behind it has since gone terminal — in which case the
+    /// caller hands the session off to [`crate::worker_readoption`] instead of
+    /// leaving a live worker untracked — or the token is unknown to this DB
+    /// at all, which the caller treats as out of scope (a leaked session for
+    /// a separate sweep to reap).
+    pub fn execution_id_for_tmux_spawn_token(&self, spawn_token: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT execution_id FROM work_runs WHERE tmux_spawn_token = ?1",
+            params![spawn_token],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// Test-only helper: force `transcript_path` back to NULL on an
     /// existing row. Used by the dispatcher regression test to model
     /// the production race where a SessionStart's payload-driven
