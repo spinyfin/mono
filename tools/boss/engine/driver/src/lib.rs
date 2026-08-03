@@ -464,17 +464,10 @@ pub struct ModelMenu {
     /// Used to branch the spawn invocation's permission flag.
     pub model_requires_auto_permissions: fn(&str) -> bool,
     /// Returns `true` iff the given model slug is one this driver's CLI
-    /// accepts — the model/driver compatibility gate the spawn path checks
-    /// right before launch (`runner::worker_spawn::check_model_driver_compatibility`).
-    ///
-    /// Exists because `resolve_spawn_config`'s resolved model can come from
-    /// several sources (`tasks.model_override`, a pool override, the
-    /// `reasoning`/effort tables, `products.default_model`) and nothing
-    /// upstream of the gate guarantees the value names a model *this*
-    /// driver understands — a hardcoded alias from one driver's vocabulary
-    /// (e.g. Claude's `"opus"`) reaching another driver's CLI verbatim fails
-    /// as an opaque HTTP 400 well after the worker has spawned, instead of
-    /// failing loudly at dispatch time.
+    /// accepts. Coupled spawn resolution uses it to refuse invalid literal
+    /// overrides (and to make an incompatible product default yield to the
+    /// driver default); the spawn path checks it again immediately before
+    /// launch as a defence-in-depth compatibility gate.
     pub model_belongs_to_driver: fn(&str) -> bool,
 }
 

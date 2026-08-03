@@ -128,12 +128,7 @@ async fn pane_spawn_failure_raises_attention_item_and_dispatch_event() {
     coordinator.kick();
     wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Failed).await;
 
-    // The execution went all the way through the lease + change
-    // creation. `rescan_active_dispatch_after_release` will
-    // re-queue the chore (pre-existing retry behavior, since
-    // `start_execution_run` flipped tasks.status to `active`
-    // before the spawn failed), so cube fakes may be invoked
-    // multiple times — pin only "at least once each".
+    // The execution went all the way through the lease + change creation.
     assert!(!cube.lease_calls.lock().await.is_empty());
     assert!(!cube.create_calls.lock().await.is_empty());
     // The lease is released after the pane-spawn failure — before
@@ -143,13 +138,8 @@ async fn pane_spawn_failure_raises_attention_item_and_dispatch_event() {
 
     // Loud signal #1: the WorkAttentionItem is what surfaces in
     // the kanban "Attention" lane and through `ListAttentionItems`.
-    // The exact count varies — once the run finishes_execution_run
-    // with `failed`, `rescan_active_dispatch_after_release` will
-    // see the chore is still in `active` status (auto-advanced
-    // when `start_execution_run` committed) and re-queue another
-    // ready execution, which fails again. That retry behavior is
-    // pre-existing; this test only pins the loud-failure contract:
-    // every failed pane spawn raises exactly one attention item.
+    // The failure is terminal and the card is demoted, so this execution
+    // receives one durable attention item rather than silently re-spawning.
     let attention_items = db.list_attention_items(&execution_id).unwrap();
     assert!(
         !attention_items.is_empty(),
@@ -168,9 +158,26 @@ async fn pane_spawn_failure_raises_attention_item_and_dispatch_event() {
         first.body_markdown,
     );
 
+    let failed_execution = db.get_execution(&execution_id).unwrap();
+    assert_eq!(
+        failed_execution.pre_start_failure_count, 1,
+        "a spawn-config/pane failure happened before a worker became live and must increment the durable failure counter",
+    );
+    assert_eq!(
+        failed_execution.transient_failure_count, 0,
+        "a deterministic spawn refusal is not a transient worker failure",
+    );
+
     // Loud signal #2: a structured `pane_spawned: error` event in
     // the dispatch stream, so external tooling can flag it
     // without scanning tracing logs.
+    wait_for_dispatch_event(
+        &recording,
+        &execution_id,
+        |event| event.stage == "status_transition" && event.details["to_status"] == "todo",
+        "active-to-todo status_transition",
+    )
+    .await;
     let events = recording.events_for(&execution_id).await;
     let pane_event = events
         .iter()
@@ -184,6 +191,8 @@ async fn pane_spawn_failure_raises_attention_item_and_dispatch_event() {
         "pane_spawned event must include the underlying error; got {:?}",
         pane_event.error_message,
     );
+    assert_eq!(pane_event.details["pre_start_failure_count"], 1);
+    assert_eq!(pane_event.details["transient_failure_count"], 0);
     // The stage timeline before the failure should also be
     // visible — request_recorded, worker_claimed, cube stages,
     // run_started — so an operator can confirm dispatch did get
@@ -201,12 +210,19 @@ async fn pane_spawn_failure_raises_attention_item_and_dispatch_event() {
         "cube_change_created",
         "run_started",
         "pane_spawned",
+        "status_transition",
     ] {
         assert!(
             stages.contains(&expected),
             "stage `{expected}` missing from dispatch timeline; got {stages:?}",
         );
     }
+    let demote = events
+        .iter()
+        .find(|event| event.stage == "status_transition" && event.details["to_status"] == "todo")
+        .unwrap_or_else(|| panic!("expected active-to-todo demotion event; got {events:#?}"));
+    assert_eq!(demote.details["from_status"], "active");
+    assert_eq!(demote.details["reason"], "pane_spawn_failure");
 }
 
 /// Poll `recording` until an event for `execution_id` matches `predicate`,
@@ -1181,7 +1197,9 @@ async fn pane_spawned_event_carries_spawn_config_details() {
             reasoning: Some(crate::work::ReasoningMode::Standard),
             effort_value: Some("low"),
             model: "sonnet".to_owned(),
+            model_source: crate::effort::ModelResolutionSource::Reasoning,
             driver: crate::effort::ENGINE_DEFAULT_DRIVER.to_owned(),
+            driver_source: crate::effort::DriverResolutionSource::EngineDefault,
             prompt_addendum: None,
         }),
         ..FakeExecutionRunner::default()
@@ -1208,6 +1226,9 @@ async fn pane_spawned_event_carries_spawn_config_details() {
     assert_eq!(spawn["effort_level"], "trivial");
     assert_eq!(spawn["effort_value"], "low");
     assert_eq!(spawn["model"], "sonnet");
+    assert_eq!(spawn["model_source"], "reasoning");
+    assert_eq!(spawn["driver"], crate::effort::ENGINE_DEFAULT_DRIVER);
+    assert_eq!(spawn["driver_source"], "engine_default");
     assert_eq!(spawn["prompt_addendum_applied"], false);
 }
 

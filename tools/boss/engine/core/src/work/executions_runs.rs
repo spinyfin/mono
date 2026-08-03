@@ -1574,6 +1574,7 @@ impl WorkDb {
             result_summary,
             error_text,
             clear_workspace_lease,
+            increment_pre_start_failure_count,
             attention,
         } = input;
         // Re-borrow the owned fields as the &str/Option<&str> shapes the
@@ -1620,13 +1621,15 @@ impl WorkDb {
                  cube_lease_id = CASE WHEN ?3 THEN NULL ELSE cube_lease_id END,
                  cube_workspace_id = CASE WHEN ?3 THEN NULL ELSE cube_workspace_id END,
                  workspace_path = CASE WHEN ?3 THEN NULL ELSE workspace_path END,
-                 finished_at = ?4
+                 finished_at = ?4,
+                 pre_start_failure_count = pre_start_failure_count + CASE WHEN ?5 THEN 1 ELSE 0 END
              WHERE id = ?1",
             params![
                 execution_id,
                 execution_status.as_str(),
                 clear_workspace_lease,
                 execution_finished_at,
+                increment_pre_start_failure_count,
             ],
         )?;
 
