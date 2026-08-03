@@ -1,5 +1,6 @@
 load("@build_bazel_rules_apple//apple:macos.bzl", "macos_application", "macos_unit_test")
 load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load(
     "//tools/boss/engine/core:engine_binary.bzl",
     "ENGINE_BINARY_BAZEL_OUTPUT_FRAGMENT",
@@ -47,9 +48,19 @@ swift_library(
     # CrashWatchdog is excluded so it is only ever compiled as its own module
     # (matching Package.swift's `exclude:`); leaving it in the glob would give
     # the app a second, shadowing copy of the type it imports.
+    #
+    # Sources/EngineBinaryName.swift is excluded too: it's a checked-in copy
+    # of the genrule output below, kept in the tree only so SwiftPM/Xcode
+    # (which never see bazel genrules) can compile it. Bazel itself keeps
+    # compiling the genrule's output as the single source of truth; the
+    # checked-in copy is verified byte-identical to it by
+    # :engine_binary_name_swift_up_to_date_test.
     srcs = glob(
         ["Sources/**/*.swift"],
-        exclude = ["Sources/CrashWatchdog/**/*.swift"],
+        exclude = [
+            "Sources/CrashWatchdog/**/*.swift",
+            "Sources/EngineBinaryName.swift",
+        ],
     ) + [":engine_binary_name_swift"],
     copts = [
         # Mirror the swiftSettings define in Package.swift so @inlinable
@@ -79,6 +90,25 @@ genrule(
     outs = ["EngineBinaryName.swift"],
     cmd = "cat > $@ <<'EOF'\n%sEOF" % _ENGINE_BINARY_SWIFT_SOURCE,
     visibility = ["//visibility:private"],
+)
+
+# Guards the checked-in Sources/EngineBinaryName.swift (needed so
+# SwiftPM/Xcode builds resolve `BossEngineBinary` — they never see bazel
+# genrules) against drifting from the genrule above, which stays the single
+# source of truth for bazel builds. Fails the moment the two disagree, e.g.
+# because ENGINE_BINARY_NAME or another engine_binary.bzl constant changed
+# without the checked-in copy being regenerated.
+sh_test(
+    name = "engine_binary_name_swift_up_to_date_test",
+    srcs = ["engine_binary_name_swift_up_to_date_test.sh"],
+    args = [
+        "$(location Sources/EngineBinaryName.swift)",
+        "$(location :engine_binary_name_swift)",
+    ],
+    data = [
+        "Sources/EngineBinaryName.swift",
+        ":engine_binary_name_swift",
+    ],
 )
 
 # BossTests is sharded across four independent macos_unit_test targets so

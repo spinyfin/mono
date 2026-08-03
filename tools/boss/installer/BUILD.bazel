@@ -1,4 +1,10 @@
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load(
+    "//tools/boss/engine/core:engine_binary.bzl",
+    "ENGINE_BINARY_BUNDLE_FRAGMENT",
+    "ENGINE_BINARY_NAME",
+)
 load(":pkg.bzl", "boss_pkg_payload", "boss_pkg_unsigned", "build_info_rs", "build_provenance_rs")
 
 package(default_visibility = ["//visibility:private"])
@@ -25,12 +31,38 @@ filegroup(
     srcs = glob(["scripts/*"]),
 )
 
+# Canonical engine binary name for release.sh, sourced from
+# engine_binary.bzl so codesigning targets the same file that
+# bundled_binaries and //tools/boss/app-macos:Boss actually build.
+genrule(
+    name = "engine_binary_name_txt",
+    outs = ["engine_binary_name.txt"],
+    cmd = "echo -n '%s' > $@" % ENGINE_BINARY_NAME,
+    visibility = ["//visibility:private"],
+)
+
 # Staged payload directory: Boss.app/ tree with bundled binaries in
 # Contents/Resources/bin/ (binaries are included via additional_contents
 # on the macos_application rule in //tools/boss/app-macos:Boss).
 boss_pkg_payload(
     name = "boss_pkg_payload",
     app = "//tools/boss/app-macos:Boss",
+)
+
+# Regression coverage against the real bundle layout (not a tempdir mock):
+# asserts the staged Boss.app payload actually contains a regular file at
+# Contents/Resources/bin/$ENGINE_BINARY_NAME, at the path
+# ENGINE_BINARY_BUNDLE_FRAGMENT describes. Fails on a rename of either the
+# engine binary (ENGINE_BINARY_NAME) or the bundle's bin/ directory
+# (ENGINE_BINARY_BUNDLE_FRAGMENT) that isn't reflected in the payload the
+# macos_application rule actually produces.
+sh_test(
+    name = "boss_pkg_payload_contains_engine_binary_test",
+    srcs = ["boss_pkg_payload_contains_engine_binary_test.sh"],
+    args = [
+        "$(location :boss_pkg_payload)/Boss.app/%s" % ENGINE_BINARY_BUNDLE_FRAGMENT,
+    ],
+    data = [":boss_pkg_payload"],
 )
 
 # Unsigned .pkg installer.  Output: boss_pkg_unsigned/Boss-<sha>.pkg.
@@ -94,6 +126,9 @@ sh_binary(
         "entitlements/engine.entitlements",
         # Distribution XML for productbuild (per-user domain configuration).
         "distribution.xml",
+        # Canonical engine binary name, so codesigning stays in sync with
+        # the name //tools/boss/engine/core:engine actually builds.
+        ":engine_binary_name_txt",
     ],
     visibility = ["//visibility:public"],
 )

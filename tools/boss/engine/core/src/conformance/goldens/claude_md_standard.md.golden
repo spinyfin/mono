@@ -238,7 +238,7 @@ also blocked.
 To exercise a real engine, start an isolated one:
 
 ```sh
-env -u BOSS_EVENTS_SOCKET bazel run //tools/boss/engine:engine -- \
+env -u BOSS_EVENTS_SOCKET bazel run //tools/boss/engine/core:engine -- \
 --socket-path /tmp/boss-test-$(uuidgen).sock
 ```
 

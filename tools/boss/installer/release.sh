@@ -93,11 +93,19 @@ SCRIPTS_DIR="${WS}/${PKG_INSTALLER}/scripts"
 APP_ENTITLEMENTS="${WS}/${PKG_INSTALLER}/entitlements/app.entitlements"
 ENGINE_ENTITLEMENTS="${WS}/${PKG_INSTALLER}/entitlements/engine.entitlements"
 DISTRIBUTION_XML="${WS}/${PKG_INSTALLER}/distribution.xml"
+ENGINE_BINARY_NAME_FILE="${WS}/${PKG_INSTALLER}/engine_binary_name.txt"
 
 for path in "$PAYLOAD_DIR" "$PKG_UNSIGNED_DIR" "$SCRIPTS_DIR" \
-            "$APP_ENTITLEMENTS" "$ENGINE_ENTITLEMENTS" "$DISTRIBUTION_XML"; do
+            "$APP_ENTITLEMENTS" "$ENGINE_ENTITLEMENTS" "$DISTRIBUTION_XML" \
+            "$ENGINE_BINARY_NAME_FILE"; do
   [[ -e "$path" ]] || die "Missing runfile: $path"
 done
+
+# Sourced from //tools/boss/engine/core:engine_binary.bzl via the
+# :engine_binary_name_txt genrule — the same name bundled_binaries and
+# //tools/boss/app-macos:Boss build, so a rename can't silently desync
+# codesigning from the build.
+ENGINE_BINARY_NAME="$(cat "$ENGINE_BINARY_NAME_FILE")"
 
 # ── resolve the git SHA from the unsigned .pkg filename ───────────────────────
 
@@ -178,10 +186,14 @@ log "Signing bundled CLI binaries..."
 BIN_DIR="${APP}/Contents/Resources/bin"
 if [[ -d "$BIN_DIR" ]]; then
   # engine needs the engine entitlements (empty, but explicit for forward-compat).
-  [[ -f "${BIN_DIR}/engine" ]] && \
-    run codesign --force --options runtime \
-      --entitlements "$ENGINE_ENTITLEMENTS" \
-      -s "$APP_IDENTITY" "${BIN_DIR}/engine"
+  # A miss here is a hard failure, not a skip: silently omitting the engine
+  # binary would ship an unsigned engine inside a signed, notarized .pkg,
+  # which Gatekeeper only catches on a fresh install.
+  [[ -f "${BIN_DIR}/${ENGINE_BINARY_NAME}" ]] || \
+    die "engine binary missing from payload: ${BIN_DIR}/${ENGINE_BINARY_NAME}"
+  run codesign --force --options runtime \
+    --entitlements "$ENGINE_ENTITLEMENTS" \
+    -s "$APP_IDENTITY" "${BIN_DIR}/${ENGINE_BINARY_NAME}"
 
   # boss, bossctl, boss-event are plain Rust CLIs with no special entitlements.
   for bin in boss bossctl boss-event; do

@@ -2642,7 +2642,7 @@ mod pane_spawn_tests {
 
     /// When the engine binary has runfiles at the bazel-conventional
     /// path, the resolver must pick that up — this is the production
-    /// path under `bazel run //tools/boss/engine:engine` once the
+    /// path under `bazel run //tools/boss/engine/core:engine` once the
     /// engine `rust_binary` has the `data` dep on
     /// `//tools/boss/event-shim:boss-event`. The original #174 fix
     /// only covered the BOSS_EVENT_BIN branch; this test covers the

@@ -35,7 +35,7 @@ ANTHROPIC_API_KEY=... bazel run //tools/boss/app-macos:Boss
 By default the app launches:
 
 ```bash
-bazel run //tools/boss/engine:engine -- --socket-path /tmp/boss-engine.sock
+bazel run //tools/boss/engine/core:engine -- --socket-path /tmp/boss-engine.sock
 ```
 
 The engine runs from the workspace root.
@@ -51,7 +51,7 @@ When auto-start is enabled, the app will:
 Disable auto-start and point the app to an existing socket:
 
 ```bash
-ANTHROPIC_API_KEY=... bazel run //tools/boss/engine:engine -- --socket-path /tmp/boss-engine.sock
+ANTHROPIC_API_KEY=... bazel run //tools/boss/engine/core:engine -- --socket-path /tmp/boss-engine.sock
 ```
 
 ```bash
@@ -89,7 +89,7 @@ the operator's `state.db`), then capture:
 
 ```bash
 env -u BOSS_EVENTS_SOCKET BOSS_WORKER_POOL_SIZE=0 \
-  bazel run //tools/boss/engine:engine -- --socket-path /tmp/boss-shot-$ID.sock
+  bazel run //tools/boss/engine/core:engine -- --socket-path /tmp/boss-shot-$ID.sock
 # seed fixture rows via the boss CLI against that socket, then:
 BOSS_SOCKET_PATH=/tmp/boss-shot-$ID.sock BOSS_ENGINE_AUTOSTART=0 \
   bazel run //tools/boss/app-macos:Boss -- --capture-to /tmp/shot.png --capture-after 3

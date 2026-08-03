@@ -3,7 +3,7 @@
 //! `BossClient` opens a Unix-domain connection to the engine and provides a
 //! correlated request/response API on top of the framed JSON protocol defined
 //! in [`boss_protocol`]. Engine discovery (socket path resolution + optional
-//! autostart of the engine binary lives behind [`Discovery`] so the CLI, tests,
+//! autostart of the engine binary) lives behind [`Discovery`] so the CLI, tests,
 //! and future TUI/web frontends share one set of rules.
 
 use std::path::{Path, PathBuf};
@@ -493,14 +493,11 @@ fn default_engine_args(socket_path: &str) -> Vec<String> {
 
 fn sibling_engine_binary(exe: &Path) -> Option<(String, PathBuf)> {
     let dir = exe.parent()?;
-    let mut candidates = vec![dir.join(ENGINE_BINARY_NAME)];
-    if let Some(boss_dir) = dir.parent() {
-        candidates.push(boss_dir.join(ENGINE_BINARY_NAME).join(ENGINE_BINARY_NAME));
-    }
-    candidates
-        .into_iter()
-        .find(|candidate: &PathBuf| candidate.is_file())
-        .map(|candidate| (candidate.to_string_lossy().into_owned(), candidate))
+    let candidate = dir.join(ENGINE_BINARY_NAME);
+    candidate.is_file().then(|| {
+        let path_str = candidate.to_string_lossy().into_owned();
+        (path_str, candidate)
+    })
 }
 
 fn locate_bazel_workspace_root() -> Option<PathBuf> {
@@ -742,36 +739,6 @@ mod tests {
             cmd.source
         );
         assert_eq!(cmd.args, vec!["--socket-path".to_owned(), "/tmp/sock".to_owned()]);
-    }
-
-    #[test]
-    fn sibling_of_exe_resolves_parent_engine_engine_candidate() {
-        // The direct engine sibling is absent, but a `../engine/engine`
-        // relative to the exe's dir exists — the second sibling candidate.
-        let tmp = tempfile::tempdir().unwrap();
-        let exe_dir = tmp.path().join("boss").join("bin");
-        std::fs::create_dir_all(&exe_dir).unwrap();
-        let fake_exe = exe_dir.join("boss");
-        std::fs::write(&fake_exe, b"#!/bin/sh\nexit 0\n").unwrap();
-        // Second candidate: exe_dir.parent()/engine/engine == tmp/boss/engine/engine
-        let engine_dir = tmp.path().join("boss").join("engine");
-        std::fs::create_dir_all(&engine_dir).unwrap();
-        let engine_bin = engine_dir.join("engine");
-        std::fs::write(&engine_bin, b"#!/bin/sh\nexit 0\n").unwrap();
-
-        let input = EngineResolverInput {
-            env_cmd: None,
-            env_bin: None,
-            workspace_root: None,
-            current_exe: Some(fake_exe.clone()),
-        };
-        let cmd = resolve_engine_command_with("/tmp/sock", &input).unwrap();
-        assert_eq!(cmd.program, engine_bin.to_string_lossy());
-        assert!(
-            cmd.source.starts_with("sibling of"),
-            "expected sibling source, got {}",
-            cmd.source
-        );
     }
 
     #[test]

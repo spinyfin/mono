@@ -124,8 +124,8 @@ fn launch_guard_blocks_engine_behind_a_launcher_prefix() {
 #[test]
 fn launch_guard_blocks_bazel_run_engine_without_an_isolating_socket() {
     for command in [
-        "bazel run //tools/boss/engine:engine",
-        "bazel run //tools/boss/engine:engine -- --socket-path /tmp/boss-engine.sock",
+        "bazel run //tools/boss/engine/core:engine",
+        "bazel run //tools/boss/engine/core:engine -- --socket-path /tmp/boss-engine.sock",
     ] {
         assert_eq!(launch_decision(command), "block", "must block: {command}");
     }
@@ -139,9 +139,9 @@ fn launch_guard_blocks_bazel_run_engine_without_an_isolating_socket() {
 #[test]
 fn launch_guard_allows_an_isolated_bazel_run_engine() {
     for command in [
-        "bazel run //tools/boss/engine:engine -- --socket-path /tmp/boss-test-9d3f0f22.sock",
-        "env -u BOSS_EVENTS_SOCKET bazel run //tools/boss/engine:engine -- --socket-path /tmp/boss-test-abc.sock",
-        "bazel run //tools/boss/engine:engine -- --socket-path=/tmp/boss-test-abc.sock",
+        "bazel run //tools/boss/engine/core:engine -- --socket-path /tmp/boss-test-9d3f0f22.sock",
+        "env -u BOSS_EVENTS_SOCKET bazel run //tools/boss/engine/core:engine -- --socket-path /tmp/boss-test-abc.sock",
+        "bazel run //tools/boss/engine/core:engine -- --socket-path=/tmp/boss-test-abc.sock",
     ] {
         assert_eq!(launch_decision(command), "approve", "must allow: {command}");
     }
@@ -219,7 +219,7 @@ fn launch_guard_reason_names_the_isolated_alternative() {
     assert_eq!(decision, "block");
     for expected in [
         "--socket-path",
-        "//tools/boss/engine:engine",
+        "//tools/boss/engine/core:engine",
         "BOSS_EVENTS_SOCKET",
         "bazel build",
         "bazel test",

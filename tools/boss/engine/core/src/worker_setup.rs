@@ -268,6 +268,11 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
     } else {
         ""
     };
+    // Sourced from //tools/boss/engine/core:engine_binary.bzl at build time
+    // (via the engine_lib rustc_env) so this advice can't drift from the
+    // real bazel target label the way the pre-crate-split
+    // `//tools/boss/engine:engine` string did.
+    let engine_bazel_run_command = env!("BOSS_ENGINE_BAZEL_RUN_COMMAND");
     format!(
         "# Boss worker rules\n\
          \n\
@@ -504,7 +509,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          To exercise a real engine, start an isolated one:\n\
          \n\
          ```sh\n\
-         env -u BOSS_EVENTS_SOCKET bazel run //tools/boss/engine:engine -- \\\n\
+         env -u BOSS_EVENTS_SOCKET {engine_bazel_run_command} -- \\\n\
            --socket-path /tmp/boss-test-$(uuidgen).sock\n\
          ```\n\
          \n\

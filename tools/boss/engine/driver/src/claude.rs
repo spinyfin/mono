@@ -254,7 +254,7 @@ macro_rules! python_command_guard {
 /// target without an isolating `--socket-path`, and `swift run`.
 ///
 /// Allowed: `bazel build`, `bazel test`, unpacking or inspecting a bundle,
-/// `bazel run //tools/boss/engine:engine -- --socket-path <non-production>`,
+/// `bazel run //tools/boss/engine/core:engine -- --socket-path <non-production>`,
 /// and isolated capture launches of the app
 /// (`BOSS_SOCKET_PATH=/tmp/boss-shot-<id>.sock BOSS_ENGINE_AUTOSTART=0 bazel
 /// run //tools/boss/app-macos:Boss -- --capture-to <path>.png`).
@@ -350,7 +350,9 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     "the installed /Applications/Boss.app or an engine that can reach production state on this ",
     "machine -- the live app seizes the running engine, and an unisolated launch puts a window ",
     "on the operator screen. To exercise a real engine, start an isolated one: env -u ",
-    "BOSS_EVENTS_SOCKET bazel run //tools/boss/engine:engine -- --socket-path /tmp/boss-test-<id>.sock. ",
+    "BOSS_EVENTS_SOCKET ",
+    env!("BOSS_ENGINE_BAZEL_RUN_COMMAND"),
+    " -- --socket-path /tmp/boss-test-<id>.sock. ",
     "Any --socket-path other than /tmp/boss-engine.sock derives its own db, events socket, pid file ",
     "and control token; unsetting BOSS_EVENTS_SOCKET matters because every worker pane inherits one ",
     "pointing at production. To screenshot the real Boss UI quietly, launch an isolated capture ",
