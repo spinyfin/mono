@@ -2497,21 +2497,40 @@ fn list_reattachable_remote_runs_filters_local_and_terminal() {
 fn tmux_run_accessors_record_and_list_only_adoptable_local_runs() {
     let db = WorkDb::open(temp_db_path("tmux-adoptable")).unwrap();
     let local_exec = start_run_on_host_for_test(&db, "local");
+    let intended_local_exec = start_run_on_host_for_test(&db, "local");
+    let no_intent_exec = start_run_on_host_for_test(&db, "local");
     let remote_exec = start_run_on_host_for_test(&db, "zakalwe");
 
     assert!(
         db.record_tmux_spawn_intent_for_execution(&local_exec, "boss", "boss-worker-1", "token-local",)
             .unwrap()
     );
-    assert!(db.record_tmux_session_created_for_execution(&local_exec, 4242).unwrap());
+    assert!(
+        db.record_tmux_session_created_for_execution(&local_exec, "token-local", 4242)
+            .unwrap()
+    );
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(
+            &intended_local_exec,
+            "boss",
+            "boss-worker-intended",
+            "token-intended",
+        )
+        .unwrap()
+    );
+    assert!(
+        !db.record_tmux_session_created_for_execution(&no_intent_exec, "token-no-intent", 7)
+            .unwrap(),
+        "confirmation without a matching intent must not update a run"
+    );
     assert!(
         db.record_tmux_spawn_intent_for_execution(&remote_exec, "boss", "boss-remote", "token-remote",)
             .unwrap()
     );
 
     let adoptable = db.list_adoptable_tmux_runs().unwrap();
-    assert_eq!(adoptable.len(), 1);
-    let local = &adoptable[0];
+    assert_eq!(adoptable.len(), 2);
+    let local = adoptable.iter().find(|run| run.execution_id == local_exec).unwrap();
     assert_eq!(local.execution_id, local_exec);
     assert_eq!(local.agent_id, "worker-1");
     assert_eq!(local.tmux_server_label, "boss");
@@ -2520,10 +2539,46 @@ fn tmux_run_accessors_record_and_list_only_adoptable_local_runs() {
     assert_eq!(local.tmux_spawn_state, "created");
     assert_eq!(local.tmux_pane_pid, Some(4242));
 
+    let intended = adoptable
+        .iter()
+        .find(|run| run.execution_id == intended_local_exec)
+        .unwrap();
+    assert_eq!(intended.tmux_spawn_state, "intended");
+    assert_eq!(intended.tmux_pane_pid, None);
+
     db.mark_execution_orphaned(&local_exec, "test: terminal").unwrap();
+    let remaining = db.list_adoptable_tmux_runs().unwrap();
+    assert!(
+        !remaining.iter().any(|run| run.execution_id == local_exec),
+        "a terminal execution must not be offered for tmux adoption",
+    );
+    assert!(remaining.iter().any(|run| run.execution_id == intended_local_exec));
+}
+
+#[test]
+fn list_adoptable_tmux_runs_excludes_finished_run_of_live_execution() {
+    let db = WorkDb::open(temp_db_path("tmux-finished-run")).unwrap();
+    let execution_id = start_run_on_host_for_test(&db, "local");
+    let run = db.list_runs(&execution_id).unwrap().pop().unwrap();
+
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(&execution_id, "boss", "boss-worker", "token-finished")
+            .unwrap()
+    );
+    db.finish_execution_run(
+        FinishExecutionRunInput::builder()
+            .execution_id(execution_id.clone())
+            .run_id(run.id)
+            .execution_status(ExecutionStatus::WaitingHuman)
+            .run_status("completed")
+            .clear_workspace_lease(false)
+            .build(),
+    )
+    .unwrap();
+
     assert!(
         db.list_adoptable_tmux_runs().unwrap().is_empty(),
-        "a terminal execution must not be offered for tmux adoption"
+        "a finished run must not be offered while its execution remains non-terminal",
     );
 }
 

@@ -525,8 +525,8 @@ impl WorkDb {
     /// current run. The tmux spawn path will call this before it invokes tmux,
     /// making a session whose token is absent from the DB unambiguously leaked.
     ///
-    /// This schema task only provides the accessor; no production path writes
-    /// tmux identity until the tmux-hosting rollout uses it.
+    /// No production path calls this yet; tmux identity is written only once
+    /// tmux-hosted spawning is enabled.
     pub fn record_tmux_spawn_intent_for_execution(
         &self,
         execution_id: &str,
@@ -551,20 +551,25 @@ impl WorkDb {
         Ok(updated > 0)
     }
 
-    /// Confirm that tmux created the current run's session and report the
-    /// initial pane pid it returned. Kept separate from intent persistence so
-    /// a crash between the DB commit and `tmux new-session` remains visible as
+    /// Confirm that tmux created the session identified by `spawn_token` and
+    /// report the initial pane pid it returned. The token, rather than a fresh
+    /// resolution of `execution_id`, identifies the row that received the
+    /// intent write; an execution can acquire sibling run rows between the two
+    /// writes. Kept separate from intent persistence so a crash between the DB
+    /// commit and `tmux new-session` remains visible as
     /// `tmux_spawn_state = 'intended'` to the adoption pass.
-    pub fn record_tmux_session_created_for_execution(&self, execution_id: &str, pane_pid: i64) -> Result<bool> {
+    pub fn record_tmux_session_created_for_execution(
+        &self,
+        execution_id: &str,
+        spawn_token: &str,
+        pane_pid: i64,
+    ) -> Result<bool> {
         let conn = self.connect()?;
-        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
-            return Ok(false);
-        };
         let updated = conn.execute(
             "UPDATE work_runs
-             SET tmux_spawn_state = 'created', tmux_pane_pid = ?2
-             WHERE id = ?1 AND tmux_spawn_token IS NOT NULL",
-            params![run_id, pane_pid],
+             SET tmux_spawn_state = 'created', tmux_pane_pid = ?3
+             WHERE execution_id = ?1 AND tmux_spawn_token = ?2",
+            params![execution_id, spawn_token, pane_pid],
         )?;
         Ok(updated > 0)
     }
@@ -831,7 +836,8 @@ impl WorkDb {
                     r.tmux_spawn_state, r.tmux_pane_pid
              FROM work_runs r
              JOIN work_executions e ON e.id = r.execution_id
-             WHERE r.host_id = 'local'
+             WHERE r.status = 'active'
+               AND r.host_id = 'local'
                AND r.tmux_spawn_token IS NOT NULL
                AND r.tmux_server_label IS NOT NULL
                AND r.tmux_session_name IS NOT NULL
