@@ -44,6 +44,7 @@ When auto-start is enabled, the app will:
 
 - reuse an existing engine process from the PID file when available,
 - otherwise launch a new engine,
+- relaunch an engine that exits unexpectedly with bounded exponential backoff,
 - keep the engine running when the app exits (unless `BOSS_ENGINE_STOP_ON_EXIT=1`).
 
 ## External engine mode
@@ -132,6 +133,8 @@ the PR body what you verified and what you could not.
 - `BOSS_ENGINE_PID_PATH`: engine pid file path (default `/tmp/boss-engine.pid`)
 - `BOSS_ENGINE_FORCE_RESTART`: set `1` to force-restart the engine on app launch
 - `BOSS_ENGINE_STOP_ON_EXIT`: set `1` to stop engine when app exits
+- `BOSS_ENGINE_RESTART_BACKOFF_SECONDS`: comma-separated restart delays in seconds (default `1,2,4,8,16,30`)
+- `BOSS_ENGINE_RESTART_MAX_ATTEMPTS`: maximum automatic restart attempts before the app shows a manual-restart banner (default `6`)
 - `BOSS_SHOW_SYSTEM_MESSAGES`: set `1` to include internal system status messages
 - `BOSS_ENGINE_LOG_PATH`: log file path (default `/tmp/boss-engine.log`)
 - `BOSS_ENGINE_AUDIT_PATH`: audit log file path (default
