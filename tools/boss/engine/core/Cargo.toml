@@ -57,6 +57,7 @@ boss-engine-utility-model = { path = "../utility-model" }
 boss-engine-utils = { path = "../utils" }
 boss-engine-worker-bin = { path = "../worker-bin" }
 boss-engine-worker-policy = { path = "../worker-policy" }
+boss-tmux = { path = "../../tmux" }
 boss-transcript-tail = { path = "../transcript-tail" }
 clap = { workspace = true, features = ["derive"] }
 fastrand = { workspace = true }

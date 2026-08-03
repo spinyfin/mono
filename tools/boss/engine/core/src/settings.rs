@@ -11,7 +11,7 @@
 //! human-readable description, and default. Read at consumer sites via
 //! [`SettingsStore::is_enabled`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -25,6 +25,91 @@ pub struct SettingSpec {
     pub key: &'static str,
     pub description: &'static str,
     pub default_enabled: bool,
+}
+
+/// Settings key whose value is the set of worker pools hosted by tmux.
+///
+/// Unlike the boolean settings in [`REGISTRY`], this is deliberately a set:
+/// migration proceeds review → automation → interactive, and a pool can be
+/// rolled back without changing the hosting mode of another pool.
+pub const TMUX_HOSTING_SETTING: &str = "workers.tmux_hosting";
+
+/// A worker pool eligible for tmux hosting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TmuxHostingPool {
+    Interactive,
+    Automation,
+    Review,
+}
+
+impl TmuxHostingPool {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "interactive" => Ok(Self::Interactive),
+            "automation" => Ok(Self::Automation),
+            "review" => Ok(Self::Review),
+            _ => anyhow::bail!(
+                "invalid {TMUX_HOSTING_SETTING} pool {value:?} (expected interactive, automation, or review)"
+            ),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Automation => "automation",
+            Self::Review => "review",
+        }
+    }
+
+    fn from_attributed_pool(value: &str) -> Option<Self> {
+        match value {
+            // Live worker state calls the primary interactive pool "main";
+            // the settings vocabulary keeps the operator-facing name from the
+            // tmux migration design.
+            "main" | "interactive" => Some(Self::Interactive),
+            "automation" => Some(Self::Automation),
+            "review" => Some(Self::Review),
+            _ => None,
+        }
+    }
+}
+
+/// The configured set of pools whose workers launch in detached tmux
+/// sessions. An empty set is the safe default and preserves the legacy
+/// app-hosted path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TmuxHostingPools(BTreeSet<TmuxHostingPool>);
+
+impl TmuxHostingPools {
+    /// Whether an attributed worker pool (the internal `main` / `automation`
+    /// / `review` labels) is configured for tmux hosting.
+    pub fn contains_attributed_pool(&self, pool: &str) -> bool {
+        TmuxHostingPool::from_attributed_pool(pool).is_some_and(|pool| self.0.contains(&pool))
+    }
+
+    fn from_toml(value: &toml::Value) -> Result<Self> {
+        let values = value
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("{TMUX_HOSTING_SETTING} must be an array of pool names"))?;
+        let mut pools = BTreeSet::new();
+        for value in values {
+            let value = value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("{TMUX_HOSTING_SETTING} entries must be strings"))?;
+            pools.insert(TmuxHostingPool::parse(value)?);
+        }
+        Ok(Self(pools))
+    }
+
+    fn as_toml(&self) -> toml::Value {
+        toml::Value::Array(
+            self.0
+                .iter()
+                .map(|pool| toml::Value::String(pool.as_str().to_owned()))
+                .collect(),
+        )
+    }
 }
 
 /// Static registry. Append here, read with `SettingsStore::is_enabled`.
@@ -66,25 +151,33 @@ pub struct SettingSnapshot {
     pub enabled: bool,
 }
 
-/// On-disk file shape: flat key → bool mapping.
+/// On-disk file shape. The established settings remain booleans, while
+/// `workers.tmux_hosting` is a deliberately typed pool set.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct FileShape {
     #[serde(flatten)]
-    settings: HashMap<String, bool>,
+    settings: HashMap<String, toml::Value>,
+}
+
+#[derive(Debug, Default)]
+struct SettingsState {
+    booleans: HashMap<String, bool>,
+    tmux_hosting: TmuxHostingPools,
+    tmux_hosting_overridden: bool,
 }
 
 /// Thread-safe store. In-memory overrides keyed by setting key;
 /// falls back to registry default for any key not in the map.
 pub struct SettingsStore {
     path: PathBuf,
-    state: Mutex<HashMap<String, bool>>,
+    state: Mutex<SettingsState>,
 }
 
 impl SettingsStore {
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
-            state: Mutex::new(HashMap::new()),
+            state: Mutex::new(SettingsState::default()),
         }
     }
 
@@ -104,7 +197,7 @@ impl SettingsStore {
             Ok(s) => s,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 let mut guard = self.state.lock().expect("settings lock poisoned");
-                guard.clear();
+                *guard = SettingsState::default();
                 return Ok(());
             }
             Err(err) => {
@@ -113,9 +206,13 @@ impl SettingsStore {
         };
         let parsed: FileShape =
             toml::from_str(&contents).with_context(|| format!("parse settings file: {}", self.path.display()))?;
-        let mut guard = self.state.lock().expect("settings lock poisoned");
-        guard.clear();
+        let mut next = SettingsState::default();
         for (key, value) in parsed.settings {
+            if key == TMUX_HOSTING_SETTING {
+                next.tmux_hosting = TmuxHostingPools::from_toml(&value)?;
+                next.tmux_hosting_overridden = true;
+                continue;
+            }
             // workers.always_use_opus was superseded by workers.non_opus_permission_mode
             // (T462 → this chore). If the old key is still in the file it is a no-op;
             // log once so operators know to clean it up.
@@ -128,9 +225,14 @@ impl SettingsStore {
                 continue;
             }
             if REGISTRY.iter().any(|spec| spec.key == key) {
-                guard.insert(key, value);
+                let value = value
+                    .as_bool()
+                    .ok_or_else(|| anyhow::anyhow!("setting {key:?} must be a boolean, got {value}"))?;
+                next.booleans.insert(key, value);
             }
         }
+        let mut guard = self.state.lock().expect("settings lock poisoned");
+        *guard = next;
         Ok(())
     }
 
@@ -139,7 +241,7 @@ impl SettingsStore {
     pub fn get(&self, key: &str) -> Option<bool> {
         let spec = REGISTRY.iter().find(|spec| spec.key == key)?;
         let guard = self.state.lock().expect("settings lock poisoned");
-        Some(guard.get(key).copied().unwrap_or(spec.default_enabled))
+        Some(guard.booleans.get(key).copied().unwrap_or(spec.default_enabled))
     }
 
     /// Convenience for the one-line consumer check.
@@ -154,9 +256,32 @@ impl SettingsStore {
         }
         {
             let mut guard = self.state.lock().expect("settings lock poisoned");
-            guard.insert(key.to_owned(), enabled);
+            guard.booleans.insert(key.to_owned(), enabled);
         }
         self.write_to_disk()
+    }
+
+    /// Set the pools that launch workers in tmux and atomically persist them.
+    /// This is separate from [`Self::set`] because the settings RPC currently
+    /// models toggles only; staged pool enablement will expose its own
+    /// multi-select control.
+    pub fn set_tmux_hosting_pools(&self, pools: TmuxHostingPools) -> Result<()> {
+        {
+            let mut guard = self.state.lock().expect("settings lock poisoned");
+            guard.tmux_hosting = pools;
+            guard.tmux_hosting_overridden = true;
+        }
+        self.write_to_disk()
+    }
+
+    /// Whether the given attributed pool should use the tmux-hosted spawn
+    /// path. Unknown pool labels intentionally remain on the legacy path.
+    pub fn tmux_hosting_enabled_for(&self, pool: &str) -> bool {
+        self.state
+            .lock()
+            .expect("settings lock poisoned")
+            .tmux_hosting
+            .contains_attributed_pool(pool)
     }
 
     /// Snapshot of every registered setting in registry order.
@@ -168,7 +293,7 @@ impl SettingsStore {
                 key: spec.key.to_owned(),
                 description: spec.description.to_owned(),
                 default_enabled: spec.default_enabled,
-                enabled: guard.get(spec.key).copied().unwrap_or(spec.default_enabled),
+                enabled: guard.booleans.get(spec.key).copied().unwrap_or(spec.default_enabled),
             })
             .collect()
     }
@@ -176,9 +301,15 @@ impl SettingsStore {
     fn write_to_disk(&self) -> Result<()> {
         let serialized = {
             let guard = self.state.lock().expect("settings lock poisoned");
-            let shape = FileShape {
-                settings: guard.clone(),
-            };
+            let mut settings = guard
+                .booleans
+                .iter()
+                .map(|(key, value)| (key.clone(), toml::Value::Boolean(*value)))
+                .collect::<HashMap<_, _>>();
+            if guard.tmux_hosting_overridden {
+                settings.insert(TMUX_HOSTING_SETTING.to_owned(), guard.tmux_hosting.as_toml());
+            }
+            let shape = FileShape { settings };
             toml::to_string_pretty(&shape).context("serialize settings to TOML")?
         };
 
@@ -271,6 +402,45 @@ mod tests {
         let store = make_store(&tmp);
         store.load().unwrap();
         assert!(!store.is_enabled("workers.non_opus_permission_mode"));
+    }
+
+    #[test]
+    fn tmux_hosting_defaults_to_no_pools() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+
+        assert!(!store.tmux_hosting_enabled_for("review"));
+        assert!(!store.tmux_hosting_enabled_for("automation"));
+        assert!(!store.tmux_hosting_enabled_for("main"));
+    }
+
+    #[test]
+    fn tmux_hosting_pool_set_round_trips_and_uses_interactive_for_main() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        let pools = TmuxHostingPools(
+            [TmuxHostingPool::Review, TmuxHostingPool::Interactive]
+                .into_iter()
+                .collect(),
+        );
+        store.set_tmux_hosting_pools(pools).unwrap();
+
+        let restored = make_store(&tmp);
+        restored.load().unwrap();
+        assert!(restored.tmux_hosting_enabled_for("review"));
+        assert!(restored.tmux_hosting_enabled_for("main"));
+        assert!(!restored.tmux_hosting_enabled_for("automation"));
+    }
+
+    #[test]
+    fn tmux_hosting_rejects_unknown_pool_name() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.toml");
+        std::fs::write(&path, "\"workers.tmux_hosting\" = [\"unsupported\"]\n").unwrap();
+
+        let error = SettingsStore::new(path).load().unwrap_err();
+        assert!(error.to_string().contains("unsupported"));
     }
 
     #[test]

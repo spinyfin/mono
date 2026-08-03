@@ -372,6 +372,10 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
     fn non_opus_auto_mode(&self) -> bool {
         self.settings.is_enabled("workers.non_opus_permission_mode")
     }
+
+    fn tmux_hosting_enabled_for(&self, pool: &str) -> bool {
+        self.settings.tmux_hosting_enabled_for(pool)
+    }
 }
 
 #[async_trait]

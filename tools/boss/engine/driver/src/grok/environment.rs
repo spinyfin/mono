@@ -520,8 +520,13 @@ mod tests {
     fn directives_delegate_host_state_and_force_oauth() {
         let tmp = TempDir::new().unwrap();
         let host_home = tmp.path().join("host-home");
-        std::fs::create_dir_all(host_home.join("Library/Application Support/jj")).unwrap();
-        std::fs::write(host_home.join("Library/Application Support/jj/config.toml"), "[user]\n").unwrap();
+        let jj_config = if cfg!(target_os = "macos") {
+            host_home.join("Library/Application Support/jj/config.toml")
+        } else {
+            host_home.join(".config/jj/config.toml")
+        };
+        std::fs::create_dir_all(jj_config.parent().unwrap()).unwrap();
+        std::fs::write(&jj_config, "[user]\n").unwrap();
         std::fs::write(host_home.join(".gitconfig"), "[user]\n").unwrap();
         let _guard = EnvGuard::set_and_clear(
             &[("HOME", &host_home)],
@@ -552,10 +557,7 @@ mod tests {
             ("GH_CONFIG_DIR", host_home.join(".config/gh")),
             ("CUBE_DATA_DIR", host_home.join(".local/share/cube")),
             ("CUBE_CONFIG_DIR", host_home.join(".config/cube")),
-            (
-                "JJ_CONFIG",
-                host_home.join("Library/Application Support/jj/config.toml"),
-            ),
+            ("JJ_CONFIG", jj_config),
             ("GIT_CONFIG_GLOBAL", host_home.join(".gitconfig")),
             ("XDG_CACHE_HOME", host_home.join(".cache")),
             ("REPOBIN_CACHE_DIR", host_home.join(".cache/repobin")),
