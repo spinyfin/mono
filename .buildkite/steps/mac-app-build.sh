@@ -23,4 +23,12 @@ bazel build //tools/boss/app-macos/... //tools/boss/installer/...
 # //tools/boss/app-macos/Tests/UpdateCore:UpdateTests.
 bazel test --test_output=errors //tools/boss/app-macos/...
 
+# Gate the bundled-engine layout: boss_pkg_payload_contains_engine_binary_test
+# asserts the packaged .pkg payload actually contains the engine binary at the
+# name/path release.sh expects. bazel-build-test.sh excludes
+# //tools/boss/installer/... entirely (its boss_pkg_payload rule needs the
+# Swift/macOS toolchain this step provides), so this is the only CI step that
+# can run it.
+bazel test --test_output=errors //tools/boss/installer/...
+
 echo "[mac-app-build] ok"
