@@ -2492,3 +2492,52 @@ fn list_reattachable_remote_runs_filters_local_and_terminal() {
         "a run whose execution has settled must not be reattachable",
     );
 }
+
+#[test]
+fn tmux_run_accessors_record_and_list_only_adoptable_local_runs() {
+    let db = WorkDb::open(temp_db_path("tmux-adoptable")).unwrap();
+    let local_exec = start_run_on_host_for_test(&db, "local");
+    let remote_exec = start_run_on_host_for_test(&db, "zakalwe");
+
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(&local_exec, "boss", "boss-worker-1", "token-local",)
+            .unwrap()
+    );
+    assert!(db.record_tmux_session_created_for_execution(&local_exec, 4242).unwrap());
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(&remote_exec, "boss", "boss-remote", "token-remote",)
+            .unwrap()
+    );
+
+    let adoptable = db.list_adoptable_tmux_runs().unwrap();
+    assert_eq!(adoptable.len(), 1);
+    let local = &adoptable[0];
+    assert_eq!(local.execution_id, local_exec);
+    assert_eq!(local.agent_id, "worker-1");
+    assert_eq!(local.tmux_server_label, "boss");
+    assert_eq!(local.tmux_session_name, "boss-worker-1");
+    assert_eq!(local.tmux_spawn_token, "token-local");
+    assert_eq!(local.tmux_spawn_state, "created");
+    assert_eq!(local.tmux_pane_pid, Some(4242));
+
+    db.mark_execution_orphaned(&local_exec, "test: terminal").unwrap();
+    assert!(
+        db.list_adoptable_tmux_runs().unwrap().is_empty(),
+        "a terminal execution must not be offered for tmux adoption"
+    );
+}
+
+#[test]
+fn tmux_spawn_tokens_are_unique_across_runs() {
+    let db = WorkDb::open(temp_db_path("tmux-token-unique")).unwrap();
+    let first_exec = start_run_on_host_for_test(&db, "local");
+    let second_exec = start_run_on_host_for_test(&db, "local");
+    db.record_tmux_spawn_intent_for_execution(&first_exec, "boss", "boss-one", "token-shared")
+        .unwrap();
+
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(&second_exec, "boss", "boss-two", "token-shared")
+            .is_err(),
+        "the durable tmux token must identify at most one run"
+    );
+}

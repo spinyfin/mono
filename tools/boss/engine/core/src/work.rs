@@ -558,6 +558,7 @@ pub use output_types::RemoteRunHandle;
 pub use output_types::SetRunTranscriptPathOutcome;
 pub use output_types::StoredExternalRef;
 pub use output_types::StrandedCiRemediationAttempt;
+pub use output_types::TmuxRunHandle;
 pub use output_types::WorkerPrCompletion;
 pub use output_types::WorkerPrCompletionTarget;
 pub use planner_runs::ClaimPlannerRunInput;

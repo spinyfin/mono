@@ -222,11 +222,19 @@ impl WorkDb {
                 host_id TEXT NOT NULL DEFAULT 'local',
                 cube_workspace_id TEXT,
                 remote_pid INTEGER,
-                shell_pid INTEGER
+                shell_pid INTEGER,
+                tmux_server_label TEXT,
+                tmux_session_name TEXT,
+                tmux_spawn_token TEXT,
+                tmux_spawn_state TEXT,
+                tmux_pane_pid INTEGER
             );
 
             CREATE INDEX IF NOT EXISTS work_runs_execution_idx
                 ON work_runs(execution_id, created_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS work_runs_tmux_spawn_token_idx
+                ON work_runs(tmux_spawn_token)
+                WHERE tmux_spawn_token IS NOT NULL;
 
             CREATE TABLE IF NOT EXISTS work_attention_items (
                 id TEXT PRIMARY KEY,
@@ -696,6 +704,11 @@ impl WorkDb {
         // long-lived agent session's rollout at the right byte rather than
         // replaying it from zero or skipping to its end.
         migrate_work_runs_progress_ingress_checkpoint(conn)?;
+        // Tmux session identity is durable per spawned run so startup
+        // adoption can match a surviving session by its opaque token.
+        // The spawn path does not use these columns until the tmux-hosting
+        // rollout lands.
+        migrate_work_runs_tmux_columns(conn)?;
         // Backfill: tombstone `merge-conflict:*` / `ci-fix:*` revisions that
         // were cancelled by a human before their chain root's PR merged or
         // closed, and never revisited afterward because
@@ -913,6 +926,34 @@ mod tests {
             )
             .unwrap();
         assert_eq!(run_cost_columns, 9, "expected all per-run cost columns");
+
+        let tmux_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('work_runs')
+                 WHERE name IN (
+                     'tmux_server_label',
+                     'tmux_session_name',
+                     'tmux_spawn_token',
+                     'tmux_spawn_state',
+                     'tmux_pane_pid'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tmux_columns, 5, "expected all per-run tmux columns");
+
+        let tmux_token_index_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_master
+                     WHERE type = 'index' AND name = 'work_runs_tmux_spawn_token_idx'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(tmux_token_index_exists, "expected unique tmux token index");
     }
 
     /// The fast path a brand-new database actually takes must reach the
