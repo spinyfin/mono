@@ -212,6 +212,12 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          direct evidence the pane-spawn problem is no longer blocking it — the same reasoning as \
          `driver_terminal_error`, one stage earlier in the run's lifecycle.",
     ),
+    entry(
+        crate::stale_worker_sweep::STALE_WORKER_ATTENTION_KIND,
+        ClearedBy::HumanDecision,
+        "Tmux can prove a worker is quiet but cannot prove why. The attention deliberately remains \
+         open until an operator inspects the retained session and decides whether to stop or resume it.",
+    ),
     // ── Cleared by a later completed pass of the same kind ──────────────
     entry(
         crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND,
@@ -521,6 +527,7 @@ mod tests {
             crate::completion::DRIVER_TERMINAL_ERROR_ATTENTION_KIND,
             crate::completion::REVISION_NO_OP_ATTENTION_KIND,
             crate::coordinator::PANE_SPAWN_FAILED_ATTENTION_KIND,
+            crate::stale_worker_sweep::STALE_WORKER_ATTENTION_KIND,
             crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND,
             crate::worker_escalation::WORKER_ESCALATION_ATTENTION_KIND,
             crate::worker_escalation::WORKER_BLOCKED_ATTENTION_KIND,

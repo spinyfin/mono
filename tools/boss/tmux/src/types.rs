@@ -96,6 +96,7 @@ pub enum DisplayField {
     PanePid,
     PaneDead,
     PaneDeadStatus,
+    PaneCurrentCommand,
     WindowActivity,
 }
 
@@ -105,6 +106,7 @@ impl DisplayField {
             Self::PanePid => "#{pane_pid}",
             Self::PaneDead => "#{pane_dead}",
             Self::PaneDeadStatus => "#{pane_dead_status}",
+            Self::PaneCurrentCommand => "#{pane_current_command}",
             Self::WindowActivity => "#{window_activity}",
         }
     }
