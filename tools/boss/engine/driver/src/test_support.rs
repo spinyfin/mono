@@ -90,6 +90,58 @@ pub fn grok_homes_override(root: &Path) -> GrokHomesOverride {
     GrokHomesOverride { _lock: lock, prior }
 }
 
+/// RAII override of [`crate::transcript_store::WORKER_TRANSCRIPTS_ROOT_ENV`],
+/// obtained from [`transcript_store_override`].
+///
+/// The guard serializes every test that changes the process-wide transcript
+/// store root, including tests that temporarily clear it to exercise the
+/// production default. Always acquire this guard after any homes override;
+/// it is the innermost environment lock.
+pub struct TranscriptStoreOverride {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prior: Option<std::ffi::OsString>,
+}
+
+static TRANSCRIPT_STORE_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Point durable worker transcript storage at `root` for as long as the
+/// returned guard lives. Always call this after acquiring any homes override,
+/// so the transcript-store lock remains innermost.
+pub fn transcript_store_override(root: &Path) -> TranscriptStoreOverride {
+    TranscriptStoreOverride::set(Some(root))
+}
+
+impl TranscriptStoreOverride {
+    /// Temporarily clear the transcript-store override while retaining the
+    /// shared environment lock. This is used to test the production default.
+    pub fn unset() -> Self {
+        Self::set(None)
+    }
+
+    fn set(root: Option<&Path>) -> Self {
+        let lock = TRANSCRIPT_STORE_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prior = std::env::var_os(crate::transcript_store::WORKER_TRANSCRIPTS_ROOT_ENV);
+        // SAFETY: the process-wide lock above is held until this guard restores the variable.
+        match root {
+            Some(root) => unsafe { std::env::set_var(crate::transcript_store::WORKER_TRANSCRIPTS_ROOT_ENV, root) },
+            None => unsafe { std::env::remove_var(crate::transcript_store::WORKER_TRANSCRIPTS_ROOT_ENV) },
+        }
+        Self { _lock: lock, prior }
+    }
+}
+
+impl Drop for TranscriptStoreOverride {
+    fn drop(&mut self) {
+        // SAFETY: this guard still holds the process-wide lock.
+        match self.prior.as_ref() {
+            Some(value) => unsafe { std::env::set_var(crate::transcript_store::WORKER_TRANSCRIPTS_ROOT_ENV, value) },
+            None => unsafe { std::env::remove_var(crate::transcript_store::WORKER_TRANSCRIPTS_ROOT_ENV) },
+        }
+    }
+}
+
 impl Drop for GrokHomesOverride {
     fn drop(&mut self) {
         // SAFETY: same as in `grok_homes_override` — the lock this guard

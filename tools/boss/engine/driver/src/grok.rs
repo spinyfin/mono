@@ -28,6 +28,8 @@ use boss_protocol::{NormalizeError, PaneMonitorSpec, WorkerEvent};
 use boss_ssh_transport::shell_quote;
 use serde_json::Value;
 
+use crate::transcript_store::{durable_sessions_dir, transcript_store_root, verified_durable_sessions_dir};
+
 mod classify_error;
 mod environment;
 mod home;
@@ -370,8 +372,8 @@ impl AgentDriver for GrokDriver {
         };
         let runtime = GrokRuntimeState::from_driver_runtime_state(state)?;
         // Containment check even though we do not delete here: a tampered
-        // payload must surface loudly. Home is retained as run evidence
-        // (same retention posture as Codex); reclaim is a follow-on policy.
+        // payload must surface loudly. The full transcript is already in the
+        // durable sessions link; this temporary home remains reclaimable.
         assert_grok_home_safe_to_delete(&runtime.grok_home)?;
         Ok(())
     }
@@ -640,6 +642,38 @@ impl AgentDriver for GrokDriver {
         Some(Box::new(GrokTranscriptSession::default()))
     }
 
+    fn transcript_containment_root(&self, run_id: &str) -> anyhow::Result<Option<PathBuf>> {
+        let grok_home = grok_home_for_run(run_id)?;
+        let sessions_path = grok_home.join("sessions");
+        match fs::symlink_metadata(&sessions_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let store_root = transcript_store_root()?;
+                return Ok(Some(verified_durable_sessions_dir(
+                    &grok_home,
+                    &store_root,
+                    "grok",
+                    run_id,
+                )?));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let store_root = transcript_store_root()?;
+                let durable = durable_sessions_dir(&store_root, "grok", run_id)?;
+                if let Ok(canonical) = fs::canonicalize(&durable)
+                    && canonical.is_dir()
+                {
+                    return Ok(Some(canonical));
+                }
+            }
+            Err(err) => tracing::debug!(
+                ?err,
+                path = %sessions_path.display(),
+                "stat of temporary sessions path failed; falling back to legacy containment"
+            ),
+            _ => {}
+        }
+        Ok(None)
+    }
+
     fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value {
         // Isolated single-record reshape for direct callers that do not
         // hold a `transcript_session()` tail. Each call starts a fresh,
@@ -824,6 +858,7 @@ mod tests {
     /// Point homes + auth at a temp tree; skip live inspect when requested.
     struct EnvGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
+        _transcript_store: crate::test_support::TranscriptStoreOverride,
         prior_homes: Option<std::ffi::OsString>,
         prior_auth: Option<std::ffi::OsString>,
         prior_skip: Option<std::ffi::OsString>,
@@ -862,6 +897,7 @@ mod tests {
         }
         EnvGuard {
             _lock: lock,
+            _transcript_store: crate::test_support::transcript_store_override(&homes.join("transcripts")),
             prior_homes,
             prior_auth,
             prior_skip,

@@ -622,10 +622,9 @@ fn command_denial_notification(reported_failure: bool, exit_code: Option<i64>, o
         .then(|| format!("codex: command execution reported a non-zero exit status (exit_code={exit_code:?})"))
 }
 
-/// Verify `codex_home` is a real (non-symlinked) descendant of `homes_root`
-/// and return its canonical `sessions` subdirectory, itself a real
-/// descendant of `codex_home` — or `None` if any link in that chain is
-/// symlinked or doesn't nest as expected.
+/// Verify a legacy in-home sessions directory is a real (non-symlinked)
+/// descendant of the Codex home. New provisioned homes intentionally use a
+/// durable sessions link and are handled by the driver's containment method.
 pub(super) fn verified_sessions_root(homes_root: &Path, codex_home: &Path) -> Option<PathBuf> {
     if fs::symlink_metadata(homes_root).ok()?.file_type().is_symlink()
         || fs::symlink_metadata(codex_home).ok()?.file_type().is_symlink()

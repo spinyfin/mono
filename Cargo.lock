@@ -596,6 +596,7 @@ dependencies = [
  "boss-engine-structured-output",
  "boss-engine-transient-error",
  "boss-engine-utils",
+ "boss-log-files",
  "boss-pr-review",
  "boss-protocol",
  "boss-ssh-transport",

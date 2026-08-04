@@ -11,6 +11,7 @@ bon = { workspace = true }
 boss-codex-auth = { path = "../../codex_auth" }
 boss-engine-codex-hook-trust = { path = "../codex-hook-trust" }
 boss-engine-codex-rollout = { path = "../codex-rollout" }
+boss-log-files = { path = "../../log-files" }
 boss-engine-structured-output = { path = "../structured-output" }
 boss-engine-transient-error = { path = "../transient-error" }
 boss-engine-utils = { path = "../utils" }

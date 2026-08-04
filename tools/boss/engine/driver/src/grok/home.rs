@@ -22,6 +22,7 @@ use super::environment::resolve_gh_config_dir;
 #[cfg(test)]
 use super::environment::resolve_login_keychain_source;
 use super::preflight::run_worker_preflight;
+use crate::transcript_store::provision_durable_sessions;
 
 /// Env override for the root under which per-run `GROK_HOME` directories live.
 /// Tests set this so homes land in a disposable temp tree.
@@ -399,6 +400,8 @@ pub fn read_workspace_path_stamp(grok_home: &Path) -> anyhow::Result<PathBuf> {
 /// Idempotent: rewrites config, trust, hooks canary, and prompt on every call
 /// so reused cube workspaces always get a compat-suppressing posture. OAuth
 /// remains outside this directory and is shared through `GROK_AUTH_PATH`.
+/// Everything under this home is temporary except `sessions/`, which is a
+/// link into Boss's durable per-execution transcript store.
 pub fn provision_grok_home(workspace: &Path, prompt_text: &str, run_id: &str) -> anyhow::Result<GrokRuntimeState> {
     let container = grok_run_container_for_run(run_id)?;
     let grok_home = container.join(GROK_HOME_LEAF);
@@ -407,8 +410,7 @@ pub fn provision_grok_home(workspace: &Path, prompt_text: &str, run_id: &str) ->
     fs::create_dir_all(&grok_home).with_context(|| format!("creating GROK_HOME {}", grok_home.display()))?;
     fs::create_dir_all(grok_home.join("hooks"))
         .with_context(|| format!("creating hooks dir under {}", grok_home.display()))?;
-    fs::create_dir_all(grok_home.join("sessions"))
-        .with_context(|| format!("creating sessions dir under {}", grok_home.display()))?;
+    provision_durable_sessions(&grok_home, "grok", run_id)?;
     // Scoped HOME with no `.claude` tree — quarantine operator Claude settings.
     fs::create_dir_all(&process_home).with_context(|| format!("creating process HOME {}", process_home.display()))?;
     // Explicitly ensure no leftover .claude from a prior mis-provision.

@@ -348,6 +348,7 @@ fn provision_workspace_creates_owned_home_and_snapshots_auth() {
 
     // Point homes + auth source at the temp tree; never touch ~/.codex.
     let _auth = crate::test_support::codex_auth_source_override(&homes, &auth_src);
+    let _transcripts = crate::test_support::transcript_store_override(&tmp.path().join("transcripts"));
 
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -907,7 +908,7 @@ fn empty_run_id_refused_for_codex_home() {
 }
 
 /// The root/home pair must come from one read of the homes-root env, so
-/// every containment comparison downstream (`verified_sessions_root`)
+/// every containment comparison downstream
 /// sees a home that is genuinely a child of the root it was handed.
 /// Pairing an independent `codex_homes_root()`
 /// call with `codex_home_for_run()` is what made a sibling test's env

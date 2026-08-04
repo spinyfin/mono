@@ -41,6 +41,9 @@ mod tool_surface_guard;
 use guard_trace::{GUARD_TRACE_SHIM_FILENAME, GUARD_TRACE_SHIM_SCRIPT, guard_trace_path, wrapper_body};
 use tool_surface_guard::CODEX_TOOL_SURFACE_GUARD_SCRIPT;
 
+use crate::transcript_store::{
+    durable_sessions_dir, provision_durable_sessions, transcript_store_root, verified_durable_sessions_dir,
+};
 use progress::{CodexRolloutProgressSession, CodexTranscriptSession, normalize_rollout, verified_sessions_root};
 
 use super::claude::{BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND};
@@ -323,6 +326,8 @@ const HOOK_TRUST_ATTESTATION_FILENAME: &str = "hook-trust-attestation.json";
 // ---------------------------------------------------------------------------
 
 /// Root directory that holds Boss-owned per-run `CODEX_HOME` trees.
+/// Everything under each home is temporary except `sessions/`, which is a
+/// link into Boss's durable per-execution transcript store.
 ///
 /// Prefer [`CODEX_HOMES_ROOT_ENV`] when set (tests); otherwise
 /// `$TMPDIR/boss-codex-homes`. Never the operator interactive `~/.codex`.
@@ -1404,8 +1409,7 @@ impl AgentDriver for CodexDriver {
             .with_context(|| format!("resolving Boss-owned CODEX_HOME for run_id {run_id:?}"))?;
         fs::create_dir_all(&codex_home)
             .with_context(|| format!("creating Boss-owned CODEX_HOME {}", codex_home.display()))?;
-        fs::create_dir_all(codex_home.join("sessions"))
-            .with_context(|| format!("creating Codex sessions directory under {}", codex_home.display()))?;
+        provision_durable_sessions(&codex_home, "codex", run_id)?;
 
         // Auth: SnapshotWithRefreshAdoption. Source is the operator auth
         // discovery path (or BOSS_CODEX_AUTH_SOURCE when set for tests);
@@ -1443,12 +1447,14 @@ impl AgentDriver for CodexDriver {
 
     /// Adopt any mid-run auth refresh back into the source.
     ///
-    /// Leaves the Boss-owned `CODEX_HOME` on disk as terminal-run evidence
-    /// for the retention policy (`boss-engine-codex-rollout-retention` /
-    /// `codex_home_retention_sweep`). Disk reclaim happens later against
-    /// **this recorded path only** — never by scanning `~/.codex` or
-    /// inferring a home from the engine environment. Idempotent: a missing
-    /// home or missing runtime state is a pure no-op.
+    /// Leaves the temporary Boss-owned `CODEX_HOME` for its existing reclaim
+    /// policy. Its `sessions/` link already writes the full rollout into
+    /// Boss-owned transcript storage, while auth and every other home file
+    /// remain temporary. Disk reclaim later uses the recorded path only;
+    /// it never scans `~/.codex` or infers a home from the engine environment.
+    /// `boss-engine-codex-rollout-retention` and `codex_home_retention_sweep`
+    /// own that reclaim policy. Idempotent: a missing home or missing runtime
+    /// state is a pure no-op.
     async fn teardown_workspace(
         &self,
         _workspace: Option<&Path>,
@@ -1735,9 +1741,36 @@ impl AgentDriver for CodexDriver {
 
     fn transcript_containment_root(&self, run_id: &str) -> anyhow::Result<Option<PathBuf>> {
         let (homes_root, codex_home) = codex_homes_root_and_home_for_run(run_id)?;
+        let sessions_path = codex_home.join("sessions");
+        match fs::symlink_metadata(&sessions_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let store_root = transcript_store_root()?;
+                return Ok(Some(verified_durable_sessions_dir(
+                    &codex_home,
+                    &store_root,
+                    "codex",
+                    run_id,
+                )?));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let store_root = transcript_store_root()?;
+                let durable = durable_sessions_dir(&store_root, "codex", run_id)?;
+                if let Ok(canonical) = fs::canonicalize(&durable)
+                    && canonical.is_dir()
+                {
+                    return Ok(Some(canonical));
+                }
+            }
+            Err(err) => tracing::debug!(
+                ?err,
+                path = %sessions_path.display(),
+                "stat of temporary sessions path failed; falling back to legacy containment"
+            ),
+            _ => {}
+        }
         let sessions = verified_sessions_root(&homes_root, &codex_home).ok_or_else(|| {
             anyhow!(
-                "Codex transcript root for run {run_id:?} is missing, symlinked, replaced, or outside {}",
+                "Codex transcript root for run {run_id:?} is missing, replaced, or outside {}",
                 homes_root.display()
             )
         })?;
