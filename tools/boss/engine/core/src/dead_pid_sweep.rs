@@ -587,11 +587,7 @@ pub async fn reap_reported_pane_death(
 
     let now_epoch_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
 
-    let detail = match report_reason {
-        WorkerPaneDeathReason::SurfaceCreationFailed => "surface creation failed before a child process attached",
-        WorkerPaneDeathReason::ChildProcessExited => "attached child process exited",
-        WorkerPaneDeathReason::Unknown => "app did not identify which pane-death callback fired",
-    };
+    let detail = report_reason.describe();
     let reason = format!("worker-pane-died: app reported {detail}");
     reap_dead_execution(
         work_db,

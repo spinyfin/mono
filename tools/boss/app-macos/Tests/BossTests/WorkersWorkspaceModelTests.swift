@@ -232,11 +232,15 @@ final class WorkersWorkspaceModelSpawnTests: XCTestCase {
         }
     }
 
-    func testSurfaceFailureReportsPaneDied() {
-        // The pane's libghostty surface never attached — no shell
-        // process ever started for this run. `onPaneDied` must fire
-        // with the run id so ContentView can report it to the engine
-        // immediately instead of waiting for the periodic dead-pid sweep.
+    func testSurfaceFailureReportsSpawnFailureNotPaneDeath() {
+        // The pane's libghostty surface never attached — no shell process
+        // ever started for this run, so nothing died. It must be reported
+        // as a SPAWN failure (`onSpawnFailed`, which the engine reaps via
+        // the never-started-spawn path that feeds the cross-work-item
+        // spawn-capability breaker) and must NOT also fire `onPaneDied`
+        // (whose engine reap does not feed that breaker). Reporting both
+        // is what raced the diagnosis out of the record and left the
+        // breaker starved through the 2026-07 no-active-display churn.
         let model = WorkersWorkspaceModel()
         var diedRunIds: [String] = []
         var reasons: [WorkerPaneDeathReason] = []
@@ -244,30 +248,44 @@ final class WorkersWorkspaceModelSpawnTests: XCTestCase {
             diedRunIds.append(runId)
             reasons.append(reason)
         }
+        var spawnFailures: [(String, String)] = []
+        model.onSpawnFailed = { spawnFailures.append(($0, $1)) }
 
         _ = model.spawnWorkerPane(makeRequest(slot: 5, runId: "exec-surface-failed"))
         let session = model.slots.first(where: { $0.slotId == 5 })?.session
-        session?.onSurfaceFailed?()
+        session?.onSurfaceCreationFailed?("no active display")
 
-        XCTAssertEqual(diedRunIds, ["exec-surface-failed"])
-        XCTAssertEqual(reasons, [.surfaceCreationFailed])
+        XCTAssertEqual(spawnFailures.map(\.0), ["exec-surface-failed"])
+        XCTAssertEqual(spawnFailures.map(\.1), ["no active display"])
+        XCTAssertTrue(
+            diedRunIds.isEmpty,
+            "a surface that never came up hosted no shell and must not be reported as a pane death"
+        )
+        XCTAssertTrue(reasons.isEmpty)
     }
 
-    func testSurfaceFailureGateSuppressesReportWithNoActiveDisplay() {
-        // The transient "no active display" condition (#800) is
-        // recoverable: `installScreenObserverIfNeeded()` retries
-        // `attemptSurfaceCreation()` once a display returns. Reporting
-        // that as a pane death would have the engine reap a
-        // live/not-yet-started execution and redispatch straight back
-        // into the same no-display wall. Only a NULL surface with a
-        // display actually present is a genuine, unrecoverable failure.
-        XCTAssertFalse(
-            GhosttyTerminalHostView.shouldReportSurfaceFailure(hasActiveDisplay: false),
-            "no active display must not be reported as a pane death"
-        )
+    func testSurfaceFailureReasonNamesTheDisplayStateActuallyObserved() {
+        // The reason string is the operator-facing explanation the engine
+        // stores as the orphan reason. A reason that names display
+        // availability whatever the real display state is makes the
+        // recoverable #800 condition and a genuine non-transient rejection
+        // (env pollution, bad cwd, version mismatch) indistinguishable in
+        // the record, so each branch must name what it actually observed.
+        let noDisplay = GhosttyTerminalHostView.surfaceFailureReason(hasActiveDisplay: false)
         XCTAssertTrue(
-            GhosttyTerminalHostView.shouldReportSurfaceFailure(hasActiveDisplay: true),
-            "a NULL surface with a display present is a genuine failure and must be reported"
+            noDisplay.contains("no active display"),
+            "the no-display case must name it as the cause; got: \(noDisplay)"
+        )
+
+        let withDisplay = GhosttyTerminalHostView.surfaceFailureReason(hasActiveDisplay: true)
+        XCTAssertTrue(
+            withDisplay.contains("a display IS active"),
+            "a failure with a display present must not blame display availability; got: \(withDisplay)"
+        )
+        XCTAssertNotEqual(
+            noDisplay,
+            withDisplay,
+            "the two causes must be distinguishable from the reason string alone"
         )
     }
 

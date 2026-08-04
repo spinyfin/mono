@@ -986,14 +986,19 @@ fn match_sig_e_spawn_nack(events: &[DispatchEvent], scope: &BTreeSet<String>) ->
         if !in_scope(&event.execution_id, scope) {
             continue;
         }
-        if event.stage != "spawn_nack" {
+        // Both stages are the same failure class: the app could not stand up
+        // a worker shell for a pane it accepted. Which one lands depends on
+        // whether the app NACKed the spawn or the pane-death report won the
+        // race (and an older app build only ever sends the latter), so
+        // matching just `spawn_nack` would leave the incident undiagnosed.
+        if event.stage != "spawn_nack" && event.stage != "pane_death_before_start" {
             continue;
         }
         out.push(Finding {
             sig_id: "SIG-E".into(),
             absence_based: false,
             severity: Severity::P2,
-            title: "spawn_nack / libghostty surface failure".into(),
+            title: "spawn_nack / pane_death_before_start / libghostty surface failure".into(),
             execution_id: Some(event.execution_id.clone()),
             work_item_id: work_item_of(event),
             count: 1,
@@ -2268,11 +2273,28 @@ mod tests {
         let nack = ev_from_json(
             r#"{"ts_epoch_ms":1784890000000,"stage":"spawn_nack","outcome":"ok","execution_id":"exec_sig_e","details":{"reason":"libghostty surface creation failed"}}"#,
         );
+        // Same failure class, different stage: the app-reported pane death
+        // that lost no shell (it never had one) is reaped as
+        // `pane_death_before_start` and must diagnose as SIG-E too.
+        let before_start = ev_from_json(
+            r#"{"ts_epoch_ms":1784890001000,"stage":"pane_death_before_start","outcome":"ok","execution_id":"exec_sig_e_pane","details":{"reason":"pane-death-before-start: the app reported that the pane's child process exited"}}"#,
+        );
         let parse = ev_from_json(
             r#"{"ts_epoch_ms":1783000000000,"stage":"pane_spawned","outcome":"error","execution_id":"exec_sig_f","worker_id":"auto-worker-2","error_message":"PaneSpawnRunner received worker_id \"auto-worker-2\" that does not parse as worker-{N}","details":{"slot_id":2}}"#,
         );
-        let findings = match_dispatch_signatures(&[nack, parse], 0, None, None, &scope(&["exec_sig_e", "exec_sig_f"]));
-        assert!(findings.iter().any(|f| f.sig_id == "SIG-E"));
+        let findings = match_dispatch_signatures(
+            &[nack, before_start, parse],
+            0,
+            None,
+            None,
+            &scope(&["exec_sig_e", "exec_sig_e_pane", "exec_sig_f"]),
+        );
+        let sig_e: Vec<_> = findings
+            .iter()
+            .filter(|f| f.sig_id == "SIG-E")
+            .filter_map(|f| f.execution_id.as_deref())
+            .collect();
+        assert_eq!(sig_e, vec!["exec_sig_e", "exec_sig_e_pane"], "{findings:?}");
         assert!(findings.iter().any(|f| f.sig_id == "SIG-F"));
     }
 

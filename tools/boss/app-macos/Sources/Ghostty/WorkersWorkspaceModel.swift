@@ -84,13 +84,17 @@ final class WorkersWorkspaceModel: ObservableObject {
     var onShellPidAvailable: ((String, Int32) -> Void)?
 
     /// Called when a worker pane dies before the engine could observe it
-    /// any other way — its surface never attached (`onSurfaceFailed`) or
-    /// its shell process exited (`onChildExited`, which only worker panes
-    /// wire up; the Boss pane instead restarts itself). `ContentView`
-    /// installs this closure to forward the death to the engine via
-    /// `sendWorkerPaneDied` so reconciliation fires immediately instead of
+    /// any other way — its shell process exited (`onChildExited`, which only
+    /// worker panes wire up; the Boss pane instead restarts itself).
+    /// `ContentView` installs this closure to forward the death to the engine
+    /// via `sendWorkerPaneDied` so reconciliation fires immediately instead of
     /// waiting for the periodic dead-pid sweep. The `runId` is the raw
     /// execution id (without the "run-" session prefix).
+    ///
+    /// A pane whose surface never came up never had a shell to exit and is
+    /// reported via [`onSpawnFailed`] instead — the two are different events
+    /// with different engine reaps, and conflating them is what produced the
+    /// 2026-07 no-active-display churn.
     var onPaneDied: ((String, WorkerPaneDeathReason) -> Void)?
 
     /// Called when a worker pane's libghostty surface FAILS to create so no
@@ -224,13 +228,10 @@ final class WorkersWorkspaceModel: ObservableObject {
             }
         }
         // Report the pane's death to the engine the moment the app itself
-        // observes it — either the surface never attached at all, or the
-        // shell process exited — instead of waiting for the periodic
-        // dead-pid sweep (up to 60s) or an app restart to notice.
-        session.onSurfaceFailed = { [weak self, weak session] in
-            guard session?.claimPaneDeathReport() == true else { return }
-            self?.onPaneDied?(capturedRunId, .surfaceCreationFailed)
-        }
+        // observes it — the shell process exited — instead of waiting for the
+        // periodic dead-pid sweep (up to 60s) or an app restart to notice.
+        // A surface that never came up is NOT reported here: it never had a
+        // shell to exit, and it goes down the spawn-failure path below.
         session.onChildExited = { [weak self, weak session] in
             // A close callback can arrive while libghostty is still creating
             // the surface, or after an engine-driven release has begun.

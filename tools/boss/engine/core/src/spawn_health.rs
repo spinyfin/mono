@@ -763,7 +763,8 @@ pub async fn trip_spawn_capability_circuit(
              machine slept, i.e. no active display).\n\n\
              Dispatch has been **paused** to stop the engine from burning spawn attempts against a \
              dead app path. Each affected execution was reaped (see the `spawn_nack` / \
-             `spawn_ack_timeout` events in `dispatch-events/current.jsonl`).\n\n\
+             `spawn_ack_timeout` / `pane_death_before_start` / `driver_start_timeout` events in \
+             `dispatch-events/current.jsonl`).\n\n\
              **Recovery is automatic:** the engine periodically force-dispatches a single queued \
              execution as a recovery probe (backing off between attempts) and auto-resumes dispatch \
              the moment one reports a real shell pid — see `spawn_capability_recovered` in \
@@ -782,7 +783,8 @@ pub async fn trip_spawn_capability_circuit(
              The spawn-capability breaker is **disabled by config** \
              (`BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER=false` is set; the breaker defaults on) — dispatch \
              was **NOT** paused; this item is observability only. Each affected execution was reaped and \
-             will be redispatched normally (see the `spawn_nack` / `spawn_ack_timeout` events in \
+             will be redispatched normally (see the `spawn_nack` / `spawn_ack_timeout` / \
+             `pane_death_before_start` / `driver_start_timeout` events in \
              `dispatch-events/current.jsonl`).\n\n\
              If this keeps happening, consider removing/unsetting `BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER=false` \
              so a systemic outage pauses dispatch (with automatic recovery) instead of relying on the \
