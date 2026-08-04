@@ -98,7 +98,25 @@ const PROJECTS_STATUS_CHECK_COLUMNS: &[(&str, &str)] = &[
     ("design_doc_draft", "design_doc_draft TEXT"),
     ("last_status_actor", "last_status_actor TEXT NOT NULL DEFAULT 'human'"),
     ("short_id", "short_id INTEGER"),
+    ("status_basis", "status_basis TEXT"),
 ];
+
+/// Add current and historical provenance for project status changes.
+///
+/// `projects.status_basis` travels with the denormalized current status so
+/// ordinary project reads can explain it. `project_property_audit.basis`
+/// extends the existing general project-property ledger; status writers add
+/// `property = 'status'` rows there so a later transition cannot erase the
+/// evidence needed to explain an earlier one.
+pub(crate) fn migrate_project_status_provenance(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "projects", "status_basis")? {
+        conn.execute("ALTER TABLE projects ADD COLUMN status_basis TEXT", [])?;
+    }
+    if !table_has_column(conn, "project_property_audit", "basis")? {
+        conn.execute("ALTER TABLE project_property_audit ADD COLUMN basis TEXT", [])?;
+    }
+    Ok(())
+}
 
 /// Every index on `projects`, recreated after the rebuild — `DROP TABLE`
 /// takes a table's indexes with it.

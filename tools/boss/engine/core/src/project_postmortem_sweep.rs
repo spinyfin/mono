@@ -11,10 +11,10 @@
 //! returns that kind for a project — see that function's doc comment; note
 //! this is *not* the same as `WorkDb::list_tasks`, the general CLI/RPC
 //! listing surface, which does include `design_postmortem` rows) is
-//! terminal. That same "implementation work drained" predicate also
-//! advances the project's status to [`ProjectStatus::Done`] (see
-//! [`maybe_mark_project_done`]) so a fully completed project does not stay
-//! `planned` forever. If at least one `project_task`/`investigation`
+//! terminal. This predicate controls postmortem scheduling only; it cannot
+//! certify the project itself complete because planning/materialization can
+//! still be in flight and because the trigger query intentionally excludes
+//! other task kinds. If at least one `project_task`/`investigation`
 //! completed since the last postmortem (or since the sweep's watermark, if
 //! there has been none — see "Boot-time-backfill bound" below), the engine
 //! auto-creates a new `design_postmortem` task whose remit is to review the
@@ -104,7 +104,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 
-use crate::work::{Product, Project, ProjectStatus, TaskKind, TaskStatus, TriggerTaskSnapshot, WorkDb, WorkItemPatch};
+use crate::work::{Product, Project, ProjectStatus, TaskKind, TaskStatus, TriggerTaskSnapshot, WorkDb};
 
 /// Interval between sweep passes. Postmortem scheduling is not latency
 /// sensitive (it fires once a whole wave of implementation work has
@@ -305,15 +305,6 @@ async fn evaluate_project(
         return Ok(EvalOutcome::Skipped);
     }
 
-    // Same drain predicate that gates postmortem scheduling: every
-    // non-cancelled outstanding task has reached a terminal status.
-    // Stamp the project `done` here so the two effects cannot drift —
-    // a project that gets a postmortem always also flips to done (and a
-    // project that drains without a postmortem, e.g. zero net new
-    // completions since the last one, still flips). Operator-driven
-    // statuses (`blocked`, `archived`) are left alone.
-    maybe_mark_project_done(work_db, project);
-
     if let Some(ref lp) = work_db.last_live_design_postmortem_for_project(&project.id)?
         && !lp.status.is_terminal()
     {
@@ -396,44 +387,6 @@ async fn evaluate_project(
     }
 
     Ok(EvalOutcome::Scheduled)
-}
-
-/// Advance `project` to [`ProjectStatus::Done`] once its trigger tasks
-/// have all reached a terminal status. Called from the same drain check
-/// that decides whether to schedule a `design_postmortem`, so the two
-/// effects share one predicate.
-///
-/// No-ops when the project is already `done`, or when the operator has
-/// parked it in `blocked` / `archived` (those statuses stay
-/// operator-driven). Failures are logged and swallowed so a stuck write
-/// cannot block postmortem scheduling on the same pass.
-fn maybe_mark_project_done(work_db: &WorkDb, project: &Project) {
-    if !matches!(project.status, ProjectStatus::Planned | ProjectStatus::Active) {
-        return;
-    }
-    match work_db.update_work_item_as_actor(
-        &project.id,
-        WorkItemPatch {
-            status: Some(ProjectStatus::Done.as_str().to_owned()),
-            ..WorkItemPatch::default()
-        },
-        "engine",
-    ) {
-        Ok(_) => {
-            tracing::info!(
-                project_id = %project.id,
-                previous_status = %project.status,
-                "project-postmortem sweep: advanced project status to done",
-            );
-        }
-        Err(err) => {
-            tracing::warn!(
-                project_id = %project.id,
-                ?err,
-                "project-postmortem sweep: failed to advance project status to done",
-            );
-        }
-    }
 }
 
 /// Parse a `completed_at`-shaped column (decimal epoch-seconds string) into
@@ -601,35 +554,12 @@ mod tests {
         }
     }
 
-    fn create_cancelled_project_task(db: &WorkDb, product_id: &str, project_id: &str, name: &str) -> Task {
-        let task = db
-            .create_task(
-                CreateTaskInput::builder()
-                    .product_id(product_id)
-                    .project_id(project_id)
-                    .name(name)
-                    .build(),
-            )
-            .unwrap();
-        db.update_work_item(
-            &task.id,
-            WorkItemPatch {
-                status: Some("cancelled".to_owned()),
-                ..WorkItemPatch::default()
-            },
-        )
-        .unwrap();
-        match db.get_work_item(&task.id).unwrap() {
-            boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t,
-            other => panic!("expected a task, got {other:?}"),
-        }
-    }
-
-    /// When every trigger task is terminal (`done`), the project advances
-    /// from `planned` to `done` on the same pass that schedules the
-    /// postmortem — one drain predicate, two effects.
+    /// Trigger-task drain schedules a postmortem but never certifies the
+    /// project complete. In production a planner can be between claiming its
+    /// run and materializing open tasks at this exact point; the trigger query
+    /// also deliberately excludes revision and postmortem rows.
     #[tokio::test]
-    async fn advances_project_to_done_when_all_tasks_terminal() {
+    async fn trigger_task_drain_does_not_mark_project_done() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
         let project = create_project_no_seed(&db, &product_id, "Alpha");
@@ -643,8 +573,8 @@ mod tests {
         assert_eq!(outcome.postmortems_created, 1);
         assert_eq!(
             project_status(db.as_ref(), &project.id),
-            ProjectStatus::Done,
-            "project must flip to done once every trigger task is terminal"
+            ProjectStatus::Planned,
+            "postmortem scheduling is not authority to certify project completion"
         );
     }
 
@@ -683,64 +613,7 @@ mod tests {
         );
     }
 
-    /// Cancelled work is terminal and not outstanding: a project whose
-    /// remaining tasks are all `cancelled` is complete and advances to
-    /// `done`. (A pure-cancelled wave does not schedule a postmortem —
-    /// there is no `done` project_task/`investigation` to review — but
-    /// the status transition still fires from the shared drain check.)
-    #[tokio::test]
-    async fn advances_project_to_done_when_remaining_tasks_are_cancelled() {
-        let (_dir, db) = open_db();
-        let product_id = create_product(&db);
-        let project = create_project_no_seed(&db, &product_id, "Alpha");
-        set_design_doc(&db, &project.id);
-        seed_watermark(&db, 0);
-        create_cancelled_project_task(&db, &product_id, &project.id, "scrapped A");
-        create_cancelled_project_task(&db, &product_id, &project.id, "scrapped B");
-        assert_eq!(project_status(&db, &project.id), ProjectStatus::Planned);
-
-        let db = Arc::new(db);
-        let outcome = run_one_pass(db.as_ref()).await;
-        assert_eq!(
-            outcome.postmortems_created, 0,
-            "cancelled-only wave has nothing to review; no postmortem"
-        );
-        assert_eq!(
-            project_status(db.as_ref(), &project.id),
-            ProjectStatus::Done,
-            "cancelled tasks are terminal; project must still flip to done"
-        );
-    }
-
-    /// Mix of `done` and `cancelled` is also complete — cancelled is not
-    /// outstanding work.
-    #[tokio::test]
-    async fn advances_project_to_done_with_mix_of_done_and_cancelled() {
-        let (_dir, db) = open_db();
-        let product_id = create_product(&db);
-        let project = create_project_no_seed(&db, &product_id, "Alpha");
-        set_design_doc(&db, &project.id);
-        seed_watermark(&db, 0);
-        create_done_project_task(
-            &db,
-            &product_id,
-            &project.id,
-            "shipped",
-            "https://github.com/o/r/pull/1",
-        );
-        create_cancelled_project_task(&db, &product_id, &project.id, "dropped");
-
-        let db = Arc::new(db);
-        let outcome = run_one_pass(db.as_ref()).await;
-        assert_eq!(outcome.postmortems_created, 1);
-        assert_eq!(
-            project_status(db.as_ref(), &project.id),
-            ProjectStatus::Done,
-            "done + cancelled must count as fully drained"
-        );
-    }
-
-    /// Operator-driven `blocked` is not overwritten by the auto-done path.
+    /// Operator-driven `blocked` is not changed by the scheduling sweep.
     #[tokio::test]
     async fn does_not_overwrite_operator_blocked_status() {
         let (_dir, db) = open_db();
@@ -764,7 +637,7 @@ mod tests {
         assert_eq!(
             project_status(db.as_ref(), &project.id),
             ProjectStatus::Blocked,
-            "blocked is operator-driven and must not be auto-advanced to done"
+            "postmortem scheduling must not change project status"
         );
     }
 

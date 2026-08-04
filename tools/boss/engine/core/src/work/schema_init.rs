@@ -756,6 +756,10 @@ impl WorkDb {
         // otherwise reject any still-corrupt row.
         migrate_repair_invalid_project_status(conn)?;
         migrate_projects_tasks_status_check(conn)?;
+        // Project lifecycle provenance: the current row states why its status
+        // was selected, and the existing append-only property audit retains
+        // every status transition (including transitions later superseded).
+        migrate_project_status_provenance(conn)?;
         // `products.design_guidance`: kind-scoped design-directive guidance,
         // distinct from `dispatch_preamble` (every kind) and
         // `editorial_rules.instructions` (GitHub-visible surfaces only) — see

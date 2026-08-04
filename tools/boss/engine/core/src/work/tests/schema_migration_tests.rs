@@ -791,6 +791,41 @@ fn migration_repairs_out_of_enum_project_status() {
     let _ = std::fs::remove_file(path);
 }
 
+/// Existing databases gain both halves of project-status provenance without
+/// fabricating a basis for transitions that happened before the migration.
+#[test]
+fn migration_adds_project_status_provenance_columns() {
+    let (_dir, path) = disk_db_path("project-status-provenance");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    LegacySchema::new(4)
+        .products(NO_EXTRA_COLUMNS)
+        .projects(PROJECTS_V4_COLUMNS)
+        .tasks(TASKS_V4_COLUMNS)
+        .seed(&legacy_product_seed("prod_legacy", "Legacy", "legacy"))
+        .seed(
+            "INSERT INTO projects(id, product_id, name, slug, status, priority, last_status_actor, created_at, updated_at)
+             VALUES ('proj_legacy', 'prod_legacy', 'Legacy project', 'legacy-project', 'active', 'medium', 'human', '1700000000', '1700000000');",
+        )
+        .create(&conn);
+    drop(conn);
+
+    let db = WorkDb::open(path.clone()).unwrap();
+    let conn = db.connect().unwrap();
+    assert!(table_has_column(&conn, "projects", "status_basis").unwrap());
+    assert!(table_has_column(&conn, "project_property_audit", "basis").unwrap());
+    let basis: Option<String> = conn
+        .query_row(
+            "SELECT status_basis FROM projects WHERE id = 'proj_legacy'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(basis.is_none(), "legacy status basis must remain unknown, not guessed");
+
+    drop(conn);
+    let _ = std::fs::remove_file(path);
+}
+
 /// After the schema-init migration chain runs, both `projects.status` and
 /// `tasks.status` must be constrained by the new `CHECK` — not just the
 /// application-level `ProjectStatus`/`TaskStatus` parsers used by the typed

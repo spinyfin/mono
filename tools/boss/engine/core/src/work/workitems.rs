@@ -790,7 +790,7 @@ impl WorkDb {
         let projects = {
             let mut stmt = conn.prepare(
                 "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor,
-                        design_doc_repo_remote_url, design_doc_branch, design_doc_path, short_id
+                        design_doc_repo_remote_url, design_doc_branch, design_doc_path, short_id, status_basis
                  FROM projects
                  WHERE product_id = ?1
                  ORDER BY created_at ASC, name COLLATE NOCASE ASC",
@@ -1076,7 +1076,7 @@ impl WorkDb {
         if let Some(project) = conn
             .query_row(
                 "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor,
-                        design_doc_repo_remote_url, design_doc_branch, design_doc_path, short_id
+                        design_doc_repo_remote_url, design_doc_branch, design_doc_path, short_id, status_basis
                  FROM projects
                  WHERE product_id = ?1 AND short_id = ?2",
                 params![product_id, short_id],
