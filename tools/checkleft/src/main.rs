@@ -36,7 +36,9 @@ use checkleft::progress::render::TermRenderer;
 use checkleft::progress::{DEFAULT_DEBOUNCE, LiveProgress, NoopProgressReporter, ProgressReporter, RenderFindings};
 use checkleft::runner::{DEFAULT_FIX_PASSES, Runner};
 use checkleft::source_tree::LocalSourceTree;
-use checkleft::vcs::{BaseRevision, Vcs, github_pr_number_for_branch, github_pull_request_description};
+use checkleft::vcs::{
+    BaseRevision, GithubApiContext, GithubApiTimeout, Vcs, github_pr_number_for_branch, github_pull_request_description,
+};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -270,7 +272,7 @@ enum ExternalProviderMode {
 /// `dispatch_run` / `dispatch_fix`).
 const EXIT_CHECKS_FAILED: u8 = 1;
 
-/// Exit code for "checkleft could not determine what changed" — a missing
+/// Exit code for "checkleft could not gather the inputs needed to run" — a missing
 /// merge base, a detached HEAD with no parent, an unresolvable `--base-ref`,
 /// or a shallow clone whose history never reaches the base. Deliberately
 /// distinct from both `ExitCode::SUCCESS` (0, a genuinely empty diff or a
@@ -285,7 +287,7 @@ const EXIT_CHANGESET_UNDETERMINED: u8 = 3;
 /// Returns the raw `u8` (rather than `ExitCode`, which is intentionally
 /// opaque and has no public equality) so the mapping itself is unit-testable.
 fn exit_code_for_error(error: &anyhow::Error) -> u8 {
-    if error.downcast_ref::<ChangesetUndetermined>().is_some() {
+    if error.downcast_ref::<ChangesetUndetermined>().is_some() || error.downcast_ref::<GithubApiTimeout>().is_some() {
         EXIT_CHANGESET_UNDETERMINED
     } else {
         1 // matches ExitCode::FAILURE
@@ -601,7 +603,7 @@ async fn dispatch_run(
     )
     .await?;
     info!("resolving changeset for run");
-    let changeset = attach_description_context(changeset_from_plan(vcs, &plan)?, vcs, env, &plan).await;
+    let changeset = attach_description_context(changeset_from_plan(vcs, &plan)?, vcs, env, &plan).await?;
     let file_count = changeset.changed_files.len();
     info!(changed_files = file_count, "resolved changeset for run");
 
@@ -1356,7 +1358,7 @@ async fn dispatch_fix(
     )
     .await?;
     info!("resolving changeset for fix");
-    let changeset = attach_description_context(changeset_from_plan(vcs, &plan)?, vcs, env, &plan).await;
+    let changeset = attach_description_context(changeset_from_plan(vcs, &plan)?, vcs, env, &plan).await?;
     info!(
         changed_files = changeset.changed_files.len(),
         "resolved changeset for fix"
@@ -1714,7 +1716,7 @@ async fn attach_description_context(
     vcs: &Vcs,
     env: &CiEnvironment,
     plan: &ChangePlan,
-) -> ChangeSet {
+) -> Result<ChangeSet> {
     info!("attaching commit and PR metadata");
     // Split commit-message surfaces:
     // - tip (`commit_description`): leakage checks (boss-ism/pr-text-leakage via
@@ -1734,13 +1736,13 @@ async fn attach_description_context(
     };
     let change_id = resolve_change_id(env);
     let repository = resolve_repository(vcs);
-    let pr_description = resolve_pr_description(repository.as_deref(), change_id.as_deref(), env, vcs).await;
-    changeset
+    let pr_description = resolve_pr_description(repository.as_deref(), change_id.as_deref(), env, vcs).await?;
+    Ok(changeset
         .with_commit_description(tip_description)
         .with_bypass_commit_descriptions(bypass_commit_descriptions)
         .with_change_id(change_id)
         .with_repository(repository)
-        .with_pr_description(pr_description)
+        .with_pr_description(pr_description))
 }
 
 /// Resolve the PR/change identifier used to fetch the PR description.
@@ -1797,15 +1799,19 @@ async fn resolve_pr_description(
     change_id: Option<&str>,
     env: &CiEnvironment,
     vcs: &Vcs,
-) -> Option<String> {
+) -> Result<Option<String>> {
     // Explicit override: highest precedence, no network call needed.
     if let Ok(raw) = std::env::var(CHECKS_PR_DESCRIPTION_ENV)
         && !raw.trim().is_empty()
     {
-        return Some(raw);
+        return Ok(Some(raw));
     }
 
-    let repository = repository?;
+    let Some(repository) = repository else {
+        return Ok(None);
+    };
+    let github_base_url = github_api_base_url();
+    let github = GithubApiContext::production(&github_base_url);
     let github_token = detect_github_token();
 
     if github_token.is_none() {
@@ -1819,8 +1825,10 @@ async fn resolve_pr_description(
             change_id = change_id,
             "fetching PR description by change id"
         );
-        if let Some(desc) = github_pull_request_description(repository, change_id, github_token.as_deref()).await {
-            return Some(desc);
+        if let Some(desc) =
+            github_pull_request_description(github, repository, change_id, github_token.as_deref()).await?
+        {
+            return Ok(Some(desc));
         }
     }
 
@@ -1841,31 +1849,37 @@ async fn resolve_pr_description(
         let mut descriptions = Vec::new();
         for pr_number in merge_queue_pr_numbers {
             if let Some(description) =
-                github_pull_request_description(repository, &pr_number, github_token.as_deref()).await
+                github_pull_request_description(github, repository, &pr_number, github_token.as_deref()).await?
             {
                 descriptions.push(description);
             }
         }
-        return (!descriptions.is_empty()).then(|| descriptions.join("\n\n"));
+        return Ok((!descriptions.is_empty()).then(|| descriptions.join("\n\n")));
     }
 
     // Level 3b: no PR number from env — detect the current branch and look up
     // the open PR via the GitHub API. Best-effort: missing token, no open PR,
-    // or any network failure all silently yield None.
-    let branch = detect_current_branch(env, vcs)?;
+    // or non-timeout network failure all silently yield None. Timeouts are
+    // fatal because proceeding without mandatory GitHub inputs is unsafe.
+    let Some(branch) = detect_current_branch(env, vcs) else {
+        return Ok(None);
+    };
     info!(
         repository = repository,
         branch = branch,
         "resolving PR description via branch lookup"
     );
-    let pr_number = github_pr_number_for_branch(repository, &branch, github_token.as_deref()).await?;
+    let Some(pr_number) = github_pr_number_for_branch(github, repository, &branch, github_token.as_deref()).await?
+    else {
+        return Ok(None);
+    };
     info!(
         repository = repository,
         branch = branch,
         pr_number = pr_number,
         "fetching PR description for branch-resolved PR"
     );
-    github_pull_request_description(repository, &pr_number, github_token.as_deref()).await
+    github_pull_request_description(github, repository, &pr_number, github_token.as_deref()).await
 }
 
 /// Detect the name of the current branch for Level 3b PR lookup (branch→PR

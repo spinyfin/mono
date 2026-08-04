@@ -2,16 +2,71 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::input::{ChangeKind, ChangeSet, ChangedFile};
-use tracing::info;
+use tracing::{info, warn};
 
 mod patch_line_deltas;
 
 use patch_line_deltas::parse_file_diffs_from_git_patch;
+
+/// Thirty seconds accommodates a slow TLS handshake and GitHub response while
+/// still failing promptly when a blackholed connection would block checkleft.
+const GITHUB_API_TIMEOUT_SECS: u64 = 30;
+
+/// Settings for best-effort GitHub API lookups.
+///
+/// The base URL supports GitHub Enterprise and mock servers in tests. The
+/// timeout remains explicit so callers cannot accidentally make these lookups
+/// unbounded.
+#[derive(Clone, Copy)]
+pub struct GithubApiContext<'a> {
+    pub base_url: &'a str,
+    pub timeout: Duration,
+}
+
+impl<'a> GithubApiContext<'a> {
+    pub fn new(base_url: &'a str, timeout: Duration) -> Self {
+        Self { base_url, timeout }
+    }
+
+    pub fn production(base_url: &'a str) -> Self {
+        Self::new(base_url, Duration::from_secs(GITHUB_API_TIMEOUT_SECS))
+    }
+}
+
+/// The GitHub inputs required to run checkleft could not be retrieved before
+/// the configured deadline.
+#[derive(Debug)]
+pub struct GithubApiTimeout {
+    operation: &'static str,
+}
+
+impl GithubApiTimeout {
+    pub fn new(operation: &'static str) -> Self {
+        Self { operation }
+    }
+}
+
+impl std::fmt::Display for GithubApiTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "GitHub API call timed out after {GITHUB_API_TIMEOUT_SECS} seconds while {}",
+            self.operation
+        )
+    }
+}
+
+impl std::error::Error for GithubApiTimeout {}
+
+fn github_timeout(operation: &'static str) -> anyhow::Error {
+    GithubApiTimeout::new(operation).into()
+}
 
 /// Install the process-wide rustls crypto provider exactly once, before the
 /// first TLS handshake. Shared by every authenticated GitHub API path (PR
@@ -270,13 +325,20 @@ struct GithubPullRequestListItem {
 }
 
 pub async fn github_pull_request_description(
+    github: GithubApiContext<'_>,
     repository: &str,
     change_id: &str,
     github_token: Option<&str>,
-) -> Option<String> {
-    let url = format!("https://api.github.com/repos/{repository}/pulls/{change_id}");
+) -> Result<Option<String>> {
+    let url = format!(
+        "{}/repos/{repository}/pulls/{change_id}",
+        github.base_url.trim_end_matches('/')
+    );
     ensure_rustls_provider();
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(github.timeout)
+        .build()
+        .context("failed to build GitHub API client for PR description lookup")?;
     let mut request = client
         .get(url)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
@@ -286,27 +348,62 @@ pub async fn github_pull_request_description(
         request = request.bearer_auth(token);
     }
 
-    let response = request.send().await.ok()?;
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(error) if error.is_timeout() => return Err(github_timeout("fetching PR description")),
+        Err(error) => {
+            warn!(repository, error = %error, "checkleft: GitHub PR description lookup skipped — transport error");
+            return Ok(None);
+        }
+    };
     if !response.status().is_success() {
-        return None;
+        warn!(repository, status = %response.status(), "checkleft: GitHub PR description lookup skipped — non-success status");
+        return Ok(None);
     }
 
-    let response_bytes = response.bytes().await.ok()?;
-    let payload: GithubPullRequestResponse = serde_json::from_slice(&response_bytes).ok()?;
+    let response_bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) if error.is_timeout() => return Err(github_timeout("fetching PR description")),
+        Err(error) => {
+            warn!(repository, error = %error, "checkleft: GitHub PR description lookup skipped — response body error");
+            return Ok(None);
+        }
+    };
+    let payload: GithubPullRequestResponse = match serde_json::from_slice(&response_bytes) {
+        Ok(payload) => payload,
+        Err(error) => {
+            warn!(repository, error = %error, "checkleft: GitHub PR description lookup skipped — invalid JSON response");
+            return Ok(None);
+        }
+    };
     // A successful response with an empty body is still a resolved PR
     // description. Callers need that distinction to avoid reporting that the
     // PR description was unreachable.
-    Some(payload.body.unwrap_or_default())
+    Ok(Some(payload.body.unwrap_or_default()))
 }
 
 /// Look up the open PR number for a branch via the GitHub API.
 /// Returns the PR number as a string (e.g. "42"), or None if no open PR is
-/// found, auth fails, or any error occurs (all failures are best-effort).
-pub async fn github_pr_number_for_branch(repository: &str, branch: &str, github_token: Option<&str>) -> Option<String> {
-    let owner = repository.split('/').next()?;
-    let url = format!("https://api.github.com/repos/{repository}/pulls?head={owner}:{branch}&state=open&per_page=1");
+/// found, auth fails, or a non-timeout error occurs. Timeouts are returned as
+/// errors so the caller cannot proceed with incomplete GitHub inputs.
+pub async fn github_pr_number_for_branch(
+    github: GithubApiContext<'_>,
+    repository: &str,
+    branch: &str,
+    github_token: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(owner) = repository.split('/').next() else {
+        return Ok(None);
+    };
+    let url = format!(
+        "{}/repos/{repository}/pulls?head={owner}:{branch}&state=open&per_page=1",
+        github.base_url.trim_end_matches('/')
+    );
     ensure_rustls_provider();
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(github.timeout)
+        .build()
+        .context("failed to build GitHub API client for branch PR lookup")?;
     let mut request = client
         .get(url)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
@@ -316,14 +413,35 @@ pub async fn github_pr_number_for_branch(repository: &str, branch: &str, github_
         request = request.bearer_auth(token);
     }
 
-    let response = request.send().await.ok()?;
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(error) if error.is_timeout() => return Err(github_timeout("looking up the open PR for a branch")),
+        Err(error) => {
+            warn!(repository, error = %error, "checkleft: GitHub branch PR lookup skipped — transport error");
+            return Ok(None);
+        }
+    };
     if !response.status().is_success() {
-        return None;
+        warn!(repository, status = %response.status(), "checkleft: GitHub branch PR lookup skipped — non-success status");
+        return Ok(None);
     }
 
-    let bytes = response.bytes().await.ok()?;
-    let prs: Vec<GithubPullRequestListItem> = serde_json::from_slice(&bytes).ok()?;
-    prs.into_iter().next().map(|pr| pr.number.to_string())
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) if error.is_timeout() => return Err(github_timeout("looking up the open PR for a branch")),
+        Err(error) => {
+            warn!(repository, error = %error, "checkleft: GitHub branch PR lookup skipped — response body error");
+            return Ok(None);
+        }
+    };
+    let prs: Vec<GithubPullRequestListItem> = match serde_json::from_slice(&bytes) {
+        Ok(prs) => prs,
+        Err(error) => {
+            warn!(repository, error = %error, "checkleft: GitHub branch PR lookup skipped — invalid JSON response");
+            return Ok(None);
+        }
+    };
+    Ok(prs.into_iter().next().map(|pr| pr.number.to_string()))
 }
 
 fn run_command(root: &Path, binary: &str, args: &[&str]) -> Result<String> {
@@ -699,14 +817,61 @@ fn parse_repo_slug_from_remote_url(remote_url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use crate::input::ChangeKind;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{
-        parse_git_name_status, parse_git_status_porcelain_paths, parse_jj_diff_summary, parse_jj_remote_list_url,
-        parse_repo_root_output, parse_repo_slug_from_remote_url, parse_tracked_file_list,
-        resolve_jj_repo_slug_from_remote_list, try_expand_brace_notation,
+        GithubApiContext, GithubApiTimeout, github_pull_request_description, parse_git_name_status,
+        parse_git_status_porcelain_paths, parse_jj_diff_summary, parse_jj_remote_list_url, parse_repo_root_output,
+        parse_repo_slug_from_remote_url, parse_tracked_file_list, resolve_jj_repo_slug_from_remote_list,
+        try_expand_brace_notation,
     };
+
+    #[tokio::test]
+    async fn pr_description_timeout_is_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/pulls/42"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(100)))
+            .mount(&server)
+            .await;
+
+        let error = github_pull_request_description(
+            GithubApiContext::new(&server.uri(), Duration::from_millis(10)),
+            "o/r",
+            "42",
+            None,
+        )
+        .await
+        .expect_err("a delayed GitHub response must not degrade to no description");
+
+        assert!(error.downcast_ref::<GithubApiTimeout>().is_some());
+        assert!(error.to_string().contains("timed out"), "unexpected error: {error:#}");
+    }
+
+    #[tokio::test]
+    async fn pr_description_non_success_degrades_to_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/pulls/42"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let description = github_pull_request_description(
+            GithubApiContext::new(&server.uri(), Duration::from_secs(1)),
+            "o/r",
+            "42",
+            None,
+        )
+        .await
+        .expect("non-timeout GitHub failures are best effort");
+
+        assert_eq!(description, None);
+    }
 
     #[test]
     fn parses_jj_diff_summary() {
