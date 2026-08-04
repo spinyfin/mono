@@ -32,7 +32,9 @@ use tracing::warn;
 
 use crate::exclusion_matcher::ExclusionMatcher;
 use crate::external::sandbox::HostCeiling;
-use crate::external::timeout::{CheckDeadline, output_with_timeout, resolve_timeout_ms};
+use crate::external::timeout::{
+    CheckDeadline, DECLARATIVE_HOST_CEILING_TIMEOUT_MS, output_with_timeout, resolve_timeout_ms,
+};
 use crate::fix::safety::WritableSandbox;
 use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
@@ -121,18 +123,9 @@ fn run_declarative_check_impl(
     }
 
     // Resolution is only needed for tool invocations; bazel_aspect invocations
-    // delegate to bazel and declare no binaries (needs may be empty).
-    // Per-file invocations receive the one-file default rather than multiplying
-    // the proportional increment by the entire check's file count for every
-    // individual subprocess.
-    let timeout_file_count = if package.invocations.iter().all(
-        |invocation| matches!(invocation.kind, InvocationKind::Tool(ref tool) if tool.mode == InvocationMode::PerFile),
-    ) {
-        1
-    } else {
-        files.len()
-    };
-    let timeout_ms = resolve_timeout_ms(package.limits.as_ref(), timeout_file_count);
+    // delegate to bazel and declare no binaries (needs may be empty). The
+    // deadline is shared by the whole check, including all per-file invocations.
+    let timeout_ms = declarative_timeout_ms(package, files.len());
     let context = CheckExecutionContext {
         repo_root,
         check_id: package_id,
@@ -176,6 +169,13 @@ fn run_declarative_check_impl(
         check_id: package_id.to_owned(),
         findings,
     })
+}
+
+/// Resolve the one deadline shared by binary resolution and every invocation
+/// in a declarative check. The file count therefore reflects the complete
+/// eligible changeset even when invocations run one subprocess per file.
+pub(super) fn declarative_timeout_ms(package: &ExternalCheckDeclarativePackage, n_files: usize) -> u64 {
+    resolve_timeout_ms(package.limits.as_ref(), n_files, DECLARATIVE_HOST_CEILING_TIMEOUT_MS)
 }
 
 /// Remove findings that describe the same location + issue as an earlier finding.
@@ -1031,14 +1031,7 @@ pub fn run_declarative_fix(
         .collect();
     let fixable_files = fixable_files.as_slice();
 
-    let timeout_file_count = if package.invocations.iter().all(
-        |invocation| matches!(invocation.kind, InvocationKind::Tool(ref tool) if tool.mode == InvocationMode::PerFile),
-    ) {
-        1
-    } else {
-        fixable_files.len()
-    };
-    let timeout_ms = resolve_timeout_ms(package.limits.as_ref(), timeout_file_count);
+    let timeout_ms = declarative_timeout_ms(package, fixable_files.len());
     let context = CheckExecutionContext {
         repo_root: context.repo_root,
         check_id: context.check_id,

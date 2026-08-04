@@ -103,7 +103,11 @@ pub(crate) fn resolve_all_with_npx(
         config,
         npx,
         "binary resolution",
-        CheckDeadline::new(crate::external::timeout::resolve_timeout_ms(None, 0)),
+        CheckDeadline::new(crate::external::timeout::resolve_timeout_ms(
+            None,
+            0,
+            crate::external::timeout::DECLARATIVE_HOST_CEILING_TIMEOUT_MS,
+        )),
     )
 }
 
@@ -334,7 +338,11 @@ pub fn binary_version_string(binary: &Path) -> String {
         binary,
         "binary version probe",
         &format!("version probe for binary `{}`", binary.display()),
-        crate::external::timeout::resolve_timeout_ms(None, 0),
+        crate::external::timeout::resolve_timeout_ms(
+            None,
+            0,
+            crate::external::timeout::DECLARATIVE_HOST_CEILING_TIMEOUT_MS,
+        ),
     )
     .unwrap_or_default()
 }

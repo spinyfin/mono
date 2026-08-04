@@ -163,10 +163,10 @@ pub struct ExternalCheckComponentPackage {
     pub provenance: Option<ExternalCheckArtifactProvenance>,
 }
 
-/// Per-manifest resource limits. `timeout_ms` bounds each component or
-/// declarative subprocess independently; `max_memory_mb` applies only to
-/// component checks. Values are clamped by host ceilings so out-of-tree
-/// manifests cannot grant themselves unbounded resources.
+/// Per-manifest resource limits. `timeout_ms` bounds the complete component or
+/// declarative check execution, including binary resolution and all subprocesses;
+/// `max_memory_mb` applies only to component checks. Values are clamped by host
+/// ceilings so out-of-tree manifests cannot grant themselves unbounded resources.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalCheckLimits {
     pub timeout_ms: Option<u64>,
@@ -287,7 +287,7 @@ impl RawDeclarativeCheckManifest {
         };
 
         let implementation = ExternalCheckPackageImplementation::Declarative(
-            declarative::validate_declarative_implementation(&id, declarative_fields)?,
+            declarative::validate_declarative_implementation(declarative_fields)?,
         );
         Ok(ExternalCheckPackage {
             id,
@@ -404,7 +404,6 @@ impl RawExternalCheckPackage {
                 reject_if_present_list("checks", &checks)?;
                 reject_if_present("provenance", provenance.as_ref())?;
                 ExternalCheckPackageImplementation::Declarative(declarative::validate_declarative_implementation(
-                    &id,
                     declarative,
                 )?)
             }

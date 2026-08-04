@@ -769,7 +769,7 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
 ///
 /// Returns `(timeout_ms, max_memory_bytes)`.
 fn resolve_component_limits(limits: Option<&ExternalCheckLimits>, n_files: usize) -> (u64, usize) {
-    let timeout_ms = super::timeout::resolve_timeout_ms(limits, n_files);
+    let timeout_ms = super::timeout::resolve_timeout_ms(limits, n_files, super::timeout::HOST_CEILING_TIMEOUT_MS);
 
     let max_memory_mb = limits
         .and_then(|l| l.max_memory_mb)

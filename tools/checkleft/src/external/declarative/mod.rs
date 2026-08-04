@@ -115,7 +115,9 @@ use template::Template;
 /// nothing else (no guest code) to run the wrapped tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalCheckDeclarativePackage {
-    /// Per-subprocess wall-clock limit shared with component checks.
+    /// Check-wide wall-clock budget using the shared component timeout formula.
+    /// Declarative checks use their own host ceiling because Bazel resolution can
+    /// legitimately wait longer than a WASM component execution.
     pub limits: Option<ExternalCheckLimits>,
     /// Declared binary requirements ("named holes"), keyed by name. Each carries a
     /// default binding; a CHECKS-config override may substitute a different one.
@@ -479,7 +481,6 @@ struct RawFinding {
 /// Validate the raw declarative fields into the [`ExternalCheckDeclarativePackage`]
 /// model. Called by the parent manifest validator for `mode = "declarative"`.
 pub(super) fn validate_declarative_implementation(
-    _id: &str,
     raw: RawDeclarativeFields,
 ) -> Result<ExternalCheckDeclarativePackage> {
     if raw.applies_to.is_empty() {

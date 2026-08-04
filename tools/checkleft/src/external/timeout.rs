@@ -1,10 +1,10 @@
 //! Shared wall-clock timeout policy for external check execution.
 //!
 //! Component and declarative checks use the same manifest `limits.timeout_ms`
-//! override, proportional default, and host ceiling. Declarative subprocesses
-//! are supervised synchronously: if the parent cannot observe their completion
-//! before the deadline, it kills the child and returns an error rather than
-//! treating an incomplete check as clean.
+//! override and proportional default, while retaining separate host ceilings.
+//! Declarative subprocesses are supervised synchronously: if the parent cannot
+//! observe their completion before the deadline, it kills the child and returns
+//! an error rather than treating an incomplete check as clean.
 
 use std::fmt;
 use std::io::Read;
@@ -17,20 +17,21 @@ use anyhow::{Context, Result};
 
 use super::ExternalCheckLimits;
 
-/// Base wall-clock budget for external checks (15 seconds). Used as the fixed
+/// Base wall-clock budget for component checks (5 seconds). Used as the fixed
 /// component of the proportional timeout formula when no explicit
 /// `limits.timeout_ms` override is set in the check manifest.
 ///
-/// A subprocess can be queued briefly on a loaded CI host even when it is not
-/// wedged. Fifteen seconds leaves room for that normal scheduling variance while
-/// still failing a stalled check promptly.
-pub(crate) const BASE_COMPONENT_TIMEOUT_MS: u64 = 15_000;
+pub(crate) const BASE_COMPONENT_TIMEOUT_MS: u64 = 5_000;
 /// Per-file wall-clock budget increment (100 ms per changed file). Combined
 /// with [`BASE_COMPONENT_TIMEOUT_MS`] to form a proportional default timeout.
 pub(crate) const PER_FILE_COMPONENT_TIMEOUT_MS: u64 = 100;
-/// Maximum timeout a manifest may request (15 minutes). Requests above this are
+/// Maximum component timeout a manifest may request (5 minutes). Requests above this are
 /// silently clamped so out-of-tree manifests cannot hang the host unboundedly.
-pub(crate) const HOST_CEILING_TIMEOUT_MS: u64 = 900_000;
+pub(crate) const HOST_CEILING_TIMEOUT_MS: u64 = 300_000;
+/// Maximum declarative timeout a manifest may request (15 minutes). Bazel-backed
+/// declarative checks can legitimately wait on a shared Bazel server longer than
+/// the component ceiling, while remaining bounded.
+pub(crate) const DECLARATIVE_HOST_CEILING_TIMEOUT_MS: u64 = 900_000;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Bounded time to collect pipe readers after the direct child exits.
@@ -87,14 +88,19 @@ impl fmt::Display for SubprocessTimeout {
 
 impl std::error::Error for SubprocessTimeout {}
 
-/// Resolve the shared component/declarative timeout budget for `n_files`.
-pub(crate) fn resolve_timeout_ms(limits: Option<&ExternalCheckLimits>, n_files: usize) -> u64 {
+/// Resolve the shared proportional timeout formula for `n_files`, clamped to
+/// the caller's host ceiling.
+pub(crate) fn resolve_timeout_ms(
+    limits: Option<&ExternalCheckLimits>,
+    n_files: usize,
+    host_ceiling_timeout_ms: u64,
+) -> u64 {
     if let Some(explicit) = limits.and_then(|limits| limits.timeout_ms) {
-        explicit.min(HOST_CEILING_TIMEOUT_MS)
+        explicit.min(host_ceiling_timeout_ms)
     } else {
         BASE_COMPONENT_TIMEOUT_MS
             .saturating_add(PER_FILE_COMPONENT_TIMEOUT_MS.saturating_mul(n_files as u64))
-            .min(HOST_CEILING_TIMEOUT_MS)
+            .min(host_ceiling_timeout_ms)
     }
 }
 

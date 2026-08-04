@@ -5,7 +5,9 @@
 
 use std::path::Path;
 
-use crate::external::timeout::{HOST_CEILING_TIMEOUT_MS, resolve_timeout_ms};
+use crate::external::timeout::{
+    BASE_COMPONENT_TIMEOUT_MS, DECLARATIVE_HOST_CEILING_TIMEOUT_MS, PER_FILE_COMPONENT_TIMEOUT_MS,
+};
 use crate::input::{ChangeKind, ChangeSet, ChangedFile};
 use crate::output::Severity;
 
@@ -96,7 +98,48 @@ message = "unused"
     let crate::external::ExternalCheckPackageImplementation::Declarative(package) = package.implementation else {
         panic!("expected declarative package");
     };
-    assert_eq!(resolve_timeout_ms(package.limits.as_ref(), 1), HOST_CEILING_TIMEOUT_MS);
+    assert_eq!(
+        super::executor::declarative_timeout_ms(&package, 1),
+        DECLARATIVE_HOST_CEILING_TIMEOUT_MS
+    );
+}
+
+#[test]
+fn multi_file_per_file_check_uses_a_check_wide_proportional_budget() {
+    let package = crate::external::parse_external_check_package_manifest(
+        r#"
+id = "test/check-wide-default"
+mode = "declarative"
+runtime = "declarative-v1"
+api_version = "v1"
+applies_to = ["**/*.rs"]
+
+[needs.tool.default]
+path = "/bin/true"
+
+[[invocations]]
+id = "per-file"
+run = "tool"
+mode = "per_file"
+args = ["{{file}}"]
+exit = { "0" = "ok", default = "error" }
+
+[invocations.transform]
+kind = "linelist"
+message = "unused"
+"#,
+    )
+    .expect("manifest parses");
+    let crate::external::ExternalCheckPackageImplementation::Declarative(package) = package.implementation else {
+        panic!("expected declarative package");
+    };
+
+    let file_count = 10usize;
+    assert_eq!(
+        super::executor::declarative_timeout_ms(&package, file_count),
+        BASE_COMPONENT_TIMEOUT_MS + PER_FILE_COMPONENT_TIMEOUT_MS * file_count as u64,
+        "a check-wide deadline must account for every eligible file, even for per-file subprocesses"
+    );
 }
 
 #[cfg(unix)]
