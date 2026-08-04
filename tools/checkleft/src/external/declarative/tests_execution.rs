@@ -11,6 +11,60 @@ use crate::output::Severity;
 use super::ExternalCheckDeclarativePackage;
 use super::tests_common::{make_changeset, write_executable};
 
+#[cfg(unix)]
+#[test]
+fn timed_out_subprocess_fails_with_named_limit() {
+    let repo_root = tempfile::tempdir().expect("temp repo root");
+    let script = repo_root.path().join("hang.sh");
+    write_executable(&script, "#!/bin/sh\nsleep 1\n");
+    let manifest = format!(
+        r#"
+id = "test/timeout"
+mode = "declarative"
+runtime = "declarative-v1"
+api_version = "v1"
+applies_to = ["**/*.rs"]
+
+[limits]
+timeout_ms = 25
+
+[needs.tool.default]
+path = "{}"
+
+[[invocations]]
+id = "hang"
+run = "tool"
+mode = "batch"
+args = ["{{{{files}}}}"]
+exit = {{ "0" = "ok", default = "error" }}
+
+[invocations.transform]
+kind = "linelist"
+message = "unused"
+"#,
+        script.display()
+    );
+    let package = crate::external::parse_external_check_package_manifest(&manifest).expect("manifest parses");
+    let crate::external::ExternalCheckPackageImplementation::Declarative(package) = package.implementation else {
+        panic!("expected declarative package");
+    };
+
+    let error = super::run_declarative_check(
+        repo_root.path(),
+        "test/timeout",
+        &package,
+        &make_changeset(&["src/lib.rs"]),
+        &toml::Value::Table(Default::default()),
+        None,
+    )
+    .expect_err("timed-out subprocess must fail the check");
+    let message = format!("{error:#}");
+    assert!(message.contains("check `test/timeout`"), "{message}");
+    assert!(message.contains("declarative invocation `hang`"), "{message}");
+    assert!(message.contains("25 ms wall-clock limit"), "{message}");
+    assert!(message.contains("after"), "{message}");
+}
+
 // ── batch chunking (ARG_MAX guard) ────────────────────────────────────────────────
 
 #[test]

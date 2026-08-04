@@ -23,28 +23,17 @@ use super::component_bindings::checkleft::check::types as wit_types;
 use super::declarative::run_declarative_check_with_progress;
 use super::sandbox::{AccessScope, HostCeiling, create_sandbox};
 use super::{
-    EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1, ExternalCheckComponentLimits, ExternalCheckComponentPackage,
-    ExternalCheckPackage, ExternalCheckPackageImplementation,
+    EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1, ExternalCheckComponentPackage, ExternalCheckLimits, ExternalCheckPackage,
+    ExternalCheckPackageImplementation,
 };
 
 mod cwasm_cache;
 pub use cwasm_cache::{ComponentAotCache, cache_file_name, precompile_into_cache_dir};
 
-/// Base wall-clock budget for component-v1 checks (5 seconds). Used as the
-/// fixed component of the proportional timeout formula when no explicit
-/// `timeout_ms` override is set in the check manifest.
-pub(crate) const BASE_COMPONENT_TIMEOUT_MS: u64 = 5_000;
-/// Per-file wall-clock budget increment (100 ms per changed file). Combined
-/// with `BASE_COMPONENT_TIMEOUT_MS` to form a proportional default timeout:
-/// `effective_ms = BASE + PER_FILE * n_files`, clamped to
-/// `HOST_CEILING_TIMEOUT_MS`.
-pub(crate) const PER_FILE_COMPONENT_TIMEOUT_MS: u64 = 100;
+#[cfg(test)]
+pub(crate) use super::timeout::{BASE_COMPONENT_TIMEOUT_MS, HOST_CEILING_TIMEOUT_MS, PER_FILE_COMPONENT_TIMEOUT_MS};
 /// Default memory cap for component-v1 checks (256 MiB).
 pub(crate) const DEFAULT_COMPONENT_MAX_MEMORY_MB: u64 = 256;
-/// Maximum timeout a manifest may request (5 minutes). Requests above this
-/// are silently clamped so out-of-tree manifests cannot hang the host for an
-/// unbounded duration. Sized to accommodate whole-repo changesets.
-pub(crate) const HOST_CEILING_TIMEOUT_MS: u64 = 300_000;
 /// Maximum memory a manifest may request (512 MiB). Requests above this are
 /// silently clamped so out-of-tree manifests cannot exhaust host memory.
 pub(crate) const HOST_CEILING_MAX_MEMORY_MB: u64 = 512;
@@ -781,14 +770,8 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
 /// × n_files`, also clamped to the ceiling.
 ///
 /// Returns `(timeout_ms, max_memory_bytes)`.
-fn resolve_component_limits(limits: Option<&ExternalCheckComponentLimits>, n_files: usize) -> (u64, usize) {
-    let timeout_ms = if let Some(explicit) = limits.and_then(|l| l.timeout_ms) {
-        explicit.min(HOST_CEILING_TIMEOUT_MS)
-    } else {
-        let proportional =
-            BASE_COMPONENT_TIMEOUT_MS.saturating_add(PER_FILE_COMPONENT_TIMEOUT_MS.saturating_mul(n_files as u64));
-        proportional.min(HOST_CEILING_TIMEOUT_MS)
-    };
+fn resolve_component_limits(limits: Option<&ExternalCheckLimits>, n_files: usize) -> (u64, usize) {
+    let timeout_ms = super::timeout::resolve_timeout_ms(limits, n_files);
 
     let max_memory_mb = limits
         .and_then(|l| l.max_memory_mb)
@@ -954,7 +937,7 @@ struct ComponentRun<'a> {
     package: &'a ExternalCheckPackage,
     check_name: &'a str,
     component: &'a Component,
-    limits: Option<&'a ExternalCheckComponentLimits>,
+    limits: Option<&'a ExternalCheckLimits>,
     changeset: &'a ChangeSet,
     source_tree: &'a dyn SourceTree,
     config: &'a toml::Value,
@@ -1083,7 +1066,7 @@ struct FixRun<'a> {
     package: &'a ExternalCheckPackage,
     check_name: &'a str,
     component: &'a Component,
-    limits: Option<&'a ExternalCheckComponentLimits>,
+    limits: Option<&'a ExternalCheckLimits>,
     changeset: &'a ChangeSet,
     source_tree: &'a dyn SourceTree,
     config: &'a toml::Value,

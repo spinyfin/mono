@@ -28,6 +28,7 @@ use std::collections::BTreeMap;
 use anyhow::{Result, bail};
 use serde::Deserialize;
 
+use crate::external::ExternalCheckLimits;
 use crate::output::Severity;
 
 pub mod executor;
@@ -114,6 +115,10 @@ use template::Template;
 /// nothing else (no guest code) to run the wrapped tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalCheckDeclarativePackage {
+    /// Manifest check ID, used in operator-visible subprocess failures.
+    pub id: String,
+    /// Per-execution wall-clock limit shared with component checks.
+    pub limits: Option<ExternalCheckLimits>,
     /// Declared binary requirements ("named holes"), keyed by name. Each carries a
     /// default binding; a CHECKS-config override may substitute a different one.
     pub needs: BTreeMap<String, BinaryRequirement>,
@@ -340,13 +345,18 @@ pub(super) struct RawDeclarativeFields {
     pub needs: BTreeMap<String, RawBinaryRequirement>,
     pub invocations: Vec<RawInvocation>,
     pub skip_symlinks: bool,
+    pub limits: Option<ExternalCheckLimits>,
 }
 
 impl RawDeclarativeFields {
     /// True when none of the declarative-only fields are set — used by the parent
     /// module to reject them in artifact/exec modes.
     pub(super) fn is_empty(&self) -> bool {
-        self.applies_to.is_empty() && self.needs.is_empty() && self.invocations.is_empty() && !self.skip_symlinks
+        self.applies_to.is_empty()
+            && self.needs.is_empty()
+            && self.invocations.is_empty()
+            && !self.skip_symlinks
+            && self.limits.is_none()
     }
 }
 
@@ -471,6 +481,7 @@ struct RawFinding {
 /// Validate the raw declarative fields into the [`ExternalCheckDeclarativePackage`]
 /// model. Called by the parent manifest validator for `mode = "declarative"`.
 pub(super) fn validate_declarative_implementation(
+    id: &str,
     raw: RawDeclarativeFields,
 ) -> Result<ExternalCheckDeclarativePackage> {
     if raw.applies_to.is_empty() {
@@ -509,6 +520,8 @@ pub(super) fn validate_declarative_implementation(
     }
 
     Ok(ExternalCheckDeclarativePackage {
+        id: id.to_owned(),
+        limits: raw.limits,
         needs,
         applies_to: raw.applies_to,
         invocations,

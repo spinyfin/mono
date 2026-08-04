@@ -32,6 +32,7 @@ use tracing::warn;
 
 use crate::exclusion_matcher::ExclusionMatcher;
 use crate::external::sandbox::HostCeiling;
+use crate::external::timeout::{output_with_timeout, resolve_timeout_ms};
 use crate::fix::safety::WritableSandbox;
 use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
@@ -121,12 +122,18 @@ fn run_declarative_check_impl(
 
     // Resolution is only needed for tool invocations; bazel_aspect invocations
     // delegate to bazel and declare no binaries (needs may be empty).
+    let timeout_ms = resolve_timeout_ms(package.limits.as_ref(), files.len());
+    let context = CheckExecutionContext {
+        repo_root,
+        check_id: package_id,
+        timeout_ms,
+    };
     let binaries = if package
         .invocations
         .iter()
         .any(|invocation| matches!(invocation.kind, InvocationKind::Tool(_)))
     {
-        resolve::resolve_all(repo_root, &package.needs, config)?
+        resolve::resolve_all(repo_root, &package.needs, config, context.check_id, context.timeout_ms)?
     } else {
         BTreeMap::new()
     };
@@ -140,7 +147,7 @@ fn run_declarative_check_impl(
     let mut findings = Vec::new();
     for invocation in &package.invocations {
         findings.extend(run_invocation(
-            repo_root,
+            context,
             &binaries,
             invocation,
             &files,
@@ -313,7 +320,7 @@ pub(crate) fn select_files(
 }
 
 fn run_invocation(
-    repo_root: &Path,
+    context: CheckExecutionContext<'_>,
     binaries: &BTreeMap<String, resolve::ResolvedBinary>,
     invocation: &Invocation,
     files: &[String],
@@ -323,7 +330,7 @@ fn run_invocation(
 ) -> Result<Vec<Finding>> {
     let mut findings = match &invocation.kind {
         InvocationKind::Tool(tool) => run_tool_invocation(
-            repo_root,
+            context,
             binaries,
             invocation,
             tool,
@@ -332,19 +339,19 @@ fn run_invocation(
             on_file_processed,
         )?,
         InvocationKind::BazelAspect(aspect) => {
-            run_bazel_aspect_invocation(repo_root, invocation, aspect, files, effective_severity)?
+            run_bazel_aspect_invocation(context, invocation, aspect, files, effective_severity)?
         }
     };
 
     // Normalize absolute paths to repo-relative. Tools invoked via the hermetic
     // Bazel toolchain wrapper may receive absolute input paths and echo them back;
     // the framework strips the repo root prefix before the finding reaches the runner.
-    normalize_finding_paths(&mut findings, repo_root);
+    normalize_finding_paths(&mut findings, context.repo_root);
     Ok(findings)
 }
 
 fn run_tool_invocation(
-    repo_root: &Path,
+    context: CheckExecutionContext<'_>,
     binaries: &BTreeMap<String, resolve::ResolvedBinary>,
     invocation: &Invocation,
     tool: &ToolInvocation,
@@ -382,7 +389,7 @@ fn run_tool_invocation(
                     .args
                     .iter()
                     .filter(|a| *a != "{{files}}")
-                    .map(|a| a.replace("{{repo_root}}", &repo_root.to_string_lossy()))
+                    .map(|a| a.replace("{{repo_root}}", &context.repo_root.to_string_lossy()))
                     .map(|a| a.len() + 1)
                     .sum::<usize>();
             let chunks = split_files_into_chunks(fixed_cost, files);
@@ -391,8 +398,8 @@ fn run_tool_invocation(
             // as a single tick (one batch invocation per chunk).
             let mut processed = 0usize;
             for chunk in chunks {
-                let args = with_prefix(expand_batch_args(repo_root, &tool.args, chunk, config_values)?);
-                let output = spawn(repo_root, &binary.program, &args, &invocation.id)?;
+                let args = with_prefix(expand_batch_args(context.repo_root, &tool.args, chunk, config_values)?);
+                let output = spawn(context, &binary.program, &args, &invocation.id)?;
                 findings.extend(classify_and_project(
                     invocation,
                     &output,
@@ -413,8 +420,13 @@ fn run_tool_invocation(
             let mut findings = Vec::new();
             let mut processed = 0usize;
             for file in files {
-                let args = with_prefix(expand_per_file_args(repo_root, &tool.args, file, config_values)?);
-                let output = spawn(repo_root, &binary.program, &args, &invocation.id)?;
+                let args = with_prefix(expand_per_file_args(
+                    context.repo_root,
+                    &tool.args,
+                    file,
+                    config_values,
+                )?);
+                let output = spawn(context, &binary.program, &args, &invocation.id)?;
                 match invocation.exit.classify(output.exit_code) {
                     ExitOutcome::Ok => {}
                     ExitOutcome::Findings => {
@@ -500,7 +512,7 @@ fn expand_build_flag(flag: &str, effective_severity: Option<Severity>) -> Option
 /// reduces to artifact lookup. Freshness is bazel's guarantee — checkleft never
 /// reads an artifact bazel did not just account for.
 fn run_bazel_aspect_invocation(
-    repo_root: &Path,
+    context: CheckExecutionContext<'_>,
     invocation: &Invocation,
     aspect: &BazelAspectInvocation,
     files: &[String],
@@ -530,7 +542,7 @@ fn run_bazel_aspect_invocation(
         "--output=label".to_owned(),
         query,
     ]);
-    let query_output = spawn(repo_root, &bazel, &query_args, &invocation.id)?;
+    let query_output = spawn(context, &bazel, &query_args, &invocation.id)?;
     if !matches!(query_output.exit_code, Some(0) | Some(3)) {
         bail!(
             "bazel_aspect invocation `{}`: target query failed (exit {}): {}",
@@ -584,7 +596,7 @@ fn run_bazel_aspect_invocation(
             "--output=label".to_owned(),
             test_query,
         ]);
-        let test_query_output = spawn(repo_root, &bazel, &test_query_args, &invocation.id)?;
+        let test_query_output = spawn(context, &bazel, &test_query_args, &invocation.id)?;
         if matches!(test_query_output.exit_code, Some(0) | Some(3)) {
             for line in String::from_utf8_lossy(&test_query_output.stdout).lines() {
                 let line = line.trim();
@@ -628,7 +640,7 @@ fn run_bazel_aspect_invocation(
     build_args.extend(aspect_flags.iter().cloned());
     build_args.extend(expanded_build_flags.iter().cloned());
     build_args.extend(targets.iter().cloned());
-    let build_output = spawn(repo_root, &bazel, &build_args, &invocation.id)?;
+    let build_output = spawn(context, &bazel, &build_args, &invocation.id)?;
     match invocation.exit.classify(build_output.exit_code) {
         ExitOutcome::Ok => return Ok(Vec::new()),
         ExitOutcome::Findings => {}
@@ -649,7 +661,7 @@ fn run_bazel_aspect_invocation(
     cquery_args.extend(expanded_build_flags.iter().cloned());
     cquery_args.push("--output=files".to_owned());
     cquery_args.push(format!("set({})", targets.join(" ")));
-    let cquery_output = spawn(repo_root, &bazel, &cquery_args, &invocation.id)?;
+    let cquery_output = spawn(context, &bazel, &cquery_args, &invocation.id)?;
     if cquery_output.exit_code != Some(0) {
         bail!(
             "bazel_aspect invocation `{}`: artifact discovery (cquery --output=files) failed (exit {}): {}",
@@ -669,7 +681,7 @@ fn run_bazel_aspect_invocation(
         if artifact.is_empty() {
             continue;
         }
-        let path = repo_root.join(artifact);
+        let path = context.repo_root.join(artifact);
         let contents = std::fs::read(&path).with_context(|| {
             format!(
                 "bazel_aspect invocation `{}`: failed to read artifact `{}`",
@@ -866,15 +878,27 @@ struct InvocationOutput {
     exit_code: Option<i32>,
 }
 
-fn spawn(repo_root: &Path, binary: &Path, args: &[String], invocation_id: &str) -> Result<InvocationOutput> {
+#[derive(Clone, Copy)]
+struct CheckExecutionContext<'a> {
+    repo_root: &'a Path,
+    check_id: &'a str,
+    timeout_ms: u64,
+}
+
+fn spawn(
+    context: CheckExecutionContext<'_>,
+    binary: &Path,
+    args: &[String],
+    invocation_id: &str,
+) -> Result<InvocationOutput> {
     let mut command = Command::new(binary);
-    command.args(args).current_dir(repo_root);
-    let output = command.output().with_context(|| {
-        format!(
-            "failed to spawn declarative invocation `{invocation_id}` binary `{}`",
-            binary.display()
-        )
-    })?;
+    command.args(args).current_dir(context.repo_root);
+    let output = output_with_timeout(
+        &mut command,
+        context.check_id,
+        &format!("declarative invocation `{invocation_id}` binary `{}`", binary.display()),
+        context.timeout_ms,
+    )?;
     Ok(InvocationOutput {
         stdout: output.stdout,
         stderr: output.stderr,
@@ -990,7 +1014,13 @@ pub fn run_declarative_fix(
         .collect();
     let fixable_files = fixable_files.as_slice();
 
-    let binaries = match resolve::resolve_all(repo_root, &package.needs, config) {
+    let timeout_ms = resolve_timeout_ms(package.limits.as_ref(), fixable_files.len());
+    let context = CheckExecutionContext {
+        repo_root,
+        check_id: &package.id,
+        timeout_ms,
+    };
+    let binaries = match resolve::resolve_all(repo_root, &package.needs, config, context.check_id, context.timeout_ms) {
         Ok(b) => b,
         Err(err) => {
             // Binary resolution failed: synthesize an error for every fix-capable
@@ -1114,7 +1144,7 @@ pub fn run_declarative_fix(
         let outcome = match fix.mode {
             InvocationMode::Batch => execute_fix_batch(
                 sandbox.root_path(),
-                repo_root,
+                context,
                 &binary.program,
                 &binary.prefix_args,
                 fix,
@@ -1129,7 +1159,7 @@ pub fn run_declarative_fix(
             ),
             InvocationMode::PerFile => execute_fix_per_file(
                 sandbox.root_path(),
-                repo_root,
+                context,
                 &binary.program,
                 &binary.prefix_args,
                 fix,
@@ -1170,7 +1200,7 @@ pub fn run_declarative_fix(
 #[allow(clippy::too_many_arguments)]
 fn execute_fix_batch(
     sandbox_root: &Path,
-    repo_root: &Path,
+    context: CheckExecutionContext<'_>,
     program: &Path,
     prefix_args: &[String],
     fix: &FixBlock,
@@ -1186,15 +1216,19 @@ fn execute_fix_batch(
             .args
             .iter()
             .filter(|a| *a != "{{files}}")
-            .map(|a| a.replace("{{repo_root}}", &repo_root.to_string_lossy()))
+            .map(|a| a.replace("{{repo_root}}", &context.repo_root.to_string_lossy()))
             .map(|a| a.len() + 1)
             .sum::<usize>();
     let chunks = split_files_into_chunks(fixed_cost, files);
 
     for chunk in chunks {
         let mut args = prefix_args.to_vec();
-        args.extend(expand_batch_args(repo_root, &fix.args, chunk, config_values)?);
-        let output = spawn(sandbox_root, program, &args, invocation_id)?;
+        args.extend(expand_batch_args(context.repo_root, &fix.args, chunk, config_values)?);
+        let sandbox_context = CheckExecutionContext {
+            repo_root: sandbox_root,
+            ..context
+        };
+        let output = spawn(sandbox_context, program, &args, invocation_id)?;
         if fix.exit.classify(output.exit_code) == FixExitOutcome::Error {
             // Any chunk error → abort. Dropping `sandbox` removes staged work;
             // the real tree is untouched.
@@ -1217,7 +1251,7 @@ fn execute_fix_batch(
     let changed = sandbox
         .detect_changes()
         .context("failed to detect changes in fix sandbox")?;
-    let report = sandbox.copy_back(&changed, repo_root);
+    let report = sandbox.copy_back(&changed, context.repo_root);
     let error = report
         .failed
         .map(|(path, err)| anyhow!("copy-back stopped at {}: {err:#}", path.display()));
@@ -1242,7 +1276,7 @@ fn execute_fix_batch(
 #[allow(clippy::too_many_arguments)]
 fn execute_fix_per_file(
     sandbox_root: &Path,
-    repo_root: &Path,
+    context: CheckExecutionContext<'_>,
     program: &Path,
     prefix_args: &[String],
     fix: &FixBlock,
@@ -1257,8 +1291,12 @@ fn execute_fix_per_file(
 
     for file in files {
         let mut args = prefix_args.to_vec();
-        args.extend(expand_per_file_args(repo_root, &fix.args, file, config_values)?);
-        match spawn(sandbox_root, program, &args, invocation_id) {
+        args.extend(expand_per_file_args(context.repo_root, &fix.args, file, config_values)?);
+        let sandbox_context = CheckExecutionContext {
+            repo_root: sandbox_root,
+            ..context
+        };
+        match spawn(sandbox_context, program, &args, invocation_id) {
             Ok(output) => match fix.exit.classify(output.exit_code) {
                 FixExitOutcome::Ok => {
                     ok_files.insert(PathBuf::from(file));
@@ -1289,7 +1327,7 @@ fn execute_fix_per_file(
         .detect_changes()
         .context("failed to detect changes in fix sandbox")?;
     let to_copy_back: Vec<PathBuf> = changed.into_iter().filter(|p| ok_files.contains(p)).collect();
-    let report = sandbox.copy_back(&to_copy_back, repo_root);
+    let report = sandbox.copy_back(&to_copy_back, context.repo_root);
     let error = report
         .failed
         .map(|(path, err)| anyhow!("copy-back stopped at {}: {err:#}", path.display()));
@@ -1320,7 +1358,7 @@ mod tests {
 
     use tempfile::{TempDir, tempdir};
 
-    use super::{execute_fix_batch, execute_fix_per_file, normalize_finding_paths};
+    use super::{CheckExecutionContext, execute_fix_batch, execute_fix_per_file, normalize_finding_paths};
     use crate::external::declarative::FixBlock;
     use crate::external::sandbox::HostCeiling;
     use crate::fix::safety::WritableSandbox;
@@ -1429,7 +1467,11 @@ case "$1" in *b.txt) exit 1 ;; *) exit 0 ;; esac"#,
 
         let outcome = execute_fix_per_file(
             sandbox.root_path(),
-            dir.path(),
+            CheckExecutionContext {
+                repo_root: dir.path(),
+                check_id: "test/fix",
+                timeout_ms: 5_000,
+            },
             Path::new("/bin/sh"),
             &prefix,
             &fix,
@@ -1488,7 +1530,11 @@ exit 1"#,
 
         let outcome = execute_fix_per_file(
             sandbox.root_path(),
-            dir.path(),
+            CheckExecutionContext {
+                repo_root: dir.path(),
+                check_id: "test/fix",
+                timeout_ms: 5_000,
+            },
             Path::new("/bin/sh"),
             &prefix,
             &fix,
@@ -1535,7 +1581,11 @@ exit 1"#,
 
         let outcome = execute_fix_batch(
             sandbox.root_path(),
-            dir.path(),
+            CheckExecutionContext {
+                repo_root: dir.path(),
+                check_id: "test/fix",
+                timeout_ms: 5_000,
+            },
             Path::new("/bin/sh"),
             &prefix,
             &fix,

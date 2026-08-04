@@ -33,6 +33,9 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 use super::{BinaryBinding, BinaryRequirement};
+#[cfg(test)]
+use crate::external::timeout::resolve_timeout_ms;
+use crate::external::timeout::{SubprocessTimeout, output_with_timeout};
 
 /// A declared binary resolved to a concrete command: the program to spawn plus any
 /// prefix args that must precede the invocation's own templated args.
@@ -69,18 +72,39 @@ pub fn resolve_all(
     repo_root: &Path,
     needs: &BTreeMap<String, BinaryRequirement>,
     config: &toml::Value,
+    check_id: &str,
+    timeout_ms: u64,
 ) -> Result<BTreeMap<String, ResolvedBinary>> {
-    resolve_all_with_npx(repo_root, needs, config, locate_npx().as_deref())
+    resolve_all_with_npx_and_timeout(repo_root, needs, config, locate_npx().as_deref(), check_id, timeout_ms)
 }
 
 /// Inner resolver with the located `npx` (or `None`) injected. Split out so tests
 /// can drive both the resolved-pin and missing-npx-fallback paths deterministically
 /// without depending on the host PATH.
+#[cfg(test)]
 pub(crate) fn resolve_all_with_npx(
     repo_root: &Path,
     needs: &BTreeMap<String, BinaryRequirement>,
     config: &toml::Value,
     npx: Option<&Path>,
+) -> Result<BTreeMap<String, ResolvedBinary>> {
+    resolve_all_with_npx_and_timeout(
+        repo_root,
+        needs,
+        config,
+        npx,
+        "binary resolution",
+        resolve_timeout_ms(None, 0),
+    )
+}
+
+fn resolve_all_with_npx_and_timeout(
+    repo_root: &Path,
+    needs: &BTreeMap<String, BinaryRequirement>,
+    config: &toml::Value,
+    npx: Option<&Path>,
+    check_id: &str,
+    timeout_ms: u64,
 ) -> Result<BTreeMap<String, ResolvedBinary>> {
     let mut resolved = BTreeMap::new();
     for (name, requirement) in needs {
@@ -89,10 +113,10 @@ pub(crate) fn resolve_all_with_npx(
             .with_context(|| format!("invalid config override for binary `{name}`"))?;
 
         let binary = if let Some(binding) = override_binding {
-            resolve_binding(repo_root, &binding, npx)
+            resolve_binding(repo_root, &binding, npx, check_id, timeout_ms)
                 .with_context(|| format!("failed to resolve declared binary `{name}`"))?
         } else {
-            resolve_requirement(repo_root, name, requirement, npx)?
+            resolve_requirement(repo_root, name, requirement, npx, check_id, timeout_ms)?
         };
 
         resolved.insert(name.clone(), binary);
@@ -108,8 +132,10 @@ fn resolve_requirement(
     name: &str,
     requirement: &BinaryRequirement,
     npx: Option<&Path>,
+    check_id: &str,
+    timeout_ms: u64,
 ) -> Result<ResolvedBinary> {
-    match resolve_binding(repo_root, &requirement.default, npx) {
+    match resolve_binding(repo_root, &requirement.default, npx, check_id, timeout_ms) {
         Ok(binary) => Ok(binary),
         Err(err) => {
             let Some(fallback) = &requirement.fallback else {
@@ -120,10 +146,23 @@ fn resolve_requirement(
                     )
                 });
             };
-            let fallback_binary = resolve_binding(repo_root, fallback, npx).with_context(|| {
-                format!("primary resolution of `{name}` failed AND fallback resolution also failed")
-            })?;
-            let version = binary_version_string(&fallback_binary.program);
+            let fallback_binary =
+                resolve_binding(repo_root, fallback, npx, check_id, timeout_ms).with_context(|| {
+                    format!("primary resolution of `{name}` failed AND fallback resolution also failed")
+                })?;
+            let version = match binary_version_string(
+                &fallback_binary.program,
+                check_id,
+                &format!(
+                    "version probe for fallback binary `{}`",
+                    fallback_binary.program.display()
+                ),
+                timeout_ms,
+            ) {
+                Ok(version) => version,
+                Err(err) if err.downcast_ref::<SubprocessTimeout>().is_some() => return Err(err),
+                Err(_) => String::new(),
+            };
             eprintln!(
                 "warning: checkleft: `{name}`: hermetic toolchain unresolved ({err:#}); \
                  falling back to PATH binary `{}` ({})",
@@ -139,13 +178,19 @@ fn resolve_requirement(
     }
 }
 
-fn resolve_binding(repo_root: &Path, binding: &BinaryBinding, npx: Option<&Path>) -> Result<ResolvedBinary> {
+fn resolve_binding(
+    repo_root: &Path,
+    binding: &BinaryBinding,
+    npx: Option<&Path>,
+    check_id: &str,
+    timeout_ms: u64,
+) -> Result<ResolvedBinary> {
     match binding {
         BinaryBinding::Path(path) => Ok(ResolvedBinary::bare(resolve_path_binding(repo_root, path))),
-        BinaryBinding::Bazel(target) => Ok(ResolvedBinary::bare(resolve_bazel_target_executable(
-            repo_root, target,
+        BinaryBinding::Bazel(target) => Ok(ResolvedBinary::bare(resolve_bazel_target_executable_with_timeout(
+            repo_root, target, check_id, timeout_ms,
         )?)),
-        BinaryBinding::Npm { package, version } => resolve_npm_binding(package, version, npx),
+        BinaryBinding::Npm { package, version } => resolve_npm_binding(package, version, npx, check_id, timeout_ms),
     }
 }
 
@@ -165,14 +210,20 @@ const MIN_NODE_MAJOR_VERSION: u32 = 22;
 /// any globally-installed copy. Returns `Err` (so a declared `fallback` can take
 /// over) when `npx` is not on PATH, or when the Node runtime `npx` would run under
 /// is older than [`MIN_NODE_MAJOR_VERSION`].
-fn resolve_npm_binding(package: &str, version: &str, npx: Option<&Path>) -> Result<ResolvedBinary> {
+fn resolve_npm_binding(
+    package: &str,
+    version: &str,
+    npx: Option<&Path>,
+    check_id: &str,
+    timeout_ms: u64,
+) -> Result<ResolvedBinary> {
     let npx = npx.ok_or_else(|| {
         anyhow::anyhow!(
             "`npx` not found on PATH; cannot provision npm package `{package}@{version}` \
              (install Node.js/npm, or declare a `needs.<name>.fallback.path`)"
         )
     })?;
-    check_node_runtime_version(package, npx)?;
+    check_node_runtime_version(package, npx, check_id, timeout_ms)?;
     Ok(ResolvedBinary {
         program: npx.to_path_buf(),
         // `--yes` auto-confirms fetching the pinned package non-interactively (CI);
@@ -207,14 +258,19 @@ fn locate_npx() -> Option<PathBuf> {
 /// the runtime npx will use. When no colocated `node` is found, or its version
 /// can't be parsed, this is a no-op (best-effort diagnostic, not a strict gate —
 /// npx's own PATH resolution is authoritative for what actually runs).
-fn check_node_runtime_version(package: &str, npx: &Path) -> Result<()> {
+fn check_node_runtime_version(package: &str, npx: &Path, check_id: &str, timeout_ms: u64) -> Result<()> {
     let Some(node) = npx.parent().map(|dir| dir.join("node")) else {
         return Ok(());
     };
     if !node.is_file() {
         return Ok(());
     }
-    let raw_version = binary_version_string(&node);
+    let raw_version = binary_version_string(
+        &node,
+        check_id,
+        &format!("Node runtime version probe for npm package `{package}`"),
+        timeout_ms,
+    )?;
     let Some(major) = parse_node_major_version(&raw_version) else {
         return Ok(());
     };
@@ -256,15 +312,15 @@ fn resolve_path_binding(repo_root: &Path, path: &str) -> PathBuf {
     }
 }
 
-/// Returns the trimmed first line of `binary --version`, or an empty string on failure.
-pub fn binary_version_string(binary: &Path) -> String {
-    Command::new(binary)
-        .arg("--version")
-        .output()
+/// Returns the trimmed first line of `binary --version` under the shared limit.
+fn binary_version_string(binary: &Path, check_id: &str, subprocess: &str, timeout_ms: u64) -> Result<String> {
+    let mut command = Command::new(binary);
+    command.arg("--version");
+    let output = output_with_timeout(&mut command, check_id, subprocess, timeout_ms)?;
+    Ok(String::from_utf8(output.stdout)
         .ok()
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|s| s.lines().next().unwrap_or("").trim().to_owned())
-        .unwrap_or_default()
+        .and_then(|version| version.lines().next().map(|line| line.trim().to_owned()))
+        .unwrap_or_default())
 }
 
 /// Read an optional `applies_to` glob list override from the per-check `config` blob.
@@ -391,8 +447,19 @@ fn override_npm_binding(name: &str, requirement: &BinaryRequirement, npm: &toml:
 /// Returns an absolute path to the built binary.
 ///
 /// `pub(crate)` so tests can call it directly (gated e2e, parity).
+#[cfg(test)]
 pub(crate) fn resolve_bazel_target_executable(repo_root: &Path, target: &str) -> Result<PathBuf> {
-    let build_output = Command::new("bazel")
+    resolve_bazel_target_executable_with_timeout(repo_root, target, "binary resolution", resolve_timeout_ms(None, 0))
+}
+
+fn resolve_bazel_target_executable_with_timeout(
+    repo_root: &Path,
+    target: &str,
+    check_id: &str,
+    timeout_ms: u64,
+) -> Result<PathBuf> {
+    let mut build = Command::new("bazel");
+    build
         .args(super::ci_bazel_startup_flags())
         .arg("build")
         .arg("--color=no")
@@ -401,9 +468,13 @@ pub(crate) fn resolve_bazel_target_executable(repo_root: &Path, target: &str) ->
         .arg("--show_result=0")
         .arg("--ui_event_filters=-info")
         .arg(target)
-        .current_dir(repo_root)
-        .output()
-        .with_context(|| format!("failed to spawn `bazel build {target}`"))?;
+        .current_dir(repo_root);
+    let build_output = output_with_timeout(
+        &mut build,
+        check_id,
+        &format!("Bazel build while resolving `{target}`"),
+        timeout_ms,
+    )?;
 
     if !build_output.status.success() {
         let stderr = String::from_utf8_lossy(&build_output.stderr);
@@ -414,7 +485,8 @@ pub(crate) fn resolve_bazel_target_executable(repo_root: &Path, target: &str) ->
         );
     }
 
-    let cquery_output = Command::new("bazel")
+    let mut cquery = Command::new("bazel");
+    cquery
         .args(super::ci_bazel_startup_flags())
         .arg("cquery")
         .arg("--color=no")
@@ -423,9 +495,13 @@ pub(crate) fn resolve_bazel_target_executable(repo_root: &Path, target: &str) ->
         .arg(target)
         .arg("--output=starlark")
         .arg("--starlark:expr=target.files_to_run.executable.path if target.files_to_run.executable else ''")
-        .current_dir(repo_root)
-        .output()
-        .with_context(|| format!("failed to spawn `bazel cquery {target}`"))?;
+        .current_dir(repo_root);
+    let cquery_output = output_with_timeout(
+        &mut cquery,
+        check_id,
+        &format!("Bazel cquery while resolving `{target}`"),
+        timeout_ms,
+    )?;
 
     if !cquery_output.status.success() {
         let stderr = String::from_utf8_lossy(&cquery_output.stderr);
@@ -493,7 +569,8 @@ mod tests {
         let npx = temp.path().join("npx");
         write_fake_executable(&npx, "#!/bin/sh\n");
 
-        let err = check_node_runtime_version("oxfmt", &npx).expect_err("stale node must fail preflight");
+        let err =
+            check_node_runtime_version("oxfmt", &npx, "test/node", 5_000).expect_err("stale node must fail preflight");
         let message = format!("{err:#}");
         assert!(message.contains("Node.js >= 22"), "message: {message}");
         assert!(message.contains("v20.7.0"), "message: {message}");
@@ -508,14 +585,14 @@ mod tests {
         let npx = temp.path().join("npx");
         write_fake_executable(&npx, "#!/bin/sh\n");
 
-        check_node_runtime_version("oxfmt", &npx).expect("current node must pass preflight");
+        check_node_runtime_version("oxfmt", &npx, "test/node", 5_000).expect("current node must pass preflight");
     }
 
     #[test]
     fn check_node_runtime_version_is_noop_without_colocated_node() {
         // No `node` binary next to `npx` — best-effort diagnostic, not a strict
         // gate, so resolution proceeds and npx's own PATH lookup is authoritative.
-        check_node_runtime_version("oxfmt", Path::new("/fake/bin/npx"))
+        check_node_runtime_version("oxfmt", Path::new("/fake/bin/npx"), "test/node", 5_000)
             .expect("must not fail without a colocated node");
     }
 }
