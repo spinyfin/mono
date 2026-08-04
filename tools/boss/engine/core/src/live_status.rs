@@ -283,13 +283,18 @@ fn render_entry(line: &Value) -> String {
         "assistant" => render_assistant(line),
         "tool_result" => {
             let name = line.get("tool_name").and_then(Value::as_str).unwrap_or("tool");
+            let verb = if line.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
+                "failed:"
+            } else {
+                "returned"
+            };
             let output = line
                 .get("content")
                 .and_then(compact_value_text)
                 .map(|text| boss_engine_utils::string_clip::clip_to_bytes(&text, 200));
             match output {
-                Some(output) if !output.is_empty() => format!("tool: {name} returned {output}"),
-                _ => format!("tool: {name} returned"),
+                Some(output) if !output.is_empty() => format!("tool: {name} {verb} {output}"),
+                _ => format!("tool: {name} {verb}"),
             }
         }
         // Codex lifecycle fillers (`task_started` / bare `task_complete` /
@@ -557,6 +562,15 @@ mod tests {
                 "content":"all tests passed\n"
             })),
             "tool: Bash returned all tests passed"
+        );
+        assert_eq!(
+            render_entry(&json!({
+                "type":"tool_result",
+                "tool_name":"Bash",
+                "content":"command exited 1\n",
+                "is_error":true
+            })),
+            "tool: Bash failed: command exited 1"
         );
     }
 

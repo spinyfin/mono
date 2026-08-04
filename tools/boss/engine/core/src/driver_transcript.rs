@@ -311,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_driver_normalization_matches_canonical_conversation_records() {
+    fn codex_driver_normalization_matches_canonical_conversation_turns() {
         // A complete Codex turn carries user and assistant prose in multiple
         // rollout representations. The driver path feeds the app and marker
         // scans, so its conversation records must agree with the schema-aware
@@ -329,7 +329,7 @@ mod tests {
             "\n",
             r#"{"timestamp":"2026-08-04T02:15:19.965Z","type":"event_msg","payload":{"type":"agent_message","message":"answer"}}"#,
             "\n",
-            r#"{"timestamp":"2026-08-04T02:15:19.965Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"}}}"#,
+            r#"{"timestamp":"2026-08-04T02:15:19.965Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}}"#,
             "\n",
             r#"{"timestamp":"2026-08-04T02:15:20.012Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":"answer"}}"#,
             "\n",
@@ -337,7 +337,10 @@ mod tests {
         let driver = DriverRegistry::default().require("codex").unwrap();
         let normalized = parse_transcript_with_driver(Some(driver.as_ref()), jsonl);
         let canonical = crate::transcript_markdown::parse_transcript_checked(jsonl).unwrap();
-        let conversation_kinds = |events: &[TranscriptEvent]| {
+        // Reasoning records are intentionally excluded: the schema-aware
+        // parser retains them as Thinking, while the driver path drops them
+        // because they are not worker conversation or marker-scannable prose.
+        let conversation_turn_kinds = |events: &[TranscriptEvent]| {
             events
                 .iter()
                 .filter(|event| {
@@ -353,7 +356,10 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        assert_eq!(conversation_kinds(&normalized), conversation_kinds(&canonical));
+        assert_eq!(
+            conversation_turn_kinds(&normalized),
+            conversation_turn_kinds(&canonical)
+        );
         assert_eq!(assistant_texts(&normalized), vec!["answer"]);
         assert!(normalized.iter().any(|event| matches!(
             &event.kind,

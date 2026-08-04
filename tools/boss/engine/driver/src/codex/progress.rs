@@ -14,7 +14,6 @@
 //! `tools/boss/docs/designs/codex-as-a-first-class-agent-driver.md` — so it
 //! was removed rather than kept unreachable.
 
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -693,10 +692,9 @@ pub(super) fn normalize_rollout(raw: Value) -> Value {
 pub(super) struct CodexTranscriptSession {
     calls: RolloutCallTracker,
     /// Assistant response_item messages are the canonical transcript source.
-    /// Keep the turn ids until task_complete so its last_agent_message can
-    /// remain a fallback for a partially flushed rollout without becoming a
-    /// second copy of an already-recorded assistant message.
-    assistant_response_turns: HashSet<String>,
+    /// Keep whether one arrived since the current task boundary so its
+    /// last_agent_message can remain a fallback for a partially flushed
+    /// rollout without becoming a second copy of an already-recorded message.
     assistant_response_since_boundary: bool,
 }
 
@@ -708,7 +706,6 @@ impl Default for CodexTranscriptSession {
     fn default() -> Self {
         Self {
             calls: RolloutCallTracker::with_capacity(MAX_TRACKED_TRANSCRIPT_TOOL_CALLS, "transcript"),
-            assistant_response_turns: HashSet::new(),
             assistant_response_since_boundary: false,
         }
     }
@@ -727,7 +724,6 @@ impl CodexTranscriptSession {
         let normalized = match parsed {
             RolloutEnvelope::SessionMeta => {
                 self.calls.reset();
-                self.assistant_response_turns.clear();
                 self.assistant_response_since_boundary = false;
                 json!({"type":"system"})
             }
@@ -813,10 +809,9 @@ impl CodexTranscriptSession {
             return None;
         }
         let normalized = normalize_rollout_message(payload)?;
-        if let Some(turn_id) = rollout_turn_id(payload) {
-            self.assistant_response_turns.insert(turn_id.to_owned());
+        if normalized["type"] == "assistant" {
+            self.assistant_response_since_boundary = true;
         }
-        self.assistant_response_since_boundary = true;
         Some(normalized)
     }
 
@@ -824,7 +819,7 @@ impl CodexTranscriptSession {
         match event_type {
             // `response_item` role=assistant is the canonical per-message
             // source. `agent_message` is a rollout echo of it.
-            "agent_message" => None,
+            "agent_message" => Some(json!({"type":"system"})),
             // `event_msg.user_message` is the canonical user source. Its
             // response_item counterpart includes injected boilerplate.
             "user_message" => Some(json!({
@@ -845,9 +840,7 @@ impl CodexTranscriptSession {
                 Some(lifecycle_system("task_started", "turn started"))
             }
             "task_complete" => {
-                let had_canonical_assistant = rollout_turn_id(payload)
-                    .map(|turn_id| self.assistant_response_turns.remove(turn_id))
-                    .unwrap_or(self.assistant_response_since_boundary);
+                let had_canonical_assistant = self.assistant_response_since_boundary;
                 self.assistant_response_since_boundary = false;
 
                 // A fatal `error` takes priority over `last_agent_message` (Codex
@@ -878,15 +871,6 @@ impl TranscriptSessionNormalizer for CodexTranscriptSession {
     fn normalize_transcript_entry(&mut self, raw: Value) -> Value {
         self.normalize(raw)
     }
-}
-
-fn rollout_turn_id(payload: &Map<String, Value>) -> Option<&str> {
-    payload.get("turn_id").and_then(Value::as_str).or_else(|| {
-        payload
-            .get("internal_chat_message_metadata_passthrough")
-            .and_then(|metadata| metadata.get("turn_id"))
-            .and_then(Value::as_str)
-    })
 }
 
 fn preserve_rollout_timestamp(mut normalized: Value, raw: &Value) -> Value {
@@ -977,7 +961,10 @@ fn normalize_rollout_message(payload: &Map<String, Value>) -> Option<Value> {
         "assistant" if !text.is_empty() => Some(assistant_text(&text)),
         // `event_msg.user_message` is the canonical source for user prose;
         // it avoids replaying Codex's injected context. Developer/system
-        // messages are likewise not conversation turns.
+        // messages are likewise not conversation turns. Return the canonical
+        // system marker so deliberate suppression is distinct from an
+        // unrecognized additive rollout variant.
+        "user" | "developer" | "system" => Some(json!({"type":"system"})),
         _ => None,
     }
 }
@@ -1972,6 +1959,18 @@ mod tests {
 
     #[test]
     fn rollout_records_become_canonical_renderable_records() {
+        let agent_echo = normalize_rollout(json!({
+            "type":"event_msg",
+            "payload":{"type":"agent_message","message":"answer"}
+        }));
+        assert_eq!(agent_echo, json!({"type":"system"}));
+
+        let injected_user = normalize_rollout(json!({
+            "type":"response_item",
+            "payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"context"}]}
+        }));
+        assert_eq!(injected_user, json!({"type":"system"}));
+
         let aborted = normalize_rollout(json!({
             "type":"event_msg",
             "payload":{"type":"turn_aborted","turn_id":"turn-1","reason":"interrupted"}
