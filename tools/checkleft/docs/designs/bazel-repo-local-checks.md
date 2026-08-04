@@ -180,7 +180,7 @@ Execution should fail when:
 
 Implementation should bound resource usage with:
 
-- the shared `limits.timeout_ms` wall-clock budget used by component and declarative checks,
+- the shared `limits.timeout_ms` per-subprocess wall-clock budget used by component and declarative checks,
 - stdout and stderr capture limits.
 
 ## Manifest Model
@@ -496,7 +496,7 @@ Framework changes should be:
 - add a repo-local executor that spawns the executable directly,
 - set `cwd` to repo root and pass stdin JSON,
 - capture stdout and stderr with limits,
-- apply the shared `limits.timeout_ms` timeout policy used by component and declarative checks,
+- apply the shared `limits.timeout_ms` per-subprocess timeout policy used by component and declarative checks,
 - disallow repo-local exec packages coming from remote external config.
 
 The current JSON input and output structs can be reused as the wire format.

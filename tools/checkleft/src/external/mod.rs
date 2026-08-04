@@ -24,7 +24,8 @@ pub mod declarative;
 pub(crate) mod timeout;
 
 pub use declarative::{
-    ExternalCheckDeclarativePackage, FixInvocationOutcome, run_declarative_check, run_declarative_fix,
+    DeclarativeFixContext, ExternalCheckDeclarativePackage, FixInvocationOutcome, run_declarative_check,
+    run_declarative_fix,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,15 +163,18 @@ pub struct ExternalCheckComponentPackage {
     pub provenance: Option<ExternalCheckArtifactProvenance>,
 }
 
-/// Per-manifest resource limits. `timeout_ms` applies to component and
-/// declarative execution; `max_memory_mb` applies only to component checks.
-/// Values are clamped by host ceilings so out-of-tree manifests cannot grant
-/// themselves unbounded resources.
+/// Per-manifest resource limits. `timeout_ms` bounds each component or
+/// declarative subprocess independently; `max_memory_mb` applies only to
+/// component checks. Values are clamped by host ceilings so out-of-tree
+/// manifests cannot grant themselves unbounded resources.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalCheckLimits {
     pub timeout_ms: Option<u64>,
     pub max_memory_mb: Option<u64>,
 }
+
+/// Backwards-compatible name for [`ExternalCheckLimits`].
+pub type ExternalCheckComponentLimits = ExternalCheckLimits;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -30,7 +30,7 @@ use crate::external::{ExternalCheckPackageImplementation, parse_declarative_chec
 use crate::source_tree::LocalSourceTree;
 
 use super::ExternalCheckDeclarativePackage;
-use super::executor::run_declarative_fix;
+use super::executor::{DeclarativeFixContext, run_declarative_fix};
 
 /// The committed format/rust manifest — the actual thing shipped to CI.
 const RUSTFMT_MANIFEST: &str = include_str!("../../../checks/format/rust.yaml");
@@ -130,7 +130,10 @@ async fn fix_succeeds_on_file_declaring_absent_sibling_module() {
     let exclusion = ExclusionMatcher::default();
 
     let outcomes = run_declarative_fix(
-        repo_root.path(),
+        DeclarativeFixContext {
+            repo_root: repo_root.path(),
+            check_id: "format/rust",
+        },
         &package,
         &[PathBuf::from("src/lib.rs")],
         &source_tree,

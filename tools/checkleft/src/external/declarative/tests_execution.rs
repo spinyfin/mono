@@ -99,6 +99,66 @@ message = "unused"
     assert_eq!(resolve_timeout_ms(package.limits.as_ref(), 1), HOST_CEILING_TIMEOUT_MS);
 }
 
+#[cfg(unix)]
+#[test]
+fn near_deadline_subprocess_succeeds_and_captures_stdout() {
+    let repo_root = tempfile::tempdir().expect("temp repo root");
+    let script = repo_root.path().join("near-deadline.sh");
+    write_executable(
+        &script,
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then\n  printf 'test tool 1.0\\n'\n  exit 0\nfi\nsleep 1.5\nprintf 'src/lib.rs\\n'\n",
+    );
+    let manifest = format!(
+        r#"
+id = "test/near-deadline"
+mode = "declarative"
+runtime = "declarative-v1"
+api_version = "v1"
+applies_to = ["**/*.rs"]
+
+[limits]
+timeout_ms = 3000
+
+[needs.tool.default]
+path = "{}"
+
+[[invocations]]
+id = "emit"
+run = "tool"
+mode = "batch"
+args = ["{{{{files}}}}"]
+exit = {{ "0" = "findings", default = "error" }}
+
+[invocations.transform]
+kind = "linelist"
+message = "captured output"
+"#,
+        script.display()
+    );
+    let package = crate::external::parse_external_check_package_manifest(&manifest).expect("manifest parses");
+    let crate::external::ExternalCheckPackageImplementation::Declarative(package) = package.implementation else {
+        panic!("expected declarative package");
+    };
+
+    let result = super::run_declarative_check(
+        repo_root.path(),
+        "test/near-deadline",
+        &package,
+        &make_changeset(&["src/lib.rs"]),
+        &toml::Value::Table(Default::default()),
+        None,
+    )
+    .expect("a completed subprocess must not time out while its output drains");
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(
+        result.findings[0]
+            .location
+            .as_ref()
+            .map(|location| location.path.as_path()),
+        Some(std::path::Path::new("src/lib.rs"))
+    );
+}
+
 // ── batch chunking (ARG_MAX guard) ────────────────────────────────────────────────
 
 #[test]

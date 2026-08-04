@@ -122,7 +122,17 @@ fn run_declarative_check_impl(
 
     // Resolution is only needed for tool invocations; bazel_aspect invocations
     // delegate to bazel and declare no binaries (needs may be empty).
-    let timeout_ms = resolve_timeout_ms(package.limits.as_ref(), files.len());
+    // Per-file invocations receive the one-file default rather than multiplying
+    // the proportional increment by the entire check's file count for every
+    // individual subprocess.
+    let timeout_file_count = if package.invocations.iter().all(
+        |invocation| matches!(invocation.kind, InvocationKind::Tool(ref tool) if tool.mode == InvocationMode::PerFile),
+    ) {
+        1
+    } else {
+        files.len()
+    };
+    let timeout_ms = resolve_timeout_ms(package.limits.as_ref(), timeout_file_count);
     let context = CheckExecutionContext {
         repo_root,
         check_id: package_id,
@@ -133,7 +143,7 @@ fn run_declarative_check_impl(
         .iter()
         .any(|invocation| matches!(invocation.kind, InvocationKind::Tool(_)))
     {
-        resolve::resolve_all(repo_root, &package.needs, config, context.check_id, context.deadline)?
+        resolve::resolve_all_with_deadline(repo_root, &package.needs, config, context.check_id, context.deadline)?
     } else {
         BTreeMap::new()
     };
@@ -974,6 +984,13 @@ pub struct FixInvocationOutcome {
     pub error: Option<anyhow::Error>,
 }
 
+/// Operator-visible identity and root for a declarative fix invocation.
+#[derive(Clone, Copy)]
+pub struct DeclarativeFixContext<'a> {
+    pub repo_root: &'a Path,
+    pub check_id: &'a str,
+}
+
 /// Execute all declared `fix` blocks for `package` over `fixable_files`.
 ///
 /// Each invocation's `fix` block gets its own fresh [`WritableSandbox`]: the
@@ -997,7 +1014,7 @@ pub struct FixInvocationOutcome {
 /// file the repo asked to exclude — the same guarantee `select_files` gives the run
 /// path.
 pub fn run_declarative_fix(
-    repo_root: &Path,
+    context: DeclarativeFixContext<'_>,
     package: &ExternalCheckDeclarativePackage,
     fixable_files: &[PathBuf],
     source_tree: &dyn SourceTree,
@@ -1014,13 +1031,26 @@ pub fn run_declarative_fix(
         .collect();
     let fixable_files = fixable_files.as_slice();
 
-    let timeout_ms = resolve_timeout_ms(package.limits.as_ref(), fixable_files.len());
+    let timeout_file_count = if package.invocations.iter().all(
+        |invocation| matches!(invocation.kind, InvocationKind::Tool(ref tool) if tool.mode == InvocationMode::PerFile),
+    ) {
+        1
+    } else {
+        fixable_files.len()
+    };
+    let timeout_ms = resolve_timeout_ms(package.limits.as_ref(), timeout_file_count);
     let context = CheckExecutionContext {
-        repo_root,
-        check_id: &package.id,
+        repo_root: context.repo_root,
+        check_id: context.check_id,
         deadline: CheckDeadline::new(timeout_ms),
     };
-    let binaries = match resolve::resolve_all(repo_root, &package.needs, config, context.check_id, context.deadline) {
+    let binaries = match resolve::resolve_all_with_deadline(
+        context.repo_root,
+        &package.needs,
+        config,
+        context.check_id,
+        context.deadline,
+    ) {
         Ok(b) => b,
         Err(err) => {
             // Binary resolution failed: synthesize an error for every fix-capable
@@ -1041,7 +1071,7 @@ pub fn run_declarative_fix(
     };
 
     let config_values = extract_config_string_values(config);
-    let ceiling = HostCeiling::new(repo_root);
+    let ceiling = HostCeiling::new(context.repo_root);
     let mut outcomes = Vec::new();
     let mut total_processed = 0usize;
 

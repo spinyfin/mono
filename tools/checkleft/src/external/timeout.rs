@@ -33,6 +33,12 @@ pub(crate) const PER_FILE_COMPONENT_TIMEOUT_MS: u64 = 100;
 pub(crate) const HOST_CEILING_TIMEOUT_MS: u64 = 900_000;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Bounded time to collect pipe readers after the direct child exits.
+///
+/// A descendant may keep a pipe open after the child exits, so this cannot be
+/// unbounded. It deliberately does not consume the subprocess execution budget:
+/// the child has already completed successfully at this point.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Named timeout cause so optional diagnostics can preserve ordinary probe
 /// failures without ever swallowing a deadline violation.
@@ -155,14 +161,14 @@ pub(crate) fn output_with_timeout(
         }
     };
 
-    // Once the child has exited both pipes are closed, so allow reader threads
-    // a short grace period instead of reusing an already-exhausted deadline.
-    let reader_grace = timeout.saturating_sub(started.elapsed()).max(Duration::from_secs(1));
+    // Once the child has exited its pipe ends are closed. Drain readers under a
+    // fixed grace, rather than the residual execution budget, so a successful
+    // near-deadline child cannot be reported as a timeout while posting output.
     let stdout = receive_output(
         stdout_rx,
         "stdout",
         started,
-        reader_grace,
+        DRAIN_GRACE,
         check_id,
         subprocess,
         timeout_ms,
@@ -171,7 +177,7 @@ pub(crate) fn output_with_timeout(
         stderr_rx,
         "stderr",
         started,
-        reader_grace,
+        DRAIN_GRACE,
         check_id,
         subprocess,
         timeout_ms,

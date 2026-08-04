@@ -62,7 +62,8 @@ struct BundledCheckDef {
     check_names: &'static [&'static str],
     kind: BundledCheckDefKind,
     /// Per-execution resource limits for component-mode definitions.
-    /// `None` uses the host's defaults (5 s timeout, 256 MiB memory).
+    /// `None` uses the host defaults: the proportional timeout from
+    /// [`crate::external::timeout`] and 256 MiB memory.
     limits: Option<ExternalCheckLimits>,
 }
 

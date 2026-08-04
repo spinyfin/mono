@@ -838,7 +838,7 @@ impl Runner {
                         let check_id_for_progress = check_id.clone();
                         let invocation_outcomes = match declarative_info.get(check_id) {
                             Some(Some((package, config, exclusion_matcher))) => crate::external::run_declarative_fix(
-                                repo_root,
+                                crate::external::DeclarativeFixContext { repo_root, check_id },
                                 package,
                                 &fix_plan[check_id],
                                 source_tree.as_ref(),

@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use tempfile::{TempDir, tempdir};
 
 use crate::external::{
-    ExternalCheckDeclarativePackage, ExternalCheckPackageImplementation, parse_declarative_check_manifest,
-    run_declarative_fix,
+    DeclarativeFixContext, ExternalCheckDeclarativePackage, ExternalCheckPackageImplementation,
+    parse_declarative_check_manifest, run_declarative_fix,
 };
 use crate::fix::scheduler::build_fix_schedule;
 use crate::source_tree::LocalSourceTree;
@@ -151,7 +151,10 @@ fn no_fix_block_returns_no_outcomes_and_leaves_originals_untouched() {
     let package = declarative_no_fix();
 
     let outcomes = run_declarative_fix(
-        dir.path(),
+        DeclarativeFixContext {
+            repo_root: dir.path(),
+            check_id: "test/fix",
+        },
         &package,
         &paths(&["a.txt"]),
         &tree,
@@ -197,7 +200,10 @@ printf 'ESCAPED' > sandbox_escape.txt"#,
 
     let package = declarative_with_fixer(&script.to_string_lossy());
     let outcomes = run_declarative_fix(
-        dir.path(),
+        DeclarativeFixContext {
+            repo_root: dir.path(),
+            check_id: "test/fix",
+        },
         &package,
         &paths(&["a.txt"]),
         &tree,
@@ -249,7 +255,10 @@ done"#,
     let exclusion = crate::exclusion_matcher::ExclusionMatcher::new(&["vendor/**".to_owned()]).expect("matcher");
 
     let outcomes = run_declarative_fix(
-        dir.path(),
+        DeclarativeFixContext {
+            repo_root: dir.path(),
+            check_id: "test/fix",
+        },
         &package,
         &paths(&["keep.txt", "vendor/skip.txt"]),
         &tree,
@@ -301,7 +310,10 @@ exit 1"#,
 
     let package = declarative_with_fixer(&script.to_string_lossy());
     let outcomes = run_declarative_fix(
-        dir.path(),
+        DeclarativeFixContext {
+            repo_root: dir.path(),
+            check_id: "test/fix",
+        },
         &package,
         &paths(&["a.rs", "b.rs"]),
         &tree,
@@ -360,7 +372,10 @@ done"#,
 
     // First pass: "lower" → "LOWER", must be applied.
     let outcomes1 = run_declarative_fix(
-        dir.path(),
+        DeclarativeFixContext {
+            repo_root: dir.path(),
+            check_id: "test/fix",
+        },
         &package,
         &paths(&["a.txt"]),
         &tree,
@@ -383,7 +398,10 @@ done"#,
     // Second pass: "LOWER" → "LOWER" (already uppercase) → detect_changes
     // finds no byte difference → copy-back writes nothing.
     let outcomes2 = run_declarative_fix(
-        dir.path(),
+        DeclarativeFixContext {
+            repo_root: dir.path(),
+            check_id: "test/fix",
+        },
         &package,
         &paths(&["a.txt"]),
         &tree,

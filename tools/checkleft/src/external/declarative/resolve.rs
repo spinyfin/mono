@@ -66,7 +66,18 @@ impl ResolvedBinary {
 
 /// Resolve every declared binary to a concrete command, honoring CHECKS-config
 /// overrides. Returns a map keyed by the declared name.
-pub(crate) fn resolve_all(
+pub fn resolve_all(
+    repo_root: &Path,
+    needs: &BTreeMap<String, BinaryRequirement>,
+    config: &toml::Value,
+    check_id: &str,
+    timeout_ms: u64,
+) -> Result<BTreeMap<String, ResolvedBinary>> {
+    resolve_all_with_deadline(repo_root, needs, config, check_id, CheckDeadline::new(timeout_ms))
+}
+
+/// Resolve every declared binary under a check-wide execution deadline.
+pub(crate) fn resolve_all_with_deadline(
     repo_root: &Path,
     needs: &BTreeMap<String, BinaryRequirement>,
     config: &toml::Value,
@@ -147,7 +158,7 @@ fn resolve_requirement(
             let fallback_binary = resolve_binding(repo_root, fallback, npx, check_id, deadline).with_context(|| {
                 format!("primary resolution of `{name}` failed AND fallback resolution also failed")
             })?;
-            let version = match binary_version_string(
+            let version = match binary_version_string_with_timeout(
                 &fallback_binary.program,
                 check_id,
                 &format!(
@@ -262,7 +273,7 @@ fn check_node_runtime_version(package: &str, npx: &Path, check_id: &str, deadlin
     if !node.is_file() {
         return Ok(());
     }
-    let raw_version = match binary_version_string(
+    let raw_version = match binary_version_string_with_timeout(
         &node,
         check_id,
         &format!("Node runtime version probe for npm package `{package}`"),
@@ -313,8 +324,29 @@ fn resolve_path_binding(repo_root: &Path, path: &str) -> PathBuf {
     }
 }
 
-/// Returns the trimmed first line of `binary --version` under the shared limit.
-fn binary_version_string(binary: &Path, check_id: &str, subprocess: &str, timeout_ms: u64) -> Result<String> {
+/// Returns the trimmed first line of `binary --version`, or an empty string
+/// when the probe cannot run or emits non-UTF-8 output.
+///
+/// This preserves the original best-effort public API. Runtime resolution uses
+/// [`binary_version_string_with_timeout`] so it can distinguish timeouts.
+pub fn binary_version_string(binary: &Path) -> String {
+    binary_version_string_with_timeout(
+        binary,
+        "binary version probe",
+        &format!("version probe for binary `{}`", binary.display()),
+        crate::external::timeout::resolve_timeout_ms(None, 0),
+    )
+    .unwrap_or_default()
+}
+
+/// Returns the trimmed first line of `binary --version` under the supplied
+/// timeout, preserving errors for callers that must fail closed on deadlines.
+fn binary_version_string_with_timeout(
+    binary: &Path,
+    check_id: &str,
+    subprocess: &str,
+    timeout_ms: u64,
+) -> Result<String> {
     let mut command = Command::new(binary);
     command.arg("--version");
     let output = output_with_timeout(&mut command, check_id, subprocess, timeout_ms)?;
@@ -583,6 +615,19 @@ mod tests {
 
         check_node_runtime_version("oxfmt", &npx, "test/node", CheckDeadline::new(5_000))
             .expect("current node must pass preflight");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_node_runtime_version_is_noop_when_colocated_node_is_not_executable() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let node = temp.path().join("node");
+        fs::write(&node, "#!/bin/sh\necho 'v20.7.0'\n").expect("write node");
+        let npx = temp.path().join("npx");
+        write_fake_executable(&npx, "#!/bin/sh\n");
+
+        check_node_runtime_version("oxfmt", &npx, "test/node", CheckDeadline::new(5_000))
+            .expect("an unexecutable best-effort probe must not block resolution");
     }
 
     #[test]
