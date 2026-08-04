@@ -2667,6 +2667,56 @@ async fn background_children_horizon_expiry_falls_back_to_normal_nudge() {
     assert_eq!(queued[0].1, PROBE_NO_PR);
 }
 
+#[tokio::test]
+async fn background_children_horizon_is_rechecked_without_another_stop() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    let detector = StubPrDetector::ok(None);
+    let TestHarness {
+        handler,
+        publisher,
+        probes,
+        ..
+    } = TestHarness::new(db.clone(), detector);
+    let handler = handler.with_background_activity_probe(Arc::new(FixedDescendantProbe(1)));
+
+    let first = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(first, StopOutcome::BackgroundChildrenPending { .. }),
+        "the Stop must establish a pending background-child nudge; got {first:?}",
+    );
+    assert!(probes.snapshot().is_empty());
+
+    // No second `on_stop` call: change only the horizon and drive the same
+    // recurring pass production uses. The saved Stop intent must be replayed.
+    let handler = handler.with_background_children_horizon_secs(0);
+    crate::merge_poller::run_one_pass(
+        db.as_ref(),
+        &NoopMergeProbe,
+        publisher.as_ref(),
+        None,
+        Some(&handler),
+        None,
+    )
+    .await;
+
+    let queued = probes.snapshot();
+    assert_eq!(queued, [(execution_id, PROBE_NO_PR.to_owned())]);
+}
+
+#[tokio::test]
+async fn indeterminate_background_child_probe_fails_open_to_nudge() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, probes, .. } = TestHarness::new(db, detector);
+    let handler = handler.with_background_activity_probe(Arc::new(FailingDescendantProbe));
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert_eq!(outcome, StopOutcome::AwaitingInput);
+    assert_eq!(probes.snapshot(), [(execution_id, PROBE_NO_PR.to_owned())]);
+}
+
 // -----------------------------------------------------------
 // Operator hold (`bossctl agents hold`). An explicit hold must skip the
 // idle-park flow entirely — no nudge, no breaker consultation, no park
