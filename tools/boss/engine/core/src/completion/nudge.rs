@@ -130,8 +130,8 @@ impl WorkerCompletionHandler {
         // Background-children suppression (observed live 2026-07-17): the
         // worker's own turn genuinely ended (Stop fired, hooks go quiet), but its
         // process tree still has live descendants outside the foreground
-        // driver process group — a
-        // backgrounded subagent spawned via the harness Agent tool that
+        // driver process group — a backgrounded subagent spawned via the
+        // harness Agent tool that
         // has not yet reported back with a task-notification. That is
         // WAITING, not stalled: nudging it just manufactures the next
         // Stop and burns the breaker cap below, exactly like the
@@ -164,6 +164,7 @@ impl WorkerCompletionHandler {
                                 fingerprint: fingerprint.to_owned(),
                                 bound_pr_url: bound_pr_url.map(str::to_owned),
                                 proceed_outcome: proceed_outcome.clone(),
+                                activity_watermark: self.background_activity_probe.activity_watermark(&execution.id),
                             },
                         );
                         tracing::info!(
@@ -202,7 +203,7 @@ impl WorkerCompletionHandler {
                 }
             }
             Err(reason) => {
-                self.background_children_tracker.forget_intent(&execution.id);
+                self.background_children_tracker.forget(&execution.id);
                 tracing::warn!(
                     execution_id = %execution.id,
                     %reason,
@@ -246,7 +247,7 @@ impl WorkerCompletionHandler {
                     "auto-nudge: suppressed — identical fingerprint re-fired inside the debounce \
                      window; waiting for external state to change before re-nudging",
                 );
-                proceed_outcome
+                StopOutcome::NudgeDebounced
             }
             NudgeDecision::Trip { count } => {
                 self.park_for_unproductive_nudges(execution, count, bound_pr_url, "no new commit, PR, or state change")
@@ -268,6 +269,20 @@ impl WorkerCompletionHandler {
     /// no-PR nudges. Returns `None` when the execution has moved on.
     pub(crate) async fn recheck_background_nudge(&self, execution_id: &str) -> Option<StopOutcome> {
         let intent = self.background_children_tracker.intent(execution_id)?;
+        if let Some(watermark) = intent.activity_watermark.as_deref()
+            && self
+                .background_activity_probe
+                .activity_watermark(execution_id)
+                .as_deref()
+                != Some(watermark)
+        {
+            tracing::debug!(
+                execution_id,
+                "auto-nudge: recurring background-child recheck retired after worker hook activity resumed"
+            );
+            self.background_children_tracker.forget(execution_id);
+            return None;
+        }
         let execution = match self.work_db.get_execution(execution_id) {
             Ok(execution) if execution.status == ExecutionStatus::WaitingHuman => execution,
             Ok(_) => {
@@ -300,6 +315,7 @@ impl WorkerCompletionHandler {
                 | StopOutcome::BuildWaitPending { .. }
                 | StopOutcome::EscalationPending { .. }
                 | StopOutcome::Held { .. }
+                | StopOutcome::NudgeDebounced
         ) {
             self.background_children_tracker.forget_intent(execution_id);
         }

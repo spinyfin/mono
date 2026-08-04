@@ -1150,6 +1150,32 @@ impl crate::background_children::BackgroundActivityProbe for FailingDescendantPr
     }
 }
 
+struct WatermarkedDescendantProbe {
+    watermark: std::sync::Mutex<String>,
+}
+
+impl WatermarkedDescendantProbe {
+    fn new(watermark: &str) -> Arc<Self> {
+        Arc::new(Self {
+            watermark: std::sync::Mutex::new(watermark.to_owned()),
+        })
+    }
+
+    fn set_watermark(&self, watermark: &str) {
+        *self.watermark.lock().expect("watermark mutex poisoned") = watermark.to_owned();
+    }
+}
+
+impl crate::background_children::BackgroundActivityProbe for WatermarkedDescendantProbe {
+    fn live_delegated_descendant_count(&self, _execution_id: &str) -> std::result::Result<usize, String> {
+        Ok(1)
+    }
+
+    fn activity_watermark(&self, _execution_id: &str) -> Option<String> {
+        Some(self.watermark.lock().expect("watermark mutex poisoned").clone())
+    }
+}
+
 /// Build a conflict-resolution revision fixture. The parent chore is
 /// `blocked: merge_conflict`. A `conflict_resolutions` row is inserted
 /// in `running` state (simulating an active attempt). A revision task is
@@ -1706,3 +1732,4 @@ mod t05;
 mod t06;
 mod t07;
 mod t08;
+mod t09;
