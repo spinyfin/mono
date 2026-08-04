@@ -1939,7 +1939,7 @@ mod changeset_undetermined {
     use checkleft::change_detection::base::EmptyReason;
     use checkleft::change_detection::environment::CiEnvironment;
     use checkleft::change_detection::{ChangeOverrides, ChangePlan, ChangesetUndetermined, resolve_change_plan};
-    use checkleft::vcs::Vcs;
+    use checkleft::vcs::{GithubApiTimeout, Vcs};
     use tempfile::tempdir;
 
     fn git(root: &std::path::Path, args: &[&str]) {
@@ -2143,6 +2143,16 @@ mod changeset_undetermined {
             super::super::EXIT_CHANGESET_UNDETERMINED,
             super::super::EXIT_CHECKS_FAILED,
             "the 'could not determine changes' code must differ from the 'checks found problems' code"
+        );
+    }
+
+    #[test]
+    fn exit_code_for_error_treats_github_timeout_as_input_unavailable() {
+        let timeout: anyhow::Error = GithubApiTimeout::new("fetching PR description").into();
+
+        assert_eq!(
+            super::super::exit_code_for_error(&timeout),
+            super::super::EXIT_CHANGESET_UNDETERMINED
         );
     }
 }

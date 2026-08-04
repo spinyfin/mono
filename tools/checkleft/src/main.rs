@@ -36,7 +36,9 @@ use checkleft::progress::render::TermRenderer;
 use checkleft::progress::{DEFAULT_DEBOUNCE, LiveProgress, NoopProgressReporter, ProgressReporter, RenderFindings};
 use checkleft::runner::{DEFAULT_FIX_PASSES, Runner};
 use checkleft::source_tree::LocalSourceTree;
-use checkleft::vcs::{BaseRevision, Vcs, github_pr_number_for_branch, github_pull_request_description};
+use checkleft::vcs::{
+    BaseRevision, GithubApiContext, GithubApiTimeout, Vcs, github_pr_number_for_branch, github_pull_request_description,
+};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -270,7 +272,7 @@ enum ExternalProviderMode {
 /// `dispatch_run` / `dispatch_fix`).
 const EXIT_CHECKS_FAILED: u8 = 1;
 
-/// Exit code for "checkleft could not determine what changed" — a missing
+/// Exit code for "checkleft could not gather the inputs needed to run" — a missing
 /// merge base, a detached HEAD with no parent, an unresolvable `--base-ref`,
 /// or a shallow clone whose history never reaches the base. Deliberately
 /// distinct from both `ExitCode::SUCCESS` (0, a genuinely empty diff or a
@@ -285,7 +287,7 @@ const EXIT_CHANGESET_UNDETERMINED: u8 = 3;
 /// Returns the raw `u8` (rather than `ExitCode`, which is intentionally
 /// opaque and has no public equality) so the mapping itself is unit-testable.
 fn exit_code_for_error(error: &anyhow::Error) -> u8 {
-    if error.downcast_ref::<ChangesetUndetermined>().is_some() {
+    if error.downcast_ref::<ChangesetUndetermined>().is_some() || error.downcast_ref::<GithubApiTimeout>().is_some() {
         EXIT_CHANGESET_UNDETERMINED
     } else {
         1 // matches ExitCode::FAILURE
@@ -1808,6 +1810,8 @@ async fn resolve_pr_description(
     let Some(repository) = repository else {
         return Ok(None);
     };
+    let github_base_url = github_api_base_url();
+    let github = GithubApiContext::production(&github_base_url);
     let github_token = detect_github_token();
 
     if github_token.is_none() {
@@ -1821,7 +1825,9 @@ async fn resolve_pr_description(
             change_id = change_id,
             "fetching PR description by change id"
         );
-        if let Some(desc) = github_pull_request_description(repository, change_id, github_token.as_deref()).await? {
+        if let Some(desc) =
+            github_pull_request_description(github, repository, change_id, github_token.as_deref()).await?
+        {
             return Ok(Some(desc));
         }
     }
@@ -1843,7 +1849,7 @@ async fn resolve_pr_description(
         let mut descriptions = Vec::new();
         for pr_number in merge_queue_pr_numbers {
             if let Some(description) =
-                github_pull_request_description(repository, &pr_number, github_token.as_deref()).await?
+                github_pull_request_description(github, repository, &pr_number, github_token.as_deref()).await?
             {
                 descriptions.push(description);
             }
@@ -1863,7 +1869,8 @@ async fn resolve_pr_description(
         branch = branch,
         "resolving PR description via branch lookup"
     );
-    let Some(pr_number) = github_pr_number_for_branch(repository, &branch, github_token.as_deref()).await? else {
+    let Some(pr_number) = github_pr_number_for_branch(github, repository, &branch, github_token.as_deref()).await?
+    else {
         return Ok(None);
     };
     info!(
@@ -1872,7 +1879,7 @@ async fn resolve_pr_description(
         pr_number = pr_number,
         "fetching PR description for branch-resolved PR"
     );
-    github_pull_request_description(repository, &pr_number, github_token.as_deref()).await
+    github_pull_request_description(github, repository, &pr_number, github_token.as_deref()).await
 }
 
 /// Detect the name of the current branch for Level 3b PR lookup (branch→PR
