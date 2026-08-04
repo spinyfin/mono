@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::tempdir;
 
+use crate::external::timeout::{BASE_COMPONENT_TIMEOUT_MS, HOST_CEILING_TIMEOUT_MS, PER_FILE_COMPONENT_TIMEOUT_MS};
 use crate::external::{
     EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, ExternalCheckComponentPackage, ExternalCheckLimits,
     ExternalCheckPackage, ExternalCheckPackageImplementation,
@@ -12,10 +13,9 @@ use crate::output::{CheckResult, Finding, Location, Severity};
 use crate::source_tree::LocalSourceTree;
 
 use super::{
-    BASE_COMPONENT_TIMEOUT_MS, EPOCH_DEADLINE_NEVER, ExternalCheckExecutor, HOST_CEILING_TIMEOUT_MS, HostState,
-    MemoryLimiter, PER_FILE_COMPONENT_TIMEOUT_MS, apply_edits_to_sandbox, apply_file_edit, apply_struct_exclusions,
-    build_wasmtime_engine, call_declared_exclusions, call_evaluate_exclusion, compile_component, is_interrupt_error,
-    lower_changeset, resolve_component_limits,
+    EPOCH_DEADLINE_NEVER, ExternalCheckExecutor, HostState, MemoryLimiter, apply_edits_to_sandbox, apply_file_edit,
+    apply_struct_exclusions, build_wasmtime_engine, call_declared_exclusions, call_evaluate_exclusion,
+    compile_component, is_interrupt_error, lower_changeset, resolve_component_limits,
 };
 use wasmtime::{Instance, Module, Store};
 

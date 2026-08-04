@@ -2,10 +2,10 @@ id: format/rust
 mode: declarative
 runtime: declarative-v1
 api_version: v1
-# Bazel may legitimately wait for its shared server lock. Two minutes preserves
-# that behavior while still surfacing a wedged server as a failed check.
+# Building hermetic rustfmt on a cold Bazel cache and a shared-server lock can
+# take several minutes; retain a bounded check-wide allowance for both.
 limits:
-  timeout_ms: 120000
+  timeout_ms: 600000
 applies_to:
   - "**/*.rs"
 

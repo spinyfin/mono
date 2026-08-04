@@ -32,7 +32,7 @@ use tracing::warn;
 
 use crate::exclusion_matcher::ExclusionMatcher;
 use crate::external::sandbox::HostCeiling;
-use crate::external::timeout::{output_with_timeout, resolve_timeout_ms};
+use crate::external::timeout::{CheckDeadline, output_with_timeout, resolve_timeout_ms};
 use crate::fix::safety::WritableSandbox;
 use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
@@ -126,14 +126,14 @@ fn run_declarative_check_impl(
     let context = CheckExecutionContext {
         repo_root,
         check_id: package_id,
-        timeout_ms,
+        deadline: CheckDeadline::new(timeout_ms),
     };
     let binaries = if package
         .invocations
         .iter()
         .any(|invocation| matches!(invocation.kind, InvocationKind::Tool(_)))
     {
-        resolve::resolve_all(repo_root, &package.needs, config, context.check_id, context.timeout_ms)?
+        resolve::resolve_all(repo_root, &package.needs, config, context.check_id, context.deadline)?
     } else {
         BTreeMap::new()
     };
@@ -882,7 +882,7 @@ struct InvocationOutput {
 struct CheckExecutionContext<'a> {
     repo_root: &'a Path,
     check_id: &'a str,
-    timeout_ms: u64,
+    deadline: CheckDeadline,
 }
 
 fn spawn(
@@ -897,7 +897,7 @@ fn spawn(
         &mut command,
         context.check_id,
         &format!("declarative invocation `{invocation_id}` binary `{}`", binary.display()),
-        context.timeout_ms,
+        context.deadline.remaining_ms(),
     )?;
     Ok(InvocationOutput {
         stdout: output.stdout,
@@ -1018,9 +1018,9 @@ pub fn run_declarative_fix(
     let context = CheckExecutionContext {
         repo_root,
         check_id: &package.id,
-        timeout_ms,
+        deadline: CheckDeadline::new(timeout_ms),
     };
-    let binaries = match resolve::resolve_all(repo_root, &package.needs, config, context.check_id, context.timeout_ms) {
+    let binaries = match resolve::resolve_all(repo_root, &package.needs, config, context.check_id, context.deadline) {
         Ok(b) => b,
         Err(err) => {
             // Binary resolution failed: synthesize an error for every fix-capable
@@ -1361,6 +1361,7 @@ mod tests {
     use super::{CheckExecutionContext, execute_fix_batch, execute_fix_per_file, normalize_finding_paths};
     use crate::external::declarative::FixBlock;
     use crate::external::sandbox::HostCeiling;
+    use crate::external::timeout::CheckDeadline;
     use crate::fix::safety::WritableSandbox;
     use crate::output::{Finding, Location, Severity};
     use crate::source_tree::LocalSourceTree;
@@ -1470,7 +1471,7 @@ case "$1" in *b.txt) exit 1 ;; *) exit 0 ;; esac"#,
             CheckExecutionContext {
                 repo_root: dir.path(),
                 check_id: "test/fix",
-                timeout_ms: 5_000,
+                deadline: CheckDeadline::new(5_000),
             },
             Path::new("/bin/sh"),
             &prefix,
@@ -1533,7 +1534,7 @@ exit 1"#,
             CheckExecutionContext {
                 repo_root: dir.path(),
                 check_id: "test/fix",
-                timeout_ms: 5_000,
+                deadline: CheckDeadline::new(5_000),
             },
             Path::new("/bin/sh"),
             &prefix,
@@ -1584,7 +1585,7 @@ exit 1"#,
             CheckExecutionContext {
                 repo_root: dir.path(),
                 check_id: "test/fix",
-                timeout_ms: 5_000,
+                deadline: CheckDeadline::new(5_000),
             },
             Path::new("/bin/sh"),
             &prefix,
@@ -1605,6 +1606,46 @@ exit 1"#,
             b"before",
             "real tree untouched"
         );
+    }
+
+    /// A timed-out fixer never reaches copy-back, even if it already changed its
+    /// sandbox copy before it stalled.
+    #[cfg(unix)]
+    #[test]
+    fn batch_fix_timeout_leaves_real_tree_untouched() {
+        let (dir, tree) = disk_tree(&[("a.txt", b"before")]);
+        let scripts_dir = tempdir().expect("scripts dir");
+        let script = make_script(scripts_dir.path(), "fixer.sh", "printf FIXED > \"$1\"\nsleep 1");
+        let ceiling = HostCeiling::new(dir.path());
+        let sandbox = WritableSandbox::stage(&paths(&["a.txt"]), &tree, &ceiling).expect("stage");
+        let staged: Vec<String> = sandbox
+            .staged_paths()
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let fix = make_fix_block("batch", &["{{files}}"]);
+        let prefix = vec![script.to_string_lossy().into_owned()];
+        let error = execute_fix_batch(
+            sandbox.root_path(),
+            CheckExecutionContext {
+                repo_root: dir.path(),
+                check_id: "test/fix",
+                deadline: CheckDeadline::new(25),
+            },
+            Path::new("/bin/sh"),
+            &prefix,
+            &fix,
+            &staged,
+            &BTreeMap::new(),
+            "inv",
+            &sandbox,
+            &mut || {},
+        )
+        .expect_err("timed-out fixer must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("check `test/fix`"), "{message}");
+        assert!(message.contains("ms wall-clock limit"), "{message}");
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"before");
     }
 
     #[test]

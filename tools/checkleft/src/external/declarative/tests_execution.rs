@@ -5,6 +5,7 @@
 
 use std::path::Path;
 
+use crate::external::timeout::{HOST_CEILING_TIMEOUT_MS, resolve_timeout_ms};
 use crate::input::{ChangeKind, ChangeSet, ChangedFile};
 use crate::output::Severity;
 
@@ -61,8 +62,41 @@ message = "unused"
     let message = format!("{error:#}");
     assert!(message.contains("check `test/timeout`"), "{message}");
     assert!(message.contains("declarative invocation `hang`"), "{message}");
-    assert!(message.contains("25 ms wall-clock limit"), "{message}");
+    assert!(message.contains("ms wall-clock limit"), "{message}");
     assert!(message.contains("after"), "{message}");
+}
+
+#[test]
+fn declarative_manifest_timeout_is_clamped_to_host_ceiling() {
+    let manifest = r#"
+id = "test/ceiling"
+mode = "declarative"
+runtime = "declarative-v1"
+api_version = "v1"
+applies_to = ["**/*.rs"]
+
+[limits]
+timeout_ms = 999999999
+
+[[invocations]]
+id = "noop"
+run = "tool"
+mode = "batch"
+args = ["{{files}}"]
+exit = { "0" = "ok", default = "error" }
+
+[needs.tool.default]
+path = "/bin/true"
+
+[invocations.transform]
+kind = "linelist"
+message = "unused"
+"#;
+    let package = crate::external::parse_external_check_package_manifest(manifest).expect("manifest parses");
+    let crate::external::ExternalCheckPackageImplementation::Declarative(package) = package.implementation else {
+        panic!("expected declarative package");
+    };
+    assert_eq!(resolve_timeout_ms(package.limits.as_ref(), 1), HOST_CEILING_TIMEOUT_MS);
 }
 
 // ── batch chunking (ARG_MAX guard) ────────────────────────────────────────────────

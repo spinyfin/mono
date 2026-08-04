@@ -30,8 +30,6 @@ use super::{
 mod cwasm_cache;
 pub use cwasm_cache::{ComponentAotCache, cache_file_name, precompile_into_cache_dir};
 
-#[cfg(test)]
-pub(crate) use super::timeout::{BASE_COMPONENT_TIMEOUT_MS, HOST_CEILING_TIMEOUT_MS, PER_FILE_COMPONENT_TIMEOUT_MS};
 /// Default memory cap for component-v1 checks (256 MiB).
 pub(crate) const DEFAULT_COMPONENT_MAX_MEMORY_MB: u64 = 256;
 /// Maximum memory a manifest may request (512 MiB). Requests above this are

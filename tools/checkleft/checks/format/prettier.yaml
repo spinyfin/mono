@@ -2,6 +2,10 @@ id: format/prettier
 mode: declarative
 runtime: declarative-v1
 api_version: v1
+# `npx --yes` provisions the pinned package inside the invocation; allow a
+# cold npm cache download while keeping the entire check bounded.
+limits:
+  timeout_ms: 300000
 applies_to:
   - "**/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,json,css,scss,less,html,vue,md,markdown,yaml,yml,graphql,gql}"
 skip_symlinks: true

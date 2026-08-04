@@ -28,9 +28,9 @@ pub(crate) const BASE_COMPONENT_TIMEOUT_MS: u64 = 15_000;
 /// Per-file wall-clock budget increment (100 ms per changed file). Combined
 /// with [`BASE_COMPONENT_TIMEOUT_MS`] to form a proportional default timeout.
 pub(crate) const PER_FILE_COMPONENT_TIMEOUT_MS: u64 = 100;
-/// Maximum timeout a manifest may request (5 minutes). Requests above this are
+/// Maximum timeout a manifest may request (15 minutes). Requests above this are
 /// silently clamped so out-of-tree manifests cannot hang the host unboundedly.
-pub(crate) const HOST_CEILING_TIMEOUT_MS: u64 = 300_000;
+pub(crate) const HOST_CEILING_TIMEOUT_MS: u64 = 900_000;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -42,6 +42,31 @@ pub(crate) struct SubprocessTimeout {
     subprocess: String,
     timeout_ms: u64,
     elapsed_ms: u128,
+}
+
+/// A single wall-clock budget shared by every subprocess in one check execution.
+#[derive(Clone, Copy)]
+pub(crate) struct CheckDeadline {
+    started: Instant,
+    budget: Duration,
+}
+
+impl CheckDeadline {
+    pub(crate) fn new(timeout_ms: u64) -> Self {
+        Self {
+            started: Instant::now(),
+            budget: Duration::from_millis(timeout_ms),
+        }
+    }
+
+    /// The unconsumed portion of the check-wide budget, in milliseconds.
+    pub(crate) fn remaining_ms(self) -> u64 {
+        self.budget
+            .saturating_sub(self.started.elapsed())
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
 }
 
 impl fmt::Display for SubprocessTimeout {
@@ -78,7 +103,12 @@ pub(crate) fn output_with_timeout(
     subprocess: &str,
     timeout_ms: u64,
 ) -> Result<Output> {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Match `Command::output()`: subprocesses must see immediate EOF rather
+    // than inheriting checkleft's stdin (which is the pre-push ref list there).
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn subprocess `{subprocess}` for check `{check_id}`"))?;
@@ -125,8 +155,27 @@ pub(crate) fn output_with_timeout(
         }
     };
 
-    let stdout = receive_output(stdout_rx, "stdout", started, timeout, check_id, subprocess, timeout_ms)?;
-    let stderr = receive_output(stderr_rx, "stderr", started, timeout, check_id, subprocess, timeout_ms)?;
+    // Once the child has exited both pipes are closed, so allow reader threads
+    // a short grace period instead of reusing an already-exhausted deadline.
+    let reader_grace = timeout.saturating_sub(started.elapsed()).max(Duration::from_secs(1));
+    let stdout = receive_output(
+        stdout_rx,
+        "stdout",
+        started,
+        reader_grace,
+        check_id,
+        subprocess,
+        timeout_ms,
+    )?;
+    let stderr = receive_output(
+        stderr_rx,
+        "stderr",
+        started,
+        reader_grace,
+        check_id,
+        subprocess,
+        timeout_ms,
+    )?;
     Ok(Output { status, stdout, stderr })
 }
 
@@ -134,14 +183,12 @@ fn receive_output(
     receiver: Receiver<Result<Vec<u8>>>,
     stream: &str,
     started: Instant,
-    timeout: Duration,
+    wait: Duration,
     check_id: &str,
     subprocess: &str,
     timeout_ms: u64,
 ) -> Result<Vec<u8>> {
-    let elapsed = started.elapsed();
-    let remaining = timeout.saturating_sub(elapsed);
-    match receiver.recv_timeout(remaining) {
+    match receiver.recv_timeout(wait) {
         Ok(output) => {
             output.with_context(|| format!("failed to read {stream} for check `{check_id}` subprocess `{subprocess}`"))
         }

@@ -2,10 +2,10 @@ id: lint/rust
 mode: declarative
 runtime: declarative-v1
 api_version: v1
-# Bazel may legitimately wait for its shared server lock. Two minutes preserves
-# that behavior while still surfacing a wedged server as a failed check.
+# Six minutes covers a cold-cache clippy-aspect build as well as a shared Bazel
+# server-lock wait, while the host ceiling still bounds a wedged invocation.
 limits:
-  timeout_ms: 120000
+  timeout_ms: 600000
 applies_to:
   - "**/*.rs"
 
