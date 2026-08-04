@@ -152,7 +152,7 @@ pub struct UntrackedTmuxSession {
 }
 
 /// What one pass did; the caller logs it.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, bon::Builder)]
 pub struct TmuxAdoptionOutcome {
     /// Execution ids whose derived bookkeeping was rebuilt this pass.
     /// [`crate::run_reconcile`] should not re-probe these against cube — tmux

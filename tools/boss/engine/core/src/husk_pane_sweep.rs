@@ -905,7 +905,12 @@ mod tests {
 
         assert_eq!(second.retired, 2);
         let mut retired = source.retired();
-        retired.sort_unstable();
+        retired.sort_unstable_by_key(|session| {
+            session
+                .strip_prefix("boss-worker-")
+                .and_then(|slot| slot.parse::<u8>().ok())
+                .expect("fixture sessions use numeric boss-worker slots")
+        });
         assert_eq!(retired, vec!["boss-worker-1", "boss-worker-2"]);
         assert_eq!(sink.events().await.len(), 2);
     }
@@ -1176,7 +1181,12 @@ mod tests {
         assert_eq!(second.independently_confirmed, 11);
 
         let mut retired = source.retired();
-        retired.sort_unstable();
+        retired.sort_unstable_by_key(|session| {
+            session
+                .strip_prefix("boss-worker-")
+                .and_then(|slot| slot.parse::<u8>().ok())
+                .expect("fixture sessions use numeric boss-worker slots")
+        });
         assert_eq!(
             retired,
             (0..11).map(|slot| format!("boss-worker-{slot}")).collect::<Vec<_>>(),
@@ -1231,14 +1241,16 @@ mod tests {
         assert_eq!(attentions[0].status, "open");
         for slot in 0..5 {
             assert!(
-                attentions[0].body_markdown.contains(&format!("slot **{slot}**")),
+                attentions[0]
+                    .body_markdown
+                    .contains(&format!("tmux session `boss-worker-{slot}`")),
                 "every held-back slot must be named in the escalation: {}",
                 attentions[0].body_markdown,
             );
             assert!(
                 attentions[0]
                     .body_markdown
-                    .contains(&format!("bossctl agents retire-pane {slot}")),
+                    .contains(&format!("tmux -L boss kill-session -t boss-worker-{slot}")),
                 "the escalation must carry the manual reclaim command",
             );
         }
