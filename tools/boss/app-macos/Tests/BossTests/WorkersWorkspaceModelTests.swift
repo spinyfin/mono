@@ -265,11 +265,13 @@ final class WorkersWorkspaceModelSpawnTests: XCTestCase {
             reasons.append(reason)
         }
         var spawnFailures: [(String, String)] = []
-        model.onSpawnFailed = { spawnFailures.append(($0, $1)) }
+        model.onSpawnFailed = { runId, reason, _ in
+            spawnFailures.append((runId, reason))
+        }
 
         _ = model.spawnWorkerPane(makeRequest(slot: 5, runId: "exec-surface-failed"))
         let session = model.slots.first(where: { $0.slotId == 5 })?.session
-        session?.onSurfaceCreationFailed?("no active display")
+        session?.onSurfaceCreationFailed?("no active display", true)
 
         XCTAssertEqual(spawnFailures.map(\.0), ["exec-surface-failed"])
         XCTAssertEqual(spawnFailures.map(\.1), ["no active display"])
