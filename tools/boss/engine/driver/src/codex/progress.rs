@@ -713,6 +713,7 @@ impl Default for CodexTranscriptSession {
 
 impl CodexTranscriptSession {
     fn normalize(&mut self, raw: Value) -> Value {
+        let timestamp = raw.get("timestamp").cloned();
         let parsed = match raw.as_object().and_then(parse_rollout_envelope) {
             Some(parsed) => parsed,
             None => {
@@ -731,20 +732,20 @@ impl CodexTranscriptSession {
                 .normalize_rollout_event_message(&event_type, &payload)
                 .unwrap_or_else(|| {
                     tracing::debug!(event_type, "codex rollout: ignoring additive event_msg variant");
-                    raw.clone()
+                    raw
                 }),
             RolloutEnvelope::ResponseItem { item_type, payload } => self
                 .normalize_rollout_response_item(&item_type, &payload)
                 .unwrap_or_else(|| {
                     tracing::debug!(item_type, "codex rollout: ignoring additive response_item variant");
-                    raw.clone()
+                    raw
                 }),
             RolloutEnvelope::Unknown { record_type } => {
                 tracing::debug!(record_type, "codex rollout: ignoring additive record variant");
-                raw.clone()
+                raw
             }
         };
-        preserve_rollout_timestamp(normalized, &raw)
+        preserve_rollout_timestamp(normalized, timestamp)
     }
 
     fn normalize_rollout_response_item(&mut self, item_type: &str, payload: &Map<String, Value>) -> Option<Value> {
@@ -873,8 +874,8 @@ impl TranscriptSessionNormalizer for CodexTranscriptSession {
     }
 }
 
-fn preserve_rollout_timestamp(mut normalized: Value, raw: &Value) -> Value {
-    let Some(timestamp) = raw.get("timestamp").cloned() else {
+fn preserve_rollout_timestamp(mut normalized: Value, timestamp: Option<Value>) -> Value {
+    let Some(timestamp) = timestamp else {
         return normalized;
     };
     if let Some(object) = normalized.as_object_mut() {
@@ -958,7 +959,11 @@ fn normalize_rollout_message(payload: &Map<String, Value>) -> Option<Value> {
     // `boss_engine_codex_rollout::extract_text_blocks`.
     let text = extract_text_blocks(content);
     match role {
-        "assistant" if !text.is_empty() => Some(assistant_text(&text)),
+        "assistant" => Some(if text.is_empty() {
+            json!({"type":"system"})
+        } else {
+            assistant_text(&text)
+        }),
         // `event_msg.user_message` is the canonical source for user prose;
         // it avoids replaying Codex's injected context. Developer/system
         // messages are likewise not conversation turns. Return the canonical
@@ -1971,6 +1976,12 @@ mod tests {
         }));
         assert_eq!(injected_user, json!({"type":"system"}));
 
+        let empty_assistant = normalize_rollout(json!({
+            "type":"response_item",
+            "payload":{"type":"message","role":"assistant","content":[]}
+        }));
+        assert_eq!(empty_assistant, json!({"type":"system"}));
+
         let aborted = normalize_rollout(json!({
             "type":"event_msg",
             "payload":{"type":"turn_aborted","turn_id":"turn-1","reason":"interrupted"}
@@ -2037,6 +2048,34 @@ mod tests {
         assert_eq!(output["tool_input"], json!({"command":"echo rollout"}));
         assert_eq!(output["content"], "rollout\n");
         assert_eq!(output["is_error"], false);
+    }
+
+    #[test]
+    fn task_started_rearms_last_agent_message_fallback_for_each_turn() {
+        let mut session = CodexTranscriptSession::default();
+
+        session.normalize(json!({"type":"event_msg","payload":{"type":"task_started"}}));
+        assert_eq!(
+            session.normalize(json!({
+                "type":"response_item",
+                "payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"first"}]}
+            }))["type"],
+            "assistant"
+        );
+        let first_complete = session.normalize(json!({
+            "type":"event_msg",
+            "payload":{"type":"task_complete","last_agent_message":"first"}
+        }));
+        assert_eq!(first_complete["type"], "system");
+        assert_eq!(first_complete["subtype"], "task_complete");
+
+        session.normalize(json!({"type":"event_msg","payload":{"type":"task_started"}}));
+        let second_complete = session.normalize(json!({
+            "type":"event_msg",
+            "payload":{"type":"task_complete","last_agent_message":"final"}
+        }));
+        assert_eq!(second_complete["type"], "assistant");
+        assert_eq!(second_complete["content"][0]["text"], "final");
     }
 
     #[test]

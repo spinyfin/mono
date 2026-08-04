@@ -929,6 +929,9 @@ fn render_tool_result_segment(
 }
 
 fn render_system_segment(event: &TranscriptEvent, subtype: Option<&str>, body: &str) -> Option<TranscriptSegment> {
+    if subtype.is_none() && body.is_empty() {
+        return None;
+    }
     match subtype {
         Some("init") => None,
         Some("pr-link") => {
@@ -1551,6 +1554,13 @@ mod tests {
         }];
         let segs = events_to_segments(&events, &RenderOpts::default());
         assert!(segs.is_empty(), "init events should be filtered");
+    }
+
+    #[test]
+    fn bare_system_event_is_skipped() {
+        let events = parse_transcript("{\"type\":\"system\"}");
+        let segs = events_to_segments(&events, &RenderOpts::default());
+        assert!(segs.is_empty(), "empty system events should be filtered");
     }
 
     #[test]
