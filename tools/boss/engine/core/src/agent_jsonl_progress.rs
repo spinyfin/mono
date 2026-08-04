@@ -848,10 +848,10 @@ async fn run_prepared<S>(
         }
     });
 
-    // Codex and Grok provision their `sessions/` directory as a link into
-    // Claude's durable transcript store. Persist the resolved target, not
-    // the temporary per-run-home pathname, so terminal readers keep working
-    // after macOS reaps the home.
+    // Codex and Grok link their `sessions/` directory into Boss's
+    // per-execution transcript store. Persist the resolved target, not the
+    // temporary per-run-home pathname, so terminal readers keep working after
+    // the home is reaped.
     let transcript_path = std::fs::canonicalize(&transcript_path).unwrap_or(transcript_path);
     let config = ProgressSessionConfig {
         run_id: Some(run_id.clone()),

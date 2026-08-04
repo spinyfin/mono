@@ -28,7 +28,7 @@ use boss_protocol::{NormalizeError, PaneMonitorSpec, WorkerEvent};
 use boss_ssh_transport::shell_quote;
 use serde_json::Value;
 
-use crate::transcript_store::transcript_store_root;
+use crate::transcript_store::{transcript_store_root, verified_durable_sessions_dir};
 
 mod classify_error;
 mod environment;
@@ -648,7 +648,14 @@ impl AgentDriver for GrokDriver {
             .map(|metadata| metadata.file_type().is_symlink())
             .unwrap_or(false)
         {
-            return Ok(Some(transcript_store_root()?));
+            let store_root = transcript_store_root()?;
+            let grok_home = grok_home_for_run(run_id)?;
+            return Ok(Some(verified_durable_sessions_dir(
+                &grok_home,
+                &store_root,
+                "grok",
+                run_id,
+            )?));
         }
         Ok(None)
     }

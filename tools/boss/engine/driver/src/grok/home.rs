@@ -41,8 +41,6 @@ pub const GROK_SKIP_POSTURE_ASSERT_ENV: &str = "BOSS_GROK_SKIP_POSTURE_ASSERT";
 pub static GROK_HOMES_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Default leaf under the system temp when [`GROK_HOMES_ROOT_ENV`] is unset.
-/// Session JSONL is the deliberate exception: provisioning links only that
-/// subtree into Boss-owned per-execution storage for durable forensic retention.
 const GROK_HOMES_DIR_NAME: &str = "boss-grok-homes";
 
 /// Most recent Grok CLI version actually characterised by the design +
@@ -402,6 +400,8 @@ pub fn read_workspace_path_stamp(grok_home: &Path) -> anyhow::Result<PathBuf> {
 /// Idempotent: rewrites config, trust, hooks canary, and prompt on every call
 /// so reused cube workspaces always get a compat-suppressing posture. OAuth
 /// remains outside this directory and is shared through `GROK_AUTH_PATH`.
+/// Everything under this home is temporary except `sessions/`, which is a
+/// link into Boss's durable per-execution transcript store.
 pub fn provision_grok_home(workspace: &Path, prompt_text: &str, run_id: &str) -> anyhow::Result<GrokRuntimeState> {
     let container = grok_run_container_for_run(run_id)?;
     let grok_home = container.join(GROK_HOME_LEAF);
@@ -410,9 +410,7 @@ pub fn provision_grok_home(workspace: &Path, prompt_text: &str, run_id: &str) ->
     fs::create_dir_all(&grok_home).with_context(|| format!("creating GROK_HOME {}", grok_home.display()))?;
     fs::create_dir_all(grok_home.join("hooks"))
         .with_context(|| format!("creating hooks dir under {}", grok_home.display()))?;
-    fs::create_dir_all(grok_home.join("sessions"))
-        .with_context(|| format!("creating sessions dir under {}", grok_home.display()))?;
-    provision_durable_sessions(&grok_home, "grok", workspace, run_id)?;
+    provision_durable_sessions(&grok_home, "grok", run_id)?;
     // Scoped HOME with no `.claude` tree — quarantine operator Claude settings.
     fs::create_dir_all(&process_home).with_context(|| format!("creating process HOME {}", process_home.display()))?;
     // Explicitly ensure no leftover .claude from a prior mis-provision.

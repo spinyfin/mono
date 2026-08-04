@@ -41,7 +41,7 @@ mod tool_surface_guard;
 use guard_trace::{GUARD_TRACE_SHIM_FILENAME, GUARD_TRACE_SHIM_SCRIPT, guard_trace_path, wrapper_body};
 use tool_surface_guard::CODEX_TOOL_SURFACE_GUARD_SCRIPT;
 
-use crate::transcript_store::{provision_durable_sessions, transcript_store_root};
+use crate::transcript_store::{provision_durable_sessions, transcript_store_root, verified_durable_sessions_dir};
 use progress::{CodexRolloutProgressSession, CodexTranscriptSession, normalize_rollout, verified_sessions_root};
 
 use super::claude::{BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND};
@@ -294,8 +294,6 @@ pub const CODEX_HOMES_ROOT_ENV: &str = "BOSS_CODEX_HOMES_DIR";
 pub static CODEX_HOMES_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Default leaf under the system temp when [`CODEX_HOMES_ROOT_ENV`] is unset.
-/// Session JSONL is the deliberate exception: provisioning links only that
-/// subtree into Boss-owned per-execution storage for durable forensic retention.
 const CODEX_HOMES_DIR_NAME: &str = "boss-codex-homes";
 
 /// Filename of the hook-trust attestation JSON written next to the run home.
@@ -306,6 +304,8 @@ const HOOK_TRUST_ATTESTATION_FILENAME: &str = "hook-trust-attestation.json";
 // ---------------------------------------------------------------------------
 
 /// Root directory that holds Boss-owned per-run `CODEX_HOME` trees.
+/// Everything under each home is temporary except `sessions/`, which is a
+/// link into Boss's durable per-execution transcript store.
 ///
 /// Prefer [`CODEX_HOMES_ROOT_ENV`] when set (tests); otherwise
 /// `$TMPDIR/boss-codex-homes`. Never the operator interactive `~/.codex`.
@@ -1387,9 +1387,7 @@ impl AgentDriver for CodexDriver {
             .with_context(|| format!("resolving Boss-owned CODEX_HOME for run_id {run_id:?}"))?;
         fs::create_dir_all(&codex_home)
             .with_context(|| format!("creating Boss-owned CODEX_HOME {}", codex_home.display()))?;
-        fs::create_dir_all(codex_home.join("sessions"))
-            .with_context(|| format!("creating Codex sessions directory under {}", codex_home.display()))?;
-        provision_durable_sessions(&codex_home, "codex", workspace, run_id)?;
+        provision_durable_sessions(&codex_home, "codex", run_id)?;
 
         // Auth: SnapshotWithRefreshAdoption. Source is the operator auth
         // discovery path (or BOSS_CODEX_AUTH_SOURCE when set for tests);
@@ -1430,8 +1428,11 @@ impl AgentDriver for CodexDriver {
     /// Leaves the temporary Boss-owned `CODEX_HOME` for its existing reclaim
     /// policy. Its `sessions/` link already writes the full rollout into
     /// Boss-owned transcript storage, while auth and every other home file
-    /// remain temporary. Idempotent: a missing home or missing runtime state
-    /// is a pure no-op.
+    /// remain temporary. Disk reclaim later uses the recorded path only;
+    /// it never scans `~/.codex` or infers a home from the engine environment.
+    /// `boss-engine-codex-rollout-retention` and `codex_home_retention_sweep`
+    /// own that reclaim policy. Idempotent: a missing home or missing runtime
+    /// state is a pure no-op.
     async fn teardown_workspace(
         &self,
         _workspace: Option<&Path>,
@@ -1723,7 +1724,13 @@ impl AgentDriver for CodexDriver {
             .map(|metadata| metadata.file_type().is_symlink())
             .unwrap_or(false)
         {
-            return Ok(Some(transcript_store_root()?));
+            let store_root = transcript_store_root()?;
+            return Ok(Some(verified_durable_sessions_dir(
+                &codex_home,
+                &store_root,
+                "codex",
+                run_id,
+            )?));
         }
         let sessions = verified_sessions_root(&homes_root, &codex_home).ok_or_else(|| {
             anyhow!(
