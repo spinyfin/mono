@@ -81,13 +81,16 @@ fn agent_rules_require_session_polling_until_a_real_exit_status() {
     let preamble = CodexDriver::default().agent_rules_preamble();
     for required in [
         "expected to exceed roughly ten seconds",
-        "exec_command` yields after at\nmost 30 seconds",
+        "exec_command` yields after at most 30 seconds;",
         "tools.write_stdin",
         "chars: \"\"",
         "text(JSON.stringify(r))",
-        "calls 2..N — poll the SAME session, unbounded",
-        "terminal result carries `exit_code`",
-        "own foreground\ntimeout",
+        "completion in the same JavaScript cell",
+        "let r = await tools.exec_command",
+        "session_id: r.session_id",
+        "yield_time_ms: 300000",
+        "carries `exit_code`.",
+        "own foreground timeout",
     ] {
         assert!(
             preamble.contains(required),
@@ -95,15 +98,19 @@ fn agent_rules_require_session_polling_until_a_real_exit_status() {
         );
     }
     assert!(
-        preamble.contains("a result containing `session_id` means the command is\nstill running"),
+        preamble.contains("a result containing\n`session_id` means the command is still running"),
         "a yielded session must never be presented as a completed gate: {preamble}"
     );
     assert!(
-        preamble.contains("`text(r.output)` discards\nthat handle"),
+        preamble.contains("`text(r.output)` discards that handle"),
         "the worker must retain its session handle for polling: {preamble}"
     );
     assert!(
-        preamble.contains("Do not end the turn or claim a gate\nresult without the real `exit_code`"),
+        preamble.contains("only that invocation's output and logs") && preamble.contains("global process-name matches"),
+        "the worker must not attribute unrelated global processes to its command: {preamble}"
+    );
+    assert!(
+        preamble.contains("without the real `exit_code`"),
         "the worker must not infer success from a missing exit status: {preamble}"
     );
 }
