@@ -136,6 +136,97 @@ struct FailedCheckRecord<'a> {
 /// Attention kind used when CI remediation exhausts its attempt budget.
 pub const CI_REMEDIATION_EXHAUSTED_ATTENTION_KIND: &str = "ci_remediation_exhausted";
 
+/// Retained audit record for a CI-watch evaluation that found an active
+/// attempt but deliberately left it in place. These decisions are `info`
+/// because the engine's retained trace omits debug records, and a repeated
+/// guard is precisely the evidence needed to diagnose a wedged attempt.
+pub(crate) fn record_declined_evaluation(
+    candidate: &PendingMergeCheck,
+    active: &CiRemediation,
+    current_head_sha: Option<&str>,
+    guard: &'static str,
+) {
+    tracing::info!(
+        work_item_id = %candidate.work_item_id,
+        pr_url = %candidate.pr_url,
+        attempt_id = %active.id,
+        attempt_kind = %active.attempt_kind,
+        head_sha_at_trigger = %active.head_sha_at_trigger,
+        current_head_sha = current_head_sha.unwrap_or("<unavailable>"),
+        guard,
+        "ci_watch: evaluation declined by active-attempt guard",
+    );
+}
+
+/// Retire a GitHub merge-queue attempt after GitHub's compare API proves
+/// that its synthetic trigger commit no longer contains the current PR
+/// head. Queue commits live on `gh-readonly-queue/*` and never become part
+/// of the PR branch, so equality with `head_sha_at_trigger` cannot be the
+/// retirement test. The caller performs the reachability query; this
+/// function owns the attempt/signal transition and its UI events.
+pub(crate) async fn retire_superseded_merge_queue_attempt(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    active: &CiRemediation,
+    current_head_sha: &str,
+) -> bool {
+    let retired = match work_db.mark_ci_remediation_abandoned(&active.id, "merge_queue_trigger_superseded") {
+        Ok(Some(row)) => row,
+        Ok(None) => return false,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                attempt_id = %active.id,
+                ?err,
+                "ci_watch: failed to retire superseded merge-queue remediation",
+            );
+            return false;
+        }
+    };
+    if let Err(err) = work_db.clear_ci_failure_signal_only(&candidate.work_item_id) {
+        tracing::warn!(
+            work_item_id = %candidate.work_item_id,
+            attempt_id = %active.id,
+            ?err,
+            "ci_watch: failed to clear superseded merge-queue failure signal",
+        );
+    }
+    close_superseded_moot_revision(
+        work_db,
+        &candidate.work_item_id,
+        active.revision_task_id.as_deref(),
+        "superseded by a PR head that is no longer contained by the merge-queue trigger",
+    );
+    publisher
+        .publish_work_item_changed(
+            &candidate.product_id,
+            &candidate.work_item_id,
+            "merge_queue_ci_attempt_superseded",
+        )
+        .await;
+    publisher
+        .publish_frontend_event_on_product(
+            &candidate.product_id,
+            FrontendEvent::CiFailureCleared {
+                product_id: candidate.product_id.clone(),
+                work_item_id: candidate.work_item_id.clone(),
+                pr_url: candidate.pr_url.clone(),
+            },
+        )
+        .await;
+    tracing::info!(
+        work_item_id = %candidate.work_item_id,
+        pr_url = %candidate.pr_url,
+        attempt_id = %retired.id,
+        attempt_kind = %retired.attempt_kind,
+        head_sha_at_trigger = %retired.head_sha_at_trigger,
+        current_head_sha,
+        "ci_watch: retired merge-queue remediation whose trigger no longer contains the PR head",
+    );
+    true
+}
+
 /// Create a work-item-scoped attention item signalling that automated CI
 /// remediation gave up, and emit [`FrontendEvent::AttentionItemCreated`]
 /// so the UI surfaces it immediately. Best-effort: filing errors are
@@ -312,12 +403,25 @@ pub async fn on_ci_failure_detected(
                 publisher
                     .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, "ci_revision_in_flight")
                     .await;
+            } else {
+                record_declined_evaluation(
+                    candidate,
+                    &active,
+                    probe.head_ref_oid.as_deref(),
+                    "active_revision_reconcile_noop",
+                );
             }
             return reconciled;
         }
         // Parent is `in_review` (or human-moved): idempotent probe. Keep the
         // in-flight signal armed so `maybe_clear_blocked` fires on green.
         let _ = work_db.record_ci_failure_in_flight(&candidate.work_item_id, &active.id);
+        record_declined_evaluation(
+            candidate,
+            &active,
+            probe.head_ref_oid.as_deref(),
+            "active_revision_overlap",
+        );
         return false;
     }
 
@@ -1714,12 +1818,11 @@ pub async fn on_ci_in_flight_supersedes_failure(
             // marks the attempt succeeded, or a new failing episode).
             // Mirrors the identical guard in `on_ci_resolved`.
             if is_queue_side_failure_kind(active.failure_kind.as_deref()) {
-                tracing::debug!(
-                    work_item_id = %candidate.work_item_id,
-                    pr_url = %candidate.pr_url,
-                    failure_kind = ?active.failure_kind,
-                    "ci_watch: InFlight supersede skipped — active queue-side-failure attempt; \
-                     head-branch CI is not the clearing signal for queue failures",
+                record_declined_evaluation(
+                    candidate,
+                    &active,
+                    current_head_sha,
+                    "queue_failure_not_cleared_by_head_ci_inflight",
                 );
                 return false;
             }
@@ -1762,11 +1865,11 @@ pub async fn on_ci_in_flight_supersedes_failure(
                 // Fall through — treat as no active attempt.
             } else {
                 // Case (b): same head SHA → the fix is running; leave it.
-                tracing::debug!(
-                    work_item_id = %candidate.work_item_id,
-                    pr_url = %candidate.pr_url,
-                    "ci_watch: InFlight with active remediation for current head; \
-                     leaving the in-flight badge to the attempt's terminal transition",
+                record_declined_evaluation(
+                    candidate,
+                    &active,
+                    current_head_sha,
+                    "current_head_attempt_owns_inflight_run",
                 );
                 return false;
             }
@@ -1950,13 +2053,9 @@ pub async fn on_ci_resolved(
                 .and_then(|id| work_db.get_work_item(id).ok())
                 .is_some_and(|item| matches!(item, WorkItem::Task(t) if t.status == TaskStatus::Done));
         if !revision_landed {
-            tracing::debug!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                is_trunk_eviction,
-                "ci_watch: skipping on_ci_resolved — active queue-side-failure attempt; \
-                 head-branch CI clean is not the clearing signal for queue failures",
-            );
+            if let Some(active) = attempt.as_ref() {
+                record_declined_evaluation(candidate, active, None, "queue_failure_not_cleared_by_head_ci_clean");
+            }
             return false;
         }
     }
