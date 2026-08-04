@@ -282,23 +282,101 @@ impl ExecutionCoordinator {
                  being dispatched — cannot force-dispatch"
             ));
         };
+        if self.work_db.begin_execution_dispatch(execution_id)?.is_none() {
+            let current = self.work_db.get_execution(execution_id)?;
+            return Err(anyhow!(
+                "execution {execution_id} changed to status `{}` before its dispatch claim; no worker was claimed",
+                current.status,
+            ));
+        }
         let preferred_workspace_id = execution.preferred_workspace_id.clone();
         let pool = self.pool_for_execution(&execution);
         let pool_label = self.attributed_pool_label(&execution);
-        let worker_id = pool
+        let worker_id = match pool
             .claim_worker_force(&execution.id, preferred_workspace_id.as_deref())
             .await
-            .ok_or_else(|| {
-                anyhow!(
+        {
+            Some(worker_id) => worker_id,
+            None => {
+                self.work_db.release_execution_dispatch(&execution.id)?;
+                return Err(anyhow!(
                     "{pool_label} pool already at hard cap ({cap}); cannot force-dispatch {execution_id}",
                     cap = pool.hard_cap(),
-                )
-            })?;
+                ));
+            }
+        };
         if let Err(err) = self.schedule_execution(&execution, &worker_id).await {
+            if let Err(release_err) = self.work_db.release_execution_dispatch(&execution.id) {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    ?release_err,
+                    "failed to release force-dispatch readiness claim",
+                );
+            }
             pool.release_worker(&worker_id, preferred_workspace_id.as_deref()).await;
             return Err(err);
         }
         Ok(worker_id)
+    }
+
+    /// Atomically settle an execution's readiness before any worker slot or
+    /// preemption is touched. A stale queue snapshot is expected under
+    /// concurrent reconciliation; it becomes a visible skipped dispatch,
+    /// never an expensive attempt that discovers the new status at run start.
+    async fn begin_dispatch_or_skip(&self, execution: &WorkExecution) -> bool {
+        match self.work_db.begin_execution_dispatch(&execution.id) {
+            Ok(Some(_)) => true,
+            Ok(None) => {
+                let current_status = self
+                    .work_db
+                    .get_execution(&execution.id)
+                    .map(|current| current.status.as_str().to_owned())
+                    .unwrap_or_else(|_| "unknown".to_owned());
+                tracing::info!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    current_status,
+                    "spawn_attempt status=ready -> skipped reason=readiness_changed_before_claim",
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Skipped, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_details(serde_json::json!({
+                                "reason": "readiness_changed_before_claim",
+                                "snapshot_status": execution.status.as_str(),
+                                "current_status": current_status,
+                            })),
+                    )
+                    .await;
+                false
+            }
+            Err(err) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    ?err,
+                    "failed to settle execution readiness before worker claim",
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_error(&err)
+                            .with_details(serde_json::json!({
+                                "reason": "readiness_claim_failed",
+                            })),
+                    )
+                    .await;
+                false
+            }
+        }
+    }
+
+    fn release_dispatch_claim(&self, execution_id: &str) {
+        if let Err(err) = self.work_db.release_execution_dispatch(execution_id) {
+            tracing::error!(execution_id, ?err, "failed to release execution dispatch claim",);
+        }
     }
 
     async fn run_scheduler(self: Arc<Self>) {
@@ -962,6 +1040,9 @@ impl ExecutionCoordinator {
                 live_workers_at_cap_check.is_some_and(|live| live >= self.max_concurrent_interactive_workers());
 
             if capped {
+                if !self.begin_dispatch_or_skip(&execution).await {
+                    continue;
+                }
                 let claimed = if preempted_this_pass {
                     None
                 } else {
@@ -976,6 +1057,7 @@ impl ExecutionCoordinator {
                     }
                 };
                 let Some(worker_id) = claimed else {
+                    self.release_dispatch_claim(&execution.id);
                     let live_workers = live_workers_at_cap_check.unwrap_or_default();
                     let cap = self.max_concurrent_interactive_workers();
                     tracing::info!(
@@ -1259,6 +1341,10 @@ impl ExecutionCoordinator {
 
             let pool = self.pool_for_execution(&execution);
 
+            if !self.begin_dispatch_or_skip(&execution).await {
+                continue;
+            }
+
             // Not capped (capped mainline rows already `continue`d above,
             // either dispatched via preemption or deferred with
             // `interactive_concurrency_cap`), so a genuinely idle slot is
@@ -1290,6 +1376,7 @@ impl ExecutionCoordinator {
             };
 
             let Some(worker_id) = claimed else {
+                self.release_dispatch_claim(&execution.id);
                 // This pool is fully claimed. Record exhaustion and continue
                 // so executions for the other pools can still be dispatched.
                 let pool_capacity = pool.capacity().await;
@@ -1378,6 +1465,9 @@ impl ExecutionCoordinator {
         // mainline work.
         for execution in spill_candidates {
             let preferred_workspace_id = execution.preferred_workspace_id.clone();
+            if !self.begin_dispatch_or_skip(&execution).await {
+                continue;
+            }
             // Re-read per candidate: each successful spill in this loop
             // raises the live-worker count, so a cap snapshotted once
             // before the loop would let later candidates in the same
@@ -1392,6 +1482,7 @@ impl ExecutionCoordinator {
                 )
                 .await
             else {
+                self.release_dispatch_claim(&execution.id);
                 // No free Lower Decks slot either, or the interactive
                 // concurrency cap is already saturated: this automation
                 // row waits, exactly as it did before spillover existed.
@@ -1869,6 +1960,7 @@ impl ExecutionCoordinator {
             self.pool_for_worker_id(worker_id)
                 .release_worker(worker_id, execution.preferred_workspace_id.as_deref())
                 .await;
+            self.release_dispatch_claim(&execution.id);
             return;
         };
         let coordinator = Arc::clone(self);
@@ -1891,7 +1983,7 @@ impl ExecutionCoordinator {
                     // the claim anyway: bailing out silently would strand
                     // this worker slot forever, since `pool_claim_sweep`
                     // only reclaims slots whose execution went terminal and
-                    // this row is still `ready`.
+                    // this row is still `dispatching`.
                     tracing::error!(
                         execution_id = %execution.id,
                         worker_id = %worker_id,
@@ -1901,6 +1993,7 @@ impl ExecutionCoordinator {
                         .pool_for_worker_id(&worker_id)
                         .release_worker(&worker_id, execution.preferred_workspace_id.as_deref())
                         .await;
+                    coordinator.release_dispatch_claim(&execution.id);
                     return;
                 }
             };
@@ -1926,6 +2019,7 @@ impl ExecutionCoordinator {
                         .pool_for_worker_id(&worker_id)
                         .release_worker(&worker_id, execution.preferred_workspace_id.as_deref())
                         .await;
+                    coordinator.release_dispatch_claim(&execution.id);
                 }
             }
         });

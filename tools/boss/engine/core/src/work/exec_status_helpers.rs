@@ -526,7 +526,16 @@ mod tests {
         for status in [Queued, Ready, WaitingDependency] {
             assert!(status.can_reconcile(), "{status} should be reconcilable");
         }
-        for status in [Running, WaitingHuman, Completed, Failed, Abandoned, Cancelled, Orphaned] {
+        for status in [
+            Dispatching,
+            Running,
+            WaitingHuman,
+            Completed,
+            Failed,
+            Abandoned,
+            Cancelled,
+            Orphaned,
+        ] {
             assert!(!status.can_reconcile(), "{status} should not be reconcilable");
         }
     }
@@ -539,7 +548,7 @@ mod tests {
         for status in [Completed, Failed, Abandoned, Cancelled, Orphaned] {
             assert!(status.is_terminal(), "{status} should be terminal");
         }
-        for status in [Queued, Ready, Running, WaitingHuman, WaitingDependency] {
+        for status in [Queued, Ready, Dispatching, Running, WaitingHuman, WaitingDependency] {
             assert!(!status.is_terminal(), "{status} should not be terminal");
         }
     }
@@ -555,6 +564,7 @@ mod tests {
         for status in [
             Queued,
             Ready,
+            Dispatching,
             WaitingDependency,
             Completed,
             Failed,

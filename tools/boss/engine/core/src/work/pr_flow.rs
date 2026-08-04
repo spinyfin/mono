@@ -714,7 +714,7 @@ impl WorkDb {
                  SELECT 1 FROM work_executions live
                  WHERE live.work_item_id = we.work_item_id
                    AND live.status IN (
-                     'queued', 'ready', 'waiting_dependency', 'running',
+                     'queued', 'ready', 'dispatching', 'waiting_dependency', 'running',
                      'waiting_human', 'waiting_review', 'waiting_merge'
                    )
                )
@@ -770,7 +770,7 @@ impl WorkDb {
                  SELECT 1 FROM work_executions live
                  WHERE live.work_item_id = ?1
                    AND live.status IN (
-                     'queued', 'ready', 'waiting_dependency', 'running',
+                     'queued', 'ready', 'dispatching', 'waiting_dependency', 'running',
                      'waiting_human', 'waiting_review', 'waiting_merge'
                    )
                )",

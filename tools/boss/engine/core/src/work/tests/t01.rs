@@ -909,6 +909,75 @@ fn reconciles_missing_executions_for_product_tree() {
 }
 
 #[test]
+fn dispatch_claim_prevents_reconcile_from_rewriting_readiness() {
+    let path = temp_db_path("dispatch-claim-readiness");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let project = db
+        .create_project(CreateProjectInput {
+            product_id: product.id.clone(),
+            name: "Claim ordering".to_owned(),
+            description: None,
+            goal: None,
+            autostart: true,
+            no_design_task: true,
+        })
+        .unwrap();
+    let _first = db
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("First")
+                .build(),
+        )
+        .unwrap();
+    let second = db
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("Second")
+                .build(),
+        )
+        .unwrap();
+
+    db.reconcile_product_executions(&product.id).unwrap();
+    let waiting = db.list_executions(Some(&second.id)).unwrap().pop().unwrap();
+    assert_eq!(waiting.status, ExecutionStatus::WaitingDependency);
+
+    // An explicit dispatch promotes the row. Product reconciliation used to
+    // race the asynchronous scheduler and move it back to waiting after the
+    // scheduler had already consumed its ready snapshot.
+    let ready = db
+        .request_execution(RequestExecutionInput::builder().work_item_id(second.id.clone()).build())
+        .unwrap();
+    assert_eq!(ready.status, ExecutionStatus::Ready);
+
+    let claimed = db.begin_execution_dispatch(&ready.id).unwrap().unwrap();
+    assert_eq!(claimed.status, ExecutionStatus::Dispatching);
+    db.reconcile_product_executions(&product.id).unwrap();
+    assert_eq!(
+        db.get_execution(&ready.id).unwrap().status,
+        ExecutionStatus::Dispatching,
+        "reconciliation must not invalidate a scheduler-owned dispatch claim",
+    );
+
+    let (running, _) = db
+        .start_execution_run(
+            &ready.id,
+            "worker-1",
+            "mono",
+            "lease-1",
+            "workspace-1",
+            "/tmp/workspace-1",
+        )
+        .unwrap();
+    assert_eq!(running.status, ExecutionStatus::Running);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn reconcile_promotes_next_project_task_when_previous_done() {
     let path = temp_db_path("reconcile-promote");
     let db = WorkDb::open(path.clone()).unwrap();

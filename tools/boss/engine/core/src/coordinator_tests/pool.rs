@@ -2207,7 +2207,7 @@ async fn fast_items_dispatch_without_waiting_behind_a_slow_one() {
     // ...while the slow row is still stuck in its `ensure_repo`.
     assert_eq!(
         db.get_execution(&slow).unwrap().status,
-        ExecutionStatus::Ready,
+        ExecutionStatus::Dispatching,
         "the slow row should still be dispatching — the point is that the fast rows \
          overtook it rather than queueing behind it",
     );
@@ -2456,7 +2456,7 @@ async fn a_chain_sibling_defers_behind_a_dispatch_still_in_flight() {
     );
     assert_eq!(
         db.get_execution(&revision_exec.id).unwrap().status,
-        ExecutionStatus::Ready,
+        ExecutionStatus::Dispatching,
         "sanity: the revision is still mid-dispatch, so the deferral above was \
          decided against an in-flight sibling and not a DB-visible live one",
     );

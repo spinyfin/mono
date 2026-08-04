@@ -1478,6 +1478,7 @@ fn all_execution_statuses() -> Vec<ExecutionStatus> {
     let all = vec![
         Queued,
         Ready,
+        Dispatching,
         WaitingDependency,
         Running,
         WaitingHuman,
@@ -1491,8 +1492,8 @@ fn all_execution_statuses() -> Vec<ExecutionStatus> {
     ];
     for status in &all {
         match status {
-            Queued | Ready | WaitingDependency | Running | WaitingHuman | WaitingReview | WaitingMerge | Completed
-            | Failed | Abandoned | Cancelled | Orphaned => {}
+            Queued | Ready | Dispatching | WaitingDependency | Running | WaitingHuman | WaitingReview
+            | WaitingMerge | Completed | Failed | Abandoned | Cancelled | Orphaned => {}
         }
     }
     all
@@ -1507,6 +1508,7 @@ fn execution_status_is_terminal_marks_only_closed_states() {
     for status in [
         Queued,
         Ready,
+        Dispatching,
         WaitingDependency,
         Running,
         WaitingHuman,
@@ -1526,6 +1528,7 @@ fn execution_status_is_live_marks_only_active_states() {
     for status in [
         Queued,
         Ready,
+        Dispatching,
         WaitingDependency,
         WaitingReview,
         WaitingMerge,
@@ -1546,6 +1549,7 @@ fn execution_status_can_reconcile_marks_only_pre_dispatch_states() {
         assert!(status.can_reconcile(), "{status} should be reconcilable");
     }
     for status in [
+        Dispatching,
         Running,
         WaitingHuman,
         WaitingReview,
@@ -1575,12 +1579,17 @@ fn execution_status_classifications_are_mutually_exclusive() {
 }
 
 #[test]
-fn execution_status_waiting_review_and_merge_are_unclassified() {
-    // WaitingReview/WaitingMerge are intentionally in none of the three
-    // buckets: the work is done from the engine's dispatch perspective but
-    // not yet closed, and nothing to reconcile. Pin that gap so a future
-    // reclassification is a deliberate, test-visible change.
-    for status in [ExecutionStatus::WaitingReview, ExecutionStatus::WaitingMerge] {
+fn execution_status_dispatching_waiting_review_and_merge_are_unclassified() {
+    // Dispatching/WaitingReview/WaitingMerge are intentionally in none of the
+    // three buckets. Dispatching is scheduler-owned pre-run work;
+    // WaitingReview/WaitingMerge are done from the dispatch perspective but
+    // not yet closed. None may be reconciled. Pin that gap so a future
+    // reclassification is deliberate and test-visible.
+    for status in [
+        ExecutionStatus::Dispatching,
+        ExecutionStatus::WaitingReview,
+        ExecutionStatus::WaitingMerge,
+    ] {
         assert!(!status.is_terminal(), "{status} should not be terminal");
         assert!(!status.is_live(), "{status} should not be live");
         assert!(!status.can_reconcile(), "{status} should not be reconcilable");

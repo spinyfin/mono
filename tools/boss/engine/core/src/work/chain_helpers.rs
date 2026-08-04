@@ -184,7 +184,8 @@ pub(crate) fn collect_chain_revision_ids_including_deleted(
 
 /// Abandon every not-yet-live execution row belonging to `work_item_id`.
 ///
-/// Without this a `ready` / `queued` / `waiting_dependency` row (e.g. minted
+/// Without this a `ready` / `queued` / `dispatching` / `waiting_dependency`
+/// row (e.g. minted
 /// by the dependency-unblock cascade, which is not chain-root-aware) is
 /// stranded on a work item that is about to be archived or settled — it can
 /// never be dispatched, and `bossctl work start` on the row just mints
@@ -205,7 +206,7 @@ pub(crate) fn abandon_pending_executions(
     let mut stmt = conn.prepare(
         "SELECT id, status FROM work_executions
          WHERE work_item_id = ?1
-           AND status IN ('queued', 'ready', 'waiting_dependency')",
+           AND status IN ('queued', 'ready', 'dispatching', 'waiting_dependency')",
     )?;
     let doomed: Vec<(String, String)> = stmt
         .query_map(params![work_item_id], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -217,7 +218,7 @@ pub(crate) fn abandon_pending_executions(
          SET status = 'abandoned',
              finished_at = COALESCE(finished_at, ?2)
          WHERE work_item_id = ?1
-           AND status IN ('queued', 'ready', 'waiting_dependency')",
+           AND status IN ('queued', 'ready', 'dispatching', 'waiting_dependency')",
         params![work_item_id, now],
     )?;
     for (execution_id, from_status) in &doomed {
