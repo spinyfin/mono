@@ -172,19 +172,33 @@ fn is_wall_time_line(line: &str) -> bool {
 /// as terminal is exactly what let a still-running command look observed.
 ///
 /// Only a recognised harness chunk (a JSON object carrying `chunk_id`) can
-/// be still-running here. Probe 8's bare `7` projection (`text(r.exit_code)`)
-/// and probe 3's truncation-warning prose are not chunks at all; calling
-/// those still-running would manufacture a false abandoned command.
+/// be still-running here. A bare `7` projection (`text(r.exit_code)`) and
+/// truncation-warning prose are not chunks at all.
 pub fn payload_is_running_chunk(payload: &str) -> bool {
     let Ok(Value::Object(chunk)) = serde_json::from_str::<Value>(payload) else {
         return false;
     };
-    let reports_exit_code = chunk.contains_key("exit_code")
+    chunk.contains_key("chunk_id") && !payload_reports_exit_code(payload)
+}
+
+/// Whether a structured harness chunk reports the command's exit status.
+pub fn payload_reports_exit_code(payload: &str) -> bool {
+    let Ok(Value::Object(chunk)) = serde_json::from_str::<Value>(payload) else {
+        return false;
+    };
+    chunk.contains_key("exit_code")
         || chunk
             .get("metadata")
             .and_then(|metadata| metadata.get("exit_code"))
-            .is_some();
-    chunk.contains_key("chunk_id") && !reports_exit_code
+            .is_some()
+}
+
+/// Whether the harness truncated a completed cell's output before forwarding
+/// it. The warning is emitted only after the cell completed, so it is a
+/// terminal result even though the structured chunk and its exit code are no
+/// longer available.
+pub fn payload_is_truncated_output(payload: &str) -> bool {
+    payload.starts_with("Warning: truncated output (original token count:")
 }
 
 /// The shell-session identifier carried by a structured harness chunk.
@@ -463,10 +477,24 @@ mod tests {
     }
 
     #[test]
+    fn payload_reports_exit_code_checks_top_level_and_metadata_fields() {
+        assert!(payload_reports_exit_code(r#"{"exit_code":0}"#));
+        assert!(payload_reports_exit_code(r#"{"metadata":{"exit_code":4}}"#));
+        assert!(!payload_reports_exit_code(r#"{"chunk_id":"running"}"#));
+    }
+
+    #[test]
+    fn truncation_warning_marks_a_completed_payload_as_terminal() {
+        assert!(payload_is_truncated_output(
+            "Warning: truncated output (original token count: 11827)\n\ntouch: x: denied\n"
+        ));
+        assert!(!payload_is_truncated_output("partial output\n"));
+    }
+
+    #[test]
     fn a_payload_that_is_not_a_harness_chunk_is_never_still_running() {
         // Probe 8 projects the exit code alone; probe 3's outer truncation
-        // warning leaves the payload unparseable. Neither may become a
-        // false abandoned command.
+        // warning leaves the payload unparseable. Neither is a running chunk.
         assert!(!payload_is_running_chunk("7"));
         assert!(!payload_is_running_chunk(
             "Warning: truncated output (original token count: 11827)\n\n{\"chunk_id\":\"5ce387\"}"

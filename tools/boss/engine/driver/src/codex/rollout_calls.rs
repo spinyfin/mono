@@ -44,8 +44,8 @@
 use std::collections::{HashMap, VecDeque};
 
 use boss_engine_codex_rollout::cell::{
-    CellOutcome, CellOutput, is_cell_wait_tool, parse_cell_output, payload_is_running_chunk, payload_session_id,
-    wait_target_cell_id,
+    CellOutcome, CellOutput, commands_from_cell_script, is_cell_wait_tool, parse_cell_output, payload_is_running_chunk,
+    payload_is_truncated_output, payload_reports_exit_code, payload_session_id, wait_target_cell_id,
 };
 use boss_engine_codex_rollout::{CanonicalRolloutToolOutput, canonical_rollout_tool_output, flatten_tool_output_text};
 use serde_json::Value;
@@ -123,6 +123,10 @@ pub(super) enum OutputDisposition {
     /// output — `call` is the call that issued the command, which for a
     /// continuation is *not* the call this output's `call_id` names.
     Completed(RolloutToolCall),
+    /// The cell forwarded output, but omitted the command's terminal signal.
+    /// Report this record so downstream consumers retain its body, while
+    /// keeping the call open for abandoned-command detection at the boundary.
+    UnconfirmedResult(RolloutToolCall),
     /// The command is still running: nothing about it is observed yet, and
     /// the call stays open. `cell_id` is the cell a further `wait` must poll
     /// to reach the command's real result, when the record named one — the
@@ -396,9 +400,22 @@ impl RolloutCallTracker {
         let parsed = parse_cell_output(&flatten_tool_output_text(output));
         let session_id = parsed.as_ref().and_then(|parsed| payload_session_id(&parsed.payload));
         let binding = self.waits.remove(call_id);
-        let origin = session_id
-            .as_deref()
-            .and_then(|session_id| self.sessions.get(session_id).cloned())
+        // A cell that starts a new command owns its result even when the
+        // shell happens to reuse a previously tracked session. Only a pure
+        // continuation cell (`tools.write_stdin`) resolves through sessions.
+        let is_continuation_cell = self
+            .calls
+            .get(call_id)
+            .and_then(|call| call.tool_input.get("command"))
+            .and_then(Value::as_str)
+            .is_some_and(|command| commands_from_cell_script(command).is_empty());
+        let origin = is_continuation_cell
+            .then(|| {
+                session_id
+                    .as_deref()
+                    .and_then(|session_id| self.sessions.get(session_id).cloned())
+            })
+            .flatten()
             .or_else(|| binding.as_ref().map(|binding| binding.origin.clone()))
             .unwrap_or_else(|| call_id.to_owned());
         if !self.calls.contains_key(&origin) {
@@ -438,7 +455,7 @@ impl RolloutCallTracker {
             Some(CellOutput {
                 outcome: CellOutcome::Completed,
                 payload,
-            }) if payload_reports_exit_code(&payload) => {}
+            }) if payload_reports_exit_code(&payload) || payload_is_truncated_output(&payload) => {}
             // `text(r.output)` discards both `session_id` and `exit_code`.
             // A completed cell carrying that projection is not evidence that
             // the command terminated, so leave it open for the turn boundary.
@@ -446,10 +463,15 @@ impl RolloutCallTracker {
                 outcome: CellOutcome::Completed,
                 ..
             }) => {
+                let call = self
+                    .calls
+                    .get(&origin)
+                    .expect("origin call presence was just checked")
+                    .clone();
                 if origin != call_id {
                     self.calls.remove(call_id);
                 }
-                return Ok(OutputDisposition::StillRunning { cell_id: None });
+                return Ok(OutputDisposition::UnconfirmedResult(call));
             }
             _ => {}
         }
@@ -524,17 +546,6 @@ pub(super) fn cell_aware_tool_output(output: &Value) -> CanonicalRolloutToolOutp
         Some(parsed) => canonical_rollout_tool_output(&Value::String(parsed.payload)),
         None => canonical_rollout_tool_output(output),
     }
-}
-
-fn payload_reports_exit_code(payload: &str) -> bool {
-    let Ok(Value::Object(chunk)) = serde_json::from_str::<Value>(payload) else {
-        return false;
-    };
-    chunk.contains_key("exit_code")
-        || chunk
-            .get("metadata")
-            .and_then(|metadata| metadata.get("exit_code"))
-            .is_some()
 }
 
 #[cfg(test)]
@@ -688,24 +699,35 @@ mod tests {
     }
 
     #[test]
-    fn a_completed_cell_with_an_unstructured_payload_stays_open() {
+    fn an_unstructured_completed_cell_preserves_its_result_and_stays_open() {
         // A cell using `text(r.output)` loses both the session handle and
         // exit code. Boss cannot treat that projection as a pass, even when
         // the string happens to look like an exit code.
-        for payload in [
-            "7",
-            "Warning: truncated output (original token count: 11827)\n\ntouch: x: denied\n",
-        ] {
-            let mut tracker = RolloutCallTracker::default();
-            tracker.observe_call("A", bash("echo hi")).unwrap();
-            assert!(
-                matches!(
-                    tracker.observe_output("A", &completed(payload)),
-                    Ok(OutputDisposition::StillRunning { cell_id: None })
-                ),
-                "payload {payload:?} must remain unobserved"
-            );
-        }
+        let payload = "7";
+        let mut tracker = RolloutCallTracker::default();
+        tracker.observe_call("A", bash("echo hi")).unwrap();
+        assert!(
+            matches!(
+                tracker.observe_output("A", &completed(payload)),
+                Ok(OutputDisposition::UnconfirmedResult(_))
+            ),
+            "payload {payload:?} must remain unobserved"
+        );
+        assert_eq!(tracker.drain_open_calls().len(), 1);
+    }
+
+    #[test]
+    fn a_truncated_completed_cell_is_terminal() {
+        let mut tracker = RolloutCallTracker::default();
+        tracker.observe_call("A", bash("echo hi")).unwrap();
+        assert!(matches!(
+            tracker.observe_output(
+                "A",
+                &completed("Warning: truncated output (original token count: 11827)\n\ntouch: x: denied\n")
+            ),
+            Ok(OutputDisposition::Completed(_))
+        ));
+        assert!(tracker.drain_open_calls().is_empty());
     }
 
     #[test]
@@ -718,25 +740,25 @@ mod tests {
         // its structured chunk names A's shell session.
         tracker
             .observe_call(
-                "P1",
+                "poll-1",
                 RolloutToolCall {
                     tool_name: "exec".to_owned(),
-                    tool_input: json!({"source":"tools.write_stdin(...)"}),
+                    tool_input: json!({"command":"const r = await tools.write_stdin({\"session_id\":8467,\"chars\":\"\"});"}),
                 },
             )
             .unwrap();
-        tracker.observe_output("P1", &completed(P6_RUNNING_CHUNK)).unwrap();
+        tracker.observe_output("poll-1", &completed(P6_RUNNING_CHUNK)).unwrap();
         tracker
             .observe_call(
-                "P2",
+                "poll-2",
                 RolloutToolCall {
                     tool_name: "exec".to_owned(),
-                    tool_input: json!({"source":"tools.write_stdin(...)"}),
+                    tool_input: json!({"command":"const r = await tools.write_stdin({\"session_id\":8467,\"chars\":\"\"});"}),
                 },
             )
             .unwrap();
         let result = tracker.observe_output(
-            "P2",
+            "poll-2",
             &completed(r#"{"chunk_id":"d0540d","session_id":8467,"exit_code":0,"output":"done\n"}"#),
         );
         assert!(
@@ -763,7 +785,7 @@ mod tests {
         tracker.observe_call("A", bash("slow build")).unwrap();
         assert!(matches!(
             tracker.observe_output("A", &completed("partial output\n")),
-            Ok(OutputDisposition::StillRunning { cell_id: None })
+            Ok(OutputDisposition::UnconfirmedResult(_))
         ));
         assert_eq!(
             tracker
@@ -772,6 +794,52 @@ mod tests {
                 .map(rollout_call_command_display)
                 .collect::<Vec<_>>(),
             ["slow build"]
+        );
+    }
+
+    #[test]
+    fn a_command_cell_reusing_a_session_keeps_its_own_call_open() {
+        let mut tracker = RolloutCallTracker::default();
+        tracker
+            .observe_call(
+                "A",
+                RolloutToolCall {
+                    tool_name: "Bash".to_owned(),
+                    tool_input: json!({"command":"const r = await tools.exec_command({\"cmd\":\"first\"});"}),
+                },
+            )
+            .unwrap();
+        tracker.observe_output("A", &completed(P6_RUNNING_CHUNK)).unwrap();
+        tracker
+            .observe_call(
+                "B",
+                RolloutToolCall {
+                    tool_name: "Bash".to_owned(),
+                    tool_input: json!({"command":"const r = await tools.exec_command({\"cmd\":\"second\"});"}),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            tracker.observe_output("B", &completed(P6_RUNNING_CHUNK)),
+            Ok(OutputDisposition::StillRunning { .. })
+        ));
+        let Ok(OutputDisposition::Completed(call)) = tracker.observe_output(
+            "B",
+            &completed(r#"{"chunk_id":"d0540d","session_id":8467,"exit_code":0,"output":"done\n"}"#),
+        ) else {
+            panic!("the second command must complete itself");
+        };
+        assert_eq!(
+            rollout_call_command_display(&call),
+            "const r = await tools.exec_command({\"cmd\":\"second\"});"
+        );
+        assert_eq!(
+            tracker
+                .drain_open_calls()
+                .iter()
+                .map(rollout_call_command_display)
+                .collect::<Vec<_>>(),
+            ["const r = await tools.exec_command({\"cmd\":\"first\"});"]
         );
     }
 

@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use boss_engine_codex_rollout::{
-    CanonicalRolloutToolCall, canonical_rollout_tool_call as shared_canonical_rollout_tool_call,
-    canonical_rollout_tool_output, extract_text_blocks, is_rollout_tool_output,
+    CanonicalRolloutToolCall, canonical_rollout_tool_call as shared_canonical_rollout_tool_call, extract_text_blocks,
+    is_rollout_tool_output,
 };
 use boss_protocol::{NormalizeError, SessionStartSource, StopReason, WorkerEvent};
 use serde_json::{Map, Value, json};
@@ -414,7 +414,7 @@ impl CodexRolloutProgressSession {
                         .ok_or(NormalizeError::MissingField("payload.call_id"))?;
                     let raw_output = payload.get("output").cloned().unwrap_or(Value::Null);
                     let call = match self.calls.observe_output(call_id, &raw_output) {
-                        Ok(OutputDisposition::Completed(call)) => call,
+                        Ok(OutputDisposition::Completed(call) | OutputDisposition::UnconfirmedResult(call)) => call,
                         // The cell yielded: nothing about the command is
                         // observed yet, and its real output is still to come
                         // on a `wait`. Reporting the placeholder as this
@@ -774,7 +774,7 @@ impl CodexTranscriptSession {
             let call_id = payload.get("call_id")?.as_str()?;
             let raw_output = payload.get("output").cloned().unwrap_or(Value::Null);
             let call = match self.calls.observe_output(call_id, &raw_output) {
-                Ok(OutputDisposition::Completed(call)) => call,
+                Ok(OutputDisposition::Completed(call) | OutputDisposition::UnconfirmedResult(call)) => call,
                 // The command is still running; its real result arrives on a
                 // later `wait` and is rendered against this same call then.
                 // Say so rather than emitting a bare `{"type":"system"}`: if
@@ -796,7 +796,7 @@ impl CodexTranscriptSession {
                     ));
                 }
             };
-            let output = canonical_rollout_tool_output(&raw_output);
+            let output = cell_aware_tool_output(&raw_output);
             return Some(json!({
                 "type":"tool_result",
                 "content":output.body,
@@ -1312,7 +1312,11 @@ mod tests {
         cell_exec_call(
             call_id,
             &format!(
-                r#"const r = await tools.write_stdin({{"session_id":{session_id},"chars":"","yield_time_ms":30000}});\ntext(JSON.stringify(r));"#
+                concat!(
+                    r#"const r = await tools.write_stdin({{"session_id":{session_id},"chars":"","yield_time_ms":30000}});"#,
+                    "\ntext(JSON.stringify(r));"
+                ),
+                session_id = session_id
             ),
         )
     }
@@ -1531,17 +1535,28 @@ mod tests {
     }
 
     #[test]
-    fn one_shot_cell_without_session_or_exit_code_is_flagged_at_the_turn_boundary() {
+    fn one_shot_cell_preserves_its_url_and_is_flagged_at_the_turn_boundary() {
         let mut session = cell_harness_session();
         session
             .normalize_progress_events(&cell_exec_call("call-one-shot", PR_CELL_SCRIPT))
             .unwrap();
         assert_eq!(
             session
-                .normalize_progress_events(&cell_completed_output("call-one-shot", "partial output\n"))
+                .normalize_progress_events(&cell_completed_output(
+                    "call-one-shot",
+                    "https://github.com/spinyfin/mono/pull/2666\n",
+                ))
                 .unwrap(),
-            Vec::new(),
-            "an unstructured cell payload must not be accepted as the command result"
+            vec![WorkerEvent::PostToolUse {
+                session_id: "thread-cell".into(),
+                tool_name: "Bash".into(),
+                tool_input: json!({"command":"cube pr create --branch boss/exec_1 --title T"}),
+                tool_response: json!([
+                    {"type":"input_text","text":"Script completed\nWall time 17.7 seconds\nOutput:\n"},
+                    {"type":"input_text","text":"https://github.com/spinyfin/mono/pull/2666\n"},
+                ]),
+            }],
+            "an unstructured cell payload must reach result consumers without confirming completion"
         );
         let boundary = session
             .normalize_progress_events(&json!({
@@ -1719,7 +1734,7 @@ mod tests {
             rendered
                 .get("content")
                 .and_then(Value::as_str)
-                .is_some_and(|content| content.contains("done\\n")),
+                .is_some_and(|content| content.contains("done\n")),
             "completed cell output must be preserved: {rendered}"
         );
         assert_eq!(
@@ -1746,6 +1761,21 @@ mod tests {
                 "command still running; no result delivered yet (cell 1)"
             ),
             "a `Script completed` with no exit code is not the command's result"
+        );
+    }
+
+    #[test]
+    fn an_unconfirmed_cell_result_keeps_its_body_in_the_transcript() {
+        let mut session = CodexTranscriptSession::default();
+        session.normalize_transcript_entry(cell_exec_call("call-url", PR_CELL_SCRIPT));
+        let rendered = session.normalize_transcript_entry(cell_completed_output(
+            "call-url",
+            "https://github.com/spinyfin/mono/pull/2666\n",
+        ));
+        assert_eq!(rendered.get("type").and_then(Value::as_str), Some("tool_result"));
+        assert_eq!(
+            rendered.get("content").and_then(Value::as_str),
+            Some("https://github.com/spinyfin/mono/pull/2666\n")
         );
     }
 
