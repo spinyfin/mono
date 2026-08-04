@@ -877,6 +877,26 @@ impl LiveWorkerStateRegistry {
             .filter(|pid| *pid > 0)
     }
 
+    /// Return the most recent hook-activity stamp for `run_id`. Callers use
+    /// this as an opaque watermark: equality means no hook arrived since the
+    /// snapshot, while a change proves the worker resumed after its Stop.
+    pub fn activity_watermark_for_run(&self, run_id: &str) -> Option<String> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard
+            .values()
+            .find(|entry| !entry.state.activity.is_terminal() && entry.state.run_id == run_id)
+            .and_then(|entry| {
+                entry
+                    .state
+                    .last_event_at
+                    .as_ref()
+                    .into_iter()
+                    .chain(entry.state.last_tool_ended_at.as_ref())
+                    .max()
+                    .cloned()
+            })
+    }
+
     /// True iff a live state entry exists for `run_id` whose activity
     /// indicates the worker is still attached to the slot. Used by
     /// `RequestExecution` to detect "the latest execution is

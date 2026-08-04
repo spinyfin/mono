@@ -950,6 +950,7 @@ pub(crate) async fn sweep_pending_pr(
         // path nudges); covered here for exhaustiveness. SignalAlreadyCleared
         // is also only reachable via on-Stop, not recheck_for_pr.
         | StopOutcome::NudgeBreakerParked { .. }
+        | StopOutcome::NudgeDebounced
         | StopOutcome::SignalAlreadyCleared { .. }
         // DeliverableSatisfied is only reachable via the on-Stop path
         // (try_finalize_satisfied_deliverable_on_stop); covered for exhaustiveness.
@@ -1045,6 +1046,7 @@ pub(crate) async fn sweep_late_pr(
         // `recheck_for_pr_late` never parks via the breaker; covered for
         // exhaustiveness. SignalAlreadyCleared is only reachable via on-Stop.
         | StopOutcome::NudgeBreakerParked { .. }
+        | StopOutcome::NudgeDebounced
         | StopOutcome::SignalAlreadyCleared { .. }
         // DeliverableSatisfied is only reachable via the on-Stop path
         // (try_finalize_satisfied_deliverable_on_stop); covered for exhaustiveness.

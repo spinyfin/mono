@@ -19,15 +19,15 @@
 //! genuinely ended and its process tree simply still contains live
 //! descendant processes doing delegated work.
 //!
-//! The fix is a cheap, sweep-time process-tree scan: before nudging or
-//! parking a worker whose Stop looks idle, check whether its shell pid
-//! still has live descendants outside the terminal's foreground process
-//! group. The foreground group is the worker's own driver runtime (including
-//! helpers it starts); a separately backgrounded job has a different process
-//! group by POSIX job-control semantics. This structural discriminator avoids
-//! coupling the engine to driver executable names. A worker with delegated
-//! descendants is WAITING, not stalled — the same time-bounded
-//! suppression pattern build-wait uses
+//! Process groups were initially used as a name-free discriminator. Live
+//! Codex and Claude trees disproved that premise: driver helpers and ordinary
+//! tool subprocesses may create their own process groups just like delegated
+//! work. A process table therefore cannot honestly distinguish those two
+//! kinds of child. The production probe consequently fails open until a
+//! driver/harness-owned delegated-work signal is available. The retained
+//! interface remains useful to that future signal and to deterministic tests.
+//! A worker with delegated descendants is WAITING, not stalled — the same
+//! time-bounded suppression pattern build-wait uses
 //! ([`crate::build_wait_tracker::BuildWaitTracker`]) bounds how long that
 //! trust lasts, so a descendant that never exits (a genuinely wedged
 //! subagent) still eventually surfaces to the normal nudge/park flow
@@ -284,6 +284,13 @@ pub trait BackgroundActivityProbe: Send + Sync {
     /// `execution_id`. An unresolved worker or indeterminate process-tree
     /// classification is an error so the caller can fail loudly and nudge.
     fn live_delegated_descendant_count(&self, execution_id: &str) -> Result<usize, String>;
+
+    /// Opaque hook-activity watermark for avoiding a recurring probe in the
+    /// middle of a worker's resumed turn. Implementations without hook state
+    /// return `None`.
+    fn activity_watermark(&self, _execution_id: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Default probe that always reports zero descendants. Used as the
@@ -319,7 +326,15 @@ impl BackgroundActivityProbe for RegistryBackgroundActivityProbe {
         if shell_pid <= 0 {
             return Err(format!("invalid shell pid {shell_pid} for execution {execution_id}"));
         }
-        count_live_delegated_descendants(shell_pid as libc::pid_t)
+        // Do not classify descendants by pgid: Codex's code-mode host and
+        // Claude Bash tools both legitimately run in their own group, which
+        // is indistinguishable from a delegated child.
+        let _ = shell_pid;
+        Err("process-table descendants cannot distinguish driver helpers from delegated work".to_owned())
+    }
+
+    fn activity_watermark(&self, execution_id: &str) -> Option<String> {
+        self.live_worker_states.activity_watermark_for_run(execution_id)
     }
 }
 
