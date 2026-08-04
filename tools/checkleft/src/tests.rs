@@ -1882,7 +1882,9 @@ async fn attach_description_context_splits_tip_leakage_from_range_bypass() {
     };
     let env = CiEnvironment::default();
 
-    let attached = super::attach_description_context(ChangeSet::default(), &vcs, &env, &plan).await;
+    let attached = super::attach_description_context(ChangeSet::default(), &vcs, &env, &plan)
+        .await
+        .expect("attach description context");
 
     assert_eq!(
         attached.commit_description.as_deref(),

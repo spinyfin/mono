@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -12,6 +13,10 @@ use tracing::info;
 mod patch_line_deltas;
 
 use patch_line_deltas::parse_file_diffs_from_git_patch;
+
+/// Bound mandatory GitHub API input lookups so a blackholed connection cannot
+/// indefinitely block a checkleft run.
+const GITHUB_API_TIMEOUT_SECS: u64 = 30;
 
 /// Install the process-wide rustls crypto provider exactly once, before the
 /// first TLS handshake. Shared by every authenticated GitHub API path (PR
@@ -273,10 +278,13 @@ pub async fn github_pull_request_description(
     repository: &str,
     change_id: &str,
     github_token: Option<&str>,
-) -> Option<String> {
+) -> Result<Option<String>> {
     let url = format!("https://api.github.com/repos/{repository}/pulls/{change_id}");
     ensure_rustls_provider();
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(GITHUB_API_TIMEOUT_SECS))
+        .build()
+        .context("failed to build GitHub API client for PR description lookup")?;
     let mut request = client
         .get(url)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
@@ -286,27 +294,52 @@ pub async fn github_pull_request_description(
         request = request.bearer_auth(token);
     }
 
-    let response = request.send().await.ok()?;
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(error) if error.is_timeout() => {
+            bail!("GitHub API call timed out while fetching PR description after {GITHUB_API_TIMEOUT_SECS} seconds")
+        }
+        Err(_) => return Ok(None),
+    };
     if !response.status().is_success() {
-        return None;
+        return Ok(None);
     }
 
-    let response_bytes = response.bytes().await.ok()?;
-    let payload: GithubPullRequestResponse = serde_json::from_slice(&response_bytes).ok()?;
+    let response_bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) if error.is_timeout() => {
+            bail!("GitHub API call timed out while fetching PR description after {GITHUB_API_TIMEOUT_SECS} seconds")
+        }
+        Err(_) => return Ok(None),
+    };
+    let payload: GithubPullRequestResponse = match serde_json::from_slice(&response_bytes) {
+        Ok(payload) => payload,
+        Err(_) => return Ok(None),
+    };
     // A successful response with an empty body is still a resolved PR
     // description. Callers need that distinction to avoid reporting that the
     // PR description was unreachable.
-    Some(payload.body.unwrap_or_default())
+    Ok(Some(payload.body.unwrap_or_default()))
 }
 
 /// Look up the open PR number for a branch via the GitHub API.
 /// Returns the PR number as a string (e.g. "42"), or None if no open PR is
-/// found, auth fails, or any error occurs (all failures are best-effort).
-pub async fn github_pr_number_for_branch(repository: &str, branch: &str, github_token: Option<&str>) -> Option<String> {
-    let owner = repository.split('/').next()?;
+/// found, auth fails, or a non-timeout error occurs. Timeouts are returned as
+/// errors so the caller cannot proceed with incomplete GitHub inputs.
+pub async fn github_pr_number_for_branch(
+    repository: &str,
+    branch: &str,
+    github_token: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(owner) = repository.split('/').next() else {
+        return Ok(None);
+    };
     let url = format!("https://api.github.com/repos/{repository}/pulls?head={owner}:{branch}&state=open&per_page=1");
     ensure_rustls_provider();
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(GITHUB_API_TIMEOUT_SECS))
+        .build()
+        .context("failed to build GitHub API client for branch PR lookup")?;
     let mut request = client
         .get(url)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
@@ -316,14 +349,29 @@ pub async fn github_pr_number_for_branch(repository: &str, branch: &str, github_
         request = request.bearer_auth(token);
     }
 
-    let response = request.send().await.ok()?;
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(error) if error.is_timeout() => bail!(
+            "GitHub API call timed out while looking up the open PR for a branch after {GITHUB_API_TIMEOUT_SECS} seconds"
+        ),
+        Err(_) => return Ok(None),
+    };
     if !response.status().is_success() {
-        return None;
+        return Ok(None);
     }
 
-    let bytes = response.bytes().await.ok()?;
-    let prs: Vec<GithubPullRequestListItem> = serde_json::from_slice(&bytes).ok()?;
-    prs.into_iter().next().map(|pr| pr.number.to_string())
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) if error.is_timeout() => bail!(
+            "GitHub API call timed out while looking up the open PR for a branch after {GITHUB_API_TIMEOUT_SECS} seconds"
+        ),
+        Err(_) => return Ok(None),
+    };
+    let prs: Vec<GithubPullRequestListItem> = match serde_json::from_slice(&bytes) {
+        Ok(prs) => prs,
+        Err(_) => return Ok(None),
+    };
+    Ok(prs.into_iter().next().map(|pr| pr.number.to_string()))
 }
 
 fn run_command(root: &Path, binary: &str, args: &[&str]) -> Result<String> {

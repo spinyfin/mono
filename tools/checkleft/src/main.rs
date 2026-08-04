@@ -601,7 +601,7 @@ async fn dispatch_run(
     )
     .await?;
     info!("resolving changeset for run");
-    let changeset = attach_description_context(changeset_from_plan(vcs, &plan)?, vcs, env, &plan).await;
+    let changeset = attach_description_context(changeset_from_plan(vcs, &plan)?, vcs, env, &plan).await?;
     let file_count = changeset.changed_files.len();
     info!(changed_files = file_count, "resolved changeset for run");
 
@@ -1356,7 +1356,7 @@ async fn dispatch_fix(
     )
     .await?;
     info!("resolving changeset for fix");
-    let changeset = attach_description_context(changeset_from_plan(vcs, &plan)?, vcs, env, &plan).await;
+    let changeset = attach_description_context(changeset_from_plan(vcs, &plan)?, vcs, env, &plan).await?;
     info!(
         changed_files = changeset.changed_files.len(),
         "resolved changeset for fix"
@@ -1714,7 +1714,7 @@ async fn attach_description_context(
     vcs: &Vcs,
     env: &CiEnvironment,
     plan: &ChangePlan,
-) -> ChangeSet {
+) -> Result<ChangeSet> {
     info!("attaching commit and PR metadata");
     // Split commit-message surfaces:
     // - tip (`commit_description`): leakage checks (boss-ism/pr-text-leakage via
@@ -1734,13 +1734,13 @@ async fn attach_description_context(
     };
     let change_id = resolve_change_id(env);
     let repository = resolve_repository(vcs);
-    let pr_description = resolve_pr_description(repository.as_deref(), change_id.as_deref(), env, vcs).await;
-    changeset
+    let pr_description = resolve_pr_description(repository.as_deref(), change_id.as_deref(), env, vcs).await?;
+    Ok(changeset
         .with_commit_description(tip_description)
         .with_bypass_commit_descriptions(bypass_commit_descriptions)
         .with_change_id(change_id)
         .with_repository(repository)
-        .with_pr_description(pr_description)
+        .with_pr_description(pr_description))
 }
 
 /// Resolve the PR/change identifier used to fetch the PR description.
@@ -1797,15 +1797,17 @@ async fn resolve_pr_description(
     change_id: Option<&str>,
     env: &CiEnvironment,
     vcs: &Vcs,
-) -> Option<String> {
+) -> Result<Option<String>> {
     // Explicit override: highest precedence, no network call needed.
     if let Ok(raw) = std::env::var(CHECKS_PR_DESCRIPTION_ENV)
         && !raw.trim().is_empty()
     {
-        return Some(raw);
+        return Ok(Some(raw));
     }
 
-    let repository = repository?;
+    let Some(repository) = repository else {
+        return Ok(None);
+    };
     let github_token = detect_github_token();
 
     if github_token.is_none() {
@@ -1819,8 +1821,8 @@ async fn resolve_pr_description(
             change_id = change_id,
             "fetching PR description by change id"
         );
-        if let Some(desc) = github_pull_request_description(repository, change_id, github_token.as_deref()).await {
-            return Some(desc);
+        if let Some(desc) = github_pull_request_description(repository, change_id, github_token.as_deref()).await? {
+            return Ok(Some(desc));
         }
     }
 
@@ -1841,24 +1843,29 @@ async fn resolve_pr_description(
         let mut descriptions = Vec::new();
         for pr_number in merge_queue_pr_numbers {
             if let Some(description) =
-                github_pull_request_description(repository, &pr_number, github_token.as_deref()).await
+                github_pull_request_description(repository, &pr_number, github_token.as_deref()).await?
             {
                 descriptions.push(description);
             }
         }
-        return (!descriptions.is_empty()).then(|| descriptions.join("\n\n"));
+        return Ok((!descriptions.is_empty()).then(|| descriptions.join("\n\n")));
     }
 
     // Level 3b: no PR number from env — detect the current branch and look up
     // the open PR via the GitHub API. Best-effort: missing token, no open PR,
-    // or any network failure all silently yield None.
-    let branch = detect_current_branch(env, vcs)?;
+    // or non-timeout network failure all silently yield None. Timeouts are
+    // fatal because proceeding without mandatory GitHub inputs is unsafe.
+    let Some(branch) = detect_current_branch(env, vcs) else {
+        return Ok(None);
+    };
     info!(
         repository = repository,
         branch = branch,
         "resolving PR description via branch lookup"
     );
-    let pr_number = github_pr_number_for_branch(repository, &branch, github_token.as_deref()).await?;
+    let Some(pr_number) = github_pr_number_for_branch(repository, &branch, github_token.as_deref()).await? else {
+        return Ok(None);
+    };
     info!(
         repository = repository,
         branch = branch,
