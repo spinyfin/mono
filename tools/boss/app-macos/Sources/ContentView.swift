@@ -164,11 +164,10 @@ struct ContentView: View {
             workersWorkspace.onShellPidAvailable = { [model] runId, shellPid in
                 model.workerPaneShellPidAvailable(runId: runId, shellPid: shellPid)
             }
-            // Forward worker-pane deaths (the pane's shell process exited; a
-            // surface that never attached goes to `onSpawnFailed` below
-            // instead) to the engine immediately so it can
-            // reap the backing execution instead of waiting for the
-            // periodic dead-pid sweep.
+            // Forward worker-pane deaths to the engine immediately so it can
+            // reap the backing execution instead of waiting for the periodic
+            // dead-pid sweep. A surface that never attached goes to
+            // `onSpawnFailed` below instead.
             workersWorkspace.onPaneDied = { [model] runId, reason in
                 model.workerPaneDied(runId: runId, reason: reason)
             }

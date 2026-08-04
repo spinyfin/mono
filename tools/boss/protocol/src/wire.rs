@@ -2476,6 +2476,15 @@ pub enum WorkerPaneDeathReason {
 }
 
 impl WorkerPaneDeathReason {
+    /// Human-readable detail for durable lifecycle narratives.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::SurfaceCreationFailed => "surface creation failed before a child process attached",
+            Self::ChildProcessExited => "attached child process exited",
+            Self::Unknown => "app did not identify which pane-death callback fired",
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SurfaceCreationFailed => "surface_creation_failed",

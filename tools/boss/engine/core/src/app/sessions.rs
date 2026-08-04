@@ -374,24 +374,6 @@ pub(super) async fn handle_worker_pane_died(ctx: Dispatch, req: FrontendRequest)
     tokio::spawn(async move { resolve_reported_pane_death(&server_state, &run_id, reason).await });
 }
 
-/// What the app tells us it saw when it reports a pane death: the pane's
-/// child process exited. The app raises this only from `onChildExited`; a
-/// surface that never attached hosted no child to exit and is reported as a
-/// spawn NACK instead, so that cause is deliberately absent here.
-///
-/// A bare observation, with no "the app reported" prefix and no cause
-/// disjunction: both reap narratives already say who reported it, and a
-/// detail that restates its own prefix is what made the durable reason read
-/// "app reported the worker pane died … : app reported the worker pane died".
-/// Deliberately one string shared by both reap paths so the record says the
-/// same thing however the report is classified.
-///
-/// Note this is a constant, not a diagnosis: the app's display-state-aware
-/// `surfaceFailureReason` text (app-side) reaches the record only via the NACK path.
-/// A failure that arrives on the pane-death channel — an older app build, or
-/// a genuine child exit — carries this generic string instead.
-const PANE_DIED_DETAIL: &str = "the pane's child process exited";
-
 /// Classify and resolve one app-reported pane death — the body of
 /// [`handle_worker_pane_died`], split out so the routing decision is
 /// directly awaitable in tests instead of racing a detached `tokio::spawn`.
@@ -452,7 +434,7 @@ async fn resolve_reported_pane_death(
         state.slot_id,
         state.shell_pid,
         crate::spawn_ack_sweep::ReapCause::PaneDiedBeforeStart {
-            detail: PANE_DIED_DETAIL,
+            detail: reason.describe(),
         },
         boss_engine_utils::epoch_time::now_epoch_secs(),
     )
@@ -809,28 +791,44 @@ mod tests {
     /// reason is guarded separately and is covered by its own work item.
     #[tokio::test]
     async fn pane_death_before_start_records_a_never_started_audit_line() {
-        let (server_state, _dir) = test_server_state();
-        let execution_id = create_ready_execution(&server_state);
-        let work_item_id = server_state.work_db.get_execution(&execution_id).unwrap().work_item_id;
-        server_state
-            .live_worker_states
-            .register_spawn(1, &execution_id, "claude-opus-4-7", 0, None);
+        for (reason, expected_detail, unexpected_detail) in [
+            (
+                boss_protocol::WorkerPaneDeathReason::SurfaceCreationFailed,
+                "surface creation failed before a child process attached",
+                "child process exited",
+            ),
+            (
+                boss_protocol::WorkerPaneDeathReason::ChildProcessExited,
+                "attached child process exited",
+                "surface creation failed",
+            ),
+        ] {
+            let (server_state, _dir) = test_server_state();
+            let execution_id = create_ready_execution(&server_state);
+            let work_item_id = server_state.work_db.get_execution(&execution_id).unwrap().work_item_id;
+            server_state
+                .live_worker_states
+                .register_spawn(1, &execution_id, "claude-opus-4-7", 0, None);
 
-        resolve_reported_pane_death(
-            &server_state,
-            &execution_id,
-            boss_protocol::WorkerPaneDeathReason::SurfaceCreationFailed,
-        )
-        .await;
+            resolve_reported_pane_death(&server_state, &execution_id, reason).await;
 
-        let description = match server_state.work_db.get_work_item(&work_item_id).unwrap() {
-            boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t.description,
-            other => panic!("expected a chore work item, got {other:?}"),
-        };
-        assert!(
-            description.contains("death before start"),
-            "the audit line must say the pane never came up; got: {description}",
-        );
+            let description = match server_state.work_db.get_work_item(&work_item_id).unwrap() {
+                boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t.description,
+                other => panic!("expected a chore work item, got {other:?}"),
+            };
+            assert!(
+                description.contains("death before start"),
+                "the audit line must say the pane never came up; got: {description}",
+            );
+            assert!(
+                description.contains(expected_detail),
+                "the audit line must retain the reported cause; got: {description}",
+            );
+            assert!(
+                !description.contains(unexpected_detail),
+                "the audit line must not narrate a different cause; got: {description}",
+            );
+        }
     }
 
     /// The other side of the classification: a pane that reported a real
