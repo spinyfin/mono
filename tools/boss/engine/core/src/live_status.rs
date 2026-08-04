@@ -281,6 +281,17 @@ fn render_entry(line: &Value) -> String {
                 .unwrap_or_else(|| "user: prompt".to_owned())
         }
         "assistant" => render_assistant(line),
+        "tool_result" => {
+            let name = line.get("tool_name").and_then(Value::as_str).unwrap_or("tool");
+            let output = line
+                .get("content")
+                .and_then(compact_value_text)
+                .map(|text| boss_engine_utils::string_clip::clip_to_bytes(&text, 200));
+            match output {
+                Some(output) if !output.is_empty() => format!("tool: {name} returned {output}"),
+                _ => format!("tool: {name} returned"),
+            }
+        }
         // Codex lifecycle fillers (`task_started` / bare `task_complete` /
         // `turn_aborted`) are normalized as system so they don't masquerade as
         // worker prose for marker scans. Still surface a short line so the
@@ -538,6 +549,14 @@ mod tests {
                 "tool_response":{"stdout":"all tests passed\n"}
             })),
             "user: Bash returned all tests passed"
+        );
+        assert_eq!(
+            render_entry(&json!({
+                "type":"tool_result",
+                "tool_name":"Bash",
+                "content":"all tests passed\n"
+            })),
+            "tool: Bash returned all tests passed"
         );
     }
 
