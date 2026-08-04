@@ -254,6 +254,15 @@ static CODEX_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
 /// ([`tool_surface_guard`]): both routes are ones Boss's command guardrails
 /// cannot observe, so a worker that reaches for them gets a hard block. Saying
 /// so up front turns a wasted turn into a known constraint.
+///
+/// The long-command rule is also Codex-specific. `exec_command`'s initial
+/// yield is capped at 30 seconds by codex-cli 0.145.0 and has no config/env/CLI
+/// override (`--strict-config` rejects the corresponding candidate keys).
+/// Unified exec does, however, return a session id and supports empty
+/// `write_stdin` polls up to 300 seconds. Keeping those polls inside the
+/// originating JavaScript cell matters: the rollout correlator observes that
+/// cell through its `wait` continuations and ultimately receives the command's
+/// real `exit_code`; a separate polling cell has no attributable command.
 const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed worker session. The engine\n\
      spawned you in a leased cube workspace and observes this session\n\
      via the Codex rollout JSONL file in this run's isolated CODEX_HOME.\n\
@@ -272,7 +281,18 @@ const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed 
      `write_stdin`; commands typed into one are invisible to the guardrails.\n\
      Run each command as its own shell invocation instead:\n\
      `bash -lc '<command>'`, `python3 -c '<code>'`, `python3 <script.py>`,\n\
-     `sqlite3 <db> '<sql>'`.";
+     `sqlite3 <db> '<sql>'`.\n\
+     \n\
+     Long foreground commands need one extra step because Codex's\n\
+     `exec_command` yields after at most 30 seconds. A result containing\n\
+     `session_id` means the command is still running — never that it passed\n\
+     or failed. In the same JavaScript cell, keep awaiting\n\
+     `tools.write_stdin({session_id: r.session_id, chars: \"\",\n\
+     yield_time_ms: 300000})`, replacing `r` with each result, until `r`\n\
+     contains `exit_code`. Empty polling is allowed; writing commands through\n\
+     stdin is not. Do not end the turn or claim a gate result without the real\n\
+     exit status. Give a command that might hang its own foreground timeout so\n\
+     expiry returns a nonzero status instead of polling forever.";
 
 /// Single-pattern gitignore for the workspace-local `.codex/` config dir
 /// (prompt + agent-rules copies). Engine-injected files must not appear in

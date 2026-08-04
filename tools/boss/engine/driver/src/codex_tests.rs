@@ -77,6 +77,34 @@ fn codex_descriptor_matches_design() {
 }
 
 #[test]
+fn agent_rules_require_same_cell_polling_until_a_real_exit_status() {
+    let preamble = CodexDriver::default().agent_rules_preamble();
+    for required in [
+        "exec_command` yields after at most 30 seconds",
+        "same JavaScript cell",
+        "tools.write_stdin",
+        "chars: \"\"",
+        "yield_time_ms: 300000",
+        "until `r`",
+        "contains `exit_code`",
+        "foreground timeout",
+    ] {
+        assert!(
+            preamble.contains(required),
+            "Codex worker rules must preserve the long-command contract {required:?}: {preamble}"
+        );
+    }
+    assert!(
+        preamble.contains("A result containing\n`session_id` means the command is still running"),
+        "a yielded session must never be presented as a completed gate: {preamble}"
+    );
+    assert!(
+        preamble.contains("Do not end the turn or claim a gate result without the real\nexit status"),
+        "the worker must not infer success from a missing exit status: {preamble}"
+    );
+}
+
+#[test]
 fn agent_rules_destination_is_codex_home_not_dot_codex() {
     // Codex never reads `.codex/AGENTS.md` (verified with `codex debug
     // prompt-input`). Must route to `$CODEX_HOME/AGENTS.md`, not the
