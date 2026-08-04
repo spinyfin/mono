@@ -256,31 +256,34 @@ pub fn redact_and_assemble(transcript_lines: &[Value]) -> String {
 fn render_entry(line: &Value) -> String {
     let entry_type = line.get("type").and_then(Value::as_str).unwrap_or("unknown");
     match entry_type {
-        "user" => {
-            // User-side payloads usually wrap a tool_result; we want
-            // a short marker plus enough output to explain the next action.
-            if let Some(name) = line.get("tool_name").and_then(Value::as_str) {
-                let output = line
-                    .get("tool_response")
-                    .and_then(compact_value_text)
-                    .map(|text| boss_engine_utils::string_clip::clip_to_bytes(&text, 200));
-                return match output {
-                    Some(output) if !output.is_empty() => format!("user: {name} returned {output}"),
-                    _ => format!("user: {name} returned"),
-                };
-            }
-            line.get("text")
-                .and_then(Value::as_str)
-                .map(|text| {
-                    let one_line = text.trim().replace('\n', " ");
-                    format!(
-                        "user: {}",
-                        boss_engine_utils::string_clip::clip_to_bytes(&one_line, 200)
-                    )
-                })
-                .unwrap_or_else(|| "user: prompt".to_owned())
-        }
+        "user" => line
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| {
+                let one_line = text.trim().replace('\n', " ");
+                format!(
+                    "user: {}",
+                    boss_engine_utils::string_clip::clip_to_bytes(&one_line, 200)
+                )
+            })
+            .unwrap_or_else(|| "user: prompt".to_owned()),
         "assistant" => render_assistant(line),
+        "tool_result" => {
+            let name = line.get("tool_name").and_then(Value::as_str).unwrap_or("tool");
+            let verb = if line.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
+                "failed"
+            } else {
+                "returned"
+            };
+            let output = line
+                .get("content")
+                .and_then(compact_value_text)
+                .map(|text| boss_engine_utils::string_clip::clip_to_bytes(&text, 200));
+            match output {
+                Some(output) if !output.is_empty() => format!("tool: {name} {verb} {output}"),
+                _ => format!("tool: {name} {verb}"),
+            }
+        }
         // Codex lifecycle fillers (`task_started` / bare `task_complete` /
         // `turn_aborted`) are normalized as system so they don't masquerade as
         // worker prose for marker scans. Still surface a short line so the
@@ -533,11 +536,24 @@ mod tests {
         );
         assert_eq!(
             render_entry(&json!({
-                "type":"user",
+                "type":"tool_result",
                 "tool_name":"Bash",
-                "tool_response":{"stdout":"all tests passed\n"}
+                "content":"all tests passed\n"
             })),
-            "user: Bash returned all tests passed"
+            "tool: Bash returned all tests passed"
+        );
+        assert_eq!(
+            render_entry(&json!({
+                "type":"tool_result",
+                "tool_name":"Bash",
+                "content":"command exited 1\n",
+                "is_error":true
+            })),
+            "tool: Bash failed command exited 1"
+        );
+        assert_eq!(
+            render_entry(&json!({"type":"tool_result","tool_name":"Bash","content":"","is_error":true})),
+            "tool: Bash failed"
         );
     }
 

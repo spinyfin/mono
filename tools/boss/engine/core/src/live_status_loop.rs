@@ -1279,6 +1279,10 @@ mod tests {
             }),
             serde_json::json!({
                 "type":"response_item",
+                "payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"inspecting the split module"}]}
+            }),
+            serde_json::json!({
+                "type":"response_item",
                 "payload":{
                     "type":"custom_tool_call",
                     "call_id":"call-1",
@@ -1395,6 +1399,10 @@ mod tests {
             serde_json::json!({
                 "type":"event_msg",
                 "payload":{"type":"agent_message","message":"inspecting codex rollout safely"}
+            }),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"inspecting codex rollout safely"}]}
             }),
             serde_json::json!({
                 "type":"response_item",

@@ -1150,9 +1150,10 @@ mod tests {
                 "rawOutput": {"exit_code": 0}
             }}
         }));
-        assert_eq!(result["type"], "user");
+        assert_eq!(result["type"], "tool_result");
         assert_eq!(result["tool_name"], "Bash");
-        assert_eq!(result["tool_response"], json!({"exit_code": 0}));
+        assert_eq!(result["content"], r#"{"exit_code":0}"#);
+        assert_eq!(result["is_error"], false);
     }
 
     #[test]

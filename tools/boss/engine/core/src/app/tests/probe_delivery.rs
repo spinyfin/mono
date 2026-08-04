@@ -1090,6 +1090,7 @@ async fn a_folded_codex_turn_completes_the_probe_cycle_on_its_single_boundary() 
         for line in [
             r#"{"type":"event_msg","payload":{"type":"user_message","message":"[coordinator-nudge] what is your status?"}}"#,
             r#"{"type":"event_msg","payload":{"type":"agent_message","message":"status: pushed, waiting on CI"}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"status: pushed, waiting on CI"}]}}"#,
             r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
         ] {
             writeln!(file, "{line}").unwrap();

@@ -2,8 +2,8 @@
 //! dialect written to
 //! `$GROK_HOME/sessions/<pct-encoded-cwd>/<sid>/updates.jsonl` -> the
 //! canonical redactable shape `boss_engine_live_status_redact` and the
-//! live-status summariser expect (`tool_name` / `tool_input` /
-//! `tool_response` at the top level; `content[].type` of `text`,
+//! live-status summariser expect (`tool_name` / `tool_input` at the top
+//! level and a `tool_result.content`; `content[].type` of `text`,
 //! `thinking`, or `tool_use` with `name` + `input`).
 //!
 //! Deliberately **not** shared with any other driver's transcript dialect:
@@ -81,6 +81,39 @@ fn mapped_tool_name(raw_tool: &str) -> String {
 struct PendingToolCall {
     tool_name: String,
     tool_input: Value,
+}
+
+fn canonical_tool_result(output: Value) -> (String, bool) {
+    let is_error = output
+        .get("is_error")
+        .or_else(|| output.get("isError"))
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            output
+                .get("exit_code")
+                .or_else(|| output.get("exitCode"))
+                .and_then(Value::as_i64)
+                .map(|code| code != 0)
+        })
+        .unwrap_or(false);
+    let grok_text = super::grok_bash_output_text(&output);
+    let content = if grok_text.is_empty() {
+        output
+            .get("output")
+            .or_else(|| output.get("text"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| output.as_str().map(str::to_owned))
+            .unwrap_or_default()
+    } else {
+        grok_text
+    };
+    let content = if content.is_empty() {
+        serde_json::to_string(&output).unwrap_or_default()
+    } else {
+        content
+    };
+    (content, is_error)
 }
 
 enum ProseRole {
@@ -257,12 +290,16 @@ impl GrokTranscriptSession {
             AcpEnvelope::ToolCallUpdate { call_id, output } => match output {
                 None => json!({"type": "system"}),
                 Some(tool_response) => match self.take(&call_id) {
-                    Some(call) => json!({
-                        "type": "user",
-                        "tool_name": call.tool_name,
-                        "tool_input": call.tool_input,
-                        "tool_response": tool_response,
-                    }),
+                    Some(call) => {
+                        let (content, is_error) = canonical_tool_result(tool_response);
+                        json!({
+                            "type": "tool_result",
+                            "content": content,
+                            "is_error": is_error,
+                            "tool_name": call.tool_name,
+                            "tool_input": call.tool_input,
+                        })
+                    }
                     None => {
                         tracing::debug!(call_id, "grok updates.jsonl: omitting unmatched tool_call_update body");
                         json!({"type": "system"})
@@ -300,7 +337,7 @@ impl TranscriptSessionNormalizer for GrokTranscriptSession {
 /// [`GrokTranscriptSession`] correlates `tool_call` / `tool_call_update`
 /// pairs across an entire tail; an isolated call here sees at most the
 /// `tool_call` half of that join (a bare `tool_use`, no matching
-/// `tool_response`), the same trade-off `codex/progress.rs::normalize_rollout`
+/// tool result), the same trade-off `codex/progress.rs::normalize_rollout`
 /// documents for its own isolated-session form.
 pub(super) fn normalize_acp_update(raw: Value) -> Value {
     GrokTranscriptSession::default().normalize(raw)
@@ -456,10 +493,11 @@ mod tests {
                 "rawOutput": {"exit_code": 0, "output": []}
             }}
         }));
-        assert_eq!(result["type"], "user");
+        assert_eq!(result["type"], "tool_result");
         assert_eq!(result["tool_name"], "Bash");
         assert_eq!(result["tool_input"], json!({"command": "sleep 45"}));
-        assert_eq!(result["tool_response"], json!({"exit_code": 0, "output": []}));
+        assert_eq!(result["content"], r#"{"exit_code":0,"output":[]}"#);
+        assert_eq!(result["is_error"], false);
 
         // The call was consumed; a second matching update finds nothing pending.
         let stale = session.normalize(json!({
@@ -471,6 +509,28 @@ mod tests {
             }}
         }));
         assert_eq!(stale, json!({"type": "system"}));
+    }
+
+    #[test]
+    fn tool_call_update_marks_nonzero_exit_as_error_and_preserves_text_output() {
+        let mut session = GrokTranscriptSession::default();
+        session.normalize(json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "tool_call", "toolCallId": "call-fail", "title": "run_terminal_command",
+                "rawInput": {"command": "false"}
+            }}
+        }));
+        let result = session.normalize(json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "tool_call_update", "toolCallId": "call-fail",
+                "rawOutput": {"exit_code": 1, "output": "failed\n"}
+            }}
+        }));
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["content"], "failed\n");
+        assert_eq!(result["is_error"], true);
     }
 
     #[test]
