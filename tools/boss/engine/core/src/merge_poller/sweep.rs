@@ -305,6 +305,14 @@ pub async fn run_one_pass_observed(
             Vec::new()
         }
     };
+    // Stop-boundary nudges held for delegated background work must be
+    // revisited by a recurring path: the worker may never emit another Stop.
+    // The handler snapshots the exact suppressed intents so this also covers
+    // revision executions with an already-bound PR, not just the no-PR query
+    // above.
+    let pending_background_nudges = completion_handler
+        .map(WorkerCompletionHandler::pending_background_nudge_execution_ids)
+        .unwrap_or_default();
     let stranded_ci_attempts = match work_db.list_stranded_ci_remediation_attempts() {
         Ok(items) => items,
         Err(err) => {
@@ -343,6 +351,7 @@ pub async fn run_one_pass_observed(
         + blocked_conflict.len()
         + blocked_ci.len()
         + pending_pr_recheck.len()
+        + pending_background_nudges.len()
         + stranded_ci_attempts.len()
         + stranded_blocked.len()
         + late_pr_candidates.len();
@@ -356,6 +365,7 @@ pub async fn run_one_pass_observed(
         blocked_conflict = blocked_conflict.len(),
         blocked_ci = blocked_ci.len(),
         pending_pr_recheck = pending_pr_recheck.len(),
+        pending_background_nudges = pending_background_nudges.len(),
         stranded_ci_attempts = stranded_ci_attempts.len(),
         stranded_blocked = stranded_blocked.len(),
         late_pr_candidates = late_pr_candidates.len(),
@@ -417,6 +427,15 @@ pub async fn run_one_pass_observed(
     if let Some(handler) = completion_handler {
         for execution_id in &pending_pr_recheck {
             sweep_pending_pr(handler, execution_id, &mut outcome).await;
+        }
+        for execution_id in &pending_background_nudges {
+            if let Some(recheck_outcome) = handler.recheck_background_nudge(execution_id).await {
+                tracing::info!(
+                    execution_id,
+                    outcome = ?recheck_outcome,
+                    "merge poller: recurring background-child nudge recheck completed",
+                );
+            }
         }
     } else if !pending_pr_recheck.is_empty() {
         tracing::debug!(

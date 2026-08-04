@@ -21,7 +21,11 @@
 //!
 //! The fix is a cheap, sweep-time process-tree scan: before nudging or
 //! parking a worker whose Stop looks idle, check whether its shell pid
-//! still has any live descendant processes. A worker with live
+//! still has live descendants outside the terminal's foreground process
+//! group. The foreground group is the worker's own driver runtime (including
+//! helpers it starts); a separately backgrounded job has a different process
+//! group by POSIX job-control semantics. This structural discriminator avoids
+//! coupling the engine to driver executable names. A worker with delegated
 //! descendants is WAITING, not stalled — the same time-bounded
 //! suppression pattern build-wait uses
 //! ([`crate::build_wait_tracker::BuildWaitTracker`]) bounds how long that
@@ -40,51 +44,160 @@
 /// wedge instead of exiting.
 pub const DEFAULT_BACKGROUND_CHILDREN_HORIZON_SECS: i64 = crate::build_wait_tracker::DEFAULT_BUILD_WAIT_HORIZON_SECS;
 
-/// Count every live descendant process of `pid` — children, grandchildren,
-/// … down to [`DESCENDANT_WALK_DEPTH`] levels — NOT including `pid`
-/// itself. Best-effort: a pid that no longer exists, or any per-pid probe
-/// failure, simply contributes zero children rather than aborting the
-/// whole walk, since a transient race on one branch of the tree must never
-/// hide live descendants found on another branch.
+/// Count live descendants of `shell_pid` that do not belong to the shell's
+/// foreground process group — children, grandchildren, … down to
+/// [`DESCENDANT_WALK_DEPTH`] levels. The foreground group is the driver
+/// runtime; other process groups are background jobs, including delegated
+/// subagents.
 ///
-/// Returns `0` on non-macOS targets — this repo's worker panes are
-/// macOS-only (libghostty), so the process-tree scan has nothing to do
-/// there; callers treat `0` the same as "no evidence of pending work",
-/// which is the safe direction (falls through to the normal nudge/park
-/// flow rather than suppressing it).
-pub fn count_live_descendants(pid: libc::pid_t) -> usize {
-    imp::count_live_descendants(pid)
+/// Any failure to identify the foreground group or classify a descendant is
+/// returned to the caller. Suppression is fail-open: an indeterminate probe
+/// must be logged and the nudge allowed to proceed, never silently converted
+/// into evidence that background work is present.
+pub fn count_live_delegated_descendants(shell_pid: libc::pid_t) -> Result<usize, String> {
+    imp::count_live_delegated_descendants(shell_pid)
 }
+
+trait ProcessTable {
+    fn child_pids(&self, pid: libc::pid_t) -> Result<Vec<libc::pid_t>, String>;
+    fn process_group(&self, pid: libc::pid_t) -> Result<libc::pid_t, String>;
+    fn foreground_process_group(&self, pid: libc::pid_t) -> Result<libc::pid_t, String>;
+}
+
+fn count_with_process_table(table: &dyn ProcessTable, shell_pid: libc::pid_t) -> Result<usize, String> {
+    let foreground_pgid = table.foreground_process_group(shell_pid)?;
+    if foreground_pgid <= 0 {
+        return Err(format!(
+            "shell pid {shell_pid} has no foreground process group (tpgid={foreground_pgid})"
+        ));
+    }
+
+    let mut frontier = vec![shell_pid];
+    let mut visited = 0usize;
+    let mut delegated = 0usize;
+    for _ in 0..DESCENDANT_WALK_DEPTH {
+        if frontier.is_empty() || visited >= MAX_VISITED_PIDS {
+            break;
+        }
+        let mut next = Vec::new();
+        for parent in frontier {
+            let children = table.child_pids(parent)?;
+            for child in children {
+                if visited >= MAX_VISITED_PIDS {
+                    break;
+                }
+                visited += 1;
+                if table.process_group(child)? != foreground_pgid {
+                    delegated += 1;
+                }
+                next.push(child);
+            }
+        }
+        frontier = next;
+    }
+    if visited >= MAX_VISITED_PIDS {
+        return Err(format!(
+            "process tree below shell pid {shell_pid} exceeded the {MAX_VISITED_PIDS}-pid probe cap"
+        ));
+    }
+    if frontier.iter().try_fold(false, |has_more, pid| {
+        table.child_pids(*pid).map(|children| has_more || !children.is_empty())
+    })? {
+        return Err(format!(
+            "process tree below shell pid {shell_pid} exceeded the {DESCENDANT_WALK_DEPTH}-level probe depth"
+        ));
+    }
+    Ok(delegated)
+}
+
+/// Bound on how many process-tree levels the probe walks below the shell.
+const DESCENDANT_WALK_DEPTH: usize = 8;
+
+/// Hard cap on how many pids a single probe visits across the whole walk.
+const MAX_VISITED_PIDS: usize = 512;
 
 #[cfg(target_os = "macos")]
 mod imp {
+    use super::{ProcessTable, count_with_process_table};
     use std::os::raw::c_void;
 
-    /// Bound on how many process-tree levels [`count_live_descendants`] walks
-    /// below the probed pid. Mirrors [`crate::worker_registry::ANCESTOR_WALK_DEPTH`]'s
-    /// choice of a small, generous-enough constant rather than an unbounded
-    /// walk — a worker's own descendant tree (shell → claude → subagent(s)) is
-    /// only ever a couple of levels deep in practice; this just guards against
-    /// a pathological tree turning a "cheap" sweep-time check into a long scan.
-    const DESCENDANT_WALK_DEPTH: usize = 8;
+    const PROC_PIDTBSDINFO: libc::c_int = 3;
 
-    /// Hard cap on how many pids a single probe visits across the whole walk.
-    /// A real worker's descendant count is in the single digits; this bound
-    /// only ever protects against a runaway process tree (fork bomb, buggy
-    /// tool loop) making the probe itself expensive.
-    const MAX_VISITED_PIDS: usize = 512;
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcBsdHeader {
+        flags: u32,
+        status: u32,
+        xstatus: u32,
+        pid: u32,
+        ppid: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcBsdCredentials {
+        uid: u32,
+        gid: u32,
+        ruid: u32,
+        rgid: u32,
+        svuid: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcBsdNames {
+        svgid: u32,
+        reserved: u32,
+        command: [u8; 16],
+        name: [u8; 32],
+        open_files: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcBsdJobControl {
+        process_group: u32,
+        job_count: u32,
+        terminal_device: u32,
+        terminal_foreground_group: u32,
+        nice: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcBsdStartTime {
+        seconds: u64,
+        microseconds: u64,
+    }
+
+    /// Rust layout mirror of Darwin's `proc_bsdinfo`. Grouping adjacent C
+    /// fields into `repr(C)` components preserves the ABI while keeping the
+    /// process-table API focused on the job-control fields this probe reads.
+    #[repr(C)]
+    #[derive(Default)]
+    pub(super) struct ProcBsdInfo {
+        header: ProcBsdHeader,
+        credentials: ProcBsdCredentials,
+        names: ProcBsdNames,
+        job_control: ProcBsdJobControl,
+        start_time: ProcBsdStartTime,
+    }
 
     unsafe extern "C" {
         fn proc_listchildpids(ppid: libc::pid_t, buffer: *mut c_void, buffersize: libc::c_int) -> libc::c_int;
+        fn proc_pidinfo(
+            pid: libc::c_int,
+            flavor: libc::c_int,
+            arg: u64,
+            buffer: *mut c_void,
+            buffersize: libc::c_int,
+        ) -> libc::c_int;
     }
 
     /// Direct (one-level) live children of `pid`, via `libproc`'s
-    /// `proc_listchildpids`. Returns an empty vec for a pid with no
-    /// children, an already-dead pid, or any probe error — this is a
-    /// best-effort liveness signal, not a source of truth that must be
-    /// propagated as an error (see [`super::count_live_descendants`]'s
-    /// doc comment on why per-pid failures must not abort the walk).
-    fn list_child_pids(pid: libc::pid_t) -> Vec<libc::pid_t> {
+    /// `proc_listchildpids`. Errors are propagated because an unclassifiable
+    /// tree must never suppress a nudge.
+    fn list_child_pids(pid: libc::pid_t) -> Result<Vec<libc::pid_t>, String> {
         const MAX_CHILDREN: usize = 256;
         let mut buf: Vec<libc::pid_t> = vec![0; MAX_CHILDREN];
         let buffersize = (buf.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
@@ -92,39 +205,68 @@ mod imp {
         // `buffersize` bytes; `proc_listchildpids` only ever writes up to
         // that many bytes and returns the count of pids it wrote.
         let n = unsafe { proc_listchildpids(pid, buf.as_mut_ptr() as *mut c_void, buffersize) };
-        if n <= 0 {
-            return Vec::new();
+        if n < 0 {
+            return Err(format!(
+                "proc_listchildpids failed for pid {pid}: {}",
+                std::io::Error::last_os_error()
+            ));
         }
-        buf.truncate((n as usize).min(MAX_CHILDREN));
-        buf
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        if n as usize >= MAX_CHILDREN {
+            return Err(format!(
+                "pid {pid} has at least {MAX_CHILDREN} direct children; process-tree probe is incomplete"
+            ));
+        }
+        buf.truncate(n as usize);
+        Ok(buf)
     }
 
-    pub(super) fn count_live_descendants(pid: libc::pid_t) -> usize {
-        let mut frontier = vec![pid];
-        let mut total = 0usize;
-        for _ in 0..DESCENDANT_WALK_DEPTH {
-            if frontier.is_empty() || total >= MAX_VISITED_PIDS {
-                break;
-            }
-            let mut next = Vec::new();
-            for p in frontier {
-                let children = list_child_pids(p);
-                total += children.len();
-                next.extend(children);
-                if total >= MAX_VISITED_PIDS {
-                    break;
-                }
-            }
-            frontier = next;
+    fn process_info(pid: libc::pid_t) -> Result<ProcBsdInfo, String> {
+        let mut info = ProcBsdInfo::default();
+        let info_size = std::mem::size_of::<ProcBsdInfo>() as libc::c_int;
+        // SAFETY: `info` is a valid buffer of exactly `info_size` bytes.
+        let n = unsafe { proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &mut info as *mut _ as *mut c_void, info_size) };
+        if n <= 0 {
+            return Err(format!(
+                "proc_pidinfo failed for pid {pid}: {}",
+                std::io::Error::last_os_error()
+            ));
         }
-        total
+        if n != info_size {
+            return Err(format!(
+                "proc_pidinfo returned {n} bytes for pid {pid}; expected {info_size}"
+            ));
+        }
+        Ok(info)
+    }
+
+    struct MacProcessTable;
+
+    impl ProcessTable for MacProcessTable {
+        fn child_pids(&self, pid: libc::pid_t) -> Result<Vec<libc::pid_t>, String> {
+            list_child_pids(pid)
+        }
+
+        fn process_group(&self, pid: libc::pid_t) -> Result<libc::pid_t, String> {
+            Ok(process_info(pid)?.job_control.process_group as libc::pid_t)
+        }
+
+        fn foreground_process_group(&self, pid: libc::pid_t) -> Result<libc::pid_t, String> {
+            Ok(process_info(pid)?.job_control.terminal_foreground_group as libc::pid_t)
+        }
+    }
+
+    pub(super) fn count_live_delegated_descendants(shell_pid: libc::pid_t) -> Result<usize, String> {
+        count_with_process_table(&MacProcessTable, shell_pid)
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
-    pub(super) fn count_live_descendants(_pid: libc::pid_t) -> usize {
-        0
+    pub(super) fn count_live_delegated_descendants(_pid: libc::pid_t) -> Result<usize, String> {
+        Err("background process-group probing is only supported on macOS".to_owned())
     }
 }
 
@@ -134,10 +276,10 @@ mod imp {
 /// distinguish "waiting on delegated work" from "genuinely idle". See the
 /// module doc comment for the incident this exists to fix.
 pub trait BackgroundActivityProbe: Send + Sync {
-    /// Number of live descendant processes for the worker backing
-    /// `execution_id`, or `0` if there are none, the worker's shell pid
-    /// cannot be resolved, or the execution is not a live worker at all.
-    fn live_descendant_count(&self, execution_id: &str) -> usize;
+    /// Number of live delegated descendants for the worker backing
+    /// `execution_id`. An unresolved worker or indeterminate process-tree
+    /// classification is an error so the caller can fail loudly and nudge.
+    fn live_delegated_descendant_count(&self, execution_id: &str) -> Result<usize, String>;
 }
 
 /// Default probe that always reports zero descendants. Used as the
@@ -147,8 +289,8 @@ pub trait BackgroundActivityProbe: Send + Sync {
 pub struct NoopBackgroundActivityProbe;
 
 impl BackgroundActivityProbe for NoopBackgroundActivityProbe {
-    fn live_descendant_count(&self, _execution_id: &str) -> usize {
-        0
+    fn live_delegated_descendant_count(&self, _execution_id: &str) -> Result<usize, String> {
+        Ok(0)
     }
 }
 
@@ -166,79 +308,97 @@ impl RegistryBackgroundActivityProbe {
 }
 
 impl BackgroundActivityProbe for RegistryBackgroundActivityProbe {
-    fn live_descendant_count(&self, execution_id: &str) -> usize {
+    fn live_delegated_descendant_count(&self, execution_id: &str) -> Result<usize, String> {
         let Some(shell_pid) = self.live_worker_states.shell_pid_for_run(execution_id) else {
-            return 0;
+            return Err(format!("no live shell pid registered for execution {execution_id}"));
         };
         if shell_pid <= 0 {
-            return 0;
+            return Err(format!("invalid shell pid {shell_pid} for execution {execution_id}"));
         }
-        count_live_descendants(shell_pid as libc::pid_t)
+        count_live_delegated_descendants(shell_pid as libc::pid_t)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn no_children_counts_zero() {
-        // A freshly-spawned test process (this test itself) has no
-        // children unless something else in the process forked one.
-        let self_pid = std::process::id() as libc::pid_t;
-        // Not asserting exactly zero (the test harness/runtime may hold
-        // its own worker threads/processes) — just that a pid with no
-        // deliberately-spawned children doesn't explode or hang.
-        let _ = count_live_descendants(self_pid);
+    fn proc_bsd_info_layout_matches_darwin_abi() {
+        assert_eq!(std::mem::size_of::<imp::ProcBsdInfo>(), 136);
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn direct_child_is_counted() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("5")
-            .spawn()
-            .expect("failed to spawn sleep");
-        // Give the OS a moment to register the child in the process table.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let self_pid = std::process::id() as libc::pid_t;
-        let count = count_live_descendants(self_pid);
-        child.kill().ok();
-        child.wait().ok();
-        assert!(count >= 1, "expected at least the spawned `sleep` child, got {count}");
+    struct FakeProcessTable {
+        foreground_pgid: libc::pid_t,
+        children: HashMap<libc::pid_t, Vec<libc::pid_t>>,
+        process_groups: HashMap<libc::pid_t, libc::pid_t>,
     }
 
-    #[cfg(target_os = "macos")]
+    impl ProcessTable for FakeProcessTable {
+        fn child_pids(&self, pid: libc::pid_t) -> Result<Vec<libc::pid_t>, String> {
+            Ok(self.children.get(&pid).cloned().unwrap_or_default())
+        }
+
+        fn process_group(&self, pid: libc::pid_t) -> Result<libc::pid_t, String> {
+            self.process_groups
+                .get(&pid)
+                .copied()
+                .ok_or_else(|| format!("missing process group for pid {pid}"))
+        }
+
+        fn foreground_process_group(&self, _pid: libc::pid_t) -> Result<libc::pid_t, String> {
+            Ok(self.foreground_pgid)
+        }
+    }
+
     #[test]
-    fn dead_pid_counts_zero() {
-        // A pid vanishingly unlikely to be alive.
-        assert_eq!(count_live_descendants(999_999), 0);
+    fn probe_returns_zero_for_driver_runtime_and_helpers() {
+        // shell(10) -> driver(20) -> runtime helper(21). Both descendants
+        // belong to the terminal foreground process group, so the probe
+        // excludes them without consulting executable names.
+        let table = FakeProcessTable {
+            foreground_pgid: 100,
+            children: HashMap::from([(10, vec![20]), (20, vec![21])]),
+            process_groups: HashMap::from([(20, 100), (21, 100)]),
+        };
+        assert_eq!(count_with_process_table(&table, 10), Ok(0));
+    }
+
+    #[test]
+    fn separate_background_process_group_is_counted_as_delegated() {
+        let table = FakeProcessTable {
+            foreground_pgid: 100,
+            children: HashMap::from([(10, vec![20, 30]), (20, vec![21]), (30, vec![31])]),
+            process_groups: HashMap::from([(20, 100), (21, 100), (30, 300), (31, 300)]),
+        };
+        assert_eq!(count_with_process_table(&table, 10), Ok(2));
     }
 
     struct FixedProbe(usize);
     impl BackgroundActivityProbe for FixedProbe {
-        fn live_descendant_count(&self, _execution_id: &str) -> usize {
-            self.0
+        fn live_delegated_descendant_count(&self, _execution_id: &str) -> Result<usize, String> {
+            Ok(self.0)
         }
     }
 
     #[test]
     fn noop_probe_always_reports_zero() {
         let probe = NoopBackgroundActivityProbe;
-        assert_eq!(probe.live_descendant_count("exec_a"), 0);
+        assert_eq!(probe.live_delegated_descendant_count("exec_a"), Ok(0));
     }
 
     #[test]
     fn fixed_probe_reports_configured_count() {
         let probe = FixedProbe(3);
-        assert_eq!(probe.live_descendant_count("exec_a"), 3);
+        assert_eq!(probe.live_delegated_descendant_count("exec_a"), Ok(3));
     }
 
     #[test]
-    fn registry_probe_returns_zero_for_unknown_execution() {
+    fn registry_probe_fails_for_unknown_execution() {
         let registry = std::sync::Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
         let probe = RegistryBackgroundActivityProbe::new(registry);
-        assert_eq!(probe.live_descendant_count("exec_unknown"), 0);
+        assert!(probe.live_delegated_descendant_count("exec_unknown").is_err());
     }
 }

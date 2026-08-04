@@ -1138,8 +1138,15 @@ impl MergeProbe for FixedStateProbe {
 /// "still working" arm).
 struct FixedDescendantProbe(usize);
 impl crate::background_children::BackgroundActivityProbe for FixedDescendantProbe {
-    fn live_descendant_count(&self, _execution_id: &str) -> usize {
-        self.0
+    fn live_delegated_descendant_count(&self, _execution_id: &str) -> std::result::Result<usize, String> {
+        Ok(self.0)
+    }
+}
+
+struct FailingDescendantProbe;
+impl crate::background_children::BackgroundActivityProbe for FailingDescendantProbe {
+    fn live_delegated_descendant_count(&self, _execution_id: &str) -> std::result::Result<usize, String> {
+        Err("synthetic process-table failure".to_owned())
     }
 }
 

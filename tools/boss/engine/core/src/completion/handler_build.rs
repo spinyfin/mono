@@ -40,7 +40,7 @@ impl WorkerCompletionHandler {
             build_wait_tracker: Arc::new(BuildWaitTracker::new()),
             build_wait_horizon_secs: DEFAULT_BUILD_WAIT_HORIZON_SECS,
             background_activity_probe: Arc::new(crate::background_children::NoopBackgroundActivityProbe),
-            background_children_tracker: Arc::new(BuildWaitTracker::new()),
+            background_children_tracker: Arc::new(BackgroundNudgeTracker::new(Arc::new(BuildWaitTracker::new()))),
             background_children_horizon_secs: crate::background_children::DEFAULT_BACKGROUND_CHILDREN_HORIZON_SECS,
             hold_registry: Arc::new(crate::hold_registry::HoldRegistry::new()),
             teardown_registry: Arc::new(crate::teardown_registry::TeardownRegistry::new()),
@@ -138,7 +138,7 @@ impl WorkerCompletionHandler {
     /// Wire an externally-owned background-children tracker into this
     /// handler. Tests use it to share / inspect tracker state.
     pub fn with_background_children_tracker(mut self, tracker: Arc<BuildWaitTracker>) -> Self {
-        self.background_children_tracker = tracker;
+        self.background_children_tracker = Arc::new(BackgroundNudgeTracker::new(tracker));
         self
     }
 
