@@ -128,11 +128,9 @@ pub(crate) fn migrate_project_design_doc_columns(conn: &Connection) -> Result<()
     Ok(())
 }
 
-/// Create the `project_property_audit` side table for the
-/// design-doc-pointer audit log (chore #15 of the
-/// `project-design-doc-pointer` design). Append-only history of
-/// `projects.design_doc_*` writes, with one row per (column, write)
-/// pair where the value actually changed.
+/// Create the general `project_property_audit` side table (introduced for the
+/// design-doc-pointer audit log). It now carries append-only status history as
+/// well; later migrations add provenance fields without replacing this table.
 ///
 /// `project_id` is intentionally *not* a foreign key — projects can
 /// be soft-deleted out from under their history, but the forensic

@@ -563,8 +563,9 @@ pub(crate) fn record_merge_order_on_merge(conn: &Connection, merged_id: &str) ->
     Ok(later_count)
 }
 
-/// Internal write that stamps `last_status_actor = 'engine'` on a
-/// project row. Used by the auto-block / unblock paths.
+/// Internal write used by project auto-block / unblock paths. It stamps the
+/// current actor/basis and appends the matching status audit in the caller's
+/// transaction. `done` is deliberately outside this writer's authority.
 ///
 /// Takes a typed [`ProjectStatus`] rather than a bare `&str` — the
 /// engine previously routed both task and project auto-block/unblock
@@ -583,11 +584,37 @@ pub(crate) fn write_engine_project_status(
     new_status: ProjectStatus,
     now_epoch: &str,
 ) -> Result<()> {
+    if new_status == ProjectStatus::Done {
+        bail!(
+            "engine dependency cascades cannot mark projects done; completion requires an explicit operator or audited agent action"
+        );
+    }
+    let Some(project) = query_project(conn, project_id)? else {
+        return Ok(());
+    };
+    if project.status == new_status {
+        return Ok(());
+    }
+    let basis = match new_status {
+        ProjectStatus::Blocked => "dependency cascade found an unmet prerequisite",
+        ProjectStatus::Planned => "dependency cascade found every prerequisite satisfied",
+        ProjectStatus::Active | ProjectStatus::Archived => "engine dependency cascade status transition",
+        ProjectStatus::Done => unreachable!("done rejected above"),
+    };
     conn.execute(
         "UPDATE projects
-         SET status = ?2, last_status_actor = 'engine', updated_at = ?3
+         SET status = ?2, last_status_actor = 'engine', updated_at = ?3, status_basis = ?4
          WHERE id = ?1",
-        params![project_id, new_status.as_str(), now_epoch],
+        params![project_id, new_status.as_str(), now_epoch, basis],
+    )?;
+    record_project_status_audit(
+        conn,
+        project_id,
+        project.status,
+        new_status,
+        boss_protocol::LAST_STATUS_ACTOR_ENGINE,
+        basis,
+        now_epoch,
     )?;
     Ok(())
 }

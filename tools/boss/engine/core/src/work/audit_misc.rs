@@ -26,6 +26,9 @@ pub struct ProjectPropertyAuditEntry {
     pub new_value: Option<String>,
     pub actor: String,
     pub changed_at: String,
+    /// Human-readable basis for the transition. Present for `status`
+    /// entries; `None` for older rows and design-doc property edits.
+    pub basis: Option<String>,
 }
 
 /// Emit one `project_property_audit` row for each of the three
@@ -64,6 +67,38 @@ pub(crate) fn record_design_doc_audit(
             params![id, project_id, property, old, new, actor, now],
         )?;
     }
+    Ok(())
+}
+
+/// Record one append-only project status transition in the existing general
+/// project-property audit ledger. The caller owns the transaction that also
+/// updates `projects`, so provenance and state cannot commit independently.
+pub(crate) fn record_project_status_audit(
+    conn: &Connection,
+    project_id: &str,
+    old_status: ProjectStatus,
+    new_status: ProjectStatus,
+    actor: &str,
+    basis: &str,
+    now: &str,
+) -> Result<()> {
+    if old_status == new_status {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO project_property_audit
+            (id, project_id, property, old_value, new_value, actor, changed_at, basis)
+         VALUES (?1, ?2, 'status', ?3, ?4, ?5, ?6, ?7)",
+        params![
+            next_id("paud"),
+            project_id,
+            old_status.as_str(),
+            new_status.as_str(),
+            actor,
+            now,
+            basis,
+        ],
+    )?;
     Ok(())
 }
 

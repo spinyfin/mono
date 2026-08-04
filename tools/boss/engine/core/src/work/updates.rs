@@ -36,6 +36,53 @@ fn validate_blocked_reason_length(reason: &str) -> Result<()> {
     Ok(())
 }
 
+/// Count every live task under a project, using the canonical terminal
+/// vocabulary shared by [`TaskStatus::is_terminal`]. Status provenance uses
+/// both numbers so a deliberate completion with open work says so explicitly
+/// instead of looking like an automatic certification.
+fn project_task_completion_counts(conn: &Connection, project_id: &str) -> Result<(i64, i64)> {
+    conn.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(CASE
+                    WHEN status IN ('done', 'archived', 'cancelled') THEN 0
+                    ELSE 1
+                END), 0)
+         FROM tasks
+         WHERE project_id = ?1 AND deleted_at IS NULL",
+        [project_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .map_err(Into::into)
+}
+
+fn explicit_project_status_basis(
+    conn: &Connection,
+    project_id: &str,
+    actor: &str,
+    previous: ProjectStatus,
+    next: ProjectStatus,
+) -> Result<String> {
+    if next != ProjectStatus::Done {
+        return Ok(format!(
+            "status transition requested by {actor}: {} to {}",
+            previous.as_str(),
+            next.as_str()
+        ));
+    }
+
+    let (total, open) = project_task_completion_counts(conn, project_id)?;
+    let terminal = total - open;
+    if open == 0 {
+        Ok(format!(
+            "completion requested by {actor} after all {total} live task(s) reached a terminal status"
+        ))
+    } else {
+        Ok(format!(
+            "completion override requested by {actor} with {open} open and {terminal} terminal live task(s)"
+        ))
+    }
+}
+
 /// Whether `kind` may be moved between project membership states via
 /// `WorkItemPatch::project_id`. `Chore` and `ProjectTask` differ *only*
 /// by project membership (see `TaskKind` docs), so they are the only
@@ -195,16 +242,33 @@ impl WorkDb {
         if status_changed {
             refuse_manual_move_off_blocked_while_gated(&tx, id, previous_status.as_str(), project.status.as_str())?;
         }
-        let actor_stamp = if status_changed && previous_status != project.status {
-            actor
+        let actual_status_change = status_changed && previous_status != project.status;
+        if actual_status_change
+            && project.status == ProjectStatus::Done
+            && actor == boss_protocol::LAST_STATUS_ACTOR_ENGINE
+        {
+            bail!(
+                "engine-originated project completion is not allowed: only an explicit operator or audited agent action may mark a project done"
+            );
+        }
+        let status_basis = if actual_status_change {
+            Some(explicit_project_status_basis(
+                &tx,
+                id,
+                actor,
+                previous_status,
+                project.status,
+            )?)
         } else {
-            ""
+            None
         };
+        let actor_stamp = if actual_status_change { actor } else { "" };
 
         tx.execute(
             "UPDATE projects
              SET name = ?2, slug = ?3, description = ?4, goal = ?5, status = ?6, priority = ?7, updated_at = ?8,
-                 last_status_actor = CASE WHEN ?9 = '' THEN last_status_actor ELSE ?9 END
+                 last_status_actor = CASE WHEN ?9 = '' THEN last_status_actor ELSE ?9 END,
+                 status_basis = CASE WHEN ?9 = '' THEN status_basis ELSE ?10 END
              WHERE id = ?1",
             params![
                 project.id,
@@ -216,16 +280,26 @@ impl WorkDb {
                 project.priority,
                 project.updated_at,
                 actor_stamp,
+                status_basis,
             ],
         )?;
 
         let mut pending = PendingEvents::new();
-        if status_changed && previous_status != project.status {
+        if actual_status_change {
             cascade_dependents_after_prereq_status_change(
                 &mut pending,
                 &tx,
                 id,
                 project.status.as_str(),
+                &project.updated_at,
+            )?;
+            record_project_status_audit(
+                &tx,
+                id,
+                previous_status,
+                project.status,
+                actor,
+                status_basis.as_deref().expect("status transition basis"),
                 &project.updated_at,
             )?;
         }

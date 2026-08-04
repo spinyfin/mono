@@ -804,6 +804,10 @@ fn project_dependent_auto_unblocks_to_planned_not_todo() {
     let WorkItem::Project(p) = blocked else { panic!() };
     assert_eq!(p.status, ProjectStatus::Blocked);
     assert_eq!(p.last_status_actor, "engine");
+    assert_eq!(
+        p.status_basis.as_deref(),
+        Some("dependency cascade found an unmet prerequisite")
+    );
 
     // Prereq project reaches `done` (a project-valid status, unlike
     // `archived`'s task counterpart) — the cascade fires.
@@ -824,6 +828,10 @@ fn project_dependent_auto_unblocks_to_planned_not_todo() {
         "a project dependent must auto-unblock to `planned` — `todo` is not a valid ProjectStatus",
     );
     assert_eq!(p.last_status_actor, "engine");
+    assert_eq!(
+        p.status_basis.as_deref(),
+        Some("dependency cascade found every prerequisite satisfied")
+    );
 
     // The row must still decode cleanly through the strict reader —
     // this is exactly the read that hard-failed for the whole product's
@@ -833,6 +841,11 @@ fn project_dependent_auto_unblocks_to_planned_not_todo() {
         .unwrap()
         .expect("project must still exist");
     assert_eq!(reread.status, ProjectStatus::Planned);
+    drop(conn);
+    let audit = db.list_project_property_audit(&dependent.id).unwrap();
+    assert_eq!(audit.len(), 2, "both engine status transitions must be durable");
+    assert_eq!(audit[0].new_value.as_deref(), Some("blocked"));
+    assert_eq!(audit[1].new_value.as_deref(), Some("planned"));
     let _ = std::fs::remove_file(path);
 }
 

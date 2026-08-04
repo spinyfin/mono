@@ -58,8 +58,15 @@ final class ProjectShortIDBadgeTests: XCTestCase {
     /// `WorkSidebarFilterRow` collapses its subtitle slot.
     func testSidebarSubtitleIsNilWhenShortIDAbsent() {
         let project = makeProject(shortID: nil)
-        let subtitle = project.shortID.map { "P\($0)" }
-        XCTAssertNil(subtitle)
+        XCTAssertNil(project.sidebarSubtitle)
+    }
+
+    /// A stored `done` status is rendered directly even when child task rows
+    /// remain open; the app must not silently derive or hide project state.
+    func testDoneProjectUsesVisibleStoredStatus() {
+        let project = makeProject(shortID: 42, status: "done")
+        XCTAssertEqual(project.sidebarSubtitle, "P42 · Done")
+        XCTAssertEqual(project.sidebarSystemImage, "checkmark.circle")
     }
 
     // MARK: - ViewModel wiring
@@ -109,7 +116,7 @@ final class ProjectShortIDBadgeTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private func makeProject(shortID: Int?) -> WorkProject {
+    private func makeProject(shortID: Int?, status: String = "active") -> WorkProject {
         WorkProject(
             id: "proj_test",
             productID: "prod_test",
@@ -117,7 +124,7 @@ final class ProjectShortIDBadgeTests: XCTestCase {
             slug: "test",
             description: "",
             goal: "",
-            status: "active",
+            status: status,
             priority: "medium",
             createdAt: "2026-05-15T00:00:00Z",
             updatedAt: "2026-05-15T00:00:00Z",

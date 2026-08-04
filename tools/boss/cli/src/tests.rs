@@ -1809,6 +1809,7 @@ fn lint_project(slug: &str, path: Option<&str>) -> Project {
         created_at: String::new(),
         updated_at: String::new(),
         last_status_actor: "human".to_owned(),
+        status_basis: None,
         design_doc_repo_remote_url: None,
         design_doc_branch: None,
         design_doc_path: path.map(str::to_owned),

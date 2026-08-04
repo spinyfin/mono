@@ -656,8 +656,8 @@ struct ContentView: View {
                         )
                         WorkSidebarFilterRow(
                             title: project.name,
-                            subtitle: project.shortID.map { "P" + String($0) },
-                            systemImage: isArchived ? "archivebox" : "folder",
+                            subtitle: project.sidebarSubtitle,
+                            systemImage: project.sidebarSystemImage,
                             isSelected: isOn,
                             trailing: nil,
                             showsCheckbox: true,

@@ -169,6 +169,7 @@ pub(crate) fn project_image(project: &Project) -> ColumnImage {
         ("priority", Some(project.priority.clone())),
         ("slug", Some(project.slug.clone())),
         ("status", Some(project.status.as_str().to_owned())),
+        ("status_basis", project.status_basis.clone()),
     ])
 }
 

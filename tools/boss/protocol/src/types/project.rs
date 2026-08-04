@@ -119,6 +119,13 @@ pub struct Project {
     #[builder(default = default_human_actor())]
     pub last_status_actor: String,
 
+    /// Why the current status was selected. Engine and operator status
+    /// writers stamp this together with `status` / `last_status_actor`, so a
+    /// project can explain its current lifecycle state without reconstructing
+    /// it from task rows. `None` means the status predates provenance capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_basis: Option<String>,
+
     pub name: String,
     #[builder(default = default_priority())]
     pub priority: String,

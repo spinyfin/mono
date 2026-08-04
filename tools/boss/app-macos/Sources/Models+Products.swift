@@ -247,6 +247,9 @@ struct WorkProject: Identifiable, Hashable {
     /// kanban uses this to distinguish auto-blocks (chain badge,
     /// drag refusal) from user-chosen blocks.
     var lastStatusActor: String = "human"
+    /// Engine-recorded explanation for the current project status. `nil`
+    /// means the transition predates status provenance capture.
+    var statusBasis: String? = nil
     /// Repo URL the project's design doc lives in. `nil` → inherit
     /// from the project's product. Mirrors
     /// `Project.design_doc_repo_remote_url`.
@@ -262,6 +265,26 @@ struct WorkProject: Identifiable, Hashable {
     /// (the engine backfills these at startup, so `nil` is transient).
     /// Mirrors `Project.short_id` on the wire.
     var shortID: Int? = nil
+}
+
+extension WorkProject {
+    /// Sidebar copy derived from the authoritative stored project status.
+    /// `done` is intentionally visible rather than inferred from child rows.
+    var sidebarSubtitle: String? {
+        let parts = [
+            shortID.map { "P" + String($0) },
+            status == "done" ? "Done" : nil,
+        ].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    var sidebarSystemImage: String {
+        switch status {
+        case "archived": "archivebox"
+        case "done": "checkmark.circle"
+        default: "folder"
+        }
+    }
 }
 
 /// Swift mirror of `boss_protocol::SetProjectDesignDocInput`.

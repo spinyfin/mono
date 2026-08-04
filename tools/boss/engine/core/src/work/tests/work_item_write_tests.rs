@@ -235,3 +235,112 @@ fn real_status_change_sets_last_status_actor_human_for_task() {
 
     let _ = std::fs::remove_file(path);
 }
+
+/// The automatic postmortem sweep used to call this actor-aware write path
+/// with `actor = engine`, letting a partial task-kind predicate certify the
+/// whole project complete. The authoritative project writer now rejects that
+/// authority even when no open task happens to be visible at the instant of
+/// the write.
+#[test]
+fn engine_cannot_mark_project_done() {
+    let path = temp_db_path("engine-project-completion-refused");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "P", Some("git@github.com:example/repo.git"));
+    let project = db
+        .create_project(
+            CreateProjectInput::builder()
+                .product_id(product.id)
+                .name("Project")
+                .no_design_task(true)
+                .build(),
+        )
+        .unwrap();
+
+    let err = db
+        .update_work_item_as_actor(
+            &project.id,
+            WorkItemPatch {
+                status: Some("done".to_owned()),
+                ..WorkItemPatch::default()
+            },
+            boss_protocol::LAST_STATUS_ACTOR_ENGINE,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("engine-originated project completion is not allowed"),
+        "got: {err}"
+    );
+    assert_eq!(db.get_project(&project.id).unwrap().status, ProjectStatus::Planned);
+    assert!(db.list_project_property_audit(&project.id).unwrap().is_empty());
+
+    let conn = db.connect().unwrap();
+    let err = write_engine_project_status(&conn, &project.id, ProjectStatus::Done, "1700000000")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("cannot mark projects done"), "got: {err}");
+    drop(conn);
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// Deliberate completion remains available even with open tasks, but both the
+/// current project row and the append-only audit must make that override
+/// explicit. A later status change must not erase the completion evidence.
+#[test]
+fn explicit_project_completion_with_open_tasks_records_basis_and_history() {
+    let path = temp_db_path("explicit-project-completion-basis");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "P", Some("git@github.com:example/repo.git"));
+    let project = db
+        .create_project(
+            CreateProjectInput::builder()
+                .product_id(&product.id)
+                .name("Project")
+                .no_design_task(true)
+                .build(),
+        )
+        .unwrap();
+    db.create_task(
+        CreateTaskInput::builder()
+            .product_id(&product.id)
+            .project_id(&project.id)
+            .name("Still open")
+            .build(),
+    )
+    .unwrap();
+
+    db.update_work_item(
+        &project.id,
+        WorkItemPatch {
+            status: Some("done".to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    let completed = db.get_project(&project.id).unwrap();
+    assert_eq!(completed.status, ProjectStatus::Done);
+    assert_eq!(completed.last_status_actor, boss_protocol::LAST_STATUS_ACTOR_HUMAN);
+    let basis = completed.status_basis.as_deref().expect("completion basis");
+    assert!(basis.contains("completion override requested by human"), "got: {basis}");
+    assert!(basis.contains("1 open and 0 terminal"), "got: {basis}");
+
+    db.update_work_item(
+        &project.id,
+        WorkItemPatch {
+            status: Some("active".to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    let audit = db.list_project_property_audit(&project.id).unwrap();
+    assert_eq!(audit.len(), 2);
+    assert_eq!(audit[0].property, "status");
+    assert_eq!(audit[0].old_value.as_deref(), Some("planned"));
+    assert_eq!(audit[0].new_value.as_deref(), Some("done"));
+    assert_eq!(audit[0].basis.as_deref(), Some(basis));
+    assert_eq!(audit[1].old_value.as_deref(), Some("done"));
+    assert_eq!(audit[1].new_value.as_deref(), Some("active"));
+
+    let _ = std::fs::remove_file(path);
+}

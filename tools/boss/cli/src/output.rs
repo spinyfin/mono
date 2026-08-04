@@ -469,6 +469,14 @@ pub(crate) fn print_project_details(
     println!("Name: {}", project.name);
     println!("Slug: {}", project.slug);
     println!("Status: {}", project.status);
+    println!("Status actor: {}", project.last_status_actor);
+    println!(
+        "Status basis: {}",
+        project
+            .status_basis
+            .as_deref()
+            .unwrap_or("not recorded (status predates provenance capture)")
+    );
     if let Some(product) = parent_product {
         // Projects have no per-row override column today, so the
         // override slot is always `None`; the line reduces to the

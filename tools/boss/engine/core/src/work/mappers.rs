@@ -88,6 +88,7 @@ pub(crate) fn map_project(row: &Row<'_>) -> rusqlite::Result<Project> {
         design_doc_branch: row.get(12)?,
         design_doc_path: row.get(13)?,
         short_id: row.get(14)?,
+        status_basis: row.get(15)?,
     })
 }
 

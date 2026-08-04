@@ -370,14 +370,13 @@ impl WorkDb {
     /// first), with a stable secondary sort on row id so two writes
     /// landing in the same `changed_at` second still serialise.
     ///
-    /// v1 records design-doc pointer columns
-    /// (`design_doc_repo_remote_url`, `design_doc_branch`,
-    /// `design_doc_path`); the schema is general so future edits to
-    /// other project properties can ride along without a re-migration.
+    /// Records design-doc pointer columns and project status transitions;
+    /// the schema remains general so future project-property provenance can
+    /// ride the same ledger.
     pub fn list_project_property_audit(&self, project_id: &str) -> Result<Vec<ProjectPropertyAuditEntry>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT id, project_id, property, old_value, new_value, actor, changed_at
+            "SELECT id, project_id, property, old_value, new_value, actor, changed_at, basis
              FROM project_property_audit
              WHERE project_id = ?1
              ORDER BY changed_at ASC, id ASC",
@@ -391,6 +390,7 @@ impl WorkDb {
                 new_value: row.get(4)?,
                 actor: row.get(5)?,
                 changed_at: row.get(6)?,
+                basis: row.get(7)?,
             })
         })?;
         collect_rows(rows)
