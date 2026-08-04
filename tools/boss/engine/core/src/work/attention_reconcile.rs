@@ -103,6 +103,7 @@ fn work_resumed_evidence() -> String {
              WHERE e.work_item_id = {ATTENTION_WORK_ITEM}
                AND r.started_at IS NOT NULL
                AND CAST(r.started_at AS INTEGER) >= CAST({ATTENTION_RAISED_AT} AS INTEGER)
+               AND r.execution_id IS NOT work_attention_items.execution_id
          )"
     )
 }

@@ -438,7 +438,8 @@ pub struct WorkExecution {
     pub created_at: String,
     pub kind: ExecutionKind,
     /// Number of pre-start failures (cube_repo_ensure, workspace_lease,
-    /// change_create, run_start) accumulated on this execution row. The
+    /// change_create, run_start, spawn-config composition, pane spawn)
+    /// accumulated on this execution row. The
     /// engine retries up to N times before marking the execution `failed`
     /// permanently. Reset to 0 on a fresh `ready` execution.
     #[serde(default)]

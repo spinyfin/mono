@@ -425,7 +425,7 @@ impl ExecutionCoordinator {
                         .run_status("failed")
                         .error_text(error_text.as_str())
                         .clear_workspace_lease(released)
-                        .increment_pre_start_failure_count(true)
+                        .increment_pre_start_failure_count(!is_slot_busy)
                         .maybe_attention(attention)
                         .build(),
                 ) {
@@ -509,7 +509,11 @@ impl ExecutionCoordinator {
                         // stays in Doing and dispatches onto the next free
                         // slot exactly like a plain pool-exhaustion wait.
                         if execution.kind != ExecutionKind::PrReview && !is_slot_busy {
-                            match self.work_db.demote_active_work_item_to_todo(&execution.work_item_id) {
+                            match self.work_db.bounce_dispatch_failed_to_backlog(
+                                &execution.work_item_id,
+                                "pane_spawn_failed",
+                                error_text.as_str(),
+                            ) {
                                 Ok(true) => {
                                     tracing::info!(
                                         execution_id = %execution.id,

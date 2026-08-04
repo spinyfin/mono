@@ -44,7 +44,7 @@ use crate::work::WorkDb;
 /// ahead of and overriding the reviewed/automated row's own
 /// `tasks.driver` → `products.default_driver` → engine-default chain
 /// ([`WorkDb::get_execution_driver_slug`]) — exactly the precedence
-/// `worker_spawn::effective_task_driver_for_worker` applies at spawn. The
+/// `SpawnResolutionInput::pool_policy_driver` applies at spawn. The
 /// resolved slug is looked up in the same [`DriverRegistry`] every other call
 /// site uses.
 ///
@@ -339,7 +339,7 @@ mod tests {
     /// A review-pool worker id (`review-N`) must override a codex-attributed
     /// row's own driver: the reviewer pane is always a Claude pane regardless
     /// of what the row under review carries. Mirrors
-    /// `worker_spawn::effective_task_driver_for_worker`'s precedence and pins
+    /// `SpawnResolutionInput::pool_policy_driver`'s precedence and pins
     /// the same shape `completion/tests/t04.rs::
     /// pr_review_pass_recovers_claude_shaped_fallback_for_codex_attributed_chore`
     /// exercises end-to-end, but in the module that actually owns the

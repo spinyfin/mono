@@ -130,7 +130,7 @@ fn eligibility_is_exactly_what_the_dispatch_gate_says() {
     let registry = crate::driver::DriverRegistry::default();
     let execution_kind = ExecutionKind::ChoreImplementation;
     for kind in TaskKind::ALL {
-        let eligible = eligible_drivers_for(kind, &execution_kind);
+        let eligible = eligible_drivers_for(kind, &execution_kind, None);
         for driver in DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER {
             let gate_ok = registry
                 .resolver(driver)
@@ -480,6 +480,27 @@ fn product_default_driver_overrides_allocation() {
     let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
     assert_eq!(decision.driver.as_deref(), Some("copilot"));
     assert_eq!(decision.reason, REASON_EXPLICIT);
+}
+
+#[test]
+fn incompatible_model_override_falls_back_to_the_engine_default_driver() {
+    let (_dir, db) = open_db();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100)).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, &product.id, "model-pinned chore");
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            model_override: Some("opus".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let execution = create_ready_chore_execution(&db, &chore.id);
+    let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+    assert_eq!(decision.driver, None);
+    assert_eq!(decision.reason, REASON_DEFAULT);
 }
 
 /// Same work item id → same decision, deterministically, across repeated

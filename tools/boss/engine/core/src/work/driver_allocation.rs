@@ -173,12 +173,23 @@ impl DriverDecision {
 /// `ConflictResolution` / `CiRemediation`, which is exactly why allocation
 /// must decline those two kinds rather than treating every `tasks`-bound
 /// execution kind as equally eligible.
-fn eligible_drivers_for(kind: &TaskKind, execution_kind: &ExecutionKind) -> Vec<&'static str> {
-    crate::driver::DriverRegistry::default().eligible_drivers_for_kind(
-        kind,
-        Some(execution_kind),
-        &DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER,
-    )
+fn eligible_drivers_for(
+    kind: &TaskKind,
+    execution_kind: &ExecutionKind,
+    model_override: Option<&str>,
+) -> Vec<&'static str> {
+    let registry = crate::driver::DriverRegistry::default();
+    registry
+        .eligible_drivers_for_kind(kind, Some(execution_kind), &DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER)
+        .into_iter()
+        .filter(|slug| {
+            model_override.is_none_or(|model| {
+                registry
+                    .get(slug)
+                    .is_some_and(|driver| (driver.descriptor().model_menu.model_belongs_to_driver)(model))
+            })
+        })
+        .collect()
 }
 
 /// Deterministic hash of `work_item_id` into `[0, 100)`. SHA-256 rather
@@ -323,6 +334,7 @@ pub(crate) fn get_execution_driver_decision_conn(
 /// name at the point it is used.
 struct AllocationRow {
     explicit_driver: Option<String>,
+    model_override: Option<String>,
     task_kind: String,
     source_automation_id: Option<String>,
     product_default_driver: Option<String>,
@@ -380,7 +392,7 @@ pub(crate) fn decide_execution_driver(
 ) -> Result<DriverDecision> {
     let row = conn
         .query_row(
-            "SELECT t.driver, t.kind, t.source_automation_id, p.default_driver
+            "SELECT t.driver, t.model_override, t.kind, t.source_automation_id, p.default_driver
                FROM tasks t
                LEFT JOIN products p ON p.id = t.product_id
               WHERE t.id = ?1",
@@ -388,9 +400,10 @@ pub(crate) fn decide_execution_driver(
             |row| {
                 Ok(AllocationRow {
                     explicit_driver: row.get(0)?,
-                    task_kind: row.get(1)?,
-                    source_automation_id: row.get(2)?,
-                    product_default_driver: row.get(3)?,
+                    model_override: row.get(1)?,
+                    task_kind: row.get(2)?,
+                    source_automation_id: row.get(3)?,
+                    product_default_driver: row.get(4)?,
                 })
             },
         )
@@ -418,9 +431,21 @@ pub(crate) fn decide_execution_driver(
              refusing to allocate a driver for a kind whose capability requirements this engine cannot resolve",
         )
     })?;
-    let eligible = eligible_drivers_for(&task_kind, &kind);
+    let model_override = row
+        .model_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty());
+    let eligible = eligible_drivers_for(&task_kind, &kind, model_override);
+    if eligible.is_empty() && model_override.is_some() {
+        return Ok(DriverDecision::default_no_override());
+    }
     let split = load_driver_traffic_split_conn(conn)?;
-    let driver = allocate_among(split, work_item_id, &task_kind, &eligible)?;
+    let driver = match allocate_among(split, work_item_id, &task_kind, &eligible) {
+        Ok(driver) => driver,
+        Err(_) if model_override.is_some() => return Ok(DriverDecision::default_no_override()),
+        Err(err) => return Err(err),
+    };
     Ok(DriverDecision::allocated(driver, split))
 }
 
