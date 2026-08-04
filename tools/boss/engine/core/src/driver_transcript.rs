@@ -311,6 +311,65 @@ mod tests {
     }
 
     #[test]
+    fn codex_driver_normalization_matches_canonical_conversation_records() {
+        // A complete Codex turn carries user and assistant prose in multiple
+        // rollout representations. The driver path feeds the app and marker
+        // scans, so its conversation records must agree with the schema-aware
+        // parser rather than re-emitting the agent/task-complete echoes.
+        let jsonl = concat!(
+            r#"{"timestamp":"2026-08-04T02:15:10.606Z","type":"session_meta","payload":{"id":"s1"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-04T02:15:10.606Z","type":"event_msg","payload":{"type":"user_message","message":"probe"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-04T02:15:10.606Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"injected context and probe"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-04T02:15:12.000Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call-1","name":"exec","input":"{\"cmd\":\"echo tool\"}"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-04T02:15:13.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-1","output":[{"type":"input_text","text":"tool\n"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-04T02:15:19.965Z","type":"event_msg","payload":{"type":"agent_message","message":"answer"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-04T02:15:19.965Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-04T02:15:20.012Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":"answer"}}"#,
+            "\n",
+        );
+        let driver = DriverRegistry::default().require("codex").unwrap();
+        let normalized = parse_transcript_with_driver(Some(driver.as_ref()), jsonl);
+        let canonical = crate::transcript_markdown::parse_transcript_checked(jsonl).unwrap();
+        let conversation_kinds = |events: &[TranscriptEvent]| {
+            events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.kind,
+                        TranscriptEventKind::UserText(_)
+                            | TranscriptEventKind::AssistantText(_)
+                            | TranscriptEventKind::ToolUse { .. }
+                            | TranscriptEventKind::ToolResult { .. }
+                    )
+                })
+                .map(|event| format!("{:?}", event.kind))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(conversation_kinds(&normalized), conversation_kinds(&canonical));
+        assert_eq!(assistant_texts(&normalized), vec!["answer"]);
+        assert!(normalized.iter().any(|event| matches!(
+            &event.kind,
+            TranscriptEventKind::ToolResult { output, is_error: false } if output == "tool\n"
+        )));
+        assert!(normalized.iter().any(|event| {
+            matches!(&event.kind, TranscriptEventKind::UserText(text) if text == "probe")
+                && event.timestamp.as_deref() == Some("2026-08-04T02:15:10.606Z")
+        }));
+        assert!(normalized.iter().any(|event| {
+            matches!(&event.kind, TranscriptEventKind::AssistantText(text) if text == "answer")
+                && event.timestamp.as_deref() == Some("2026-08-04T02:15:19.965Z")
+        }));
+    }
+
+    #[test]
     fn execution_driver_resolves_from_the_task_row() {
         let (_dir, db) = open_db();
         let product = create_test_product(&db);

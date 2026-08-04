@@ -14,13 +14,14 @@
 //! `tools/boss/docs/designs/codex-as-a-first-class-agent-driver.md` — so it
 //! was removed rather than kept unreachable.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use boss_engine_codex_rollout::{
-    CanonicalRolloutToolCall, canonical_rollout_tool_call as shared_canonical_rollout_tool_call, extract_text_blocks,
-    is_rollout_tool_output,
+    CanonicalRolloutToolCall, canonical_rollout_tool_call as shared_canonical_rollout_tool_call,
+    canonical_rollout_tool_output, extract_text_blocks, is_rollout_tool_output,
 };
 use boss_protocol::{NormalizeError, SessionStartSource, StopReason, WorkerEvent};
 use serde_json::{Map, Value, json};
@@ -691,6 +692,12 @@ pub(super) fn normalize_rollout(raw: Value) -> Value {
 
 pub(super) struct CodexTranscriptSession {
     calls: RolloutCallTracker,
+    /// Assistant response_item messages are the canonical transcript source.
+    /// Keep the turn ids until task_complete so its last_agent_message can
+    /// remain a fallback for a partially flushed rollout without becoming a
+    /// second copy of an already-recorded assistant message.
+    assistant_response_turns: HashSet<String>,
+    assistant_response_since_boundary: bool,
 }
 
 impl Default for CodexTranscriptSession {
@@ -701,6 +708,8 @@ impl Default for CodexTranscriptSession {
     fn default() -> Self {
         Self {
             calls: RolloutCallTracker::with_capacity(MAX_TRACKED_TRANSCRIPT_TOOL_CALLS, "transcript"),
+            assistant_response_turns: HashSet::new(),
+            assistant_response_since_boundary: false,
         }
     }
 }
@@ -715,28 +724,31 @@ impl CodexTranscriptSession {
             }
         };
 
-        match parsed {
+        let normalized = match parsed {
             RolloutEnvelope::SessionMeta => {
                 self.calls.reset();
+                self.assistant_response_turns.clear();
+                self.assistant_response_since_boundary = false;
                 json!({"type":"system"})
             }
-            RolloutEnvelope::EventMessage { event_type, payload } => {
-                normalize_rollout_event_message(&event_type, &payload).unwrap_or_else(|| {
+            RolloutEnvelope::EventMessage { event_type, payload } => self
+                .normalize_rollout_event_message(&event_type, &payload)
+                .unwrap_or_else(|| {
                     tracing::debug!(event_type, "codex rollout: ignoring additive event_msg variant");
-                    raw
-                })
-            }
+                    raw.clone()
+                }),
             RolloutEnvelope::ResponseItem { item_type, payload } => self
                 .normalize_rollout_response_item(&item_type, &payload)
                 .unwrap_or_else(|| {
                     tracing::debug!(item_type, "codex rollout: ignoring additive response_item variant");
-                    raw
+                    raw.clone()
                 }),
             RolloutEnvelope::Unknown { record_type } => {
                 tracing::debug!(record_type, "codex rollout: ignoring additive record variant");
-                raw
+                raw.clone()
             }
-        }
+        };
+        preserve_rollout_timestamp(normalized, &raw)
     }
 
     fn normalize_rollout_response_item(&mut self, item_type: &str, payload: &Map<String, Value>) -> Option<Value> {
@@ -788,16 +800,77 @@ impl CodexTranscriptSession {
                     ));
                 }
             };
+            let output = canonical_rollout_tool_output(&raw_output);
             return Some(json!({
-                "type":"user",
+                "type":"tool_result",
+                "content":output.body,
+                "is_error":output.is_error,
                 "tool_name":call.tool_name,
                 "tool_input":call.tool_input,
-                "tool_response":raw_output,
             }));
         }
-        (item_type == "message")
-            .then(|| normalize_rollout_message(payload))
-            .flatten()
+        if item_type != "message" {
+            return None;
+        }
+        let normalized = normalize_rollout_message(payload)?;
+        if let Some(turn_id) = rollout_turn_id(payload) {
+            self.assistant_response_turns.insert(turn_id.to_owned());
+        }
+        self.assistant_response_since_boundary = true;
+        Some(normalized)
+    }
+
+    fn normalize_rollout_event_message(&mut self, event_type: &str, payload: &Map<String, Value>) -> Option<Value> {
+        match event_type {
+            // `response_item` role=assistant is the canonical per-message
+            // source. `agent_message` is a rollout echo of it.
+            "agent_message" => None,
+            // `event_msg.user_message` is the canonical user source. Its
+            // response_item counterpart includes injected boilerplate.
+            "user_message" => Some(json!({
+                "type":"user",
+                "text": payload.get("message")?.as_str()?,
+            })),
+            // Lifecycle fillers are `system`, not assistant text. Emitting them as
+            // AssistantText made every Codex Stop-boundary read that landed on a
+            // partial rollout (session_meta + task_started, final agent_message
+            // not yet flushed) treat the synthetic "turn started" as worker prose,
+            // short-circuit the flush-race retry, and permanently miss markers.
+            "turn_aborted" => {
+                let reason = payload.get("reason").and_then(Value::as_str).unwrap_or("interrupted");
+                Some(lifecycle_system("turn_aborted", &format!("turn aborted: {reason}")))
+            }
+            "task_started" => {
+                self.assistant_response_since_boundary = false;
+                Some(lifecycle_system("task_started", "turn started"))
+            }
+            "task_complete" => {
+                let had_canonical_assistant = rollout_turn_id(payload)
+                    .map(|turn_id| self.assistant_response_turns.remove(turn_id))
+                    .unwrap_or(self.assistant_response_since_boundary);
+                self.assistant_response_since_boundary = false;
+
+                // A fatal `error` takes priority over `last_agent_message` (Codex
+                // sends `last_agent_message: null` alongside a fatal error — the
+                // worker never got to speak). Surfaced as AssistantText, not a
+                // lifecycle filler, so transcript readers recover the provider's
+                // diagnostic instead of finding no assistant text at all.
+                if let Some(message) = rollout_task_complete_error_message(payload) {
+                    return Some(assistant_text(&format!("Codex reported a fatal error: {message}")));
+                }
+                // A partial rollout can terminate before the canonical
+                // response_item flushes. Keep last_agent_message only in that
+                // case; otherwise it is an unconditional duplicate.
+                match (
+                    had_canonical_assistant,
+                    payload.get("last_agent_message").and_then(Value::as_str),
+                ) {
+                    (false, Some(message)) => Some(assistant_text(message)),
+                    _ => Some(lifecycle_system("task_complete", "turn completed")),
+                }
+            }
+            _ => None,
+        }
     }
 }
 
@@ -807,45 +880,23 @@ impl TranscriptSessionNormalizer for CodexTranscriptSession {
     }
 }
 
-fn normalize_rollout_event_message(event_type: &str, payload: &Map<String, Value>) -> Option<Value> {
-    match event_type {
-        "agent_message" => Some(assistant_text(payload.get("message")?.as_str()?)),
-        "user_message" => Some(json!({
-            "type":"user",
-            "text": payload.get("message")?.as_str()?,
-        })),
-        // Lifecycle fillers are `system`, not assistant text. Emitting them as
-        // AssistantText made every Codex Stop-boundary read that landed on a
-        // partial rollout (session_meta + task_started, final agent_message
-        // not yet flushed) treat the synthetic "turn started" as worker prose,
-        // short-circuit the flush-race retry, and permanently miss markers.
-        "turn_aborted" => {
-            let reason = payload.get("reason").and_then(Value::as_str).unwrap_or("interrupted");
-            Some(lifecycle_system("turn_aborted", &format!("turn aborted: {reason}")))
-        }
-        "task_started" => Some(lifecycle_system("task_started", "turn started")),
-        "task_complete" => {
-            // A fatal `error` takes priority over `last_agent_message` (Codex
-            // sends `last_agent_message: null` alongside a fatal error — the
-            // worker never got to speak). Surfaced as AssistantText, not a
-            // lifecycle filler, so the transcript readers that scan for
-            // worker prose (triage decision, PR-URL fallback, the
-            // `pr_review` ReviewResult fallback) recover the provider's own
-            // diagnostic instead of finding no assistant text at all — the
-            // exact vague "transcript had no assistant text event" diagnosis
-            // this closes.
-            if let Some(message) = rollout_task_complete_error_message(payload) {
-                return Some(assistant_text(&format!("Codex reported a fatal error: {message}")));
-            }
-            // Real final prose stays AssistantText so marker scans can see it.
-            // The bare "turn completed" filler is lifecycle-only.
-            match payload.get("last_agent_message").and_then(Value::as_str) {
-                Some(message) => Some(assistant_text(message)),
-                None => Some(lifecycle_system("task_complete", "turn completed")),
-            }
-        }
-        _ => None,
+fn rollout_turn_id(payload: &Map<String, Value>) -> Option<&str> {
+    payload.get("turn_id").and_then(Value::as_str).or_else(|| {
+        payload
+            .get("internal_chat_message_metadata_passthrough")
+            .and_then(|metadata| metadata.get("turn_id"))
+            .and_then(Value::as_str)
+    })
+}
+
+fn preserve_rollout_timestamp(mut normalized: Value, raw: &Value) -> Value {
+    let Some(timestamp) = raw.get("timestamp").cloned() else {
+        return normalized;
+    };
+    if let Some(object) = normalized.as_object_mut() {
+        object.insert("timestamp".to_owned(), timestamp);
     }
+    normalized
 }
 
 /// Extract a diagnostic message from a rollout `task_complete` payload's
@@ -923,9 +974,10 @@ fn normalize_rollout_message(payload: &Map<String, Value>) -> Option<Value> {
     // `boss_engine_codex_rollout::extract_text_blocks`.
     let text = extract_text_blocks(content);
     match role {
-        "assistant" => Some(assistant_text(&text)),
-        "user" => Some(json!({"type":"user","text":text})),
-        "developer" | "system" => Some(json!({"type":"system"})),
+        "assistant" if !text.is_empty() => Some(assistant_text(&text)),
+        // `event_msg.user_message` is the canonical source for user prose;
+        // it avoids replaying Codex's injected context. Developer/system
+        // messages are likewise not conversation turns.
         _ => None,
     }
 }
@@ -1593,7 +1645,14 @@ mod tests {
             "a wait poll must not render as a tool named `wait`"
         );
         let rendered = session.normalize_transcript_entry(cell_completed_output("call-wait", "done\n"));
-        assert_eq!(rendered.get("type").and_then(Value::as_str), Some("user"));
+        assert_eq!(rendered.get("type").and_then(Value::as_str), Some("tool_result"));
+        assert!(
+            rendered
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.ends_with("done\n")),
+            "completed cell output must be preserved: {rendered}"
+        );
         assert_eq!(
             rendered.get("tool_input"),
             Some(&json!({"command":"cube pr create --branch boss/exec_1 --title T"}))
@@ -1974,13 +2033,11 @@ mod tests {
                 "output":[{"type":"input_text","text":"rollout\n"}]
             }
         }));
-        assert_eq!(output["type"], "user");
+        assert_eq!(output["type"], "tool_result");
         assert_eq!(output["tool_name"], "Bash");
         assert_eq!(output["tool_input"], json!({"command":"echo rollout"}));
-        assert_eq!(
-            output["tool_response"],
-            json!([{"type":"input_text","text":"rollout\n"}])
-        );
+        assert_eq!(output["content"], "rollout\n");
+        assert_eq!(output["is_error"], false);
     }
 
     #[test]
