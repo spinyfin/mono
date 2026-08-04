@@ -95,7 +95,8 @@ pub fn grok_homes_override(root: &Path) -> GrokHomesOverride {
 ///
 /// The guard serializes every test that changes the process-wide transcript
 /// store root, including tests that temporarily clear it to exercise the
-/// production default.
+/// production default. Always acquire this guard after any homes override;
+/// it is the innermost environment lock.
 pub struct TranscriptStoreOverride {
     _lock: std::sync::MutexGuard<'static, ()>,
     prior: Option<std::ffi::OsString>,
@@ -104,7 +105,8 @@ pub struct TranscriptStoreOverride {
 static TRANSCRIPT_STORE_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Point durable worker transcript storage at `root` for as long as the
-/// returned guard lives.
+/// returned guard lives. Always call this after acquiring any homes override,
+/// so the transcript-store lock remains innermost.
 pub fn transcript_store_override(root: &Path) -> TranscriptStoreOverride {
     TranscriptStoreOverride::set(Some(root))
 }

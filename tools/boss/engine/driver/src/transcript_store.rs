@@ -217,31 +217,34 @@ mod tests {
     fn drivers_contain_transcripts_to_their_own_durable_sessions_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let store = tmp.path().join("executions");
-        let _store = crate::test_support::transcript_store_override(&store);
+        {
+            let _codex_homes = crate::test_support::codex_homes_override(&tmp.path().join("codex-homes"));
+            let _store = crate::test_support::transcript_store_override(&store);
+            let codex_run_id = "codex-containment";
+            let codex_home = codex_home_for_run(codex_run_id).unwrap();
+            fs::create_dir_all(&codex_home).unwrap();
+            let codex_expected = provision_durable_sessions(&codex_home, "codex", codex_run_id).unwrap();
+            fs::remove_dir_all(&codex_home).unwrap();
+            assert_eq!(
+                CodexDriver::default()
+                    .transcript_containment_root(codex_run_id)
+                    .unwrap(),
+                Some(fs::canonicalize(codex_expected).unwrap())
+            );
+        }
 
-        let _codex_homes = crate::test_support::codex_homes_override(&tmp.path().join("codex-homes"));
-        let codex_run_id = "codex-containment";
-        let codex_home = codex_home_for_run(codex_run_id).unwrap();
-        fs::create_dir_all(&codex_home).unwrap();
-        let codex_expected = provision_durable_sessions(&codex_home, "codex", codex_run_id).unwrap();
-        fs::remove_dir_all(&codex_home).unwrap();
-        assert_eq!(
-            CodexDriver::default()
-                .transcript_containment_root(codex_run_id)
-                .unwrap(),
-            Some(fs::canonicalize(codex_expected).unwrap())
-        );
-        drop(_codex_homes);
-
-        let _grok_homes = crate::test_support::grok_homes_override(&tmp.path().join("grok-homes"));
-        let grok_run_id = "grok-containment";
-        let grok_home = grok_home_for_run(grok_run_id).unwrap();
-        fs::create_dir_all(&grok_home).unwrap();
-        let grok_expected = provision_durable_sessions(&grok_home, "grok", grok_run_id).unwrap();
-        fs::remove_dir_all(&grok_home).unwrap();
-        assert_eq!(
-            GrokDriver::default().transcript_containment_root(grok_run_id).unwrap(),
-            Some(fs::canonicalize(grok_expected).unwrap())
-        );
+        {
+            let _grok_homes = crate::test_support::grok_homes_override(&tmp.path().join("grok-homes"));
+            let _store = crate::test_support::transcript_store_override(&store);
+            let grok_run_id = "grok-containment";
+            let grok_home = grok_home_for_run(grok_run_id).unwrap();
+            fs::create_dir_all(&grok_home).unwrap();
+            let grok_expected = provision_durable_sessions(&grok_home, "grok", grok_run_id).unwrap();
+            fs::remove_dir_all(&grok_home).unwrap();
+            assert_eq!(
+                GrokDriver::default().transcript_containment_root(grok_run_id).unwrap(),
+                Some(fs::canonicalize(grok_expected).unwrap())
+            );
+        }
     }
 }

@@ -664,6 +664,11 @@ impl AgentDriver for GrokDriver {
                     return Ok(Some(canonical));
                 }
             }
+            Err(err) => tracing::debug!(
+                ?err,
+                path = %sessions_path.display(),
+                "stat of temporary sessions path failed; falling back to legacy containment"
+            ),
             _ => {}
         }
         Ok(None)

@@ -1741,6 +1741,11 @@ impl AgentDriver for CodexDriver {
                     return Ok(Some(canonical));
                 }
             }
+            Err(err) => tracing::debug!(
+                ?err,
+                path = %sessions_path.display(),
+                "stat of temporary sessions path failed; falling back to legacy containment"
+            ),
             _ => {}
         }
         let sessions = verified_sessions_root(&homes_root, &codex_home).ok_or_else(|| {
