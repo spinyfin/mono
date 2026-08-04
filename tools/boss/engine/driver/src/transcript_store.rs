@@ -1,32 +1,34 @@
 //! Durable, transcript-only storage for isolated agent homes.
 //!
-//! Claude already keeps conversations in `$HOME/.claude/projects`; Codex and
-//! Grok use that same durable store for their session JSONL while retaining
-//! credentials, hooks, and all other per-run state in their temporary homes.
+//! Codex and Grok retain their session JSONL under Boss's state root while
+//! keeping credentials, hooks, and all other per-run state in their temporary
+//! homes. The per-execution layout mirrors Boss's other durable artifacts.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 
-/// Test/operator override for the existing Claude transcript-store root.
-/// Production uses `$HOME/.claude/projects`.
+/// Test/operator override for the Boss-owned worker transcript-store root.
 pub const WORKER_TRANSCRIPTS_ROOT_ENV: &str = "BOSS_WORKER_TRANSCRIPTS_ROOT";
 
-/// Resolve the existing durable transcript store used by Claude Code.
+/// Resolve Boss's durable worker transcript store.
+///
+/// Production uses `<Boss state root>/executions`, alongside other
+/// per-execution artifacts. Tests and operators can override that root with
+/// [`WORKER_TRANSCRIPTS_ROOT_ENV`].
 pub fn transcript_store_root() -> anyhow::Result<PathBuf> {
     if let Some(root) = std::env::var_os(WORKER_TRANSCRIPTS_ROOT_ENV).filter(|root| !root.is_empty()) {
         return Ok(PathBuf::from(root));
     }
-    let home = std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("HOME is unset; cannot retain worker transcript in ~/.claude/projects"))?;
-    Ok(PathBuf::from(home).join(".claude").join("projects"))
+    boss_log_files::default_state_root()
+        .map(|root| root.join("executions"))
+        .ok_or_else(|| anyhow::anyhow!("HOME is unset; cannot resolve Boss worker transcript storage"))
 }
 
 /// Make `home/sessions` a link to a dedicated transcript-only directory in
-/// Claude's existing transcript store. The destination is namespaced by the
-/// workspace and run so neither driver can collide with a Claude session.
+/// Boss's per-execution artifact directory. The destination is namespaced by
+/// run and driver so neither driver can collide.
 ///
 /// This is deliberately a provisioning error, not a best-effort completion
 /// action: a killed or orphaned worker is still writing to the durable file,
@@ -46,15 +48,15 @@ pub fn provision_durable_sessions_in(
     home: &Path,
     store_root: &Path,
     driver: &str,
-    workspace: &Path,
+    _workspace: &Path,
     run_id: &str,
 ) -> anyhow::Result<PathBuf> {
     let driver = safe_segment(driver, "driver")?;
     let run_id = safe_segment(run_id, "run_id")?;
-    let workspace_slug = workspace_slug(workspace)?;
     let destination = store_root
-        .join(workspace_slug)
-        .join(format!("boss-{driver}-{run_id}"))
+        .join(run_id)
+        .join("transcripts")
+        .join(driver)
         .join("sessions");
     fs::create_dir_all(&destination)
         .with_context(|| format!("creating durable worker transcript directory {}", destination.display()))?;
@@ -121,18 +123,6 @@ fn safe_segment(value: &str, field: &str) -> anyhow::Result<String> {
     Ok(value.to_owned())
 }
 
-fn workspace_slug(workspace: &Path) -> anyhow::Result<String> {
-    let value = workspace.to_string_lossy();
-    let slug = value.replace(['/', '\\'], "-");
-    if slug.is_empty() || slug == "-" {
-        bail!(
-            "workspace path has no usable Claude transcript slug: {}",
-            workspace.display()
-        );
-    }
-    Ok(slug)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,7 +131,7 @@ mod tests {
     fn sessions_link_retains_only_the_transcript_subtree() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("temporary-home");
-        let store = tmp.path().join("claude-projects");
+        let store = tmp.path().join("boss-executions");
         fs::create_dir_all(home.join("sessions")).unwrap();
         fs::write(home.join("auth.json"), "credential").unwrap();
 
@@ -156,5 +146,18 @@ mod tests {
         assert!(home.join("auth.json").is_file());
         fs::remove_dir_all(&home).unwrap();
         assert!(durable.join("rollout.jsonl").is_file());
+    }
+
+    #[test]
+    fn durable_sessions_follow_boss_per_execution_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("temporary-home");
+        let store = tmp.path().join("executions");
+        fs::create_dir_all(home.join("sessions")).unwrap();
+
+        let durable =
+            provision_durable_sessions_in(&home, &store, "codex", Path::new("/work/project"), "exec-run").unwrap();
+
+        assert_eq!(durable, store.join("exec-run/transcripts/codex/sessions"));
     }
 }

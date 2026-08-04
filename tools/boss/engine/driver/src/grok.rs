@@ -28,6 +28,8 @@ use boss_protocol::{NormalizeError, PaneMonitorSpec, WorkerEvent};
 use boss_ssh_transport::shell_quote;
 use serde_json::Value;
 
+use crate::transcript_store::transcript_store_root;
+
 mod classify_error;
 mod environment;
 mod home;
@@ -638,6 +640,17 @@ impl AgentDriver for GrokDriver {
         // records, joined only by `toolCallId` — GrokTranscriptSession
         // owns that per-tail correlation (see `grok/transcript.rs`).
         Some(Box::new(GrokTranscriptSession::default()))
+    }
+
+    fn transcript_containment_root(&self, run_id: &str) -> anyhow::Result<Option<PathBuf>> {
+        let sessions_path = grok_home_for_run(run_id)?.join("sessions");
+        if fs::symlink_metadata(&sessions_path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Ok(Some(transcript_store_root()?));
+        }
+        Ok(None)
     }
 
     fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value {

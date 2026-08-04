@@ -295,7 +295,7 @@ pub static CODEX_HOMES_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::n
 
 /// Default leaf under the system temp when [`CODEX_HOMES_ROOT_ENV`] is unset.
 /// Session JSONL is the deliberate exception: provisioning links only that
-/// subtree into `$HOME/.claude/projects` for durable forensic retention.
+/// subtree into Boss-owned per-execution storage for durable forensic retention.
 const CODEX_HOMES_DIR_NAME: &str = "boss-codex-homes";
 
 /// Filename of the hook-trust attestation JSON written next to the run home.
@@ -1428,8 +1428,8 @@ impl AgentDriver for CodexDriver {
     /// Adopt any mid-run auth refresh back into the source.
     ///
     /// Leaves the temporary Boss-owned `CODEX_HOME` for its existing reclaim
-    /// policy. Its `sessions/` link already writes the full rollout into the
-    /// durable Claude transcript store, while auth and every other home file
+    /// policy. Its `sessions/` link already writes the full rollout into
+    /// Boss-owned transcript storage, while auth and every other home file
     /// remain temporary. Idempotent: a missing home or missing runtime state
     /// is a pure no-op.
     async fn teardown_workspace(

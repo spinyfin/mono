@@ -42,7 +42,7 @@ pub static GROK_HOMES_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::ne
 
 /// Default leaf under the system temp when [`GROK_HOMES_ROOT_ENV`] is unset.
 /// Session JSONL is the deliberate exception: provisioning links only that
-/// subtree into `$HOME/.claude/projects` for durable forensic retention.
+/// subtree into Boss-owned per-execution storage for durable forensic retention.
 const GROK_HOMES_DIR_NAME: &str = "boss-grok-homes";
 
 /// Most recent Grok CLI version actually characterised by the design +
