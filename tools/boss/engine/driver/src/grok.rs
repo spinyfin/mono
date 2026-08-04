@@ -370,8 +370,8 @@ impl AgentDriver for GrokDriver {
         };
         let runtime = GrokRuntimeState::from_driver_runtime_state(state)?;
         // Containment check even though we do not delete here: a tampered
-        // payload must surface loudly. Home is retained as run evidence
-        // (same retention posture as Codex); reclaim is a follow-on policy.
+        // payload must surface loudly. The full transcript is already in the
+        // durable sessions link; this temporary home remains reclaimable.
         assert_grok_home_safe_to_delete(&runtime.grok_home)?;
         Ok(())
     }

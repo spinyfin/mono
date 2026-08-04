@@ -41,6 +41,7 @@ mod tool_surface_guard;
 use guard_trace::{GUARD_TRACE_SHIM_FILENAME, GUARD_TRACE_SHIM_SCRIPT, guard_trace_path, wrapper_body};
 use tool_surface_guard::CODEX_TOOL_SURFACE_GUARD_SCRIPT;
 
+use crate::transcript_store::{provision_durable_sessions, transcript_store_root};
 use progress::{CodexRolloutProgressSession, CodexTranscriptSession, normalize_rollout, verified_sessions_root};
 
 use super::claude::{BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND};
@@ -293,6 +294,8 @@ pub const CODEX_HOMES_ROOT_ENV: &str = "BOSS_CODEX_HOMES_DIR";
 pub static CODEX_HOMES_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Default leaf under the system temp when [`CODEX_HOMES_ROOT_ENV`] is unset.
+/// Session JSONL is the deliberate exception: provisioning links only that
+/// subtree into `$HOME/.claude/projects` for durable forensic retention.
 const CODEX_HOMES_DIR_NAME: &str = "boss-codex-homes";
 
 /// Filename of the hook-trust attestation JSON written next to the run home.
@@ -1386,6 +1389,7 @@ impl AgentDriver for CodexDriver {
             .with_context(|| format!("creating Boss-owned CODEX_HOME {}", codex_home.display()))?;
         fs::create_dir_all(codex_home.join("sessions"))
             .with_context(|| format!("creating Codex sessions directory under {}", codex_home.display()))?;
+        provision_durable_sessions(&codex_home, "codex", workspace, run_id)?;
 
         // Auth: SnapshotWithRefreshAdoption. Source is the operator auth
         // discovery path (or BOSS_CODEX_AUTH_SOURCE when set for tests);
@@ -1423,12 +1427,11 @@ impl AgentDriver for CodexDriver {
 
     /// Adopt any mid-run auth refresh back into the source.
     ///
-    /// Leaves the Boss-owned `CODEX_HOME` on disk as terminal-run evidence
-    /// for the retention policy (`boss-engine-codex-rollout-retention` /
-    /// `codex_home_retention_sweep`). Disk reclaim happens later against
-    /// **this recorded path only** — never by scanning `~/.codex` or
-    /// inferring a home from the engine environment. Idempotent: a missing
-    /// home or missing runtime state is a pure no-op.
+    /// Leaves the temporary Boss-owned `CODEX_HOME` for its existing reclaim
+    /// policy. Its `sessions/` link already writes the full rollout into the
+    /// durable Claude transcript store, while auth and every other home file
+    /// remain temporary. Idempotent: a missing home or missing runtime state
+    /// is a pure no-op.
     async fn teardown_workspace(
         &self,
         _workspace: Option<&Path>,
@@ -1715,9 +1718,16 @@ impl AgentDriver for CodexDriver {
 
     fn transcript_containment_root(&self, run_id: &str) -> anyhow::Result<Option<PathBuf>> {
         let (homes_root, codex_home) = codex_homes_root_and_home_for_run(run_id)?;
+        let sessions_path = codex_home.join("sessions");
+        if fs::symlink_metadata(&sessions_path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Ok(Some(transcript_store_root()?));
+        }
         let sessions = verified_sessions_root(&homes_root, &codex_home).ok_or_else(|| {
             anyhow!(
-                "Codex transcript root for run {run_id:?} is missing, symlinked, replaced, or outside {}",
+                "Codex transcript root for run {run_id:?} is missing, replaced, or outside {}",
                 homes_root.display()
             )
         })?;

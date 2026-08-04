@@ -879,7 +879,7 @@ fn empty_run_id_refused_for_codex_home() {
 }
 
 /// The root/home pair must come from one read of the homes-root env, so
-/// every containment comparison downstream (`verified_sessions_root`)
+/// every containment comparison downstream
 /// sees a home that is genuinely a child of the root it was handed.
 /// Pairing an independent `codex_homes_root()`
 /// call with `codex_home_for_run()` is what made a sibling test's env

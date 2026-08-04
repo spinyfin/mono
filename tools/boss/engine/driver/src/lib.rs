@@ -19,6 +19,8 @@ use boss_protocol::{
     EffortLevel, ExecutionKind, NormalizeError, PaneMonitorSpec, ReasoningMode, StopReason, TaskKind, WorkerEvent,
 };
 
+pub mod transcript_store;
+
 /// Worker posture for the [`Capability::PermissionPolicy`] capability's
 /// deny-rule selection (reviewer read-only, triage no-work, answer-agent
 /// allowlist).
