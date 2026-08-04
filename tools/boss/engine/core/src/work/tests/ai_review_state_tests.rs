@@ -211,6 +211,104 @@ fn ai_review_state_is_none_when_no_verdict_exists_for_the_current_head() {
     );
 }
 
+/// A failed reviewer attempt is operational history, not a verdict. Once a
+/// later pass completes, its durable verdict must still drive the card badge.
+/// This specifically protects retry/recovery after reviewer-pool contention:
+/// the failed execution remains queryable for diagnosis without hiding the
+/// completed review from the board.
+#[test]
+fn ai_review_state_shows_completed_review_after_an_earlier_failed_attempt() {
+    let db = WorkDb::open(temp_db_path("ai-review-state-failed-then-completed")).unwrap();
+    let product_id = make_revision_product(&db, "failed-then-completed");
+    let chore_id = make_in_review_chore(&db, &product_id, "https://github.com/spinyfin/mono/pull/8101");
+
+    let failed = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let completed = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_executions SET status = 'failed' WHERE id = ?1",
+            rusqlite::params![failed.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            rusqlite::params![completed.id],
+        )
+        .unwrap();
+        WorkDb::insert_review_verdict_in_tx(
+            &conn,
+            &completed.id,
+            &chore_id,
+            &crate::work::ReviewVerdictInput {
+                head_sha: Some("sha-completed-after-retry".to_owned()),
+                findings_count: 0,
+                revision_warranted: false,
+                gate_outcome: crate::work::REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
+            },
+        )
+        .unwrap();
+    }
+
+    let tree = db.get_work_tree(&product_id).unwrap();
+    let card = tree.chores.iter().find(|c| c.id == chore_id).expect("chore present");
+    assert_eq!(
+        card.ai_review_state.as_deref(),
+        Some("reviewed_all_clear"),
+        "a completed review must show even when an earlier pr_review execution failed"
+    );
+}
+
+/// A terminal failure does not itself establish that a review occurred. The
+/// card remains unbadged until a reviewer produces an informative verdict.
+#[test]
+fn ai_review_state_hides_badge_when_every_review_attempt_failed() {
+    let db = WorkDb::open(temp_db_path("ai-review-state-only-failed")).unwrap();
+    let product_id = make_revision_product(&db, "only-failed");
+    let chore_id = make_in_review_chore(&db, &product_id, "https://github.com/spinyfin/mono/pull/8102");
+
+    let failed = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_executions SET status = 'failed' WHERE id = ?1",
+            rusqlite::params![failed.id],
+        )
+        .unwrap();
+    }
+
+    let tree = db.get_work_tree(&product_id).unwrap();
+    let card = tree.chores.iter().find(|c| c.id == chore_id).expect("chore present");
+    assert!(
+        card.ai_review_state.is_none(),
+        "failed pr_review executions must not be inferred as completed reviews"
+    );
+}
+
 /// The "reviewing" state must track the existing `ai_reviewing` flag exactly
 /// — this is a thin remap, not a second independent computation.
 #[test]
