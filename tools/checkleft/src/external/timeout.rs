@@ -17,10 +17,14 @@ use anyhow::{Context, Result};
 
 use super::ExternalCheckLimits;
 
-/// Base wall-clock budget for external checks (5 seconds). Used as the fixed
+/// Base wall-clock budget for external checks (15 seconds). Used as the fixed
 /// component of the proportional timeout formula when no explicit
 /// `limits.timeout_ms` override is set in the check manifest.
-pub(crate) const BASE_COMPONENT_TIMEOUT_MS: u64 = 5_000;
+///
+/// A subprocess can be queued briefly on a loaded CI host even when it is not
+/// wedged. Fifteen seconds leaves room for that normal scheduling variance while
+/// still failing a stalled check promptly.
+pub(crate) const BASE_COMPONENT_TIMEOUT_MS: u64 = 15_000;
 /// Per-file wall-clock budget increment (100 ms per changed file). Combined
 /// with [`BASE_COMPONENT_TIMEOUT_MS`] to form a proportional default timeout.
 pub(crate) const PER_FILE_COMPONENT_TIMEOUT_MS: u64 = 100;
