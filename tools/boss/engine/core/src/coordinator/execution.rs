@@ -2150,6 +2150,19 @@ impl ExecutionCoordinator {
                     return Err(record_err);
                 }
 
+                if matches!(
+                    current.as_ref().map(|current| current.status.clone()),
+                    Some(ExecutionStatus::Cancelled | ExecutionStatus::Abandoned)
+                ) {
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        worker_id,
+                        current_status = %current.as_ref().expect("status was checked").status,
+                        "pre-start failure followed a deliberate execution settlement; skipping readiness-violation recovery",
+                    );
+                    return Ok(());
+                }
+
                 let current_status = current
                     .as_ref()
                     .map(|current| current.status.as_str())

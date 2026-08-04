@@ -820,8 +820,9 @@ pub(crate) fn reconcile_revision_execution(
             if existing.kind == ExecutionKind::RevisionImplementation
                 && (existing.status.is_live() || existing.status == ExecutionStatus::Dispatching) =>
         {
-            // A live execution (running or waiting_human) is already in
-            // progress — do not spawn a duplicate worker. Without this arm
+            // A worker is already attached (running or waiting_human), or
+            // the scheduler holds a dispatch claim — do not spawn a duplicate
+            // worker. Without this arm
             // the `_ =>` branch fires for every reconcile tick while the
             // execution is waiting_human, creating an unbounded cascade of
             // ready executions and spawning multiple concurrent workers on

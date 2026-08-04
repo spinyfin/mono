@@ -66,19 +66,19 @@ impl WorkDb {
                 existing.status
             );
         }
-        if opts.queued_only && !existing.status.can_reconcile() {
+        if opts.queued_only && !(existing.status.can_reconcile() || existing.status == ExecutionStatus::Dispatching) {
             if existing.status.is_live() {
                 bail!(
                     "execution {execution_id} is `{}` (already started); \
                      use `bossctl agents stop {execution_id}` to stop a live worker — \
                      `executions cancel` only accepts never-started \
-                     (queued/ready/waiting_dependency) rows",
+                     (queued/ready/dispatching/waiting_dependency) rows",
                     existing.status
                 );
             }
             bail!(
                 "execution {execution_id} is `{}` and has already left the \
-                 never-started set (queued/ready/waiting_dependency); \
+                 never-started set (queued/ready/dispatching/waiting_dependency); \
                  use `bossctl work cancel {execution_id}` for any non-terminal \
                  row, or `bossctl agents stop` if a live worker still backs it",
                 existing.status

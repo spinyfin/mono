@@ -756,7 +756,7 @@ impl WorkDb {
                AND NOT EXISTS (
                    SELECT 1 FROM work_executions we
                    WHERE we.work_item_id = t.id
-                     AND we.status IN ('ready', 'running', 'waiting_human')
+                    AND we.status IN ('ready', 'dispatching', 'running', 'waiting_human')
                )
                AND NOT EXISTS (
                    SELECT 1 FROM work_attention_items a
@@ -1485,7 +1485,7 @@ impl WorkDb {
     /// (or a concurrent path) already moved to `blocked`/`in_review`/a
     /// terminal status is left alone. Returns `true` iff the task actually
     /// transitioned; the execution abandon always applies (best-effort,
-    /// WHERE-guarded on `status = 'ready'` so a concurrent claim isn't
+    /// WHERE-guarded on a pre-run status so a concurrent live run isn't
     /// clobbered).
     pub fn retire_stale_revision_before_dispatch(&self, execution_id: &str, task_id: &str) -> Result<bool> {
         let mut conn = self.connect()?;
@@ -1496,7 +1496,7 @@ impl WorkDb {
              SET status = 'abandoned',
                  finished_at = COALESCE(finished_at, ?2)
              WHERE id = ?1
-               AND status = 'ready'",
+               AND status IN ('ready', 'dispatching')",
             params![execution_id, now],
         )?;
         let mut pending = PendingEvents::new();

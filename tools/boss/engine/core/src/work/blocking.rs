@@ -58,7 +58,7 @@ impl WorkDb {
                    SELECT 1 FROM work_executions we
                    WHERE we.work_item_id = cr.work_item_id
                      AND we.kind = 'ci_remediation'
-                     AND we.status IN ('ready', 'running', 'waiting_human')
+                     AND we.status IN ('ready', 'dispatching', 'running', 'waiting_human')
                )
              ORDER BY cr.created_at ASC",
         )?;

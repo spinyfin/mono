@@ -3,6 +3,61 @@
 //! `coordinator` module split; see [`super`] for the struct and shared types.
 use super::*;
 
+/// Cleans up a claimed dispatch if its handoff task unwinds before it either
+/// starts a run or follows an ordinary error path. The durable claim and pool
+/// slot must move together: otherwise an unwind strands both until restart.
+struct DispatchClaimCleanup {
+    coordinator: Arc<ExecutionCoordinator>,
+    execution: WorkExecution,
+    worker_id: String,
+    armed: bool,
+}
+
+impl DispatchClaimCleanup {
+    fn new(coordinator: Arc<ExecutionCoordinator>, execution: WorkExecution, worker_id: String) -> Self {
+        Self {
+            coordinator,
+            execution,
+            worker_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DispatchClaimCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        tracing::error!(
+            execution_id = %self.execution.id,
+            worker_id = %self.worker_id,
+            "dispatch handoff ended without settling its claim; scheduling cleanup",
+        );
+        let coordinator = Arc::clone(&self.coordinator);
+        let execution = self.execution.clone();
+        let worker_id = self.worker_id.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                coordinator
+                    .pool_for_worker_id(&worker_id)
+                    .release_worker(&worker_id, execution.preferred_workspace_id.as_deref())
+                    .await;
+                coordinator.release_dispatch_claim(&execution.id);
+            });
+        } else {
+            tracing::error!(
+                execution_id = %self.execution.id,
+                "dispatch claim cleanup ran outside Tokio and could not release the pool slot",
+            );
+        }
+    }
+}
+
 impl ExecutionCoordinator {
     /// Wake the scheduler. Every call site that just enqueued a `ready`
     /// execution — a kanban drag, a reconciler sweep, the heartbeat, an
@@ -1971,6 +2026,7 @@ impl ExecutionCoordinator {
             // Held for the whole dispatch: the guard de-registers the
             // reservation on drop, on every path including a panic.
             let _reservation = reservation;
+            let mut cleanup = DispatchClaimCleanup::new(Arc::clone(&coordinator), execution.clone(), worker_id.clone());
             // Bounds concurrent cube subprocesses. Acquired inside the
             // task, never in the caller's loop, so a saturated cap would
             // delay only this dispatch rather than re-serializing the
@@ -1994,11 +2050,13 @@ impl ExecutionCoordinator {
                         .release_worker(&worker_id, execution.preferred_workspace_id.as_deref())
                         .await;
                     coordinator.release_dispatch_claim(&execution.id);
+                    cleanup.disarm();
                     return;
                 }
             };
             match coordinator.schedule_execution(&execution, &worker_id).await {
                 Ok(()) => {
+                    cleanup.disarm();
                     tracing::info!(
                         execution_id = %execution.id,
                         work_item_id = %execution.work_item_id,
@@ -2020,6 +2078,7 @@ impl ExecutionCoordinator {
                         .release_worker(&worker_id, execution.preferred_workspace_id.as_deref())
                         .await;
                     coordinator.release_dispatch_claim(&execution.id);
+                    cleanup.disarm();
                 }
             }
         });
