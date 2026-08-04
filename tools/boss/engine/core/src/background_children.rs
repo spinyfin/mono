@@ -58,12 +58,14 @@ pub fn count_live_delegated_descendants(shell_pid: libc::pid_t) -> Result<usize,
     imp::count_live_delegated_descendants(shell_pid)
 }
 
+#[cfg(any(target_os = "macos", test))]
 trait ProcessTable {
     fn child_pids(&self, pid: libc::pid_t) -> Result<Vec<libc::pid_t>, String>;
     fn process_group(&self, pid: libc::pid_t) -> Result<libc::pid_t, String>;
     fn foreground_process_group(&self, pid: libc::pid_t) -> Result<libc::pid_t, String>;
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn count_with_process_table(table: &dyn ProcessTable, shell_pid: libc::pid_t) -> Result<usize, String> {
     let foreground_pgid = table.foreground_process_group(shell_pid)?;
     if foreground_pgid <= 0 {
@@ -111,9 +113,11 @@ fn count_with_process_table(table: &dyn ProcessTable, shell_pid: libc::pid_t) ->
 }
 
 /// Bound on how many process-tree levels the probe walks below the shell.
+#[cfg(any(target_os = "macos", test))]
 const DESCENDANT_WALK_DEPTH: usize = 8;
 
 /// Hard cap on how many pids a single probe visits across the whole walk.
+#[cfg(any(target_os = "macos", test))]
 const MAX_VISITED_PIDS: usize = 512;
 
 #[cfg(target_os = "macos")]
