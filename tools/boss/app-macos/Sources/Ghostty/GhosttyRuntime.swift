@@ -287,8 +287,10 @@ final class GhosttyRuntime: @unchecked Sendable {
     /// change exists to stop. See [[SpawnCapability]].
     private func handleDisplaysDidWake() {
         NotificationCenter.default.post(name: .ghosttyDisplaysDidWake, object: nil)
-        guard !SpawnCapability.current().isBlocked else { return }
-        onDisplaysDidWake?()
+        Task { @MainActor [weak self] in
+            guard !SpawnCapability.current().isBlocked else { return }
+            self?.onDisplaysDidWake?()
+        }
     }
 
     fileprivate static func runtime(from userdata: UnsafeMutableRawPointer?) -> GhosttyRuntime? {
