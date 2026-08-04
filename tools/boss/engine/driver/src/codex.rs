@@ -280,22 +280,36 @@ const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed 
      connectors). Use the shell instead: `gh` for GitHub reads,\n\
      `cube pr create` / `cube pr update` for pull requests, `jj` for VCS.\n\
      - **Do not start interactive, stdin-driven sessions** (a bare `bash` /\n\
-     `sh -s` / `python3` REPL, an editor, a pager) and drive them with\n\
-     `write_stdin`; commands typed into one are invisible to the guardrails.\n\
+     `sh -s` / `python3` REPL, an editor, a pager). Commands typed into those\n\
+     sessions are invisible to the guardrails.\n\
      Run each command as its own shell invocation instead:\n\
      `bash -lc '<command>'`, `python3 -c '<code>'`, `python3 <script.py>`,\n\
      `sqlite3 <db> '<sql>'`.\n\
      \n\
-     Long foreground commands need one extra step because Codex's\n\
-     `exec_command` yields after at most 30 seconds. A result containing\n\
-     `session_id` means the command is still running — never that it passed\n\
-     or failed. In the same JavaScript cell, keep awaiting\n\
-     `tools.write_stdin({session_id: r.session_id, chars: \"\",\n\
-     yield_time_ms: 300000})`, replacing `r` with each result, until `r`\n\
-     contains `exit_code`. Empty polling is allowed; writing commands through\n\
-     stdin is not. Do not end the turn or claim a gate result without the real\n\
-     exit status. Give a command that might hang its own foreground timeout so\n\
-     expiry returns a nonzero status instead of polling forever.";
+     For any ordinary command expected to exceed roughly ten seconds, keep its\n\
+     session handle and poll it to completion. `exec_command` yields after at\n\
+     most 30 seconds; a result containing `session_id` means the command is\n\
+     still running — never that it passed or failed. `text(r.output)` discards\n\
+     that handle, so use this pattern instead:\n\
+     \n\
+     ```js\n\
+     // call 1 — start it, keep the WHOLE result object\n\
+     const r = await tools.exec_command({cmd: \"bazel test //backend/blob:blob_test //backend/admintasks:admintasks_test\",\n\
+     workdir: \"…\", yield_time_ms: 1000, max_output_tokens: 20000});\n\
+     text(JSON.stringify(r));\n\
+     \n\
+     // calls 2..N — poll the SAME session, unbounded\n\
+     const r = await tools.write_stdin({session_id: 20995, chars: \"\",\n\
+       yield_time_ms: 1000, max_output_tokens: 20000});\n\
+     text(JSON.stringify(r));\n\
+     ```\n\
+     \n\
+     Empty `write_stdin(session_id, chars: \"\")` polling is explicitly\n\
+     allowed for a session started by an ordinary command; repeat the poll with\n\
+     its returned `session_id` until the terminal result carries `exit_code`.\n\
+     Writing commands through stdin is not. Do not end the turn or claim a gate\n\
+     result without the real `exit_code`. Give a command that might hang its own foreground\n\
+     timeout so expiry returns a nonzero status instead of polling forever.";
 
 /// Single-pattern gitignore for the workspace-local `.codex/` config dir
 /// (prompt + agent-rules copies). Engine-injected files must not appear in
