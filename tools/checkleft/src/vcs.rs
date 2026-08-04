@@ -14,8 +14,8 @@ mod patch_line_deltas;
 
 use patch_line_deltas::parse_file_diffs_from_git_patch;
 
-/// Bound mandatory GitHub API input lookups so a blackholed connection cannot
-/// indefinitely block a checkleft run.
+/// Thirty seconds accommodates a slow TLS handshake and GitHub response while
+/// still failing promptly when a blackholed connection would block checkleft.
 const GITHUB_API_TIMEOUT_SECS: u64 = 30;
 
 /// Install the process-wide rustls crypto provider exactly once, before the
