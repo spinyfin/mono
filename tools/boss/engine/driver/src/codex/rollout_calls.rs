@@ -18,11 +18,12 @@
 //!   observed and [`crate::codex::UNOBSERVED_COMMAND_MARKER`] detection
 //!   could not see it.
 //!
-//! [`RolloutCallTracker`] closes both by making the **cell**, not the
-//! record, the unit of correlation: a yielded call stays open, keyed by its
-//! cell id, until a continuation delivers a terminal result. The call it
-//! then completes is the *originating* call, so downstream consumers see
-//! the real command paired with the real output and never learn that a
+//! [`RolloutCallTracker`] closes both by using the **shell session**, not the
+//! JavaScript cell, as the durable unit of correlation. A cell id bridges a
+//! yielded call to its first poll, but the structured chunk's `session_id`
+//! then binds every later polling cell to the originating command. The call
+//! it completes is therefore the *originating* call, so downstream consumers
+//! see the real command paired with the real output and never learn that a
 //! `wait` was involved.
 //!
 //! "Terminal" here is about the **command**, not the cell. `Script
@@ -43,7 +44,8 @@
 use std::collections::{HashMap, VecDeque};
 
 use boss_engine_codex_rollout::cell::{
-    CellOutcome, CellOutput, is_cell_wait_tool, parse_cell_output, payload_is_running_chunk, wait_target_cell_id,
+    CellOutcome, CellOutput, is_cell_wait_tool, parse_cell_output, payload_is_running_chunk, payload_session_id,
+    wait_target_cell_id,
 };
 use boss_engine_codex_rollout::{CanonicalRolloutToolOutput, canonical_rollout_tool_output, flatten_tool_output_text};
 use serde_json::Value;
@@ -228,6 +230,10 @@ impl<V> BoundedMap<V> {
         self.entries.contains_key(key)
     }
 
+    fn get(&self, key: &str) -> Option<&V> {
+        self.entries.get(key)
+    }
+
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -276,7 +282,7 @@ impl<V> BoundedMap<V> {
 /// A tracker's correlation state, in a form a readopted session can be
 /// re-seeded from.
 ///
-/// All three maps are carried, not just the open calls: a cell binding dropped
+/// All four maps are carried, not just the open calls: a cell or session binding dropped
 /// across a restart would make the next `wait` name a cell the tracker never
 /// saw yield, which [`RolloutCallTracker::observe_call`] reports as a
 /// correlation failure — a real signal that would then be fired by the restart
@@ -285,6 +291,8 @@ impl<V> BoundedMap<V> {
 pub(super) struct RolloutCallSnapshot {
     open_calls: Vec<(String, RolloutToolCall)>,
     cells: Vec<(String, String)>,
+    #[serde(default)]
+    sessions: Vec<(String, String)>,
     waits: Vec<(String, WaitBinding)>,
 }
 
@@ -298,6 +306,10 @@ pub(super) struct RolloutCallTracker {
     /// Yielded cell id → originating call id. Removed when a `wait` binds
     /// the cell, so this never outgrows `calls`.
     cells: BoundedMap<String>,
+    /// Live shell session id → originating call id. The session outlives the
+    /// JavaScript cell that first observed it, so later polling cells resolve
+    /// through this map instead of being treated as unrelated commands.
+    sessions: BoundedMap<String>,
     /// `wait` call id → what that poll targets.
     waits: BoundedMap<WaitBinding>,
 }
@@ -332,6 +344,7 @@ impl RolloutCallTracker {
         Self {
             calls: BoundedMap::new(cap, purpose),
             cells: BoundedMap::new(cap, purpose),
+            sessions: BoundedMap::new(cap, purpose),
             waits: BoundedMap::new(cap, purpose),
         }
     }
@@ -380,15 +393,18 @@ impl RolloutCallTracker {
         call_id: &str,
         output: &Value,
     ) -> Result<OutputDisposition, CorrelationError> {
+        let parsed = parse_cell_output(&flatten_tool_output_text(output));
+        let session_id = parsed.as_ref().and_then(|parsed| payload_session_id(&parsed.payload));
         let binding = self.waits.remove(call_id);
-        let origin = binding
-            .as_ref()
-            .map(|binding| binding.origin.clone())
+        let origin = session_id
+            .as_deref()
+            .and_then(|session_id| self.sessions.get(session_id).cloned())
+            .or_else(|| binding.as_ref().map(|binding| binding.origin.clone()))
             .unwrap_or_else(|| call_id.to_owned());
         if !self.calls.contains_key(&origin) {
             return Err(CorrelationError::UnmatchedOutput(call_id.to_owned()));
         }
-        match parse_cell_output(&flatten_tool_output_text(output)) {
+        match parsed {
             // The cell yielded under a (possibly new) cell id: bind that id
             // so the next `wait` resolves back to this same command.
             Some(CellOutput {
@@ -407,11 +423,33 @@ impl RolloutCallTracker {
                 outcome: CellOutcome::Completed,
                 payload,
             }) if payload_is_running_chunk(&payload) => {
+                if let Some(session_id) = payload_session_id(&payload) {
+                    self.sessions.insert(session_id, origin.clone());
+                }
                 let cell_id = binding.map(|binding| binding.cell_id);
                 if let Some(cell_id) = cell_id.clone() {
-                    self.cells.insert(cell_id, origin);
+                    self.cells.insert(cell_id, origin.clone());
+                }
+                if origin != call_id {
+                    self.calls.remove(call_id);
                 }
                 return Ok(OutputDisposition::StillRunning { cell_id });
+            }
+            Some(CellOutput {
+                outcome: CellOutcome::Completed,
+                payload,
+            }) if payload_reports_exit_code(&payload) => {}
+            // `text(r.output)` discards both `session_id` and `exit_code`.
+            // A completed cell carrying that projection is not evidence that
+            // the command terminated, so leave it open for the turn boundary.
+            Some(CellOutput {
+                outcome: CellOutcome::Completed,
+                ..
+            }) => {
+                if origin != call_id {
+                    self.calls.remove(call_id);
+                }
+                return Ok(OutputDisposition::StillRunning { cell_id: None });
             }
             _ => {}
         }
@@ -419,6 +457,12 @@ impl RolloutCallTracker {
             .calls
             .remove(&origin)
             .expect("origin call presence was just checked");
+        if let Some(session_id) = session_id {
+            self.sessions.remove(&session_id);
+        }
+        if origin != call_id {
+            self.calls.remove(call_id);
+        }
         Ok(OutputDisposition::Completed(call))
     }
 
@@ -433,6 +477,7 @@ impl RolloutCallTracker {
     /// legitimately be resolved by a later, unrelated turn.
     pub(super) fn drain_open_calls(&mut self) -> Vec<RolloutToolCall> {
         self.cells.clear();
+        self.sessions.clear();
         self.waits.clear();
         self.calls.drain_in_order()
     }
@@ -442,6 +487,7 @@ impl RolloutCallTracker {
         RolloutCallSnapshot {
             open_calls: self.calls.entries_in_order(),
             cells: self.cells.entries_in_order(),
+            sessions: self.sessions.entries_in_order(),
             waits: self.waits.entries_in_order(),
         }
     }
@@ -450,6 +496,7 @@ impl RolloutCallTracker {
     pub(super) fn restore(&mut self, snapshot: RolloutCallSnapshot) {
         self.calls.restore_in_order(snapshot.open_calls);
         self.cells.restore_in_order(snapshot.cells);
+        self.sessions.restore_in_order(snapshot.sessions);
         self.waits.restore_in_order(snapshot.waits);
     }
 
@@ -458,6 +505,7 @@ impl RolloutCallTracker {
     pub(super) fn reset(&mut self) {
         self.calls.clear();
         self.cells.clear();
+        self.sessions.clear();
         self.waits.clear();
     }
 }
@@ -476,6 +524,17 @@ pub(super) fn cell_aware_tool_output(output: &Value) -> CanonicalRolloutToolOutp
         Some(parsed) => canonical_rollout_tool_output(&Value::String(parsed.payload)),
         None => canonical_rollout_tool_output(output),
     }
+}
+
+fn payload_reports_exit_code(payload: &str) -> bool {
+    let Ok(Value::Object(chunk)) = serde_json::from_str::<Value>(payload) else {
+        return false;
+    };
+    chunk.contains_key("exit_code")
+        || chunk
+            .get("metadata")
+            .and_then(|metadata| metadata.get("exit_code"))
+            .is_some()
 }
 
 #[cfg(test)]
@@ -563,7 +622,9 @@ mod tests {
         ));
         assert!(tracker.has_open_calls());
         tracker.observe_call("W2", wait("2")).unwrap();
-        let Ok(OutputDisposition::Completed(call)) = tracker.observe_output("W2", &completed("{}")) else {
+        let Ok(OutputDisposition::Completed(call)) =
+            tracker.observe_output("W2", &completed(r#"{"chunk_id":"done","exit_code":0,"output":"ok"}"#))
+        else {
             panic!("the second continuation must complete the originating call");
         };
         assert_eq!(
@@ -627,10 +688,10 @@ mod tests {
     }
 
     #[test]
-    fn a_payload_that_is_not_a_harness_chunk_still_completes_the_call() {
-        // Probe 8 projects only the exit code, and probe 3's truncation
-        // warning leaves the payload unparseable. Neither is a running
-        // chunk, so neither may be turned into a false abandoned command.
+    fn a_completed_cell_with_an_unstructured_payload_stays_open() {
+        // A cell using `text(r.output)` loses both the session handle and
+        // exit code. Boss cannot treat that projection as a pass, even when
+        // the string happens to look like an exit code.
         for payload in [
             "7",
             "Warning: truncated output (original token count: 11827)\n\ntouch: x: denied\n",
@@ -640,11 +701,78 @@ mod tests {
             assert!(
                 matches!(
                     tracker.observe_output("A", &completed(payload)),
-                    Ok(OutputDisposition::Completed(_))
+                    Ok(OutputDisposition::StillRunning { cell_id: None })
                 ),
-                "payload {payload:?} must stay terminal"
+                "payload {payload:?} must remain unobserved"
             );
         }
+    }
+
+    #[test]
+    fn multi_cell_session_is_observed_when_a_later_poll_reports_an_exit_code() {
+        let mut tracker = RolloutCallTracker::default();
+        tracker.observe_call("A", bash("slow build")).unwrap();
+        tracker.observe_output("A", &completed(P6_RUNNING_CHUNK)).unwrap();
+
+        // Each poll runs in a fresh cell. Its call id is unrelated to A, but
+        // its structured chunk names A's shell session.
+        tracker
+            .observe_call(
+                "P1",
+                RolloutToolCall {
+                    tool_name: "exec".to_owned(),
+                    tool_input: json!({"source":"tools.write_stdin(...)"}),
+                },
+            )
+            .unwrap();
+        tracker.observe_output("P1", &completed(P6_RUNNING_CHUNK)).unwrap();
+        tracker
+            .observe_call(
+                "P2",
+                RolloutToolCall {
+                    tool_name: "exec".to_owned(),
+                    tool_input: json!({"source":"tools.write_stdin(...)"}),
+                },
+            )
+            .unwrap();
+        let result = tracker.observe_output(
+            "P2",
+            &completed(r#"{"chunk_id":"d0540d","session_id":8467,"exit_code":0,"output":"done\n"}"#),
+        );
+        assert!(
+            matches!(result, Ok(OutputDisposition::Completed(call)) if rollout_call_command_display(&call) == "slow build")
+        );
+        assert!(tracker.drain_open_calls().is_empty());
+    }
+
+    #[test]
+    fn session_without_an_exit_code_drains_as_abandoned() {
+        let mut tracker = RolloutCallTracker::default();
+        tracker.observe_call("A", bash("slow build")).unwrap();
+        tracker.observe_output("A", &completed(P6_RUNNING_CHUNK)).unwrap();
+        let abandoned = tracker.drain_open_calls();
+        assert_eq!(
+            abandoned.iter().map(rollout_call_command_display).collect::<Vec<_>>(),
+            ["slow build"]
+        );
+    }
+
+    #[test]
+    fn one_shot_cell_without_session_or_exit_code_drains_as_abandoned() {
+        let mut tracker = RolloutCallTracker::default();
+        tracker.observe_call("A", bash("slow build")).unwrap();
+        assert!(matches!(
+            tracker.observe_output("A", &completed("partial output\n")),
+            Ok(OutputDisposition::StillRunning { cell_id: None })
+        ));
+        assert_eq!(
+            tracker
+                .drain_open_calls()
+                .iter()
+                .map(rollout_call_command_display)
+                .collect::<Vec<_>>(),
+            ["slow build"]
+        );
     }
 
     #[test]

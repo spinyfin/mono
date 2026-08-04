@@ -187,6 +187,21 @@ pub fn payload_is_running_chunk(payload: &str) -> bool {
     chunk.contains_key("chunk_id") && !reports_exit_code
 }
 
+/// The shell-session identifier carried by a structured harness chunk.
+///
+/// Terminal chunks carry it too, so a later polling cell can associate the
+/// terminal result with the command that started the session.
+pub fn payload_session_id(payload: &str) -> Option<String> {
+    serde_json::from_str::<Value>(payload)
+        .ok()?
+        .get("session_id")
+        .and_then(|session_id| match session_id {
+            Value::String(value) => Some(value.clone()),
+            Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        })
+}
+
 /// The shell command(s) a cell script issues, in source order.
 ///
 /// The cell's tool input is JavaScript source, so it never parses as JSON
@@ -419,6 +434,19 @@ mod tests {
         assert!(payload_is_running_chunk(
             r#"{"chunk_id":"d0540d","wall_time_seconds":30.001035083,"session_id":8467,"original_token_count":14,"output":"tick-1\ntick-2\n"}"#
         ));
+    }
+
+    #[test]
+    fn payload_session_id_reads_numeric_and_string_session_handles() {
+        assert_eq!(
+            payload_session_id(r#"{"chunk_id":"chunk","session_id":8467,"output":"tick"}"#).as_deref(),
+            Some("8467")
+        );
+        assert_eq!(
+            payload_session_id(r#"{"chunk_id":"chunk","session_id":"session-1","exit_code":0}"#).as_deref(),
+            Some("session-1")
+        );
+        assert_eq!(payload_session_id(r#"{"chunk_id":"chunk","output":"tick"}"#), None);
     }
 
     #[test]

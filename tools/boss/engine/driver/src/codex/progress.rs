@@ -1308,6 +1308,15 @@ mod tests {
         })
     }
 
+    fn cell_session_poll_call(call_id: &str, session_id: u32) -> Value {
+        cell_exec_call(
+            call_id,
+            &format!(
+                r#"const r = await tools.write_stdin({{"session_id":{session_id},"chars":"","yield_time_ms":30000}});\ntext(JSON.stringify(r));"#
+            ),
+        )
+    }
+
     fn cell_completed_output(call_id: &str, payload: &str) -> Value {
         json!({
             "type":"response_item",
@@ -1484,6 +1493,72 @@ mod tests {
     }
 
     #[test]
+    fn multi_cell_session_is_not_flagged_after_a_later_poll_reports_its_exit_code() {
+        let mut session = cell_harness_session();
+        session
+            .normalize_progress_events(&cell_exec_call("call-start", PR_CELL_SCRIPT))
+            .unwrap();
+        session
+            .normalize_progress_events(&cell_completed_output("call-start", P6_RUNNING_CHUNK))
+            .unwrap();
+        session
+            .normalize_progress_events(&cell_session_poll_call("call-poll-1", 8467))
+            .unwrap();
+        session
+            .normalize_progress_events(&cell_completed_output("call-poll-1", P6_RUNNING_CHUNK))
+            .unwrap();
+        session
+            .normalize_progress_events(&cell_session_poll_call("call-poll-2", 8467))
+            .unwrap();
+        let completed = session
+            .normalize_progress_events(&cell_completed_output(
+                "call-poll-2",
+                r#"{"chunk_id":"d0540d","session_id":8467,"exit_code":0,"output":"done\n"}"#,
+            ))
+            .unwrap();
+        assert!(matches!(completed.as_slice(), [WorkerEvent::PostToolUse { .. }]));
+
+        let boundary = session
+            .normalize_progress_events(&json!({
+                "type":"event_msg",
+                "payload":{"type":"task_complete","last_agent_message":"done","error":null}
+            }))
+            .unwrap();
+        assert!(
+            matches!(boundary.as_slice(), [WorkerEvent::Stop { .. }]),
+            "a session whose exit code was observed must not produce an unobserved-command notification: {boundary:?}"
+        );
+    }
+
+    #[test]
+    fn one_shot_cell_without_session_or_exit_code_is_flagged_at_the_turn_boundary() {
+        let mut session = cell_harness_session();
+        session
+            .normalize_progress_events(&cell_exec_call("call-one-shot", PR_CELL_SCRIPT))
+            .unwrap();
+        assert_eq!(
+            session
+                .normalize_progress_events(&cell_completed_output("call-one-shot", "partial output\n"))
+                .unwrap(),
+            Vec::new(),
+            "an unstructured cell payload must not be accepted as the command result"
+        );
+        let boundary = session
+            .normalize_progress_events(&json!({
+                "type":"event_msg",
+                "payload":{"type":"task_complete","last_agent_message":"done","error":null}
+            }))
+            .unwrap();
+        assert!(matches!(
+            boundary.as_slice(),
+            [WorkerEvent::Notification { message, .. }, WorkerEvent::Stop { .. }]
+                if message == &crate::codex::unobserved_command_notification(
+                    "cube pr create --branch boss/exec_1 --title T"
+                )
+        ));
+    }
+
+    #[test]
     fn a_yielded_cell_that_is_never_polled_is_flagged_abandoned_at_the_turn_boundary() {
         let mut session = cell_harness_session();
         session
@@ -1635,13 +1710,16 @@ mod tests {
             json!({"type":"system"}),
             "a wait poll must not render as a tool named `wait`"
         );
-        let rendered = session.normalize_transcript_entry(cell_completed_output("call-wait", "done\n"));
+        let rendered = session.normalize_transcript_entry(cell_completed_output(
+            "call-wait",
+            r#"{"chunk_id":"done","session_id":1,"exit_code":0,"output":"done\n"}"#,
+        ));
         assert_eq!(rendered.get("type").and_then(Value::as_str), Some("tool_result"));
         assert!(
             rendered
                 .get("content")
                 .and_then(Value::as_str)
-                .is_some_and(|content| content.ends_with("done\n")),
+                .is_some_and(|content| content.contains("done\\n")),
             "completed cell output must be preserved: {rendered}"
         );
         assert_eq!(
