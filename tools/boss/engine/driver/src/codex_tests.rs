@@ -320,6 +320,7 @@ fn provision_workspace_creates_owned_home_and_snapshots_auth() {
 
     // Point homes + auth source at the temp tree; never touch ~/.codex.
     let _auth = crate::test_support::codex_auth_source_override(&homes, &auth_src);
+    let _transcripts = crate::test_support::transcript_store_override(&tmp.path().join("transcripts"));
 
     tokio::runtime::Builder::new_current_thread()
         .enable_all()

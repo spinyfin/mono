@@ -28,7 +28,7 @@ use boss_protocol::{NormalizeError, PaneMonitorSpec, WorkerEvent};
 use boss_ssh_transport::shell_quote;
 use serde_json::Value;
 
-use crate::transcript_store::{transcript_store_root, verified_durable_sessions_dir};
+use crate::transcript_store::{durable_sessions_dir, transcript_store_root, verified_durable_sessions_dir};
 
 mod classify_error;
 mod environment;
@@ -643,19 +643,28 @@ impl AgentDriver for GrokDriver {
     }
 
     fn transcript_containment_root(&self, run_id: &str) -> anyhow::Result<Option<PathBuf>> {
-        let sessions_path = grok_home_for_run(run_id)?.join("sessions");
-        if fs::symlink_metadata(&sessions_path)
-            .map(|metadata| metadata.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            let store_root = transcript_store_root()?;
-            let grok_home = grok_home_for_run(run_id)?;
-            return Ok(Some(verified_durable_sessions_dir(
-                &grok_home,
-                &store_root,
-                "grok",
-                run_id,
-            )?));
+        let grok_home = grok_home_for_run(run_id)?;
+        let sessions_path = grok_home.join("sessions");
+        match fs::symlink_metadata(&sessions_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let store_root = transcript_store_root()?;
+                return Ok(Some(verified_durable_sessions_dir(
+                    &grok_home,
+                    &store_root,
+                    "grok",
+                    run_id,
+                )?));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let store_root = transcript_store_root()?;
+                let durable = durable_sessions_dir(&store_root, "grok", run_id)?;
+                if let Ok(canonical) = fs::canonicalize(&durable)
+                    && canonical.is_dir()
+                {
+                    return Ok(Some(canonical));
+                }
+            }
+            _ => {}
         }
         Ok(None)
     }
@@ -844,6 +853,7 @@ mod tests {
     /// Point homes + auth at a temp tree; skip live inspect when requested.
     struct EnvGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
+        _transcript_store: crate::test_support::TranscriptStoreOverride,
         prior_homes: Option<std::ffi::OsString>,
         prior_auth: Option<std::ffi::OsString>,
         prior_skip: Option<std::ffi::OsString>,
@@ -882,6 +892,7 @@ mod tests {
         }
         EnvGuard {
             _lock: lock,
+            _transcript_store: crate::test_support::transcript_store_override(&homes.join("transcripts")),
             prior_homes,
             prior_auth,
             prior_skip,

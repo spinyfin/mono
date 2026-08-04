@@ -41,7 +41,9 @@ mod tool_surface_guard;
 use guard_trace::{GUARD_TRACE_SHIM_FILENAME, GUARD_TRACE_SHIM_SCRIPT, guard_trace_path, wrapper_body};
 use tool_surface_guard::CODEX_TOOL_SURFACE_GUARD_SCRIPT;
 
-use crate::transcript_store::{provision_durable_sessions, transcript_store_root, verified_durable_sessions_dir};
+use crate::transcript_store::{
+    durable_sessions_dir, provision_durable_sessions, transcript_store_root, verified_durable_sessions_dir,
+};
 use progress::{CodexRolloutProgressSession, CodexTranscriptSession, normalize_rollout, verified_sessions_root};
 
 use super::claude::{BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND};
@@ -1720,17 +1722,26 @@ impl AgentDriver for CodexDriver {
     fn transcript_containment_root(&self, run_id: &str) -> anyhow::Result<Option<PathBuf>> {
         let (homes_root, codex_home) = codex_homes_root_and_home_for_run(run_id)?;
         let sessions_path = codex_home.join("sessions");
-        if fs::symlink_metadata(&sessions_path)
-            .map(|metadata| metadata.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            let store_root = transcript_store_root()?;
-            return Ok(Some(verified_durable_sessions_dir(
-                &codex_home,
-                &store_root,
-                "codex",
-                run_id,
-            )?));
+        match fs::symlink_metadata(&sessions_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let store_root = transcript_store_root()?;
+                return Ok(Some(verified_durable_sessions_dir(
+                    &codex_home,
+                    &store_root,
+                    "codex",
+                    run_id,
+                )?));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let store_root = transcript_store_root()?;
+                let durable = durable_sessions_dir(&store_root, "codex", run_id)?;
+                if let Ok(canonical) = fs::canonicalize(&durable)
+                    && canonical.is_dir()
+                {
+                    return Ok(Some(canonical));
+                }
+            }
+            _ => {}
         }
         let sessions = verified_sessions_root(&homes_root, &codex_home).ok_or_else(|| {
             anyhow!(

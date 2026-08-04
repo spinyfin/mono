@@ -55,9 +55,9 @@ pub fn provision_durable_sessions_in(
             verified_durable_sessions_dir(home, store_root, driver, run_id)?;
         }
         Ok(metadata) if metadata.is_dir() => {
-            // Provisioning creates this empty directory before the driver has
-            // started. Never relocate a non-empty directory: that could hide
-            // an already-written transcript instead of retaining it.
+            // A reused home or a driver that started first may leave this
+            // directory behind. Never relocate a non-empty one: that could
+            // hide an already-written transcript instead of retaining it.
             if fs::read_dir(&sessions)?.next().is_some() {
                 bail!(
                     "refusing to replace non-empty temporary sessions directory {}",
@@ -147,36 +147,6 @@ mod tests {
     use crate::AgentDriver;
     use crate::codex::{CodexDriver, codex_home_for_run};
     use crate::grok::{GrokDriver, grok_home_for_run};
-    use std::sync::Mutex;
-
-    static TRANSCRIPT_STORE_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    struct TranscriptStoreOverride {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        prior: Option<std::ffi::OsString>,
-    }
-
-    impl TranscriptStoreOverride {
-        fn new(root: &Path) -> Self {
-            let lock = TRANSCRIPT_STORE_ENV_TEST_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let prior = std::env::var_os(WORKER_TRANSCRIPTS_ROOT_ENV);
-            // SAFETY: the process-wide lock above is held until this guard restores the variable.
-            unsafe { std::env::set_var(WORKER_TRANSCRIPTS_ROOT_ENV, root) };
-            Self { _lock: lock, prior }
-        }
-    }
-
-    impl Drop for TranscriptStoreOverride {
-        fn drop(&mut self) {
-            // SAFETY: this guard still holds the process-wide lock.
-            match self.prior.as_ref() {
-                Some(value) => unsafe { std::env::set_var(WORKER_TRANSCRIPTS_ROOT_ENV, value) },
-                None => unsafe { std::env::remove_var(WORKER_TRANSCRIPTS_ROOT_ENV) },
-            }
-        }
-    }
 
     #[test]
     fn sessions_link_retains_only_the_transcript_subtree() {
@@ -230,40 +200,31 @@ mod tests {
     fn transcript_store_root_honors_the_override() {
         let tmp = tempfile::tempdir().unwrap();
         let override_root = tmp.path().join("transcripts");
-        let _override = TranscriptStoreOverride::new(&override_root);
+        let _override = crate::test_support::transcript_store_override(&override_root);
         assert_eq!(transcript_store_root().unwrap(), override_root);
     }
 
     #[test]
     fn transcript_store_root_defaults_to_boss_executions_directory() {
-        let _lock = TRANSCRIPT_STORE_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let prior = std::env::var_os(WORKER_TRANSCRIPTS_ROOT_ENV);
-        // SAFETY: the process-wide lock is held and the variable is restored below.
-        unsafe { std::env::remove_var(WORKER_TRANSCRIPTS_ROOT_ENV) };
+        let _override = crate::test_support::TranscriptStoreOverride::unset();
         assert_eq!(
             transcript_store_root().unwrap(),
             boss_log_files::default_state_root().unwrap().join("executions")
         );
-        // SAFETY: the process-wide lock is still held.
-        match prior.as_ref() {
-            Some(value) => unsafe { std::env::set_var(WORKER_TRANSCRIPTS_ROOT_ENV, value) },
-            None => unsafe { std::env::remove_var(WORKER_TRANSCRIPTS_ROOT_ENV) },
-        }
     }
 
     #[test]
     fn drivers_contain_transcripts_to_their_own_durable_sessions_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let store = tmp.path().join("executions");
-        let _store = TranscriptStoreOverride::new(&store);
+        let _store = crate::test_support::transcript_store_override(&store);
 
         let _codex_homes = crate::test_support::codex_homes_override(&tmp.path().join("codex-homes"));
         let codex_run_id = "codex-containment";
         let codex_home = codex_home_for_run(codex_run_id).unwrap();
         fs::create_dir_all(&codex_home).unwrap();
         let codex_expected = provision_durable_sessions(&codex_home, "codex", codex_run_id).unwrap();
+        fs::remove_dir_all(&codex_home).unwrap();
         assert_eq!(
             CodexDriver::default()
                 .transcript_containment_root(codex_run_id)
@@ -277,6 +238,7 @@ mod tests {
         let grok_home = grok_home_for_run(grok_run_id).unwrap();
         fs::create_dir_all(&grok_home).unwrap();
         let grok_expected = provision_durable_sessions(&grok_home, "grok", grok_run_id).unwrap();
+        fs::remove_dir_all(&grok_home).unwrap();
         assert_eq!(
             GrokDriver::default().transcript_containment_root(grok_run_id).unwrap(),
             Some(fs::canonicalize(grok_expected).unwrap())
