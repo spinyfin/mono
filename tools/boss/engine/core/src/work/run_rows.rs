@@ -720,6 +720,52 @@ impl WorkDb {
         .map_err(Into::into)
     }
 
+    /// Terminal executions whose latest run recorded a recent local shell
+    /// pid. This is the restart-robust candidate set for resolving a worker
+    /// that outlived the state the engine recorded for it.
+    ///
+    /// The latest-run, local-host, and `COALESCE(finished_at, created_at)`
+    /// predicates deliberately match
+    /// [`Self::latest_local_shell_pid_for_execution_within`]. The caller will
+    /// perform that bounded probe before acting; applying the same bound here
+    /// keeps old terminal history out of every sweep pass without weakening
+    /// the destructive path's own safety check.
+    pub fn list_recent_terminal_executions_with_local_shell_pid(
+        &self,
+        max_age_secs: i64,
+        now_epoch_secs: i64,
+    ) -> Result<Vec<WorkExecution>> {
+        let conn = self.connect()?;
+        let cutoff = now_epoch_secs - max_age_secs;
+        let mut stmt = conn.prepare(
+            "SELECT e.id, e.work_item_id, e.kind, e.status, e.repo_remote_url, e.cube_repo_id,
+                    e.cube_lease_id, e.cube_workspace_id, e.workspace_path, e.priority,
+                    e.preferred_workspace_id, e.created_at, e.started_at, e.finished_at,
+                    e.pre_start_failure_count, e.dispatch_not_before, e.pr_url, e.pr_head_before,
+                    e.prefer_is_soft, e.worker_branch_prefix, e.transient_failure_count,
+                    e.allow_dirty, e.branch_naming, e.dispatch_wait_reason, e.dispatch_wait_since,
+                    e.driver_runtime_state, e.driver, e.model, e.effort_level
+             FROM work_executions e
+             WHERE e.status IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+               AND EXISTS (
+                   SELECT 1 FROM work_runs r
+                   WHERE r.id = (
+                       SELECT latest.id FROM work_runs latest
+                       WHERE latest.execution_id = e.id
+                       ORDER BY latest.created_at DESC, latest.id DESC
+                       LIMIT 1
+                   )
+                     AND r.host_id = 'local'
+                     AND r.shell_pid IS NOT NULL
+                     AND r.shell_pid > 0
+                     AND CAST(COALESCE(r.finished_at, r.created_at) AS INTEGER) >= ?1
+               )
+             ORDER BY e.created_at ASC, e.id ASC",
+        )?;
+        let rows = stmt.query_map(params![cutoff], map_execution)?;
+        collect_rows(rows)
+    }
+
     /// The newest LOCAL worker process this work item ever recorded: the
     /// `(execution_id, shell_pid)` of the most recently created `work_runs`
     /// row across ALL of the item's executions — terminal ones included —

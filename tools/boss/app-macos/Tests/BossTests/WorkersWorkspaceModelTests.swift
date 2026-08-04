@@ -239,13 +239,18 @@ final class WorkersWorkspaceModelSpawnTests: XCTestCase {
         // immediately instead of waiting for the periodic dead-pid sweep.
         let model = WorkersWorkspaceModel()
         var diedRunIds: [String] = []
-        model.onPaneDied = { diedRunIds.append($0) }
+        var reasons: [WorkerPaneDeathReason] = []
+        model.onPaneDied = { runId, reason in
+            diedRunIds.append(runId)
+            reasons.append(reason)
+        }
 
         _ = model.spawnWorkerPane(makeRequest(slot: 5, runId: "exec-surface-failed"))
         let session = model.slots.first(where: { $0.slotId == 5 })?.session
         session?.onSurfaceFailed?()
 
         XCTAssertEqual(diedRunIds, ["exec-surface-failed"])
+        XCTAssertEqual(reasons, [.surfaceCreationFailed])
     }
 
     func testSurfaceFailureGateSuppressesReportWithNoActiveDisplay() {
@@ -273,13 +278,72 @@ final class WorkersWorkspaceModelSpawnTests: XCTestCase {
         // immediately.
         let model = WorkersWorkspaceModel()
         var diedRunIds: [String] = []
-        model.onPaneDied = { diedRunIds.append($0) }
+        var reasons: [WorkerPaneDeathReason] = []
+        model.onPaneDied = { runId, reason in
+            diedRunIds.append(runId)
+            reasons.append(reason)
+        }
 
         _ = model.spawnWorkerPane(makeRequest(slot: 5, runId: "exec-child-exited"))
         let session = model.slots.first(where: { $0.slotId == 5 })?.session
+        session?.terminalReady = true
+        session?.onChildExited?()
         session?.onChildExited?()
 
         XCTAssertEqual(diedRunIds, ["exec-child-exited"])
+        XCTAssertEqual(reasons, [.childProcessExited])
+    }
+
+    func testChildExitBeforeSurfaceAttachIsNotReported() {
+        let model = WorkersWorkspaceModel()
+        var reports = 0
+        model.onPaneDied = { _, _ in reports += 1 }
+
+        _ = model.spawnWorkerPane(makeRequest(slot: 5, runId: "exec-not-attached"))
+        let session = model.slots.first(where: { $0.slotId == 5 })?.session
+        XCTAssertFalse(session?.terminalReady ?? true)
+
+        session?.onChildExited?()
+
+        XCTAssertEqual(reports, 0, "a pre-attach close callback is not a child-process death")
+    }
+
+    func testCloseCallbackRequiresActualCurrentChildExit() {
+        XCTAssertFalse(
+            GhosttyRuntime.shouldReportChildExit(
+                needsConfirmation: false,
+                isCurrentAttachedSurface: true,
+                isReleased: false,
+                processExited: false
+            ),
+            "a no-confirm close request does not mean the child exited"
+        )
+        XCTAssertFalse(
+            GhosttyRuntime.shouldReportChildExit(
+                needsConfirmation: false,
+                isCurrentAttachedSurface: false,
+                isReleased: false,
+                processExited: true
+            ),
+            "a stale or not-yet-attached surface cannot report this session dead"
+        )
+        XCTAssertFalse(
+            GhosttyRuntime.shouldReportChildExit(
+                needsConfirmation: false,
+                isCurrentAttachedSurface: true,
+                isReleased: true,
+                processExited: true
+            ),
+            "engine-driven release must not echo a new pane-death report"
+        )
+        XCTAssertTrue(
+            GhosttyRuntime.shouldReportChildExit(
+                needsConfirmation: false,
+                isCurrentAttachedSurface: true,
+                isReleased: false,
+                processExited: true
+            )
+        )
     }
 
     func testSurfaceCreationFailureForwardsNackWithRunId() {

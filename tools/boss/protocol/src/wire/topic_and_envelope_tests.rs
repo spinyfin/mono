@@ -180,3 +180,43 @@ fn report_worker_spawn_failed_round_trips_with_expected_tag() {
         other => panic!("wrong variant: {other:?}"),
     }
 }
+
+/// Pane-death provenance is part of the request payload, not inferred from a
+/// generic engine reason after the fact. This pins the Swift app's hand-built
+/// JSON keys and the enum's snake-case values together.
+#[test]
+fn worker_pane_died_round_trips_with_callback_reason() {
+    let original = FrontendRequest::WorkerPaneDied {
+        run_id: "exec_abc".to_owned(),
+        reason: WorkerPaneDeathReason::ChildProcessExited,
+    };
+    let value = serde_json::to_value(&original).unwrap();
+    assert_eq!(value["type"], "worker_pane_died");
+    assert_eq!(value["run_id"], "exec_abc");
+    assert_eq!(value["reason"], "child_process_exited");
+
+    let parsed: FrontendRequest = serde_json::from_value(value).unwrap();
+    assert!(matches!(
+        parsed,
+        FrontendRequest::WorkerPaneDied {
+            run_id,
+            reason: WorkerPaneDeathReason::ChildProcessExited,
+        } if run_id == "exec_abc"
+    ));
+}
+
+#[test]
+fn worker_pane_died_without_reason_decodes_as_unknown() {
+    let parsed: FrontendRequest = serde_json::from_value(serde_json::json!({
+        "type": "worker_pane_died",
+        "run_id": "exec_old_app",
+    }))
+    .unwrap();
+    assert!(matches!(
+        parsed,
+        FrontendRequest::WorkerPaneDied {
+            reason: WorkerPaneDeathReason::Unknown,
+            ..
+        }
+    ));
+}

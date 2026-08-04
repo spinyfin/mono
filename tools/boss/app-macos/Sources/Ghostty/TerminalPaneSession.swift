@@ -207,6 +207,13 @@ enum PaneRole: Equatable {
     }
 }
 
+/// App callback that supplied a worker-pane death observation. Raw values are
+/// the protocol strings sent to the engine in `worker_pane_died.reason`.
+enum WorkerPaneDeathReason: String, Equatable {
+    case surfaceCreationFailed = "surface_creation_failed"
+    case childProcessExited = "child_process_exited"
+}
+
 @MainActor
 final class TerminalPaneSession: ObservableObject, Identifiable {
     let id: String
@@ -236,10 +243,22 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     /// armed) can't create a fresh surface and spawn a duplicate `claude`
     /// for an execution the engine has already given up on.
     private(set) var isReleased = false
+    /// One pane may produce more than one close/failure callback while its
+    /// surface is dismantled. Only the first genuine death observation is
+    /// reportable to the engine.
+    private var paneDeathReported = false
 
     /// Mark this session as released. Idempotent.
     func markReleased() {
         isReleased = true
+    }
+
+    /// Atomically claim this session's one allowed pane-death report.
+    /// Main-actor isolation serializes the two callback sources.
+    func claimPaneDeathReport() -> Bool {
+        guard !paneDeathReported else { return false }
+        paneDeathReported = true
+        return true
     }
     private var paneMonitorTracker: PaneMonitorTracker
     /// Called on the main actor when the pane's child process exits.

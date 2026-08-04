@@ -120,6 +120,128 @@ async fn readoption_stops_the_orphan_sweep_from_redispatching() {
     assert_eq!(executions.len(), 1, "no second execution may be created");
 }
 
+/// A terminal execution with a live durable pid must not depend on another
+/// worker event to converge. This reproduces the silent finished-worker case:
+/// the engine already dropped its slot mapping, the app still hosts the pane,
+/// and the work item has since closed. The durable state scan must issue the
+/// real app release, stop the process, and return the pool slot.
+#[tokio::test]
+async fn durable_state_scan_reclaims_a_live_pane_after_its_work_closes() {
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+
+    let mut child = crate::test_support::spawn_group_leader_sleeper();
+    let execution_id = create_spawned_execution(db, &work_item_id, i64::from(child.id()));
+    db.mark_execution_orphaned(&execution_id, "app reported a pane death")
+        .unwrap();
+    db.update_work_item(
+        &work_item_id,
+        crate::work::WorkItemPatch {
+            status: Some("done".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let pool = server_state.execution_coordinator.worker_pool();
+    let claimed = pool.claim_worker(&execution_id, None).await.unwrap();
+    assert_eq!(claimed, "worker-1");
+    assert_eq!(pool.idle_count().await, 0);
+    assert!(
+        server_state.worker_registry.slot_for_run(&execution_id).is_none(),
+        "precondition: terminalization already erased the engine's run-to-slot mapping",
+    );
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    let scan_server = server_state.clone();
+    let scan = tokio::spawn(async move {
+        crate::dead_pane_sweep::run_one_pass(
+            scan_server.work_db.as_ref(),
+            scan_server.execution_coordinator.clone(),
+            scan_server.dispatch_events.as_ref(),
+            scan_server.as_ref(),
+        )
+        .await
+    });
+
+    let hosted_lookup = sink.next().await.expect("hosted-pane lookup should be enqueued");
+    let lookup_id = match hosted_lookup.payload {
+        FrontendEvent::EngineRequest { request_id, request } => {
+            assert!(
+                matches!(request, EngineToAppRequest::ListHostedPanes(_)),
+                "expected ListHostedPanes, got {request:?}",
+            );
+            request_id
+        }
+        other => panic!("expected EngineRequest, got {other:?}"),
+    };
+    server_state
+        .deliver_app_response(
+            "session-app",
+            &lookup_id,
+            EngineToAppResponse::ListHostedPanes {
+                result: Ok(crate::protocol::ListHostedPanesResult {
+                    panes: vec![crate::protocol::HostedPaneEntry {
+                        slot_id: 1,
+                        run_id: execution_id.clone(),
+                        summary: None,
+                        task_title: None,
+                    }],
+                }),
+            },
+        )
+        .await;
+
+    let release = sink.next().await.expect("pane release should be enqueued");
+    let release_id = match release.payload {
+        FrontendEvent::EngineRequest { request_id, request } => {
+            assert!(
+                matches!(
+                    request,
+                    EngineToAppRequest::ReleaseWorkerPane(ReleaseWorkerPaneInput { slot_id: 1, .. })
+                ),
+                "expected ReleaseWorkerPane for slot 1, got {request:?}",
+            );
+            request_id
+        }
+        other => panic!("expected EngineRequest, got {other:?}"),
+    };
+    server_state
+        .deliver_app_response(
+            "session-app",
+            &release_id,
+            EngineToAppResponse::ReleaseWorkerPane {
+                result: Ok(crate::protocol::ReleaseWorkerPaneResult {}),
+            },
+        )
+        .await;
+
+    let outcome = scan.await.expect("durable state scan");
+    assert_eq!(outcome.terminal_handoffs, 1);
+    assert_eq!(
+        pool.idle_count().await,
+        1,
+        "the hosted pane's pool slot must be reusable after convergence",
+    );
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Orphaned,
+        "closed work is authoritative; the inferred execution must not be re-adopted",
+    );
+
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .expect("join child wait")
+        .expect("wait for child");
+    assert!(!status.success(), "the worker process tree must be stopped");
+}
+
 /// A terminal status somebody actually *decided* is not reversible. A worker
 /// that keeps hooking after `bossctl agents stop` cancelled its execution must
 /// be reaped, not resurrected — otherwise the stop verb silently fails to stop

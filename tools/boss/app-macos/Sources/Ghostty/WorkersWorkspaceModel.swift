@@ -91,7 +91,7 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// `sendWorkerPaneDied` so reconciliation fires immediately instead of
     /// waiting for the periodic dead-pid sweep. The `runId` is the raw
     /// execution id (without the "run-" session prefix).
-    var onPaneDied: ((String) -> Void)?
+    var onPaneDied: ((String, WorkerPaneDeathReason) -> Void)?
 
     /// Called when a worker pane's libghostty surface FAILS to create so no
     /// shell ever comes up (the post-sleep "no active display" condition).
@@ -227,11 +227,20 @@ final class WorkersWorkspaceModel: ObservableObject {
         // observes it — either the surface never attached at all, or the
         // shell process exited — instead of waiting for the periodic
         // dead-pid sweep (up to 60s) or an app restart to notice.
-        session.onSurfaceFailed = { [weak self] in
-            self?.onPaneDied?(capturedRunId)
+        session.onSurfaceFailed = { [weak self, weak session] in
+            guard session?.claimPaneDeathReport() == true else { return }
+            self?.onPaneDied?(capturedRunId, .surfaceCreationFailed)
         }
-        session.onChildExited = { [weak self] in
-            self?.onPaneDied?(capturedRunId)
+        session.onChildExited = { [weak self, weak session] in
+            // A close callback can arrive while libghostty is still creating
+            // the surface, or after an engine-driven release has begun.
+            // Neither is evidence that this run's attached child exited.
+            guard let session,
+                  session.terminalReady,
+                  !session.isReleased,
+                  session.claimPaneDeathReport()
+            else { return }
+            self?.onPaneDied?(capturedRunId, .childProcessExited)
         }
         // Fail-fast NACK: if the libghostty surface never comes up (the
         // post-sleep "no active display" condition), tell the engine at once

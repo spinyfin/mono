@@ -2436,6 +2436,11 @@ pub enum FrontendRequest {
     /// response expected.
     WorkerPaneDied {
         run_id: String,
+        /// The app callback that supplied the death observation. Older app
+        /// builds omitted this field, so `Unknown` preserves wire
+        /// compatibility while making every new report attributable.
+        #[serde(default)]
+        reason: WorkerPaneDeathReason,
     },
 
     /// Snapshot every engine worker pool's (main, automation, review)
@@ -2454,6 +2459,30 @@ pub enum FrontendRequest {
     /// returned vector mirrors cube's view, optionally annotated with
     /// the engine's own knowledge of which leases back which executions.
     WorkspacePoolSummary,
+}
+
+/// App-side observation that caused a [`FrontendRequest::WorkerPaneDied`]
+/// report. The distinction matters because surface creation and a child
+/// process exit have different lifecycle guards and recovery semantics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerPaneDeathReason {
+    SurfaceCreationFailed,
+    ChildProcessExited,
+    /// Compatibility value for reports from an app build that predates the
+    /// reason field. New senders must always choose a specific variant.
+    #[default]
+    Unknown,
+}
+
+impl WorkerPaneDeathReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SurfaceCreationFailed => "surface_creation_failed",
+            Self::ChildProcessExited => "child_process_exited",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 mod events;

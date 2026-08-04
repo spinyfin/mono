@@ -127,7 +127,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use boss_protocol::{LiveWorkerState, WorkExecution};
+use boss_protocol::{LiveWorkerState, WorkExecution, WorkerPaneDeathReason};
 
 use crate::coordinator::{ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
@@ -476,6 +476,7 @@ pub async fn run_one_pass(
                 now_epoch_secs,
                 file_pane_death_attention,
                 probe_observation: Some(&observation),
+                app_report_reason: None,
             },
         )
         .await;
@@ -556,7 +557,7 @@ pub async fn reap_reported_pane_death(
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: &dyn DispatchEventSink,
     run_id: &str,
-    detail: &str,
+    report_reason: WorkerPaneDeathReason,
 ) -> bool {
     let Some(state) = live_states.snapshot().into_iter().find(|s| s.run_id == run_id) else {
         tracing::warn!(
@@ -586,7 +587,12 @@ pub async fn reap_reported_pane_death(
 
     let now_epoch_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
 
-    let reason = format!("worker-pane-died: {detail}");
+    let detail = match report_reason {
+        WorkerPaneDeathReason::SurfaceCreationFailed => "surface creation failed before a child process attached",
+        WorkerPaneDeathReason::ChildProcessExited => "attached child process exited",
+        WorkerPaneDeathReason::Unknown => "app did not identify which pane-death callback fired",
+    };
+    let reason = format!("worker-pane-died: app reported {detail}");
     reap_dead_execution(
         work_db,
         live_states,
@@ -599,6 +605,7 @@ pub async fn reap_reported_pane_death(
             now_epoch_secs,
             file_pane_death_attention: false,
             probe_observation: None,
+            app_report_reason: Some(report_reason),
         },
     )
     .await
@@ -680,6 +687,9 @@ struct ReapOptions<'a> {
     /// speculative periodic sweep. `None` for the app-reported pane-death
     /// reap, which has no speculative probe to describe.
     probe_observation: Option<&'a LivenessProbeObservation>,
+    /// Callback provenance for an app-reported reap. `None` on periodic
+    /// PID-probe paths.
+    app_report_reason: Option<WorkerPaneDeathReason>,
 }
 
 /// Shared reap effects for a single dead worker: mark the execution
@@ -707,6 +717,7 @@ async fn reap_dead_execution(
         now_epoch_secs,
         file_pane_death_attention,
         probe_observation,
+        app_report_reason,
     } = options;
     let execution_id = &state.run_id;
 
@@ -804,6 +815,7 @@ async fn reap_dead_execution(
     let mut details = serde_json::json!({
         "dead_pid": state.shell_pid,
         "slot_id": state.slot_id,
+        "app_report_reason": app_report_reason.map(WorkerPaneDeathReason::as_str),
         "recovery_patch": recovery_patch
             .as_deref()
             .map(|p| p.display().to_string()),
@@ -1453,7 +1465,7 @@ mod tests {
             coordinator.clone(),
             sink.as_ref(),
             &execution_id,
-            "surface failed to attach",
+            WorkerPaneDeathReason::SurfaceCreationFailed,
         )
         .await;
 
@@ -1468,6 +1480,10 @@ mod tests {
         let events = sink.events().await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].stage, "dead_pid_reconcile");
+        assert_eq!(
+            events[0].details["app_report_reason"],
+            WorkerPaneDeathReason::SurfaceCreationFailed.as_str(),
+        );
     }
 
     /// No live slot for the reported `run_id` (already released, or the
@@ -1486,7 +1502,7 @@ mod tests {
             coordinator,
             sink.as_ref(),
             "run-does-not-exist",
-            "surface failed to attach",
+            WorkerPaneDeathReason::SurfaceCreationFailed,
         )
         .await;
 
@@ -1524,7 +1540,7 @@ mod tests {
             coordinator,
             sink.as_ref(),
             &execution_id,
-            "surface failed to attach",
+            WorkerPaneDeathReason::SurfaceCreationFailed,
         )
         .await;
 
@@ -1555,7 +1571,7 @@ mod tests {
             coordinator,
             sink.as_ref(),
             &execution_id,
-            "surface failed to attach",
+            WorkerPaneDeathReason::SurfaceCreationFailed,
         )
         .await;
 
@@ -2018,7 +2034,7 @@ mod tests {
             coordinator.clone(),
             sink.as_ref(),
             &execution_id,
-            "app reported the worker pane died (child process exited)",
+            WorkerPaneDeathReason::ChildProcessExited,
         )
         .await;
 
@@ -2060,7 +2076,7 @@ mod tests {
             coordinator.clone(),
             sink.as_ref(),
             &execution_id,
-            "app reported the worker pane died (surface failed to attach)",
+            WorkerPaneDeathReason::SurfaceCreationFailed,
         )
         .await;
 
@@ -2132,7 +2148,7 @@ mod tests {
             coordinator.clone(),
             Arc::new(RecordingDispatchEventSink::new()).as_ref(),
             &execution_id,
-            "child process exited",
+            WorkerPaneDeathReason::ChildProcessExited,
         )
         .await;
 
@@ -2171,7 +2187,7 @@ mod tests {
             coordinator.clone(),
             sink.as_ref(),
             &execution_id,
-            "app reported the worker pane died",
+            WorkerPaneDeathReason::ChildProcessExited,
         )
         .await;
 

@@ -45,8 +45,8 @@ private func ghosttyRuntimeWriteClipboard(
     )
 }
 
-private func ghosttyRuntimeCloseSurface(_ userdata: UnsafeMutableRawPointer?, _ processAlive: Bool) {
-    GhosttyRuntime.closeSurface(userdata, processAlive: processAlive)
+private func ghosttyRuntimeCloseSurface(_ userdata: UnsafeMutableRawPointer?, _ needsConfirmation: Bool) {
+    GhosttyRuntime.closeSurface(userdata, needsConfirmation: needsConfirmation)
 }
 
 extension Notification.Name {
@@ -499,11 +499,30 @@ final class GhosttyRuntime: @unchecked Sendable {
         }
     }
 
-    fileprivate static func closeSurface(_ userdata: UnsafeMutableRawPointer?, processAlive: Bool) {
+    /// Classify libghostty's close callback using the facts that actually
+    /// describe a child exit. The callback's Boolean is `needsConfirmQuit()`
+    /// in the bundled libghostty API; it is not process liveness.
+    static func shouldReportChildExit(
+        needsConfirmation: Bool,
+        isCurrentAttachedSurface: Bool,
+        isReleased: Bool,
+        processExited: Bool
+    ) -> Bool {
+        !needsConfirmation && isCurrentAttachedSurface && !isReleased && processExited
+    }
+
+    fileprivate static func closeSurface(_ userdata: UnsafeMutableRawPointer?, needsConfirmation: Bool) {
         guard let host = hostView(from: userdata) else { return }
         OperationQueue.main.addOperation {
             MainActor.assumeIsolated {
-                guard !processAlive else {
+                let isCurrentAttachedSurface = host.session.terminalReady && host.session.hostView === host
+                let processExited = host.surface.map { ghostty_surface_process_exited($0) } ?? false
+                guard Self.shouldReportChildExit(
+                    needsConfirmation: needsConfirmation,
+                    isCurrentAttachedSurface: isCurrentAttachedSurface,
+                    isReleased: host.session.isReleased,
+                    processExited: processExited
+                ) else {
                     host.session.statusMessage = "Surface requested close"
                     return
                 }
