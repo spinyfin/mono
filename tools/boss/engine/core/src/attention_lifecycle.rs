@@ -212,12 +212,6 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          direct evidence the pane-spawn problem is no longer blocking it — the same reasoning as \
          `driver_terminal_error`, one stage earlier in the run's lifecycle.",
     ),
-    entry(
-        crate::stale_worker_sweep::STALE_WORKER_ATTENTION_KIND,
-        ClearedBy::ProducerReconciles,
-        "The stale-worker sweep rechecks tmux evidence every pass and resolves this attention when the \
-         same worker resumes terminal activity or terminalizes.",
-    ),
     // ── Cleared by a later completed pass of the same kind ──────────────
     entry(
         crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND,
@@ -227,6 +221,12 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          engine process was running, and the shape the rest of the table is modelled on.",
     ),
     // ── The producer owns resolution ────────────────────────────────────
+    entry(
+        crate::stale_worker_sweep::STALE_WORKER_ATTENTION_KIND,
+        ClearedBy::ProducerReconciles,
+        "The stale-worker sweep rechecks tmux evidence every pass and resolves this attention when the \
+         same worker resumes terminal activity or terminalizes.",
+    ),
     entry(
         crate::worker_escalation::WORKER_ESCALATION_ATTENTION_KIND,
         ClearedBy::ProducerReconciles,

@@ -546,13 +546,7 @@ impl WorkDb {
         let tx = conn.transaction()?;
         let _ = product_id_for_work_item(&tx, work_item_id)?;
         let id = match reraise_open_work_item_attention(&tx, work_item_id, kind)? {
-            Some(id) => {
-                tx.execute(
-                    "UPDATE work_attention_items SET title = ?2, body_markdown = ?3 WHERE id = ?1",
-                    params![id, title, body_markdown],
-                )?;
-                id
-            }
+            Some(id) => id,
             None => {
                 let id = next_id("attn");
                 let now = now_string();
