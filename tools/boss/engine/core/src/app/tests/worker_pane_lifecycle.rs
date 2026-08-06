@@ -145,36 +145,7 @@ async fn release_worker_pane_reaps_the_tmux_session_for_a_slot_mapped_run() {
     // a tmux-hosted worker's session must be torn down and its identity
     // columns cleared alongside the libghostty pane release, even when no
     // app session is registered to answer the pane-release request.
-    use boss_tmux::{CommandOutput, CommandRunner, Tmux};
-
-    #[derive(Default)]
-    struct StubRunner {
-        outcomes: std::sync::Mutex<std::collections::VecDeque<CommandOutput>>,
-    }
-    #[async_trait::async_trait]
-    impl CommandRunner for StubRunner {
-        async fn run(
-            &self,
-            _program: &std::path::Path,
-            _args: &[std::ffi::OsString],
-            _cwd: Option<&std::path::Path>,
-        ) -> std::io::Result<CommandOutput> {
-            Ok(self
-                .outcomes
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("stub runner received an unexpected tmux command"))
-        }
-    }
-    fn ok_output(stdout: &str) -> CommandOutput {
-        CommandOutput {
-            success: true,
-            code: Some(0),
-            stdout: stdout.to_owned(),
-            stderr: String::new(),
-        }
-    }
+    use super::tmux_stub::{fake_tmux, ok};
 
     let (server_state, _dir) = test_server_state();
     let db = server_state.work_db.as_ref();
@@ -194,14 +165,7 @@ async fn release_worker_pane_reaps_the_tmux_session_for_a_slot_mapped_run() {
 
     server_state.worker_registry.register_run_slot(&execution_id, 1);
 
-    let runner = StubRunner {
-        outcomes: std::sync::Mutex::new(std::collections::VecDeque::from([
-            ok_output("BOSS_SPAWN_TOKEN=tok-y\n"),
-            ok_output("BOSS_SPAWN_TOKEN=tok-y\n"),
-            ok_output(""),
-        ])),
-    };
-    let tmux = Tmux::with_runner("/opt/homebrew/bin/tmux", std::sync::Arc::new(runner)).unwrap();
+    let (tmux, runner) = fake_tmux([ok("BOSS_SPAWN_TOKEN=tok-y\n"), ok("BOSS_SPAWN_TOKEN=tok-y\n"), ok("")]);
     server_state.set_tmux_override_for_test(tmux);
 
     // No app session registered, so the pane-release SendToApp call
@@ -211,6 +175,29 @@ async fn release_worker_pane_reaps_the_tmux_session_for_a_slot_mapped_run() {
     assert!(
         db.tmux_identity_for_execution(&execution_id).unwrap().is_none(),
         "the slot-mapped release path must also reap the tmux session and clear its identity",
+    );
+    assert_eq!(
+        runner.calls(),
+        vec![
+            vec![
+                "-L",
+                "boss",
+                "show-environment",
+                "-t",
+                "boss-1-example",
+                "BOSS_SPAWN_TOKEN"
+            ],
+            vec![
+                "-L",
+                "boss",
+                "show-environment",
+                "-t",
+                "boss-1-example",
+                "BOSS_SPAWN_TOKEN"
+            ],
+            vec!["-L", "boss", "kill-session", "-t", "boss-1-example"],
+        ],
+        "the slot-mapped reap path must issue show-environment then kill-session, nothing else",
     );
 }
 

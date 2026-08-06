@@ -215,6 +215,28 @@ async fn kill_session_verified_kills_only_on_an_exact_token_match() {
 }
 
 #[tokio::test]
+async fn kill_session_verified_treats_a_session_destroyed_just_before_the_kill_as_absent() {
+    // The token read matches, but the session dies on its own (the
+    // ordinary worker-completion race) before the kill-session call
+    // lands — tmux reports it the same way it would report a session
+    // that was already gone at the token read. That must still resolve
+    // to Absent, not surface as a hard Tmux error.
+    let (tmux, runner) = tmux([
+        success("BOSS_SPAWN_TOKEN=secret\n"),
+        failure("can't find session: boss-1"),
+    ]);
+    let outcome = tmux.kill_session_verified("boss-1", "secret").await.unwrap();
+    assert_eq!(outcome, KillSessionOutcome::Absent);
+    assert_eq!(
+        runner.calls(),
+        vec![
+            vec!["-L", "boss", "show-environment", "-t", "boss-1", "BOSS_SPAWN_TOKEN"],
+            vec!["-L", "boss", "kill-session", "-t", "boss-1"],
+        ],
+    );
+}
+
+#[tokio::test]
 async fn kill_session_verified_refuses_a_token_mismatch_and_never_kills() {
     let (tmux, runner) = tmux([success("BOSS_SPAWN_TOKEN=someone-elses-token\n")]);
     let error = tmux.kill_session_verified("boss-1", "secret").await.unwrap_err();
@@ -434,9 +456,12 @@ async fn command_failures_include_the_argv_and_stderr() {
 
 #[tokio::test]
 async fn kill_session_verified_surfaces_a_kill_session_failure_after_a_matched_token() {
+    // A genuine kill-session failure — not one of the absent-session stderr
+    // shapes `is_absent_session_stderr` recognizes — must still surface as
+    // a hard error rather than being swallowed as Absent.
     let (tmux, _) = tmux([
         success("BOSS_SPAWN_TOKEN=secret\n"),
-        failure("session not found: boss-1"),
+        failure("server exited unexpectedly"),
     ]);
     let error = tmux.kill_session_verified("boss-1", "secret").await.unwrap_err();
     let KillSessionError::Tmux(err) = error else {
@@ -444,7 +469,7 @@ async fn kill_session_verified_surfaces_a_kill_session_failure_after_a_matched_t
     };
     let text = err.to_string();
     assert!(text.contains("kill-session"), "error was: {text}");
-    assert!(text.contains("session not found: boss-1"), "error was: {text}");
+    assert!(text.contains("server exited unexpectedly"), "error was: {text}");
 }
 
 #[tokio::test]

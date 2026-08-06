@@ -302,8 +302,17 @@ impl Tmux {
         match self.show_environment(session, BOSS_SPAWN_TOKEN_ENV).await? {
             None => Ok(KillSessionOutcome::Absent),
             Some(actual) if actual == expected_token => {
-                self.kill_session_unchecked(session).await?;
-                Ok(KillSessionOutcome::Killed)
+                // The session can still die on its own between the token
+                // read above and this call — the ordinary worker-completion
+                // race. Treat a kill that fails because the session is
+                // already gone as Absent, not a hard error, so this window
+                // doesn't leak the identity columns the way an unclassified
+                // Refused would.
+                if self.kill_session_unchecked(session).await? {
+                    Ok(KillSessionOutcome::Killed)
+                } else {
+                    Ok(KillSessionOutcome::Absent)
+                }
             }
             Some(actual) => Err(KillSessionError::TokenMismatch {
                 session: session.to_owned(),
@@ -315,12 +324,21 @@ impl Tmux {
 
     /// Low-level `kill-session -t <name>`, with no identity verification.
     /// Private: [`Self::kill_session_verified`] is this crate's only public
-    /// teardown entry point, by design — see its doc comment.
-    async fn kill_session_unchecked(&self, session: &str) -> Result<()> {
+    /// teardown entry point, by design — see its doc comment. Returns
+    /// `Ok(true)` when the session was actually killed, `Ok(false)` when it
+    /// had already vanished (a real command failure still becomes `Err`).
+    async fn kill_session_unchecked(&self, session: &str) -> Result<bool> {
         validate_value("session name", session)?;
         let mut args = self.server_args();
         args.extend(["kill-session".into(), "-t".into(), session.into()]);
-        self.invoke(args).await.map(|_| ())
+        let output = self.run(&args).await?;
+        if output.success {
+            return Ok(true);
+        }
+        if is_absent_session_stderr(&output.stderr) {
+            return Ok(false);
+        }
+        command_failed(&args, &output)
     }
 
     /// Reads one known pane/window field without parsing a pane capture.

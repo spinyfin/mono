@@ -3,83 +3,11 @@
 //! tmux binary on the host — mirroring [`crate::tmux_adoption`]'s
 //! `FakeTmuxServer` pattern.
 
-use std::collections::VecDeque;
-use std::ffi::OsString;
-use std::path::Path;
-use std::sync::{Arc, Mutex as StdMutex};
-
-use boss_tmux::{CommandOutput, CommandRunner, Tmux};
-
+use super::tmux_stub::{failure, fake_tmux, ok};
 use super::*;
 use crate::app::tmux_teardown::TmuxTeardownOutcome;
 use crate::test_support::*;
 use crate::work::TmuxIdentity;
-
-/// Scripted `tmux` replies in exact call order. Panics on an unexpected
-/// call, which is what makes "no kill-session was issued" assertable —
-/// a refused teardown that nonetheless tried to kill fails the test by
-/// running out of scripted replies.
-#[derive(Default)]
-struct StubRunner {
-    outcomes: StdMutex<VecDeque<CommandOutput>>,
-    calls: StdMutex<Vec<Vec<String>>>,
-}
-
-impl StubRunner {
-    fn replies(replies: impl IntoIterator<Item = CommandOutput>) -> Arc<Self> {
-        Arc::new(Self {
-            outcomes: StdMutex::new(replies.into_iter().collect()),
-            calls: StdMutex::new(Vec::new()),
-        })
-    }
-
-    fn calls(&self) -> Vec<Vec<String>> {
-        self.calls.lock().unwrap().clone()
-    }
-}
-
-#[async_trait::async_trait]
-impl CommandRunner for StubRunner {
-    async fn run(&self, _program: &Path, args: &[OsString], cwd: Option<&Path>) -> std::io::Result<CommandOutput> {
-        assert!(cwd.is_none());
-        self.calls
-            .lock()
-            .unwrap()
-            .push(args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect());
-        Ok(self
-            .outcomes
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("stub runner received an unexpected tmux command"))
-    }
-}
-
-fn ok(stdout: &str) -> CommandOutput {
-    CommandOutput {
-        success: true,
-        code: Some(0),
-        stdout: stdout.to_owned(),
-        stderr: String::new(),
-    }
-}
-
-fn failure(stderr: &str) -> CommandOutput {
-    CommandOutput {
-        success: false,
-        code: Some(1),
-        stdout: String::new(),
-        stderr: stderr.to_owned(),
-    }
-}
-
-fn fake_tmux(replies: impl IntoIterator<Item = CommandOutput>) -> (Tmux, Arc<StubRunner>) {
-    let runner = StubRunner::replies(replies);
-    (
-        Tmux::with_runner("/opt/homebrew/bin/tmux", runner.clone()).unwrap(),
-        runner,
-    )
-}
 
 /// Seed an execution with a started (unfinished) local run and a durably
 /// recorded tmux identity — the shape `reap_tmux_worker` reads from.

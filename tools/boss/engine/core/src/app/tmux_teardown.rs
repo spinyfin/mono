@@ -72,9 +72,12 @@ impl ServerState {
                 return TmuxTeardownOutcome::NotTmuxHosted;
             }
         };
-        let override_tmux = self.tmux_override.lock().unwrap().clone();
-        if let Some(tmux) = override_tmux {
-            return self.reap_tmux_worker_with(&tmux, execution_id, &identity).await;
+        #[cfg(test)]
+        {
+            let override_tmux = self.tmux_override.lock().unwrap().clone();
+            if let Some(tmux) = override_tmux {
+                return self.reap_tmux_worker_with(&tmux, execution_id, &identity).await;
+            }
         }
         let tmux = match Tmux::resolve() {
             Ok(tmux) => tmux,

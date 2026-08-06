@@ -548,6 +548,7 @@ struct ServerState {
     /// into the tmux reap can be exercised end-to-end against a stubbed
     /// `Tmux` (mirroring `reap_tmux_worker_with`'s injected-runner tests)
     /// without a real tmux binary on the test host.
+    #[cfg(test)]
     #[builder(default)]
     tmux_override: std::sync::Mutex<Option<boss_tmux::Tmux>>,
     /// One prepared/active run-correlated JSONL file source per execution.

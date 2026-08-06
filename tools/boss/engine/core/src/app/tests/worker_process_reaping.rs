@@ -1,47 +1,7 @@
-use boss_tmux::{CommandOutput, CommandRunner, Tmux};
-
 use super::super::server::process_group_signal_target;
+use super::tmux_stub::{fake_tmux, ok};
 use super::*;
 use crate::test_support::spawn_group_leader_sleeper;
-
-#[derive(Default)]
-struct StubTmuxRunner {
-    outcomes: std::sync::Mutex<std::collections::VecDeque<CommandOutput>>,
-}
-
-impl StubTmuxRunner {
-    fn replies(replies: impl IntoIterator<Item = CommandOutput>) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self {
-            outcomes: std::sync::Mutex::new(replies.into_iter().collect()),
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl CommandRunner for StubTmuxRunner {
-    async fn run(
-        &self,
-        _program: &std::path::Path,
-        _args: &[std::ffi::OsString],
-        _cwd: Option<&std::path::Path>,
-    ) -> std::io::Result<CommandOutput> {
-        Ok(self
-            .outcomes
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("stub runner received an unexpected tmux command"))
-    }
-}
-
-fn ok_output(stdout: &str) -> CommandOutput {
-    CommandOutput {
-        success: true,
-        code: Some(0),
-        stdout: stdout.to_owned(),
-        stderr: String::new(),
-    }
-}
 
 #[test]
 fn process_group_signal_target_negates_pgid_for_live_pid() {
@@ -187,12 +147,7 @@ async fn release_worker_pane_still_reaps_a_tmux_session_for_a_dead_recorded_pid(
         "creation write must find the intent row it just wrote",
     );
 
-    let runner = StubTmuxRunner::replies([
-        ok_output("BOSS_SPAWN_TOKEN=tok-x\n"),
-        ok_output("BOSS_SPAWN_TOKEN=tok-x\n"),
-        ok_output(""),
-    ]);
-    let tmux = Tmux::with_runner("/opt/homebrew/bin/tmux", runner).unwrap();
+    let (tmux, runner) = fake_tmux([ok("BOSS_SPAWN_TOKEN=tok-x\n"), ok("BOSS_SPAWN_TOKEN=tok-x\n"), ok("")]);
     server_state.set_tmux_override_for_test(tmux);
 
     assert_eq!(
@@ -205,6 +160,29 @@ async fn release_worker_pane_still_reaps_a_tmux_session_for_a_dead_recorded_pid(
         db.tmux_identity_for_execution(&execution_id).unwrap().is_none(),
         "the tmux session must still be reaped and its identity cleared even though the pid probe \
          found no live process to vouch for",
+    );
+    assert_eq!(
+        runner.calls(),
+        vec![
+            vec![
+                "-L",
+                "boss",
+                "show-environment",
+                "-t",
+                "boss-1-example",
+                "BOSS_SPAWN_TOKEN"
+            ],
+            vec![
+                "-L",
+                "boss",
+                "show-environment",
+                "-t",
+                "boss-1-example",
+                "BOSS_SPAWN_TOKEN"
+            ],
+            vec!["-L", "boss", "kill-session", "-t", "boss-1-example"],
+        ],
+        "the dead-pid reap path must issue show-environment then kill-session, nothing else",
     );
 }
 
