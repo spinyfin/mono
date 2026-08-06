@@ -90,18 +90,36 @@ impl WorkDb {
         })
     }
 
-    /// Every migration this database has ever needed, applied in order
-    /// against an existing connection. This is the only path for a database
-    /// that isn't brand-new (reopening an on-disk or shared-cache database
-    /// an earlier `init()` call already migrated) — every step here must
-    /// stay idempotent against its own prior output, since `init()` can run
-    /// it again on an already-current database. For a brand-new database,
-    /// [`Self::apply_final_schema_template`] reaches the same end state far
-    /// faster; that fast path's own template is itself captured by running
-    /// this function once, in [`Self::final_schema_ddl`].
-    pub(crate) fn run_full_migration_chain(conn: &Connection) -> Result<()> {
-        conn.execute_batch(
-            "
+    /// The baseline tables every Boss database starts from.
+    ///
+    /// **`CREATE TABLE IF NOT EXISTS` statements only — no indexes, and no
+    /// column that a later `migrate_*` step supplies.** Both rules exist for
+    /// the same reason, and both are load-bearing:
+    ///
+    /// - `CREATE TABLE IF NOT EXISTS` is a no-op against a database whose
+    ///   table already exists, so a column added to a definition here never
+    ///   reaches any existing database. Columns must be added by a
+    ///   `table_has_column`-guarded `ALTER TABLE` migration instead — the only
+    ///   form that upgrades a database in place. Declaring a column in *both*
+    ///   places is the same trap wearing a disguise: it looks migrated
+    ///   because every fresh database has it.
+    /// - An index (or any statement) referencing a migration-supplied column
+    ///   cannot live here at all. This batch is the FIRST thing
+    ///   [`Self::run_full_migration_chain`] executes, hundreds of lines before
+    ///   the migration that adds the column, and SQLite errors on
+    ///   `CREATE INDEX IF NOT EXISTS` over a missing column rather than
+    ///   skipping it — aborting the batch, failing `WorkDb::open`, and taking
+    ///   the engine down on every existing install before it binds its socket.
+    ///   That is exactly how the in-development tmux work bricked startup: the
+    ///   five `work_runs.tmux_*` columns were declared both here and in
+    ///   `migrate_work_runs_tmux_columns`, and the partial unique index over
+    ///   `tmux_spawn_token` sat in this batch.
+    ///
+    /// Indexes over these tables live in [`Self::BASELINE_INDEX_DDL`] and run
+    /// after the whole migration chain. `baseline_schema_declares_no_indexes`
+    /// and `baseline_columns_are_not_also_migration_supplied` in this module's
+    /// tests hold both rules.
+    const BASELINE_SCHEMA_DDL: &'static str = "
             PRAGMA foreign_keys = ON;
 
             CREATE TABLE IF NOT EXISTS metadata (
@@ -117,17 +135,7 @@ impl WorkDb {
                 repo_remote_url TEXT,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                default_model TEXT,
-                default_driver TEXT,
-                ci_attempt_budget INTEGER NOT NULL DEFAULT 3,
-                dispatch_preamble TEXT,
-                design_guidance TEXT,
-                external_tracker_kind TEXT,
-                external_tracker_config TEXT,
-                design_repo TEXT,
-                worker_branch_prefix TEXT,
-                merge_mechanism TEXT
+                updated_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS projects (
@@ -140,14 +148,8 @@ impl WorkDb {
                 status TEXT NOT NULL,
                 priority TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                design_doc_repo_remote_url TEXT,
-                design_doc_branch TEXT,
-                design_doc_path TEXT
+                updated_at TEXT NOT NULL
             );
-
-            CREATE UNIQUE INDEX IF NOT EXISTS projects_product_slug_idx
-                ON projects(product_id, slug);
 
             CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
@@ -161,32 +163,8 @@ impl WorkDb {
                 pr_url TEXT,
                 deleted_at TEXT,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                autostart INTEGER NOT NULL DEFAULT 1,
-                deferred INTEGER NOT NULL DEFAULT 0,
-                human_driven INTEGER NOT NULL DEFAULT 0,
-                completion_summary TEXT,
-                priority TEXT NOT NULL DEFAULT 'medium',
-                repo_remote_url TEXT,
-                created_via TEXT NOT NULL DEFAULT 'unknown',
-                effort_level TEXT,
-                model_override TEXT,
-                reasoning TEXT,
-                driver TEXT,
-                ci_attempt_budget INTEGER,
-                ci_attempts_used INTEGER NOT NULL DEFAULT 0,
-                external_ref_kind TEXT,
-                external_ref_canonical_id TEXT,
-                external_ref_raw TEXT,
-                external_ref_synced_at TEXT,
-                external_ref_unbound_at TEXT
+                updated_at TEXT NOT NULL
             );
-
-            CREATE INDEX IF NOT EXISTS tasks_product_idx
-                ON tasks(product_id, kind, deleted_at);
-
-            CREATE INDEX IF NOT EXISTS tasks_project_idx
-                ON tasks(project_id, deleted_at, ordinal);
 
             CREATE TABLE IF NOT EXISTS work_executions (
                 id TEXT PRIMARY KEY,
@@ -196,17 +174,11 @@ impl WorkDb {
                 repo_remote_url TEXT NOT NULL,
                 cube_repo_id TEXT,
                 cube_lease_id TEXT,
-                cube_workspace_id TEXT,
                 workspace_path TEXT,
-                priority INTEGER NOT NULL DEFAULT 0,
-                preferred_workspace_id TEXT,
                 created_at TEXT NOT NULL,
                 started_at TEXT,
                 finished_at TEXT
             );
-
-            CREATE INDEX IF NOT EXISTS work_executions_work_item_idx
-                ON work_executions(work_item_id, created_at);
 
             CREATE TABLE IF NOT EXISTS work_runs (
                 id TEXT PRIMARY KEY,
@@ -219,23 +191,8 @@ impl WorkDb {
                 artifacts_path TEXT,
                 created_at TEXT NOT NULL,
                 started_at TEXT,
-                finished_at TEXT,
-                host_id TEXT NOT NULL DEFAULT 'local',
-                cube_workspace_id TEXT,
-                remote_pid INTEGER,
-                shell_pid INTEGER,
-                tmux_server_label TEXT,
-                tmux_session_name TEXT,
-                tmux_spawn_token TEXT,
-                tmux_spawn_state TEXT,
-                tmux_pane_pid INTEGER
+                finished_at TEXT
             );
-
-            CREATE INDEX IF NOT EXISTS work_runs_execution_idx
-                ON work_runs(execution_id, created_at);
-            CREATE UNIQUE INDEX IF NOT EXISTS work_runs_tmux_spawn_token_idx
-                ON work_runs(tmux_spawn_token)
-                WHERE tmux_spawn_token IS NOT NULL;
 
             CREATE TABLE IF NOT EXISTS work_attention_items (
                 id TEXT PRIMARY KEY,
@@ -247,16 +204,11 @@ impl WorkDb {
                 body_markdown TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 resolved_at TEXT,
-                converted_task_id TEXT,
-                last_raised_at TEXT,
                 CHECK (
                     (execution_id IS NOT NULL AND work_item_id IS NULL)
                     OR (execution_id IS NULL AND work_item_id IS NOT NULL)
                 )
             );
-
-            CREATE INDEX IF NOT EXISTS work_attention_items_execution_idx
-                ON work_attention_items(execution_id, created_at);
 
             CREATE TABLE IF NOT EXISTS pane_summaries (
                 work_item_id TEXT PRIMARY KEY,
@@ -274,12 +226,6 @@ impl WorkDb {
                 CHECK (dependent_id <> prerequisite_id)
             );
 
-            CREATE INDEX IF NOT EXISTS work_item_dependencies_prereq_idx
-                ON work_item_dependencies(prerequisite_id, relation);
-
-            CREATE INDEX IF NOT EXISTS work_item_dependencies_dependent_idx
-                ON work_item_dependencies(dependent_id, relation);
-
             CREATE TABLE IF NOT EXISTS project_property_audit (
                 id          TEXT PRIMARY KEY,
                 project_id  TEXT NOT NULL,
@@ -289,11 +235,66 @@ impl WorkDb {
                 actor       TEXT NOT NULL,
                 changed_at  TEXT NOT NULL
             );
+            ";
+
+    /// Indexes over the [`Self::BASELINE_SCHEMA_DDL`] tables, created only
+    /// once every migration in the chain has run.
+    ///
+    /// Deferring them is what makes it safe for a baseline table to gain
+    /// columns over time: by the time these statements execute, every
+    /// `ALTER TABLE ... ADD COLUMN` migration has brought an existing
+    /// database up to the current column set, so an index may reference any
+    /// column in the final schema regardless of when it was introduced.
+    /// `IF NOT EXISTS` keeps re-running them free, and running them after
+    /// `migrate_projects_tasks_status_check`'s table rebuild means a rebuild
+    /// can never leave one of them dropped.
+    const BASELINE_INDEX_DDL: &'static str = "
+            CREATE UNIQUE INDEX IF NOT EXISTS projects_product_slug_idx
+                ON projects(product_id, slug);
+
+            CREATE INDEX IF NOT EXISTS tasks_product_idx
+                ON tasks(product_id, kind, deleted_at);
+
+            CREATE INDEX IF NOT EXISTS tasks_project_idx
+                ON tasks(project_id, deleted_at, ordinal);
+
+            CREATE INDEX IF NOT EXISTS work_executions_work_item_idx
+                ON work_executions(work_item_id, created_at);
+
+            CREATE INDEX IF NOT EXISTS work_runs_execution_idx
+                ON work_runs(execution_id, created_at);
+
+            CREATE INDEX IF NOT EXISTS work_attention_items_execution_idx
+                ON work_attention_items(execution_id, created_at);
+
+            CREATE INDEX IF NOT EXISTS work_item_dependencies_prereq_idx
+                ON work_item_dependencies(prerequisite_id, relation);
+
+            CREATE INDEX IF NOT EXISTS work_item_dependencies_dependent_idx
+                ON work_item_dependencies(dependent_id, relation);
 
             CREATE INDEX IF NOT EXISTS project_property_audit_project_idx
                 ON project_property_audit(project_id, changed_at);
-            ",
-        )?;
+
+            CREATE INDEX IF NOT EXISTS work_executions_ready_idx
+                ON work_executions(status, priority, created_at);
+
+            CREATE INDEX IF NOT EXISTS tasks_repo_idx
+                ON tasks(repo_remote_url, deleted_at)
+                WHERE repo_remote_url IS NOT NULL;
+            ";
+
+    /// Every migration this database has ever needed, applied in order
+    /// against an existing connection. This is the only path for a database
+    /// that isn't brand-new (reopening an on-disk or shared-cache database
+    /// an earlier `init()` call already migrated) — every step here must
+    /// stay idempotent against its own prior output, since `init()` can run
+    /// it again on an already-current database. For a brand-new database,
+    /// [`Self::apply_final_schema_template`] reaches the same end state far
+    /// faster; that fast path's own template is itself captured by running
+    /// this function once, in [`Self::final_schema_ddl`].
+    pub(crate) fn run_full_migration_chain(conn: &Connection) -> Result<()> {
+        conn.execute_batch(Self::BASELINE_SCHEMA_DDL)?;
         migrate_work_executions_v3(conn)?;
         migrate_tasks_autostart(conn)?;
         migrate_tasks_deferred(conn)?;
@@ -306,24 +307,6 @@ impl WorkDb {
         migrate_backfill_project_design_tasks(conn)?;
         migrate_tasks_repo_remote_url(conn)?;
         migrate_project_property_audit_table(conn)?;
-        // Index creation must follow migration: pre-v3 databases don't
-        // have `priority` until `migrate_work_executions_v3` adds it,
-        // and SQLite's `CREATE INDEX IF NOT EXISTS` errors on missing
-        // columns rather than silently skipping. Keep this out of the
-        // schema-init batch so a pre-v3 database can still be opened.
-        // The same rule applies to `tasks_repo_idx` against pre-v5
-        // databases that haven't yet been migrated.
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS work_executions_ready_idx
-                ON work_executions(status, priority, created_at)",
-            [],
-        )?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS tasks_repo_idx
-                ON tasks(repo_remote_url, deleted_at)
-                WHERE repo_remote_url IS NOT NULL",
-            [],
-        )?;
         migrate_timestamps_to_epoch(conn)?;
         migrate_tasks_blocked_reason(conn)?;
         migrate_products_auto_pr_maintenance_enabled(conn)?;
@@ -765,6 +748,10 @@ impl WorkDb {
         // `editorial_rules.instructions` (GitHub-visible surfaces only) — see
         // `migrate_products_design_guidance`'s doc comment.
         migrate_products_design_guidance(conn)?;
+        // Indexes last, over the now-current column set — see
+        // `BASELINE_INDEX_DDL`. Nothing above this line may create an index
+        // over a column a migration supplies.
+        conn.execute_batch(Self::BASELINE_INDEX_DDL)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '31')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -841,6 +828,211 @@ impl WorkDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// `(table, column)` for every table/column the given database has.
+    fn columns_of(conn: &Connection) -> BTreeSet<(String, String)> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+            .unwrap();
+        let tables: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let mut out = BTreeSet::new();
+        for table in tables {
+            let mut cols = conn
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                .unwrap();
+            for name in cols.query_map([], |row| row.get::<_, String>(0)).unwrap() {
+                out.insert((table.clone(), name.unwrap()));
+            }
+        }
+        out
+    }
+
+    /// Index names (excluding SQLite's implicit `sqlite_autoindex_*`).
+    fn indexes_of(conn: &Connection) -> BTreeSet<String> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// `table -> [column, ...]` as *declared* by `BASELINE_SCHEMA_DDL`, read
+    /// back from a database seeded with nothing else. Deliberately derived
+    /// from SQLite rather than by parsing the string.
+    fn baseline_columns() -> BTreeMap<String, Vec<String>> {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(WorkDb::BASELINE_SCHEMA_DDL).unwrap();
+        let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (table, column) in columns_of(&conn) {
+            out.entry(table).or_default().push(column);
+        }
+        out
+    }
+
+    /// The bug that took the engine down on every existing install
+    /// (`no such column: tmux_spawn_token` while creating
+    /// `work_runs_tmux_spawn_token_idx`), reproduced against the database
+    /// shape that actually hit it: `work_runs` as it stood before the
+    /// in-development tmux work, with none of the five `tmux_*` columns and
+    /// no token index.
+    ///
+    /// Startup on such a database must bring it fully up to date. Before the
+    /// fix this failed outright: the token index sat in the schema-bootstrap
+    /// batch, which runs first and aborts the whole of `WorkDb::open` — the
+    /// migration that adds the columns is invoked hundreds of lines later and
+    /// never got the chance.
+    #[test]
+    fn existing_database_predating_the_tmux_columns_migrates_cleanly() {
+        let conn = Connection::open_in_memory().unwrap();
+        WorkDb::run_full_migration_chain(&conn).unwrap();
+
+        // Wind `work_runs` back to its pre-tmux shape.
+        conn.execute_batch("DROP INDEX IF EXISTS work_runs_tmux_spawn_token_idx")
+            .unwrap();
+        for column in [
+            "tmux_server_label",
+            "tmux_session_name",
+            "tmux_spawn_token",
+            "tmux_spawn_state",
+            "tmux_pane_pid",
+        ] {
+            conn.execute_batch(&format!("ALTER TABLE work_runs DROP COLUMN {column}"))
+                .unwrap();
+        }
+        let wound_back = columns_of(&conn);
+        for column in ["tmux_spawn_token", "tmux_spawn_state", "tmux_pane_pid"] {
+            assert!(
+                !wound_back.contains(&("work_runs".to_owned(), column.to_owned())),
+                "fixture setup: work_runs.{column} should be gone"
+            );
+        }
+
+        WorkDb::run_full_migration_chain(&conn)
+            .expect("startup must migrate a database that predates the tmux columns");
+
+        let after = columns_of(&conn);
+        for column in [
+            "tmux_server_label",
+            "tmux_session_name",
+            "tmux_spawn_token",
+            "tmux_spawn_state",
+            "tmux_pane_pid",
+        ] {
+            assert!(
+                after.contains(&("work_runs".to_owned(), column.to_owned())),
+                "expected migrate_work_runs_tmux_columns to add work_runs.{column}"
+            );
+        }
+        assert!(
+            indexes_of(&conn).contains("work_runs_tmux_spawn_token_idx"),
+            "expected the partial unique token index to be recreated"
+        );
+    }
+
+    /// A database created by an older release — its tables present but
+    /// carrying only the baseline column set, and none of the indexes or
+    /// tables later migrations introduce — must come up on the current
+    /// binary with the full current schema.
+    ///
+    /// This is the general form of the tmux failure: it is the only test that
+    /// exercises `run_full_migration_chain` against a database it did not
+    /// itself just create, which is the shape every real install has and the
+    /// blind spot that let an index over a migration-supplied column ship.
+    #[test]
+    fn database_seeded_from_the_baseline_schema_reaches_the_current_schema() {
+        let legacy = Connection::open_in_memory().unwrap();
+        legacy.execute_batch(WorkDb::BASELINE_SCHEMA_DDL).unwrap();
+        assert!(
+            indexes_of(&legacy).is_empty(),
+            "the baseline batch must not create indexes; see BASELINE_SCHEMA_DDL"
+        );
+
+        WorkDb::run_full_migration_chain(&legacy).expect("startup must migrate a baseline-shaped database");
+
+        let current = Connection::open_in_memory().unwrap();
+        WorkDb::run_full_migration_chain(&current).unwrap();
+
+        assert_eq!(columns_of(&legacy), columns_of(&current));
+        assert_eq!(indexes_of(&legacy), indexes_of(&current));
+    }
+
+    /// `BASELINE_SCHEMA_DDL` runs before every migration, so an index in it
+    /// over a column a migration supplies aborts startup on exactly the
+    /// databases the migration exists for. Indexes belong in
+    /// `BASELINE_INDEX_DDL` (or in the migration that adds their columns),
+    /// both of which run after the chain.
+    #[test]
+    fn baseline_schema_declares_no_indexes() {
+        let upper = WorkDb::BASELINE_SCHEMA_DDL.to_uppercase();
+        assert!(
+            !upper.contains("CREATE INDEX") && !upper.contains("CREATE UNIQUE INDEX"),
+            "BASELINE_SCHEMA_DDL must contain CREATE TABLE statements only — it runs before \
+             every migration, so an index here over a migration-supplied column aborts startup \
+             on every existing database. Move it to BASELINE_INDEX_DDL, which runs after the chain."
+        );
+    }
+
+    /// No baseline column may also be supplied by a `migrate_*` step.
+    ///
+    /// Declaring a column in both places is what makes column drift invisible:
+    /// `CREATE TABLE IF NOT EXISTS` is a no-op on an existing database, so the
+    /// declaration here only ever benefits fresh databases, while the
+    /// migration is what actually upgrades everyone else. Whichever one is
+    /// wrong or missing, every dev machine and CI run still looks fine.
+    ///
+    /// Detected by construction rather than by parsing: seed a database from
+    /// the baseline, remove one column, and run the chain. If the column comes
+    /// back, a migration owns it and the baseline declaration is redundant —
+    /// delete it, and let the migration be the single source of truth.
+    #[test]
+    fn baseline_columns_are_not_also_migration_supplied() {
+        let mut redundant = Vec::new();
+        for (table, columns) in baseline_columns() {
+            for column in columns {
+                let probe = Connection::open_in_memory().unwrap();
+                probe.execute_batch(WorkDb::BASELINE_SCHEMA_DDL).unwrap();
+                if probe
+                    .execute_batch(&format!("ALTER TABLE \"{table}\" DROP COLUMN \"{column}\""))
+                    .is_err()
+                {
+                    // Part of a key or a constraint, so structurally original
+                    // to the table and not something an ALTER could supply.
+                    continue;
+                }
+                if WorkDb::run_full_migration_chain(&probe).is_err() {
+                    // The chain needs the column, which means nothing in it
+                    // adds the column — an original baseline column.
+                    continue;
+                }
+                let restored: i64 = probe
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+                        [column.as_str()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                if restored == 1 {
+                    redundant.push(format!("{table}.{column}"));
+                }
+            }
+        }
+        assert!(
+            redundant.is_empty(),
+            "these columns are declared in BASELINE_SCHEMA_DDL *and* supplied by a migration: {}. \
+             Remove them from the baseline — the migration is the only one of the two that reaches \
+             an existing database, and keeping both makes a broken migration undetectable on any \
+             fresh database.",
+            redundant.join(", ")
+        );
+    }
 
     /// Coverage of record for the real incremental migration chain — the
     /// fast fresh-database path (`apply_final_schema_template`) reaches an
