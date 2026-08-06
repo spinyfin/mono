@@ -630,11 +630,27 @@ pub enum Stage {
     /// from what this engine would have written. Refusing-then-reaping
     /// (rather than refusing and leaving the session alive) prevents two
     /// live workers ever sharing one cube workspace. `details` carries
-    /// `session_name`, `reason`, and `schema_guard_failure` (`missing` /
+    /// `session_name`, `reason`, `schema_guard_failure` (`missing` /
     /// `unparseable` / `too_new`) plus the raw and supported schema values
-    /// where applicable. The execution itself is left for the normal
-    /// dead-worker reconcilers to redispatch.
+    /// where applicable, and `reaped` (`true`/`false`) — whether the
+    /// `kill-session` this refusal depends on actually succeeded. Outcome is
+    /// [`Outcome::Ok`] when `reaped` is `true` and [`Outcome::Error`] when
+    /// the kill itself failed, since the session may still be running in
+    /// that case. The execution itself is left for the normal dead-worker
+    /// reconcilers to redispatch.
     TmuxAdoptionRefused,
+    /// The boot-time tmux adoption pass (`boss-engine`'s
+    /// `tmux_adoption::claim_or_detect_conflicting_owner`) refused to run at
+    /// all because the server-scoped `@boss_engine_owner` tmux option was
+    /// stamped by a different, still-live engine process — double-adoption
+    /// would risk two engines controlling the same worker sessions. Not
+    /// scoped to any one execution (the whole pass is skipped before any
+    /// session is even enumerated), so `execution_id` is a synthetic
+    /// per-boot marker rather than a real `work_runs` row. `details` carries
+    /// `other_pid` and `this_pid`. Always [`Outcome::Error`] — a skipped
+    /// adoption pass on a host with tmux-hosted workers is itself an
+    /// operational problem, not a routine outcome.
+    TmuxAdoptionOwnerConflict,
 }
 
 impl Stage {
@@ -690,6 +706,7 @@ impl Stage {
             Stage::RedispatchBlockedLiveProcess => "redispatch_blocked_live_process",
             Stage::TmuxWorkerAdopted => "tmux_worker_adopted",
             Stage::TmuxAdoptionRefused => "tmux_adoption_refused",
+            Stage::TmuxAdoptionOwnerConflict => "tmux_adoption_owner_conflict",
         }
     }
 }
@@ -1459,6 +1476,10 @@ mod tests {
         );
         assert_eq!(Stage::TmuxWorkerAdopted.as_str(), "tmux_worker_adopted");
         assert_eq!(Stage::TmuxAdoptionRefused.as_str(), "tmux_adoption_refused");
+        assert_eq!(
+            Stage::TmuxAdoptionOwnerConflict.as_str(),
+            "tmux_adoption_owner_conflict"
+        );
     }
 
     /// `Outcome::as_str` strings are the on-disk outcome identifiers;

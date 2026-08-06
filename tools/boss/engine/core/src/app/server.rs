@@ -739,6 +739,7 @@ pub async fn serve_with_merge_probe(
                 server_state.as_ref(),
                 server_state.as_ref(),
                 server_state.dispatch_events.as_ref(),
+                &crate::tmux_adoption::PsEngineOwnerProbe,
             )
             .await
         }
@@ -750,11 +751,17 @@ pub async fn serve_with_merge_probe(
             crate::tmux_adoption::TmuxAdoptionOutcome::default()
         }
     };
-    if !tmux_adoption_report.adopted_execution_ids.is_empty() || tmux_adoption_report.terminal_handoffs > 0 {
+    if !tmux_adoption_report.adopted_execution_ids.is_empty()
+        || tmux_adoption_report.terminal_handoffs > 0
+        || tmux_adoption_report.refused_schema_skew > 0
+        || tmux_adoption_report.owner_conflict
+    {
         tracing::info!(
             adopted = tmux_adoption_report.adopted_execution_ids.len(),
             repaired_intents = tmux_adoption_report.repaired_intents,
             terminal_handoffs = tmux_adoption_report.terminal_handoffs,
+            refused_schema_skew = tmux_adoption_report.refused_schema_skew,
+            owner_conflict = tmux_adoption_report.owner_conflict,
             "engine startup: tmux boot-time adoption pass complete",
         );
     }

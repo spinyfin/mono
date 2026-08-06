@@ -126,8 +126,10 @@ pub(crate) const TMUX_SESSION_SCHEMA: &str = "1";
 /// Redeclared in [`crate::tmux_adoption`] rather than imported, matching
 /// [`TMUX_SPAWN_TOKEN_ENV`]'s rationale: adoption reads what this constant
 /// names from a different process generation's live session, not from
-/// this module's own state.
-pub(crate) const TMUX_SESSION_SCHEMA_ENV: &str = "BOSS_SESSION_SCHEMA";
+/// this module's own state. Private (not `pub(crate)`) because nothing
+/// outside this module reads it — only [`TMUX_SESSION_SCHEMA`] needs the
+/// wider visibility, for the reason given above.
+const TMUX_SESSION_SCHEMA_ENV: &str = "BOSS_SESSION_SCHEMA";
 const TMUX_SPAWN_TOKEN_ENV: &str = "BOSS_SPAWN_TOKEN";
 const TMUX_SPAWN_TOKEN_OPTION: &str = "@boss_spawn_token";
 
