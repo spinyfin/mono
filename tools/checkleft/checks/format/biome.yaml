@@ -2,6 +2,10 @@ id: format/biome
 mode: declarative
 runtime: declarative-v1
 api_version: v1
+# `npx --yes` provisions the pinned package inside the invocation; allow a
+# cold npm cache download while keeping the entire check bounded.
+limits:
+  timeout_ms: 300000
 # The file types Biome's formatter handles. Confirmed against Biome 2.5.0:
 # JS/TS family, JSON/JSONC, CSS, and GraphQL are formatted; HTML and Markdown
 # are NOT (Biome emits no format diagnostic for them), so they are excluded.

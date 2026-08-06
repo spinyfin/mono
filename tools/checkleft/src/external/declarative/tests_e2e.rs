@@ -42,8 +42,13 @@ fn e2e_bazel_resolver_resolves_buildifier() {
     }
     // Exercises the framework-owned bazel resolver.
     let root = workspace_root();
-    let resolved = super::resolve::resolve_bazel_target_executable(&root, "@buildifier_prebuilt//:buildifier")
-        .expect("bazel must resolve buildifier");
+    let resolved = super::resolve::resolve_bazel_target_executable(
+        &root,
+        "@buildifier_prebuilt//:buildifier",
+        "test/e2e",
+        crate::external::timeout::CheckDeadline::new(15_000),
+    )
+    .expect("bazel must resolve buildifier");
     assert!(
         resolved.exists(),
         "resolved buildifier path must exist: {}",
@@ -59,8 +64,13 @@ fn e2e_declarative_runs_buildifier_end_to_end() {
     // Full pipeline: file selection -> binary resolution (path override to the
     // bazel-resolved buildifier) -> invocations -> exit semantics -> transform.
     let root = workspace_root();
-    let buildifier = super::resolve::resolve_bazel_target_executable(&root, "@buildifier_prebuilt//:buildifier")
-        .expect("resolve buildifier");
+    let buildifier = super::resolve::resolve_bazel_target_executable(
+        &root,
+        "@buildifier_prebuilt//:buildifier",
+        "test/e2e",
+        crate::external::timeout::CheckDeadline::new(15_000),
+    )
+    .expect("resolve buildifier");
 
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(temp.path().join("a/b")).unwrap();

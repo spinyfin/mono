@@ -70,6 +70,39 @@ max_memory_mb = 64
 }
 
 #[test]
+fn declarative_mode_parses_timeout_limit() {
+    let manifest = r#"
+id = "test/timeout"
+mode = "declarative"
+runtime = "declarative-v1"
+api_version = "v1"
+applies_to = ["**/*.rs"]
+
+[limits]
+timeout_ms = 1234
+
+[needs.tool.default]
+path = "tool"
+
+[[invocations]]
+id = "run"
+run = "tool"
+mode = "batch"
+args = ["{{files}}"]
+exit = { "0" = "ok", default = "error" }
+
+[invocations.transform]
+kind = "linelist"
+message = "unused"
+"#;
+    let package = parse_external_check_package_manifest(manifest).expect("valid manifest");
+    let ExternalCheckPackageImplementation::Declarative(declarative) = package.implementation else {
+        panic!("expected declarative implementation");
+    };
+    assert_eq!(declarative.limits.and_then(|limits| limits.timeout_ms), Some(1234));
+}
+
+#[test]
 fn component_mode_parses_checks_allowlist() {
     let manifest = r#"
 id = "workflow-shell-strict-v2"

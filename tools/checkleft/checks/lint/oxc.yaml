@@ -2,6 +2,10 @@ id: lint/oxc
 mode: declarative
 runtime: declarative-v1
 api_version: v1
+# `npx --yes` provisions the pinned package inside the invocation; allow a
+# cold npm cache download while keeping the entire check bounded.
+limits:
+  timeout_ms: 300000
 # oxlint's scope: the JS/TS family plus the framework single-file-component
 # wrappers whose embedded <script> oxlint extracts and lints out of the box
 # (confirmed against the pinned oxlint 1.70.0 — a `debugger` inside the <script>

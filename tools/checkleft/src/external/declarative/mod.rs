@@ -28,6 +28,7 @@ use std::collections::BTreeMap;
 use anyhow::{Result, bail};
 use serde::Deserialize;
 
+use crate::external::ExternalCheckLimits;
 use crate::output::Severity;
 
 pub mod executor;
@@ -103,7 +104,7 @@ mod rustfmt_skip_children_fix_e2e;
 
 pub(crate) use executor::eligible_file_count;
 pub(crate) use executor::run_declarative_check_with_progress;
-pub use executor::{FixInvocationOutcome, run_declarative_check, run_declarative_fix};
+pub use executor::{DeclarativeFixContext, FixInvocationOutcome, run_declarative_check, run_declarative_fix};
 
 use selector::Selector;
 use template::Template;
@@ -114,6 +115,10 @@ use template::Template;
 /// nothing else (no guest code) to run the wrapped tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalCheckDeclarativePackage {
+    /// Check-wide wall-clock budget using the shared component timeout formula.
+    /// Declarative checks use their own host ceiling because Bazel resolution can
+    /// legitimately wait longer than a WASM component execution.
+    pub limits: Option<ExternalCheckLimits>,
     /// Declared binary requirements ("named holes"), keyed by name. Each carries a
     /// default binding; a CHECKS-config override may substitute a different one.
     pub needs: BTreeMap<String, BinaryRequirement>,
@@ -340,13 +345,18 @@ pub(super) struct RawDeclarativeFields {
     pub needs: BTreeMap<String, RawBinaryRequirement>,
     pub invocations: Vec<RawInvocation>,
     pub skip_symlinks: bool,
+    pub limits: Option<ExternalCheckLimits>,
 }
 
 impl RawDeclarativeFields {
     /// True when none of the declarative-only fields are set — used by the parent
     /// module to reject them in artifact/exec modes.
     pub(super) fn is_empty(&self) -> bool {
-        self.applies_to.is_empty() && self.needs.is_empty() && self.invocations.is_empty() && !self.skip_symlinks
+        self.applies_to.is_empty()
+            && self.needs.is_empty()
+            && self.invocations.is_empty()
+            && !self.skip_symlinks
+            && self.limits.is_none()
     }
 }
 
@@ -509,6 +519,7 @@ pub(super) fn validate_declarative_implementation(
     }
 
     Ok(ExternalCheckDeclarativePackage {
+        limits: raw.limits,
         needs,
         applies_to: raw.applies_to,
         invocations,

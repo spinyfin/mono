@@ -3,19 +3,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::tempdir;
 
+use crate::external::timeout::{BASE_COMPONENT_TIMEOUT_MS, HOST_CEILING_TIMEOUT_MS, PER_FILE_COMPONENT_TIMEOUT_MS};
 use crate::external::{
-    EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, ExternalCheckComponentLimits,
-    ExternalCheckComponentPackage, ExternalCheckPackage, ExternalCheckPackageImplementation,
+    EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, ExternalCheckComponentPackage, ExternalCheckLimits,
+    ExternalCheckPackage, ExternalCheckPackageImplementation,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, DiffHunk, FileDiff, SourceTree, TreeVersion};
 use crate::output::{CheckResult, Finding, Location, Severity};
 use crate::source_tree::LocalSourceTree;
 
 use super::{
-    BASE_COMPONENT_TIMEOUT_MS, EPOCH_DEADLINE_NEVER, ExternalCheckExecutor, HOST_CEILING_TIMEOUT_MS, HostState,
-    MemoryLimiter, PER_FILE_COMPONENT_TIMEOUT_MS, apply_edits_to_sandbox, apply_file_edit, apply_struct_exclusions,
-    build_wasmtime_engine, call_declared_exclusions, call_evaluate_exclusion, compile_component, is_interrupt_error,
-    lower_changeset, resolve_component_limits,
+    EPOCH_DEADLINE_NEVER, ExternalCheckExecutor, HostState, MemoryLimiter, apply_edits_to_sandbox, apply_file_edit,
+    apply_struct_exclusions, build_wasmtime_engine, call_declared_exclusions, call_evaluate_exclusion,
+    compile_component, is_interrupt_error, lower_changeset, resolve_component_limits,
 };
 use wasmtime::{Instance, Module, Store};
 
@@ -567,7 +567,7 @@ fn resolve_limits_proportional_clamped_to_ceiling() {
 
 #[test]
 fn resolve_limits_respects_manifest_overrides() {
-    let limits = ExternalCheckComponentLimits {
+    let limits = ExternalCheckLimits {
         timeout_ms: Some(2_000),
         max_memory_mb: Some(64),
     };
@@ -579,7 +579,7 @@ fn resolve_limits_respects_manifest_overrides() {
 #[test]
 fn resolve_limits_explicit_override_ignores_file_count() {
     // An explicit manifest timeout must be used as-is regardless of n_files.
-    let limits = ExternalCheckComponentLimits {
+    let limits = ExternalCheckLimits {
         timeout_ms: Some(10_000),
         max_memory_mb: None,
     };
@@ -591,7 +591,7 @@ fn resolve_limits_explicit_override_ignores_file_count() {
 
 #[test]
 fn resolve_limits_clamps_to_host_ceiling() {
-    let limits = ExternalCheckComponentLimits {
+    let limits = ExternalCheckLimits {
         timeout_ms: Some(HOST_CEILING_TIMEOUT_MS + 60_000),
         max_memory_mb: Some(super::HOST_CEILING_MAX_MEMORY_MB + 256),
     };
@@ -602,7 +602,7 @@ fn resolve_limits_clamps_to_host_ceiling() {
 
 #[test]
 fn resolve_limits_partial_override_timeout_only() {
-    let limits = ExternalCheckComponentLimits {
+    let limits = ExternalCheckLimits {
         timeout_ms: Some(1_000),
         max_memory_mb: None,
     };
@@ -614,7 +614,7 @@ fn resolve_limits_partial_override_timeout_only() {
 #[test]
 fn resolve_limits_partial_override_memory_only() {
     // No explicit timeout → proportional default (n_files=0 means BASE only).
-    let limits = ExternalCheckComponentLimits {
+    let limits = ExternalCheckLimits {
         timeout_ms: None,
         max_memory_mb: Some(128),
     };

@@ -21,9 +21,11 @@ pub const GENERATED_IMPLEMENTATION_PREFIX: &str = "generated:";
 pub const BUNDLED_IMPLEMENTATION_PREFIX: &str = "bundled:";
 
 pub mod declarative;
+pub(crate) mod timeout;
 
 pub use declarative::{
-    ExternalCheckDeclarativePackage, FixInvocationOutcome, run_declarative_check, run_declarative_fix,
+    DeclarativeFixContext, ExternalCheckDeclarativePackage, FixInvocationOutcome, run_declarative_check,
+    run_declarative_fix,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,21 +156,25 @@ pub struct ExternalCheckComponentPackage {
     /// always equals the package `id`. For multi-check component bundles it
     /// selects the specific export within the component.
     pub check_name: String,
-    pub limits: Option<ExternalCheckComponentLimits>,
+    pub limits: Option<ExternalCheckLimits>,
     /// Optional allowlist of check IDs exported by this component. When present,
     /// must agree with what `list-checks` returns (defense-in-depth).
     pub checks: Option<Vec<String>>,
     pub provenance: Option<ExternalCheckArtifactProvenance>,
 }
 
-/// Per-manifest resource limits for a component-mode check. Values are clamped
-/// by a host ceiling at execution time so an out-of-tree manifest cannot grant
-/// itself unbounded resources.
+/// Per-manifest resource limits. `timeout_ms` bounds the complete component or
+/// declarative check execution, including binary resolution and all subprocesses;
+/// `max_memory_mb` applies only to component checks. Values are clamped by host
+/// ceilings so out-of-tree manifests cannot grant themselves unbounded resources.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternalCheckComponentLimits {
+pub struct ExternalCheckLimits {
     pub timeout_ms: Option<u64>,
     pub max_memory_mb: Option<u64>,
 }
+
+/// Backwards-compatible name for [`ExternalCheckLimits`].
+pub type ExternalCheckComponentLimits = ExternalCheckLimits;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -252,6 +258,8 @@ struct RawDeclarativeCheckManifest {
     invocations: Vec<declarative::RawInvocation>,
     #[serde(default)]
     skip_symlinks: bool,
+    #[serde(default)]
+    limits: Option<RawExternalCheckLimits>,
 }
 
 impl RawDeclarativeCheckManifest {
@@ -275,15 +283,17 @@ impl RawDeclarativeCheckManifest {
             needs: self.needs,
             invocations: self.invocations,
             skip_symlinks: self.skip_symlinks,
+            limits: validate_declarative_limits(self.limits)?,
         };
 
+        let implementation = ExternalCheckPackageImplementation::Declarative(
+            declarative::validate_declarative_implementation(declarative_fields)?,
+        );
         Ok(ExternalCheckPackage {
             id,
             runtime,
             api_version,
-            implementation: ExternalCheckPackageImplementation::Declarative(
-                declarative::validate_declarative_implementation(declarative_fields)?,
-            ),
+            implementation,
         })
     }
 }
@@ -308,7 +318,7 @@ struct RawExternalCheckPackage {
     artifact_sha256: Option<String>,
     // Component-mode fields.
     #[serde(default)]
-    limits: Option<RawExternalCheckComponentLimits>,
+    limits: Option<RawExternalCheckLimits>,
     #[serde(default)]
     checks: Vec<String>,
     #[serde(default)]
@@ -327,9 +337,9 @@ struct RawExternalCheckPackage {
     skip_symlinks: bool,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawExternalCheckComponentLimits {
+struct RawExternalCheckLimits {
     #[serde(default)]
     timeout_ms: Option<u64>,
     #[serde(default)]
@@ -358,6 +368,10 @@ impl RawExternalCheckPackage {
             needs,
             invocations,
             skip_symlinks,
+            limits: match mode {
+                RawExternalCheckMode::Declarative => validate_declarative_limits(limits.clone())?,
+                RawExternalCheckMode::Component => None,
+            },
         };
 
         let id = required_non_empty("id", id)?;
@@ -387,7 +401,6 @@ impl RawExternalCheckPackage {
             RawExternalCheckMode::Declarative => {
                 reject_if_present("artifact_path", artifact_path.as_ref())?;
                 reject_if_present("artifact_sha256", artifact_sha256.as_ref())?;
-                reject_if_present("limits", limits.as_ref())?;
                 reject_if_present_list("checks", &checks)?;
                 reject_if_present("provenance", provenance.as_ref())?;
                 ExternalCheckPackageImplementation::Declarative(declarative::validate_declarative_implementation(
@@ -409,11 +422,11 @@ fn validate_component_implementation(
     id: &str,
     artifact_path: Option<String>,
     artifact_sha256: Option<String>,
-    limits: Option<RawExternalCheckComponentLimits>,
+    limits: Option<RawExternalCheckLimits>,
     checks: Vec<String>,
     provenance: Option<ExternalCheckArtifactProvenance>,
 ) -> Result<ExternalCheckComponentPackage> {
-    let validated_limits = limits.as_ref().map(|raw| ExternalCheckComponentLimits {
+    let validated_limits = limits.as_ref().map(|raw| ExternalCheckLimits {
         timeout_ms: raw.timeout_ms,
         max_memory_mb: raw.max_memory_mb,
     });
@@ -427,6 +440,17 @@ fn validate_component_implementation(
         checks: checks_allowlist,
         provenance,
     })
+}
+
+fn validate_declarative_limits(limits: Option<RawExternalCheckLimits>) -> Result<Option<ExternalCheckLimits>> {
+    let Some(limits) = limits else { return Ok(None) };
+    if limits.max_memory_mb.is_some() {
+        bail!("declarative `limits` supports `timeout_ms` only; `max_memory_mb` applies only to component checks")
+    }
+    Ok(Some(ExternalCheckLimits {
+        timeout_ms: limits.timeout_ms,
+        max_memory_mb: None,
+    }))
 }
 
 fn validate_runtime_for_mode(mode: RawExternalCheckMode, runtime: &str) -> Result<()> {

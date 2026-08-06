@@ -49,9 +49,9 @@ use sha2::{Digest, Sha256};
 use anyhow::{Context, Result};
 
 use super::{
-    EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, ExternalCheckComponentLimits,
-    ExternalCheckComponentPackage, ExternalCheckImplementationRef, ExternalCheckPackage,
-    ExternalCheckPackageImplementation, ExternalCheckPackageProvider, parse_external_check_manifest,
+    EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, ExternalCheckComponentPackage,
+    ExternalCheckImplementationRef, ExternalCheckLimits, ExternalCheckPackage, ExternalCheckPackageImplementation,
+    ExternalCheckPackageProvider, parse_external_check_manifest,
 };
 
 /// A first-party definition compiled into the binary.
@@ -62,8 +62,9 @@ struct BundledCheckDef {
     check_names: &'static [&'static str],
     kind: BundledCheckDefKind,
     /// Per-execution resource limits for component-mode definitions.
-    /// `None` uses the host's defaults (5 s timeout, 256 MiB memory).
-    limits: Option<ExternalCheckComponentLimits>,
+    /// `None` uses the host defaults: the proportional timeout from
+    /// [`crate::external::timeout`] and 256 MiB memory.
+    limits: Option<ExternalCheckLimits>,
 }
 
 enum BundledCheckDefKind {
@@ -250,7 +251,7 @@ fn resolve_from_defs(defs: &[BundledCheckDef], name: &str) -> Result<Option<Exte
 fn build_bundled_component_package(
     check_name: &str,
     bytes: &'static [u8],
-    limits: Option<ExternalCheckComponentLimits>,
+    limits: Option<ExternalCheckLimits>,
 ) -> ExternalCheckPackage {
     let hash = Sha256::digest(bytes);
     let mut sha256 = String::with_capacity(64);

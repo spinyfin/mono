@@ -2,6 +2,10 @@ id: lint/bazel
 mode: declarative
 runtime: declarative-v1
 api_version: v1
+# Building buildifier on a cold Bazel cache and a shared-server lock can take
+# several minutes; retain a bounded check-wide allowance for both.
+limits:
+  timeout_ms: 600000
 applies_to:
   - "**/BUILD"
   - "**/BUILD.bazel"
