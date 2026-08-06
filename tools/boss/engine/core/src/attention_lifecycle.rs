@@ -233,12 +233,6 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          for that question proves the queue wait ended; the scheduler also refreshes this signal while \
          the execution remains ready so an operator can distinguish an active wait from stale history.",
     ),
-    entry(
-        crate::stale_worker_sweep::STALE_WORKER_ATTENTION_KIND,
-        ClearedBy::ProducerReconciles,
-        "The stale-worker sweep rechecks tmux evidence every pass and resolves this attention when the \
-         same worker resumes terminal activity or terminalizes.",
-    ),
     // ── Cleared by a later completed pass of the same kind ──────────────
     entry(
         crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND,
@@ -248,6 +242,12 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          engine process was running, and the shape the rest of the table is modelled on.",
     ),
     // ── The producer owns resolution ────────────────────────────────────
+    entry(
+        crate::stale_worker_sweep::STALE_WORKER_ATTENTION_KIND,
+        ClearedBy::ProducerReconciles,
+        "The stale-worker sweep rechecks tmux evidence every pass and resolves this attention when the \
+         same worker resumes terminal activity or terminalizes.",
+    ),
     entry(
         crate::worker_escalation::WORKER_ESCALATION_ATTENTION_KIND,
         ClearedBy::ProducerReconciles,

@@ -228,14 +228,9 @@ const WORKER_XAI_API_KEY_NO_INTERACTIVE_AUTH: &str = "xai-boss-worker-no-interac
 /// unparseable, or newer than this value.
 pub(crate) const TMUX_SESSION_SCHEMA: &str = "1";
 /// Name of the environment variable [`TMUX_SESSION_SCHEMA`] is carried in.
-/// Redeclared in [`crate::tmux_adoption`] rather than imported, matching
-/// [`TMUX_SPAWN_TOKEN_ENV`]'s rationale: adoption reads what this constant
-/// names from a different process generation's live session, not from
-/// this module's own state. Private (not `pub(crate)`) because nothing
-/// outside this module reads it — only [`TMUX_SESSION_SCHEMA`] needs the
-/// wider visibility, for the reason given above.
+/// Adoption reads this name from a different process generation's live
+/// session, so it remains local to that compatibility boundary.
 const TMUX_SESSION_SCHEMA_ENV: &str = "BOSS_SESSION_SCHEMA";
-const TMUX_SPAWN_TOKEN_ENV: &str = "BOSS_SPAWN_TOKEN";
 const TMUX_SPAWN_TOKEN_OPTION: &str = "@boss_spawn_token";
 
 /// Durable writes surrounding a tmux session creation. Kept as a narrow

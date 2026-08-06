@@ -36,16 +36,20 @@
 //!    append an audit line, release the pool slot, emit a dispatch event, and
 //!    kick the coordinator so stranded work is redispatched.
 //!
-//! ## False-positive guards
+//! ## False-positive guards (cadence fallback)
 //!
-//! The combination of (a) `activity == Working`, (b) no tool in flight,
-//! and (c) a generous [`DEFAULT_STALE_THRESHOLD_SECS`] (30 min) keeps
-//! this conservative. A worker that is merely thinking, streaming a long
-//! response, or running a foreground command emits a hook (or holds
-//! `current_tool`) well inside that window; only a worker that has
-//! genuinely parked itself trips the reap. The [`STALE_GRACE_SECS`]
-//! guard additionally skips executions whose `started_at` is too recent
-//! to have a meaningful event history.
+//! These guards apply only to the cadence fallback in step 3 above — the
+//! terminal branch in step 2 reaps on an authoritative dead-pane signal with
+//! no tool-in-flight or cadence check at all. For the fallback, the
+//! combination of (a) `activity == Working`, (b) no tool in flight, (c) the
+//! driver's [`crate::driver::ProgressFidelity`] tier not being exempt from
+//! cadence reaping (`fidelity_exempt_skipped`), and (d) a generous
+//! [`DEFAULT_STALE_THRESHOLD_SECS`] (30 min) keeps it conservative. A worker
+//! that is merely thinking, streaming a long response, or running a
+//! foreground command emits a hook (or holds `current_tool`) well inside
+//! that window; only a worker that has genuinely parked itself trips the
+//! reap. The [`STALE_GRACE_SECS`] guard additionally skips executions whose
+//! `started_at` is too recent to have a meaningful event history.
 //!
 //! ## Cadence
 //!
@@ -63,7 +67,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use boss_protocol::WorkerActivity;
+use boss_protocol::{WorkerActivity, WorkerPaneDeathReason};
 use boss_tmux::{DisplayField, Tmux};
 
 use crate::coordinator::{ExecutionCoordinator, worker_id_for_slot};
@@ -311,6 +315,10 @@ pub struct StaleWorkerSweepOutcome {
     /// Slots skipped because an operator placed an explicit hold on the
     /// execution via `bossctl agents hold` (see [`crate::hold_registry`]).
     pub held_skipped: usize,
+    /// Slots skipped by the cadence fallback because the driver's
+    /// [`crate::driver::ProgressFidelity`] tier (`Coarse`/`Minimal`) is
+    /// exempt from hook-cadence-based reaping — those drivers do not emit
+    /// hooks reliably enough for silence to imply a stall.
     pub fidelity_exempt_skipped: usize,
 }
 
@@ -330,6 +338,7 @@ impl crate::sweep_loop::SweepOutcome for StaleWorkerSweepOutcome {
             tool_in_flight_skipped = self.tool_in_flight_skipped,
             grace_skipped = self.grace_skipped,
             held_skipped = self.held_skipped,
+            fidelity_exempt_skipped = self.fidelity_exempt_skipped,
             "stale-worker sweep: pass complete",
         );
     }
@@ -497,8 +506,11 @@ pub async fn run_one_pass_with_terminal(
                 continue;
             };
             if execution.status.is_terminal() {
-                let _ =
-                    work_db.resolve_external_tracker_attention(&execution.work_item_id, STALE_WORKER_ATTENTION_KIND);
+                if let Err(err) =
+                    work_db.resolve_external_tracker_attention(&execution.work_item_id, STALE_WORKER_ATTENTION_KIND)
+                {
+                    tracing::warn!(execution_id = %state.run_id, ?err, "stale-worker sweep: failed to resolve stale-worker attention on terminal execution");
+                }
                 continue;
             }
             let Some(started_epoch) = execution.started_epoch() else {
@@ -535,7 +547,7 @@ pub async fn run_one_pass_with_terminal(
                         stale_threshold_secs,
                         iso8601_utc(window_activity_epoch_secs),
                     );
-                    if let Err(err) = work_db.upsert_work_item_attention(
+                    if let Err(err) = work_db.upsert_external_tracker_attention(
                         &execution.work_item_id,
                         STALE_WORKER_ATTENTION_KIND,
                         "Worker appears stuck; inspection required",
@@ -553,25 +565,29 @@ pub async fn run_one_pass_with_terminal(
                     pane_dead_status,
                 } => {
                     outcome.dead += 1;
-                    let detail = match pane_dead_status.as_deref() {
-                        Some(status) => {
-                            format!("tmux session {session_name} reports pane_dead=1 (exit status {status})")
-                        }
-                        None => format!("tmux session {session_name} is absent or its spawn token no longer matches"),
-                    };
                     tracing::info!(
                         execution_id = %state.run_id,
                         session_name,
                         ?pane_dead_status,
                         "stale-worker sweep: tmux reports a dead worker; reconciling it",
                     );
+                    // The reap below releases the pool slot and drops this
+                    // slot's live-state entry, so no later pass can
+                    // reconcile a still-open stale_worker attention for this
+                    // work item — resolve it now while we still hold
+                    // `execution.work_item_id`.
+                    if let Err(err) =
+                        work_db.resolve_external_tracker_attention(&execution.work_item_id, STALE_WORKER_ATTENTION_KIND)
+                    {
+                        tracing::warn!(execution_id = %state.run_id, ?err, "stale-worker sweep: failed to resolve stale-worker attention on dead pane");
+                    }
                     if crate::dead_pid_sweep::reap_reported_pane_death(
                         work_db,
                         live_states,
                         coordinator.clone(),
                         dispatch_events,
                         &state.run_id,
-                        &detail,
+                        WorkerPaneDeathReason::ChildProcessExited,
                     )
                     .await
                     {
@@ -704,6 +720,20 @@ pub async fn run_one_pass_with_terminal(
                 "stale-worker sweep: failed to mark execution orphaned; skipping reap",
             );
             continue;
+        }
+
+        // This reap releases the pool slot and drops this slot's live-state
+        // entry, so no later pass can reconcile a still-open stale_worker
+        // attention for this work item — resolve it now while we still hold
+        // `execution.work_item_id`.
+        if let Err(err) =
+            work_db.resolve_external_tracker_attention(&execution.work_item_id, STALE_WORKER_ATTENTION_KIND)
+        {
+            tracing::warn!(
+                execution_id,
+                ?err,
+                "stale-worker sweep: failed to resolve stale-worker attention on cadence reap"
+            );
         }
 
         // Reap termination path (stale-worker sweep): tear down any
@@ -909,6 +939,18 @@ mod tests {
         }
     }
 
+    /// A terminal inspector that always fails the probe — models a tmux
+    /// command erroring (e.g. the server is unreachable). The sweep must
+    /// treat this as "unknown", never as "dead".
+    struct FailingTerminalInspector;
+
+    #[async_trait]
+    impl WorkerTerminalInspector for FailingTerminalInspector {
+        async fn inspect(&self, _execution_id: &str) -> Result<Option<TerminalLiveness>> {
+            Err(anyhow::anyhow!("tmux probe failed"))
+        }
+    }
+
     #[async_trait]
     impl StaleWorkerReaper for RecordingReaper {
         async fn reap_worker(&self, execution_id: &str) {
@@ -1091,6 +1133,246 @@ mod tests {
             attention
                 .body_markdown
                 .contains("tmux -L boss attach -t boss-worker-test")
+        );
+    }
+
+    /// The `WorkerLiveness::Dead` arm reaps through
+    /// `reap_reported_pane_death`, records the `pane_dead_status` detail on
+    /// the reap reason, and resolves any previously-open `stale_worker`
+    /// attention for the work item — the ProducerReconciles contract
+    /// `attention_lifecycle.rs` declares for this kind.
+    #[tokio::test]
+    async fn dead_tmux_pane_is_reaped_and_resolves_open_attention() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot(&live_states, 1, &execution_id, &work_item_id);
+        drive_to_working_idle(&live_states, 1);
+
+        // A prior pass raised a stale_worker attention (e.g. the worker was
+        // genuinely stuck before its pane died). It must be resolved once
+        // the pane is confirmed dead, or it is stranded open forever.
+        db.upsert_external_tracker_attention(
+            &work_item_id,
+            STALE_WORKER_ATTENTION_KIND,
+            "Worker appears stuck; inspection required",
+            "prior body",
+        )
+        .unwrap();
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+        let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let inspector = StaticTerminalInspector(TerminalLiveness::Dead {
+            session_name: "boss-worker-test".to_owned(),
+            pane_dead_status: Some("1".to_owned()),
+        });
+        let hold_registry = HoldRegistry::new();
+        let outcome = run_one_pass_with_terminal(
+            db.as_ref(),
+            &live_states,
+            Some(&inspector),
+            coordinator.clone(),
+            sink.as_ref(),
+            StaleWorkerSweepControls {
+                reaper: reaper.as_ref(),
+                hold_registry: &hold_registry,
+            },
+            ALWAYS_STALE,
+        )
+        .await;
+
+        assert_eq!(outcome.dead, 1);
+        assert_eq!(outcome.reaped, 1);
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Orphaned
+        );
+        // `reap_reported_pane_death` reconciles through the dead-pid-sweep
+        // teardown path, not the injected `StaleWorkerReaper` — that
+        // reaper backs only the cadence-fallback OS-process kill.
+        assert!(reaper.reaped().is_empty());
+
+        let open_items: Vec<_> = db
+            .list_attention_items_for_work_item(&work_item_id)
+            .unwrap()
+            .into_iter()
+            .filter(|item| item.kind == STALE_WORKER_ATTENTION_KIND && item.status == "open")
+            .collect();
+        assert!(
+            open_items.is_empty(),
+            "a dead pane must resolve any open stale_worker attention for the work item: {open_items:?}",
+        );
+    }
+
+    /// A tmux probe failure must never be treated as death: the slot is
+    /// skipped entirely, `terminal_probe_failed` is incremented, and nothing
+    /// is reaped.
+    #[tokio::test]
+    async fn terminal_probe_failure_skips_the_slot_without_reaping() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot(&live_states, 1, &execution_id, &work_item_id);
+        drive_to_working_idle(&live_states, 1);
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+        let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let inspector = FailingTerminalInspector;
+        let hold_registry = HoldRegistry::new();
+        let outcome = run_one_pass_with_terminal(
+            db.as_ref(),
+            &live_states,
+            Some(&inspector),
+            coordinator.clone(),
+            sink.as_ref(),
+            StaleWorkerSweepControls {
+                reaper: reaper.as_ref(),
+                hold_registry: &hold_registry,
+            },
+            ALWAYS_STALE,
+        )
+        .await;
+
+        assert_eq!(outcome.terminal_probe_failed, 1);
+        assert_eq!(outcome.reaped, 0);
+        assert_eq!(outcome.dead, 0);
+        assert_eq!(outcome.genuinely_stuck, 0);
+        assert_eq!(outcome.alive_and_working, 0);
+        assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Ready);
+        assert!(reaper.reaped().is_empty());
+        assert!(sink.events().await.is_empty());
+    }
+
+    /// A slot found `AliveAndWorking` after terminal evidence resolves any
+    /// previously-open `stale_worker` attention — the recovery half of the
+    /// ProducerReconciles contract.
+    #[tokio::test]
+    async fn alive_and_working_resolves_previously_open_attention() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot(&live_states, 1, &execution_id, &work_item_id);
+        drive_to_working_idle(&live_states, 1);
+
+        db.upsert_external_tracker_attention(
+            &work_item_id,
+            STALE_WORKER_ATTENTION_KIND,
+            "Worker appears stuck; inspection required",
+            "prior body",
+        )
+        .unwrap();
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+        let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        // Recent window activity and an in-flight hook both read as
+        // AliveAndWorking regardless of foreground state.
+        let inspector = StaticTerminalInspector(live_terminal(i64::MAX / 2, true));
+        let hold_registry = HoldRegistry::new();
+        let outcome = run_one_pass_with_terminal(
+            db.as_ref(),
+            &live_states,
+            Some(&inspector),
+            coordinator.clone(),
+            sink.as_ref(),
+            StaleWorkerSweepControls {
+                reaper: reaper.as_ref(),
+                hold_registry: &hold_registry,
+            },
+            ALWAYS_STALE,
+        )
+        .await;
+
+        assert_eq!(outcome.alive_and_working, 1);
+        assert_eq!(outcome.reaped, 0);
+        assert!(reaper.reaped().is_empty());
+
+        let open_items: Vec<_> = db
+            .list_attention_items_for_work_item(&work_item_id)
+            .unwrap()
+            .into_iter()
+            .filter(|item| item.kind == STALE_WORKER_ATTENTION_KIND && item.status == "open")
+            .collect();
+        assert!(
+            open_items.is_empty(),
+            "a recovered worker must resolve its open stale_worker attention: {open_items:?}",
+        );
+    }
+
+    /// A slot whose execution has already reached a terminal DB status is
+    /// skipped outright (the completion path raced the sweep) and any open
+    /// `stale_worker` attention is resolved rather than left stranded.
+    #[tokio::test]
+    async fn terminal_execution_is_skipped_and_resolves_open_attention() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+        let execution_id = create_old_execution(&db, &work_item_id);
+        db.mark_execution_orphaned(&execution_id, "test: already settled")
+            .unwrap();
+
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot(&live_states, 1, &execution_id, &work_item_id);
+        drive_to_working_idle(&live_states, 1);
+
+        db.upsert_external_tracker_attention(
+            &work_item_id,
+            STALE_WORKER_ATTENTION_KIND,
+            "Worker appears stuck; inspection required",
+            "prior body",
+        )
+        .unwrap();
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let inspector = StaticTerminalInspector(live_terminal(0, true));
+        let hold_registry = HoldRegistry::new();
+        let outcome = run_one_pass_with_terminal(
+            db.as_ref(),
+            &live_states,
+            Some(&inspector),
+            coordinator.clone(),
+            sink.as_ref(),
+            StaleWorkerSweepControls {
+                reaper: reaper.as_ref(),
+                hold_registry: &hold_registry,
+            },
+            ALWAYS_STALE,
+        )
+        .await;
+
+        assert_eq!(outcome.reaped, 0);
+        assert_eq!(outcome.dead, 0);
+        assert_eq!(outcome.genuinely_stuck, 0);
+        assert_eq!(outcome.alive_and_working, 0);
+        assert!(reaper.reaped().is_empty());
+        assert!(sink.events().await.is_empty());
+
+        let open_items: Vec<_> = db
+            .list_attention_items_for_work_item(&work_item_id)
+            .unwrap()
+            .into_iter()
+            .filter(|item| item.kind == STALE_WORKER_ATTENTION_KIND && item.status == "open")
+            .collect();
+        assert!(
+            open_items.is_empty(),
+            "a terminal execution must resolve its open stale_worker attention: {open_items:?}",
         );
     }
 

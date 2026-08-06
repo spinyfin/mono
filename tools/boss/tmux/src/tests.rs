@@ -208,11 +208,10 @@ async fn environment_and_option_reads_distinguish_absence() {
 }
 
 #[tokio::test]
-async fn set_option_capture_kill_and_display_use_the_private_server() {
+async fn set_option_capture_and_display_use_the_private_server() {
     let (tmux, runner) = tmux([
         success(""),
         success("pane text\n"),
-        success(""),
         success("1234\n"),
         success("claude\n"),
     ]);
