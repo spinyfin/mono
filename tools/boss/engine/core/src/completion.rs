@@ -1131,6 +1131,15 @@ impl BackgroundNudgeTracker {
         self.intents.forget(execution_id);
     }
 
+    /// Clear only the wait-duration horizon, leaving any recorded intent
+    /// alone. Used when the probe/horizon says suppression is no longer in
+    /// effect (no descendants, horizon elapsed, probe indeterminate) but the
+    /// nudge itself then gets debounced — the intent must survive that so
+    /// the recurring recheck sweep can still find and re-evaluate it later.
+    fn forget_horizon(&self, execution_id: &str) {
+        self.horizon.forget(execution_id);
+    }
+
     fn forget(&self, execution_id: &str) {
         self.horizon.forget(execution_id);
         self.intents.forget(execution_id);
@@ -1811,19 +1820,29 @@ pub enum StopOutcome {
     /// horizon elapses, the normal nudge/park flow resumes automatically
     /// (no coordinator action required — unlike [`StopOutcome::EscalationPending`]).
     BuildWaitPending { waited_secs: i64 },
-    /// The worker's Stop-boundary process tree still has live descendants
-    /// outside its foreground driver process group — e.g. a backgrounded
-    /// subagent spawned via the harness Agent tool that has not yet reported
-    /// back (observed live 2026-07-17). Same suppression shape as
-    /// [`Self::BuildWaitPending`] (checked before [`crate::nudge_breaker`] is
-    /// even consulted, so this Stop does not burn any of its cap) but a
-    /// distinct signal: process-tree-based rather than text-narration-based.
+    /// The worker's Stop-boundary process tree still has live delegated
+    /// descendants — e.g. a backgrounded subagent spawned via the harness
+    /// Agent tool that has not yet reported back (observed live
+    /// 2026-07-17). Same suppression shape as [`Self::BuildWaitPending`]
+    /// (checked before [`crate::nudge_breaker`] is even consulted, so this
+    /// Stop does not burn any of its cap) but a distinct signal:
+    /// process-tree-based rather than text-narration-based.
     /// `descendant_count` is how many delegated descendants
     /// [`crate::background_children`] found; `waited_secs` is how long this
     /// execution has been continuously reporting delegated descendants. The
     /// execution stays `waiting_human`; no probe is sent, nothing is parked. Once
     /// [`Self::background_children_horizon_secs`] elapses, the normal
     /// nudge/park flow resumes automatically.
+    ///
+    /// **Currently unreachable in production.** The process-group
+    /// discriminator this variant's `descendant_count` used to come from
+    /// was disproved (driver helpers and ordinary tool subprocesses may
+    /// legitimately run in their own process group, indistinguishable from
+    /// a delegated child) and removed — see
+    /// [`crate::background_children`]'s module doc. The production probe
+    /// now reports indeterminate on every Stop, so this variant only fires
+    /// today from a test-supplied probe, pending a driver/harness-owned
+    /// delegated-work signal to replace the process-group walk.
     BackgroundChildrenPending { descendant_count: usize, waited_secs: i64 },
     /// An operator placed an explicit hold on this execution via
     /// `bossctl agents hold` (see [`crate::hold_registry`]). The
