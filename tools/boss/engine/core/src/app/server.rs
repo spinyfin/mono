@@ -1001,9 +1001,9 @@ pub async fn serve_with_merge_probe(
         crate::database_backup::retention_count(),
     );
 
-    // Install the auto-populate capability (P783 task 7) before the merge
-    // poller starts, so the first design-PR merge it detects can enqueue a
-    // populate. Held in a process-wide OnceLock so the merge-trigger hook —
+    // Install the auto-populate capability before the merge poller starts,
+    // so the first design-PR merge it detects can enqueue a populate. Held
+    // in a process-wide OnceLock so the merge-trigger hook —
     // deep in the poller's call chain with only a `&WorkDb` — can spawn the
     // background pass without threading the provider through every signature.
     // It is the same utility-model provider the live-status summarizer uses;
