@@ -1,12 +1,13 @@
 //! Single shared mirror of Darwin's `proc_bsdinfo` (`<sys/proc_info.h>`),
 //! read via `libproc`'s `proc_pidinfo(PROC_PIDTBSDINFO, ...)`.
 //!
-//! [`crate::worker_registry::parent_pid`] and
-//! [`crate::background_children`]'s macOS process-group probe both need
-//! fields out of this same struct (`pbi_ppid`, `pbi_pgid`, `e_tpgid`).
-//! Keeping two independent ABI mirrors in the crate risked them silently
-//! diverging if `<sys/proc_info.h>` ever shifted, or if one mirror got a
-//! field-order fix the other didn't — so there is exactly one mirror, here.
+//! [`crate::worker_registry::parent_pid`] needs `pbi_ppid` out of this
+//! struct. The pgid/foreground-pgid fields this used to also expose (for
+//! [`crate::background_children`]'s process-group probe) were removed along
+//! with that probe — see `background_children`'s module doc for why the
+//! pgid discriminator was abandoned. The full raw layout mirror stays as-is
+//! regardless of which subset is exposed, since `proc_pidinfo` still needs
+//! a correctly sized buffer to write into.
 
 use std::os::raw::c_void;
 
@@ -77,8 +78,6 @@ struct RawProcBsdInfo {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ProcBsdInfo {
     pub(crate) ppid: libc::pid_t,
-    pub(crate) pgid: libc::pid_t,
-    pub(crate) foreground_pgid: libc::pid_t,
 }
 
 unsafe extern "C" {
@@ -91,8 +90,7 @@ unsafe extern "C" {
     ) -> libc::c_int;
 }
 
-/// Fetch `pid`'s `proc_bsdinfo` via `libproc` and pull out `pbi_ppid`,
-/// `pbi_pgid`, and `e_tpgid`.
+/// Fetch `pid`'s `proc_bsdinfo` via `libproc` and pull out `pbi_ppid`.
 pub(crate) fn proc_bsd_info(pid: libc::pid_t) -> std::io::Result<ProcBsdInfo> {
     let mut info = RawProcBsdInfo::default();
     let info_size = std::mem::size_of::<RawProcBsdInfo>() as libc::c_int;
@@ -108,8 +106,6 @@ pub(crate) fn proc_bsd_info(pid: libc::pid_t) -> std::io::Result<ProcBsdInfo> {
     }
     Ok(ProcBsdInfo {
         ppid: info.header.ppid as libc::pid_t,
-        pgid: info.job_control.process_group as libc::pid_t,
-        foreground_pgid: info.job_control.terminal_foreground_group as libc::pid_t,
     })
 }
 

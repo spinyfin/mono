@@ -142,10 +142,14 @@ impl WorkerCompletionHandler {
         self
     }
 
-    /// Wire the real [`crate::background_children::BackgroundActivityProbe`]
-    /// into this handler. `app.rs` wires in
-    /// [`crate::background_children::RegistryBackgroundActivityProbe`]; tests
-    /// inject a fixed-count stub to exercise the suppression path
+    /// Wire a [`crate::background_children::BackgroundActivityProbe`] into
+    /// this handler. `app.rs` wires in
+    /// [`crate::background_children::RegistryBackgroundActivityProbe`] —
+    /// which currently reports every Stop as indeterminate in production
+    /// (see that type's doc for why the process-group discriminator it used
+    /// to classify descendants was removed), so `BackgroundChildrenPending`
+    /// does not fire from the production wiring today. Tests inject a
+    /// fixed-count stub instead, to exercise the suppression path
     /// deterministically without a real process tree.
     pub fn with_background_activity_probe(
         mut self,

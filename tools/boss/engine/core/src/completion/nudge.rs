@@ -140,6 +140,14 @@ impl WorkerCompletionHandler {
         // Bounded by `background_children_tracker`'s horizon so a
         // genuinely wedged subagent (one that never exits) still
         // eventually reaches the normal nudge/park path.
+        // NOTE: none of the arms below clear the tracked *intent* on their
+        // own anymore — only the wait-duration horizon. Whether the intent
+        // itself survives this call is decided once, after the breaker
+        // verdict is known, below. Clearing it here (the previous shape)
+        // meant `NudgeDecision::TooSoon` always found the intent already
+        // gone, so `pending_background_nudge_execution_ids()` silently
+        // dropped the execution on the very first debounced recheck —
+        // exactly the stranding this suppression exists to prevent.
         let delegated_descendant_count = self
             .background_activity_probe
             .live_delegated_descendant_count(&execution.id);
@@ -147,7 +155,7 @@ impl WorkerCompletionHandler {
             Ok(0) => {
                 // A previously delegated child exited between recurring sweeps.
                 // Clear its wait baseline before the normal nudge proceeds.
-                self.background_children_tracker.forget(&execution.id);
+                self.background_children_tracker.forget_horizon(&execution.id);
             }
             Ok(descendant_count) => {
                 let now_epoch_secs = boss_engine_utils::epoch_time::now_epoch_secs();
@@ -189,7 +197,7 @@ impl WorkerCompletionHandler {
                         };
                     }
                     BuildWaitDecision::Expired { waited_secs } => {
-                        self.background_children_tracker.forget_intent(&execution.id);
+                        self.background_children_tracker.forget_horizon(&execution.id);
                         tracing::warn!(
                             execution_id = %execution.id,
                             descendant_count,
@@ -203,8 +211,8 @@ impl WorkerCompletionHandler {
                 }
             }
             Err(reason) => {
-                self.background_children_tracker.forget(&execution.id);
-                tracing::warn!(
+                self.background_children_tracker.forget_horizon(&execution.id);
+                tracing::debug!(
                     execution_id = %execution.id,
                     %reason,
                     "auto-nudge: background-child probe indeterminate — proceeding to nudge; \
@@ -212,7 +220,7 @@ impl WorkerCompletionHandler {
                 );
             }
         }
-        match self.nudge_breaker.record(
+        let outcome = match self.nudge_breaker.record(
             &execution.id,
             fingerprint,
             self.max_unproductive_nudges,
@@ -227,7 +235,7 @@ impl WorkerCompletionHandler {
                 );
                 self.publish_awaiting_pr(execution).await;
                 self.probe_queuer.queue_probe(&execution.id, probe_text);
-                proceed_outcome
+                proceed_outcome.clone()
             }
             NudgeDecision::TooSoon { since_last } => {
                 // The identical fingerprint was just nudged; a Stop this
@@ -253,7 +261,33 @@ impl WorkerCompletionHandler {
                 self.park_for_unproductive_nudges(execution, count, bound_pr_url, "no new commit, PR, or state change")
                     .await
             }
+        };
+        // A debounced Stop carries no evidence the worker resumed — the
+        // nudge simply didn't fire this round because of the fingerprint
+        // debounce window — so the intent must stay observable for the
+        // recurring background-nudge recheck sweep
+        // (`pending_background_nudge_execution_ids`) to re-evaluate later.
+        // Re-record with fresh context (a new watermark, in particular) so
+        // the recheck compares against current state, not stale state from
+        // whenever this intent was first captured. Every other outcome
+        // means the nudge/park path actually concluded (or an early
+        // `BackgroundChildrenPending`/similar suppression above already
+        // returned), so any tracked intent is stale and safe to drop.
+        if matches!(outcome, StopOutcome::NudgeDebounced) {
+            self.background_children_tracker.record_intent(
+                &execution.id,
+                BackgroundNudgeIntent {
+                    probe_text: probe_text.to_owned(),
+                    fingerprint: fingerprint.to_owned(),
+                    bound_pr_url: bound_pr_url.map(str::to_owned),
+                    proceed_outcome,
+                    activity_watermark: self.background_activity_probe.activity_watermark(&execution.id),
+                },
+            );
+        } else {
+            self.background_children_tracker.forget_intent(&execution.id);
         }
+        outcome
     }
 
     /// Execution ids whose Stop-boundary nudge is currently suppressed by
@@ -269,12 +303,18 @@ impl WorkerCompletionHandler {
     /// no-PR nudges. Returns `None` when the execution has moved on.
     pub(crate) async fn recheck_background_nudge(&self, execution_id: &str) -> Option<StopOutcome> {
         let intent = self.background_children_tracker.intent(execution_id)?;
+        // Only retire on POSITIVE proof of resumption: both the recorded and
+        // the current watermark must be present and differ. A current
+        // watermark of `None` is "no hook-only evidence available right
+        // now" (e.g. the registry entry momentarily turned terminal or was
+        // re-registered) — not proof the worker resumed — so it must never
+        // retire the intent on its own. Retiring on a `None` here is the
+        // fail-closed bug this check exists to avoid: it would strand a
+        // worker that never resumed by discarding the one record that lets
+        // it be rechecked again.
         if let Some(watermark) = intent.activity_watermark.as_deref()
-            && self
-                .background_activity_probe
-                .activity_watermark(execution_id)
-                .as_deref()
-                != Some(watermark)
+            && let Some(current) = self.background_activity_probe.activity_watermark(execution_id)
+            && current != watermark
         {
             tracing::debug!(
                 execution_id,
