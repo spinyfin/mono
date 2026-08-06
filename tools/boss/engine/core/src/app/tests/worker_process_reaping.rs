@@ -1,6 +1,47 @@
+use boss_tmux::{CommandOutput, CommandRunner, Tmux};
+
 use super::super::server::process_group_signal_target;
 use super::*;
 use crate::test_support::spawn_group_leader_sleeper;
+
+#[derive(Default)]
+struct StubTmuxRunner {
+    outcomes: std::sync::Mutex<std::collections::VecDeque<CommandOutput>>,
+}
+
+impl StubTmuxRunner {
+    fn replies(replies: impl IntoIterator<Item = CommandOutput>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            outcomes: std::sync::Mutex::new(replies.into_iter().collect()),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandRunner for StubTmuxRunner {
+    async fn run(
+        &self,
+        _program: &std::path::Path,
+        _args: &[std::ffi::OsString],
+        _cwd: Option<&std::path::Path>,
+    ) -> std::io::Result<CommandOutput> {
+        Ok(self
+            .outcomes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("stub runner received an unexpected tmux command"))
+    }
+}
+
+fn ok_output(stdout: &str) -> CommandOutput {
+    CommandOutput {
+        success: true,
+        code: Some(0),
+        stdout: stdout.to_owned(),
+        stderr: String::new(),
+    }
+}
 
 #[test]
 fn process_group_signal_target_negates_pgid_for_live_pid() {
@@ -115,6 +156,55 @@ async fn release_worker_pane_reports_no_live_worker_for_a_dead_recorded_pid() {
     assert_eq!(
         server_state.release_worker_pane(&execution_id).await,
         PaneReleaseOutcome::NoLiveWorker,
+    );
+}
+
+/// A tmux-hosted worker whose recorded pane pid is dead still leaks its
+/// session unless the `NoLiveWorker` early return also runs the tmux reap.
+/// Seeds a tmux identity on top of the dead-pid shape from the test above,
+/// installs a stubbed `Tmux` so the reap runs against a scripted server
+/// instead of a real binary, and asserts the session gets killed and the
+/// identity columns cleared even though the OS-pid probe found nothing to
+/// vouch for.
+#[tokio::test]
+async fn release_worker_pane_still_reaps_a_tmux_session_for_a_dead_recorded_pid() {
+    use crate::test_support::*;
+
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+    let execution_id = create_spawned_execution(db, &work_item_id, 4_194_303);
+
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(&execution_id, boss_tmux::SERVER_LABEL, "boss-1-example", "tok-x")
+            .unwrap(),
+        "intent write must find the run row",
+    );
+    assert!(
+        db.record_tmux_session_created_for_execution(&execution_id, "tok-x", 4_194_303)
+            .unwrap(),
+        "creation write must find the intent row it just wrote",
+    );
+
+    let runner = StubTmuxRunner::replies([
+        ok_output("BOSS_SPAWN_TOKEN=tok-x\n"),
+        ok_output("BOSS_SPAWN_TOKEN=tok-x\n"),
+        ok_output(""),
+    ]);
+    let tmux = Tmux::with_runner("/opt/homebrew/bin/tmux", runner).unwrap();
+    server_state.set_tmux_override_for_test(tmux);
+
+    assert_eq!(
+        server_state.release_worker_pane(&execution_id).await,
+        PaneReleaseOutcome::NoLiveWorker,
+        "no live OS pid, so the lease contract is unchanged by the tmux reap",
+    );
+
+    assert!(
+        db.tmux_identity_for_execution(&execution_id).unwrap().is_none(),
+        "the tmux session must still be reaped and its identity cleared even though the pid probe \
+         found no live process to vouch for",
     );
 }
 

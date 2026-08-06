@@ -72,6 +72,10 @@ impl ServerState {
                 return TmuxTeardownOutcome::NotTmuxHosted;
             }
         };
+        let override_tmux = self.tmux_override.lock().unwrap().clone();
+        if let Some(tmux) = override_tmux {
+            return self.reap_tmux_worker_with(&tmux, execution_id, &identity).await;
+        }
         let tmux = match Tmux::resolve() {
             Ok(tmux) => tmux,
             Err(err) => {
@@ -86,6 +90,17 @@ impl ServerState {
             }
         };
         self.reap_tmux_worker_with(&tmux, execution_id, &identity).await
+    }
+
+    /// Test-only: install a stubbed [`Tmux`] that [`Self::reap_tmux_worker`]
+    /// uses instead of resolving a real tmux binary. Lets a test exercise
+    /// the caller-side wiring (`release_worker_pane`,
+    /// `reap_untracked_worker_process`) end-to-end against a scripted
+    /// `CommandRunner`, the same way [`Self::reap_tmux_worker_with`]'s own
+    /// direct-call tests do.
+    #[cfg(test)]
+    pub(crate) fn set_tmux_override_for_test(&self, tmux: Tmux) {
+        *self.tmux_override.lock().unwrap() = Some(tmux);
     }
 
     /// [`Self::reap_tmux_worker`]'s dependency-injected body — split out so
@@ -185,21 +200,34 @@ impl ServerState {
             .work_db
             .clear_tmux_identity_for_execution(execution_id, &identity.spawn_token)
         {
-            Ok(true) => tracing::info!(
-                execution_id,
-                session = %identity.session_name,
-                "reap_tmux_worker: session reaped and identity columns cleared",
-            ),
-            Ok(false) => tracing::debug!(
-                execution_id,
-                "reap_tmux_worker: identity columns already cleared (idempotent)",
-            ),
-            Err(err) => tracing::warn!(
-                execution_id,
-                error = %format!("{err:#}"),
-                "reap_tmux_worker: failed clearing tmux identity columns",
-            ),
+            Ok(true) => {
+                tracing::info!(
+                    execution_id,
+                    session = %identity.session_name,
+                    "reap_tmux_worker: session reaped and identity columns cleared",
+                );
+                TmuxTeardownOutcome::Reaped
+            }
+            Ok(false) => {
+                tracing::debug!(
+                    execution_id,
+                    "reap_tmux_worker: identity columns already cleared (idempotent)",
+                );
+                TmuxTeardownOutcome::Reaped
+            }
+            Err(err) => {
+                // The session itself may already be dead/destroyed, but the
+                // identity columns still claim a live tmux identity — a
+                // future teardown call must retry the clear, so this must
+                // NOT report `Reaped` (whose contract is "and the identity
+                // columns were cleared").
+                tracing::warn!(
+                    execution_id,
+                    error = %format!("{err:#}"),
+                    "reap_tmux_worker: failed clearing tmux identity columns",
+                );
+                TmuxTeardownOutcome::Refused
+            }
         }
-        TmuxTeardownOutcome::Reaped
     }
 }

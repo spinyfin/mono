@@ -264,6 +264,44 @@ async fn kill_session_verified_treats_an_absent_session_as_already_torn_down() {
 }
 
 #[tokio::test]
+async fn kill_session_verified_treats_a_missing_session_as_already_torn_down() {
+    let (tmux, runner) = tmux([failure("can't find session: boss-1")]);
+    let outcome = tmux.kill_session_verified("boss-1", "secret").await.unwrap();
+    assert_eq!(outcome, KillSessionOutcome::Absent);
+    assert_eq!(
+        runner.calls(),
+        vec![vec![
+            "-L",
+            "boss",
+            "show-environment",
+            "-t",
+            "boss-1",
+            "BOSS_SPAWN_TOKEN"
+        ]],
+        "a missing session must never issue kill-session",
+    );
+}
+
+#[tokio::test]
+async fn kill_session_verified_treats_a_dead_server_as_already_torn_down() {
+    let (tmux, runner) = tmux([failure("no server running on /tmp/tmux-501/boss")]);
+    let outcome = tmux.kill_session_verified("boss-1", "secret").await.unwrap();
+    assert_eq!(outcome, KillSessionOutcome::Absent);
+    assert_eq!(
+        runner.calls(),
+        vec![vec![
+            "-L",
+            "boss",
+            "show-environment",
+            "-t",
+            "boss-1",
+            "BOSS_SPAWN_TOKEN"
+        ]],
+        "a dead server must never issue kill-session",
+    );
+}
+
+#[tokio::test]
 async fn standard_tmux_options_are_supported() {
     let (tmux, runner) = tmux([success("")]);
     tmux.set_option("boss-1", "remain-on-exit", "on").await.unwrap();

@@ -138,6 +138,83 @@ async fn release_worker_pane_drops_live_worker_state() {
 }
 
 #[tokio::test]
+async fn release_worker_pane_reaps_the_tmux_session_for_a_slot_mapped_run() {
+    // Regression coverage for the slot-mapped call site
+    // (`release_worker_pane`'s primary body, as opposed to the
+    // no-slot-mapping fallback covered in `worker_process_reaping.rs`):
+    // a tmux-hosted worker's session must be torn down and its identity
+    // columns cleared alongside the libghostty pane release, even when no
+    // app session is registered to answer the pane-release request.
+    use boss_tmux::{CommandOutput, CommandRunner, Tmux};
+
+    #[derive(Default)]
+    struct StubRunner {
+        outcomes: std::sync::Mutex<std::collections::VecDeque<CommandOutput>>,
+    }
+    #[async_trait::async_trait]
+    impl CommandRunner for StubRunner {
+        async fn run(
+            &self,
+            _program: &std::path::Path,
+            _args: &[std::ffi::OsString],
+            _cwd: Option<&std::path::Path>,
+        ) -> std::io::Result<CommandOutput> {
+            Ok(self
+                .outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("stub runner received an unexpected tmux command"))
+        }
+    }
+    fn ok_output(stdout: &str) -> CommandOutput {
+        CommandOutput {
+            success: true,
+            code: Some(0),
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+        }
+    }
+
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+    let execution_id = create_old_execution(db, &work_item_id);
+    db.start_execution_run(&execution_id, "worker-1", "repo-1", "lease-1", "ws-1", "/tmp/ws")
+        .unwrap();
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(&execution_id, boss_tmux::SERVER_LABEL, "boss-1-example", "tok-y")
+            .unwrap(),
+    );
+    assert!(
+        db.record_tmux_session_created_for_execution(&execution_id, "tok-y", 0)
+            .unwrap(),
+    );
+
+    server_state.worker_registry.register_run_slot(&execution_id, 1);
+
+    let runner = StubRunner {
+        outcomes: std::sync::Mutex::new(std::collections::VecDeque::from([
+            ok_output("BOSS_SPAWN_TOKEN=tok-y\n"),
+            ok_output("BOSS_SPAWN_TOKEN=tok-y\n"),
+            ok_output(""),
+        ])),
+    };
+    let tmux = Tmux::with_runner("/opt/homebrew/bin/tmux", std::sync::Arc::new(runner)).unwrap();
+    server_state.set_tmux_override_for_test(tmux);
+
+    // No app session registered, so the pane-release SendToApp call
+    // returns NotRegistered — the tmux reap must still run.
+    server_state.release_worker_pane(&execution_id).await;
+
+    assert!(
+        db.tmux_identity_for_execution(&execution_id).unwrap().is_none(),
+        "the slot-mapped release path must also reap the tmux session and clear its identity",
+    );
+}
+
+#[tokio::test]
 async fn release_worker_pane_releases_matching_worker_pool_slot() {
     // Engine-side lifecycle pairing: the WorkerPool slot is held
     // for the lifetime of the libghostty pane (not just for the

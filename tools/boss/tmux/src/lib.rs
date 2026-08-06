@@ -170,7 +170,7 @@ impl Tmux {
         ]);
         let output = self.run(&args).await?;
         if !output.success {
-            if output.stderr.contains("no server running") {
+            if is_absent_session_stderr(&output.stderr) {
                 return Ok(Vec::new());
             }
             return command_failed(&args, &output);
@@ -198,7 +198,10 @@ impl Tmux {
                 .map(|value| Some(value.to_owned()))
                 .ok_or_else(|| anyhow::anyhow!("unexpected tmux environment output for {name:?}: {value:?}"));
         }
-        if output.stderr.contains("unknown variable") || output.stderr.contains("environment variable not found") {
+        if output.stderr.contains("unknown variable")
+            || output.stderr.contains("environment variable not found")
+            || is_absent_session_stderr(&output.stderr)
+        {
             return Ok(None);
         }
         command_failed(&args, &output)
@@ -364,6 +367,18 @@ fn parse_session(line: &str) -> Result<Session> {
         name: name.to_owned(),
         spawn_token: (!token.is_empty()).then(|| token.to_owned()),
     })
+}
+
+/// True when tmux's stderr indicates the target session (or the whole
+/// private server) simply does not exist, as opposed to a real command
+/// failure. tmux reports this a few different ways depending on whether the
+/// session is missing or the server itself was never started:
+/// `"can't find session: <name>"`, `"session not found: <name>"`, and
+/// `"no server running on <socket>"`.
+fn is_absent_session_stderr(stderr: &str) -> bool {
+    stderr.contains("can't find session")
+        || stderr.contains("session not found")
+        || stderr.contains("no server running")
 }
 
 fn command_failed<T>(args: &[OsString], output: &CommandOutput) -> Result<T> {

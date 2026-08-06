@@ -885,12 +885,23 @@ impl WorkDb {
         .map_err(Into::into)
     }
 
-    /// The tmux session identity durably recorded for `execution_id`'s
-    /// current run — the read [`crate::app::ServerState::reap_tmux_worker`]
-    /// starts every tmux teardown from. Targets the same row
+    /// The tmux session identity durably recorded for `execution_id` — the
+    /// read [`crate::app::ServerState::reap_tmux_worker`] starts every tmux
+    /// teardown from. Targets the same row
     /// [`Self::record_tmux_spawn_intent_for_execution`] /
-    /// [`Self::record_tmux_session_created_for_execution`] wrote, via
-    /// [`resolve_run_id_for_execution_hooks`].
+    /// [`Self::record_tmux_session_created_for_execution`] wrote.
+    ///
+    /// Deliberately does NOT go through [`resolve_run_id_for_execution_hooks`]:
+    /// that resolver's tie-breaks (prefer unfinished, deprioritize `failed`,
+    /// prefer a row with a transcript) exist for routing a *live hook write*
+    /// to the run it's about, and can pick an older sibling run over the
+    /// execution's newest one — e.g. after a resume/re-dispatch left two rows
+    /// behind and the newer one is `failed` or has no transcript yet. That
+    /// older row's identity columns are normally already NULL, so the query
+    /// would then report "no identity" and silently leave the newer run's
+    /// live session untorn-down. Teardown does not need those tie-breaks; it
+    /// needs the newest row that actually still carries an identity, so this
+    /// queries `work_runs` directly and orders by recency.
     ///
     /// Unlike [`Self::list_adoptable_tmux_runs`], this applies no status
     /// filtering at all: teardown must find a run's tmux identity even
@@ -900,14 +911,13 @@ impl WorkDb {
     /// callers must treat both as nothing left to do.
     pub fn tmux_identity_for_execution(&self, execution_id: &str) -> Result<Option<TmuxIdentity>> {
         let conn = self.connect()?;
-        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
-            return Ok(None);
-        };
         conn.query_row(
             "SELECT tmux_session_name, tmux_spawn_token, tmux_pane_pid
              FROM work_runs
-             WHERE id = ?1 AND tmux_session_name IS NOT NULL AND tmux_spawn_token IS NOT NULL",
-            params![run_id],
+             WHERE execution_id = ?1 AND tmux_session_name IS NOT NULL AND tmux_spawn_token IS NOT NULL
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+            params![execution_id],
             |row| {
                 Ok(TmuxIdentity {
                     session_name: row.get(0)?,
