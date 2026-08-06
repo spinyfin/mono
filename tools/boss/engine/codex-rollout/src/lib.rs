@@ -22,6 +22,19 @@ pub struct CanonicalRolloutToolCall {
     pub call_id: Option<String>,
     pub tool_name: String,
     pub tool_input: Value,
+    /// Whether this call itself starts a shell command, as opposed to being
+    /// a pure continuation of one already running (a `tools.write_stdin`
+    /// cell, or any non-`exec`/`exec_command` tool).
+    ///
+    /// Computed from the **raw** dialect input, not from `tool_input`: for
+    /// the cell-harness (JavaScript) dialect, `tool_input.command` is
+    /// already the *extracted* command string once reshaped by
+    /// [`exec_command`], so re-deriving this fact from it would find no
+    /// `tools.exec_command(` call and misclassify every command-bearing
+    /// cell as a continuation. See
+    /// `boss_engine_driver::codex::rollout_calls::RolloutCallTracker::observe_output`,
+    /// the sole consumer, for why the distinction matters.
+    pub issues_command: bool,
 }
 
 /// Parsed tool-output body plus error flag derived from the rollout dialect.
@@ -76,6 +89,10 @@ pub fn canonical_rollout_tool_call(item_type: &str, payload: &Map<String, Value>
         other => other,
     };
 
+    let issues_command = match provider_name {
+        "exec" | "exec_command" => exec_input_issues_command(&parsed_input),
+        _ => true,
+    };
     let (tool_name, tool_input) = match provider_name {
         "exec" | "exec_command" => ("Bash".to_owned(), json!({"command": exec_command(&parsed_input)})),
         other => (other.to_owned(), parsed_input),
@@ -84,7 +101,35 @@ pub fn canonical_rollout_tool_call(item_type: &str, payload: &Map<String, Value>
         call_id,
         tool_name,
         tool_input,
+        issues_command,
     })
+}
+
+/// Whether an `exec` / `exec_command` call's raw (pre-reshape) input starts a
+/// command, as opposed to being a pure continuation.
+///
+/// The plain shell-tool dialect (`cmd`/`command`) always issues a command by
+/// definition. The cell-harness dialect only does when its script contains a
+/// command-bearing `tools.*` call ([`cell::commands_from_cell_script`]); a
+/// pure `tools.write_stdin` continuation script does not. Any other shape —
+/// an argv array, or an object using some other key — is unrecognised, and
+/// defaults to `true` (issues a command) rather than `false`: treating an
+/// unknown shape as a pure continuation would route its output through
+/// `sessions` in `observe_output` and let it be silently subsumed into
+/// someone else's origin, which is exactly the failure mode this field
+/// exists to prevent. Only a positively-identified continuation script (a
+/// string with no command-bearing cell call) returns `false`.
+fn exec_input_issues_command(parsed_input: &Value) -> bool {
+    if parsed_input
+        .get("cmd")
+        .or_else(|| parsed_input.get("command"))
+        .is_some()
+    {
+        return true;
+    }
+    !parsed_input
+        .as_str()
+        .is_some_and(|source| cell::commands_from_cell_script(source).is_empty())
 }
 
 /// The command an `exec` / `exec_command` tool call runs.
@@ -324,6 +369,22 @@ mod tests {
             .clone();
         let call = canonical_rollout_tool_call("custom_tool_call", &payload).expect("call");
         assert_eq!(call.tool_input.get("command").and_then(Value::as_str), Some(source));
+    }
+
+    #[test]
+    fn exec_input_issues_command_covers_the_known_and_unknown_shapes() {
+        assert!(exec_input_issues_command(&json!({"cmd": "echo hi"})));
+        assert!(exec_input_issues_command(&json!(
+            "const r = await tools.exec_command({\"cmd\":\"echo hi\"});"
+        )));
+        assert!(!exec_input_issues_command(&json!(
+            "const r = load(\"run\");\nconst p = await tools.write_stdin({\"session_id\":r.session_id});"
+        )));
+        // An unrecognised shape (here, an argv array with no `cmd`/`command`
+        // key) must default to `true`: treating it as a pure continuation
+        // would let `observe_output` silently subsume its output into
+        // someone else's session.
+        assert!(exec_input_issues_command(&json!({"argv": ["echo", "hi"]})));
     }
 
     #[test]
