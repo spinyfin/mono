@@ -155,13 +155,6 @@ impl WorkerCompletionHandler {
         self
     }
 
-    /// Wire an externally-owned background-children tracker into this
-    /// handler. Tests use it to share / inspect tracker state.
-    pub fn with_background_children_tracker(mut self, tracker: Arc<BuildWaitTracker>) -> Self {
-        self.background_children_tracker = Arc::new(BackgroundNudgeTracker::new(tracker));
-        self
-    }
-
     /// Override the background-children suppression horizon. Tests set this
     /// low (or to `0`) to exercise the post-expiry fallback to the normal
     /// nudge/park flow deterministically; production uses the default.

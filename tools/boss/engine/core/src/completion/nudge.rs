@@ -300,6 +300,39 @@ impl WorkerCompletionHandler {
             }
         };
 
+        // Consult the probe and horizon directly first. When the outcome is
+        // unchanged from the last pass (still delegated descendants, still
+        // inside the horizon), return the same `BackgroundChildrenPending`
+        // without re-reading the transcript or re-publishing the
+        // invalidation event — a long-running delegated subagent would
+        // otherwise produce a steady stream of duplicate publishes and log
+        // lines every sweep for the entire horizon. Only fall through to
+        // the full `nudge_or_park` path (which does that IO) once the
+        // outcome actually might have changed: the child exited or the
+        // horizon elapsed.
+        if let Ok(descendant_count) = self
+            .background_activity_probe
+            .live_delegated_descendant_count(execution_id)
+            && descendant_count > 0
+            && let BuildWaitDecision::Suppress { waited_secs } = self.background_children_tracker.record(
+                execution_id,
+                boss_engine_utils::epoch_time::now_epoch_secs(),
+                self.background_children_horizon_secs,
+            )
+        {
+            tracing::debug!(
+                execution_id,
+                descendant_count,
+                waited_secs,
+                "auto-nudge: recurring background-child recheck unchanged — still suppressed, \
+                 no republish"
+            );
+            return Some(StopOutcome::BackgroundChildrenPending {
+                descendant_count,
+                waited_secs,
+            });
+        }
+
         let outcome = self
             .nudge_or_park(
                 &execution,
