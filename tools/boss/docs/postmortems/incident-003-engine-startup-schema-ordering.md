@@ -115,7 +115,14 @@ pub(crate) fn migrate_work_runs_tmux_columns(conn: &Connection) -> Result<()> {
 
 It is invoked at `schema_init.rs:712` — **415 lines after the statement that already killed the process.**
 
-The decisive detail: the `CREATE UNIQUE INDEX` statement is **duplicated**. The same index appears once correctly (inside the migration, reachable only after the columns exist) and once fatally (inside the bootstrap batch, reachable before). Deleting the batch copy is the entire fix.
+The decisive detail: the `CREATE UNIQUE INDEX` statement is **duplicated**. The same index appears once correctly (inside the migration, reachable only after the columns exist) and once fatally (inside the bootstrap batch, reachable before).
+
+Deleting the batch copy would have stopped this outage, but it is not what shipped, and it would not have closed the class — the duplication is systemic (§3.5). The shipped fix instead makes the batch structurally incapable of failing on an existing database:
+
+- **Split the batch.** Baseline DDL is now tables only. Baseline index DDL runs _after_ the full migration chain, over the already-migrated column set, so no index statement can ever resolve a column the chain has not yet supplied.
+- **Folded in the exceptions.** Two indexes had previously been hand-hoisted out of the batch for this same reason. They now follow the one rule, so there is one rule instead of a rule plus two exceptions.
+- **Removed the duplicated column declarations.** All 40 columns that the baseline and a migration both supplied (§3.5) are gone from the baseline, so each column has a single owner.
+- **Added structural guard tests.** One asserts the baseline declares no indexes at all; one detects baseline/migration column duplication by construction. Reintroducing either shape fails the build rather than shipping.
 
 ### 3.3 Reproduced
 
@@ -143,6 +150,21 @@ Note the second command's output: the `CREATE TABLE IF NOT EXISTS` added **nothi
 Fresh databases — every developer machine, every CI run, every new install — take `apply_final_schema_template` (or run the chain against an empty file), create `work_runs` _with_ the five columns, and start cleanly. Only a database with history breaks, and it breaks deterministically, every single start.
 
 The installs with the most real work recorded in them are the ones guaranteed to fail. No amount of local testing on a scratch database can see it.
+
+### 3.5 The generator: 40 columns are declared twice
+
+One duplicated index caused this outage. It is not the interesting number. The fix work measured the class exhaustively: for each of the **577 columns** in the canonical schema, build a fresh database via the chain, drop that one column, re-run the chain, and record both whether the column comes back and whether the chain errors. Two distinct populations fall out.
+
+- **Index-ordering class — exactly one column.** `work_runs.tmux_spawn_token` is the _only_ column in the entire schema whose absence makes the bootstrap batch itself abort. This outage sat on a population of one. That is luck, not margin: it means the failure mode was one statement away from existing anywhere else in the file, and nothing was preventing it.
+- **Column-duplication class — 40 columns.** Forty columns are declared in the bootstrap batch _and_ supplied by a `migrate_*` function: the five `tmux_*` columns plus 35 across `products`, `projects`, `tasks`, `work_executions`, `work_runs`, and `work_attention_items`.
+
+The second number is the generator of this bug class, and the mechanism is worth naming precisely:
+
+> The baseline declaration only ever helps a **fresh** database. The migration is what upgrades **everyone else**. When both exist, the fresh path is served entirely by the baseline and never depends on the migration at all.
+
+So for any of those 40 columns, a migration that is broken, mis-guarded, or simply unreachable is **invisible on every developer machine and every CI run**, and visible only on installs with history. The duplication does not merely fail to help; it actively suppresses the signal, because it guarantees the only databases anyone tests against take the path that cannot notice. That is what makes this class recurrent rather than incidental — 40 independent opportunities for the same shape of defect, each one green in CI by construction.
+
+The single duplicated index was one of the 40 that happened to also be fatal. Removing it addresses the outage; removing the duplication addresses the class.
 
 ## 4. Recovery, and what it proves
 
@@ -456,7 +478,11 @@ The CLI's user-facing message (`client/src/lib.rs:228-232`) is therefore a bare 
 
 `boss chore create` routes through `ensure_engine_running`, so the outage blocked filing the chore _about_ the outage. Any Boss defect that prevents engine start is self-concealing: it destroys its own incident record at the moment the record would be created.
 
-This is a plausible explanation for why the 2026-08-01 incident appears in git history but not in the work tracker, and it means the surfacing work below is load-bearing rather than cosmetic — it is the difference between an incident that gets recorded and one that only gets remembered.
+This is a real property of the tooling, and it is verifiable from the code path alone: for the eleven minutes of this outage, the command that files an incident record was one of the commands the incident had disabled.
+
+**It is not, however, why the 2026-08-01 incident has no postmortem.** An earlier draft of this document inferred that the tracker gap for that incident was caused by the same self-concealment. That inference was wrong. The operator has stated the actual reason: he did not instruct the coordinator to write one. Nothing was blocked; a postmortem was simply not requested. The gap has a human cause, not a systemic one, and reading a tooling failure into it would have manufactured evidence for a conclusion that does not need it.
+
+The distinction matters for the same reason the rest of this document is careful about mechanisms: a self-concealing failure mode is worth stating because it is structurally true, not because it can be pinned to a specific missing record. §9.4's recommendations rest on the mechanism and on the eleven minutes of triage this outage actually cost — not on the Aug 1 gap.
 
 ### 9.4 What it should do instead
 
@@ -509,8 +535,8 @@ Owners are given by area. None of these are implemented by this document; the sc
 
 **Immediate — engine / schema**
 
-1. Remove the duplicated `CREATE UNIQUE INDEX … work_runs_tmux_spawn_token_idx` from the bootstrap batch (`schema_init.rs:236-238`). The correct copy already exists at `migrations_a.rs:499`. _(Tracked separately — do not duplicate.)_
-2. Remove the five tmux column declarations from the batch's `CREATE TABLE work_runs` (`schema_init.rs:227-231`). They are unreachable-by-design on the upgrade path and misleading on the fresh path, where the chain reaches the migration anyway.
+1. Split the bootstrap batch so baseline DDL is tables only and all baseline index DDL runs after the full migration chain, over the already-migrated column set — making the baseline structurally incapable of failing on an existing database. Fold in the two indexes previously hand-hoisted out for this same reason, so there is one rule and no exceptions. Add structural guard tests: one asserting the baseline declares no indexes, one detecting baseline/migration column duplication by construction. _(Tracked separately — do not duplicate.)_
+2. Remove the 40 duplicated column declarations from the baseline (§3.5), including the five `tmux_*` columns at `schema_init.rs:227-231`, so every column has a single owner. On the upgrade path the baseline copies are unreachable by design; on the fresh path the chain reaches the migration anyway, so the duplication buys nothing and costs the CI signal. _(Shipped as part of the same change as item 1 — tracked separately, do not duplicate.)_
 
 **Immediate — engine / testing**
 
