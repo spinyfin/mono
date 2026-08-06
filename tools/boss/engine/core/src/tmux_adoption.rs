@@ -692,16 +692,12 @@ async fn live_pid_exe_basename(pid: i32) -> Option<String> {
 /// Claim server-scoped tmux ownership for this engine process, or detect
 /// that a different, still-live engine already holds it.
 ///
-/// The recorded value is the bare pid. An earlier revision additionally
-/// appended a random per-boot marker (`<pid>:<marker>`) intending to match
-/// the design doc's `@boss_engine_owner = <engine boot id>` (L336), but nothing
-/// ever read it back: only one stamp value is visible at a time (whatever
-/// the option currently holds), with no history of prior markers to compare
-/// against, so there was no data left to corroborate a marker mismatch
-/// against — the field was write-only. It has been dropped; distinguishing a
-/// live conflict from a stale, pid-recycled stamp is [`EngineOwnerProbe`]'s
-/// job alone: a live pid is only treated as a genuine conflict when its own
-/// executable also looks like this engine's binary. An indeterminate probe
+/// The recorded value is the bare pid. A pid alone is not durable evidence
+/// of identity — if the engine that wrote it crashed, the OS can reassign
+/// the same pid to an unrelated process, and `kill(pid, 0)` cannot tell the
+/// two apart. [`EngineOwnerProbe`] is the mitigation: a live pid is only
+/// treated as a genuine conflict when its own executable also looks like
+/// this engine's binary. An indeterminate probe
 /// result (e.g. this process's own exe path is unavailable) falls back to
 /// the conservative "treat as conflict" default, same as every other
 /// best-effort check in this module. Adequate for the single-user-desktop
@@ -729,11 +725,9 @@ async fn claim_or_detect_conflicting_owner(
         }
     };
     if let Some(raw) = &existing {
-        // Only the part before the first `:` is ever meaningful: this
-        // process always writes a bare pid below, but a stamp left by an
-        // older build that still wrote `<pid>:<marker>` must keep parsing
-        // correctly across a rolling upgrade, so take the leading segment
-        // either way.
+        // Parse defensively: take the leading `:`-delimited segment so a
+        // hand-set or otherwise malformed option value degrades to
+        // "unparseable, treat as unset" rather than being mis-read.
         let other_pid = raw
             .split(':')
             .next()
@@ -958,12 +952,16 @@ async fn refuse_and_reap(
     } else {
         let after_kill = match row_kind {
             RefusedRowKind::NonTerminal => {
-                format!("then let the normal dead-worker reconcilers redispatch execution `{execution_id}`")
+                format!(
+                    "Then let the normal dead-worker reconcilers redispatch execution \
+                     `{execution_id}` — until it is killed, a redispatch risks a second worker \
+                     landing in the same cube workspace."
+                )
             }
             RefusedRowKind::Terminal => {
                 format!(
-                    "execution `{execution_id}` was already terminal, so once it is killed there is \
-                     nothing further to redispatch here"
+                    "Execution `{execution_id}` was already terminal, so there is nothing to \
+                     redispatch — killing the session is the whole remedy."
                 )
             }
         };
@@ -974,8 +972,7 @@ async fn refuse_and_reap(
              session was written by a build this engine no longer trusts to attach to safely. The \
              engine's attempt to kill the session ALSO FAILED, so it may still be running \
              unattended in tmux session `{session_name}`. Run `tmux -L boss kill-session -t \
-             {session_name}` manually to reap it, {after_kill} — until it is killed, a redispatch \
-             risks a second worker landing in the same cube workspace.\n\n\
+             {session_name}` manually to reap it. {after_kill}\n\n\
              This item is informational; dismiss it once you've manually killed the session and \
              confirmed the chore resumed.",
             failure.describe(),
