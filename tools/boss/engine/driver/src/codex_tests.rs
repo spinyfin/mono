@@ -77,17 +77,20 @@ fn codex_descriptor_matches_design() {
 }
 
 #[test]
-fn agent_rules_require_same_cell_polling_until_a_real_exit_status() {
+fn agent_rules_require_session_polling_until_a_real_exit_status() {
     let preamble = CodexDriver::default().agent_rules_preamble();
     for required in [
-        "exec_command` yields after at most 30 seconds",
-        "same JavaScript cell",
+        "expected to exceed roughly ten seconds",
+        "exec_command` yields after at most 30 seconds;",
         "tools.write_stdin",
         "chars: \"\"",
+        "text(JSON.stringify(r))",
+        "completion in the same JavaScript cell",
+        "let r = await tools.exec_command",
+        "session_id: r.session_id",
         "yield_time_ms: 300000",
-        "until `r`",
-        "contains `exit_code`",
-        "foreground timeout",
+        "carries `exit_code`.",
+        "own foreground timeout",
     ] {
         assert!(
             preamble.contains(required),
@@ -95,11 +98,19 @@ fn agent_rules_require_same_cell_polling_until_a_real_exit_status() {
         );
     }
     assert!(
-        preamble.contains("A result containing\n`session_id` means the command is still running"),
+        preamble.contains("a result containing\n`session_id` means the command is still running"),
         "a yielded session must never be presented as a completed gate: {preamble}"
     );
     assert!(
-        preamble.contains("Do not end the turn or claim a gate result without the real\nexit status"),
+        preamble.contains("`text(r.output)` discards that handle"),
+        "the worker must retain its session handle for polling: {preamble}"
+    );
+    assert!(
+        preamble.contains("only that invocation's output and logs") && preamble.contains("global process-name matches"),
+        "the worker must not attribute unrelated global processes to its command: {preamble}"
+    );
+    assert!(
+        preamble.contains("without the real `exit_code`"),
         "the worker must not infer success from a missing exit status: {preamble}"
     );
 }

@@ -262,10 +262,11 @@ static CODEX_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
 /// yield is capped at 30 seconds by codex-cli 0.145.0 and has no config/env/CLI
 /// override (`--strict-config` rejects the corresponding candidate keys).
 /// Unified exec does, however, return a session id and supports empty
-/// `write_stdin` polls up to 300 seconds. Keeping those polls inside the
-/// originating JavaScript cell matters: the rollout correlator observes that
-/// cell through its `wait` continuations and ultimately receives the command's
-/// real `exit_code`; a separate polling cell has no attributable command.
+/// `write_stdin` polls up to 300 seconds. The injected example keeps those
+/// polls inside the originating JavaScript cell: the rollout correlator
+/// observes that cell through its `wait` continuations and ultimately receives
+/// the command's real `exit_code`; a separate polling cell has no attributable
+/// command.
 const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed worker session. The engine\n\
      spawned you in a leased cube workspace and observes this session\n\
      via the Codex rollout JSONL file in this run's isolated CODEX_HOME.\n\
@@ -280,22 +281,38 @@ const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed 
      connectors). Use the shell instead: `gh` for GitHub reads,\n\
      `cube pr create` / `cube pr update` for pull requests, `jj` for VCS.\n\
      - **Do not start interactive, stdin-driven sessions** (a bare `bash` /\n\
-     `sh -s` / `python3` REPL, an editor, a pager) and drive them with\n\
-     `write_stdin`; commands typed into one are invisible to the guardrails.\n\
+     `sh -s` / `python3` REPL, an editor, a pager). Commands typed into those\n\
+     sessions are invisible to the guardrails.\n\
      Run each command as its own shell invocation instead:\n\
      `bash -lc '<command>'`, `python3 -c '<code>'`, `python3 <script.py>`,\n\
      `sqlite3 <db> '<sql>'`.\n\
      \n\
-     Long foreground commands need one extra step because Codex's\n\
-     `exec_command` yields after at most 30 seconds. A result containing\n\
-     `session_id` means the command is still running — never that it passed\n\
-     or failed. In the same JavaScript cell, keep awaiting\n\
-     `tools.write_stdin({session_id: r.session_id, chars: \"\",\n\
-     yield_time_ms: 300000})`, replacing `r` with each result, until `r`\n\
-     contains `exit_code`. Empty polling is allowed; writing commands through\n\
-     stdin is not. Do not end the turn or claim a gate result without the real\n\
-     exit status. Give a command that might hang its own foreground timeout so\n\
-     expiry returns a nonzero status instead of polling forever.";
+     To diagnose any command, use only that invocation's output and logs;\n\
+     never infer ownership or blockage from global process-name matches.\n\
+     \n\
+     For any ordinary command expected to exceed roughly ten seconds, keep its\n\
+     session handle and poll it to completion in the same JavaScript cell.\n\
+     `exec_command` yields after at most 30 seconds; a result containing\n\
+     `session_id` means the command is still running — never that it passed or\n\
+     failed. `text(r.output)` discards that handle, so use this pattern instead:\n\
+     \n\
+     ```js\n\
+     let r = await tools.exec_command({cmd: \"bazel test //backend/blob:blob_test //backend/admintasks:admintasks_test\",\n\
+     workdir: \"…\", yield_time_ms: 30000, max_output_tokens: 20000});\n\
+     while (!(\"exit_code\" in r)) {\n\
+       r = await tools.write_stdin({session_id: r.session_id, chars: \"\",\n\
+         yield_time_ms: 300000, max_output_tokens: 20000});\n\
+     }\n\
+     text(JSON.stringify(r));\n\
+     ```\n\
+     \n\
+     Empty `write_stdin(session_id, chars: \"\")` polling is explicitly\n\
+     allowed for a session started by an ordinary command; repeat the poll in\n\
+     that same cell with its returned `session_id` until the terminal result\n\
+     carries `exit_code`. Writing commands through stdin is not. Do not end the\n\
+     turn or claim a gate result without the real `exit_code`. Give a command\n\
+     that might hang its own foreground timeout so expiry returns a nonzero\n\
+     status instead of polling forever.";
 
 /// Single-pattern gitignore for the workspace-local `.codex/` config dir
 /// (prompt + agent-rules copies). Engine-injected files must not appear in

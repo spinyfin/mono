@@ -963,8 +963,10 @@ fn bazel_gate_present_for_chore_on_bazel_workspace_seam_on() {
         prompt.contains("build-class command")
             && prompt.contains("checkleft")
             && prompt.contains("FOREGROUND")
-            && prompt.contains("backgrounded or asynchronous tool invocation"),
-        "gate must require foreground execution for Bazel, checkleft, and tests, and forbid the background-and-idle anti-pattern (issue #976), in driver-agnostic terms (no Claude-specific tool names):\n{prompt}",
+            && prompt.contains("keep polling that session until it returns `exit_code`")
+            && prompt.contains("backgrounded/asynchronous invocation")
+            && prompt.contains("global process-name matches"),
+        "gate must define foreground session polling and prohibit ambiguous global-process attribution:\n{prompt}",
     );
 }
 
