@@ -1,0 +1,32 @@
+[
+  {
+    "question_type": "yes_no",
+    "prompt": "Keep the foreground mandate in the worker prompt unchanged until `boss run` and the busyness verdict have landed (entries 6, 8, 9)? The design recommends yes — relaxing it first trades silent gate-blindness for silent reaping.",
+    "anchor": "chosen-approach"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Should `boss run` be advisory or enforced for build-class commands in v1?",
+    "choices": [
+      "Advisory in v1 — prompt contract only, non-adopters fall back to today's behaviour (design's recommendation)",
+      "Enforced in v1 — refuse a worker's 'checks passed' claim without an obligation handle whose verdict is exited 0 (pulls deferred entry 14 into scope)",
+      "Advisory, but add a hard PreToolUse block on bare bazel/checkleft invocations so the wrapper is unavoidable"
+    ],
+    "anchor": "chosen-approach"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Entry 9 deletes `background_children` outright. If entry 1's measurement confirms the probe suppresses every nudge for 45 minutes, what should happen to the delegated-subagent coverage it nominally provided?",
+    "choices": [
+      "Delete it and defer the subagent case (design's recommendation) — the coverage was never real",
+      "Delete it and pull deferred entry 13 into v1 so there is no gap at any point",
+      "Keep the probe behind a flag until entry 13 lands"
+    ],
+    "anchor": "risks-open-questions"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Does this project own the `boss run` wrapper (entry 6), with the separately-filed Codex exit-code work consuming it rather than building its own? If not, entry 6 becomes a dependency on that project instead.",
+    "anchor": "risks-open-questions"
+  }
+]
