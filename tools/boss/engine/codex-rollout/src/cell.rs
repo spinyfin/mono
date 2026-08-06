@@ -194,11 +194,22 @@ pub fn payload_reports_exit_code(payload: &str) -> bool {
 }
 
 /// Whether the harness truncated a completed cell's output before forwarding
-/// it. The warning is emitted only after the cell completed, so it is a
-/// terminal result even though the structured chunk and its exit code are no
-/// longer available.
+/// it, in a way that still carries the command's terminal signal.
+///
+/// The warning prefix alone is not evidence the *command* finished — outer
+/// truncation is applied to the tool-output block regardless of whether the
+/// forwarded chunk reports an exit code, so a poll whose command is still
+/// running but whose large partial output triggered truncation carries the
+/// same prefix (see `cell.rs`'s own
+/// `a_payload_that_is_not_a_harness_chunk_is_never_still_running` fixture).
+/// The investigation doc records that `exit_code` survives outer truncation
+/// in text form even though the payload as a whole no longer parses as
+/// JSON, so require its literal occurrence too: only a truncated payload
+/// that still shows `"exit_code"` is terminal. A truncated payload with no
+/// exit-code evidence falls through to the unconfirmed-result case instead,
+/// leaving the call open.
 pub fn payload_is_truncated_output(payload: &str) -> bool {
-    payload.starts_with("Warning: truncated output (original token count:")
+    payload.starts_with("Warning: truncated output (original token count:") && payload.contains("\"exit_code\"")
 }
 
 /// The shell-session identifier carried by a structured harness chunk.
@@ -484,11 +495,24 @@ mod tests {
     }
 
     #[test]
-    fn truncation_warning_marks_a_completed_payload_as_terminal() {
+    fn truncation_warning_with_exit_code_evidence_marks_a_completed_payload_as_terminal() {
         assert!(payload_is_truncated_output(
-            "Warning: truncated output (original token count: 11827)\n\ntouch: x: denied\n"
+            "Warning: truncated output (original token count: 11827)\n\ntouch: x: denied\n\"exit_code\":1\n"
         ));
         assert!(!payload_is_truncated_output("partial output\n"));
+    }
+
+    #[test]
+    fn truncation_warning_with_no_exit_code_evidence_is_not_terminal() {
+        // A still-running poll whose large partial output triggered outer
+        // truncation carries the same warning prefix as a genuinely
+        // finished command, but with no `exit_code` surviving in the text —
+        // this must not be read as terminal (probe 3's `chunk_id`-only
+        // shape, also asserted by
+        // `a_payload_that_is_not_a_harness_chunk_is_never_still_running`).
+        assert!(!payload_is_truncated_output(
+            "Warning: truncated output (original token count: 11827)\n\n{\"chunk_id\":\"5ce387\"}"
+        ));
     }
 
     #[test]

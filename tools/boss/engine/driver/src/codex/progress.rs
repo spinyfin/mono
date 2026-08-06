@@ -42,9 +42,17 @@ fn canonical_rollout_tool_call(item_type: &str, payload: &Map<String, Value>) ->
         call_id,
         tool_name,
         tool_input,
+        issues_command,
     } = shared_canonical_rollout_tool_call(item_type, payload)?;
     let call_id = call_id?;
-    Some((call_id, RolloutToolCall { tool_name, tool_input }))
+    Some((
+        call_id,
+        RolloutToolCall {
+            tool_name,
+            tool_input,
+            issues_command,
+        },
+    ))
 }
 
 /// Mutable state owned by one rollout-file reader.

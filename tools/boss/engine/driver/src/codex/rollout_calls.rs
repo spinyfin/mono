@@ -44,7 +44,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use boss_engine_codex_rollout::cell::{
-    CellOutcome, CellOutput, commands_from_cell_script, is_cell_wait_tool, parse_cell_output, payload_is_running_chunk,
+    CellOutcome, CellOutput, is_cell_wait_tool, parse_cell_output, payload_is_running_chunk,
     payload_is_truncated_output, payload_reports_exit_code, payload_session_id, wait_target_cell_id,
 };
 use boss_engine_codex_rollout::{CanonicalRolloutToolOutput, canonical_rollout_tool_output, flatten_tool_output_text};
@@ -90,6 +90,20 @@ pub(super) const MAX_TRACKED_TRANSCRIPT_TOOL_CALLS: usize = 4096;
 pub(super) struct RolloutToolCall {
     pub(super) tool_name: String,
     pub(super) tool_input: Value,
+    /// Whether this call itself starts a shell command, as opposed to being
+    /// a pure continuation of one already running. See
+    /// [`boss_engine_codex_rollout::CanonicalRolloutToolCall::issues_command`]
+    /// for why this has to be carried from canonicalisation rather than
+    /// re-derived from `tool_input`. Defaults to `true` (not a continuation)
+    /// for a snapshot persisted before this field existed, which is the
+    /// conservative reading — it only ever widens session-resolution
+    /// eligibility for calls that never asserted otherwise.
+    #[serde(default = "default_issues_command")]
+    pub(super) issues_command: bool,
+}
+
+fn default_issues_command() -> bool {
+    true
 }
 
 /// Render a display string for one abandoned rollout tool call, for the
@@ -403,12 +417,12 @@ impl RolloutCallTracker {
         // A cell that starts a new command owns its result even when the
         // shell happens to reuse a previously tracked session. Only a pure
         // continuation cell (`tools.write_stdin`) resolves through sessions.
-        let is_continuation_cell = self
-            .calls
-            .get(call_id)
-            .and_then(|call| call.tool_input.get("command"))
-            .and_then(Value::as_str)
-            .is_some_and(|command| commands_from_cell_script(command).is_empty());
+        // `issues_command` is carried from canonicalisation, not re-derived
+        // from `tool_input.command`: that field is the already-extracted
+        // command string for a command-bearing cell, not its raw script, so
+        // re-running `commands_from_cell_script` on it here would find
+        // nothing and misclassify every command-bearing cell too.
+        let is_continuation_cell = self.calls.get(call_id).is_some_and(|call| !call.issues_command);
         let origin = is_continuation_cell
             .then(|| {
                 session_id
@@ -557,6 +571,7 @@ mod tests {
         RolloutToolCall {
             tool_name: "Bash".to_owned(),
             tool_input: json!({"command": command}),
+            issues_command: true,
         }
     }
 
@@ -564,6 +579,25 @@ mod tests {
         RolloutToolCall {
             tool_name: "wait".to_owned(),
             tool_input: json!({"cell_id": cell_id, "yield_time_ms": 30000}),
+            issues_command: true,
+        }
+    }
+
+    /// Canonicalise a raw cell-harness `exec` script exactly as production
+    /// does, so tests exercise the real `tool_input`/`issues_command` shape
+    /// (the extracted command, never the script) rather than a hand-built
+    /// approximation.
+    fn cell_exec(call_id: &str, script: &str) -> RolloutToolCall {
+        let payload = json!({"name": "exec", "call_id": call_id, "input": script})
+            .as_object()
+            .unwrap()
+            .clone();
+        let canonical = boss_engine_codex_rollout::canonical_rollout_tool_call("custom_tool_call", &payload)
+            .expect("canonicalises");
+        RolloutToolCall {
+            tool_name: canonical.tool_name,
+            tool_input: canonical.tool_input,
+            issues_command: canonical.issues_command,
         }
     }
 
@@ -717,17 +751,37 @@ mod tests {
     }
 
     #[test]
-    fn a_truncated_completed_cell_is_terminal() {
+    fn a_truncated_completed_cell_with_exit_code_evidence_is_terminal() {
         let mut tracker = RolloutCallTracker::default();
         tracker.observe_call("A", bash("echo hi")).unwrap();
         assert!(matches!(
             tracker.observe_output(
                 "A",
-                &completed("Warning: truncated output (original token count: 11827)\n\ntouch: x: denied\n")
+                &completed(
+                    "Warning: truncated output (original token count: 11827)\n\ntouch: x: denied\n\"exit_code\":1\n"
+                )
             ),
             Ok(OutputDisposition::Completed(_))
         ));
         assert!(tracker.drain_open_calls().is_empty());
+    }
+
+    #[test]
+    fn a_truncated_still_running_chunk_with_no_exit_code_evidence_stays_open() {
+        // Outer truncation applies to the tool-output block regardless of
+        // whether the forwarded chunk reports an exit code, so a poll that
+        // is still running but whose partial output was large enough to be
+        // truncated must not close its call.
+        let mut tracker = RolloutCallTracker::default();
+        tracker.observe_call("A", bash("slow build")).unwrap();
+        assert!(matches!(
+            tracker.observe_output(
+                "A",
+                &completed("Warning: truncated output (original token count: 11827)\n\n{\"chunk_id\":\"5ce387\"}")
+            ),
+            Ok(OutputDisposition::UnconfirmedResult(_))
+        ));
+        assert_eq!(tracker.drain_open_calls().len(), 1);
     }
 
     #[test]
@@ -741,20 +795,20 @@ mod tests {
         tracker
             .observe_call(
                 "poll-1",
-                RolloutToolCall {
-                    tool_name: "exec".to_owned(),
-                    tool_input: json!({"command":"const r = await tools.write_stdin({\"session_id\":8467,\"chars\":\"\"});"}),
-                },
+                cell_exec(
+                    "poll-1",
+                    "const r = await tools.write_stdin({\"session_id\":8467,\"chars\":\"\"});",
+                ),
             )
             .unwrap();
         tracker.observe_output("poll-1", &completed(P6_RUNNING_CHUNK)).unwrap();
         tracker
             .observe_call(
                 "poll-2",
-                RolloutToolCall {
-                    tool_name: "exec".to_owned(),
-                    tool_input: json!({"command":"const r = await tools.write_stdin({\"session_id\":8467,\"chars\":\"\"});"}),
-                },
+                cell_exec(
+                    "poll-2",
+                    "const r = await tools.write_stdin({\"session_id\":8467,\"chars\":\"\"});",
+                ),
             )
             .unwrap();
         let result = tracker.observe_output(
@@ -799,24 +853,23 @@ mod tests {
 
     #[test]
     fn a_command_cell_reusing_a_session_keeps_its_own_call_open() {
+        // Both calls go through the real canonicaliser, so `tool_input` here
+        // is the *extracted* command ("first" / "second"), never the raw
+        // script — the shape `issues_command` has to be derived correctly
+        // against, per the false-assurance failure mode this test used to
+        // give when it hand-built `tool_input` from the raw script instead.
         let mut tracker = RolloutCallTracker::default();
         tracker
             .observe_call(
                 "A",
-                RolloutToolCall {
-                    tool_name: "Bash".to_owned(),
-                    tool_input: json!({"command":"const r = await tools.exec_command({\"cmd\":\"first\"});"}),
-                },
+                cell_exec("A", "const r = await tools.exec_command({\"cmd\":\"first\"});"),
             )
             .unwrap();
         tracker.observe_output("A", &completed(P6_RUNNING_CHUNK)).unwrap();
         tracker
             .observe_call(
                 "B",
-                RolloutToolCall {
-                    tool_name: "Bash".to_owned(),
-                    tool_input: json!({"command":"const r = await tools.exec_command({\"cmd\":\"second\"});"}),
-                },
+                cell_exec("B", "const r = await tools.exec_command({\"cmd\":\"second\"});"),
             )
             .unwrap();
         assert!(matches!(
@@ -829,17 +882,14 @@ mod tests {
         ) else {
             panic!("the second command must complete itself");
         };
-        assert_eq!(
-            rollout_call_command_display(&call),
-            "const r = await tools.exec_command({\"cmd\":\"second\"});"
-        );
+        assert_eq!(rollout_call_command_display(&call), "second");
         assert_eq!(
             tracker
                 .drain_open_calls()
                 .iter()
                 .map(rollout_call_command_display)
                 .collect::<Vec<_>>(),
-            ["const r = await tools.exec_command({\"cmd\":\"first\"});"]
+            ["first"]
         );
     }
 
@@ -874,6 +924,7 @@ mod tests {
                 RolloutToolCall {
                     tool_name: "wait".to_owned(),
                     tool_input: json!({"yield_time_ms": 30000}),
+                    issues_command: true,
                 },
             )
             .expect_err("must not resolve");
