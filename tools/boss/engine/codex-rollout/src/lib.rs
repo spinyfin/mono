@@ -111,7 +111,14 @@ pub fn canonical_rollout_tool_call(item_type: &str, payload: &Map<String, Value>
 /// The plain shell-tool dialect (`cmd`/`command`) always issues a command by
 /// definition. The cell-harness dialect only does when its script contains a
 /// command-bearing `tools.*` call ([`cell::commands_from_cell_script`]); a
-/// pure `tools.write_stdin` continuation script does not.
+/// pure `tools.write_stdin` continuation script does not. Any other shape —
+/// an argv array, or an object using some other key — is unrecognised, and
+/// defaults to `true` (issues a command) rather than `false`: treating an
+/// unknown shape as a pure continuation would route its output through
+/// `sessions` in `observe_output` and let it be silently subsumed into
+/// someone else's origin, which is exactly the failure mode this field
+/// exists to prevent. Only a positively-identified continuation script (a
+/// string with no command-bearing cell call) returns `false`.
 fn exec_input_issues_command(parsed_input: &Value) -> bool {
     if parsed_input
         .get("cmd")
@@ -120,9 +127,9 @@ fn exec_input_issues_command(parsed_input: &Value) -> bool {
     {
         return true;
     }
-    parsed_input
+    !parsed_input
         .as_str()
-        .is_some_and(|source| !cell::commands_from_cell_script(source).is_empty())
+        .is_some_and(|source| cell::commands_from_cell_script(source).is_empty())
 }
 
 /// The command an `exec` / `exec_command` tool call runs.
@@ -362,6 +369,22 @@ mod tests {
             .clone();
         let call = canonical_rollout_tool_call("custom_tool_call", &payload).expect("call");
         assert_eq!(call.tool_input.get("command").and_then(Value::as_str), Some(source));
+    }
+
+    #[test]
+    fn exec_input_issues_command_covers_the_known_and_unknown_shapes() {
+        assert!(exec_input_issues_command(&json!({"cmd": "echo hi"})));
+        assert!(exec_input_issues_command(&json!(
+            "const r = await tools.exec_command({\"cmd\":\"echo hi\"});"
+        )));
+        assert!(!exec_input_issues_command(&json!(
+            "const r = load(\"run\");\nconst p = await tools.write_stdin({\"session_id\":r.session_id});"
+        )));
+        // An unrecognised shape (here, an argv array with no `cmd`/`command`
+        // key) must default to `true`: treating it as a pure continuation
+        // would let `observe_output` silently subsume its output into
+        // someone else's session.
+        assert!(exec_input_issues_command(&json!({"argv": ["echo", "hi"]})));
     }
 
     #[test]

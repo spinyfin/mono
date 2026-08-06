@@ -853,11 +853,11 @@ mod tests {
 
     #[test]
     fn a_command_cell_reusing_a_session_keeps_its_own_call_open() {
-        // Both calls go through the real canonicaliser, so `tool_input` here
-        // is the *extracted* command ("first" / "second"), never the raw
-        // script — the shape `issues_command` has to be derived correctly
-        // against, per the false-assurance failure mode this test used to
-        // give when it hand-built `tool_input` from the raw script instead.
+        // Both calls go through the real canonicaliser, so `tool_input` here is
+        // the *extracted* command ("first" / "second"), never the raw script.
+        // `issues_command` must therefore be derived from the raw script at
+        // canonicalisation time, not from `tool_input` — that is the shape
+        // this test pins.
         let mut tracker = RolloutCallTracker::default();
         tracker
             .observe_call(
