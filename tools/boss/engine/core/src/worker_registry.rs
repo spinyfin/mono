@@ -18,9 +18,6 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex};
 
-#[cfg(target_os = "macos")]
-use std::os::raw::c_void;
-
 const ANCESTOR_WALK_DEPTH: usize = 8;
 
 /// First slot id reserved for remote workers' virtual slots.
@@ -199,69 +196,7 @@ impl WorkerRegistry {
 /// 0 / launchd).
 #[cfg(target_os = "macos")]
 pub fn parent_pid(pid: libc::pid_t) -> io::Result<Option<libc::pid_t>> {
-    // proc_bsdinfo struct layout per <sys/proc_info.h> on Darwin.
-    // We read PROC_PIDTBSDINFO (flavor 3) and pull pbi_ppid from it.
-    const PROC_PIDTBSDINFO: libc::c_int = 3;
-
-    #[repr(C)]
-    #[derive(Default)]
-    struct ProcBsdInfo {
-        pbi_flags: u32,
-        pbi_status: u32,
-        pbi_xstatus: u32,
-        pbi_pid: u32,
-        pbi_ppid: u32,
-        pbi_uid: u32,
-        pbi_gid: u32,
-        pbi_ruid: u32,
-        pbi_rgid: u32,
-        pbi_svuid: u32,
-        pbi_svgid: u32,
-        rfu_1: u32,
-        pbi_comm: [u8; 16],
-        pbi_name: [u8; 32],
-        pbi_nfiles: u32,
-        pbi_pgid: u32,
-        pbi_pjobc: u32,
-        e_tdev: u32,
-        e_tpgid: u32,
-        pbi_nice: i32,
-        pbi_start_tvsec: u64,
-        pbi_start_tvusec: u64,
-    }
-
-    unsafe extern "C" {
-        fn proc_pidinfo(
-            pid: libc::c_int,
-            flavor: libc::c_int,
-            arg: u64,
-            buffer: *mut c_void,
-            buffersize: libc::c_int,
-        ) -> libc::c_int;
-    }
-
-    let mut info = ProcBsdInfo::default();
-    let info_size = std::mem::size_of::<ProcBsdInfo>() as libc::c_int;
-    // SAFETY: passing a valid &mut to proc_pidinfo, sized correctly.
-    let n = unsafe {
-        proc_pidinfo(
-            pid as libc::c_int,
-            PROC_PIDTBSDINFO,
-            0,
-            &mut info as *mut _ as *mut c_void,
-            info_size,
-        )
-    };
-    if n <= 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if (n as usize) < std::mem::size_of::<ProcBsdInfo>() {
-        return Err(io::Error::other(format!(
-            "proc_pidinfo returned {n} bytes; expected {info_size}"
-        )));
-    }
-
-    let ppid = info.pbi_ppid as libc::pid_t;
+    let ppid = crate::libproc::proc_bsd_info(pid)?.ppid;
     if ppid == 0 { Ok(None) } else { Ok(Some(ppid)) }
 }
 

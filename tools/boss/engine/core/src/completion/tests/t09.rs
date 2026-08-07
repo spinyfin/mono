@@ -1,0 +1,214 @@
+use super::*;
+
+#[tokio::test]
+async fn background_children_recheck_does_not_probe_after_worker_resumes() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, probes, .. } = TestHarness::new(db, detector);
+    let probe = WatermarkedDescendantProbe::new("before-stop");
+    let handler = handler.with_background_activity_probe(probe.clone());
+
+    assert!(matches!(
+        handler.on_stop(&execution_id).await,
+        StopOutcome::BackgroundChildrenPending { .. }
+    ));
+    probe.set_watermark("new-worker-hook");
+
+    assert_eq!(handler.recheck_background_nudge(&execution_id).await, None);
+    assert!(
+        probes.snapshot().is_empty(),
+        "a resumed worker must not receive a recurring probe"
+    );
+    assert!(handler.pending_background_nudge_execution_ids().is_empty());
+}
+
+/// `activity_watermark` on demand: `None` simulates "no hook-only
+/// evidence available right now" (e.g. a momentarily terminal or
+/// re-registered live-state entry) independent of whatever
+/// `live_delegated_descendant_count` reports.
+struct ToggleWatermarkProbe {
+    descendant_count: usize,
+    watermark: std::sync::Mutex<Option<String>>,
+}
+
+impl ToggleWatermarkProbe {
+    fn new(descendant_count: usize, watermark: Option<&str>) -> Arc<Self> {
+        Arc::new(Self {
+            descendant_count,
+            watermark: std::sync::Mutex::new(watermark.map(str::to_owned)),
+        })
+    }
+
+    fn set_watermark(&self, watermark: Option<&str>) {
+        *self.watermark.lock().expect("watermark mutex poisoned") = watermark.map(str::to_owned);
+    }
+}
+
+impl crate::background_children::BackgroundActivityProbe for ToggleWatermarkProbe {
+    fn live_delegated_descendant_count(&self, _execution_id: &str) -> std::result::Result<usize, String> {
+        Ok(self.descendant_count)
+    }
+
+    fn activity_watermark(&self, _execution_id: &str) -> Option<String> {
+        self.watermark.lock().expect("watermark mutex poisoned").clone()
+    }
+}
+
+#[tokio::test]
+async fn recheck_does_not_retire_intent_when_current_watermark_is_unavailable() {
+    // Regression: `LiveWorkerStateRegistry::activity_watermark_for_run`
+    // can legitimately return `None` (the live-state entry momentarily
+    // turned terminal, or was re-registered) even though the worker never
+    // actually resumed. `recheck_background_nudge` must treat an
+    // unavailable *current* watermark as "no evidence either way" and
+    // keep the intent — retiring it here is the fail-closed bug this
+    // pins down (a worker that never resumes would otherwise be
+    // permanently dropped from the recheck-eligible set on engine-side
+    // bookkeeping alone).
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, .. } = TestHarness::new(db, detector);
+    let probe = ToggleWatermarkProbe::new(1, Some("wm-1"));
+    let handler = handler.with_background_activity_probe(probe.clone());
+
+    let first = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(first, StopOutcome::BackgroundChildrenPending { .. }),
+        "got {first:?}",
+    );
+    assert!(handler.pending_background_nudge_execution_ids().contains(&execution_id));
+
+    // The watermark becomes unavailable while descendants are still
+    // (independently) reported live.
+    probe.set_watermark(None);
+
+    let outcome = handler.recheck_background_nudge(&execution_id).await;
+    assert!(
+        matches!(outcome, Some(StopOutcome::BackgroundChildrenPending { .. })),
+        "recheck must not retire on an unavailable current watermark; got {outcome:?}",
+    );
+    assert!(
+        handler.pending_background_nudge_execution_ids().contains(&execution_id),
+        "intent must survive an unavailable current watermark",
+    );
+}
+
+#[tokio::test]
+async fn debounced_nudge_with_indeterminate_probe_stays_pending_for_recheck() {
+    // Regression for "NudgeDebounced retention is a no-op": every arm of
+    // `nudge_or_park`'s descendant-probe match used to clear the tracked
+    // intent unconditionally (`Ok(0)`/`Err` called `forget`, `Expired`
+    // called `forget_intent`) before the breaker verdict was known, so a
+    // `NudgeDecision::TooSoon` (-> `StopOutcome::NudgeDebounced`) could
+    // never be retained for the recurring recheck sweep — the execution
+    // was already gone from `pending_background_nudge_execution_ids()` by
+    // the time the breaker even ran. Pin the clock so the second Stop
+    // lands inside the debounce window and assert the execution is still
+    // listed for recheck afterward.
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, .. } = TestHarness::new(db, detector);
+    let handler = handler.with_background_activity_probe(Arc::new(FailingDescendantProbe));
+    let fixed_now = std::time::Instant::now();
+    let handler = handler.with_now_fn(std::sync::Arc::new(move || fixed_now));
+
+    let first = handler.on_stop(&execution_id).await;
+    let second = handler.on_stop(&execution_id).await;
+
+    assert!(matches!(first, StopOutcome::AwaitingInput), "got {first:?}");
+    assert!(matches!(second, StopOutcome::NudgeDebounced), "got {second:?}");
+    assert!(
+        handler.pending_background_nudge_execution_ids().contains(&execution_id),
+        "a debounced Stop must not drop the execution from the recheck-eligible set",
+    );
+}
+
+#[tokio::test]
+async fn ci_remediation_debounced_nudge_does_not_double_fail_or_republish() {
+    // `nudge_or_park`'s `NudgeDecision::TooSoon` arm returns
+    // `StopOutcome::NudgeDebounced` for every caller, not just the
+    // background-children recheck path — previously it returned the
+    // caller's `proceed_outcome` verbatim (e.g. `AwaitingInput`), which
+    // the catch-all finalizer below treats as "mark the attempt failed".
+    //
+    // For `ci_remediation` specifically this is provably a no-op change:
+    // `NudgeDecision::TooSoon` can only fire for a fingerprint that was
+    // already nudged (`NudgeDecision::Proceed`) inside the debounce
+    // window — there is no history to debounce against otherwise — and
+    // that earlier Proceed already ran this same finalizer with the same
+    // `proceed_outcome`. `WorkDb::mark_ci_remediation_failed` WHERE-guards
+    // on `status IN ('pending', 'running')`, so by the time the debounced
+    // repeat arrives the attempt is already terminal either way and a
+    // second failed-mark attempt would have been an idempotent no-op even
+    // under the old behaviour. This test pins that down: a debounced Stop
+    // must not publish a second `CiRemediationFailed` event or otherwise
+    // observably differ from the old (harmless) double-mark.
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id, attempt_id) = ci_remediation_fixture(workspace.path());
+    let detector = StubPrDetector::ok(None);
+
+    let TestHarness {
+        handler,
+        probes,
+        publisher,
+        ..
+    } = TestHarness::new(db.clone(), detector);
+    // Pin the clock so the second `on_stop` lands inside
+    // `nudge_breaker::MIN_RENUDGE_INTERVAL` of the first — the debounce
+    // window this test exists to exercise. `TestHarness::new`'s default
+    // auto-advancing clock exists precisely to avoid this, so override it.
+    let fixed_now = std::time::Instant::now();
+    let handler = handler.with_now_fn(std::sync::Arc::new(move || fixed_now));
+
+    let first = handler.on_stop(&execution_id).await;
+    let second = handler.on_stop(&execution_id).await;
+
+    assert!(
+        matches!(first, StopOutcome::AwaitingInput),
+        "first Stop nudges normally; got {first:?}",
+    );
+    assert!(
+        matches!(second, StopOutcome::NudgeDebounced),
+        "second Stop inside the debounce window must be suppressed as NudgeDebounced; got {second:?}",
+    );
+    assert_eq!(
+        probes.snapshot().len(),
+        1,
+        "only the first Stop should have queued a probe",
+    );
+
+    // The `ci_remediation` finalizer marks failed on the very first idle
+    // Stop by design (see `finalize_ci_remediation_attempt`'s doc) — that
+    // already happened on `first`, before debounce ever entered the
+    // picture.
+    let attempt = db.get_ci_remediation(&attempt_id).unwrap().unwrap();
+    assert_eq!(attempt.status, "failed");
+    assert_eq!(attempt.failure_reason.as_deref(), Some(CI_NO_PUSH_REASON));
+
+    // Exactly one `CiRemediationFailed` publish — the debounced repeat
+    // must not fire a second one now that it short-circuits to `false`
+    // before ever calling `mark_ci_remediation_failed`.
+    let typed = publisher.typed_events.lock().await.clone();
+    let fail_events = typed
+        .iter()
+        .filter(|(_, ev)| matches!(ev, boss_protocol::FrontendEvent::CiRemediationFailed { attempt_id: a, .. } if a == &attempt_id))
+        .count();
+    assert_eq!(
+        fail_events, 1,
+        "a debounced Stop must not republish CiRemediationFailed; got {typed:?}",
+    );
+
+    // And the execution stays observable for a later recheck: the intent
+    // is retained rather than dropped on the debounced Stop (see the
+    // `nudge_or_park`/`recheck_background_nudge` retention fix) — even
+    // though this particular execution has nothing left to recheck for,
+    // the intent bookkeeping must behave uniformly across every
+    // `nudge_or_park` caller.
+    assert!(
+        handler.pending_background_nudge_execution_ids().contains(&execution_id),
+        "a debounced nudge must keep the execution tracked for the recurring recheck sweep",
+    );
+}

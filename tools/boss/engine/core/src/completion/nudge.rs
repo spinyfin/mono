@@ -129,8 +129,9 @@ impl WorkerCompletionHandler {
         }
         // Background-children suppression (observed live 2026-07-17): the
         // worker's own turn genuinely ended (Stop fired, hooks go quiet), but its
-        // process tree still has live descendant processes — a
-        // backgrounded subagent spawned via the harness Agent tool that
+        // process tree still has live descendants outside the foreground
+        // driver process group — a backgrounded subagent spawned via the
+        // harness Agent tool that
         // has not yet reported back with a task-notification. That is
         // WAITING, not stalled: nudging it just manufactures the next
         // Stop and burns the breaker cap below, exactly like the
@@ -139,50 +140,87 @@ impl WorkerCompletionHandler {
         // Bounded by `background_children_tracker`'s horizon so a
         // genuinely wedged subagent (one that never exits) still
         // eventually reaches the normal nudge/park path.
-        let descendant_count = self.background_activity_probe.live_descendant_count(&execution.id);
-        if descendant_count > 0 {
-            let now_epoch_secs = boss_engine_utils::epoch_time::now_epoch_secs();
-            match self.background_children_tracker.record(
-                &execution.id,
-                now_epoch_secs,
-                self.background_children_horizon_secs,
-            ) {
-                BuildWaitDecision::Suppress { waited_secs } => {
-                    tracing::info!(
-                        execution_id = %execution.id,
-                        descendant_count,
-                        waited_secs,
-                        horizon_secs = self.background_children_horizon_secs,
-                        "auto-nudge: suppressed — worker has live background children; holding \
-                         (breaker not consulted, no probe queued)"
-                    );
-                    self.publisher
-                        .publish(
+        // NOTE: none of the arms below clear the tracked *intent* on their
+        // own anymore — only the wait-duration horizon. Whether the intent
+        // itself survives this call is decided once, after the breaker
+        // verdict is known, below. Clearing it here (the previous shape)
+        // meant `NudgeDecision::TooSoon` always found the intent already
+        // gone, so `pending_background_nudge_execution_ids()` silently
+        // dropped the execution on the very first debounced recheck —
+        // exactly the stranding this suppression exists to prevent.
+        let delegated_descendant_count = self
+            .background_activity_probe
+            .live_delegated_descendant_count(&execution.id);
+        match delegated_descendant_count {
+            Ok(0) => {
+                // A previously delegated child exited between recurring sweeps.
+                // Clear its wait baseline before the normal nudge proceeds.
+                self.background_children_tracker.forget_horizon(&execution.id);
+            }
+            Ok(descendant_count) => {
+                let now_epoch_secs = boss_engine_utils::epoch_time::now_epoch_secs();
+                match self.background_children_tracker.record(
+                    &execution.id,
+                    now_epoch_secs,
+                    self.background_children_horizon_secs,
+                ) {
+                    BuildWaitDecision::Suppress { waited_secs } => {
+                        self.background_children_tracker.record_intent(
                             &execution.id,
-                            &execution.work_item_id,
-                            execution.status.as_str(),
-                            "worker_background_children_pending",
-                        )
-                        .await;
-                    return StopOutcome::BackgroundChildrenPending {
-                        descendant_count,
-                        waited_secs,
-                    };
-                }
-                BuildWaitDecision::Expired { waited_secs } => {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        descendant_count,
-                        waited_secs,
-                        horizon_secs = self.background_children_horizon_secs,
-                        "auto-nudge: background-children horizon elapsed — no longer suppressing, \
-                         falling back to the normal nudge/park flow"
-                    );
-                    // Fall through to the normal nudge/park flow below.
+                            BackgroundNudgeIntent {
+                                probe_text: probe_text.to_owned(),
+                                fingerprint: fingerprint.to_owned(),
+                                bound_pr_url: bound_pr_url.map(str::to_owned),
+                                proceed_outcome: proceed_outcome.clone(),
+                                activity_watermark: self.background_activity_probe.activity_watermark(&execution.id),
+                            },
+                        );
+                        tracing::info!(
+                            execution_id = %execution.id,
+                            descendant_count,
+                            waited_secs,
+                            horizon_secs = self.background_children_horizon_secs,
+                            "auto-nudge: suppressed — worker has live background children; holding \
+                             (breaker not consulted, no probe queued)"
+                        );
+                        self.publisher
+                            .publish(
+                                &execution.id,
+                                &execution.work_item_id,
+                                execution.status.as_str(),
+                                "worker_background_children_pending",
+                            )
+                            .await;
+                        return StopOutcome::BackgroundChildrenPending {
+                            descendant_count,
+                            waited_secs,
+                        };
+                    }
+                    BuildWaitDecision::Expired { waited_secs } => {
+                        self.background_children_tracker.forget_horizon(&execution.id);
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            descendant_count,
+                            waited_secs,
+                            horizon_secs = self.background_children_horizon_secs,
+                            "auto-nudge: background-children horizon elapsed — no longer suppressing, \
+                             falling back to the normal nudge/park flow"
+                        );
+                        // Fall through to the normal nudge/park flow below.
+                    }
                 }
             }
+            Err(reason) => {
+                self.background_children_tracker.forget_horizon(&execution.id);
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    %reason,
+                    "auto-nudge: background-child probe indeterminate — proceeding to nudge; \
+                     suppression precondition could not be evaluated"
+                );
+            }
         }
-        match self.nudge_breaker.record(
+        let outcome = match self.nudge_breaker.record(
             &execution.id,
             fingerprint,
             self.max_unproductive_nudges,
@@ -197,7 +235,7 @@ impl WorkerCompletionHandler {
                 );
                 self.publish_awaiting_pr(execution).await;
                 self.probe_queuer.queue_probe(&execution.id, probe_text);
-                proceed_outcome
+                proceed_outcome.clone()
             }
             NudgeDecision::TooSoon { since_last } => {
                 // The identical fingerprint was just nudged; a Stop this
@@ -217,13 +255,144 @@ impl WorkerCompletionHandler {
                     "auto-nudge: suppressed — identical fingerprint re-fired inside the debounce \
                      window; waiting for external state to change before re-nudging",
                 );
-                proceed_outcome
+                StopOutcome::NudgeDebounced
             }
             NudgeDecision::Trip { count } => {
                 self.park_for_unproductive_nudges(execution, count, bound_pr_url, "no new commit, PR, or state change")
                     .await
             }
+        };
+        // A debounced Stop carries no evidence the worker resumed — the
+        // nudge simply didn't fire this round because of the fingerprint
+        // debounce window — so the intent must stay observable for the
+        // recurring background-nudge recheck sweep
+        // (`pending_background_nudge_execution_ids`) to re-evaluate later.
+        // Re-record with fresh context (a new watermark, in particular) so
+        // the recheck compares against current state, not stale state from
+        // whenever this intent was first captured. Every other outcome
+        // means the nudge/park path actually concluded (or an early
+        // `BackgroundChildrenPending`/similar suppression above already
+        // returned), so any tracked intent is stale and safe to drop.
+        if matches!(outcome, StopOutcome::NudgeDebounced) {
+            self.background_children_tracker.record_intent(
+                &execution.id,
+                BackgroundNudgeIntent {
+                    probe_text: probe_text.to_owned(),
+                    fingerprint: fingerprint.to_owned(),
+                    bound_pr_url: bound_pr_url.map(str::to_owned),
+                    proceed_outcome,
+                    activity_watermark: self.background_activity_probe.activity_watermark(&execution.id),
+                },
+            );
+        } else {
+            self.background_children_tracker.forget_intent(&execution.id);
         }
+        outcome
+    }
+
+    /// Execution ids whose Stop-boundary nudge is currently suppressed by
+    /// delegated background work. The merge poller includes these in every
+    /// recurring pass so the horizon is enforced without another Stop.
+    pub(crate) fn pending_background_nudge_execution_ids(&self) -> Vec<String> {
+        self.background_children_tracker.execution_ids()
+    }
+
+    /// Re-evaluate one previously suppressed nudge from the recurring merge
+    /// poller. Replays the exact probe/fingerprint/bound-PR context captured at
+    /// Stop, so revision nudges remain revision nudges and no-PR nudges remain
+    /// no-PR nudges. Returns `None` when the execution has moved on.
+    pub(crate) async fn recheck_background_nudge(&self, execution_id: &str) -> Option<StopOutcome> {
+        let intent = self.background_children_tracker.intent(execution_id)?;
+        // Only retire on POSITIVE proof of resumption: both the recorded and
+        // the current watermark must be present and differ. A current
+        // watermark of `None` is "no hook-only evidence available right
+        // now" (e.g. the registry entry momentarily turned terminal or was
+        // re-registered) — not proof the worker resumed — so it must never
+        // retire the intent on its own. Retiring on a `None` here is the
+        // fail-closed bug this check exists to avoid: it would strand a
+        // worker that never resumed by discarding the one record that lets
+        // it be rechecked again.
+        if let Some(watermark) = intent.activity_watermark.as_deref()
+            && let Some(current) = self.background_activity_probe.activity_watermark(execution_id)
+            && current != watermark
+        {
+            tracing::debug!(
+                execution_id,
+                "auto-nudge: recurring background-child recheck retired after worker hook activity resumed"
+            );
+            self.background_children_tracker.forget(execution_id);
+            return None;
+        }
+        let execution = match self.work_db.get_execution(execution_id) {
+            Ok(execution) if execution.status == ExecutionStatus::WaitingHuman => execution,
+            Ok(_) => {
+                self.background_children_tracker.forget(execution_id);
+                return None;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    ?err,
+                    "auto-nudge: recurring background-child recheck could not load execution; \
+                     will retry on the next sweep"
+                );
+                return None;
+            }
+        };
+
+        // Consult the probe and horizon directly first. When the outcome is
+        // unchanged from the last pass (still delegated descendants, still
+        // inside the horizon), return the same `BackgroundChildrenPending`
+        // without re-reading the transcript or re-publishing the
+        // invalidation event — a long-running delegated subagent would
+        // otherwise produce a steady stream of duplicate publishes and log
+        // lines every sweep for the entire horizon. Only fall through to
+        // the full `nudge_or_park` path (which does that IO) once the
+        // outcome actually might have changed: the child exited or the
+        // horizon elapsed.
+        if let Ok(descendant_count) = self
+            .background_activity_probe
+            .live_delegated_descendant_count(execution_id)
+            && descendant_count > 0
+            && let BuildWaitDecision::Suppress { waited_secs } = self.background_children_tracker.record(
+                execution_id,
+                boss_engine_utils::epoch_time::now_epoch_secs(),
+                self.background_children_horizon_secs,
+            )
+        {
+            tracing::debug!(
+                execution_id,
+                descendant_count,
+                waited_secs,
+                "auto-nudge: recurring background-child recheck unchanged — still suppressed, \
+                 no republish"
+            );
+            return Some(StopOutcome::BackgroundChildrenPending {
+                descendant_count,
+                waited_secs,
+            });
+        }
+
+        let outcome = self
+            .nudge_or_park(
+                &execution,
+                &intent.probe_text,
+                &intent.fingerprint,
+                intent.bound_pr_url.as_deref(),
+                intent.proceed_outcome,
+            )
+            .await;
+        if !matches!(
+            outcome,
+            StopOutcome::BackgroundChildrenPending { .. }
+                | StopOutcome::BuildWaitPending { .. }
+                | StopOutcome::EscalationPending { .. }
+                | StopOutcome::Held { .. }
+                | StopOutcome::NudgeDebounced
+        ) {
+            self.background_children_tracker.forget_intent(execution_id);
+        }
+        Some(outcome)
     }
 
     /// Park `execution` because the auto-nudge circuit breaker tripped

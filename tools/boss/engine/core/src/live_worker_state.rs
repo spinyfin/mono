@@ -877,6 +877,32 @@ impl LiveWorkerStateRegistry {
             .filter(|pid| *pid > 0)
     }
 
+    /// Return the most recent hook-activity stamp for `run_id`. Callers use
+    /// this as an opaque watermark: equality means no hook arrived since the
+    /// snapshot, while a change proves the worker resumed after its Stop.
+    ///
+    /// Deliberately reads `last_tool_ended_at` alone, never `last_event_at`.
+    /// `last_tool_ended_at` is written from exactly one place —
+    /// [`Self::apply_event`]'s `PostToolUse` arm — so it can only advance on
+    /// a real hook from the worker. `last_event_at` is also stamped by
+    /// engine-side inference ([`Self::mark_stalled_spawns`],
+    /// [`Self::mark_errored`]) that runs with no worker activity at all;
+    /// treating it as proof of resumption would let the engine's own
+    /// bookkeeping (e.g. an events-socket decode failure) retire a
+    /// suppressed nudge for a worker that never actually resumed — the
+    /// exact fail-closed failure mode
+    /// [`crate::completion::WorkerCompletionHandler::recheck_background_nudge`]
+    /// must avoid. `None` here means "no hook-only evidence available yet",
+    /// not "nothing changed" — callers must treat it as inconclusive rather
+    /// than as license to retire tracking.
+    pub fn activity_watermark_for_run(&self, run_id: &str) -> Option<String> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard
+            .values()
+            .find(|entry| !entry.state.activity.is_terminal() && entry.state.run_id == run_id)
+            .and_then(|entry| entry.state.last_tool_ended_at.clone())
+    }
+
     /// True iff a live state entry exists for `run_id` whose activity
     /// indicates the worker is still attached to the slot. Used by
     /// `RequestExecution` to detect "the latest execution is

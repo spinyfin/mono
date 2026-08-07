@@ -19,14 +19,25 @@
 //! genuinely ended and its process tree simply still contains live
 //! descendant processes doing delegated work.
 //!
-//! The fix is a cheap, sweep-time process-tree scan: before nudging or
-//! parking a worker whose Stop looks idle, check whether its shell pid
-//! still has any live descendant processes. A worker with live
-//! descendants is WAITING, not stalled — the same time-bounded
-//! suppression pattern build-wait uses
-//! ([`crate::build_wait_tracker::BuildWaitTracker`]) bounds how long that
-//! trust lasts, so a descendant that never exits (a genuinely wedged
-//! subagent) still eventually surfaces to the normal nudge/park flow
+//! Process groups were initially used as a name-free discriminator, backed
+//! by a `libproc`-based process-tree walk. Live Codex and Claude trees
+//! disproved that premise: driver helpers and ordinary tool subprocesses may
+//! create their own process groups just like delegated work, so a process
+//! table cannot honestly distinguish those two kinds of child. The pgid walk
+//! was removed as a result — [`RegistryBackgroundActivityProbe`] now fails
+//! open unconditionally, reporting every Stop as indeterminate, until a
+//! driver/harness-owned delegated-work signal is available to replace it
+//! (see `[deferred-scope]` in the PR that landed this). The trait and
+//! horizon/recheck machinery below stay in place so that future signal has
+//! somewhere to plug in; the pgid-specific walk itself does not survive this
+//! revision — see git history (`count_with_process_table`) if it is ever
+//! needed as a reference.
+//!
+//! Once a real signal exists, a worker with delegated descendants is
+//! WAITING, not stalled — the same time-bounded suppression pattern
+//! build-wait uses ([`crate::build_wait_tracker::BuildWaitTracker`]) bounds
+//! how long that trust lasts, so a descendant that never exits (a genuinely
+//! wedged subagent) still eventually surfaces to the normal nudge/park flow
 //! rather than being trusted forever.
 
 /// Default horizon a continuously-reported live-descendant sighting is
@@ -40,104 +51,23 @@
 /// wedge instead of exiting.
 pub const DEFAULT_BACKGROUND_CHILDREN_HORIZON_SECS: i64 = crate::build_wait_tracker::DEFAULT_BUILD_WAIT_HORIZON_SECS;
 
-/// Count every live descendant process of `pid` — children, grandchildren,
-/// … down to [`DESCENDANT_WALK_DEPTH`] levels — NOT including `pid`
-/// itself. Best-effort: a pid that no longer exists, or any per-pid probe
-/// failure, simply contributes zero children rather than aborting the
-/// whole walk, since a transient race on one branch of the tree must never
-/// hide live descendants found on another branch.
-///
-/// Returns `0` on non-macOS targets — this repo's worker panes are
-/// macOS-only (libghostty), so the process-tree scan has nothing to do
-/// there; callers treat `0` the same as "no evidence of pending work",
-/// which is the safe direction (falls through to the normal nudge/park
-/// flow rather than suppressing it).
-pub fn count_live_descendants(pid: libc::pid_t) -> usize {
-    imp::count_live_descendants(pid)
-}
-
-#[cfg(target_os = "macos")]
-mod imp {
-    use std::os::raw::c_void;
-
-    /// Bound on how many process-tree levels [`count_live_descendants`] walks
-    /// below the probed pid. Mirrors [`crate::worker_registry::ANCESTOR_WALK_DEPTH`]'s
-    /// choice of a small, generous-enough constant rather than an unbounded
-    /// walk — a worker's own descendant tree (shell → claude → subagent(s)) is
-    /// only ever a couple of levels deep in practice; this just guards against
-    /// a pathological tree turning a "cheap" sweep-time check into a long scan.
-    const DESCENDANT_WALK_DEPTH: usize = 8;
-
-    /// Hard cap on how many pids a single probe visits across the whole walk.
-    /// A real worker's descendant count is in the single digits; this bound
-    /// only ever protects against a runaway process tree (fork bomb, buggy
-    /// tool loop) making the probe itself expensive.
-    const MAX_VISITED_PIDS: usize = 512;
-
-    unsafe extern "C" {
-        fn proc_listchildpids(ppid: libc::pid_t, buffer: *mut c_void, buffersize: libc::c_int) -> libc::c_int;
-    }
-
-    /// Direct (one-level) live children of `pid`, via `libproc`'s
-    /// `proc_listchildpids`. Returns an empty vec for a pid with no
-    /// children, an already-dead pid, or any probe error — this is a
-    /// best-effort liveness signal, not a source of truth that must be
-    /// propagated as an error (see [`super::count_live_descendants`]'s
-    /// doc comment on why per-pid failures must not abort the walk).
-    fn list_child_pids(pid: libc::pid_t) -> Vec<libc::pid_t> {
-        const MAX_CHILDREN: usize = 256;
-        let mut buf: Vec<libc::pid_t> = vec![0; MAX_CHILDREN];
-        let buffersize = (buf.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
-        // SAFETY: `buf` is a valid, appropriately-sized buffer for
-        // `buffersize` bytes; `proc_listchildpids` only ever writes up to
-        // that many bytes and returns the count of pids it wrote.
-        let n = unsafe { proc_listchildpids(pid, buf.as_mut_ptr() as *mut c_void, buffersize) };
-        if n <= 0 {
-            return Vec::new();
-        }
-        buf.truncate((n as usize).min(MAX_CHILDREN));
-        buf
-    }
-
-    pub(super) fn count_live_descendants(pid: libc::pid_t) -> usize {
-        let mut frontier = vec![pid];
-        let mut total = 0usize;
-        for _ in 0..DESCENDANT_WALK_DEPTH {
-            if frontier.is_empty() || total >= MAX_VISITED_PIDS {
-                break;
-            }
-            let mut next = Vec::new();
-            for p in frontier {
-                let children = list_child_pids(p);
-                total += children.len();
-                next.extend(children);
-                if total >= MAX_VISITED_PIDS {
-                    break;
-                }
-            }
-            frontier = next;
-        }
-        total
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-mod imp {
-    pub(super) fn count_live_descendants(_pid: libc::pid_t) -> usize {
-        0
-    }
-}
-
 /// Reports whether an execution's worker process tree still has live
 /// descendant processes at Stop boundary — the signal
 /// [`crate::completion::WorkerCompletionHandler::nudge_or_park`] uses to
 /// distinguish "waiting on delegated work" from "genuinely idle". See the
 /// module doc comment for the incident this exists to fix.
 pub trait BackgroundActivityProbe: Send + Sync {
-    /// Number of live descendant processes for the worker backing
-    /// `execution_id`, or `0` if there are none, the worker's shell pid
-    /// cannot be resolved, or the execution is not a live worker at all.
-    fn live_descendant_count(&self, execution_id: &str) -> usize;
+    /// Number of live delegated descendants for the worker backing
+    /// `execution_id`. An unresolved worker or indeterminate process-tree
+    /// classification is an error so the caller can fail loudly and nudge.
+    fn live_delegated_descendant_count(&self, execution_id: &str) -> Result<usize, String>;
+
+    /// Opaque hook-activity watermark for avoiding a recurring probe in the
+    /// middle of a worker's resumed turn. Implementations without hook state
+    /// return `None`.
+    fn activity_watermark(&self, _execution_id: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Default probe that always reports zero descendants. Used as the
@@ -147,14 +77,17 @@ pub trait BackgroundActivityProbe: Send + Sync {
 pub struct NoopBackgroundActivityProbe;
 
 impl BackgroundActivityProbe for NoopBackgroundActivityProbe {
-    fn live_descendant_count(&self, _execution_id: &str) -> usize {
-        0
+    fn live_delegated_descendant_count(&self, _execution_id: &str) -> Result<usize, String> {
+        Ok(0)
     }
 }
 
-/// Production probe: resolves `execution_id` to its live worker's shell
-/// pid via [`crate::live_worker_state::LiveWorkerStateRegistry`], then
-/// scans that pid's process tree.
+/// Production probe: resolves `execution_id` to its live worker's shell pid
+/// via [`crate::live_worker_state::LiveWorkerStateRegistry`], then reports
+/// indeterminate unconditionally — see the module doc for why the pgid
+/// discriminator this used to classify descendants was removed. Reporting
+/// indeterminate (rather than a count) is what keeps every Stop on the
+/// normal nudge/park path instead of wrongly suppressing a real nudge.
 pub struct RegistryBackgroundActivityProbe {
     live_worker_states: std::sync::Arc<crate::live_worker_state::LiveWorkerStateRegistry>,
 }
@@ -166,14 +99,23 @@ impl RegistryBackgroundActivityProbe {
 }
 
 impl BackgroundActivityProbe for RegistryBackgroundActivityProbe {
-    fn live_descendant_count(&self, execution_id: &str) -> usize {
+    fn live_delegated_descendant_count(&self, execution_id: &str) -> Result<usize, String> {
         let Some(shell_pid) = self.live_worker_states.shell_pid_for_run(execution_id) else {
-            return 0;
+            return Err(format!("no live shell pid registered for execution {execution_id}"));
         };
         if shell_pid <= 0 {
-            return 0;
+            return Err(format!("invalid shell pid {shell_pid} for execution {execution_id}"));
         }
-        count_live_descendants(shell_pid as libc::pid_t)
+        // Do not classify descendants by pgid: Codex's code-mode host and
+        // Claude Bash tools both legitimately run in their own group, which
+        // is indistinguishable from a delegated child.
+        Err(format!(
+            "process-table descendants cannot distinguish driver helpers from delegated work (shell pid {shell_pid})"
+        ))
+    }
+
+    fn activity_watermark(&self, execution_id: &str) -> Option<String> {
+        self.live_worker_states.activity_watermark_for_run(execution_id)
     }
 }
 
@@ -181,64 +123,42 @@ impl BackgroundActivityProbe for RegistryBackgroundActivityProbe {
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn no_children_counts_zero() {
-        // A freshly-spawned test process (this test itself) has no
-        // children unless something else in the process forked one.
-        let self_pid = std::process::id() as libc::pid_t;
-        // Not asserting exactly zero (the test harness/runtime may hold
-        // its own worker threads/processes) — just that a pid with no
-        // deliberately-spawned children doesn't explode or hang.
-        let _ = count_live_descendants(self_pid);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn direct_child_is_counted() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("5")
-            .spawn()
-            .expect("failed to spawn sleep");
-        // Give the OS a moment to register the child in the process table.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let self_pid = std::process::id() as libc::pid_t;
-        let count = count_live_descendants(self_pid);
-        child.kill().ok();
-        child.wait().ok();
-        assert!(count >= 1, "expected at least the spawned `sleep` child, got {count}");
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn dead_pid_counts_zero() {
-        // A pid vanishingly unlikely to be alive.
-        assert_eq!(count_live_descendants(999_999), 0);
+    fn registry_probe_always_fails_open() {
+        // The pgid discriminator was removed (see module doc): a live shell
+        // pid is not sufficient to tell driver helpers from delegated work,
+        // so the production probe must always report indeterminate, never a
+        // count — that is what keeps `BackgroundChildrenPending` from firing
+        // on a driver helper and wrongly suppressing a real nudge.
+        let registry = std::sync::Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+        registry.register_spawn(1, "exec_a", "opus", 4242, None);
+        let probe = RegistryBackgroundActivityProbe::new(registry);
+        assert!(probe.live_delegated_descendant_count("exec_a").is_err());
     }
 
     struct FixedProbe(usize);
     impl BackgroundActivityProbe for FixedProbe {
-        fn live_descendant_count(&self, _execution_id: &str) -> usize {
-            self.0
+        fn live_delegated_descendant_count(&self, _execution_id: &str) -> Result<usize, String> {
+            Ok(self.0)
         }
     }
 
     #[test]
     fn noop_probe_always_reports_zero() {
         let probe = NoopBackgroundActivityProbe;
-        assert_eq!(probe.live_descendant_count("exec_a"), 0);
+        assert_eq!(probe.live_delegated_descendant_count("exec_a"), Ok(0));
     }
 
     #[test]
     fn fixed_probe_reports_configured_count() {
         let probe = FixedProbe(3);
-        assert_eq!(probe.live_descendant_count("exec_a"), 3);
+        assert_eq!(probe.live_delegated_descendant_count("exec_a"), Ok(3));
     }
 
     #[test]
-    fn registry_probe_returns_zero_for_unknown_execution() {
+    fn registry_probe_fails_for_unknown_execution() {
         let registry = std::sync::Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
         let probe = RegistryBackgroundActivityProbe::new(registry);
-        assert_eq!(probe.live_descendant_count("exec_unknown"), 0);
+        assert!(probe.live_delegated_descendant_count("exec_unknown").is_err());
     }
 }

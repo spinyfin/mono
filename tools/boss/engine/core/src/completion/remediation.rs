@@ -226,6 +226,7 @@ impl WorkerCompletionHandler {
             // Breaker parked the execution for a human; don't mark the
             // attempt failed (that risks a retrigger that re-loops).
             StopOutcome::NudgeBreakerParked { .. } => false,
+            StopOutcome::NudgeDebounced => false,
             // Worker declared an unresolved escalation/blocker; the
             // auto-nudge is suppressed, not the attempt marked failed —
             // mirrors NudgeBreakerParked.
