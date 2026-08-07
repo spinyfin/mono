@@ -1957,6 +1957,48 @@ fn revision_directive_permits_leaving_accurate_description_untouched() {
     );
 }
 
+#[test]
+fn revision_directive_requires_findings_status_comment() {
+    // Operator instruction: revisions that address automated review
+    // findings must post a compact GitHub comment summarising the status of
+    // every finding, alongside (not instead of) the PR-description
+    // reconciliation above. It must be skipped entirely — no empty table —
+    // when the revision has no review findings to report.
+    let work_item = revision_task_with_created_via(None, "operator");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("findings-status summary comment"),
+        "revision directive must require a findings-status summary comment:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("Every finding from that review pass must appear as a row"),
+        "revision directive must require every finding to appear, including unaddressed ones:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("SKIP this step entirely"),
+        "revision directive must instruct skipping the comment (not an empty table) when there are no review findings:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("gh pr comment 77 -R org/repo --body-file"),
+        "revision directive must interpolate the real PR number and repo slug into the gh pr comment command:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("not \"not addressed\" alone") || prompt.contains("\"not addressed\" alone is not acceptable"),
+        "a red-cross row must require a reason, not just \"not addressed\":\n{prompt}",
+    );
+    assert!(
+        prompt.contains("does not substitute for the PR description update"),
+        "the findings comment must be required in addition to, not instead of, the PR description reconciliation:\n{prompt}",
+    );
+}
+
 // -----------------------------------------------------------------------
 // `[deferred-scope]` marker directive (root-caused to PR #765)
 // -----------------------------------------------------------------------
