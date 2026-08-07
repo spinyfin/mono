@@ -519,9 +519,24 @@ pub(crate) async fn run_list_revisions(
     } else {
         None
     };
-    let revisions = list_revisions(client, &product.id, dep_filter, args.include_deleted, parent_id).await?;
-    let known_ids: std::collections::HashSet<&str> = revisions.iter().map(|t| t.id.as_str()).collect();
-    let resolved_ids = resolve_ids_filter(client, ctx, &args.ids, &product.id, &known_ids).await?;
+    let revisions = list_revisions(
+        client,
+        &product.id,
+        dep_filter.clone(),
+        args.include_deleted,
+        parent_id.clone(),
+    )
+    .await?;
+    let resolved_ids = if args.ids.is_empty() {
+        Vec::new()
+    } else if dep_filter.is_none() && parent_id.is_none() {
+        let known: Vec<(&str, Option<i64>)> = revisions.iter().map(|t| (t.id.as_str(), t.short_id)).collect();
+        resolve_ids_filter(client, ctx, &args.ids, &product.id, &known).await?
+    } else {
+        let unfiltered = list_revisions(client, &product.id, None, args.include_deleted, None).await?;
+        let known: Vec<(&str, Option<i64>)> = unfiltered.iter().map(|t| (t.id.as_str(), t.short_id)).collect();
+        resolve_ids_filter(client, ctx, &args.ids, &product.id, &known).await?
+    };
     let revisions = apply_task_list_filters(
         revisions,
         TaskListCriteria::builder()
@@ -2208,46 +2223,73 @@ pub(crate) async fn resolve_selector_to_primary_id(
 }
 
 /// Resolve a `--ids` list-filter argument to canonical primary ids and
-/// verify every one names a row present in `known_ids` — the full,
-/// unfiltered listing for this product/kind, collected *before* the
-/// other list filters (status, priority, ...) run.
+/// verify every one names a row present in `known` — the full,
+/// unfiltered listing for this product/kind (i.e. fetched with no
+/// `--dep` / `--project` / `--parent` narrowing applied), so an id that
+/// merely gets excluded by one of those composed filters is never
+/// mistaken for one that doesn't exist. Each entry is `(primary_id,
+/// short_id)`.
 ///
-/// Reuses [`resolve_selector_to_primary_id`] (the same resolution path
-/// `boss task show` uses) so `T42` / `42` / `#42` / `task_…` /
-/// `boss/42` all mean the same thing here as everywhere else.
+/// Short-id selectors (`T42` / `42` / `#42`) resolve locally against
+/// `known`'s `short_id` column — no RPC — since `known` is already the
+/// full unfiltered listing and therefore a superset of every valid
+/// short id in this product. Typed primary ids (`task_…`) and opaque
+/// `Other` selectors pass through
+/// [`resolve_selector_to_primary_id`](resolve_selector_to_primary_id)
+/// unchanged, same as everywhere else that resolves selectors. Only the
+/// cross-product `boss/42` form still round-trips to the engine, since
+/// it names a different product than `known` covers.
 ///
-/// Checking membership in `known_ids` — rather than trusting
+/// Checking membership in `known` — rather than trusting
 /// `resolve_selector_to_primary_id`'s pass-through for typed/opaque
 /// forms — is what catches a typo'd primary id or a valid id from the
-/// wrong product/kind: the resolver only round-trips through the
-/// engine (and so can actually error) for the short-id forms, and
-/// silently returns typed/`Other` selectors unchanged.
+/// wrong product/kind.
 ///
-/// Errors naming every selector that didn't resolve to a known row,
-/// rather than silently returning fewer rows than requested — that
-/// silent-drop is exactly the failure mode `--ids` exists to prevent.
-/// An id that resolves but gets excluded by another composed filter
-/// (e.g. `--status`) is not this function's concern — that's ordinary
-/// AND-filter composition, decided by the caller after this returns.
+/// Errors naming every selector that didn't resolve to a known row —
+/// including a short id that isn't in `known` and a cross-product
+/// selector the engine reports not-found — rather than silently
+/// returning fewer rows than requested or aborting after the first bad
+/// one. That silent-drop is exactly the failure mode `--ids` exists to
+/// prevent. An id that resolves but gets excluded by another composed
+/// filter (e.g. `--status`) is not this function's concern — that's
+/// ordinary AND-filter composition, decided by the caller after this
+/// returns. An all-empty/whitespace `selectors` list (e.g. `--ids ""`
+/// from an unset shell variable) errors rather than silently degrading
+/// to "no id filter".
 pub(crate) async fn resolve_ids_filter(
     client: &mut BossClient,
     ctx: &RunContext,
     selectors: &[String],
     product_id: &str,
-    known_ids: &std::collections::HashSet<&str>,
+    known: &[(&str, Option<i64>)],
 ) -> Result<Vec<String>, CliError> {
-    let mut resolved = Vec::with_capacity(selectors.len());
+    if selectors.is_empty() {
+        return Ok(Vec::new());
+    }
+    let trimmed: Vec<&str> = selectors.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if trimmed.is_empty() {
+        return Err(CliError::usage("--ids: no ids given (empty value)"));
+    }
+
+    let short_id_index: std::collections::HashMap<i64, &str> = known
+        .iter()
+        .filter_map(|(id, short_id)| short_id.map(|n| (n, *id)))
+        .collect();
+    let primary_ids: std::collections::HashSet<&str> = known.iter().map(|(id, _)| *id).collect();
+
+    let mut resolved = Vec::with_capacity(trimmed.len());
     let mut unknown = Vec::new();
-    for raw in selectors {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            continue;
+    for selector in trimmed {
+        match parse_work_item_selector(selector) {
+            WorkItemSelector::ShortId(n) => match short_id_index.get(&n) {
+                Some(id) => resolved.push((*id).to_owned()),
+                None => unknown.push(selector.to_owned()),
+            },
+            _ => match resolve_selector_to_primary_id(client, ctx, selector, Some(product_id.to_owned())).await {
+                Ok(id) if primary_ids.contains(id.as_str()) => resolved.push(id),
+                Ok(_) | Err(_) => unknown.push(selector.to_owned()),
+            },
         }
-        let id = resolve_selector_to_primary_id(client, ctx, trimmed, Some(product_id.to_owned())).await?;
-        if !known_ids.contains(id.as_str()) {
-            unknown.push(trimmed.to_owned());
-        }
-        resolved.push(id);
     }
     if !unknown.is_empty() {
         return Err(CliError::not_found(format!(

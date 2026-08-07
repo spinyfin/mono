@@ -331,9 +331,17 @@ pub(crate) async fn run_project_command(command: ProjectCommand, ctx: &RunContex
             let product = resolve_product(&mut client, args.product, ctx).await?;
             let dep_filter = args.dep.into_filter();
             let repo_selector = args.repo.as_deref().map(RepoSelector::parse).transpose()?;
-            let projects = list_projects(&mut client, &product.id, dep_filter).await?;
-            let known_ids: std::collections::HashSet<&str> = projects.iter().map(|p| p.id.as_str()).collect();
-            let resolved_ids = resolve_ids_filter(&mut client, ctx, &args.ids, &product.id, &known_ids).await?;
+            let projects = list_projects(&mut client, &product.id, dep_filter.clone()).await?;
+            let resolved_ids = if args.ids.is_empty() {
+                Vec::new()
+            } else if dep_filter.is_none() {
+                let known: Vec<(&str, Option<i64>)> = projects.iter().map(|p| (p.id.as_str(), p.short_id)).collect();
+                resolve_ids_filter(&mut client, ctx, &args.ids, &product.id, &known).await?
+            } else {
+                let unfiltered = list_projects(&mut client, &product.id, None).await?;
+                let known: Vec<(&str, Option<i64>)> = unfiltered.iter().map(|p| (p.id.as_str(), p.short_id)).collect();
+                resolve_ids_filter(&mut client, ctx, &args.ids, &product.id, &known).await?
+            };
             let projects = apply_project_list_filters(
                 projects,
                 &args.status,
@@ -719,12 +727,20 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
                 &mut client,
                 &product.id,
                 project.as_ref().map(|project| project.id.as_str()),
-                dep_filter,
+                dep_filter.clone(),
                 args.include_deleted,
             )
             .await?;
-            let known_ids: std::collections::HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
-            let resolved_ids = resolve_ids_filter(&mut client, ctx, &args.ids, &product.id, &known_ids).await?;
+            let resolved_ids = if args.ids.is_empty() {
+                Vec::new()
+            } else if dep_filter.is_none() && project.is_none() {
+                let known: Vec<(&str, Option<i64>)> = tasks.iter().map(|t| (t.id.as_str(), t.short_id)).collect();
+                resolve_ids_filter(&mut client, ctx, &args.ids, &product.id, &known).await?
+            } else {
+                let unfiltered = list_tasks(&mut client, &product.id, None, None, args.include_deleted).await?;
+                let known: Vec<(&str, Option<i64>)> = unfiltered.iter().map(|t| (t.id.as_str(), t.short_id)).collect();
+                resolve_ids_filter(&mut client, ctx, &args.ids, &product.id, &known).await?
+            };
             let tasks = apply_task_list_filters(
                 tasks,
                 TaskListCriteria::builder()
@@ -845,9 +861,17 @@ pub(crate) async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -
             let product = resolve_product(&mut client, args.product, ctx).await?;
             let dep_filter = args.dep.into_filter();
             let repo_selector = args.repo.as_deref().map(RepoSelector::parse).transpose()?;
-            let chores = list_chores(&mut client, &product.id, dep_filter, args.include_deleted).await?;
-            let known_ids: std::collections::HashSet<&str> = chores.iter().map(|t| t.id.as_str()).collect();
-            let resolved_ids = resolve_ids_filter(&mut client, ctx, &args.ids, &product.id, &known_ids).await?;
+            let chores = list_chores(&mut client, &product.id, dep_filter.clone(), args.include_deleted).await?;
+            let resolved_ids = if args.ids.is_empty() {
+                Vec::new()
+            } else if dep_filter.is_none() {
+                let known: Vec<(&str, Option<i64>)> = chores.iter().map(|t| (t.id.as_str(), t.short_id)).collect();
+                resolve_ids_filter(&mut client, ctx, &args.ids, &product.id, &known).await?
+            } else {
+                let unfiltered = list_chores(&mut client, &product.id, None, args.include_deleted).await?;
+                let known: Vec<(&str, Option<i64>)> = unfiltered.iter().map(|t| (t.id.as_str(), t.short_id)).collect();
+                resolve_ids_filter(&mut client, ctx, &args.ids, &product.id, &known).await?
+            };
             let chores = apply_task_list_filters(
                 chores,
                 TaskListCriteria::builder()

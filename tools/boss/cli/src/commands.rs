@@ -1992,7 +1992,8 @@ pub(crate) struct ProjectListArgs {
     /// rather than being silently dropped. Composes with the other
     /// filters below as an AND — a row excluded by e.g. `--status` is
     /// not an error, only an id that doesn't exist at all is.
-    #[arg(long = "ids", value_delimiter = ',')]
+    /// `--id` is accepted as a legacy alias for existing scripts.
+    #[arg(long = "ids", alias = "id", value_delimiter = ',')]
     pub(crate) ids: Vec<String>,
 
     /// Filter by resolved repo. Accepts a full URL or a short
@@ -2309,8 +2310,9 @@ pub(crate) struct TaskListArgs {
     /// product errors rather than being silently dropped. Composes with
     /// the other filters below as an AND — a row excluded by e.g.
     /// `--status` is not an error, only an id that doesn't exist at
-    /// all is.
-    #[arg(long = "ids", value_delimiter = ',')]
+    /// all is. `--id` is accepted as a legacy alias for existing
+    /// scripts.
+    #[arg(long = "ids", alias = "id", value_delimiter = ',')]
     pub(crate) ids: Vec<String>,
 
     /// Include soft-deleted (tombstoned) tasks in the listing. Use this
@@ -2586,8 +2588,9 @@ pub(crate) struct RevisionListArgs {
 
     /// Filter to specific id(s). Comma-separated, or repeat the flag.
     /// See `boss task list --help` for the accepted id forms and the
-    /// unknown-id / filter-composition contract.
-    #[arg(long = "ids", value_delimiter = ',')]
+    /// unknown-id / filter-composition contract. `--id` is accepted as
+    /// a legacy alias for existing scripts.
+    #[arg(long = "ids", alias = "id", value_delimiter = ',')]
     pub(crate) ids: Vec<String>,
 
     /// Include soft-deleted (tombstoned) revisions in the listing. See
@@ -2680,8 +2683,9 @@ pub(crate) struct ChoreListArgs {
 
     /// Filter to specific id(s). Comma-separated, or repeat the flag.
     /// See `boss task list --help` for the accepted id forms and the
-    /// unknown-id / filter-composition contract.
-    #[arg(long = "ids", value_delimiter = ',')]
+    /// unknown-id / filter-composition contract. `--id` is accepted as
+    /// a legacy alias for existing scripts.
+    #[arg(long = "ids", alias = "id", value_delimiter = ',')]
     pub(crate) ids: Vec<String>,
 
     /// Include soft-deleted (tombstoned) chores in the listing. See
