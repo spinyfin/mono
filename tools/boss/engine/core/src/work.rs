@@ -580,7 +580,7 @@ pub use proposals::SubmitWorkerProposalOutcome;
 pub use review_verdicts::{
     REVIEW_GATE_OUTCOME_COMPLETED_CLEAN, REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS,
     REVIEW_GATE_OUTCOME_DROPPED_DUPLICATE_HEAD, REVIEW_GATE_OUTCOME_GAVE_UP,
-    REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED, ReviewVerdict, ReviewVerdictInput,
+    REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED, ReviewVerdict, ReviewVerdictInput, is_informative_gate_outcome,
 };
 pub use revision_helpers::normalize_priority;
 pub use trunk_merge_intents::{ActiveTrunkMergeIntent, TrunkMergeIntent, TrunkMergeIntentInsertInput};

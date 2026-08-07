@@ -1313,6 +1313,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Review {
             action: review::ReviewAction::Start { pr_number, repo },
         } => review::review_start(&cli.socket_path, cli.json, pr_number, repo).await,
+        Command::Review {
+            action: review::ReviewAction::Show { work_item, state_root },
+        } => review::review_show(cli.json, state_root, work_item),
         Command::LiveStatus {
             action: LiveStatusAction::Debug,
         } => live_status_debug(&cli.socket_path, cli.json).await,
