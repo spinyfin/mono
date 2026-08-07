@@ -64,7 +64,7 @@ async fn a_hook_for_an_orphaned_execution_readopts_it() {
     let after = server_state.work_db.get_execution(&execution_id).unwrap();
     assert_eq!(
         after.status,
-        ExecutionStatus::WaitingHuman,
+        ExecutionStatus::Running,
         "the run must return to the state a healthy pane-hosted worker occupies",
     );
     assert!(
@@ -290,7 +290,7 @@ async fn a_survivor_is_reaped_when_a_replacement_execution_is_already_live() {
     );
     assert_eq!(
         server_state.work_db.get_execution(&replacement).unwrap().status,
-        ExecutionStatus::WaitingHuman,
+        ExecutionStatus::Running,
         "the live replacement must be left completely alone",
     );
 }
@@ -340,7 +340,7 @@ async fn a_worker_whose_spawn_ack_was_lost_is_readopted_once_it_hooks() {
         db.set_run_shell_pid_for_execution(&execution_id, live_pid).unwrap(),
         "the durable pid write is what makes this recoverable at all",
     );
-    finish_run_waiting_human(db, &execution_id, &run.id, Some("Spawned worker pane in slot 1."));
+    finish_run_worker_pane_alive(db, &execution_id, &run.id, Some("Spawned worker pane in slot 1."));
 
     // (3) A reap concludes the worker never came up. This is the false
     //     inference the degraded network produces.
@@ -362,7 +362,7 @@ async fn a_worker_whose_spawn_ack_was_lost_is_readopted_once_it_hooks() {
     let after = db.get_execution(&execution_id).unwrap();
     assert_eq!(
         after.status,
-        ExecutionStatus::WaitingHuman,
+        ExecutionStatus::Running,
         "a lost ack must not be able to leave a running worker permanently untracked",
     );
     assert!(after.finished_at.is_none());
@@ -568,7 +568,7 @@ async fn a_readopted_run_whose_checkpoint_is_unresolvable_files_an_attention_ite
     );
     assert_eq!(
         server_state.work_db.get_execution(&execution_id).unwrap().status,
-        ExecutionStatus::WaitingHuman,
+        ExecutionStatus::Running,
         "a failed ingress restore must not block the row restore — the duplicate-dispatch stop \
          is the more urgent half and does not depend on the tail",
     );
@@ -704,6 +704,6 @@ async fn concurrent_hooks_for_one_run_converge_once() {
     );
     assert_eq!(
         server_state.work_db.get_execution(&execution_id).unwrap().status,
-        ExecutionStatus::WaitingHuman,
+        ExecutionStatus::Running,
     );
 }

@@ -613,31 +613,32 @@ impl WorkerCompletionHandler {
             );
         }
 
-        // AI #6 running-status gate (incident 001 §5): in Claude Code
-        // the `Stop` hook fires after every assistant turn, not just
-        // at worker exit. With no staged URL on a still-`running`
-        // execution we MUST NOT fall through to `detect_pr` — the
-        // worker is alive and any positive result would race against
-        // its own in-flight push.
+        // AI #6 turn-loop gate (incident 001 §5): in Claude Code the
+        // `Stop` hook fires after every assistant turn, not just at
+        // worker exit. The cold-path fallback below (a jj revset plus a
+        // GitHub walk) is only meaningful for a live worker that owns its
+        // own turn loop; see [`super::worker_owns_turn_loop`] for why this
+        // used to be spelled `status == waiting_human` and what it always
+        // actually meant.
         //
-        // Note: `waiting_human` is set immediately at pane spawn
-        // (PaneSpawnRunner), NOT at worker exit — the worker is still
-        // actively running turns when in `waiting_human`. This gate
-        // is useful only as a coarse filter for the PR-detection
-        // fallthrough below: a worker in `running` (either between its
-        // `start_execution_run`/`finish_execution_run` calls, or a
-        // `pr_review` reviewer pane, which the design deliberately keeps
-        // in `running` — see `RunWaitState::ReviewerPaneAlive`) never
-        // falls through to `detect_pr`/the nudge loop. Marker detection
-        // above already ran regardless of this gate, so a `[blocked]` or
-        // `[deferred-scope]` signal from a `running` worker is still filed
-        // and visible to the coordinator even though this Stop parks here
-        // as a no-op.
-        if execution.status != ExecutionStatus::WaitingHuman {
+        // Defense-in-depth on THIS path: both of the predicate's halves are
+        // already enforced upstream in `on_stop_inner` — the non-live
+        // statuses return `AlreadyTerminal`, and `pr_review` diverts to
+        // `finalize_pr_review_pass` — so a hit here means one of those
+        // funnels moved. It is load-bearing on the predicate's other caller,
+        // `recheck_for_pr`, which the merge poller reaches by query rather
+        // than by hook and which has no such funnel.
+        //
+        // Marker detection above already ran regardless of this gate, so a
+        // `[blocked]` or `[deferred-scope]` signal is still filed and
+        // visible to the coordinator even when this Stop parks here as a
+        // no-op.
+        if !super::worker_owns_turn_loop(&execution) {
             tracing::debug!(
                 execution_id,
                 status = %execution.status,
-                "stop event: no staged URL and execution is not waiting_human — skipping fallback (running-status gate)",
+                kind = %execution.kind,
+                "stop event: no staged URL and this execution does not own a live worker turn loop — skipping fallback",
             );
             return StopOutcome::RunningNoStagedPr;
         }

@@ -538,6 +538,20 @@ pub(super) async fn dispatch_live_worker_state(
     // hook arriving before `register_spawn` or after `release_slot`
     // is a benign no-op.
     let new_activity = server_state.live_worker_states.get(slot_id).map(|s| s.activity);
+    // Project the pane's awaiting-input state onto the durable row, so
+    // `work_executions.status` and `bossctl agents`' `activity` cannot
+    // disagree about whether this worker is blocked on a human. Runs
+    // immediately after `apply_event` — while the before/after activity
+    // pair is in hand — and is a cheap no-op for every event that doesn't
+    // cross the boundary. See `crate::awaiting_input_status`.
+    crate::awaiting_input_status::mirror_awaiting_input(
+        &server_state.work_db,
+        &server_state.publisher,
+        run_id,
+        prior_activity,
+        new_activity,
+    )
+    .await;
     // The end-of-turn trigger comes from the run's driver
     // (`Capability::TurnBoundary`), resolved once at ingress — not from this
     // dispatcher recognising a Claude-shaped `Stop`. Checked ahead of the

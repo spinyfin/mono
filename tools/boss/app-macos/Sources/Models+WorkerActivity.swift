@@ -85,11 +85,17 @@ enum AgentActivityState: Equatable {
         }
         switch executionStatus {
         case "running":
-            if runtime.runStatus == "active" {
-                self = .active
-            } else {
-                self = .waiting(reason: "Run \(runtime.runStatus ?? "in progress")")
-            }
+            // `running` means the agent is working — the engine is still
+            // spawning, or the pane is up and its agent owns the turn loop.
+            // Deliberately NOT gated on `runStatus`: the `work_runs` row
+            // describes the engine's *spawn* run, which PaneSpawnRunner
+            // closes the instant the pane comes up, so a healthy worker
+            // spends its whole life as `running` + a closed spawn run.
+            // Gating on it here painted every such worker as "Run
+            // completed". That gate only ever looked right because a live
+            // worker used to (wrongly) store `waiting_human` and never
+            // reached this arm at all — see mono#2680.
+            self = .active
         case "ready":
             self = .waiting(reason: "Queued for a worker")
         case "waiting_human":

@@ -548,11 +548,11 @@ async fn ack_timeout_provisional_spawn_is_tracked_not_failed_or_duplicated() {
     );
     let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
     coordinator.kick();
-    wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::WaitingHuman).await;
+    wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Running).await;
 
     // Tracked, not failed — the pane may be live and doing work.
     let execution = db.get_execution(&execution_id).unwrap();
-    assert_eq!(execution.status, ExecutionStatus::WaitingHuman);
+    assert_eq!(execution.status, ExecutionStatus::Running);
     // The lease is retained on the tracked row (a provisional pane may
     // be occupying the workspace) — clearing it would let the workspace
     // be re-leased out from under a live worker.
@@ -1210,7 +1210,7 @@ async fn pane_spawned_event_carries_spawn_config_details() {
     );
     let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
     coordinator.kick();
-    wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::WaitingHuman).await;
+    wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Running).await;
 
     let events = recording.events_for(&execution_id).await;
     let pane_event = events

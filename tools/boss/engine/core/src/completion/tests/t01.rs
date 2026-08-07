@@ -1283,7 +1283,7 @@ async fn pr_absent_publishes_awaiting_pr_and_queues_probe() {
         other => panic!("expected chore, got {other:?}"),
     }
     let execution = db.get_execution(&execution_id).unwrap();
-    assert_eq!(execution.status, ExecutionStatus::WaitingHuman);
+    assert_eq!(execution.status, ExecutionStatus::Running);
     assert_eq!(execution.cube_lease_id.as_deref(), Some("lease-1"));
     assert!(
         cube.release_calls.lock().await.is_empty(),
@@ -1346,7 +1346,7 @@ async fn stale_pr_publishes_awaiting_pr_and_queues_push_probe() {
         other => panic!("expected chore, got {other:?}"),
     }
     let execution = db.get_execution(&execution_id).unwrap();
-    assert_eq!(execution.status, ExecutionStatus::WaitingHuman);
+    assert_eq!(execution.status, ExecutionStatus::Running);
     assert_eq!(execution.cube_lease_id.as_deref(), Some("lease-1"));
     assert!(cube.release_calls.lock().await.is_empty());
     assert!(pane.calls.lock().await.is_empty());
@@ -1973,47 +1973,89 @@ async fn stale_stop_from_superseded_workspace_occupant_is_ignored() {
     );
 }
 
-#[tokio::test]
-async fn running_status_short_circuits_without_calling_detector() {
-    let workspace = tempdir().unwrap();
-    let (_dir, db, _product_id, chore_id, execution_id) = fixture_running(workspace.path());
-
-    let detector = StubPrDetector::ok(Some("https://github.com/should/not/pull/999"));
-
-    let TestHarness {
-        handler,
-        cube,
-        publisher,
-        pane,
-        probes,
-    } = TestHarness::new(db.clone(), detector.clone());
-
-    let outcome = handler.on_stop(&execution_id).await;
-    assert_eq!(
-        outcome,
-        StopOutcome::RunningNoStagedPr,
-        "running execution with no staged URL must short-circuit, not invoke the detector",
-    );
-    assert_eq!(detector.call_count(), 0, "running-status gate must not call detect_pr",);
-    // Chore stays put, no probe queued, no publish.
-    let item = db.get_work_item(&chore_id).unwrap();
-    match item {
-        WorkItem::Chore(t) => {
-            assert_eq!(t.status, TaskStatus::Active);
-            assert!(t.pr_url.is_none());
-        }
-        other => panic!("expected chore, got {other:?}"),
+/// Unit coverage for the shared gate predicate itself.
+///
+/// The `on_stop` path cannot reach the gate with a failing input — it
+/// returns `AlreadyTerminal` for a non-live row long before, and diverts
+/// `pr_review` to `finalize_pr_review_pass` — so the predicate is pinned
+/// here directly. It IS load-bearing on the other caller,
+/// `recheck_for_pr`, which the merge poller reaches by query rather than
+/// by hook and which therefore has no such upstream funnel.
+#[test]
+fn worker_owns_turn_loop_admits_live_workers_and_excludes_reviewers() {
+    fn execution(status: ExecutionStatus, kind: ExecutionKind) -> crate::work::WorkExecution {
+        crate::work::WorkExecution::builder()
+            .id("exec_test")
+            .work_item_id("task_test")
+            .kind(kind)
+            .status(status)
+            .repo_remote_url("git@example.com:foo.git")
+            .created_at("2026-08-06T00:00:00Z")
+            .build()
     }
-    assert!(cube.release_calls.lock().await.is_empty());
-    assert!(pane.calls.lock().await.is_empty());
-    assert!(probes.snapshot().is_empty());
-    assert!(publisher.publish_calls.lock().await.is_empty());
+
+    // Both live statuses admit a worker: a worker parked on a human does
+    // not un-push whatever it pushed before parking.
+    for status in [ExecutionStatus::Running, ExecutionStatus::WaitingHuman] {
+        assert!(
+            crate::completion::worker_owns_turn_loop(&execution(status.clone(), ExecutionKind::ChoreImplementation)),
+            "{status} is a live worker status and must pass the gate",
+        );
+    }
+    // A reviewer never opens a PR of its own — running branch detection
+    // for one could only ever bind somebody else's.
+    assert!(
+        !crate::completion::worker_owns_turn_loop(&execution(ExecutionStatus::Running, ExecutionKind::PrReview)),
+        "a live reviewer must never reach the PR-detection fallback",
+    );
+    // Everything the completion and dispatch paths own stays excluded.
+    for status in [
+        ExecutionStatus::Queued,
+        ExecutionStatus::Ready,
+        ExecutionStatus::WaitingDependency,
+        ExecutionStatus::WaitingReview,
+        ExecutionStatus::WaitingMerge,
+        ExecutionStatus::Completed,
+        ExecutionStatus::Failed,
+        ExecutionStatus::Abandoned,
+        ExecutionStatus::Cancelled,
+        ExecutionStatus::Orphaned,
+    ] {
+        assert!(
+            !crate::completion::worker_owns_turn_loop(&execution(status.clone(), ExecutionKind::ChoreImplementation)),
+            "{status} is not a live worker turn loop and must not reach the fallback",
+        );
+    }
 }
 
-/// Companion to the running-status gate test: when the execution
-/// IS in `waiting_human` (worker has paused and is awaiting human
-/// review), the fallback fires. This is the only state in which
-/// the cold path is allowed to run, per the incident-001 fix.
+/// Regression (mono#2680): a worker whose row reads `running` is a live
+/// worker, and its Stop MUST reach the PR-detection fallback.
+///
+/// This test asserted the exact opposite until `running` stopped meaning
+/// "the engine is mid-spawn" and started meaning "the pane is up and its
+/// agent is working" — which is the state every worker now spends its life
+/// in. Had the old gate survived that change, the cold-path recovery would
+/// have been switched off for every worker in the system.
+#[tokio::test]
+async fn running_worker_falls_through_to_detector() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture_running(workspace.path());
+
+    let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/911"));
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+        "a live `running` worker must fall through to the detector; got {outcome:?}",
+    );
+    assert_eq!(detector.call_count(), 1, "detect_pr must run for a live running worker");
+}
+
+/// Companion to the gate tests: a `waiting_human` execution — a worker
+/// genuinely blocked on a person — also falls through. Parking on a human
+/// does not un-push whatever the worker pushed before it parked, so the
+/// recovery path must still be able to bind that PR.
 #[tokio::test]
 async fn waiting_human_status_invokes_detector_with_expected_branch() {
     let workspace = tempdir().unwrap();
@@ -2079,7 +2121,7 @@ async fn empty_diff_pr_publishes_awaiting_pr_and_queues_empty_pr_probe() {
         other => panic!("expected chore, got {other:?}"),
     }
     let execution = db.get_execution(&execution_id).unwrap();
-    assert_eq!(execution.status, ExecutionStatus::WaitingHuman);
+    assert_eq!(execution.status, ExecutionStatus::Running);
     assert_eq!(execution.cube_lease_id.as_deref(), Some("lease-1"));
     assert!(
         cube.release_calls.lock().await.is_empty(),
@@ -2151,7 +2193,7 @@ PR #379. PR #379.";
             workspace.path().to_str().unwrap(),
         )
         .unwrap();
-    finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned worker pane"));
+    finish_run_worker_pane_alive(&db, &execution.id, &run.id, Some("spawned worker pane"));
 
     // Worker exited without pushing — the (now-fixed) detector
     // returns `None` rather than misbinding to one of the PRs
@@ -2186,8 +2228,8 @@ PR #379. PR #379.";
     let exec_after = db.get_execution(&execution.id).unwrap();
     assert_eq!(
         exec_after.status,
-        ExecutionStatus::WaitingHuman,
-        "execution must stay in waiting_human so a follow-up Stop can re-check",
+        ExecutionStatus::Running,
+        "execution must stay live (running) so a follow-up Stop can re-check",
     );
     assert_eq!(
         exec_after.cube_lease_id.as_deref(),
@@ -2238,7 +2280,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             workspace.path().to_str().unwrap(),
         )
         .unwrap();
-    finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned worker pane"));
+    finish_run_worker_pane_alive(&db, &execution.id, &run.id, Some("spawned worker pane"));
 
     // The worker DID create a real PR — number 500, freshly
     // opened. The (fixed) detector reports that fresh PR's url,

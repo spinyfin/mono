@@ -39,7 +39,7 @@ async fn merge_poller_recheck_binds_three_stuck_workers_when_detector_recovers()
             ws2.path().to_str().unwrap(),
         )
         .unwrap();
-    finish_run_waiting_human(&db, &exec2.id, &run2.id, None);
+    finish_run_worker_pane_alive(&db, &exec2.id, &run2.id, None);
     let chore3 = db
         .create_chore(
             crate::work::CreateChoreInput::builder()
@@ -62,7 +62,7 @@ async fn merge_poller_recheck_binds_three_stuck_workers_when_detector_recovers()
             ws3.path().to_str().unwrap(),
         )
         .unwrap();
-    finish_run_waiting_human(&db, &exec3.id, &run3.id, None);
+    finish_run_worker_pane_alive(&db, &exec3.id, &run3.id, None);
 
     // Detector that returns Stale for every candidate — simulates
     // the failure mode where the worker's `@`/`@-` drifted from
@@ -125,8 +125,8 @@ async fn merge_poller_recheck_binds_three_stuck_workers_when_detector_recovers()
         let execution = db.get_execution(execution_id).unwrap();
         assert_eq!(
             execution.status,
-            ExecutionStatus::WaitingHuman,
-            "execution must stay in waiting_human after a Stale recheck",
+            ExecutionStatus::Running,
+            "execution must stay live (running) after a Stale recheck",
         );
         assert!(
             execution.cube_lease_id.is_some(),
@@ -272,8 +272,8 @@ async fn on_stop_skips_detector_when_feature_flag_is_off() {
     let execution = db.get_execution(&execution_id).unwrap();
     assert_eq!(
         execution.status,
-        ExecutionStatus::WaitingHuman,
-        "execution must remain `waiting_human` for the human to resolve",
+        ExecutionStatus::Running,
+        "execution must remain live for the human to resolve",
     );
     assert!(
         execution.cube_lease_id.is_some(),
@@ -1322,16 +1322,12 @@ async fn effort_escalation_and_deferred_scope_also_survive_a_non_claude_transcri
 
 #[tokio::test]
 async fn blocked_marker_files_attention_even_while_execution_still_running() {
-    // A worker can emit the sanctioned `[blocked]` marker while
-    // `execution.status` is still `running` — briefly between
-    // `start_execution_run` and the coordinator's post-spawn-ack flip
-    // to `waiting_human`, and unconditionally for a `pr_review`
-    // reviewer pane (`RunWaitState::ReviewerPaneAlive` keeps it in
-    // `running` for the pane's whole lifetime, by design). A
-    // `[blocked]` marker emitted in either state must still be filed as
-    // an attention item; it must not sit behind the `waiting_human`-only
-    // gate that used to skip `detect_and_file_worker_signals` entirely
-    // for any execution not in exactly that one status.
+    // `running` is the status EVERY live pane worker sits in
+    // (`RunWaitState::WorkerPaneAlive`), so this is the ordinary case for
+    // a `[blocked]` marker, not an edge one. It must be filed as an
+    // attention item, and it must not sit behind the `waiting_human`-only
+    // gate that used to skip `detect_and_file_worker_signals` entirely for
+    // any execution not in exactly that one status.
     let workspace = tempdir().unwrap();
     let dir = tempdir().unwrap();
     let path = dir.path().join("boss.db");
@@ -1365,12 +1361,12 @@ async fn blocked_marker_files_attention_even_while_execution_still_running() {
 
     let outcome = handler.on_stop(&execution.id).await;
     assert!(
-        matches!(outcome, StopOutcome::RunningNoStagedPr),
-        "a `running` execution still falls through the PR-detection gate as a no-op; got {outcome:?}",
+        matches!(outcome, StopOutcome::EscalationPending { .. }),
+        "the unresolved `[blocked]` signal must suppress nudging for this live worker; got {outcome:?}",
     );
     assert!(
         probes.snapshot().is_empty(),
-        "no produce-a-PR nudge may be queued for a running execution",
+        "no produce-a-PR nudge may be queued for a worker that just declared itself blocked",
     );
     let items = db.list_attention_items(&execution.id).unwrap();
     assert_eq!(
@@ -1379,8 +1375,8 @@ async fn blocked_marker_files_attention_even_while_execution_still_running() {
             .filter(|i| i.kind == worker_escalation::WORKER_BLOCKED_ATTENTION_KIND)
             .count(),
         1,
-        "the [blocked] marker must be filed as an attention item even though \
-         `execution.status` is `running`, not `waiting_human`; got {items:?}",
+        "the [blocked] marker must be filed as an attention item for a live \
+         `running` worker; got {items:?}",
     );
 }
 
@@ -2376,7 +2372,7 @@ async fn blocked_worker_is_never_reaped_across_repeated_stops() {
     let execution = db.get_execution(&execution_id).unwrap();
     assert_eq!(
         execution.status,
-        ExecutionStatus::WaitingHuman,
+        ExecutionStatus::Running,
         "a genuinely blocked worker must stay live, not be finalized",
     );
     assert!(execution.cube_lease_id.is_some(), "lease must remain attached");
@@ -2526,7 +2522,7 @@ async fn build_wait_narration_suppresses_nudge_across_repeated_stops() {
     let execution = db.get_execution(&execution_id).unwrap();
     assert_eq!(
         execution.status,
-        ExecutionStatus::WaitingHuman,
+        ExecutionStatus::Running,
         "a healthy build-waiting worker must stay live, not be finalized",
     );
     assert!(execution.cube_lease_id.is_some(), "lease must remain attached");
@@ -2633,7 +2629,7 @@ async fn background_children_suppress_nudge_across_repeated_stops() {
     let execution = db.get_execution(&execution_id).unwrap();
     assert_eq!(
         execution.status,
-        ExecutionStatus::WaitingHuman,
+        ExecutionStatus::Running,
         "a healthy worker with live background children must stay live, not be finalized",
     );
     let items = db.list_attention_items(&execution_id).unwrap();
@@ -2874,7 +2870,7 @@ async fn revision_with_no_bound_pr_parks_instead_of_nudging_create() {
             workspace.path().to_str().unwrap(),
         )
         .unwrap();
-    finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned revision worker pane"));
+    finish_run_worker_pane_alive(&db, &execution.id, &run.id, Some("spawned revision worker pane"));
 
     let detector = StubPrDetector::ok(None);
 

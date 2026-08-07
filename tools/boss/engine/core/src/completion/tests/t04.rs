@@ -1449,7 +1449,7 @@ async fn full_produce_review_revise_re_review_loop_converges() {
             workspace.path().to_str().unwrap(),
         )
         .unwrap();
-    finish_run_waiting_human(&db, &pr_review_exec_1.id, &run1.id, Some("reviewer spawned"));
+    finish_run_worker_pane_alive(&db, &pr_review_exec_1.id, &run1.id, Some("reviewer spawned"));
 
     // Write a transcript with a HIGH finding.
     let high_json = high_finding_review_result_json(PR_URL);
@@ -1505,7 +1505,7 @@ async fn full_produce_review_revise_re_review_loop_converges() {
             workspace.path().to_str().unwrap(),
         )
         .unwrap();
-    finish_run_waiting_human(&db, &rev_exec.id, &rev_run.id, Some("revision worker spawned"));
+    finish_run_worker_pane_alive(&db, &rev_exec.id, &rev_run.id, Some("revision worker spawned"));
 
     // Stage the same PR URL for the revision execution.
     let rev_staged = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
@@ -1548,7 +1548,7 @@ async fn full_produce_review_revise_re_review_loop_converges() {
             workspace.path().to_str().unwrap(),
         )
         .unwrap();
-    finish_run_waiting_human(&db, &pr_review_exec_2.id, &run2.id, Some("reviewer 2 spawned"));
+    finish_run_worker_pane_alive(&db, &pr_review_exec_2.id, &run2.id, Some("reviewer 2 spawned"));
 
     // Write a clean transcript — no qualifying findings.
     let clean_json = clean_review_result_json(PR_URL);
@@ -1706,7 +1706,7 @@ async fn revision_triggered_review_catches_motivating_duplication_case() {
             workspace.path().to_str().unwrap(),
         )
         .unwrap();
-    finish_run_waiting_human(&db, &pr_review_exec.id, &run.id, Some("reviewer spawned"));
+    finish_run_worker_pane_alive(&db, &pr_review_exec.id, &run.id, Some("reviewer spawned"));
 
     let dup_json = duplication_finding_review_result_json(parent_pr_url);
     let transcript = workspace.path().join(format!("transcript-{}.jsonl", pr_review_exec.id));
@@ -2143,7 +2143,7 @@ async fn pure_rebase_skip_gate_falls_through_when_no_attempt_row_exists() {
             workspace.path().to_str().unwrap(),
         )
         .unwrap();
-    finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned revision worker pane"));
+    finish_run_worker_pane_alive(&db, &execution.id, &run.id, Some("spawned revision worker pane"));
 
     let verifier = StubBranchVerifier::ok("boss/exec_parent");
     let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
@@ -2338,7 +2338,7 @@ async fn on_stop_does_not_finalize_satisfied_revision_when_ci_inflight() {
     // Worker must NOT be reaped.
     assert_eq!(
         db.get_execution(&execution_id).unwrap().status,
-        ExecutionStatus::WaitingHuman,
+        ExecutionStatus::Running,
     );
     assert!(cube.release_calls.lock().await.is_empty());
     assert!(pane.calls.lock().await.is_empty());
@@ -2404,7 +2404,7 @@ async fn on_stop_finalizes_satisfied_chore_when_pr_clean_and_sha_unchanged() {
             workspace.path().to_str().unwrap(),
         )
         .unwrap();
-    finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned worker pane"));
+    finish_run_worker_pane_alive(&db, &execution.id, &run.id, Some("spawned worker pane"));
     db.set_execution_pr_head_before(&execution.id, head).unwrap();
 
     // SHA unchanged → NoContribution.

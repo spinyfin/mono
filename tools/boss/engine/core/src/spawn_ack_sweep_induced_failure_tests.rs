@@ -115,8 +115,8 @@ async fn a_pane_hosting_only_a_live_login_shell_is_detected_and_fully_released()
     let execution_id = create_spawned_execution(&db, &work_item_id, shell_pid as i64);
     assert_eq!(
         db.get_execution(&execution_id).unwrap().status,
-        ExecutionStatus::WaitingHuman,
-        "precondition: the incident's execution parked at waiting_human",
+        ExecutionStatus::Running,
+        "precondition: the incident's execution is a live pane-hosted worker (`running`)",
     );
 
     // The live-state shape: grok (no `Capability::AwaitingInputSignal`),
@@ -319,7 +319,7 @@ async fn the_same_pane_with_a_driver_signal_is_left_completely_alone() {
     assert_eq!(outcome.reaped, 0);
     assert_eq!(
         db.get_execution(&execution_id).unwrap().status,
-        ExecutionStatus::WaitingHuman,
+        ExecutionStatus::Running,
         "a working worker's execution must be untouched",
     );
     assert!(

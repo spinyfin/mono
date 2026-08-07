@@ -398,12 +398,12 @@ impl ExecutionRunner for FakeExecutionRunner {
         if self.ack_timed_out {
             // Mirror the real PaneSpawnRunner after a SpawnWorkerPane
             // ack timeout: a PROVISIONAL spawn. The pane may be live,
-            // so the run is tracked in `waiting_human` with its slot
+            // so the run is tracked live (`running`) with its slot
             // retained (slot_id = Some ⇒ the coordinator defers the
             // pool-slot release and does NOT release the workspace
             // lease). No attention item — this is not a failure.
             return Ok(RunOutcome {
-                wait_state: RunWaitState::WaitingHuman,
+                wait_state: RunWaitState::WorkerPaneAlive,
                 result_summary: Some("provisional spawn: SpawnWorkerPane ack timed out".to_owned()),
                 attention: None,
                 slot_id: Some(1),
@@ -412,7 +412,7 @@ impl ExecutionRunner for FakeExecutionRunner {
         }
 
         Ok(RunOutcome {
-            wait_state: self.wait_state.unwrap_or(RunWaitState::WaitingHuman),
+            wait_state: self.wait_state.unwrap_or(RunWaitState::WorkerPaneAlive),
             result_summary: Some(format!("finished {}", execution.kind)),
             attention: Some(RunAttention {
                 kind: "review_required".to_owned(),

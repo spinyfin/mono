@@ -54,6 +54,11 @@ pub enum RunWaitState {
     WaitingDependency,
     /// Worker is awaiting human input/redirect. Workspace is retained so
     /// the next run can continue in-place.
+    ///
+    /// **Not** the post-spawn outcome of a pane-hosted run — that is
+    /// [`Self::WorkerPaneAlive`]. A runner may only return this when it has
+    /// positive evidence the worker is blocked on a person; a runner that
+    /// merely handed off to a live agent has not.
     WaitingHuman,
     /// Worker is awaiting human review of an open PR. Workspace retained.
     WaitingReview,
@@ -68,19 +73,25 @@ pub enum RunWaitState {
     /// [`PaneSpawnRunner::run_execution`] and the mid-spawn-cancel
     /// collision this closes.
     CancelledDuringSpawn,
-    /// A `pr_review` reviewer pane was successfully spawned. The pane is
-    /// alive and the reviewer agent is actively working. The execution
-    /// stays in `running` (not `waiting_human`) until the Stop hook fires
-    /// and `finalize_pr_review_pass` transitions it to `completed` via
-    /// `record_worker_pr_completion`. Workspace is retained so the reviewer
-    /// pane can continue.
+    /// An agent pane was successfully spawned. The pane is alive and its
+    /// agent is actively working; the engine has handed the turn loop off
+    /// but nothing is blocked on a person. The execution stays in
+    /// `running` until the agent's own lifecycle concludes it — a Stop
+    /// hook driving `on_stop`'s completion machinery for a worker, or
+    /// `finalize_pr_review_pass` → `record_worker_pr_completion` for a
+    /// reviewer. Workspace is retained so the pane can continue.
     ///
-    /// Using `running` (rather than `waiting_human`) is what keeps the
-    /// "AI reviewing" badge visible on kanban cards for the duration of
-    /// the review — the badge queries `pr_review` executions in `running`
-    /// status. `waiting_human` is semantically wrong here: nobody is waiting
-    /// for a human while the reviewer agent is working.
-    ReviewerPaneAlive,
+    /// This is the outcome of every successful pane spawn, whatever the
+    /// execution kind. It started life as `ReviewerPaneAlive`, applied
+    /// only to `pr_review`, on the reasoning that "`waiting_human` is
+    /// semantically wrong here: nobody is waiting for a human while the
+    /// reviewer agent is working" — which is equally true of every other
+    /// kind, and was the defect mono#2680 fixed by generalizing it.
+    ///
+    /// Using `running` is also what keeps the "AI reviewing" badge visible
+    /// on kanban cards for the duration of a review — the badge queries
+    /// `pr_review` executions in `running` status.
+    WorkerPaneAlive,
 }
 
 impl RunWaitState {
@@ -95,8 +106,8 @@ impl RunWaitState {
             // drives a status transition for this variant. Report the
             // terminal status for completeness.
             RunWaitState::CancelledDuringSpawn => ExecutionStatus::Cancelled,
-            // Reviewer pane is alive; execution stays `running`.
-            RunWaitState::ReviewerPaneAlive => ExecutionStatus::Running,
+            // Agent pane is alive and working; execution stays `running`.
+            RunWaitState::WorkerPaneAlive => ExecutionStatus::Running,
         }
     }
 

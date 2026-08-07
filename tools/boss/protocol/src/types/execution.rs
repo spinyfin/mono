@@ -124,7 +124,31 @@ pub enum ExecutionStatus {
     Queued,
     Ready,
     WaitingDependency,
+    /// The engine has dispatched this execution and its agent is working:
+    /// either the engine is still inside `run_execution` (the spawn
+    /// window), or the spawn completed and the worker's agent now owns the
+    /// turn loop in its pane. Either way *something is making progress*,
+    /// and nothing is blocked on a person.
+    ///
+    /// This is the status a healthy pane-hosted worker sits in for the bulk
+    /// of its life. Until mono#2680 it was `WaitingHuman`, written
+    /// unconditionally by `PaneSpawnRunner` the instant the pane came up —
+    /// so the stored value contradicted the worker's own hook stream for
+    /// the entire run.
     Running,
+    /// The worker's agent is blocked on a person: it emitted its driver's
+    /// awaiting-input signal (Claude's `Notification` hook) and will not
+    /// make further progress until a human or the coordinator replies.
+    ///
+    /// This is the durable projection of
+    /// `boss_protocol::WorkerActivity::WaitingForInput`, and the two are
+    /// kept in agreement by the engine's worker-event dispatcher — see
+    /// `tools/boss/docs/worker-liveness-contract.md`. It is written *only*
+    /// on that transition and cleared the moment the worker resumes, so a
+    /// row reading `waiting_human` means the pane really is waiting.
+    ///
+    /// It is NOT a post-spawn park state, and nothing may write it to mean
+    /// "the engine has handed off". Use [`Self::Running`] for that.
     WaitingHuman,
     WaitingReview,
     WaitingMerge,

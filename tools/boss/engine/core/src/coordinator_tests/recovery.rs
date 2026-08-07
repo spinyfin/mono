@@ -515,7 +515,7 @@ async fn lease_falls_back_when_no_prefer_and_first_workspace_refused() {
     );
     let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
     coordinator.kick();
-    wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::WaitingHuman).await;
+    wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Running).await;
 
     // Two cube lease invocations: first fails, second succeeds.
     let calls = cube.lease_calls.lock().await;

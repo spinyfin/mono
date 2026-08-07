@@ -13,6 +13,7 @@ pub mod audit_effort;
 pub use boss_engine_automation_schedule as automation_schedule;
 pub mod automation_scheduler;
 pub mod automation_triage;
+pub mod awaiting_input_status;
 pub mod background_children;
 pub mod blocking_signal;
 pub mod boss_construct_scan;

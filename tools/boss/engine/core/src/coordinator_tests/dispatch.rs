@@ -214,10 +214,10 @@ async fn interactive_concurrency_cap_holds_ready_rows() {
     assert_eq!(execution.status, ExecutionStatus::Ready);
 
     let cube = Arc::new(FakeCubeClient::default());
-    // `pending: true` keeps the run parked in `Running` so the
-    // post-cap-release assertion below has a stable status to wait
-    // for — the default fake runner completes instantly to
-    // `WaitingHuman`, which would race straight past `Running`.
+    // `pending: true` holds the run OPEN (a `work_runs` row with no
+    // `finished_at`) so the post-cap-release assertion below has a stable
+    // state to wait for — the default fake runner closes its run
+    // instantly, which would race straight past the window under test.
     let runner = Arc::new(FakeExecutionRunner {
         pending: true,
         ..FakeExecutionRunner::default()
@@ -761,7 +761,7 @@ async fn slot_id_from_outcome_is_stamped_onto_run_agent_id() {
     coordinator.kick();
 
     let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
-    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::WaitingHuman).await;
+    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
 
     let run = db.list_runs(&execution.id).unwrap().pop().unwrap();
     assert_eq!(run.status, "completed");
@@ -771,7 +771,7 @@ async fn slot_id_from_outcome_is_stamped_onto_run_agent_id() {
 #[tokio::test]
 async fn pane_spawn_run_does_not_release_worker_pool_slot() {
     // The libghostty pane outlives the `run_execution` call —
-    // PaneSpawnRunner returns Ok(WaitingHuman) the instant the
+    // PaneSpawnRunner returns Ok(WorkerPaneAlive) the instant the
     // SpawnWorkerPane RPC completes, but the user-visible worker
     // is just getting started. If the coordinator freed the
     // WorkerPool slot at that moment, the next dispatch could
@@ -793,7 +793,7 @@ async fn pane_spawn_run_does_not_release_worker_pool_slot() {
     coordinator.kick();
 
     let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
-    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::WaitingHuman).await;
+    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
 
     // Slot 1 still belongs to the (notionally) live pane. Only
     // `release_worker_pane` (driven by completion / force release
@@ -859,14 +859,14 @@ async fn missing_slot_id_leaves_worker_pool_placeholder_in_agent_id() {
     coordinator.kick();
 
     let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
-    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::WaitingHuman).await;
+    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
 
     let run = db.list_runs(&execution.id).unwrap().pop().unwrap();
     assert_eq!(run.agent_id, "worker-1");
 }
 
 #[tokio::test]
-async fn successful_run_moves_execution_to_waiting_human_and_releases_worker() {
+async fn successful_run_leaves_execution_running_and_releases_worker() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     let product = create_test_product(&db);
@@ -879,10 +879,10 @@ async fn successful_run_moves_execution_to_waiting_human_and_releases_worker() {
     coordinator.kick();
 
     let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
-    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::WaitingHuman).await;
+    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
 
     let execution = db.get_execution(&execution.id).unwrap();
-    assert_eq!(execution.status, ExecutionStatus::WaitingHuman);
+    assert_eq!(execution.status, ExecutionStatus::Running);
     assert_eq!(execution.cube_lease_id.as_deref(), Some("lease-1"));
     let run = db.list_runs(&execution.id).unwrap().pop().unwrap();
     assert_eq!(run.status, "completed");

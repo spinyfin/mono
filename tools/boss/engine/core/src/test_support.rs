@@ -223,7 +223,7 @@ pub fn create_spawned_execution(db: &WorkDb, work_item_id: &str, shell_pid: i64)
         db.set_run_shell_pid_for_execution(&execution_id, shell_pid).unwrap(),
         "the run row must exist before a shell pid can be recorded against it",
     );
-    finish_run_waiting_human(db, &execution_id, &run.id, Some("Spawned worker pane in slot 1."));
+    finish_run_worker_pane_alive(db, &execution_id, &run.id, Some("Spawned worker pane in slot 1."));
     execution_id
 }
 
@@ -253,18 +253,25 @@ pub fn spawn_group_leader_sleeper() -> std::process::Child {
 }
 
 /// Finish an execution's active run the way `PaneSpawnRunner` does: record
-/// the run as `completed` while parking the execution in `waiting_human`
-/// with its workspace lease still held. This is the post-spawn state the
-/// coordinator observes, and the `completion` test module hand-rolled the
-/// same `finish_execution_run(...)` builder block at a dozen-odd sites.
+/// the run as `completed` while the execution stays `running` — its pane is
+/// up and its agent is working — with its workspace lease still held. This
+/// is the post-spawn state the coordinator observes, and the `completion`
+/// test module hand-rolled the same `finish_execution_run(...)` builder
+/// block at a dozen-odd sites.
+///
+/// Named for `RunWaitState::WorkerPaneAlive`, the outcome it mirrors. It
+/// used to park in `waiting_human`, which is precisely the defect
+/// mono#2680 fixed; keeping the fixture on the old status would have left
+/// the entire completion suite exercising a state production no longer
+/// produces.
 ///
 /// Pass the per-site `result_summary` (or `None` where the test omits it).
-pub fn finish_run_waiting_human(db: &WorkDb, execution_id: &str, run_id: &str, result_summary: Option<&str>) {
+pub fn finish_run_worker_pane_alive(db: &WorkDb, execution_id: &str, run_id: &str, result_summary: Option<&str>) {
     db.finish_execution_run(
         FinishExecutionRunInput::builder()
             .execution_id(execution_id)
             .run_id(run_id)
-            .execution_status(ExecutionStatus::WaitingHuman)
+            .execution_status(ExecutionStatus::Running)
             .run_status("completed")
             .maybe_result_summary(result_summary)
             .build(),
@@ -457,7 +464,7 @@ crate::stub_cube_client! { AlwaysSucceedsCube {
 } }
 
 /// An [`ExecutionRunner`] test double that always reports a benign
-/// `WaitingHuman` outcome instead of panicking. Pairs with
+/// `WorkerPaneAlive` outcome instead of panicking. Pairs with
 /// [`AlwaysSucceedsCube`] — see its doc comment for why this pair exists.
 pub struct AlwaysSucceedsRunner;
 
@@ -472,7 +479,7 @@ impl ExecutionRunner for AlwaysSucceedsRunner {
         _cube_change_id: Option<&str>,
     ) -> Result<RunOutcome> {
         Ok(RunOutcome {
-            wait_state: RunWaitState::WaitingHuman,
+            wait_state: RunWaitState::WorkerPaneAlive,
             result_summary: Some(format!("test run finished for {}", execution.id)),
             attention: None,
             slot_id: None,

@@ -618,7 +618,7 @@ async fn scheduler_passes_preferred_workspace_to_lease_and_records_affinity() {
     coordinator.kick();
 
     let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
-    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::WaitingHuman).await;
+    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
 
     let calls = cube.lease_calls.lock().await;
     assert_eq!(calls.len(), 1);
@@ -653,7 +653,7 @@ async fn coordinator_publishes_execution_topic_events() {
     coordinator.kick();
 
     let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
-    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::WaitingHuman).await;
+    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
 
     let events = publisher.publish_calls.lock().await;
     let reasons: Vec<&str> = events.iter().map(|(_, _, _, reason)| reason.as_str()).collect();
@@ -664,11 +664,11 @@ async fn coordinator_publishes_execution_topic_events() {
         .rev()
         .find(|(_, _, _, reason)| reason == "execution_run_completed")
         .map(|(_, _, status, _)| status.clone());
-    assert_eq!(last_status.as_deref(), Some("waiting_human"));
+    assert_eq!(last_status.as_deref(), Some("running"));
 
     // The kanban activity-icon depends on a work-tree invalidation
     // on run completion, otherwise the card would stay stuck on
-    // "active" after the agent moved to waiting_human. Confirm the
+    // "active" after the spawn run closed. Confirm the
     // coordinator now fires the broadcast on the completion path
     // too — not just on execution-start auto-advance.
     let work_item_events = publisher.events.lock().await;
@@ -706,7 +706,7 @@ async fn coordinator_publishes_work_item_changed_on_execution_start() {
     coordinator.kick();
 
     let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
-    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::WaitingHuman).await;
+    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
 
     // Work-item invalidation should have fired with the chore's
     // product id and the chore's work-item id. Reason wording
@@ -1418,13 +1418,13 @@ async fn worker_release_skips_no_autostart_active_chore() {
     ));
     coordinator.kick();
 
-    // Wait for the warm-up to settle (its run will finish on
-    // WaitingHuman). After that the rescan has had its chance to
-    // touch the parked chore — it must not have.
+    // Wait for the warm-up to settle (its run finishes leaving the
+    // execution live in `running`). After that the rescan has had its
+    // chance to touch the parked chore — it must not have.
     wait_for_execution_status(
         db.as_ref(),
         &db.list_executions(Some(&warm.id)).unwrap()[0].id,
-        ExecutionStatus::WaitingHuman,
+        ExecutionStatus::Running,
     )
     .await;
     // Give the post-release rescan a clear window in which to
@@ -1817,7 +1817,7 @@ async fn ready_row_added_during_active_window_still_dispatches() {
     // assert the row reaches `waiting_human`.
     coordinator.kick();
     let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
-    wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::WaitingHuman).await;
+    wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Running).await;
 }
 
 /// Bus-routed sibling of [`kick_during_active_scheduler_latches_pending_wakeup`]
@@ -2090,7 +2090,7 @@ async fn heartbeat_rekicks_when_ready_row_was_orphaned_by_a_dropped_kick() {
     // Within a few intervals the heartbeat should kick the
     // scheduler, drain the row, and move it through to
     // `waiting_human` via the fake runner.
-    wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::WaitingHuman).await;
+    wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Running).await;
 }
 
 /// `stranded_ready_executions` is the read-side helper the heartbeat
