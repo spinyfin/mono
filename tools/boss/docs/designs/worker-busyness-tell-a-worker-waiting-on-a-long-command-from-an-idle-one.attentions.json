@@ -16,11 +16,11 @@
   },
   {
     "question_type": "multiple_choice",
-    "prompt": "The interception guard (entry 11) gives real prevention on Claude but is measurably holed on Codex: `write_stdin` fires no hook at all and MCP app tools evade `Bash` matchers. The 2026-07-29 guard-coverage investigation found the worker prompt had been asserting guard coverage that was false in two reachable ways. How should the guard be scoped on Codex?",
+    "prompt": "The interception guard (entry 11) gives real prevention on Claude. On Codex, the two routes a `Bash`-matcher guard cannot reach — `write_stdin` and `mcp__*` app tools — are already closed by the shipped, always-on `codex_tool_surface_guard` (`matcher = \".*\"`), independent of entry 11. What remains on Codex is narrower: that guard's interactive-interpreter denylist is a maintained list, not a structural guarantee (a determined agent could find an unlisted interactive stdin consumer), and Codex's `ToolUseInterception` is deny-only, so entry 11's own guard can block a bare build-class command but never silently rewrite it into the wrapped form. How should entry 11's guard be scoped on Codex?",
     "choices": [
-      "Install it on Codex, and state its known limits in the prompt rather than asserting coverage (design's recommendation) — it closes the accidental case, which is the common one",
-      "Install it on Codex silently — partial prevention beats none and the limits are an engine-side concern",
-      "Do not install it on Codex — partial coverage that reads as full coverage is how the previous false assertion happened; rely on layers 3 and 4 there"
+      "Install it on Codex, and state the enumerable-list residual in the prompt rather than asserting complete coverage (design's recommendation) — it closes the accidental case, which is the common one, on top of the platform-level closures already shipped",
+      "Install it on Codex silently — partial prevention beats none and the residual is an engine-side concern",
+      "Do not install it on Codex — an enumerable list that reads as a structural guarantee is how the previous false assertion happened; rely on layers 3 and 4 there"
     ],
     "anchor": "enforcement-what-stops-a-worker-sidestepping-the-wrapper"
   },
