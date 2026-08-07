@@ -1264,19 +1264,30 @@ pub async fn serve_with_merge_probe(
         crate::remote_lease_reconcile::DEFAULT_INTERVAL,
     );
 
-    // Periodic stale-worker liveness backstop: detects worker slots whose
-    // `claude` process is still alive but has made no transcript progress
-    // (no hook event) for longer than the staleness threshold while
-    // `activity=working` with no tool in flight. This is the wedged-
-    // dependency hang from issue #976 — a worker that backgrounded its
-    // pre-push bazel build and idled "until the gate is green" forever
-    // when bazel never completed. The dead-PID sweep cannot catch it
-    // (the process is alive), so this reaps the execution and releases
-    // the slot for redispatch. Runs every 60s and fires on boot.
+    // Periodic stale-worker liveness backstop: tmux-hosted workers are
+    // classified from hook recency plus pane output, foreground command, and
+    // pane death. A quietly stuck but live pane raises an attention item;
+    // confirmed death remains with the existing death reconcilers. Runs every
+    // 60s and fires on boot.
+    let stale_worker_terminal_inspector = match boss_tmux::Tmux::resolve() {
+        Ok(tmux) => Some(Arc::new(crate::stale_worker_sweep::TmuxWorkerTerminalInspector::new(
+            server_state.work_db.clone(),
+            tmux,
+        ))
+            as Arc<dyn crate::stale_worker_sweep::WorkerTerminalInspector>),
+        Err(err) => {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                "stale-worker sweep: tmux not resolvable; terminal liveness classification is unavailable",
+            );
+            None
+        }
+    };
     let _stale_worker_sweep_handle = crate::stale_worker_sweep::spawn_loop(
         crate::stale_worker_sweep::StaleWorkerSweepDeps {
             work_db: server_state.work_db.clone(),
             live_states: server_state.live_worker_states.clone(),
+            terminal_inspector: stale_worker_terminal_inspector,
             coordinator: server_state.execution_coordinator.clone(),
             dispatch_events: server_state.dispatch_events.clone(),
             // Reap via the same `release_worker_pane` teardown as `bossctl

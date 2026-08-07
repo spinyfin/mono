@@ -2583,6 +2583,73 @@ fn list_adoptable_tmux_runs_excludes_finished_run_of_live_execution() {
 }
 
 #[test]
+fn tmux_run_for_execution_prefers_the_newest_active_run() {
+    let db = WorkDb::open(temp_db_path("tmux-run-for-exec-newest")).unwrap();
+    let execution_id = start_run_on_host_for_test(&db, "local");
+
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(&execution_id, "boss", "boss-worker-old", "token-old")
+            .unwrap()
+    );
+    assert!(
+        db.record_tmux_session_created_for_execution(&execution_id, "token-old", 111)
+            .unwrap()
+    );
+
+    // A second active run for the same execution — e.g. left behind by a
+    // reconnect/redispatch that created a fresh run row without settling
+    // the prior one.
+    db.create_run(
+        CreateRunInput::builder()
+            .agent_id("worker-1")
+            .execution_id(execution_id.clone())
+            .status("active")
+            .build(),
+    )
+    .unwrap();
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(&execution_id, "boss", "boss-worker-new", "token-new")
+            .unwrap()
+    );
+    assert!(
+        db.record_tmux_session_created_for_execution(&execution_id, "token-new", 222)
+            .unwrap()
+    );
+
+    let run = db
+        .tmux_run_for_execution(&execution_id)
+        .unwrap()
+        .expect("expected a tmux run for the execution");
+    assert_eq!(
+        run.tmux_session_name, "boss-worker-new",
+        "the newest active run must win the tie-break",
+    );
+}
+
+#[test]
+fn tmux_run_for_execution_excludes_terminal_executions() {
+    let db = WorkDb::open(temp_db_path("tmux-run-for-exec-terminal")).unwrap();
+    let execution_id = start_run_on_host_for_test(&db, "local");
+
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(&execution_id, "boss", "boss-worker", "token")
+            .unwrap()
+    );
+    assert!(
+        db.record_tmux_session_created_for_execution(&execution_id, "token", 111)
+            .unwrap()
+    );
+    assert!(db.tmux_run_for_execution(&execution_id).unwrap().is_some());
+
+    db.mark_execution_orphaned(&execution_id, "test: terminal").unwrap();
+
+    assert!(
+        db.tmux_run_for_execution(&execution_id).unwrap().is_none(),
+        "a terminal execution's tmux run must not be offered",
+    );
+}
+
+#[test]
 fn tmux_spawn_tokens_are_unique_across_runs() {
     let db = WorkDb::open(temp_db_path("tmux-token-unique")).unwrap();
     let first_exec = start_run_on_host_for_test(&db, "local");
