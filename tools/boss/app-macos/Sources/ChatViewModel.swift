@@ -2130,6 +2130,8 @@ final class ChatViewModel: ObservableObject {
     /// leaves them `nil` and those arms answer with a failure.
     var paneSpawnHandler: ((EngineSpawnRequest) -> EngineSpawnResult)?
     var paneReleaseHandler: ((Int, UInt32) -> EngineReleaseResult)?
+    var paneAttachHandler: ((EngineAttachRequest) -> EngineAttachResult)?
+    var paneDetachHandler: ((Int) -> EngineReleaseResult)?
     var paneSendHandler: ((Int, String) -> EngineSendResult)?
     var paneFocusHandler: ((Int) -> EngineFocusResult)?
     var paneInterruptHandler: ((Int) -> EngineInterruptResult)?

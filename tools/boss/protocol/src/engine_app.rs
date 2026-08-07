@@ -129,6 +129,36 @@ pub struct ReleaseWorkerPaneInput {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReleaseWorkerPaneResult {}
 
+/// Engine asks the app to attach a Ghostty surface to a worker already
+/// running in a Boss-owned tmux session. Unlike [`SpawnWorkerPaneInput`], the
+/// app does not start a shell or supply an environment: tmux owns the worker
+/// process and the app is only a viewer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachWorkerPaneInput {
+    pub run_id: String,
+    pub slot_id: u8,
+    pub session_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_title: Option<String>,
+}
+
+/// App's reply when it has attached the requested tmux session.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachWorkerPaneResult {}
+
+/// Engine asks the app to remove its Ghostty surface from a tmux-hosted
+/// worker. This must not signal or otherwise stop the tmux session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DetachWorkerPaneInput {
+    pub slot_id: u8,
+}
+
+/// App's reply when its surface is detached.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DetachWorkerPaneResult {}
+
 /// Engine asks the app to report every slot it currently hosts a
 /// session in, regardless of whether the engine has a live-tracked
 /// run for that slot. Powers `bossctl agents list --all`: the engine
@@ -236,6 +266,8 @@ pub struct OpenDocumentResult {}
 pub enum EngineToAppRequest {
     SpawnWorkerPane(SpawnWorkerPaneInput),
     ReleaseWorkerPane(ReleaseWorkerPaneInput),
+    AttachWorkerPane(AttachWorkerPaneInput),
+    DetachWorkerPane(DetachWorkerPaneInput),
     SendToPane(SendToPaneInput),
     FocusWorkerPane(FocusWorkerPaneInput),
     InterruptWorkerPane(InterruptWorkerPaneInput),
@@ -259,6 +291,12 @@ pub enum EngineToAppResponse {
     },
     ReleaseWorkerPane {
         result: Result<ReleaseWorkerPaneResult, EngineToAppError>,
+    },
+    AttachWorkerPane {
+        result: Result<AttachWorkerPaneResult, EngineToAppError>,
+    },
+    DetachWorkerPane {
+        result: Result<DetachWorkerPaneResult, EngineToAppError>,
     },
     SendToPane {
         result: Result<SendToPaneResult, EngineToAppError>,
@@ -299,8 +337,8 @@ pub enum EngineToAppError {
     /// the engine claim path, not this RPC.
     #[error("no free worker slot (legacy app signal; engine-side claim already enforces concurrency)")]
     NoAvailableSlot,
-    /// `ReleaseWorkerPane` / `SendToPane` / `FocusWorkerPane` /
-    /// `InterruptWorkerPane` referred to a slot the app does not
+    /// `ReleaseWorkerPane` / `DetachWorkerPane` / `SendToPane` /
+    /// `FocusWorkerPane` / `InterruptWorkerPane` referred to a slot the app does not
     /// recognise — already released, never allocated, or stale after
     /// an app restart.
     #[error("unknown worker slot")]
@@ -551,6 +589,33 @@ mod tests {
         let json = serde_json::to_string(&original).unwrap();
         let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn attach_and_detach_round_trip() {
+        let attach = EngineToAppRequest::AttachWorkerPane(AttachWorkerPaneInput {
+            run_id: "run-tmux".into(),
+            slot_id: 3,
+            session_name: "boss-3-run-tmux".into(),
+            summary: Some("implementing attach mode".into()),
+            task_title: Some("attach panes".into()),
+        });
+        let attach_json = serde_json::to_string(&attach).unwrap();
+        assert!(attach_json.contains("attach_worker_pane"));
+        assert_eq!(
+            serde_json::from_str::<EngineToAppRequest>(&attach_json).unwrap(),
+            attach
+        );
+
+        let detach = EngineToAppResponse::DetachWorkerPane {
+            result: Ok(DetachWorkerPaneResult {}),
+        };
+        let detach_json = serde_json::to_string(&detach).unwrap();
+        assert!(detach_json.contains("detach_worker_pane"));
+        assert_eq!(
+            serde_json::from_str::<EngineToAppResponse>(&detach_json).unwrap(),
+            detach
+        );
     }
 
     #[test]

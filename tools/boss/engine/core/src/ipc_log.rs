@@ -119,6 +119,8 @@ fn request_kind(req: &EngineToAppRequest) -> &'static str {
     match req {
         EngineToAppRequest::SpawnWorkerPane(_) => "spawn_worker_pane",
         EngineToAppRequest::ReleaseWorkerPane(_) => "release_worker_pane",
+        EngineToAppRequest::AttachWorkerPane(_) => "attach_worker_pane",
+        EngineToAppRequest::DetachWorkerPane(_) => "detach_worker_pane",
         EngineToAppRequest::SendToPane(_) => "send_to_pane",
         EngineToAppRequest::FocusWorkerPane(_) => "focus_worker_pane",
         EngineToAppRequest::InterruptWorkerPane(_) => "interrupt_worker_pane",
@@ -132,6 +134,8 @@ fn response_kind(resp: &EngineToAppResponse) -> &'static str {
     match resp {
         EngineToAppResponse::SpawnWorkerPane { .. } => "spawn_worker_pane",
         EngineToAppResponse::ReleaseWorkerPane { .. } => "release_worker_pane",
+        EngineToAppResponse::AttachWorkerPane { .. } => "attach_worker_pane",
+        EngineToAppResponse::DetachWorkerPane { .. } => "detach_worker_pane",
         EngineToAppResponse::SendToPane { .. } => "send_to_pane",
         EngineToAppResponse::FocusWorkerPane { .. } => "focus_worker_pane",
         EngineToAppResponse::InterruptWorkerPane { .. } => "interrupt_worker_pane",
@@ -145,6 +149,7 @@ fn response_kind(resp: &EngineToAppResponse) -> &'static str {
 mod tests {
     use super::*;
     use crate::protocol::{
+        AttachWorkerPaneInput, AttachWorkerPaneResult, DetachWorkerPaneInput, DetachWorkerPaneResult,
         EngineToAppResponse, FocusWorkerPaneInput, FocusWorkerPaneResult, InterruptWorkerPaneInput,
         InterruptWorkerPaneResult, ListHostedPanesInput, ListHostedPanesResult, OpenDocumentInput, OpenDocumentResult,
         ReleaseWorkerPaneInput, ReleaseWorkerPaneResult, RevealWorkItemInput, RevealWorkItemResult, SendToPaneInput,
@@ -177,6 +182,20 @@ mod tests {
                     kill_grace_seconds: 0,
                 }),
                 "release_worker_pane",
+            ),
+            (
+                EngineToAppRequest::AttachWorkerPane(AttachWorkerPaneInput {
+                    run_id: "run-1".into(),
+                    slot_id: 1,
+                    session_name: "boss-1-run-1".into(),
+                    summary: None,
+                    task_title: None,
+                }),
+                "attach_worker_pane",
+            ),
+            (
+                EngineToAppRequest::DetachWorkerPane(DetachWorkerPaneInput { slot_id: 1 }),
+                "detach_worker_pane",
             ),
             (
                 EngineToAppRequest::SendToPane(SendToPaneInput {
@@ -236,6 +255,18 @@ mod tests {
                     result: Ok(ReleaseWorkerPaneResult {}),
                 },
                 "release_worker_pane",
+            ),
+            (
+                EngineToAppResponse::AttachWorkerPane {
+                    result: Ok(AttachWorkerPaneResult {}),
+                },
+                "attach_worker_pane",
+            ),
+            (
+                EngineToAppResponse::DetachWorkerPane {
+                    result: Ok(DetachWorkerPaneResult {}),
+                },
+                "detach_worker_pane",
             ),
             (
                 EngineToAppResponse::SendToPane {
