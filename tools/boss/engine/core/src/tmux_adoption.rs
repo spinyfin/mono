@@ -61,7 +61,7 @@
 //! responsible for resolving [`Tmux`] itself and deciding what a resolve
 //! failure means (see `app/server.rs`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use boss_tmux::{DisplayField, Tmux};
 
@@ -76,14 +76,24 @@ use crate::worker_readoption::LiveWorkerConvergence;
 /// Mirrors [`crate::spawn_flow`]'s private constant of the same name — this
 /// module reads what that one writes, from a different process generation at
 /// boot, so it is redeclared rather than imported.
-const TMUX_SPAWN_TOKEN_ENV: &str = "BOSS_SPAWN_TOKEN";
+pub(crate) const TMUX_SPAWN_TOKEN_ENV: &str = "BOSS_SPAWN_TOKEN";
 
 /// Trigger name recorded on the dispatch event and carried into
 /// [`LiveWorkerConvergence::converge_live_worker`] for a session whose token
 /// matched a terminal execution — the third trigger alongside
 /// `hook_after_terminal` and `redispatch_guard` (see
 /// [`crate::worker_readoption`]'s module doc).
-const TERMINAL_HANDOFF_TRIGGER: &str = "boot_tmux_adoption";
+const TERMINAL_HANDOFF_TRIGGER: &str = "tmux_session_sweep";
+
+/// A live Boss-owned tmux session whose spawn token has no durable run row.
+///
+/// The token is the durable identity, while the session name is the resource
+/// the sweep must destroy after its two-pass confirmation succeeds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UntrackedTmuxSession {
+    pub session_name: String,
+    pub spawn_token: String,
+}
 
 /// What one pass did; the caller logs it.
 #[derive(Debug, Default, Clone)]
@@ -99,12 +109,16 @@ pub struct TmuxAdoptionOutcome {
     /// Live sessions handed off to [`crate::worker_readoption`] because their
     /// token resolved to a terminal execution.
     pub terminal_handoffs: usize,
+    /// Sessions whose token has no row in this engine DB. They cannot be
+    /// adopted or handed to contradiction convergence; the periodic husk
+    /// sweep confirms and reaps them separately.
+    pub untracked_sessions: Vec<UntrackedTmuxSession>,
 }
 
-/// Run one boot-time adoption pass. See the module doc for the full
-/// algorithm; this is the entry point `app/server.rs` calls once at startup,
-/// ahead of [`crate::run_reconcile::probe_in_flight_runs`].
-pub async fn run_boot_time_adoption<S>(
+/// Run one tmux-server adoption pass. Startup and the periodic leaked-session
+/// sweep share this exact inventory and classification so a session cannot be
+/// called a leak merely because derived engine state has not been rebuilt yet.
+pub async fn run_adoption_pass<S>(
     work_db: &WorkDb,
     tmux: &Tmux,
     coordinator: &ExecutionCoordinator,
@@ -133,11 +147,14 @@ where
 
     // The authoritative token per session — never the `@boss_spawn_token`
     // option mirror `list_sessions` also returns. See the module doc.
-    let mut live_tokens: HashMap<String, String> = HashMap::new();
+    let mut live_sessions = Vec::new();
     for session in &sessions {
         match tmux.show_environment(&session.name, TMUX_SPAWN_TOKEN_ENV).await {
             Ok(Some(token)) => {
-                live_tokens.insert(token, session.name.clone());
+                live_sessions.push(UntrackedTmuxSession {
+                    session_name: session.name.clone(),
+                    spawn_token: token,
+                });
             }
             Ok(None) => {
                 // Not a Boss worker session (or predates this env contract)
@@ -152,7 +169,7 @@ where
             }
         }
     }
-    if live_tokens.is_empty() {
+    if live_sessions.is_empty() {
         return outcome;
     }
 
@@ -169,7 +186,10 @@ where
 
     let mut claimed_tokens: HashSet<String> = HashSet::new();
     for handle in &adoptable {
-        let Some(session_name) = live_tokens.get(&handle.tmux_spawn_token) else {
+        let Some(session) = live_sessions
+            .iter()
+            .find(|session| session.spawn_token == handle.tmux_spawn_token)
+        else {
             continue;
         };
         claimed_tokens.insert(handle.tmux_spawn_token.clone());
@@ -180,20 +200,48 @@ where
             spawner,
             dispatch_events,
             handle,
-            session_name,
+            &session.session_name,
             &mut outcome,
         )
         .await;
     }
 
-    for (token, session_name) in &live_tokens {
-        if claimed_tokens.contains(token) {
+    for session in live_sessions {
+        if claimed_tokens.contains(&session.spawn_token) {
             continue;
         }
-        hand_off_if_terminal(work_db, convergence, token, session_name, &mut outcome).await;
+        classify_untracked_session(
+            work_db,
+            tmux,
+            coordinator,
+            spawner,
+            convergence,
+            dispatch_events,
+            session,
+            &mut outcome,
+        )
+        .await;
     }
 
     outcome
+}
+
+/// Run the startup invocation of [`run_adoption_pass`].
+///
+/// Kept as a named entry point so the startup ordering in `app/server.rs`
+/// remains explicit; periodic callers use [`run_adoption_pass`] directly.
+pub async fn run_boot_time_adoption<S>(
+    work_db: &WorkDb,
+    tmux: &Tmux,
+    coordinator: &ExecutionCoordinator,
+    spawner: &S,
+    convergence: &dyn LiveWorkerConvergence,
+    dispatch_events: &dyn DispatchEventSink,
+) -> TmuxAdoptionOutcome
+where
+    S: WorkerSpawner + ?Sized,
+{
+    run_adoption_pass(work_db, tmux, coordinator, spawner, convergence, dispatch_events).await
 }
 
 /// Rebuild derived bookkeeping for one confirmed-live, non-terminal match.
@@ -354,26 +402,35 @@ async fn adopt_one<S>(
         .await;
 }
 
-/// A live token that matched no adoptable row: if it resolves to a terminal
-/// execution, hand it to [`crate::worker_readoption`] unchanged. Anything
-/// else (unknown token, or a non-terminal execution excluded from
-/// `list_adoptable_tmux_runs` for some other reason) is left alone — out of
-/// scope for this pass.
-async fn hand_off_if_terminal(
+/// Classify a session that missed the normal non-terminal adoption set.
+///
+/// A missing DB row is a leak. A terminal row is a contradiction for
+/// `worker_readoption`; a non-terminal row missed by the broad query is sent
+/// through the same adoption routine rather than being reaped.
+#[allow(clippy::too_many_arguments)]
+async fn classify_untracked_session<S>(
     work_db: &WorkDb,
+    tmux: &Tmux,
+    coordinator: &ExecutionCoordinator,
+    spawner: &S,
     convergence: &dyn LiveWorkerConvergence,
-    token: &str,
-    session_name: &str,
+    dispatch_events: &dyn DispatchEventSink,
+    session: UntrackedTmuxSession,
     outcome: &mut TmuxAdoptionOutcome,
-) {
-    let execution_id = match work_db.execution_id_for_tmux_spawn_token(token) {
+) where
+    S: WorkerSpawner + ?Sized,
+{
+    let execution_id = match work_db.execution_id_for_tmux_spawn_token(&session.spawn_token) {
         Ok(Some(id)) => id,
-        Ok(None) => return,
+        Ok(None) => {
+            outcome.untracked_sessions.push(session);
+            return;
+        }
         Err(err) => {
             tracing::warn!(
-                session = session_name,
+                session = %session.session_name,
                 error = %format!("{err:#}"),
-                "tmux boot adoption: failed to resolve a live session's spawn token; skipping",
+                "tmux session sweep: failed to resolve a live session's spawn token; skipping",
             );
             return;
         }
@@ -384,25 +441,56 @@ async fn hand_off_if_terminal(
             tracing::warn!(
                 execution_id,
                 error = %format!("{err:#}"),
-                "tmux boot adoption: failed to load the execution behind a live session's spawn token",
+                "tmux session sweep: failed to load the execution behind a live session's spawn token",
             );
             return;
         }
     };
-    if !execution.status.is_terminal() {
-        // Non-terminal but absent from `list_adoptable_tmux_runs` — e.g. a
-        // non-`local` host_id. Not this pass's job.
+    if execution.status.is_terminal() {
+        convergence
+            .converge_live_worker(&execution_id, TERMINAL_HANDOFF_TRIGGER)
+            .await;
+        outcome.terminal_handoffs += 1;
         return;
     }
-    convergence
-        .converge_live_worker(&execution_id, TERMINAL_HANDOFF_TRIGGER)
-        .await;
-    outcome.terminal_handoffs += 1;
+
+    match work_db.tmux_run_handle_for_spawn_token(&session.spawn_token) {
+        Ok(Some(handle)) => {
+            tracing::warn!(
+                execution_id,
+                session = %session.session_name,
+                "tmux session sweep: non-terminal session missed normal adoption; retrying adoption",
+            );
+            adopt_one(
+                work_db,
+                tmux,
+                coordinator,
+                spawner,
+                dispatch_events,
+                &handle,
+                &session.session_name,
+                outcome,
+            )
+            .await;
+        }
+        Ok(None) => tracing::warn!(
+            execution_id,
+            session = %session.session_name,
+            "tmux session sweep: non-terminal execution has no complete tmux run handle; skipping",
+        ),
+        Err(err) => tracing::warn!(
+            execution_id,
+            session = %session.session_name,
+            error = %format!("{err:#}"),
+            "tmux session sweep: failed to load non-terminal tmux run handle; skipping",
+        ),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::ffi::OsString;
     use std::path::Path;
     use std::sync::{Arc, Mutex as StdMutex};
@@ -747,6 +835,13 @@ mod tests {
 
         assert!(outcome.adopted_execution_ids.is_empty());
         assert_eq!(outcome.terminal_handoffs, 0);
+        assert_eq!(
+            outcome.untracked_sessions,
+            vec![UntrackedTmuxSession {
+                session_name: "boss-worker-9".to_owned(),
+                spawn_token: "tok-unknown".to_owned(),
+            }]
+        );
         assert!(convergence.calls.lock().unwrap().is_empty());
         assert!(sink.events().await.is_empty());
     }

@@ -477,26 +477,15 @@ pub enum Stage {
     /// execution behind it.
     SpawnCapabilityRecovered,
     /// The periodic husk-pane sweep (`boss_engine::husk_pane_sweep`) found a
-    /// worker pane the macOS app is STILL hosting for a slot the engine has
-    /// no live-tracked run for at all, confirmed across two consecutive
-    /// passes, and retired it (the same teardown `bossctl agents
-    /// retire-pane` performs). This is the general backstop for the
-    /// 2026-07-14 pool-exhaustion incident: every other reap path
-    /// (`dead_pid_reconcile`, `spawn_ack_timeout`, `terminal_work_reconcile`,
-    /// `pool_claim_reconcile`, …) is driven by the ENGINE's own bookkeeping
-    /// (`LiveWorkerStateRegistry` / the worker-pool claim), so a path that
-    /// clears its own state without the app's `ReleaseWorkerPane` RPC
-    /// actually landing (an ack timeout, a wedged/unreachable app session, a
-    /// terminal-transition bug) leaves the real pane alive and hosted while
-    /// the engine believes the slot is free — a "husk" invisible to every
-    /// engine-state-driven sweep and to `bossctl agents list` (which only
-    /// ever shows what the engine tracks). This sweep instead asks the APP
-    /// what it hosts (`ListHostedPanes`) and diffs against the engine's live
-    /// set, so it catches a husk regardless of which terminal-transition
-    /// site produced the divergence. Two-pass confirmation (mirroring
-    /// `terminal_work_reconcile`) guards against racing a fresh spawn whose
-    /// live-state registration hasn't landed yet. The `details` object
-    /// carries the retired `slot_id` and, when known, the work item's title.
+    /// Boss-owned tmux session whose durable spawn token has no DB row,
+    /// confirmed it across two consecutive passes, and destroyed the session.
+    /// The same server-wide inventory first re-enters non-terminal sessions
+    /// into adoption and routes terminal rows through `worker_readoption`, so
+    /// only a truly unknown token reaches this reap event. This is the
+    /// general backstop for a session that survives after engine bookkeeping
+    /// has been cleared. Tmux is the physical inventory authority; two-pass
+    /// confirmation protects against a fresh durable write racing the sweep.
+    /// The `details` object carries the retired `tmux_session_name`.
     HuskPaneReconcile,
     /// The execution-liveness reconciler finalized a non-terminal LOCAL
     /// execution whose worker pane never reported a shell pid and has been
