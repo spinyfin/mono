@@ -261,7 +261,7 @@ impl WorkDb {
     /// i.e. the batch of tasks the Materializer created for that run.
     ///
     /// `tasks.planner_run_id` is a targeted column omitted from the standard
-    /// `map_task` SELECT (like `review_cycle` / `completed_at`), so this is
+    /// `map_task` SELECT (like `completed_at`), so this is
     /// the read side of the Materializer's tag. Ordered by `created_at` for
     /// a stable, reviewable listing. Used by the undo path
     /// (`boss project unpopulate --run <id>`) and by Materializer tests.

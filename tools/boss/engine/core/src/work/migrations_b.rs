@@ -1910,10 +1910,9 @@ pub(crate) fn migrate_tasks_completed_at(conn: &Connection) -> Result<()> {
 /// (`boss project unpopulate --run <id>`) uses it to delete exactly the
 /// batch a given run created (design §"Undo / rollback").
 ///
-/// Deliberately kept out of the standard `map_task` SELECT (like
-/// `review_cycle` / `completed_at`) so no mapper column indices shift;
-/// reads go through the targeted `WorkDb::list_task_ids_for_planner_run`
-/// accessor. Idempotent.
+/// Deliberately kept out of the standard `map_task` SELECT so no mapper
+/// column indices shift; reads go through the targeted
+/// `WorkDb::list_task_ids_for_planner_run` accessor. Idempotent.
 pub(crate) fn migrate_tasks_planner_run_id(conn: &Connection) -> Result<()> {
     if !table_has_column(conn, "tasks", "planner_run_id")? {
         conn.execute("ALTER TABLE tasks ADD COLUMN planner_run_id TEXT", [])?;
