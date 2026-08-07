@@ -6,7 +6,7 @@ api_version: v1
 # cold npm cache download while keeping the entire check bounded.
 limits:
   timeout_ms: 300000
-applies_to:
+include:
   - "**/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts}"
 
 # Binary resolution + version pinning:

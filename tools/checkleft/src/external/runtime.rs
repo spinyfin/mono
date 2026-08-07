@@ -12,11 +12,11 @@ use wasmtime::{Config, Engine, ResourceLimiter, Store};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::exclusion::{DeclaredExclusion, ExclusionStatus};
-use crate::exclusion_matcher::ExclusionMatcher;
 use crate::fix::{ComponentFixOutcome, CopyBackReport, WritableSandbox};
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, DiffHunk, FileDiff, SourceTree};
 use crate::output::{CheckResult, FileEdit, Finding, Location, Severity, SuggestedFix, Surface};
 use crate::path::validate_relative_path;
+use crate::path_scope::PathScope;
 
 use super::component_bindings::Check as WitCheck;
 use super::component_bindings::checkleft::check::types as wit_types;
@@ -201,7 +201,7 @@ pub trait ExternalCheckExecutor: Send + Sync {
         config: &toml::Value,
         config_dir: &Path,
         effective_severity: Option<Severity>,
-        exclusion: &ExclusionMatcher,
+        path_scope: &PathScope,
     ) -> Result<CheckResult>;
 
     /// Like [`Self::execute`] but accepts a progress callback that is called
@@ -210,9 +210,10 @@ pub trait ExternalCheckExecutor: Send + Sync {
     /// delegates to [`Self::execute`]; override in executors that run
     /// declarative checks to provide live per-file/per-batch progress.
     ///
-    /// `exclusion` is the framework exclusion matcher for this check instance. The
-    /// host applies it as selection-time subtraction so neither a guest component
-    /// nor a declarative tool ever targets an excluded path.
+    /// `path_scope` is the framework path scope for this check instance (the
+    /// check-entry `applies_to` positive selection, and the effective exclude
+    /// set). The host applies it as selection-time subtraction so neither a
+    /// guest component nor a declarative tool ever targets an out-of-scope path.
     #[allow(clippy::too_many_arguments)]
     fn execute_with_progress(
         &self,
@@ -222,7 +223,7 @@ pub trait ExternalCheckExecutor: Send + Sync {
         config: &toml::Value,
         config_dir: &Path,
         effective_severity: Option<Severity>,
-        exclusion: &ExclusionMatcher,
+        path_scope: &PathScope,
         _on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
     ) -> Result<CheckResult> {
         self.execute(
@@ -232,7 +233,7 @@ pub trait ExternalCheckExecutor: Send + Sync {
             config,
             config_dir,
             effective_severity,
-            exclusion,
+            path_scope,
         )
     }
 
@@ -243,12 +244,7 @@ pub trait ExternalCheckExecutor: Send + Sync {
     /// The default returns the full changeset size, which is correct for component
     /// checks (they receive the entire changeset). Declarative checks override this
     /// to apply their `applies_to` glob filter.
-    fn eligible_file_count(
-        &self,
-        _package: &ExternalCheckPackage,
-        changeset: &ChangeSet,
-        _config: &toml::Value,
-    ) -> usize {
+    fn eligible_file_count(&self, _package: &ExternalCheckPackage, changeset: &ChangeSet) -> usize {
         changeset.changed_files.len()
     }
 
@@ -296,7 +292,7 @@ impl ExternalCheckExecutor for NoopExternalCheckExecutor {
         _config: &toml::Value,
         _config_dir: &Path,
         _effective_severity: Option<Severity>,
-        _exclusion: &ExclusionMatcher,
+        _path_scope: &PathScope,
     ) -> Result<CheckResult> {
         bail!(
             "external check package `{}` resolved successfully but runtime execution is not implemented yet",
@@ -580,13 +576,14 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
         config: &toml::Value,
         config_dir: &Path,
         effective_severity: Option<Severity>,
-        exclusion: &ExclusionMatcher,
+        path_scope: &PathScope,
     ) -> Result<CheckResult> {
         match &package.implementation {
             ExternalCheckPackageImplementation::Component(component) => {
-                // The host lowers an exclusion-filtered changeset so the guest never
-                // sees an excluded path and cannot target it.
-                let filtered = exclusion.filter_changeset(changeset);
+                // The host lowers a scope-filtered changeset so the guest never sees
+                // an out-of-scope (excluded, or outside `applies_to`) path and cannot
+                // target it.
+                let filtered = path_scope.filter_changeset(changeset);
                 self.execute_component_check(package, component, &filtered, source_tree, config, config_dir)
             }
             ExternalCheckPackageImplementation::Declarative(declarative) => {
@@ -606,7 +603,7 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
                     changeset,
                     config,
                     effective_severity,
-                    exclusion,
+                    path_scope,
                     Arc::new(|_| {}),
                 )
             }
@@ -622,15 +619,16 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
         config: &toml::Value,
         config_dir: &Path,
         effective_severity: Option<Severity>,
-        exclusion: &ExclusionMatcher,
+        path_scope: &PathScope,
         on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
     ) -> Result<CheckResult> {
         match &package.implementation {
             ExternalCheckPackageImplementation::Component(component) => {
                 // Component checks are opaque wasm calls — no per-file granularity.
-                // The host lowers an exclusion-filtered changeset so the guest never
-                // sees an excluded path and cannot target it.
-                let filtered = exclusion.filter_changeset(changeset);
+                // The host lowers a scope-filtered changeset so the guest never sees
+                // an out-of-scope (excluded, or outside `applies_to`) path and cannot
+                // target it.
+                let filtered = path_scope.filter_changeset(changeset);
                 self.execute_component_check(package, component, &filtered, source_tree, config, config_dir)
             }
             ExternalCheckPackageImplementation::Declarative(declarative) => {
@@ -648,22 +646,17 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
                     changeset,
                     config,
                     effective_severity,
-                    exclusion,
+                    path_scope,
                     on_file_processed,
                 )
             }
         }
     }
 
-    fn eligible_file_count(
-        &self,
-        package: &ExternalCheckPackage,
-        changeset: &ChangeSet,
-        config: &toml::Value,
-    ) -> usize {
+    fn eligible_file_count(&self, package: &ExternalCheckPackage, changeset: &ChangeSet) -> usize {
         match &package.implementation {
             ExternalCheckPackageImplementation::Declarative(d) => {
-                super::declarative::eligible_file_count(&self.root, d, changeset, config)
+                super::declarative::eligible_file_count(&self.root, d, changeset)
             }
             ExternalCheckPackageImplementation::Component(_) => changeset.changed_files.len(),
         }
@@ -1427,7 +1420,7 @@ fn lower_check_input(
     config: &toml::Value,
 ) -> Result<wit_types::CheckInput> {
     // Framework exclusion is now host-authoritative: the host filters the changeset
-    // before lowering it (see `ExclusionMatcher::filter_changeset`), so the guest
+    // before lowering it (see `PathScope::filter_changeset`), so the guest
     // never sees an excluded path and no longer reads `exclude_files`/`exclude_globs`
     // from its config. The config is passed through verbatim.
     let config_json =

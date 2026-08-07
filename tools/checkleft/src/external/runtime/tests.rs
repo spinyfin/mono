@@ -87,7 +87,7 @@ fn component_v1_non_component_bytes_give_compile_error() {
             &toml::Value::Table(Default::default()),
             std::path::Path::new(""),
             None,
-            &crate::exclusion_matcher::ExclusionMatcher::default(),
+            &crate::path_scope::PathScope::default(),
         )
         .expect_err("core wasm bytes must not parse as a component");
     let msg = error.to_string();
@@ -136,7 +136,7 @@ fn component_v1_digest_mismatch_is_rejected() {
             &toml::Value::Table(Default::default()),
             std::path::Path::new(""),
             None,
-            &crate::exclusion_matcher::ExclusionMatcher::default(),
+            &crate::path_scope::PathScope::default(),
         )
         .expect_err("digest mismatch must be rejected");
     assert!(error.to_string().contains("artifact sha256 mismatch"));
@@ -813,7 +813,7 @@ fn bundled_giant_structs_check_finds_violation_in_rs_file() {
             &toml::Value::Table(Default::default()),
             std::path::Path::new(""),
             None,
-            &crate::exclusion_matcher::ExclusionMatcher::default(),
+            &crate::path_scope::PathScope::default(),
         )
         .expect("execute");
 
@@ -892,7 +892,7 @@ fn bundled_giant_structs_check_handles_large_rs_file() {
             &toml::Value::Table(Default::default()),
             std::path::Path::new(""),
             None,
-            &crate::exclusion_matcher::ExclusionMatcher::default(),
+            &crate::path_scope::PathScope::default(),
         )
         .expect("check must complete without fuel exhaustion or timeout on a large file");
 
@@ -1016,7 +1016,7 @@ fn giant_structs_qualified_exclusion_exempts_only_the_named_file() {
             &config,
             std::path::Path::new("tools/boss"),
             None,
-            &crate::exclusion_matcher::ExclusionMatcher::default(),
+            &crate::path_scope::PathScope::default(),
         )
         .expect("execute");
 
@@ -1063,7 +1063,7 @@ fn bundled_change_file_count_flags_oversized_and_noops_whole_repo() {
             &config,
             std::path::Path::new(""),
             None,
-            &crate::exclusion_matcher::ExclusionMatcher::default(),
+            &crate::path_scope::PathScope::default(),
         )
         .expect("execute");
     assert_eq!(fail.findings.len(), 1);
@@ -1090,7 +1090,7 @@ fn bundled_change_file_count_flags_oversized_and_noops_whole_repo() {
             &config,
             std::path::Path::new(""),
             None,
-            &crate::exclusion_matcher::ExclusionMatcher::default(),
+            &crate::path_scope::PathScope::default(),
         )
         .expect("execute whole_repo");
     assert!(
@@ -1125,7 +1125,7 @@ fn component_check_never_sees_excluded_files() {
         },
     ]);
     let config = toml::Value::Table(toml::toml! { max_lines = 2 });
-    let exclusion = crate::exclusion_matcher::ExclusionMatcher::new(&["vendor/**".to_owned()]).expect("matcher");
+    let exclusion = crate::path_scope::PathScope::exclude_only(&["vendor/**".to_owned()]).expect("matcher");
 
     let executor = crate::external::test_support::executor_with_precompiled_cache(temp.path());
     let result = executor
@@ -1273,7 +1273,7 @@ fn giant_structs_create_exclude_structs_suppresses_finding() {
             &config,
             std::path::Path::new(""),
             None,
-            &crate::exclusion_matcher::ExclusionMatcher::default(),
+            &crate::path_scope::PathScope::default(),
         )
         .expect("execute");
 

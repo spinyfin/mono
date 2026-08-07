@@ -98,14 +98,17 @@ Optional:
 Not allowed in `component` mode:
 
 1. `executable_path`, `args`
-2. `applies_to`, `needs`, `invocations` (declarative-only)
+2. `include`, `needs`, `invocations` (declarative-only)
 
 ### `declarative` mode fields
 
 `runtime = "declarative-v1"`. The framework selects files, resolves declared
 binaries, runs declared invocations, and applies declared transforms. Required:
 
-1. `applies_to` — non-empty list of file globs the check applies to.
+1. `include` — non-empty list of file globs the check applies to. This is the
+   canonical spelling. `applies_to` remains a permanent alias for existing
+   declarative manifests; each manifest entry must use only one of the two
+   spellings.
 2. `needs` — at least one declared binary, each with a `default` binding and an
    optional `fallback` binding. A binding sets **exactly one** of:
    - `bazel: "<label>"` — a Bazel label, built and resolved to its executable

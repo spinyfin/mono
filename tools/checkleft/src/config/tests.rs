@@ -198,68 +198,6 @@ fn subdirectory_override_without_scope_inherits_root_changeset_scope() {
 }
 
 #[test]
-fn changeset_scope_with_applies_to_override_produces_diagnostic_and_is_not_scheduled() {
-    // A `scope = changeset` check resolves once at repo root with no changed file
-    // to filter (Runner::schedule_changeset_scope_runs), so a `config.applies_to`
-    // override on it is meaningless and must be rejected, not silently accepted.
-    let temp = tempdir().expect("create temp dir");
-    fs::write(
-        temp.path().join("CHECKS.toml"),
-        r#"
-[[checks]]
-id = "boss/no-boss-isms"
-scope = "changeset"
-
-[checks.config]
-applies_to = ["**/*.rs"]
-"#,
-    )
-    .expect("write config");
-
-    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
-    let checks = resolver.resolve_for_file(Path::new("a.rs")).expect("resolve checks");
-
-    assert!(
-        checks.get("boss/no-boss-isms").is_none(),
-        "a changeset-scope check with a meaningless applies_to override must not be scheduled"
-    );
-    let diagnostics: Vec<_> = checks.diagnostics().collect();
-    assert!(
-        diagnostics.iter().any(|diagnostic| {
-            diagnostic.message.contains("scope: changeset") && diagnostic.message.contains("applies_to")
-        }),
-        "expected a diagnostic naming the scope+applies_to combination, got {diagnostics:?}"
-    );
-}
-
-#[test]
-fn changeset_scope_without_applies_to_override_is_unaffected() {
-    let temp = tempdir().expect("create temp dir");
-    fs::write(
-        temp.path().join("CHECKS.toml"),
-        r#"
-[[checks]]
-id = "boss/no-boss-isms"
-scope = "changeset"
-
-[checks.config]
-some_other_key = true
-"#,
-    )
-    .expect("write config");
-
-    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
-    let checks = resolver.resolve_for_file(Path::new("a.rs")).expect("resolve checks");
-
-    let check = checks.get("boss/no-boss-isms").expect("check present");
-    assert_eq!(check.scope, CheckScope::Changeset);
-    assert!(
-        checks.diagnostics().next().is_none(),
-        "unrelated config keys must not trip this"
-    );
-}
-
-#[test]
 fn invalid_scope_produces_diagnostic() {
     let temp = tempdir().expect("create temp dir");
     fs::write(
@@ -1548,6 +1486,7 @@ exclude = ["vendor/**"]
 [[checks]]
 id = "format/oxc"
 exclude = ["testdata/**"]
+include = ["src/**"]
 "#,
     )
     .expect("write config");
@@ -1570,6 +1509,14 @@ exclude = ["testdata/**"]
     assert!(
         !matcher.is_excluded(Path::new("src/lib.ts")),
         "normal file must not be excluded"
+    );
+    assert!(
+        matcher.is_included(Path::new("src/lib.ts")),
+        "include pattern must include matching files"
+    );
+    assert!(
+        !matcher.is_included(Path::new("docs/readme.md")),
+        "include pattern must exclude non-matching files from the positive side"
     );
 }
 
@@ -1898,43 +1845,64 @@ whatever_the_check_wants = 1
     );
 }
 
-#[test]
-fn invalid_glob_in_global_exclude_produces_diagnostic() {
-    let temp = tempdir().expect("create temp dir");
-    fs::write(
-        temp.path().join("CHECKS.toml"),
-        r#"
-exclude = ["[invalid-glob"]
-
-[[checks]]
-id = "file-size"
-"#,
-    )
-    .expect("write config");
-
-    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
-    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
-
-    let diagnostics: Vec<_> = checks.diagnostics().collect();
-    assert!(
-        diagnostics
-            .iter()
-            .any(|d| d.message.contains("invalid glob pattern") && d.message.contains("exclude")),
-        "expected diagnostic about invalid glob in global exclude; got {diagnostics:?}"
-    );
-    // No patterns should have been added.
-    assert!(checks.global_exclude_patterns().is_empty());
-}
+// ── include (include side) ───────────────────────────────────────────────
 
 #[test]
-fn invalid_glob_in_per_check_exclude_produces_diagnostic_and_skips_check() {
+fn per_check_include_are_stored_on_check_config() {
     let temp = tempdir().expect("create temp dir");
     fs::write(
         temp.path().join("CHECKS.toml"),
         r#"
 [[checks]]
 id = "format/oxc"
-exclude = ["[invalid-glob"]
+include = ["frontend/**/*.ts"]
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("frontend/src/app.ts"))
+        .expect("resolve");
+
+    let check = checks.get("format/oxc").expect("check exists");
+    assert_eq!(check.applies_to_patterns, vec!["frontend/**/*.ts".to_owned()]);
+}
+
+#[test]
+fn per_check_include_from_subdirectory_are_normalized() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("frontend")).expect("create frontend dir");
+
+    fs::write(
+        temp.path().join("frontend/CHECKS.toml"),
+        r#"
+[[checks]]
+id = "format/oxc"
+include = ["src/**"]
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("frontend/src/app.ts"))
+        .expect("resolve");
+
+    let check = checks.get("format/oxc").expect("check exists");
+    // Authored as "src/**" in frontend/CHECKS.toml → normalized to "frontend/src/**".
+    assert_eq!(check.applies_to_patterns, vec!["frontend/src/**".to_owned()]);
+}
+
+#[test]
+fn empty_per_check_include_list_produces_diagnostic_and_skips_check() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "format/oxc"
+include = []
 "#,
     )
     .expect("write config");
@@ -1946,242 +1914,118 @@ exclude = ["[invalid-glob"]
     assert!(
         diagnostics
             .iter()
-            .any(|d| d.message.contains("invalid glob pattern") && d.message.contains("format/oxc")),
-        "expected diagnostic about invalid glob for check; got {diagnostics:?}"
-    );
-    // The check itself should be skipped (not added to resolved set).
-    assert!(
-        checks.get("format/oxc").is_none(),
-        "check with invalid exclude glob should be absent"
-    );
-}
-
-// ── structurally-empty patterns on the framework `exclude` key ────────────────
-//
-// Same taxonomy as `applies_to` (see `external::declarative` tests): a leading
-// `./`, a trailing path separator, or a `!` prefix can never match any
-// changeset path, decided from the pattern text alone, on either the
-// top-level global `exclude` or a per-check `exclude`.
-
-#[test]
-fn global_exclude_leading_dot_slash_produces_diagnostic() {
-    let temp = tempdir().expect("create temp dir");
-    fs::write(
-        temp.path().join("CHECKS.toml"),
-        r#"
-exclude = ["./vendor/**"]
-
-[[checks]]
-id = "file-size"
-"#,
-    )
-    .expect("write config");
-
-    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
-    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
-
-    let diagnostics: Vec<_> = checks.diagnostics().collect();
-    assert!(
-        diagnostics
-            .iter()
-            .any(|d| d.message.contains("./vendor/**") && d.message.contains("exclude[0]")),
-        "expected diagnostic naming the pattern and position; got {diagnostics:?}"
-    );
-    assert!(checks.global_exclude_patterns().is_empty());
-}
-
-#[test]
-fn global_exclude_negation_prefix_produces_diagnostic() {
-    let temp = tempdir().expect("create temp dir");
-    fs::write(
-        temp.path().join("CHECKS.toml"),
-        r#"
-exclude = ["!vendor/**"]
-
-[[checks]]
-id = "file-size"
-"#,
-    )
-    .expect("write config");
-
-    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
-    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
-
-    let diagnostics: Vec<_> = checks.diagnostics().collect();
-    assert!(
-        diagnostics.iter().any(|d| d.message.contains("!vendor/**")),
-        "expected diagnostic naming the pattern; got {diagnostics:?}"
-    );
-}
-
-#[test]
-fn global_exclude_trailing_separator_produces_diagnostic() {
-    let temp = tempdir().expect("create temp dir");
-    fs::write(
-        temp.path().join("CHECKS.toml"),
-        r#"
-exclude = ["vendor/"]
-
-[[checks]]
-id = "file-size"
-"#,
-    )
-    .expect("write config");
-
-    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
-    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
-
-    let diagnostics: Vec<_> = checks.diagnostics().collect();
-    assert!(
-        diagnostics
-            .iter()
-            .any(|d| d.message.contains("vendor/") && d.message.contains("separator")),
-        "expected diagnostic naming the pattern and reason; got {diagnostics:?}"
-    );
-}
-
-#[test]
-fn global_exclude_typo_and_wrong_case_are_not_rejected() {
-    // Case (b): not statically decidable, must never error here.
-    let temp = tempdir().expect("create temp dir");
-    fs::write(
-        temp.path().join("CHECKS.toml"),
-        r#"
-exclude = ["vendorr/**", "VENDOR/**"]
-
-[[checks]]
-id = "file-size"
-"#,
-    )
-    .expect("write config");
-
-    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
-    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
-
-    assert!(
-        checks.diagnostics().next().is_none(),
-        "typo'd/wrong-case exclude patterns must not produce a diagnostic"
-    );
-    assert_eq!(
-        checks.global_exclude_patterns(),
-        &["vendorr/**".to_owned(), "VENDOR/**".to_owned()]
-    );
-}
-
-#[test]
-fn per_check_exclude_structurally_empty_pattern_produces_diagnostic_and_skips_check() {
-    let temp = tempdir().expect("create temp dir");
-    fs::write(
-        temp.path().join("CHECKS.toml"),
-        r#"
-[[checks]]
-id = "format/oxc"
-exclude = ["./testdata/**"]
-"#,
-    )
-    .expect("write config");
-
-    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
-    let checks = resolver.resolve_for_file(Path::new("src/file.ts")).expect("resolve");
-
-    let diagnostics: Vec<_> = checks.diagnostics().collect();
-    assert!(
-        diagnostics
-            .iter()
-            .any(|d| d.message.contains("./testdata/**") && d.message.contains("format/oxc")),
-        "expected diagnostic naming the pattern and check; got {diagnostics:?}"
+            .any(|d| d.message.contains("must not be an empty list")),
+        "expected diagnostic about empty per-check include list; got {diagnostics:?}"
     );
     assert!(
         checks.get("format/oxc").is_none(),
-        "check with invalid exclude should be absent"
+        "check with invalid include should be absent"
     );
 }
 
 #[test]
-fn global_exclude_one_bad_pattern_does_not_discard_the_others() {
-    // A single structurally-empty pattern in a multi-entry `exclude` list must
-    // not discard the file's other, valid global excludes — only the offending
-    // entry is rejected (with a diagnostic), the rest still apply.
-    let temp = tempdir().expect("create temp dir");
-    fs::write(
-        temp.path().join("CHECKS.toml"),
-        r#"
-exclude = ["vendor/**", "./third_party/**", "generated/**"]
-
-[[checks]]
-id = "file-size"
-"#,
-    )
-    .expect("write config");
-
-    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
-    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
-
-    let diagnostics: Vec<_> = checks.diagnostics().collect();
-    assert!(
-        diagnostics
-            .iter()
-            .any(|d| d.message.contains("./third_party/**") && d.message.contains("exclude[1]")),
-        "expected diagnostic naming the offending pattern and its index; got {diagnostics:?}"
-    );
-    assert_eq!(
-        checks.global_exclude_patterns(),
-        &["vendor/**".to_owned(), "generated/**".to_owned()],
-        "the other, valid patterns must still apply despite the one bad entry"
-    );
-}
-
-#[test]
-fn legacy_exclude_files_structurally_empty_pattern_produces_diagnostic() {
-    // The legacy `config.exclude_files`/`config.exclude_globs` alias position is a
-    // live, documented backwards-compatible exclude position — it must be validated
-    // the same way as the framework-level `exclude` key, not silently accept a
-    // structurally-empty pattern.
+fn legacy_config_include_is_merged_into_per_check_include() {
     let temp = tempdir().expect("create temp dir");
     fs::write(
         temp.path().join("CHECKS.toml"),
         r#"
 [[checks]]
-id = "format/oxc"
+id = "file/size"
 
 [checks.config]
-exclude_files = ["vendor/"]
+max_lines = 500
+include = ["**/*.rs", "**/*.toml"]
 "#,
     )
     .expect("write config");
 
     let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
-    let checks = resolver.resolve_for_file(Path::new("src/file.ts")).expect("resolve");
+    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
 
+    let check = checks.get("file/size").expect("check exists");
+    assert_eq!(
+        check.applies_to_patterns,
+        vec!["**/*.rs".to_owned(), "**/*.toml".to_owned()]
+    );
+
+    // Using the legacy in-`config` position emits a warning diagnostic, but does
+    // not skip the check.
     let diagnostics: Vec<_> = checks.diagnostics().collect();
     assert!(
         diagnostics
             .iter()
-            .any(|d| d.message.contains("vendor/") && d.message.contains("exclude_files")),
-        "expected diagnostic naming the pattern and legacy key; got {diagnostics:?}"
-    );
-    assert!(
-        checks.get("format/oxc").is_none(),
-        "check with an invalid legacy exclude should be absent"
+            .any(|d| d.severity == Severity::Warning && d.message.contains("legacy `config.include`")),
+        "expected a deprecation warning for the legacy position; got {diagnostics:?}"
     );
 }
 
 #[test]
-fn per_repo_applies_to_override_structurally_empty_pattern_produces_diagnostic_at_resolution() {
-    // The per-repo `config.applies_to` override position is what authors actually
-    // type into CHECKS.yaml. It must produce a `ConfigDiagnostic` at config
-    // resolution time (not only at check-execution time via `override_applies_to`),
-    // so it's visible to `list_configured_checks` and any run that never schedules
-    // this check (e.g. an empty changeset).
+fn framework_level_and_legacy_include_are_merged() {
     let temp = tempdir().expect("create temp dir");
     fs::write(
         temp.path().join("CHECKS.toml"),
         r#"
 [[checks]]
-id = "file-size"
+id = "file/size"
+include = ["**/*.generated.rs"]
 
 [checks.config]
-applies_to = ["./src/**/*.rs"]
+max_lines = 500
+include = ["**/*.md"]
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
+
+    let check = checks.get("file/size").expect("check exists");
+    assert_eq!(
+        check.applies_to_patterns,
+        vec!["**/*.generated.rs".to_owned(), "**/*.md".to_owned()]
+    );
+}
+
+#[test]
+fn legacy_config_include_scalar_produces_diagnostic_and_skips_check() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "file/size"
+
+[checks.config]
+include = "**/*.rs"
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
+
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert!(
+        diagnostics.iter().any(|d| d.message.contains("not a scalar")),
+        "expected diagnostic about scalar config.include; got {diagnostics:?}"
+    );
+    assert!(
+        checks.get("file/size").is_none(),
+        "check with malformed legacy include should be absent"
+    );
+}
+
+#[test]
+fn legacy_config_include_empty_list_produces_diagnostic_and_skips_check() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "file/size"
+
+[checks.config]
+include = []
 "#,
     )
     .expect("write config");
@@ -2193,7 +2037,34 @@ applies_to = ["./src/**/*.rs"]
     assert!(
         diagnostics
             .iter()
-            .any(|d| d.message.contains("./src/**/*.rs") && d.message.contains("applies_to[0]")),
-        "expected a config-resolution-time diagnostic naming the pattern and position; got {diagnostics:?}"
+            .any(|d| d.message.contains("must not be an empty list")),
+        "expected diagnostic about empty legacy config.include; got {diagnostics:?}"
     );
+    assert!(checks.get("file/size").is_none());
+}
+
+#[test]
+fn legacy_config_include_non_string_entry_produces_diagnostic_and_skips_check() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "file/size"
+
+[checks.config]
+include = ["**/*.rs", 42]
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
+
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert!(
+        diagnostics.iter().any(|d| d.message.contains("must be a string")),
+        "expected diagnostic about non-string legacy include entry; got {diagnostics:?}"
+    );
+    assert!(checks.get("file/size").is_none());
 }

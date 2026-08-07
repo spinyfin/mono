@@ -12,7 +12,7 @@ limits:
 # of .vue / .svelte / .astro is reported with no extra plugin flag). oxlint is a
 # JS/TS linter only: there is no markdown/css/yaml linting, so those are NOT in
 # scope (that is the formatter's job — see format/oxc).
-applies_to:
+include:
   - "**/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,vue,svelte,astro}"
 
 # Binary resolution + version pinning:

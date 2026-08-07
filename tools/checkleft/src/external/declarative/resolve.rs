@@ -387,7 +387,7 @@ pub fn override_applies_to(config: &toml::Value) -> Option<Result<Vec<String>>> 
     if array.is_empty() {
         return Some(Err(anyhow::anyhow!(
             "`applies_to` config override must not be empty; \
-             use `enabled: false` to disable the check instead"
+              use `enabled: false` to disable the check instead"
         )));
     }
     let mut globs = Vec::with_capacity(array.len());

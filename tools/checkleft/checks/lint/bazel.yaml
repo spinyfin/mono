@@ -6,7 +6,7 @@ api_version: v1
 # several minutes; retain a bounded check-wide allowance for both.
 limits:
   timeout_ms: 600000
-applies_to:
+include:
   - "**/BUILD"
   - "**/BUILD.bazel"
   - "**/*.bzl"
