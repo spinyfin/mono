@@ -176,6 +176,8 @@ extension EngineClient {
                 payload["occupying_run_id"] = occupyingRunId
             }
             return payload
+        case .hostEnvironmentUnavailable(let reason):
+            return ["kind": "host_environment_unavailable", "reason": reason]
         case .internalFailure(let message):
             return ["kind": "internal", "message": message]
         }

@@ -109,6 +109,15 @@ pub const SPAWN_HEALTH_WINDOW_SECS: i64 = 300;
 /// trips. Stable — external tooling and the app's attention pane pin it.
 pub const SPAWN_CAPABILITY_ATTENTION_KIND: &str = "app_spawn_capability_unhealthy";
 
+/// Kind string for the attention item raised when dispatch is held because
+/// the *host* cannot create a worker pane (no active display). Distinct from
+/// [`SPAWN_CAPABILITY_ATTENTION_KIND`] on purpose: that one means "the app's
+/// spawn path looks broken and we inferred it from a failure count", this one
+/// means "the app measured the host and told us, once, authoritatively". They
+/// want different words in front of an operator, and conflating them would
+/// re-introduce the misattribution this change exists to remove.
+pub const HOST_ENVIRONMENT_ATTENTION_KIND: &str = "host_environment_cannot_spawn";
+
 /// Backoff before the first half-open recovery probe after a trip, and the
 /// base of the exponential backoff applied after each subsequent probe
 /// failure. 60s mirrors [`crate::spawn_ack_sweep::SPAWN_ACK_GRACE_SECS`] — a
@@ -477,6 +486,148 @@ impl SpawnHealthTracker {
     pub fn reset_probe(&self) {
         *self.probe.lock().unwrap() = ProbeState::default();
     }
+}
+
+/// Hold dispatch because the **host** cannot create a worker pane at all.
+///
+/// ## Why this exists alongside the breaker
+///
+/// The breaker is a *detector*: it infers a broken spawn path from
+/// [`SPAWN_HEALTH_DISTINCT_WORK_ITEM_THRESHOLD`] distinct work items failing
+/// inside [`SPAWN_HEALTH_WINDOW_SECS`]. Inference needs a sample, and paying
+/// for that sample in dispatched work items is exactly what the 2026-07-30
+/// incident did — three rows spent discovering a fact the app could have
+/// stated on the first request.
+///
+/// This path is not an inference. The app measured the host (zero active
+/// displays — `ghostty_surface_new` provably cannot succeed, see the app's
+/// `SpawnCapability`) and reported it. One such report is conclusive, so
+/// dispatch is held immediately and the breaker goes back to being the
+/// backstop it should always have been: it still catches causes the app
+/// cannot see in advance, and its threshold and window are untouched.
+///
+/// ## Why it reuses [`DispatchPauseOrigin::Breaker`]
+///
+/// Deliberately, so this pause inherits the recovery machinery that already
+/// exists and is already tested: [`maybe_admit_recovery_probe`] canaries it,
+/// [`resume_dispatch_after_breaker_recovery`] auto-resumes it when the app
+/// reports capability restored or a canary reports a real shell pid, and it
+/// does not exempt `pr_review` (a review pane needs a surface exactly like a
+/// worker pane does).
+///
+/// An operator pause is never overridden: this is a no-op whenever dispatch
+/// is *already* paused, whatever the origin. Over a Breaker pause that is
+/// plain idempotence — a second rejected spawn during the same outage must
+/// not re-pause or file a duplicate attention item. Over an Operator pause
+/// it is a hard invariant: overwriting one would erase the operator's reason
+/// and hand their deliberate pause to
+/// [`resume_dispatch_after_breaker_recovery`], which would auto-resume it as
+/// soon as a display came back. Dispatch is held either way, which is all
+/// this function was trying to achieve.
+pub async fn hold_dispatch_for_host_environment(
+    work_db: &WorkDb,
+    coordinator: &ExecutionCoordinator,
+    dispatch_events: &dyn DispatchEventSink,
+    execution_id: &str,
+    work_item_id: &str,
+    host_reason: &str,
+    now_epoch_secs: i64,
+) {
+    if let Some(origin) = coordinator.dispatch_pause_origin() {
+        // Dispatch is already held, so the hold has nothing left to add:
+        // re-pausing would only rewrite the reason and re-file a duplicate
+        // attention item. Critically, this must be an origin check and not
+        // `!dispatch_pause_exempts_reviews()`: an operator pause exempts
+        // reviews, so the inverted form fell through here and overwrote the
+        // operator's pause with a Breaker one — destroying the record of who
+        // paused and why, and making the pause auto-resumable by
+        // `resume_dispatch_after_breaker_recovery` the moment a display came
+        // back. An operator pause is never overridden.
+        tracing::debug!(
+            execution_id,
+            origin = origin.as_metadata_str(),
+            "host-environment hold: dispatch already paused; skipping duplicate hold",
+        );
+        return;
+    }
+    let now_u64 = now_epoch_secs.max(0) as u64;
+    let reason_text = format!("worker panes cannot be created on this host right now: {host_reason}");
+    let reason = boss_protocol::PauseReason::new(reason_text).expect("format! output is never empty");
+    // `pause_dispatch` fans a fresh engine-health snapshot out to connected
+    // frontends (see `ExecutionCoordinator::set_health_notifier`), so the
+    // operator's banner names this pause without waiting for a reconnect.
+    coordinator.pause_dispatch(now_u64, DispatchPauseOrigin::Breaker, reason);
+    if let Err(err) = work_db
+        .set_metadata(METADATA_KEY_DISPATCH_PAUSED, "1")
+        .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSED_SINCE, &now_u64.to_string()))
+        .and_then(|()| {
+            work_db.set_metadata(
+                METADATA_KEY_DISPATCH_PAUSE_ORIGIN,
+                DispatchPauseOrigin::Breaker.as_metadata_str(),
+            )
+        })
+        .and_then(|()| {
+            work_db.set_metadata(
+                METADATA_KEY_DISPATCH_PAUSE_REASON,
+                coordinator.dispatch_paused_reason().as_deref().unwrap_or_default(),
+            )
+        })
+    {
+        tracing::warn!(
+            ?err,
+            "host-environment hold: failed to persist dispatch pause to state.db — \
+             applied in-memory but will revert on engine restart",
+        );
+    }
+    tracing::error!(
+        execution_id,
+        work_item_id,
+        host_reason,
+        "host environment cannot host a worker pane; holding dispatch (no work consumed)",
+    );
+    if let Err(err) = work_db.create_attention_item(CreateAttentionItemInput {
+        body_markdown: format!(
+            "Boss cannot create worker panes on this machine right now, so dispatch is **held**.\n\n\
+             **Measured cause:** {host_reason}\n\n\
+             No work was lost or consumed: the execution that hit this was returned to the queue \
+             re-dispatchable, and queued work is simply waiting.\n\n\
+             **This clears itself.** The moment a display is active again — you wake or unlock the \
+             machine, or reconnect a monitor — the app tells the engine and dispatch resumes \
+             automatically (`spawn_capability_recovered` in `dispatch-events/current.jsonl`). The \
+             engine also force-dispatches a single probe execution periodically to test recovery on \
+             its own. No command is required; `bossctl dispatch resume` or the app's dispatch toggle \
+             will force it early if you need to."
+        ),
+        kind: HOST_ENVIRONMENT_ATTENTION_KIND.to_owned(),
+        title: "Dispatch held — no active display to host worker panes".to_owned(),
+        execution_id: Some(execution_id.to_owned()),
+        resolved_at: None,
+        status: None,
+        work_item_id: None,
+    }) {
+        tracing::warn!(
+            ?err,
+            execution_id,
+            "host-environment hold: failed to raise attention item",
+        );
+    }
+    dispatch_events
+        .emit(
+            DispatchEvent::new(Stage::DispatchPaused, Outcome::Ok, execution_id)
+                .with_work_item(work_item_id)
+                .with_details(serde_json::json!({
+                    "origin": "breaker",
+                    "actor": "host_environment",
+                    "paused_since_epoch_s": now_u64,
+                    "reviews_held": true,
+                    "scope": ["dispatch", "reviews"],
+                    "trigger": {
+                        "rule": "app measured that the host cannot create a worker-pane surface",
+                        "host_reason": host_reason,
+                    },
+                })),
+        )
+        .await;
 }
 
 /// Half-open recovery attempt: if dispatch is currently paused by
@@ -863,6 +1014,353 @@ mod tests {
     use super::*;
 
     use boss_protocol::PauseReason;
+
+    /// **Outcome C, at the root.** The pause that went unnoticed for twenty
+    /// minutes was invisible because `broadcast_engine_health` was only ever
+    /// called from a human-initiated pause RPC and from app-session
+    /// registration — never from the breaker. Hooking the notification to
+    /// the state transition itself means every pause origin is covered by
+    /// construction, including ones added later.
+    #[tokio::test]
+    async fn every_pause_and_resume_notifies_the_health_sink() {
+        struct CountingNotifier(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl crate::coordinator::EngineHealthNotifier for CountingNotifier {
+            async fn broadcast_engine_health(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let (_dir, db) = open_db();
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let notifier = Arc::new(CountingNotifier(std::sync::atomic::AtomicUsize::new(0)));
+        coordinator.set_health_notifier(Arc::downgrade(
+            &(notifier.clone() as Arc<dyn crate::coordinator::EngineHealthNotifier>),
+        ));
+
+        coordinator.pause_dispatch(
+            1000,
+            DispatchPauseOrigin::Breaker,
+            PauseReason::new("breaker: no active display").unwrap(),
+        );
+        coordinator.resume_dispatch();
+        // The broadcast is fire-and-forget on a detached task so a pause is
+        // never blocked on frontend fan-out; yield until both land.
+        for _ in 0..100 {
+            if notifier.0.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            notifier.0.load(Ordering::SeqCst),
+            2,
+            "a breaker pause and its resume must each push a fresh health snapshot — \
+             a pause recorded only in the engine log is how this went unnoticed",
+        );
+    }
+
+    /// **Outcome B.** One measured host report is conclusive, so dispatch is
+    /// held on the *first* rejection rather than after the breaker has spent
+    /// [`SPAWN_HEALTH_DISTINCT_WORK_ITEM_THRESHOLD`] work items proving what
+    /// the app already knew. The breaker's own threshold and window are
+    /// deliberately untouched — it remains the backstop for causes the app
+    /// cannot measure in advance.
+    #[tokio::test]
+    async fn host_environment_hold_pauses_dispatch_on_the_first_report() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = RecordingDispatchEventSink::new();
+        assert!(!coordinator.is_dispatch_paused(), "precondition");
+
+        hold_dispatch_for_host_environment(
+            &db,
+            &coordinator,
+            &sink,
+            &execution_id,
+            &work_item_id,
+            "no active display",
+            1000,
+        )
+        .await;
+
+        assert!(
+            coordinator.is_dispatch_paused(),
+            "one report is enough to hold dispatch"
+        );
+        assert!(
+            !coordinator.dispatch_pause_exempts_reviews(),
+            "a review pane needs a surface exactly like a worker pane does, so reviews are held too",
+        );
+        let reason = coordinator.dispatch_paused_reason().expect("pause must carry a reason");
+        assert!(reason.contains("no active display"), "{reason}");
+    }
+
+    /// **Outcome C.** The pause must reach the operator, naming the cause and
+    /// what clears it — a pause recorded only in the engine log is how this
+    /// went unnoticed for twenty minutes.
+    #[tokio::test]
+    async fn host_environment_hold_files_an_attention_item_naming_cause_and_recovery() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = RecordingDispatchEventSink::new();
+
+        hold_dispatch_for_host_environment(
+            &db,
+            &coordinator,
+            &sink,
+            &execution_id,
+            &work_item_id,
+            "no active display",
+            1000,
+        )
+        .await;
+
+        let attn = db.list_attention_items(&execution_id).unwrap();
+        let item = attn
+            .iter()
+            .find(|a| a.kind == HOST_ENVIRONMENT_ATTENTION_KIND)
+            .expect("a held dispatch must be visible to the operator");
+        assert!(item.body_markdown.contains("no active display"), "must name the cause");
+        assert!(
+            item.body_markdown.contains("clears itself"),
+            "must tell the operator what clears it",
+        );
+        assert!(
+            item.body_markdown.contains("returned to the queue"),
+            "must state that no work was lost — otherwise the operator hunts for damage that isn't there",
+        );
+
+        let events = sink.events().await;
+        let paused: Vec<_> = events.iter().filter(|e| e.stage == "dispatch_paused").collect();
+        assert_eq!(paused.len(), 1);
+        assert_eq!(paused[0].details["actor"], serde_json::json!("host_environment"));
+    }
+
+    /// A second rejection during the same outage must not re-pause or file a
+    /// duplicate item — an outage lasts as long as the display is away.
+    #[tokio::test]
+    async fn host_environment_hold_is_idempotent_within_one_outage() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = RecordingDispatchEventSink::new();
+
+        for _ in 0..3 {
+            hold_dispatch_for_host_environment(
+                &db,
+                &coordinator,
+                &sink,
+                &execution_id,
+                &work_item_id,
+                "no active display",
+                1000,
+            )
+            .await;
+        }
+
+        let attn = db.list_attention_items(&execution_id).unwrap();
+        assert_eq!(
+            attn.iter()
+                .filter(|a| a.kind == HOST_ENVIRONMENT_ATTENTION_KIND)
+                .count(),
+            1,
+            "a sustained outage must raise exactly one attention item",
+        );
+    }
+
+    /// **Outcome D.** The hold reuses `DispatchPauseOrigin::Breaker` so the
+    /// existing auto-resume path clears it when the app reports capability
+    /// restored. If this ever regressed to a bespoke origin, recovery would
+    /// silently become manual-only.
+    #[tokio::test]
+    async fn host_environment_hold_is_cleared_by_the_existing_auto_resume() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = RecordingDispatchEventSink::new();
+
+        hold_dispatch_for_host_environment(
+            &db,
+            &coordinator,
+            &sink,
+            &execution_id,
+            &work_item_id,
+            "no active display",
+            1000,
+        )
+        .await;
+        assert!(coordinator.is_dispatch_paused());
+
+        let resumed = resume_dispatch_after_breaker_recovery(
+            &db,
+            &coordinator,
+            &sink,
+            Some(&execution_id),
+            "app reported a display is active again",
+        )
+        .await;
+
+        assert!(
+            resumed,
+            "a host-environment hold must auto-resume when the display returns"
+        );
+        assert!(!coordinator.is_dispatch_paused());
+    }
+
+    /// An operator pause is never overridden by a host-environment report —
+    /// a human pause stays manual-resume-only, exactly as the breaker's own
+    /// contract requires.
+    #[tokio::test]
+    async fn host_environment_hold_does_not_resume_an_operator_pause() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.pause_dispatch(
+            900,
+            DispatchPauseOrigin::Operator,
+            PauseReason::new("operator pause").unwrap(),
+        );
+        let sink = RecordingDispatchEventSink::new();
+
+        let resumed = resume_dispatch_after_breaker_recovery(
+            &db,
+            &coordinator,
+            &sink,
+            Some(&execution_id),
+            "display is active again",
+        )
+        .await;
+        assert!(!resumed, "an operator pause must survive display recovery");
+        assert!(coordinator.is_dispatch_paused());
+    }
+
+    /// The hold itself must leave an operator pause completely untouched.
+    ///
+    /// The sibling test above only exercises the *resume* side, so it could
+    /// never catch the real hazard: the hold's idempotence guard was
+    /// originally phrased as `paused && !exempts_reviews`, and an operator
+    /// pause exempts reviews — so the guard did not fire, and the hold
+    /// re-paused with `DispatchPauseOrigin::Breaker`. That erased the
+    /// operator's reason, started holding reviews they never asked to hold,
+    /// and — worst — made their deliberate pause auto-resumable by
+    /// `resume_dispatch_after_breaker_recovery`. This path is live: reviews
+    /// keep dispatching through an operator pause, so a review spawn hitting
+    /// the app's pre-flight lands exactly here.
+    #[tokio::test]
+    async fn host_environment_hold_never_overwrites_an_operator_pause() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.pause_dispatch(
+            900,
+            DispatchPauseOrigin::Operator,
+            PauseReason::new("operator pause: reviewing a bad merge").unwrap(),
+        );
+        let sink = RecordingDispatchEventSink::new();
+
+        hold_dispatch_for_host_environment(
+            &db,
+            &coordinator,
+            &sink,
+            &execution_id,
+            &work_item_id,
+            "no active display",
+            1000,
+        )
+        .await;
+
+        assert_eq!(
+            coordinator.dispatch_pause_origin(),
+            Some(DispatchPauseOrigin::Operator),
+            "the operator's pause must keep its origin — a Breaker origin would auto-resume it",
+        );
+        assert!(
+            coordinator.dispatch_pause_exempts_reviews(),
+            "the operator did not ask for reviews to be held",
+        );
+        assert_eq!(
+            coordinator.dispatch_paused_reason().as_deref(),
+            Some("operator pause: reviewing a bad merge"),
+            "the record of who paused and why must survive",
+        );
+        assert_eq!(
+            coordinator.dispatch_paused_since_epoch_s(),
+            Some(900),
+            "the pause's start time is part of that record",
+        );
+        assert!(
+            db.list_attention_items(&execution_id)
+                .unwrap()
+                .iter()
+                .all(|a| a.kind != HOST_ENVIRONMENT_ATTENTION_KIND),
+            "dispatch is already held, so the hold has nothing to tell the operator",
+        );
+        assert!(
+            sink.events().await.iter().all(|e| e.stage != "dispatch_paused"),
+            "no pause transition happened, so none may be recorded",
+        );
+
+        // And the operator's pause is still theirs to clear: display
+        // recovery must not resume it.
+        let resumed = resume_dispatch_after_breaker_recovery(
+            &db,
+            &coordinator,
+            &sink,
+            Some(&execution_id),
+            "display is active again",
+        )
+        .await;
+        assert!(!resumed, "an operator pause must survive display recovery");
+        assert!(coordinator.is_dispatch_paused());
+    }
+
+    /// A pre-flight rejection is handled synchronously by the coordinator
+    /// and never reaches `spawn_ack_sweep`'s reap, so it has to resolve the
+    /// half-open probe itself. Without that the canary stays `in_flight`
+    /// until the 120s stall backstop, pinning probes to a flat 120s cadence
+    /// and logging "went stale" for a probe that resolved immediately.
+    #[test]
+    fn rejected_probe_resolves_immediately_and_backs_off() {
+        let tracker = SpawnHealthTracker::with_config(3, 300);
+        assert!(tracker.try_admit_probe(1000), "precondition: a probe is due");
+        tracker.mark_probe_dispatched("exec-canary", 1000);
+        assert!(!tracker.try_admit_probe(1001), "one probe in flight at a time");
+
+        // What the coordinator does on a pre-flight rejection.
+        tracker.record_probe_failure("exec-canary", 1001);
+
+        assert!(
+            !tracker.try_admit_probe(1001),
+            "the probe resolved as a failure, so backoff applies rather than an immediate retry",
+        );
+        assert!(
+            tracker.try_admit_probe(1001 + SPAWN_HEALTH_PROBE_STALL_DEADLINE_SECS),
+            "and the next attempt is due well before the 120s stall backstop would have fired",
+        );
+    }
 
     #[test]
     fn trips_when_threshold_distinct_work_items_fail_in_window() {

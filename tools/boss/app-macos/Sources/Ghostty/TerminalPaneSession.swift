@@ -271,9 +271,9 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     /// Boss trust root after a restart produces a new shell pid.
     var onSurfaceAttached: (() -> Void)?
     /// Called on the main actor when this session's libghostty surface
-    /// FAILS to create (`ghostty_surface_new` returned NULL — typically the
-    /// post-sleep "no active display" condition, #800). Worker panes set
-    /// this to a closure that NACKs the spawn back to the engine
+    /// FAILS to create (`ghostty_surface_new` returned NULL — most often the
+    /// no-active-display condition, #800). Worker panes set this to a
+    /// closure that NACKs the spawn back to the engine
     /// (`report_worker_spawn_failed`) so it fails fast instead of waiting
     /// out the 60s spawn-ack timeout, and logs a durable diagnostic. Fired
     /// at most once per session — the host view dedupes — and never for a
@@ -289,7 +289,13 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     /// per-work-item guard never will. Misclassifying here is what let the
     /// 2026-07 no-active-display incident burn 818 executions across 79
     /// work items with the breaker never fed once.
-    var onSurfaceCreationFailed: ((_ reason: String) -> Void)?
+    ///
+    /// `environmental` is `true` only when the host view **measured** a
+    /// condition that makes surface creation impossible for any work item
+    /// (see [[SpawnCapability]]). It decides whether the engine returns the
+    /// execution to the queue or terminalizes it, so it must never be set
+    /// for a NULL surface whose cause was not positively identified.
+    var onSurfaceCreationFailed: ((_ reason: String, _ environmental: Bool) -> Void)?
 
 
     init(

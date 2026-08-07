@@ -229,6 +229,13 @@ final class GhosttyTerminalHostView: NSView {
         }
 
         guard let surface = makeSurface() else {
+            // Measure the host instead of asserting a cause. The old NACK
+            // string hardcoded "likely no active display after sleep/wake",
+            // which is what sent the 2026-07-30 investigation toward
+            // sleep/wake on a machine whose lid was open and which never
+            // slept — its screen had simply locked. See [[SpawnCapability]].
+            let host = SpawnCapability.snapshot()
+            let verdict = SpawnCapability.verdict(for: host)
             session.statusMessage = "Waiting for an active display…"
             installScreenObserverIfNeeded()
             // Tell the session the SPAWN failed — never that the pane died.
@@ -247,7 +254,8 @@ final class GhosttyTerminalHostView: NSView {
             if !reportedSurfaceCreationFailure {
                 reportedSurfaceCreationFailure = true
                 session.onSurfaceCreationFailed?(
-                    Self.surfaceFailureReason(hasActiveDisplay: NSScreen.main != nil)
+                    Self.surfaceFailureNackReason(host: host, verdict: verdict),
+                    verdict.isBlocked
                 )
             }
             return
@@ -296,6 +304,30 @@ final class GhosttyTerminalHostView: NSView {
             : "no active display (lid closed, monitors disconnected, or display asleep); "
                 + "libghostty cannot create a surface headless"
         return "libghostty surface creation failed (ghostty_surface_new returned NULL — \(cause))"
+    }
+
+    /// The NACK reason shipped to the engine when `ghostty_surface_new`
+    /// returns NULL. Pure and `static` so the message contract is
+    /// unit-testable without a libghostty surface.
+    ///
+    /// Two shapes, and the difference matters downstream: an *environmental*
+    /// verdict carries the measured host state and is what lets the engine
+    /// requeue the execution instead of burning it, while an unclassified
+    /// NULL keeps the honest "cause unidentified" wording and stays a hard
+    /// failure. Never phrase the latter as a display problem — that is
+    /// exactly the misattribution this replaces.
+    static func surfaceFailureNackReason(
+        host: HostDisplaySnapshot,
+        verdict: SpawnCapability.Verdict
+    ) -> String {
+        switch verdict {
+        case .environmentUnavailable(let reason):
+            return "libghostty surface creation failed (ghostty_surface_new returned NULL): \(reason)"
+        case .canHostPane:
+            return "libghostty surface creation failed (ghostty_surface_new returned NULL) with a "
+                + "usable display present, so the cause is NOT the host display state; "
+                + "measured \(host.summary)"
+        }
     }
 
     /// Build the surface config from `launchSpec` and call

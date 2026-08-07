@@ -1644,6 +1644,26 @@ fn slot_busy_occupant(err: &anyhow::Error) -> Option<Option<String>> {
     }
 }
 
+/// Extract the app's measured "this host cannot create a pane at all" reason
+/// from a spawn failure, walking the `.with_context(…)` chain the same way
+/// [`slot_busy_occupant`] does.
+///
+/// `Some` means the app rejected the spawn *before allocating anything* on a
+/// measured host condition (no active display). Nothing was consumed, so the
+/// execution must go back to the queue rather than terminal — see
+/// [`crate::work::WorkDb::requeue_execution_after_environmental_failure`].
+/// `None` for every other error keeps the historical hard-failure path,
+/// which is deliberate: only a positively identified environmental cause may
+/// take the requeue branch.
+pub(crate) fn host_environment_unavailable_reason(err: &anyhow::Error) -> Option<String> {
+    match err.chain().find_map(|cause| cause.downcast_ref::<StartWorkerError>()) {
+        Some(StartWorkerError::AppError(EngineToAppError::HostEnvironmentUnavailable { reason })) => {
+            Some(reason.clone())
+        }
+        _ => None,
+    }
+}
+
 /// Sink for `executions.<id>` topic invalidations. The engine wires this
 /// to the topic broker; tests use a no-op or recording double.
 #[async_trait]
@@ -2000,6 +2020,48 @@ pub struct ExecutionCoordinator {
     /// cap doesn't collide with the path under test.
     #[builder(default = AtomicUsize::new(MAX_CONCURRENT_INTERACTIVE_WORKERS))]
     max_concurrent_interactive_workers: AtomicUsize,
+    /// Sink notified whenever the dispatch-pause state changes, so the app's
+    /// health banner reflects a pause the operator did not initiate.
+    ///
+    /// Before this, `broadcast_engine_health` was only ever called from the
+    /// operator's own pause/resume RPC and from app-session registration. A
+    /// breaker-origin pause therefore reached the operator through nothing
+    /// but the engine log until the app happened to reconnect — which is how
+    /// the 2026-07-30 pause went unnoticed for twenty minutes. Hooking the
+    /// notification to the state transition itself, rather than to
+    /// individual callers, means every present and future pause origin is
+    /// covered by construction.
+    ///
+    /// `Weak` deliberately: the notifier is `ServerState`, which owns an
+    /// `Arc<ExecutionCoordinator>`. A strong reference here would close that
+    /// cycle and leak both for the process lifetime.
+    #[builder(default = std::sync::Mutex::new(None))]
+    health_notifier: std::sync::Mutex<Option<std::sync::Weak<dyn EngineHealthNotifier>>>,
+    /// Spawn-health tracker, so a spawn the app refuses synchronously at its
+    /// pre-flight can resolve an in-flight half-open recovery probe on the
+    /// spot (see [`crate::spawn_health::SpawnHealthTracker::record_probe_failure`]).
+    ///
+    /// Every other probe outcome reaches the tracker through
+    /// `spawn_ack_sweep`, which owns its own handle. A pre-flight rejection
+    /// never reaches the sweep — the coordinator handles the error itself —
+    /// so without this the canary would sit `in_flight` until the 120s stall
+    /// backstop, pinning recovery probes to a flat 120s cadence instead of
+    /// the intended exponential backoff and logging a "went stale" warning
+    /// for a probe that in fact resolved immediately.
+    ///
+    /// `None` in tests that construct a bare coordinator; production
+    /// installs it via [`Self::set_spawn_health`] from `app::server::serve`.
+    #[builder(default = std::sync::Mutex::new(None))]
+    spawn_health: std::sync::Mutex<Option<Arc<crate::spawn_health::SpawnHealthTracker>>>,
+}
+
+/// Notified when engine-health-affecting state changes so connected
+/// frontends can re-render without polling or reconnecting. Implemented by
+/// `ServerState`; kept as a trait so `coordinator` does not depend on the
+/// app layer.
+#[async_trait::async_trait]
+pub trait EngineHealthNotifier: Send + Sync {
+    async fn broadcast_engine_health(&self);
 }
 
 mod config;

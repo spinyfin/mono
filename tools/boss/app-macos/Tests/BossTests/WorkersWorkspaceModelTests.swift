@@ -1,6 +1,22 @@
 import XCTest
 @testable import Boss
 
+/// A model whose host pre-flight always says "yes".
+///
+/// `spawnWorkerPane` now measures the host before allocating anything, and a
+/// locked screen drops `CGGetActiveDisplayList` to zero (measured on a real
+/// host: `active_displays=0` while `online_displays=2`). Without pinning the
+/// check, every slot-bookkeeping test below would fail whenever the machine
+/// running them had its screen locked — the suite would pass or fail based on
+/// whether the operator had stepped away. Tests that exercise the pre-flight
+/// itself set `spawnCapabilityCheck` explicitly instead.
+@MainActor
+private func makeSpawnableModel() -> WorkersWorkspaceModel {
+    let model = WorkersWorkspaceModel()
+    model.spawnCapabilityCheck = { .canHostPane }
+    return model
+}
+
 @MainActor
 final class WorkersWorkspaceModelSendTests: XCTestCase {
     func testSendToUnknownSlotReturnsUnknownSlot() {
@@ -12,7 +28,7 @@ final class WorkersWorkspaceModelSendTests: XCTestCase {
         // shape of the original intervene bug — a missing slot looked
         // like a successful injection, the engine moved on, and the
         // prompt was lost.
-        let model = WorkersWorkspaceModel()
+        let model = makeSpawnableModel()
         let result = model.sendToPane(slotId: 99, text: "echo hello")
         guard case .failure(.unknownSlot) = result else {
             XCTFail("expected .unknownSlot for nonexistent slot, got \(result)")
@@ -26,7 +42,7 @@ final class WorkersWorkspaceModelSendTests: XCTestCase {
         // surface to write to. Matches the equivalent
         // `focusWorkerPane` test so the engine's failure-handling
         // path stays uniform across the three pane verbs.
-        let model = WorkersWorkspaceModel()
+        let model = makeSpawnableModel()
         let result = model.sendToPane(slotId: 1, text: "echo hello")
         guard case .failure(.unknownSlot) = result else {
             XCTFail("expected .unknownSlot for idle slot, got \(result)")
@@ -138,7 +154,7 @@ final class GhosttyTerminalHostSurfaceFailureDiagnosticTests: XCTestCase {
 @MainActor
 final class WorkersWorkspaceModelFocusTests: XCTestCase {
     func testFocusUnknownSlotReturnsUnknownSlot() {
-        let model = WorkersWorkspaceModel()
+        let model = makeSpawnableModel()
         // Interactive grid is 1...16 (Bridge Crew + Lower Decks); 99 has no slot at all.
         let result = model.focusWorkerPane(slotId: 99)
         guard case .failure(.unknownSlot) = result else {
@@ -148,7 +164,7 @@ final class WorkersWorkspaceModelFocusTests: XCTestCase {
     }
 
     func testFocusIdleSlotReturnsUnknownSlot() {
-        let model = WorkersWorkspaceModel()
+        let model = makeSpawnableModel()
         // All slots start without a session attached. Focusing an
         // idle slot should fail the same way as an unknown one — the
         // app has nothing to raise. Mirrors the
@@ -182,7 +198,7 @@ final class WorkersWorkspaceModelSpawnTests: XCTestCase {
         // slot 5 — not the lowest free slot, not a random one. This
         // is the contract that replaces the old firstIndex(where:)
         // heuristic.
-        let model = WorkersWorkspaceModel()
+        let model = makeSpawnableModel()
         let result = model.spawnWorkerPane(makeRequest(slot: 5))
         guard case .success(let slotId, _) = result else {
             XCTFail("expected .success, got \(result)")
@@ -204,7 +220,7 @@ final class WorkersWorkspaceModelSpawnTests: XCTestCase {
         // app must surface .slotBusy rather than silently picking a
         // different slot — that would re-introduce the dual
         // allocator the engine-owns-slots refactor exists to remove.
-        let model = WorkersWorkspaceModel()
+        let model = makeSpawnableModel()
         _ = model.spawnWorkerPane(makeRequest(slot: 3, runId: "run-first"))
         let result = model.spawnWorkerPane(makeRequest(slot: 3, runId: "run-second"))
         guard case .failure(.slotBusy(let occupyingRunId)) = result else {
@@ -219,7 +235,7 @@ final class WorkersWorkspaceModelSpawnTests: XCTestCase {
     }
 
     func testSpawnRejectsOutOfRangeSlot() {
-        let model = WorkersWorkspaceModel()
+        let model = makeSpawnableModel()
         let zeroResult = model.spawnWorkerPane(makeRequest(slot: 0))
         guard case .failure(.internalFailure) = zeroResult else {
             XCTFail("expected .internalFailure for slot 0, got \(zeroResult)")
@@ -241,7 +257,7 @@ final class WorkersWorkspaceModelSpawnTests: XCTestCase {
         // (whose engine reap does not feed that breaker). Reporting both
         // is what raced the diagnosis out of the record and left the
         // breaker starved through the 2026-07 no-active-display churn.
-        let model = WorkersWorkspaceModel()
+        let model = makeSpawnableModel()
         var diedRunIds: [String] = []
         var reasons: [WorkerPaneDeathReason] = []
         model.onPaneDied = { runId, reason in
@@ -249,11 +265,13 @@ final class WorkersWorkspaceModelSpawnTests: XCTestCase {
             reasons.append(reason)
         }
         var spawnFailures: [(String, String)] = []
-        model.onSpawnFailed = { spawnFailures.append(($0, $1)) }
+        model.onSpawnFailed = { runId, reason, _ in
+            spawnFailures.append((runId, reason))
+        }
 
         _ = model.spawnWorkerPane(makeRequest(slot: 5, runId: "exec-surface-failed"))
         let session = model.slots.first(where: { $0.slotId == 5 })?.session
-        session?.onSurfaceCreationFailed?("no active display")
+        session?.onSurfaceCreationFailed?("no active display", true)
 
         XCTAssertEqual(spawnFailures.map(\.0), ["exec-surface-failed"])
         XCTAssertEqual(spawnFailures.map(\.1), ["no active display"])
@@ -294,7 +312,7 @@ final class WorkersWorkspaceModelSpawnTests: XCTestCase {
         // Boss pane, which restarts itself) must report this to the
         // engine via `onPaneDied` so the backing execution is reaped
         // immediately.
-        let model = WorkersWorkspaceModel()
+        let model = makeSpawnableModel()
         var diedRunIds: [String] = []
         var reasons: [WorkerPaneDeathReason] = []
         model.onPaneDied = { runId, reason in
@@ -364,15 +382,57 @@ final class WorkersWorkspaceModelSpawnTests: XCTestCase {
         )
     }
 
+    /// **Outcome B.** When the host cannot host a pane, the spawn is refused
+    /// *before* anything is allocated — no slot taken, no session built — so
+    /// the engine can defer the execution rather than consuming it to
+    /// discover a wall the app could already see.
+    func testSpawnIsRefusedWithoutAllocatingWhenTheHostCannotHostAPane() {
+        let model = WorkersWorkspaceModel()
+        model.spawnCapabilityCheck = { .environmentUnavailable(reason: "no active display") }
+
+        let result = model.spawnWorkerPane(makeRequest(slot: 3, runId: "exec-deferred"))
+
+        guard case .failure(.hostEnvironmentUnavailable(let reason)) = result else {
+            return XCTFail("expected a host-environment rejection, got \(result)")
+        }
+        XCTAssertEqual(reason, "no active display")
+        XCTAssertNil(
+            model.slots.first(where: { $0.slotId == 3 })?.session,
+            "a refused spawn must not leave a session behind"
+        )
+        XCTAssertNil(
+            model.slots.first(where: { $0.slotId == 3 })?.runId,
+            "a refused spawn must not claim the slot for the run"
+        )
+        XCTAssertEqual(model.liveWorkerPaneCount, 0)
+    }
+
+    /// The pre-flight must not mask a genuine engine/app slot desync: an
+    /// occupied slot still reports `slotBusy`, which the engine reconciles
+    /// differently from a host condition.
+    func testSlotBusyStillWinsOverTheHostPreflight() {
+        let model = WorkersWorkspaceModel()
+        model.spawnCapabilityCheck = { .canHostPane }
+        _ = model.spawnWorkerPane(makeRequest(slot: 4, runId: "exec-first"))
+        model.spawnCapabilityCheck = { .environmentUnavailable(reason: "no active display") }
+
+        let result = model.spawnWorkerPane(makeRequest(slot: 4, runId: "exec-second"))
+        guard case .failure(.slotBusy) = result else {
+            return XCTFail("an occupied slot must still report slotBusy, got \(result)")
+        }
+    }
+
     func testSurfaceCreationFailureForwardsNackWithRunId() {
         // The post-sleep false-live spawn: `spawnWorkerPane` wires the
         // session's `onSurfaceCreationFailed` to the model's `onSpawnFailed`
         // so the app can NACK the engine (fail-fast) instead of leaving the
         // spawn to the engine's 60s spawn-ack timeout. Simulate the surface
         // failing and assert the NACK carries the raw run id and the reason.
-        let model = WorkersWorkspaceModel()
-        var captured: (runId: String, reason: String)?
-        model.onSpawnFailed = { runId, reason in captured = (runId, reason) }
+        let model = makeSpawnableModel()
+        var captured: (runId: String, reason: String, environmental: Bool)?
+        model.onSpawnFailed = { runId, reason, environmental in
+            captured = (runId, reason, environmental)
+        }
 
         let result = model.spawnWorkerPane(makeRequest(slot: 2, runId: "exec-nack"))
         guard case .success = result else {
@@ -385,10 +445,16 @@ final class WorkersWorkspaceModelSpawnTests: XCTestCase {
             "spawn must wire the surface-creation-failure callback so a no-display spawn can NACK"
         )
 
-        session?.onSurfaceCreationFailed?("no active display")
+        session?.onSurfaceCreationFailed?("no active display", true)
 
         XCTAssertEqual(captured?.runId, "exec-nack", "NACK must carry the raw execution id")
         XCTAssertEqual(captured?.reason, "no active display")
+        XCTAssertEqual(
+            captured?.environmental,
+            true,
+            "the measured environmental verdict must reach the engine — it is what decides "
+                + "whether the execution is requeued or burned"
+        )
     }
 }
 
@@ -412,7 +478,7 @@ final class WorkersWorkspaceModelReleaseTests: XCTestCase {
         // grid is 1...16 — there's nothing to release. Mirrors the
         // `sendToPane` / `focusWorkerPane` shape so the engine's
         // failure-handling stays uniform across pane verbs.
-        let model = WorkersWorkspaceModel()
+        let model = makeSpawnableModel()
         let result = model.releaseWorkerPane(slotId: 99, killGraceSeconds: 0)
         guard case .failure(.unknownSlot) = result else {
             XCTFail("expected .unknownSlot for slot outside 1...16, got \(result)")
@@ -427,7 +493,7 @@ final class WorkersWorkspaceModelReleaseTests: XCTestCase {
         // `release_worker_pane` idempotent across the redundant
         // chore-done / completion-detection / `bossctl agents stop`
         // paths.
-        let model = WorkersWorkspaceModel()
+        let model = makeSpawnableModel()
         let result = model.releaseWorkerPane(slotId: 1, killGraceSeconds: 5)
         guard case .failure(.unknownSlot) = result else {
             XCTFail("expected .unknownSlot for idle slot, got \(result)")
@@ -444,7 +510,7 @@ final class WorkersWorkspaceModelReleaseTests: XCTestCase {
         // effects are covered by `WorkerProcessKillerTests`; here we
         // only assert the slot-state half so a regression on the
         // session-clearing wouldn't masquerade as success.
-        let model = WorkersWorkspaceModel()
+        let model = makeSpawnableModel()
         let spawn = model.spawnWorkerPane(makeSpawn(slot: 4))
         guard case .success = spawn else {
             XCTFail("spawn precondition failed: \(spawn)")
@@ -487,7 +553,7 @@ final class WorkersWorkspaceModelPageTests: XCTestCase {
         // The interactive pool is now two pages of 8: Bridge Crew (slots
         // 1...8) and Lower Decks (slots 9...16). Both are drawn from the flat
         // `slots` array; the pages must be disjoint and cover it exactly.
-        let model = WorkersWorkspaceModel()
+        let model = makeSpawnableModel()
         XCTAssertEqual(model.slots.count, 16, "main pool must span both pages")
         XCTAssertEqual(model.bridgeCrewSlots.map(\.slotId), Array(1...8))
         XCTAssertEqual(model.lowerDecksSlots.map(\.slotId), Array(9...16))
@@ -501,7 +567,7 @@ final class WorkersWorkspaceModelPageTests: XCTestCase {
         // second page existed it was the automation pool and would not host a
         // main worker; now it must spawn into the main `slots` array and show
         // up under `lowerDecksSlots`, indistinguishable from a Bridge Crew pane.
-        let model = WorkersWorkspaceModel()
+        let model = makeSpawnableModel()
         let result = model.spawnWorkerPane(makeRequest(slot: 9, runId: "run-ld1"))
         guard case .success(let slotId, _) = result else {
             XCTFail("expected .success spawning Lower Decks slot 9, got \(result)")
@@ -522,7 +588,7 @@ final class WorkersWorkspaceModelPageTests: XCTestCase {
     func testSpawnIntoTopLowerDecksSlotSucceeds() {
         // Slot 16 is the last interactive slot. It must be a valid spawn
         // target (it was out of range when the pool capped at 8).
-        let model = WorkersWorkspaceModel()
+        let model = makeSpawnableModel()
         let result = model.spawnWorkerPane(makeRequest(slot: 16, runId: "run-ld8"))
         guard case .success(let slotId, _) = result else {
             XCTFail("expected .success spawning Lower Decks slot 16, got \(result)")

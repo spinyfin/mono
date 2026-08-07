@@ -1305,6 +1305,22 @@ pub async fn serve_with_merge_probe(
         Duration::from_secs(60),
     );
 
+    // Let every dispatch pause/resume — whatever its origin — push a fresh
+    // health snapshot to connected frontends. Registered here because it is
+    // the first point at which `ServerState` exists as an `Arc`; stored
+    // weakly inside the coordinator so this does not create a reference
+    // cycle with `server_state.execution_coordinator`.
+    server_state.execution_coordinator.set_health_notifier(Arc::downgrade(
+        &(server_state.clone() as Arc<dyn crate::coordinator::EngineHealthNotifier>),
+    ));
+
+    // Give the coordinator the spawn-health tracker so a pre-flight spawn
+    // rejection can resolve an in-flight recovery probe immediately rather
+    // than leaving it to the 120s stall backstop.
+    server_state
+        .execution_coordinator
+        .set_spawn_health(server_state.spawn_health.clone());
+
     // Periodic spawn-ack sweep: detects worker slots stuck in `Spawning`
     // that never reported a shell pid AND never received a single hook
     // event — proof no worker process ever came up at all, distinct from

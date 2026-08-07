@@ -46,7 +46,19 @@ final class SpawnDiagnosticsLogTests: XCTestCase {
 
         let log = SpawnDiagnosticsLog(directory: dir.path)
         log.spawnRequested(runId: "exec-99", slotId: 7, workspacePath: "/tmp/ws")
-        log.surfaceFailed(runId: "exec-99", reason: "ghostty_surface_new returned NULL")
+        log.surfaceFailed(
+            runId: "exec-99",
+            reason: "ghostty_surface_new returned NULL",
+            environmental: true,
+            host: HostDisplaySnapshot(
+                activeDisplayCount: 0,
+                onlineDisplayCount: 1,
+                mainDisplayAsleep: true,
+                sessionLocked: true,
+                sessionOnConsole: true,
+                screenCount: 0
+            )
+        )
         log.flushForTesting()
 
         let files = try FileManager.default.contentsOfDirectory(atPath: dir.path)
@@ -60,5 +72,11 @@ final class SpawnDiagnosticsLogTests: XCTestCase {
         XCTAssertTrue(lines[0].contains("\"run_id\":\"exec-99\""))
         XCTAssertTrue(lines[1].contains("\"event\":\"surface_failed\""))
         XCTAssertTrue(lines[1].contains("ghostty_surface_new returned NULL"))
+        // The measured host state must be recorded alongside the reason —
+        // before this, the record carried only a hardcoded guess about the
+        // cause, which is what misdirected the 2026-07-30 investigation.
+        XCTAssertTrue(lines[1].contains("\"active_display_count\":0"), lines[1])
+        XCTAssertTrue(lines[1].contains("\"session_locked\":true"), lines[1])
+        XCTAssertTrue(lines[1].contains("\"environmental\":true"), lines[1])
     }
 }

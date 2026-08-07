@@ -65,6 +65,11 @@ impl ExecutionCoordinator {
         let host_adapter_provider: Arc<dyn HostAdapterProvider> =
             Arc::new(LocalHostAdapterProvider::new(Arc::clone(&host_adapter)));
         Self {
+            // No frontend to notify in this constructor's context; `app::server`
+            // registers the real sink via `set_health_notifier` at startup.
+            health_notifier: std::sync::Mutex::new(None),
+            // Likewise installed by `app::server` via `set_spawn_health`.
+            spawn_health: std::sync::Mutex::new(None),
             work_db,
             worker_pool,
             automation_pool: WorkerPool::new_automation(MAX_AUTOMATION_POOL_SIZE),
@@ -427,6 +432,7 @@ impl ExecutionCoordinator {
         self.dispatch_pause_exempts_reviews
             .store(origin == DispatchPauseOrigin::Operator, Ordering::Release);
         *self.dispatch_paused_reason.lock().unwrap() = Some(reason.into());
+        self.notify_health_changed();
     }
 
     /// Resume global dispatch. Clears the pause flag, the paused-since
@@ -440,6 +446,58 @@ impl ExecutionCoordinator {
         self.dispatch_paused.store(false, Ordering::Release);
         self.dispatch_paused_since_epoch_s.store(0, Ordering::Release);
         *self.dispatch_paused_reason.lock().unwrap() = None;
+        self.notify_health_changed();
+    }
+
+    /// Register the engine-health sink. Called once at startup by
+    /// `app::server`, after `ServerState` exists. Stored weakly — see the
+    /// field's doc comment for the reference cycle this avoids.
+    pub fn set_health_notifier(&self, notifier: std::sync::Weak<dyn crate::coordinator::EngineHealthNotifier>) {
+        *self.health_notifier.lock().unwrap() = Some(notifier);
+    }
+
+    /// Register the spawn-health tracker. Called once at startup by
+    /// `app::server`, with the same `Arc` the spawn-ack sweep gets — see the
+    /// field's doc comment for why the coordinator needs it.
+    ///
+    /// A strong reference is safe here: the tracker owns nothing and holds
+    /// no reference back to the coordinator, so there is no cycle to break.
+    pub fn set_spawn_health(&self, spawn_health: Arc<crate::spawn_health::SpawnHealthTracker>) {
+        *self.spawn_health.lock().unwrap() = Some(spawn_health);
+    }
+
+    /// The registered spawn-health tracker, if any.
+    pub(crate) fn spawn_health(&self) -> Option<Arc<crate::spawn_health::SpawnHealthTracker>> {
+        self.spawn_health.lock().unwrap().clone()
+    }
+
+    /// Fire a health broadcast for a pause-state transition.
+    ///
+    /// Fire-and-forget on a detached task: `pause_dispatch` /
+    /// `resume_dispatch` are synchronous and are called from inside sweep
+    /// passes and RPC handlers, none of which should block on fanning a
+    /// push out to every connected frontend. A dropped notification is a
+    /// stale banner until the next transition or reconnect, never a stalled
+    /// pause — the state change itself has already been applied and
+    /// persisted by the caller.
+    ///
+    /// No-op when no notifier is registered, which is the case in every unit
+    /// test that constructs a bare coordinator (and outside a tokio runtime,
+    /// where `spawn` would panic).
+    fn notify_health_changed(&self) {
+        let Some(notifier) = self
+            .health_notifier
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        tokio::spawn(async move { notifier.broadcast_engine_health().await });
     }
 
     /// `true` when dispatch is globally paused.
@@ -452,6 +510,26 @@ impl ExecutionCoordinator {
     /// [`Self::is_dispatch_paused`] is `false`.
     pub fn dispatch_pause_exempts_reviews(&self) -> bool {
         self.dispatch_pause_exempts_reviews.load(Ordering::Acquire)
+    }
+
+    /// Who paused dispatch, or `None` when dispatch is not paused.
+    ///
+    /// Derived from the same bit `dispatch_pause_exempts_reviews` reads,
+    /// which [`Self::pause_dispatch`] sets from the origin — but stated in
+    /// the vocabulary callers actually reason in. A caller asking "may I
+    /// pause over this?" must ask about the *origin*, not about review
+    /// exemption: an operator pause must never be overwritten by an
+    /// automatic one, and phrasing that guard as `!exempts_reviews` inverts
+    /// it (see [`crate::spawn_health::hold_dispatch_for_host_environment`]).
+    pub fn dispatch_pause_origin(&self) -> Option<DispatchPauseOrigin> {
+        if !self.is_dispatch_paused() {
+            return None;
+        }
+        Some(if self.dispatch_pause_exempts_reviews() {
+            DispatchPauseOrigin::Operator
+        } else {
+            DispatchPauseOrigin::Breaker
+        })
     }
 
     /// The epoch-seconds timestamp at which dispatch was last paused, or

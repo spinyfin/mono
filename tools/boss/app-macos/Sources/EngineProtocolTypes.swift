@@ -38,6 +38,13 @@ enum EngineSpawnError: Sendable {
     /// slot is currently hosting, so the engine can log which pane
     /// caused the rejection instead of just "SlotBusy".
     case slotBusy(occupyingRunId: String?)
+    /// The host cannot currently create a libghostty surface at all — the
+    /// app measured it before allocating anything, so no slot was claimed,
+    /// no session was created and nothing about the execution was consumed.
+    /// The engine returns the execution to the queue and holds dispatch
+    /// until the condition clears, rather than terminalizing the row. See
+    /// [[SpawnCapability]] for the measured constraint.
+    case hostEnvironmentUnavailable(reason: String)
     case internalFailure(String)
 }
 
