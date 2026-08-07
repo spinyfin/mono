@@ -520,13 +520,15 @@ pub(crate) async fn run_list_revisions(
         None
     };
     let revisions = list_revisions(client, &product.id, dep_filter, args.include_deleted, parent_id).await?;
+    let known_ids: std::collections::HashSet<&str> = revisions.iter().map(|t| t.id.as_str()).collect();
+    let resolved_ids = resolve_ids_filter(client, ctx, &args.ids, &product.id, &known_ids).await?;
     let revisions = apply_task_list_filters(
         revisions,
         TaskListCriteria::builder()
             .statuses(&args.status)
             .priorities(&args.priority)
             .maybe_match_term(args.match_term.as_deref())
-            .ids(&args.id)
+            .ids(&resolved_ids)
             .maybe_limit(args.limit)
             .include_archived(args.include_archived)
             .build(),
@@ -2203,6 +2205,57 @@ pub(crate) async fn resolve_selector_to_primary_id(
         }
         WorkItemSelector::PrimaryId(id) | WorkItemSelector::Other(id) => Ok(id),
     }
+}
+
+/// Resolve a `--ids` list-filter argument to canonical primary ids and
+/// verify every one names a row present in `known_ids` — the full,
+/// unfiltered listing for this product/kind, collected *before* the
+/// other list filters (status, priority, ...) run.
+///
+/// Reuses [`resolve_selector_to_primary_id`] (the same resolution path
+/// `boss task show` uses) so `T42` / `42` / `#42` / `task_…` /
+/// `boss/42` all mean the same thing here as everywhere else.
+///
+/// Checking membership in `known_ids` — rather than trusting
+/// `resolve_selector_to_primary_id`'s pass-through for typed/opaque
+/// forms — is what catches a typo'd primary id or a valid id from the
+/// wrong product/kind: the resolver only round-trips through the
+/// engine (and so can actually error) for the short-id forms, and
+/// silently returns typed/`Other` selectors unchanged.
+///
+/// Errors naming every selector that didn't resolve to a known row,
+/// rather than silently returning fewer rows than requested — that
+/// silent-drop is exactly the failure mode `--ids` exists to prevent.
+/// An id that resolves but gets excluded by another composed filter
+/// (e.g. `--status`) is not this function's concern — that's ordinary
+/// AND-filter composition, decided by the caller after this returns.
+pub(crate) async fn resolve_ids_filter(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    selectors: &[String],
+    product_id: &str,
+    known_ids: &std::collections::HashSet<&str>,
+) -> Result<Vec<String>, CliError> {
+    let mut resolved = Vec::with_capacity(selectors.len());
+    let mut unknown = Vec::new();
+    for raw in selectors {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let id = resolve_selector_to_primary_id(client, ctx, trimmed, Some(product_id.to_owned())).await?;
+        if !known_ids.contains(id.as_str()) {
+            unknown.push(trimmed.to_owned());
+        }
+        resolved.push(id);
+    }
+    if !unknown.is_empty() {
+        return Err(CliError::not_found(format!(
+            "--ids: no matching row for {}",
+            unknown.join(", ")
+        )));
+    }
+    Ok(resolved)
 }
 
 /// If `selector` is a typed engine work-item id, look it up and return

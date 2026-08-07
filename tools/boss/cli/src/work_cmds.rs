@@ -332,11 +332,13 @@ pub(crate) async fn run_project_command(command: ProjectCommand, ctx: &RunContex
             let dep_filter = args.dep.into_filter();
             let repo_selector = args.repo.as_deref().map(RepoSelector::parse).transpose()?;
             let projects = list_projects(&mut client, &product.id, dep_filter).await?;
+            let known_ids: std::collections::HashSet<&str> = projects.iter().map(|p| p.id.as_str()).collect();
+            let resolved_ids = resolve_ids_filter(&mut client, ctx, &args.ids, &product.id, &known_ids).await?;
             let projects = apply_project_list_filters(
                 projects,
                 &args.status,
                 args.match_term.as_deref(),
-                &args.id,
+                &resolved_ids,
                 args.limit,
                 repo_selector.as_ref(),
                 product.repo_remote_url.as_deref(),
@@ -721,13 +723,15 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
                 args.include_deleted,
             )
             .await?;
+            let known_ids: std::collections::HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+            let resolved_ids = resolve_ids_filter(&mut client, ctx, &args.ids, &product.id, &known_ids).await?;
             let tasks = apply_task_list_filters(
                 tasks,
                 TaskListCriteria::builder()
                     .statuses(&args.status)
                     .priorities(&args.priority)
                     .maybe_match_term(args.match_term.as_deref())
-                    .ids(&args.id)
+                    .ids(&resolved_ids)
                     .maybe_limit(args.limit)
                     .include_archived(args.include_archived)
                     .build(),
@@ -842,13 +846,15 @@ pub(crate) async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -
             let dep_filter = args.dep.into_filter();
             let repo_selector = args.repo.as_deref().map(RepoSelector::parse).transpose()?;
             let chores = list_chores(&mut client, &product.id, dep_filter, args.include_deleted).await?;
+            let known_ids: std::collections::HashSet<&str> = chores.iter().map(|t| t.id.as_str()).collect();
+            let resolved_ids = resolve_ids_filter(&mut client, ctx, &args.ids, &product.id, &known_ids).await?;
             let chores = apply_task_list_filters(
                 chores,
                 TaskListCriteria::builder()
                     .statuses(&args.status)
                     .priorities(&args.priority)
                     .maybe_match_term(args.match_term.as_deref())
-                    .ids(&args.id)
+                    .ids(&resolved_ids)
                     .maybe_limit(args.limit)
                     .include_archived(args.include_archived)
                     .build(),
