@@ -212,6 +212,29 @@ async fn standard_tmux_options_are_supported() {
     );
 }
 
+#[tokio::test]
+async fn server_option_set_and_read_carry_no_session_target() {
+    let (tmux, runner) = tmux([success(""), success("4242\n")]);
+    tmux.set_server_option("@boss_engine_owner", "4242").await.unwrap();
+    assert_eq!(
+        tmux.show_server_option("@boss_engine_owner").await.unwrap(),
+        Some("4242".to_owned())
+    );
+    assert_eq!(
+        runner.calls(),
+        vec![
+            vec!["-L", "boss", "set-option", "-s", "@boss_engine_owner", "4242"],
+            vec!["-L", "boss", "show-options", "-s", "-v", "@boss_engine_owner"],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn server_option_read_distinguishes_absence() {
+    let (tmux, _) = tmux([failure("invalid option: @missing")]);
+    assert_eq!(tmux.show_server_option("@missing").await.unwrap(), None);
+}
+
 #[tokio::test(start_paused = true)]
 async fn send_keys_chunks_utf8_then_submits_in_a_separate_command() {
     let text = format!("{}é", "x".repeat(DEFAULT_SEND_CHUNK_BYTES));
