@@ -2596,3 +2596,71 @@ fn tmux_spawn_tokens_are_unique_across_runs() {
         "the durable tmux token must identify at most one run"
     );
 }
+
+/// `tmux_identity_for_execution` must find the NEWEST run's identity, not
+/// whichever run `resolve_run_id_for_execution_hooks`'s hook-write tie-breaks
+/// (prefer unfinished, deprioritize `failed`, prefer a row with a transcript)
+/// would pick. A resumed/re-dispatched execution can leave an older run row
+/// behind whose identity columns are already NULL; if teardown followed the
+/// hook resolver, a newer `failed` run with no transcript yet would lose to
+/// that older row and its still-live tmux session would never be read back,
+/// let alone torn down.
+#[test]
+fn tmux_identity_for_execution_prefers_the_newest_run_over_the_hook_resolver() {
+    let db = WorkDb::open(temp_db_path("tmux-identity-newest-run")).unwrap();
+    let execution_id = start_run_on_host_for_test(&db, "local");
+    let older_run = db.list_runs(&execution_id).unwrap().pop().unwrap();
+
+    // The older run finishes cleanly (not failed, transcript set) — exactly
+    // the shape the hook resolver's tie-breaks would prefer over a `failed`,
+    // transcript-less newer run.
+    db.set_run_transcript_path_if_unset(&execution_id, "/tmp/older.jsonl")
+        .unwrap();
+    db.finish_execution_run(
+        FinishExecutionRunInput::builder()
+            .execution_id(execution_id.clone())
+            .run_id(older_run.id)
+            .execution_status(ExecutionStatus::WaitingHuman)
+            .run_status("completed")
+            .clear_workspace_lease(false)
+            .build(),
+    )
+    .unwrap();
+
+    // Reconcile the execution back to `Ready` and start a second, newer run
+    // for the SAME execution — the resume/re-dispatch shape. It gets a tmux
+    // identity but is left `failed` with no transcript, the exact profile
+    // the hook resolver deprioritizes.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'ready' WHERE id = ?1",
+            rusqlite::params![&execution_id],
+        )
+        .unwrap();
+    let (_exec, newer_run) = db
+        .start_execution_run(&execution_id, "worker-1", "mono", "lease-2", "ws-2", "/tmp/ws-2")
+        .unwrap();
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(&execution_id, "boss", "boss-newer", "token-newer")
+            .unwrap()
+    );
+    assert!(
+        db.record_tmux_session_created_for_execution(&execution_id, "token-newer", 4242)
+            .unwrap()
+    );
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET status = 'failed', finished_at = created_at WHERE id = ?1",
+            rusqlite::params![&newer_run.id],
+        )
+        .unwrap();
+
+    let identity = db
+        .tmux_identity_for_execution(&execution_id)
+        .unwrap()
+        .expect("the newer run's tmux identity must be found");
+    assert_eq!(identity.session_name, "boss-newer");
+    assert_eq!(identity.spawn_token, "token-newer");
+}
