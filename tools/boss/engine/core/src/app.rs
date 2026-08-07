@@ -536,6 +536,10 @@ struct ServerState {
     /// attention item. Shared with the sweep loop (wired in
     /// `app::server::serve`). See [`crate::spawn_health`].
     spawn_health: Arc<crate::spawn_health::SpawnHealthTracker>,
+    /// Startup result for the required tmux runtime. The process only ever
+    /// uses the resolved path recorded in the ready variant.
+    #[builder(default = Arc::new(std::sync::RwLock::new(crate::tmux_preflight::TmuxPreflight::Unavailable { reason: "tmux preflight has not run yet".to_owned() })))]
+    tmux_preflight: Arc<std::sync::RwLock<crate::tmux_preflight::TmuxPreflight>>,
     /// Per-slot trigger fan-in for the live-status summarizer. Started
     /// when `spawn_flow` calls `start_live_status_slot`; torn down
     /// in `release_worker_pane`.

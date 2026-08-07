@@ -417,6 +417,20 @@ pub async fn serve_with_merge_probe(
         None,
         None,
     )?;
+    let tmux_preflight = crate::tmux_preflight::TmuxPreflight::probe().await;
+    if let Some(reason) = tmux_preflight.unavailable_reason() {
+        tracing::error!(%reason, "tmux preflight failed; refusing all new local dispatches");
+        server_state
+            .execution_coordinator
+            .set_dispatch_preflight_block(Some(reason.to_owned()));
+        raise_tmux_preflight_attention(&server_state, reason).await;
+    } else if let crate::tmux_preflight::TmuxPreflight::Ready { program, version } = &tmux_preflight {
+        tracing::info!(tmux_program = %program.display(), tmux_version_major = version.major, tmux_version_minor = version.minor, "tmux preflight passed");
+    }
+    *server_state
+        .tmux_preflight
+        .write()
+        .expect("tmux preflight lock poisoned") = tmux_preflight;
 
     // GitHub API usage telemetry: install the process-wide sink and start
     // its batching writer.
@@ -1904,6 +1918,61 @@ pub async fn serve_with_merge_probe(
                         tracing::error!(?err, "frontend connection failed");
                     }
                 });
+            }
+        }
+    }
+}
+
+/// Surface a failed required-runtime check in each active project's attention
+/// feed. Attentions require a work-item association, so project-scoped items
+/// are the durable global-notification representation available to the app.
+async fn raise_tmux_preflight_attention(server_state: &Arc<ServerState>, reason: &str) {
+    let products = match server_state.work_db.list_products() {
+        Ok(products) => products,
+        Err(err) => {
+            tracing::warn!(?err, "tmux preflight: failed to list products for startup attention");
+            return;
+        }
+    };
+    for product in products.into_iter().filter(|product| product.status == "active") {
+        let projects = match server_state.work_db.list_projects(&product.id, None) {
+            Ok(projects) => projects,
+            Err(err) => {
+                tracing::warn!(product_id = %product.id, ?err, "tmux preflight: failed to list projects for startup attention");
+                continue;
+            }
+        };
+        for project in projects {
+            let input = boss_protocol::CreateAttentionInput::builder()
+                .kind("question")
+                .group_key(format!("engine_health_tmux|{}", project.id))
+                .association_project_id(project.id.clone())
+                .source_kind("manual")
+                .source_doc_path("engine-health/tmux")
+                .question_type("prompt")
+                .prompt_text(format!(
+                    "Local dispatch is blocked because tmux is unavailable: {reason}"
+                ))
+                .build();
+            match server_state.work_db.reconcile_attentions(vec![input]) {
+                Ok(Some((group, attentions))) => {
+                    for attention in attentions {
+                        server_state
+                            .publisher
+                            .publish_frontend_event_on_product(
+                                &group.product_id,
+                                boss_protocol::FrontendEvent::AttentionCreated {
+                                    attention,
+                                    group: group.clone(),
+                                },
+                            )
+                            .await;
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(project_id = %project.id, ?err, "tmux preflight: failed to create startup attention")
+                }
             }
         }
     }

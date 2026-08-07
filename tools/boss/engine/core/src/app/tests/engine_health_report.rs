@@ -8,6 +8,10 @@ use super::*;
 #[tokio::test]
 async fn engine_health_report_flags_missing_anthropic_api_key() {
     let (state, _dir) = test_server_state();
+    *state.tmux_preflight.write().unwrap() = crate::tmux_preflight::TmuxPreflight::Ready {
+        program: std::path::PathBuf::from("/usr/local/bin/tmux"),
+        version: boss_tmux::MINIMUM_VERSION,
+    };
     // Pin: the test fixture intentionally builds without an
     // ANTHROPIC_API_KEY so the missing-key arm is exercised.
     assert!(
@@ -48,6 +52,10 @@ async fn engine_health_report_is_empty_when_api_key_present() {
     };
     let cfg = Arc::new(RuntimeConfig::from_parts(work, Some(agent)));
     let state = ServerState::new_arc_with_app_pid_and_merge_probe(cfg, None, None, None, None, None, None).unwrap();
+    *state.tmux_preflight.write().unwrap() = crate::tmux_preflight::TmuxPreflight::Ready {
+        program: std::path::PathBuf::from("/usr/local/bin/tmux"),
+        version: boss_tmux::MINIMUM_VERSION,
+    };
 
     let report = build_engine_health_report(&state);
     assert!(report.anthropic_api_key_present);
@@ -56,6 +64,22 @@ async fn engine_health_report_is_empty_when_api_key_present() {
         "healthy engine must report no issues; got {:?}",
         report.issues,
     );
+}
+
+#[tokio::test]
+async fn engine_health_report_flags_unavailable_tmux() {
+    let (state, _dir) = test_server_state();
+    *state.tmux_preflight.write().unwrap() = crate::tmux_preflight::TmuxPreflight::Unavailable {
+        reason: "tmux 3.2 is required".to_owned(),
+    };
+
+    let issue = build_engine_health_report(&state)
+        .issues
+        .into_iter()
+        .find(|issue| issue.kind == "tmux_unavailable")
+        .expect("unavailable tmux must be visible in engine health");
+    assert_eq!(issue.severity, "error");
+    assert!(issue.body.contains("tmux 3.2"));
 }
 
 /// Pausing dispatch must surface a warning-severity `dispatch_paused`

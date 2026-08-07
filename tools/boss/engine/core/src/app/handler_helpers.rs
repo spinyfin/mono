@@ -167,6 +167,20 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
         });
     }
 
+    let tmux_preflight = server_state
+        .tmux_preflight
+        .read()
+        .expect("tmux preflight lock poisoned")
+        .clone();
+    if let Some(reason) = tmux_preflight.unavailable_reason() {
+        issues.push(EngineHealthIssue {
+            kind: "tmux_unavailable".to_owned(),
+            severity: "error".to_owned(),
+            title: "tmux is required for durable worker sessions".to_owned(),
+            body: reason.to_owned(),
+        });
+    }
+
     if dispatch_paused {
         let reviews_exempt = server_state.execution_coordinator.dispatch_pause_exempts_reviews();
         let scope_body = if reviews_exempt {
