@@ -229,9 +229,9 @@ impl WorkDb {
     /// Every review verdict recorded for `work_item_id`, most recent first —
     /// the full attempt history, including non-informative outcomes
     /// (`gave_up`, `dropped_duplicate_head`). Backs `bossctl review show`'s
-    /// "repeated attempts" view; see [`Self::latest_informative_review_verdict`]
-    /// for just the single row that answers "what's the current, load-bearing
-    /// verdict."
+    /// both the "latest informative verdict" view (callers filter with
+    /// [`is_informative_gate_outcome`] to find it) and the "repeated
+    /// attempts" history view.
     pub fn review_verdicts_for_work_item(&self, work_item_id: &str) -> Result<Vec<ReviewVerdict>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
@@ -245,20 +245,6 @@ impl WorkDb {
             .query_map(params![work_item_id], map_review_verdict)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
-    }
-
-    /// The most recent verdict for `work_item_id` whose `gate_outcome` is
-    /// informative (see [`is_informative_gate_outcome`]) — the single-id CLI
-    /// counterpart to [`query_latest_informative_review_verdicts`], which
-    /// batches this same "does this outcome count" filter across a whole
-    /// board. `None` means either no pass has ever completed, or every
-    /// completed pass gave up or was dropped as a duplicate head — never
-    /// infer a clean result from `None`.
-    pub fn latest_informative_review_verdict(&self, work_item_id: &str) -> Result<Option<ReviewVerdict>> {
-        Ok(self
-            .review_verdicts_for_work_item(work_item_id)?
-            .into_iter()
-            .find(|v| is_informative_gate_outcome(&v.gate_outcome)))
     }
 }
 

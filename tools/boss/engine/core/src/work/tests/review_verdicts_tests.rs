@@ -142,13 +142,42 @@ fn review_verdicts_for_work_item_is_empty_for_never_reviewed_item() {
     assert!(db.review_verdicts_for_work_item(&chore.id).unwrap().is_empty());
 }
 
-/// `latest_informative_review_verdict` skips past a `gave_up` /
-/// `dropped_duplicate_head` pass (neither is positive evidence of anything)
-/// and returns the most recent pass that actually represents a completed
-/// judgement — mirroring the same distinction the AI-review badge resolver
-/// applies via `query_latest_informative_review_verdicts`.
+/// `is_informative_gate_outcome` distinguishes the two outcomes that
+/// represent a real completed judgement (`completed_clean`,
+/// `completed_with_findings`) from the two that don't (`gave_up`,
+/// `dropped_duplicate_head`) — the same distinction the AI-review badge
+/// resolver applies via `query_latest_informative_review_verdicts`, and
+/// that `bossctl review show` applies inline via
+/// `history.iter().find(|v| is_informative_gate_outcome(&v.gate_outcome))`
+/// to find the latest informative verdict in a full history returned by
+/// `review_verdicts_for_work_item`.
 #[test]
-fn latest_informative_review_verdict_skips_non_informative_outcomes() {
+fn is_informative_gate_outcome_distinguishes_completed_from_abandoned() {
+    assert!(crate::work::is_informative_gate_outcome(
+        crate::work::REVIEW_GATE_OUTCOME_COMPLETED_CLEAN
+    ));
+    assert!(crate::work::is_informative_gate_outcome(
+        crate::work::REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS
+    ));
+    assert!(crate::work::is_informative_gate_outcome(
+        crate::work::REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED
+    ));
+    assert!(!crate::work::is_informative_gate_outcome(
+        crate::work::REVIEW_GATE_OUTCOME_GAVE_UP
+    ));
+    assert!(!crate::work::is_informative_gate_outcome(
+        crate::work::REVIEW_GATE_OUTCOME_DROPPED_DUPLICATE_HEAD
+    ));
+}
+
+/// `review_verdicts_for_work_item` combined with an
+/// `is_informative_gate_outcome` filter — the pattern `bossctl review show`
+/// uses — skips past a `gave_up` / `dropped_duplicate_head` pass (neither is
+/// positive evidence of anything) and finds the most recent pass that
+/// actually represents a completed judgement, even when it isn't the
+/// newest row.
+#[test]
+fn history_filtered_by_informative_outcome_skips_abandoned_passes() {
     let db = WorkDb::open(temp_db_path("verdict-informative")).unwrap();
     let product = create_test_product(&db);
     let (chore, exec_a) = seed_pr_review_execution(&db, &product.id, "a");
@@ -179,9 +208,10 @@ fn latest_informative_review_verdict_skips_non_informative_outcomes() {
         crate::work::REVIEW_GATE_OUTCOME_GAVE_UP,
     );
 
-    let latest_informative = db
-        .latest_informative_review_verdict(&chore.id)
-        .unwrap()
+    let history = db.review_verdicts_for_work_item(&chore.id).unwrap();
+    let latest_informative = history
+        .iter()
+        .find(|v| crate::work::is_informative_gate_outcome(&v.gate_outcome))
         .expect("the earlier clean verdict must still be found");
     assert_eq!(
         latest_informative.execution_id, exec_a.id,
@@ -199,5 +229,10 @@ fn latest_informative_review_verdict_skips_non_informative_outcomes() {
         "100",
         crate::work::REVIEW_GATE_OUTCOME_GAVE_UP,
     );
-    assert!(db2.latest_informative_review_verdict(&chore2.id).unwrap().is_none());
+    let history2 = db2.review_verdicts_for_work_item(&chore2.id).unwrap();
+    assert!(
+        !history2
+            .iter()
+            .any(|v| crate::work::is_informative_gate_outcome(&v.gate_outcome))
+    );
 }

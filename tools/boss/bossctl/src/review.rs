@@ -70,29 +70,48 @@ pub(crate) enum ReviewAction {
 /// runs, not a worker-facing surface (see `bossctl`'s crate doc comment).
 pub(crate) fn review_show(json: bool, state_root: Option<PathBuf>, work_item: String) -> Result<()> {
     let db = super::open_state_db(state_root)?;
+    // `get_pr_status_snapshot` returns `Ok(None)` ONLY when the `tasks` row
+    // itself is absent or soft-deleted (see its doc comment) — never for a
+    // work item that merely has no PR yet. Treat `None` as "unknown work
+    // item", not as evidence the item was never reviewed, so a bare id typo
+    // doesn't come back looking like a valid negative verdict.
+    let Some(pr_status) = db
+        .get_pr_status_snapshot(&work_item)
+        .context("reading PR status snapshot")?
+    else {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "work_item_id": work_item,
+                    "work_item_exists": false,
+                })
+            );
+            return Ok(());
+        }
+        bail!("unknown or deleted work item: {work_item}");
+    };
     let history = db
         .review_verdicts_for_work_item(&work_item)
         .context("reading review verdict history")?;
     let latest_informative = history.iter().find(|v| is_informative_gate_outcome(&v.gate_outcome));
-    let pr_status = db
-        .get_pr_status_snapshot(&work_item)
-        .context("reading PR status snapshot")?;
-    let current_head_sha = pr_status.as_ref().and_then(|s| s.head_sha.clone());
+    let current_head_sha = pr_status.head_sha.clone();
     // `None` means "can't tell" (no informative verdict yet, or the PR head
     // has never been polled) — deliberately distinct from `Some(false)`, so
     // a caller never confuses "unknown" with "confirmed current".
-    let reviewed_head_is_stale = match (latest_informative, &current_head_sha) {
-        (Some(v), Some(current)) => v.head_sha.as_deref().map(|reviewed| reviewed != current),
-        _ => None,
-    };
+    let reviewed_head_is_stale = reviewed_head_staleness(
+        latest_informative.and_then(|v| v.head_sha.as_deref()),
+        current_head_sha.as_deref(),
+    );
 
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "work_item_id": work_item,
-                "pr_url": pr_status.as_ref().and_then(|s| s.pr_url.clone()),
+                "pr_url": pr_status.pr_url,
                 "current_head_sha": current_head_sha,
+                "current_head_observed_at": pr_status.observed_at,
                 "latest_informative_verdict": latest_informative.map(verdict_json),
                 "reviewed_head_is_stale": reviewed_head_is_stale,
                 "history": history.iter().map(verdict_json_with_informative_flag).collect::<Vec<_>>(),
@@ -102,12 +121,13 @@ pub(crate) fn review_show(json: bool, state_root: Option<PathBuf>, work_item: St
     }
 
     println!("work item: {work_item}");
-    match pr_status.as_ref().and_then(|s| s.pr_url.as_deref()) {
+    match pr_status.pr_url.as_deref() {
         Some(pr_url) => {
             println!("  pr:           {pr_url}");
             println!(
-                "  current head: {}",
-                current_head_sha.as_deref().unwrap_or("(not yet probed)")
+                "  current head: {} (as of {})",
+                current_head_sha.as_deref().unwrap_or("(not yet probed)"),
+                pr_status.observed_at.as_deref().unwrap_or("(never observed)"),
             );
         }
         None => println!("  pr: (none bound to this work item yet)"),
@@ -118,10 +138,16 @@ pub(crate) fn review_show(json: bool, state_root: Option<PathBuf>, work_item: St
         None if history.is_empty() => {
             println!("never reviewed — no pr_review pass has completed for this work item");
         }
-        None => println!(
-            "no informative verdict — {} pass(es) recorded, all gave_up or dropped_duplicate_head",
-            history.len()
-        ),
+        None => {
+            let mut outcomes: Vec<&str> = history.iter().map(|v| v.gate_outcome.as_str()).collect();
+            outcomes.sort_unstable();
+            outcomes.dedup();
+            println!(
+                "no informative verdict — {} pass(es) recorded ({})",
+                history.len(),
+                outcomes.join(", "),
+            );
+        }
         Some(v) => {
             println!("latest informative verdict:");
             println!("  outcome:            {}", v.gate_outcome);
@@ -138,13 +164,13 @@ pub(crate) fn review_show(json: bool, state_root: Option<PathBuf>, work_item: St
                     "  ** STALE — the PR has moved since this review; current head is {} **",
                     current_head_sha.as_deref().unwrap_or("(unknown)")
                 ),
-                Some(false) => println!("  reviewed head matches the PR's current head"),
+                Some(false) => println!("  reviewed head matches the last-polled head"),
                 None => {}
             }
         }
     }
 
-    if history.len() > 1 {
+    if history.len() > 1 || (latest_informative.is_none() && !history.is_empty()) {
         println!();
         println!("full history ({} pass(es), most recent first):", history.len());
         for v in &history {
@@ -164,6 +190,18 @@ pub(crate) fn review_show(json: bool, state_root: Option<PathBuf>, work_item: St
     }
 
     Ok(())
+}
+
+/// Whether the head sha a review verdict was recorded against still matches
+/// the PR's last-polled head. `None` means "can't tell" — either no
+/// informative verdict has a recorded head, or the PR's current head has
+/// never been observed — deliberately distinct from `Some(false)`, so a
+/// caller never confuses "unknown" with "confirmed current".
+fn reviewed_head_staleness(reviewed: Option<&str>, current: Option<&str>) -> Option<bool> {
+    match (reviewed, current) {
+        (Some(reviewed), Some(current)) => Some(reviewed != current),
+        _ => None,
+    }
 }
 
 fn verdict_json(v: &ReviewVerdict) -> serde_json::Value {
@@ -230,5 +268,59 @@ pub(crate) async fn review_start(
             bail!("engine rejected review start: {message}")
         }
         other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use boss_engine::work::REVIEW_GATE_OUTCOME_COMPLETED_CLEAN;
+    use boss_engine::work::REVIEW_GATE_OUTCOME_GAVE_UP;
+
+    use super::*;
+
+    #[test]
+    fn staleness_none_when_reviewed_head_unknown() {
+        assert_eq!(reviewed_head_staleness(None, Some("abc")), None);
+    }
+
+    #[test]
+    fn staleness_none_when_current_head_unknown() {
+        assert_eq!(reviewed_head_staleness(Some("abc"), None), None);
+    }
+
+    #[test]
+    fn staleness_false_when_heads_match() {
+        assert_eq!(reviewed_head_staleness(Some("abc"), Some("abc")), Some(false));
+    }
+
+    #[test]
+    fn staleness_true_when_heads_differ() {
+        assert_eq!(reviewed_head_staleness(Some("abc"), Some("def")), Some(true));
+    }
+
+    fn verdict(gate_outcome: &str) -> ReviewVerdict {
+        ReviewVerdict {
+            id: "verdict_1".to_owned(),
+            execution_id: "exec_1".to_owned(),
+            work_item_id: "task_1".to_owned(),
+            head_sha: Some("abc123".to_owned()),
+            findings_count: 0,
+            revision_warranted: false,
+            gate_outcome: gate_outcome.to_owned(),
+            revision_task_id: None,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn verdict_json_marks_informative_outcome() {
+        let json = verdict_json_with_informative_flag(&verdict(REVIEW_GATE_OUTCOME_COMPLETED_CLEAN));
+        assert_eq!(json["informative"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn verdict_json_marks_non_informative_outcome() {
+        let json = verdict_json_with_informative_flag(&verdict(REVIEW_GATE_OUTCOME_GAVE_UP));
+        assert_eq!(json["informative"], serde_json::json!(false));
     }
 }
