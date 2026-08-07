@@ -1451,3 +1451,37 @@ impl WorkDb {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::test_support::*;
+    use boss_protocol::WorkItem;
+
+    /// A task whose `review_cycle` is a known non-zero value must serialise
+    /// that real value through every mapper path, not the hardcoded `0`
+    /// `map_task` used to return regardless of the stored column. Exercises
+    /// both `get_work_item` (the `boss task show --json` path, via
+    /// `map_task_with_parent_provenance_and_archived_reason`) and the plain
+    /// `map_task` base reached by `list_tasks_for_product`.
+    #[test]
+    fn review_cycle_and_last_reviewed_sha_survive_through_task_show() {
+        let (_tmp, db) = open_db();
+        let product = create_test_product(&db);
+        let task = create_test_chore(&db, product.id.clone(), "review cycle task");
+
+        db.increment_task_review_cycle(&task.id, Some("deadbeef")).unwrap();
+        db.increment_task_review_cycle(&task.id, Some("cafef00d")).unwrap();
+
+        let item = db.get_work_item(&task.id).unwrap();
+        let WorkItem::Chore(shown) = item else {
+            panic!("expected a chore, got {item:?}");
+        };
+        assert_eq!(shown.review_cycle, 2);
+        assert_eq!(shown.last_reviewed_sha.as_deref(), Some("cafef00d"));
+
+        let listed = db.list_tasks(&product.id, None, None, false).unwrap();
+        let listed_task = listed.iter().find(|t| t.id == task.id).unwrap();
+        assert_eq!(listed_task.review_cycle, 2);
+        assert_eq!(listed_task.last_reviewed_sha.as_deref(), Some("cafef00d"));
+    }
+}
