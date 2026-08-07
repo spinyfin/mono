@@ -539,7 +539,7 @@ pub(super) async fn dispatch_live_worker_state(
     // is a benign no-op.
     let new_state = server_state.live_worker_states.get(slot_id);
     let new_activity = new_state.as_ref().map(|s| s.activity);
-    let is_pr_review = new_state.as_ref().and_then(|s| s.kind.as_deref()) == Some("pr_review");
+    let is_pr_review = new_state.as_ref().and_then(|s| s.kind.as_deref()) == Some(ExecutionKind::PrReview.as_str());
     // Project the pane's awaiting-input state onto the durable row, so
     // `work_executions.status` and `bossctl agents`' `activity` cannot
     // disagree about whether this worker is blocked on a human. Runs

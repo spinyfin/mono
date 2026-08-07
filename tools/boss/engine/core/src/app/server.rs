@@ -1765,24 +1765,14 @@ pub async fn serve_with_merge_probe(
                     // sees it — mirror it onto the row here instead, or the
                     // directory-trust-prompt stall leaves `status = running`
                     // forever with no later hook to re-converge it. See
-                    // `mirror_stalled_spawn_wait`'s doc.
-                    for slot_id in &stalled {
-                        // `run_id`, not `execution_id`: the latter is only
-                        // populated when a `WorkItemBinding` was passed at
-                        // registration, but production dispatch always
-                        // stamps `run_id` with the execution id (see
-                        // `WorkItemBinding::execution_id`'s doc) — the same
-                        // value the hook-dispatch mirror above uses.
-                        let Some(execution_id) = live_worker_states.get(*slot_id).map(|state| state.run_id) else {
-                            continue;
-                        };
-                        crate::awaiting_input_status::mirror_stalled_spawn_wait(
-                            &server_clone.work_db,
-                            &server_clone.publisher,
-                            &execution_id,
-                        )
-                        .await;
-                    }
+                    // `mirror_stalled_spawn_waits`'s doc.
+                    crate::awaiting_input_status::mirror_stalled_spawn_waits(
+                        &live_worker_states,
+                        &server_clone.work_db,
+                        &server_clone.publisher,
+                        &stalled,
+                    )
+                    .await;
                 }
                 let downgraded = live_worker_states
                     .downgrade_stale_activity(now, crate::live_worker_state::STALE_ACTIVITY_DOWNGRADE_SECS);

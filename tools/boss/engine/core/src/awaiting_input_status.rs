@@ -59,9 +59,10 @@
 
 use std::sync::Arc;
 
-use boss_protocol::WorkerActivity;
+use boss_protocol::{ExecutionKind, WorkerActivity};
 
 use crate::coordinator::ExecutionPublisher;
+use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::work::WorkDb;
 
 /// Reason string stamped on the `executions.<id>` topic invalidation when
@@ -153,12 +154,46 @@ pub async fn mirror_awaiting_input(
 /// emitting a hook, which resumes it through [`mirror_awaiting_input`]
 /// instead. [`WorkDb::set_execution_awaiting_human`]'s SQL guard makes a
 /// redundant or late call here a safe no-op.
+///
+/// `is_pr_review` mirrors [`mirror_awaiting_input`]'s exclusion: a reviewer
+/// stalled on the directory-trust prompt has no hook-dispatch path to ever
+/// resume it (that edge lives solely in `mirror_awaiting_input`, which
+/// returns early for reviewers), so mirroring the wait here would strand
+/// the row in `waiting_human` for the rest of the review with nothing able
+/// to clear it.
 pub async fn mirror_stalled_spawn_wait(
     work_db: &Arc<WorkDb>,
     publisher: &Arc<dyn ExecutionPublisher>,
     execution_id: &str,
+    is_pr_review: bool,
 ) {
+    if is_pr_review {
+        return;
+    }
     write_awaiting_status(work_db, publisher, execution_id, true).await;
+}
+
+/// Resolve each stalled slot to its run id and kind, and mirror the
+/// promotion onto the row via [`mirror_stalled_spawn_wait`].
+///
+/// This is the sole call site both `app/server.rs`'s stalled-spawn timer and
+/// its tests should use — pulling the slot resolution and the `pr_review`
+/// skip out of the timer body means the two can never diverge, and a test
+/// that calls this function is actually pinning the production wiring
+/// rather than a re-typed copy of it.
+pub async fn mirror_stalled_spawn_waits(
+    registry: &LiveWorkerStateRegistry,
+    work_db: &Arc<WorkDb>,
+    publisher: &Arc<dyn ExecutionPublisher>,
+    stalled: &[u8],
+) {
+    for slot_id in stalled {
+        let Some(state) = registry.get(*slot_id) else {
+            continue;
+        };
+        let is_pr_review = state.kind.as_deref() == Some(ExecutionKind::PrReview.as_str());
+        mirror_stalled_spawn_wait(work_db, publisher, &state.run_id, is_pr_review).await;
+    }
 }
 
 async fn write_awaiting_status(

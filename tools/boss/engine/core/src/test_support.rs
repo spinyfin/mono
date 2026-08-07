@@ -259,11 +259,8 @@ pub fn spawn_group_leader_sleeper() -> std::process::Child {
 /// test module hand-rolled the same `finish_execution_run(...)` builder
 /// block at a dozen-odd sites.
 ///
-/// Named for `RunWaitState::WorkerPaneAlive`, the outcome it mirrors. It
-/// used to park in `waiting_human`, which is precisely the defect
-/// mono#2673 fixed; keeping the fixture on the old status would have left
-/// the entire completion suite exercising a state production no longer
-/// produces.
+/// Named for `RunWaitState::WorkerPaneAlive`. Parks the execution in
+/// `running`, the status `PaneSpawnRunner` leaves behind once the pane is up.
 ///
 /// Pass the per-site `result_summary` (or `None` where the test omits it).
 pub fn finish_run_worker_pane_alive(db: &WorkDb, execution_id: &str, run_id: &str, result_summary: Option<&str>) {

@@ -90,11 +90,8 @@ pub enum RunWaitState {
     /// reviewer. Workspace is retained so the pane can continue.
     ///
     /// This is the outcome of every successful pane spawn, whatever the
-    /// execution kind. It started life as `ReviewerPaneAlive`, applied
-    /// only to `pr_review`, on the reasoning that "`waiting_human` is
-    /// semantically wrong here: nobody is waiting for a human while the
-    /// reviewer agent is working" — which is equally true of every other
-    /// kind, and was the defect mono#2673 fixed by generalizing it.
+    /// execution kind: `waiting_human` would be semantically wrong for any
+    /// of them — nobody is waiting for a person while the agent is working.
     ///
     /// Using `running` is also what keeps the "AI reviewing" badge visible
     /// on kanban cards for the duration of a review — the badge queries

@@ -258,7 +258,9 @@ async fn a_late_notification_never_drags_a_settled_row_back() {
 /// slot that never receives a single hook. `mark_stalled_spawns` (the
 /// timer-driven sweep in `app/server.rs`, not the hook-dispatch path) is
 /// the only thing that ever observes this, so it must mirror the promotion
-/// onto the row itself — see `awaiting_input_status::mirror_stalled_spawn_wait`.
+/// onto the row itself — see `awaiting_input_status::mirror_stalled_spawn_waits`,
+/// the exact function `app/server.rs`'s timer calls, exercised here rather
+/// than a re-typed copy of its body.
 #[tokio::test]
 async fn a_stalled_spawn_with_no_hooks_ever_mirrors_onto_the_row() {
     let (server_state, _dir) = test_server_state();
@@ -272,19 +274,13 @@ async fn a_stalled_spawn_with_no_hooks_ever_mirrors_onto_the_row() {
         .mark_stalled_spawns(now, crate::live_worker_state::STALLED_SPAWN_THRESHOLD_SECS);
     assert_eq!(stalled, vec![SLOT], "the pid-bearing, capable slot must be promoted");
 
-    for slot_id in &stalled {
-        let execution_id = server_state
-            .live_worker_states
-            .get(*slot_id)
-            .map(|state| state.run_id)
-            .expect("slot must resolve to a run id");
-        crate::awaiting_input_status::mirror_stalled_spawn_wait(
-            &server_state.work_db,
-            &server_state.publisher,
-            &execution_id,
-        )
-        .await;
-    }
+    crate::awaiting_input_status::mirror_stalled_spawn_waits(
+        &server_state.live_worker_states,
+        &server_state.work_db,
+        &server_state.publisher,
+        &stalled,
+    )
+    .await;
 
     assert_surfaces_agree(
         &server_state,
@@ -292,6 +288,63 @@ async fn a_stalled_spawn_with_no_hooks_ever_mirrors_onto_the_row() {
         ExecutionStatus::WaitingHuman,
         WorkerActivity::WaitingForInput,
         "stalled on the directory-trust prompt with no hook ever received",
+    );
+}
+
+/// The same stall, but for a `pr_review` reviewer: the stalled-spawn sweep
+/// must apply the same exclusion `mirror_awaiting_input` applies on the
+/// hook-dispatch path, or a reviewer stuck on the directory-trust prompt
+/// would have its row promoted to `waiting_human` with nothing able to ever
+/// clear it — the resumption edge lives solely in `mirror_awaiting_input`,
+/// which returns early for reviewers.
+#[tokio::test]
+async fn a_stalled_pr_review_spawn_never_moves_the_row_off_running() {
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product = create_test_product_with_repo(db, "p", Some("git@example.com:p.git"));
+    let chore = create_test_chore_manual(db, product.id.clone(), "c");
+    let execution = db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    let (_exec, run) = db
+        .start_execution_run(&execution.id, "worker-1", "repo-1", "lease-1", "ws-1", "/tmp/ws")
+        .unwrap();
+    finish_run_worker_pane_alive(db, &execution.id, &run.id, Some("Spawned reviewer pane in slot 1."));
+    server_state.live_worker_states.register_spawn_with_capabilities(
+        SLOT,
+        execution.id.clone(),
+        "claude-opus-4-7",
+        4242,
+        None,
+        true,
+        LiveSpawnRouting::new("review", "pr_review"),
+    );
+    server_state.worker_registry.register_run_slot(&execution.id, SLOT);
+
+    let now =
+        boss_engine_utils::epoch_time::now_epoch_secs() + crate::live_worker_state::STALLED_SPAWN_THRESHOLD_SECS + 1;
+    let stalled = server_state
+        .live_worker_states
+        .mark_stalled_spawns(now, crate::live_worker_state::STALLED_SPAWN_THRESHOLD_SECS);
+    assert_eq!(
+        stalled,
+        vec![SLOT],
+        "the pid-bearing, capable reviewer slot must still be promoted at the pane"
+    );
+
+    crate::awaiting_input_status::mirror_stalled_spawn_waits(
+        &server_state.live_worker_states,
+        &server_state.work_db,
+        &server_state.publisher,
+        &stalled,
+    )
+    .await;
+
+    let status = server_state.work_db.get_execution(&execution.id).unwrap().status;
+    assert_eq!(
+        status,
+        ExecutionStatus::Running,
+        "a stalled pr_review row must stay running so the AI-reviewing badge survives the directory-trust prompt",
     );
 }
 
