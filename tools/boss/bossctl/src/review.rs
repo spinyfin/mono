@@ -1,13 +1,23 @@
-//! `bossctl review` — operator control verbs for the automated review
-//! pipeline.
+//! `bossctl review` — operator control and inspection verbs for the
+//! automated review pipeline.
 //!
 //! `review start --pr <n>` re-enqueues a `pr_review` execution for an
 //! open PR on demand: the same dispatch path the engine's dead-review
 //! auto-recovery sweep (`boss_engine::pr_review_recovery`) uses when a
 //! reviewer dies mid-run. Useful for post-hoc review after an incident, or
 //! a deliberate re-review after significant new commits.
+//!
+//! `review show <work-item>` is the read counterpart: it answers "was this
+//! PR actually reviewed, and what did the reviewer conclude" from the
+//! durable `pr_review_verdicts` row(s) the engine already writes, without a
+//! direct database query. See its own doc comment below for why it lives
+//! under `bossctl` rather than `boss` — the coordinator, not a worker, is
+//! the caller who needs this.
+
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use boss_engine::work::{ReviewVerdict, is_informative_gate_outcome};
 use boss_protocol::{FrontendEvent, FrontendRequest};
 use clap::Subcommand;
 
@@ -33,6 +43,190 @@ pub(crate) enum ReviewAction {
         #[arg(long)]
         repo: Option<String>,
     },
+    /// Show the review-verdict history for a work item: has it been
+    /// reviewed, did it come back clean or with findings, and is the
+    /// reviewed head still the PR's current head.
+    ///
+    /// Read-only — never mutates a verdict, re-enqueues a review, or
+    /// resolves an attention item. Reads `pr_review_verdicts` (and the PR's
+    /// last-polled head sha) directly out of `state.db`, the same
+    /// direct-DB pattern `bossctl work executions` already uses, so it
+    /// still answers even when the engine itself is wedged.
+    Show {
+        /// Work item id (task/chore), e.g. `task_abc123`.
+        work_item: String,
+        /// Override the Boss state-root directory.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+}
+
+/// `bossctl review show` — see [`ReviewAction::Show`].
+///
+/// Lives under `bossctl review` (a sibling of `review start`, which already
+/// owns the review-pipeline verb namespace) rather than under `boss`: the
+/// motivating case — "why was this task not reviewed" — is a coordinator
+/// question, and `bossctl` is the Boss-only CLI the coordinator session
+/// runs, not a worker-facing surface (see `bossctl`'s crate doc comment).
+pub(crate) fn review_show(json: bool, state_root: Option<PathBuf>, work_item: String) -> Result<()> {
+    let db = super::open_state_db(state_root)?;
+    // `get_pr_status_snapshot` returns `Ok(None)` ONLY when the `tasks` row
+    // itself is absent or soft-deleted (see its doc comment) — never for a
+    // work item that merely has no PR yet. Treat `None` as "unknown work
+    // item", not as evidence the item was never reviewed, so a bare id typo
+    // doesn't come back looking like a valid negative verdict.
+    let Some(pr_status) = db
+        .get_pr_status_snapshot(&work_item)
+        .context("reading PR status snapshot")?
+    else {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "work_item_id": work_item,
+                    "work_item_exists": false,
+                })
+            );
+            return Ok(());
+        }
+        bail!("unknown or deleted work item: {work_item}");
+    };
+    let history = db
+        .review_verdicts_for_work_item(&work_item)
+        .context("reading review verdict history")?;
+    let latest_informative = history.iter().find(|v| is_informative_gate_outcome(&v.gate_outcome));
+    let current_head_sha = pr_status.head_sha.clone();
+    // `None` means "can't tell" (no informative verdict yet, or the PR head
+    // has never been polled) — deliberately distinct from `Some(false)`, so
+    // a caller never confuses "unknown" with "confirmed current".
+    let reviewed_head_is_stale = reviewed_head_staleness(
+        latest_informative.and_then(|v| v.head_sha.as_deref()),
+        current_head_sha.as_deref(),
+    );
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "work_item_id": work_item,
+                "pr_url": pr_status.pr_url,
+                "current_head_sha": current_head_sha,
+                "current_head_observed_at": pr_status.observed_at,
+                "latest_informative_verdict": latest_informative.map(verdict_json),
+                "reviewed_head_is_stale": reviewed_head_is_stale,
+                "history": history.iter().map(verdict_json_with_informative_flag).collect::<Vec<_>>(),
+            })
+        );
+        return Ok(());
+    }
+
+    println!("work item: {work_item}");
+    match pr_status.pr_url.as_deref() {
+        Some(pr_url) => {
+            println!("  pr:           {pr_url}");
+            println!(
+                "  current head: {} (as of {})",
+                current_head_sha.as_deref().unwrap_or("(not yet probed)"),
+                pr_status.observed_at.as_deref().unwrap_or("(never observed)"),
+            );
+        }
+        None => println!("  pr: (none bound to this work item yet)"),
+    }
+    println!();
+
+    match latest_informative {
+        None if history.is_empty() => {
+            println!("never reviewed — no pr_review pass has completed for this work item");
+        }
+        None => {
+            let mut outcomes: Vec<&str> = history.iter().map(|v| v.gate_outcome.as_str()).collect();
+            outcomes.sort_unstable();
+            outcomes.dedup();
+            println!(
+                "no informative verdict — {} pass(es) recorded ({})",
+                history.len(),
+                outcomes.join(", "),
+            );
+        }
+        Some(v) => {
+            println!("latest informative verdict:");
+            println!("  outcome:            {}", v.gate_outcome);
+            println!("  findings:           {}", v.findings_count);
+            println!("  revision warranted: {}", v.revision_warranted);
+            println!(
+                "  revision task:      {}",
+                v.revision_task_id.as_deref().unwrap_or("(none)")
+            );
+            println!("  reviewed head:      {}", v.head_sha.as_deref().unwrap_or("(unknown)"));
+            println!("  recorded at:        {}", v.created_at);
+            match reviewed_head_is_stale {
+                Some(true) => println!(
+                    "  ** STALE — the PR has moved since this review; current head is {} **",
+                    current_head_sha.as_deref().unwrap_or("(unknown)")
+                ),
+                Some(false) => println!("  reviewed head matches the last-polled head"),
+                None => {}
+            }
+        }
+    }
+
+    if history.len() > 1 || (latest_informative.is_none() && !history.is_empty()) {
+        println!();
+        println!("full history ({} pass(es), most recent first):", history.len());
+        for v in &history {
+            let tag = if is_informative_gate_outcome(&v.gate_outcome) {
+                "informative"
+            } else {
+                "skipped    "
+            };
+            println!(
+                "  [{tag}] {:<26} findings={:<3} head={:<10} {}",
+                v.gate_outcome,
+                v.findings_count,
+                v.head_sha.as_deref().unwrap_or("-"),
+                v.created_at,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Whether the head sha a review verdict was recorded against still matches
+/// the PR's last-polled head. `None` means "can't tell" — either no
+/// informative verdict has a recorded head, or the PR's current head has
+/// never been observed — deliberately distinct from `Some(false)`, so a
+/// caller never confuses "unknown" with "confirmed current".
+fn reviewed_head_staleness(reviewed: Option<&str>, current: Option<&str>) -> Option<bool> {
+    match (reviewed, current) {
+        (Some(reviewed), Some(current)) => Some(reviewed != current),
+        _ => None,
+    }
+}
+
+fn verdict_json(v: &ReviewVerdict) -> serde_json::Value {
+    serde_json::json!({
+        "id": v.id,
+        "execution_id": v.execution_id,
+        "work_item_id": v.work_item_id,
+        "head_sha": v.head_sha,
+        "findings_count": v.findings_count,
+        "revision_warranted": v.revision_warranted,
+        "gate_outcome": v.gate_outcome,
+        "revision_task_id": v.revision_task_id,
+        "created_at": v.created_at,
+    })
+}
+
+fn verdict_json_with_informative_flag(v: &ReviewVerdict) -> serde_json::Value {
+    let mut value = verdict_json(v);
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "informative".to_owned(),
+            serde_json::Value::Bool(is_informative_gate_outcome(&v.gate_outcome)),
+        );
+    }
+    value
 }
 
 pub(crate) async fn review_start(
@@ -74,5 +268,59 @@ pub(crate) async fn review_start(
             bail!("engine rejected review start: {message}")
         }
         other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use boss_engine::work::REVIEW_GATE_OUTCOME_COMPLETED_CLEAN;
+    use boss_engine::work::REVIEW_GATE_OUTCOME_GAVE_UP;
+
+    use super::*;
+
+    #[test]
+    fn staleness_none_when_reviewed_head_unknown() {
+        assert_eq!(reviewed_head_staleness(None, Some("abc")), None);
+    }
+
+    #[test]
+    fn staleness_none_when_current_head_unknown() {
+        assert_eq!(reviewed_head_staleness(Some("abc"), None), None);
+    }
+
+    #[test]
+    fn staleness_false_when_heads_match() {
+        assert_eq!(reviewed_head_staleness(Some("abc"), Some("abc")), Some(false));
+    }
+
+    #[test]
+    fn staleness_true_when_heads_differ() {
+        assert_eq!(reviewed_head_staleness(Some("abc"), Some("def")), Some(true));
+    }
+
+    fn verdict(gate_outcome: &str) -> ReviewVerdict {
+        ReviewVerdict {
+            id: "verdict_1".to_owned(),
+            execution_id: "exec_1".to_owned(),
+            work_item_id: "task_1".to_owned(),
+            head_sha: Some("abc123".to_owned()),
+            findings_count: 0,
+            revision_warranted: false,
+            gate_outcome: gate_outcome.to_owned(),
+            revision_task_id: None,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn verdict_json_marks_informative_outcome() {
+        let json = verdict_json_with_informative_flag(&verdict(REVIEW_GATE_OUTCOME_COMPLETED_CLEAN));
+        assert_eq!(json["informative"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn verdict_json_marks_non_informative_outcome() {
+        let json = verdict_json_with_informative_flag(&verdict(REVIEW_GATE_OUTCOME_GAVE_UP));
+        assert_eq!(json["informative"], serde_json::json!(false));
     }
 }

@@ -37,6 +37,15 @@ const INFORMATIVE_GATE_OUTCOMES: [&str; 3] = [
     REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED,
 ];
 
+/// Whether `gate_outcome` is one of [`INFORMATIVE_GATE_OUTCOMES`] — the
+/// same "does this outcome represent a real completed judgement" test the
+/// AI-review badge resolver applies, exposed so callers outside this module
+/// (currently `bossctl review show`) can classify a verdict row without
+/// re-deriving the list themselves.
+pub fn is_informative_gate_outcome(gate_outcome: &str) -> bool {
+    INFORMATIVE_GATE_OUTCOMES.contains(&gate_outcome)
+}
+
 /// What [`crate::completion::WorkerCompletionHandler::finalize_pr_review_pass`]
 /// knows about a completed reviewer pass at the moment it calls
 /// [`WorkDb::record_worker_pr_completion`]. Written into `pr_review_verdicts`
@@ -215,6 +224,27 @@ impl WorkDb {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Every review verdict recorded for `work_item_id`, most recent first —
+    /// the full attempt history, including non-informative outcomes
+    /// (`gave_up`, `dropped_duplicate_head`). Backs `bossctl review show`'s
+    /// both the "latest informative verdict" view (callers filter with
+    /// [`is_informative_gate_outcome`] to find it) and the "repeated
+    /// attempts" history view.
+    pub fn review_verdicts_for_work_item(&self, work_item_id: &str) -> Result<Vec<ReviewVerdict>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, execution_id, work_item_id, head_sha, findings_count,
+                    revision_warranted, gate_outcome, revision_task_id, created_at
+             FROM pr_review_verdicts
+             WHERE work_item_id = ?1
+             ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![work_item_id], map_review_verdict)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 }
 
