@@ -20,7 +20,7 @@ use crate::path::validate_relative_path;
 
 use super::component_bindings::Check as WitCheck;
 use super::component_bindings::checkleft::check::types as wit_types;
-use super::declarative::run_declarative_check_with_progress;
+use super::declarative::{resolve, run_declarative_check_with_progress};
 use super::sandbox::{AccessScope, HostCeiling, create_sandbox};
 use super::{
     EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1, ExternalCheckComponentPackage, ExternalCheckLimits, ExternalCheckPackage,
@@ -571,6 +571,47 @@ impl DefaultExternalCheckExecutor {
     }
 }
 
+/// Narrow `changeset` to the files selected by a component check's `applies_to`
+/// config override, using the shared glob dialect and repo-relative path
+/// coordinates the declarative path's `select_files` (`executor.rs:280-313`)
+/// also uses: [`resolve::applies_to_globset`], matched against `ChangedFile::path`.
+///
+/// Returns `Ok(None)` when `config` carries no `applies_to` key — component
+/// checks then keep receiving the full changeset, unchanged from prior
+/// behaviour (there is no definition-side `applies_to` for component packages
+/// to fall back to; `mod.rs`'s `reject_declarative_fields` rejects the field on
+/// the manifest side, so "override, or match-all" is the entire semantics).
+///
+/// When the override is present but selects none of `changeset`'s files
+/// (including the repo-wide case where the glob(s) match no tracked file at
+/// all — e.g. a guard check scoped to a file type the repo does not yet
+/// contain), that is treated the same as the declarative path treats a
+/// zero-match `select_files` result: a clean, empty selection, not an error
+/// (`declarative/executor.rs:115-120`). A `scope: files` check's changeset is
+/// exactly the files that resolved to the CHECKS entry declaring it
+/// (`runner.rs:1133-1196`), so "none of *this changeset's* files match" is the
+/// ordinary case for e.g. a Swift-only override sitting in a manifest that a
+/// Rust-only PR also schedules — it must not fail the check. A glob that
+/// cannot match any file in any repo (a leading `./`, a trailing `/`, a `!`
+/// prefix) is a distinct, structurally-decidable error case handled
+/// elsewhere at config-resolution time, not here.
+fn narrow_by_applies_to(changeset: &ChangeSet, config: &toml::Value) -> Result<Option<ChangeSet>> {
+    let globs = match resolve::override_applies_to(config) {
+        None => return Ok(None),
+        Some(result) => result.context("invalid `applies_to` config override")?,
+    };
+    let globset = resolve::applies_to_globset(&globs).context("invalid `applies_to` config override")?;
+
+    let mut narrowed = changeset.clone();
+    narrowed.changed_files.retain(|file| globset.is_match(&file.path));
+    narrowed
+        .file_line_deltas
+        .retain(|path, _| globset.is_match(path.as_path()));
+    narrowed.file_diffs.retain(|path, _| globset.is_match(path.as_path()));
+
+    Ok(Some(narrowed))
+}
+
 impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
     fn execute(
         &self,
@@ -584,9 +625,11 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
     ) -> Result<CheckResult> {
         match &package.implementation {
             ExternalCheckPackageImplementation::Component(component) => {
-                // The host lowers an exclusion-filtered changeset so the guest never
-                // sees an excluded path and cannot target it.
+                // The host lowers an exclusion-filtered, applies_to-narrowed changeset
+                // so the guest never sees an excluded or out-of-scope path and cannot
+                // target it.
                 let filtered = exclusion.filter_changeset(changeset);
+                let filtered = narrow_by_applies_to(&filtered, config)?.unwrap_or(filtered);
                 self.execute_component_check(package, component, &filtered, source_tree, config, config_dir)
             }
             ExternalCheckPackageImplementation::Declarative(declarative) => {
@@ -628,9 +671,11 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
         match &package.implementation {
             ExternalCheckPackageImplementation::Component(component) => {
                 // Component checks are opaque wasm calls — no per-file granularity.
-                // The host lowers an exclusion-filtered changeset so the guest never
-                // sees an excluded path and cannot target it.
+                // The host lowers an exclusion-filtered, applies_to-narrowed changeset
+                // so the guest never sees an excluded or out-of-scope path and cannot
+                // target it.
                 let filtered = exclusion.filter_changeset(changeset);
+                let filtered = narrow_by_applies_to(&filtered, config)?.unwrap_or(filtered);
                 self.execute_component_check(package, component, &filtered, source_tree, config, config_dir)
             }
             ExternalCheckPackageImplementation::Declarative(declarative) => {
@@ -665,7 +710,15 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
             ExternalCheckPackageImplementation::Declarative(d) => {
                 super::declarative::eligible_file_count(&self.root, d, changeset, config)
             }
-            ExternalCheckPackageImplementation::Component(_) => changeset.changed_files.len(),
+            // Only a malformed override errors here; fall back to the full
+            // changeset size so the progress count is conservative and
+            // consistent with the "something went wrong" signal the runner
+            // will surface when the check actually runs.
+            ExternalCheckPackageImplementation::Component(_) => narrow_by_applies_to(changeset, config)
+                .ok()
+                .flatten()
+                .map(|narrowed| narrowed.changed_files.len())
+                .unwrap_or_else(|| changeset.changed_files.len()),
         }
     }
 

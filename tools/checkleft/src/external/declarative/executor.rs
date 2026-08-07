@@ -27,7 +27,6 @@ use std::process::Command;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use globset::{Glob, GlobSetBuilder};
 use tracing::warn;
 
 use crate::exclusion_matcher::ExclusionMatcher;
@@ -301,11 +300,7 @@ pub(crate) fn select_files(
     skip_symlinks: bool,
     exclusion: &ExclusionMatcher,
 ) -> Result<Vec<String>> {
-    let mut builder = GlobSetBuilder::new();
-    for pattern in applies_to {
-        builder.add(Glob::new(pattern).with_context(|| format!("invalid applies_to glob `{pattern}`"))?);
-    }
-    let globset = builder.build().context("failed to build applies_to glob set")?;
+    let globset = resolve::applies_to_globset(applies_to)?;
 
     let mut files: Vec<String> = changeset
         .changed_files
@@ -1365,11 +1360,7 @@ fn execute_fix_per_file(
 /// Filter `files` to those whose repo-relative path matches any of the
 /// `applies_to` glob patterns. Returns the matching subset (same order).
 fn filter_by_applies_to(files: &[PathBuf], applies_to: &[String]) -> Result<Vec<PathBuf>> {
-    let mut builder = GlobSetBuilder::new();
-    for pattern in applies_to {
-        builder.add(Glob::new(pattern).with_context(|| format!("invalid applies_to glob `{pattern}`"))?);
-    }
-    let globset = builder.build().context("failed to build applies_to glob set")?;
+    let globset = resolve::applies_to_globset(applies_to)?;
     Ok(files.iter().filter(|p| globset.is_match(p)).cloned().collect())
 }
 

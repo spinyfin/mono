@@ -87,12 +87,21 @@ checks:
   # `write(contentsOf: ...)` call (the safe throwing API this check steers
   # callers toward) or a `write(to: ...)` call (`Data`'s unrelated,
   # already-safe throwing API), both of which take a labeled first argument.
+  #
+  # `applies_to` scopes the whole check to Swift files: `FileHandle` is a
+  # Foundation (Swift-only) API, so these are raw text patterns that can
+  # otherwise false-positive on unrelated languages (e.g. a Rust string
+  # literal embedding a Python `sys.stdout.write(...)` call matched
+  # `filehandle-write-unlabeled` and pointed at Swift remediation text that
+  # made no sense there).
   - id: boss/no-legacy-filehandle-write-api
     check: text/forbidden-pattern
     policy:
       severity: warning
       changed_lines_only: true
     config:
+      applies_to:
+        - "**/*.swift"
       surfaces:
         - files
       patterns:

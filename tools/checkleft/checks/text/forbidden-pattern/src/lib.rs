@@ -41,6 +41,15 @@
 //! per line, a pattern containing a literal newline can never match and is
 //! rejected as a config error.
 //!
+//! A rule whose forbidden text is only meaningful in one language or subtree
+//! (e.g. a Swift-only API name) is scoped with the framework's `applies_to`
+//! key at the check level in `CHECKS.yaml` (`config.applies_to`, honoured by
+//! the host for every implementation type, including this one) rather than
+//! by any config this check defines itself — without it, a pattern like a
+//! Swift API name can false-positive on an unrelated file (a Rust string
+//! literal, a doc example) in a different language that happens to contain
+//! the same substring.
+//!
 //! `surfaces` controls which text sources every configured pattern is
 //! evaluated against. It is a list containing one or both of:
 //!
