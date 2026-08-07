@@ -1617,6 +1617,45 @@ mod tests {
         assert!(instructions.contains("high")); // severity
     }
 
+    // `compose_revision_directive` step 6a in `tools/boss/engine/core/src/
+    // runner/prompt.rs` decides whether to require a findings-status PR
+    // comment by scanning the revision task description for a `### [<severity>]
+    // <title>` heading — the exact shape this function emits below. The two
+    // live in different crates with nothing else tying them together: if this
+    // heading format is ever reworded, step 6 silently stops firing and no
+    // test in the `core` crate would catch it. This test pins the coupling
+    // from the render.rs side so a change here fails loudly.
+    #[test]
+    fn render_revision_instructions_finding_heading_matches_step_6a_trigger_shape() {
+        let result = ReviewResult {
+            pr_url: "https://github.com/org/repo/pull/5".to_owned(),
+            head_sha: String::new(),
+            summary: "One bug found.".to_owned(),
+            revision_warranted: true,
+            findings: vec![
+                ReviewFinding::builder()
+                    .severity(ReviewFindingSeverity::High)
+                    .category(ReviewFindingCategory::Correctness)
+                    .file("src/main.rs")
+                    .title("Null pointer dereference")
+                    .detail("Add a guard.")
+                    .confidence(ReviewFindingConfidence::High)
+                    .build(),
+            ],
+            regression_check: RegressionCheck {
+                performed: true,
+                suspected_deletions: vec![],
+            },
+        };
+        let instructions = render_revision_instructions(&result, test_origin());
+        assert!(
+            instructions.contains("### [high] Null pointer dereference\n"),
+            "finding heading must render as `### [<severity>] <title>` — this exact shape is \
+             what compose_revision_directive's step 6a keys on to decide whether to require a \
+             findings-status comment; if this format changes, step 6 must change with it:\n{instructions}",
+        );
+    }
+
     #[test]
     fn render_revision_instructions_opens_with_origin_before_preamble() {
         let result = ReviewResult {

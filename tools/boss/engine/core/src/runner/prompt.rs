@@ -1683,23 +1683,27 @@ fn compose_revision_directive(
          did NOT change — a table listing only what you fixed defeats the purpose; the reviewer \
          needs to see what was consciously left.\n",
     );
-    out.push_str(&format!(
+    out.push_str(
         "   c. Post a NEW comment — do not edit or delete a findings-status comment from an \
          earlier revision pass on this PR. Each pass gets its own comment, so the history of \
-         prior passes stays visible:\n\
-         ```\n\
-         body=$(mktemp)\n\
-         cat > \"$body\" << 'EOF'\n\
-         ## Review findings — this revision\n\
-         \n\
-         | | Finding | Notes |\n\
-         |---|---|---|\n\
-         | ✅ | <finding title or file:line> | <one sentence: what changed> |\n\
-         | ❌ | <finding title or file:line> | <one sentence: why it was left, or where it went instead> |\n\
-         EOF\n\
-         gh pr comment {pr_number} -R {repo_slug} --body-file \"$body\"\n\
-         ```\n"
+         prior passes stays visible:\n",
+    );
+    out.push_str("   ```\n");
+    out.push_str("   body=$(mktemp)\n");
+    out.push_str("   cat > \"$body\" << 'EOF'\n");
+    out.push_str("   ## Review findings — this revision\n");
+    out.push_str("   \n");
+    out.push_str("   | | Finding | Notes |\n");
+    out.push_str("   |---|---|---|\n");
+    out.push_str("   | ✅ | <finding title or file:line> | <one sentence: what changed> |\n");
+    out.push_str(
+        "   | ❌ | <finding title or file:line> | <one sentence: why it was left, or where it went instead> |\n",
+    );
+    out.push_str("   EOF\n");
+    out.push_str(&format!(
+        "   gh pr comment {pr_number} -R {repo_slug} --body-file \"$body\"\n"
     ));
+    out.push_str("   ```\n");
     out.push_str(
         "   d. Formatting: ✅ or ❌ per row. The \"Finding\" column is a short identifier only \
          — the finding's title, or `file:line` — never the full finding text. The \"Notes\" \

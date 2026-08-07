@@ -1990,7 +1990,7 @@ fn revision_directive_requires_findings_status_comment() {
         "revision directive must interpolate the real PR number and repo slug into the gh pr comment command:\n{prompt}",
     );
     assert!(
-        prompt.contains("not \"not addressed\" alone") || prompt.contains("\"not addressed\" alone is not acceptable"),
+        prompt.contains("\"not addressed\" alone is not acceptable"),
         "a red-cross row must require a reason, not just \"not addressed\":\n{prompt}",
     );
     assert!(
