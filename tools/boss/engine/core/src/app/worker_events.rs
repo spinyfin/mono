@@ -537,7 +537,9 @@ pub(super) async fn dispatch_live_worker_state(
     // The manager drops the trigger if no slot task is running, so a
     // hook arriving before `register_spawn` or after `release_slot`
     // is a benign no-op.
-    let new_activity = server_state.live_worker_states.get(slot_id).map(|s| s.activity);
+    let new_state = server_state.live_worker_states.get(slot_id);
+    let new_activity = new_state.as_ref().map(|s| s.activity);
+    let is_pr_review = new_state.as_ref().and_then(|s| s.kind.as_deref()) == Some("pr_review");
     // Project the pane's awaiting-input state onto the durable row, so
     // `work_executions.status` and `bossctl agents`' `activity` cannot
     // disagree about whether this worker is blocked on a human. Runs
@@ -548,6 +550,7 @@ pub(super) async fn dispatch_live_worker_state(
         &server_state.work_db,
         &server_state.publisher,
         run_id,
+        is_pr_review,
         prior_activity,
         new_activity,
     )

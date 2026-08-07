@@ -1073,7 +1073,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         // The pane is up and its agent is working, so the execution stays in
         // `running` — for every kind, not just `pr_review`. Nobody is waiting
         // for a human at this instant, and writing `waiting_human` here (the
-        // pre-mono#2680 behaviour) put every worker's stored status in direct
+        // pre-mono#2673 behaviour) put every worker's stored status in direct
         // contradiction with its own hook stream for the whole run.
         //
         // `waiting_human` now has exactly one writer — the worker-event
@@ -1928,7 +1928,7 @@ mod pane_spawn_tests {
         assert_eq!(spawn.prompt_addendum, None);
     }
 
-    /// Regression (mono#2680): `PaneSpawnRunner::run_execution` must return
+    /// Regression (mono#2673): `PaneSpawnRunner::run_execution` must return
     /// `WorkerPaneAlive` — never `WaitingHuman` — for EVERY execution kind,
     /// so the stored status is `running` while the agent pane is alive and
     /// working.

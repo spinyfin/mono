@@ -435,9 +435,9 @@ mod tests {
                 workspace.to_str().unwrap(),
             )
             .unwrap();
-        // The spawn run hands off to the pane: the execution parks
-        // `waiting_human` while the worker lives, exactly as `PaneSpawnRunner`
-        // leaves it — the status the observed strand was stuck in.
+        // The spawn run hands off to the pane: the execution stays live in
+        // `running` while the worker's agent works, exactly as
+        // `PaneSpawnRunner` leaves it.
         crate::test_support::finish_run_worker_pane_alive(db, &execution.id, &spawn_run.id, Some("spawned"));
         (comment.id, run.id, execution.id)
     }

@@ -281,11 +281,11 @@ pub async fn run_one_pass(
         // one would clobber a live in-flight workspace and put a duplicate
         // worker on the row.
         //
-        // This checked `waiting_human` alone until mono#2680, when a
-        // working worker stopped being mis-stored as `waiting_human` and
-        // started correctly storing `running`. Had the guard not been
-        // widened with the candidate query, every healthy worker would
-        // have fallen straight past it.
+        // This guard is coupled to the candidate query above: both must
+        // check the same two live statuses. If this check narrowed back
+        // to `waiting_human` alone while the candidate query kept excluding
+        // `running` too, every healthy `running` worker would fall straight
+        // past this defense-in-depth check.
         if let Some(live) = &live_execution
             && live.status.is_live()
         {
@@ -920,16 +920,9 @@ mod tests {
         );
     }
 
-    /// The same protection for `running`, which since mono#2680 is the
-    /// status EVERY healthy pane worker sits in for its whole life —
-    /// making this the common case, not an edge one.
-    ///
-    /// Before that fix a working worker stored `waiting_human` and was
-    /// covered by the test above; `running` meant a sub-second spawn window
-    /// or a corpse, so the candidate query deliberately admitted it. Had
-    /// the query not been widened alongside, this sweep — whose verb is
-    /// abandon-and-re-dispatch — would have pointed straight at every live
-    /// worker that had released its pool slot.
+    /// The same protection for `running`, which is the status EVERY healthy
+    /// pane worker sits in for its whole life — making this the common
+    /// case, not an edge one.
     ///
     /// Deciding a live row is actually dead belongs to the death sweeps
     /// (`dead_pane_sweep`, `husk_pane_sweep`, `lost_workspace_sweep`,
@@ -1079,14 +1072,14 @@ mod tests {
     /// A live reviewer claimed in NO pool at all — the "pool union absent"
     /// scenario — must still survive the sweep.
     ///
-    /// Since mono#2680 this is enforced one layer earlier than it used to
-    /// be: `list_orphan_active_candidates` excludes every work item with a
-    /// live (`running`/`waiting_human`) execution, so the item never
-    /// reaches the in-loop guard and `running_reviewer_skipped` stays 0.
-    /// The guard is retained as genuine defense-in-depth; the assertion
-    /// below on the candidate list is what pins the mechanism, so a future
-    /// change that re-admits live rows to the candidate set fails here
-    /// rather than silently falling back on the guard.
+    /// This is enforced one layer before the in-loop guard:
+    /// `list_orphan_active_candidates` excludes every work item with a live
+    /// (`running`/`waiting_human`) execution, so the item never reaches the
+    /// in-loop guard and `running_reviewer_skipped` stays 0. The guard is
+    /// retained as genuine defense-in-depth; the assertion below on the
+    /// candidate list is what pins the mechanism, so a future change that
+    /// re-admits live rows to the candidate set fails here rather than
+    /// silently falling back on the guard.
     #[tokio::test]
     async fn running_pr_review_not_in_any_pool_survives_the_sweep() {
         let (_dir, db) = open_db();

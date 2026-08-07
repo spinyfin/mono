@@ -447,16 +447,13 @@ impl WorkDb {
     /// don't share the PR lifecycle). `revision` is also included because
     /// its on-Stop hook stamps the parent pr_url, not its own.
     ///
-    /// The status filter is both live statuses, not `waiting_human` alone.
-    /// It only ever read `waiting_human` because `PaneSpawnRunner` stamped
-    /// that on every worker at spawn (mono#2680); a working worker now
-    /// stores `running`, and filtering on the old value would have left
-    /// this sweep — the recovery path for a *missed* PR-open — matching
-    /// nothing but genuinely-parked workers. `pr_review` is excluded
-    /// explicitly for the same reason the Stop-path gate excludes it: a
-    /// reviewer never opens a PR of its own. Mirrors
-    /// [`crate::completion::worker_owns_turn_loop`], which is the gate the
-    /// candidates then have to pass anyway.
+    /// The status filter is both live statuses, not `waiting_human` alone: a
+    /// working worker stores `running`, and this sweep — the recovery path
+    /// for a *missed* PR-open — must match it, not just a genuinely-parked
+    /// one. `pr_review` is excluded explicitly for the same reason the
+    /// Stop-path gate excludes it: a reviewer never opens a PR of its own.
+    /// Mirrors [`crate::completion::worker_owns_turn_loop`], which is the
+    /// gate the candidates then have to pass anyway.
     pub fn list_executions_pending_pr_detection(&self) -> Result<Vec<String>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(&format!(

@@ -2028,7 +2028,7 @@ fn worker_owns_turn_loop_admits_live_workers_and_excludes_reviewers() {
     }
 }
 
-/// Regression (mono#2680): a worker whose row reads `running` is a live
+/// Regression (mono#2673): a worker whose row reads `running` is a live
 /// worker, and its Stop MUST reach the PR-detection fallback.
 ///
 /// This test asserted the exact opposite until `running` stopped meaning

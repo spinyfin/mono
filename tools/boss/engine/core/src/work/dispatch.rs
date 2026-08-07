@@ -742,13 +742,6 @@ impl WorkDb {
         // the sweep from reading an unclaimed slot as "dead worker" and
         // abandoning a valid in-flight execution.
         //
-        // Before mono#2680 only `waiting_human` needed excluding, because
-        // `PaneSpawnRunner` stamped it on every live worker at spawn and a
-        // `running` row was either a sub-second spawn window or a corpse.
-        // Now that a working worker correctly stores `running`, listing it
-        // as a candidate would point this sweep — whose verb is abandon
-        // and re-dispatch — straight at healthy workers.
-        //
         // Deciding that a live row is actually dead is NOT this sweep's
         // job and never was: `dead_pane_sweep`, `husk_pane_sweep`,
         // `lost_workspace_sweep`, `dead_pid_sweep` and `spawn_ack_sweep`

@@ -261,7 +261,7 @@ pub fn spawn_group_leader_sleeper() -> std::process::Child {
 ///
 /// Named for `RunWaitState::WorkerPaneAlive`, the outcome it mirrors. It
 /// used to park in `waiting_human`, which is precisely the defect
-/// mono#2680 fixed; keeping the fixture on the old status would have left
+/// mono#2673 fixed; keeping the fixture on the old status would have left
 /// the entire completion suite exercising a state production no longer
 /// produces.
 ///

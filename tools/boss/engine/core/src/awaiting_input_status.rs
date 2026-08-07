@@ -18,7 +18,7 @@
 //! the row does not get to *disagree* with the pane — it has to be written
 //! from it.
 //!
-//! Until mono#2680 it wasn't. `PaneSpawnRunner` stamped `waiting_human` on
+//! Until mono#2673 it wasn't. `PaneSpawnRunner` stamped `waiting_human` on
 //! the row the instant the pane came up and nothing ever cleared it, so a
 //! worker mid-`Bash`-call — `activity: working`, `last_tool_end` seconds
 //! ago — stored `waiting_human` for its entire life. Two live surfaces,
@@ -105,6 +105,16 @@ pub fn awaiting_input_transition(prior: Option<WorkerActivity>, new: Option<Work
 /// moved on (terminal, `waiting_review`, `waiting_merge`) is never dragged
 /// back into a live status by a late hook.
 ///
+/// `is_pr_review` excludes `pr_review` executions: a reviewer's own kanban
+/// "AI reviewing" badge is keyed off `status = running` for the duration of
+/// the review (see `runner::RunWaitState::WorkerPaneAlive`'s doc), and a
+/// reviewer session runs with tool calls denied — exactly the shape that
+/// produces a `Notification` permission-prompt hook. Mirroring that onto
+/// the row would flip a healthy, still-working reviewer to `waiting_human`
+/// and drop the badge mid-review for no genuine wait. This matches the
+/// exclusion `completion::worker_owns_turn_loop` already applies to
+/// reviewers.
+///
 /// Best-effort: a failed write is logged and dropped. This runs inline on
 /// the worker-event dispatch path and must never block or fail it — the
 /// worst case of a dropped write is the pre-fix behaviour for one
@@ -113,20 +123,56 @@ pub async fn mirror_awaiting_input(
     work_db: &Arc<WorkDb>,
     publisher: &Arc<dyn ExecutionPublisher>,
     execution_id: &str,
+    is_pr_review: bool,
     prior: Option<WorkerActivity>,
     new: Option<WorkerActivity>,
 ) {
+    if is_pr_review {
+        return;
+    }
     let Some(awaiting) = awaiting_input_transition(prior, new) else {
         return;
     };
+    write_awaiting_status(work_db, publisher, execution_id, awaiting).await;
+}
+
+/// Mirror `LiveWorkerStateRegistry::mark_stalled_spawns`'s promotion onto
+/// the row.
+///
+/// That sweep is a second, independent producer of
+/// [`WorkerActivity::WaitingForInput`] — the directory-trust-prompt stall,
+/// which by construction has `last_event_at == None` (no hook has ever
+/// arrived) and never will, so [`mirror_awaiting_input`] above — which only
+/// runs off the hook-dispatch path — can never observe or mirror it. Left
+/// unmirrored, that is the one wait an unattended run most needs surfaced:
+/// the row stays `running` forever, disagreeing with a pane that is
+/// genuinely, permanently blocked on a human.
+///
+/// Always enters the wait (`awaiting = true`); the sweep never produces the
+/// resumption edge — a worker that gets past the trust prompt does so by
+/// emitting a hook, which resumes it through [`mirror_awaiting_input`]
+/// instead. [`WorkDb::set_execution_awaiting_human`]'s SQL guard makes a
+/// redundant or late call here a safe no-op.
+pub async fn mirror_stalled_spawn_wait(
+    work_db: &Arc<WorkDb>,
+    publisher: &Arc<dyn ExecutionPublisher>,
+    execution_id: &str,
+) {
+    write_awaiting_status(work_db, publisher, execution_id, true).await;
+}
+
+async fn write_awaiting_status(
+    work_db: &Arc<WorkDb>,
+    publisher: &Arc<dyn ExecutionPublisher>,
+    execution_id: &str,
+    awaiting: bool,
+) {
     let updated = match work_db.set_execution_awaiting_human(execution_id, awaiting) {
         Ok(Some(execution)) => execution,
         Ok(None) => {
             tracing::debug!(
                 execution_id,
                 awaiting,
-                ?prior,
-                ?new,
                 "awaiting-input mirror: no row moved (already in the target state, or the row is \
                  no longer a live pane-hosted worker)",
             );
@@ -152,8 +198,6 @@ pub async fn mirror_awaiting_input(
         execution_id,
         work_item_id = %updated.work_item_id,
         status = %updated.status,
-        ?prior,
-        ?new,
         "awaiting-input mirror: stored execution status now agrees with the pane",
     );
     publisher

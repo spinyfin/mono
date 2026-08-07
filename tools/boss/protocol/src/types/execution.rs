@@ -131,7 +131,7 @@ pub enum ExecutionStatus {
     /// and nothing is blocked on a person.
     ///
     /// This is the status a healthy pane-hosted worker sits in for the bulk
-    /// of its life. Until mono#2680 it was `WaitingHuman`, written
+    /// of its life. Until mono#2673 it was `WaitingHuman`, written
     /// unconditionally by `PaneSpawnRunner` the instant the pane came up —
     /// so the stored value contradicted the worker's own hook stream for
     /// the entire run.

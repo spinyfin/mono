@@ -314,7 +314,7 @@ impl WorkDb {
         }
 
         // The status a healthy pane-hosted worker sits in: its pane is up
-        // and its agent is working. Kind-independent since mono#2680 — a
+        // and its agent is working, whatever the execution kind. A
         // re-adopted worker is by definition one whose hooks proved it
         // alive, so restoring it to `waiting_human` would assert the one
         // thing the evidence contradicts.
@@ -1712,9 +1712,10 @@ impl WorkDb {
     /// `finished_at IS NULL` left to find, so a finalizer that only closes
     /// "active" runs is a silent no-op — the execution stays live forever,
     /// and the pane-death sweep later "reconciles" it a second time with a
-    /// misleading pane-died detail (the double-finalize this closes). This instead closes any run that happens to still be
-    /// open (the rarer multi-turn/nudge case) and unconditionally transitions
-    /// the execution row itself, both in one transaction.
+    /// misleading pane-died detail (the double-finalize this closes). This
+    /// instead closes any run that happens to still be open (the rarer
+    /// multi-turn/nudge case) and unconditionally transitions the execution
+    /// row itself, both in one transaction.
     ///
     /// Idempotent: returns `Ok(None)` without writing anything if the
     /// execution is already terminal, so it is always safe to call from a
@@ -1767,15 +1768,13 @@ impl WorkDb {
     /// `waiting_human` → `running` when it is false.
     ///
     /// This is the ONLY writer of `waiting_human` for a pane-hosted worker,
-    /// and the only clearer of it. Before mono#2680 the status was stamped
-    /// unconditionally by `PaneSpawnRunner` the instant the pane came up and
-    /// nothing ever cleared it, so every worker's row read `waiting_human`
-    /// for its entire working life and no genuine wait was distinguishable
-    /// from the park. The signal that drives this — the driver's
-    /// awaiting-input notification, surfaced as
-    /// [`boss_protocol::WorkerActivity::WaitingForInput`] — was already
-    /// being delivered to the in-memory registry; it simply never reached
-    /// the durable row.
+    /// and the only clearer of it — called from `awaiting_input_status`'s
+    /// two producers (the hook-dispatch mirror and the stalled-spawn sweep
+    /// mirror), never directly by a runner or a completion path. The
+    /// signal driving it — the driver's own awaiting-input notification,
+    /// surfaced as [`boss_protocol::WorkerActivity::WaitingForInput`] — is
+    /// the pane's positive evidence that a worker is blocked on a human,
+    /// not an inference from tool-call timing.
     ///
     /// Deliberately narrow, and expressed as a status-guarded `UPDATE` so
     /// the guard is applied by the same statement that writes:

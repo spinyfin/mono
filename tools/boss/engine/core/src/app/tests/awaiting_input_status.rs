@@ -16,6 +16,7 @@
 
 use super::*;
 
+use crate::live_worker_state::LiveSpawnRouting;
 use crate::protocol::WorkerEvent;
 use crate::test_support::*;
 use crate::work::ExecutionStatus;
@@ -100,7 +101,7 @@ async fn a_worker_enters_a_genuine_wait_and_comes_back_out_with_the_row_correct_
     let execution_id = spawned_worker(&server_state);
 
     // 1. Post-spawn. Nothing is waiting on a human: the pane is up and the
-    //    row says so. Before mono#2680 this instant already stored
+    //    row says so. Before mono#2673 this instant already stored
     //    `waiting_human`, and stayed there for the rest of the run.
     assert_eq!(
         server_state.work_db.get_execution(&execution_id).unwrap().status,
@@ -250,5 +251,92 @@ async fn a_late_notification_never_drags_a_settled_row_back() {
         server_state.work_db.get_execution(&execution_id).unwrap().status,
         ExecutionStatus::WaitingReview,
         "a settled row is owned by the completion path, not by a late hook",
+    );
+}
+
+/// The directory-trust-prompt stall: a pid-bearing, capability-declaring
+/// slot that never receives a single hook. `mark_stalled_spawns` (the
+/// timer-driven sweep in `app/server.rs`, not the hook-dispatch path) is
+/// the only thing that ever observes this, so it must mirror the promotion
+/// onto the row itself — see `awaiting_input_status::mirror_stalled_spawn_wait`.
+#[tokio::test]
+async fn a_stalled_spawn_with_no_hooks_ever_mirrors_onto_the_row() {
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+
+    // No hook ever arrives — advance straight past the threshold.
+    let now =
+        boss_engine_utils::epoch_time::now_epoch_secs() + crate::live_worker_state::STALLED_SPAWN_THRESHOLD_SECS + 1;
+    let stalled = server_state
+        .live_worker_states
+        .mark_stalled_spawns(now, crate::live_worker_state::STALLED_SPAWN_THRESHOLD_SECS);
+    assert_eq!(stalled, vec![SLOT], "the pid-bearing, capable slot must be promoted");
+
+    for slot_id in &stalled {
+        let execution_id = server_state
+            .live_worker_states
+            .get(*slot_id)
+            .map(|state| state.run_id)
+            .expect("slot must resolve to a run id");
+        crate::awaiting_input_status::mirror_stalled_spawn_wait(
+            &server_state.work_db,
+            &server_state.publisher,
+            &execution_id,
+        )
+        .await;
+    }
+
+    assert_surfaces_agree(
+        &server_state,
+        &execution_id,
+        ExecutionStatus::WaitingHuman,
+        WorkerActivity::WaitingForInput,
+        "stalled on the directory-trust prompt with no hook ever received",
+    );
+}
+
+/// A `pr_review` reviewer must never be mirrored out of `running`: the
+/// kanban "AI reviewing" badge queries `kind = pr_review AND status =
+/// running` with no `is_live()` widening, so moving the row to
+/// `waiting_human` would silently drop the badge for the duration of an
+/// ordinary permission-prompt notification — which reviewer sessions (run
+/// with tool calls denied) hit routinely, not just on a genuine wait.
+#[tokio::test]
+async fn a_pr_review_notification_never_moves_the_row_off_running() {
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product = create_test_product_with_repo(db, "p", Some("git@example.com:p.git"));
+    let chore = create_test_chore_manual(db, product.id.clone(), "c");
+    let execution = db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    let (_exec, run) = db
+        .start_execution_run(&execution.id, "worker-1", "repo-1", "lease-1", "ws-1", "/tmp/ws")
+        .unwrap();
+    finish_run_worker_pane_alive(db, &execution.id, &run.id, Some("Spawned reviewer pane in slot 1."));
+    server_state.live_worker_states.register_spawn_with_capabilities(
+        SLOT,
+        execution.id.clone(),
+        "claude-opus-4-7",
+        4242,
+        None,
+        true,
+        LiveSpawnRouting::new("review", "pr_review"),
+    );
+    server_state.worker_registry.register_run_slot(&execution.id, SLOT);
+
+    dispatch_worker_event_fanout(&server_state, &notification(&execution.id)).await;
+
+    let status = server_state.work_db.get_execution(&execution.id).unwrap().status;
+    let activity = server_state.live_worker_states.get(SLOT).unwrap().activity;
+    assert_eq!(
+        activity,
+        WorkerActivity::WaitingForInput,
+        "the pane still honestly reports the notification",
+    );
+    assert_eq!(
+        status,
+        ExecutionStatus::Running,
+        "a pr_review row must stay running so the AI-reviewing badge survives a permission prompt",
     );
 }

@@ -59,6 +59,14 @@ pub enum RunWaitState {
     /// [`Self::WorkerPaneAlive`]. A runner may only return this when it has
     /// positive evidence the worker is blocked on a person; a runner that
     /// merely handed off to a live agent has not.
+    ///
+    /// No runner currently constructs this — `PaneSpawnRunner` and the
+    /// remote host adapter both return [`Self::WorkerPaneAlive`], and the
+    /// only source of positive wait-on-a-person evidence today is the
+    /// driver's own hook stream, mirrored onto the row by
+    /// `crate::awaiting_input_status` rather than returned from a runner.
+    /// Retained for a runner that can observe a genuine block directly
+    /// (out-of-band from the hook stream) rather than inferring it.
     WaitingHuman,
     /// Worker is awaiting human review of an open PR. Workspace retained.
     WaitingReview,
@@ -86,7 +94,7 @@ pub enum RunWaitState {
     /// only to `pr_review`, on the reasoning that "`waiting_human` is
     /// semantically wrong here: nobody is waiting for a human while the
     /// reviewer agent is working" — which is equally true of every other
-    /// kind, and was the defect mono#2680 fixed by generalizing it.
+    /// kind, and was the defect mono#2673 fixed by generalizing it.
     ///
     /// Using `running` is also what keeps the "AI reviewing" badge visible
     /// on kanban cards for the duration of a review — the badge queries

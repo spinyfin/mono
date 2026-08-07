@@ -2101,11 +2101,6 @@ pub(crate) fn should_enqueue_reviewer_for_primary(kind: &ExecutionKind) -> bool 
 /// are cold paths — a jj revset plus a GitHub walk — that must only run
 /// against a worker whose push, if any, has already happened.
 ///
-/// It used to be spelled `status == waiting_human`, which worked only
-/// because `PaneSpawnRunner` stamped that status on every worker at spawn.
-/// That is exactly the bug mono#2680 fixed, so the predicate is now
-/// expressed as what it always meant:
-///
 /// - **Live** ([`ExecutionStatus::is_live`], i.e. `running` *or*
 ///   `waiting_human`). A worker blocked on a human is still a worker that
 ///   may have pushed a PR before it parked, so the wait must not exclude
@@ -2115,8 +2110,6 @@ pub(crate) fn should_enqueue_reviewer_for_primary(kind: &ExecutionKind) -> bool 
 /// - **Not a reviewer.** A `pr_review` pane never opens a PR of its own —
 ///   its lifecycle terminates through `finalize_pr_review_pass`. Running
 ///   branch detection for one could only ever bind somebody else's PR.
-///   Reviewers were excluded before only as a side effect of staying in
-///   `running`; now the exclusion is stated.
 pub(crate) fn worker_owns_turn_loop(execution: &crate::work::WorkExecution) -> bool {
     ExecutionStatus::is_live(&execution.status) && execution.kind != ExecutionKind::PrReview
 }
