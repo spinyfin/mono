@@ -1,14 +1,19 @@
 //! Integration tests for `--ids` on the list verbs (`boss task list`,
-//! `boss chore list`, `boss project list`). Drives the `boss` binary
-//! against an in-process engine to verify: friendly-id resolution
-//! (mixing short and primary id forms in one call), the all-or-nothing
-//! unknown-id error, composition with an existing filter
-//! (`--priority`), composition with a server-side dependency filter
-//! (`--blocked-by-deps`), and the all-empty-selector footgun.
+//! `boss chore list`, `boss project list`, `boss task list-revisions`).
+//! Drives the `boss` binary against an in-process engine to verify:
+//! friendly-id resolution (mixing short and primary id forms in one
+//! call), the all-or-nothing unknown-id error, composition with an
+//! existing filter (`--priority`), composition with server-side
+//! dependency/parent/deleted filters (`--blocked-by-deps`,
+//! `--parent`, `--deleted`), the all-empty-selector footgun, and that
+//! a selector-resolution failure unrelated to "row doesn't exist"
+//! (an unknown cross-product slug) propagates as its own error rather
+//! than folding into the generic unknown-id message.
 
 use anyhow::Result;
 use boss_client::BossClient;
-use boss_protocol::CreateChoreInput;
+use boss_engine::work::{PrOpenState, StaticPrStateChecker};
+use boss_protocol::{CreateChoreInput, CreateRevisionInput};
 
 use common::{run_boss, run_boss_expect_failure};
 use harness::{TestEngine, create_chore, create_chore_with, create_product, create_project, create_task};
@@ -49,6 +54,52 @@ fn project_ids(value: &serde_json::Value) -> Vec<String> {
             .map(|p| p["id"].as_str().expect("project id").to_owned())
             .collect(),
     )
+}
+
+fn revision_ids(value: &serde_json::Value) -> Vec<String> {
+    sorted(
+        value["revisions"]
+            .as_array()
+            .expect("revisions array")
+            .iter()
+            .map(|r| r["id"].as_str().expect("revision id").to_owned())
+            .collect(),
+    )
+}
+
+/// Create a task, bind a (fake, never dialed out to) PR URL to it, and
+/// insert `count` revisions directly against the engine's db using
+/// [`StaticPrStateChecker`] so the create-time PR gate is satisfied
+/// without a real `gh pr view` round-trip. Returns the parent task id
+/// and the created revisions in insertion order.
+async fn create_task_with_revisions(
+    engine: &TestEngine,
+    client: &mut BossClient,
+    product_id: &str,
+    project_id: &str,
+    parent_name: &str,
+    count: usize,
+) -> Result<(String, Vec<boss_protocol::Task>)> {
+    let parent = create_task(client, product_id, project_id, parent_name).await?;
+    run_boss(
+        engine.socket_str(),
+        &["task", "bind-pr", &parent.id, "https://github.com/acme/repo/pull/1"],
+    )?;
+
+    let db = engine.db()?;
+    let checker = StaticPrStateChecker(PrOpenState::Open);
+    let mut revisions = Vec::with_capacity(count);
+    for n in 0..count {
+        let revision = db.create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(parent.id.clone())
+                .description(format!("Revision {n}"))
+                .build(),
+            &checker,
+        )?;
+        revisions.push(revision);
+    }
+    Ok((parent.id, revisions))
 }
 
 /// A single `--ids` call mixing a friendly short id (`T<n>`) and a
@@ -177,8 +228,9 @@ async fn task_list_ids_accepts_mixed_short_and_primary_ids() -> Result<()> {
 /// an AND, exactly like it does with `--priority`: a requested id that
 /// exists but gets excluded by `--blocked-by-deps` (because it has no
 /// incomplete prerequisite) is dropped from the result, not reported
-/// as an unknown id. Before the fix, `known_ids` was built from the
-/// already dep-filtered listing, so this case spuriously errored.
+/// as an unknown id. The membership set `--ids` checks against is
+/// fetched with `dep_filter` unset, so a dep filter narrowing the
+/// result can never be mistaken for the row not existing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_list_ids_composes_with_dep_filter_without_erroring() -> Result<()> {
     let engine = TestEngine::spawn().await?;
@@ -240,7 +292,7 @@ async fn project_list_ids_accepts_short_id() -> Result<()> {
 
 /// A syntactically valid but non-existent primary id (`task_deadbeef`)
 /// takes the typed/`Other`-selector path rather than the short-id
-/// path, and must still fail the `known_ids` membership check with the
+/// path, and must still fail the membership check with the
 /// `--ids:`-prefixed message, not a generic engine error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_list_ids_unknown_primary_id_errors_with_ids_message() -> Result<()> {
@@ -287,9 +339,8 @@ async fn chore_list_ids_all_empty_errors() -> Result<()> {
     Ok(())
 }
 
-/// The old `--id` spelling (pre-`--ids`) must keep working as an
-/// alias, unchanged in meaning — deleting it outright would silently
-/// break any existing script or agent invocation using it.
+/// `--id` predates `--ids`; existing scripts and agent invocations use
+/// it, so it must keep resolving to the same rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chore_list_id_alias_still_works() -> Result<()> {
     let engine = TestEngine::spawn().await?;
@@ -304,5 +355,155 @@ async fn chore_list_id_alias_still_works() -> Result<()> {
     )?;
 
     assert_eq!(chore_ids(&value), vec![a.id]);
+    Ok(())
+}
+
+/// `boss task list-revisions --ids` accepts the revision's own primary
+/// id and returns exactly that row, the same contract as `task list` /
+/// `chore list` / `project list`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_revisions_ids_returns_exact_row() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let product = create_product(&mut client, "Boss").await?;
+    let project = create_project(&mut client, &product.id, "Project").await?;
+    let (_parent_id, revisions) =
+        create_task_with_revisions(&engine, &mut client, &product.id, &project.id, "Parent", 2).await?;
+    let target = &revisions[0];
+
+    let value = run_boss(
+        engine.socket_str(),
+        &[
+            "task",
+            "list-revisions",
+            "--product",
+            &product.id,
+            "--ids",
+            &target.id,
+            "--json",
+        ],
+    )?;
+
+    assert_eq!(revision_ids(&value), vec![target.id.clone()]);
+    Ok(())
+}
+
+/// `--ids` composes with `--parent` (a server-side narrowing filter,
+/// like `--dep`) as an AND rather than erroring: a revision that
+/// exists but targets a different parent than the one requested via
+/// `--parent` is excluded from the result, not reported as unknown.
+/// This exercises the branch in `run_list_revisions` that also has to
+/// null out `parent_id` (in addition to `dep_filter`) when refetching
+/// the unfiltered membership listing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_revisions_ids_composes_with_parent_filter_without_erroring() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let product = create_product(&mut client, "Boss").await?;
+    let project = create_project(&mut client, &product.id, "Project").await?;
+    let (_parent_a, revisions_a) =
+        create_task_with_revisions(&engine, &mut client, &product.id, &project.id, "Parent A", 1).await?;
+    let (parent_b, _revisions_b) =
+        create_task_with_revisions(&engine, &mut client, &product.id, &project.id, "Parent B", 1).await?;
+    let rev_a = &revisions_a[0];
+
+    let value = run_boss(
+        engine.socket_str(),
+        &[
+            "task",
+            "list-revisions",
+            "--product",
+            &product.id,
+            "--ids",
+            &rev_a.id,
+            "--parent",
+            &parent_b,
+            "--json",
+        ],
+    )?;
+
+    // `rev_a` exists (so `--ids` doesn't error) but belongs to a
+    // different parent than requested via `--parent`, so it is
+    // excluded from the result rather than causing an unknown-id error.
+    assert_eq!(revision_ids(&value), Vec::<String>::new());
+    Ok(())
+}
+
+/// `--include-deleted`/`--deleted` narrows the listing exactly like
+/// `--dep`/`--project`/`--parent`: existence must not depend on it, so
+/// a tombstoned task requested via `--ids` (without `--deleted`)
+/// narrows to an empty result instead of erroring as unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_list_ids_include_deleted_narrows_not_errors() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let product = create_product(&mut client, "Boss").await?;
+    let project = create_project(&mut client, &product.id, "Project").await?;
+    let a = create_task(&mut client, &product.id, &project.id, "A").await?;
+
+    run_boss(engine.socket_str(), &["task", "delete", &a.id])?;
+
+    // Without --deleted: `a` exists (soft-deleted, but exists) so
+    // --ids must not error; it narrows to an empty result because the
+    // listing itself excludes tombstoned rows by default.
+    let value = run_boss(
+        engine.socket_str(),
+        &["task", "list", "--product", &product.id, "--ids", &a.id, "--json"],
+    )?;
+    assert_eq!(task_ids(&value), Vec::<String>::new());
+
+    // With --deleted: the row is included in the listing, so --ids
+    // finds it.
+    let value = run_boss(
+        engine.socket_str(),
+        &[
+            "task",
+            "list",
+            "--product",
+            &product.id,
+            "--ids",
+            &a.id,
+            "--deleted",
+            "--json",
+        ],
+    )?;
+    assert_eq!(task_ids(&value), vec![a.id]);
+    Ok(())
+}
+
+/// A `--ids` selector that fails to resolve for a reason other than
+/// "the row doesn't exist" — here, an unknown product slug on the
+/// cross-product `boss/<n>` form — must surface that distinct cause
+/// rather than being folded into the generic `--ids: no matching row`
+/// message, which would send the caller looking for a missing row when
+/// the real problem is the product name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_list_ids_unknown_cross_product_slug_is_not_reported_as_no_matching_row() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let product = create_product(&mut client, "Boss").await?;
+    let project = create_project(&mut client, &product.id, "Project").await?;
+    let _a = create_task(&mut client, &product.id, &project.id, "A").await?;
+
+    let stderr = run_boss_expect_failure(
+        engine.socket_str(),
+        &[
+            "task",
+            "list",
+            "--product",
+            &product.id,
+            "--ids",
+            "no-such-product/1",
+            "--json",
+        ],
+    )?;
+    assert!(
+        stderr.contains("could not resolve") && stderr.contains("no-such-product"),
+        "expected a resolution-failure message naming the bad product, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no matching row"),
+        "an unresolved product slug must not be reported as a missing row: {stderr}"
+    );
     Ok(())
 }

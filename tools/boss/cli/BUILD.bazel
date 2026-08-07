@@ -315,8 +315,11 @@ rust_test(
     ),
 )
 
-# `--ids` list-filter coverage: mixed short/primary id resolution, the
-# unknown-id error, and composition with an existing filter (--priority).
+# `--ids` list-filter coverage across all four list verbs (task, chore,
+# project, list-revisions): see tests/ids_filter.rs's module doc for the
+# full case list (mixed short/primary id resolution, the unknown-id error,
+# composition with --priority/--dep/--parent/--deleted, the all-empty
+# footgun, and resolution-failure vs. not-found error propagation).
 rust_test(
     name = "ids_filter_test",
     size = "small",

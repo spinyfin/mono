@@ -529,13 +529,20 @@ pub(crate) async fn run_list_revisions(
     .await?;
     let resolved_ids = if args.ids.is_empty() {
         Vec::new()
-    } else if dep_filter.is_none() && parent_id.is_none() {
-        let known: Vec<(&str, Option<i64>)> = revisions.iter().map(|t| (t.id.as_str(), t.short_id)).collect();
-        resolve_ids_filter(client, ctx, &args.ids, &product.id, &known).await?
+    } else if dep_filter.is_none() && parent_id.is_none() && args.include_deleted {
+        resolve_ids_for_listing(client, ctx, &args.ids, &product.id, &revisions, |t| {
+            (t.id.as_str(), t.short_id)
+        })
+        .await?
     } else {
-        let unfiltered = list_revisions(client, &product.id, None, args.include_deleted, None).await?;
-        let known: Vec<(&str, Option<i64>)> = unfiltered.iter().map(|t| (t.id.as_str(), t.short_id)).collect();
-        resolve_ids_filter(client, ctx, &args.ids, &product.id, &known).await?
+        // See the task-list arm in work_cmds.rs: existence must be
+        // independent of --include-deleted too, so a tombstoned id
+        // narrows to an empty result instead of erroring as unknown.
+        let unfiltered = list_revisions(client, &product.id, None, true, None).await?;
+        resolve_ids_for_listing(client, ctx, &args.ids, &product.id, &unfiltered, |t| {
+            (t.id.as_str(), t.short_id)
+        })
+        .await?
     };
     let revisions = apply_task_list_filters(
         revisions,
@@ -2287,7 +2294,32 @@ pub(crate) async fn resolve_ids_filter(
             },
             _ => match resolve_selector_to_primary_id(client, ctx, selector, Some(product_id.to_owned())).await {
                 Ok(id) if primary_ids.contains(id.as_str()) => resolved.push(id),
-                Ok(_) | Err(_) => unknown.push(selector.to_owned()),
+                // `Application` is what a genuinely-missing row surfaces
+                // as here: `get_work_item_by_short_id_rpc`'s `Ok(None)`
+                // case is reported by the engine as a `WorkError`, which
+                // the `rpc_call!` macro turns into `CliError::Application`
+                // (see `handle_get_work_item_by_short_id`) — there is no
+                // dedicated "not found" variant on this RPC path. Fold it
+                // into `unknown` like any other missing selector.
+                Ok(_) | Err(CliError::Application(_)) => unknown.push(selector.to_owned()),
+                Err(err) => {
+                    // Everything else — an unresolved/ambiguous product
+                    // slug (`CliError::NotFound`/`Conflict` from
+                    // `resolve_product`), a socket/transport failure
+                    // (`EngineUnavailable`), or an internal error — is not
+                    // "this id doesn't exist"; propagate it under its own
+                    // error kind so the caller sees the real cause instead
+                    // of a misleading "no matching row".
+                    let message = format!("--ids: could not resolve {selector}: {err}");
+                    return Err(match err {
+                        CliError::Usage(_) => CliError::usage(message),
+                        CliError::NotFound(_) => CliError::not_found(message),
+                        CliError::Conflict(_) => CliError::conflict(message),
+                        CliError::EngineUnavailable(_) => CliError::engine_unavailable(message),
+                        CliError::Application(_) => unreachable!("handled above"),
+                        CliError::Internal(_) => CliError::internal(anyhow::anyhow!(message)),
+                    });
+                }
             },
         }
     }
@@ -2298,6 +2330,31 @@ pub(crate) async fn resolve_ids_filter(
         )));
     }
     Ok(resolved)
+}
+
+/// Shared tail end of every `--ids`-aware list verb: build the
+/// `(primary_id, short_id)` membership set from `rows` — which the
+/// caller must already have fetched as the correct listing, narrowed
+/// or not — and resolve `ids` against it via [`resolve_ids_filter`].
+/// Each of the four list verbs (task/chore/project/revision) still
+/// decides for itself whether `rows` is the already-fetched listing or
+/// a freshly refetched unfiltered one, since that decision depends on
+/// a different set of server-side filters per verb; this only
+/// collapses the identical "build `known` and resolve" step that
+/// followed that decision at every call site.
+pub(crate) async fn resolve_ids_for_listing<T>(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    ids: &[String],
+    product_id: &str,
+    rows: &[T],
+    key: impl Fn(&T) -> (&str, Option<i64>),
+) -> Result<Vec<String>, CliError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let known: Vec<(&str, Option<i64>)> = rows.iter().map(&key).collect();
+    resolve_ids_filter(client, ctx, ids, product_id, &known).await
 }
 
 /// If `selector` is a typed engine work-item id, look it up and return

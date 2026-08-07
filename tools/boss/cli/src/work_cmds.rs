@@ -335,12 +335,16 @@ pub(crate) async fn run_project_command(command: ProjectCommand, ctx: &RunContex
             let resolved_ids = if args.ids.is_empty() {
                 Vec::new()
             } else if dep_filter.is_none() {
-                let known: Vec<(&str, Option<i64>)> = projects.iter().map(|p| (p.id.as_str(), p.short_id)).collect();
-                resolve_ids_filter(&mut client, ctx, &args.ids, &product.id, &known).await?
+                resolve_ids_for_listing(&mut client, ctx, &args.ids, &product.id, &projects, |p| {
+                    (p.id.as_str(), p.short_id)
+                })
+                .await?
             } else {
                 let unfiltered = list_projects(&mut client, &product.id, None).await?;
-                let known: Vec<(&str, Option<i64>)> = unfiltered.iter().map(|p| (p.id.as_str(), p.short_id)).collect();
-                resolve_ids_filter(&mut client, ctx, &args.ids, &product.id, &known).await?
+                resolve_ids_for_listing(&mut client, ctx, &args.ids, &product.id, &unfiltered, |p| {
+                    (p.id.as_str(), p.short_id)
+                })
+                .await?
             };
             let projects = apply_project_list_filters(
                 projects,
@@ -733,13 +737,21 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
             .await?;
             let resolved_ids = if args.ids.is_empty() {
                 Vec::new()
-            } else if dep_filter.is_none() && project.is_none() {
-                let known: Vec<(&str, Option<i64>)> = tasks.iter().map(|t| (t.id.as_str(), t.short_id)).collect();
-                resolve_ids_filter(&mut client, ctx, &args.ids, &product.id, &known).await?
+            } else if dep_filter.is_none() && project.is_none() && args.include_deleted {
+                resolve_ids_for_listing(&mut client, ctx, &args.ids, &product.id, &tasks, |t| {
+                    (t.id.as_str(), t.short_id)
+                })
+                .await?
             } else {
-                let unfiltered = list_tasks(&mut client, &product.id, None, None, args.include_deleted).await?;
-                let known: Vec<(&str, Option<i64>)> = unfiltered.iter().map(|t| (t.id.as_str(), t.short_id)).collect();
-                resolve_ids_filter(&mut client, ctx, &args.ids, &product.id, &known).await?
+                // Existence must be independent of every server-side
+                // narrowing filter, including --include-deleted: a
+                // tombstoned row still exists, so it must narrow to
+                // an empty result rather than error as unknown.
+                let unfiltered = list_tasks(&mut client, &product.id, None, None, true).await?;
+                resolve_ids_for_listing(&mut client, ctx, &args.ids, &product.id, &unfiltered, |t| {
+                    (t.id.as_str(), t.short_id)
+                })
+                .await?
             };
             let tasks = apply_task_list_filters(
                 tasks,
@@ -864,13 +876,20 @@ pub(crate) async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -
             let chores = list_chores(&mut client, &product.id, dep_filter.clone(), args.include_deleted).await?;
             let resolved_ids = if args.ids.is_empty() {
                 Vec::new()
-            } else if dep_filter.is_none() {
-                let known: Vec<(&str, Option<i64>)> = chores.iter().map(|t| (t.id.as_str(), t.short_id)).collect();
-                resolve_ids_filter(&mut client, ctx, &args.ids, &product.id, &known).await?
+            } else if dep_filter.is_none() && args.include_deleted {
+                resolve_ids_for_listing(&mut client, ctx, &args.ids, &product.id, &chores, |t| {
+                    (t.id.as_str(), t.short_id)
+                })
+                .await?
             } else {
-                let unfiltered = list_chores(&mut client, &product.id, None, args.include_deleted).await?;
-                let known: Vec<(&str, Option<i64>)> = unfiltered.iter().map(|t| (t.id.as_str(), t.short_id)).collect();
-                resolve_ids_filter(&mut client, ctx, &args.ids, &product.id, &known).await?
+                // See the task-list arm: existence must be independent
+                // of --include-deleted too, so a tombstoned id narrows
+                // to an empty result instead of erroring as unknown.
+                let unfiltered = list_chores(&mut client, &product.id, None, true).await?;
+                resolve_ids_for_listing(&mut client, ctx, &args.ids, &product.id, &unfiltered, |t| {
+                    (t.id.as_str(), t.short_id)
+                })
+                .await?
             };
             let chores = apply_task_list_filters(
                 chores,
