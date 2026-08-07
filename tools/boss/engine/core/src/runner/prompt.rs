@@ -1668,12 +1668,63 @@ fn compose_revision_directive(
     );
     out.push_str("   d. What to write: rewrite the description so it is accurate and self-contained for reviewers NOW. The main summary must describe the CURRENT state — what the PR does, not what it used to do. Do NOT append a changelog that leaves a contradictory original summary above it; instead correct the summary in place. A brief \"Changes in this revision\" note may follow the corrected summary if it adds context, but it must never contradict or overshadow the corrected summary.\n");
     out.push_str("   e. A revision may skip steps c–d ONLY if it changes ZERO source files (e.g. a PR-description-only fix or a pure markdown/comment edit) AND involves no rebase, merge, or conflict resolution. Rebase and conflict-resolution revisions do NOT qualify for this skip — they touch compiled output and must go through the full description review. The title check (step b2) is NEVER skippable — always verify it.\n");
+    out.push_str("   f. If, after the comparison in step b, the description already matches the PR's current state, do NOT edit it just to have touched it — leave it as-is and say so explicitly in your final response (e.g. \"PR description verified accurate against this revision's diff; no edit needed\"). The bar is whether the description describes the PR's current state, not whether this revision left a visible mark on it.\n");
+    out.push('\n');
+    out.push_str("6. **If this revision addresses automated review findings, post a findings-status summary comment on the PR.** This is a DIFFERENT artifact from the PR description in step 5, for a different reader: the description tells reviewers what the PR now does; this comment tells them what happened to each finding from the review pass that spawned this revision.\n");
+    out.push_str(
+        "   a. This applies ONLY when this task's description (above, in \"What this revision \
+         should change\") enumerates review findings — look for one or more `### [<severity>] \
+         <title>` sections, the shape an automated review pass renders. If this revision is \
+         responding to a plain operator instruction with no such findings, SKIP this step \
+         entirely: do not post a comment, and do not emit a table with zero rows.\n",
+    );
+    out.push_str(
+        "   b. Every finding from that review pass must appear as a row, including ones you \
+         did NOT change — a table listing only what you fixed defeats the purpose; the reviewer \
+         needs to see what was consciously left.\n",
+    );
+    out.push_str(
+        "   c. Post a NEW comment — do not edit or delete a findings-status comment from an \
+         earlier revision pass on this PR. Each pass gets its own comment, so the history of \
+         prior passes stays visible:\n",
+    );
+    out.push_str("   ```\n");
+    out.push_str("   body=$(mktemp)\n");
+    out.push_str("   cat > \"$body\" << 'EOF'\n");
+    out.push_str("   ## Review findings — this revision\n");
+    out.push_str("   \n");
+    out.push_str("   | | Finding | Notes |\n");
+    out.push_str("   |---|---|---|\n");
+    out.push_str("   | ✅ | <finding title or file:line> | <one sentence: what changed> |\n");
+    out.push_str(
+        "   | ❌ | <finding title or file:line> | <one sentence: why it was left, or where it went instead> |\n",
+    );
+    out.push_str("   EOF\n");
+    out.push_str(&format!(
+        "   gh pr comment {pr_number} -R {repo_slug} --body-file \"$body\"\n"
+    ));
+    out.push_str("   ```\n");
+    out.push_str(
+        "   d. Formatting: ✅ or ❌ per row. The \"Finding\" column is a short identifier only \
+         — the finding's title, or `file:line` — never the full finding text. The \"Notes\" \
+         column is exactly one sentence. A ❌ row's sentence must say WHY the finding was left \
+         (or where the issue went instead) — \"not addressed\" alone is not acceptable.\n",
+    );
+    out.push_str(
+        "   e. Never reference a finding by an internal row id in this comment — title or \
+         `file:line` only, per this repo's editorial rules against Boss-internal id shapes in \
+         worker-authored text.\n",
+    );
+    out.push_str(
+        "   f. This comment does not substitute for the PR description update in step 5 — both \
+         are required when findings are present.\n",
+    );
     out.push('\n');
     out.push_str(&format!(
-        "6. Confirm the new commit is on the PR: `gh pr view {pr_number} -R {repo_slug}`\n"
+        "7. Confirm the new commit is on the PR: `gh pr view {pr_number} -R {repo_slug}`\n"
     ));
     out.push_str(&format!(
-        "7. Print the parent PR URL on its own line as the FINAL thing in your final response: {parent_pr_url}\n"
+        "8. Print the parent PR URL on its own line as the FINAL thing in your final response: {parent_pr_url}\n"
     ));
     out.push('\n');
     out.push_str("Preserve revision history — each revision is a new commit on the PR branch; never amend, squash, or rename existing commits on the branch.\n");
@@ -1710,6 +1761,7 @@ fn compose_revision_directive(
         "\nAcceptance criterion: when you believe the work is done, the deliverable is the parent PR URL.\n\
          - Push your changes to the parent branch (see step 4 above). Do NOT open a new PR.\n\
          - Update the PR title and description per step 5 above — a stale or contradictory title or description is a defect. If this revision changes or overturns the PR's scope or conclusion, the title MUST reflect the final state.\n\
+         - If this revision addressed automated review findings, post the findings-status comment per step 6 above — every finding accounted for, one sentence each.\n\
          - Confirm the parent PR shows your new commit with `gh pr view {pr_number} -R {repo_slug}`.\n\
          - Print {parent_pr_url} on its own line as the final thing in your final response so the engine can pick it up.\n\
          - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty and no rebase was needed, stop and explain.\n"
