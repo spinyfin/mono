@@ -129,6 +129,8 @@ fn grok_initial_input_stays_under_the_limit_with_long_workspace_path_and_full_de
     use crate::driver::grok::{
         GROK_HOMES_ENV_TEST_LOCK, GROK_HOMES_ROOT_ENV, GROK_SKIP_POSTURE_ASSERT_ENV, grok_home_for_run,
     };
+    use boss_engine_driver::test_support::transcript_store_override;
+    use boss_engine_driver::transcript_store::provision_durable_sessions;
 
     let workspace = TempDir::new().unwrap();
     let long_workspace_path = workspace
@@ -159,6 +161,12 @@ fn grok_initial_input_stays_under_the_limit_with_long_workspace_path_and_full_de
     let run_id = "run-grok-length-1";
     let grok_home = grok_home_for_run(run_id).unwrap();
     std::fs::create_dir_all(&grok_home).unwrap();
+    // The Seatbelt profile has to name the resolved target of the
+    // `$GROK_HOME/sessions` link, so the fixture has to provision that link
+    // the way `provision_workspace` does — into a disposable store root.
+    let transcripts_root = TempDir::new().unwrap();
+    let _transcript_store = transcript_store_override(transcripts_root.path());
+    provision_durable_sessions(&grok_home, "grok", run_id).unwrap();
     std::fs::write(
         grok_home.join("boss-session-id"),
         "11111111-2222-4333-8444-555555555555\n",

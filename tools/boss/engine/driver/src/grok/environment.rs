@@ -94,6 +94,12 @@ impl GrokProcessEnvironment {
         })
     }
 
+    /// The per-run `GROK_HOME` this environment points Grok at. Preflight
+    /// needs it to probe the session store that lives under it.
+    pub fn grok_home(&self) -> &Path {
+        &self.grok_home
+    }
+
     pub fn directives(&self) -> Vec<EnvDirective> {
         let mut directives = vec![
             EnvDirective::Set("GROK_HOME".to_owned(), self.grok_home.display().to_string()),

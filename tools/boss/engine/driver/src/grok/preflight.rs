@@ -126,6 +126,55 @@ fn run_worker_preflight_with(
     let jj_remotes = runner.run("jj", &["git", "remote", "list"], workspace, environment)?;
     assert_jj_remotes(&jj_remotes)?;
 
+    assert_session_store_writable(runner, workspace, environment)?;
+
+    Ok(())
+}
+
+/// Absolute path of the probe file, under the sessions directory itself so
+/// the write is evaluated exactly where Grok will create its session.
+const SESSION_STORE_PROBE_LEAF: &str = "sessions/.boss-preflight-write-probe";
+
+/// Prove Grok can create a file in its own session store *through the exact
+/// sandbox the pane will run under* — the one capability whose absence parks
+/// the CLI on its start menu instead of failing it outward.
+///
+/// Grok's session store is a symlink out of `$GROK_HOME` into Boss's state
+/// root ([`crate::transcript_store::provision_durable_sessions`]). Seatbelt
+/// evaluates the resolved target, so granting `$GROK_HOME` says nothing about
+/// whether this write lands: the sandbox can deny it while every path-shaped
+/// check in the profile looks right. When it is denied, `grok` starts, reports
+/// `Session creation failed: Permission denied.: {"code": "FS_PERMISSION_DENIED",
+/// "detail": "Operation not permitted (os error 1)"}`, and then sits at its
+/// start menu holding a slot and a cube lease — it never execs a session, so
+/// no driver signal is ever emitted and nothing downstream can attribute the
+/// stall to a permission fault.
+///
+/// Running the probe here converts that into a pre-spawn error carrying the
+/// kernel's own `Operation not permitted` text, before any pane, slot, or
+/// lease is committed. It is a real write rather than a permission
+/// calculation, so it stays honest about any future fence — not just the
+/// Boss-data-dir one that first caused this.
+fn assert_session_store_writable(
+    runner: &dyn PreflightRunner,
+    workspace: &Path,
+    environment: &GrokProcessEnvironment,
+) -> anyhow::Result<()> {
+    let probe = environment.grok_home().join(SESSION_STORE_PROBE_LEAF);
+    let probe_arg = probe.display().to_string();
+    let output = runner.run("/usr/bin/touch", &[&probe_arg], workspace, environment)?;
+    // The engine itself is unsandboxed, so it can always clear the probe —
+    // and must, so a successful preflight leaves the transcript store clean.
+    let _ = std::fs::remove_file(&probe);
+    if !output.success {
+        bail!(
+            "Grok worker preflight failed: Grok session storage at {} is not writable under the worker sandbox; \
+             Grok would start and then fail session creation with FS_PERMISSION_DENIED. \
+             {}",
+            probe.display(),
+            rendered_output(&output)
+        );
+    }
     Ok(())
 }
 
@@ -278,10 +327,76 @@ mod tests {
             success("Logged in to github.com account worker (keyring)\n"),
             success("/workspace\n"),
             success("origin git@github.com:example/repo.git\n"),
+            success(""),
         ]);
 
         run_worker_preflight_with(&runner, workspace, &environment()).unwrap();
-        assert_eq!(runner.programs.into_inner(), ["grok", "cube", "gh", "jj", "jj"]);
+        assert_eq!(
+            runner.programs.into_inner(),
+            ["grok", "cube", "gh", "jj", "jj", "/usr/bin/touch"]
+        );
+    }
+
+    /// The failure this check exists for: the session store is unwritable
+    /// under the sandbox. It must abort the preflight — i.e. abort before a
+    /// pane, slot, or lease is committed — and carry the kernel's own text.
+    #[test]
+    fn an_unwritable_session_store_fails_the_preflight() {
+        let runner = FakeRunner::new(vec![
+            success("You are logged in with grok.com.\n"),
+            success(r#"{"workspace":{"workspace_path":"/workspace"}}"#),
+            success("Logged in to github.com account worker (keyring)\n"),
+            success("/workspace\n"),
+            success("origin git@github.com:example/repo.git\n"),
+            PreflightOutput {
+                success: false,
+                status: "exit status: 1".to_owned(),
+                stdout: String::new(),
+                stderr: "touch: sessions/.boss-preflight-write-probe: Operation not permitted\n".to_owned(),
+            },
+        ]);
+
+        let error = run_worker_preflight_with(&runner, Path::new("/workspace"), &environment())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not writable under the worker sandbox"), "{error}");
+        assert!(error.contains("FS_PERMISSION_DENIED"), "{error}");
+        assert!(error.contains("Operation not permitted"), "{error}");
+    }
+
+    /// The probe has to target the sessions directory itself — probing
+    /// `$GROK_HOME` instead would pass while the symlinked destination stayed
+    /// denied, which is precisely the blind spot being closed.
+    #[test]
+    fn the_probe_writes_through_the_sessions_link() {
+        let environment = environment();
+        struct CapturingRunner(RefCell<Vec<String>>);
+        impl PreflightRunner for CapturingRunner {
+            fn run(
+                &self,
+                _program: &str,
+                args: &[&str],
+                _workspace: &Path,
+                _environment: &GrokProcessEnvironment,
+            ) -> anyhow::Result<PreflightOutput> {
+                self.0.borrow_mut().extend(args.iter().map(|a| (*a).to_owned()));
+                Ok(success(""))
+            }
+        }
+
+        let runner = CapturingRunner(RefCell::new(Vec::new()));
+        assert_session_store_writable(&runner, Path::new("/workspace"), &environment).unwrap();
+        let args = runner.0.into_inner();
+        assert_eq!(
+            args,
+            vec![
+                environment
+                    .grok_home()
+                    .join(SESSION_STORE_PROBE_LEAF)
+                    .display()
+                    .to_string()
+            ]
+        );
     }
 
     #[test]
