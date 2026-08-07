@@ -410,7 +410,7 @@ pub fn provision_grok_home(workspace: &Path, prompt_text: &str, run_id: &str) ->
     fs::create_dir_all(&grok_home).with_context(|| format!("creating GROK_HOME {}", grok_home.display()))?;
     fs::create_dir_all(grok_home.join("hooks"))
         .with_context(|| format!("creating hooks dir under {}", grok_home.display()))?;
-    provision_durable_sessions(&grok_home, "grok", run_id)?;
+    provision_durable_sessions(&grok_home, super::TRANSCRIPT_DRIVER_SLUG, run_id)?;
     // Scoped HOME with no `.claude` tree — quarantine operator Claude settings.
     fs::create_dir_all(&process_home).with_context(|| format!("creating process HOME {}", process_home.display()))?;
     // Explicitly ensure no leftover .claude from a prior mis-provision.

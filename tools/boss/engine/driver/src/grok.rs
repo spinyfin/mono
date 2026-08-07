@@ -28,7 +28,15 @@ use boss_protocol::{NormalizeError, PaneMonitorSpec, WorkerEvent};
 use boss_ssh_transport::shell_quote;
 use serde_json::Value;
 
-use crate::transcript_store::{durable_sessions_dir, transcript_store_root, verified_durable_sessions_dir};
+use crate::transcript_store::{
+    durable_sessions_dir, resolve_durable_sessions_dir, transcript_store_root, verified_durable_sessions_dir,
+};
+
+/// Namespace this driver's durable transcripts are filed under in Boss's
+/// worker transcript store. Every caller that resolves, provisions, or grants
+/// access to that directory must agree on it, so it lives here rather than as
+/// a repeated literal.
+pub(crate) const TRANSCRIPT_DRIVER_SLUG: &str = "grok";
 
 mod classify_error;
 mod environment;
@@ -461,6 +469,18 @@ impl AgentDriver for GrokDriver {
             let environment = GrokProcessEnvironment::resolve(&grok_home, &process_home, &auth_source)
                 .context("resolving Grok environment for macOS Seatbelt policy")?;
             let profile_path = permissions::macos_seatbelt_profile_path(&grok_home);
+            // Grok writes its session state through `$GROK_HOME/sessions`, a
+            // symlink into Boss's state root. Seatbelt matches the resolved
+            // target, so the profile has to name it or the Boss-data-dir
+            // fence denies Grok its own transcript. Resolve (never guess) it.
+            let durable_sessions_dir = resolve_durable_sessions_dir(&grok_home, TRANSCRIPT_DRIVER_SLUG, &input.run_id)
+                .with_context(|| {
+                    format!(
+                        "resolving the durable Grok sessions directory linked from {}/sessions so the \
+                         macOS Seatbelt profile can grant it",
+                        grok_home.display()
+                    )
+                })?;
             fs::write(
                 &profile_path,
                 permissions::render_macos_seatbelt_profile(
@@ -469,6 +489,7 @@ impl AgentDriver for GrokDriver {
                     &grok_home,
                     &environment.macos_writable_roots(&input.workspace_path),
                     boss_data_dir.as_deref(),
+                    Some(durable_sessions_dir.as_path()),
                 ),
             )
             .with_context(|| format!("writing {}", profile_path.display()))?;
@@ -651,13 +672,13 @@ impl AgentDriver for GrokDriver {
                 return Ok(Some(verified_durable_sessions_dir(
                     &grok_home,
                     &store_root,
-                    "grok",
+                    TRANSCRIPT_DRIVER_SLUG,
                     run_id,
                 )?));
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 let store_root = transcript_store_root()?;
-                let durable = durable_sessions_dir(&store_root, "grok", run_id)?;
+                let durable = durable_sessions_dir(&store_root, TRANSCRIPT_DRIVER_SLUG, run_id)?;
                 if let Ok(canonical) = fs::canonicalize(&durable)
                     && canonical.is_dir()
                 {
@@ -1851,6 +1872,17 @@ mod tests {
             assert!(profile.contains("(allow default)"), "{profile}");
             assert!(profile.contains("(deny file-write*)"), "{profile}");
             assert!(profile.contains(&boss_data_dir.display().to_string()), "{profile}");
+            // The end-to-end proof that the sessions link target — not just
+            // `$GROK_HOME` — is named in the profile the pane actually runs
+            // under. Resolve it the same way the kernel will.
+            let sessions = fs::canonicalize(grok_home.join("sessions")).unwrap();
+            assert!(
+                profile.contains(&format!(
+                    "(allow file-read* file-write* (literal \"{}\")",
+                    sessions.display()
+                )),
+                "Grok's own session store must be granted; got:\n{profile}"
+            );
             let spawn = driver.spawn_invocation(spawn_request("grok-4.5", run_id));
             assert!(
                 spawn.command.starts_with("/usr/bin/sandbox-exec -f "),

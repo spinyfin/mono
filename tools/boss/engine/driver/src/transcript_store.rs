@@ -26,6 +26,20 @@ pub fn transcript_store_root() -> anyhow::Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("HOME is unset; cannot resolve Boss worker transcript storage"))
 }
 
+/// Resolve — and verify — where `home/sessions` actually lands for this run,
+/// against the production transcript-store root.
+///
+/// Callers that must name the durable destination in an OS sandbox policy use
+/// this rather than re-deriving the path: it returns the canonical form the
+/// kernel will match after resolving the `home/sessions` symlink, and it fails
+/// loudly if the link does not point where this run's layout says it should.
+/// Granting a guessed path would be worse than granting nothing — the sandbox
+/// would silently fence off the real destination while looking correct.
+pub fn resolve_durable_sessions_dir(home: &Path, driver: &str, run_id: &str) -> anyhow::Result<PathBuf> {
+    let root = transcript_store_root()?;
+    verified_durable_sessions_dir(home, &root, driver, run_id)
+}
+
 /// Make `home/sessions` a link to a dedicated transcript-only directory in
 /// Boss's per-execution artifact directory. The destination is namespaced by
 /// run and driver so neither driver can collide.
