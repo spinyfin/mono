@@ -4,8 +4,8 @@
 - **Status:** proposed — design only, no code changed in this run
 - **Parent project:** Worker busyness: tell a worker waiting on a long command from an idle one (`mono` product Boss)
 - **Deliverable:** design document plus an implementation task breakdown
-- **Primary sources read:** `stale_worker_sweep.rs`, `husk_pane_sweep.rs`, `dead_pid_sweep.rs`, `background_children.rs`, `build_wait.rs`, `build_wait_tracker.rs`, `completion/nudge.rs`, `live_worker_state.rs`, `engine/driver/src/lib.rs`, `runner/prompt.rs`, `codex_unobserved_command.rs`, `worker_registry.rs`
-- **Related docs:** [`worker-liveness-contract.md`](../worker-liveness-contract.md), [`codex-exit-code-surfacing.md`](../investigations/codex-exit-code-surfacing.md), [`codex-as-a-first-class-agent-driver.md`](./codex-as-a-first-class-agent-driver.md)
+- **Primary sources read:** `stale_worker_sweep.rs`, `husk_pane_sweep.rs`, `dead_pid_sweep.rs`, `background_children.rs`, `build_wait.rs`, `build_wait_tracker.rs`, `completion/nudge.rs`, `live_worker_state.rs`, `engine/driver/src/lib.rs`, `runner/prompt.rs`, `codex_unobserved_command.rs`, `worker_registry.rs`, and — for the enforcement section — `worker_setup.rs`, `engine/driver/src/claude.rs`, `engine/driver/src/codex.rs`, `app/worker_events.rs`, `worker_sandbox_audit.rs`
+- **Related docs:** [`worker-liveness-contract.md`](../worker-liveness-contract.md), [`codex-exit-code-surfacing.md`](../investigations/codex-exit-code-surfacing.md), [`codex-as-a-first-class-agent-driver.md`](./codex-as-a-first-class-agent-driver.md), [`codex-pretooluse-guard-coverage-2026-07-29.md`](../investigations/codex-pretooluse-guard-coverage-2026-07-29.md)
 
 Boss has five subsystems that each answer "is this worker busy?" from a different proxy, and every one of those proxies is an _observation of the worker's environment_ rather than a fact Boss owns. This document argues that observation is the wrong shape for the question, and proposes that Boss issue and observe the obligation instead.
 
@@ -13,7 +13,7 @@ Boss has five subsystems that each answer "is this worker busy?" from a differen
 
 **The central bet, stated so a reviewer can disagree with it: busyness must be a Boss-issued, Boss-observed obligation with an owner process and a named outcome — not anything inferred from the worker's tool stream, its process tree, or its prose.** Every current signal is an inference, and each one breaks precisely where the inference diverges from the thing it stands in for.
 
-Concretely: a `boss run -- <argv>` wrapper opens an obligation the engine records, attributes to the run by peer-pid ancestry, and keeps open until the wrapper reports a verdict or the wrapper's own process dies. One verdict function, `busyness(execution)`, then serves reaping, husk/dead-pid corroboration, and the auto-nudge. It is strictly additive: a worker that never calls `boss run` is judged exactly as it is today.
+Concretely: a `boss run -- <argv>` wrapper opens an obligation the engine records, attributes to the run by peer-pid ancestry, and keeps open until the wrapper reports a verdict or the wrapper's own process dies. One verdict function, `busyness(execution)`, then serves reaping, husk/dead-pid corroboration, and the auto-nudge. The _mechanism_ is strictly additive — a worker that never calls `boss run` is judged exactly as it is today, so nothing regresses on non-adoption — but additive is not the same as optional: [Enforcement](#enforcement-what-stops-a-worker-sidestepping-the-wrapper) sets out the four layers that hold a worker to the wrapper and which of them v1 ships.
 
 **The foreground mandate stays until that lands.** Relaxing it first trades silent gate-blindness for silent reaping, which is worse. Once `boss run` exists the mandate is not deleted but _re-expressed at the level of the property it was always trying to protect_.
 
@@ -24,6 +24,7 @@ Concretely: a `boss run -- <argv>` wrapper opens an obligation the engine record
 - A worker-facing contract that can express three distinct states — _still running_, _finished with verdict X_, _finished-or-not, verdict unobtainable_ — and that renders the third one loudly rather than as success.
 - A verification story that demonstrates both directions against a real engine: a legitimately busy worker is not reaped, and a genuinely dead one still is.
 - Make backgrounding safe, so the foreground mandate can be replaced by something enforceable on every driver.
+- An enforcement story that does not rest on the worker's cooperation: the wrapper must be the cheapest path to take, evading it must be visible to the engine, and a claim resting on a command Boss never observed must not be cashable. See [Enforcement](#enforcement-what-stops-a-worker-sidestepping-the-wrapper).
 
 ## Non-goals
 
@@ -183,9 +184,76 @@ Obligations are durable, in a `work_command_observations` table, not in-memory l
 
 An obligation may carry an optional `--deadline`. It does **not** flip `Busy` to `Idle`. It files an attention item ("this command has been open longer than declared") and nothing else. Owner-pid liveness stays the sole primary signal; the deadline exists so a wedged-but-alive command still surfaces to a human, the same job `build_wait_tracker`'s 45-minute horizon does today, without inheriting its role as the decider.
 
+## Enforcement: what stops a worker sidestepping the wrapper
+
+A mechanism that depends on the worker choosing to use it is a mechanism that reports on well-behaved workers only, and the interesting cases are rarely well-behaved. This section is the answer to that objection, and it changes what v1 ships: three enforcement layers move into scope, and the fourth becomes an explicit, framed decision rather than a bullet in the risk list.
+
+### The two enforcement problems are different, and only one of them is adversarial
+
+Treating "will workers use `boss run`?" as one question is what made the first draft's answer — _it is voluntary in v1_ — read as no answer at all. There are two questions with opposite incentive structures.
+
+**Busyness is self-enforcing, because sidestepping harms the sidestepper.** A worker that runs `bazel test` bare gets today's inference-based judgement: its busyness is guessed from a tool span, and on any driver where that span is a polling window rather than a command, it is guessed wrong in the direction of _reapable_. The wrapper is the thing that keeps a legitimately busy worker alive across a sweep pass. Skipping it does not buy the worker anything — it forfeits protection. On this axis, enforcement is mostly a usability problem: make the wrapper the shortest path, make its absence visible, and adoption follows without coercion.
+
+**Validation claims are adversarial, because sidestepping pays.** A worker that skips the wrapper and then reports "build and tests pass" has escaped the only thing that could have contradicted it. Here the incentive points the other way, and nothing about the busyness design constrains it. This is the half the reviewer's question is really about, and it is answered below by layer 3 — the only layer that removes the payoff rather than obstructing the act.
+
+Holding those apart matters because they call for different machinery and land in different places in the plan. It also means "advisory" is a defensible answer for the first and an indefensible one for the second.
+
+### The enforcement ladder
+
+Boss already runs four kinds of enforcement against workers. The wrapper does not need new machinery; it needs to be wired into the machinery that exists.
+
+| Layer | Mechanism for `boss run`                                                                                                                                                      | Precedent already shipping                                                                                                           | Prevents or detects?                 | Driver coverage                     |
+| ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------ | ----------------------------------- |
+| 0     | Prompt contract: build-class commands run through the wrapper                                                                                                                 | today's foreground mandate (`runner/prompt.rs:710`)                                                                                  | **neither** — states intent          | all drivers                         |
+| 1     | Permission deny rules on bare build-class argv (`Bash(bazel:*)`, `Bash(cargo:*)`), with no rule matching `boss run` — a `boss run --` prefix is the only spelling that passes | `deny_rules()` in `worker_setup.rs:773` (`Bash(bossctl:*)`, `Bash(boss engine stop:*)`)                                              | prevents, coarsely                   | drivers with `PermissionPolicy`     |
+| 2     | A `PreToolUse` interception guard that tokenises argv and denies a build-class command not already wrapped                                                                    | `PR_REDIRECT_GUARD_COMMAND`, `REVISION_PR_GUARD_COMMAND`, `BOSS_LAUNCH_GUARD_COMMAND`, `boss-checkleft-push-guard.py`                | prevents, precisely                  | Claude full; Codex deny-only, holed |
+| 3     | Refuse a downstream claim that rests on a command with no `exited 0` obligation                                                                                               | `codex_unobserved_command.rs` — **already** refuses a worker's `NO_CHANGES_NEEDED` for the rest of a run after an unobserved command | prevents the **payoff**, not the act | all drivers — engine-side           |
+| 4     | Detect a build-class command that ran outside an obligation; file an attention item                                                                                           | `worker_sandbox_audit.rs`; the unobserved-command audit trail                                                                        | detects only                         | all drivers                         |
+
+Layer 1 works because of a detail of the permission engine that is easy to miss: rules match the command's leading token, so `boss run -- bazel test //…` is a `boss` invocation, not a `bazel` one, and a deny on `Bash(bazel:*)` fences the bare form while leaving the wrapped form untouched. That is a genuine allowlist-by-construction and it costs two strings. It is also brittle in the ways every string match is brittle — `env bazel …`, `sh -c 'bazel …'`, a `$TOOL` indirection — which is exactly the gap layer 2 exists to close, and the existing guards already do that work: `BOSS_LAUNCH_GUARD_COMMAND` splits on shell delimiters, strips wrapper commands (`nohup`, `env`, `sudo`, `exec`, `xargs`, …) and resolves single-level shell variables before matching. A `boss run` guard is that guard with a different target list.
+
+### The structural point: only layer 3 is out of the worker's reach
+
+Layers 0 through 2 all execute inside the worker's own harness. They police _the act_, and their strength is bounded by what the harness lets Boss intercept. Layer 3 executes in the engine, on state the worker cannot write. It polices _the payoff_ — and it is the only layer that is uniformly available across drivers, because it needs no hook surface at all.
+
+That is the load-bearing claim of this section: **a worker cannot be reliably prevented from running a command outside the wrapper, but it can be reliably prevented from banking a result it obtained that way.** The second is sufficient, and it is achievable on every driver.
+
+It is also not speculative. `codex_unobserved_command` already implements the narrow case: when Boss observes a command start with no completion, it files an attention item _and_ refuses the worker's "validation passed, nothing to do" claim for the remainder of the run, on the stated ground that a downstream claim resting on an unobserved step is unconfirmed rather than verified. Generalising that from "Codex commands Boss watched start and lose" to "any build-class command with no obligation" is a widening of a live mechanism, not new machinery — which is a substantially cheaper proposition than the deferred entry's `large` hint implied when it was written.
+
+### Where the layers break, measured rather than assumed
+
+Enforcement claims are worth exactly as much as their weakest driver, and Boss has already paid for that lesson in evidence. [`codex-pretooluse-guard-coverage-2026-07-29.md`](../investigations/codex-pretooluse-guard-coverage-2026-07-29.md) set out to confirm the Codex guards fire and instead found two live bypasses that had been sitting behind a prompt sentence asserting the opposite:
+
+- **`tools.write_stdin` fires no hook at all.** A cell starts a long-lived shell with `exec_command` (which the guards approve, because `sh -s` is innocuous) and then feeds it arbitrary command lines that no guard ever sees. This was demonstrated end-to-end against the push guard, not theorised.
+- **App/MCP tools arrive under an `mcp__…` tool name** that no `matcher = "Bash"` guard matches.
+
+Codex additionally declares `ToolUseInterception` as **deny-only** (`codex.rs:1275`): it honours `permissionDecision: deny` but rejects `allow` / `ask` / `updatedInput`, so a guard there can block but cannot rewrite — no "silently upgrade the bare command into a wrapped one" path exists on that driver. And a driver that declares the capability not at all lands on `AbsenceDisposition::Degrade`, where `dispatch_post_hoc_interception_on_post_tool_use` can only flag an artefact after the fact, logging in terms that this "is not equivalent to pre-hoc interception".
+
+Two consequences follow, and the design takes both:
+
+1. **Layer 2 is best-effort by construction, and the design must not rest on it.** It is worth shipping — it closes the accidental case, which is the common case — but a plan whose safety argument terminates at a `PreToolUse` guard is a plan that is already known to be false on one of the two drivers in production.
+2. **Guards fail closed.** `boss-path-guard.py`'s rule is the one to copy: for the tools it reasons about, a payload it cannot parse is _blocked_, because a gate that waves through what it cannot read is not a gate. The `boss run` guard inherits that posture, so an unrecognised payload shape from a future driver surfaces as a block plus an operator signal rather than a silent hole.
+
+### What v1 commits to
+
+- **Layer 0** — entry 10 already rewrites the prompt; it now states the wrapper contract rather than the foreground container.
+- **Layers 1 and 2** — new entry 11, gated on the wrapper existing.
+- **Layer 4** — new entry 12, and this is what makes non-adoption _measurable_ rather than merely tolerated. Without it, "adoption is voluntary" is a claim nobody can check.
+- **Layer 3** — remains deferred (entry 16), because deny-by-default claim refusal is a policy decision about how Boss treats its workers and a human should make it. What changes is the framing: it is no longer an optional extra at the bottom of a list, it is the answer to the enforcement question, and it is cheaper than first estimated because the narrow version ships today. The questions manifest puts the fork to the operator directly.
+
+### What is deliberately not claimed
+
+No layer here makes the wrapper unavoidable for a worker determined to evade it. Backgrounding _inside_ `boss run`, detaching with `nohup`, or driving a shell through `write_stdin` all defeat the mechanism, and no liveness signal can fix a worker that sets out to lie about its own state. The standard this design holds itself to is the one every other Boss guard is held to, and it is met on all three counts:
+
+- the wrapped form is the cheapest path to take,
+- evasion is visible to the engine rather than silent, and
+- a claim resting on a command Boss never observed cannot be cashed.
+
+The last is the one that matters, and it does not depend on the worker's cooperation.
+
 ## Answers to the five questions the brief asked
 
-**1. What signal would actually be correct?** A live owner process, handed to Boss by the wrapper that spawned the command, holding a named obligation whose completion Boss records. Costs: worker cooperation, one new CLI, one table, one RPC. Fails on: a worker that does not use the wrapper (degrades to today's behaviour, never worse), and a wrapper killed by the same event that killed the worker (surfaces as `Unresolved`, loudly).
+**1. What signal would actually be correct?** A live owner process, handed to Boss by the wrapper that spawned the command, holding a named obligation whose completion Boss records. Costs: one new CLI, one table, one RPC, and the enforcement wiring in entries 11 and 12. Fails on: a worker that does not use the wrapper (degrades to today's behaviour, never worse — and [Enforcement](#enforcement-what-stops-a-worker-sidestepping-the-wrapper) is what keeps that case rare and visible rather than merely tolerated), and a wrapper killed by the same event that killed the worker (surfaces as `Unresolved`, loudly).
 
 **2. Can one signal serve all consumers?** Yes for four of the five, and that is the finding: reaping, husk retirement, dead-pid corroboration, and the build-wait half of the nudge are one question and get one answer. The fifth — delegated subagent work — is genuinely a different question. It is not "is a command running" but "has the runtime delegated a turn"; the correct signal there is the runtime's own event stream, not a process count. It is deferred, and the wrong probe is deleted rather than left in place looking like coverage.
 
@@ -211,18 +279,19 @@ _Acceptance sweep — end to end, against the real path._ Both directions must b
 
 ## Risks / open questions
 
-- **Adoption is the whole safety argument, and it is voluntary in v1.** The design is strictly additive, so non-adoption is not a regression — but it is also not a fix. Whether `boss run` should become mandatory for build-class commands (deny-by-default validation claims, the exit-code investigation's option 4) is a real fork with a much larger surface, and it is a human call. Filed in the questions manifest.
+- **Enforcement is layered, and the strongest layer is deferred to a human decision.** [Enforcement](#enforcement-what-stops-a-worker-sidestepping-the-wrapper) sets out four layers; v1 ships three of them (prompt contract, deny rules plus interception guard, and detection of unwrapped build commands). The fourth — refusing a validation claim that cites no observed exit code — is the only one that removes the _payoff_ from sidestepping rather than obstructing the act, and it is a policy decision about how Boss treats its workers. It stays deferred as entry 16 and is put to the operator in the questions manifest. If the answer is "advisory", the residual risk is precisely that a worker can sidestep the wrapper and make an unverifiable claim — entry 12's detection makes that visible after the fact but does not stop it.
+- **Layer 2 is measurably incomplete on Codex, and that is load-bearing, not incidental.** `write_stdin` fires no hook, MCP app tools evade `Bash` matchers, and Codex's `ToolUseInterception` is deny-only — all measured, not assumed. Any future argument that leans on the interception guard as _the_ enforcement answer is wrong on the driver that most needs it. The guard is worth shipping for the accidental case; the safety argument must terminate at layer 3.
 - **Retiring `background_children` removes coverage the nudge nominally had.** The claim in Finding 2 is that the coverage was never real. That claim is checkable and the discovery entry checks it first — but if the measurement contradicts it, the deletion must not proceed.
 - **The wrapper adds a process to every build.** One extra pid per command, negligible, but it does change the process tree shape that `husk_pane_sweep` and `dead_pid_sweep` walk. The acceptance sweep must confirm no interaction.
-- **A worker can defeat the wrapper trivially** by not using it, or by backgrounding _inside_ it. The prompt contract addresses the first; nothing addresses the second, and nothing should — a worker determined to lie is out of scope for a liveness signal.
+- **A worker can still defeat the wrapper by backgrounding _inside_ it**, or by detaching, or by driving a shell through `write_stdin`. Not using the wrapper at all is addressed by the enforcement ladder; deliberate evasion from within is not, and should not be — a worker determined to lie about its own state is out of scope for a liveness signal. What the ladder buys is that evasion must be deliberate and leaves an engine-side trace, rather than being the default path.
 - **`Unresolved` degrading to `Idle` is a judgement call.** The alternative — treating an abandoned obligation as continued busyness — would create the never-reap path the brief forbids. But it means an abandoned command's worker becomes reapable at the moment the attention item is filed, and a human may want a grace window there.
 - **Two designs meet at `boss run`.** The separately-filed Codex exit-code work wants the same wrapper for a different reason. If both land independently they will duplicate it. The breakdown assumes this project owns the wrapper and the other consumes it; that assumption should be confirmed before entry 6 starts.
 
 ## Proposed implementation task breakdown
 
-Breakdown size: 14 entries (11 in-scope, 3 deferred) — this spans three subsystems (engine/core, the `boss` CLI, and the worker prompt) plus a shared protocol crate, a schema change, and a discovery step, which is the 8–14 anchor band; it lands at the top of that band rather than above it because the five consumers collapse into two cutover entries instead of five.
+Breakdown size: 16 entries (13 in-scope, 3 deferred) — this spans four subsystems (engine/core, the `boss` CLI, the worker prompt, and the worker-setup guard wiring) plus a shared protocol crate, a schema change, and a discovery step. That is at the ceiling of the 8–14 anchor band rather than inside it, and the two entries above the band are the enforcement pair (11 and 12) added to answer the enforcement question; the five busyness consumers still collapse into two cutover entries instead of five.
 
-**Parallelism summary.** Depth 0: entries 1 and 2 in parallel. Depth 1: entries 3 and 4 in parallel. Depth 3: entry 6 may run in parallel with entry 7. Depth 4: entries 8 and 9 are functionally independent but **not** file-independent — see entry 9's note.
+**Parallelism summary.** Depth 0: entries 1 and 2 in parallel. Depth 1: entries 3 and 4 in parallel. Depth 3: entry 6 may run in parallel with entry 7. Depth 4: entries 8 and 9 are functionally independent but **not** file-independent — see entry 9's note. Entries 11 and 12 are independent of each other and of the consumer cutovers (8, 9); entry 11 needs only the wrapper (6), entry 12 needs only the obligation store and the verdict function (5, 7), so both can run alongside the cutover work.
 
 ---
 
@@ -306,23 +375,39 @@ Rewrite `runner/prompt.rs`'s pre-push gate and conflict-resolution gate blocks t
 - Dependencies: entries 6, 8, 9
 - Scope: in-scope
 
-**11. End-to-end acceptance sweep against a real isolated engine**
+**11. Enforcement layers 1 and 2: deny rules plus a `boss run` interception guard**
 
-Run an isolated engine and drive a real Claude worker and a real Codex worker, each executing a genuine multi-minute `bazel` build through `boss run`, and demonstrate both directions: neither is reaped or retired across sweep passes, and a `SIGKILL`ed worker is still reclaimed on the next pass. Record raw artifacts. Deliberately end-to-end rather than a reconstructed harness, because the failures on this path have all been integration failures.
+Add deny rules for bare build-class argv (`Bash(bazel:*)`, `Bash(cargo:*)`, and the checkleft/test shapes) to `deny_rules()` in `worker_setup.rs`, leaving `boss run --` as the only spelling that passes, and add a `PreToolUse` interception guard that catches the shapes a leading-token match cannot — wrapper commands, shell-variable indirection, `sh -c`. Build it from the existing `python_command_guard!` seam, copying `BOSS_LAUNCH_GUARD_COMMAND`'s delimiter splitting, wrapper stripping, and single-level variable expansion, and copying `boss-path-guard.py`'s fail-closed posture: a payload the guard cannot parse is blocked, not approved. Wire it through `AgentDriver::tool_use_interception_wiring` so per-driver capability decides whether it is installed, and assert in tests that it denies rather than rewrites (Codex's `ToolUseInterception` is deny-only). The guard's deny message must name the wrapped form to run instead — a guard that blocks without naming the sanctioned alternative just costs a turn.
 
 - Effort hint: `medium`
-- Dependencies: entries 8, 9, 10
+- Dependencies: entry 6
 - Scope: in-scope
 
-**12. Retire `current_tool` as a busyness input**
+**12. Enforcement layer 4: detect and report build-class commands that ran outside an obligation**
 
-Once entry 11 and production telemetry show `boss run` adoption is high enough that the retained `current_tool` disjunct never changes a decision, drop it from the three reap-and-spare consumers, leaving `busyness()` as the sole input. `current_tool` remains as a UI field.
+At the `PostToolUse` boundary, recognise a build-class command whose argv is not a `boss run` invocation and for which no obligation was opened, and record it against the execution — an attention item naming the argv, plus a per-execution counter, following `worker_sandbox_audit`'s observe-attempts shape and `codex_unobserved_command`'s bounded audit trail (including its overflow attention, so a pathological run cannot file unboundedly). This is what makes adoption measurable rather than assumed: without it, "adoption is voluntary" is a claim nobody can check, and the operator has no basis on which to answer the layer-3 fork. Detection only — this entry changes no decision and blocks nothing.
+
+- Effort hint: `medium`
+- Dependencies: entries 5, 7
+- Scope: in-scope
+
+**13. End-to-end acceptance sweep against a real isolated engine**
+
+Run an isolated engine and drive a real Claude worker and a real Codex worker, each executing a genuine multi-minute `bazel` build through `boss run`, and demonstrate both directions: neither is reaped or retired across sweep passes, and a `SIGKILL`ed worker is still reclaimed on the next pass. Also exercise the enforcement path on both drivers: a bare build-class command is denied on Claude, and on Codex confirm what the guard actually does rather than assuming parity — the deny-only capability and the measured `write_stdin` hole mean the Codex result is a finding to record, not a box to tick. Record raw artifacts. Deliberately end-to-end rather than a reconstructed harness, because the failures on this path have all been integration failures.
+
+- Effort hint: `medium`
+- Dependencies: entries 8, 9, 10, 11, 12
+- Scope: in-scope
+
+**14. Retire `current_tool` as a busyness input**
+
+Once entry 13 and production telemetry show `boss run` adoption is high enough that the retained `current_tool` disjunct never changes a decision, drop it from the three reap-and-spare consumers, leaving `busyness()` as the sole input. `current_tool` remains as a UI field. Entry 12's unwrapped-command counter is the telemetry this gate reads.
 
 - Effort hint: `small`
-- Dependencies: entry 11
+- Dependencies: entries 12, 13
 - Scope: deferred (future / not a v1 blocker) — gated on measured adoption that does not exist yet; retiring it early reintroduces the reaping risk for any worker not using the wrapper
 
-**13. Busyness for delegated subagent work**
+**15. Busyness for delegated subagent work**
 
 Give the auto-nudge a correct signal for the case `background_children` was aimed at: a worker whose turn genuinely ended because it delegated work to a harness subagent. The signal belongs in the driver's own event stream (a delegation boundary the runtime reports), not in a process count, and it is a different question from command busyness.
 
@@ -330,10 +415,10 @@ Give the auto-nudge a correct signal for the case `background_children` was aime
 - Dependencies: entry 7
 - Scope: deferred (future / not a v1 blocker) — a distinct question with no measured incident behind it; deleting the wrong probe in entry 9 is the v1 correction
 
-**14. Deny-by-default validation claims citing observed exit codes**
+**16. Enforcement layer 3: deny-by-default validation claims citing observed exit codes**
 
-Require a worker asserting "checks passed" to cite an obligation handle whose verdict is `exited 0`, and refuse the claim otherwise. This is the exit-code investigation's option 4 and the only measure that also covers sandbox denials, where the exit code is `0` and honest. It belongs to the driver abstraction and to the deliverable-coverage gate rather than to this project.
+Require a worker asserting "checks passed" to cite an obligation handle whose verdict is `exited 0`, and refuse the claim otherwise. This is the exit-code investigation's option 4, the only measure that also covers sandbox denials (where the exit code is `0` and honest), and — per [Enforcement](#enforcement-what-stops-a-worker-sidestepping-the-wrapper) — the only layer that removes the payoff from sidestepping rather than obstructing the act, and the only one that needs no hook surface and so holds uniformly across drivers. Generalises the refusal `codex_unobserved_command` already applies to `NO_CHANGES_NEEDED`, so the mechanism exists and this widens its trigger; the `large` hint is carried over from the original estimate and is probably now conservative. It reaches the driver abstraction and the deliverable-coverage gate, which is why it is not folded into this project unilaterally.
 
 - Effort hint: `large`
-- Dependencies: entry 6
-- Scope: deferred (future / not a v1 blocker) — much larger surface than a busyness signal, and it is a policy decision a human should make (see the questions manifest)
+- Dependencies: entries 6, 12
+- Scope: deferred (future / not a v1 blocker) — reaches beyond a busyness signal, and it is a policy decision about how Boss treats worker claims that a human should make. Entry 12 supplies the adoption data that decision needs. This is the fork the questions manifest puts to the operator; deferring it is the design's recommendation, **not** a judgement that enforcement is unnecessary

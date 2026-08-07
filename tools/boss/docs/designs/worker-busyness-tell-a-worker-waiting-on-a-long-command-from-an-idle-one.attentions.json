@@ -6,13 +6,23 @@
   },
   {
     "question_type": "multiple_choice",
-    "prompt": "Should `boss run` be advisory or enforced for build-class commands in v1?",
+    "prompt": "Enforcement layer 3 is the only layer that removes the payoff from sidestepping the wrapper rather than obstructing the act, and the only one that holds uniformly across drivers (it needs no hook surface). v1 ships layers 0, 1, 2 and 4 regardless. Does layer 3 — refusing a worker's 'checks passed' claim that cites no obligation with an `exited 0` verdict — come into v1?",
     "choices": [
-      "Advisory in v1 — prompt contract only, non-adopters fall back to today's behaviour (design's recommendation)",
-      "Enforced in v1 — refuse a worker's 'checks passed' claim without an obligation handle whose verdict is exited 0 (pulls deferred entry 14 into scope)",
-      "Advisory, but add a hard PreToolUse block on bare bazel/checkleft invocations so the wrapper is unavoidable"
+      "Keep it deferred as entry 16 (design's recommendation) — ship detection first, let entry 12's adoption data inform the decision, accept that a worker can meanwhile make an unverifiable claim",
+      "Pull entry 16 into v1 — a worker claim resting on a command Boss never observed should never have been cashable, and the narrow version already ships for Codex unobserved commands",
+      "Pull it in narrowly — apply claim refusal only where an unwrapped build-class command was actually detected (entry 12), rather than requiring a cited handle from every worker"
     ],
-    "anchor": "chosen-approach"
+    "anchor": "enforcement-what-stops-a-worker-sidestepping-the-wrapper"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "The interception guard (entry 11) gives real prevention on Claude but is measurably holed on Codex: `write_stdin` fires no hook at all and MCP app tools evade `Bash` matchers. The 2026-07-29 guard-coverage investigation found the worker prompt had been asserting guard coverage that was false in two reachable ways. How should the guard be scoped on Codex?",
+    "choices": [
+      "Install it on Codex, and state its known limits in the prompt rather than asserting coverage (design's recommendation) — it closes the accidental case, which is the common one",
+      "Install it on Codex silently — partial prevention beats none and the limits are an engine-side concern",
+      "Do not install it on Codex — partial coverage that reads as full coverage is how the previous false assertion happened; rely on layers 3 and 4 there"
+    ],
+    "anchor": "enforcement-what-stops-a-worker-sidestepping-the-wrapper"
   },
   {
     "question_type": "multiple_choice",
