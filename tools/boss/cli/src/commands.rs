@@ -1985,9 +1985,16 @@ pub(crate) struct ProjectListArgs {
     #[arg(long)]
     pub(crate) limit: Option<usize>,
 
-    /// Filter to specific id(s); repeatable.
-    #[arg(long)]
-    pub(crate) id: Vec<String>,
+    /// Filter to specific id(s). Comma-separated, or repeat the flag.
+    /// Accepts the same forms as `boss task show`: friendly short ids
+    /// (`P7`, `7`, `#7`), primary ids (`proj_…`), and the cross-product
+    /// form (`boss/7`). An id that names no row in the product errors
+    /// rather than being silently dropped. Composes with the other
+    /// filters below as an AND — a row excluded by e.g. `--status` is
+    /// not an error, only an id that doesn't exist at all is.
+    /// `--id` is accepted as a legacy alias for existing scripts.
+    #[arg(long = "ids", alias = "id", value_delimiter = ',')]
+    pub(crate) ids: Vec<String>,
 
     /// Filter by resolved repo. Accepts a full URL or a short
     /// name (basename of the URL minus `.git`). Short-name match is
@@ -2296,9 +2303,17 @@ pub(crate) struct TaskListArgs {
     #[arg(long)]
     pub(crate) limit: Option<usize>,
 
-    /// Filter to specific id(s); repeatable.
-    #[arg(long)]
-    pub(crate) id: Vec<String>,
+    /// Filter to specific id(s). Comma-separated, or repeat the flag.
+    /// Accepts the same forms as `boss task show`: friendly short ids
+    /// (`T42`, `42`, `#42`), primary ids (`task_…`), and the
+    /// cross-product form (`boss/42`). An id that names no row in the
+    /// product errors rather than being silently dropped. Composes with
+    /// the other filters below as an AND — a row excluded by e.g.
+    /// `--status` is not an error, only an id that doesn't exist at
+    /// all is. `--id` is accepted as a legacy alias for existing
+    /// scripts.
+    #[arg(long = "ids", alias = "id", value_delimiter = ',')]
+    pub(crate) ids: Vec<String>,
 
     /// Include soft-deleted (tombstoned) tasks in the listing. Use this
     /// to find a `deleted_at` row to `boss task restore`. The DELETED
@@ -2571,9 +2586,12 @@ pub(crate) struct RevisionListArgs {
     #[arg(long)]
     pub(crate) limit: Option<usize>,
 
-    /// Filter to specific id(s); repeatable.
-    #[arg(long)]
-    pub(crate) id: Vec<String>,
+    /// Filter to specific id(s). Comma-separated, or repeat the flag.
+    /// See `boss task list --help` for the accepted id forms and the
+    /// unknown-id / filter-composition contract. `--id` is accepted as
+    /// a legacy alias for existing scripts.
+    #[arg(long = "ids", alias = "id", value_delimiter = ',')]
+    pub(crate) ids: Vec<String>,
 
     /// Include soft-deleted (tombstoned) revisions in the listing. See
     /// `boss task list --help`.
@@ -2663,9 +2681,12 @@ pub(crate) struct ChoreListArgs {
     #[arg(long)]
     pub(crate) limit: Option<usize>,
 
-    /// Filter to specific id(s); repeatable.
-    #[arg(long)]
-    pub(crate) id: Vec<String>,
+    /// Filter to specific id(s). Comma-separated, or repeat the flag.
+    /// See `boss task list --help` for the accepted id forms and the
+    /// unknown-id / filter-composition contract. `--id` is accepted as
+    /// a legacy alias for existing scripts.
+    #[arg(long = "ids", alias = "id", value_delimiter = ',')]
+    pub(crate) ids: Vec<String>,
 
     /// Include soft-deleted (tombstoned) chores in the listing. See
     /// `boss task list --help`.

@@ -519,14 +519,38 @@ pub(crate) async fn run_list_revisions(
     } else {
         None
     };
-    let revisions = list_revisions(client, &product.id, dep_filter, args.include_deleted, parent_id).await?;
+    let revisions = list_revisions(
+        client,
+        &product.id,
+        dep_filter.clone(),
+        args.include_deleted,
+        parent_id.clone(),
+    )
+    .await?;
+    let resolved_ids = if args.ids.is_empty() {
+        Vec::new()
+    } else if dep_filter.is_none() && parent_id.is_none() && args.include_deleted {
+        resolve_ids_for_listing(client, ctx, &args.ids, &product.id, &revisions, |t| {
+            (t.id.as_str(), t.short_id)
+        })
+        .await?
+    } else {
+        // See the task-list arm in work_cmds.rs: existence must be
+        // independent of --include-deleted too, so a tombstoned id
+        // narrows to an empty result instead of erroring as unknown.
+        let unfiltered = list_revisions(client, &product.id, None, true, None).await?;
+        resolve_ids_for_listing(client, ctx, &args.ids, &product.id, &unfiltered, |t| {
+            (t.id.as_str(), t.short_id)
+        })
+        .await?
+    };
     let revisions = apply_task_list_filters(
         revisions,
         TaskListCriteria::builder()
             .statuses(&args.status)
             .priorities(&args.priority)
             .maybe_match_term(args.match_term.as_deref())
-            .ids(&args.id)
+            .ids(&resolved_ids)
             .maybe_limit(args.limit)
             .include_archived(args.include_archived)
             .build(),
@@ -2203,6 +2227,134 @@ pub(crate) async fn resolve_selector_to_primary_id(
         }
         WorkItemSelector::PrimaryId(id) | WorkItemSelector::Other(id) => Ok(id),
     }
+}
+
+/// Resolve a `--ids` list-filter argument to canonical primary ids and
+/// verify every one names a row present in `known` — the full,
+/// unfiltered listing for this product/kind (i.e. fetched with no
+/// `--dep` / `--project` / `--parent` narrowing applied), so an id that
+/// merely gets excluded by one of those composed filters is never
+/// mistaken for one that doesn't exist. Each entry is `(primary_id,
+/// short_id)`.
+///
+/// Short-id selectors (`T42` / `42` / `#42`) resolve locally against
+/// `known`'s `short_id` column — no RPC — since `known` is already the
+/// full unfiltered listing and therefore a superset of every valid
+/// short id in this product. Typed primary ids (`task_…`) and opaque
+/// `Other` selectors pass through
+/// [`resolve_selector_to_primary_id`](resolve_selector_to_primary_id)
+/// unchanged, same as everywhere else that resolves selectors. Only the
+/// cross-product `boss/42` form still round-trips to the engine, since
+/// it names a different product than `known` covers.
+///
+/// Checking membership in `known` — rather than trusting
+/// `resolve_selector_to_primary_id`'s pass-through for typed/opaque
+/// forms — is what catches a typo'd primary id or a valid id from the
+/// wrong product/kind.
+///
+/// Errors naming every selector that didn't resolve to a known row —
+/// including a short id that isn't in `known` and a cross-product
+/// selector the engine reports not-found — rather than silently
+/// returning fewer rows than requested or aborting after the first bad
+/// one. That silent-drop is exactly the failure mode `--ids` exists to
+/// prevent. An id that resolves but gets excluded by another composed
+/// filter (e.g. `--status`) is not this function's concern — that's
+/// ordinary AND-filter composition, decided by the caller after this
+/// returns. An all-empty/whitespace `selectors` list (e.g. `--ids ""`
+/// from an unset shell variable) errors rather than silently degrading
+/// to "no id filter".
+pub(crate) async fn resolve_ids_filter(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    selectors: &[String],
+    product_id: &str,
+    known: &[(&str, Option<i64>)],
+) -> Result<Vec<String>, CliError> {
+    if selectors.is_empty() {
+        return Ok(Vec::new());
+    }
+    let trimmed: Vec<&str> = selectors.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if trimmed.is_empty() {
+        return Err(CliError::usage("--ids: no ids given (empty value)"));
+    }
+
+    let short_id_index: std::collections::HashMap<i64, &str> = known
+        .iter()
+        .filter_map(|(id, short_id)| short_id.map(|n| (n, *id)))
+        .collect();
+    let primary_ids: std::collections::HashSet<&str> = known.iter().map(|(id, _)| *id).collect();
+
+    let mut resolved = Vec::with_capacity(trimmed.len());
+    let mut unknown = Vec::new();
+    for selector in trimmed {
+        match parse_work_item_selector(selector) {
+            WorkItemSelector::ShortId(n) => match short_id_index.get(&n) {
+                Some(id) => resolved.push((*id).to_owned()),
+                None => unknown.push(selector.to_owned()),
+            },
+            _ => match resolve_selector_to_primary_id(client, ctx, selector, Some(product_id.to_owned())).await {
+                Ok(id) if primary_ids.contains(id.as_str()) => resolved.push(id),
+                // `Application` is what a genuinely-missing row surfaces
+                // as here: `get_work_item_by_short_id_rpc`'s `Ok(None)`
+                // case is reported by the engine as a `WorkError`, which
+                // the `rpc_call!` macro turns into `CliError::Application`
+                // (see `handle_get_work_item_by_short_id`) — there is no
+                // dedicated "not found" variant on this RPC path. Fold it
+                // into `unknown` like any other missing selector.
+                Ok(_) | Err(CliError::Application(_)) => unknown.push(selector.to_owned()),
+                Err(err) => {
+                    // Everything else — an unresolved/ambiguous product
+                    // slug (`CliError::NotFound`/`Conflict` from
+                    // `resolve_product`), a socket/transport failure
+                    // (`EngineUnavailable`), or an internal error — is not
+                    // "this id doesn't exist"; propagate it under its own
+                    // error kind so the caller sees the real cause instead
+                    // of a misleading "no matching row".
+                    let message = format!("--ids: could not resolve {selector}: {err}");
+                    return Err(match err {
+                        CliError::Usage(_) => CliError::usage(message),
+                        CliError::NotFound(_) => CliError::not_found(message),
+                        CliError::Conflict(_) => CliError::conflict(message),
+                        CliError::EngineUnavailable(_) => CliError::engine_unavailable(message),
+                        CliError::Application(_) => unreachable!("handled above"),
+                        CliError::Internal(_) => CliError::internal(anyhow::anyhow!(message)),
+                    });
+                }
+            },
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(CliError::not_found(format!(
+            "--ids: no matching row for {}",
+            unknown.join(", ")
+        )));
+    }
+    Ok(resolved)
+}
+
+/// Shared tail end of every `--ids`-aware list verb: build the
+/// `(primary_id, short_id)` membership set from `rows` — which the
+/// caller must already have fetched as the correct listing, narrowed
+/// or not — and resolve `ids` against it via [`resolve_ids_filter`].
+/// Each of the four list verbs (task/chore/project/revision) still
+/// decides for itself whether `rows` is the already-fetched listing or
+/// a freshly refetched unfiltered one, since that decision depends on
+/// a different set of server-side filters per verb; this only
+/// collapses the identical "build `known` and resolve" step that
+/// followed that decision at every call site.
+pub(crate) async fn resolve_ids_for_listing<T>(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    ids: &[String],
+    product_id: &str,
+    rows: &[T],
+    key: impl Fn(&T) -> (&str, Option<i64>),
+) -> Result<Vec<String>, CliError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let known: Vec<(&str, Option<i64>)> = rows.iter().map(&key).collect();
+    resolve_ids_filter(client, ctx, ids, product_id, &known).await
 }
 
 /// If `selector` is a typed engine work-item id, look it up and return
