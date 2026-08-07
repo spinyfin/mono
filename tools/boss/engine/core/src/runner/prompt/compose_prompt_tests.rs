@@ -1929,6 +1929,34 @@ fn revision_directive_requires_pr_title_update() {
     );
 }
 
+#[test]
+fn revision_directive_permits_leaving_accurate_description_untouched() {
+    // Motivating incidents: flunge PR #1306 and #1301, where a revision's PR
+    // description drifted to assert the opposite of the diff it described.
+    // The fix is "verify against the current diff", not "always rewrite" —
+    // a worker that finds the description already accurate must leave it
+    // alone and say so, not edit it just to show it did something.
+    let work_item = revision_task_with_created_via(None, "operator");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("do NOT edit it just to have touched it"),
+        "revision directive must instruct the worker to leave an already-accurate \
+             description untouched rather than rewrite it for its own sake:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("say so explicitly in your final response"),
+        "revision directive must require the worker to state affirmatively when the \
+             description was already accurate, not just silently skip the edit:\n{prompt}",
+    );
+}
+
 // -----------------------------------------------------------------------
 // `[deferred-scope]` marker directive (root-caused to PR #765)
 // -----------------------------------------------------------------------

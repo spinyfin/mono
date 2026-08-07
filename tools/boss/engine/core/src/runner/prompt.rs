@@ -1668,6 +1668,7 @@ fn compose_revision_directive(
     );
     out.push_str("   d. What to write: rewrite the description so it is accurate and self-contained for reviewers NOW. The main summary must describe the CURRENT state — what the PR does, not what it used to do. Do NOT append a changelog that leaves a contradictory original summary above it; instead correct the summary in place. A brief \"Changes in this revision\" note may follow the corrected summary if it adds context, but it must never contradict or overshadow the corrected summary.\n");
     out.push_str("   e. A revision may skip steps c–d ONLY if it changes ZERO source files (e.g. a PR-description-only fix or a pure markdown/comment edit) AND involves no rebase, merge, or conflict resolution. Rebase and conflict-resolution revisions do NOT qualify for this skip — they touch compiled output and must go through the full description review. The title check (step b2) is NEVER skippable — always verify it.\n");
+    out.push_str("   f. If, after the comparison in step b, the description already matches the PR's current state, do NOT edit it just to have touched it — leave it as-is and say so explicitly in your final response (e.g. \"PR description verified accurate against this revision's diff; no edit needed\"). The bar is whether the description describes the PR's current state, not whether this revision left a visible mark on it.\n");
     out.push('\n');
     out.push_str(&format!(
         "6. Confirm the new commit is on the PR: `gh pr view {pr_number} -R {repo_slug}`\n"
