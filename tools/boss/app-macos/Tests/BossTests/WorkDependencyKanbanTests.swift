@@ -591,30 +591,15 @@ extension ChatViewModel {
     /// Append one active revision row whose chain root is `parentID`,
     /// so `setRevisionBadgeHover(parentID)` has something to highlight.
     fileprivate func addActiveRevisionForTest(parentID: String) {
-        guard let projectID = projectsByProductID.values.first?.first?.id,
-              let productID = projectsByProductID.first?.key
-        else {
-            XCTFail("addActiveRevisionForTest called before fixture had a project")
-            return
-        }
-        let revision = WorkTask(
+        upsertTaskForTest(
             id: "task_rev_of_\(parentID)",
-            productID: productID,
-            projectID: projectID,
-            kind: "revision",
             name: "Revision of \(parentID)",
-            description: "",
             status: "active",
-            priority: "medium",
-            ordinal: nil,
-            prURL: nil,
-            deletedAt: nil,
-            createdAt: "2026-05-08T00:00:00Z",
-            updatedAt: "2026-05-08T00:00:00Z",
+            lastStatusActor: "human",
+            kind: "revision",
             parentTaskId: parentID,
             revisionSeq: 1
         )
-        tasksByProjectID[projectID, default: []].append(revision)
     }
 
     /// Inject (or replace) a task on the fixture's first project.
@@ -625,7 +610,10 @@ extension ChatViewModel {
         id: String,
         name: String,
         status: String,
-        lastStatusActor: String
+        lastStatusActor: String,
+        kind: String = "task",
+        parentTaskId: String? = nil,
+        revisionSeq: Int? = nil
     ) {
         guard let projectID = projectsByProductID.values.first?.first?.id,
               let productID = projectsByProductID.first?.key
@@ -637,7 +625,7 @@ extension ChatViewModel {
             id: id,
             productID: productID,
             projectID: projectID,
-            kind: "task",
+            kind: kind,
             name: name,
             description: "",
             status: status,
@@ -647,7 +635,9 @@ extension ChatViewModel {
             deletedAt: nil,
             createdAt: "2026-05-08T00:00:00Z",
             updatedAt: "2026-05-08T00:00:00Z",
-            lastStatusActor: lastStatusActor
+            lastStatusActor: lastStatusActor,
+            parentTaskId: parentTaskId,
+            revisionSeq: revisionSeq
         )
         var tasks = tasksByProjectID[projectID] ?? []
         if let existing = tasks.firstIndex(where: { $0.id == id }) {
