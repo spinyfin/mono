@@ -172,8 +172,9 @@ fn mark_ci_remediation_abandoned_no_ops_on_terminal_and_unknown() {
 // ── abandon_active_ci_remediations_for_work_item ────────────────────────────
 
 /// Happy path: every non-terminal (`pending`/`running`) attempt for the work
-/// item flips to `abandoned` with `failure_reason='pr_merged'` in one shot; the
-/// return count matches the number flipped.
+/// item flips to `abandoned` with the caller's `failure_reason` in one shot,
+/// and the returned rows are exactly the ones flipped — the caller needs them
+/// to close the revisions those attempts spawned.
 #[test]
 fn abandon_active_for_work_item_retires_all_non_terminal_attempts() {
     let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
@@ -187,8 +188,19 @@ fn abandon_active_for_work_item_retires_all_non_terminal_attempts() {
         .unwrap()
         .expect("second attempt is running");
 
-    let count = db.abandon_active_ci_remediations_for_work_item(&chore).unwrap();
-    assert_eq!(count, 2, "both the pending and running attempts are retired");
+    let abandoned = db
+        .abandon_active_ci_remediations_for_work_item(&chore, "pr_merged")
+        .unwrap();
+    assert_eq!(abandoned.len(), 2, "both the pending and running attempts are retired");
+    let mut returned: Vec<&str> = abandoned.iter().map(|row| row.id.as_str()).collect();
+    returned.sort_unstable();
+    let mut expected = [pending.as_str(), running.as_str()];
+    expected.sort_unstable();
+    assert_eq!(returned, expected, "every abandoned row must come back to the caller");
+    for row in &abandoned {
+        assert_eq!(row.status, "abandoned");
+        assert_eq!(row.failure_reason.as_deref(), Some("pr_merged"));
+    }
 
     // Both rows are now terminal with the merge reason — re-abandon no-ops.
     for id in [&pending, &running] {
@@ -216,8 +228,13 @@ fn abandon_active_for_work_item_skips_terminal_and_other_work_items() {
     // A sibling work item has a live pending attempt that must survive.
     let sibling = seed_pending_remediation(&db, &product, &other, "sha-scope-2");
 
-    let count = db.abandon_active_ci_remediations_for_work_item(&target).unwrap();
-    assert_eq!(count, 0, "no active attempts on the target → nothing retired");
+    let abandoned = db
+        .abandon_active_ci_remediations_for_work_item(&target, "superseded_by_resolved_ci")
+        .unwrap();
+    assert!(
+        abandoned.is_empty(),
+        "no active attempts on the target → nothing retired"
+    );
 
     // The sibling's attempt is still active: it can be flipped to running.
     let still_active = db

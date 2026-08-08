@@ -1466,6 +1466,141 @@ async fn an_intent_awaiting_resubmit_is_resubmitted_and_returns_to_the_merging_l
     );
 }
 
+// ── Stalled-resubmit backstop ─────────────────────────────────────────────
+
+/// Backdate an intent's `last_trunk_state_at` so the age-bounded backstop can
+/// be exercised without sleeping. `record_trunk_merge_intent_state` always
+/// stamps "now", so the column has to be rewritten directly.
+fn backdate_intent_state(db: &WorkDb, intent_id: &str, seconds_ago: i64) {
+    let then = boss_engine_utils::epoch_time::now_epoch_secs() - seconds_ago;
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE trunk_merge_intents SET last_trunk_state_at = ?2 WHERE id = ?1",
+            rusqlite::params![intent_id, then.to_string()],
+        )
+        .unwrap();
+}
+
+/// Park an intent at a terminal Trunk state whose entry is gone from the
+/// queue — the exact shape a stranded PR ends up in — and run one pass.
+async fn run_pass_over_a_parked_intent(db: &WorkDb, task_id: &str, seconds_ago: i64) -> TrunkSweepOutcome {
+    let intent = db.get_active_trunk_merge_intent(task_id).unwrap().unwrap();
+    db.record_trunk_merge_intent_state(&intent.id, "failed").unwrap();
+    backdate_intent_state(db, &intent.id, seconds_ago);
+
+    let api = StubTrunkApi::with_queue(vec![Ok(queue_of(TrunkQueueState::Running, Vec::new()))]);
+    let publisher = RecordingPublisher::default();
+    let mut probe = probe();
+    let ctx = TrunkSweepContext {
+        work_db: db,
+        publisher: &publisher,
+        api: &api,
+    };
+    probe.run_pass(&ctx, Instant::now()).await
+}
+
+/// The cause-agnostic backstop: an intent sitting out of the queue in a
+/// terminal state, with no in-flight remediation, past the age bound, must
+/// raise an attention item.
+///
+/// This is what would have caught the 50 h 23 m strand regardless of which
+/// bug produced it — the poller's `already_resolved_terminal` arm is where a
+/// stranded intent lands forever, silently, and silence was the real defect.
+#[tokio::test]
+async fn a_terminal_intent_with_no_remediation_raises_an_attention_item_once_aged_out() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "stalled-resubmit", 1148);
+
+    let outcome = run_pass_over_a_parked_intent(&db, &task_id, STALLED_RESUBMIT_ATTENTION_AFTER_SECS + 60).await;
+
+    assert_eq!(outcome.attentions_filed, 1);
+    assert!(
+        attention_kinds(&db, &task_id).contains(&TRUNK_QUEUE_RESUBMIT_STALLED_ATTENTION_KIND.to_owned()),
+        "a stranded intent must reach a human: {:?}",
+        attention_kinds(&db, &task_id),
+    );
+}
+
+/// The same shape, but only just evicted: nothing is filed. Otherwise every
+/// ordinary eviction would raise an item before its fix revision had a chance
+/// to run.
+#[tokio::test]
+async fn a_freshly_terminal_intent_does_not_raise_the_stalled_backstop() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "fresh-eviction", 1149);
+
+    let outcome = run_pass_over_a_parked_intent(&db, &task_id, 60).await;
+
+    assert_eq!(outcome.attentions_filed, 0);
+    assert!(attention_kinds(&db, &task_id).is_empty());
+}
+
+/// An aged-out intent WITH a live `ci_remediations` row is being worked on —
+/// the normal remediation cycle keeps such a row `pending` for its whole
+/// duration — so the backstop must stay quiet. This is the guard that keeps
+/// it from firing on slow-but-healthy fixes.
+#[tokio::test]
+async fn an_in_flight_remediation_suppresses_the_stalled_backstop() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (product_id, task_id) = seed_intent(&db, "stall-with-fix", 1150);
+    db.insert_ci_remediation(crate::work::CiRemediationInsertInput {
+        product_id,
+        work_item_id: task_id.clone(),
+        pr_url: pr_url(1150),
+        pr_number: 1150,
+        head_branch: "feature".to_owned(),
+        head_sha_at_trigger: "trunk:e1@2026-07-27T23:07:13.000Z".to_owned(),
+        attempt_kind: "fix".to_owned(),
+        consumes_budget: 1,
+        failed_checks: "[]".to_owned(),
+        failure_kind: "trunk_queue_eviction".to_owned(),
+        before_commit_sha: None,
+    })
+    .unwrap()
+    .expect("fresh attempt row");
+
+    let outcome = run_pass_over_a_parked_intent(&db, &task_id, STALLED_RESUBMIT_ATTENTION_AFTER_SECS + 60).await;
+
+    assert_eq!(outcome.attentions_filed, 0);
+    assert!(attention_kinds(&db, &task_id).is_empty());
+}
+
+/// The poller runs every 15-30 seconds; a stalled intent must not accumulate
+/// one attention item per pass. `upsert_work_item_attention` folds onto the
+/// open row of the same kind.
+#[tokio::test]
+async fn the_stalled_backstop_files_one_item_not_one_per_sweep() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "stall-dedupe", 1151);
+    let intent = db.get_active_trunk_merge_intent(&task_id).unwrap().unwrap();
+    db.record_trunk_merge_intent_state(&intent.id, "failed").unwrap();
+    backdate_intent_state(&db, &intent.id, STALLED_RESUBMIT_ATTENTION_AFTER_SECS + 60);
+
+    let api = StubTrunkApi::with_queue(vec![
+        Ok(queue_of(TrunkQueueState::Running, Vec::new())),
+        Ok(queue_of(TrunkQueueState::Running, Vec::new())),
+        Ok(queue_of(TrunkQueueState::Running, Vec::new())),
+    ]);
+    let publisher = RecordingPublisher::default();
+    let mut probe = probe();
+    let ctx = TrunkSweepContext {
+        work_db: &db,
+        publisher: &publisher,
+        api: &api,
+    };
+    let t0 = Instant::now();
+    probe.run_pass(&ctx, t0).await;
+    probe.run_pass(&ctx, t0 + Duration::from_secs(31)).await;
+    probe.run_pass(&ctx, t0 + Duration::from_secs(62)).await;
+
+    let filed = attention_kinds(&db, &task_id)
+        .into_iter()
+        .filter(|kind| kind == TRUNK_QUEUE_RESUBMIT_STALLED_ATTENTION_KIND)
+        .count();
+    assert_eq!(filed, 1, "repeated sweeps must fold onto the one open item");
+}
+
 #[tokio::test]
 async fn a_failed_resubmit_leaves_the_sentinel_for_the_next_cycle() {
     let (_tmp, db) = crate::test_support::open_db();

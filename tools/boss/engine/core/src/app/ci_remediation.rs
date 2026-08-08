@@ -110,6 +110,75 @@ pub(super) async fn handle_mark_ci_remediation_retriggered(ctx: Dispatch, req: F
         // never exist (the stuck-loop bug). The merge-poller still observes
         // the re-run's outcome on its next sweep and clears the signal when
         // CI goes green.
+        //
+        // That last sentence is precisely what does NOT hold for a queue-side
+        // failure, which is why this verb refuses one — see the guard below.
+
+        // A queue-side failure (GitHub merge-queue rebounce or a Trunk queue
+        // eviction) is not retriggerable through this verb, and accepting it
+        // is what stranded a real PR out of the Trunk queue for 50 hours:
+        // `mark_ci_remediation_retriggered` is a TERMINAL transition with no
+        // resubmit path, and the "merge-poller observes the re-run and clears
+        // the signal when CI goes green" premise is structurally false here —
+        // the PR's own head CI is green *by definition* for a queue-side
+        // failure (the failure lived on a synthetic/ephemeral commit), so
+        // there is no red-to-green transition left for the poller to observe.
+        // The attempt retires terminal, the trunk intent stays parked at
+        // `failed`, no `boss:awaiting_resubmit` sentinel is ever written, and
+        // the card renders "Merging / Testing" forever.
+        //
+        // Refuse loudly, naming the verb that *is* correct — never a silent
+        // no-op. This mirrors the identical `is_queue_side_failure_kind`
+        // guards on the two sibling verbs (`mark-succeeded-via-rebase` and
+        // `mark-noop`); this handler was the one member of the family missing
+        // it.
+        let queue_side = match work_db.get_ci_remediation(&attempt_id) {
+            Ok(Some(attempt)) => crate::ci_watch::is_queue_side_failure_kind(attempt.failure_kind.as_deref())
+                .then(|| (attempt.work_item_id.clone(), attempt.failure_kind.clone())),
+            // Unknown id: fall through to the normal path, which
+            // distinguishes unknown-vs-terminal on its own.
+            Ok(None) => None,
+            // The lookup itself failed. Fall through rather than guess: the
+            // normal path's UPDATE reads the same table and will almost
+            // certainly fail too, surfacing the real error to the worker
+            // instead of a fabricated verdict. Logged so it is never silent.
+            Err(err) => {
+                tracing::warn!(
+                    %attempt_id,
+                    ?err,
+                    "mark_ci_remediation_retriggered: could not read the attempt to check its failure_kind",
+                );
+                None
+            }
+        };
+        if let Some((work_item_id, failure_kind)) = queue_side {
+            tracing::warn!(
+                %attempt_id,
+                %work_item_id,
+                ?failure_kind,
+                "mark_ci_remediation_retriggered: rejected — a queue-side-failure attempt has no retrigger path",
+            );
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::WorkError {
+                    message: format!(
+                        "ci_remediation attempt {attempt_id:?} is a queue-side failure \
+                         ({kind}) and cannot be marked retriggered: its failure lives on a \
+                         synthetic/ephemeral commit the queue assembled, so the PR's own head CI is \
+                         green already and re-running it proves nothing. `mark-retriggered` is \
+                         terminal and would leave the PR permanently out of its merge queue. \
+                         Push a fix onto the PR branch instead — the engine resubmits the PR to the \
+                         queue once this revision comes to rest and head CI is green. If the failure \
+                         is genuinely not fixable from this PR, use \
+                         `boss engine ci mark-failed --attempt-id {attempt_id} --reason <reason>`.",
+                        kind = failure_kind.as_deref().unwrap_or("queue-side"),
+                    ),
+                },
+            );
+            return;
+        }
+
         match work_db.mark_ci_remediation_retriggered(&attempt_id) {
             Ok(Some(attempt)) => {
                 tracing::info!(

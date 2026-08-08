@@ -54,7 +54,9 @@ fn needs_remediation(last_trunk_state: Option<&str>) -> bool {
 ///
 /// `allowed_from` scopes which sub-state this caller is entitled to advance
 /// out of: an eviction episode (`ci_watch::on_ci_resolved`, gated on the
-/// spawned revision reaching `done`) and a conflict episode
+/// spawned revision coming to rest at `in_review`/`done` *and* head CI
+/// reading green — both observable while the PR is still open) and a
+/// conflict episode
 /// (`conflict_watch::on_resolved`, gated on GitHub reporting the PR
 /// mergeable again) can both be live on the same work item at once — see
 /// `on_conflict_detected`'s takeover of a `blocked: ci_failure` row — so

@@ -322,18 +322,18 @@ async fn trunk_eviction_block_is_not_cleared_by_head_branch_ci() {
     );
 }
 
-/// Once the spawned revision actually lands (`done`) AND the head-branch CI
-/// probe is clean, `on_ci_resolved` DOES retire a `trunk_queue_eviction`
-/// attempt — and tells the Trunk merge intent it's clear to auto-resubmit
-/// (design §"Eviction: a first-class failure signal", step 4). This is the
-/// one exception to `trunk_eviction_block_is_not_cleared_by_head_branch_ci`.
-#[tokio::test]
-async fn trunk_eviction_block_clears_once_the_revision_lands() {
-    let dir = tempdir().unwrap();
-    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
-    let pr = "https://github.com/foo/bar/pull/1014";
-    let (product, chore) = make_in_review(&db, "C-trunk-evict-lands", pr);
-    let pub_ = Arc::new(RecordingPublisher::default());
+/// Drive one eviction episode to the point where a fix revision exists,
+/// returning `(chore, candidate, attempt, revision_task_id)`. Shared by the
+/// auto-resubmit trigger tests below so each can vary only the revision's
+/// final status.
+async fn evicted_with_a_fix_revision(
+    db: &WorkDb,
+    pub_: &RecordingPublisher,
+    slug: &str,
+    pr: &str,
+    pr_number: i64,
+) -> (String, PendingMergeCheck, boss_protocol::CiRemediation, String) {
+    let (product, chore) = make_in_review(db, slug, pr);
     let cand = candidate(&product, &chore, pr);
 
     let intent = db
@@ -341,7 +341,7 @@ async fn trunk_eviction_block_clears_once_the_revision_lands() {
             crate::work::TrunkMergeIntentInsertInput::builder()
                 .work_item_id(chore.clone())
                 .pr_url(pr)
-                .pr_number(1014)
+                .pr_number(pr_number)
                 .repo("foo/bar")
                 .target_branch("main")
                 .build(),
@@ -353,36 +353,72 @@ async fn trunk_eviction_block_clears_once_the_revision_lands() {
     db.record_trunk_merge_intent_state(&intent.id, "failed").unwrap();
 
     on_trunk_queue_eviction_detected(
-        &db,
-        pub_.as_ref(),
+        db,
+        pub_,
         &cand,
         Some("feature"),
-        "entry-lands",
+        &format!("entry-{slug}"),
         "2026-07-23T08:00:00.000Z",
         &one_failure(),
     )
     .await;
-
-    // Before the revision lands, `on_ci_resolved` must still decline (same
-    // guard as `trunk_eviction_block_is_not_cleared_by_head_branch_ci`).
-    assert!(!on_ci_resolved(&db, pub_.as_ref(), &cand, &[]).await);
 
     let attempt = db
         .active_ci_remediation_for_work_item(&chore)
         .unwrap()
         .expect("active attempt row");
     let revision_id = attempt.revision_task_id.clone().expect("revision spawned");
+    (chore, cand, attempt, revision_id)
+}
+
+fn set_revision_status(db: &WorkDb, revision_id: &str, status: &str) {
     db.update_work_item(
-        &revision_id,
+        revision_id,
         crate::work::WorkItemPatch {
-            status: Some("done".into()),
+            status: Some(status.into()),
             ..crate::work::WorkItemPatch::default()
         },
     )
     .unwrap();
+}
+
+/// Once the spawned revision comes to rest at `in_review` AND the head-branch
+/// CI probe is clean, `on_ci_resolved` DOES retire a `trunk_queue_eviction`
+/// attempt — and tells the Trunk merge intent it's clear to auto-resubmit
+/// (design §"Eviction: a first-class failure signal", step 4). This is the
+/// one exception to `trunk_eviction_block_is_not_cleared_by_head_branch_ci`.
+///
+/// `in_review`, not `done`, is the load-bearing status here: it is the ONLY
+/// terminal a revision on a still-open PR can reach. See
+/// `trunk_eviction_resubmit_does_not_require_the_unreachable_done_status`.
+#[tokio::test]
+async fn trunk_eviction_block_clears_once_the_revision_comes_to_rest() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let (chore, cand, attempt, revision_id) = evicted_with_a_fix_revision(
+        &db,
+        pub_.as_ref(),
+        "C-trunk-evict-lands",
+        "https://github.com/foo/bar/pull/1014",
+        1014,
+    )
+    .await;
+
+    // While the revision is still running, `on_ci_resolved` must decline
+    // (same guard as `trunk_eviction_block_is_not_cleared_by_head_branch_ci`)
+    // — this is what keeps a green head-branch probe from flip-flopping the
+    // episode the moment it is detected.
+    set_revision_status(&db, &revision_id, "active");
+    assert!(!on_ci_resolved(&db, pub_.as_ref(), &cand, &[]).await);
+
+    set_revision_status(&db, &revision_id, "in_review");
 
     let resolved = on_ci_resolved(&db, pub_.as_ref(), &cand, &[]).await;
-    assert!(resolved, "on_ci_resolved must retire once the revision reaches done");
+    assert!(
+        resolved,
+        "on_ci_resolved must retire once the revision comes to rest at in_review"
+    );
 
     assert!(
         !db.active_blocked_signals(&chore)
@@ -399,6 +435,95 @@ async fn trunk_eviction_block_clears_once_the_revision_lands() {
         intent.last_trunk_state.as_deref(),
         Some(crate::trunk_merge::TRUNK_INTENT_AWAITING_RESUBMIT),
         "the intent must be marked ready for the poller to auto-resubmit",
+    );
+}
+
+/// Regression guard for the circular dependency that stranded a real PR out
+/// of the Trunk queue for 50 h 23 m.
+///
+/// The auto-resubmit used to require the fix revision to reach `done`. A
+/// revision on an open PR **cannot** reach `done`: every writer of that
+/// status (`flip_in_review_revisions_to_done`,
+/// `WorkerPrCompletionTarget::Done`) fires only once the parent PR merges or
+/// closes — so the resubmit could only fire after the very merge it existed
+/// to cause. The old unit test passed solely because it wrote `status =
+/// 'done'` on the revision directly, manufacturing a state production could
+/// never produce.
+///
+/// This test therefore asserts the *negative*: the trigger must not depend on
+/// `done`. It drives the revision only as far as production can — `in_review`
+/// — and requires the whole chain (attempt retired, signal cleared, resubmit
+/// sentinel written) to complete from there. If someone reinstates a
+/// `done`-only gate, this fails.
+#[tokio::test]
+async fn trunk_eviction_resubmit_does_not_require_the_unreachable_done_status() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let (chore, cand, _attempt, revision_id) = evicted_with_a_fix_revision(
+        &db,
+        pub_.as_ref(),
+        "C-trunk-evict-open-pr",
+        "https://github.com/foo/bar/pull/1015",
+        1015,
+    )
+    .await;
+
+    set_revision_status(&db, &revision_id, "in_review");
+    // The parent chore is still `in_review` — its PR is open and unmerged,
+    // which is precisely the state in which the old gate was unsatisfiable.
+    let parent = db.get_work_item(&chore).unwrap();
+    assert!(
+        matches!(parent, boss_protocol::WorkItem::Chore(ref t) if t.status == boss_protocol::TaskStatus::InReview),
+        "precondition: the parent PR has NOT merged, so the chore is still in_review: {parent:?}",
+    );
+
+    assert!(
+        on_ci_resolved(&db, pub_.as_ref(), &cand, &[]).await,
+        "the resubmit trigger must be satisfiable while the parent PR is still open",
+    );
+    assert_eq!(
+        db.get_active_trunk_merge_intent(&chore)
+            .unwrap()
+            .expect("still active")
+            .last_trunk_state
+            .as_deref(),
+        Some(crate::trunk_merge::TRUNK_INTENT_AWAITING_RESUBMIT),
+    );
+}
+
+/// A revision that was *withdrawn* (archived as moot/superseded) is not
+/// evidence that a fix landed, so it must not trigger a resubmit. The
+/// stalled-resubmit backstop in `trunk_queue_poller` is what surfaces this
+/// to a human instead.
+#[tokio::test]
+async fn trunk_eviction_resubmit_declines_for_an_archived_revision() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let (chore, cand, _attempt, revision_id) = evicted_with_a_fix_revision(
+        &db,
+        pub_.as_ref(),
+        "C-trunk-evict-archived",
+        "https://github.com/foo/bar/pull/1016",
+        1016,
+    )
+    .await;
+
+    set_revision_status(&db, &revision_id, "archived");
+
+    assert!(
+        !on_ci_resolved(&db, pub_.as_ref(), &cand, &[]).await,
+        "a withdrawn revision must not be read as a landed fix",
+    );
+    assert_eq!(
+        db.get_active_trunk_merge_intent(&chore)
+            .unwrap()
+            .expect("still active")
+            .last_trunk_state
+            .as_deref(),
+        Some("failed"),
+        "the intent must stay parked for the backstop to notice",
     );
 }
 

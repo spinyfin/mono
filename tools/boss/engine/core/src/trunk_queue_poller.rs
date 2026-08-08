@@ -206,6 +206,29 @@ pub const TRUNK_QUEUE_ENTRY_CANCELLED_ATTENTION_KIND: &str = "trunk_queue_entry_
 /// failure, which never files an attention item because it has a fix
 /// revision to speak for it.
 pub const TRUNK_QUEUE_MERGE_FAILURE_ATTENTION_KIND: &str = "trunk_queue_merge_failure";
+/// `work_attention_items.kind` for an intent that has been sitting out of
+/// the queue in a terminal Trunk state, with nothing remediating it, for
+/// longer than [`STALLED_RESUBMIT_ATTENTION_AFTER`].
+pub const TRUNK_QUEUE_RESUBMIT_STALLED_ATTENTION_KIND: &str = "trunk_queue_resubmit_stalled";
+
+/// How long an `active` intent may sit at a terminal `last_trunk_state`
+/// (`failed`/`pending_failure`) with **no** in-flight CI remediation before
+/// the operator is told.
+///
+/// This is a cause-agnostic backstop, not a fix for any one bug. The
+/// stranding it exists to catch — a PR out of the Trunk queue, its card
+/// still rendering "Merging", nobody informed — was produced once by a
+/// circular auto-resubmit gate and once by a worker taking a terminal
+/// no-push exit, and there is no reason to believe those are the last two
+/// ways to reach it. Anything that leaves this shape for six hours is a
+/// defect, whatever produced it.
+///
+/// Six hours is deliberately far longer than a healthy remediation cycle
+/// (spawn a revision, push, wait for CI, resubmit — minutes to low hours,
+/// and the whole of it keeps a `pending`/`running` `ci_remediations` row
+/// alive, which suppresses this entirely), and far shorter than the 50 h 23 m
+/// a real PR was stranded for before a human noticed.
+const STALLED_RESUBMIT_ATTENTION_AFTER_SECS: i64 = 6 * 60 * 60;
 
 // ── Transport seam ────────────────────────────────────────────────────────
 
@@ -669,9 +692,9 @@ impl TrunkQueueProbe {
                 }
                 // The eviction/conflict fix landed — `ci_watch::on_ci_resolved`
                 // or `conflict_watch::on_resolved` flipped the sentinel once
-                // the revision reached `done`. Resubmit; a success clears the
-                // sentinel so the arm above picks the entry back up on the
-                // next `getQueue` response.
+                // the revision came to rest and the PR read healthy again.
+                // Resubmit; a success clears the sentinel so the arm above
+                // picks the entry back up on the next `getQueue` response.
                 None if is_awaiting_resubmit(member) => {
                     resubmit_intent(ctx, member, &repo_ref, &key.target_branch, outcome).await;
                     None
@@ -683,7 +706,16 @@ impl TrunkQueueProbe {
                 // `enqueuedPullRequests` — where the arm above picks it up
                 // — so re-asking every cycle would buy nothing and never
                 // stop.
-                None if already_resolved_terminal(member) => None,
+                //
+                // This is also the arm a stranded intent lands in forever,
+                // silently, which is why the age-bounded backstop lives
+                // here: this is the exact point at which the poller decides
+                // there is nothing to do, and "nothing to do" past a bound
+                // with nothing remediating is the shape of a stall.
+                None if already_resolved_terminal(member) => {
+                    maybe_file_stalled_resubmit_attention(ctx, member, outcome).await;
+                    None
+                }
                 None => {
                     resolve_missing_entry(ctx, evidence.as_ref(), member, &repo_ref, &key.target_branch, outcome).await
                 }
@@ -1793,6 +1825,23 @@ async fn handle_trunk_queue_eviction(
             {
                 outcome.evictions_detected += 1;
             }
+            // Design §"Failure surfacing" / :221: an evicted card leaves the
+            // Merging lane. `on_trunk_queue_eviction_detected` clears the
+            // columns itself on a freshly-inserted attempt, but it has exits
+            // that clear nothing — most importantly its refusal to flip a
+            // Trunk episode carrying no failing checks — and on those the card
+            // would keep rendering a "queued"/"Testing" badge for a PR that is
+            // provably out of the queue. `preserve_merge_queue_state` means no
+            // later GitHub sweep would ever correct it.
+            //
+            // Unconditional, and single-shot because `apply_resolved_state`
+            // only routes here once per episode: after the call above it is a
+            // same-value no-op via `set_task_merge_queue_state`'s change
+            // guard, so it costs one guarded UPDATE and publishes nothing.
+            // This also makes all three `TrunkEvictionCause` arms agree that an
+            // eviction snaps the card back, rather than one of them relying on
+            // a downstream side effect for it.
+            snap_card_back_to_review(ctx, member, "trunk_queue_eviction", outcome).await;
         }
         TrunkEvictionCause::HeadConflict { evidence } => {
             hand_eviction_to_conflict_lane(ctx, member, &evidence, outcome).await;
@@ -1820,7 +1869,7 @@ async fn handle_trunk_queue_eviction(
 /// `mark_trunk_intent_awaiting_resubmit(&[SUPERSEDED_BY_CONFLICT])` cannot fire
 /// either, because the intent is still sitting at `failed`. Only
 /// `ci_watch::on_ci_resolved` can advance a `failed` intent, and that is gated
-/// on a CI revision reaching `done` — which will never happen now that no CI
+/// on a CI-fix revision concluding — which will never happen now that no CI
 /// revision is spawned. So writing the sentinel here is what keeps the PR's
 /// resubmit reachable: without it the conflict would be resolved and the PR
 /// would never re-enter the queue.
@@ -1946,6 +1995,110 @@ async fn retire_eviction_with_no_remediation(
         outcome,
     )
     .await;
+}
+
+/// Age-bounded backstop: tell a human when an intent has been out of the
+/// queue in a terminal Trunk state for longer than
+/// [`STALLED_RESUBMIT_ATTENTION_AFTER_SECS`] with nothing remediating it.
+///
+/// The three conditions are deliberately narrow, so a healthy remediation
+/// cycle never trips this:
+///
+/// 1. The intent is `active` with a terminal `last_trunk_state` — the caller
+///    already established this via [`already_resolved_terminal`].
+/// 2. No `ci_remediations` row for the work item is `pending`/`running`. The
+///    whole normal cycle (revision spawned → worker pushes → CI runs →
+///    `on_ci_resolved` retires the attempt and writes the resubmit sentinel)
+///    keeps such a row alive, so an in-flight fix suppresses this outright.
+///    An attempt that reached a *terminal* status without the intent leaving
+///    the terminal state is precisely the stranded shape.
+/// 3. That state was recorded more than the threshold ago.
+///
+/// Filed through [`WorkDb::upsert_work_item_attention`], which folds onto
+/// the existing open item of the same kind — so a stalled intent produces
+/// one attention item, not one per 30-second sweep.
+///
+/// Best-effort throughout: a lookup failure declines to file rather than
+/// filing on incomplete evidence, and an unparseable/absent
+/// `last_trunk_state_at` likewise declines (an intent whose state timestamp
+/// we cannot read has no measurable age; the next `record_trunk_merge_intent_state`
+/// write repairs it). This never treats an unreadable value as healthy *or*
+/// as stalled — it just doesn't answer.
+async fn maybe_file_stalled_resubmit_attention(
+    ctx: &TrunkSweepContext<'_>,
+    member: &ActiveTrunkMergeIntent,
+    outcome: &mut TrunkSweepOutcome,
+) {
+    let work_item_id = &member.intent.work_item_id;
+    match ctx.work_db.active_ci_remediation_for_work_item(work_item_id) {
+        // A fix is in flight — the normal path, and by far the common one.
+        Ok(Some(_)) => return,
+        Ok(None) => {}
+        Err(err) => {
+            tracing::warn!(
+                work_item_id,
+                ?err,
+                "trunk queue poller: could not check for an in-flight remediation; \
+                 not filing a stalled-resubmit item on incomplete evidence",
+            );
+            return;
+        }
+    }
+    let Some(state_at) = member
+        .intent
+        .last_trunk_state_at
+        .as_deref()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+    else {
+        tracing::debug!(
+            work_item_id,
+            last_trunk_state_at = ?member.intent.last_trunk_state_at,
+            "trunk queue poller: intent has no readable last_trunk_state_at; cannot age the stall",
+        );
+        return;
+    };
+    let age_secs = boss_engine_utils::epoch_time::now_epoch_secs().saturating_sub(state_at);
+    if age_secs < STALLED_RESUBMIT_ATTENTION_AFTER_SECS {
+        return;
+    }
+
+    let state = member.intent.last_trunk_state.as_deref().unwrap_or("failed");
+    let hours = age_secs / 3600;
+    let title = format!("PR has been out of the Trunk merge queue for {hours}h with nothing fixing it");
+    let body = format!(
+        "{pr} left the Trunk merge queue as `{state}` **{hours} hours ago**, and Boss has had no \
+         in-flight CI remediation for it since. Nothing is going to resubmit it on its own.\n\n\
+         Boss auto-resubmits an evicted PR once its CI-fix revision comes to rest and the PR's head \
+         CI reads green. Reaching this state means that never happened — the revision was never \
+         spawned, was withdrawn, or ended without pushing a commit — so the queue slot is simply \
+         gone and the card is no longer moving.\n\n\
+         What to check: whether the PR needs a fix pushed at all, and whether its CI-fix revision \
+         (if one exists) got as far as a commit. Once the PR is genuinely ready, click Merge again \
+         to resubmit it to the queue.",
+        pr = member.intent.pr_url,
+    );
+    match ctx.work_db.upsert_work_item_attention(
+        work_item_id,
+        TRUNK_QUEUE_RESUBMIT_STALLED_ATTENTION_KIND,
+        &title,
+        &body,
+    ) {
+        Ok(_) => {
+            outcome.attentions_filed += 1;
+            tracing::warn!(
+                work_item_id,
+                pr_url = %member.intent.pr_url,
+                state,
+                age_secs,
+                "trunk queue poller: intent stranded out of the queue with no remediation; operator told",
+            );
+        }
+        Err(err) => tracing::warn!(
+            work_item_id,
+            ?err,
+            "trunk queue poller: failed to file the stalled-resubmit attention item",
+        ),
+    }
 }
 
 /// Clear the Merging-lane columns so a card whose queue entry is definitively

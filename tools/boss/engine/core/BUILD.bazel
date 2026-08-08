@@ -300,6 +300,7 @@ rust_test(
     srcs = [
         "tests/common/mod.rs",
         "tests/control_verbs.rs",
+        "tests/control_verbs/remediation_verbs.rs",
     ],
     crate_root = "tests/control_verbs.rs",
     edition = "2024",
