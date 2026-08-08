@@ -136,12 +136,25 @@ extension ChatViewModel {
     /// frontier — the set of reachable, unblocked, open prerequisites —
     /// and publishes them so every frontier card gets a transient
     /// highlight. On leave (`nil`), clears the set.
+    ///
+    /// **The write is equality-gated, and that is load-bearing.** This
+    /// is a hit-test callback: SwiftUI re-runs hover delivery at the end
+    /// of every graph update whose layout moved anything under the
+    /// pointer (`Update.dispatchActions()` →
+    /// `EventBindingManager.enqueueHoverUpdateIfNeeded()`). An
+    /// unconditional assignment to a `@Published` fires
+    /// `objectWillChange` even when the value is identical, and
+    /// `WorkBoardSectionItemsView` observes the whole `ChatViewModel`
+    /// and reads this set — so one no-op hover tick re-evaluated the
+    /// column, rebuilt every card's `WorkCardSnapshot`, and re-applied
+    /// the entire `LazyVStack` list, which invalidated the responder
+    /// tree and enqueued the next hover update. That is a closed
+    /// re-entrant loop with no fixed point; see
+    /// `tools/boss/docs/investigations/work-board-layout-livelock-2026-08-07.md`.
     func setDepBadgeHover(_ taskID: String?) {
-        guard let taskID else {
-            depFrontierHighlightIDs = []
-            return
-        }
-        depFrontierHighlightIDs = actionablePrereqFrontier(for: taskID)
+        let next: Set<String> = taskID.map { actionablePrereqFrontier(for: $0) } ?? []
+        guard next != depFrontierHighlightIDs else { return }
+        depFrontierHighlightIDs = next
     }
 
     /// Walk `parentTaskId` links from `startID` through `kind == "revision"`
@@ -188,12 +201,15 @@ extension ChatViewModel {
     /// whose chain rolls up to `taskID` (see `activeRevisions`) and highlights
     /// them with the same green-border overlay used by the dep frontier. On
     /// leave (`nil`), clears.
+    ///
+    /// Equality-gated for the same reason as `setDepBadgeHover` above —
+    /// this runs on the hover hit-test path, and a redundant
+    /// `objectWillChange` here re-lays-out the whole column.
     func setRevisionBadgeHover(_ taskID: String?) {
-        guard let taskID else {
-            revisionHighlightIDs = []
-            return
-        }
-        revisionHighlightIDs = Set(activeRevisions(forParentID: taskID).map(\.id))
+        let next: Set<String> = taskID
+            .map { Set(activeRevisions(forParentID: $0).map(\.id)) } ?? []
+        guard next != revisionHighlightIDs else { return }
+        revisionHighlightIDs = next
     }
 
     /// The revision task the "In revision" badge should reveal when tapped:
