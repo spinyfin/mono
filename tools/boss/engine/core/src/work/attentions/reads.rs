@@ -70,11 +70,13 @@ impl WorkDb {
 
 pub(in crate::work) fn list_items(conn: &Connection, work_item_id: &str) -> Result<Vec<WorkAttentionItem>> {
     let mut stmt = conn.prepare(
-            "SELECT id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at, converted_task_id
-             FROM work_attention_items
-             WHERE work_item_id = ?1
-             ORDER BY created_at ASC, id ASC",
-        )?;
+        "SELECT a.id, a.execution_id, a.work_item_id, a.kind, a.status, a.title, a.body_markdown,
+                a.created_at, a.resolved_at, a.converted_task_id
+         FROM work_attention_items a
+         WHERE a.work_item_id = ?1
+            OR a.execution_id IN (SELECT e.id FROM work_executions e WHERE e.work_item_id = ?1)
+         ORDER BY a.created_at ASC, a.id ASC",
+    )?;
     let rows = stmt.query_map([work_item_id], map_attention_item)?;
     collect_rows(rows)
 }
