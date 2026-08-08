@@ -1835,9 +1835,9 @@ async fn pane_spawn_precondition_failure_reaches_all_three_operator_surfaces() {
 
     // ── Surface 1: the work item's own attention list ───────────────────
     // This is `ListAttentionItemsForWorkItem` — `boss chore show` /
-    // `boss task show --json` and the macOS Attention surface. Before the
-    // fix it returned nothing at all for this failure class, because
-    // `finish_execution_run` files execution-scoped rows by contract.
+    // `boss task show --json`. Before the fix it returned nothing at all
+    // for this failure class, because `finish_execution_run` files
+    // execution-scoped rows by contract.
     let items = db.list_attention_items_for_work_item(&chore.id).unwrap();
     let spawn_item = items
         .iter()
