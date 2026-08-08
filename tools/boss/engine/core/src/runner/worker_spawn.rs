@@ -10,8 +10,10 @@ use boss_gh_telemetry::{callers, scope as gh_scope};
 use crate::coordinator::pool_dispatch_policy_for_worker_id;
 use crate::effort::{SpawnConfig, SpawnResolutionInput, resolve_spawn_config_in};
 use crate::structured_output::StructuredOutputKind;
-use crate::work::{REASON_ALLOCATION, REASON_LEGACY_PERCENTAGE, WorkDb, WorkExecution, WorkItem};
-use boss_protocol::ExecutionKind;
+use crate::work::{
+    REASON_ALLOCATION, REASON_LEGACY_PERCENTAGE, WorkDb, WorkExecution, WorkItem, driver_clears_dispatch_gate,
+};
+use boss_protocol::{ExecutionKind, TaskKind};
 
 use super::prompt::{
     ExecutionPromptParams, compose_answer_agent_prompt, compose_execution_prompt, render_merge_order_preservation_lines,
@@ -192,19 +194,66 @@ async fn fetch_pr_diff(pr_url: &str) -> Option<String> {
         .ok()
 }
 
-/// The task-driver value fed into `resolve_spawn_config`'s driver-resolution
-/// step for this spawn. Review/automation-pool workers dispatch on
-/// `pool_policy`'s fixed driver unconditionally — ignoring `row_driver`
-/// entirely, so the driver of the row under review/automation never leaks
-/// into who reviews/automates it (see
-/// [`crate::coordinator::pool_dispatch_policy_for_worker_id`]'s doc comment).
-/// Main-pool workers (`pool_policy = None`) fall through to `row_driver` (or
-/// `None`, letting `resolve_spawn_config` fall through to the
-/// product/engine default) exactly as before.
+/// Drop a live task/product driver pin that cannot clear the capability gate
+/// for `(task_kind, execution_kind)`, returning the next-precedence pin (or
+/// `None`) so spawn falls through to allocation / the engine default.
 ///
-/// A separate, standalone function for the same reason as
-/// [`check_model_driver_compatibility`]: testable without the full async
-/// prompt-composition machinery.
+/// Same substitution shape the review/automation pool pin already uses:
+/// a source that cannot honour the dispatch is dropped rather than hard-
+/// failing the worker. Without this, a product whose `default_driver` is
+/// codex/grok (or a row with an explicit `--driver` pin) would refuse to
+/// spawn `ConflictResolution` / `CiRemediation` workers at the capability
+/// gate — those kinds require `CommandOutcomeObservation`, which only
+/// claude declares today.
+///
+/// Logs each substitution so an operator can see their pin was not
+/// honoured for that one execution.
+fn yield_pins_that_fail_capability_gate<'a>(
+    execution_id: &str,
+    execution_kind: &ExecutionKind,
+    task_kind: Option<&TaskKind>,
+    task_driver: Option<&'a str>,
+    product_default_driver: Option<&'a str>,
+) -> (Option<&'a str>, Option<&'a str>) {
+    let Some(task_kind) = task_kind else {
+        return (task_driver, product_default_driver);
+    };
+    let task_driver = match task_driver.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(pin) if !driver_clears_dispatch_gate(pin, task_kind, execution_kind) => {
+            tracing::info!(
+                execution_id = %execution_id,
+                execution_kind = %execution_kind,
+                pinned_driver = %pin,
+                pin_source = "tasks.driver",
+                "dropping driver pin that fails the capability gate for this execution kind; \
+                 falling through to product/allocation/engine default",
+            );
+            None
+        }
+        other => other,
+    };
+    // Product pin only matters when the task pin is absent (or just yielded).
+    let product_default_driver = if task_driver.is_some() {
+        product_default_driver
+    } else {
+        match product_default_driver.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(pin) if !driver_clears_dispatch_gate(pin, task_kind, execution_kind) => {
+                tracing::info!(
+                    execution_id = %execution_id,
+                    execution_kind = %execution_kind,
+                    pinned_driver = %pin,
+                    pin_source = "products.default_driver",
+                    "dropping product default driver that fails the capability gate for this \
+                     execution kind; falling through to allocation/engine default",
+                );
+                None
+            }
+            other => other,
+        }
+    };
+    (task_driver, product_default_driver)
+}
+
 /// Model/driver compatibility gate. Returns an error naming both the driver
 /// and the model when `model` is not one `driver_descriptor`'s
 /// [`crate::driver::ModelMenu::model_belongs_to_driver`] recognises as
@@ -656,13 +705,28 @@ pub(crate) async fn compose_worker_spawn(
     // `pool_dispatch_policy_for_worker_id`'s doc comment. `None` for
     // main-pool workers, which dispatch on the row's own `driver` column.
     let pool_policy = pool_dispatch_policy_for_worker_id(worker_id);
+    // Main-pool only: a live pin that the capability gate will refuse for
+    // this execution kind yields to allocation / the engine default rather
+    // than hard-failing `compose_worker_spawn`. Pool workers already ignore
+    // row pins via `pool_policy_driver`, so they skip this yield.
+    let (effective_task_driver, effective_product_default_driver) = if pool_policy.is_some() {
+        (row_driver.as_deref(), product_default_driver.as_deref())
+    } else {
+        yield_pins_that_fail_capability_gate(
+            &execution.id,
+            &execution.kind,
+            work_item_kind,
+            row_driver.as_deref(),
+            product_default_driver.as_deref(),
+        )
+    };
     let spawn_input = SpawnResolutionInput::builder()
         .maybe_effort_level(row_effort)
         .maybe_model_override(row_model_override.as_deref())
         .maybe_pool_model_override(pool_policy.map(|p| p.model_tier))
         .maybe_product_default_model(product_default_model.as_deref())
-        .maybe_task_driver(row_driver.as_deref())
-        .maybe_product_default_driver(product_default_driver.as_deref())
+        .maybe_task_driver(effective_task_driver)
+        .maybe_product_default_driver(effective_product_default_driver)
         .maybe_pool_policy_driver(pool_policy.map(|policy| policy.driver))
         .maybe_allocated_driver(allocated_driver.as_deref())
         .maybe_kind(work_item_kind)
@@ -1129,5 +1193,160 @@ mod compose_worker_spawn_tests {
             composed.spawn_config.driver, "codex",
             "product's default_driver must not apply to a Product-scoped execution"
         );
+    }
+
+    fn conflict_resolution_execution(work_item_id: &str) -> WorkExecution {
+        WorkExecution::builder()
+            .id("exec_conflict_01")
+            .work_item_id(work_item_id)
+            .kind(ExecutionKind::ConflictResolution)
+            .status(ExecutionStatus::Running)
+            .repo_remote_url("git@github.com:org/repo.git")
+            .workspace_path("/tmp/workspace")
+            .created_at("2026-05-15T00:00:00Z")
+            .build()
+    }
+
+    fn chore_with_driver(task_id: &str, driver: Option<&str>, product_id: &str) -> WorkItem {
+        let mut task = Task::builder()
+            .id(task_id)
+            .product_id(product_id)
+            .kind(TaskKind::Chore)
+            .name("Resolve merge conflict")
+            .description("Conflict-resolution chore.")
+            .status(TaskStatus::Todo)
+            .created_at("2026-05-15T00:00:00Z")
+            .updated_at("2026-05-15T00:00:00Z")
+            .autostart(false)
+            .build();
+        task.driver = driver.map(str::to_owned);
+        WorkItem::Chore(task)
+    }
+
+    /// A codex task pin must not hard-fail ConflictResolution spawn: the pin
+    /// yields to the engine default (claude), which clears the capability gate.
+    #[tokio::test]
+    async fn conflict_resolution_with_codex_task_pin_spawns_on_claude() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        let execution = conflict_resolution_execution("task-conflict-1");
+        let work_item = chore_with_driver("task-conflict-1", Some("codex"), "prod-1");
+
+        let composed = compose_worker_spawn(
+            &db,
+            "worker-1",
+            &execution,
+            &work_item,
+            workspace.path(),
+            None,
+            WorkerSpawnOpts::default(),
+        )
+        .await
+        .expect("codex pin must yield, not fail the capability gate");
+
+        assert_eq!(
+            composed.spawn_config.driver, "claude",
+            "ConflictResolution must spawn on claude when the codex pin fails the gate",
+        );
+    }
+
+    /// Same yield via `products.default_driver = codex` — the documented way
+    /// to run a whole product on a non-default driver.
+    #[tokio::test]
+    async fn conflict_resolution_with_codex_product_pin_spawns_on_claude() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        let product = db
+            .create_product(
+                crate::work::CreateProductInput::builder()
+                    .name("Codex Product")
+                    .repo_remote_url("git@github.com:org/codex-product.git")
+                    .build(),
+            )
+            .unwrap();
+        db.update_product(
+            &product.id,
+            crate::work::WorkItemPatch::builder().default_driver("codex").build(),
+        )
+        .unwrap();
+
+        let execution = conflict_resolution_execution("task-conflict-prod");
+        let work_item = chore_with_driver("task-conflict-prod", None, &product.id);
+
+        let composed = compose_worker_spawn(
+            &db,
+            "worker-1",
+            &execution,
+            &work_item,
+            workspace.path(),
+            None,
+            WorkerSpawnOpts::default(),
+        )
+        .await
+        .expect("product codex pin must yield, not fail the capability gate");
+
+        assert_eq!(
+            composed.spawn_config.driver, "claude",
+            "ConflictResolution must spawn on claude when the product codex pin fails the gate",
+        );
+    }
+
+    /// CiRemediation shares the CommandOutcomeObservation gate with
+    /// ConflictResolution — a codex pin must yield there too.
+    #[tokio::test]
+    async fn ci_remediation_with_codex_task_pin_spawns_on_claude() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        let execution = WorkExecution::builder()
+            .id("exec_ci_01")
+            .work_item_id("task-ci-1")
+            .kind(ExecutionKind::CiRemediation)
+            .status(ExecutionStatus::Running)
+            .repo_remote_url("git@github.com:org/repo.git")
+            .workspace_path("/tmp/workspace")
+            .created_at("2026-05-15T00:00:00Z")
+            .build();
+        let work_item = chore_with_driver("task-ci-1", Some("codex"), "prod-1");
+
+        let composed = compose_worker_spawn(
+            &db,
+            "worker-1",
+            &execution,
+            &work_item,
+            workspace.path(),
+            None,
+            WorkerSpawnOpts::default(),
+        )
+        .await
+        .expect("codex pin must yield for CiRemediation");
+
+        assert_eq!(composed.spawn_config.driver, "claude");
+    }
+
+    /// Unit coverage for the yield helper itself: a pin that clears the gate
+    /// is preserved; one that does not is dropped.
+    #[test]
+    fn yield_pins_helper_drops_codex_for_conflict_resolution_keeps_it_for_chore() {
+        let (task, product) = yield_pins_that_fail_capability_gate(
+            "exec_x",
+            &ExecutionKind::ConflictResolution,
+            Some(&TaskKind::Chore),
+            Some("codex"),
+            Some("codex"),
+        );
+        assert_eq!(task, None);
+        assert_eq!(product, None);
+
+        let (task, product) = yield_pins_that_fail_capability_gate(
+            "exec_y",
+            &ExecutionKind::ChoreImplementation,
+            Some(&TaskKind::Chore),
+            Some("codex"),
+            Some("grok"),
+        );
+        assert_eq!(task, Some("codex"));
+        // Task pin is present, so product pin is left as-is for the resolver
+        // (which will not consult it).
+        assert_eq!(product, Some("grok"));
     }
 }

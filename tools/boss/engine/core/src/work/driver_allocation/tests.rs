@@ -294,6 +294,129 @@ fn conflict_resolution_and_ci_remediation_stay_on_claude_regardless_of_the_split
     }
 }
 
+/// A live `tasks.driver = codex` pin must yield for ConflictResolution /
+/// CiRemediation rather than record an explicit codex decision the spawn
+/// path would then hard-fail on. Allocation places the row among the
+/// eligible set (claude only) instead.
+#[test]
+fn conflict_resolution_and_ci_remediation_yield_a_codex_task_pin_to_claude() {
+    let (_dir, db) = open_db();
+    // Claude is a minority share so the result cannot be explained by the
+    // split alone: only the capability gate (eligible set = {claude}) can
+    // force the yield. codex=70 would own ordinary unpinned work.
+    db.set_driver_traffic_split(DriverTrafficSplit::new(10, 20, 70))
+        .unwrap();
+    let product = create_test_product(&db);
+    for kind in [ExecutionKind::ConflictResolution, ExecutionKind::CiRemediation] {
+        let chore = create_test_chore(&db, &product.id, format!("{kind} pinned chore"));
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                driver: Some(DRIVER_SLUG_CODEX.to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(kind.clone())
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+        assert_eq!(
+            decision.reason, REASON_ALLOCATION,
+            "{kind}: codex pin must yield to allocation among eligible drivers, not record explicit",
+        );
+        assert_eq!(
+            decision.driver.as_deref(),
+            Some(DRIVER_SLUG_CLAUDE),
+            "{kind}: yielded pin must allocate to claude",
+        );
+        // Spawn-time / events-socket resolver must also refuse to honour the
+        // live pin for this execution kind.
+        assert_eq!(
+            db.get_execution_driver_slug(&execution.id).unwrap().as_deref(),
+            Some(DRIVER_SLUG_CLAUDE),
+            "{kind}: live codex pin must not win at lookup once the gate refuses it",
+        );
+    }
+}
+
+/// Same pin-yield as the task pin, but via `products.default_driver` — the
+/// documented way to run a whole product on a non-default driver.
+#[test]
+fn conflict_resolution_and_ci_remediation_yield_a_codex_product_pin_to_claude() {
+    let (_dir, db) = open_db();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(10, 20, 70))
+        .unwrap();
+    let product = create_test_product(&db);
+    db.update_work_item(
+        &product.id,
+        WorkItemPatch {
+            default_driver: Some(DRIVER_SLUG_CODEX.to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for kind in [ExecutionKind::ConflictResolution, ExecutionKind::CiRemediation] {
+        let chore = create_test_chore(&db, &product.id, format!("{kind} product-pin chore"));
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(kind.clone())
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+        assert_eq!(
+            decision.reason, REASON_ALLOCATION,
+            "{kind}: product codex pin must yield to allocation, not record explicit",
+        );
+        assert_eq!(
+            decision.driver.as_deref(),
+            Some(DRIVER_SLUG_CLAUDE),
+            "{kind}: yielded product pin must allocate to claude",
+        );
+        assert_eq!(
+            db.get_execution_driver_slug(&execution.id).unwrap().as_deref(),
+            Some(DRIVER_SLUG_CLAUDE),
+            "{kind}: live product pin must not win at lookup once the gate refuses it",
+        );
+    }
+}
+
+/// An ordinary chore implementation with a codex pin still honours the pin
+/// — the yield is execution-kind-specific, not a general pin disable.
+#[test]
+fn ordinary_chore_implementation_still_honours_a_codex_task_pin() {
+    let (_dir, db) = open_db();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(100, 0, 0)).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, &product.id, "pinned ordinary chore");
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            driver: Some(DRIVER_SLUG_CODEX.to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let execution = create_ready_chore_execution(&db, &chore.id);
+    let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+    assert_eq!(decision.reason, REASON_EXPLICIT);
+    assert_eq!(decision.driver.as_deref(), Some(DRIVER_SLUG_CODEX));
+    assert_eq!(
+        db.get_execution_driver_slug(&execution.id).unwrap().as_deref(),
+        Some(DRIVER_SLUG_CODEX),
+    );
+}
+
 /// Work that came from an automation runs on the automation pool, which
 /// pins the same driver the review pool does
 /// (`ClaudeCoordinator::execution_targets_automation_pool`). Allocation

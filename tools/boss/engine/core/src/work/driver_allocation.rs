@@ -58,10 +58,15 @@
 //! persisted per-execution in `execution_driver_decisions` (see
 //! [`record_execution_driver_decision`]).
 //!
-//! An explicit driver pin always wins over allocation: the work item's own
-//! `driver` column first, then its product's `default_driver`. Allocation
-//! only decides rows that expressed no preference at either level — which is
-//! also what makes the shipped default behaviour-preserving (see
+//! An explicit driver pin wins over allocation when the pin clears the
+//! dispatch capability gate for the execution: the work item's own `driver`
+//! column first, then its product's `default_driver`. A pin of a driver that
+//! the gate refuses for this execution kind (today: codex/grok on
+//! `conflict_resolution` / `ci_remediation`) is dropped so allocation can
+//! place the row among the eligible drivers — otherwise the pin would stall
+//! the worker at the spawn-time gate. Allocation only decides rows that
+//! expressed no (honourable) preference at either level — which is also what
+//! makes the shipped default behaviour-preserving for ordinary kinds (see
 //! [`load_driver_traffic_split_conn`]).
 //!
 //! [`WorkDb::get_execution_driver_decision`] is the read side both real
@@ -340,17 +345,42 @@ struct AllocationRow {
     product_default_driver: Option<String>,
 }
 
+/// Whether `driver_slug` clears [`crate::driver::CapabilityResolver::check_dispatch`]
+/// for `(task_kind, execution_kind)`.
+///
+/// Unregistered slugs return `true` so the existing `UnknownDriver` failure
+/// path still owns them — this helper only yields pins for *known* drivers
+/// that the gate refuses (e.g. codex/grok on `ConflictResolution`). Used by
+/// allocation, spawn composition, and the events-socket driver lookup so a
+/// pin the gate will refuse never outranks a runnable substitute.
+pub(crate) fn driver_clears_dispatch_gate(
+    driver_slug: &str,
+    task_kind: &TaskKind,
+    execution_kind: &ExecutionKind,
+) -> bool {
+    let registry = crate::driver::DriverRegistry::default();
+    match registry.resolver(driver_slug) {
+        Some(resolver) => resolver.check_dispatch(task_kind, Some(execution_kind)).is_ok(),
+        None => true,
+    }
+}
+
 /// Decide which driver governs a newly-created execution row and why.
 /// Called once, from `insert_execution`, using the same open `Connection`
 /// (never `WorkDb::connect()` — see `load_driver_traffic_split_conn`).
 ///
 /// Precedence:
-/// 1. The work item's own explicit `driver` column wins.
-/// 2. Otherwise the product's `default_driver` wins. Both of these are an
-///    operator saying "this work goes there"; allocation only decides rows
-///    that expressed no preference. Respecting the product pin is also what
-///    makes the shipped default split byte-for-byte behaviour-preserving —
-///    it is not a new per-product override, it is the existing one.
+/// 1. The work item's own explicit `driver` column wins **when that driver
+///    clears the capability gate for this execution kind**.
+/// 2. Otherwise the product's `default_driver` wins under the same gate
+///    check. Both of these are an operator saying "this work goes there";
+///    allocation only decides rows that expressed no honourable preference.
+///    A pin the gate refuses for this execution (e.g. `tasks.driver =
+///    codex` on `ConflictResolution`) is dropped — not recorded as
+///    `explicit` — so the row can still dispatch on an eligible driver
+///    instead of stalling at the spawn-time gate. Respecting a pin that
+///    *does* clear the gate is also what makes the shipped default split
+///    byte-for-byte behaviour-preserving for ordinary kinds.
 /// 3. Otherwise, if the execution's driver comes from a worker pool rather
 ///    than from its row, allocation declines (no override). Two shapes:
 ///    [`crate::coordinator::kind_always_dispatches_on_pool_driver`] covers
@@ -373,7 +403,11 @@ struct AllocationRow {
 ///    pool pin were removed to make it bite, would undo that independence
 ///    and the reviewer-model choice with it. Reviews participating is a
 ///    change to reviewer dispatch policy — one function, deliberately — not
-///    a change to allocation.
+///    a change to allocation. The events-socket resolver
+///    ([`crate::work::driver_lookup::WorkDb::get_execution_driver_slug`])
+///    mirrors the pool pin for these kinds so a reviewed row's live
+///    `tasks.driver` cannot select the wrong normaliser for the reviewer
+///    worker's hook stream.
 /// 4. Otherwise, place the work item's own id on the split's bucket line,
 ///    renormalised over exactly the drivers eligible for the row's
 ///    [`TaskKind`] ([`eligible_drivers_for`]).
@@ -413,19 +447,43 @@ pub(crate) fn decide_execution_driver(
         // to a comment id) — nothing to route.
         return Ok(DriverDecision::default_no_override());
     };
+    let task_kind_raw = row.task_kind;
+    let task_kind: Result<TaskKind, _> = task_kind_raw.parse();
     let pinned = row
         .explicit_driver
         .filter(|s| !s.trim().is_empty())
         .or_else(|| row.product_default_driver.filter(|s| !s.trim().is_empty()));
     if let Some(driver) = pinned {
-        return Ok(DriverDecision::explicit(driver));
+        // Honour the pin only when it clears the capability gate for this
+        // execution kind. A product default (or `--driver`) of codex/grok
+        // must not stall ConflictResolution / CiRemediation — those kinds
+        // require CommandOutcomeObservation, which only claude declares
+        // today. Drop the pin and fall through to allocation among the
+        // eligible set instead of recording an explicit decision the spawn
+        // path would then hard-fail on.
+        let pin_ok = match &task_kind {
+            Ok(tk) => driver_clears_dispatch_gate(&driver, tk, &kind),
+            // Unrecognised task kind is handled below as a hard error once
+            // we reach allocation; keep the pin so the error surface does
+            // not change for that data-integrity case.
+            Err(_) => true,
+        };
+        if pin_ok {
+            return Ok(DriverDecision::explicit(driver));
+        }
+        tracing::info!(
+            work_item_id = %work_item_id,
+            execution_kind = %kind,
+            pinned_driver = %driver,
+            "dropping driver pin that fails the capability gate for this execution kind; \
+             allocating among eligible drivers instead",
+        );
     }
     let automation_sourced = row.source_automation_id.is_some_and(|id| !id.trim().is_empty());
     if crate::coordinator::kind_always_dispatches_on_pool_driver(&kind) || automation_sourced {
         return Ok(DriverDecision::default_no_override());
     }
-    let task_kind_raw = row.task_kind;
-    let task_kind: TaskKind = task_kind_raw.parse().map_err(|err| {
+    let task_kind: TaskKind = task_kind.map_err(|err| {
         anyhow::anyhow!(
             "driver_traffic_split: work item {work_item_id} has unrecognised kind {task_kind_raw:?} ({err}); \
              refusing to allocate a driver for a kind whose capability requirements this engine cannot resolve",

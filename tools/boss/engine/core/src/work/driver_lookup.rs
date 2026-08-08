@@ -14,14 +14,21 @@ use super::*;
 
 impl WorkDb {
     /// Resolve the driver slug for `execution_id`'s worker, applying the
-    /// same `tasks.driver` → `products.default_driver` →
-    /// [`boss_engine_effort::ENGINE_DEFAULT_DRIVER`] precedence used at
-    /// spawn time ([`boss_engine_effort::resolve_driver`]).
+    /// same precedence used at spawn time:
+    ///
+    /// 1. Pool-bound kinds (`pr_review`, `automation_triage`) →
+    ///    [`crate::coordinator::pool_driver_slug_for_execution_kind`]'s
+    ///    fixed driver (the review/automation pool pin), so a reviewed
+    ///    row's live `tasks.driver` cannot select the wrong normaliser.
+    /// 2. A live pin (`tasks.driver`, then `products.default_driver`) that
+    ///    clears the capability gate for this execution kind.
+    /// 3. A recorded traffic-allocation decision.
+    /// 4. [`boss_engine_effort::ENGINE_DEFAULT_DRIVER`] via
+    ///    [`boss_engine_effort::resolve_driver`].
     ///
     /// Returns `Ok(None)` only when the execution row itself cannot be found,
     /// or when it binds to a work item this cannot resolve a driver for (a
-    /// Product/Project execution, or an `automation_triage` execution whose
-    /// `work_item_id` is an automation id) — the caller then skips rather than
+    /// Product/Project execution) — the caller then skips rather than
     /// guessing a driver. A task whose `product_id` has no matching `products`
     /// row (a data-integrity problem) still resolves via the task's own
     /// `driver` or the engine default — it is not conflated with the
@@ -30,43 +37,76 @@ impl WorkDb {
     /// An `answer_agent` execution binds to a `work_comments.id`, so the
     /// `tasks` join can never match it; see
     /// [`Self::answer_agent_driver_slug`] for how it resolves instead.
+    /// An `automation_triage` execution binds to an automation id; the
+    /// non-task path still returns the pool driver.
     pub fn get_execution_driver_slug(&self, execution_id: &str) -> Result<Option<String>> {
         // Scoped so the pooled connection is released before the non-task-bound
         // fallback below, which re-enters `WorkDb` methods that take the same
         // (non-reentrant) connection lock.
         let binding = {
             let conn = self.connect()?;
-            let row: Option<(Option<String>, Option<String>)> = conn
+            // `e.kind` and `t.kind` are needed up front: pool-bound executions
+            // short-circuit to the pool driver before any row pin can win, and
+            // a pin that fails the capability gate for this execution kind
+            // must yield (same substitution the spawn path applies).
+            let row: Option<(String, String, Option<String>, Option<String>)> = conn
                 .query_row(
-                    "SELECT t.driver, p.default_driver
+                    "SELECT e.kind, t.kind, t.driver, p.default_driver
                        FROM work_executions e
                        JOIN tasks t ON t.id = e.work_item_id
                        LEFT JOIN products p ON p.id = t.product_id
                       WHERE e.id = ?1",
                     [execution_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()?;
-            if let Some((task_driver, product_default_driver)) = row {
+            if let Some((exec_kind_raw, task_kind_raw, task_driver, product_default_driver)) = row {
+                let exec_kind: ExecutionKind = exec_kind_raw.parse().map_err(|err| {
+                    anyhow::anyhow!("execution {execution_id} has unrecognised kind {exec_kind_raw:?}: {err}")
+                })?;
+                // Pool-bound kinds (pr_review, automation_triage) always run
+                // on the pool's fixed driver. The tasks join matches for
+                // pr_review because work_item_id is the producing task — so
+                // without this short-circuit a codex-authored row's live pin
+                // would select the wrong normaliser for the Claude reviewer
+                // worker's hook stream.
+                if let Some(pool_driver) = crate::coordinator::pool_driver_slug_for_execution_kind(&exec_kind) {
+                    return Ok(Some(pool_driver.to_owned()));
+                }
+
                 // Precedence: a LIVE explicit pin (`tasks.driver`, then
-                // `products.default_driver`) → the recorded traffic-allocation
+                // `products.default_driver`) that clears the capability gate
+                // for this execution → the recorded traffic-allocation
                 // decision → the ordinary default resolution.
                 //
                 // The pins are read fresh rather than taken from the recorded
                 // decision on purpose. An operator can pin a driver on a row
                 // after its execution row already exists but before it
-                // dispatches, and that must still win — "an explicit driver on
-                // the row always wins" is about the row, not about the instant
-                // the execution was created. Only the *allocation* is frozen at
-                // insert time (see `work::driver_allocation`), which is what
-                // keeps a row from flipping driver between attempts of one
-                // dispatch and keeps a split change off already-dispatched work.
+                // dispatches, and that must still win when the gate accepts
+                // it — "an explicit driver on the row always wins" is about
+                // the row, not about the instant the execution was created.
+                // Only the *allocation* is frozen at insert time (see
+                // `work::driver_allocation`), which is what keeps a row from
+                // flipping driver between attempts of one dispatch and keeps
+                // a split change off already-dispatched work.
+                //
+                // A pin the gate refuses for this execution kind is dropped
+                // here exactly as at spawn: honouring it would point the
+                // events-socket normaliser at a driver the worker never ran.
+                let task_kind: Option<TaskKind> = task_kind_raw.parse().ok();
                 let pinned = task_driver
                     .as_deref()
                     .filter(|s| !s.trim().is_empty())
                     .or_else(|| product_default_driver.as_deref().filter(|s| !s.trim().is_empty()));
                 if let Some(pinned) = pinned {
-                    return Ok(Some(pinned.to_owned()));
+                    let honour_pin = match &task_kind {
+                        Some(tk) => driver_clears_dispatch_gate(pinned, tk, &exec_kind),
+                        // Unparseable task kind: keep pre-existing pin behaviour.
+                        None => true,
+                    };
+                    if honour_pin {
+                        return Ok(Some(pinned.to_owned()));
+                    }
                 }
                 // Only an `allocation` decision routes. An `explicit` one is an
                 // audit record of a pin that the branch above reads live, so
@@ -77,12 +117,26 @@ impl WorkDb {
                 {
                     return Ok(Some(allocated));
                 }
-                // No pin and no allocation (an ineligible row, or an execution
-                // created before this feature landed and so carrying no
-                // decision row at all) — resolves exactly as it always did.
+                // No honourable pin and no allocation (an ineligible row, a
+                // pin the gate refused, or an execution created before this
+                // feature landed) — resolves through the ordinary default
+                // chain. When a pin was dropped above it is deliberately not
+                // re-fed into `resolve_driver`, which would re-honour it.
+                let honourable_task = task_driver.as_deref().filter(|s| {
+                    !s.trim().is_empty()
+                        && task_kind
+                            .as_ref()
+                            .is_none_or(|tk| driver_clears_dispatch_gate(s, tk, &exec_kind))
+                });
+                let honourable_product = product_default_driver.as_deref().filter(|s| {
+                    !s.trim().is_empty()
+                        && task_kind
+                            .as_ref()
+                            .is_none_or(|tk| driver_clears_dispatch_gate(s, tk, &exec_kind))
+                });
                 return Ok(Some(boss_engine_effort::resolve_driver(
-                    task_driver.as_deref(),
-                    product_default_driver.as_deref(),
+                    honourable_task,
+                    honourable_product,
                 )));
             }
 
@@ -95,12 +149,13 @@ impl WorkDb {
         };
         match kind {
             ExecutionKind::AnswerAgent => Ok(Some(self.answer_agent_driver_slug(&work_item_id))),
-            // `automation_triage` binds to an `automations.id`, which this
-            // cannot resolve a driver for either. Left as-is deliberately:
-            // triage dispatches on the automation pool's FIXED driver
-            // (`coordinator::pool_dispatch_policy_for_worker_id`), not on any
-            // product default, so resolving it correctly is a different fix
-            // from this one.
+            // `automation_triage` binds to an `automations.id`, so the tasks
+            // join above never matches. Its driver is still the automation
+            // pool's fixed pin — return that rather than `None`, which would
+            // drop every hook event the triage worker sends.
+            kind if crate::coordinator::kind_always_dispatches_on_pool_driver(&kind) => {
+                Ok(crate::coordinator::pool_driver_slug_for_execution_kind(&kind).map(str::to_owned))
+            }
             _ => Ok(None),
         }
     }
@@ -337,6 +392,42 @@ mod tests {
         assert_eq!(
             db.get_execution_driver_slug(&execution.id).unwrap(),
             Some(boss_engine_effort::ENGINE_DEFAULT_DRIVER.to_owned()),
+        );
+    }
+
+    /// A `pr_review` execution's `work_item_id` is the producing task, so the
+    /// tasks join matches and used to return that row's live pin — selecting
+    /// the wrong normaliser for the Claude reviewer worker. Pool-bound kinds
+    /// must short-circuit to the pool driver before any row pin wins.
+    #[test]
+    fn pr_review_execution_resolves_the_pool_driver_not_the_reviewed_rows_pin() {
+        use boss_protocol::{CreateExecutionInput, DRIVER_SLUG_CODEX, ExecutionKind, ExecutionStatus};
+
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, &product.id, "reviewed chore");
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                driver: Some(DRIVER_SLUG_CODEX.to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.get_execution_driver_slug(&execution.id).unwrap().as_deref(),
+            Some("claude"),
+            "pr_review must resolve the review-pool driver, not the producing row's codex pin",
         );
     }
 }

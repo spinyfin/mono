@@ -1580,6 +1580,20 @@ pub fn kind_always_dispatches_on_pool_driver(kind: &ExecutionKind) -> bool {
     }
 }
 
+/// Driver slug every execution of a pool-bound [`ExecutionKind`] actually
+/// runs on — the companion of [`kind_always_dispatches_on_pool_driver`] for
+/// callers that have a kind but no worker id (notably
+/// [`crate::work::driver_lookup`]'s events-socket resolver).
+///
+/// Returns [`REVIEWER_POOL_DRIVER`] for `pr_review` / `automation_triage`
+/// and `None` for main-pool kinds. Matches what
+/// [`pool_dispatch_policy_for_worker_id`] returns for a `review-*` /
+/// `auto-worker-*` slot today, so a reviewed row's live `tasks.driver` pin
+/// cannot select the wrong normaliser for the reviewer worker's hook stream.
+pub fn pool_driver_slug_for_execution_kind(kind: &ExecutionKind) -> Option<&'static str> {
+    kind_always_dispatches_on_pool_driver(kind).then_some(REVIEWER_POOL_DRIVER)
+}
+
 /// Derive the canonical worker-id string for a pane slot id.
 /// Inverse of [`slot_id_from_worker_id`]: regular-pool slots
 /// (1..=MAX_WORKER_POOL_SIZE) produce `"worker-{N}"`; automation-pool
