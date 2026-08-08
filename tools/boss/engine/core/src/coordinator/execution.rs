@@ -2147,7 +2147,7 @@ impl ExecutionCoordinator {
                     !matches!(current.status, ExecutionStatus::Ready | ExecutionStatus::Dispatching)
                 });
                 if !readiness_changed {
-                    return Err(record_err);
+                    return Err(record_err.context(format!("while recording pre-start failure for {error:#}")));
                 }
 
                 if matches!(

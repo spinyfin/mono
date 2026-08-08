@@ -43,11 +43,18 @@ impl Drop for DispatchClaimCleanup {
         let worker_id = self.worker_id.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                coordinator
-                    .pool_for_worker_id(&worker_id)
-                    .release_worker(&worker_id, execution.preferred_workspace_id.as_deref())
-                    .await;
-                coordinator.release_dispatch_claim(&execution.id);
+                // Settle the durable claim first: only revert the pool slot
+                // if the claim itself reverted from `dispatching`. If a run
+                // already started (row moved past `dispatching`), the pool
+                // slot is now owned by that live worker and must not be
+                // freed out from under it.
+                let claim_reverted = coordinator.release_dispatch_claim(&execution.id);
+                if claim_reverted {
+                    coordinator
+                        .pool_for_worker_id(&worker_id)
+                        .release_worker(&worker_id, execution.preferred_workspace_id.as_deref())
+                        .await;
+                }
             });
         } else {
             tracing::error!(
@@ -428,9 +435,17 @@ impl ExecutionCoordinator {
         }
     }
 
-    fn release_dispatch_claim(&self, execution_id: &str) {
-        if let Err(err) = self.work_db.release_execution_dispatch(execution_id) {
-            tracing::error!(execution_id, ?err, "failed to release execution dispatch claim",);
+    /// Reverts a `dispatching` row back to `ready`. Returns whether it
+    /// actually reverted — `false` means the row had already moved on (e.g.
+    /// a run already started), which callers use to decide whether the pool
+    /// slot backing that claim is still theirs to release.
+    fn release_dispatch_claim(&self, execution_id: &str) -> bool {
+        match self.work_db.release_execution_dispatch(execution_id) {
+            Ok(reverted) => reverted,
+            Err(err) => {
+                tracing::error!(execution_id, ?err, "failed to release execution dispatch claim",);
+                false
+            }
         }
     }
 
@@ -918,13 +933,15 @@ impl ExecutionCoordinator {
             crate::dispatch_metrics::record_queue_snapshot(&self.metrics, snapshot);
         }
 
-        // Drop rows whose work item a previous drain already handed off. A
-        // dispatched row keeps `status = 'ready'` until its task reaches
-        // `start_execution_run_on_host`, so `list_ready_executions` still
-        // returns it — and drains overlap freely now that the loop no longer
-        // awaits each dispatch: a kick landing mid-pass re-enters the loop
-        // immediately, and the 15s heartbeat spawns a fresh scheduler as soon
-        // as the previous (now fast) one relinquishes `scheduling_active`.
+        // Drop rows whose work item a previous drain already handed off. The
+        // dispatched row itself is now `dispatching` and drops out of
+        // `list_ready_executions`, but a duplicate `ready` row for the SAME
+        // work item is still returned; without this filter a re-drain would
+        // claim a second worker for a work item already being dispatched.
+        // Drains overlap freely now that the loop no longer awaits each
+        // dispatch: a kick landing mid-pass re-enters the loop immediately,
+        // and the 15s heartbeat spawns a fresh scheduler as soon as the
+        // previous (now fast) one relinquishes `scheduling_active`.
         // Without this, such a re-drain would claim a SECOND worker for a row
         // already dispatching and spawn it twice; neither the chain guard nor
         // the double-spawn guard would stop it, because both exclude the

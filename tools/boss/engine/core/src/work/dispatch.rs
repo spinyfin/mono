@@ -756,7 +756,7 @@ impl WorkDb {
                AND NOT EXISTS (
                    SELECT 1 FROM work_executions we
                    WHERE we.work_item_id = t.id
-                    AND we.status IN ('ready', 'dispatching', 'running', 'waiting_human')
+                     AND we.status IN ('ready', 'dispatching', 'running', 'waiting_human')
                )
                AND NOT EXISTS (
                    SELECT 1 FROM work_attention_items a

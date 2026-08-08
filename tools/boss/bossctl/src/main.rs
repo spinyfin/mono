@@ -35,9 +35,9 @@ mod stream_integrity;
 use boss_engine::dispatch_events::DispatchEvent;
 use boss_engine::dispatch_reader;
 use boss_protocol::{
-    FrontendEvent, FrontendRequest, HostedPaneState, HostedPaneStatus, LiveStatusDebugReport, LiveStatusSlotDebug,
-    LiveWorkerState, MetricLiveEntry, ProposalKind, ProposalState, ROSTER, RequestExecutionInput, WorkExecution,
-    WorkItem, WorkRun, WorkerProposal, WorkspacePoolEntry,
+    ExecutionStatus, FrontendEvent, FrontendRequest, HostedPaneState, HostedPaneStatus, LiveStatusDebugReport,
+    LiveStatusSlotDebug, LiveWorkerState, MetricLiveEntry, ProposalKind, ProposalState, ROSTER, RequestExecutionInput,
+    WorkExecution, WorkItem, WorkRun, WorkerProposal, WorkspacePoolEntry,
 };
 use clap::{Parser, Subcommand};
 
