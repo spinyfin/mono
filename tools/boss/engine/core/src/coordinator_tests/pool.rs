@@ -1461,6 +1461,25 @@ async fn force_dispatch_errors_at_hard_cap() {
     );
 }
 
+#[tokio::test]
+async fn force_dispatch_refuses_a_failed_startup_preflight() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db,
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        Arc::new(FakeExecutionRunner::default()),
+    ));
+    coordinator.set_dispatch_preflight_block(Some("tmux 3.2 is required".to_owned()));
+
+    let error = coordinator
+        .force_dispatch("exec-preflight-blocked")
+        .await
+        .expect_err("force dispatch must not bypass a failed tmux preflight");
+    assert!(error.to_string().contains("tmux 3.2 is required"));
+}
+
 /// `force_dispatch`'s original bug: `claim_worker_force`'s pool-growth path
 /// always minted `worker-N` ids bounded by `MAX_WORKER_POOL_SIZE`, no matter
 /// which `WorkerPool` instance it was called on. Pin the fix directly at the
