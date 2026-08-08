@@ -14,7 +14,7 @@ use crate::coordinator::slot_id_from_worker_id;
 use crate::pane_summary;
 use crate::spawn_flow::{StartWorkerInput, TmuxWorkerHost, start_worker};
 use crate::work::{WorkDb, WorkExecution, WorkItem};
-use boss_protocol::{ExecutionKind, ExecutionStatus, WorkItemBinding};
+use boss_protocol::{ExecutionStatus, WorkItemBinding};
 
 use super::prompt::structured_output_env_vars;
 use super::work_item::{work_item_id, work_item_name, work_item_task_kind};
@@ -246,11 +246,11 @@ mod pty_initial_input_tests;
 /// worker pane, and registers the returned shell pid against the
 /// run id so events-socket hook deliveries can correlate.
 ///
-/// Returns `WaitingHuman` immediately on a successful spawn — the
-/// pane stays alive in the app and the workspace lease is retained
-/// until a human or follow-up flow concludes the run. Real lifecycle
-/// (the pane signaling "Stop" → run completes) lands once the
-/// events-socket consumer drives state transitions.
+/// Returns `WorkerPaneAlive` immediately on a successful spawn — the
+/// pane stays alive in the app with its agent working, and the
+/// workspace lease is retained until a follow-up flow concludes the
+/// run. Real lifecycle (the pane signaling "Stop" → run completes)
+/// lands once the events-socket consumer drives state transitions.
 pub struct PaneSpawnRunner {
     cfg: Arc<RuntimeConfig>,
     /// Backing store for the pane-titlebar summary cache. Looked up
@@ -1070,18 +1070,17 @@ impl ExecutionRunner for PaneSpawnRunner {
             }
         }
 
-        // A `pr_review` reviewer pane stays in `running` after spawn so that
-        // the "AI reviewing" kanban badge remains visible while the reviewer
-        // agent is actively working. `waiting_human` is only correct once the
-        // review is done and a human must act; the execution transitions to
-        // `completed` when the Stop hook fires and `finalize_pr_review_pass`
-        // calls `record_worker_pr_completion`. All other execution kinds use
-        // `WaitingHuman` — the normal post-spawn park state.
-        let wait_state = if execution.kind == ExecutionKind::PrReview {
-            RunWaitState::ReviewerPaneAlive
-        } else {
-            RunWaitState::WaitingHuman
-        };
+        // The pane is up and its agent is working, so the execution stays in
+        // `running` — for every kind, not just `pr_review`. Nobody is waiting
+        // for a human at this instant, and writing `waiting_human` here (the
+        // pre-mono#2673 behaviour) put every worker's stored status in direct
+        // contradiction with its own hook stream for the whole run.
+        //
+        // `waiting_human` now has exactly one writer — the worker-event
+        // dispatcher, on the driver's awaiting-input signal — and is cleared
+        // when the worker resumes. See `RunWaitState::WorkerPaneAlive` and
+        // `tools/boss/docs/worker-liveness-contract.md`.
+        let wait_state = RunWaitState::WorkerPaneAlive;
         let result_summary = if started.ack_timed_out {
             format!(
                 "Spawned worker pane in slot {} PROVISIONALLY — the SpawnWorkerPane ack timed out, \
@@ -1929,16 +1928,17 @@ mod pane_spawn_tests {
         assert_eq!(spawn.prompt_addendum, None);
     }
 
-    /// Regression: `PaneSpawnRunner::run_execution` must return
-    /// `ReviewerPaneAlive` (not `WaitingHuman`) for `PrReview` executions so
-    /// the execution stays in `running` while the reviewer pane is alive.
+    /// Regression (mono#2673): `PaneSpawnRunner::run_execution` must return
+    /// `WorkerPaneAlive` — never `WaitingHuman` — for EVERY execution kind,
+    /// so the stored status is `running` while the agent pane is alive and
+    /// working.
     ///
-    /// This pins the runner.rs change at the `PaneSpawnRunner` level.
-    /// Reverting `run_execution` back to always returning `WaitingHuman`
-    /// would cause this test to fail even if the badge-SQL test in t01.rs
-    /// still passes.
+    /// This pins the rule at the `PaneSpawnRunner` level. Reverting
+    /// `run_execution` to the old kind-conditional shape (`WaitingHuman`
+    /// for everything but `pr_review`) fails here even if the badge-SQL
+    /// test in t01.rs still passes.
     #[tokio::test]
-    async fn pr_review_execution_yields_reviewer_pane_alive() {
+    async fn every_execution_kind_yields_worker_pane_alive() {
         let workspace = TempDir::new().unwrap();
         let (_spawner, weak, cfg, work_db) = spawn_test_env(&workspace);
 
@@ -1971,12 +1971,13 @@ mod pane_spawn_tests {
 
         assert_eq!(
             outcome.wait_state,
-            RunWaitState::ReviewerPaneAlive,
-            "PaneSpawnRunner must return ReviewerPaneAlive for PrReview executions so the \
+            RunWaitState::WorkerPaneAlive,
+            "PaneSpawnRunner must return WorkerPaneAlive for PrReview executions so the \
              execution stays in running (not waiting_human) while the reviewer pane is alive"
         );
 
-        // Verify that a non-PrReview kind still yields WaitingHuman.
+        // A non-review worker kind must yield the SAME state: its agent is
+        // just as alive, and just as much not waiting for a human.
         let runner2 = PaneSpawnRunner::new(cfg, work_db, flags);
         runner2.set_server_state(weak);
         let mut chore_exec = sample_execution(workspace.path());
@@ -1996,8 +1997,15 @@ mod pane_spawn_tests {
 
         assert_eq!(
             outcome2.wait_state,
-            RunWaitState::WaitingHuman,
-            "PaneSpawnRunner must return WaitingHuman for non-PrReview executions"
+            RunWaitState::WorkerPaneAlive,
+            "PaneSpawnRunner must return WorkerPaneAlive for a chore worker too — the pane is \
+             alive and its agent is working, so the stored status must be `running`, not the \
+             spurious `waiting_human` this run used to be parked in for its whole life"
+        );
+        assert_eq!(
+            outcome2.wait_state.execution_status(),
+            ExecutionStatus::Running,
+            "the stored status a chore worker parks in must be `running`"
         );
     }
 

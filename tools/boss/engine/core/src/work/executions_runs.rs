@@ -313,12 +313,12 @@ impl WorkDb {
             );
         }
 
-        // The status a healthy pane-hosted worker of this kind parks in.
-        let restored = if existing.kind == ExecutionKind::PrReview {
-            ExecutionStatus::Running
-        } else {
-            ExecutionStatus::WaitingHuman
-        };
+        // The status a healthy pane-hosted worker sits in: its pane is up
+        // and its agent is working, whatever the execution kind. A
+        // re-adopted worker is by definition one whose hooks proved it
+        // alive, so restoring it to `waiting_human` would assert the one
+        // thing the evidence contradicts.
+        let restored = ExecutionStatus::Running;
         let now = now_string();
         tx.execute(
             "UPDATE work_executions
@@ -1706,16 +1706,16 @@ impl WorkDb {
     /// Why this exists instead of routing through [`Self::finish_execution_run`]
     /// via [`Self::active_run_ids_for_execution`]: `PaneSpawnRunner` records
     /// the spawn itself as the run's completion the instant the pane comes up
-    /// — parking the execution in `waiting_human` with the run's
-    /// `finished_at` already stamped (see `RunWaitState::WaitingHuman`). By
-    /// the time the worker's actual Stop hook fires, `work_runs` normally has
-    /// no row with `finished_at IS NULL` left to find, so a finalizer that
-    /// only closes "active" runs is a silent no-op — the execution stays
-    /// `waiting_human` forever, and the pane-death sweep later "reconciles"
-    /// it a second time with a misleading pane-died detail (the double-finalize
-    /// this closes). This instead closes any run that happens to still be
-    /// open (the rarer multi-turn/nudge case) and unconditionally transitions
-    /// the execution row itself, both in one transaction.
+    /// — leaving the execution live in `running` with the run's `finished_at`
+    /// already stamped (see `RunWaitState::WorkerPaneAlive`). By the time the
+    /// worker's actual Stop hook fires, `work_runs` normally has no row with
+    /// `finished_at IS NULL` left to find, so a finalizer that only closes
+    /// "active" runs is a silent no-op — the execution stays live forever,
+    /// and the pane-death sweep later "reconciles" it a second time with a
+    /// misleading pane-died detail (the double-finalize this closes). This
+    /// instead closes any run that happens to still be open (the rarer
+    /// multi-turn/nudge case) and unconditionally transitions the execution
+    /// row itself, both in one transaction.
     ///
     /// Idempotent: returns `Ok(None)` without writing anything if the
     /// execution is already terminal, so it is always safe to call from a
@@ -1761,6 +1761,56 @@ impl WorkDb {
         stage_execution_terminal(&mut pending, &tx, execution_id, &updated.work_item_id)?;
         commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(Some(updated))
+    }
+
+    /// Mirror a live worker's own awaiting-input signal onto its stored
+    /// status: `running` → `waiting_human` when `awaiting` is true, and
+    /// `waiting_human` → `running` when it is false.
+    ///
+    /// This is the ONLY writer of `waiting_human` for a pane-hosted worker,
+    /// and the only clearer of it — called from `awaiting_input_status`'s
+    /// two producers (the hook-dispatch mirror and the stalled-spawn sweep
+    /// mirror), never directly by a runner or a completion path. The
+    /// signal driving it — the driver's own awaiting-input notification,
+    /// surfaced as [`boss_protocol::WorkerActivity::WaitingForInput`] — is
+    /// the pane's positive evidence that a worker is blocked on a human,
+    /// not an inference from tool-call timing.
+    ///
+    /// Deliberately narrow, and expressed as a status-guarded `UPDATE` so
+    /// the guard is applied by the same statement that writes:
+    ///
+    /// - Only the `running` ⇄ `waiting_human` pair is ever touched. A
+    ///   terminal row, a `waiting_review`/`waiting_merge` row, or a row
+    ///   still pre-dispatch (`queued`/`ready`/`waiting_dependency`) is left
+    ///   exactly as it is — those states are owned by the completion and
+    ///   dispatch paths, and a late/duplicate hook must never drag one back
+    ///   into a live status.
+    /// - Idempotent: re-asserting the state the row is already in matches no
+    ///   rows and returns `Ok(None)`, so a repeated `Notification` (or a
+    ///   `Stop` that merely re-affirms a pending one) writes nothing.
+    ///
+    /// Returns `Ok(Some(execution))` with the post-write row when the
+    /// transition actually fired, `Ok(None)` when it was a no-op.
+    pub fn set_execution_awaiting_human(&self, execution_id: &str, awaiting: bool) -> Result<Option<WorkExecution>> {
+        let (from, to) = if awaiting {
+            (ExecutionStatus::Running, ExecutionStatus::WaitingHuman)
+        } else {
+            (ExecutionStatus::WaitingHuman, ExecutionStatus::Running)
+        };
+        let conn = self.connect()?;
+        let rows_changed = conn.execute(
+            "UPDATE work_executions
+             SET status = ?2
+             WHERE id = ?1
+               AND status = ?3",
+            params![execution_id, to.as_str(), from.as_str()],
+        )?;
+        if rows_changed == 0 {
+            return Ok(None);
+        }
+        Ok(Some(
+            query_execution(&conn, execution_id).require("execution", execution_id)?,
+        ))
     }
 
     /// Unconditionally drive a pane-parked execution (`running` or

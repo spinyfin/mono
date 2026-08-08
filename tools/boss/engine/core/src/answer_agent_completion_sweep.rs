@@ -435,10 +435,10 @@ mod tests {
                 workspace.to_str().unwrap(),
             )
             .unwrap();
-        // The spawn run hands off to the pane: the execution parks
-        // `waiting_human` while the worker lives, exactly as `PaneSpawnRunner`
-        // leaves it — the status the observed strand was stuck in.
-        crate::test_support::finish_run_waiting_human(db, &execution.id, &spawn_run.id, Some("spawned"));
+        // The spawn run hands off to the pane: the execution stays live in
+        // `running` while the worker's agent works, exactly as
+        // `PaneSpawnRunner` leaves it.
+        crate::test_support::finish_run_worker_pane_alive(db, &execution.id, &spawn_run.id, Some("spawned"));
         (comment.id, run.id, execution.id)
     }
 
@@ -471,8 +471,8 @@ mod tests {
         deliver_the_reply(&db, &comment_id, &run_id);
         assert_eq!(
             db.get_execution(&execution_id).unwrap().status.as_str(),
-            "waiting_human",
-            "precondition: the execution is pane-parked and non-terminal",
+            "running",
+            "precondition: the execution is pane-hosted, live and non-terminal",
         );
 
         let finalizer = RecordingFinalizer::new(Arc::clone(&db));
@@ -551,10 +551,7 @@ mod tests {
         assert_eq!(first.completed + second.completed, 0);
         assert_eq!(first.pending + second.pending, 0);
         assert!(finalizer.finalized().is_empty());
-        assert_eq!(
-            db.get_execution(&execution_id).unwrap().status.as_str(),
-            "waiting_human",
-        );
+        assert_eq!(db.get_execution(&execution_id).unwrap().status.as_str(), "running",);
     }
 
     /// A completion teardown already in flight owns the pane; the sweep must

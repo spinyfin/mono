@@ -18,6 +18,30 @@ Both inputs are engine-owned. **The app has no independent liveness signal and m
 
 So: **a wrong indicator is an engine bug, essentially always.** The app is a faithful renderer of what it is told.
 
+## The row must not disagree with the pane
+
+The two inputs above are not peers. `LiveWorkerState.activity` is fed event-by-event from the worker's own hook stream and is the authority on moment-to-moment activity. `work_executions.status` is the durable projection of it, and it is what every other consumer reads — dispatch admission, the liveness sweeps, the reaper, attention surfacing, the kanban's fallback path, and every CLI/JSON reader. A projection does not get to contradict what it projects.
+
+Until mono#2673 it did. `PaneSpawnRunner` stamped `waiting_human` on the row the instant the pane came up and nothing ever cleared it, so a worker mid-`Bash`-call stored `waiting_human` for its entire life:
+
+```text
+bossctl agents:  slot 4  activity: working  tool: Bash   last_tool_end: 35s ago
+work_executions: exec_…   status: waiting_human          finished_at: null
+```
+
+Two live surfaces, flatly contradicting each other, with the wrong one being the one everything downstream reads. Anything hunting stuck workers could not see a working worker; anything hunting workers that need an operator saw every worker in the system.
+
+The two statuses now mean what they say, and both are `is_live()`:
+
+| Status          | Meaning                                                                                                               | Written by                                                                                 |
+| --------------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `running`       | The agent is working — the engine is inside `run_execution`, or the pane is up and its agent owns the turn loop.      | The dispatch path (`RunWaitState::WorkerPaneAlive`), and `awaiting_input_status` on resume |
+| `waiting_human` | The agent is blocked on a person: it emitted its driver's awaiting-input signal and will not progress until answered. | `awaiting_input_status` only                                                               |
+
+`waiting_human` has exactly one writer and exactly one clearer, both in `engine/core/src/awaiting_input_status.rs`, driven off the `WorkerActivity::WaitingForInput` transition on the ordinary hook-dispatch path. That signal is the driver's own notification (Claude's `Notification` hook), honoured only for a driver declaring `Capability::AwaitingInputSignal` — never inferred from tool timing or elapsed silence. The write is guarded in SQL to the `running` ⇄ `waiting_human` pair, so a late hook can never drag a settled row (terminal, `waiting_review`, `waiting_merge`) back into a live status.
+
+A pane going `Terminated`/`Errored` is deliberately NOT mirrored. That is a death signal, and death detection has its own owners with their own corroboration rules — see Convergence below.
+
 ### `live_status` is not the indicator's input
 
 Two unrelated fields are named `live_status`, and neither drives the dot:

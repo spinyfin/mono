@@ -68,7 +68,7 @@ fn seed_parked_answer_agent(server_state: &Arc<ServerState>, slot_id: u8) -> (St
             workspace.to_str().unwrap(),
         )
         .unwrap();
-    crate::test_support::finish_run_waiting_human(work_db, &execution.id, &spawn_run.id, Some("spawned"));
+    crate::test_support::finish_run_worker_pane_alive(work_db, &execution.id, &spawn_run.id, Some("spawned"));
     register_working_worker(server_state, &execution.id, slot_id);
     (comment.id, run.id, execution.id)
 }
@@ -151,7 +151,7 @@ async fn a_delivered_answer_completes_the_execution_and_frees_its_slot_on_the_tu
             .unwrap()
             .status
             .as_str(),
-        "waiting_human",
+        "running",
     );
     assert!(server_state.live_worker_states.get(slot_id).is_some());
 

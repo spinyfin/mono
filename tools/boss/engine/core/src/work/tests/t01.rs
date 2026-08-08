@@ -2139,7 +2139,7 @@ fn ai_reviewing_badge_only_shows_while_reviewer_running() {
 /// Regression for T1647: the "AI reviewing" badge (`ai_reviewing`) must
 /// remain visible after `finish_execution_run(Running)` — the post-spawn
 /// state `PaneSpawnRunner` now writes for `pr_review` executions via
-/// `RunWaitState::ReviewerPaneAlive`. Before the fix, `PaneSpawnRunner`
+/// `RunWaitState::WorkerPaneAlive`. Before the fix, `PaneSpawnRunner`
 /// returned `WaitingHuman`, immediately flipping the execution to
 /// `waiting_human` after spawn; the badge queries only `running`, so it
 /// disappeared the moment the pane was spawned even though the reviewer
@@ -2183,7 +2183,7 @@ fn ai_reviewing_badge_shows_after_reviewer_pane_spawn() {
         )
         .unwrap();
 
-    // Simulate `PaneSpawnRunner` returning `ReviewerPaneAlive`: the run is
+    // Simulate `PaneSpawnRunner` returning `WorkerPaneAlive`: the run is
     // recorded as completed but the execution stays `running`.
     db.finish_execution_run(
         FinishExecutionRunInput::builder()

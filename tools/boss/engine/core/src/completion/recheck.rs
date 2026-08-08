@@ -72,22 +72,18 @@ impl WorkerCompletionHandler {
                 .await;
         }
 
-        // Running-status gate mirror (AI #6): the merge-poller's
-        // recheck sweep is intended for `waiting_human` workers whose
-        // staged URL was missed. Skipping for `running` keeps the
-        // fallback off in-flight workers even when the poller's
-        // candidate query picks them up by race.
-        //
-        // Note: waiting_human is set immediately at pane spawn
-        // (PaneSpawnRunner), so it does NOT indicate a terminal worker.
-        // The check is still useful as a coarse filter because `running`
-        // executions are between their start_execution_run and
-        // finish_execution_run calls and are never WaitingHuman.
-        if execution.status != ExecutionStatus::WaitingHuman {
+        // Turn-loop gate mirror (AI #6): the merge-poller's recheck sweep
+        // is intended for live workers whose staged URL was missed, so it
+        // applies the same predicate `on_stop_inner` does — see
+        // [`super::worker_owns_turn_loop`]. Keeping the two spelled
+        // identically is what stops the poller's candidate query from
+        // reaching a row the Stop path would have refused.
+        if !super::worker_owns_turn_loop(&execution) {
             tracing::debug!(
                 execution_id,
                 status = %execution.status,
-                "pr-recheck: skipping fallback — execution is not waiting_human (running-status gate)",
+                kind = %execution.kind,
+                "pr-recheck: skipping fallback — execution does not own a live worker turn loop",
             );
             return StopOutcome::RunningNoStagedPr;
         }

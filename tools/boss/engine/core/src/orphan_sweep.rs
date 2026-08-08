@@ -16,15 +16,20 @@
 //!    not, returns early — a `ready` execution created now would just
 //!    queue behind the full pool and can wait for the next sweep.
 //! 2. Queries `active` work items whose `updated_at` is older than
-//!    [`ORPHAN_MIN_AGE_SECS`] and that have no `ready` or `waiting_human`
-//!    execution. `waiting_human` is a live state where the worker has parked
-//!    for human input and may have released its pool slot — it must never
-//!    be treated as orphaned.
+//!    [`ORPHAN_MIN_AGE_SECS`] and that have no `ready`, `running` or
+//!    `waiting_human` execution. Both live statuses describe a worker the
+//!    engine dispatched and has not concluded — one working, one parked on
+//!    a human — and either may have released its pool slot without being
+//!    dead, so neither may be treated as orphaned. Deciding that a live row
+//!    is actually a corpse belongs to the death sweeps (`dead_pane_sweep`,
+//!    `husk_pane_sweep`, `lost_workspace_sweep`, `dead_pid_sweep`,
+//!    `spawn_ack_sweep`); this sweep picks the item up on the pass after
+//!    one of them reconciles it to `orphaned`/`abandoned`.
 //! 3. For each candidate, checks whether its latest non-terminal
 //!    execution (if any) is claimed by a live worker slot. If it is,
 //!    the execution is genuinely live and the candidate is skipped.
 //!    As a defense-in-depth guard, any candidate whose live execution is
-//!    still `waiting_human` at this point is also skipped unconditionally.
+//!    still in a live status at this point is also skipped unconditionally.
 //! 4. Applies the churn guard: if the work item has already had
 //!    [`ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD`] terminal executions
 //!    in the last [`ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS`], it
@@ -70,10 +75,11 @@ pub struct OrphanSweepOutcome {
     pub redispatched: usize,
     pub churn_skipped: usize,
     pub no_worker_skipped: usize,
-    /// Items skipped because their live execution is in `waiting_human`
-    /// state. These should already be filtered by the DB query; a non-zero
-    /// count here indicates a data-consistency gap worth investigating.
-    pub waiting_human_skipped: usize,
+    /// Items skipped because their live execution is in a live status
+    /// (`running` or `waiting_human`). These should already be filtered by
+    /// the DB query; a non-zero count here indicates a data-consistency gap
+    /// worth investigating.
+    pub live_execution_skipped: usize,
     /// Items skipped because their live execution is a `running` `pr_review`
     /// (an active reviewer pane). With the union-of-pools liveness fix this
     /// should never fire; a non-zero count here means the pool snapshot did
@@ -96,7 +102,7 @@ impl crate::sweep_loop::SweepOutcome for OrphanSweepOutcome {
     fn has_activity(&self) -> bool {
         self.redispatched > 0
             || self.churn_skipped > 0
-            || self.waiting_human_skipped > 0
+            || self.live_execution_skipped > 0
             || self.running_reviewer_skipped > 0
             || self.live_process_skipped > 0
     }
@@ -106,7 +112,7 @@ impl crate::sweep_loop::SweepOutcome for OrphanSweepOutcome {
             redispatched = self.redispatched,
             churn_skipped = self.churn_skipped,
             no_worker_skipped = self.no_worker_skipped,
-            waiting_human_skipped = self.waiting_human_skipped,
+            live_execution_skipped = self.live_execution_skipped,
             running_reviewer_skipped = self.running_reviewer_skipped,
             live_process_skipped = self.live_process_skipped,
             "orphan sweep: pass complete",
@@ -267,46 +273,44 @@ pub async fn run_one_pass(
                 .await;
         }
 
-        // Defense-in-depth: never re-dispatch a waiting_human execution even
-        // if the DB exclusion above somehow let it through. waiting_human is a
-        // legitimate live state — the worker parked for human input and may have
-        // released its pool slot, but the execution is alive. Abandoning it would
-        // clobber a live in-flight workspace and create a duplicate worker on the
-        // same row.
+        // Defense-in-depth: never re-dispatch a work item that still has a
+        // LIVE execution, even if the DB exclusion above somehow let it
+        // through. `running` and `waiting_human` are the same fact — a
+        // worker the engine dispatched and has not concluded — and either
+        // may have released its pool slot without being dead. Abandoning
+        // one would clobber a live in-flight workspace and put a duplicate
+        // worker on the row.
+        //
+        // This guard is coupled to the candidate query above: both must
+        // check the same two live statuses. If this check narrowed back
+        // to `waiting_human` alone while the candidate query kept excluding
+        // `running` too, every healthy `running` worker would fall straight
+        // past this defense-in-depth check.
         if let Some(live) = &live_execution
-            && live.status == ExecutionStatus::WaitingHuman
+            && live.status.is_live()
         {
             tracing::warn!(
                 work_item_id = %work_item_id,
                 execution_id = %live.id,
-                "orphan sweep: candidate has a waiting_human execution; skipping \
+                status = %live.status,
+                kind = %live.kind,
+                "orphan sweep: candidate has a live execution; skipping \
                  (should have been excluded by DB query — investigate)",
             );
-            outcome.waiting_human_skipped += 1;
-            continue;
-        }
-
-        // Defense-in-depth: a `running` pr_review execution is a live reviewer
-        // pane actively working (RunWaitState::ReviewerPaneAlive). With the
-        // union-of-pools fix the reviewer's review-pool claim is already in
-        // `claimed`, so `request_execution_with_live_check` sees it as live
-        // and returns the existing execution (non-ready → we skip below).
-        // This guard fires ONLY when the reviewer is NOT in `claimed` — i.e.
-        // a future pool-split scenario where the pool union missed the reviewer.
-        // A non-zero `running_reviewer_skipped` count means the union failed;
-        // investigate.
-        if let Some(live) = &live_execution
-            && live.status == ExecutionStatus::Running
-            && live.kind == ExecutionKind::PrReview
-            && !claimed.contains(&live.id)
-        {
-            tracing::warn!(
-                work_item_id = %work_item_id,
-                execution_id = %live.id,
-                "orphan sweep: candidate has a running pr_review execution not in any pool claim \
-                 (pool union failed?); skipping to protect live reviewer — investigate",
-            );
-            outcome.running_reviewer_skipped += 1;
+            if live.status == ExecutionStatus::Running
+                && live.kind == ExecutionKind::PrReview
+                && !claimed.contains(&live.id)
+            {
+                // Kept as a distinct counter: a live reviewer reaching
+                // this guard while absent from `claimed` additionally
+                // means the union-of-pools claim snapshot missed the
+                // review pool. A non-zero `running_reviewer_skipped`
+                // still means "investigate the pool union", exactly as
+                // before.
+                outcome.running_reviewer_skipped += 1;
+            } else {
+                outcome.live_execution_skipped += 1;
+            }
             continue;
         }
 
@@ -916,10 +920,74 @@ mod tests {
         );
     }
 
+    /// The same protection for `running`, which is the status EVERY healthy
+    /// pane worker sits in for its whole life — making this the common
+    /// case, not an edge one.
+    ///
+    /// Deciding a live row is actually dead belongs to the death sweeps
+    /// (`dead_pane_sweep`, `husk_pane_sweep`, `lost_workspace_sweep`,
+    /// `dead_pid_sweep`, `spawn_ack_sweep`); this sweep picks the item up
+    /// on the pass after one of them reconciles it to `orphaned`.
+    #[tokio::test]
+    async fn skips_item_with_running_worker_execution() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        make_old(&db, &work_item_id);
+
+        let execution = db
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(work_item_id.clone())
+                    .build(),
+            )
+            .unwrap();
+        db.force_execution_status_for_test(&work_item_id, ExecutionStatus::Running)
+            .unwrap();
+
+        let db = Arc::new(db);
+        // Deliberately unclaimed, the shape that made the pre-fix sweep
+        // treat "unclaimed + non-terminal" as a dead worker.
+        let coordinator = make_coordinator(db.clone(), 1);
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.redispatched, 0,
+            "sweep must not re-dispatch on top of a running worker"
+        );
+        assert!(
+            !db.list_orphan_active_candidates(ORPHAN_MIN_AGE_SECS)
+                .unwrap()
+                .contains(&work_item_id),
+            "a work item with a running execution must not be an orphan candidate at all"
+        );
+        let events = sink.events().await;
+        assert!(
+            events.iter().all(|e| e.stage != "orphan_active_redispatch"),
+            "no orphan_active_redispatch event should fire for a running worker"
+        );
+
+        let executions = db.list_executions(Some(&work_item_id)).unwrap();
+        assert!(
+            executions
+                .iter()
+                .any(|e| e.id == execution.id && e.status == ExecutionStatus::Running),
+            "running execution must not be abandoned by the sweep"
+        );
+    }
+
     /// Regression for the critical finding in T1647's automated review:
     ///
     /// A `running` `pr_review` execution is a live reviewer pane actively
-    /// working (`RunWaitState::ReviewerPaneAlive`). The reviewer is claimed
+    /// working (`RunWaitState::WorkerPaneAlive`). The reviewer is claimed
     /// in the REVIEW pool — not the MAIN pool. The old sweep only consulted
     /// `coordinator.worker_pool().claimed_execution_ids()` (the main pool),
     /// so a review-pool-claimed reviewer read as dead. The sweep would then
@@ -1001,12 +1069,19 @@ mod tests {
         );
     }
 
-    /// Defense-in-depth regression: even if the pool-union fix were somehow
-    /// absent (e.g. a future refactor splits pools again), the explicit
-    /// `running pr_review` guard in `run_one_pass` must fire and prevent
-    /// abandoning the live reviewer.
+    /// A live reviewer claimed in NO pool at all — the "pool union absent"
+    /// scenario — must still survive the sweep.
+    ///
+    /// This is enforced one layer before the in-loop guard:
+    /// `list_orphan_active_candidates` excludes every work item with a live
+    /// (`running`/`waiting_human`) execution, so the item never reaches the
+    /// in-loop guard and `running_reviewer_skipped` stays 0. The guard is
+    /// retained as genuine defense-in-depth; the assertion below on the
+    /// candidate list is what pins the mechanism, so a future change that
+    /// re-admits live rows to the candidate set fails here rather than
+    /// silently falling back on the guard.
     #[tokio::test]
-    async fn running_pr_review_not_in_any_pool_hits_defense_in_depth_skip() {
+    async fn running_pr_review_not_in_any_pool_survives_the_sweep() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
@@ -1043,11 +1118,14 @@ mod tests {
 
         assert_eq!(
             outcome.redispatched, 0,
-            "defense-in-depth guard must prevent re-dispatch of a running pr_review execution"
+            "the sweep must not re-dispatch on top of a running pr_review execution"
         );
-        assert_eq!(
-            outcome.running_reviewer_skipped, 1,
-            "defense-in-depth skip counter must be incremented"
+        assert!(
+            !db.list_orphan_active_candidates(ORPHAN_MIN_AGE_SECS)
+                .unwrap()
+                .contains(&work_item_id),
+            "a work item with a live execution must be excluded at the candidate query, before \
+             the in-loop defense-in-depth guard is ever consulted"
         );
         let executions = db.list_executions(Some(&work_item_id)).unwrap();
         assert!(

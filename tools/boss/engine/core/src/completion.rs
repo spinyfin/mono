@@ -1,12 +1,12 @@
 //! Worker completion detection.
 //!
-//! `PaneSpawnRunner` returns `WaitingHuman` immediately after spawning
+//! `PaneSpawnRunner` returns `WorkerPaneAlive` immediately after spawning
 //! the worker pane, so the run row is recorded as `completed` before
-//! the worker has actually done any work. The execution sits in
-//! `waiting_human` with the cube lease retained, and the linked
-//! task/chore stays in `active` (kanban "Doing"). Without something
-//! else driving the lifecycle, completed work just sits in Doing
-//! forever — that is the bug this module exists to close.
+//! the worker has actually done any work. The execution sits live in
+//! `running` with the cube lease retained, and the linked task/chore
+//! stays in `active` (kanban "Doing"). Without something else driving
+//! the lifecycle, completed work just sits in Doing forever — that is
+//! the bug this module exists to close.
 //!
 //! ## Detection
 //!
@@ -2089,6 +2089,29 @@ pub(crate) fn should_enqueue_reviewer_for_primary(kind: &ExecutionKind) -> bool 
         kind,
         ExecutionKind::ChoreImplementation | ExecutionKind::TaskImplementation
     )
+}
+
+/// Whether `execution` is a live worker that owns its own turn loop — i.e.
+/// the engine has dispatched it, its agent is driving, and a `Stop` from it
+/// is the worker's own turn boundary rather than an artefact of some other
+/// phase.
+///
+/// This is the gate on the *fallback* PR-detection paths ([`stop`]'s
+/// post-marker fallthrough and the merge poller's [`recheck`] sweep). Both
+/// are cold paths — a jj revset plus a GitHub walk — that must only run
+/// against a worker whose push, if any, has already happened.
+///
+/// - **Live** ([`ExecutionStatus::is_live`], i.e. `running` *or*
+///   `waiting_human`). A worker blocked on a human is still a worker that
+///   may have pushed a PR before it parked, so the wait must not exclude
+///   it; the pre-dispatch, `waiting_review`/`waiting_merge` and terminal
+///   statuses are all owned by other paths and stay excluded exactly as
+///   before.
+/// - **Not a reviewer.** A `pr_review` pane never opens a PR of its own —
+///   its lifecycle terminates through `finalize_pr_review_pass`. Running
+///   branch detection for one could only ever bind somebody else's PR.
+pub(crate) fn worker_owns_turn_loop(execution: &crate::work::WorkExecution) -> bool {
+    ExecutionStatus::is_live(&execution.status) && execution.kind != ExecutionKind::PrReview
 }
 
 #[cfg(test)]

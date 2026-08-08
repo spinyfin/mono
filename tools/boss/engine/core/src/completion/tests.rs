@@ -464,7 +464,7 @@ fn fixture(workspace_path: &Path) -> (TempDir, Arc<WorkDb>, String, String, Stri
         .unwrap();
     // Mirror PaneSpawnRunner: run is recorded as completed and the
     // execution sits in `waiting_human` with the lease still held.
-    finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned worker pane"));
+    finish_run_worker_pane_alive(&db, &execution.id, &run.id, Some("spawned worker pane"));
 
     (dir, db, product.id, chore.id, execution.id)
 }
@@ -579,7 +579,7 @@ fn automation_triage_fixture_dispatched_as(
             workspace_path.to_str().unwrap(),
         )
         .unwrap();
-    finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned worker pane"));
+    finish_run_worker_pane_alive(&db, &execution.id, &run.id, Some("spawned worker pane"));
     db.record_automation_run_and_advance(
         crate::work::AutomationFireRecord::builder()
             .automation_id(automation.id.clone())
@@ -650,7 +650,7 @@ fn ci_remediation_fixture(workspace_path: &Path) -> (TempDir, Arc<WorkDb>, Strin
             workspace_path.to_str().unwrap(),
         )
         .unwrap();
-    finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned worker pane"));
+    finish_run_worker_pane_alive(&db, &execution.id, &run.id, Some("spawned worker pane"));
     (dir, db, product.id, chore.id, execution.id, attempt.id)
 }
 
@@ -679,7 +679,7 @@ fn seed_workspace_occupant(
     let (_e, run) = db
         .start_execution_run(&exec.id, "worker", "mono", lease, workspace_id, workspace_path)
         .unwrap();
-    finish_run_waiting_human(db, &exec.id, &run.id, Some("spawned worker pane"));
+    finish_run_worker_pane_alive(db, &exec.id, &run.id, Some("spawned worker pane"));
     (chore.id, exec.id)
 }
 
@@ -879,7 +879,7 @@ fn revision_fixture_no_execution_pr_url(
             workspace_path.to_str().unwrap(),
         )
         .unwrap();
-    finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned revision worker pane"));
+    finish_run_worker_pane_alive(&db, &execution.id, &run.id, Some("spawned revision worker pane"));
     (dir, db, product.id, revision.id, execution.id)
 }
 
@@ -913,7 +913,7 @@ fn abandoned_execution_fixture() -> (TempDir, Arc<WorkDb>, String, String, Strin
         )
         .unwrap();
     // Mirror the waiting_human state.
-    finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned pane"));
+    finish_run_worker_pane_alive(&db, &execution.id, &run.id, Some("spawned pane"));
     // Simulate orphan sweep abandoning exec_A.
     db.mark_execution_redundant(&execution.id).unwrap();
     (dir, db, product.id, chore.id, execution.id)
@@ -983,7 +983,7 @@ fn revision_fixture(
             workspace_path.to_str().unwrap(),
         )
         .unwrap();
-    finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned revision worker pane"));
+    finish_run_worker_pane_alive(&db, &execution.id, &run.id, Some("spawned revision worker pane"));
     // Snapshot the parent PR's head SHA as `on_execution_started` does.
     db.set_execution_pr_head_before(&execution.id, head_before).unwrap();
     (dir, db, product.id, revision.id, execution.id)
@@ -1110,7 +1110,7 @@ fn pure_rebase_revision_fixture(
             workspace_path.to_str().unwrap(),
         )
         .unwrap();
-    finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned revision worker pane"));
+    finish_run_worker_pane_alive(&db, &execution.id, &run.id, Some("spawned revision worker pane"));
     db.set_execution_pr_head_before(&execution.id, head_before).unwrap();
     (dir, db, product.id, parent.id, revision.id, execution.id)
 }
@@ -1229,7 +1229,7 @@ fn conflict_revision_fixture(
             workspace_path.to_str().unwrap(),
         )
         .unwrap();
-    finish_run_waiting_human(
+    finish_run_worker_pane_alive(
         &db,
         &execution.id,
         &run.id,
@@ -1339,7 +1339,7 @@ fn ci_revision_fixture_with_kind(
             workspace_path.to_str().unwrap(),
         )
         .unwrap();
-    finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned CI-fix revision worker pane"));
+    finish_run_worker_pane_alive(&db, &execution.id, &run.id, Some("spawned CI-fix revision worker pane"));
     db.set_execution_pr_head_before(&execution.id, head).unwrap();
     (dir, db, product.id, parent.id, revision.id, execution.id, attempt.id)
 }
@@ -1488,10 +1488,10 @@ fn pr_review_exec_fixture_with_jsonl(
     .unwrap();
 
     // PrReview execution in running (reviewer pane spawned and alive, about to stop).
-    // After the fix, `PaneSpawnRunner` returns `ReviewerPaneAlive` for `pr_review`
+    // After the fix, `PaneSpawnRunner` returns `WorkerPaneAlive` for `pr_review`
     // executions so the execution stays in `running` (not `waiting_human`) while the
     // reviewer agent is working. The Stop hook transitions it to `completed` via
-    // `record_worker_pr_completion`. See runner.rs `RunWaitState::ReviewerPaneAlive`.
+    // `record_worker_pr_completion`. See runner.rs `RunWaitState::WorkerPaneAlive`.
     let pr_review_exec = db
         .create_execution(
             CreateExecutionInput::builder()

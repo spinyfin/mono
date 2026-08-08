@@ -734,11 +734,20 @@ impl WorkDb {
         // cap was reached, this work item must NOT be blindly
         // re-dispatched — it is flagged for a human. Resolving the
         // attention item makes it a candidate again.
-        // waiting_human is a live state: the worker parked for human input and
-        // then exited, releasing its worker-pool slot. The execution is still
-        // alive — it just isn't currently claimed. Excluding it here prevents
-        // the sweep from treating an unclaimed slot as "dead worker" and
+        // Both live statuses are excluded. `running` and `waiting_human`
+        // are the same fact — a worker the engine dispatched and has not
+        // concluded — differing only in whether its agent is currently
+        // blocked on a person; a worker in either one may have released
+        // its worker-pool slot without being dead. Excluding them prevents
+        // the sweep from reading an unclaimed slot as "dead worker" and
         // abandoning a valid in-flight execution.
+        //
+        // Deciding that a live row is actually dead is NOT this sweep's
+        // job and never was: `dead_pane_sweep`, `husk_pane_sweep`,
+        // `lost_workspace_sweep`, `dead_pid_sweep` and `spawn_ack_sweep`
+        // each own one death signal, with their own corroboration rules,
+        // and reconcile such a row to `orphaned`/`abandoned`. This query
+        // legitimately picks the work item up on the pass after that.
         let stmt_sql = format!(
             "SELECT t.id FROM tasks t
              WHERE t.status = 'active'
@@ -747,7 +756,7 @@ impl WorkDb {
                AND NOT EXISTS (
                    SELECT 1 FROM work_executions we
                    WHERE we.work_item_id = t.id
-                     AND we.status IN ('ready', 'waiting_human')
+                     AND we.status IN ('ready', 'running', 'waiting_human')
                )
                AND NOT EXISTS (
                    SELECT 1 FROM work_attention_items a

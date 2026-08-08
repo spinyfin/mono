@@ -13,7 +13,7 @@
 //! via the shared `runner::compose_worker_spawn`, ships the worker's
 //! `.claude` hook settings + initial prompt to the remote, opens the
 //! reverse events-socket forward, and launches the detached worker — then
-//! returns `WaitingHuman` so `completion::on_stop` drives the in_review /
+//! returns `WorkerPaneAlive` so `completion::on_stop` drives the in_review /
 //! PR-URL transition over the forwarded socket. Coordinator host-selection
 //! / routing (PR 3) and live-status + transcript readback (PR 4) build on
 //! top. The trait stays stable across local and remote.
@@ -282,7 +282,7 @@ impl HostAdapter for LocalHostAdapter {
 /// wrapper is current, composes the worker prompt via the shared path,
 /// ships the worker's `.claude` settings + initial prompt to the remote,
 /// opens the reverse events-socket forward, and launches the detached
-/// remote worker — returning `WaitingHuman` so `completion::on_stop`
+/// remote worker — returning `WorkerPaneAlive` so `completion::on_stop`
 /// drives the in_review / PR-URL transition over the forwarded socket.
 pub struct SshHostAdapter {
     transport: SshTransport,
@@ -827,7 +827,10 @@ impl HostAdapter for SshHostAdapter {
             "remote worker launched; awaiting Stop over the forwarded events socket",
         );
 
-        // WaitingHuman: the lease + workspace are retained and
+        // WorkerPaneAlive: the remote agent is up and working, so the
+        // execution stays `running` (never `waiting_human` — nothing is
+        // blocked on a person at this point; see `RunWaitState`). The
+        // lease + workspace are retained and
         // `completion::on_stop` drives the in_review / PR-URL transition
         // when the worker's Stop event tunnels back over the forwarded
         // socket (it keys purely on the run id we stamped into
@@ -840,7 +843,7 @@ impl HostAdapter for SshHostAdapter {
             .map(|p| format!(" (remote pid {p})"))
             .unwrap_or_default();
         Ok(RunOutcome {
-            wait_state: RunWaitState::WaitingHuman,
+            wait_state: RunWaitState::WorkerPaneAlive,
             result_summary: Some(format!(
                 "Launched remote worker '{}' on host {host}{pid_suffix}. \
                  Hook events tunnel back over the forwarded events socket.",

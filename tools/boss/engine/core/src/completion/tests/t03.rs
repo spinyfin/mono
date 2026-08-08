@@ -623,7 +623,7 @@ async fn on_stop_records_marker_but_awaits_ci_when_body_changed_but_ci_not_green
     }
     assert_eq!(
         db.get_execution(&execution_id).unwrap().status,
-        ExecutionStatus::WaitingHuman
+        ExecutionStatus::Running
     );
     assert!(cube.release_calls.lock().await.is_empty());
     assert!(pane.calls.lock().await.is_empty());
@@ -671,7 +671,7 @@ async fn on_stop_does_not_finalize_revision_when_body_unchanged() {
     }
     assert_eq!(
         db.get_execution(&execution_id).unwrap().status,
-        ExecutionStatus::WaitingHuman
+        ExecutionStatus::Running
     );
     assert!(cube.release_calls.lock().await.is_empty());
     assert!(pane.calls.lock().await.is_empty());
@@ -765,7 +765,7 @@ async fn recheck_does_not_finalize_unmarked_revision_even_with_green_ci() {
     }
     assert_eq!(
         db.get_execution(&execution_id).unwrap().status,
-        ExecutionStatus::WaitingHuman
+        ExecutionStatus::Running
     );
     assert!(
         cube.release_calls.lock().await.is_empty(),
@@ -899,8 +899,8 @@ async fn revision_on_stop_sha_delta_api_failure_does_not_nudge() {
     let execution = db.get_execution(&execution_id).unwrap();
     assert_eq!(
         execution.status,
-        ExecutionStatus::WaitingHuman,
-        "execution must remain in waiting_human until merge poller finalizes it",
+        ExecutionStatus::Running,
+        "execution must remain live until the merge poller finalizes it",
     );
 }
 
@@ -1069,7 +1069,7 @@ async fn revision_on_stop_no_pr_head_before_snapshot_and_ci_not_ready_awaits_wit
     }
     assert_eq!(
         db.get_execution(&execution_id).unwrap().status,
-        ExecutionStatus::WaitingHuman,
+        ExecutionStatus::Running,
         "execution stays live so a later Stop can retry",
     );
     assert!(cube.release_calls.lock().await.is_empty());

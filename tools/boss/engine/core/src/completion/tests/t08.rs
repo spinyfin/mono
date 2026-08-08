@@ -88,7 +88,7 @@ async fn on_stop_refuses_to_finalize_revision_that_contributed_nothing() {
     let exec = db.get_execution(&execution_id).unwrap();
     assert_eq!(
         exec.status,
-        ExecutionStatus::WaitingHuman,
+        ExecutionStatus::Running,
         "the execution must stay live so the worker can finish and push",
     );
     assert!(
@@ -163,7 +163,7 @@ async fn revision_that_contributed_nothing_is_left_alone_while_background_work_i
     );
     assert_eq!(
         db.get_execution(&execution_id).unwrap().status,
-        ExecutionStatus::WaitingHuman,
+        ExecutionStatus::Running,
         "the live worker must not be terminalized",
     );
     assert!(cube.release_calls.lock().await.is_empty());

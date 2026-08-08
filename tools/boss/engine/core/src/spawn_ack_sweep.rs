@@ -1757,7 +1757,7 @@ mod tests {
         assert_eq!(outcome.reaped, 0);
         assert_eq!(
             db.get_execution(&execution_id).unwrap().status,
-            ExecutionStatus::WaitingHuman,
+            ExecutionStatus::Running,
             "the execution must be left exactly as it was",
         );
         assert!(
@@ -1836,7 +1836,7 @@ mod tests {
         assert_eq!(outcome.reaped, 0);
         assert_eq!(
             db.get_execution(&execution_id).unwrap().status,
-            ExecutionStatus::WaitingHuman,
+            ExecutionStatus::Running,
             "the re-adopted execution must be left exactly as re-adoption restored it",
         );
         assert!(
@@ -1880,7 +1880,7 @@ mod tests {
         assert_eq!(outcome.driver_start_reaped, 0, "a fresh spawn must be given its window");
         assert_eq!(
             db.get_execution(&execution_id).unwrap().status,
-            ExecutionStatus::WaitingHuman,
+            ExecutionStatus::Running,
         );
     }
 

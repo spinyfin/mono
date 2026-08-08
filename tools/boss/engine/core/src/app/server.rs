@@ -1760,6 +1760,19 @@ pub async fn serve_with_merge_probe(
                         "stalled-spawn sweep: transitioned slots from Spawning to WaitingForInput \
                          (no hook event since spawn — likely blocked on initial directory-trust prompt)",
                     );
+                    // This promotion happens off the hook-dispatch path, so
+                    // `awaiting_input_status::mirror_awaiting_input` never
+                    // sees it — mirror it onto the row here instead, or the
+                    // directory-trust-prompt stall leaves `status = running`
+                    // forever with no later hook to re-converge it. See
+                    // `mirror_stalled_spawn_waits`'s doc.
+                    crate::awaiting_input_status::mirror_stalled_spawn_waits(
+                        &live_worker_states,
+                        &server_clone.work_db,
+                        &server_clone.publisher,
+                        &stalled,
+                    )
+                    .await;
                 }
                 let downgraded = live_worker_states
                     .downgrade_stale_activity(now, crate::live_worker_state::STALE_ACTIVITY_DOWNGRADE_SECS);
