@@ -158,6 +158,27 @@ pub(super) async fn handle_mark_ci_remediation_retriggered(ctx: Dispatch, req: F
                 ?failure_kind,
                 "mark_ci_remediation_retriggered: rejected — a queue-side-failure attempt has no retrigger path",
             );
+            // The resubmit path differs by kind: for `trunk_queue_eviction`
+            // the engine itself owns the resubmit (see
+            // `trunk_merge::mark_trunk_intent_awaiting_resubmit`, driven by
+            // `ci_watch::on_ci_resolved`'s `trunk_eviction_fix_concluded`
+            // gate). `merge_queue_rebounce` has no Boss sentinel and no
+            // engine-initiated resubmit at all — GitHub's own merge queue
+            // automatically re-tries an evicted-but-still-armed PR once its
+            // checks pass again; telling a rebounce worker to wait on an
+            // engine resubmit would have it wait on an action that never
+            // comes.
+            let resubmit_sentence = match failure_kind.as_deref() {
+                Some("trunk_queue_eviction") => {
+                    "Push a fix onto the PR branch instead — the engine resubmits the PR to the \
+                     queue once this revision comes to rest and head CI is green."
+                }
+                _ => {
+                    "Push a fix onto the PR branch instead — the PR re-enters GitHub's merge queue \
+                     on its own once a fix lands and its checks pass; there is no engine-side \
+                     resubmit for this failure kind."
+                }
+            };
             send_response(
                 &sink,
                 &request_id,
@@ -168,10 +189,8 @@ pub(super) async fn handle_mark_ci_remediation_retriggered(ctx: Dispatch, req: F
                          synthetic/ephemeral commit the queue assembled, so the PR's own head CI is \
                          green already and re-running it proves nothing. `mark-retriggered` is \
                          terminal and would leave the PR permanently out of its merge queue. \
-                         Push a fix onto the PR branch instead — the engine resubmits the PR to the \
-                         queue once this revision comes to rest and head CI is green. If the failure \
-                         is genuinely not fixable from this PR, use \
-                         `boss engine ci mark-failed --attempt-id {attempt_id} --reason <reason>`.",
+                         {resubmit_sentence} If the failure is genuinely not fixable from this PR, \
+                         use `boss engine ci mark-failed --attempt-id {attempt_id} --reason <reason>`.",
                         kind = failure_kind.as_deref().unwrap_or("queue-side"),
                     ),
                 },

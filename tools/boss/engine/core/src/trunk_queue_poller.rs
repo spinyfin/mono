@@ -635,6 +635,21 @@ impl TrunkQueueProbe {
             Ok(queue) => queue,
             Err(err) => {
                 self.record_queue_failure(ctx, key, members, &err, now, outcome).await;
+                // Same reasoning as `reconcile_missed_transitions` above: the
+                // stalled-resubmit age check reads only `member.intent` and
+                // the DB, never this failed `getQueue` response, so a
+                // persistently-failing (or backed-off-to-the-cap) queue must
+                // not stop a six-hour-stranded intent from getting flagged.
+                // Run it here on the failure exit; the success path still
+                // reaches its member-loop copy of this call further down,
+                // which additionally has the fresh `queue` snapshot to
+                // confirm the entry is genuinely still gone rather than
+                // live again.
+                for member in members {
+                    if already_resolved_terminal(member) {
+                        maybe_file_stalled_resubmit_attention(ctx, member, outcome).await;
+                    }
+                }
                 return;
             }
         };
@@ -1825,7 +1840,7 @@ async fn handle_trunk_queue_eviction(
             {
                 outcome.evictions_detected += 1;
             }
-            // Design §"Failure surfacing" / :221: an evicted card leaves the
+            // Design §"Failure surfacing": an evicted card leaves the
             // Merging lane. `on_trunk_queue_eviction_detected` clears the
             // columns itself on a freshly-inserted attempt, but it has exits
             // that clear nothing — most importantly its refusal to flip a
@@ -1834,10 +1849,12 @@ async fn handle_trunk_queue_eviction(
             // provably out of the queue. `preserve_merge_queue_state` means no
             // later GitHub sweep would ever correct it.
             //
-            // Unconditional, and single-shot because `apply_resolved_state`
-            // only routes here once per episode: after the call above it is a
+            // Unconditional and idempotent: after the first pass this is a
             // same-value no-op via `set_task_merge_queue_state`'s change
-            // guard, so it costs one guarded UPDATE and publishes nothing.
+            // guard, which matters because the non-inserting exits above
+            // (e.g. the no-failing-checks refusal) leave
+            // `already_handled_this_episode` false, so `apply_resolved_state`
+            // re-routes here on every sweep rather than once per episode.
             // This also makes all three `TrunkEvictionCause` arms agree that an
             // eviction snaps the card back, rather than one of them relying on
             // a downstream side effect for it.

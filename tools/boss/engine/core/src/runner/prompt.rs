@@ -2472,7 +2472,7 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
         // Re-running the failing build is still the right diagnosis — the
         // *delivery* is a push, because a resubmit is what actually re-runs
         // the construction build, and only a new head sha triggers one.
-        if is_rebounce || is_trunk_eviction {
+        if is_queue_side_failure {
             out.push_str(
                 "- `flaky_or_infra` → the failure is environmental. There is still no no-push exit: \
                 `mark-retriggered` is rejected for a queue-side failure (it is terminal and would \

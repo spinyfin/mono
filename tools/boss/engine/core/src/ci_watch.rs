@@ -2198,8 +2198,8 @@ pub async fn on_ci_resolved(
         }
     }
 
-    // CI is green for this work item's PR, so EVERY attempt still open
-    // against it is moot — not just the one
+    // CI is green for this work item's PR, so EVERY *non-queue-side* attempt
+    // still open against it is moot — not just the one
     // `active_ci_remediation_for_work_item` happened to return. That read is
     // `LIMIT 1` over `created_at DESC`, so an older `pending` row is
     // invisible to it and, before this sweep existed, was retired by nothing
@@ -2208,9 +2208,25 @@ pub async fn on_ci_resolved(
     // (if any) stayed dispatchable. Runs after the retire above so the
     // selected attempt is already `succeeded` and this only catches the rows
     // it masked.
+    //
+    // A queue-side row must NOT be swept on this evidence alone: head CI is
+    // green *by construction* when the failure lived on the queue's
+    // synthetic commit, so a green head-branch probe says nothing about
+    // whether the queue-side issue is resolved — the same invariant
+    // `is_queue_side_failure_kind` enforces above and in
+    // `on_ci_in_flight_supersedes_failure`. The one exception is when the
+    // attempt just retired above was itself queue-side (this function
+    // already required its fix revision to have concluded to get here) —
+    // the back-to-back-eviction case, where sweeping an older queue-side
+    // episode is correct because the newer episode's resolution supersedes
+    // it.
     if attempt_transitioned {
-        match work_db.abandon_active_ci_remediations_for_work_item(&candidate.work_item_id, "superseded_by_resolved_ci")
-        {
+        let include_queue_side = is_queue_side_failure_kind(failure_kind);
+        match work_db.abandon_active_ci_remediations_for_work_item(
+            &candidate.work_item_id,
+            "superseded_by_resolved_ci",
+            include_queue_side,
+        ) {
             Ok(masked) => {
                 for row in &masked {
                     tracing::info!(
@@ -2508,18 +2524,19 @@ pub async fn rescue_stranded_ci_remediation_attempt(
 /// re-set the "ci failing" badge on every app restart, even after the
 /// task is `done`.
 pub async fn on_pr_merged(work_db: &WorkDb, publisher: &dyn ExecutionPublisher, candidate: &PendingMergeCheck) {
-    let abandoned = match work_db.abandon_active_ci_remediations_for_work_item(&candidate.work_item_id, "pr_merged") {
-        Ok(rows) => rows,
-        Err(err) => {
-            tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                ?err,
-                "ci_watch: failed to abandon active ci_remediations on PR merge; badge may persist",
-            );
-            return;
-        }
-    };
+    let abandoned =
+        match work_db.abandon_active_ci_remediations_for_work_item(&candidate.work_item_id, "pr_merged", true) {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    ?err,
+                    "ci_watch: failed to abandon active ci_remediations on PR merge; badge may persist",
+                );
+                return;
+            }
+        };
     let count = abandoned.len();
     if count > 0 {
         publisher
