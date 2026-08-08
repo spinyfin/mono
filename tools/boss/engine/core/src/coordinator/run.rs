@@ -421,8 +421,10 @@ impl ExecutionCoordinator {
                 //
                 // The item is execution-scoped (`work_item_id: None`) —
                 // `finish_execution_run` rejects anything else. That is why
-                // `list_attention_items_for_work_item`, which backs both
-                // `boss task show` and the app's Attention lane, has to
+                // `list_attention_items_for_work_item`, which backs
+                // `boss task show` / `boss chore show --json` (NOT the app's
+                // per-product Attention lane, which the app queries by
+                // product id and which this change does not touch), has to
                 // resolve an item's work item through its execution: fifteen
                 // consecutive spawn failures filed fifteen of these rows and
                 // not one of them reached a work-item surface.
