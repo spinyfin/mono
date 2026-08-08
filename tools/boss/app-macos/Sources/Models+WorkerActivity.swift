@@ -94,7 +94,7 @@ enum AgentActivityState: Equatable {
             // Gating on it here would paint every such worker as "Run
             // completed".
             self = .active
-        case "ready":
+        case "ready", "dispatching":
             self = .waiting(reason: "Queued for a worker")
         case "waiting_human":
             self = .waiting(reason: "Waiting on human input")

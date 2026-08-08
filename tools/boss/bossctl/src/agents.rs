@@ -1141,8 +1141,9 @@ pub(crate) async fn work_cancel(socket_path: &Option<String>, json: bool, execut
 }
 
 /// `bossctl executions cancel` — cancel never-started (`queued` /
-/// `ready` / `waiting_dependency`) executions only. Refuses live /
-/// mid-flight rows so operators don't confuse this with `agents stop`.
+/// `ready` / `dispatching` / `waiting_dependency`) executions only.
+/// Refuses live / mid-flight rows so operators don't confuse this with
+/// `agents stop`.
 ///
 /// `execution_id` and `work_item_id` are mutually exclusive selectors:
 /// by work item cancels every never-started execution currently on that
@@ -1221,7 +1222,10 @@ async fn executions_cancel_for_work_item(
     // Never-started only — same gate the engine enforces under
     // `queued_only`. Filter client-side so we don't spam WorkErrors for
     // every historical terminal/running row on the item.
-    let candidates: Vec<_> = executions.into_iter().filter(|e| e.status.can_reconcile()).collect();
+    let candidates: Vec<_> = executions
+        .into_iter()
+        .filter(|e| e.status.can_reconcile() || e.status == ExecutionStatus::Dispatching)
+        .collect();
     if candidates.is_empty() {
         if json {
             println!(
@@ -1233,7 +1237,7 @@ async fn executions_cancel_for_work_item(
                 })
             );
         } else {
-            println!("no never-started (queued/ready/waiting_dependency) executions for {work_item_id}");
+            println!("no never-started (queued/ready/dispatching/waiting_dependency) executions for {work_item_id}");
         }
         return Ok(());
     }

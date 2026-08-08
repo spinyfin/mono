@@ -130,6 +130,59 @@ fn retire_stale_revision_before_dispatch_abandons_execution_and_advances_task() 
     );
 }
 
+/// The dispatcher claims a row before it checks whether a conflict-resolution
+/// revision is stale. That claim must still be retired instead of being
+/// released back to `ready` for another scheduler pass.
+#[test]
+fn retire_stale_revision_before_dispatch_abandons_a_dispatch_claim() {
+    let db = WorkDb::open(temp_db_path("retire-dispatching")).unwrap();
+    let (revision, exec_id) = seed_ready_revision(&db, "retire-dispatching");
+    assert!(db.begin_execution_dispatch(&exec_id).unwrap().is_some());
+
+    assert!(db.retire_stale_revision_before_dispatch(&exec_id, &revision).unwrap());
+    assert_eq!(task_status(&db, &revision), "in_review");
+    assert_eq!(
+        db.get_execution(&exec_id).unwrap().status,
+        ExecutionStatus::Abandoned,
+        "a stale claimed revision must be terminalized, not requeued"
+    );
+    assert!(
+        !db.release_execution_dispatch(&exec_id).unwrap(),
+        "releasing after retirement must not restore the row to ready"
+    );
+}
+
+// ── durable dispatch-claim recovery (work/dispatch.rs) ─────────────────────
+
+#[test]
+fn release_execution_dispatch_returns_a_claimed_execution_to_ready() {
+    let db = WorkDb::open(temp_db_path("release-dispatch-happy")).unwrap();
+    let product = create_test_product_named(&db, "Boss-release-dispatch");
+    let chore = create_test_chore(&db, product.id.clone(), "release-dispatch");
+    let exec = create_ready_chore_execution(&db, chore.id.clone());
+    assert!(db.begin_execution_dispatch(&exec.id).unwrap().is_some());
+
+    assert!(db.release_execution_dispatch(&exec.id).unwrap());
+    assert_eq!(db.get_execution(&exec.id).unwrap().status, ExecutionStatus::Ready);
+    assert!(!db.release_execution_dispatch(&exec.id).unwrap());
+}
+
+#[test]
+fn requeue_interrupted_dispatches_releases_only_dispatch_claims() {
+    let db = WorkDb::open(temp_db_path("requeue-interrupted-dispatches")).unwrap();
+    let product = create_test_product_named(&db, "Boss-requeue-dispatch");
+    let claimed_chore = create_test_chore(&db, product.id.clone(), "claimed");
+    let ready_chore = create_test_chore(&db, product.id.clone(), "ready");
+    let claimed = create_ready_chore_execution(&db, claimed_chore.id.clone());
+    let ready = create_ready_chore_execution(&db, ready_chore.id.clone());
+    assert!(db.begin_execution_dispatch(&claimed.id).unwrap().is_some());
+
+    assert_eq!(db.requeue_interrupted_dispatches().unwrap(), vec![claimed.id.clone()]);
+    assert_eq!(db.get_execution(&claimed.id).unwrap().status, ExecutionStatus::Ready);
+    assert_eq!(db.get_execution(&ready.id).unwrap().status, ExecutionStatus::Ready);
+    assert!(db.requeue_interrupted_dispatches().unwrap().is_empty());
+}
+
 /// The task-status guard accepts `active` as well as `todo`: a revision that
 /// already flipped to `active` (a worker started before the retire raced in)
 /// is still retired.

@@ -213,15 +213,19 @@ fn dependency_unblock_of_moot_revision_does_not_strand_ready_execution() {
     );
     let executions = executions_for(&db, &rev_id);
     assert!(
-        executions
-            .iter()
-            .all(|(_, status)| !matches!(status.as_str(), "queued" | "ready" | "waiting_dependency")),
+        executions.iter().all(|(_, status)| {
+            !matches!(
+                status.as_str(),
+                "queued" | "ready" | "dispatching" | "waiting_dependency"
+            )
+        }),
         "no dispatchable execution may remain against the now-archived revision: {executions:?}"
     );
 }
 
 /// Regression (proj_18be59fc8d8b2440_363): the startup reconciliation sweep
-/// must clean up any `ready`/`queued`/`waiting_dependency` execution that
+/// must clean up any `ready`/`queued`/`dispatching`/`waiting_dependency`
+/// execution that
 /// slipped through against a work item already terminal or soft-deleted —
 /// the backstop for the create-time guards.
 #[test]
