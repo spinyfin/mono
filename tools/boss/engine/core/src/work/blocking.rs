@@ -1329,6 +1329,17 @@ impl WorkDb {
     /// or `None`. Used by `ci_watch` to detect "an attempt is already
     /// in flight" and by the retire path to find the row to flip to
     /// `succeeded` when the next probe reports CI back at clean.
+    /// Note the `LIMIT 1`: this returns only the NEWEST active attempt.
+    /// Two episodes can legitimately be active at once for one work item
+    /// (`on_queue_side_failure_detected` deliberately inserts a fresh
+    /// attempt for a back-to-back second event, and the
+    /// `(work_item_id, head_sha_at_trigger, attempt_kind)` unique key admits
+    /// it), and while that happens the older row is invisible to every
+    /// consumer of this read. That is survivable only because the settle
+    /// paths sweep the whole work item rather than the row this read picked:
+    /// see [`Self::abandon_active_ci_remediations_for_work_item`], which
+    /// `on_ci_resolved` and `on_pr_merged` both call. Do not add a consumer
+    /// that assumes this row is the ONLY active attempt.
     pub fn active_ci_remediation_for_work_item(&self, work_item_id: &str) -> Result<Option<CiRemediation>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
@@ -1767,27 +1778,63 @@ impl WorkDb {
         finish_attempt_update(tx, rows, attempt_id, query_ci_remediation)
     }
 
-    /// Abandon all `pending` or `running` `ci_remediations` rows for
-    /// `work_item_id` in one shot. Called when the parent PR is marked
-    /// merged so any in-flight or queued fix attempts are retired cleanly
-    /// rather than left in a non-terminal state.
+    /// Abandon every `pending` or `running` `ci_remediations` row for
+    /// `work_item_id` in one shot, stamping `reason` as the
+    /// `failure_reason`. Two callers, both meaning "this work item's CI
+    /// question is settled, so nothing still open about it is actionable":
+    /// `ci_watch::on_pr_merged` (`'pr_merged'`) and `ci_watch::on_ci_resolved`
+    /// (`'superseded_by_resolved_ci'`).
     ///
-    /// Returns the number of rows affected. A return value of `0` means
-    /// there were no active attempts (normal when CI had already resolved
-    /// before the merge).
-    pub fn abandon_active_ci_remediations_for_work_item(&self, work_item_id: &str) -> Result<usize> {
-        let conn = self.connect()?;
+    /// Returns the rows it abandoned, so the caller can also close the
+    /// revision tasks they spawned — an abandoned attempt whose revision is
+    /// left `todo` would otherwise dispatch a worker to fix CI that is
+    /// already green.
+    ///
+    /// This is the sweep that keeps [`Self::active_ci_remediation_for_work_item`]'s
+    /// `LIMIT 1` honest on the retire path: that read returns only the newest
+    /// active row, so any older one is invisible to it. Without this, an
+    /// older `pending` row survived its episode's resolution forever, kept
+    /// re-arming the "ci failing" badge from `sendListCiRemediations` on
+    /// every app restart, and was never retired by anything.
+    pub fn abandon_active_ci_remediations_for_work_item(
+        &self,
+        work_item_id: &str,
+        reason: &str,
+    ) -> Result<Vec<CiRemediation>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
         let now = now_string();
-        let rows = conn.execute(
+        let ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM ci_remediations
+                  WHERE work_item_id = ?1
+                    AND status IN ('pending', 'running')
+                  ORDER BY created_at ASC, id ASC",
+            )?;
+            let rows = stmt.query_map([work_item_id], |row| row.get(0))?;
+            collect_rows(rows)?
+        };
+        if ids.is_empty() {
+            tx.commit()?;
+            return Ok(Vec::new());
+        }
+        tx.execute(
             "UPDATE ci_remediations
                 SET status         = 'abandoned',
-                    failure_reason = 'pr_merged',
-                    finished_at    = COALESCE(finished_at, ?2)
+                    failure_reason = ?2,
+                    finished_at    = COALESCE(finished_at, ?3)
               WHERE work_item_id = ?1
                 AND status IN ('pending', 'running')",
-            params![work_item_id, now],
+            params![work_item_id, reason, now],
         )?;
-        Ok(rows)
+        let mut abandoned = Vec::with_capacity(ids.len());
+        for id in &ids {
+            if let Some(row) = query_ci_remediation(&tx, id)? {
+                abandoned.push(row);
+            }
+        }
+        tx.commit()?;
+        Ok(abandoned)
     }
 
     /// Engine-side abandon for a `ci_remediations` attempt. Used for

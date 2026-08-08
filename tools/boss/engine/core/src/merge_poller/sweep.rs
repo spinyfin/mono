@@ -1740,7 +1740,16 @@ pub(crate) async fn maybe_clear_blocked(
                     outcome.conflict_cleared += 1;
                 }
             }
-            "ci_failure" | "ci_failure_exhausted" => {
+            // `ci_flaky_retriggered` belongs here, not in the `other =>`
+            // debug arm: it is stamped by `mark_ci_remediation_retriggered`
+            // on the SAME axis as `ci_failure` (the worker re-ran a failing
+            // build rather than pushing), and `ci_watch::on_ci_resolved` is
+            // its retire path too. It usually rides alongside a `ci_failure`
+            // row, which is the only reason the omission was survivable —
+            // but when it is the only active signal, falling to `other`
+            // meant nothing ever dispatched and the flake tag stuck to the
+            // card after CI had gone green.
+            "ci_failure" | "ci_failure_exhausted" | "ci_flaky_retriggered" => {
                 if !ci_clean {
                     continue;
                 }

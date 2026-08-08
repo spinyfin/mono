@@ -2726,6 +2726,70 @@ async fn stale_ci_failing_badge_cleared_by_poll_without_active_signal() {
     );
 }
 
+/// `ci_flaky_retriggered` had no arm in `maybe_clear_blocked`'s dispatch: it
+/// fell through to the `other =>` debug arm, which owns nothing and clears
+/// nothing. When it was the ONLY active signal — a worker classified a
+/// failure as infra, re-ran the build, and pushed nothing — no retire path
+/// ever dispatched, so the flake tag stayed armed on the card after CI went
+/// green. It rides alongside `ci_failure` in the common case, which is the
+/// only reason the omission was survivable at all.
+///
+/// It belongs on the same axis as `ci_failure`: `ci_watch::on_ci_resolved` is
+/// its retire path too, and the clear-side SQL
+/// (`clear_ci_failure_signal_only`) already listed the reason.
+#[tokio::test]
+async fn a_lone_ci_flaky_retriggered_signal_is_cleared_when_ci_goes_green() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/1153";
+    let (product, chore) = make_chore_in_review(&db, "C-lone-flaky", pr);
+    let probe = StubProbe::new();
+    let publisher = Arc::new(RecordingPublisher::default());
+
+    // A worker took the flake/infra exit on an ordinary per-PR CI failure:
+    // the attempt goes terminal `retriggered` and stamps the signal.
+    let attempt = db
+        .insert_ci_remediation(crate::work::CiRemediationInsertInput {
+            product_id: product.clone(),
+            work_item_id: chore.clone(),
+            pr_url: pr.to_owned(),
+            pr_number: 1153,
+            head_branch: "feature".to_owned(),
+            head_sha_at_trigger: "head-1".to_owned(),
+            attempt_kind: "retrigger".to_owned(),
+            consumes_budget: 0,
+            failed_checks: "[]".to_owned(),
+            failure_kind: "pr_branch_ci".to_owned(),
+            before_commit_sha: None,
+        })
+        .unwrap()
+        .expect("fresh attempt row");
+    db.mark_ci_remediation_retriggered(&attempt.id)
+        .unwrap()
+        .expect("attempt flips to retriggered");
+
+    let signals = db.active_blocked_signals(&chore).unwrap();
+    assert_eq!(
+        signals.iter().map(|s| s.reason.as_str()).collect::<Vec<_>>(),
+        vec!["ci_flaky_retriggered"],
+        "precondition: this is the ONLY active signal — the uncovered dispatch case",
+    );
+
+    // The re-run comes back green.
+    probe
+        .states
+        .lock()
+        .unwrap()
+        .insert(pr.to_owned(), Ok(probe_ci_clean(pr, "head-1")));
+    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
+
+    assert!(
+        db.active_blocked_signals(&chore).unwrap().is_empty(),
+        "a green re-run must retire the flake signal, not leave it armed forever: {:?}",
+        db.active_blocked_signals(&chore).unwrap(),
+    );
+}
+
 /// The poll-state safety net must NOT fire on a no-op clean poll: a chore
 /// whose CI was already `success` (or never failing) must not emit a
 /// spurious `CiFailureCleared` on every sweep. Only a genuine
