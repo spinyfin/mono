@@ -148,9 +148,13 @@ impl WorkDb {
     /// `driver_terminal_error`, `worker_escalation`, …).
     ///
     /// This is the query behind `ListAttentionItemsForWorkItem` — i.e.
-    /// behind `boss task show` / `boss chore show` and the macOS app's
-    /// Attention surface — and it used to match on `work_item_id = ?1`
-    /// alone. `work_attention_items` has a `CHECK` enforcing that exactly
+    /// behind `boss task show` / `boss chore show --json` — and it used to
+    /// match on `work_item_id = ?1` alone. It does NOT reach the macOS
+    /// app's per-product Attention surface: the app's four call sites all
+    /// pass a *product* id, not a task/chore id, and products have no
+    /// `work_executions` rows, so the widened `execution_id IN (...)`
+    /// branch below never matches for them. `work_attention_items` has a
+    /// `CHECK` enforcing that exactly
     /// one of `execution_id` / `work_item_id` is set, and
     /// `finish_execution_run` *rejects* a payload carrying a
     /// `work_item_id`, so every failure a run-completion handler files is
