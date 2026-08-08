@@ -1535,13 +1535,21 @@ pub async fn serve_with_merge_probe(
     // `bossctl agents reap`), best-effort releases its cube lease, and kicks
     // the scheduler so the orphan-active sweep re-dispatches the freed work
     // item to a still-eligible host. Runs every 60s and fires on boot so a
-    // host disabled while the engine was down is drained at startup.
+    // host disabled while the engine was down is drained at startup; it also
+    // subscribes to `Event::HostDisabled` so an operator disable (or the
+    // dispatch-health circuit breaker tripping) is drained immediately
+    // instead of waiting for the next tick, with the periodic sweep as the
+    // backstop for a dropped/missed event.
+    let host_disabled_events = server_state
+        .event_bus
+        .subscribe(TopicFilter::kind(EventKind::HostDisabled));
     let _host_reconcile_handle = crate::host_reconcile::spawn_loop(
         server_state.work_db.clone(),
         server_state.cube_client.clone(),
         server_state.execution_coordinator.clone(),
         server_state.dispatch_events.clone(),
         crate::host_reconcile::DEFAULT_INTERVAL,
+        host_disabled_events,
     );
 
     // External-tracker reconciler: periodically pulls upstream issue state
