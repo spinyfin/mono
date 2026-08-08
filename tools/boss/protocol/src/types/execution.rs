@@ -123,6 +123,10 @@ pub enum ExecutionStatus {
     #[default]
     Queued,
     Ready,
+    /// The scheduler atomically claimed a `ready` row before claiming a
+    /// worker slot. Reconcilers must not rewrite readiness while this state
+    /// is held; engine startup returns interrupted claims to `ready`.
+    Dispatching,
     WaitingDependency,
     /// The engine has dispatched this execution and its agent is working:
     /// either the engine is still inside `run_execution` (the spawn
@@ -164,6 +168,7 @@ impl ExecutionStatus {
         match self {
             Self::Queued => "queued",
             Self::Ready => "ready",
+            Self::Dispatching => "dispatching",
             Self::WaitingDependency => "waiting_dependency",
             Self::Running => "running",
             Self::WaitingHuman => "waiting_human",
@@ -205,6 +210,7 @@ impl std::str::FromStr for ExecutionStatus {
         match s {
             "queued" => Ok(Self::Queued),
             "ready" => Ok(Self::Ready),
+            "dispatching" => Ok(Self::Dispatching),
             "waiting_dependency" => Ok(Self::WaitingDependency),
             "running" => Ok(Self::Running),
             "waiting_human" => Ok(Self::WaitingHuman),

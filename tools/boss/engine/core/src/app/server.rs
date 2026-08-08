@@ -525,6 +525,22 @@ pub async fn serve_with_merge_probe(
         });
     }
 
+    // A durable dispatch claim protects a ready row from reconciliation
+    // while the scheduler is between its queue snapshot and run start. No
+    // scheduler task survives an engine restart, so recover those interrupted
+    // claims before any startup reconciliation decides what can run.
+    match server_state.work_db.requeue_interrupted_dispatches() {
+        Ok(requeued) if !requeued.is_empty() => {
+            tracing::warn!(
+                count = requeued.len(),
+                execution_ids = ?requeued,
+                "requeued dispatch claims interrupted by engine restart",
+            );
+        }
+        Ok(_) => tracing::debug!("no interrupted dispatch claims at startup"),
+        Err(err) => tracing::error!(?err, "interrupted-dispatch recovery failed; continuing"),
+    }
+
     // First, sweep "ghost active" rows that the previous engine left
     // behind without ever spawning a worker — `tasks.status = 'active'`
     // with no `work_runs` history at all. These are demoted back to
@@ -564,7 +580,8 @@ pub async fn serve_with_merge_probe(
         }
     }
 
-    // Second, sweep any `queued`/`ready`/`waiting_dependency` execution
+    // Second, sweep any `queued`/`ready`/`dispatching`/`waiting_dependency`
+    // execution
     // stranded against a work item that is already terminal (done/archived/
     // cancelled) or soft-deleted. These can only exist from a race the
     // create-time guards missed (or a prior build that predates them) —

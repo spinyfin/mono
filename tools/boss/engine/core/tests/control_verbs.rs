@@ -1053,7 +1053,7 @@ async fn kanban_drag_to_doing_dispatches_autostart_false_chore() -> Result<()> {
     assert!(
         matches!(
             exec.status.as_str(),
-            "ready" | "queued" | "running" | "waiting_human" | "waiting_dependency"
+            "ready" | "queued" | "dispatching" | "running" | "waiting_human" | "waiting_dependency"
         ),
         "drag-to-Doing execution should be non-terminal; got status={status:?}",
         status = exec.status

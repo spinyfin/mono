@@ -66,19 +66,19 @@ impl WorkDb {
                 existing.status
             );
         }
-        if opts.queued_only && !existing.status.can_reconcile() {
+        if opts.queued_only && !(existing.status.can_reconcile() || existing.status == ExecutionStatus::Dispatching) {
             if existing.status.is_live() {
                 bail!(
                     "execution {execution_id} is `{}` (already started); \
                      use `bossctl agents stop {execution_id}` to stop a live worker — \
                      `executions cancel` only accepts never-started \
-                     (queued/ready/waiting_dependency) rows",
+                     (queued/ready/dispatching/waiting_dependency) rows",
                     existing.status
                 );
             }
             bail!(
                 "execution {execution_id} is `{}` and has already left the \
-                 never-started set (queued/ready/waiting_dependency); \
+                 never-started set (queued/ready/dispatching/waiting_dependency); \
                  use `bossctl work cancel {execution_id}` for any non-terminal \
                  row, or `bossctl agents stop` if a live worker still backs it",
                 existing.status
@@ -938,13 +938,12 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        if execution.status != ExecutionStatus::Ready {
+        if !matches!(execution.status, ExecutionStatus::Ready | ExecutionStatus::Dispatching) {
             bail!(
-                "execution {execution_id} is not ready and cannot start a run from status `{}`",
+                "execution {execution_id} is not dispatchable and cannot start a run from status `{}`",
                 execution.status
             );
         }
-
         let now = now_string();
         tx.execute(
             "UPDATE work_executions
@@ -1397,12 +1396,13 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        if execution.status != ExecutionStatus::Ready {
+        if !matches!(execution.status, ExecutionStatus::Ready | ExecutionStatus::Dispatching) {
             bail!(
-                "execution {execution_id} is not ready and cannot fail startup from status `{}`",
+                "execution {execution_id} is not dispatchable and cannot fail startup from status `{}`",
                 execution.status
             );
         }
+        let starting_status = execution.status.clone();
 
         let now = now_string();
         tx.execute(
@@ -1433,7 +1433,7 @@ impl WorkDb {
         tracing::warn!(
             execution_id = %execution_id,
             work_item_id = %execution.work_item_id,
-            from_status = %ExecutionStatus::Ready,
+            from_status = %starting_status,
             to_status = %execution.status,
             reason = %error_text,
             "execution terminalized: fail start",
@@ -1484,13 +1484,14 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        if execution.status != ExecutionStatus::Ready {
+        if !matches!(execution.status, ExecutionStatus::Ready | ExecutionStatus::Dispatching) {
             bail!(
-                "execution {execution_id} is not ready and cannot record pre-start failure \
+                "execution {execution_id} is not dispatchable and cannot record pre-start failure \
                  from status `{}`",
                 execution.status
             );
         }
+        let starting_status = execution.status.clone();
 
         let now = now_string();
         let new_count = execution.pre_start_failure_count + 1;
@@ -1502,7 +1503,8 @@ impl WorkDb {
                 (boss_engine_utils::epoch_time::now_epoch_secs() as u64 + delay.as_secs()).to_string();
             tx.execute(
                 "UPDATE work_executions
-                 SET pre_start_failure_count = ?2,
+                 SET status = 'ready',
+                     pre_start_failure_count = ?2,
                      cube_repo_id = COALESCE(?3, cube_repo_id),
                      cube_lease_id = NULL,
                      cube_workspace_id = NULL,
@@ -1551,7 +1553,7 @@ impl WorkDb {
             tracing::warn!(
                 execution_id = %execution_id,
                 work_item_id = %execution.work_item_id,
-                from_status = %ExecutionStatus::Ready,
+                from_status = %starting_status,
                 to_status = %execution.status,
                 reason = %error_text,
                 "execution terminalized: pre-start failure exhausted retries",

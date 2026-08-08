@@ -234,8 +234,8 @@ impl WorkDb {
         Ok(healed)
     }
 
-    /// Reconciliation sweep: abandon any `queued` / `ready` /
-    /// `waiting_dependency` execution whose work item is a task in a
+    /// Reconciliation sweep: abandon any `queued` / `ready` / `dispatching`
+    /// / `waiting_dependency` execution whose work item is a task in a
     /// terminal status (`done` / `archived` / `cancelled`) or soft-deleted.
     /// A dispatchable execution has no business existing against a closed
     /// row — it can never be picked up (the dispatcher only surfaces
@@ -256,7 +256,7 @@ impl WorkDb {
                 "SELECT we.id, we.work_item_id
                  FROM work_executions we
                  JOIN tasks t ON t.id = we.work_item_id
-                 WHERE we.status IN ('queued', 'ready', 'waiting_dependency')
+                 WHERE we.status IN ('queued', 'ready', 'dispatching', 'waiting_dependency')
                    AND (t.status IN ('done', 'archived', 'cancelled') OR t.deleted_at IS NOT NULL)",
             )?;
             stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
@@ -271,7 +271,7 @@ impl WorkDb {
                  SET status = 'abandoned',
                      finished_at = COALESCE(finished_at, ?2)
                  WHERE id = ?1
-                   AND status IN ('queued', 'ready', 'waiting_dependency')",
+                   AND status IN ('queued', 'ready', 'dispatching', 'waiting_dependency')",
                 params![execution_id, now],
             )?;
             if updated > 0 {
@@ -756,7 +756,7 @@ impl WorkDb {
                AND NOT EXISTS (
                    SELECT 1 FROM work_executions we
                    WHERE we.work_item_id = t.id
-                     AND we.status IN ('ready', 'running', 'waiting_human')
+                     AND we.status IN ('ready', 'dispatching', 'running', 'waiting_human')
                )
                AND NOT EXISTS (
                    SELECT 1 FROM work_attention_items a
@@ -1340,18 +1340,83 @@ impl WorkDb {
         Ok(())
     }
 
-    /// Atomically move a `ready` execution back to `waiting_dependency` when
-    /// the dispatcher discovers at dispatch time that the work item is still
+    /// Atomically claim a `ready` execution for dispatch before any worker
+    /// slot or external workspace resource is acquired. The compare-and-swap
+    /// closes the gap between `list_ready_executions`' snapshot and the fresh
+    /// status read at run start: once claimed, product reconciliation cannot
+    /// rewrite the row's readiness underneath the in-flight dispatch.
+    pub fn begin_execution_dispatch(&self, execution_id: &str) -> Result<Option<WorkExecution>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let affected = tx.execute(
+            "UPDATE work_executions
+             SET status = 'dispatching'
+             WHERE id = ?1
+               AND status = 'ready'",
+            rusqlite::params![execution_id],
+        )?;
+        if affected == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let execution = query_execution(&tx, execution_id)?
+            .with_context(|| format!("execution {execution_id} disappeared after its dispatch claim"))?;
+        tx.commit()?;
+        Ok(Some(execution))
+    }
+
+    /// Release a dispatch claim that did not reach `run_started`. This is a
+    /// guarded no-op after a pre-start failure already moved the row to
+    /// `ready`/`failed`, or after a dependency backstop parked it.
+    pub fn release_execution_dispatch(&self, execution_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let affected = conn.execute(
+            "UPDATE work_executions
+             SET status = 'ready'
+             WHERE id = ?1
+               AND status = 'dispatching'",
+            rusqlite::params![execution_id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Engine-start recovery for durable dispatch claims. No scheduler task
+    /// survives a process restart, so every persisted `dispatching` row is an
+    /// interrupted pre-slot/pre-run claim and is safe to return to `ready`.
+    pub fn requeue_interrupted_dispatches(&self) -> Result<Vec<String>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let execution_ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM work_executions
+                 WHERE status = 'dispatching'
+                 ORDER BY created_at ASC, id ASC",
+            )?;
+            stmt.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?
+        };
+        tx.execute(
+            "UPDATE work_executions
+             SET status = 'ready'
+             WHERE status = 'dispatching'",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(execution_ids)
+    }
+
+    /// Atomically move a `ready` or dispatch-claimed execution back to
+    /// `waiting_dependency` when the dispatcher discovers at dispatch time
+    /// that the work item is still
     /// gated by an unmet prereq. A no-op (returns `false`) when the execution
-    /// is not in `ready` status — it may have been promoted or claimed by
-    /// a concurrent path. Returns `true` when the row was actually updated.
+    /// is in neither status — it may have been settled by a concurrent path.
+    /// Returns `true` when the row was actually updated.
     pub fn downgrade_ready_to_waiting_dependency(&self, execution_id: &str) -> Result<bool> {
         let conn = self.connect()?;
         let affected = conn.execute(
             "UPDATE work_executions
              SET status = 'waiting_dependency'
              WHERE id = ?1
-               AND status = 'ready'",
+               AND status IN ('ready', 'dispatching')",
             rusqlite::params![execution_id],
         )?;
         Ok(affected > 0)
@@ -1420,7 +1485,7 @@ impl WorkDb {
     /// (or a concurrent path) already moved to `blocked`/`in_review`/a
     /// terminal status is left alone. Returns `true` iff the task actually
     /// transitioned; the execution abandon always applies (best-effort,
-    /// WHERE-guarded on `status = 'ready'` so a concurrent claim isn't
+    /// WHERE-guarded on a pre-run status so a concurrent live run isn't
     /// clobbered).
     pub fn retire_stale_revision_before_dispatch(&self, execution_id: &str, task_id: &str) -> Result<bool> {
         let mut conn = self.connect()?;
@@ -1431,7 +1496,7 @@ impl WorkDb {
              SET status = 'abandoned',
                  finished_at = COALESCE(finished_at, ?2)
              WHERE id = ?1
-               AND status = 'ready'",
+               AND status IN ('ready', 'dispatching')",
             params![execution_id, now],
         )?;
         let mut pending = PendingEvents::new();
