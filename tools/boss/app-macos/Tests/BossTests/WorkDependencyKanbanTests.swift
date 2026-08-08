@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 @testable import Boss
 
@@ -385,6 +386,87 @@ final class WorkDependencyKanbanTests: XCTestCase {
         XCTAssertTrue(model.depFrontierHighlightIDs.isEmpty, "should clear on nil")
     }
 
+    // MARK: - Hover-publish idempotence (livelock regression guard)
+    //
+    // `setDepBadgeHover` / `setRevisionBadgeHover` run on SwiftUI's hover
+    // hit-test path, which re-fires at the end of every graph update whose
+    // layout moved anything under the pointer. `WorkBoardSectionItemsView`
+    // observes the whole `ChatViewModel` and reads both highlight sets, so a
+    // `@Published` write that changes nothing still re-evaluates the column,
+    // rebuilds every card snapshot, and re-applies the whole `LazyVStack`
+    // list — which invalidates the responder tree and enqueues the *next*
+    // hover update. Publishing unconditionally closes that loop.
+    //
+    // These tests assert the gate rather than the value, because the value
+    // assertions above already pass with an ungated setter: the ungated bug
+    // is invisible to every test that only reads `depFrontierHighlightIDs`.
+
+    /// A hover-exit while nothing is highlighted must not publish.
+    /// This is the exact tick SwiftUI replays on every responder rebuild.
+    func testRedundantDepBadgeHoverExitDoesNotPublish() {
+        let model = makeFixture()
+        XCTAssertTrue(model.depFrontierHighlightIDs.isEmpty, "precondition: nothing highlighted")
+
+        var publishes = 0
+        let token = model.objectWillChange.sink { _ in publishes += 1 }
+        defer { token.cancel() }
+
+        model.setDepBadgeHover(nil)
+        model.setDepBadgeHover(nil)
+
+        XCTAssertEqual(publishes, 0, "clearing an already-empty frontier must not fire objectWillChange")
+    }
+
+    /// Re-entering the same badge — which a responder rebuild replays
+    /// verbatim — must publish once, not once per hover tick.
+    func testRepeatedDepBadgeHoverEnterPublishesOnlyOnChange() {
+        let model = makeFixture()
+        guard let phase4 = model.taskByName("Phase 4") else {
+            XCTFail("expected fixture tasks"); return
+        }
+
+        var publishes = 0
+        let token = model.objectWillChange.sink { _ in publishes += 1 }
+        defer { token.cancel() }
+
+        model.setDepBadgeHover(phase4.id)
+        XCTAssertEqual(publishes, 1, "the first enter changes the set and must publish")
+
+        model.setDepBadgeHover(phase4.id)
+        model.setDepBadgeHover(phase4.id)
+        XCTAssertEqual(publishes, 1, "re-entering the same badge must not re-publish")
+
+        model.setDepBadgeHover(nil)
+        XCTAssertEqual(publishes, 2, "a genuine exit still publishes so the highlight clears")
+    }
+
+    /// Same gate on the "In revision" badge, which shares the highlight
+    /// overlay and the same hit-test path.
+    func testRevisionBadgeHoverPublishesOnlyOnChange() {
+        let model = makeFixture()
+        guard let phase2 = model.taskByName("Phase 2") else {
+            XCTFail("expected fixture tasks"); return
+        }
+        model.addActiveRevisionForTest(parentID: phase2.id)
+
+        var publishes = 0
+        let token = model.objectWillChange.sink { _ in publishes += 1 }
+        defer { token.cancel() }
+
+        model.setRevisionBadgeHover(nil)
+        XCTAssertEqual(publishes, 0, "clearing an already-empty highlight set must not publish")
+
+        model.setRevisionBadgeHover(phase2.id)
+        XCTAssertEqual(model.revisionHighlightIDs.count, 1, "the revision must actually highlight")
+        XCTAssertEqual(publishes, 1, "the first enter changes the set and must publish")
+
+        model.setRevisionBadgeHover(phase2.id)
+        XCTAssertEqual(publishes, 1, "re-entering the same badge must not re-publish")
+
+        model.setRevisionBadgeHover(nil)
+        XCTAssertEqual(publishes, 2, "a genuine exit still publishes so the highlight clears")
+    }
+
     // MARK: - Fixture
 
     /// One product, one project, three tasks (Phase 1 done, Phase 2
@@ -506,6 +588,20 @@ extension ChatViewModel {
         return nil
     }
 
+    /// Append one active revision row whose chain root is `parentID`,
+    /// so `setRevisionBadgeHover(parentID)` has something to highlight.
+    fileprivate func addActiveRevisionForTest(parentID: String) {
+        upsertTaskForTest(
+            id: "task_rev_of_\(parentID)",
+            name: "Revision of \(parentID)",
+            status: "active",
+            lastStatusActor: "human",
+            kind: "revision",
+            parentTaskId: parentID,
+            revisionSeq: 1
+        )
+    }
+
     /// Inject (or replace) a task on the fixture's first project.
     /// Lets each test extend the baseline fixture with a single
     /// targeted row (manual block, ungated mover) without rebuilding
@@ -514,7 +610,10 @@ extension ChatViewModel {
         id: String,
         name: String,
         status: String,
-        lastStatusActor: String
+        lastStatusActor: String,
+        kind: String = "task",
+        parentTaskId: String? = nil,
+        revisionSeq: Int? = nil
     ) {
         guard let projectID = projectsByProductID.values.first?.first?.id,
               let productID = projectsByProductID.first?.key
@@ -526,7 +625,7 @@ extension ChatViewModel {
             id: id,
             productID: productID,
             projectID: projectID,
-            kind: "task",
+            kind: kind,
             name: name,
             description: "",
             status: status,
@@ -536,7 +635,9 @@ extension ChatViewModel {
             deletedAt: nil,
             createdAt: "2026-05-08T00:00:00Z",
             updatedAt: "2026-05-08T00:00:00Z",
-            lastStatusActor: lastStatusActor
+            lastStatusActor: lastStatusActor,
+            parentTaskId: parentTaskId,
+            revisionSeq: revisionSeq
         )
         var tasks = tasksByProjectID[projectID] ?? []
         if let existing = tasks.firstIndex(where: { $0.id == id }) {

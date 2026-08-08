@@ -453,6 +453,9 @@ struct WorkBoardCardView: View, @MainActor Equatable {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(cardBackground)
                 .brightness(isHovered && !snap.isSelected ? 0.04 : 0)
+                // Scoped to `isHovered` and to the background shape, and
+                // both halves of that matter — see `onHover` below.
+                .animation(.easeInOut(duration: 0.15), value: isHovered)
                 .overlay(
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
                         .strokeBorder(borderColor, lineWidth: snap.isSelected ? 2 : 1)
@@ -463,10 +466,27 @@ struct WorkBoardCardView: View, @MainActor Equatable {
             radius: 4, x: 0, y: 1.5
         )
         .draggable(snap.id)
+        // Plain assignment, NOT `withAnimation`. `withAnimation` sets
+        // `Transaction.animation` for the entire update, so it animates
+        // every animatable attribute that moves in that turn — including
+        // view *frames* (`AnimatableFrameAttribute`), not just this
+        // card's brightness. Hover delivery runs at the *end* of a graph
+        // update (`Update.dispatchActions()` →
+        // `enqueueHoverUpdateIfNeeded()`), so the transaction it joins is
+        // already carrying whatever layout changed that turn. Animated
+        // frames then slide cards under a stationary pointer, which
+        // produces the next hover transition, which opens the next global
+        // animated transaction; `AnimatorState.nextUpdate()` re-arms a
+        // frame every tick, so `GraphHost.flushTransactions()` always has
+        // another transaction queued and the run loop never gets a quiet
+        // turn. That is the 100%-CPU work-board beachball — a livelock,
+        // not a deadlock. See
+        // `tools/boss/docs/investigations/work-board-layout-livelock-2026-08-07.md`.
+        //
+        // The `.animation(_:value:)` above gives the same visual fade
+        // while confining it to a property that cannot move a frame.
         .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.15)) {
-                isHovered = hovering
-            }
+            isHovered = hovering
         }
     }
 
