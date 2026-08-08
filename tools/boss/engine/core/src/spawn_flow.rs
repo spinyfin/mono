@@ -752,7 +752,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
 mod tests {
     use super::*;
     use crate::app::SendToAppError;
-    use crate::driver::test_support::codex_homes_override;
+    use crate::driver::test_support::{codex_homes_override, transcript_store_override};
     use boss_tmux::{CommandOutput, CommandRunner};
     use std::ffi::OsString;
     use std::path::Path;
@@ -1353,11 +1353,16 @@ mod tests {
     }
 
     /// Build a `StartWorkerInput` for the real `CodexDriver`, plus the
-    /// per-run `CODEX_HOME` layout `CodexDriver::provision_workspace`
-    /// leaves behind in production (the `sessions/` directory the rollout
-    /// ingress roots itself at).
-    fn codex_input(workspace: &TempDir, homes_root: &std::path::Path, run_id: &str, slot_id: u8) -> StartWorkerInput {
-        std::fs::create_dir_all(homes_root.join(run_id).join("sessions")).unwrap();
+    /// per-run `CODEX_HOME` layout `CodexDriver::provision_workspace` leaves
+    /// behind in production: `sessions/` is a symlink into the durable
+    /// transcript store, not a real directory. Faking a real directory here
+    /// (as this fixture used to) would hide exactly the writer/checker
+    /// mismatch this test exists to catch, so it drives the real
+    /// `provision_durable_sessions` writer instead.
+    fn codex_input(workspace: &TempDir, run_id: &str, slot_id: u8) -> StartWorkerInput {
+        let codex_home = crate::driver::codex::codex_home_for_run(run_id).unwrap();
+        std::fs::create_dir_all(&codex_home).unwrap();
+        crate::driver::transcript_store::provision_durable_sessions(&codex_home, "codex", run_id).unwrap();
         let mut input = sample_input(workspace);
         input.run_id = run_id.to_owned();
         input.slot_id = slot_id;
@@ -1399,9 +1404,19 @@ mod tests {
         let homes = TempDir::new().unwrap();
         let _homes_env = codex_homes_override(homes.path());
 
+        // `progress_observation_wiring` watches the durable transcript store
+        // directly (see [`durable_sessions_dir`]) rather than the
+        // `CODEX_HOME/sessions` symlink `provision_workspace` points at it —
+        // that link is itself a symlink and fails the progress ingress's
+        // real-directory precondition. Override the store root so
+        // `codex_input`'s real `provision_durable_sessions` call lands
+        // somewhere this test controls.
+        let transcripts = TempDir::new().unwrap();
+        let _transcripts_env = transcript_store_override(transcripts.path());
+
         let workspace = TempDir::new().unwrap();
         let spawner = LiveStateSpawner::new(4, 4242);
-        let input = codex_input(&workspace, homes.path(), "exec-codex-1", 4);
+        let input = codex_input(&workspace, "exec-codex-1", 4);
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

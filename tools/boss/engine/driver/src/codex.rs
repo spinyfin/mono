@@ -1601,9 +1601,21 @@ impl AgentDriver for CodexDriver {
         // rollout JSONL under the run-private CODEX_HOME, so the engine tails
         // that file and feeds it to the generic JSONL reader. Hooks remain the
         // ToolUseInterception transport only.
-        let directory = codex_home_for_run(&config.run_id)
-            .unwrap_or_else(|_| codex_homes_root().join("__invalid_run__"))
-            .join("sessions");
+        //
+        // `CODEX_HOME/sessions` is itself a symlink into Boss's durable
+        // per-execution transcript store (`provision_durable_sessions`,
+        // called from `provision_workspace` before this wiring runs), so it
+        // fails `agent_jsonl_progress`'s `VerifiedRoot` symlink-root check —
+        // that check exists to stop a compromised worker from swapping its
+        // own watched root out from under the engine, and CODEX_HOME sits
+        // inside the worker's write surface. Watch the resolved durable
+        // directory directly instead: it is the real directory Boss itself
+        // created, Codex still reaches it (and only it) through the
+        // `sessions` link, and `VerifiedRoot` can hold it to a stable
+        // identity across the run.
+        let directory = transcript_store_root()
+            .and_then(|root| durable_sessions_dir(&root, "codex", &config.run_id))
+            .unwrap_or_else(|_| codex_homes_root().join("__invalid_run__").join("sessions"));
         ProgressIngress::AgentJsonlFile(AgentJsonlFileIngress {
             directory,
             filename_prefix: "rollout-".to_owned(),
