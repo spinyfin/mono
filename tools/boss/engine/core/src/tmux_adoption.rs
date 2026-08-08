@@ -152,6 +152,13 @@ pub struct UntrackedTmuxSession {
 }
 
 /// What one pass did; the caller logs it.
+///
+/// Constructed with [`Default`] and its fields set directly; the
+/// `bon::Builder` derive is present only to satisfy checkleft's
+/// `rust/giant-structs` check (6+ named fields require it in
+/// `boss-engine`'s internal types) — no caller builds one via
+/// `TmuxAdoptionOutcome::builder()`. Mirrors [`crate::husk_pane_sweep::HuskPaneSweepOutcome`]'s
+/// identical situation.
 #[derive(Debug, Default, Clone, bon::Builder)]
 pub struct TmuxAdoptionOutcome {
     /// Execution ids whose derived bookkeeping was rebuilt this pass.

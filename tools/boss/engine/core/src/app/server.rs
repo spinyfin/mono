@@ -212,10 +212,10 @@ impl crate::terminal_work_sweep::WorkerReaper for ServerState {
 }
 
 // Lets `Arc<ServerState>` be coerced to `Arc<dyn HuskPaneSweepSource>` for the
-// tmux-session reconciler (wired in `run` below). The tmux server, not the
-// app's hosted-pane inventory, is authoritative now: the shared adoption pass
-// re-adopts non-terminal sessions and hands terminal contradictions to
-// `worker_readoption`, returning only DB-unknown sessions for two-pass reaping.
+// tmux-session reconciler (wired in `run` below). The tmux server is the
+// inventory authority: the shared adoption pass re-adopts non-terminal
+// sessions, hands terminal contradictions to `worker_readoption`, and
+// returns only DB-unknown sessions for two-pass reaping.
 #[async_trait::async_trait]
 impl crate::husk_pane_sweep::HuskPaneSweepSource for ServerState {
     async fn list_husk_candidates(&self) -> Option<Vec<crate::tmux_adoption::UntrackedTmuxSession>> {

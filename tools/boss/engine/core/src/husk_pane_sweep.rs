@@ -1,63 +1,65 @@
-//! Periodic reconciler that retires "husk" panes — worker panes the macOS
-//! app is still hosting for a slot the engine has already forgotten.
+//! Periodic reconciler that retires leaked tmux sessions — worker panes the
+//! private `boss` tmux server is still hosting under a spawn token that has
+//! no durable row in this engine's DB at all.
 //!
 //! ## The gap this closes
 //!
-//! Every other reconciler in this crate (`dead_pid_sweep`, `spawn_ack_sweep`,
-//! `terminal_work_sweep`, `pool_claim_sweep`, …) is driven by the ENGINE's
-//! own bookkeeping: a `LiveWorkerStateRegistry` entry, or the worker pool's
-//! own claim table. That bookkeeping is cleared unconditionally at the end
-//! of [`crate::app::ServerState::release_worker_pane`] — "now that the pane
-//! has been torn down — successfully or not — the engine and the app are
-//! back in agreement that slot N is free" (see that function's own
-//! comment). The "successfully or not" is the gap: if the app's
-//! `ReleaseWorkerPane` RPC times out, the app session is transiently
-//! unreachable, or a terminal-transition site (an ack timeout, a
-//! fire-and-forget teardown task) clears engine state without the app RPC
-//! ever landing, the engine's own state is clean — no live-state entry, no
-//! pool claim — while the app is still physically hosting the pane. Nothing
-//! ENGINE-STATE-DRIVEN can ever see this: `bossctl agents list` reads
-//! exactly the same `LiveWorkerStateRegistry` the leak already cleared, and
-//! `terminal_work_sweep`/`pool_claim_sweep` both iterate structures the leak
-//! already emptied.
+//! The tmux server, not the macOS app's hosted-pane inventory, is the
+//! authoritative record of what worker sessions physically exist.
+//! [`crate::tmux_adoption`] enumerates that server and, for every live
+//! session, resolves its `BOSS_SPAWN_TOKEN` against `work_runs` via
+//! [`crate::work::WorkDb::execution_id_for_tmux_spawn_token`]: a match
+//! re-adopts the session (non-terminal execution) or hands it to
+//! [`crate::worker_readoption`] (terminal execution, a live-vs-terminal
+//! contradiction). A session whose token matches **no row at all** is
+//! neither — it is a [`crate::tmux_adoption::UntrackedTmuxSession`], pushed
+//! onto [`crate::tmux_adoption::TmuxAdoptionOutcome::untracked_sessions`],
+//! and this sweep is what confirms and reaps those.
 //!
+//! Historically the same shape (a pane the app still hosts that the
+//! engine's own bookkeeping no longer references) was reached from the
+//! *app*-hosted-pane side: `release_worker_pane` clears engine state
+//! unconditionally at the end of teardown — "successfully or not" — so an
+//! `ReleaseWorkerPane` RPC that timed out, or a terminal-transition site
+//! that cleared engine state without the app RPC ever landing, left the
+//! app still physically hosting a pane no engine-state-driven reconciler
+//! could see (`bossctl agents list` and `terminal_work_sweep`/
+//! `pool_claim_sweep` all iterate structures the leak already emptied).
 //! The operator-observed 2026-07-14 incident (worker "O'Brien"'s exec
 //! created 06:26:19Z, pane spawned only 06:31:22Z; dispatch showed twelve
 //! `request_recorded` → `worker_claimed=skipped` cycles from 06:29:06 to
-//! 06:31:10) is this shape: a slot the engine's pool considered free was
-//! actually still occupied by a real app-hosted pane, so `SpawnWorkerPane`
-//! for the next dispatch kept losing the race against `SlotBusy` until the
-//! stray pane finally cleared. 77 occurrences of the
-//! `[engine-reconcile] live hook event arrived for a TERMINAL execution`
-//! WARN that same day (see [`crate::app::worker_events::dispatch_live_worker_state`])
-//! are the same contradiction observed from the hook-fan-out side: a run the
-//! engine had already terminalized was still alive and emitting hooks.
+//! 06:31:10) is that shape: a slot the engine's pool considered free was
+//! actually still occupied by a real hosted pane, so `SpawnWorkerPane` for
+//! the next dispatch kept losing the race against `SlotBusy` until the
+//! stray pane finally cleared. tmux-session enumeration closes the same gap
+//! from the resource-identity side instead of the app-RPC side: the tmux
+//! server is asked directly what exists, so no teardown RPC failure mode
+//! can hide a leaked session from it.
 //!
 //! [`crate::app::ServerState::list_husk_panes`] and
-//! [`crate::app::ServerState::retire_pane`] already exist as the manual,
+//! [`crate::app::ServerState::retire_pane`] remain as the manual,
 //! operator-invoked break-glass path (`bossctl agents list --all` /
-//! `bossctl agents retire-pane`) for exactly this "husk" shape — but until
-//! this sweep, nothing called them automatically. This sweep is the
-//! backstop: it asks the APP what it hosts, diffs against the engine's live
-//! set (the same diff `list_husk_panes` already performs), and — once a
-//! slot has been reported a husk on two consecutive passes — retires it,
+//! `bossctl agents retire-pane`) over the app's own hosted-pane inventory.
+//! This sweep is the automatic backstop over the tmux server's inventory
+//! instead: once a leaked session has been reported untracked on two
+//! consecutive passes, it retires it (`tmux -L boss kill-session`),
 //! regardless of which terminal-transition site produced the divergence.
 //!
 //! ## Two-pass confirmation
 //!
-//! A slot the app just started hosting (a fresh `SpawnWorkerPane` whose
-//! `register_spawn` call hasn't landed in `LiveWorkerStateRegistry` yet) can
-//! transiently look like a husk. Requiring the SAME `(slot_id, run_id)` pair
-//! to appear on two consecutive passes (mirroring
+//! A session tmux just created (a fresh spawn whose intent write hasn't
+//! landed in `work_runs` yet, or whose adoption pass hasn't run) can
+//! transiently look untracked. Requiring the SAME `(session_name,
+//! spawn_token)` pair to appear on two consecutive passes (mirroring
 //! [`crate::terminal_work_sweep`]) gives any in-flight registration or
-//! teardown a full interval to resolve before this sweep acts, and a slot
-//! that stops looking like a husk between passes (registration landed, or
-//! the pane was cleared by something else) simply drops out of the
-//! confirmed set. Keying on the pair (not slot id alone) means a slot whose
-//! husk run changes between passes — the original husk cleared and a
-//! different leaked run took the same slot — resets the confirmation clock
-//! for the new run instead of being mistaken for the same husk observed
-//! twice.
+//! teardown a full interval to resolve before this sweep acts, and a
+//! session that stops looking untracked between passes (its row landed, or
+//! it was cleared by something else) simply drops out of the confirmed
+//! set. Keying on the pair (not session name alone) means a session name
+//! whose spawn token changes between passes — the original leak cleared and
+//! a different leaked session reused the same name — resets the
+//! confirmation clock for the new token instead of being mistaken for the
+//! same leak observed twice.
 //!
 //! ## Liveness corroboration (why "the engine forgot it" is not enough)
 //!
@@ -76,10 +78,16 @@
 //! The lesson is that a sweep whose action is irreversible must not take
 //! engine bookkeeping as its only input. [`live_process_evidence`] is the
 //! second, independent opinion: the OS (`kill(pid, 0)`) plus the worker's
-//! own hook stream. It runs in both places — when a pane is *classified*
-//! (so a live worker is never flagged, never counted, and never appears in
-//! `bossctl agents list --all` as a husk) and again inside `retire_pane`
-//! (so the break-glass verb and any future caller inherit it too).
+//! own hook stream. It backs the manual, app-hosted-pane break-glass path
+//! instead — `list_husk_panes`'s own classification (so a live worker is
+//! never flagged, never counted, and never appears in `bossctl agents list
+//! --all` as a husk) and again inside `retire_pane`'s guard (so the
+//! break-glass verb and any future caller inherit it too). This periodic
+//! sweep does not need a separate liveness probe for the same reason: a
+//! session only reaches it as an [`crate::tmux_adoption::UntrackedTmuxSession`]
+//! after [`crate::tmux_adoption::classify_untracked_session`] has already
+//! failed to resolve its token to ANY execution, live or dead — there is no
+//! `LiveWorkerState` for it to corroborate against in the first place.
 //!
 //! ## Corroboration when there is NO live-state entry at all
 //!
@@ -255,16 +263,28 @@ pub enum HuskDeathEvidence {
     /// registry forgot (the 2026-07-26 shape) or a run mid-transition.
     /// Either way, not confirmation.
     DbSaysNotTerminal { status: String },
-    /// No row, or the lookup itself failed. No opinion, so no confirmation.
+    /// The spawn token has no row in `work_runs` at all. Every candidate
+    /// this sweep sees reached it precisely because
+    /// [`crate::tmux_adoption::classify_untracked_session`] already failed
+    /// to resolve its token to an execution — so this is not "unknown", it
+    /// is positive: the token was never durably recorded against any
+    /// execution this engine ever dispatched, and therefore cannot belong
+    /// to a run the engine still considers live. Independently confirmed,
+    /// same as [`Self::DbConfirmedTerminal`].
+    TokenUnknownToDb,
+    /// The spawn-token or execution lookup itself failed (a DB error, not a
+    /// miss). No opinion, so no confirmation.
     Unknown { reason: String },
 }
 
 impl HuskDeathEvidence {
-    /// True only for [`Self::DbConfirmedTerminal`]. Absence of contradiction
-    /// is deliberately not confirmation: an unreadable DB must not be able
-    /// to buy a candidate its way past the burst limit.
+    /// True for [`Self::DbConfirmedTerminal`] and [`Self::TokenUnknownToDb`].
+    /// Absence of contradiction is deliberately not confirmation on its
+    /// own — an unreadable DB must not be able to buy a candidate its way
+    /// past the burst limit — but a token that provably never had a row is
+    /// positive evidence, not absence of it.
     pub fn is_independently_confirmed(&self) -> bool {
-        matches!(self, Self::DbConfirmedTerminal { .. })
+        matches!(self, Self::DbConfirmedTerminal { .. } | Self::TokenUnknownToDb)
     }
 
     /// Short stable label for logs and dispatch-event details.
@@ -272,6 +292,7 @@ impl HuskDeathEvidence {
         match self {
             Self::DbConfirmedTerminal { .. } => "db_confirmed_terminal",
             Self::DbSaysNotTerminal { .. } => "db_says_not_terminal",
+            Self::TokenUnknownToDb => "token_unknown_to_db",
             Self::Unknown { .. } => "unknown",
         }
     }
@@ -282,6 +303,7 @@ impl HuskDeathEvidence {
             Self::DbConfirmedTerminal { status } | Self::DbSaysNotTerminal { status } => {
                 format!("execution row status `{status}`")
             }
+            Self::TokenUnknownToDb => "spawn token has no work_runs row in this engine's DB".to_owned(),
             Self::Unknown { reason } => reason.clone(),
         }
     }
@@ -289,21 +311,31 @@ impl HuskDeathEvidence {
 
 /// Ask the work DB whether the run behind a husk candidate is terminal.
 ///
-/// A husk's `run_id` IS its execution id (the same identity
-/// [`crate::transient_recovery`] looks up from `LiveWorkerState::run_id`),
-/// so this is one indexed row read per confirmed candidate per pass.
-pub(crate) fn death_evidence_from_db(work_db: &WorkDb, run_id: &str) -> HuskDeathEvidence {
-    match work_db.get_execution(run_id) {
-        Ok(execution) => {
-            let status = execution.status.as_str().to_owned();
-            if execution.status.is_terminal() {
-                HuskDeathEvidence::DbConfirmedTerminal { status }
-            } else {
-                HuskDeathEvidence::DbSaysNotTerminal { status }
+/// Candidates reach this sweep only after
+/// [`crate::tmux_adoption::classify_untracked_session`] already tried and
+/// failed to resolve their spawn token to an execution via
+/// [`crate::work::WorkDb::execution_id_for_tmux_spawn_token`] — a husk's
+/// `spawn_token` is NOT its execution id, so this repeats that same
+/// token-keyed lookup (rather than treating the token as an execution id)
+/// to see whether that classification still holds a pass later.
+pub(crate) fn death_evidence_from_db(work_db: &WorkDb, spawn_token: &str) -> HuskDeathEvidence {
+    match work_db.execution_id_for_tmux_spawn_token(spawn_token) {
+        Ok(Some(execution_id)) => match work_db.get_execution(&execution_id) {
+            Ok(execution) => {
+                let status = execution.status.as_str().to_owned();
+                if execution.status.is_terminal() {
+                    HuskDeathEvidence::DbConfirmedTerminal { status }
+                } else {
+                    HuskDeathEvidence::DbSaysNotTerminal { status }
+                }
             }
-        }
+            Err(err) => HuskDeathEvidence::Unknown {
+                reason: format!("execution lookup failed: {err}"),
+            },
+        },
+        Ok(None) => HuskDeathEvidence::TokenUnknownToDb,
         Err(err) => HuskDeathEvidence::Unknown {
-            reason: format!("execution lookup failed: {err}"),
+            reason: format!("spawn-token lookup failed: {err}"),
         },
     }
 }
@@ -494,11 +526,11 @@ pub fn spawn_loop(
 }
 
 /// Run a single husk-pane reconciliation pass. `seen_husks` carries the set
-/// of `(slot_id, run_id)` pairs observed as husks on the *previous* pass; on
-/// return it holds this pass's candidates so the next pass can confirm them.
-/// Keying on the pair (not slot id alone) means a slot whose husk run
-/// changes between passes never inherits a prior run's confirmation.
-/// Returns a summary; callers may log it.
+/// of `(session_name, spawn_token)` pairs observed as untracked on the
+/// *previous* pass; on return it holds this pass's candidates so the next
+/// pass can confirm them. Keying on the pair (not session name alone) means
+/// a session name whose spawn token changes between passes never inherits a
+/// prior leak's confirmation. Returns a summary; callers may log it.
 pub async fn run_one_pass(
     source: &dyn HuskPaneSweepSource,
     work_db: &WorkDb,
@@ -581,8 +613,8 @@ pub async fn run_one_pass(
              {MAX_UNCONFIRMED_RETIREMENTS_PER_PASS}-per-pass limit. Retiring none of them: a burst this size with \
              the engine's own execution rows still disagreeing is far better explained by engine bookkeeping that \
              went wrong for every slot at once than by that many simultaneously-orphaned panes, and retiring a live \
-             worker is unrecoverable. Verify the panes by hand and reclaim genuine husks with \
-             `bossctl agents retire-pane <slot>`.",
+             worker is unrecoverable. Verify the sessions named below by hand and reclaim genuine husks with \
+             `tmux -L boss kill-session -t <session>`.",
             unconfirmed.len(),
         );
         for (pane, evidence) in &unconfirmed {
@@ -681,16 +713,25 @@ fn file_breaker_attention(
     let mut ordered: Vec<&(crate::tmux_adoption::UntrackedTmuxSession, HuskDeathEvidence)> = held_back.iter().collect();
     ordered.sort_by_key(|(pane, _)| (pane.session_name.clone(), pane.spawn_token.clone()));
 
+    // A pane only lands in `held_back` (the unconfirmed partition) when its
+    // spawn token DOES resolve to a `work_runs` row whose execution is not
+    // terminal — a token with no row at all is [`HuskDeathEvidence::TokenUnknownToDb`],
+    // which is independently confirmed and never reaches this function. So
+    // this two-step, token-keyed lookup (never "treat the token as an
+    // execution id") is expected to resolve for every held-back pane; the
+    // `find_map` only has to survive an actual DB error on some candidates.
     let Some(work_item_id) = ordered.iter().find_map(|(pane, _)| {
         work_db
-            .get_execution(&pane.spawn_token)
+            .execution_id_for_tmux_spawn_token(&pane.spawn_token)
             .ok()
+            .flatten()
+            .and_then(|execution_id| work_db.get_execution(&execution_id).ok())
             .map(|execution| execution.work_item_id)
     }) else {
         tracing::error!(
             held_back = held_back.len(),
             "husk-pane sweep: circuit breaker tripped but NO held-back pane resolved to a work item, so the \
-             refusal could not be escalated. Reclaim the slots by hand with `bossctl agents retire-pane <slot>`.",
+             refusal could not be escalated. Reclaim the sessions by hand, e.g. `tmux -L boss kill-session -t <session>`.",
         );
         return false;
     };
@@ -754,18 +795,18 @@ mod tests {
     use crate::test_support::{create_active_chore, create_product, open_db};
 
     /// A DB with no execution rows at all. Every husk candidate looked up
-    /// against it yields [`HuskDeathEvidence::Unknown`], which is the
-    /// partition the pre-existing behaviour tests want: an unknown run is
-    /// never independently confirmed, so it stays under the burst limit
-    /// exactly as before this partition existed.
+    /// against it yields [`HuskDeathEvidence::TokenUnknownToDb`] — the
+    /// production shape, since a candidate only ever reaches this sweep
+    /// after `classify_untracked_session` already failed to resolve its
+    /// token to any execution.
     fn empty_db() -> (TempDir, WorkDb) {
         open_db()
     }
 
-    fn husk(slot_id: u8, run_id: &str) -> crate::tmux_adoption::UntrackedTmuxSession {
+    fn husk(slot_id: u8, spawn_token: &str) -> crate::tmux_adoption::UntrackedTmuxSession {
         crate::tmux_adoption::UntrackedTmuxSession {
             session_name: format!("boss-worker-{slot_id}"),
-            spawn_token: run_id.to_owned(),
+            spawn_token: spawn_token.to_owned(),
         }
     }
 
@@ -958,13 +999,27 @@ mod tests {
 
     // ─── mass-retirement circuit breaker ─────────────────────────────────────
     //
-    // These run against `empty_db()`, so every candidate's death evidence is
-    // `Unknown` and they all land in the counted partition. That is the
-    // behaviour the breaker shipped with, asserted unchanged; the tests below
-    // the divider cover what the DB evidence adds on top.
+    // These use `EvidenceDb::running_session_token` to build genuine
+    // "unconfirmed" candidates: a real `work_runs` row whose execution is
+    // not terminal. That is the ONLY shape that still lands in the
+    // breaker's counted partition — a spawn token with no row at all is
+    // `HuskDeathEvidence::TokenUnknownToDb`, independently confirmed, and
+    // bypasses the breaker entirely (see
+    // `tokens_unknown_to_the_db_are_independently_confirmed_and_reclaimed`
+    // below the "independent death evidence" divider).
 
-    fn husks(count: usize) -> Vec<crate::tmux_adoption::UntrackedTmuxSession> {
-        (0..count).map(|i| husk(i as u8, &format!("exec-{i}"))).collect()
+    fn unconfirmed_husks(fixture: &EvidenceDb, count: usize) -> Vec<crate::tmux_adoption::UntrackedTmuxSession> {
+        (0..count)
+            .map(|i| husk(i as u8, &fixture.running_session_token()))
+            .collect()
+    }
+
+    /// Spawn tokens with no `work_runs` row anywhere in the DB — the shape
+    /// every real candidate this sweep sees takes, since
+    /// `classify_untracked_session` already failed to resolve them to an
+    /// execution before this sweep ever saw them.
+    fn unknown_token_husks(count: usize) -> Vec<crate::tmux_adoption::UntrackedTmuxSession> {
+        (0..count).map(|i| husk(i as u8, &format!("spawn-token-{i}"))).collect()
     }
 
     /// Exactly [`MAX_UNCONFIRMED_RETIREMENTS_PER_PASS`] confirmed husks is under the
@@ -972,14 +1027,14 @@ mod tests {
     /// sweep's normal reclaim behaviour.
     #[tokio::test]
     async fn breaker_allows_a_pass_at_the_limit() {
-        let batch = husks(MAX_UNCONFIRMED_RETIREMENTS_PER_PASS);
+        let fixture = EvidenceDb::new();
+        let batch = unconfirmed_husks(&fixture, MAX_UNCONFIRMED_RETIREMENTS_PER_PASS);
         let source = ScriptedSource::new(vec![Some(batch.clone()), Some(batch)]);
         let sink = RecordingDispatchEventSink::new();
-        let (_dir, db) = empty_db();
         let mut seen = HashSet::new();
 
-        run_one_pass(&source, &db, &sink, &mut seen).await;
-        let second = run_one_pass(&source, &db, &sink, &mut seen).await;
+        run_one_pass(&source, &fixture.db, &sink, &mut seen).await;
+        let second = run_one_pass(&source, &fixture.db, &sink, &mut seen).await;
 
         assert_eq!(second.retired, MAX_UNCONFIRMED_RETIREMENTS_PER_PASS);
         assert_eq!(second.breaker_tripped, None);
@@ -992,14 +1047,14 @@ mod tests {
     /// five independently-orphaned panes, and the kill is irreversible.
     #[tokio::test]
     async fn breaker_trips_and_retires_nothing_above_the_limit() {
-        let batch = husks(MAX_UNCONFIRMED_RETIREMENTS_PER_PASS + 2);
+        let fixture = EvidenceDb::new();
+        let batch = unconfirmed_husks(&fixture, MAX_UNCONFIRMED_RETIREMENTS_PER_PASS + 2);
         let source = ScriptedSource::new(vec![Some(batch.clone()), Some(batch)]);
         let sink = RecordingDispatchEventSink::new();
-        let (_dir, db) = empty_db();
         let mut seen = HashSet::new();
 
-        run_one_pass(&source, &db, &sink, &mut seen).await;
-        let second = run_one_pass(&source, &db, &sink, &mut seen).await;
+        run_one_pass(&source, &fixture.db, &sink, &mut seen).await;
+        let second = run_one_pass(&source, &fixture.db, &sink, &mut seen).await;
 
         assert_eq!(second.breaker_tripped, Some(MAX_UNCONFIRMED_RETIREMENTS_PER_PASS + 2));
         assert_eq!(second.retired, 0, "the breaker must retire nothing at all");
@@ -1026,15 +1081,15 @@ mod tests {
     /// declined.
     #[tokio::test]
     async fn breaker_stays_tripped_while_the_burst_persists() {
-        let batch = husks(MAX_UNCONFIRMED_RETIREMENTS_PER_PASS + 2);
+        let fixture = EvidenceDb::new();
+        let batch = unconfirmed_husks(&fixture, MAX_UNCONFIRMED_RETIREMENTS_PER_PASS + 2);
         let source = ScriptedSource::new(vec![Some(batch.clone()), Some(batch.clone()), Some(batch)]);
         let sink = RecordingDispatchEventSink::new();
-        let (_dir, db) = empty_db();
         let mut seen = HashSet::new();
 
-        run_one_pass(&source, &db, &sink, &mut seen).await;
-        run_one_pass(&source, &db, &sink, &mut seen).await;
-        let third = run_one_pass(&source, &db, &sink, &mut seen).await;
+        run_one_pass(&source, &fixture.db, &sink, &mut seen).await;
+        run_one_pass(&source, &fixture.db, &sink, &mut seen).await;
+        let third = run_one_pass(&source, &fixture.db, &sink, &mut seen).await;
 
         assert_eq!(third.breaker_tripped, Some(MAX_UNCONFIRMED_RETIREMENTS_PER_PASS + 2));
         assert_eq!(third.retired, 0);
@@ -1046,18 +1101,21 @@ mod tests {
     /// that disables the sweep forever.
     #[tokio::test]
     async fn breaker_resets_once_the_burst_subsides() {
-        let big = husks(MAX_UNCONFIRMED_RETIREMENTS_PER_PASS + 2);
-        let small = vec![husk(0, "exec-0")];
+        let fixture = EvidenceDb::new();
+        let big = unconfirmed_husks(&fixture, MAX_UNCONFIRMED_RETIREMENTS_PER_PASS + 2);
+        // Reuse the first big-batch candidate's exact (session_name, spawn_token)
+        // pair, rather than minting a fresh one, so it is already confirmed from
+        // the prior passes and this pass reclaims it immediately.
+        let small = vec![big[0].clone()];
         let source = ScriptedSource::new(vec![Some(big.clone()), Some(big), Some(small)]);
         let sink = RecordingDispatchEventSink::new();
-        let (_dir, db) = empty_db();
         let mut seen = HashSet::new();
 
-        run_one_pass(&source, &db, &sink, &mut seen).await;
-        let tripped = run_one_pass(&source, &db, &sink, &mut seen).await;
+        run_one_pass(&source, &fixture.db, &sink, &mut seen).await;
+        let tripped = run_one_pass(&source, &fixture.db, &sink, &mut seen).await;
         assert_eq!(tripped.retired, 0);
 
-        let third = run_one_pass(&source, &db, &sink, &mut seen).await;
+        let third = run_one_pass(&source, &fixture.db, &sink, &mut seen).await;
         assert_eq!(third.breaker_tripped, None);
         assert_eq!(third.retired, 1, "a single husk is retired normally again");
         assert_eq!(source.retired(), vec!["boss-worker-0"]);
@@ -1133,6 +1191,43 @@ mod tests {
             id
         }
 
+        /// Record a genuine tmux spawn token for an execution — the same
+        /// call `crate::tmux_adoption`'s spawn path makes before tmux ever
+        /// creates the session. Deliberately distinct from the execution
+        /// id: [`crate::tmux_adoption::UntrackedTmuxSession::spawn_token`]
+        /// is never an execution id in production, and a fixture that used
+        /// the execution id as the token would exercise a lookup shape
+        /// `death_evidence_from_db` never actually sees.
+        fn record_spawn_token(&self, execution_id: &str) -> String {
+            let token = format!("spawn-token-for-{execution_id}");
+            self.db
+                .record_tmux_spawn_intent_for_execution(
+                    execution_id,
+                    "boss",
+                    &format!("session-{execution_id}"),
+                    &token,
+                )
+                .unwrap();
+            token
+        }
+
+        /// A genuine "unconfirmed" candidate: a real, non-terminal
+        /// execution's spawn token, the only shape
+        /// [`HuskDeathEvidence::DbSaysNotTerminal`] can arise from.
+        fn running_session_token(&self) -> String {
+            let execution_id = self.running_execution();
+            self.record_spawn_token(&execution_id)
+        }
+
+        /// A genuine "independently confirmed dead" candidate sourced from a
+        /// real terminal execution row, as opposed to
+        /// [`HuskDeathEvidence::TokenUnknownToDb`], the other
+        /// independently-confirmed shape.
+        fn orphaned_session_token(&self) -> String {
+            let execution_id = self.orphaned_execution();
+            self.record_spawn_token(&execution_id)
+        }
+
         /// Every breaker attention item across every work item this fixture
         /// created — the escalation anchors to one of them, and the test
         /// should not have to know which.
@@ -1162,7 +1257,7 @@ mod tests {
     async fn mass_orphan_burst_reclaims_every_slot_without_manual_intervention() {
         let fixture = EvidenceDb::new();
         let batch: Vec<crate::tmux_adoption::UntrackedTmuxSession> = (0..11)
-            .map(|slot| husk(slot as u8, &fixture.orphaned_execution()))
+            .map(|slot| husk(slot as u8, &fixture.orphaned_session_token()))
             .collect();
         let source = ScriptedSource::new(vec![Some(batch.clone()), Some(batch)]);
         let sink = RecordingDispatchEventSink::new();
@@ -1222,7 +1317,7 @@ mod tests {
     async fn breaker_still_refuses_and_now_escalates_when_the_db_says_the_runs_are_live() {
         let fixture = EvidenceDb::new();
         let batch: Vec<crate::tmux_adoption::UntrackedTmuxSession> = (0..5)
-            .map(|slot| husk(slot as u8, &fixture.running_execution()))
+            .map(|slot| husk(slot as u8, &fixture.running_session_token()))
             .collect();
         let source = ScriptedSource::new(vec![Some(batch.clone()), Some(batch)]);
         let sink = RecordingDispatchEventSink::new();
@@ -1273,9 +1368,9 @@ mod tests {
     async fn mixed_burst_reclaims_the_confirmed_dead_and_holds_back_the_rest() {
         let fixture = EvidenceDb::new();
         let mut batch: Vec<crate::tmux_adoption::UntrackedTmuxSession> = (0..6)
-            .map(|slot| husk(slot as u8, &fixture.orphaned_execution()))
+            .map(|slot| husk(slot as u8, &fixture.orphaned_session_token()))
             .collect();
-        batch.extend((6..10).map(|slot| husk(slot as u8, &fixture.running_execution())));
+        batch.extend((6..10).map(|slot| husk(slot as u8, &fixture.running_session_token())));
         let source = ScriptedSource::new(vec![Some(batch.clone()), Some(batch)]);
         let sink = RecordingDispatchEventSink::new();
         let mut seen = HashSet::new();
@@ -1303,7 +1398,7 @@ mod tests {
     async fn escalation_dedupes_while_the_burst_persists() {
         let fixture = EvidenceDb::new();
         let batch: Vec<crate::tmux_adoption::UntrackedTmuxSession> = (0..5)
-            .map(|slot| husk(slot as u8, &fixture.running_execution()))
+            .map(|slot| husk(slot as u8, &fixture.running_session_token()))
             .collect();
         let source = ScriptedSource::new(vec![
             Some(batch.clone()),
@@ -1325,23 +1420,39 @@ mod tests {
         );
     }
 
-    /// A DB that cannot answer is not a DB that agrees. An unreadable or
-    /// missing execution row leaves the candidate in the counted partition,
-    /// so a lookup failure can never buy a burst its way past the limit.
+    /// The only production shape: every real candidate this sweep sees
+    /// reached it because `classify_untracked_session` already failed to
+    /// resolve its spawn token to any execution at all — there is no row
+    /// for the DB to disagree with. That is positive evidence the token
+    /// cannot belong to a live tracked run, so a burst of these bypasses
+    /// the breaker entirely and reclaims every slot, unlike a burst of the
+    /// [`EvidenceDb`]-backed "unconfirmed" shape exercised above.
     #[tokio::test]
-    async fn unknown_execution_rows_are_not_confirmation() {
-        let fixture = EvidenceDb::new();
-        let batch = husks(5); // run ids with no row in this DB at all
+    async fn tokens_unknown_to_the_db_are_independently_confirmed_and_reclaimed() {
+        let batch = unknown_token_husks(5);
         let source = ScriptedSource::new(vec![Some(batch.clone()), Some(batch)]);
         let sink = RecordingDispatchEventSink::new();
+        let (_dir, db) = empty_db();
         let mut seen = HashSet::new();
 
-        run_one_pass(&source, &fixture.db, &sink, &mut seen).await;
-        let second = run_one_pass(&source, &fixture.db, &sink, &mut seen).await;
+        run_one_pass(&source, &db, &sink, &mut seen).await;
+        let second = run_one_pass(&source, &db, &sink, &mut seen).await;
 
-        assert_eq!(second.breaker_tripped, Some(5));
-        assert_eq!(second.retired, 0);
-        assert_eq!(second.independently_confirmed, 0);
+        assert_eq!(
+            second.breaker_tripped, None,
+            "there is no execution row for the breaker to be suspicious of",
+        );
+        assert_eq!(second.retired, 5);
+        assert_eq!(second.independently_confirmed, 5);
+        assert_eq!(source.retired().len(), 5);
+
+        let events = sink.events().await;
+        assert_eq!(events.len(), 5);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.details["death_evidence"] == "token_unknown_to_db")
+        );
     }
 
     /// `death_evidence_from_db` reads the execution row and nothing else.
@@ -1349,19 +1460,22 @@ mod tests {
     async fn death_evidence_reads_the_execution_row() {
         let fixture = EvidenceDb::new();
 
-        let orphaned = death_evidence_from_db(&fixture.db, &fixture.orphaned_execution());
+        let orphaned = death_evidence_from_db(&fixture.db, &fixture.orphaned_session_token());
         assert!(orphaned.is_independently_confirmed());
         assert_eq!(orphaned.label(), "db_confirmed_terminal");
         assert!(orphaned.detail().contains("orphaned"));
 
-        let running = death_evidence_from_db(&fixture.db, &fixture.running_execution());
+        let running = death_evidence_from_db(&fixture.db, &fixture.running_session_token());
         assert!(!running.is_independently_confirmed());
         assert_eq!(running.label(), "db_says_not_terminal");
         assert!(running.detail().contains("running"));
 
-        let missing = death_evidence_from_db(&fixture.db, "exec-that-never-existed");
-        assert!(!missing.is_independently_confirmed());
-        assert_eq!(missing.label(), "unknown");
+        let unknown_token = death_evidence_from_db(&fixture.db, "spawn-token-that-never-existed");
+        assert!(
+            unknown_token.is_independently_confirmed(),
+            "a token with no work_runs row at all can never belong to a live tracked run",
+        );
+        assert_eq!(unknown_token.label(), "token_unknown_to_db");
     }
 
     // ─── liveness corroboration ──────────────────────────────────────────────

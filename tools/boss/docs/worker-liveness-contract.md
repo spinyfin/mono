@@ -91,16 +91,19 @@ detected — a hook, or the redispatch guard. It never runs unprompted, so a
 tmux-hosted worker whose execution is still **non-terminal** (the row was
 never wrong) would otherwise sit invisible to `bossctl agents list` from the
 moment the engine restarts until it happens to hook. `engine/core/src/tmux_adoption.rs`
-closes that gap, once, at boot, before `run_reconcile` gets a turn: it
-enumerates the private `boss` tmux server, exact-matches each live session's
-authoritative `BOSS_SPAWN_TOKEN` (`show-environment`, never the
-`@boss_spawn_token` option mirror) against the non-terminal tmux-tracked
-`work_runs` rows, and rebuilds the pool slot claim, `WorkerRegistry` entry,
-`LiveWorkerState` entry, and live-status summarizer for every match. A
-session whose token instead resolves to a **terminal** execution is handed to
-`worker_readoption` exactly as above, via the trigger `boot_tmux_adoption`,
-and emits `tmux_worker_adopted` (rebuilt) or the usual `live_worker_readopted`
-/ `husk_pane_reconcile` events (handed off) accordingly.
+closes that gap, once at boot and periodically thereafter, before
+`run_reconcile` gets a turn on the boot pass: it enumerates the private
+`boss` tmux server, exact-matches each live session's authoritative
+`BOSS_SPAWN_TOKEN` (`show-environment`, never the `@boss_spawn_token` option
+mirror) against the non-terminal tmux-tracked `work_runs` rows, and rebuilds
+the pool slot claim, `WorkerRegistry` entry, `LiveWorkerState` entry, and
+live-status summarizer for every match. A session whose token instead
+resolves to a **terminal** execution is handed to `worker_readoption` exactly
+as above, via the trigger `tmux_session_sweep`, and emits
+`tmux_worker_adopted` (rebuilt) or the usual `live_worker_readopted` /
+`husk_pane_reconcile` events (handed off) accordingly. A session whose token
+resolves to no row at all is left for `engine/core/src/husk_pane_sweep.rs`'s
+periodic two-pass reap instead of being handled here.
 
 ## Rules of thumb for future work here
 
