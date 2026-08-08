@@ -1980,7 +1980,7 @@ async fn lease_failure_retries_clean_scratch_even_with_old_preference() {
 }
 
 // ── reconcile_workspace_recovery: cube first, patch second ────────────
-
+ 
 /// The invariant behind the "executions fail seconds after start with
 /// `driver` unresolved" report.
 ///
@@ -2446,116 +2446,116 @@ async fn pane_spawn_precondition_failure_reaches_all_three_operator_surfaces() {
     // `boss task show --json`. Before the fix it returned nothing at all
     // for this failure class, because `finish_execution_run` files
     // execution-scoped rows by contract.
-    let items = db.list_attention_items_for_work_item(&chore.id).unwrap();
-    let spawn_item = items
-        .iter()
-        .find(|item| item.kind == "pane_spawn_failed")
-        .unwrap_or_else(|| panic!("work item must surface the pane-spawn failure; got {items:#?}"));
-    assert_eq!(spawn_item.status, "open");
-    assert_eq!(
-        spawn_item.execution_id.as_deref(),
-        Some(execution_id.as_str()),
-        "the item stays execution-scoped; only the work-item query had to learn to resolve through it",
-    );
-    assert!(
-        spawn_item.body_markdown.contains(INGRESS_PRECONDITION),
-        "the attention body must carry the underlying cause, not just 'spawn failed'; got {:?}",
-        spawn_item.body_markdown,
-    );
-    assert!(
-        spawn_item.body_markdown.contains("progress_ingress"),
-        "the attention body must name the step that refused; got {:?}",
-        spawn_item.body_markdown,
-    );
-
-    // ── Surface 2: the dispatch event's structured classification ───────
-    let events = recording.events_for(&execution_id).await;
-    let spawn_failed = events
-        .iter()
-        .find(|event| event.stage == "spawn_failed" && event.outcome == "error")
-        .unwrap_or_else(|| panic!("expected a spawn_failed:error event; got {events:#?}"));
-    assert_eq!(spawn_failed.details["spawn_failure"]["class"], "progress_ingress");
-    assert_eq!(spawn_failed.details["spawn_failure"]["cause"], INGRESS_PRECONDITION);
-    assert!(
-        spawn_failed
-            .error_message
-            .as_deref()
-            .is_some_and(|msg| msg.contains(INGRESS_PRECONDITION)),
-        "the event's flattened chain must still carry the cause; got {:?}",
-        spawn_failed.error_message,
-    );
-
-    // ── Surface 3: the run row's error_text ─────────────────────────────
-    let runs = db.list_runs(&execution_id).unwrap();
-    let failed_run = runs
-        .iter()
-        .find(|run| run.status == "failed")
-        .unwrap_or_else(|| panic!("expected a failed run row; got {runs:#?}"));
-    let error_text = failed_run
-        .error_text
-        .as_deref()
-        .unwrap_or_else(|| panic!("failed run must record an error_text; got {failed_run:#?}"));
-    assert!(
-        error_text.contains("spawning worker pane for run"),
-        "error_text must keep the outer context; got {error_text:?}",
-    );
-    assert!(
-        error_text.contains(INGRESS_PRECONDITION),
-        "error_text must carry the flattened cause, not just the outermost context; got {error_text:?}",
-    );
-}
-
-/// A redispatch that fails to spawn identically is NOT evidence that the
-/// previous pane-spawn failure is over — but the generic `WorkResumed`
-/// evidence clause used to accept it, because `work_runs.started_at` is
-/// stamped when the row is inserted, before the pane is ever asked for. That
-/// is how fifteen consecutive failures kept clearing their own predecessor.
-#[tokio::test]
-async fn a_repeat_pane_spawn_failure_does_not_resolve_the_previous_signal() {
-    let dir = tempdir().unwrap();
-    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-    let product = create_test_product(&db);
-    let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
-    db.reconcile_product_executions(&product.id).unwrap();
-
-    let cube = Arc::new(FakeCubeClient::default());
-    let runner = Arc::new(FakeExecutionRunner {
-        progress_ingress_failure: Some(INGRESS_PRECONDITION.to_owned()),
-        ..FakeExecutionRunner::default()
-    });
-    let coordinator = Arc::new(ExecutionCoordinator::new(
-        db.clone(),
-        WorkerPool::new(1),
-        cube.clone(),
-        runner.clone(),
-    ));
-
-    let first = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
-    coordinator.kick();
-    wait_for_execution_status(db.as_ref(), &first, ExecutionStatus::Failed).await;
-
-    // The operator (or the reconciler) puts the item back in flight; the
-    // host precondition is still broken, so it fails identically.
-    let second = db
-        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
-        .unwrap()
-        .id;
-    assert_ne!(second, first);
-    coordinator.kick();
-    wait_for_execution_status(db.as_ref(), &second, ExecutionStatus::Failed).await;
-
-    let outcome = db.reconcile_stale_attention_signals().unwrap();
-
-    let items = db.list_attention_items_for_work_item(&chore.id).unwrap();
-    let spawn_items: Vec<_> = items.iter().filter(|item| item.kind == "pane_spawn_failed").collect();
-    assert_eq!(
-        spawn_items.len(),
-        2,
-        "each failed spawn keeps its own row — recurrence must stay visible, not be collapsed; got {items:#?}",
-    );
-    assert!(
-        spawn_items.iter().all(|item| item.status == "open"),
-        "a redispatch that failed the same way is not evidence the condition ended \
-         (reconcile outcome: {outcome:?}); got {spawn_items:#?}",
-    );
-}
+     let items = db.list_attention_items_for_work_item(&chore.id).unwrap();
+     let spawn_item = items
+         .iter()
+         .find(|item| item.kind == "pane_spawn_failed")
+         .unwrap_or_else(|| panic!("work item must surface the pane-spawn failure; got {items:#?}"));
+     assert_eq!(spawn_item.status, "open");
+     assert_eq!(
+         spawn_item.execution_id.as_deref(),
+         Some(execution_id.as_str()),
+         "the item stays execution-scoped; only the work-item query had to learn to resolve through it",
+     );
+     assert!(
+         spawn_item.body_markdown.contains(INGRESS_PRECONDITION),
+         "the attention body must carry the underlying cause, not just 'spawn failed'; got {:?}",
+         spawn_item.body_markdown,
+     );
+     assert!(
+         spawn_item.body_markdown.contains("progress_ingress"),
+         "the attention body must name the step that refused; got {:?}",
+         spawn_item.body_markdown,
+     );
+ 
+     // ── Surface 2: the dispatch event's structured classification ───────
+     let events = recording.events_for(&execution_id).await;
+     let spawn_failed = events
+         .iter()
+         .find(|event| event.stage == "spawn_failed" && event.outcome == "error")
+         .unwrap_or_else(|| panic!("expected a spawn_failed:error event; got {events:#?}"));
+     assert_eq!(spawn_failed.details["spawn_failure"]["class"], "progress_ingress");
+     assert_eq!(spawn_failed.details["spawn_failure"]["cause"], INGRESS_PRECONDITION);
+     assert!(
+         spawn_failed
+             .error_message
+             .as_deref()
+             .is_some_and(|msg| msg.contains(INGRESS_PRECONDITION)),
+         "the event's flattened chain must still carry the cause; got {:?}",
+         spawn_failed.error_message,
+     );
+ 
+     // ── Surface 3: the run row's error_text ─────────────────────────────
+     let runs = db.list_runs(&execution_id).unwrap();
+     let failed_run = runs
+         .iter()
+         .find(|run| run.status == "failed")
+         .unwrap_or_else(|| panic!("expected a failed run row; got {runs:#?}"));
+     let error_text = failed_run
+         .error_text
+         .as_deref()
+         .unwrap_or_else(|| panic!("failed run must record an error_text; got {failed_run:#?}"));
+     assert!(
+         error_text.contains("spawning worker pane for run"),
+         "error_text must keep the outer context; got {error_text:?}",
+     );
+     assert!(
+         error_text.contains(INGRESS_PRECONDITION),
+         "error_text must carry the flattened cause, not just the outermost context; got {error_text:?}",
+     );
+ }
+ 
+ /// A redispatch that fails to spawn identically is NOT evidence that the
+ /// previous pane-spawn failure is over — but the generic `WorkResumed`
+ /// evidence clause used to accept it, because `work_runs.started_at` is
+ /// stamped when the row is inserted, before the pane is ever asked for. That
+ /// is how fifteen consecutive failures kept clearing their own predecessor.
+ #[tokio::test]
+ async fn a_repeat_pane_spawn_failure_does_not_resolve_the_previous_signal() {
+     let dir = tempdir().unwrap();
+     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+     let product = create_test_product(&db);
+     let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+     db.reconcile_product_executions(&product.id).unwrap();
+ 
+     let cube = Arc::new(FakeCubeClient::default());
+     let runner = Arc::new(FakeExecutionRunner {
+         progress_ingress_failure: Some(INGRESS_PRECONDITION.to_owned()),
+         ..FakeExecutionRunner::default()
+     });
+     let coordinator = Arc::new(ExecutionCoordinator::new(
+         db.clone(),
+         WorkerPool::new(1),
+         cube.clone(),
+         runner.clone(),
+     ));
+ 
+     let first = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+     coordinator.kick();
+     wait_for_execution_status(db.as_ref(), &first, ExecutionStatus::Failed).await;
+ 
+     // The operator (or the reconciler) puts the item back in flight; the
+     // host precondition is still broken, so it fails identically.
+     let second = db
+         .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+         .unwrap()
+         .id;
+     assert_ne!(second, first);
+     coordinator.kick();
+     wait_for_execution_status(db.as_ref(), &second, ExecutionStatus::Failed).await;
+ 
+     let outcome = db.reconcile_stale_attention_signals().unwrap();
+ 
+     let items = db.list_attention_items_for_work_item(&chore.id).unwrap();
+     let spawn_items: Vec<_> = items.iter().filter(|item| item.kind == "pane_spawn_failed").collect();
+     assert_eq!(
+         spawn_items.len(),
+         2,
+         "each failed spawn keeps its own row — recurrence must stay visible, not be collapsed; got {items:#?}",
+     );
+     assert!(
+         spawn_items.iter().all(|item| item.status == "open"),
+         "a redispatch that failed the same way is not evidence the condition ended \
+          (reconcile outcome: {outcome:?}); got {spawn_items:#?}",
+     );
+ }

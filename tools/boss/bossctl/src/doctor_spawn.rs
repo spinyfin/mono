@@ -55,11 +55,11 @@ const PROGRESS_INGRESS_MARKER: &str = "preparing progress ingress: ";
 /// under-ranked, never invisible.
 ///
 /// `response_kind_mismatch` is deliberately NOT in this list: unlike
-/// `progress_ingress`/`write_files`, which are evaluated before the app is
-/// ever contacted (`spawn_flow.rs:517-520`), `StartWorkerError::ResponseKindMismatch`
-/// is returned only after `SpawnWorkerPane` was sent and the app replied with
-/// the wrong response variant (`spawn_flow.rs:691`). That is a transport/
-/// protocol desync, not a host precondition — a pane may well have been
+/// `progress_ingress`/`write_files`, which are evaluated inside `spawn_flow`'s
+/// pre-request path, before `SpawnWorkerPane` is sent, `StartWorkerError::ResponseKindMismatch`
+/// is returned from the match on the app's reply to `SpawnWorkerPane` — i.e. only
+/// after it was sent and the app replied with the wrong response variant. That is a
+/// transport/protocol desync, not a host precondition — a pane may well have been
 /// spawned and now needs reaping, so the P0 "no pane was ever requested;
 /// do not grow the pool, retry, or reap panes" advice would be actively
 /// wrong for it. It takes the transport branch below instead, which hands
@@ -138,11 +138,17 @@ pub(crate) fn match_sig_i_spawn_precondition(events: &[DispatchEvent], scope: &B
              item is filed against the work item with the same flattened cause."
         };
 
+        let title = if deterministic {
+            "Worker pane never requested — spawn precondition rejected"
+        } else {
+            "Worker pane spawn failed — spawn round-trip rejected"
+        };
+
         out.push(Finding {
             sig_id: "SIG-I".into(),
             absence_based: false,
             severity: if deterministic { Severity::P0 } else { Severity::P1 },
-            title: "Worker pane never requested — spawn precondition rejected".into(),
+            title: title.into(),
             execution_id: Some(event.execution_id.clone()),
             work_item_id: work_item_of(event),
             count: 1,
@@ -281,6 +287,11 @@ mod tests {
             findings[0].recovery,
         );
         assert_eq!(findings[0].details["deterministic_precondition"], false);
+        assert!(
+            !findings[0].title.contains("never requested"),
+            "the transport branch must not carry the deterministic-precondition headline; got {:?}",
+            findings[0].title,
+        );
     }
 
     #[test]
