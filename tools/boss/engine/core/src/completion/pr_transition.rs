@@ -359,6 +359,18 @@ impl WorkerCompletionHandler {
                 } else {
                     design_detector::on_task_doc_pr_detected(&self.work_db, &task.id, &task.product_id, &pr_url).await;
                 }
+                // The earlier `publish_work_item_changed` above ran BEFORE
+                // this detector call, so the client's refetch it triggers
+                // can race the doc-pointer write and land the doc link
+                // absent — leaving it visible only when some later,
+                // unrelated event happens to refetch the tree. Publish a
+                // second invalidation now that the pointer write (or its
+                // no-op) has actually completed, mirroring the manual
+                // `boss task set-doc` path (`app/work_items.rs`, reason
+                // `task_doc_pointer_set`).
+                self.publisher
+                    .publish_work_item_changed(&task.product_id, &task.id, "task_doc_pointer_set")
+                    .await;
             }
         }
 
@@ -405,6 +417,13 @@ impl WorkerCompletionHandler {
                 design_detector::on_design_pr_detected(&self.work_db, &task.id, &task.product_id, project_id, &pr_url)
                     .await;
             }
+            // See the matching comment on the per-task doc branch above:
+            // the earlier `publish_work_item_changed` predates this
+            // detector's pointer write, so publish a follow-up
+            // invalidation now that it has actually landed.
+            self.publisher
+                .publish_work_item_changed(&task.product_id, &task.id, "design_doc_pointer_set")
+                .await;
 
             // Attentions creation pipeline (design: attentions.md).
             // A design worker may ship a sibling `<slug>.attentions.json`
