@@ -16,13 +16,13 @@ use crate::bypass::{
 use crate::check::{CheckRegistry, ConfiguredCheck};
 use crate::config::{CheckConfig, CheckConfigOrigin, CheckScope, ConfigDiagnostic, ConfigResolver};
 use crate::exclusion::ExclusionStatus;
-use crate::exclusion_matcher::ExclusionMatcher;
 use crate::external::{
     ExternalCheckExecutor, ExternalCheckPackage, ExternalCheckPackageImplementation, ExternalCheckPackageProvider,
     NoopExternalCheckExecutor, NoopExternalCheckPackageProvider,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
+use crate::path_scope::PathScope;
 use tracing::info;
 
 struct ScheduledCheckRun {
@@ -32,10 +32,11 @@ struct ScheduledCheckRun {
     policy: EffectiveCheckPolicy,
     config: toml::Value,
     changeset: ChangeSet,
-    /// Effective exclusion matcher for this check instance (global ∪ per-check
-    /// excludes). Used to subtract excluded paths from what the check sees and to
-    /// back-stop any finding that lands on an excluded path.
-    exclusion_matcher: ExclusionMatcher,
+    /// Effective path scope for this check instance: the check-entry `applies_to`
+    /// (framework include side) and the union of global ∪ per-check excludes.
+    /// Used to narrow what the check sees to its scope and to back-stop any
+    /// finding that lands outside it.
+    path_scope: PathScope,
 }
 
 enum ScheduledExecution {
@@ -86,7 +87,7 @@ struct ScheduledRuns {
 }
 
 /// Dedup key for a scheduled check run: (check id, check definition name,
-/// implementation fingerprint, config fingerprint, policy fingerprint, exclude
+/// implementation fingerprint, config fingerprint, policy fingerprint, scope
 /// fingerprint). Two changed files that resolve to identical values here share
 /// one run.
 type RunGroupKey = (String, String, String, String, String, String);
@@ -95,11 +96,15 @@ type RunGroupKey = (String, String, String, String, String, String);
 type DiagnosticGroupKey = (String, PathBuf, Option<u32>, Option<u32>, String, String);
 
 /// Build the [`RunGroupKey`] for `check` under `policy` and the given effective
-/// exclude patterns (global ∪ per-check, already normalized to repo-root-relative
-/// coords by the caller).
+/// applies_to and exclude patterns (global ∪ per-check, already normalized to
+/// repo-root-relative coords by the caller). Both join into one scope
+/// fingerprint, so two files whose effective `applies_to` or exclude set
+/// differs never share a run — each run then carries one consistent
+/// [`PathScope`].
 fn run_group_key(
     check: &CheckConfig,
     policy: &EffectiveCheckPolicy,
+    effective_applies_to_patterns: &[String],
     effective_exclude_patterns: &[String],
 ) -> RunGroupKey {
     let config_fingerprint = toml::to_string(&check.config).unwrap_or_default();
@@ -108,14 +113,18 @@ fn run_group_key(
         .as_ref()
         .map(ToString::to_string)
         .unwrap_or_default();
-    let exclude_fingerprint = effective_exclude_patterns.join("\n");
+    let scope_fingerprint = format!(
+        "applies_to={}\nexclude={}",
+        effective_applies_to_patterns.join("\n"),
+        effective_exclude_patterns.join("\n")
+    );
     (
         check.id.clone(),
         check.check.clone(),
         implementation_fingerprint,
         config_fingerprint,
         policy.fingerprint(),
-        exclude_fingerprint,
+        scope_fingerprint,
     )
 }
 
@@ -264,11 +273,13 @@ impl Runner {
                     let run_changeset = run.changeset;
                     let run_policy = run.policy;
                     let source_path = run.source_path;
-                    let exclusion_matcher = run.exclusion_matcher;
-                    // Built-in Rust checks receive the same exclusion-filtered view the
-                    // host lowers into component checks: an excluded path is removed
-                    // before the check runs, so it is never triggered on that path.
-                    let check_changeset = exclusion_matcher.filter_changeset(&run_changeset);
+                    let path_scope = run.path_scope;
+                    // Built-in Rust checks receive the same scope-filtered view the host
+                    // lowers into component checks: a path outside the check's `applies_to`
+                    // scope, or excluded, is removed before the check runs, so it is never
+                    // triggered on that path. The check's own intrinsic predicate (e.g.
+                    // `is_workflow_file`) still applies on top — the two compose as AND.
+                    let check_changeset = path_scope.filter_changeset(&run_changeset);
                     let file_count = check.applicable_file_count(&check_changeset);
                     info!(
                         check_id = %configured_check_id,
@@ -295,7 +306,7 @@ impl Runner {
                                 // Report findings under the configured instance id.
                                 result.check_id = configured_check_id.clone();
                                 let mut result =
-                                    apply_policy_to_result(result, &run_policy, &run_changeset, &exclusion_matcher);
+                                    apply_policy_to_result(result, &run_policy, &run_changeset, &path_scope);
                                 // Built-in checks declare fix capability per-finding via
                                 // `suggested_fix`, not at the check level.
                                 mark_fixability(&mut result, false);
@@ -355,14 +366,12 @@ impl Runner {
                         .parent()
                         .unwrap_or_else(|| std::path::Path::new(""))
                         .to_path_buf();
-                    let exclusion_matcher = run.exclusion_matcher;
-                    // Seed the progress count from the exclusion-filtered view so it
-                    // matches what the executor will actually process.
-                    let file_count = self.external_executor.eligible_file_count(
-                        &package,
-                        &exclusion_matcher.filter_changeset(&run_changeset),
-                        &run_config,
-                    );
+                    let path_scope = run.path_scope;
+                    // Seed the progress count from the scope-filtered view so it matches
+                    // what the executor will actually process.
+                    let file_count = self
+                        .external_executor
+                        .eligible_file_count(&package, &path_scope.filter_changeset(&run_changeset));
                     info!(
                         check_id = %configured_check_id,
                         package_id = %package.id,
@@ -396,14 +405,14 @@ impl Runner {
                                 &run_config,
                                 &run_config_dir,
                                 run_policy.severity_override,
-                                &exclusion_matcher,
+                                &path_scope,
                                 on_file_processed,
                             ) {
                                 Ok(mut result) => {
                                     let elapsed = check_start.elapsed();
                                     result.check_id = configured_check_id.clone();
                                     let mut result =
-                                        apply_policy_to_result(result, &run_policy, &run_changeset, &exclusion_matcher);
+                                        apply_policy_to_result(result, &run_policy, &run_changeset, &path_scope);
                                     mark_fixability(&mut result, package_fixable);
                                     info!(
                                         check_id = %configured_check_id,
@@ -775,24 +784,20 @@ impl Runner {
         // each check in the fix plan. Non-declarative checks (built-in, WASM) map to None.
         let mut declarative_info: BTreeMap<
             String,
-            Option<(
-                crate::external::ExternalCheckDeclarativePackage,
-                toml::Value,
-                ExclusionMatcher,
-            )>,
+            Option<(crate::external::ExternalCheckDeclarativePackage, toml::Value, PathScope)>,
         > = BTreeMap::new();
         for run in scheduled.runs {
             let check_id = run.configured_check_id.clone();
             if !fix_plan.contains_key(&check_id) {
                 continue;
             }
-            let exclusion_matcher = run.exclusion_matcher.clone();
+            let path_scope = run.path_scope.clone();
             declarative_info
                 .entry(check_id)
                 .or_insert_with(|| match &run.execution {
                     ScheduledExecution::ExternalResolved { package } => match &package.implementation {
                         ExternalCheckPackageImplementation::Declarative(d) => {
-                            Some((d.clone(), run.config.clone(), exclusion_matcher))
+                            Some((d.clone(), run.config.clone(), path_scope))
                         }
                         _ => None,
                     },
@@ -837,13 +842,13 @@ impl Runner {
                         let reporter_clone = Arc::clone(&reporter);
                         let check_id_for_progress = check_id.clone();
                         let invocation_outcomes = match declarative_info.get(check_id) {
-                            Some(Some((package, config, exclusion_matcher))) => crate::external::run_declarative_fix(
+                            Some(Some((package, config, path_scope))) => crate::external::run_declarative_fix(
                                 crate::external::DeclarativeFixContext { repo_root, check_id },
                                 package,
                                 &fix_plan[check_id],
                                 source_tree.as_ref(),
                                 config,
-                                exclusion_matcher,
+                                path_scope,
                                 move |n| reporter_clone.record_progress(&check_id_for_progress, n),
                             ),
                             _ => Vec::new(), // non-declarative or missing → no fix
@@ -1159,19 +1164,31 @@ impl Runner {
                 let policy = self.resolve_effective_policy(check);
                 // The effective exclude set (global ∪ per-check) can differ between two
                 // files that resolve to the same check id (a subdirectory `CHECKS` may
-                // add a global exclude). Fold it into the grouping key so files with a
-                // different effective matcher never share a run — each run then carries
-                // one consistent matcher.
+                // add a global exclude). Fold it — and the effective `applies_to` set —
+                // into the grouping key so files with a different effective scope never
+                // share a run; each run then carries one consistent `PathScope`.
                 let effective_exclude_patterns: Vec<String> = resolved
                     .global_exclude_patterns()
                     .iter()
                     .chain(check.exclude_patterns.iter())
                     .cloned()
                     .collect();
-                let key = run_group_key(check, &policy, &effective_exclude_patterns);
+                let effective_applies_to_patterns: Vec<String> = check.applies_to_patterns.clone();
+                let key = run_group_key(
+                    check,
+                    &policy,
+                    &effective_applies_to_patterns,
+                    &effective_exclude_patterns,
+                );
 
                 let entry = grouped_runs.entry(key).or_insert_with(|| {
-                    self.build_scheduled_check_run(check, policy, &effective_exclude_patterns, changeset)
+                    self.build_scheduled_check_run(
+                        check,
+                        policy,
+                        &effective_applies_to_patterns,
+                        &effective_exclude_patterns,
+                        changeset,
+                    )
                 });
 
                 let already_present = entry
@@ -1243,10 +1260,22 @@ impl Runner {
                 .chain(check.exclude_patterns.iter())
                 .cloned()
                 .collect();
-            let key = run_group_key(check, &policy, &effective_exclude_patterns);
+            let effective_applies_to_patterns: Vec<String> = check.applies_to_patterns.clone();
+            let key = run_group_key(
+                check,
+                &policy,
+                &effective_applies_to_patterns,
+                &effective_exclude_patterns,
+            );
 
             grouped_runs.entry(key).or_insert_with(|| {
-                self.build_scheduled_check_run(check, policy, &effective_exclude_patterns, changeset)
+                self.build_scheduled_check_run(
+                    check,
+                    policy,
+                    &effective_applies_to_patterns,
+                    &effective_exclude_patterns,
+                    changeset,
+                )
             });
         }
 
@@ -1262,6 +1291,7 @@ impl Runner {
         &self,
         check: &CheckConfig,
         policy: EffectiveCheckPolicy,
+        effective_applies_to_patterns: &[String],
         effective_exclude_patterns: &[String],
         changeset: &ChangeSet,
     ) -> ScheduledCheckRun {
@@ -1273,9 +1303,9 @@ impl Runner {
         {
             effective_policy.preserve_finding_severity = true;
         }
-        // All patterns are validated during config resolution, so this
-        // should never fail; the expect makes any regression immediately visible.
-        let exclusion_matcher = ExclusionMatcher::new(effective_exclude_patterns)
+        // All patterns are validated during config resolution, so this should
+        // never fail; the expect makes any regression immediately visible.
+        let path_scope = PathScope::new(effective_applies_to_patterns, effective_exclude_patterns)
             .expect("glob patterns pre-validated during config resolution");
         ScheduledCheckRun {
             configured_check_id: check.id.clone(),
@@ -1294,7 +1324,7 @@ impl Runner {
                 repository: changeset.repository.clone(),
                 whole_repo: changeset.whole_repo,
             },
-            exclusion_matcher,
+            path_scope,
         }
     }
 
@@ -1458,21 +1488,23 @@ fn scope_findings_to_changeset(result: &mut CheckResult, changeset: &ChangeSet) 
     });
 }
 
-/// Uniform exclusion backstop: drop any finding whose `location.path` is excluded
-/// for this check instance.
+/// Uniform scope backstop: drop any finding whose `location.path` falls outside
+/// this check instance's effective [`PathScope`] — either excluded, or outside
+/// its `applies_to` positive selection.
 ///
-/// Selection-time subtraction already keeps excluded paths out of what a check
-/// sees, but this post-filter makes the "no findings on an excluded path"
-/// guarantee uniform across *every* check kind — including a check that ignores the
-/// filtered changeset or derives a path some other way. Location-less findings
-/// (check-level errors) are kept. Framework-meta findings that intentionally land
-/// on an unchanged `CHECKS` file (config diagnostics, bypass-applied notices,
-/// stale-exclusion findings) never flow through here — they are produced outside
-/// the per-check result path — so they are exempt by construction.
-fn drop_excluded_findings(result: &mut CheckResult, exclusion: &ExclusionMatcher) {
+/// Selection-time subtraction already keeps out-of-scope paths out of what a
+/// check sees, but this post-filter makes the "no findings outside scope"
+/// guarantee uniform across *every* check kind — including a check that ignores
+/// the filtered changeset or derives a path some other way. Location-less
+/// findings (check-level errors) are kept. Framework-meta findings that
+/// intentionally land on an unchanged `CHECKS` file (config diagnostics,
+/// bypass-applied notices, stale-exclusion findings) never flow through here —
+/// they are produced outside the per-check result path — so they are exempt by
+/// construction.
+fn drop_excluded_findings(result: &mut CheckResult, path_scope: &PathScope) {
     result.findings.retain(|finding| match &finding.location {
         None => true,
-        Some(location) => !exclusion.is_excluded(location.path.as_path()),
+        Some(location) => path_scope.is_in_scope(location.path.as_path()),
     });
 }
 
@@ -1520,10 +1552,10 @@ fn apply_policy_to_result(
     mut result: CheckResult,
     policy: &EffectiveCheckPolicy,
     changeset: &ChangeSet,
-    exclusion: &ExclusionMatcher,
+    path_scope: &PathScope,
 ) -> CheckResult {
     scope_findings_to_changeset(&mut result, changeset);
-    drop_excluded_findings(&mut result, exclusion);
+    drop_excluded_findings(&mut result, path_scope);
     if policy.changed_lines_only {
         scope_findings_to_changed_lines(&mut result, changeset);
     }

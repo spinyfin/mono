@@ -23,9 +23,9 @@ limits:
 # CAVEAT — oxfmt is early-stage (0.x, released roughly weekly). The version pin
 # below freezes the behaviour above to a known-good release; do not assume a
 # later release formats the same set the same way without re-verifying. Anything
-# that slips through an applies_to override that oxfmt cannot parse surfaces as a
+# that slips through an include override that oxfmt cannot parse surfaces as a
 # per-file error finding (exit 2 → error), not a silent pass.
-applies_to:
+include:
   - "**/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,json,jsonc,json5,css,scss,less,html,vue,md,markdown,mdx,yaml,yml,toml,graphql,gql}"
 skip_symlinks: true
 

@@ -9,9 +9,9 @@ limits:
 # The file types Biome's formatter handles. Confirmed against Biome 2.5.0:
 # JS/TS family, JSON/JSONC, CSS, and GraphQL are formatted; HTML and Markdown
 # are NOT (Biome emits no format diagnostic for them), so they are excluded.
-# Anything that slips through (e.g. via an applies_to override) is skipped by
+# Anything that slips through (e.g. via an include override) is skipped by
 # `--files-ignore-unknown=true` rather than erroring.
-applies_to:
+include:
   - "**/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,json,jsonc,css,graphql,gql}"
 skip_symlinks: true
 
@@ -58,7 +58,7 @@ invocations:
     mode: batch
     args:
       - "format"
-      # Skip files Biome has no formatter for (e.g. an applies_to override that
+      # Skip files Biome has no formatter for (e.g. an include override that
       # includes an unsupported type, or a stray file in the batch) instead of
       # emitting a diagnostic — the analogue of prettier's --ignore-unknown.
       - "--files-ignore-unknown=true"

@@ -6,7 +6,7 @@ api_version: v1
 # cold npm cache download while keeping the entire check bounded.
 limits:
   timeout_ms: 300000
-applies_to:
+include:
   - "**/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,json,css,scss,less,html,vue,md,markdown,yaml,yml,graphql,gql}"
 skip_symlinks: true
 
@@ -55,7 +55,7 @@ invocations:
       # a per-file finding. This is CHECK mode — it never writes files.
       - "--list-different"
       # --ignore-unknown: silently skip a file Prettier has no parser for instead
-      # of erroring, so an applies_to match Prettier can't handle is a no-op.
+      # of erroring, so an include match Prettier can't handle is a no-op.
       - "--ignore-unknown"
       - "{{files}}"
     # Prettier exit codes in batch mode:

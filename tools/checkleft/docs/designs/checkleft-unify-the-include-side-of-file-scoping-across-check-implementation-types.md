@@ -11,7 +11,7 @@ Checkleft's exclude side is unified; its include side is not. This design picks 
 
 ## Verdict
 
-Adopt **`applies_to`** as the single framework include key — do not rename it to `include`. Make it **intersect** the check's definition scope rather than replace it, author it **config-dir-relative** exactly like `exclude`, and guard the boundary with a **name denylist anchored on the config-deserialisation doorway**, not an unanchored name denylist.
+Adopt **`include`** as the single framework include key, paired with `exclude`. Make it **intersect** the check's definition scope rather than replace it, author it **config-dir-relative** exactly like `exclude`, and guard the boundary with a **name denylist anchored on the config-deserialisation doorway**, not an unanchored name denylist.
 
 Two of those four reverse a recommendation in the input investigation. Both reversals are driven by measurements taken for this design and are argued in place.
 
@@ -19,7 +19,7 @@ Two of those four reverse a recommendation in the input investigation. Both reve
 
 Every claim about current behaviour below is labelled **read** (source at `eeb6bce6`) or **measured** (a command run for this design). No production code, build file, or `CHECKS` file was changed.
 
-The task framing for this design stated as verified-at-HEAD that "component (wasm) checks gain `config.applies_to` in mono#2554 via a third, independent implementation, `narrow_by_applies_to`". That is an accurate description of what mono#2554 _contains_, but it is not the state at HEAD: **mono#2554 is OPEN, not merged** (measured — `gh pr view 2554 -R spinyfin/mono`, `state: OPEN`, `mergedAt: null`, branch `boss/exec_18c71263d77d7260_32`, 8 files, +525/−37, last updated 2026-07-30T22:59Z). At `eeb6bce6`, `narrow_by_applies_to` does not exist anywhere in `tools/checkleft/src/` (measured — `grep -rn narrow_by_applies_to tools/checkleft/src/` returns nothing), and `userdoc/docs/checks-config.md` has no component-checks section.
+The task framing for this design stated as verified-at-HEAD that "component (wasm) checks gain `config.include` in mono#2554 via a third, independent implementation, `narrow_by_include`". That is an accurate description of what mono#2554 _contains_, but it is not the state at HEAD: **mono#2554 is OPEN, not merged** (measured — `gh pr view 2554 -R spinyfin/mono`, `state: OPEN`, `mergedAt: null`, branch `boss/exec_18c71263d77d7260_32`, 8 files, +525/−37, last updated 2026-07-30T22:59Z). At `eeb6bce6`, `narrow_by_include` does not exist anywhere in `tools/checkleft/src/` (measured — `grep -rn narrow_by_include tools/checkleft/src/` returns nothing), and `userdoc/docs/checks-config.md` has no component-checks section.
 
 This matters in two directions and both are handled below: the naming decision must weigh mono#2554's userdoc as _pending_ rather than _shipped_, and the implementation ordering must state what happens whichever of the two lands first.
 
@@ -59,11 +59,11 @@ Each of the following is deliberately out of scope. They are named here so a lat
 
 ### The include side, per implementation type
 
-| Implementation type  | Framework include side at `eeb6bce6`                                                                               | Citation                                                                                                                                                                                                                                      |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Declarative**      | Two: a required definition-manifest `applies_to`, and a per-repo `config.applies_to` override that **replaces** it | read — `src/external/mod.rs:248`; `src/external/declarative/resolve.rs:280-313`; consumed at `executor.rs:110-113`                                                                                                                            |
-| **Component (wasm)** | **None.** The changeset is filtered by exclusion only                                                              | read — `src/external/runtime.rs:602`, `:646`; `applies_to` is rejected outright in a `mode = "component"` manifest at `src/external/mod.rs:444-447`                                                                                           |
-| **Built-in (Rust)**  | **None.** `applies_to` appears nowhere in `src/runner.rs` or `src/check.rs`                                        | measured — `grep -n applies_to src/runner.rs src/check.rs` returns nothing. Built-ins receive the exclusion-filtered changeset (`src/runner.rs:268`, `:360`) narrowed by a hardcoded Rust predicate they own (`src/check.rs:75-81`, `:90-96`) |
+| Implementation type  | Framework include side at `eeb6bce6`                                                                         | Citation                                                                                                                                                                                                                                   |
+| -------------------- | ------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Declarative**      | Two: a required definition-manifest `include`, and a per-repo `config.include` override that **replaces** it | read — `src/external/mod.rs:248`; `src/external/declarative/resolve.rs:280-313`; consumed at `executor.rs:110-113`                                                                                                                         |
+| **Component (wasm)** | **None.** The changeset is filtered by exclusion only                                                        | read — `src/external/runtime.rs:602`, `:646`; `include` is rejected outright in a `mode = "component"` manifest at `src/external/mod.rs:444-447`                                                                                           |
+| **Built-in (Rust)**  | **None.** `include` appears nowhere in `src/runner.rs` or `src/check.rs`                                     | measured — `grep -n include src/runner.rs src/check.rs` returns nothing. Built-ins receive the exclusion-filtered changeset (`src/runner.rs:268`, `:360`) narrowed by a hardcoded Rust predicate they own (`src/check.rs:75-81`, `:90-96`) |
 
 So at HEAD the include side covers **one of three** implementation types via **two** mechanisms. mono#2554 would take that to two of three via three mechanisms; this design takes it to three of three via one.
 
@@ -79,37 +79,32 @@ So at HEAD the include side covers **one of three** implementation types via **t
 
 This is the single most decision-relevant measurement in this design, and it was not available to the input investigation.
 
-Command (2026-07-30): `grep -n applies_to` over every `CHECKS.yaml` / `CHECKS.toml` in mono at `eeb6bce6` and in the cube-managed checkouts of the three sibling repos.
+Command (2026-07-30): `grep -n include` over every `CHECKS.yaml` / `CHECKS.toml` in mono at `eeb6bce6` and in the cube-managed checkouts of the three sibling repos.
 
-| Repo                  | `CHECKS` files                                                                                   | `applies_to` in any config position | Other include-side keys                                                                                            |
-| --------------------- | ------------------------------------------------------------------------------------------------ | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| **mono**              | `CHECKS.yaml`, `tools/boss/CHECKS.yaml`, `tools/checkleft/CHECKS.yaml`, `tools/cube/CHECKS.toml` | **zero**                            | `md/doc-structure` `include_globs` — **root** file (`CHECKS.yaml:83-85`)                                           |
-| **flunge**            | `CHECKS.yaml`, `docs/CHECKS.yaml`, `mobile/ios/vendor/CHECKS.yaml`                               | **zero**                            | one `forbidden-imports-deps` rule with `include_globs` + `exclude_globs` — **root** file (`CHECKS.yaml:59`, `:62`) |
-| **checkleft-sandbox** | `CHECKS.yaml`                                                                                    | **zero**                            | none                                                                                                               |
-| **appoint**           | none                                                                                             | —                                   | —                                                                                                                  |
+| Repo                  | `CHECKS` files                                                                                   | `include` in any config position | Other include-side keys                                                                                            |
+| --------------------- | ------------------------------------------------------------------------------------------------ | -------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| **mono**              | `CHECKS.yaml`, `tools/boss/CHECKS.yaml`, `tools/checkleft/CHECKS.yaml`, `tools/cube/CHECKS.toml` | **zero**                         | `md/doc-structure` `include_globs` — **root** file (`CHECKS.yaml:83-85`)                                           |
+| **flunge**            | `CHECKS.yaml`, `docs/CHECKS.yaml`, `mobile/ios/vendor/CHECKS.yaml`                               | **zero**                         | one `forbidden-imports-deps` rule with `include_globs` + `exclude_globs` — **root** file (`CHECKS.yaml:59`, `:62`) |
+| **checkleft-sandbox** | `CHECKS.yaml`                                                                                    | **zero**                         | none                                                                                                               |
+| **appoint**           | none                                                                                             | —                                | —                                                                                                                  |
 
 Three consequences, each load-bearing below:
 
-1. **There is no such thing as "preserving every existing `config.applies_to` verbatim".** There are none. Any argument for a decision that rests on back-compatibility of live `applies_to` overrides is arguing about the empty set.
+1. **There is no such thing as "preserving every existing `config.include` verbatim".** There are none. Any argument for a decision that rests on back-compatibility of live `include` overrides is arguing about the empty set.
 2. **Every live include-side selector in every repo sits in a _root_ `CHECKS` file**, where `config_dir` is empty and `normalize_exclude_patterns` returns its input unchanged (read — `src/config.rs:618-621`). Config-dir-relative and repo-relative are _the same function_ at every live site.
-3. The one non-root instance that will exist is the one mono#2554 adds — `applies_to: ["**/*.swift"]` in `tools/boss/CHECKS.yaml` (read — mono#2554 diff). It is coordinate-agnostic too; see decision 3.
+3. The one non-root instance that will exist is the one mono#2554 adds — `include: ["**/*.swift"]` in `tools/boss/CHECKS.yaml` (read — mono#2554 diff). It is coordinate-agnostic too; see decision 3.
 
-## Decision 1 — naming: keep `applies_to`, do not rename to `include`
+## Decision 1 — naming: use `include`, paired with `exclude`
 
-**Decision: `applies_to` is the canonical unified word. The `include` rename is dropped.** This reverses §5.1 and §6 of the input investigation.
+**Decision: `include` is the canonical unified word.** It pairs directly with the existing singular `exclude`: one word per direction, each the obvious opposite of the other. This restores the input investigation's naming recommendation.
 
-The investigation's case for `include` was that it pairs with `exclude` — one word per direction, each the obvious opposite of the other. That is a genuine readability gain and it is the only gain. Weighed against it:
+The declarative manifest field is renamed alongside the check-entry key: `RawDeclarativeCheckManifest.include` is required and remains protected by `#[serde(deny_unknown_fields)]`. The definition surface and the `CHECKS.yaml` configuration surface therefore use the same canonical spelling, removing the split the previous decision sought to avoid. `PathScope` already represents the pair internally as `include` / `exclude`, so the vocabulary is now consistent end to end.
 
-- **The manifest field cannot be renamed cheaply, so `applies_to` survives regardless.** `RawDeclarativeCheckManifest.applies_to` is a _required_ field (read — `src/external/mod.rs:248`, no `#[serde(default)]`) on a struct carrying `#[serde(deny_unknown_fields)]` (read — `:242`). Renaming it either breaks every out-of-tree declarative package or adds a permanent serde alias. Either way `applies_to` stays in the vocabulary. Renaming only the _check-entry_ key would therefore leave the definition surface saying `applies_to` and the config surface saying `include` — reintroducing exactly the kind of split this project exists to remove.
-- **The rename buys a second permanent alias.** The investigation was explicit that `applies_to` would be retained as a permanent alias for `include`. So the end state under the rename is _two_ accepted spellings forever, and a reader of an unfamiliar `CHECKS.yaml` may meet either. That is a net loss in the "one vocabulary" objective, traded for a gain in the "reads as a pair" objective.
-- **The userdoc cost is real and would be paid twice.** `userdoc/docs/checks-config.md` documents `applies_to` at `:217`, `:219`, `:225`, `:255`, `:257`, `:259`, `:266`, `:272`, `:280`, `:281`; `userdoc/docs/external-check-package-contract.md` at `:101`, `:108` (all read). mono#2554 rewrites the first of those to make `applies_to` the cross-implementation-type word. Renaming would rewrite the same prose again days later.
-- **mono#2554's own history is evidence.** The PR originally shipped a guest-side `paths` key, which the investigation recommended renaming to `include`. The PR has since been rewritten to implement framework `applies_to` host-side instead. The investigation's `include` recommendation was superseded by the PR it was written about, before this design started.
+The declarative manifest's previous spelling shipped in a release, so it remains a permanent serde alias for `include`; manifests using either spelling parse identically, while a manifest containing both is rejected as a duplicate field. The new check-entry field has not shipped, so it accepts only `include` and does not manufacture an alias. The existing exclude-side spelling and its `exclude_files` / `exclude_globs` aliases are unchanged.
 
-**The cost of this choice, stated honestly.** `applies_to` and `exclude` do not read as opposites; a new author must learn that they are the pair, and no naming convention will teach them. The finer-axis nested selectors this design mandates become `patterns[].applies_to` and `rules[].applies_to`, which are wordier than `patterns[].include` would have been. This is a permanent, small, cosmetic tax accepted in exchange for one spelling instead of two. Every downstream task inherits it.
+## Decision 2 — composition: a check-entry `include` INTERSECTS the definition scope
 
-## Decision 2 — composition: a check-entry `applies_to` INTERSECTS the definition scope
-
-**Decision: intersect. It does not replace.** This reverses today's behaviour (read — `executor.rs:113`, `applies_to_override.as_deref().unwrap_or(&package.applies_to)`) and the shipped documentation (read — `userdoc/docs/checks-config.md:259`, "the repo's `applies_to` list **replaces** the definition's list entirely").
+**Decision: intersect. It does not replace.** This reverses today's behaviour (read — `executor.rs:113`, `include_override.as_deref().unwrap_or(&package.include)`) and the shipped documentation (read — `userdoc/docs/checks-config.md:259`, "the repo's `include` list **replaces** the definition's list entirely").
 
 The decisive argument is not safety. It is that **replace is unimplementable for two of the three implementation types**, so choosing it guarantees the per-type divergence this project exists to remove.
 
@@ -119,11 +114,11 @@ Choosing "replace" therefore yields replace-for-declarative and intersect-for-th
 
 ### The uniform formalisation
 
-Give every check a **definition scope** — the positive set it selects when the check entry carries no `applies_to`:
+Give every check a **definition scope** — the positive set it selects when the check entry carries no `include`:
 
 | Implementation type | Definition scope                     | Where it lives                                                                 |
 | ------------------- | ------------------------------------ | ------------------------------------------------------------------------------ |
-| Declarative         | the manifest's `applies_to` list     | read — `src/external/mod.rs:248` (required, so always present)                 |
+| Declarative         | the manifest's `include` list        | read — `src/external/mod.rs:248` (required, so always present)                 |
 | Component           | universal (`**`)                     | read — a component manifest may not declare one, `src/external/mod.rs:444-447` |
 | Built-in            | the check's intrinsic Rust predicate | read — `src/check.rs:75-96`; opaque to the framework, applied by the check     |
 
@@ -132,7 +127,7 @@ Then, for every implementation type:
 ```
 effective(check, file) = scheduled(check, file)          # CHECKS-file placement
                        ∧ definition_scope(check, file)
-                       ∧ entry_applies_to(check, file)   # absent ⇒ universal
+                       ∧ entry_include(check, file)   # absent ⇒ universal
                        ∧ ¬excluded(check, file)
 ```
 
@@ -140,31 +135,31 @@ For a component check, `definition_scope` is universal, so the intersection dege
 
 ### Cost, measured and honest
 
-- **Live breakage: zero.** There are no `config.applies_to` overrides in mono, flunge, checkleft-sandbox, or appoint (measured, census above). The behaviour change is real in code and has no live instance to break. Test fixtures under `src/runner/tests_external.rs`, `src/external/declarative/tests_*.rs`, and `src/fix/tests.rs` do exercise `applies_to` (measured — `grep`) and will need review, but those are definition-side lists, not entry-side overrides.
+- **Live breakage: zero.** There are no `config.include` overrides in mono, flunge, checkleft-sandbox, or appoint (measured, census above). The behaviour change is real in code and has no live instance to break. Test fixtures under `src/runner/tests_external.rs`, `src/external/declarative/tests_*.rs`, and `src/fix/tests.rs` do exercise `include` (measured — `grep`) and will need review, but those are definition-side lists, not entry-side overrides.
 - **Widening becomes impossible from a repo config.** A repo that wants `format/prettier` to also cover a file type the definition omits can no longer say so from its `CHECKS.yaml`; it must change the definition or fork it. This is a genuine capability loss. It is the right default because widening is a statement about the _check_ ("prettier handles `.mjs`"), not about the repo, and the definition is where check-wide statements belong. An explicit escape hatch is specified as a deferred task rather than built speculatively, because with zero overrides in existence there is no evidence anyone wants to widen.
 - **A userdoc rewrite is required** — `checks-config.md:257-281` documents replace semantics explicitly. Decision 1 avoided one doc rewrite; this decision incurs one. That is the honest ledger.
 
 ## Decision 3 — coordinate system: config-dir-relative, exactly like `exclude`
 
-**Decision: the check-entry `applies_to` is authored relative to the directory of the `CHECKS` file that declares it, and normalised to repo-relative at config-resolution time — through the same code path `exclude` already uses.** This applies to **both** entry positions (the new sibling-of-`config:` position and the legacy in-`config` position), so the include side has exactly one coordinate, mirroring `exclude`.
+**Decision: the check-entry `include` is authored relative to the directory of the `CHECKS` file that declares it, and normalised to repo-relative at config-resolution time — through the same code path `exclude` already uses.** This applies to **both** entry positions (the new sibling-of-`config:` position and the legacy in-`config` position), so the include side has exactly one coordinate, mirroring `exclude`.
 
 The constraint from the task framing is that the include and exclude sides must not disagree within the final design. `exclude` is config-dir-relative (read — `src/config.rs:618-624`) and has live instances in mono (`tools/boss/CHECKS.yaml:19`, root `CHECKS.yaml:32` — both read). Moving `exclude` to repo-relative is a far larger break than moving include to config-dir-relative. So include moves.
 
 The reason this is not merely the lesser evil is the census: **it is free.**
 
 - Every live include-side selector sits in a root `CHECKS` file, where `config_dir` is empty and normalisation is the identity (read — `src/config.rs:618-621` returns `patterns.to_vec()` unchanged for an empty `config_dir`). Zero live patterns change meaning.
-- The one forthcoming non-root instance — mono#2554's `applies_to: ["**/*.swift"]` in `tools/boss/CHECKS.yaml` — is also unaffected, for a structural reason worth stating because it generalises. Checks are resolved per changed file by walking from the repo root down to the file's directory and accumulating each `CHECKS` file on the way (read — `resolve_for_file` `src/config.rs:300-305` → `resolve_for_dir` `:315-331`, recursive-from-root; scheduling loop `src/runner.rs:1155-1200`). A check declared in `tools/boss/CHECKS.yaml` therefore only ever receives files under `tools/boss/`. Under config-dir-relative, `**/*.swift` normalises to `tools/boss/**/*.swift`; `**` may match zero components (measured in the input investigation §3.1), so both spellings select the identical set from a changeset that only contains `tools/boss/` paths. **This is a verify-on-migration item, not an assumption** — the protocol in decision 5 is what confirms it.
+- The one forthcoming non-root instance — mono#2554's `include: ["**/*.swift"]` in `tools/boss/CHECKS.yaml` — is also unaffected, for a structural reason worth stating because it generalises. Checks are resolved per changed file by walking from the repo root down to the file's directory and accumulating each `CHECKS` file on the way (read — `resolve_for_file` `src/config.rs:300-305` → `resolve_for_dir` `:315-331`, recursive-from-root; scheduling loop `src/runner.rs:1155-1200`). A check declared in `tools/boss/CHECKS.yaml` therefore only ever receives files under `tools/boss/`. Under config-dir-relative, `**/*.swift` normalises to `tools/boss/**/*.swift`; `**` may match zero components (measured in the input investigation §3.1), so both spellings select the identical set from a changeset that only contains `tools/boss/` paths. **This is a verify-on-migration item, not an assumption** — the protocol in decision 5 is what confirms it.
 - The ergonomic win is the same one `exclude` already delivers: in a subdirectory `CHECKS` file you write `src/**` and mean _this directory's_ `src/**`, which is what an author expects.
 
-**The definition-manifest `applies_to` stays repo-relative, and that is not a disagreement.** A check definition is authored with no consuming repo in view and has no config directory to be relative to (read — `src/external/mod.rs:248`; the manifest is resolved independently of any `CHECKS` file's location). The no-disagreement constraint is about the two keys an author writes side by side in one file — check-entry `applies_to` and check-entry `exclude` — and those agree exactly. The doc task must state this distinction explicitly, because a reader who meets both surfaces without it will read the manifest as a bug.
+**The definition-manifest `include` stays repo-relative, and that is not a disagreement.** A check definition is authored with no consuming repo in view and has no config directory to be relative to (read — `src/external/mod.rs:248`; the manifest is resolved independently of any `CHECKS` file's location). The no-disagreement constraint is about the two keys an author writes side by side in one file — check-entry `include` and check-entry `exclude` — and those agree exactly. The doc task must state this distinction explicitly, because a reader who meets both surfaces without it will read the manifest as a bug.
 
 ## Decision 4 — guard mechanism: a name denylist anchored on the config doorway
 
-**The rule to enforce:** a check may not ship config that answers "is this file a target of this check at all" — that is the framework's question. It may ship config on a strictly finer axis ("which of my rules/patterns applies to this file"), and such a selector must use the framework's word nested under the finer construct — `patterns[].applies_to`, `rules[].applies_to` — never a new word.
+**The rule to enforce:** a check may not ship config that answers "is this file a target of this check at all" — that is the framework's question. It may ship config on a strictly finer axis ("which of my rules/patterns applies to this file"), and such a selector must use the framework's word nested under the finer construct — `patterns[].include`, `rules[].include` — never a new word.
 
 **Decision: a static name denylist is strong enough, but only if it is anchored on the config-deserialisation doorway. An unanchored name denylist is not, and this is what the investigation left open.**
 
-The reason is precise. The rule _permits_ `patterns[].applies_to` and _forbids_ top-level `applies_to`. Those two are the same token on the same kind of line. A text- or regex-level denylist over check sources cannot tell them apart, so it must either reject the permitted shape (breaking the rule it is enforcing) or accept the forbidden one (enforcing nothing). Nesting is the whole distinction, and nesting is structural.
+The reason is precise. The rule _permits_ `patterns[].include` and _forbids_ top-level `include`. Those two are the same token on the same kind of line. A text- or regex-level denylist over check sources cannot tell them apart, so it must either reject the permitted shape (breaking the rule it is enforcing) or accept the forbidden one (enforcing nothing). Nesting is the whole distinction, and nesting is structural.
 
 There is a structural anchor available, one per implementation type, and both are single doorways:
 
@@ -173,11 +168,11 @@ There is a structural anchor available, one per implementation type, and both ar
 
 So the guard check parses the file with `syn`, resolves the type deserialised at the doorway, and applies the denylist **to that struct's fields only**. Fields on any other struct in the crate — a `PatternConfig` (read — `checks/text/forbidden-pattern/src/lib.rs:144-145`), a `ForbiddenImportsDepsRuleConfig` (read — `src/checks/forbidden_imports_deps.rs:104`) — are out of scope by construction, which is exactly the permitted finer-axis shape.
 
-**Denylist:** `applies_to`, `include`, `paths`, `path`, `path_globs`, `include_globs`, `file_globs`, `files`, `only`, `targets`, `scope`, `globs`.
+**Denylist:** `include`, `include`, `paths`, `path`, `path_globs`, `include_globs`, `file_globs`, `files`, `only`, `targets`, `scope`, `globs`.
 
-Both framework spellings belong on it for _guest-side_ config even though `applies_to` is a valid framework key: a guest that parses the framework's own word is re-implementing the framework's job under a name that reads as legitimate, which is harder to catch in review than a novel word like `paths`, not easier.
+Both framework spellings belong on it for _guest-side_ config even though `include` is a valid framework key: a guest that parses the framework's own word is re-implementing the framework's job under a name that reads as legitimate, which is harder to catch in review than a novel word like `paths`, not easier.
 
-**Scope of the check:** `tools/checkleft/checks/**/src/lib.rs` (wasm guests) and `tools/checkleft/src/checks/**/*.rs` (built-ins) — declared with the framework's own `applies_to`, dogfooding the key this project ships.
+**Scope of the check:** `tools/checkleft/checks/**/src/lib.rs` (wasm guests) and `tools/checkleft/src/checks/**/*.rs` (built-ins) — declared with the framework's own `include`, dogfooding the key this project ships.
 
 **Limits, stated rather than papered over.** A static denylist has a false negative for a novel word: a check that names its key `swift_only` or `subjects` passes. The denylist is a rail against the _known_ drift shapes and a reviewer-visible signal, not a proof. Two stronger mechanisms were considered and rejected for v1:
 
@@ -194,7 +189,7 @@ Consequently, for a check that is **green on both sides** — the normal state o
 
 ### The protocol
 
-A prerequisite: `checkleft explain-scope --all --format json`, a new read-only subcommand that emits, per configured check id, the resolved definition scope, the normalised entry `applies_to`, the effective exclude patterns, and **the concrete sorted list of selected files**. It is specified as its own task and gates every migration task.
+A prerequisite: `checkleft explain-scope --all --format json`, a new read-only subcommand that emits, per configured check id, the resolved definition scope, the normalised entry `include`, the effective exclude patterns, and **the concrete sorted list of selected files**. It is specified as its own task and gates every migration task.
 
 Every migration PR must run all four steps and paste the output of steps 2 and 3 into its description.
 
@@ -230,7 +225,7 @@ Neither step 2 nor step 3 is sufficient alone. Step 2 proves the framework's sel
 
 ### A. Leave the include side per-implementation-type, and only document the divergence
 
-Write down that declarative checks scope with `applies_to`, component checks with whatever key their guest ships, and built-ins by recompiling — then invest in documentation rather than framework code.
+Write down that declarative checks scope with `include`, component checks with whatever key their guest ships, and built-ins by recompiling — then invest in documentation rather than framework code.
 
 **Rejected.** This is the status quo plus prose, and the investigation established that the status quo actively regresses: `text/forbidden-pattern` is a _generic_ check with no intrinsic file type, and generic checks are exactly the ones that need include-side scoping, so the next one will again add a key to its own config because that is the only path available (read — the framework passes the config blob through verbatim, `src/external/runtime.rs`). Documentation does not close the gap that produces the drift. It also leaves the built-in path with no framework include side at all, which no amount of prose fixes.
 
@@ -240,9 +235,9 @@ Add a scope field to `check-input` in `wit/check.wit`, lower the resolved patter
 
 **Rejected**, for three reasons. It is a breaking change to `checkleft:check@0.1.0`, forcing every external `.wasm` artifact to be rebuilt and re-pinned. It is unnecessary: the host already lowers an exclusion-filtered changeset (read — `src/external/runtime.rs:602`, `:646`, with the guest-facing comment "the host lowers an exclusion-filtered changeset so the guest never sees an excluded path and cannot target it"), so applying the positive filter at the same call site makes a scoped guest simply receive a smaller list, needing no new import, export, or awareness. And it is the wrong direction on the guard question — it would hand every guest the scoping vocabulary as a first-class capability at the same moment decision 4 tries to take it away. The chosen design leaves the WIT contract at `0.1.0`, untouched.
 
-### C. Rename to `include` with `applies_to` as a permanent alias (the investigation's §5.1)
+### C. Keep an asymmetric include-side spelling
 
-**Rejected** — argued in full in decision 1. In short: the manifest field cannot be renamed cheaply so `applies_to` survives either way; the rename therefore ends at two permanent spellings rather than one, which is a net loss against the "one vocabulary" goal; and it pays a userdoc rewrite for a cosmetic gain days after mono#2554 pays one to establish `applies_to`.
+**Rejected** — the symmetry gain is worth the bounded rename cost. The manifest and check-entry fields move together to canonical `include`, so there is no definition-surface/config-surface split. The shipped manifest spelling remains only as its permanent compatibility alias; the unshipped check-entry key accepts no alias. This makes the positive and negative sides read as the pair `include` / `exclude`.
 
 ### D. Keep replace semantics for the check-entry key
 
@@ -252,13 +247,13 @@ Add a scope field to `check-input` in `wit/check.wit`, lower the resolved patter
 
 ### Config surface
 
-One framework key, `applies_to`, as a sibling of `config:` on a check entry — the same position `exclude` occupies:
+One framework key, `include`, as a sibling of `config:` on a check entry — the same position `exclude` occupies:
 
 ```yaml
 checks:
   - id: boss/no-legacy-filehandle-write-api
     check: text/forbidden-pattern
-    applies_to:
+    include:
       - "**/*.swift"
     exclude:
       - "vendor/**"
@@ -266,11 +261,11 @@ checks:
       patterns: [...]
 ```
 
-- **Position.** The sibling position is canonical. The legacy in-`config` position (`config.applies_to`) keeps working and is deprecated on the same shape the exclusion design used for its legacy position: accept both, emit a `ConfigDiagnostic` at `warning` when the in-`config` position is used, make it an error in a later release. With zero live instances, the window is a courtesy to out-of-tree configs, not a migration burden.
+- **Position.** The sibling position is canonical. The legacy in-`config` position (`config.include`) keeps working and is deprecated on the same shape the exclusion design used for its legacy position: accept both, emit a `ConfigDiagnostic` at `warning` when the in-`config` position is used, make it an error in a later release. With zero live instances, the window is a courtesy to out-of-tree configs, not a migration burden.
 - **Coordinate.** Config-dir-relative in both positions, normalised through the same function as `exclude` (read — `src/config.rs:618-624`, to be renamed to a scope-neutral name).
 - **Dialect.** Unchanged — `globset::Glob::new` with default builder options, the single dialect every glob-shaped key in the tool already shares.
-- **Absence.** No `applies_to` means the definition scope, unchanged. This is what keeps the change inert for every check that does not opt in.
-- **Empty list.** Rejected, generalising the precedent already in `override_applies_to` (read — `src/external/declarative/resolve.rs:290-295`, which errors with "use `enabled: false` to disable the check instead").
+- **Absence.** No `include` means the definition scope, unchanged. This is what keeps the change inert for every check that does not opt in.
+- **Empty list.** Rejected, generalising the precedent already in `override_include` (read — `src/external/declarative/resolve.rs:290-295`, which errors with "use `enabled: false` to disable the check instead").
 
 ### Enforcement — one type, the sites exclusion already owns
 
@@ -285,14 +280,14 @@ pub struct PathScope {
 
 `PathScope::filter_changeset` applies the positive set first and subtracts the negative set second, preserving today's "excludes always win" precedence (read — the same ordering `select_files` already uses, `src/external/declarative/executor.rs:297-298`). No new pipeline stage is introduced; the positive filter lands at the sites the negative filter already occupies:
 
-| Stage                  | Site at HEAD                                                                                       | Change                                                                                     |
-| ---------------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| Selection, built-in    | `src/runner.rs:268`, `:360`                                                                        | `exclusion_matcher.filter_changeset` → `path_scope.filter_changeset`                       |
-| Selection, component   | `src/external/runtime.rs:602`, `:646`                                                              | same substitution; the WIT contract is untouched, the guest simply receives a shorter list |
-| Selection, declarative | `select_files`, `src/external/declarative/executor.rs:280-313`                                     | the positive set becomes `definition ∩ entry` rather than `entry.unwrap_or(definition)`    |
-| Finding backstop       | `drop_excluded_findings`, `src/runner.rs:1472-1477`                                                | gains the symmetric positive test                                                          |
-| Fix path               | `src/external/declarative/executor.rs` (`run_declarative_fix` subtraction, `filter_by_applies_to`) | collapse into one `PathScope` call                                                         |
-| Run grouping           | `run_group_key`, `src/runner.rs:96-116`                                                            | the normalised `applies_to` patterns join `exclude_fingerprint` in the key                 |
+| Stage                  | Site at HEAD                                                                                    | Change                                                                                     |
+| ---------------------- | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Selection, built-in    | `src/runner.rs:268`, `:360`                                                                     | `exclusion_matcher.filter_changeset` → `path_scope.filter_changeset`                       |
+| Selection, component   | `src/external/runtime.rs:602`, `:646`                                                           | same substitution; the WIT contract is untouched, the guest simply receives a shorter list |
+| Selection, declarative | `select_files`, `src/external/declarative/executor.rs:280-313`                                  | the positive set becomes `definition ∩ entry` rather than `entry.unwrap_or(definition)`    |
+| Finding backstop       | `drop_excluded_findings`, `src/runner.rs:1472-1477`                                             | gains the symmetric positive test                                                          |
+| Fix path               | `src/external/declarative/executor.rs` (`run_declarative_fix` subtraction, `filter_by_include`) | collapse into one `PathScope` call                                                         |
+| Run grouping           | `run_group_key`, `src/runner.rs:96-116`                                                         | the normalised `include` patterns join `exclude_fingerprint` in the key                    |
 
 `scope_findings_to_changeset` (read — `src/runner.rs:1453-1459`) is **untouched**. It is load-bearing and orthogonal.
 
@@ -300,24 +295,24 @@ The construction site is `build_scheduled_check_run` (read — `src/runner.rs:12
 
 ### Diagnostics, within the binding zero-match semantics
 
-- **Structurally-empty pattern → error at config resolution**, on both `applies_to` and `exclude`, for the three textually decidable forms: leading `./`, trailing `/`, leading `!`. The `!` case gets a diagnostic pointing at `exclude` rather than compiling as a literal. Bare names are _not_ covered, for the reason given under the binding semantics.
+- **Structurally-empty pattern → error at config resolution**, on both `include` and `exclude`, for the three textually decidable forms: leading `./`, trailing `/`, leading `!`. The `!` case gets a diagnostic pointing at `exclude` rather than compiling as a literal. Bare names are _not_ covered, for the reason given under the binding semantics.
 - **Matches nothing in the whole tree → warning, only under `--all`.** This needs a selected-file count, which `explain-scope` supplies; the warning consumes the same data. Never an error, never in a diff run.
 - **Matches nothing in this changeset → silent and green, untouched.** `executor.rs:115-120`'s early return on an empty selection stays exactly as it is.
-- **`applies_to` on a `scope: changeset` check → rejected.** Such a check runs with an empty changed-file set by construction (read — `schedule_changeset_scope_runs`, `src/runner.rs:1223-1250`; the empty `changed_files` is built in `build_scheduled_check_run`, `:1258-1298`), so a positive file filter is meaningless there.
+- **`include` on a `scope: changeset` check → rejected.** Such a check runs with an empty changed-file set by construction (read — `schedule_changeset_scope_runs`, `src/runner.rs:1223-1250`; the empty `changed_files` is built in `build_scheduled_check_run`, `:1258-1298`), so a positive file filter is meaningless there.
 - **`deny_unknown_fields` on `ParsedCheckConfig`** (read — absent at `src/config.rs:561-562`), which turns `excludes:`, `includes:`, and a misplaced `paths:` into diagnostics instead of silence. This is the highest-value safety change in the set and the most likely to break an out-of-tree config, so it is gated on a survey task. Note it applies to the check _entry_ only; keys inside `config:` — including the live empty `exclude_files = []` at `tools/cube/CHECKS.toml:10` (read) — are unaffected.
 
 ### Relationship to mono#2554
 
 The two overlap and either order works; the ordering must be stated so neither worker is surprised.
 
-- **If mono#2554 lands first** (likely — it is open and near-ready), the component path already has `narrow_by_applies_to` and a shared `resolve::applies_to_globset`. The `PathScope` wiring task then _replaces_ `narrow_by_applies_to` with the unified filter and deletes it. Its semantics are already what this design specifies for a component check (entry list = entire positive selection, which is `universal ∩ entry`), so no behaviour changes and its tests should survive with mechanical edits.
+- **If mono#2554 lands first** (likely — it is open and near-ready), the component path already has `narrow_by_include` and a shared `resolve::include_globset`. The `PathScope` wiring task then _replaces_ `narrow_by_include` with the unified filter and deletes it. Its semantics are already what this design specifies for a component check (entry list = entire positive selection, which is `universal ∩ entry`), so no behaviour changes and its tests should survive with mechanical edits.
 - **If the framework work lands first**, mono#2554 reduces to the three lines of `tools/boss/CHECKS.yaml` and its guest doc comment; its `runtime.rs` and `resolve.rs` changes become unnecessary and should be dropped rather than merged.
 
 Either way the interaction is confined to one task in the breakdown, which names it explicitly.
 
 ## Risks / open questions
 
-- **Intersect is a semantic change with zero live instances but non-zero test surface.** The census is decisive about `CHECKS` files but the fixtures in `src/runner/tests_external.rs`, `src/external/declarative/tests_prettier.rs`, `tests_lint_biome.rs`, `tests_execution.rs`, `src/fix/tests.rs`, and `src/runner/tests_fix_multipass.rs` all use `applies_to` (measured — `grep`). A reviewer should expect the declarative-path task to touch several of them and should read each edit as a semantics question, not a mechanical one.
+- **Intersect is a semantic change with zero live instances but non-zero test surface.** The census is decisive about `CHECKS` files but the fixtures in `src/runner/tests_external.rs`, `src/external/declarative/tests_prettier.rs`, `tests_lint_biome.rs`, `tests_execution.rs`, `src/fix/tests.rs`, and `src/runner/tests_fix_multipass.rs` all use `include` (measured — `grep`). A reviewer should expect the declarative-path task to touch several of them and should read each edit as a semantics question, not a mechanical one.
 - **`md/doc-structure`'s `include_globs` is a required field** (read — `src/checks/doc_structure.rs:73`, no `#[serde(default)]`). Migrating it to the framework key means making it optional (defaulting to match-all) or deleting it, and either choice changes what a config missing both keys does. The migration task must state which it picked.
 - **`forbidden-imports-deps`'s per-rule `exclude_files` coordinate — recorded, not decided.** It is config-dir-relative via `strip_prefix(config_dir)` (read — `src/checks/forbidden_imports_deps.rs:109-110` declaring it with `alias = "exclude_globs"`, `:139-142` applying it, `:183-189` `is_excluded`) while its sibling `include_globs` three lines away is repo-relative (read — `:107`, applied at `:144-146`). New evidence for whoever decides it: **the disagreement has no live instance.** The only configured `forbidden-imports-deps` rule with either key in any of the four repos is in flunge's _root_ `CHECKS.yaml:59,62`, where `config_dir` is empty and `strip_prefix("")` is the identity, so the two coordinates coincide (measured). That makes a later fix cheap, but it is a behaviour change to a live config and is explicitly **out of scope here**.
 - **How many out-of-tree `CHECKS` files carry a stray key?** Unmeasurable from mono. This gates `deny_unknown_fields` and is filed as its own survey task.
@@ -347,9 +342,9 @@ Generalise `ExclusionMatcher` (`src/exclusion_matcher.rs:24-26`) into a `PathSco
 
 Scope: in-scope
 
-### 3. Parse and normalise the check-entry `applies_to` key
+### 3. Parse and normalise the check-entry `include` key
 
-Add `applies_to` to `ParsedCheckConfig` (`src/config.rs:562-586`) as a sibling of `config:`, and read the legacy in-`config` position too. Normalise both through the config-dir-relative path `exclude` already uses (`normalize_exclude_patterns`, `src/config.rs:618-624`; rename it to a scope-neutral name), carry the result on the resolved check config, and fold the normalised patterns into `run_group_key` (`src/runner.rs:96-116`) alongside `exclude_fingerprint`. Reject an empty list, mirroring `override_applies_to` (`resolve.rs:290-295`). Parse and plumb only — no enforcement in this entry, so it is inert on merge.
+Add `include` to `ParsedCheckConfig` (`src/config.rs:562-586`) as a sibling of `config:`, and read the legacy in-`config` position too. Normalise both through the config-dir-relative path `exclude` already uses (`normalize_exclude_patterns`, `src/config.rs:618-624`; rename it to a scope-neutral name), carry the result on the resolved check config, and fold the normalised patterns into `run_group_key` (`src/runner.rs:96-116`) alongside `exclude_fingerprint`. Reject an empty list, mirroring `override_include` (`resolve.rs:290-295`). Parse and plumb only — no enforcement in this entry, so it is inert on merge.
 
 - **Effort hint:** medium
 - **Dependencies:** none
@@ -358,16 +353,16 @@ Scope: in-scope
 
 ### 4. Enforce `PathScope` on the built-in and component paths
 
-Construct a `PathScope` in `build_scheduled_check_run` (`src/runner.rs:1258-1298`) from the patterns entry 3 plumbed, and substitute it at the built-in selection sites (`src/runner.rs:268`, `:360`) and the component sites (`src/external/runtime.rs:602`, `:646`). Add the symmetric positive test to `drop_excluded_findings` (`src/runner.rs:1472-1477`); leave `scope_findings_to_changeset` (`:1453-1459`) untouched. This is the entry that gives built-in checks a framework include side for the first time and gives component checks one without touching `wit/check.wit`. If mono#2554 has landed, this entry deletes `narrow_by_applies_to` and folds its tests in; if not, coordinate per entry 6.
+Construct a `PathScope` in `build_scheduled_check_run` (`src/runner.rs:1258-1298`) from the patterns entry 3 plumbed, and substitute it at the built-in selection sites (`src/runner.rs:268`, `:360`) and the component sites (`src/external/runtime.rs:602`, `:646`). Add the symmetric positive test to `drop_excluded_findings` (`src/runner.rs:1472-1477`); leave `scope_findings_to_changeset` (`:1453-1459`) untouched. This is the entry that gives built-in checks a framework include side for the first time and gives component checks one without touching `wit/check.wit`. If mono#2554 has landed, this entry deletes `narrow_by_include` and folds its tests in; if not, coordinate per entry 6.
 
 - **Effort hint:** medium
-- **Dependencies:** `PathScope` matcher core; Parse and normalise the check-entry `applies_to` key
+- **Dependencies:** `PathScope` matcher core; Parse and normalise the check-entry `include` key
 
 Scope: in-scope
 
 ### 5. Switch the declarative path to intersect semantics
 
-Change `select_files` (`src/external/declarative/executor.rs:280-313`) and its caller (`:110-113`) so the positive set is the definition manifest's `applies_to` intersected with the entry's, replacing today's `override.unwrap_or(definition)`. Update the fixtures that exercise `applies_to` (`src/runner/tests_external.rs`, `src/external/declarative/tests_prettier.rs`, `tests_lint_biome.rs`, `tests_execution.rs`) and read each edit as a semantics question. This is the only entry that changes observable behaviour for an existing config shape; the census found zero live instances, so the blast radius is tests plus out-of-tree configs.
+Change `select_files` (`src/external/declarative/executor.rs:280-313`) and its caller (`:110-113`) so the positive set is the definition manifest's `include` intersected with the entry's, replacing today's `override.unwrap_or(definition)`. Update the fixtures that exercise `include` (`src/runner/tests_external.rs`, `src/external/declarative/tests_prettier.rs`, `tests_lint_biome.rs`, `tests_execution.rs`) and read each edit as a semantics question. This is the only entry that changes observable behaviour for an existing config shape; the census found zero live instances, so the blast radius is tests plus out-of-tree configs.
 
 - **Effort hint:** medium
 - **Dependencies:** Enforce `PathScope` on the built-in and component paths
@@ -376,7 +371,7 @@ Scope: in-scope
 
 ### 6. Reconcile with mono#2554
 
-Land the two efforts in a defined order and remove the duplicate implementation. If mono#2554 merges first, this entry is folded into entry 4 and consists of deleting `narrow_by_applies_to` and re-pointing `resolve::applies_to_globset`'s callers at the unified `PathScope`. If the framework work lands first, this entry reduces mono#2554 to its `tools/boss/CHECKS.yaml` lines and its guest doc comment, dropping its `runtime.rs` and `resolve.rs` changes. Whoever picks this up must check the PR's state first rather than assuming either order.
+Land the two efforts in a defined order and remove the duplicate implementation. If mono#2554 merges first, this entry is folded into entry 4 and consists of deleting `narrow_by_include` and re-pointing `resolve::include_globset`'s callers at the unified `PathScope`. If the framework work lands first, this entry reduces mono#2554 to its `tools/boss/CHECKS.yaml` lines and its guest doc comment, dropping its `runtime.rs` and `resolve.rs` changes. Whoever picks this up must check the PR's state first rather than assuming either order.
 
 - **Effort hint:** small
 - **Dependencies:** Enforce `PathScope` on the built-in and component paths
@@ -385,7 +380,7 @@ Scope: in-scope
 
 ### 7. Unify the fix path onto `PathScope`
 
-Collapse `run_declarative_fix`'s exclusion subtraction and `filter_by_applies_to` in `src/external/declarative/executor.rs` into a single `PathScope` call, so the fix path and the run path cannot drift in what they consider in scope. Kept separate from entry 5 because the fix path has its own path-normalisation behaviour and its own tests (`src/fix/tests.rs`, `src/runner/tests_fix_multipass.rs`), and folding it in would make entry 5 span two behaviours.
+Collapse `run_declarative_fix`'s exclusion subtraction and `filter_by_include` in `src/external/declarative/executor.rs` into a single `PathScope` call, so the fix path and the run path cannot drift in what they consider in scope. Kept separate from entry 5 because the fix path has its own path-normalisation behaviour and its own tests (`src/fix/tests.rs`, `src/runner/tests_fix_multipass.rs`), and folding it in would make entry 5 span two behaviours.
 
 - **Effort hint:** small
 - **Dependencies:** Switch the declarative path to intersect semantics
@@ -394,10 +389,10 @@ Scope: in-scope
 
 ### 8. Structurally-empty pattern diagnostics
 
-Reject, at config-resolution time and as a `ConfigDiagnostic`, any `applies_to` or `exclude` pattern with a leading `./`, a trailing `/`, or a leading `!`, with the `!` case pointing the author at `exclude`. Deliberately does **not** cover bare names with no separator and no wildcard, which are structurally capable of matching a root-level file — `pnpm-lock.yaml` is a live exclude entry of exactly that shape (mono root `CHECKS.yaml:38`) and must stay green. Symmetric across both keys so the include and exclude sides validate identically.
+Reject, at config-resolution time and as a `ConfigDiagnostic`, any `include` or `exclude` pattern with a leading `./`, a trailing `/`, or a leading `!`, with the `!` case pointing the author at `exclude`. Deliberately does **not** cover bare names with no separator and no wildcard, which are structurally capable of matching a root-level file — `pnpm-lock.yaml` is a live exclude entry of exactly that shape (mono root `CHECKS.yaml:38`) and must stay green. Symmetric across both keys so the include and exclude sides validate identically.
 
 - **Effort hint:** small
-- **Dependencies:** Parse and normalise the check-entry `applies_to` key
+- **Dependencies:** Parse and normalise the check-entry `include` key
 
 Scope: in-scope
 
@@ -424,22 +419,22 @@ Scope: in-scope
 Add `#[serde(deny_unknown_fields)]` to `ParsedCheckConfig` (`src/config.rs:561-562`), turning `excludes:`, `includes:`, and a misplaced `paths:` from silent no-ops into diagnostics. Applies to the check entry only — keys inside `config:` stay untouched, so the live empty `exclude_files = []` at `tools/cube/CHECKS.toml:10` is unaffected. Land only after the survey has bounded what it breaks.
 
 - **Effort hint:** small
-- **Dependencies:** Survey: stray keys in out-of-tree `CHECKS` files; Parse and normalise the check-entry `applies_to` key
+- **Dependencies:** Survey: stray keys in out-of-tree `CHECKS` files; Parse and normalise the check-entry `include` key
 
 Scope: in-scope
 
-### 12. Reject `applies_to` on a `scope: changeset` check, and deprecate the in-`config` position
+### 12. Reject `include` on a `scope: changeset` check, and deprecate the in-`config` position
 
-Two config-resolution diagnostics that belong together because both live in the same validation pass. Reject `applies_to` on a `scope: changeset` entry, which runs against an empty changed-file set by construction and so cannot be file-scoped. Emit a `warning`-severity `ConfigDiagnostic` when `applies_to` appears in the legacy in-`config` position, pointing at the sibling-of-`config:` position; keep accepting it.
+Two config-resolution diagnostics that belong together because both live in the same validation pass. Reject `include` on a `scope: changeset` entry, which runs against an empty changed-file set by construction and so cannot be file-scoped. Emit a `warning`-severity `ConfigDiagnostic` when `include` appears in the legacy in-`config` position, pointing at the sibling-of-`config:` position; keep accepting it.
 
 - **Effort hint:** small
-- **Dependencies:** Parse and normalise the check-entry `applies_to` key
+- **Dependencies:** Parse and normalise the check-entry `include` key
 
 Scope: in-scope
 
 ### 13. Migrate `md/doc-structure` to the framework key
 
-Move `include_globs` / `exclude_globs` off `DocStructureConfig` (`src/checks/doc_structure.rs:71-82`) and onto the check entry's `applies_to` / `exclude` in mono's root `CHECKS.yaml:83-85`, leaving the check's intrinsic `.md` gate (`:101-103`) in place as its subject matter. Must state whether `include_globs` becomes optional or is deleted — it is required today, so a config carrying neither key changes meaning either way. Run the full four-step verification protocol and paste steps 2 and 3.
+Move `include_globs` / `exclude_globs` off `DocStructureConfig` (`src/checks/doc_structure.rs:71-82`) and onto the check entry's `include` / `exclude` in mono's root `CHECKS.yaml:83-85`, leaving the check's intrinsic `.md` gate (`:101-103`) in place as its subject matter. Must state whether `include_globs` becomes optional or is deleted — it is required today, so a config carrying neither key changes meaning either way. Run the full four-step verification protocol and paste steps 2 and 3.
 
 - **Effort hint:** small
 - **Dependencies:** Enforce `PathScope` on the built-in and component paths; `explain-scope` subcommand
@@ -448,7 +443,7 @@ Scope: in-scope
 
 ### 14. Hoist `forbidden-imports-deps` per-rule `include_globs`
 
-Hoist per-rule `include_globs` (`src/checks/forbidden_imports_deps.rs:107`, applied at `:144-146`) to the check entry's `applies_to` where every rule in an instance shares one scope, keeping per-rule selection available for instances whose rules genuinely differ — under the naming rule, a surviving per-rule selector must be spelled `rules[].applies_to`. **Does not touch `exclude_files`**, whose coordinate convention is an explicit non-goal. The only live instance is flunge's root `CHECKS.yaml:59`. Run the verification protocol.
+Hoist per-rule `include_globs` (`src/checks/forbidden_imports_deps.rs:107`, applied at `:144-146`) to the check entry's `include` where every rule in an instance shares one scope, keeping per-rule selection available for instances whose rules genuinely differ — under the naming rule, a surviving per-rule selector must be spelled `rules[].include`. **Does not touch `exclude_files`**, whose coordinate convention is an explicit non-goal. The only live instance is flunge's root `CHECKS.yaml:59`. Run the verification protocol.
 
 - **Effort hint:** small
 - **Dependencies:** Enforce `PathScope` on the built-in and component paths; `explain-scope` subcommand
@@ -475,7 +470,7 @@ Scope: in-scope
 
 ### 17. Guard check: no check-level file scoping
 
-Implement `checkleft/no-check-level-file-scoping`, parsing check sources with `syn`, resolving the type deserialised at the config doorway — `CheckInput::config<T>()` (`sdk/src/lib.rs:145-147`) for wasm guests, `ConfiguredCheckFactory::configure` (`src/check.rs:124`, `:129`) for built-ins — and applying the name denylist to that struct's fields only, so nested finer-axis selectors are permitted by construction. Scope it with the framework's own `applies_to` over `tools/checkleft/checks/**/src/lib.rs` and `tools/checkleft/src/checks/**/*.rs`. If the `syn` doorway resolution proves brittle, escalate to an explicit marker attribute on each top-level config struct rather than weakening the denylist.
+Implement `checkleft/no-check-level-file-scoping`, parsing check sources with `syn`, resolving the type deserialised at the config doorway — `CheckInput::config<T>()` (`sdk/src/lib.rs:145-147`) for wasm guests, `ConfiguredCheckFactory::configure` (`src/check.rs:124`, `:129`) for built-ins — and applying the name denylist to that struct's fields only, so nested finer-axis selectors are permitted by construction. Scope it with the framework's own `include` over `tools/checkleft/checks/**/src/lib.rs` and `tools/checkleft/src/checks/**/*.rs`. If the `syn` doorway resolution proves brittle, escalate to an explicit marker attribute on each top-level config struct rather than weakening the denylist.
 
 - **Effort hint:** medium
 - **Dependencies:** Switch the declarative path to intersect semantics
@@ -484,7 +479,7 @@ Scope: in-scope
 
 ### 18. Documentation
 
-Rewrite `userdoc/docs/checks-config.md` for the unified key: one `applies_to`, intersect semantics replacing the replace semantics documented at `:257-281`, config-dir-relative authoring, and an explicit note that the _definition-manifest_ `applies_to` stays repo-relative because a definition has no config directory. Fix `:190` — the in-`config` exclude position reads only `exclude_files` / `exclude_globs`, never canonical `exclude` (`src/config.rs:645`), so `exclude:` inside `config:` is a silent no-op; `:188` is accurate as written and should not be changed. Update `external-check-package-contract.md:101,108` and `check-author-api.md` with the guard rule and the required nesting for finer-axis selectors.
+Rewrite `userdoc/docs/checks-config.md` for the unified key: one `include`, intersect semantics replacing the replace semantics documented at `:257-281`, config-dir-relative authoring, and an explicit note that the _definition-manifest_ `include` stays repo-relative because a definition has no config directory. Fix `:190` — the in-`config` exclude position reads only `exclude_files` / `exclude_globs`, never canonical `exclude` (`src/config.rs:645`), so `exclude:` inside `config:` is a silent no-op; `:188` is accurate as written and should not be changed. Update `external-check-package-contract.md:101,108` and `check-author-api.md` with the guard rule and the required nesting for finer-axis selectors.
 
 - **Effort hint:** small
 - **Dependencies:** Switch the declarative path to intersect semantics; Guard check: no check-level file scoping
@@ -511,7 +506,7 @@ Scope: deferred (future / not a v1 blocker) — the denylist covers the known dr
 
 ### 21. Explicit widening escape hatch
 
-Add a way for a repo to _replace_ rather than intersect a definition's scope, for the case where a repo legitimately needs a check to cover a file type its definition omits. Deliberately not built in v1: with zero `applies_to` overrides in any of the four surveyed repos, there is no evidence anyone wants to widen, and shipping an escape hatch before the constraint has bitten anyone re-opens the composition question by the back door.
+Add a way for a repo to _replace_ rather than intersect a definition's scope, for the case where a repo legitimately needs a check to cover a file type its definition omits. Deliberately not built in v1: with zero `include` overrides in any of the four surveyed repos, there is no evidence anyone wants to widen, and shipping an escape hatch before the constraint has bitten anyone re-opens the composition question by the back door.
 
 - **Effort hint:** small
 - **Dependencies:** Switch the declarative path to intersect semantics
@@ -529,7 +524,7 @@ Scope: deferred (future / not a v1 blocker) — a behaviour change to a live con
 
 ### 23. `skip_symlinks` unification
 
-Fold the declarative-only `skip_symlinks` (`src/external/mod.rs:253-254`, applied at `executor.rs:299-307`) into a framework-level mechanism available to all three implementation types. A file-_type_ predicate rather than a path glob, so it does not fit the `applies_to` / `exclude` pair and needs its own design.
+Fold the declarative-only `skip_symlinks` (`src/external/mod.rs:253-254`, applied at `executor.rs:299-307`) into a framework-level mechanism available to all three implementation types. A file-_type_ predicate rather than a path glob, so it does not fit the `include` / `exclude` pair and needs its own design.
 
 - **Effort hint:** medium
 - **Dependencies:** none

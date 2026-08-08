@@ -5,10 +5,10 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::bypass::bypass_name_for_check_id;
-use crate::exclusion_matcher::ExclusionMatcher;
 use crate::external::ExternalCheckImplementationRef;
 use crate::output::{Location, Severity};
 use crate::path::validate_relative_path;
+use crate::path_scope::PathScope;
 use anyhow::{Context, Result, bail};
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -81,6 +81,19 @@ pub struct CheckConfig {
     /// position (backward-compat). Replaced (not unioned) on upsert, consistent with how
     /// the rest of a check entry is overridden by a child `CHECKS` file.
     pub exclude_patterns: Vec<String>,
+    /// Per-check `include` patterns (the framework include side), already
+    /// normalized to repo-root-relative coords. Empty means the check entry
+    /// declares no positive scope of its own — the check's definition scope
+    /// (declarative manifest `include`, a built-in's own predicate, or
+    /// universal for a component) is what applies, unnarrowed.
+    ///
+    /// Sourced from the framework-level `include` key on this check entry
+    /// (sibling of `config:`), plus the legacy `config.include` position
+    /// (backward-compat, same shape as `exclude`'s legacy position). This
+    /// entry-level list INTERSECTS the check's definition scope; it never
+    /// replaces it. Replaced (not unioned) on upsert, consistent with
+    /// `exclude_patterns`.
+    pub applies_to_patterns: Vec<String>,
     /// What this check's scheduling is keyed on. See [`CheckScope`].
     pub scope: CheckScope,
 }
@@ -217,21 +230,23 @@ impl ResolvedChecks {
         &self.global_exclude_patterns
     }
 
-    /// Build the effective [`ExclusionMatcher`] for a specific check instance.
-    ///
-    /// The effective matcher is the union of:
+    /// Strictly build the effective [`PathScope`] for config-time validation
+    /// of a specific check instance. The positive side is `check`'s own
+    /// `include` patterns; the negative side is the union of:
     /// 1. the accumulated global exclude patterns for this directory
     /// 2. the per-check exclude patterns on `check`
     ///
-    /// Returns an error if any pattern is invalid globset syntax.
-    pub fn effective_matcher_for(&self, check: &CheckConfig) -> Result<ExclusionMatcher> {
+    /// Returns an error if any pattern is invalid globset syntax. Run
+    /// scheduling uses its own lenient construction so malformed patterns can
+    /// be reported without preventing other checks from running.
+    pub fn effective_matcher_for(&self, check: &CheckConfig) -> Result<PathScope> {
         let all: Vec<String> = self
             .global_exclude_patterns
             .iter()
             .chain(check.exclude_patterns.iter())
             .cloned()
             .collect();
-        ExclusionMatcher::new(&all)
+        PathScope::new(&check.applies_to_patterns, &all)
     }
 
     fn upsert(&mut self, check: CheckConfig) {
@@ -505,6 +520,24 @@ impl ConfigResolver {
                     continue;
                 }
             };
+            let include_patterns = match parse_per_check_include_patterns(
+                &configured_id,
+                &check.include,
+                &check.config,
+                &check_config_dir,
+                &config_relative_path,
+            ) {
+                Ok((patterns, deprecation_warning)) => {
+                    if let Some(diagnostic) = deprecation_warning {
+                        resolved.push_diagnostic(diagnostic);
+                    }
+                    patterns
+                }
+                Err(diagnostic) => {
+                    resolved.push_diagnostic(diagnostic);
+                    continue;
+                }
+            };
             let scope_explicit = check.scope.is_some();
             let scope = match check.scope.as_deref() {
                 Some(raw) => match parse_check_scope(raw) {
@@ -597,6 +630,7 @@ impl ConfigResolver {
                 policy,
                 config: check.config,
                 exclude_patterns,
+                applies_to_patterns: include_patterns,
                 scope,
             });
         }
@@ -667,6 +701,18 @@ struct ParsedCheckConfig {
     /// also read for backward compatibility and merged with this field.
     #[serde(default, alias = "exclude_files", alias = "exclude_globs")]
     exclude: Option<Vec<String>>,
+    /// Framework-level per-check `include` (sibling to `config:`, not inside
+    /// it) — the include-side counterpart to `exclude`, occupying the position
+    /// decision 3 of the unify-include-side design specifies.
+    ///
+    /// `None` means absent; `Some(vec![])` is rejected as an error. The legacy
+    /// in-`config` position (`config.include`) is also read for backward
+    /// compatibility and merged with this field. This entry-level list
+    /// INTERSECTS the check's definition scope (decision 2); it never replaces
+    /// it — composition happens where the check's definition scope is known,
+    /// not here.
+    #[serde(default)]
+    include: Option<Vec<String>>,
     /// `files` (default) or `changeset`. See [`CheckScope`].
     #[serde(default)]
     scope: Option<String>,
@@ -703,13 +749,15 @@ struct LoadedChecksFile {
     parsed: ParsedChecksFile,
 }
 
-/// Normalize exclude patterns from the `CHECKS` file's directory to repo-root-relative.
+/// Normalize check-entry patterns (`exclude` or `include`) from the `CHECKS`
+/// file's directory to repo-root-relative.
 ///
 /// Patterns are authored relative to the `CHECKS` file that declares them. This
 /// function prefixes each pattern with `config_dir` so that matching can be done
 /// against repo-root-relative changeset paths. A root config (`config_dir` empty)
-/// requires no rewriting.
-fn normalize_exclude_patterns(patterns: &[String], config_dir: &Path) -> Vec<String> {
+/// requires no rewriting. `include` uses this exact function so the include
+/// and exclude sides share one coordinate system.
+fn normalize_check_entry_patterns(patterns: &[String], config_dir: &Path) -> Vec<String> {
     if config_dir.as_os_str().is_empty() {
         return patterns.to_vec();
     }
@@ -820,8 +868,8 @@ fn parse_global_exclude_patterns(
             valid.push(pattern.clone());
         }
     }
-    let normalized = normalize_exclude_patterns(&valid, config_dir);
-    if let Err(err) = ExclusionMatcher::new(&normalized) {
+    let normalized = normalize_check_entry_patterns(&valid, config_dir);
+    if let Err(err) = PathScope::new(&[], &normalized) {
         diagnostics.push(config_file_diagnostic(
             CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
             source_path.to_path_buf(),
@@ -879,11 +927,11 @@ fn parse_per_check_exclude_patterns(
     }
     let framework_patterns = raw_exclude
         .as_deref()
-        .map(|p| normalize_exclude_patterns(p, config_dir))
+        .map(|p| normalize_check_entry_patterns(p, config_dir))
         .unwrap_or_default();
     let legacy_patterns = extract_legacy_config_excludes(check_id, config, config_dir, source_path)?;
     let all = [framework_patterns, legacy_patterns].concat();
-    if let Err(err) = ExclusionMatcher::new(&all) {
+    if let Err(err) = PathScope::new(&[], &all) {
         return Err(config_file_diagnostic(
             check_id.to_owned(),
             source_path.to_path_buf(),
@@ -896,6 +944,139 @@ fn parse_per_check_exclude_patterns(
         ));
     }
     Ok(all)
+}
+
+/// Extract the legacy per-check `include` override from the check's `config`
+/// blob (`config.include`), normalized to repo-root-relative using
+/// `config_dir`. Returns `Ok(None)` when the key is absent — the legacy
+/// position was not used at all, so no deprecation warning is due. Returns
+/// `Ok(Some(patterns))` when the key is present and valid. Returns `Err` on a
+/// malformed value: a scalar, an empty list, an empty-string entry, or a
+/// non-string entry — mirroring the validation `resolve::override_include`
+/// performed before this rewiring.
+///
+/// This is the same legacy-position convention `extract_legacy_config_excludes`
+/// implements for `exclude`: decision 3 of the unify-include-side design treats
+/// the sibling-of-`config:` position and this in-`config` position as the same
+/// one coordinate, so both normalize through [`normalize_check_entry_patterns`].
+fn extract_legacy_config_include(
+    check_id: &str,
+    config: &toml::Value,
+    config_dir: &Path,
+    source_path: &Path,
+) -> std::result::Result<Option<Vec<String>>, ConfigDiagnostic> {
+    let Some(table) = config.as_table() else {
+        return Ok(None);
+    };
+    let Some(value) = table.get("include") else {
+        return Ok(None);
+    };
+    let malformed = |message: String| {
+        config_file_diagnostic(
+            check_id.to_owned(),
+            source_path.to_path_buf(),
+            message,
+            None,
+            None,
+            Some("Fix `config.include` for this check entry, or remove the key.".to_owned()),
+        )
+    };
+    let array = match value.as_array() {
+        Some(arr) => arr,
+        None => {
+            return Err(malformed(format!(
+                "`config.include` for check `{check_id}` must be a list of glob strings, not a scalar"
+            )));
+        }
+    };
+    if array.is_empty() {
+        return Err(malformed(format!(
+            "`config.include` for check `{check_id}` must not be an empty list; \
+             use `enabled: false` to disable the check instead"
+        )));
+    }
+    let mut raw = Vec::with_capacity(array.len());
+    for (i, entry) in array.iter().enumerate() {
+        match entry.as_str() {
+            Some(s) if !s.trim().is_empty() => raw.push(s.to_owned()),
+            Some(_) => {
+                return Err(malformed(format!(
+                    "`config.include[{i}]` for check `{check_id}` must not be an empty string"
+                )));
+            }
+            None => {
+                return Err(malformed(format!(
+                    "`config.include[{i}]` for check `{check_id}` must be a string"
+                )));
+            }
+        }
+    }
+    Ok(Some(normalize_check_entry_patterns(&raw, config_dir)))
+}
+
+/// Parse and validate per-check `include` patterns from a parsed check entry,
+/// returning them normalized to repo-root-relative coords. Returns a diagnostic
+/// on error.
+///
+/// Merges the framework-level `include` field (sibling of `config:`) with the
+/// legacy `config.include` position for backward compatibility — mirroring
+/// [`parse_per_check_exclude_patterns`] exactly, per decision 3 of the
+/// unify-include-side design (one coordinate for both entry positions).
+///
+/// This is the check-entry INCLUDE side: it later INTERSECTS the check's
+/// definition scope (decision 2) rather than replacing it — composition is
+/// applied by the caller, not here. An empty (but present) list is rejected,
+/// same as `exclude`'s precedent: "use `enabled: false` to disable the check
+/// instead". A malformed legacy `config.include` value (scalar, empty list,
+/// or a non-string/empty-string entry) is rejected the same way, restoring the
+/// validation `resolve::override_include` performed before this rewiring.
+///
+/// On success, also returns an optional `Warning`-severity deprecation
+/// [`ConfigDiagnostic`] when the legacy `config.include` position was used
+/// at all (present and valid) — the design's "accept both, emit a
+/// `ConfigDiagnostic` at `warning`" requirement. The caller should push it
+/// alongside the returned patterns without skipping the check.
+fn parse_per_check_include_patterns(
+    check_id: &str,
+    raw_include: &Option<Vec<String>>,
+    config: &toml::Value,
+    config_dir: &Path,
+    source_path: &Path,
+) -> std::result::Result<(Vec<String>, Option<ConfigDiagnostic>), ConfigDiagnostic> {
+    if matches!(raw_include, Some(p) if p.is_empty()) {
+        return Err(config_file_diagnostic(
+            check_id.to_owned(),
+            source_path.to_path_buf(),
+            format!(
+                "`include` for check `{check_id}` must not be an empty list; \
+                 use `enabled: false` to disable the check instead"
+            ),
+            None,
+            None,
+            Some("Add at least one glob pattern, or remove the `include` key from this check entry.".to_owned()),
+        ));
+    }
+    let framework_patterns = raw_include
+        .as_deref()
+        .map(|p| normalize_check_entry_patterns(p, config_dir))
+        .unwrap_or_default();
+    let legacy_patterns = extract_legacy_config_include(check_id, config, config_dir, source_path)?;
+    let deprecation_warning = legacy_patterns.is_some().then(|| {
+        config_file_diagnostic_with_severity(
+            check_id.to_owned(),
+            source_path.to_path_buf(),
+            format!(
+                "check `{check_id}` sets `include` via the legacy `config.include` position; \
+                 prefer the top-level `include` key on the check entry instead"
+            ),
+            None,
+            None,
+            Some("Move the glob list from `config.include` to a sibling `include` key on this check entry.".to_owned()),
+            Severity::Warning,
+        )
+    });
+    let patterns = [framework_patterns, legacy_patterns.unwrap_or_default()].concat();
+    Ok((patterns, deprecation_warning))
 }
 
 fn parse_checks_file(path: &Path, relative_path: &Path) -> std::result::Result<ParsedChecksFile, ConfigDiagnostic> {
@@ -1290,6 +1471,7 @@ const KNOWN_CHECK_ENTRY_FIELDS: &[&str] = &[
     "policy",
     "config",
     "exclude",
+    "include",
     "scope",
 ];
 
@@ -1485,7 +1667,7 @@ fn apply_external_checks_file(resolved: &mut ResolvedChecks, external_checks_fil
                 external_checks_file.source_label
             );
         }
-        if let Err(err) = ExclusionMatcher::new(patterns) {
+        if let Err(err) = PathScope::new(&[], patterns) {
             bail!(
                 "invalid glob pattern in top-level `exclude` in {}: {err}",
                 external_checks_file.source_label
@@ -1538,7 +1720,7 @@ fn apply_external_checks_file(resolved: &mut ResolvedChecks, external_checks_fil
                 extract_legacy_config_excludes(&configured_id, &check.config, Path::new(""), Path::new(""))
                     .map_err(|diag| anyhow::anyhow!(diag.message))?,
             );
-            if let Err(err) = ExclusionMatcher::new(&all) {
+            if let Err(err) = PathScope::new(&[], &all) {
                 bail!(
                     "invalid glob pattern in `exclude` for check `{configured_id}` in {}: {err}",
                     external_checks_file.source_label
@@ -1548,7 +1730,7 @@ fn apply_external_checks_file(resolved: &mut ResolvedChecks, external_checks_fil
         } else {
             let patterns = extract_legacy_config_excludes(&configured_id, &check.config, Path::new(""), Path::new(""))
                 .map_err(|diag| anyhow::anyhow!(diag.message))?;
-            if let Err(err) = ExclusionMatcher::new(&patterns) {
+            if let Err(err) = PathScope::new(&[], &patterns) {
                 bail!(
                     "invalid glob pattern in legacy `config.exclude_files`/`config.exclude_globs` \
                      for check `{configured_id}` in {}: {err}",
@@ -1556,6 +1738,23 @@ fn apply_external_checks_file(resolved: &mut ResolvedChecks, external_checks_fil
                 );
             }
             patterns
+        };
+        let legacy_include = extract_legacy_config_include(&configured_id, &check.config, Path::new(""), Path::new(""))
+            .map_err(|diagnostic| anyhow::anyhow!(diagnostic.message))?
+            .unwrap_or_default();
+        let include_patterns = if let Some(patterns) = &check.include {
+            if patterns.is_empty() {
+                bail!(
+                    "`include` for check `{configured_id}` in {} must not be an empty list; \
+                         use `enabled: false` to disable the check instead",
+                    external_checks_file.source_label
+                );
+            }
+            let mut all = patterns.clone();
+            all.extend(legacy_include);
+            all
+        } else {
+            legacy_include
         };
         let scope = match check.scope.as_deref() {
             Some(raw) => parse_check_scope(raw).with_context(|| {
@@ -1577,6 +1776,7 @@ fn apply_external_checks_file(resolved: &mut ResolvedChecks, external_checks_fil
             policy,
             config: check.config.clone(),
             exclude_patterns,
+            applies_to_patterns: include_patterns,
             scope,
         });
     }

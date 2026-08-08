@@ -27,10 +27,9 @@ use std::process::Command;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use globset::{Glob, GlobSetBuilder};
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use tracing::warn;
 
-use crate::exclusion_matcher::ExclusionMatcher;
 use crate::external::sandbox::HostCeiling;
 use crate::external::timeout::{
     CheckDeadline, DECLARATIVE_HOST_CEILING_TIMEOUT_MS, output_with_timeout, resolve_timeout_ms,
@@ -38,6 +37,7 @@ use crate::external::timeout::{
 use crate::fix::safety::WritableSandbox;
 use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
+use crate::path_scope::PathScope;
 
 use super::{
     ArtifactFormat, BazelAspectInvocation, ExitOutcome, ExternalCheckDeclarativePackage, FixBlock, FixExitOutcome,
@@ -66,14 +66,15 @@ pub fn run_declarative_check(
         changeset,
         config,
         effective_severity,
-        &ExclusionMatcher::default(),
+        &PathScope::default(),
         None,
     )
 }
 
 /// Like [`run_declarative_check`] but emits per-file/per-chunk progress ticks
 /// via `on_file_processed` (cumulative count of eligible files processed so far)
-/// and subtracts the framework `exclusion` set during file selection.
+/// and narrows file selection by the framework `path_scope` (check-entry
+/// `applies_to` ∩ effective exclude set) for this check instance.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_declarative_check_with_progress(
     repo_root: &Path,
@@ -82,7 +83,7 @@ pub(crate) fn run_declarative_check_with_progress(
     changeset: &ChangeSet,
     config: &toml::Value,
     effective_severity: Option<Severity>,
-    exclusion: &ExclusionMatcher,
+    path_scope: &PathScope,
     on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
 ) -> Result<CheckResult> {
     run_declarative_check_impl(
@@ -92,7 +93,7 @@ pub(crate) fn run_declarative_check_with_progress(
         changeset,
         config,
         effective_severity,
-        exclusion,
+        path_scope,
         Some(on_file_processed),
     )
 }
@@ -105,16 +106,20 @@ fn run_declarative_check_impl(
     changeset: &ChangeSet,
     config: &toml::Value,
     effective_severity: Option<Severity>,
-    exclusion: &ExclusionMatcher,
+    path_scope: &PathScope,
     on_file_processed: Option<Arc<dyn Fn(usize) + Send + Sync>>,
 ) -> Result<CheckResult> {
-    // A per-repo `applies_to` override in the CHECKS.yaml config blob replaces the
-    // definition's applies_to list entirely (same glob vocabulary, replace semantics).
-    let applies_to_override = resolve::override_applies_to(config)
-        .transpose()
-        .context("invalid `applies_to` config override")?;
-    let applies_to: &[String] = applies_to_override.as_deref().unwrap_or(&package.applies_to);
-    let files = select_files(repo_root, changeset, applies_to, package.skip_symlinks, exclusion)?;
+    // The definition's `applies_to` (this check's intrinsic scope) intersected
+    // with the framework `path_scope` (check-entry `applies_to` ∩ effective
+    // exclude set) — the same `definition ∩ entry` composition the framework
+    // applies everywhere, see decision 2 of the unify-include-side design.
+    let files = select_files(
+        repo_root,
+        changeset,
+        &package.applies_to,
+        package.skip_symlinks,
+        path_scope,
+    )?;
     if files.is_empty() {
         return Ok(CheckResult {
             check_id: package_id.to_owned(),
@@ -142,9 +147,9 @@ fn run_declarative_check_impl(
     };
 
     // Extract top-level string values from the config blob for {{config.KEY}}
-    // expansion in invocation args. Framework-level keys (needs, applies_to) are
-    // consumed by the binary resolver and apply-to override; remaining string
-    // values are user-defined parameters (e.g. config_file for lint/js).
+    // expansion in invocation args. Framework-level keys (needs) are consumed by
+    // the binary resolver; remaining string values are user-defined parameters
+    // (e.g. config_file for lint/js).
     let config_values = extract_config_string_values(config);
 
     let mut findings = Vec::new();
@@ -252,67 +257,67 @@ fn strip_bazel_out_bin_prefix(path: &Path) -> Option<PathBuf> {
     if rest.as_os_str().is_empty() { None } else { Some(rest) }
 }
 
-/// Count the files in `changeset` that the declarative check will actually process
-/// after applying the `applies_to` glob filter and any per-repo config override.
-/// Falls back to the full changeset size on glob-build errors.
+/// Count the files in `changeset` that the declarative check will actually
+/// process after applying the definition's `applies_to` glob filter. Falls
+/// back to the full changeset size on glob-build errors.
 ///
-/// Mirrors the first step of [`run_declarative_check`] so the runner can seed the
-/// progress reporter with the correct per-check eligible count before execution.
+/// `changeset` is expected to already be narrowed by the caller's framework
+/// [`PathScope`] (check-entry `applies_to` ∩ effective exclude set) — the
+/// runner seeds this from the same scope-filtered changeset used at execution
+/// time (see `Runner::run_changeset_with_progress`), so passing
+/// [`PathScope::default()`] here (a no-op) keeps this purely a definition-scope
+/// count, mirroring the first step of [`run_declarative_check`].
 pub(crate) fn eligible_file_count(
     repo_root: &Path,
     package: &ExternalCheckDeclarativePackage,
     changeset: &ChangeSet,
-    config: &toml::Value,
 ) -> usize {
-    // A malformed override causes run_declarative_check to fail; here we fall back to
-    // the full changeset size so the progress count is conservative and consistent with
-    // the "something went wrong" signal the runner will surface when the check runs.
-    let applies_to_override = match resolve::override_applies_to(config) {
-        Some(Ok(globs)) => Some(globs),
-        Some(Err(_)) => return changeset.changed_files.len(),
-        None => None,
-    };
-    let applies_to: &[String] = applies_to_override.as_deref().unwrap_or(&package.applies_to);
-    // The runner lowers an already-exclusion-filtered changeset into this count, so
-    // the empty matcher here keeps the count consistent with what the run will see.
     select_files(
         repo_root,
         changeset,
-        applies_to,
+        &package.applies_to,
         package.skip_symlinks,
-        &ExclusionMatcher::default(),
+        &PathScope::default(),
     )
     .map(|f| f.len())
     .unwrap_or_else(|_| changeset.changed_files.len())
 }
 
-/// Select non-deleted changed files matching any `applies_to` glob, sorted for
+/// Build a `GlobSet` from `applies_to`-shaped glob patterns.
+fn applies_to_globset(patterns: &[String]) -> Result<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        builder.add(Glob::new(pattern).with_context(|| format!("invalid applies_to glob `{pattern}`"))?);
+    }
+    builder.build().context("failed to build applies_to glob set")
+}
+
+/// Select non-deleted changed files in scope for this check, sorted for
 /// determinism. When `skip_symlinks` is true, paths that are symlinks (resolved
 /// against `repo_root`) are excluded without following the link.
 ///
-/// `exclusion` is the framework exclusion matcher for this check instance. Excluded
-/// paths are subtracted **after** the `applies_to` positive filter (excludes always
-/// win), so an excluded file never reaches the `{{files}}` argument list — it is
-/// neither checked nor, on `fix`, reformatted.
+/// `definition_applies_to` is the check's own definition scope (the declarative
+/// manifest's required `applies_to` list). `path_scope` is the framework's
+/// per-instance scope: the check-entry `applies_to` (INTERSECTED with the
+/// definition scope, never replacing it — decision 2 of the unify-include-side
+/// design) and the effective exclude set, subtracted last so excludes always
+/// win. A file must satisfy both the definition glob and `path_scope` to reach
+/// the `{{files}}` argument list.
 pub(crate) fn select_files(
     repo_root: &Path,
     changeset: &ChangeSet,
-    applies_to: &[String],
+    definition_applies_to: &[String],
     skip_symlinks: bool,
-    exclusion: &ExclusionMatcher,
+    path_scope: &PathScope,
 ) -> Result<Vec<String>> {
-    let mut builder = GlobSetBuilder::new();
-    for pattern in applies_to {
-        builder.add(Glob::new(pattern).with_context(|| format!("invalid applies_to glob `{pattern}`"))?);
-    }
-    let globset = builder.build().context("failed to build applies_to glob set")?;
+    let definition_globset = applies_to_globset(definition_applies_to)?;
+    let scoped = path_scope.filter_changeset(changeset);
 
-    let mut files: Vec<String> = changeset
+    let mut files: Vec<String> = scoped
         .changed_files
         .iter()
         .filter(|file| !matches!(file.kind, ChangeKind::Deleted))
-        .filter(|file| globset.is_match(&file.path))
-        .filter(|file| !exclusion.is_excluded(&file.path))
+        .filter(|file| definition_globset.is_match(&file.path))
         .filter(|file| {
             if !skip_symlinks {
                 return true;
@@ -999,8 +1004,10 @@ pub struct DeclarativeFixContext<'a> {
 /// the sandbox are copied back, via a same-directory temp + atomic rename.
 ///
 /// `fixable_files` are repo-relative paths; files absent from `source_tree` are
-/// silently dropped by staging. Only files that match the package's `applies_to`
-/// globs (or the per-repo config override) are staged and passed to the fixer.
+/// silently dropped by staging. Only files that match the package's definition
+/// `applies_to` globs INTERSECTED with `path_scope` (the check-entry `applies_to`
+/// ∩ effective exclude set) are staged and passed to the fixer — the same
+/// `definition ∩ entry` composition [`select_files`] applies on the run path.
 ///
 /// Invocations without a `fix` block are silently skipped. `bazel_aspect`
 /// invocations likewise (they cannot declare a fix block by schema).
@@ -1009,24 +1016,45 @@ pub struct DeclarativeFixContext<'a> {
 /// or after each batch invocation completes, with the running count of files
 /// processed so far across all invocations.
 ///
-/// `exclusion` is the framework exclusion matcher for this check instance. Excluded
-/// paths are removed from the fixable set up front, so `--write` never reformats a
-/// file the repo asked to exclude — the same guarantee `select_files` gives the run
-/// path.
+/// `path_scope` is the framework path scope for this check instance. Excluded
+/// paths, and paths outside the check-entry `applies_to`, are removed from the
+/// fixable set up front, so `--write` never reformats a file outside scope —
+/// the same guarantee `select_files` gives the run path.
 pub fn run_declarative_fix(
     context: DeclarativeFixContext<'_>,
     package: &ExternalCheckDeclarativePackage,
     fixable_files: &[PathBuf],
     source_tree: &dyn SourceTree,
     config: &toml::Value,
-    exclusion: &ExclusionMatcher,
+    path_scope: &PathScope,
     on_file_processed: impl Fn(usize),
 ) -> Vec<FixInvocationOutcome> {
-    // Subtract framework excludes before any invocation sees the fixable set: an
-    // excluded path must never be staged or rewritten on the fix path.
+    // The definition's own `applies_to` narrows the fixable set the same way it
+    // narrows the run path's file selection; this is invariant across every
+    // invocation in this package (there is one definition scope per check), so
+    // it is computed once up front rather than per invocation.
+    let definition_globset = match applies_to_globset(&package.applies_to) {
+        Ok(g) => g,
+        Err(err) => {
+            return package
+                .invocations
+                .iter()
+                .filter(|inv| inv.fix.is_some())
+                .map(|inv| FixInvocationOutcome {
+                    invocation_id: inv.id.clone(),
+                    applied: Vec::new(),
+                    per_file_errors: Vec::new(),
+                    error: Some(anyhow!("invalid `applies_to`: {err:#}")),
+                })
+                .collect();
+        }
+    };
+    // Subtract framework scope (entry `applies_to` ∩ ¬exclude) and the
+    // definition scope before any invocation sees the fixable set: a path
+    // outside either must never be staged or rewritten on the fix path.
     let fixable_files: Vec<PathBuf> = fixable_files
         .iter()
-        .filter(|path| !exclusion.is_excluded(path))
+        .filter(|path| path_scope.is_in_scope(path) && definition_globset.is_match(path))
         .cloned()
         .collect();
     let fixable_files = fixable_files.as_slice();
@@ -1075,38 +1103,7 @@ pub fn run_declarative_fix(
             continue;
         };
 
-        // Apply the applies_to override (if present in config) the same way the
-        // check runner does: a per-repo config override replaces the definition's
-        // glob list entirely.
-        let applies_to_override = match resolve::override_applies_to(config) {
-            Some(Ok(globs)) => Some(globs),
-            Some(Err(err)) => {
-                outcomes.push(FixInvocationOutcome {
-                    invocation_id: invocation.id.clone(),
-                    applied: Vec::new(),
-                    per_file_errors: Vec::new(),
-                    error: Some(anyhow!("invalid applies_to config override: {err:#}")),
-                });
-                continue;
-            }
-            None => None,
-        };
-        let applies_to: &[String] = applies_to_override.as_deref().unwrap_or(&package.applies_to);
-
-        // Intersect fixable_files with the package's applies_to globs (or the config override).
-        let filtered = match filter_by_applies_to(fixable_files, applies_to) {
-            Ok(f) => f,
-            Err(err) => {
-                outcomes.push(FixInvocationOutcome {
-                    invocation_id: invocation.id.clone(),
-                    applied: Vec::new(),
-                    per_file_errors: Vec::new(),
-                    error: Some(err),
-                });
-                continue;
-            }
-        };
-        if filtered.is_empty() {
+        if fixable_files.is_empty() {
             // No applicable files after filtering — record a no-op entry.
             outcomes.push(FixInvocationOutcome {
                 invocation_id: invocation.id.clone(),
@@ -1134,8 +1131,8 @@ pub fn run_declarative_fix(
             }
         };
 
-        // Stage exactly `filtered` into a writable sandbox (force-copy; no hardlinks).
-        let sandbox = match WritableSandbox::stage(&filtered, source_tree, &ceiling) {
+        // Stage exactly `fixable_files` into a writable sandbox (force-copy; no hardlinks).
+        let sandbox = match WritableSandbox::stage(fixable_files, source_tree, &ceiling) {
             Ok(s) => s,
             Err(err) => {
                 outcomes.push(FixInvocationOutcome {
@@ -1148,7 +1145,7 @@ pub fn run_declarative_fix(
             }
         };
 
-        // The staged paths are the subset of `filtered` present in the source tree.
+        // The staged paths are the subset of `fixable_files` present in the source tree.
         // Any absent paths were silently skipped by staging.
         let staged = sandbox.staged_paths();
         if staged.is_empty() {
@@ -1360,17 +1357,6 @@ fn execute_fix_per_file(
         per_file_errors,
         error,
     })
-}
-
-/// Filter `files` to those whose repo-relative path matches any of the
-/// `applies_to` glob patterns. Returns the matching subset (same order).
-fn filter_by_applies_to(files: &[PathBuf], applies_to: &[String]) -> Result<Vec<PathBuf>> {
-    let mut builder = GlobSetBuilder::new();
-    for pattern in applies_to {
-        builder.add(Glob::new(pattern).with_context(|| format!("invalid applies_to glob `{pattern}`"))?);
-    }
-    let globset = builder.build().context("failed to build applies_to glob set")?;
-    Ok(files.iter().filter(|p| globset.is_match(p)).cloned().collect())
 }
 
 #[cfg(test)]

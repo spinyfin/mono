@@ -673,7 +673,7 @@ fn per_file_progress_emits_one_tick_per_file() {
         &changeset,
         &config,
         None,
-        &crate::exclusion_matcher::ExclusionMatcher::default(),
+        &crate::path_scope::PathScope::default(),
         on_file_processed,
     )
     .expect("check must succeed");
@@ -722,7 +722,7 @@ fn batch_progress_emits_one_tick_per_chunk() {
         &changeset,
         &config,
         None,
-        &crate::exclusion_matcher::ExclusionMatcher::default(),
+        &crate::path_scope::PathScope::default(),
         on_file_processed,
     )
     .expect("check must succeed");

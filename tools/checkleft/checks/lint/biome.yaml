@@ -6,7 +6,7 @@ api_version: v1
 # cold npm cache download while keeping the entire check bounded.
 limits:
   timeout_ms: 300000
-applies_to:
+include:
   - "**/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts}"
 
 # Binary resolution + version pinning:
@@ -53,7 +53,7 @@ invocations:
     mode: batch
     args:
       - "lint"
-      # Skip files Biome cannot lint instead of erroring (defensive: applies_to is
+      # Skip files Biome cannot lint instead of erroring (defensive: include is
       # the JS/TS set Biome lints, but an override could widen it).
       - "--files-ignore-unknown=true"
       # Machine-readable JSON on stdout so the json transform can parse diagnostics.

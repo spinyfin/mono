@@ -251,7 +251,8 @@ struct RawDeclarativeCheckManifest {
     mode: String,
     runtime: String,
     api_version: String,
-    applies_to: Vec<String>,
+    #[serde(alias = "applies_to")]
+    include: Vec<String>,
     #[serde(default)]
     needs: std::collections::BTreeMap<String, declarative::RawBinaryRequirement>,
     #[serde(default)]
@@ -279,7 +280,7 @@ impl RawDeclarativeCheckManifest {
         }
 
         let declarative_fields = declarative::RawDeclarativeFields {
-            applies_to: self.applies_to,
+            applies_to: self.include,
             needs: self.needs,
             invocations: self.invocations,
             skip_symlinks: self.skip_symlinks,
@@ -327,8 +328,8 @@ struct RawExternalCheckPackage {
     // incompatible with `deny_unknown_fields`) so the existing single-parse +
     // unknown-field rejection still holds. They are rejected in component mode
     // and required in declarative mode.
-    #[serde(default)]
-    applies_to: Vec<String>,
+    #[serde(default, alias = "applies_to")]
+    include: Vec<String>,
     #[serde(default)]
     needs: std::collections::BTreeMap<String, declarative::RawBinaryRequirement>,
     #[serde(default)]
@@ -358,13 +359,13 @@ impl RawExternalCheckPackage {
             limits,
             checks,
             provenance,
-            applies_to,
+            include,
             needs,
             invocations,
             skip_symlinks,
         } = self;
         let declarative = declarative::RawDeclarativeFields {
-            applies_to,
+            applies_to: include,
             needs,
             invocations,
             skip_symlinks,
@@ -467,7 +468,9 @@ fn validate_runtime_for_mode(mode: RawExternalCheckMode, runtime: &str) -> Resul
 /// Reject declarative-only fields in non-declarative modes.
 fn reject_declarative_fields(declarative: &declarative::RawDeclarativeFields) -> Result<()> {
     if !declarative.is_empty() {
-        bail!("fields `applies_to`/`needs`/`invocations` are only allowed in `declarative` mode");
+        bail!(
+            "fields `include` (or its `applies_to` alias)/`needs`/`invocations` are only allowed in `declarative` mode"
+        );
     }
     Ok(())
 }

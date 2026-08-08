@@ -25,8 +25,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::exclusion_matcher::ExclusionMatcher;
 use crate::external::{ExternalCheckPackageImplementation, parse_declarative_check_manifest};
+use crate::path_scope::PathScope;
 use crate::source_tree::LocalSourceTree;
 
 use super::ExternalCheckDeclarativePackage;
@@ -127,7 +127,7 @@ async fn fix_succeeds_on_file_declaring_absent_sibling_module() {
     let package = parse_rustfmt_package();
     let source_tree = LocalSourceTree::new(repo_root.path()).expect("source tree over temp repo root");
     let config = config_with_rustfmt_path(&rustfmt);
-    let exclusion = ExclusionMatcher::default();
+    let exclusion = PathScope::default();
 
     let outcomes = run_declarative_fix(
         DeclarativeFixContext {

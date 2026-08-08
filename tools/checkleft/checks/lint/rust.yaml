@@ -6,7 +6,7 @@ api_version: v1
 # server-lock wait, while the host ceiling still bounds a wedged invocation.
 limits:
   timeout_ms: 600000
-applies_to:
+include:
   - "**/*.rs"
 
 # clippy via the rules_rust aspect — bazel runs clippy, checkleft reads the
