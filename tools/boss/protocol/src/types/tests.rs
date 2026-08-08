@@ -1873,6 +1873,29 @@ fn pr_created_payload_roundtrips() {
 }
 
 #[test]
+fn run_done_outcome_display_and_parse_are_inverses() {
+    for outcome in RunDoneOutcome::ALL {
+        let s = outcome.to_string();
+        let back: RunDoneOutcome = s
+            .parse()
+            .unwrap_or_else(|e| panic!("RunDoneOutcome::from_str({s:?}) failed: {e}"));
+        assert_eq!(*outcome, back, "round-trip failed for {outcome:?}");
+    }
+}
+
+#[test]
+fn run_done_payload_roundtrips() {
+    let payload = RunDoneProposalPayload {
+        outcome: RunDoneOutcome::Delivered,
+        summary: "opened https://github.com/foo/bar/pull/1 with the md5 crate swap".into(),
+    };
+    let raw = serde_json::to_value(&payload).unwrap();
+    assert_eq!(raw.get("outcome").and_then(|v| v.as_str()), Some("delivered"));
+    let back: RunDoneProposalPayload = serde_json::from_value(raw).unwrap();
+    assert_eq!(payload, back);
+}
+
+#[test]
 fn attention_payload_roundtrips_and_omits_kind_when_none() {
     let full = AttentionProposalPayload {
         body_markdown: "please check this".into(),

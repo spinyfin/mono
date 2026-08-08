@@ -186,10 +186,62 @@ crate::register_counter!(
      row of kind followup_task existed for the execution (followup_proposals_seam on).",
 );
 
+// Worker-proposal seam: fallback-hit counter for the `NO_CHANGES_NEEDED`
+// transcript marker, incremented only when `run_done_proposals_seam` is on
+// and no `run_done` declaration covered the no-op claim — mirrors the
+// counters above. Same remote-worker caveat applies.
+crate::register_counter!(
+    RUN_DONE_FALLBACK_HIT,
+    "worker_proposals.fallback_hit.run_done",
+    "A no-op terminal fell back to the legacy NO_CHANGES_NEEDED transcript marker because the \
+     execution carried no run_done declaration (run_done_proposals_seam on).",
+);
+// The run-done gate and its backstop. Together these are the soak
+// instrumentation for the declaration: `GATE_HELD` counts runs the health-alone
+// inference would have finalized and the declaration requirement did not,
+// `BACKSTOP_ASKED` counts how often that hold escalated as far as asking, and
+// `BACKSTOP_PARKED` counts the asks that went unanswered. A healthy soak has
+// `GATE_HELD` well above `BACKSTOP_ASKED` (workers declare, or finish, before
+// the horizon) and `BACKSTOP_PARKED` near zero.
+crate::register_counter!(
+    RUN_DONE_GATE_HELD,
+    "run_done.gate_held",
+    "The satisfied-deliverable gate's health-alone arm refused to finalize a run that had not \
+     declared itself done (run_done_proposals_seam on).",
+);
+crate::register_counter!(
+    RUN_DONE_BACKSTOP_ASKED,
+    "run_done.backstop_asked",
+    "The run-done backstop's silence horizon elapsed with no declaration and no sign of worker \
+     activity, so the worker was asked whether it is finished.",
+);
+crate::register_counter!(
+    RUN_DONE_BACKSTOP_PARKED,
+    "run_done.backstop_parked",
+    "The run-done backstop's ask went unanswered until the auto-nudge breaker tripped; the run was \
+     parked for a human and stamped `run_undeclared_at` — never recorded as a successful completion.",
+);
+
+/// Attention-item kind filed when the run-done backstop parks a run that
+/// never declared itself finished.
+///
+/// Distinct from [`NUDGE_BREAKER_ATTENTION_KIND`], which the park itself
+/// also files, because the two say different things to whoever reads the
+/// row: the breaker item says "we asked repeatedly and nothing changed",
+/// this one says "this run's outcome is unknown — the worker never told us
+/// it was finished, and the engine deliberately did not guess". That
+/// distinction is the whole point of the declaration, so it gets its own
+/// kind rather than being folded into a generic park.
+pub const RUN_UNDECLARED_ATTENTION_KIND: &str = "run_undeclared";
+
 /// Register all PR-URL-capture counter handles with `registry`. Called from
 /// [`crate::metrics_init::init_all`] at engine startup so duplicate-name panics
 /// surface at boot rather than at the first counter increment.
 pub fn register_metrics(registry: &Registry) {
+    registry.register_counter(&RUN_DONE_FALLBACK_HIT);
+    registry.register_counter(&RUN_DONE_GATE_HELD);
+    registry.register_counter(&RUN_DONE_BACKSTOP_ASKED);
+    registry.register_counter(&RUN_DONE_BACKSTOP_PARKED);
     registry.register_counter(&PR_URL_CAPTURE_PRIMARY_HIT);
     registry.register_counter(&PR_URL_CAPTURE_ARTIFACT_HIT);
     registry.register_counter(&PR_URL_CAPTURE_DRIVER_FALLBACK_HIT);
@@ -1187,6 +1239,15 @@ pub struct WorkerCompletionHandler {
     /// [`crate::background_children::DEFAULT_BACKGROUND_CHILDREN_HORIZON_SECS`];
     /// tests override it via [`Self::with_background_children_horizon_secs`].
     background_children_horizon_secs: i64,
+    /// Silence tracker for the run-done backstop: how long an execution
+    /// that has not declared itself done
+    /// ([`boss_protocol::ProposalKind::RunDone`]) has been quiet at Stop
+    /// boundaries. Same bounded-suppression primitive as the two trackers
+    /// above and a separate instance for the same reason — it measures a
+    /// third, independent signal. See [`crate::run_done_backstop`] for why
+    /// the backstop is silence-and-liveness based rather than a slower copy
+    /// of the inference it replaces.
+    run_done_silence_tracker: Arc<BuildWaitTracker>,
     /// Operator-placed holds that exempt a live run from the idle-park
     /// (this handler's nudge/park flow) and auto-reap
     /// ([`crate::stale_worker_sweep`]) sweeps until released or the run
@@ -1432,6 +1493,31 @@ enum ContributionEvidence {
     /// captured, or the head fetch failed. The run may or may not have
     /// contributed; SHA comparison cannot say.
     Indeterminate,
+}
+
+/// What [`WorkerCompletionHandler::evaluate_satisfied_deliverable_on_stop`]
+/// concluded, in the three-way form the two-way `Option` shape cannot
+/// express.
+///
+/// The distinction that matters is between the last two: both leave the run
+/// live, but for opposite reasons and with opposite correct responses.
+/// `NotSatisfied` means the deliverable genuinely is not ready (CI failing,
+/// conflict, closed PR) — nudging is the right answer, because there is
+/// work left to do. `AwaitingDeclaration` means the deliverable looks
+/// perfectly fine and the only missing thing is the worker saying so —
+/// nudging there would dog a worker that may be mid-investigation, which is
+/// the harm [`crate::run_done_backstop`] exists to avoid.
+#[derive(Debug)]
+pub(crate) enum SatisfiedDeliverableOutcome {
+    /// The gate finalized the run; the caller returns this outcome.
+    Finalized(StopOutcome),
+    /// The bound PR's health would have satisfied the gate, but the run has
+    /// not declared itself done and `run_done_proposals_seam` is on. The
+    /// caller hands this to the run-done backstop.
+    AwaitingDeclaration,
+    /// The bound PR is not in a satisfying state. The caller falls through
+    /// to its normal nudge/park path, exactly as before.
+    NotSatisfied,
 }
 
 /// Whether "the bound PR is open, mergeable and CI-clean" is on its own
@@ -1767,6 +1853,39 @@ pub enum StopOutcome {
     /// revision whose parent PR happens to be open and CI-clean, which is
     /// the normal case.
     DeliverableSatisfied { pr_url: String },
+    /// The bound PR looks satisfied, but this run has not declared itself
+    /// finished (`boss propose done`) and the run-done backstop is holding
+    /// it rather than terminalizing on the PR's health — see
+    /// [`crate::run_done_backstop`]. Quiet outcome: no probe, no breaker
+    /// consumption, no transition, no reap. The execution stays live.
+    ///
+    /// `reason` names *which* hold applied — the worker has live background
+    /// children, or the silence horizon has not yet elapsed — because those
+    /// are different findings to an operator reading back why a run is
+    /// still open: the first says the worker is demonstrably working, the
+    /// second says nothing is known either way yet.
+    ///
+    /// This is the outcome that replaces
+    /// [`Self::DeliverableSatisfied`] for an undeclared run. It is
+    /// deliberately not a terminal state: a run that never declares reaches
+    /// [`Self::RunUndeclaredParked`] via the ask, or is reclaimed by
+    /// [`crate::stale_worker_sweep`], but is never quietly recorded as a
+    /// success.
+    AwaitingRunDoneDeclaration { reason: String },
+    /// The run-done backstop asked an undeclared run whether it was
+    /// finished, the ask went unanswered until the auto-nudge breaker
+    /// tripped, and the run was parked for a human. `run_undeclared_at` is
+    /// stamped on the execution row and a
+    /// [`RUN_UNDECLARED_ATTENTION_KIND`] attention filed, so the ending is
+    /// distinguishable — in stored state and on the row — from a run that
+    /// declared itself done. `waited_secs` is how long the run was silent
+    /// before the backstop first asked.
+    ///
+    /// The execution stays `waiting_human`; it is NOT `completed`. An
+    /// undeclared run that produced nothing must never be recorded as a
+    /// successful completion, which is the failure this whole path exists
+    /// to end.
+    RunUndeclaredParked { reason: String, waited_secs: i64 },
     /// A CI-remediation worker classified the failure as flaky/infra and
     /// re-triggered the failing job (`boss engine ci mark-retriggered`),
     /// which stamped the `ci_flaky_retriggered` signal on the parent.

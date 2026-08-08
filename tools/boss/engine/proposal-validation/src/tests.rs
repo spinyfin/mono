@@ -55,6 +55,7 @@ fn valid_payload_for(kind: ProposalKind) -> Value {
         }),
         ProposalKind::AutomationOutcome => json!({"outcome": "skip", "reason": "repo is clean"}),
         ProposalKind::PrCreated => json!({"pr_url": "https://github.com/o/r/pull/123"}),
+        ProposalKind::RunDone => json!({"outcome": "delivered", "summary": "opened the PR"}),
     }
 }
 
@@ -497,4 +498,35 @@ fn caller_idempotency_key_rejects_over_length() {
 #[test]
 fn caller_idempotency_key_accepts_a_normal_key() {
     validate_caller_idempotency_key("my-custom-key").unwrap();
+}
+
+// ── run_done ────────────────────────────────────────────────────────────────
+
+/// The declaration's outcome is a closed vocabulary and the rejection must
+/// name it, because a worker that guesses `--outcome finished` needs to be
+/// able to fix the call from the error alone. The message comes from
+/// `RunDoneOutcome`'s own `FromStr`, so it cannot drift from the type.
+#[test]
+fn run_done_rejects_an_outcome_outside_the_closed_vocabulary() {
+    let errors = errs(
+        ProposalKind::RunDone,
+        json!({"outcome": "finished", "summary": "all good"}),
+    );
+    let message = message_for(&errors, "outcome");
+    assert!(
+        message.contains("delivered") && message.contains("no_changes_needed") && message.contains("blocked"),
+        "the rejection must enumerate the accepted outcomes: {message}"
+    );
+}
+
+/// `summary` is required, not optional: a declaration with no prose is the
+/// information vacuum the whole kind exists to fill, so it must fail at
+/// submission rather than store an empty row.
+#[test]
+fn run_done_requires_a_summary() {
+    let errors = errs(ProposalKind::RunDone, json!({"outcome": "delivered"}));
+    assert!(
+        fields(&errors).contains(&"summary"),
+        "a declaration with no summary must be rejected: {errors:?}"
+    );
 }

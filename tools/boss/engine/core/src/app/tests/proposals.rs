@@ -407,6 +407,7 @@ async fn every_kind_can_be_submitted() {
             }
             ProposalKind::AutomationOutcome => json!({"outcome": "skip", "reason": "clean"}),
             ProposalKind::PrCreated => json!({"pr_url": "https://github.com/o/r/pull/1"}),
+            ProposalKind::RunDone => json!({"outcome": "delivered", "summary": "S"}),
         };
         let (proposal, _) = submitted(submit(&fx, kind, payload).await);
         assert_eq!(proposal.kind, kind);
