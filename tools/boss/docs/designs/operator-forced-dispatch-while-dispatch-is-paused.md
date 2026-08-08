@@ -81,50 +81,13 @@ Rejected because the app's snapshot can be stale and does not own dependency, st
 - The existing protocol uses the name `force` for pool growth. Implementation should choose unambiguous internal and wire names, while retaining the operator-friendly CLI spelling `--force` only on `work start`.
 - The admission evaluator and mutating request must share one reason-producing function; two similar implementations would drift and could make the confirmation promise differ from the actual refusal.
 - Dispatch-event retention is the existing durability boundary. If operators later need a permanent per-execution badge or database query, that is a separate observability enhancement, not a reason to persist force on the row in v1.
-- Existing manual-start behavior already serves some stuck-row recovery, notably churn-guard retries. This design does not broaden that behavior; any general override taxonomy needs a separate safety review.
 
 ## Proposed implementation task breakdown
 
-Breakdown size: 4 entries (3 in-scope, 1 deferred) — this is below the 8–14 entry multi-subsystem anchor because the feature is one shared admission seam with two thin clients, and splitting its protocol and engine halves would create an unreviewable intermediate contract.
+### Implement pause-only forced dispatch end to end
 
-### Pause-only engine admission contract
-
-Scope: Add the shared read-only admission evaluation, distinct pause-override intent and entry-point provenance to the protocol and engine. Route confirmed requests through the existing request/queue/claim/spawn path; bypass only a matching operator pause, emit structured override/refusal events, preserve pool-cap force behavior, and ensure a refusal leaves no newly queued execution. Cover pause generation races, every non-overridden blocker, pool routing, and no-residue behavior with Bazel tests.
+Scope: Add the shared read-only admission evaluation, distinct pause-override intent, and entry-point provenance to the protocol and engine, with the evaluator and mutating request using the same reason-producing function. Add `--force` only to `bossctl work start`, map it to that pause-only intent with CLI provenance, and surface engine refusal messages and JSON results without mapping it to the existing pool-growth bit. Before a macOS drag-to-Doing requests execution, call the evaluator, render the pause reason and any non-overridable blockers, and send the confirmed pause generation with app-drag provenance through the existing board gesture. Route admitted requests through the existing pool-correct request/queue/claim/spawn path: `force_dispatch` previously bypassed pool classification, put PR reviews in interactive slots, and lost their model pin, so this admission path must not reintroduce that bypass. Preserve pool-cap force behavior, structured override/refusal events, pause-generation race handling, and refusal with no newly queued execution. Add Bazel test coverage for the protocol and engine admission behavior, `bossctl` parsing and engine boundary, and macOS confirmation, cancellation, changed or lifted pause, blockers, and refusal bounce-back.
 
 Effort hint: medium
 
 Dependencies: none
-
-Scope: in-scope
-
-### Coordinator `work start --force`
-
-Scope: Add `--force` only to `bossctl work start`, map it to the pause-only intent with CLI provenance, and surface engine refusal messages and JSON results without mapping it to the existing pool-growth bit. Add CLI parsing and engine-boundary tests.
-
-Effort hint: small
-
-Dependencies: Pause-only engine admission contract
-
-Scope: in-scope
-
-### Confirm paused drag in the macOS app
-
-Scope: Before a drag-to-Doing that requests execution, call the engine admission evaluator, render its pause reason and any non-overridable blockers, and send the confirmed pause generation with app-drag provenance through the existing board gesture. Add Swift tests for confirm, cancel, changed/lifted pause, and refusal bounce-back behavior.
-
-Effort hint: medium
-
-Dependencies: Pause-only engine admission contract
-
-Scope: in-scope
-
-The coordinator CLI and macOS app tasks are at the same dependency depth and may run in parallel; they edit different client trees and share only the already-landed protocol. If incidental protocol adjustments are needed, each client task must forward-port the engine contract preservingly rather than redefining it.
-
-### General manual-dispatch override taxonomy
-
-Scope: Investigate whether capacity, churn parking, deferred approval, blocked statuses, or stuck-state recovery should have separately named override intents and authorization/audit policies. Do not extend the pause-only flag or block v1 on this work.
-
-Effort hint: medium
-
-Dependencies: Pause-only engine admission contract
-
-Scope: deferred (future / not a v1 blocker) — broader overrides require separate safety decisions
