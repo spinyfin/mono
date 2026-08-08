@@ -626,7 +626,10 @@ fn codex_progress_ingress_is_run_correlated_rollout_jsonl() {
     let driver = CodexDriver::default();
     match driver.progress_observation_wiring(&config) {
         ProgressIngress::AgentJsonlFile(file) => {
-            assert_eq!(file.directory, codex_home_for_run("run").unwrap().join("sessions"));
+            assert_eq!(
+                file.directory,
+                durable_sessions_dir(&transcript_store_root().unwrap(), "codex", "run").unwrap()
+            );
             assert_eq!(file.workspace_path, PathBuf::from("/ws"));
             assert_eq!(file.filename_prefix, "rollout-");
             assert_eq!(file.filename_suffix, ".jsonl");
