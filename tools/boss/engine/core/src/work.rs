@@ -429,6 +429,7 @@ impl Clone for WorkDb {
 
 // ---- module tree (see PR description for the split rationale) ----
 mod answer_agent_runs;
+mod attachments;
 mod attention_filing;
 mod attention_reconcile;
 mod attentions;
@@ -523,6 +524,7 @@ pub(crate) use review_verdicts::query_latest_informative_review_verdicts;
 pub(crate) use revision_helpers::*;
 pub(crate) use task_targets::*;
 
+pub use attachments::{SubmitAttachmentInput, SubmitAttachmentOutcome, check_attachment_caps};
 pub use attentions::ActionedAttentionGroup;
 pub use audit_misc::AUDIT_ACTOR_DESIGN_DETECTOR;
 pub use audit_misc::AUDIT_ACTOR_HUMAN;

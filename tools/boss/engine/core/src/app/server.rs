@@ -1351,6 +1351,26 @@ pub async fn serve_with_merge_probe(
         crate::grok_home_retention_sweep::DEFAULT_INTERVAL,
     );
 
+    // The evidence surface: a loopback HTTP gallery for screenshots workers
+    // attached with `boss attach`, and the link a reviewer clicks from a
+    // GitHub PR. Bind failure is logged and the engine carries on — see
+    // `attachment_server::spawn`.
+    let _attachment_server_handle = crate::attachment_server::spawn(
+        server_state.work_db.clone(),
+        server_state.attachment_store.clone(),
+        server_state.evidence_port.clone(),
+    )
+    .await;
+
+    // Periodic evidence retention: reclaims stored screenshots past the age
+    // window and the total-bytes backstop, and collects blobs no row
+    // references. Live executions' evidence is never touched.
+    let _attachment_retention_sweep_handle = crate::attachment_retention_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.attachment_store.clone(),
+        crate::attachment_retention_sweep::DEFAULT_INTERVAL,
+    );
+
     // Periodic execution-retention sweep: prunes terminal `work_executions`
     // rows (abandoned/failed/orphaned/cancelled) past the retention bound,
     // keeping a per-work-item diagnostics floor of recent failures. Bounds

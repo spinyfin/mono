@@ -251,6 +251,25 @@ enum Command {
         #[command(subcommand)]
         action: GrokHomesAction,
     },
+    /// Inspect and reclaim stored screenshot evidence (`boss attach`).
+    ///
+    /// `list` reads `state.db` directly (same resolution as
+    /// `metrics`/`hosts`), so it works even when the engine is wedged and is
+    /// the way to find what is stored when the evidence HTTP surface is not
+    /// running. `sweep` is on-demand retention: age window plus a
+    /// total-bytes backstop, mirroring `codex-homes`/`grok-homes`. A running
+    /// engine already sweeps on its own schedule; this verb is for cleanup
+    /// between sweeps or while the engine is stopped.
+    ///
+    /// Reclaiming deletes the image bytes and leaves the row as a tombstone,
+    /// so an evidence link in an already-merged PR body explains itself
+    /// rather than 404ing. Blobs shared by several rows (identical renders
+    /// are stored once) survive until the last row referencing them is
+    /// reclaimed.
+    Attachments {
+        #[command(subcommand)]
+        action: AttachmentsAction,
+    },
     /// Read-only inspection of `work_comments` and `answer_agent_runs` rows.
     ///
     /// Reads `state.db` directly (same resolution as `metrics`/`hosts`) —
@@ -1179,6 +1198,38 @@ enum GrokHomesAction {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum AttachmentsAction {
+    /// List stored evidence, newest first, with the run that produced each
+    /// image and whether retention has reclaimed its bytes.
+    List {
+        /// Only show attachments for one work item.
+        #[arg(long)]
+        work_item: Option<String>,
+        /// Override the Boss state-root directory.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+    /// Reclaim stored evidence past the retention policy, and collect blobs
+    /// no row references (what a crash between the store write and the row
+    /// insert leaves behind). Live executions' evidence is never touched.
+    Sweep {
+        /// Only reclaim attachments created more than this many days ago.
+        #[arg(long, default_value_t = boss_engine::attachments::retention::DEFAULT_MAX_AGE_DAYS)]
+        older_than_days: u64,
+        /// Total-bytes backstop across retained evidence: once exceeded, the
+        /// oldest is reclaimed first regardless of age.
+        #[arg(long, default_value_t = boss_engine::attachments::retention::DEFAULT_MAX_TOTAL_BYTES)]
+        max_total_bytes: u64,
+        /// Preview what would be reclaimed without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Override the Boss state-root directory.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+}
+
 // Per-binary build-info stamp + `version_string` accessor. The
 // include!(env!("BOSS_BUILD_INFO_RS")) must be evaluated in this crate
 // (this rust_binary sets its own rustc_env), so the shared logic is a
@@ -1492,6 +1543,18 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     state_root,
                 },
         } => grok_homes_sweep(cli.json, state_root, older_than_days, max_total_bytes, dry_run).await,
+        Command::Attachments {
+            action: AttachmentsAction::List { work_item, state_root },
+        } => attachments_list(cli.json, state_root, work_item),
+        Command::Attachments {
+            action:
+                AttachmentsAction::Sweep {
+                    older_than_days,
+                    max_total_bytes,
+                    dry_run,
+                    state_root,
+                },
+        } => attachments_sweep(cli.json, state_root, older_than_days, max_total_bytes, dry_run).await,
         Command::Comments {
             action:
                 comments::CommentsAction::List {
@@ -2009,6 +2072,119 @@ async fn grok_homes_sweep(
             "reclaimed {} recorded Grok home(s) ({} bytes); scanned={}, skipped_live={}, kept_in_policy={}, errors={}",
             outcome.deleted,
             outcome.deleted_bytes,
+            outcome.scanned,
+            outcome.skipped_live,
+            outcome.kept_in_policy,
+            outcome.errors
+        );
+    }
+    Ok(())
+}
+
+/// `bossctl attachments list` — stored screenshot evidence, newest first.
+///
+/// Reads `state.db` directly like every other direct-DB verb, so it answers
+/// "what evidence exists" even when the engine (and therefore the loopback
+/// gallery) is not running.
+fn attachments_list(json: bool, state_root: Option<PathBuf>, work_item: Option<String>) -> Result<()> {
+    let db = open_state_db(state_root)?;
+    let attachments = match work_item.as_deref() {
+        Some(id) => db
+            .list_work_attachments_for_work_item(id)
+            .context("listing attachments for work item")?,
+        None => db.list_all_work_attachments().context("listing attachments")?,
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&attachments)?);
+        return Ok(());
+    }
+    if attachments.is_empty() {
+        println!("no stored attachments");
+        return Ok(());
+    }
+    for attachment in &attachments {
+        let state = if attachment.is_reclaimed() {
+            "reclaimed"
+        } else {
+            "stored"
+        };
+        let caption = if attachment.caption.is_empty() {
+            attachment.source_name.as_str()
+        } else {
+            attachment.caption.as_str()
+        };
+        println!(
+            "{}  {}  {}  {}x{}  {}B  {state}  {caption}",
+            attachment.id,
+            attachment.work_item_id,
+            attachment.execution_id,
+            attachment.pixel_width,
+            attachment.pixel_height,
+            attachment.size_bytes,
+        );
+    }
+    Ok(())
+}
+
+/// `bossctl attachments sweep` — on-demand evidence retention. Mirrors
+/// [`grok_homes_sweep`]: same age + total-bytes policy shape, same
+/// `--dry-run`, same "a running engine already does this on a schedule".
+async fn attachments_sweep(
+    json: bool,
+    state_root: Option<PathBuf>,
+    older_than_days: u64,
+    max_total_bytes: u64,
+    dry_run: bool,
+) -> Result<()> {
+    let store_root = resolve_db_path(state_root.clone())?
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve the Boss state root from the state.db path"))?;
+    let db = open_state_db(state_root)?;
+    let store = boss_engine::attachments::AttachmentStore::under_state_root(&store_root);
+    let policy = boss_engine::attachments::AttachmentRetentionPolicy::new(
+        std::time::Duration::from_secs(older_than_days.saturating_mul(24 * 60 * 60)),
+        max_total_bytes,
+    );
+    let outcome =
+        boss_engine::attachment_retention_sweep::run_one_pass_with_policy(&db, &store, &policy, dry_run).await;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "scanned": outcome.scanned,
+                "reclaimed_rows": outcome.reclaimed_rows,
+                "deleted_blobs": outcome.deleted_blobs,
+                "reclaimed_bytes": outcome.reclaimed_bytes,
+                "skipped_live": outcome.skipped_live,
+                "kept_in_policy": outcome.kept_in_policy,
+                "orphans_deleted": outcome.orphans_deleted,
+                "errors": outcome.errors,
+                "dry_run": dry_run,
+                "older_than_days": older_than_days,
+                "max_total_bytes": max_total_bytes,
+            })
+        );
+    } else if dry_run {
+        println!(
+            "would reclaim {} attachment(s) ({} bytes, {} blob(s)) and {} orphan blob(s); scanned={}, skipped_live={}, kept_in_policy={}",
+            outcome.reclaimed_rows,
+            outcome.reclaimed_bytes,
+            outcome.deleted_blobs,
+            outcome.orphans_deleted,
+            outcome.scanned,
+            outcome.skipped_live,
+            outcome.kept_in_policy
+        );
+    } else {
+        println!(
+            "reclaimed {} attachment(s) ({} bytes, {} blob(s)) and {} orphan blob(s); scanned={}, skipped_live={}, kept_in_policy={}, errors={}",
+            outcome.reclaimed_rows,
+            outcome.reclaimed_bytes,
+            outcome.deleted_blobs,
+            outcome.orphans_deleted,
             outcome.scanned,
             outcome.skipped_live,
             outcome.kept_in_policy,

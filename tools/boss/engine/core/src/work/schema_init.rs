@@ -765,6 +765,11 @@ impl WorkDb {
         // `editorial_rules.instructions` (GitHub-visible surfaces only) — see
         // `migrate_products_design_guidance`'s doc comment.
         migrate_products_design_guidance(conn)?;
+        // `work_attachments`: metadata for reviewer-visible screenshot
+        // evidence, whose bytes live content-addressed under the engine state
+        // root. Additive and independent of every other table.
+        // Design: tools/boss/docs/designs/worker-screenshot-evidence-attachments.md
+        migrate_work_attachments_table(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '31')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -903,6 +908,18 @@ mod tests {
         assert!(
             worker_proposals_exists,
             "expected worker_proposals table from migrate_worker_proposals_table"
+        );
+
+        let work_attachments_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'work_attachments')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            work_attachments_exists,
+            "expected work_attachments table from migrate_work_attachments_table"
         );
 
         let pr_review_verdicts_exists: bool = conn

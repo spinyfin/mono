@@ -259,9 +259,36 @@ bazel run //tools/boss/app-macos:Boss -- --capture-to /tmp/shot.png
 The instance renders itself in-process via `cacheDisplay` and exits;
 it never shows a window, never takes focus, and needs no
 screen-recording permission. Read the PNG back and state in the PR
-what you verified. Do not commit capture PNGs.
+what you verified.
 
 `bazel build` and `bazel test` are unaffected.
+
+## Showing a screenshot to your reviewer
+
+**Do not commit capture PNGs** — and do not delete them either.
+Attach them:
+
+```sh
+boss attach /tmp/shot.png --caption "wide table, after the fix"
+```
+
+The engine stores the image outside this workspace (which is
+recycled after your run) and prints a gallery URL. Put that URL in
+your PR body under an `## Evidence` heading — the reviewer clicks it
+from the GitHub PR and sees the image. Prose describing a screenshot
+nobody can look at is not evidence.
+
+Validation is immediate and typed: a path outside this workspace or
+a temp dir, a file that is not really a PNG/JPEG, an oversize render,
+or a per-run cap all come back as an error you can fix and retry now,
+rather than a silent failure discovered after you are gone. Nothing
+is ever downscaled or truncated behind your back — an image is either
+stored exactly as you rendered it or refused. `boss attach --list`
+shows what this work item already has, across runs.
+
+If `boss attach` reports that the evidence server is not listening,
+the image is still stored but there is no link to paste; say so in
+the PR body rather than inventing a URL.
 
 ## Coordinator
 

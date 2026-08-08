@@ -188,6 +188,7 @@ fn execution_id_with_driver(server_state: &ServerState, driver: Option<&str>) ->
 
 mod answer_agent_lifecycle;
 mod app_channel;
+mod attachments;
 mod awaiting_input_status;
 mod context;
 mod dispatch_pause;

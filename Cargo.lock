@@ -434,6 +434,7 @@ dependencies = [
  "boss-dispatch-events",
  "boss-dispatch-reader",
  "boss-editorial",
+ "boss-engine-attachments",
  "boss-engine-automation-dedup",
  "boss-engine-automation-schedule",
  "boss-engine-board-gesture",
@@ -494,6 +495,20 @@ dependencies = [
  "tracing-subscriber",
  "unicode-segmentation",
  "wiremock",
+]
+
+[[package]]
+name = "boss-engine-attachments"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bon",
+ "boss-protocol",
+ "chrono",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

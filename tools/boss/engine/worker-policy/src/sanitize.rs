@@ -225,6 +225,11 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::ProposalRejected { .. }
         | FrontendEvent::WorkerTierDenied { .. }
         | FrontendEvent::ProposalsList { .. }
+        // `WorkAttachment` carries no runtime-half columns at all — its only
+        // path-shaped field is `source_name`, a basename the worker itself
+        // supplied. Nothing to strip.
+        | FrontendEvent::AttachmentStored { .. }
+        | FrontendEvent::AttachmentsList { .. }
         | FrontendEvent::WorkerContextResult { .. }
         | FrontendEvent::PrStatusResult { .. }
         | FrontendEvent::PrBodyResult { .. }

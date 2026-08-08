@@ -1,0 +1,17 @@
+[package]
+name = "boss-engine-attachments"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+anyhow = { workspace = true }
+bon = { workspace = true }
+boss-protocol = { path = "../../protocol" }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "rt", "macros"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

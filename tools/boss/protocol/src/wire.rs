@@ -21,9 +21,9 @@ use crate::types::{
     Product, Project, ProposalKind, ProposalState, ProposalSubmissionError, RemoveDependencyInput,
     RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput, ReviseDocOutcome,
     SelectedProductState, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput,
-    SetTaskDocPointerInput, Task, TaskRuntime, TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution,
-    WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
-    WorkerContextBundle, WorkerProposal, WorkerTierDenial,
+    SetTaskDocPointerInput, Task, TaskRuntime, TranscriptSegment, WorkAttachment, WorkAttentionItem, WorkComment,
+    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
+    WorkRun, WorkerContextBundle, WorkerProposal, WorkerTierDenial,
 };
 
 /// Outcome of the live `getQueue` smoke check `boss engine trunk status`
@@ -1037,6 +1037,25 @@ pub enum FrontendRequest {
     /// [`FrontendEvent::WorkError`] when the comment id is unknown.
     ListAnswerAgentRuns {
         comment_id: String,
+    },
+
+    /// Worker → engine, read-only: every `work_attachments` row filed
+    /// against the caller's own work item, **across executions**, newest
+    /// first.
+    ///
+    /// Scope is the work item, not the execution, for the same reason
+    /// [`Self::ListProposals`] is: a revision chain produces several runs
+    /// against one PR, and the reviewer-facing question is "what evidence
+    /// exists for this PR", not "what did this one run render". The caller
+    /// cannot widen the scope — the work item is derived from the socket
+    /// peer's attributed execution, never from a field on this request.
+    ///
+    /// `run_id` is the caller's own `BOSS_RUN_ID` and is a **cross-check,
+    /// not a credential** — see [`Self::SubmitProposal`]. Replies with
+    /// [`FrontendEvent::AttachmentsList`], or
+    /// [`FrontendEvent::ProposalRejected`] when attribution fails.
+    ListAttachments {
+        run_id: String,
     },
 
     /// List attention groups for a product, with optional filters.
@@ -2242,6 +2261,49 @@ pub enum FrontendRequest {
     /// on the second pass.
     StopRun {
         run_id: String,
+    },
+
+    /// Worker → engine: hand over one image as reviewer-visible evidence,
+    /// synchronously validated and copied into the engine's blob store
+    /// before the reply.
+    ///
+    /// **The worker submits a path, not bytes.** The engine opens the file
+    /// itself, which keeps a multi-megabyte PNG off the socket and makes the
+    /// stored bytes the ones actually on disk rather than a re-encoding. That
+    /// only works because worker and engine share a machine — the same
+    /// local-peer constraint the proposal API already carries, and the same
+    /// [`ProposalErrorCode::NoLocalPeer`] refusal for a caller that does not.
+    ///
+    /// Because the engine reads a path the *worker* chose, the path is
+    /// confined: it must resolve inside the attributed execution's cube
+    /// workspace or under a system temp dir, and the bytes must be a real PNG
+    /// or JPEG by magic number. A worker cannot use this verb to pull an
+    /// arbitrary file into an HTTP-served store.
+    ///
+    /// Validated against the caps in `boss_protocol::types::attachment`
+    /// (size, pixel dimensions, per-execution and per-work-item counts).
+    /// Every violation is a **loud** typed refusal — nothing is downscaled,
+    /// truncated, or silently dropped.
+    ///
+    /// Idempotent on `(execution_id, content_digest)`: resubmitting the same
+    /// image inside one run returns the existing row with
+    /// `already_stored: true` rather than duplicating it, so a retried
+    /// command is safe. There is no caller-supplied idempotency key because
+    /// the bytes already are one.
+    ///
+    /// Replies with [`FrontendEvent::AttachmentStored`] or
+    /// [`FrontendEvent::ProposalRejected`].
+    SubmitAttachment {
+        run_id: String,
+        /// Path to the image, as the worker sees it. Absolute, or relative to
+        /// the engine's cwd — which is almost never what a worker means, so
+        /// the CLI absolutises it against the worker's cwd before sending.
+        path: String,
+        /// One line on what the image shows. Optional but strongly
+        /// encouraged: it is the caption the gallery renders, and "what am I
+        /// looking at" is the reviewer's first question.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
     },
 
     /// Worker → engine: submit one typed proposal, synchronously validated
