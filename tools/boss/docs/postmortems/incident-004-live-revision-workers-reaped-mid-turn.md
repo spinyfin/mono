@@ -1,7 +1,7 @@
 # Incident 004 — Engine reaped live revision workers mid-turn, discarding their work
 
 - **Date:** 2026-08-08 (America/Chicago). Focal pair on flunge PR #1342 between ~15:23 and ~15:41; the same finalization path had been active for at least three days prior.
-- **Severity:** High — silent work loss on live revision workers, plus false-success board status for a revision that produced nothing. Includes a case where a revision minted to fix live production regressions was reaped before push while the board reported success.
+- **Severity:** High — silent work loss on live revision workers, plus false-success board status for revisions that produced nothing. Measured over the retained trace window: **63 mid-turn reaps out of 64 staged-path finalizations (98.4%)** — 6 total losses, 57 partial losses, and **5 work items still sitting in review status having contributed nothing** (§4). Includes a case where a revision minted to fix live production regressions was reaped before push while the board reported success.
 - **Status:** Documented. Guard remediation for the fast path is already in flight as separate work and is not redesigned here. This postmortem is doc-only.
 - **Class:** Race between merge-poller PR recheck and a still-working agent: a staged PR URL is treated as "worker done," terminalizing and reaping a live mid-turn execution. Related prior: the 2026-07-14 SHA-delta absorption incident whose protection this fast path bypasses.
 - **Related:** [`incident-001-pr-fan-out.md`](incident-001-pr-fan-out.md) (wrong-PR finalization killing live workers); 2026-07-14 SHA-delta baseline absorption (guard comment at `completion/recheck.rs:152-166`).
@@ -12,7 +12,9 @@ The engine has a **fast path that treats a staged PR URL as permission to finali
 
 That fast path short-circuits two protections sitting **below** it in the same function: the `worker_owns_turn_loop` gate, and the SHA-delta arm that explicitly refuses to absorb a possibly in-flight push and defers to the worker's own Stop boundary. Those guards were written after an earlier race of the same class; the staged-URL path was added above them without inheriting them.
 
-Whether any given worker survives is a coin flip against the ~60 s full-sweep cadence. Staging just after a sweep often works; staging into a sweep that is about to run does not. The feature is correct when lucky; it is destructive when not.
+Whether any given worker survives is a race against the ~60 s full-sweep cadence. Staging just after a sweep can work; staging into a sweep that is about to run does not. The feature is correct when lucky and destructive when not — and measurement of the retained trace window shows the unlucky case is not the exception but the rule: **63 of 64** staged-path finalizations reaped a worker that was still `working` (§3).
+
+The defect is a property of `recheck_for_pr`'s structure, not of the staged code block alone. A further occurrence finalized through the same function's _detector_ branch and was also reaped mid-turn. **No arm of that function establishes that the worker is between turns before it terminalizes.**
 
 ## 2. Summary
 
@@ -23,7 +25,9 @@ On 2026-08-08, two consecutive revision workers on flunge PR #1342 were reaped b
 | R1       | `exec_18c9ee2925032810_47` | codex  | Pushed successfully, then reaped **2.4 s** later mid-prompt. Code reached the PR; post-push steps (including the required findings-status comment) never ran. |
 | R2       | `exec_18c9ee9f79ea3c08_4f` | claude | Reaped **before any push**. Entire local fix commit discarded with the released workspace. Board still moved the work item as if review-ready.                |
 
-This is not driver-specific and not product-specific. The two cases used different drivers and different workspaces. Across available engine-trace segments, `pr_recheck_staged` finalizations numbered in the tens to low hundreds per day; **what fraction hit live mid-turn workers is not measurable** with current instrumentation (see §9 and §11).
+This is not driver-specific and not product-specific. The two cases used different drivers and different workspaces, and the measured window confirms both: occurrences split mono 31 / flunge 32, and by driver claude 56 / grok 4 / codex 3, which tracks the traffic split.
+
+The focal pair is a calibration case, not the incident. Across the 2 d 3 h 24 m of retained engine trace, **64 finalizations took the staged fast path and 63 of them reaped a worker that was still mid-turn (98.4%)** — 6 total losses and 57 partial losses. Five work items are still sitting in review status having contributed nothing; they are listed in §4. The full measurement, its limits, and its labelling are in §3.
 
 ## 3. Impact
 
@@ -45,20 +49,108 @@ The work item was nonetheless advanced as being in review. The board reported su
 
 **Whether R2's local commit remains recoverable from the released workspace is not known.** That evidence is outside the material available for this postmortem.
 
-### Wider blast radius (unquantified)
+### Measured blast radius
 
-Counts of `pr_recheck_staged` finalizations from the available trace (not a sample of mid-turn reaps — every successful staged-path finalization, including legitimate ones):
+Every figure in this section was counted from engine trace, and each is labelled **determined** (directly counted) or **estimated** (inferred, with the inference stated). The per-driver severity rates are the only substantially estimated figures; everything else here is determined.
 
-| Trace segment                     | `pr_recheck_staged` count |
-| --------------------------------- | ------------------------- |
-| 2026-08-06→07                     | 159                       |
-| 2026-08-07                        | 17                        |
-| early 2026-08-08                  | 36                        |
-| current segment (incident window) | 28                        |
+#### Observation window — determined
 
-An unknown fraction of those hit live workers. **Do not treat these counts as an incidence rate of work loss.** They establish only that the finalization path fires often, across products, for days. Prevalence of the destructive subset is currently unknowable (see §9).
+Earliest retained trace record 2026-08-06 12:42:40 CDT, latest 2026-08-08 16:06:12 CDT: a span of **2 d 3 h 24 m** over **92,124 records** — the full stream, no truncation. The retention boundary was verified two ways; queries before 08-06 return zero records.
 
-## 4. Timeline
+**The window is a retention boundary, not a defect boundary.** An app update at ~12:38 CDT on 08-06 reset the log root after three failed engine starts. The defect may predate the window entirely, and the first occurrence lands **23 minutes into the earliest retained segment** — the path was already firing on day one of what we can see. **All counts below are a floor, not a total.**
+
+Engine restarts inside the window (determined): 08-06 12:47:06, 08-07 17:32:08, 08-07 21:29:21, 08-08 15:03:33 CDT.
+
+#### Headline — determined
+
+**64** finalizations went through the staged fast path. Of those, **63 were mid-turn reaps** (`activity: 'working'` on the paired live-state registry clear) and **1** was clean: **98.4%**.
+
+Pairing is unambiguous. Every execution had exactly one registry-clear record, median offset **7 ms**, max **1.62 s** — there is no ambiguous attribution anywhere in the set.
+
+The `activity` discriminator validates cleanly against control groups:
+
+| finalization source            | `working` | `idle` |
+| ------------------------------ | --------- | ------ |
+| `stop_staged`                  | 0         | 61     |
+| `stop_sha_delta`               | 0         | 3      |
+| `pr_recheck_staged`            | **63**    | 1      |
+| `pr_recheck` (detector branch) | **1**     | 0      |
+
+Stop-boundary paths are **64/64 idle**. Recheck paths are **64/65 working**. The signal separates the two families exactly as the mechanism in §6 predicts: finalizing at the worker's own Stop boundary finds an idle worker; finalizing from a poller recheck finds one mid-turn.
+
+**Scope finding — the missing guard is not confined to the staged fast path.** One further occurrence finalized through the _detector_ branch of the same function and was also reaped mid-turn: a chore implementation on mono #2678, 08-07 21:57 CDT, grok driver. The defect is therefore a property of `recheck_for_pr`'s structure — no arm of it establishes that the worker is between turns — not of the one code block quoted in §6.1. A guard applied only to the staged arm would leave the detector branch exposed.
+
+#### Severity — determined
+
+**6 total loss** (never pushed) and **57 partial loss** (pushed, then killed before finishing the prompt).
+
+The six total losses, by PR:
+
+| PR           | Work                                                          |
+| ------------ | ------------------------------------------------------------- |
+| mono #2321   | Merge-conflict revision                                       |
+| mono #2681   | Review revision, 4 findings                                   |
+| mono #2651   | Three consecutive merge-conflict revisions (×3, three losses) |
+| flunge #1342 | Review revision, 6 findings — R2 above, the calibration case  |
+
+Two methodology notes belong with these counts, because both are traps for anyone re-running the measurement:
+
+- **`revision_push_capture` is not proof of a push.** One execution staged push evidence from its tool stream _and_ was `sha_unchanged`, with the PR head unmoved. The tool-stream heuristic false-positives; **head-SHA movement is the decisive signal.**
+- **One engine `sha_unchanged` verdict was itself wrong.** On flunge #1327 the engine recorded `sha_unchanged` at 13:00:56 CDT, but a commit with committer date 13:00:40 — 16 seconds earlier — is in that PR, which merged at 13:02:25 with no other execution able to have pushed it. The engine's head read was stale. Classified as partial: GitHub overrode the engine.
+
+One row is genuinely **unresolvable**. A revision on flunge #1296 routed via `pr_review cycle bound reached`, which skips the SHA check, and the branch has since been force-pushed, so the head at reap time is unrecoverable. It could be a seventh total loss. It is reported as unresolvable rather than assigned to either bucket.
+
+#### Breakdowns — determined counts
+
+- **By repo:** mono 31 · flunge 32. Essentially even — this is not product-specific.
+- **By execution kind:** revision_implementation 50 · chore_implementation 10 · investigation_implementation 1 · project_design 1 · task_implementation 1.
+- **By driver:** claude 56 · grok 4 · codex 3. This tracks the traffic split, so **occurrence is not driver-specific.**
+
+Severity by driver is a different story, and must be read per-driver rather than pooled:
+
+| driver | occurrences | total loss | rate     |
+| ------ | ----------- | ---------- | -------- |
+| claude | 56          | 1          | 1.8%     |
+| grok   | 4           | 4          | **100%** |
+| codex  | 3           | 1          | 33%      |
+
+Every grok run that reached this path lost everything. The occurrence and total-loss counts are **determined**; the **rates are estimated** — N is 4 for grok and 3 for codex, so those percentages carry no useful precision and must not be quoted without their denominators. A plausible mechanism, stated as a **hypothesis and not a finding**: non-claude drivers surface a `gh pr` URL into the tool stream earlier relative to their push, so the fast path catches them further from a completed turn.
+
+#### Rate over time — determined counts, estimated trend
+
+| day                | mid-turn reaps | all PR-completion terminalizations | share |
+| ------------------ | -------------- | ---------------------------------- | ----- |
+| 08-06 (from 12:42) | 30             | 60                                 | 50%   |
+| 08-07              | 23             | 54                                 | 43%   |
+| 08-08 (to 16:06)   | 10             | 15                                 | 73%   |
+
+**The rate is flat and load-driven, not increasing.** Raw daily counts fall only because dispatch volume falls (213 → 164 → 48 spawns). Normalized, the defect fires on roughly half of all PR-completion terminalizations, and on essentially **100% of everything reaching the staged fast path** (63/64). Apparent burstiness is a load artifact: the 08-08 overnight gap has zero spawns, not zero defects. There is **no correlation with any of the four engine restarts** — rates are unchanged across all of them.
+
+The counts in the table are determined. The trend characterization ("flat, load-driven") is **estimated**: it rests on three daily points, two of which are partial days, normalized against spawn volume.
+
+## 4. Remediation list — work items that read as reviewed but contributed nothing
+
+This is the actionable output of the measurement. **Five work items currently claim review status while nothing from their execution ever reached the PR head.** Each has exactly one completed execution and no recovery run in flight. Verified against GitHub 2026-08-08 16:14 CDT (determined). They are identified here by PR and by task description.
+
+1. **Merge-conflict revision on mono #2321** — pushed nothing. Head was `b1de4521` at reap; the PR head is now `0dec5c0b`, moved by a _different_ work item's execution. This item reads as reviewed and contributed nothing.
+2. **Review revision on mono #2681** ("4 finding(s)") — head `8d2300f5`, **unchanged since 08-07 22:55 CDT**. Four review findings were never addressed. The only other execution on that item failed.
+3. **Merge-conflict revision on mono #2651** (1 of 3) — head `3cded858`, **unchanged since 08-06 13:07 CDT**; the PR is still `CONFLICTING`.
+4. **Merge-conflict revision on mono #2651** (2 of 3) — same PR, same unmoved head.
+5. **Merge-conflict revision on mono #2651** (3 of 3) — same PR, same unmoved head.
+
+### mono #2651 is the worst case and the clearest demonstration of the failure mode
+
+Three merge-conflict revisions, across three different drivers, at 15:52, 16:02 and 16:04 CDT on 08-08. Each was reaped the instant it typed a `gh pr` command. Each was recorded as successful. None of them moved the head.
+
+**The defect manufactures a retry loop that consumes a worker every few minutes and can never converge**, because the recorded outcome of every attempt is success. Nothing in the system can distinguish "the conflict was resolved" from "the resolver was killed before it pushed," so the item is re-minted, re-reaped, and re-recorded as done, indefinitely.
+
+### Recovered without intervention — not outstanding
+
+The flunge #1342 review revision (R2 above) is **not** on the list: it recovered on its own, because `reconcile_revision` spawned a follow-up that pushed successfully. It is mentioned only to establish that a recovery path exists and that it did **not** fire for the five items above. (This says nothing about whether R2's own local commit survived — see §12; the item recovered because later work redid it, not because the lost commit was retrieved.)
+
+**Why the recovery path fired for one item and not the other five is an open question**, and a significant one: if `reconcile_revision` were reliable, the false-success class would be self-healing. It is not, and nothing in the measured data explains the difference.
+
+## 5. Timeline
 
 All times America/Chicago, 2026-08-08. Anchors are from engine trace and runtime state reproduced for this writeup (not re-derived from live logs in this checkout).
 
@@ -97,9 +189,9 @@ All times America/Chicago, 2026-08-08. Anchors are from engine trace and runtime
 
 The successful #2683 case consumed 65.6 s of a ~66 s window. It was not comfortably inside budget; it barely made it. Survival is phase-dependent on the poller, not a property of the worker doing the right thing.
 
-## 5. Root cause
+## 6. Root cause
 
-### 5.1 The mechanism
+### 6.1 The mechanism
 
 Verified against this checkout.
 
@@ -168,7 +260,7 @@ That return short-circuits everything below it, including:
 
 The hazard the SHA-delta comment describes — poller races a live worker mid-session — is exactly the hazard the staged-URL fast path walks into by finalizing and tearing down.
 
-### 5.2 `worker_owns_turn_loop` would not have been enough even if reached
+### 6.2 `worker_owns_turn_loop` would not have been enough even if reached
 
 ```2113:2115:tools/boss/engine/core/src/completion.rs
 pub(crate) fn worker_owns_turn_loop(execution: &crate::work::WorkExecution) -> bool {
@@ -180,7 +272,7 @@ It admits any live non-reviewer execution. It has **no notion of mid-turn vs idl
 
 (Note on the recheck gate's polarity: when `worker_owns_turn_loop` is **false**, recheck skips. Live revision workers return **true**, so they would proceed into later arms. The gate excludes non-live and reviewer executions; it does not protect mid-turn producers.)
 
-### 5.3 Staging is armed far more broadly than "the worker pushed"
+### 6.3 Staging is armed far more broadly than "the worker pushed"
 
 ```304:324:tools/boss/engine/core/src/pr_url_capture.rs
 pub fn is_gh_pr_command_str(command: &str) -> bool {
@@ -204,13 +296,13 @@ Accepted commands:
 
 R2 was reaped off a **`gh pr edit`**. A read-only **`gh pr view`** would arm the same path. Staging therefore fires well before "the worker has delivered its push and finished its prompt."
 
-### 5.4 Finalization tears down the live worker
+### 6.4 Finalization tears down the live worker
 
 `finalize_pr_transition` (`completion/pr_transition.rs`) records completion, may map `InReview` → `PendingReview` when a reviewer is enqueued (`pr_transition.rs:226-230`), logs `pr completion: execution terminalized; teardown in flight` (`:255-260`), then calls `finish_worker_teardown` (`:279-286`), which releases the pane (`pane_outcome` includes `Reaped`) and frees the cube lease (`teardown.rs:86-156`).
 
 The live-state registry clears the slot and logs `activity` at clear time (`live_worker_state.rs:654-662`) — the incidental signal that the worker was still `working` rather than idle.
 
-### 5.5 Race against the merge-poller sweep
+### 6.5 Race against the merge-poller sweep
 
 - **Configured full-sweep interval:** 60 seconds — `tools/boss/engine/core/src/app/server.rs:1059` (`Duration::from_secs(60)` passed into `spawn_merge_poller`).
 - **Recheck invocation on each sweep:** `merge_poller/sweep.rs:417-420` iterates `pending_pr_recheck` and calls `sweep_pending_pr` (`:858-863`), which delegates to `recheck_for_pr`.
@@ -218,9 +310,9 @@ The live-state registry clears the slot and logs `activity` at clear time (`live
 
 **Line-reference correction:** the investigation brief cited `merge_poller/sweep.rs:418-419` and `:858-915` as the cadence site. Those lines are the **pending-PR recheck invocation path**, not the interval constant. The configured cadence lives at `app/server.rs:1059` (and is assumed throughout merge-poller comments as "today's 60s sweep"). The 66–91 s figure is observed wall-clock from trace, not a constant in source.
 
-## 6. Contributing factors
+## 7. Contributing factors
 
-### 6.1 Post-push deliverables live only in the prompt
+### 7.1 Post-push deliverables live only in the prompt
 
 Revision steps after the push are prompt text, not engine actions (`runner/prompt.rs`):
 
@@ -231,25 +323,27 @@ Revision steps after the push are prompt text, not engine actions (`runner/promp
 
 Anything the prompt asks for **after** the push is exposed to this race by construction. When the engine treats staging (or push) as "done," steps 5–8 are structurally orphaned. Whether post-push deliverables should remain prompt-only is an open product/engine design question (action item below).
 
-### 6.2 False-success status without head movement
+### 7.2 False-success status without head movement
 
 R2 terminalized toward review despite producing no push. The engine separately observed `sha_unchanged` when deciding whether to enqueue a reviewer (`pr_transition.rs:122-129` logs `pr_review noop skip` with `skip_reason`; noop classification includes `"sha_unchanged"` in `finalize_passes.rs` around the noop gate). The status transition and the SHA check are not coupled as a success criterion: **terminalization to PendingReview / InReview does not require that this execution moved the PR head.**
 
-### 6.3 Protection existed and was bypassed by layering
+### 7.3 Protection existed and was bypassed by layering
 
 The SHA-delta guard at `recheck.rs:144-175` encodes the exact lesson of 2026-07-14. The staged-URL fast path was added **above** it as a primary path that returns before the guard runs. Whatever review process added the fast path did not re-apply the prior incident's invariant ("do not finalize/absorb while a live worker may still be mid-session") to the new branch.
 
 This is a **layering / short-circuit** failure, not a missing idea: the idea was already written a few dozen lines down.
 
-### 6.4 Detection is incidental and not aggregated
+### 7.4 Detection is incidental and not aggregated
 
-The only field that distinguishes a mid-turn reap from a legitimate idle finalization, in the material available, is `activity` on the `live-state registry: slot entry cleared` log line (`live_worker_state.rs:654-662`). That field is not elevated to a metric, alert, or attention item. Therefore:
+The only field that distinguishes a mid-turn reap from a legitimate idle finalization is `activity` on the `live-state registry: slot entry cleared` log line (`live_worker_state.rs:654-662`). That field is not elevated to a metric, alert, or attention item. Therefore:
 
 - Operators cannot see a dashboard of mid-turn reaps.
-- Trace counts of `pr_recheck_staged` cannot be partitioned into "safe idle" vs "destructive working."
-- Prevalence is **unknown and unknowable from current data.**
+- Nothing in the running system partitions `pr_recheck_staged` finalizations into "safe idle" vs "destructive working." The partition in §3 exists only because the raw trace was pulled offline and each finalization was hand-paired to its registry-clear record.
+- **Prevalence was measurable, but only by bespoke offline reconstruction** — and only within the retention window. It was not visible to anyone operating the system, which is why a 98.4% failure rate ran for the full retained window without raising anything.
 
-### 6.5 Source-reference verification notes
+Severity was worse. The engine records a head SHA _before_ an execution runs but never _after_ teardown, so "did this execution actually push?" had to be reconstructed from the _next_ execution's `pr_head_before` snapshot or a live GitHub read. That is why one row is permanently unresolvable and why one engine `sha_unchanged` verdict turned out to be a stale-read false negative (both in §3). See action item 5.
+
+### 7.5 Source-reference verification notes
 
 | Brief citation                                         | Verified in this checkout | Notes                                                                                                                                |
 | ------------------------------------------------------ | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
@@ -261,48 +355,54 @@ The only field that distinguishes a mid-turn reap from a legitimate idle finaliz
 | `prompt.rs:1673-1721` / push at `:1653-1655`           | **Yes**                   | Step 6 findings comment after step 4 push.                                                                                           |
 | `merge_poller/sweep.rs:418-419`, `:858-915` as cadence | **Partial**               | Those lines are recheck invocation, not the 60 s interval. Cadence: `app/server.rs:1059`. Observed 66–91 s is wall-clock from trace. |
 
-## 7. What went well
+## 8. What went well
 
 - **Forensic reconstruction of the focal pair is tight.** Sub-second timestamps on staging, recheck, terminalization, activity-at-clear, and teardown path form a complete causal chain for R1 and R2 without needing to re-open live logs in this run.
 - **A clean A/B from the same afternoon exists.** mono #2683 / #2682 vs flunge #1342 shows the same feature succeeding and failing as a pure phase race, which makes the root cause teachable rather than speculative.
 - **The prior incident left a correct written invariant** in the SHA-delta arm. The right idea was already in the file; the gap is that a newer path does not share it.
 - **Activity-at-clear logging already records the distinguishing signal.** Instrumentation for detection is partially present; it is not aggregated or alerted.
-- **Driver diversity in the failure pair** (codex then claude) rules out a single-driver misconfiguration as the explanation.
+- **Driver diversity in the failure pair** (codex then claude) rules out a single-driver misconfiguration as the explanation — since confirmed at scale by the occurrence split across all three drivers (§3).
+- **The blast radius turned out to be measurable after all**, from `activity`-at-clear paired against finalization source. The discriminator validates cleanly against control groups (Stop paths 64/64 idle), so the 63/64 figure rests on a signal that demonstrably separates the two families rather than on inference.
 
-## 8. What went wrong
+## 9. What went wrong
 
-- A fast path finalizes and reaps live workers without inheriting protections a few lines below it.
+- A fast path finalizes and reaps live workers without inheriting protections a few lines below it — and the same missing check is absent from the detector branch of the same function, so the defect is structural to `recheck_for_pr`.
 - Staging treats `gh pr view|list|edit` like a push, so metadata and read commands can arm teardown.
 - Post-push prompt steps are structurally races, not guaranteed deliverables.
-- Board status can report "in review" for a revision that never moved head — false success while production regressions remain.
-- The only mid-turn reap signal is a log field that is not metricked, so multi-day blast radius cannot be sized.
+- Board status can report "in review" for a revision that never moved head — false success while production regressions remain. **Five work items are in exactly that state right now** (§4).
+- The race is not an edge case. **63 of 64** staged-path finalizations in the retained window reaped a mid-turn worker, and the rate is flat across the whole window and across four engine restarts.
+- The only mid-turn reap signal is a log field that is not metricked, so nothing raised an alarm while a 98.4% failure rate ran for days; sizing it required an offline trace reconstruction.
+- No head SHA is recorded after teardown, so "did this execution push?" is not answerable from the engine's own records — one severity determination is permanently unresolvable as a result.
 - A successful worker on the same afternoon used 65.6 s of ~66 s of runway — the system was already operating at the edge of its budget when "working."
 
-## 9. Detection and response
+## 10. Detection and response
 
 ### Detection (as of the incident)
 
-| Signal                                                                | Present?  | Actionable?                                      |
-| --------------------------------------------------------------------- | --------- | ------------------------------------------------ |
-| `source: 'pr_recheck_staged'` on terminalization                      | Yes (log) | Counts finalizations, not mid-turn harm          |
-| `activity: 'working'` on slot clear                                   | Yes (log) | Distinguishes mid-turn reaps; **not aggregated** |
-| `pane_outcome: 'Reaped'` with working activity                        | Yes (log) | Same as above                                    |
-| Metric / attention for mid-turn `pr_recheck_staged`                   | **No**    | Prevalence unknown                               |
-| Operator-facing banner when a revision finalizes with `sha_unchanged` | **No**    | R2 looked successful on the board                |
+| Signal                                                                | Present?  | Actionable?                                                            |
+| --------------------------------------------------------------------- | --------- | ---------------------------------------------------------------------- |
+| `source: 'pr_recheck_staged'` on terminalization                      | Yes (log) | Counts finalizations, not mid-turn harm                                |
+| `activity: 'working'` on slot clear                                   | Yes (log) | Distinguishes mid-turn reaps; **not aggregated**                       |
+| `pane_outcome: 'Reaped'` with working activity                        | Yes (log) | Same as above                                                          |
+| Metric / attention for mid-turn `pr_recheck_staged`                   | **No**    | Prevalence invisible in-system; only recoverable offline               |
+| Operator-facing banner when a revision finalizes with `sha_unchanged` | **No**    | R2 looked successful on the board                                      |
+| Head SHA recorded _after_ teardown                                    | **No**    | "Did this execution push?" is not answerable from engine records alone |
 
-Discovery of this incident was from a **symptom** (missing findings-status comment on R1), not from an engine-raised attention item. R2's total loss was found by forensic follow-up on the same PR, not by the board.
+Discovery of this incident was from a **symptom** (missing findings-status comment on R1), not from an engine-raised attention item. R2's total loss was found by forensic follow-up on the same PR, not by the board. Nothing in this table fired for any of the other 62 mid-turn reaps either — the measurement in §3 came from pulling raw trace off-box, not from any operator-facing surface.
 
 ### Response
 
 This document is the response artifact for the investigation. Code remediation for the guard is **in flight as separate work** and is deliberately not redesigned or re-specified here (see action item 1).
 
-## 10. Action items
+## 11. Action items
 
 Owners are **surfaces** (files / subsystems), not people. None of these are implemented by this document. Item 1's design is already in flight elsewhere — reference only.
 
+These are engineering fixes to the defect. They are **not** a substitute for the recovery work in §4: the five work items listed there are already broken and will not be repaired by any code change here.
+
 ### Immediate — completion / recheck (in flight)
 
-1. **Guard the staged-URL fast path so it cannot finalize a still-working live worker.** Surface: `tools/boss/engine/core/src/completion/recheck.rs` staged arm (`:55-72`), coordinated with `finalize_pr_transition` / teardown in `completion/pr_transition.rs` and `completion/teardown.rs`. Inherit the 2026-07-14 invariant already written at `recheck.rs:144-175` (defer to the worker's own Stop boundary while mid-session). **Remediation design is in flight as separate work — do not duplicate that design here; land and verify it there.**
+1. **Guard `recheck_for_pr` — the whole function, not just the staged arm — so no path through it can finalize a still-working live worker.** Surface: `tools/boss/engine/core/src/completion/recheck.rs` staged arm (`:55-72`) **and its detector branch**, coordinated with `finalize_pr_transition` / teardown in `completion/pr_transition.rs` and `completion/teardown.rs`. Inherit the 2026-07-14 invariant already written at `recheck.rs:144-175` (defer to the worker's own Stop boundary while mid-session). The measurement in §3 found a mid-turn reap through the detector branch as well (`pr_recheck`, 1 working / 0 idle), so **a fix scoped to the staged block alone would leave a live path open.** **Remediation design is in flight as separate work — do not duplicate that design here; land and verify it there, but confirm its scope covers both branches.**
 
 ### Near-term — staging predicate
 
@@ -314,32 +414,38 @@ Owners are **surfaces** (files / subsystems), not people. None of these are impl
 
 ### Near-term — detection / metrics
 
-4. **Emit a first-class metric (and preferably an attention item) when a `pr_recheck_staged` finalization clears a slot with `activity != idle` (or equivalent mid-turn signal).** Surfaces: `live_worker_state.rs` (`release_slot`, `:654-662`), completion teardown path, merge-poller / completion metrics registry. Goal: make mid-turn reap **countable and alertable** so prevalence is measurable. Until this lands, do not claim a numeric incidence rate.
+4. **Emit a first-class metric (and preferably an attention item) when a `pr_recheck_staged` finalization clears a slot with `activity != idle` (or equivalent mid-turn signal).** Surfaces: `live_worker_state.rs` (`release_slot`, `:654-662`), completion teardown path, merge-poller / completion metrics registry. Goal: make mid-turn reap **countable and alertable in-system**. The §3 measurement shows this is achievable from data the engine already emits — but only offline, by hand, and only back as far as log retention. Prevalence should not require a forensic exercise to see.
+
+5. **Record a `pr_head_after` on the teardown record, read at the moment the fast path decides to terminalize.** Surfaces: `completion/pr_transition.rs` (`finalize_pr_transition`) and `completion/teardown.rs`. The engine records a head SHA before an execution and never after it, so every severity determination in §3 had to be reconstructed from the _next_ execution's `pr_head_before` snapshot or a live GitHub read — which is why one row (flunge #1296) is permanently unresolvable and why one `sha_unchanged` verdict (flunge #1327) was a stale-read false negative. A `pr_head_after` field makes "did this execution move the head?" a single query, and it incidentally hands the fast path the very signal it needs to decide correctly (cf. action item 3).
 
 ### Structural — prompt vs engine ownership of post-push work
 
-5. **Decide whether post-push deliverables (PR description update, findings-status comment) remain prompt-only or become engine-owned / pre-finalize gates.** Surface: `tools/boss/engine/core/src/runner/prompt.rs` revision steps (`:1653-1728`) and the completion Stop / recheck contract. If they stay in the prompt, the engine must not finalize until Stop (or an explicit worker "done" signal). If they move into the engine, the race class shrinks by construction.
+6. **Decide whether post-push deliverables (PR description update, findings-status comment) remain prompt-only or become engine-owned / pre-finalize gates.** Surface: `tools/boss/engine/core/src/runner/prompt.rs` revision steps (`:1653-1728`) and the completion Stop / recheck contract. If they stay in the prompt, the engine must not finalize until Stop (or an explicit worker "done" signal). If they move into the engine, the race class shrinks by construction.
 
 ### Structural — turn-loop predicate
 
-6. **If recheck continues to gate on worker liveness shape, extend the predicate beyond `is_live && kind != PrReview`.** Surface: `completion.rs` `worker_owns_turn_loop` (`:2113-2115`) and call sites in `recheck.rs` / `stop.rs`. Mid-turn vs idle must be visible to any path that can reap. Note: this is **not** a substitute for action item 1 if the staged path still short-circuits the gate.
+7. **If recheck continues to gate on worker liveness shape, extend the predicate beyond `is_live && kind != PrReview`.** Surface: `completion.rs` `worker_owns_turn_loop` (`:2113-2115`) and call sites in `recheck.rs` / `stop.rs`. Mid-turn vs idle must be visible to any path that can reap. Note: this is **not** a substitute for action item 1 if the staged path still short-circuits the gate.
 
-## 11. Incomplete evidence (stated plainly)
+## 12. Incomplete evidence (stated plainly)
 
-- **R2 local commit recoverability:** unknown. The workspace lease for `flunge-agent-001` was released; whether the commit object remains in a shared jj store or any backup is outside the evidence packaged for this postmortem. Do not assert recovered or lost beyond "not pushed; lease released."
-- **True incidence of mid-turn reaps across the multi-day window:** **not measurable** with current instrumentation. Counts of `pr_recheck_staged` finalizations are not a substitute. An unknown fraction hit live workers. No estimate is offered.
+- **R2 local commit recoverability:** unknown. The workspace lease for `flunge-agent-001` was released; whether the commit object remains in a shared jj store or any backup is outside the evidence packaged for this postmortem. Do not assert recovered or lost beyond "not pushed; lease released." Note that the flunge #1342 _work item_ recovered (§4) because `reconcile_revision` spawned a follow-up that redid and pushed the work — that says nothing about the fate of R2's own commit object.
+- **Counts are a floor, not a total.** The observation window is bounded by log retention, not by the defect's lifetime: an app update reset the log root at ~12:38 CDT on 08-06, and the first occurrence is 23 minutes into the earliest retained record. How long the path had been firing before that is unknown.
+- **One severity row is unresolvable.** A revision on flunge #1296 routed via `pr_review cycle bound reached`, skipping the SHA check, and the branch has since been force-pushed. The head at reap time is unrecoverable, so it cannot be assigned to total or partial loss. It may be a seventh total loss.
+- **Per-driver severity rates are estimated, not determined.** grok 4/4 and codex 1/3 are exact counts over tiny denominators; the resulting 100% and 33% carry no useful precision. The proposed mechanism (non-claude drivers surfacing a `gh pr` URL earlier relative to their push) is a **hypothesis**, untested against the trace.
+- **Why `reconcile_revision` recovered flunge #1342 and not the five items in §4:** unexplained. Nothing in the measured data distinguishes them. This is the largest open question left by the measurement.
 - **Engine-side design of the in-flight guard fix:** deliberately not re-derived here; tracked as separate work.
-- **Full product-by-product blast list:** not available; only that the path is not flunge-specific (codex + claude, different workspaces; staged finalizations across the engine-wide trace).
 
-## 12. Lessons
+## 13. Lessons
 
 1. **A guard below a short-circuit is not a guard.** New primary paths must re-apply prior incident invariants, or they reintroduce the same hazard with a different name.
 2. **"URL staged" is not "worker finished."** Staging is a binding hint; finalization and reap require a turn boundary or stronger done signal.
 3. **Read/edit/view must not arm teardown.** Capture breadth optimized for recovery of missed PR opens is the wrong breadth for a path that kills the worker.
 4. **Prompt steps after the push are optional under a race.** If the engine can finalize on push-related signals, post-push prompt work is best-effort only.
-5. **False success is worse than visible failure** when the board hides total work loss and live production regressions.
-6. **If the only distinguishing field is a log attribute, prevalence is fiction until it is a metric.**
+5. **False success is worse than visible failure** when the board hides total work loss and live production regressions. Worse still, it is self-perpetuating: mono #2651 (§4) shows a false-success loop re-minting the same revision every few minutes, forever, because each failure is recorded as a win.
+6. **If the only distinguishing field is a log attribute, prevalence is invisible until it is a metric.** The data was there the whole time — 63 mid-turn reaps sitting in trace — and it took a hand reconstruction to see any of it. "Not aggregated" and "not happening" are indistinguishable from the operator's chair.
+7. **Record state after the action, not only before it.** Without a post-teardown head SHA, the engine cannot answer its own most important question — did this execution deliver anything? — which left one row permanently unresolvable and one verdict wrong.
+8. **A phase race measured is rarely a coin flip.** This one was assumed roughly 50/50 from two cases and turned out to be 98.4%. Estimate the rate before deciding a race is tolerable.
 
-## 13. Follow-up code changes
+## 14. Follow-up code changes
 
-This document is **doc-only**. Recommended work is listed in §10 and should be filed as separate chores/tasks against the engine completion, PR-URL capture, merge-poller, and prompt-runner surfaces. The staged-path guard fix (item 1) is already in flight and must not be redesigned or re-implemented from this PR.
+This document is **doc-only**. Recommended work is listed in §11 (engineering fixes) and §4 (recovery of the five falsely-reviewed work items) and should be filed as separate chores/tasks against the engine completion, PR-URL capture, merge-poller, and prompt-runner surfaces. The staged-path guard fix (item 1) is already in flight and must not be redesigned or re-implemented from this PR.
