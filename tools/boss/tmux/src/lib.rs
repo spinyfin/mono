@@ -175,6 +175,31 @@ impl Tmux {
         command_failed(&args, &output)
     }
 
+    /// Sets a server-scoped tmux option, such as `@boss_engine_owner`.
+    /// Server options are not addressed to any session — there is no `-t`.
+    pub async fn set_server_option(&self, option: &str, value: &str) -> Result<()> {
+        validate_value("option name", option)?;
+        validate_value("option value", value)?;
+        let mut args = self.server_args();
+        args.extend(["set-option".into(), "-s".into(), option.into(), value.into()]);
+        self.invoke(args).await.map(|_| ())
+    }
+
+    /// Reads one server-scoped tmux option, returning `None` when it is unset.
+    pub async fn show_server_option(&self, option: &str) -> Result<Option<String>> {
+        validate_value("option name", option)?;
+        let mut args = self.server_args();
+        args.extend(["show-options".into(), "-s".into(), "-v".into(), option.into()]);
+        let output = self.run(&args).await?;
+        if output.success {
+            return Ok(Some(output.stdout.trim_end().to_owned()));
+        }
+        if output.stderr.contains("invalid option") || output.stderr.contains("unknown option") {
+            return Ok(None);
+        }
+        command_failed(&args, &output)
+    }
+
     /// Sends literal input in bounded chunks, then submits it in a separate call.
     pub async fn send_keys(&self, session: &str, text: &str) -> Result<()> {
         validate_value("session name", session)?;

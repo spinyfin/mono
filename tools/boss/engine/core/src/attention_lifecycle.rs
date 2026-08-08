@@ -182,6 +182,12 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          item working again; the dead pane is history, not current state.",
     ),
     entry(
+        crate::tmux_adoption::TMUX_ADOPTION_SCHEMA_SKEW_ATTENTION_KIND,
+        ClearedBy::WorkResumed,
+        "Records that boot-time adoption refused and reaped a version-skewed tmux session for \
+         the item. A later run start is the redispatch that refusal deliberately made room for.",
+    ),
+    entry(
         crate::spawn_ack_sweep::DRIVER_START_ATTENTION_KIND,
         ClearedBy::WorkResumed,
         "Asserts the worker's driver never started. A later run start is the direct contradiction.",
@@ -514,6 +520,7 @@ mod tests {
             crate::work::ATTENTION_KIND_RECOVERY_EXHAUSTED,
             crate::coordinator::CHAIN_SERIALIZED_STALL_ATTENTION_KIND,
             crate::dead_pid_sweep::PANE_DEATH_ATTENTION_KIND,
+            crate::tmux_adoption::TMUX_ADOPTION_SCHEMA_SKEW_ATTENTION_KIND,
             crate::spawn_ack_sweep::DRIVER_START_ATTENTION_KIND,
             crate::app::readoption::PROGRESS_INGRESS_UNRECOVERABLE_ATTENTION_KIND,
             crate::completion::NUDGE_BREAKER_ATTENTION_KIND,
