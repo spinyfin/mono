@@ -141,22 +141,49 @@ impl WorkDb {
         collect_rows(rows)
     }
 
-    /// List the sticky, pre-dispatch attention items attached to a
-    /// work item (i.e. `work_item_id IS NOT NULL`). Used by the
-    /// `repo_unresolved` surface and any future work-item-scoped
-    /// attention flows. Errors if the work item id is unknown so
-    /// callers can't accidentally silently no-op on a typo. Deliberately
-    /// permissive of tombstoned tasks (e.g. an archived-and-tombstoned
-    /// moot revision) so the `revision_archived` attention item raised at
-    /// archival time stays reachable afterwards.
+    /// Every attention item that is *about* this work item, whichever way
+    /// it is scoped: the sticky work-item-scoped rows (`repo_unresolved`,
+    /// `churn_guard_parked`, …) and the execution-scoped rows filed against
+    /// any execution of the item (`pane_spawn_failed`,
+    /// `driver_terminal_error`, `worker_escalation`, …).
+    ///
+    /// This is the query behind `ListAttentionItemsForWorkItem` — i.e.
+    /// behind `boss task show` / `boss chore show` and the macOS app's
+    /// Attention surface — and it used to match on `work_item_id = ?1`
+    /// alone. `work_attention_items` has a `CHECK` enforcing that exactly
+    /// one of `execution_id` / `work_item_id` is set, and
+    /// `finish_execution_run` *rejects* a payload carrying a
+    /// `work_item_id`, so every failure a run-completion handler files is
+    /// execution-scoped by construction — and was therefore invisible on
+    /// every work-item surface. That is how fifteen consecutive
+    /// pane-spawn failures across 2026-08-06/07 filed fifteen
+    /// `pane_spawn_failed` rows while `boss task show --json` reported
+    /// `attention_items: []`, and why the failure classes that *did* show
+    /// up on those same items (`churn_guard_parked`,
+    /// `pr_review_died_without_findings`) were exactly the
+    /// work-item-scoped filers.
+    ///
+    /// Resolving through the execution mirrors what
+    /// [`crate::work::attention_reconcile`] already declares as an
+    /// attention row's work item (`ATTENTION_WORK_ITEM`); the reconciler
+    /// has always lowered both scopes, so only this read surface disagreed
+    /// about which rows belong to an item.
+    ///
+    /// Errors if the work item id is unknown so callers can't accidentally
+    /// silently no-op on a typo. Deliberately permissive of tombstoned
+    /// tasks (e.g. an archived-and-tombstoned moot revision) so the
+    /// `revision_archived` attention item raised at archival time stays
+    /// reachable afterwards.
     pub fn list_attention_items_for_work_item(&self, work_item_id: &str) -> Result<Vec<WorkAttentionItem>> {
         let conn = self.connect()?;
         let _ = product_id_for_work_item_including_deleted(&conn, work_item_id)?;
         let mut stmt = conn.prepare(
-            "SELECT id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at, converted_task_id
-             FROM work_attention_items
-             WHERE work_item_id = ?1
-             ORDER BY created_at ASC, id ASC",
+            "SELECT a.id, a.execution_id, a.work_item_id, a.kind, a.status, a.title, a.body_markdown,
+                    a.created_at, a.resolved_at, a.converted_task_id
+             FROM work_attention_items a
+             WHERE a.work_item_id = ?1
+                OR a.execution_id IN (SELECT e.id FROM work_executions e WHERE e.work_item_id = ?1)
+             ORDER BY a.created_at ASC, a.id ASC",
         )?;
         let rows = stmt.query_map([work_item_id], map_attention_item)?;
         collect_rows(rows)

@@ -1658,6 +1658,28 @@ fn slot_busy_occupant(err: &anyhow::Error) -> Option<Option<String>> {
     }
 }
 
+/// Structured classification of a pane-spawn failure for the
+/// `spawn_failed` dispatch event's `details.spawn_failure`.
+///
+/// Walks the same `.with_context(...)`-wrapped chain as
+/// [`slot_busy_occupant`] — the concrete [`StartWorkerError`] is never the
+/// outermost type — and reports `{class, cause}`: which spawn step refused,
+/// and the specific thing it refused. The event's `error_message` already
+/// carries the flattened chain, but a prose message is not something a
+/// diagnose signature can key on without regexing English; this is the
+/// machine-readable half, and it is what lets a signature's recovery text
+/// name the actual rejected precondition instead of offering generic spawn
+/// advice. `None` for a spawn error that never reached the spawn flow
+/// (prompt composition, driver provision), whose `error_message` is the
+/// only description there is.
+fn spawn_failure_classification(err: &anyhow::Error) -> Option<serde_json::Value> {
+    let start_err = err.chain().find_map(|cause| cause.downcast_ref::<StartWorkerError>())?;
+    Some(serde_json::json!({
+        "class": start_err.class(),
+        "cause": start_err.cause_detail(),
+    }))
+}
+
 /// Sink for `executions.<id>` topic invalidations. The engine wires this
 /// to the topic broker; tests use a no-op or recording double.
 #[async_trait]
