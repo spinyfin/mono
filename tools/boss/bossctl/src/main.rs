@@ -31,6 +31,7 @@ mod doctor;
 mod enrollment;
 mod focus;
 mod homes;
+mod doctor_spawn;
 mod hosts;
 mod logs;
 mod pause;

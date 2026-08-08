@@ -11,6 +11,7 @@ rust_binary(
         "src/dispatch_concurrency.rs",
         "src/dispatch_stats.rs",
         "src/doctor.rs",
+        "src/doctor_spawn.rs",
         "src/doctor_tests.rs",
         "src/enrollment.rs",
         "src/enrollment_tests.rs",
