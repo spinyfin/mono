@@ -212,6 +212,13 @@ pub fn match_dispatch_signatures(
     findings.extend(match_sig_d_transient_exhausted(events, scope_execution_ids));
     findings.extend(match_sig_e_spawn_nack(events, scope_execution_ids));
     findings.extend(match_sig_f_worker_parse(events, scope_execution_ids));
+    // `spawn_failed`: the runner returned before any pane existed. Scoped
+    // (not fleet) — the rejected precondition belongs to the execution the
+    // operator is diagnosing. See `crate::doctor_spawn`.
+    findings.extend(crate::doctor_spawn::match_sig_i_spawn_precondition(
+        events,
+        scope_execution_ids,
+    ));
     // Fleet scan: a wedged husk breaker is a pool-level fact, and the
     // execution an operator diagnoses is usually the redispatch it blocked,
     // not one of the held-back runs.
@@ -277,7 +284,7 @@ fn sort_findings(findings: &mut [Finding]) {
     });
 }
 
-fn in_scope(execution_id: &str, scope: &BTreeSet<String>) -> bool {
+pub(crate) fn in_scope(execution_id: &str, scope: &BTreeSet<String>) -> bool {
     scope.is_empty() || scope.contains(execution_id)
 }
 
@@ -296,11 +303,11 @@ fn within_recency_window(event: &DispatchEvent, now_ms: u128, window_ms: u128) -
     now_ms.saturating_sub(event.ts_epoch_ms) <= window_ms
 }
 
-fn work_item_of(event: &DispatchEvent) -> Option<String> {
+pub(crate) fn work_item_of(event: &DispatchEvent) -> Option<String> {
     event.work_item_id.clone()
 }
 
-fn evidence_line(event: &DispatchEvent) -> String {
+pub(crate) fn evidence_line(event: &DispatchEvent) -> String {
     let mut line = format!(
         "ts={} stage={}/{} exec={}",
         event.ts_epoch_ms, event.stage, event.outcome, event.execution_id
