@@ -2558,15 +2558,26 @@ fn design_directive_requires_the_scope_tag() {
         directive.contains("downstream scheduling keys off it verbatim"),
         "{directive}"
     );
-    assert!(directive.contains("rather than silently omitting them"), "{directive}");
+    assert!(
+        directive.contains("rather than silently omitting a decision the design already made"),
+        "{directive}"
+    );
+    // Deferred rows are only for genuine analysis outcomes, not padding.
+    assert!(
+        directive.contains("Do not invent deferred rows for topics the change never needed"),
+        "{directive}"
+    );
 }
 /// The breakdown block must carry proportionality calibration, not just
 /// split rules: a named cost for over-splitting to balance the scheduler
-/// rejection named for under-splitting, anchor bands relating entry count
-/// to scope, and the `Breakdown size:` self-check line the author must
-/// defend N with. Without these the guidance is one-directional and
-/// designs over-produce entries — see `compose_design_directive`'s docs
-/// for the measured distribution that motivated this.
+/// rejection named for under-splitting, a ban on fabricating entries to
+/// pad a band, anchor bands that include a one-entry outcome, and a
+/// `Breakdown size:` self-check line the author must defend N from the
+/// change (not from a band). Without these the guidance is one-directional
+/// and designs over-produce or invent entries — see
+/// `compose_design_directive`'s docs for the measured distribution that
+/// motivated the calibration, and the one-entry / no-fabricate rules that
+/// close the remaining floor-and-symmetry gaps.
 #[test]
 fn design_directive_calibrates_breakdown_size_to_problem_size() {
     let directive = compose_design_directive(None, None);
@@ -2579,23 +2590,59 @@ fn design_directive_calibrates_breakdown_size_to_problem_size() {
     // The symmetric cost for over-splitting.
     assert!(directive.contains("**too many entries**"), "{directive}");
     assert!(directive.contains("neither side is automatically safe"), "{directive}");
-    // Non-compounding instruction and the anchor bands.
+    // Fabricating entries is a named failure mode (symmetric with under-splitting).
+    assert!(directive.contains("**fabricated entries**"), "{directive}");
+    assert!(
+        directive.contains("never invent tasks the requested change does not need"),
+        "{directive}"
+    );
+    assert!(
+        directive.contains("neither as `Scope: in-scope` entries nor as `Scope: deferred` ones"),
+        "{directive}"
+    );
+    // One-entry breakdown is explicitly sanctioned — not under-analysis.
+    assert!(
+        directive.contains("**one entry is a valid and expected outcome.**"),
+        "{directive}"
+    );
+    assert!(
+        directive.contains("a single-entry breakdown is the correct answer"),
+        "{directive}"
+    );
+    assert!(directive.contains("**1 entry**"), "{directive}");
+    // Do not manufacture unreviewable intermediate contracts.
+    assert!(
+        directive.contains("**do not manufacture unreviewable intermediates.**"),
+        "{directive}"
+    );
+    assert!(
+        directive.contains("the seam's own PR would ship with no exercised caller"),
+        "{directive}"
+    );
+    // Non-compounding instruction and the anchor bands (smallest band includes one).
     assert!(
         directive.contains("split rules add, they do not multiply."),
         "{directive}"
     );
-    assert!(directive.contains("**2-4 entries**"), "{directive}");
+    assert!(directive.contains("**1-4 entries**"), "{directive}");
     assert!(directive.contains("**4-8 entries**"), "{directive}");
     assert!(directive.contains("**8-14 entries**"), "{directive}");
     assert!(directive.contains("**15+ entries**"), "{directive}");
     // No cap: a genuinely large design may still propose more.
     assert!(directive.contains("not a cap"), "{directive}");
-    // The count must be stated and justified.
+    // The count must be stated and justified from the change, not from a band.
     assert!(
         directive.contains("Breakdown size: N entries (M in-scope, K deferred)"),
         "{directive}"
     );
-    assert!(directive.contains("rather than fewer"), "{directive}");
+    assert!(
+        directive.contains("what the change actually touches and why that yields N"),
+        "{directive}"
+    );
+    assert!(
+        directive.contains("must not by itself constitute the defence"),
+        "{directive}"
+    );
 }
 /// The portable design-discipline block must appear in both design-family
 /// directives, not be duplicated as separate text in each.
