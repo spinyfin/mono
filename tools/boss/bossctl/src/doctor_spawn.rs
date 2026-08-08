@@ -53,7 +53,18 @@ const PROGRESS_INGRESS_MARKER: &str = "preparing progress ingress: ";
 /// not know still produces a finding — at P1, with whatever cause the event
 /// carried — rather than being dropped, so a class added engine-side is
 /// under-ranked, never invisible.
-const DETERMINISTIC_PRECONDITION_CLASSES: &[&str] = &["progress_ingress", "write_files", "response_kind_mismatch"];
+///
+/// `response_kind_mismatch` is deliberately NOT in this list: unlike
+/// `progress_ingress`/`write_files`, which are evaluated before the app is
+/// ever contacted (`spawn_flow.rs:517-520`), `StartWorkerError::ResponseKindMismatch`
+/// is returned only after `SpawnWorkerPane` was sent and the app replied with
+/// the wrong response variant (`spawn_flow.rs:691`). That is a transport/
+/// protocol desync, not a host precondition — a pane may well have been
+/// spawned and now needs reaping, so the P0 "no pane was ever requested;
+/// do not grow the pool, retry, or reap panes" advice would be actively
+/// wrong for it. It takes the transport branch below instead, which hands
+/// off to SIG-B/SIG-E.
+const DETERMINISTIC_PRECONDITION_CLASSES: &[&str] = &["progress_ingress", "write_files"];
 
 /// What the spawn step refused, as `(class, cause)`.
 ///
@@ -239,6 +250,37 @@ mod tests {
             "a transport-class spawn failure should hand off to the app-side signatures; got {:?}",
             findings[0].recovery,
         );
+    }
+
+    #[test]
+    fn response_kind_mismatch_is_p1_not_p0_because_the_app_already_replied() {
+        // The app WAS contacted and DID respond (just with the wrong
+        // variant) — this must take the transport branch, not the
+        // deterministic-precondition one, since a pane may need reaping.
+        let event = spawn_failed_event(
+            serde_json::json!({
+                "spawn_failure": {
+                    "class": "response_kind_mismatch",
+                    "cause": "app responded with unexpected response variant",
+                },
+            }),
+            "spawning worker pane for run exec_spawn_1: app responded with unexpected response variant",
+        );
+
+        let findings = match_sig_i_spawn_precondition(&[event], &scope_all());
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].severity,
+            Severity::P1,
+            "response_kind_mismatch is a protocol desync after the app replied, not a locally-evaluated \
+             precondition — it must not get the 'no pane was ever requested' P0 advice"
+        );
+        assert!(
+            findings[0].recovery.contains("SIG-B"),
+            "must hand off to the app-side signatures, not claim no pane was ever requested; got {:?}",
+            findings[0].recovery,
+        );
+        assert_eq!(findings[0].details["deterministic_precondition"], false);
     }
 
     #[test]

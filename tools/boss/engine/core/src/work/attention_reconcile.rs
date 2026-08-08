@@ -115,6 +115,17 @@ const ATTENTION_RAISED_AT: &str = "COALESCE(work_attention_items.last_raised_at,
 /// raised *this same signal* demonstrates the condition recurring, not
 /// ending. It is a no-op for work-item-scoped kinds, whose rows have a NULL
 /// `execution_id` and so never match a run's execution.
+///
+/// The recurrence check is scoped to `status = 'open'` and to rows raised at
+/// or after the evidence run started. Without the status filter, a
+/// recurrence row that has since been *resolved* — no longer describing a
+/// live failure — would disqualify the run forever. Without the timestamp
+/// bound, the check is execution-scoped rather than run-scoped: an
+/// execution that raised the kind and later recovered, or that raises it
+/// only after this evidence run already started, would incorrectly veto a
+/// run that itself demonstrates recovery. Both bounds narrow the clause to
+/// its stated intent — "this run itself hit the same failure" — rather than
+/// "this execution ever did, at any time, in any state".
 fn work_resumed_evidence() -> String {
     format!(
         "EXISTS (
@@ -130,6 +141,9 @@ fn work_resumed_evidence() -> String {
                    FROM work_attention_items recurrence
                    WHERE recurrence.execution_id = r.execution_id
                      AND recurrence.kind = work_attention_items.kind
+                     AND recurrence.status = 'open'
+                     AND CAST(COALESCE(recurrence.last_raised_at, recurrence.created_at) AS INTEGER)
+                         >= CAST(r.started_at AS INTEGER)
                )
          )"
     )
