@@ -56,6 +56,25 @@ impl WorkerCompletionHandler {
             .verified_staged_pr_url(execution_id, &execution, "pr-recheck")
             .await
         {
+            // A staged URL is evidence the worker *has* a PR, not that it
+            // is *done*. Finalizing here reaps a live mid-turn worker
+            // (PostToolUse of `cube pr update` / `gh pr edit` leaves
+            // activity at Working until the worker's own Stop). Defer to
+            // the Stop-boundary path (`stop_staged`) while mid-turn —
+            // same shape as the SHA-delta arm's unattributed-Contributed
+            // deferral below. Bound: once the staged entry ages past
+            // `staged_pr_mid_turn_defer_secs` (measured from
+            // `StagedPrUrlEntry::staged_at`), finalize anyway so a worker
+            // that never reaches Stop cannot hang forever.
+            if self.should_defer_staged_pr_recheck(execution_id) {
+                tracing::info!(
+                    execution_id,
+                    pr_url = %staged_url,
+                    "pr-recheck: staged PR URL present but worker is mid-turn; \
+                     deferring finalization to the worker's own Stop boundary",
+                );
+                return StopOutcome::AwaitingInput;
+            }
             tracing::info!(
                 execution_id,
                 pr_url = %staged_url,
@@ -293,6 +312,43 @@ impl WorkerCompletionHandler {
         };
         self.finalize_pr_transition(execution_id, pr_url, target, "pr_recheck")
             .await
+    }
+
+    /// True when the staged-URL recheck must **not** finalize yet:
+    /// the live-state registry reports the worker as mid-turn
+    /// ([`boss_protocol::WorkerActivity::Working`]) **and** the staged
+    /// entry is still within the deferral horizon.
+    ///
+    /// Mid-turn is decided from real liveness, not execution status —
+    /// `worker_owns_turn_loop` is only `is_live && kind != PrReview` and
+    /// cannot distinguish a parked pane from one mid-tool-call. When no
+    /// registry is wired (unit tests) or the run has no live slot, this
+    /// returns `false` so the staged path keeps its historical
+    /// finalize-immediately behaviour.
+    ///
+    /// Bound: enforced here against
+    /// [`crate::pr_url_capture::StagedPrUrlEntry::staged_at`] vs
+    /// [`Self::staged_pr_mid_turn_defer_secs`]. After the horizon the
+    /// staged path finalizes even while still Working.
+    fn should_defer_staged_pr_recheck(&self, execution_id: &str) -> bool {
+        use boss_protocol::WorkerActivity;
+
+        let Some(registry) = self.live_worker_states.as_ref() else {
+            return false;
+        };
+        let Some(activity) = registry.activity_for_run(execution_id) else {
+            return false;
+        };
+        if activity != WorkerActivity::Working {
+            return false;
+        }
+        let Some(entry) = self.staged_pr_urls.get_entry(execution_id) else {
+            // verified_staged_pr_url already returned Some, so this is
+            // only a race with forget; treat as not deferrable.
+            return false;
+        };
+        let horizon = std::time::Duration::from_secs(self.staged_pr_mid_turn_defer_secs.max(0) as u64);
+        entry.staged_at.elapsed() < horizon
     }
 
     /// PR-detection recheck for a terminal execution (status

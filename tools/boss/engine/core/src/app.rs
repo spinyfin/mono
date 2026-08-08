@@ -1197,8 +1197,11 @@ impl ServerState {
             .with_min_review_changed_lines(cfg.work.min_review_changed_lines)
             .with_enable_revision_triggered_reviews(cfg.work.enable_revision_triggered_reviews)
             .with_background_activity_probe(Arc::new(
-                crate::background_children::RegistryBackgroundActivityProbe::new(live_worker_states_for_completion),
+                crate::background_children::RegistryBackgroundActivityProbe::new(
+                    live_worker_states_for_completion.clone(),
+                ),
             ))
+            .with_live_worker_states(live_worker_states_for_completion)
             .with_hold_registry(hold_registry)
             .with_teardown_registry(teardown_registry),
         );

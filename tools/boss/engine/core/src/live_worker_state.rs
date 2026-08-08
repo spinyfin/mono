@@ -894,6 +894,20 @@ impl LiveWorkerStateRegistry {
             .any(|entry| entry.state.run_id == run_id && !entry.state.activity.is_terminal())
     }
 
+    /// Return the current [`WorkerActivity`] for the non-terminal slot
+    /// running `run_id`, or `None` if no such slot exists. Used by the
+    /// merge-poller staged-URL recheck path to decide whether a live
+    /// worker is mid-turn (`Working`) — finalizing while mid-turn reaps
+    /// the worker before its remaining prompt steps run.
+    pub fn activity_for_run(&self, run_id: &str) -> Option<WorkerActivity> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard
+            .values()
+            .map(|entry| &entry.state)
+            .find(|state| !state.activity.is_terminal() && state.run_id == run_id)
+            .map(|state| state.activity)
+    }
+
     /// Apply a hook event to the state for `slot_id`. Returns `true`
     /// if the entry actually changed, so callers can suppress no-op
     /// topic pushes. Returns `false` if no entry exists for the slot
