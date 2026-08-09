@@ -712,28 +712,64 @@ pub fn assert_inspect_json_posture(
     }
 
     // Operator Claude permission sources must not load under scoped HOME.
+    // Fail only on `$HOME/.claude/settings*` — not every path that merely
+    // contains `$HOME` as a prefix. Cube workspaces live under
+    // `$HOME/.local/share/cube/workspaces/...` and may still carry project
+    // `.claude/settings.local.json` (T-01 A7); treating those as a HOME-scoping
+    // failure aborted healthy Grok spawns.
     let perm_sources = inspect
         .pointer("/permissions/sources")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
+    let operator_home = std::env::var("HOME").unwrap_or_default();
     for src in &perm_sources {
         let s = src.as_str().unwrap_or("");
-        if s.contains(".claude/settings") && !s.contains(&process_home.display().to_string()) {
-            // Project `.claude/settings.json` under the workspace can still
-            // load when trusted (T-01 A7) — that is independent of HOME
-            // scoping. Fail only on operator-home sources.
-            let operator_home = std::env::var("HOME").unwrap_or_default();
-            if !operator_home.is_empty() && s.contains(&operator_home) {
-                bail!(
-                    "grok inspect still loads operator Claude permission source {s:?}; \
-                     process HOME scoping failed (T-01)"
-                );
-            }
+        if is_operator_claude_settings_source(s, &operator_home, process_home) {
+            bail!(
+                "grok inspect still loads operator Claude permission source {s:?}; \
+                 process HOME scoping failed (T-01)"
+            );
         }
     }
 
     Ok(())
+}
+
+/// True when `source` is the machine owner's `~/.claude/settings*` file, not a
+/// project settings path under a cube workspace (or the scoped process HOME).
+///
+/// `grok inspect` reports sources like
+/// `"/Users/op/.claude/settings.local.json (settings)"`. Matching on
+/// `source.contains($HOME)` alone false-positives on
+/// `$HOME/.local/share/cube/workspaces/<id>/.claude/settings.local.json`.
+fn is_operator_claude_settings_source(source: &str, operator_home: &str, process_home: &Path) -> bool {
+    if source.is_empty() || !source.contains(".claude/settings") {
+        return false;
+    }
+    let process_home_s = process_home.display().to_string();
+    if !process_home_s.is_empty() && source.contains(&process_home_s) {
+        return false;
+    }
+    let home = operator_home.trim_end_matches('/');
+    if home.is_empty() {
+        return false;
+    }
+    // Require the operator Claude config directory specifically.
+    let operator_claude_settings = format!("{home}/.claude/settings");
+    if source.contains(&operator_claude_settings) {
+        return true;
+    }
+    // macOS sometimes surfaces the same home via /System/Volumes/Data/Users/...
+    // when $HOME is /Users/... — keep the check tight: only the `.claude/settings`
+    // leaf under a Users/<name> home, never an arbitrary $HOME prefix.
+    if let Some(stripped) = home.strip_prefix("/Users/") {
+        let data_volume = format!("/System/Volumes/Data/Users/{stripped}/.claude/settings");
+        if source.contains(&data_volume) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Refuse teardown paths outside the Boss-owned homes root.
@@ -1035,6 +1071,75 @@ mod tests {
         assert!(
             err.to_string().contains("projectTrusted"),
             "expected trust failure, got {err}"
+        );
+    }
+
+    #[test]
+    fn operator_claude_settings_detection_is_not_a_home_prefix_match() {
+        let process_home = Path::new("/tmp/boss-grok-homes/run/process-home");
+        let operator_home = "/Users/op";
+
+        // Production false-positive: project settings under a cube workspace
+        // live under $HOME but are NOT operator ~/.claude/settings.
+        assert!(!is_operator_claude_settings_source(
+            "/Users/op/.local/share/cube/workspaces/mono-agent-001/.claude/settings.local.json (settings)",
+            operator_home,
+            process_home,
+        ));
+
+        // Real T-01 leak: operator personal Claude settings.
+        assert!(is_operator_claude_settings_source(
+            "/Users/op/.claude/settings.local.json (settings)",
+            operator_home,
+            process_home,
+        ));
+        assert!(is_operator_claude_settings_source(
+            "/Users/op/.claude/settings.json (settings)",
+            operator_home,
+            process_home,
+        ));
+
+        // Scoped process HOME must never count as a leak even if it nested
+        // under a path that looks like an operator home in tests.
+        assert!(!is_operator_claude_settings_source(
+            "/tmp/boss-grok-homes/run/process-home/.claude/settings.local.json (settings)",
+            operator_home,
+            process_home,
+        ));
+    }
+
+    #[test]
+    fn assert_inspect_json_allows_workspace_claude_settings_under_operator_home() {
+        let mut inspect = good_inspect_fixture();
+        inspect["permissions"]["sources"] = serde_json::json!([
+            "/Users/op/.local/share/cube/workspaces/mono-agent-001/.claude/settings.local.json (settings)"
+        ]);
+        let _guard = MultiEnvGuard::set(&[("HOME", Path::new("/Users/op"))]);
+        assert_inspect_json_posture(
+            &inspect,
+            Path::new("/tmp/boss-grok-homes/r/grok-home"),
+            Path::new("/tmp/boss-grok-homes/r/process-home"),
+            Path::new("/Users/op/.local/share/cube/workspaces/mono-agent-001"),
+        )
+        .expect("workspace project settings under $HOME must not fail T-01 HOME scoping");
+    }
+
+    #[test]
+    fn assert_inspect_json_fails_on_real_operator_claude_settings_leak() {
+        let mut inspect = good_inspect_fixture();
+        inspect["permissions"]["sources"] = serde_json::json!(["/Users/op/.claude/settings.local.json (settings)"]);
+        let _guard = MultiEnvGuard::set(&[("HOME", Path::new("/Users/op"))]);
+        let err = assert_inspect_json_posture(
+            &inspect,
+            Path::new("/tmp/boss-grok-homes/r/grok-home"),
+            Path::new("/tmp/boss-grok-homes/r/process-home"),
+            Path::new("/tmp/ws"),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("process HOME scoping failed") && msg.contains("/Users/op/.claude/settings"),
+            "expected real operator-home leak to fail closed, got {msg}"
         );
     }
 

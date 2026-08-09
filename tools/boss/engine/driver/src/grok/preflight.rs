@@ -36,6 +36,18 @@ impl PreflightRunner for RealPreflightRunner {
         workspace: &Path,
         environment: &GrokProcessEnvironment,
     ) -> anyhow::Result<PreflightOutput> {
+        // Hold Grok's auth.json.lock (shared) for the OAuth probe so a concurrent
+        // refresh cannot truncate auth.json under us. See
+        // `GrokProcessEnvironment::lock_auth_for_oauth_probe`.
+        let _auth_lock = if program == "grok" {
+            Some(
+                environment
+                    .lock_auth_for_oauth_probe()
+                    .context("locking shared Grok OAuth credential for preflight")?,
+            )
+        } else {
+            None
+        };
         let mut command = match &self.macos_seatbelt_profile {
             Some(profile) => {
                 let mut command = Command::new("/usr/bin/sandbox-exec");
