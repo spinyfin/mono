@@ -14,8 +14,9 @@ private let kanbanDocLinkLog = Logger(
 )
 
 /// Column-local card list. Observes `ChatViewModel` so model publishes
-/// (selection, highlights, drag/merge notices, `taskRuntimesByID`, prereq
-/// caches, …) recompute per-card `WorkCardSnapshot`s once per column
+/// (selection, dependency highlights, drag/merge notices,
+/// `taskRuntimesByID`, prereq caches, …) recompute per-card
+/// `WorkCardSnapshot`s once per column
 /// (design entry 6). Also observes `LiveWorkerStateStore` so Doing-lane
 /// live-status ticks rebuild snapshots without every card subscribing.
 /// Cards stay non-observing and receive snapshots as values —
@@ -37,7 +38,6 @@ struct WorkBoardSectionItemsView: View {
         let selectedID = model.selectedTask?.id
         let highlightID = model.revealHighlightID
         let frontierIDs = model.depFrontierHighlightIDs
-        let revisionIDs = model.revisionHighlightIDs
         let selectedRevisionParentID = model.selectedRevisionParentID
         let dragRefusal = model.dragRefusalNotice
         let mergeFeedback = model.mergeFeedbackNotice
@@ -57,7 +57,6 @@ struct WorkBoardSectionItemsView: View {
             ForEach(items) { task in
                 let isSelected = selectedID == task.id
                 let isFrontierHighlighted = frontierIDs.contains(task.id)
-                    || revisionIDs.contains(task.id)
                     || selectedRevisionParentID == task.id
                 let liveState: WorkerLiveState? = {
                     guard column == .doing,
@@ -78,6 +77,7 @@ struct WorkBoardSectionItemsView: View {
                     column: column,
                     snapshot: snapshot,
                     model: model,
+                    revisionHighlight: model.revisionHighlightState(for: task.id),
                     isRevealed: highlightID == task.id,
                     dragRefusalMessage: dragRefusal?.taskID == task.id
                         ? dragRefusal?.message : nil,
@@ -110,6 +110,9 @@ struct WorkBoardCardItem: View {
     /// Non-observing; action dispatch only. Column container owns
     /// observation and snapshot construction.
     let model: ChatViewModel
+    /// The only observed hover state on a card. This keyed cell publishes
+    /// only when this card enters or leaves the revision highlight set.
+    @ObservedObject var revisionHighlight: WorkBoardRevisionHighlightState
     var isRevealed: Bool = false
     /// Pre-resolved by the column container from `dragRefusalNotice`.
     var dragRefusalMessage: String? = nil
@@ -119,6 +122,8 @@ struct WorkBoardCardItem: View {
     @State private var showingDeleteConfirmation = false
 
     var body: some View {
+        let isFrontierHighlighted = snapshot.isFrontierHighlighted
+            || revisionHighlight.isHighlighted
         // Action closures stay outside the snapshot so `.equatable()` on
         // the card body can skip re-evaluation when only handler identity
         // would differ (design entry 5 / `WorkCardSnapshot`).
@@ -172,6 +177,7 @@ struct WorkBoardCardItem: View {
             } label: {
                 WorkBoardCardView(
                     snapshot: snapshot,
+                    isRevisionHighlighted: revisionHighlight.isHighlighted,
                     onOpenDesignDoc: onOpenDesignDoc,
                     onDepBadgeHover: { hovering in
                         model.setDepBadgeHover(hovering ? task.id : nil)
@@ -199,9 +205,9 @@ struct WorkBoardCardItem: View {
                         model.createTaskFromDeferredScopeAttention(attentionID: id)
                     }
                 )
-                // `WorkBoardCardView` is `Equatable` over its snapshot only:
-                // without `.equatable()`, every re-render of the column
-                // rebuilds and re-lays-out every card body. Closures are
+                // `WorkBoardCardView` is `Equatable` over its snapshot and
+                // keyed revision-hover boolean: without `.equatable()`, every
+                // column render rebuilds every card body. Closures stay
                 // intentionally outside `==`.
                 .equatable()
             }
@@ -217,10 +223,10 @@ struct WorkBoardCardItem: View {
             .overlay(
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .strokeBorder(
-                        Color.green.opacity(snapshot.isFrontierHighlighted ? 0.7 : 0),
+                        Color.green.opacity(isFrontierHighlighted ? 0.7 : 0),
                         lineWidth: 2
                     )
-                    .animation(.easeInOut(duration: 0.15), value: snapshot.isFrontierHighlighted)
+                    .animation(.easeInOut(duration: 0.15), value: isFrontierHighlighted)
             )
             .contextMenu {
                 if let id = task.shortID {
@@ -369,6 +375,9 @@ struct WorkBoardCardItem: View {
 /// every sub-region.
 struct WorkBoardCardView: View, @MainActor Equatable {
     let snapshot: WorkCardSnapshot
+    /// Keyed revision-hover input, kept outside the snapshot so changing it
+    /// does not require rebuilding every card snapshot in the column.
+    var isRevisionHighlighted: Bool = false
     /// Invoked when the user taps the design-doc affordance. Only
     /// called when `snapshot.showsDesignDocAffordance` is true.
     var onOpenDesignDoc: (() -> Void)? = nil
@@ -403,6 +412,7 @@ struct WorkBoardCardView: View, @MainActor Equatable {
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.snapshot == rhs.snapshot
+            && lhs.isRevisionHighlighted == rhs.isRevisionHighlighted
     }
 
     var body: some View {
@@ -494,7 +504,7 @@ struct WorkBoardCardView: View, @MainActor Equatable {
         if snapshot.isSelected {
             return Color.accentColor.opacity(0.08)
         }
-        if snapshot.isFrontierHighlighted {
+        if snapshot.isFrontierHighlighted || isRevisionHighlighted {
             return Color.green.opacity(0.07)
         }
         if snapshot.showsBlockedChrome {
