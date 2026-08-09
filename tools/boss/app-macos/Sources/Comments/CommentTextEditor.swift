@@ -36,11 +36,6 @@ struct CommentTextEditor: NSViewRepresentable {
 
         context.coordinator.textView = textView
 
-        // Focus the text view after it's in the view hierarchy
-        DispatchQueue.main.async {
-            textView.window?.makeFirstResponder(textView)
-        }
-
         return scrollView
     }
 

@@ -979,6 +979,35 @@ final class CommentLayer: NSObject, ObservableObject {
 // MARK: - NSPopoverDelegate
 
 extension CommentLayer: NSPopoverDelegate {
+    /// Called by AppKit once the popover's window has actually been ordered front and
+    /// made key. `makeNSView` (in `CommentTextEditor`) used to grab first responder via
+    /// `DispatchQueue.main.async`, but that races the popover's own key-window transition,
+    /// which AppKit runs asynchronously after `NSPopover.show(...)` returns — whichever
+    /// wins the race decides whether typing works. When the key-window transition landed
+    /// last, it reset first responder to the popover's default (nil / the view controller's
+    /// root view), silently discarding the text view's claim. `popoverDidShow` fires after
+    /// that transition has already happened, so grabbing first responder here always wins.
+    nonisolated func popoverDidShow(_ notification: Notification) {
+        MainActor.assumeIsolated {
+            guard let contentView = activePopover?.contentViewController?.view,
+                  let window = contentView.window
+            else { return }
+            if let textView = Self.firstTextView(in: contentView) {
+                window.makeFirstResponder(textView)
+            }
+        }
+    }
+
+    /// Depth-first search for the first `NSTextView` in a view subtree (the comment
+    /// form's `CommentTextEditor` is nested inside an `NSScrollView`).
+    private static func firstTextView(in view: NSView) -> NSTextView? {
+        if let textView = view as? NSTextView { return textView }
+        for subview in view.subviews {
+            if let found = firstTextView(in: subview) { return found }
+        }
+        return nil
+    }
+
     /// Called by AppKit when the popover finishes closing, whether by user dismissal or
     /// programmatic close. Resets authoring state. The extension lives in the same file
     /// so it can access private members directly.
