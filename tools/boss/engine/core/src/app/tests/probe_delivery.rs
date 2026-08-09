@@ -1259,3 +1259,270 @@ fn dispatch_outcome_labels_are_distinct() {
     assert_eq!(labels.len(), all.len(), "each dispatch outcome needs its own label");
     assert!(labels.iter().all(|l| !l.is_empty()));
 }
+
+// ── The abandoned probe nobody was told about ───────────────────────────────
+//
+// A coordinator probe against a live `grok` worker was accepted with a
+// `next_turn_boundary` commitment, the worker ran on, opened its PR and
+// completed, and the probe settled `abandoned`. Everything the engine recorded
+// was correct; nothing carried it to the issuer, who had no reason to poll
+// `probe-status` and assumed the instruction had landed.
+//
+// Two separate defects hide behind that one observation, and the tests below
+// pin them apart:
+//
+// 1. **The promised boundary was consumed by the run's own teardown.** For a
+//    driver holding the safe `MidTurnPaneInput::Rejects` default there is no
+//    earlier delivery opportunity than a turn boundary, and the fan-out ran
+//    `dispatch_completion_on_stop` — which may conclude the run is finished
+//    and call `release_worker_pane` — *before* the probe dispatcher. On a
+//    worker whose next turn boundary is also its last, that made abandonment
+//    a certainty rather than a race. `dispatch_probe_on_stop` now runs on both
+//    sides of completion.
+//
+// 2. **Nothing surfaced the abandonment.** It is now pushed on the run's probe
+//    topic *and* filed as a `probe_undelivered` attention item against the
+//    execution, which outlives the run and its topic subscribers.
+
+/// The delivery half of the fix, at the composition that mattered: a probe
+/// still queued when a turn boundary arrives is written into the pane
+/// *before* anything can tear the run down, so teardown finds nothing left to
+/// abandon.
+#[tokio::test]
+async fn a_probe_queued_at_a_turn_boundary_is_delivered_before_teardown_can_abandon_it() {
+    let (server_state, _dir) = test_server_state();
+    // `grok` holds the trait-default `MidTurnPaneInput::Rejects`, so a turn
+    // boundary is this worker's only delivery opportunity — the exact shape
+    // the field report hit.
+    let run_id = register_working_worker_with_driver(&server_state, 3, Some("grok"));
+    let probe_id = server_state.queue_probe(run_id.clone(), "do not open the PR yet".into(), false);
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Queued),
+        "precondition: a mid-turn probe on this driver cannot be written yet",
+    );
+
+    let captured = app_session_capturing_one_send(&server_state).await;
+    // Production fan-out order on a Stop: live-state apply parks the worker,
+    // then the pre-completion probe pass runs.
+    let stop = stop_event(&run_id);
+    dispatch_live_worker_state(&server_state, &stop).await;
+    let outcome = dispatch_probe_on_stop(&server_state, &stop).await;
+    assert_eq!(
+        outcome,
+        ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Consumed),
+        "the boundary the engine promised must be the boundary it delivers on",
+    );
+    let (_, text) = tokio::time::timeout(Duration::from_secs(2), captured)
+        .await
+        .expect("timed out waiting for SendToPane")
+        .expect("app responder panicked")
+        .expect("the probe text must reach the pane");
+    assert!(text.contains("do not open the PR yet"));
+
+    // Now the run ends, as it would have milliseconds later. The probe is
+    // past the queue, so teardown has nothing to abandon — it settles the
+    // delivered-but-unanswered probe honestly instead.
+    server_state.release_worker_pane(&run_id).await;
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Orphaned),
+        "a probe delivered on the run's last boundary reached the pane but was never answered",
+    );
+}
+
+/// Teardown must settle the probe *past* the queue too. Its reply would have
+/// arrived at the worker's next turn boundary and there is not going to be
+/// one, so leaving it at `consumed` reports a delivery nobody acted on as a
+/// success — the same class of lie as leaving a queued probe at `queued`.
+#[tokio::test]
+async fn a_delivered_but_unanswered_probe_is_orphaned_when_its_run_ends() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 4, None);
+    let probe_id = server_state.queue_probe(run_id.clone(), "status?".into(), false);
+    let claimed = server_state
+        .try_reserve_probe_for_delivery(&run_id, None, 0)
+        .expect("the queued probe must be claimable");
+    assert_eq!(claimed.probe_id, probe_id);
+    server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Consumed);
+
+    server_state.release_worker_pane(&run_id).await;
+
+    let record = server_state
+        .probe_record(&probe_id)
+        .expect("the probe record must survive its run");
+    assert_eq!(record.state, ProbeDeliveryState::Orphaned);
+    assert!(
+        record.state.is_undeliverable(),
+        "nobody acted on it, so it must not read as delivered",
+    );
+    assert!(
+        !record.state.is_terminal(),
+        "a reply that somehow still arrives must be able to correct the record",
+    );
+    assert!(
+        record.detail.is_some_and(|d| d.contains("turn boundary")),
+        "the record must say why no reply is coming",
+    );
+    assert!(
+        !server_state.has_in_flight_probe(&run_id),
+        "the run's delivery slot must not outlive the run",
+    );
+}
+
+/// The converse: a probe the worker already answered is settled, and teardown
+/// must not overwrite a real reply with an undeliverable state.
+#[tokio::test]
+async fn teardown_leaves_an_already_replied_probe_alone() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 5, None);
+    let probe_id = server_state.queue_probe(run_id.clone(), "status?".into(), false);
+    let claimed = server_state
+        .try_reserve_probe_for_delivery(&run_id, None, 0)
+        .expect("the queued probe must be claimable");
+    assert_eq!(claimed.probe_id, probe_id);
+    server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Replied);
+
+    server_state.release_worker_pane(&run_id).await;
+
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Replied),
+        "the worker's answer is the end of the story; teardown must not rewrite it",
+    );
+}
+
+/// The reporting half of the fix. An abandonment must reach an observer
+/// without being asked for: pushed on the run's probe topic for anything
+/// watching while the run is live, and filed against the execution so the
+/// record outlives the run, the pane, and every topic subscriber.
+#[tokio::test]
+async fn an_abandoned_probe_is_surfaced_actively_not_only_on_query() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 6, Some("grok"));
+
+    let watch_session_id = "session-probe-abandon-watch".to_owned();
+    let watch_sink = make_session_sink();
+    server_state
+        .topic_broker
+        .register_session(&watch_session_id, watch_sink.clone())
+        .await;
+    server_state
+        .topic_broker
+        .subscribe(&watch_session_id, &[probe_topic(&run_id)])
+        .await;
+
+    let probe_id = server_state.queue_probe(run_id.clone(), "do not open the PR yet".into(), false);
+    server_state.release_worker_pane(&run_id).await;
+
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Abandoned),
+        "precondition: this is the abandonment path",
+    );
+
+    let pushed = tokio::time::timeout(Duration::from_secs(2), watch_sink.next())
+        .await
+        .expect("an abandonment must be pushed, not left for a probe-status query")
+        .expect("the probe topic must carry the push");
+    match pushed.payload {
+        FrontendEvent::ProbeDeliveryEscalated {
+            probe_id: escalated,
+            reason,
+            ..
+        } => {
+            assert_eq!(escalated, probe_id);
+            assert!(
+                reason.contains("abandoned"),
+                "the push must name the terminal state, not just that something happened: {reason}",
+            );
+        }
+        other => panic!("expected ProbeDeliveryEscalated on the probe topic, got {other:?}"),
+    }
+
+    let items = server_state
+        .work_db
+        .list_attention_items(&run_id)
+        .expect("the execution's attention items must be readable");
+    let filed = items
+        .iter()
+        .find(|item| item.kind == crate::app::probes::PROBE_UNDELIVERED_ATTENTION_KIND)
+        .expect("an undelivered probe must be recorded against the execution it targeted");
+    assert!(
+        filed.body_markdown.contains(&probe_id),
+        "the item must name the probe so `bossctl probe-status` can be run against it",
+    );
+    assert!(
+        filed.body_markdown.contains("never delivered"),
+        "the item must say the text did not land, not merely that a probe existed",
+    );
+}
+
+/// The counterfactual, kept beside
+/// [`a_probe_queued_at_a_turn_boundary_is_delivered_before_teardown_can_abandon_it`]
+/// so the ordering the fan-out depends on is visible as an executable
+/// *difference* rather than a claim about where a line sits in a file.
+///
+/// Reverse the two steps — teardown first, probe dispatch second, which is
+/// what the fan-out did while `dispatch_completion_on_stop` ran ahead of
+/// `dispatch_probe_on_stop` — and the identical probe is abandoned on the
+/// very boundary it was promised, with the dispatcher then finding an empty
+/// queue. That is the reported incident in miniature: for a driver whose only
+/// delivery opportunity is a turn boundary, a worker whose next boundary is
+/// also its last loses the probe every time, not sometimes.
+#[tokio::test]
+async fn the_same_probe_is_abandoned_when_teardown_reaches_the_boundary_first() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 7, Some("grok"));
+    let probe_id = server_state.queue_probe(run_id.clone(), "do not open the PR yet".into(), false);
+
+    // Teardown wins the boundary.
+    server_state.release_worker_pane(&run_id).await;
+    let outcome = dispatch_probe_on_stop(&server_state, &stop_event(&run_id)).await;
+
+    assert_eq!(
+        outcome,
+        ProbeDispatchOutcome::NothingQueued,
+        "the dispatcher arrives to an empty queue — the probe is already gone",
+    );
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Abandoned),
+        "and the probe never reached the worker",
+    );
+}
+
+/// Wiring check on the real fan-out: a probe queued before a turn boundary is
+/// delivered by `dispatch_worker_event_fanout` itself, not merely by the
+/// dispatcher called in isolation. Pins that adding the pre-completion pass
+/// did not break the pass that was already there — both are called, and the
+/// run's single in-flight slot keeps them from double-delivering.
+#[tokio::test]
+async fn the_turn_boundary_fanout_delivers_a_probe_queued_before_it() {
+    use crate::app::worker_events::dispatch_worker_event_fanout;
+
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 8, Some("grok"));
+    let probe_id = server_state.queue_probe(run_id.clone(), "hold the PR".into(), false);
+    let captured = app_session_capturing_one_send(&server_state).await;
+
+    dispatch_worker_event_fanout(&server_state, &stop_event(&run_id)).await;
+
+    let (_, text) = tokio::time::timeout(Duration::from_secs(5), captured)
+        .await
+        .expect("timed out waiting for SendToPane")
+        .expect("app responder panicked")
+        .expect("the probe text must reach the pane");
+    assert!(text.contains("hold the PR"));
+    assert!(
+        server_state
+            .probe_lifecycle_state(&probe_id)
+            .is_some_and(|s| s.is_delivered()),
+        "the fan-out must deliver on the boundary, not leave the probe queued",
+    );
+    assert_eq!(
+        server_state.pending_probe_count(&run_id),
+        0,
+        "and must not leave a duplicate of it behind for the second pass",
+    );
+}

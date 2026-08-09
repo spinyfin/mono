@@ -15,9 +15,15 @@ use serde::{Deserialize, Serialize};
 ///
 /// Returned on `FrontendEvent::ProbeQueued` so the CLI can describe what was
 /// actually accepted instead of guessing from the `urgent` flag. A probe the
-/// engine cannot deliver is never accepted in the first place — it comes back
-/// as `FrontendEvent::ProbeRefused` — so every variant here is a promise the
-/// engine believes it can keep at the time of the call.
+/// engine cannot deliver *at all* is never accepted in the first place — it
+/// comes back as `FrontendEvent::ProbeRefused`.
+///
+/// The variants are not all equally strong, though, and treating them as if
+/// they were is what let an accepted probe be silently lost. Two of them are
+/// promises the engine keeps unilaterally; the third names a boundary the
+/// engine will use *if it arrives*, which for a worker whose next turn
+/// boundary is its last it may not. [`Self::is_best_effort`] is that
+/// distinction, and clients must surface it at issue time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeDeliveryExpectation {
@@ -33,12 +39,21 @@ pub enum ProbeDeliveryExpectation {
     /// boundary — i.e. as soon as its first/next tool call returns. Reported
     /// for a worker that is still spawning.
     NextToolBoundary,
-    /// The probe waits for the worker's next turn boundary (`Stop`). This is
-    /// now the *last-resort* contract, reported only for a worker whose
-    /// driver has not measured its mid-turn stdin behaviour and so holds the
-    /// `Rejects` trait default: for such a worker there is no earlier
-    /// opportunity, and for one mid-way through a long turn it can be a
-    /// while, which is exactly why the CLI says so.
+    /// The probe waits for the worker's next turn boundary (`Stop`). The
+    /// *last-resort* contract, reported only for a worker whose driver has
+    /// not measured its mid-turn stdin behaviour and so holds the `Rejects`
+    /// trait default: for such a worker there is no earlier opportunity.
+    ///
+    /// This is the one variant that is **not** a promise the engine can keep
+    /// on its own — see [`Self::is_best_effort`]. A worker mid-way through a
+    /// long turn may simply take a while, but a worker whose next turn
+    /// boundary is also its last reaches that boundary and is torn down
+    /// together with it, and the probe settles [`ProbeDeliveryState::Abandoned`]
+    /// or [`ProbeDeliveryState::Orphaned`] having steered nothing. The engine
+    /// spends the boundary on the probe before completion can consume it
+    /// (`dispatch_probe_on_stop` runs on both sides of the completion
+    /// handler), which is what makes the common case work — but the caller
+    /// still has to be told that a boundary is all they are getting.
     NextTurnBoundary,
 }
 
@@ -58,8 +73,54 @@ impl ProbeDeliveryExpectation {
             Self::Immediate => "written into the worker's pane now (parked, or buffered mid-turn by the agent)",
             Self::NextToolBoundary => "will be injected when the worker's next tool call returns",
             Self::NextTurnBoundary => {
-                "will be injected at the worker's next turn boundary (its driver's mid-turn input handling is undeclared)"
+                "delivery is BEST-EFFORT: it will be injected at the worker's next turn boundary \
+                 (its driver's mid-turn input handling is undeclared), and that boundary may never \
+                 arrive while the worker is still alive"
             }
+        }
+    }
+
+    /// Whether the named boundary is one the engine cannot guarantee will
+    /// arrive while the worker is still there to read the text.
+    ///
+    /// [`Self::Immediate`] and [`Self::NextToolBoundary`] both rest on the
+    /// driver consuming mid-turn pane input: the engine has either already
+    /// written the text or gets its opportunity inside the running turn, and
+    /// a turn that is running is a turn with tool calls left in it.
+    /// [`Self::NextTurnBoundary`] rests on nothing of the kind. It is the
+    /// answer for a driver whose mid-turn stdin behaviour is undeclared, so
+    /// the *only* delivery opportunity is a turn boundary — and a worker
+    /// whose next turn boundary is also its last (an autonomous run that ends
+    /// by opening its PR) reaches that boundary and is torn down in the same
+    /// breath. The probe is then honestly recorded undeliverable, but the
+    /// caller has already acted on "accepted".
+    ///
+    /// This is a property of the *delivery contract*, not of any one driver:
+    /// every driver that has not measured its mid-turn stdin behaviour holds
+    /// the safe `Rejects` default and lands here, and any driver that later
+    /// measures `Buffers` leaves without this predicate changing.
+    pub fn is_best_effort(self) -> bool {
+        matches!(self, Self::NextTurnBoundary)
+    }
+
+    /// The caveat a caller must be shown at issue time when
+    /// [`Self::is_best_effort`] holds, or `None` when the engine's
+    /// expectation is one it can keep unilaterally.
+    ///
+    /// Separate from [`Self::describe`] so a CLI can route it to stderr and
+    /// keep `--json` stdout clean, and so the wording of the warning lives
+    /// next to the predicate that decides whether to warn.
+    pub fn caveat(self) -> Option<&'static str> {
+        match self {
+            Self::Immediate | Self::NextToolBoundary => None,
+            Self::NextTurnBoundary => Some(
+                "this worker's driver does not take mid-turn input, so the engine can only inject \
+                 at a turn boundary. If the worker's next turn boundary is its last — an autonomous \
+                 run that ends by opening its PR — the text will never be acted on and the probe \
+                 settles `abandoned`. Do not rely on this channel for an instruction that must be \
+                 obeyed; prefer one that survives the run (a work-item description edit, a review \
+                 revision) when correctness depends on it.",
+            ),
         }
     }
 }
@@ -118,18 +179,26 @@ pub enum ProbeDeliveryState {
     /// state with the probe still queued. Terminal, and never the caller's
     /// fault — the boundary the engine committed to simply never came.
     Abandoned,
-    /// The pane write was issued, but the worker's recorded process had
-    /// already exited: the bytes went into a pane nothing was reading. Distinct
-    /// from [`Self::Unconfirmed`] (where the worker is alive and the text
-    /// probably landed, just unobservably) — here there was demonstrably
-    /// nobody home, so this must not be reported as [`Self::Consumed`].
+    /// The pane write was issued, but nothing was left to act on it. Two
+    /// paths reach this state, and they share the property that makes it
+    /// distinct from [`Self::Unconfirmed`] (where the worker is alive and the
+    /// text probably landed, just unobservably): here there was demonstrably
+    /// nobody home, so it must not be reported as [`Self::Consumed`].
     ///
-    /// The verdict rests on a `kill(pid, 0)` probe of the *recorded* shell
-    /// pid, which the engine treats elsewhere as a fragile identity (a wrapper
-    /// shell that exec'd or exited leaves the agent alive under another pid).
-    /// So this is undeliverable-as-far-as-we-know rather than proof of loss:
-    /// if the worker answers anyway, the reply path corrects the record to
-    /// [`Self::Replied`]. That is why it is not terminal.
+    /// * The worker's *recorded* process had already exited when the bytes
+    ///   went in. That verdict rests on a `kill(pid, 0)` probe of a pid the
+    ///   engine treats elsewhere as a fragile identity (a wrapper shell that
+    ///   exec'd or exited leaves the agent alive under another pid).
+    /// * The write landed, and then the run's pane was released before the
+    ///   worker produced the boundary its reply would have arrived on. This
+    ///   is the shape a probe delivered on a run's *final* turn boundary
+    ///   takes: the pty took the bytes, and teardown reached the worker
+    ///   first. Leaving such a probe at `Consumed` would report a delivery
+    ///   nobody ever acted on as a success.
+    ///
+    /// Either way this is undeliverable-as-far-as-we-know rather than proof
+    /// of loss: if the worker answers anyway, the reply path corrects the
+    /// record to [`Self::Replied`]. That is why it is not terminal.
     Orphaned,
 }
 
@@ -265,6 +334,51 @@ mod tests {
         }
         assert!(ProbeDeliveryState::Replied.is_terminal());
         assert!(!ProbeDeliveryState::Replied.is_undeliverable());
+    }
+
+    /// The whole point of the predicate: "the engine will write this" and
+    /// "the engine will write this if it ever gets the chance" must be
+    /// distinguishable by a caller deciding whether to rely on the channel.
+    #[test]
+    fn only_the_turn_boundary_expectation_is_best_effort() {
+        assert!(ProbeDeliveryExpectation::NextTurnBoundary.is_best_effort());
+        assert!(!ProbeDeliveryExpectation::Immediate.is_best_effort());
+        assert!(!ProbeDeliveryExpectation::NextToolBoundary.is_best_effort());
+    }
+
+    /// A best-effort acceptance must carry the explanation with it. Pairing
+    /// the two here stops a future variant gaining `is_best_effort` without
+    /// the text a caller needs in order to choose a different mechanism.
+    #[test]
+    fn every_best_effort_expectation_carries_a_caveat_and_no_other_does() {
+        for expectation in [
+            ProbeDeliveryExpectation::Immediate,
+            ProbeDeliveryExpectation::NextToolBoundary,
+            ProbeDeliveryExpectation::NextTurnBoundary,
+        ] {
+            assert_eq!(
+                expectation.caveat().is_some(),
+                expectation.is_best_effort(),
+                "{} must carry a caveat exactly when it is best-effort",
+                expectation.as_str(),
+            );
+        }
+    }
+
+    /// `describe()` is the line the CLI prints on the accept path, so the
+    /// best-effort case must not read as a plain commitment there either —
+    /// the caveat on stderr is an addition, not the only warning.
+    #[test]
+    fn best_effort_description_does_not_read_as_a_plain_commitment() {
+        let described = ProbeDeliveryExpectation::NextTurnBoundary.describe();
+        assert!(
+            described.contains("BEST-EFFORT"),
+            "best-effort acceptance must say so in its one-line description; got {described:?}",
+        );
+        assert!(
+            described.contains("may never arrive"),
+            "the description must name the failure mode, not just label it; got {described:?}",
+        );
     }
 
     #[test]

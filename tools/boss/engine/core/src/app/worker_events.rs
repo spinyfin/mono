@@ -129,17 +129,38 @@ pub(super) async fn dispatch_worker_event_fanout(
     // for the same probe (the reply text hasn't been
     // written yet at dispatch time).
     //
-    // Completion runs before probe dispatch: probes
-    // queued by the completion handler (e.g.
-    // PROBE_NO_PR) must be visible to `dispatch_probe_on_stop`
-    // so they are delivered on the *same* Stop that
-    // triggered them rather than stalling until the
-    // next Stop (which never comes for an idle worker).
     // Durably record the boundary BEFORE anything reacts to it, so it
     // survives a completion handler that errors, an engine restart, or the
     // pane going away milliseconds later.
     record_turn_boundary_on_stop(server_state, incoming);
     dispatch_probe_reply_on_stop(server_state, incoming).await;
+    // **Probe dispatch runs on both sides of completion, and that is
+    // load-bearing in each direction.**
+    //
+    // *Before* completion, for a probe that was already queued when this
+    // boundary arrived. Such a probe was accepted with a `next_turn_boundary`
+    // commitment, and this is that boundary. Completion is entitled to
+    // conclude the run is finished and call `release_worker_pane`, whose
+    // teardown drain settles every still-queued probe as `Abandoned` — so
+    // with completion running first, the *only* delivery opportunity a
+    // driver-that-takes-no-mid-turn-input ever gets was being consumed by the
+    // teardown of the run it was promised against. For an autonomous worker
+    // whose next turn boundary is also its last (it opens its PR and stops)
+    // that made abandonment a certainty rather than a race, and the engine
+    // broke a commitment it had already reported as accepted. The pre-pass is
+    // inert when nothing is queued, which is almost every boundary.
+    //
+    // *After* completion, for a probe the completion handler queued during
+    // this same fan-out (e.g. PROBE_NO_PR). Those must go out on the Stop
+    // that triggered them rather than waiting for the next one, which for a
+    // now-idle worker never comes.
+    //
+    // The two passes cannot both deliver: a probe claimed by the pre-pass
+    // holds the run's single in-flight slot, so the post-pass reports
+    // `AlreadyInFlight` and leaves the completion nudge queued — exactly what
+    // the single post-completion pass did before, since a pre-existing probe
+    // already sat ahead of the nudge in the queue.
+    let _ = dispatch_probe_on_stop(server_state, incoming).await;
     dispatch_completion_on_stop(server_state, incoming).await;
     let _ = dispatch_probe_on_stop(server_state, incoming).await;
 }
@@ -1289,6 +1310,16 @@ pub(super) async fn dispatch_post_hoc_interception_on_post_tool_use(
 /// write and leaves the probe queued — never fail-open into a non-consuming
 /// foreground process.
 ///
+/// **Called twice per turn boundary**, once on each side of
+/// `dispatch_completion_on_stop` — see the ordering comment in
+/// [`dispatch_worker_event_fanout`]. The pre-completion call is what makes
+/// the `next_turn_boundary` commitment real for a driver that takes no
+/// mid-turn input: without it, completion could conclude the run was finished
+/// and release the pane, and the teardown drain would settle the probe
+/// `Abandoned` on the very boundary it had been promised. Both calls are
+/// no-ops on the overwhelming majority of boundaries (nothing queued), and
+/// the run's single in-flight slot stops the two from both delivering.
+///
 /// **Every exit is logged and returned.** This function is the drain path a
 /// probe accepted with a `next_turn_boundary` commitment depends on, so every
 /// exit — including the routine "nothing queued" case and the "queue emptied
@@ -1447,6 +1478,15 @@ async fn deliver_probe_via_pane_write(
             if server_state.release_probe_reservation(run_id, probe) {
                 ProbeDispatchOutcome::RequeuedAfterFailure
             } else {
+                server_state
+                    .surface_undelivered_probe(
+                        run_id,
+                        &probe_id,
+                        ProbeDeliveryState::Abandoned,
+                        "the pane write failed and the run had already been released, so there was \
+                         nothing left to retry against",
+                    )
+                    .await;
                 ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Abandoned)
             }
         }
@@ -1802,6 +1842,15 @@ async fn inject_probe_mid_turn(
             if server_state.release_probe_reservation(run_id, probe) {
                 ProbeDispatchOutcome::RequeuedAfterFailure
             } else {
+                server_state
+                    .surface_undelivered_probe(
+                        run_id,
+                        &probe_id,
+                        ProbeDeliveryState::Abandoned,
+                        "the worker's posture flipped after the claim and the run had already been \
+                         released, so there was no later boundary to re-queue against",
+                    )
+                    .await;
                 ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Abandoned)
             }
         }
@@ -1817,6 +1866,15 @@ async fn inject_probe_mid_turn(
             if server_state.release_probe_reservation(run_id, probe) {
                 ProbeDispatchOutcome::RequeuedAfterFailure
             } else {
+                server_state
+                    .surface_undelivered_probe(
+                        run_id,
+                        &probe_id,
+                        ProbeDeliveryState::Abandoned,
+                        "the mid-turn pane write failed and the run had already been released, so \
+                         there was nothing left to retry against",
+                    )
+                    .await;
                 ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Abandoned)
             }
         }

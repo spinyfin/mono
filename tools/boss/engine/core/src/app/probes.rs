@@ -22,6 +22,23 @@
 
 use super::*;
 
+use crate::work::CreateAttentionItemInput;
+
+/// `work_attention_items.kind` for a probe the engine accepted and then never
+/// delivered.
+///
+/// Filed against the *execution* the probe targeted, so the abandonment is
+/// visible in that run's own history rather than only through a
+/// `bossctl probe-status <probe-id>` query the issuer has no reason to make.
+/// That asymmetry was the defect: the engine recorded the terminal state
+/// correctly and told nobody, so a coordinator whose instruction was dropped
+/// carried on as if it had landed.
+///
+/// Registered in [`crate::attention_lifecycle::ATTENTION_LIFECYCLES`] as
+/// [`crate::attention_lifecycle::ClearedBy::HumanDecision`] — see there for
+/// why no automatic evidence lowers it.
+pub const PROBE_UNDELIVERED_ATTENTION_KIND: &str = "probe_undelivered";
+
 /// Adapter so the completion handler can queue probes onto
 /// `ServerState::pending_probes` without depending on `ServerState`
 /// directly. Same late-bind dance as `ServerStatePaneReleaser` — the
@@ -491,6 +508,179 @@ impl ServerState {
             );
         }
         ids
+    }
+
+    /// Settle a probe that was written into `run_id`'s pane but never
+    /// answered, because the run is going away.
+    ///
+    /// [`Self::abandon_pending_probes_for_terminated_run`] covers probes
+    /// still in the *queue*; this covers the one past it. An in-flight probe
+    /// is normally settled by the reply path at the worker's next turn
+    /// boundary — but a run torn down before that boundary produces no reply,
+    /// ever, and the record would sit at `Consumed`/`Buffered` for the life
+    /// of the engine process. Reporting "the worker got it" for text nobody
+    /// acted on is the same class of lie as reporting `queued` for a probe
+    /// nothing will deliver, so it is recorded as
+    /// [`ProbeDeliveryState::Orphaned`]: the bytes did reach the pane, and a
+    /// reply that somehow still arrives corrects the record.
+    ///
+    /// Deliberately does **not** rewrite a probe already at a state the reply
+    /// path settled — only the delivered-but-unanswered states are re-stated.
+    /// The in-flight *slot* is freed either way: the run is going away, so a
+    /// slot held against it can only pin a probe that no longer has anywhere
+    /// to go. Returns the probe id when a state was actually re-stated, so
+    /// the caller surfaces exactly the ones it changed.
+    pub(super) fn orphan_in_flight_probe_for_terminated_run(&self, run_id: &str, cause: &str) -> Option<String> {
+        let in_flight = self.take_in_flight_probe(run_id)?;
+        let probe_id = in_flight.probe_id;
+        match self.probe_lifecycle_state(&probe_id) {
+            Some(ProbeDeliveryState::Consumed | ProbeDeliveryState::Buffered | ProbeDeliveryState::Unconfirmed) => {}
+            // `Replied` already has the worker's answer; `Injected` means the
+            // write is still in flight on another task and that task records
+            // its own outcome; anything else is already settled.
+            _ => return None,
+        }
+        tracing::warn!(
+            run_id,
+            probe_id = %probe_id,
+            cause,
+            "run terminated with a delivered probe still unanswered; recording orphaned rather \
+             than leaving it reading as consumed",
+        );
+        self.set_probe_lifecycle_detail(
+            &probe_id,
+            ProbeDeliveryState::Orphaned,
+            Some(format!(
+                "{cause}; the text reached the pane but the run ended before the worker produced \
+                 the turn boundary its reply would have arrived on"
+            )),
+        );
+        Some(probe_id)
+    }
+
+    /// Tell somebody that `probe_id` will not be delivered.
+    ///
+    /// `bossctl probe-status` already reports the terminal state correctly.
+    /// What was missing is any reason for the issuer to look: a coordinator
+    /// that was told "accepted" and never told otherwise assumes the text
+    /// landed. So an abandonment is pushed on two surfaces that reach an
+    /// observer without being asked:
+    ///
+    /// * [`FrontendEvent::ProbeDeliveryEscalated`] on the run's probe topic —
+    ///   the same channel an unconfirmed mid-turn write already escalates on,
+    ///   for anything subscribed while the run is live; and
+    /// * a [`PROBE_UNDELIVERED_ATTENTION_KIND`] attention item against the
+    ///   execution — which outlives the run, so the record is still there
+    ///   after the worker and its topic subscribers are gone.
+    ///
+    /// Best-effort on both: a probe that could not be delivered must not also
+    /// fail the teardown it was noticed during.
+    pub(super) async fn surface_undelivered_probe(
+        &self,
+        run_id: &str,
+        probe_id: &str,
+        state: ProbeDeliveryState,
+        cause: &str,
+    ) {
+        debug_assert!(
+            state.is_undeliverable(),
+            "surfacing is for probes the engine gave up on; {} is not one",
+            state.as_str(),
+        );
+        self.topic_broker
+            .publish(
+                &probe_topic(run_id),
+                FrontendEventEnvelope::push(FrontendEvent::ProbeDeliveryEscalated {
+                    run_id: run_id.to_owned(),
+                    probe_id: probe_id.to_owned(),
+                    reason: format!("probe settled {} without reaching the worker: {cause}", state.as_str()),
+                }),
+            )
+            .await;
+        self.file_undelivered_probe_attention(run_id, probe_id, state, cause)
+            .await;
+    }
+
+    /// Convenience for the teardown paths, which settle a whole batch at
+    /// once and hold the ids as a `Vec`.
+    pub(super) async fn surface_undelivered_probes(
+        &self,
+        run_id: &str,
+        probe_ids: &[String],
+        state: ProbeDeliveryState,
+        cause: &str,
+    ) {
+        for probe_id in probe_ids {
+            self.surface_undelivered_probe(run_id, probe_id, state, cause).await;
+        }
+    }
+
+    /// File the durable half of [`Self::surface_undelivered_probe`].
+    ///
+    /// Split out because every step here can legitimately fail on a run the
+    /// engine is already tearing down (the execution row may be gone, the
+    /// work item may have been deleted), and none of those failures may
+    /// escape: the caller is mid-teardown and has nothing useful to do with
+    /// an error.
+    async fn file_undelivered_probe_attention(
+        &self,
+        run_id: &str,
+        probe_id: &str,
+        state: ProbeDeliveryState,
+        cause: &str,
+    ) {
+        let text = self
+            .probe_record(probe_id)
+            .map(|record| record.urgent)
+            .map(|urgent| if urgent { "urgent probe" } else { "probe" })
+            .unwrap_or("probe");
+        let body = format!(
+            "A {text} accepted for this run was never delivered to the worker.\n\n\
+             - probe: `{probe_id}`\n\
+             - execution: `{run_id}`\n\
+             - final delivery state: `{}`\n\n\
+             Why: {cause}.\n\n\
+             Acceptance and delivery are different states. The engine accepted this probe \
+             because the run had a live pane at the time, then the delivery boundary it \
+             committed to never arrived while a worker was there to read the text. Nothing \
+             landed, so re-issuing the same instruction against a live run cannot duplicate it \
+             — but if the instruction was load-bearing (an effort-escalation acknowledgement, a \
+             \"re-read the spec\" nudge after a description edit, a hold on some action), it did \
+             not take effect and the run proceeded without it.\n\n\
+             Full record: `bossctl probe-status {probe_id}`.",
+            state.as_str(),
+        );
+        let input = CreateAttentionItemInput {
+            body_markdown: body,
+            kind: PROBE_UNDELIVERED_ATTENTION_KIND.to_owned(),
+            title: format!("Probe {probe_id} was never delivered to the worker"),
+            execution_id: Some(run_id.to_owned()),
+            resolved_at: None,
+            status: None,
+            work_item_id: None,
+        };
+        let item = match self.work_db.create_attention_item(input) {
+            Ok(item) => item,
+            Err(err) => {
+                tracing::warn!(
+                    run_id,
+                    probe_id,
+                    ?err,
+                    "could not file the undelivered-probe attention item; the abandonment is \
+                     still recorded in probe-status but nothing will surface it to an operator",
+                );
+                return;
+            }
+        };
+        let Ok(execution) = self.work_db.get_execution(run_id) else {
+            return;
+        };
+        let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) else {
+            return;
+        };
+        self.publisher
+            .publish_frontend_event_on_product(work_item.product_id(), FrontendEvent::AttentionItemCreated { item })
+            .await;
     }
 
     /// Whether the worker process behind `run_id` probes *dead* right now.
