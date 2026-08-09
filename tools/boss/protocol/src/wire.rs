@@ -15,10 +15,10 @@ use crate::types::{
     ConflictResolution, CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput,
     CreateCommentInput, CreateDecisionInput, CreateExecutionInput, CreateInvestigationInput, CreateManyChoresInput,
     CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput,
-    Decision, DeferredScopeAttention, DependencyFilter, DesignDocContent, DesignDocTreeState, DriverTrafficSplit,
-    EditorialAction, EngineAttemptListEntry, FollowupMemberOverride, GitHubAuthStateDto, LinkExternalRefInput,
-    ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch, ProbeDeliveryExpectation, ProbeDeliveryState,
-    Product, Project, ProposalKind, ProposalState, ProposalSubmissionError, RemoveDependencyInput,
+    Decision, DeferredScopeAttention, DependencyFilter, DesignDocContent, DesignDocTreeState, DispatchAdmission,
+    DriverTrafficSplit, EditorialAction, EngineAttemptListEntry, FollowupMemberOverride, GitHubAuthStateDto,
+    LinkExternalRefInput, ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch, ProbeDeliveryExpectation,
+    ProbeDeliveryState, Product, Project, ProposalKind, ProposalState, ProposalSubmissionError, RemoveDependencyInput,
     RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput, ReviseDocOutcome,
     SelectedProductState, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput,
     SetTaskDocPointerInput, Task, TaskRuntime, TranscriptSegment, WorkAttachment, WorkAttentionItem, WorkComment,
@@ -615,6 +615,23 @@ pub enum FrontendRequest {
     EngineResponse {
         request_id: String,
         response: EngineToAppResponse,
+    },
+
+    /// Read-only: answer "would this work item dispatch right now, and if
+    /// not, why not?" — the current dispatch-pause snapshot plus every
+    /// other non-overridable blocker (interactive concurrency cap, unmet
+    /// dependencies, churn-guard parking, `autostart: false`, ineligible
+    /// status), computed by the exact same function the mutating
+    /// `RequestExecution { bypass_dispatch_pause: true, .. }` path
+    /// consults. No DB writes; no topic events. The macOS app calls this
+    /// before a drag-to-Doing that would request execution, so it can
+    /// render a pause-only confirmation (or bounce the card back when a
+    /// non-overridable blocker is present) without reproducing engine
+    /// admission rules client-side. Replies with
+    /// [`FrontendEvent::DispatchAdmissionEvaluated`]. See
+    /// `docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md`.
+    EvaluateDispatchAdmission {
+        work_item_id: String,
     },
 
     /// Evaluate a product's editorial rules against a candidate PR body
@@ -1554,6 +1571,22 @@ pub enum FrontendRequest {
     MoveWorkItemOnBoard {
         id: String,
         target: BoardDropTarget,
+        /// Set when the app confirmed a pause-only override dialog for this
+        /// drop (see `EvaluateDispatchAdmission` /
+        /// `docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md`).
+        /// Only meaningful when this drop resolves to a transition that
+        /// would request execution; ignored otherwise. Entry-point
+        /// provenance is implicitly `app_drag` for every request on this
+        /// RPC, so it is not repeated on the wire here.
+        #[serde(default)]
+        bypass_dispatch_pause: bool,
+        /// The pause `paused_since_epoch_s` generation the app observed
+        /// from `EvaluateDispatchAdmission` before showing the confirmation
+        /// — `None` when `bypass_dispatch_pause` is `false`. See
+        /// [`RequestExecutionInput::observed_pause_since_epoch_s`] for the
+        /// staleness contract this feeds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_pause_since_epoch_s: Option<u64>,
     },
 
     /// Boss-tier RPC: ask the macOS app to open `path` (an absolute or

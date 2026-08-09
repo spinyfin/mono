@@ -465,6 +465,15 @@ final class EngineClient: @unchecked Sendable {
                     break
                 }
                 emit(.projectDesignDocResolved(output: output))
+            case "dispatch_admission_evaluated":
+                guard let admissionPayload = payload["admission"] as? [String: Any],
+                      let admissionData = try? JSONSerialization.data(withJSONObject: admissionPayload),
+                      let admission = try? JSONDecoder().decode(DispatchAdmission.self, from: admissionData)
+                else {
+                    emit(.error(message: "received invalid dispatch_admission_evaluated payload"))
+                    break
+                }
+                emit(.dispatchAdmissionEvaluated(admission: admission))
             case "product_design_docs_list":
                 guard let statePayload = payload["state"] as? [String: Any],
                       let stateData = try? JSONSerialization.data(withJSONObject: statePayload),

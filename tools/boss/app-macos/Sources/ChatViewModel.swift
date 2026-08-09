@@ -2392,6 +2392,17 @@ final class ChatViewModel: ObservableObject {
     /// previous notice is replaced when a new refusal fires.
     @Published var dragRefusalNotice: DragRefusalNotice?
 
+    /// A drag-to-Doing whose `EvaluateDispatchAdmission` reply is still
+    /// in flight. Single-slot, like `dragRefusalNotice` — a second drag
+    /// landing before the first's reply arrives simply supersedes it; the
+    /// stale reply is dropped by `taskID` mismatch in the event handler.
+    var pendingDragAdmissionCheck: PendingDragAdmissionCheck?
+
+    /// Set once `EvaluateDispatchAdmission` reports an active, overridable
+    /// pause and no other blocker — the confirmation dialog binds to this.
+    /// `nil` means no confirmation is showing.
+    @Published var pendingPauseOverrideConfirmation: PauseOverrideConfirmation?
+
     /// Inline confirmation banner shown on the card whose
     /// `merge_when_ready_accepted` reply just arrived (`MergeFeedbackNotice`)
     /// — for `trunk_enqueued`/`enqueued` the engine's optimistic

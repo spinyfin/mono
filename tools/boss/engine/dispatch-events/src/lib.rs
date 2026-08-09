@@ -545,6 +545,30 @@ pub enum Stage {
     /// `pause_duration_secs` (how long the episode this closes actually
     /// lasted), and a human-readable `reason`.
     DispatchResumed,
+    /// A `RequestExecution { bypass_dispatch_pause: true, .. }` request was
+    /// actually admitted through an active, overridable (operator-origin)
+    /// global dispatch pause — see
+    /// `docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md`.
+    /// Fires only on the successful dispatch itself, never merely on
+    /// passing the pause gate — a bypassed row that then loses to the
+    /// interactive concurrency cap or another admission constraint emits
+    /// [`Stage::DispatchPauseOverrideRefused`] instead, not this stage,
+    /// so this stage's presence always means a worker actually spawned.
+    /// The `details` object carries `entry_point` (`"cli"` /
+    /// `"app_drag"`), and the overridden pause's `origin`, `reason`, and
+    /// `paused_since_epoch_s`.
+    DispatchPauseOverride,
+    /// A `RequestExecution { bypass_dispatch_pause: true, .. }` request was
+    /// refused — either the pause itself was not overridable (breaker
+    /// origin), the confirmed pause generation was stale, or a
+    /// non-overridable constraint (interactive concurrency cap, unmet
+    /// dependency, chain-hold, ineligible status) still blocked it after
+    /// the pause was set aside. Never claims an override occurred — no
+    /// worker spawned, and any `ready` row this request would otherwise
+    /// have left behind is removed. The `details` object carries
+    /// `entry_point`, the blocking `reason` string, and — when the refusal
+    /// followed a stale confirmation — the pause state actually observed.
+    DispatchPauseOverrideRefused,
     /// A ready mainline item preempted an in-progress spilled automation
     /// run to obtain an interactive slot (see
     /// `boss_engine::dispatch_spillover`). Fires only when every Bridge Crew
@@ -736,6 +760,8 @@ impl Stage {
             Stage::ExecutionLivenessReconcile => "execution_liveness_reconcile",
             Stage::DispatchPaused => "dispatch_paused",
             Stage::DispatchResumed => "dispatch_resumed",
+            Stage::DispatchPauseOverride => "dispatch_pause_override",
+            Stage::DispatchPauseOverrideRefused => "dispatch_pause_override_refused",
             Stage::AutomationPreempted => "automation_preempted",
             Stage::WorkspaceRecovery => "workspace_recovery",
             Stage::AbandonedBranchPrRecovery => "abandoned_branch_pr_recovery",

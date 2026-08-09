@@ -383,6 +383,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::ProbeStatus { .. }
         | FrontendRequest::ReapRun { .. }
         | FrontendRequest::ReleaseReviewTerminal { .. }
+        | FrontendRequest::EvaluateDispatchAdmission { .. }
         | FrontendRequest::RequestExecution { .. }
         | FrontendRequest::RetirePane { .. }
         | FrontendRequest::RevealWorkItem { .. }

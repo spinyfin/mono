@@ -21,7 +21,9 @@ use crate::completion::{
     CommandPrDetector, PaneReleaseOutcome, PrDetector, ProbeQueuer, WorkerCompletionHandler, WorkerPaneReleaser,
 };
 use crate::config::RuntimeConfig;
-use crate::coordinator::{CommandCubeClient, CubeClient, ExecutionCoordinator, ExecutionPublisher, WorkerPool};
+use crate::coordinator::{
+    CommandCubeClient, CubeClient, ExecutionCoordinator, ExecutionPublisher, WorkerPool, pause_bypass_decision,
+};
 use crate::driver::AgentDriver;
 use crate::events_socket::{bind_events_socket, handle_connection, peer_pid};
 use crate::external_tracker::WorkDbOrgStateSink;
@@ -36,12 +38,12 @@ use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::merge_poller::{CommandMergeProbe, MergeProbe, spawn_loop as spawn_merge_poller};
 use crate::merge_when_ready;
 use crate::protocol::{
-    EngineToAppError, EngineToAppRequest, EngineToAppResponse, FocusWorkerPaneInput, FrontendEvent,
-    FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, GitHubAuthStateDto, HostedPaneEntry,
-    HostedPaneState, HostedPaneStatus, InterruptWorkerPaneInput, ListHostedPanesInput, OpenDocumentInput, OrgAuthState,
-    ReleaseWorkerPaneInput, RequestExecutionInput, RevealWorkItemInput, SendToPaneInput, TOPIC_ENGINE_HEALTH,
-    TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload, comment_topic,
-    editorial_actions_topic, execution_topic, probe_topic, work_product_topic,
+    DispatchAdmissionEntryPoint, EngineToAppError, EngineToAppRequest, EngineToAppResponse, FocusWorkerPaneInput,
+    FrontendEvent, FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, GitHubAuthStateDto,
+    HostedPaneEntry, HostedPaneState, HostedPaneStatus, InterruptWorkerPaneInput, ListHostedPanesInput,
+    OpenDocumentInput, OrgAuthState, ReleaseWorkerPaneInput, RequestExecutionInput, RevealWorkItemInput,
+    SendToPaneInput, TOPIC_ENGINE_HEALTH, TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES,
+    TopicEventPayload, comment_topic, editorial_actions_topic, execution_topic, probe_topic, work_product_topic,
 };
 use crate::repo_slug;
 use crate::work::{
@@ -2423,6 +2425,9 @@ async fn handle_frontend_connection(
             }
             r @ FrontendRequest::EvaluateEditorialRules { .. } => {
                 products::handle_evaluate_editorial_rules(ctx, r).await
+            }
+            r @ FrontendRequest::EvaluateDispatchAdmission { .. } => {
+                executions::handle_evaluate_dispatch_admission(ctx, r).await
             }
             r @ FrontendRequest::SetProductExternalTracker { .. } => {
                 external_tracker::handle_set_product_external_tracker(ctx, r).await

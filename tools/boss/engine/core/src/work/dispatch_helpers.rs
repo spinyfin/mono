@@ -905,6 +905,17 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         // creates / refreshes a `ready` row the same way for both
         // forced and queued requests.
         force: _,
+        // The pause-only override intent, its provenance, and the
+        // observed pause generation are all resolved entirely above this
+        // layer, by `ExecutionCoordinator::dispatch_with_pause_bypass`
+        // (see `coordinator/dispatch_admission.rs`) before it ever calls
+        // down into `request_execution_with_live_check`. By the time a
+        // request reaches here it has already been admitted (or refused
+        // and never reached this far) — this DB layer creates / refreshes
+        // a `ready` row identically regardless of how it was admitted.
+        bypass_dispatch_pause: _,
+        entry_point: _,
+        observed_pause_since_epoch_s: _,
         allow_dirty,
     } = input;
 

@@ -398,3 +398,73 @@ fn automation_pause_parses_an_explicit_reason() {
         other => panic!("expected AutomationAction::Pause, got {other:?}"),
     }
 }
+
+#[test]
+fn work_start_defaults_force_to_false() {
+    let cli = Cli::try_parse_from(["bossctl", "work", "start", "task_1"]).unwrap();
+    match cli.command {
+        Command::Work {
+            action: WorkAction::Start {
+                work_item_id, force, ..
+            },
+        } => {
+            assert_eq!(work_item_id, "task_1");
+            assert!(!force, "--force must default to false");
+        }
+        other => panic!("expected WorkAction::Start, got {other:?}"),
+    }
+}
+
+/// `agents launch`'s pool-growth `force` and `work start`'s pause-only
+/// `force` must never collide on the wire: the CLI flag spelling is
+/// shared, but each maps to a distinct `RequestExecutionInput` intent
+/// (`force` vs `bypass_dispatch_pause`) — see `agents::agents_launch`
+/// and `agents::work_start`.
+#[test]
+fn work_start_parses_force_flag() {
+    let cli = Cli::try_parse_from(["bossctl", "work", "start", "task_1", "--force"]).unwrap();
+    match cli.command {
+        Command::Work {
+            action: WorkAction::Start {
+                work_item_id, force, ..
+            },
+        } => {
+            assert_eq!(work_item_id, "task_1");
+            assert!(force);
+        }
+        other => panic!("expected WorkAction::Start, got {other:?}"),
+    }
+}
+
+#[test]
+fn work_start_force_composes_with_priority_and_workspace() {
+    let cli = Cli::try_parse_from([
+        "bossctl",
+        "work",
+        "start",
+        "task_1",
+        "--force",
+        "--priority",
+        "5",
+        "--preferred-workspace-id",
+        "mono-agent-002",
+    ])
+    .unwrap();
+    match cli.command {
+        Command::Work {
+            action:
+                WorkAction::Start {
+                    work_item_id,
+                    priority,
+                    preferred_workspace_id,
+                    force,
+                },
+        } => {
+            assert_eq!(work_item_id, "task_1");
+            assert!(force);
+            assert_eq!(priority, Some(5));
+            assert_eq!(preferred_workspace_id.as_deref(), Some("mono-agent-002"));
+        }
+        other => panic!("expected WorkAction::Start, got {other:?}"),
+    }
+}

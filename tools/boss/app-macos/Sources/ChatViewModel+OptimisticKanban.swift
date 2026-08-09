@@ -6,6 +6,42 @@ extension ChatViewModel {
         let message: String
     }
 
+    /// A drag-to-Doing waiting on its `EvaluateDispatchAdmission` reply.
+    struct PendingDragAdmissionCheck: Equatable {
+        let taskID: String
+        let column: WorkBoardColumnKey
+        let group: WorkBoardGroupKey?
+    }
+
+    /// A drag-to-Doing whose evaluation reported an active, overridable
+    /// dispatch pause and no other blocker — bound by the confirmation
+    /// alert. Carries everything needed to either send the confirmed
+    /// override or bounce the card back on cancel.
+    struct PauseOverrideConfirmation: Equatable {
+        let taskID: String
+        let taskName: String
+        let column: WorkBoardColumnKey
+        let group: WorkBoardGroupKey?
+        let pauseReason: String
+        let pausedSinceEpochS: UInt64?
+        /// Non-overridable blockers force will NOT lift, for informational
+        /// display only (`DispatchAdmission.blockers` minus the hard ones,
+        /// which would have refused the drag outright before a
+        /// confirmation was ever offered).
+        let informationalBlockers: [DispatchAdmissionBlocker]
+
+        /// Body text for the confirmation alert: the pause reason, plus
+        /// any informational-only blockers force will not touch.
+        var alertMessage: String {
+            var lines = ["Dispatch is paused: \(pauseReason). Start \(taskName) without resuming dispatch?"]
+            if !informationalBlockers.isEmpty {
+                lines.append("")
+                lines.append("Also present (unaffected by force): " + informationalBlockers.map(\.message).joined(separator: "; "))
+            }
+            return lines.joined(separator: "\n")
+        }
+    }
+
     /// Handle a kanban drop. Reports **where** the card landed and lets the
     /// engine decide what that drop meant; returns whether the drop was
     /// forwarded at all, so the source lane can render an inline warning for
@@ -76,8 +112,96 @@ extension ChatViewModel {
             invalidateWorkCache()
         }
 
+        if !staysPut, column == .doing {
+            // Entering Doing may request execution. Check dispatch
+            // admission before sending the drop so a paused engine offers
+            // a confirmation instead of either silently queuing the card
+            // (today's behavior) or, once force exists, silently
+            // dispatching around an operator's pause with no heads-up. See
+            // `EvaluateDispatchAdmission` /
+            // docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md.
+            // A false-positive check (the drop turns out to be a reorder,
+            // or the item is human-driven) is harmless — evaluation is
+            // read-only and the reply handler just forwards the drop
+            // unchanged when there is nothing to override.
+            pendingDragAdmissionCheck = PendingDragAdmissionCheck(taskID: taskID, column: column, group: group)
+            engine.sendEvaluateDispatchAdmission(workItemId: taskID)
+            return true
+        }
+
         engine.sendMoveWorkItemOnBoard(id: taskID, column: column, group: group)
         return true
+    }
+
+    /// Reply handler for `.dispatchAdmissionEvaluated`, called from
+    /// `ChatViewModel+EventHandling`. Forwards the already-optimistically-
+    /// placed drop, offers a pause-only confirmation, or bounces the card
+    /// back — see `attemptDrop`'s Doing-column branch for what queued this.
+    func handleDispatchAdmissionEvaluated(_ admission: DispatchAdmission) {
+        guard let pending = pendingDragAdmissionCheck, pending.taskID == admission.workItemID else {
+            // Stale reply (superseded by a later drag) or an evaluation the
+            // app requested for some other reason — nothing to forward.
+            return
+        }
+        pendingDragAdmissionCheck = nil
+
+        // Mirrors `pause_bypass_decision`'s order on the engine side exactly
+        // (coordinator/dispatch_admission.rs): a hard blocker refuses
+        // outright regardless of pause state, checked BEFORE "is there even
+        // a pause to override" — a dependency-gated or capped item must
+        // bounce back even when dispatch isn't paused at all.
+        let hardBlockers = admission.hardBlockers
+        if !hardBlockers.isEmpty {
+            bounceBackOptimisticMoves(message: hardBlockers.map(\.message).joined(separator: "; "))
+            return
+        }
+
+        if !admission.pause.active {
+            // Nothing to override — forward the drop exactly as the
+            // non-Doing path already does.
+            engine.sendMoveWorkItemOnBoard(id: pending.taskID, column: pending.column, group: pending.group)
+            return
+        }
+
+        if !admission.pause.overridable {
+            let reason = "dispatch is paused" + (admission.pause.reason.map { ": \($0)" } ?? "")
+                + " — this pause is not overridable"
+            bounceBackOptimisticMoves(message: reason)
+            return
+        }
+
+        let taskName = task(withID: pending.taskID)?.name ?? pending.taskID
+        pendingPauseOverrideConfirmation = PauseOverrideConfirmation(
+            taskID: pending.taskID,
+            taskName: taskName,
+            column: pending.column,
+            group: pending.group,
+            pauseReason: admission.pause.reason ?? "no reason recorded",
+            pausedSinceEpochS: admission.pause.pausedSinceEpochS,
+            informationalBlockers: admission.blockers.filter { dispatchAdmissionInformationalOnlyBlockerCodes.contains($0.code) }
+        )
+    }
+
+    /// Operator confirmed the pause-override dialog: send the drop with
+    /// the confirmed bypass and the observed pause generation.
+    func confirmPauseOverrideDrag() {
+        guard let confirmation = pendingPauseOverrideConfirmation else { return }
+        pendingPauseOverrideConfirmation = nil
+        engine.sendMoveWorkItemOnBoard(
+            id: confirmation.taskID,
+            column: confirmation.column,
+            group: confirmation.group,
+            bypassDispatchPause: true,
+            observedPauseSinceEpochS: confirmation.pausedSinceEpochS
+        )
+    }
+
+    /// Operator cancelled the pause-override dialog: bounce the
+    /// optimistically-placed card back to its origin column.
+    func cancelPauseOverrideDrag() {
+        guard pendingPauseOverrideConfirmation != nil else { return }
+        pendingPauseOverrideConfirmation = nil
+        bounceBackOptimisticMoves(message: nil)
     }
 
     /// Which of its column's named groups `task` currently renders in, or

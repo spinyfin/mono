@@ -89,6 +89,7 @@ impl ExecutionCoordinator {
             dispatch_paused_since_epoch_s: AtomicU64::new(0),
             dispatch_pause_exempts_reviews: AtomicBool::new(false),
             dispatch_paused_reason: std::sync::Mutex::new(None),
+            dispatch_pause_bypass_execution_ids: std::sync::Mutex::new(HashSet::new()),
             dispatch_preflight_block_reason: std::sync::Mutex::new(None),
             automation_paused: AtomicBool::new(false),
             automation_paused_since_epoch_s: AtomicU64::new(0),

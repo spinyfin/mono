@@ -275,6 +275,8 @@ extension ChatViewModel {
             // Batch bookkeeping and its timing log are private to
             // ChatViewModel.swift, alongside `refreshDesignDocStates`.
             applyResolvedProjectDesignDoc(output)
+        case .dispatchAdmissionEvaluated(let admission):
+            handleDispatchAdmissionEvaluated(admission)
         case .productDesignDocsList(let productID, let state):
             applyProductDesignDocsList(productID: productID, state: state)
         case .productDesignDocContent(let ref, let content):

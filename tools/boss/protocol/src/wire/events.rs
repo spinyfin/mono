@@ -109,6 +109,10 @@ pub enum FrontendEvent {
     ExecutionRequested {
         execution: WorkExecution,
     },
+    /// Reply for [`FrontendRequest::EvaluateDispatchAdmission`].
+    DispatchAdmissionEvaluated {
+        admission: DispatchAdmission,
+    },
     /// Reply for [`FrontendRequest::TriggerPrReview`]. Carries the
     /// freshly-enqueued (or reused, if one was already queued) `pr_review`
     /// execution, the work item it targets, and the PR URL under review.

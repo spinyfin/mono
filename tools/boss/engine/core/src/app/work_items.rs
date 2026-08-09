@@ -392,7 +392,22 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
     let FrontendRequest::UpdateWorkItem { id, patch } = req else {
         unreachable!()
     };
-    apply_work_item_patch(ctx, id, patch).await;
+    apply_work_item_patch(ctx, id, patch, None).await;
+}
+
+/// Confirmed pause-only override state carried from a `MoveWorkItemOnBoard`
+/// app-drag into [`apply_work_item_patch`]'s dispatch step. `None` from
+/// every other caller — an explicit `UpdateWorkItem`, and the drop's own
+/// non-active-transition resolutions (`ClearAutostart`) — since those
+/// never request execution with a bypass, so the ordinary
+/// `RequestExecution` path always runs for them regardless of this type's
+/// existence. Entry-point is always `app_drag`: [`MoveWorkItemOnBoard`] is
+/// the drag-only RPC, so it never needs to carry the enum on the wire.
+///
+/// [`MoveWorkItemOnBoard`]: boss_protocol::FrontendRequest::MoveWorkItemOnBoard
+#[derive(Debug, Clone, Copy)]
+struct BoardDragPauseBypass {
+    observed_pause_since_epoch_s: Option<u64>,
 }
 
 /// A kanban drag landed on the board. Resolve what the drop *meant* against
@@ -413,7 +428,13 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
 /// on a terminal move, auto-dispatch into Doing, the gated-`blocked`
 /// refusal) behaves identically whichever way the status was chosen.
 pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendRequest) {
-    let FrontendRequest::MoveWorkItemOnBoard { id, target } = req else {
+    let FrontendRequest::MoveWorkItemOnBoard {
+        id,
+        target,
+        bypass_dispatch_pause,
+        observed_pause_since_epoch_s,
+    } = req
+    else {
         unreachable!()
     };
     let row = match board_row_for_id(&ctx.work_db, &id) {
@@ -456,12 +477,42 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
             }
         }
         DropResolution::SetStatus(status) => {
+            if bypass_dispatch_pause {
+                // Pre-check before the status patch ever applies, so a
+                // refusal here means the card genuinely never moved — the
+                // "bounce the card back" behavior — rather than needing to
+                // revert a status flip after the fact. Uses the exact same
+                // `pause_bypass_decision` the mutating dispatch step below
+                // re-checks authoritatively, so this can never promise
+                // something that step doesn't also honor; the only gap is
+                // the ordinary TOCTOU window between the two checks, which
+                // the mutating step's own no-residue handling covers.
+                let admission = match ctx
+                    .server_state
+                    .execution_coordinator
+                    .evaluate_dispatch_admission(&id)
+                    .await
+                {
+                    Ok(admission) => admission,
+                    Err(err) => {
+                        send_work_error(&ctx.sink, &ctx.request_id, err);
+                        return;
+                    }
+                };
+                if let Err(reason) = pause_bypass_decision(&admission, observed_pause_since_epoch_s) {
+                    send_work_error(&ctx.sink, &ctx.request_id, format!("cannot start {id}: {reason}"));
+                    return;
+                }
+            }
             let patch = WorkItemPatch::builder().status(status.as_str()).build();
-            apply_work_item_patch(ctx, id, patch).await;
+            let pause_bypass = bypass_dispatch_pause.then_some(BoardDragPauseBypass {
+                observed_pause_since_epoch_s,
+            });
+            apply_work_item_patch(ctx, id, patch, pause_bypass).await;
         }
         DropResolution::ClearAutostart => {
             let patch = WorkItemPatch::builder().autostart(false).build();
-            apply_work_item_patch(ctx, id, patch).await;
+            apply_work_item_patch(ctx, id, patch, None).await;
         }
         DropResolution::Refused { message } => {
             let err = anyhow!(message);
@@ -491,7 +542,12 @@ fn board_row_for_id(work_db: &WorkDb, id: &str) -> Result<BoardRow> {
 /// [`handle_update_work_item`] (an explicit status/field edit) and
 /// [`handle_move_work_item_on_board`] (a drag whose meaning the engine just
 /// resolved).
-async fn apply_work_item_patch(ctx: Dispatch, id: String, patch: WorkItemPatch) {
+async fn apply_work_item_patch(
+    ctx: Dispatch,
+    id: String,
+    patch: WorkItemPatch,
+    pause_bypass: Option<BoardDragPauseBypass>,
+) {
     let Dispatch {
         server_state,
         work_db,
@@ -683,6 +739,28 @@ async fn apply_work_item_patch(ctx: Dispatch, id: String, patch: WorkItemPatch) 
                                     .to_owned(),
                             ),
                         )
+                    } else if needs_dispatch && let Some(bypass) = pause_bypass {
+                        // Pre-checked in `handle_move_work_item_on_board`
+                        // before this patch ever applied — this is the
+                        // authoritative re-check per the design's
+                        // pause-generation race handling, using the same
+                        // `RequestExecutionInput::bypass_dispatch_pause`
+                        // seam `bossctl work start --force` drives.
+                        let coordinator = server_state.execution_coordinator.clone();
+                        let live_states = server_state.live_worker_states.clone();
+                        let dispatch_input = RequestExecutionInput::builder()
+                            .work_item_id(work_item_id_for_event.clone())
+                            .bypass_dispatch_pause(true)
+                            .entry_point(DispatchAdmissionEntryPoint::AppDrag)
+                            .maybe_observed_pause_since_epoch_s(bypass.observed_pause_since_epoch_s)
+                            .build();
+                        match coordinator
+                            .dispatch_with_pause_bypass(dispatch_input, live_states)
+                            .await
+                        {
+                            Ok(execution) => (Some(execution.id), true, None),
+                            Err(err) => (None, false, Some(format!("{err:#}"))),
+                        }
                     } else if needs_dispatch {
                         let live_states = server_state.live_worker_states.clone();
                         let dispatch_input = RequestExecutionInput::builder()
