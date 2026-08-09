@@ -323,8 +323,12 @@ impl WorkerCompletionHandler {
             self.background_children_tracker.forget(execution_id);
             return None;
         }
+        // Accept any live post-Stop status. Pane-spawned workers park in
+        // `Running` (`RunWaitState::WorkerPaneAlive`), not `WaitingHuman`;
+        // restricting recheck to `WaitingHuman` alone dropped every intent
+        // on the first recurring sweep (CI: `engine_lib_test` shards 1/9).
         let execution = match self.work_db.get_execution(execution_id) {
-            Ok(execution) if execution.status == ExecutionStatus::WaitingHuman => execution,
+            Ok(execution) if execution.status.is_live() => execution,
             Ok(_) => {
                 self.background_children_tracker.forget(execution_id);
                 return None;
