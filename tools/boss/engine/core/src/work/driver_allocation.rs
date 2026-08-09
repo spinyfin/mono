@@ -36,18 +36,19 @@
 //! This is deliberately expressed at the gate, not as a second hardcoded
 //! kind list here.
 //!
-//! Two things allocation still declines, neither of them a claim about
+//! **An execution whose driver is pinned by the pool it will run on** is
+//! decided before allocation ever runs (`pr_review`, `automation_triage`,
+//! and any execution whose work item came from an automation): those
+//! dispatch on
+//! [`crate::coordinator::pool_dispatch_policy_for_worker_id`]'s fixed
+//! driver, so `decide_execution_driver` records that pool driver with
+//! reason `pool` up front, rather than an allocation or a row/product pin.
+//! See [`decide_execution_driver`] for the full reasoning.
+//!
+//! One thing allocation itself still declines, and it is not a claim about
 //! capability:
 //!
 //! - **A row with an explicit pin** — see below.
-//! - **An execution whose driver is pinned by the pool it will run on** — its
-//!   decision records that pool driver with reason `pool`, rather than an
-//!   allocation or a row/product pin.
-//!   (`pr_review`, `automation_triage`, and any execution whose work item
-//!   came from an automation): those dispatch on
-//!   [`crate::coordinator::pool_dispatch_policy_for_worker_id`]'s fixed
-//!   driver, so an allocation would record a driver the worker never used.
-//!   See [`decide_execution_driver`] for the full reasoning.
 //!
 //! Assignment is a deterministic hash of the work item's own id placed on
 //! the split's `[0, 100)` bucket line — not a coin flip per dispatch
@@ -385,6 +386,29 @@ pub(crate) fn driver_clears_dispatch_gate(
 /// Precedence:
 /// 1. If the execution dispatches on a pool with a fixed driver, record that
 ///    pool driver. It overrides all row/product pins, matching dispatch.
+///    Pool-bound executions take precedence because recording a row pin
+///    would name a driver the worker never ran on. Two shapes:
+///    [`crate::coordinator::kind_always_dispatches_on_pool_driver`] covers
+///    `pr_review` and `automation_triage`; `tasks.source_automation_id`
+///    covers ordinary implementation work that came from an automation and
+///    therefore runs on the automation pool
+///    (`ClaudeCoordinator::execution_targets_automation_pool`). Both pools
+///    pin `pool_dispatch_policy_for_worker_id`'s driver, which overrides the
+///    row's. Their `pool` decision names the driver the worker actually ran
+///    on, matching what the events-socket resolver
+///    ([`crate::work::driver_lookup::WorkDb::get_execution_driver_slug`])
+///    independently returns for these kinds — see that function's doc.
+///
+///    **This is why PR review does not participate in the split.** It is a
+///    decision, not an omission: reviews dispatch on the review pool's fixed
+///    driver at a fixed strong model tier precisely so that who authored a
+///    change cannot determine who reviews it (see
+///    `pool_dispatch_policy_for_worker_id`'s doc). Putting reviews in the
+///    split would either be inert (spawn ignores the allocation) or, if the
+///    pool pin were removed to make it bite, would undo that independence
+///    and the reviewer-model choice with it. Reviews participating is a
+///    change to reviewer dispatch policy — one function, deliberately — not
+///    a change to allocation.
 /// 2. Otherwise the work item's own explicit `driver` column wins **when
 ///    that driver clears the capability gate for this execution kind**.
 /// 3. Otherwise the product's `default_driver` wins under the same gate
@@ -396,33 +420,6 @@ pub(crate) fn driver_clears_dispatch_gate(
 ///    instead of stalling at the spawn-time gate. Respecting a pin that
 ///    *does* clear the gate is also what makes the shipped default split
 ///    byte-for-byte behaviour-preserving for ordinary kinds.
-///    Pool-bound executions take precedence because recording a row pin
-///    would name a driver the worker never ran on. Two shapes:
-///    [`crate::coordinator::kind_always_dispatches_on_pool_driver`] covers
-///    `pr_review` and `automation_triage`; `tasks.source_automation_id`
-///    covers ordinary implementation work that came from an automation and
-///    therefore runs on the automation pool
-///    (`ClaudeCoordinator::execution_targets_automation_pool`). Both pools
-///    pin `pool_dispatch_policy_for_worker_id`'s driver, which overrides the
-///    row's. Their `pool` decision names the driver the worker actually ran
-///    on — and the events-socket resolver
-///    ([`crate::work::driver_lookup`]) would then decode that worker's hook
-///    payloads with the wrong driver's normaliser.
-///
-///    **This is why PR review does not participate in the split.** It is a
-///    decision, not an omission: reviews dispatch on the review pool's fixed
-///    driver at a fixed strong model tier precisely so that who authored a
-///    change cannot determine who reviews it (see
-///    `pool_dispatch_policy_for_worker_id`'s doc). Putting reviews in the
-///    split would either be inert (spawn ignores the allocation) or, if the
-///    pool pin were removed to make it bite, would undo that independence
-///    and the reviewer-model choice with it. Reviews participating is a
-///    change to reviewer dispatch policy — one function, deliberately — not
-///    a change to allocation. The events-socket resolver
-///    ([`crate::work::driver_lookup::WorkDb::get_execution_driver_slug`])
-///    mirrors the pool pin for these kinds so a reviewed row's live
-///    `tasks.driver` cannot select the wrong normaliser for the reviewer
-///    worker's hook stream.
 /// 4. Otherwise, place the work item's own id on the split's bucket line,
 ///    renormalised over exactly the drivers eligible for the row's
 ///    [`TaskKind`] ([`eligible_drivers_for`]).
@@ -465,11 +462,17 @@ pub(crate) fn decide_execution_driver(
     let task_kind_raw = row.task_kind;
     let task_kind: Result<TaskKind, _> = task_kind_raw.parse();
     let automation_sourced = row.source_automation_id.is_some_and(|id| !id.trim().is_empty());
-    if crate::coordinator::kind_always_dispatches_on_pool_driver(&kind) || automation_sourced {
-        // Pool dispatch overrides row/product pins. Persist its fixed driver
-        // rather than the pin, so this durable record always names the
-        // driver the worker actually runs on.
-        return Ok(DriverDecision::pool(crate::coordinator::REVIEWER_POOL_DRIVER));
+    // Pool dispatch overrides row/product pins. Persist its fixed driver
+    // rather than the pin, so this durable record always names the driver
+    // the worker actually runs on. Routed through the same named accessors
+    // `crate::work::driver_lookup`'s events-socket resolver uses, so there is
+    // one resolution point per pool-bound shape rather than a re-derived
+    // constant here.
+    if let Some(pool_driver) = crate::coordinator::pool_driver_slug_for_execution_kind(&kind) {
+        return Ok(DriverDecision::pool(pool_driver));
+    }
+    if automation_sourced {
+        return Ok(DriverDecision::pool(crate::coordinator::automation_pool_driver_slug()));
     }
     let pinned = row
         .explicit_driver

@@ -12,14 +12,34 @@
 
 use super::*;
 
+/// The columns [`WorkDb::get_execution_driver_slug`] reads to resolve an
+/// execution's driver: the two kinds it short-circuits pool dispatch on, the
+/// row/product pin, and the automation provenance that says the driver comes
+/// from a pool instead. A named row rather than a five-wide tuple so each
+/// column is read back by name at the point it is used.
+struct ExecutionDriverRow {
+    exec_kind_raw: String,
+    task_kind_raw: String,
+    task_driver: Option<String>,
+    product_default_driver: Option<String>,
+    source_automation_id: Option<String>,
+}
+
 impl WorkDb {
     /// Resolve the driver slug for `execution_id`'s worker, applying the
-    /// same precedence used at spawn time:
+    /// same precedence used at spawn time (mirrors
+    /// [`crate::work::driver_allocation::decide_execution_driver`]'s
+    /// precedence exactly, so the durable `pool` decision it records always
+    /// names the same driver this resolves):
     ///
-    /// 1. Pool-bound kinds (`pr_review`, `automation_triage`) →
-    ///    [`crate::coordinator::pool_driver_slug_for_execution_kind`]'s
-    ///    fixed driver (the review/automation pool pin), so a reviewed
-    ///    row's live `tasks.driver` cannot select the wrong normaliser.
+    /// 1. Pool-bound executions — `pr_review` / `automation_triage` via
+    ///    [`crate::coordinator::pool_driver_slug_for_execution_kind`], or any
+    ///    execution whose work item has a non-empty
+    ///    `tasks.source_automation_id` via
+    ///    [`crate::coordinator::automation_pool_driver_slug`] — resolve to
+    ///    the review/automation pool's fixed driver, so a reviewed or
+    ///    automation-sourced row's live `tasks.driver` cannot select the
+    ///    wrong normaliser.
     /// 2. A live pin (`tasks.driver`, then `products.default_driver`) that
     ///    clears the capability gate for this execution kind.
     /// 3. A recorded traffic-allocation decision.
@@ -49,18 +69,37 @@ impl WorkDb {
             // short-circuit to the pool driver before any row pin can win, and
             // a pin that fails the capability gate for this execution kind
             // must yield (same substitution the spawn path applies).
-            let row: Option<(String, String, Option<String>, Option<String>)> = conn
+            // `t.source_automation_id` is needed for the same reason: an
+            // automation-sourced ordinary implementation execution is
+            // pool-bound too (see `decide_execution_driver`), even though its
+            // `ExecutionKind` is not one of the two pool-bound kinds.
+            let row: Option<ExecutionDriverRow> = conn
                 .query_row(
-                    "SELECT e.kind, t.kind, t.driver, p.default_driver
+                    "SELECT e.kind, t.kind, t.driver, p.default_driver, t.source_automation_id
                        FROM work_executions e
                        JOIN tasks t ON t.id = e.work_item_id
                        LEFT JOIN products p ON p.id = t.product_id
                       WHERE e.id = ?1",
                     [execution_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| {
+                        Ok(ExecutionDriverRow {
+                            exec_kind_raw: row.get(0)?,
+                            task_kind_raw: row.get(1)?,
+                            task_driver: row.get(2)?,
+                            product_default_driver: row.get(3)?,
+                            source_automation_id: row.get(4)?,
+                        })
+                    },
                 )
                 .optional()?;
-            if let Some((exec_kind_raw, task_kind_raw, task_driver, product_default_driver)) = row {
+            if let Some(ExecutionDriverRow {
+                exec_kind_raw,
+                task_kind_raw,
+                task_driver,
+                product_default_driver,
+                source_automation_id,
+            }) = row
+            {
                 let exec_kind: ExecutionKind = exec_kind_raw.parse().map_err(|err| {
                     anyhow::anyhow!("execution {execution_id} has unrecognised kind {exec_kind_raw:?}: {err}")
                 })?;
@@ -72,6 +111,13 @@ impl WorkDb {
                 // worker's hook stream.
                 if let Some(pool_driver) = crate::coordinator::pool_driver_slug_for_execution_kind(&exec_kind) {
                     return Ok(Some(pool_driver.to_owned()));
+                }
+                // Automation-sourced ordinary implementation executions are
+                // pool-bound the same way, but by provenance rather than
+                // kind — mirrors `decide_execution_driver`'s
+                // `automation_sourced` branch.
+                if source_automation_id.is_some_and(|id| !id.trim().is_empty()) {
+                    return Ok(Some(crate::coordinator::automation_pool_driver_slug().to_owned()));
                 }
 
                 // Precedence: a LIVE explicit pin (`tasks.driver`, then

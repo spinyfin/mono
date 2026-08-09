@@ -298,6 +298,102 @@ fn pool_driver_backfill_corrects_old_review_decisions_idempotently() {
     assert_eq!(decision.reason, REASON_POOL);
 }
 
+/// A row whose `work_executions.driver` — the launch tuple that actually
+/// reached the spawned worker — names a driver other than the pool driver
+/// must be left alone by the backfill: overwriting it would replace a true
+/// record of what ran with a false one, which is the exact defect this
+/// migration exists to fix, in the opposite direction.
+#[test]
+fn pool_driver_backfill_leaves_a_contradicting_launch_record_alone() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, &product.id, "legacy reviewed chore on codex");
+    let review = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE execution_driver_decisions
+         SET driver = ?1, reason = ?2
+         WHERE execution_id = ?3",
+        params![DRIVER_SLUG_CODEX, REASON_EXPLICIT, &review.id],
+    )
+    .unwrap();
+    // The recorded launch tuple says this execution really did run on
+    // codex — a pre-pin-fix review, plausibly.
+    conn.execute(
+        "UPDATE work_executions SET driver = ?1 WHERE id = ?2",
+        params![DRIVER_SLUG_CODEX, &review.id],
+    )
+    .unwrap();
+    migrate_backfill_pool_driver_decisions(&conn).unwrap();
+    drop(conn);
+
+    let decision = db.get_execution_driver_decision(&review.id).unwrap().unwrap();
+    assert_eq!(
+        decision.driver.as_deref(),
+        Some(DRIVER_SLUG_CODEX),
+        "a decision contradicted by its own execution's recorded launch driver must not be overwritten",
+    );
+    assert_eq!(decision.reason, REASON_EXPLICIT);
+}
+
+/// A historical `chore_implementation` execution on an automation-sourced
+/// row is pool-bound by the same rule `decide_execution_driver` applies
+/// today (`tasks.source_automation_id`), even though its kind is not one of
+/// the two pool-bound kinds — the backfill must correct it too.
+#[test]
+fn pool_driver_backfill_corrects_automation_sourced_ordinary_executions() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, &product.id, "legacy automation-sourced chore");
+    let automation = db
+        .create_automation(boss_protocol::CreateAutomationInput {
+            product_id: product.id.clone(),
+            name: "Fix clippy".to_owned(),
+            repo_remote_url: None,
+            trigger: boss_protocol::AutomationTrigger::Schedule {
+                cron: "0 14 * * 1-5".to_owned(),
+                timezone: "America/Los_Angeles".to_owned(),
+            },
+            standing_instruction: "Fix any new clippy warnings.".to_owned(),
+            open_task_limit: 1,
+            catch_up_window_secs: None,
+            enabled: true,
+            created_via: None,
+        })
+        .unwrap();
+    let execution = create_ready_chore_execution(&db, &chore.id);
+    let conn = db.connect().unwrap();
+    // Backdate: this row is automation-sourced, but its decision was
+    // recorded before pool-bound automation-sourced rows were recognised.
+    conn.execute(
+        "UPDATE tasks SET source_automation_id = ?1 WHERE id = ?2",
+        params![&automation.id, &chore.id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE execution_driver_decisions
+         SET driver = ?1, reason = ?2
+         WHERE execution_id = ?3",
+        params![DRIVER_SLUG_CODEX, REASON_EXPLICIT, &execution.id],
+    )
+    .unwrap();
+    migrate_backfill_pool_driver_decisions(&conn).unwrap();
+    drop(conn);
+
+    let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+    assert_eq!(decision.driver.as_deref(), Some(DRIVER_SLUG_CLAUDE));
+    assert_eq!(decision.reason, REASON_POOL);
+}
+
 /// Conflict resolution and CI remediation ARE still allocated (unlike a
 /// review, they are not pool-pinned) but the capability gate restricts them
 /// to `claude`: `KindRequirements::for_kind` marks `CommandOutcomeObservation`
@@ -500,6 +596,61 @@ fn automation_sourced_rows_record_the_pool_driver() {
     let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
     assert_eq!(decision.driver.as_deref(), Some(DRIVER_SLUG_CLAUDE));
     assert_eq!(decision.reason, REASON_POOL);
+    assert_eq!(
+        db.get_execution_driver_slug(&execution.id).unwrap().as_deref(),
+        decision.driver.as_deref(),
+        "the events-socket resolver must agree with the recorded pool decision \
+         for an automation-sourced execution, even though its ExecutionKind \
+         is not itself pool-bound",
+    );
+}
+
+/// A live `tasks.driver = codex` pin on an automation-sourced row must not
+/// win at lookup: `decide_execution_driver` and `get_execution_driver_slug`
+/// must both short-circuit to the pool driver before either reads the pin.
+#[test]
+fn automation_sourced_rows_ignore_a_live_pin_at_lookup() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, &product.id, "automation-sourced pinned chore");
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            driver: Some(DRIVER_SLUG_CODEX.to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let automation = db
+        .create_automation(boss_protocol::CreateAutomationInput {
+            product_id: product.id.clone(),
+            name: "Fix clippy".to_owned(),
+            repo_remote_url: None,
+            trigger: boss_protocol::AutomationTrigger::Schedule {
+                cron: "0 14 * * 1-5".to_owned(),
+                timezone: "America/Los_Angeles".to_owned(),
+            },
+            standing_instruction: "Fix any new clippy warnings.".to_owned(),
+            open_task_limit: 1,
+            catch_up_window_secs: None,
+            enabled: true,
+            created_via: None,
+        })
+        .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE tasks SET source_automation_id = ?1 WHERE id = ?2",
+        params![&automation.id, &chore.id],
+    )
+    .unwrap();
+    drop(conn);
+
+    let execution = create_ready_chore_execution(&db, &chore.id);
+    assert_eq!(
+        db.get_execution_driver_slug(&execution.id).unwrap().as_deref(),
+        Some(DRIVER_SLUG_CLAUDE),
+        "a live codex pin on an automation-sourced row must not win at lookup",
+    );
 }
 
 /// A restricted eligible set holding no share at all is a loud failure, not

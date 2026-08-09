@@ -2677,21 +2677,48 @@ pub(crate) fn migrate_execution_driver_decisions_table(conn: &Connection) -> Res
 }
 
 /// Correct historical decisions for executions whose kind always dispatches
-/// on the review/automation pool. Earlier versions evaluated a row/product
-/// pin first and consequently persisted that pin as `explicit`, although the
-/// pool always ran the execution on Claude. The update is self-idempotent:
-/// once a row carries the pool's driver and reason it no longer matches.
+/// on the review/automation pool, plus ordinary implementation executions on
+/// automation-sourced work items — `decide_execution_driver` treats both
+/// shapes as pool-bound (see `driver_allocation::decide_execution_driver`,
+/// which this mirrors; the two pool-bound kinds are also the two `kind_*`
+/// arms `coordinator::kind_always_dispatches_on_pool_driver` matches `true`
+/// on — extend both together if a future kind joins them). Earlier versions
+/// evaluated a row/product pin first and consequently persisted that pin as
+/// `explicit`, although the pool always ran the execution on
+/// [`crate::coordinator::pool_driver_slug_for_execution_kind`]'s driver.
+///
+/// Only rewrites rows whose `work_executions.driver` — the launch tuple that
+/// actually reached the spawned worker, added by
+/// [`migrate_work_executions_launch_config`] — agrees with (or is silent on)
+/// the pool driver. A row whose recorded launch driver contradicts the pool
+/// driver is left untouched: it is evidence the execution really did run on
+/// a different driver (e.g. before the pool pin existed), and overwriting it
+/// would recreate the same class of false record this migration exists to
+/// fix, just in the opposite direction.
+///
+/// The update is self-idempotent: once a row carries the pool's driver and
+/// reason it no longer matches.
 pub(crate) fn migrate_backfill_pool_driver_decisions(conn: &Connection) -> Result<()> {
+    let pool_driver = crate::coordinator::pool_driver_slug_for_execution_kind(&ExecutionKind::PrReview)
+        .expect("pr_review is always pool-bound");
     conn.execute(
         "UPDATE execution_driver_decisions
-         SET driver = ?1, reason = 'pool', split_at_decision = NULL
-         WHERE (driver IS NOT ?1 OR reason <> 'pool' OR split_at_decision IS NOT NULL)
+         SET driver = ?1, reason = ?2, split_at_decision = NULL
+         WHERE (driver IS NOT ?1 OR reason <> ?2 OR split_at_decision IS NOT NULL)
            AND EXISTS (
                SELECT 1 FROM work_executions we
                WHERE we.id = execution_driver_decisions.execution_id
-                 AND we.kind IN ('pr_review', 'automation_triage')
+                 AND (we.driver IS NULL OR we.driver = ?1)
+                 AND (
+                     we.kind IN ('pr_review', 'automation_triage')
+                     OR EXISTS (
+                         SELECT 1 FROM tasks t
+                         WHERE t.id = we.work_item_id
+                           AND TRIM(COALESCE(t.source_automation_id, '')) <> ''
+                     )
+                 )
            )",
-        params![crate::coordinator::REVIEWER_POOL_DRIVER],
+        params![pool_driver, crate::work::driver_allocation::REASON_POOL],
     )?;
     Ok(())
 }

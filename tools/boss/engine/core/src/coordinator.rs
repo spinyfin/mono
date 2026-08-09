@@ -1492,7 +1492,7 @@ pub fn slot_id_from_worker_id(worker_id: &str) -> Option<u8> {
 /// so the reason is legible at every call site: reviews stay on Opus, and
 /// Opus is a Claude model, so the reviewer driver is Claude — never inherited
 /// from (and never varying with) the row under review.
-pub(crate) const REVIEWER_POOL_DRIVER: &str = "claude";
+const REVIEWER_POOL_DRIVER: &str = "claude";
 
 /// Driver + model-tier dispatch policy for a pool-level worker
 /// (review or automation).
@@ -1553,8 +1553,8 @@ pub fn pool_dispatch_policy_for_worker_id(worker_id: &str) -> Option<PoolDispatc
 /// The companion of that function for callers that have a kind but no worker
 /// id yet — chiefly [`crate::work::driver_allocation`], which decides a
 /// row's driver when its execution row is created, long before a pool slot
-/// is claimed. Traffic allocation must decline these executions for exactly
-/// the reason it declines a row with an explicit `--driver`: their driver is
+/// is claimed. Traffic allocation records the pool's fixed driver for these
+/// executions (reason `pool`) rather than allocating them: their driver is
 /// already decided elsewhere, so an allocation would be a decision record
 /// that does not describe where the worker actually ran.
 ///
@@ -1565,6 +1565,11 @@ pub fn pool_dispatch_policy_for_worker_id(worker_id: &str) -> Option<PoolDispatc
 /// (`ClaudeCoordinator::execution_targets_automation_pool`); that half
 /// cannot be decided from the kind and is checked against
 /// `tasks.source_automation_id` at the allocation site.
+///
+/// Also a second site to update if a future kind joins the pool-bound set:
+/// [`crate::work::migrations_b::migrate_backfill_pool_driver_decisions`]
+/// hardcodes the same `pr_review` / `automation_triage` kind list in SQL, and
+/// has no way to build it from this function's match arms.
 pub fn kind_always_dispatches_on_pool_driver(kind: &ExecutionKind) -> bool {
     match kind {
         ExecutionKind::PrReview | ExecutionKind::AutomationTriage => true,
@@ -1592,6 +1597,17 @@ pub fn kind_always_dispatches_on_pool_driver(kind: &ExecutionKind) -> bool {
 /// cannot select the wrong normaliser for the reviewer worker's hook stream.
 pub fn pool_driver_slug_for_execution_kind(kind: &ExecutionKind) -> Option<&'static str> {
     kind_always_dispatches_on_pool_driver(kind).then_some(REVIEWER_POOL_DRIVER)
+}
+
+/// Driver slug an automation-sourced execution dispatches on — the
+/// companion of [`pool_driver_slug_for_execution_kind`] for the other
+/// pool-bound shape, which is decided from `tasks.source_automation_id`
+/// rather than from the execution's own [`ExecutionKind`] and so cannot be
+/// looked up through that function. Same fixed driver
+/// ([`REVIEWER_POOL_DRIVER`]): the automation pool pins it exactly like the
+/// review pool (see [`pool_dispatch_policy_for_worker_id`]).
+pub(crate) fn automation_pool_driver_slug() -> &'static str {
+    REVIEWER_POOL_DRIVER
 }
 
 /// Derive the canonical worker-id string for a pane slot id.
