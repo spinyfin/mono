@@ -18,7 +18,11 @@ struct CommentPopover: View {
             Text("New Comment")
                 .font(.headline)
 
-            CommentTextEditor(text: $commentBody, onSubmit: submit)
+            CommentTextEditor(
+                text: $commentBody,
+                onSubmit: submit,
+                onTextViewCreated: layer.setCommentTextView
+            )
                 .frame(minHeight: 80, maxHeight: 160)
                 .overlay(
                     RoundedRectangle(cornerRadius: 6)

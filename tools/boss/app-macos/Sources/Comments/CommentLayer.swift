@@ -71,6 +71,9 @@ final class CommentLayer: NSObject, ObservableObject {
     /// Text that precedes the selection in the Textual NSTextInteractionView path,
     /// captured at mouseUp. Used to count prior occurrences of the quoted text.
     private var anchorTextBeforeSelection: String? = nil
+    /// The comment form's explicitly-designated typing target. Keeping this separate
+    /// from `anchorTextView` avoids relying on the hosting view's subview order.
+    private weak var commentTextView: NSTextView?
 
     /// The engine's `[Revise]`-banner summary, fetched via `CommentsBannerState`
     /// alongside every `reload()`. `nil` until the first fetch lands, or always
@@ -279,6 +282,7 @@ final class CommentLayer: NSObject, ObservableObject {
         pendingQuotedText = captureCurrentSelection() ?? ""
         pendingOccurrenceIndex = computeOccurrenceIndex(for: pendingQuotedText)
         pendingFirstChar = firstChar
+        commentTextView = nil
 
         guard let (posRect, posView) = resolveAnchor() else {
             anchorLog.error("requestNewComment: resolveAnchor returned nil — popover not shown")
@@ -301,6 +305,12 @@ final class CommentLayer: NSObject, ObservableObject {
         isShowingPopover = true
 
         popover.show(relativeTo: posRect, of: posView, preferredEdge: .maxY)
+    }
+
+    /// Registers the comment form's text view as the target to focus once the popover
+    /// has completed its key-window transition.
+    func setCommentTextView(_ textView: NSTextView) {
+        commentTextView = textView
     }
 
     func addComment(quoted: String, body: String) {
@@ -979,6 +989,21 @@ final class CommentLayer: NSObject, ObservableObject {
 // MARK: - NSPopoverDelegate
 
 extension CommentLayer: NSPopoverDelegate {
+    /// Grabs first responder for the comment text view. This must happen here rather than
+    /// in the view's own setup: AppKit runs the popover's key-window transition
+    /// asynchronously after `NSPopover.show(...)` returns, and that transition resets first
+    /// responder to the popover's default, so any earlier claim is discarded.
+    /// `popoverDidShow` fires after the transition, so the claim sticks.
+    nonisolated func popoverDidShow(_ notification: Notification) {
+        MainActor.assumeIsolated {
+            guard let contentView = activePopover?.contentViewController?.view,
+                  let window = contentView.window,
+                  let textView = commentTextView
+            else { return }
+            window.makeFirstResponder(textView)
+        }
+    }
+
     /// Called by AppKit when the popover finishes closing, whether by user dismissal or
     /// programmatic close. Resets authoring state. The extension lives in the same file
     /// so it can access private members directly.
@@ -990,6 +1015,7 @@ extension CommentLayer: NSPopoverDelegate {
             self.pendingQuotedText = ""
             self.pendingOccurrenceIndex = 0
             self.activePopover = nil
+            self.commentTextView = nil
             self.anchorInteractionScreenPoint = nil
             self.anchorInteractionView = nil
             self.anchorTextBeforeSelection = nil
