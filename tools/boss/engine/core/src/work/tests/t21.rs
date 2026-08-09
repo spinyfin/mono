@@ -107,6 +107,61 @@ fn mark_chore_pr_closed_unmerged_advances_in_review_to_done() {
     assert_eq!(task_status(&db, &chore_id), "done", "the transition must be durable");
 }
 
+/// Twin of `mark_chore_pr_merged_clears_stale_merge_queue_state` (t03): a PR
+/// that closes unmerged while still enqueued must not leave the Merging-lane
+/// columns behind on the `done` row.
+///
+/// This was a real asymmetry — the merged path cleared them, this one did
+/// not. `update_pr_poll_state` (the only other writer) is skipped once the PR
+/// stops being `Open`, and for a `trunk_queue` product it would not recompute
+/// them anyway (`preserve_merge_queue_state`), so nothing else would ever fix
+/// the row: a closed-unmerged trunk card retired to `done` still carrying
+/// `queued`, and the client's `isInMergingSection` kept routing it into the
+/// kanban's "Merging" section forever.
+#[test]
+fn mark_chore_pr_closed_unmerged_clears_stale_merge_queue_state() {
+    let db = WorkDb::open(temp_db_path("closed-clears-queue-state")).unwrap();
+    let product_id = make_revision_product(&db, "closed-queue-state");
+    let pr_url = "https://github.com/spinyfin/mono/pull/4012";
+    let chore_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    db.update_task_pr_poll_state(
+        &chore_id,
+        PrPollStateInput {
+            ci_required_state: "success",
+            review_required_state: "approved",
+            merge_queue_state: Some("queued"),
+            merge_queue_detail: Some(r#"{"source":"trunk","state":"testing","section_order":1}"#),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let returned = db.mark_chore_pr_closed_unmerged(&chore_id, pr_url).unwrap();
+    assert_eq!(
+        returned.expect("the close must transition the chore").status,
+        TaskStatus::Done,
+    );
+
+    let (state, detail): (Option<String>, Option<String>) = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT merge_queue_state, merge_queue_detail FROM tasks WHERE id = ?1",
+            params![chore_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(
+        state.is_none(),
+        "merge_queue_state must be cleared when the PR closes unmerged, not left stale"
+    );
+    assert!(
+        detail.is_none(),
+        "merge_queue_detail must be cleared alongside merge_queue_state"
+    );
+}
+
 /// Idempotent for a late-arriving close event: a chore already terminal is a
 /// no-op returning `None`.
 #[test]

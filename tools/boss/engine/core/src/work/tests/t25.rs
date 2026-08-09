@@ -31,6 +31,36 @@ fn seed_pending_remediation(db: &WorkDb, product_id: &str, work_item_id: &str, h
     .id
 }
 
+/// Same as [`seed_pending_remediation`] but with a caller-chosen
+/// `failure_kind`, so a test can plant a queue-side row
+/// (`trunk_queue_eviction` / `merge_queue_rebounce`) alongside an ordinary
+/// `pr_branch_ci` one.
+fn seed_pending_remediation_with_kind(
+    db: &WorkDb,
+    product_id: &str,
+    work_item_id: &str,
+    head_sha: &str,
+    failure_kind: &str,
+) -> String {
+    db.insert_ci_remediation(
+        CiRemediationInsertInput::builder()
+            .product_id(product_id)
+            .work_item_id(work_item_id)
+            .pr_url("https://github.com/spinyfin/mono/pull/1")
+            .pr_number(1)
+            .head_branch("feature")
+            .head_sha_at_trigger(head_sha)
+            .attempt_kind("fix")
+            .consumes_budget(1)
+            .failed_checks("[]")
+            .failure_kind(failure_kind)
+            .build(),
+    )
+    .unwrap()
+    .expect("insert must land a pending remediation")
+    .id
+}
+
 /// Create a product and return its id. The crate has no public "get one
 /// remediation" method, so each test observes state through the mutator's
 /// return value — the freshly re-read `CiRemediation` row — rather than
@@ -172,8 +202,9 @@ fn mark_ci_remediation_abandoned_no_ops_on_terminal_and_unknown() {
 // ── abandon_active_ci_remediations_for_work_item ────────────────────────────
 
 /// Happy path: every non-terminal (`pending`/`running`) attempt for the work
-/// item flips to `abandoned` with `failure_reason='pr_merged'` in one shot; the
-/// return count matches the number flipped.
+/// item flips to `abandoned` with the caller's `failure_reason` in one shot,
+/// and the returned rows are exactly the ones flipped — the caller needs them
+/// to close the revisions those attempts spawned.
 #[test]
 fn abandon_active_for_work_item_retires_all_non_terminal_attempts() {
     let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
@@ -187,8 +218,19 @@ fn abandon_active_for_work_item_retires_all_non_terminal_attempts() {
         .unwrap()
         .expect("second attempt is running");
 
-    let count = db.abandon_active_ci_remediations_for_work_item(&chore).unwrap();
-    assert_eq!(count, 2, "both the pending and running attempts are retired");
+    let abandoned = db
+        .abandon_active_ci_remediations_for_work_item(&chore, "pr_merged", true)
+        .unwrap();
+    assert_eq!(abandoned.len(), 2, "both the pending and running attempts are retired");
+    let mut returned: Vec<&str> = abandoned.iter().map(|row| row.id.as_str()).collect();
+    returned.sort_unstable();
+    let mut expected = [pending.as_str(), running.as_str()];
+    expected.sort_unstable();
+    assert_eq!(returned, expected, "every abandoned row must come back to the caller");
+    for row in &abandoned {
+        assert_eq!(row.status, "abandoned");
+        assert_eq!(row.failure_reason.as_deref(), Some("pr_merged"));
+    }
 
     // Both rows are now terminal with the merge reason — re-abandon no-ops.
     for id in [&pending, &running] {
@@ -216,8 +258,13 @@ fn abandon_active_for_work_item_skips_terminal_and_other_work_items() {
     // A sibling work item has a live pending attempt that must survive.
     let sibling = seed_pending_remediation(&db, &product, &other, "sha-scope-2");
 
-    let count = db.abandon_active_ci_remediations_for_work_item(&target).unwrap();
-    assert_eq!(count, 0, "no active attempts on the target → nothing retired");
+    let abandoned = db
+        .abandon_active_ci_remediations_for_work_item(&target, "superseded_by_resolved_ci", true)
+        .unwrap();
+    assert!(
+        abandoned.is_empty(),
+        "no active attempts on the target → nothing retired"
+    );
 
     // The sibling's attempt is still active: it can be flipped to running.
     let still_active = db
@@ -226,6 +273,54 @@ fn abandon_active_for_work_item_skips_terminal_and_other_work_items() {
     assert!(
         still_active.is_some(),
         "the other work item's attempt must be untouched and still non-terminal"
+    );
+}
+
+/// `include_queue_side = false` must leave a queue-side row
+/// (`trunk_queue_eviction` / `merge_queue_rebounce`) untouched — a green
+/// head-branch CI probe is not evidence a queue-side failure is resolved,
+/// since that failure lived on the queue's synthetic commit, not the PR
+/// head. `include_queue_side = true` (the `pr_merged` caller, or the
+/// back-to-back-eviction case in `ci_watch::on_ci_resolved`) sweeps it too.
+#[test]
+fn abandon_active_for_work_item_respects_queue_side_gate() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product = make_product(&db, "cir-abandon-queue-side");
+    let chore = create_test_chore(&db, product.clone(), "abandon-queue-side").id;
+
+    let ordinary = seed_pending_remediation(&db, &product, &chore, "sha-qs-1");
+    let eviction = seed_pending_remediation_with_kind(&db, &product, &chore, "sha-qs-2", "trunk_queue_eviction");
+    let rebounce = seed_pending_remediation_with_kind(&db, &product, &chore, "sha-qs-3", "merge_queue_rebounce");
+
+    let abandoned = db
+        .abandon_active_ci_remediations_for_work_item(&chore, "superseded_by_resolved_ci", false)
+        .unwrap();
+    assert_eq!(
+        abandoned.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        vec![ordinary.as_str()],
+        "only the non-queue-side row is swept when include_queue_side is false"
+    );
+
+    // Both queue-side rows are still active and can be flipped to running.
+    for id in [&eviction, &rebounce] {
+        let still_active = db.mark_ci_remediation_running(id, "lease", "ws", "worker").unwrap();
+        assert!(
+            still_active.is_some(),
+            "queue-side attempt {id} must survive the non-queue-side sweep"
+        );
+    }
+
+    // include_queue_side = true sweeps everything still active, queue-side included.
+    let swept_all = db
+        .abandon_active_ci_remediations_for_work_item(&chore, "pr_merged", true)
+        .unwrap();
+    let mut swept_ids: Vec<&str> = swept_all.iter().map(|row| row.id.as_str()).collect();
+    swept_ids.sort_unstable();
+    let mut expected = [eviction.as_str(), rebounce.as_str()];
+    expected.sort_unstable();
+    assert_eq!(
+        swept_ids, expected,
+        "include_queue_side = true sweeps the queue-side rows too"
     );
 }
 

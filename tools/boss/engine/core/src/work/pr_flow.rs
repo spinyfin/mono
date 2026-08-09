@@ -936,6 +936,16 @@ impl WorkDb {
             return Ok(None);
         }
         let now = now_string();
+        // `merge_queue_state` / `merge_queue_detail` are cleared for exactly
+        // the reason the merged twin above clears them, and the omission here
+        // was a real gap: `update_pr_poll_state` only runs for `Open` PRs, so
+        // a PR that closes unmerged while enqueued keeps whatever queue state
+        // it carried at close time forever. For a `trunk_queue` product that
+        // is permanent — `preserve_merge_queue_state` deliberately stops the
+        // GitHub sweep from recomputing these columns, so nothing else would
+        // ever correct them — leaving a `done` row that the client's
+        // `isInMergingSection` (see `Models.swift`) still routes into the
+        // kanban's "Merging" section.
         tx.execute(
             "UPDATE tasks
              SET status             = 'done',
@@ -943,6 +953,8 @@ impl WorkDb {
                  last_status_actor  = 'engine',
                  blocked_reason     = NULL,
                  blocked_attempt_id = NULL,
+                 merge_queue_state  = NULL,
+                 merge_queue_detail = NULL,
                  completed_at       = COALESCE(completed_at, ?3)
              WHERE id = ?1
                AND pr_url = ?2",

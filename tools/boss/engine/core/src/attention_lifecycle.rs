@@ -393,6 +393,13 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         "Records a failed merge. The PR is still unmerged until someone acts.",
     ),
     entry(
+        crate::trunk_queue_poller::TRUNK_QUEUE_RESUBMIT_STALLED_ATTENTION_KIND,
+        ClearedBy::HumanDecision,
+        "The PR is out of the merge queue with nothing left running that would put it back. \
+         Re-submitting is a merge click, which is a human decision — and a later run of some \
+         unrelated work item is not evidence that this PR re-entered the queue.",
+    ),
+    entry(
         EXTERNAL_TRACKER_REMOVED_UPSTREAM_ATTENTION_KIND,
         ClearedBy::HumanDecision,
         "The upstream issue is gone; whether the Boss row should follow it is a human call.",
@@ -548,6 +555,7 @@ mod tests {
             crate::trunk_queue_poller::TRUNK_QUEUE_NOT_RUNNING_ATTENTION_KIND,
             crate::trunk_queue_poller::TRUNK_QUEUE_ENTRY_CANCELLED_ATTENTION_KIND,
             crate::trunk_queue_poller::TRUNK_QUEUE_MERGE_FAILURE_ATTENTION_KIND,
+            crate::trunk_queue_poller::TRUNK_QUEUE_RESUBMIT_STALLED_ATTENTION_KIND,
             REPO_UNRESOLVED_ATTENTION_KIND,
             REVISION_ARCHIVED_ATTENTION_KIND,
             FOLLOWUP_ATTENTION_KIND,

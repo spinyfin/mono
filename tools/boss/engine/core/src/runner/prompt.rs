@@ -2143,11 +2143,16 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
              >   build ran on Trunk's ephemeral `trunk-merge/pr-<N>/<uuid>` construction branch,\n\
              >   listed under \"Failing required checks\" below with its build URL and job id.\n\
              > - Root cause: something landed on the target branch between this PR's CI run and its\n\
-             >   queue turn that is semantically incompatible. After fixing and pushing, just push and\n\
-             >   stop — Boss auto-resubmits the PR to the Trunk queue on the next poller pass once this\n\
-             >   revision reaches `done`. Do NOT ask a human to re-run the merge, do NOT comment\n\
-             >   `/trunk merge` yourself, and do NOT run `gh pr merge` — that bypasses the queue and\n\
-             >   races the automatic resubmit.\n\n",
+             >   queue turn that is semantically incompatible. After fixing, just push and stop —\n\
+             >   Boss auto-resubmits the PR to the Trunk queue on the next poller pass, once this\n\
+             >   revision comes to rest and the PR's head CI reads green. Do NOT ask a human to\n\
+             >   re-run the merge, do NOT comment `/trunk merge` yourself, and do NOT run\n\
+             >   `gh pr merge` — that bypasses the queue and races the automatic resubmit.\n\
+             > - **You must push a commit.** The engine refuses every \"nothing to push\" terminal for\n\
+             >   a queue-side failure — the flake/infra re-run marker, the already-green claim, and\n\
+             >   the rebase-fixed-it claim are all rejected — because the PR's head CI is green\n\
+             >   already and so proves nothing about the construction-branch build. Push a fix, or\n\
+             >   call `boss engine ci mark-failed` if there is genuinely nothing to fix from this PR.\n\n",
         );
     } else {
         out.push_str(&format!(
@@ -2457,10 +2462,34 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
         }
         out.push_str(
             "1. Classify the failure with `boss engine ci classify --attempt-id <attempt-id> --class <tractable|flaky_or_infra|unfixable>`.\n   \
-                - `tractable` → there's a clear code change that resolves it. Make it. Push.\n   \
-                - `flaky_or_infra` → the failure is environmental. Pivot to the retrigger playbook \
-                (re-run the failing build via the provider CLI and call `mark-retriggered`).\n   \
-                - `unfixable` → the failure is real and out of scope. Call \
+                - `tractable` → there's a clear code change that resolves it. Make it. Push.\n   ",
+        );
+        // `flaky_or_infra` on a queue-side failure must NOT steer the worker
+        // into `mark-retriggered`: that verb is terminal, the engine now
+        // rejects it for a queue-side `failure_kind`, and following the old
+        // wording is exactly what stranded a real PR out of the Trunk queue
+        // for 50 hours (no push, attempt terminal, no resubmit sentinel).
+        // Re-running the failing build is still the right diagnosis — the
+        // *delivery* is a push, because a resubmit is what actually re-runs
+        // the construction build, and only a new head sha triggers one.
+        if is_queue_side_failure {
+            out.push_str(
+                "- `flaky_or_infra` → the failure is environmental. There is still no no-push exit: \
+                `mark-retriggered` is rejected for a queue-side failure (it is terminal and would \
+                strand the PR out of the queue). Re-running the queue's own build is what a resubmit \
+                does, and a resubmit needs a new head sha — so push something that re-triggers it \
+                (a rebase onto the current target branch is the usual minimum), or, if the infra \
+                failure is genuinely not addressable from this PR, call \
+                `boss engine ci mark-failed --attempt-id <attempt-id> --reason <reason>` and stop.\n   ",
+            );
+        } else {
+            out.push_str(
+                "- `flaky_or_infra` → the failure is environmental. Pivot to the retrigger playbook \
+                (re-run the failing build via the provider CLI and call `mark-retriggered`).\n   ",
+            );
+        }
+        out.push_str(
+            "- `unfixable` → the failure is real and out of scope. Call \
                 `boss engine ci mark-failed --attempt-id <attempt-id> --reason <reason>` \
                 and stop. Do NOT push.\n",
         );
@@ -2486,12 +2515,18 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
             );
         } else if is_trunk_eviction {
             out.push_str(
-                "**Step 3 — nothing further to do here.**\n\n\
-                 The Trunk queue does **not** auto-retry after an eviction, but Boss's own poller does: \
-                 once this revision reaches `done`, it auto-resubmits the PR to the Trunk queue on its \
-                 next pass. Push your fix and stop — do NOT ask a human to resubmit, do NOT comment \
-                 `/trunk merge` yourself, and do NOT run `gh pr merge`; either would race the automatic \
-                 resubmit.\n\n",
+                "**Step 3 — push, then stop.**\n\n\
+                 The Trunk queue does **not** auto-retry after an eviction, but Boss's own poller does. \
+                 The resubmit fires when two things are both true: this revision has come to rest \
+                 (its normal terminal is `in_review` — you do NOT need to get it to `done`, and on an \
+                 open PR it cannot reach `done`), and the merge-poller sees the PR's head CI green on \
+                 your new head sha. Then the poller calls `submitPullRequest` again on its next pass.\n\n\
+                 So: push your fix and stop — do NOT ask a human to resubmit, do NOT comment \
+                 `/trunk merge` yourself, and do NOT run `gh pr merge`; any of those would race the \
+                 automatic resubmit. **Do not exit without pushing**: with no new commit there is no \
+                 new head sha, nothing for the poller to observe, and the PR stays out of the queue. \
+                 If you truly cannot fix it here, call `boss engine ci mark-failed` so a human is \
+                 told, rather than stopping silently.\n\n",
             );
         }
     }

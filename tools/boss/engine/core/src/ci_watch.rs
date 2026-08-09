@@ -1990,6 +1990,51 @@ fn close_superseded_moot_revision(work_db: &WorkDb, work_item_id: &str, revision
     }
 }
 
+/// Whether the CI-fix revision `revision_task_id` spawned for a Trunk
+/// queue eviction has concluded, and so the PR may be auto-resubmitted to
+/// the queue.
+///
+/// "Concluded" is `in_review` or `done` — the two statuses a revision can
+/// come to rest in — and the distinction matters because only one of them
+/// is reachable while the parent PR is still open:
+///
+/// - `in_review` is the **normal** revision terminal. Every worker-completion
+///   path for a revision on an open PR lands here
+///   (`WorkerPrCompletionTarget::InReview` from `completion::stop`,
+///   `execution_started`, `metadata_gate`, `finalize_passes`). A revision
+///   does not own a PR of its own; it pushes onto the parent's branch and
+///   then rests.
+/// - `done` is reachable only *after* the parent PR merges or closes
+///   (`flip_in_review_revisions_to_done`, called from
+///   `mark_chore_pr_merged` / `mark_chore_pr_closed_unmerged`, and
+///   `WorkerPrCompletionTarget::Done`, reached only from
+///   `PrStatus::Merged`). Accepted here for completeness — by then the
+///   resubmit is moot and `mark_trunk_intent_awaiting_resubmit` will find no
+///   active intent — never as the sole trigger.
+///
+/// `archived` is deliberately excluded: an archived revision was withdrawn
+/// (moot/superseded), which is not evidence a fix landed. The eviction then
+/// stays unresolved and the queue poller's stalled-resubmit backstop raises
+/// it to a human rather than resubmitting an unfixed PR.
+fn trunk_eviction_fix_concluded(work_db: &WorkDb, revision_task_id: &str) -> bool {
+    match work_db.get_work_item(revision_task_id) {
+        // Both task-bearing variants, so the answer can never hinge on which
+        // one the mapper chose for a revision row.
+        Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => {
+            matches!(task.status, TaskStatus::InReview | TaskStatus::Done)
+        }
+        Ok(_) => false,
+        Err(err) => {
+            tracing::warn!(
+                revision_task_id,
+                ?err,
+                "ci_watch: failed to read the eviction fix revision; declining the auto-resubmit this pass",
+            );
+            false
+        }
+    }
+}
+
 /// Symmetric retire path: flip a `blocked: ci_failure` (or
 /// `ci_failure_exhausted`) row back to `in_review` when the probe
 /// says CI is green again. Returns `true` on transition.
@@ -2029,13 +2074,29 @@ pub async fn on_ci_resolved(
     // flip-flop loop where every sweep detects the failure and the next
     // probe clears it.
     //
-    // `trunk_queue_eviction` is the one exception, and only once its fix has
-    // genuinely landed: Trunk has no automatic retry, so Boss must
-    // auto-resubmit once the spawned revision reaches `done` — see
-    // `trunk_merge::mark_trunk_intent_awaiting_resubmit`, which the fall-
-    // through below calls. Gating on `done` (not merely on this sweep's
-    // `ci_clean`) is what prevents the flip-flop: right after eviction
-    // detection the revision is freshly spawned and not yet `done`, so this
+    // `trunk_queue_eviction` is the one exception, and only once its fix
+    // revision has genuinely concluded: Trunk has no automatic retry, so Boss
+    // must auto-resubmit — see `trunk_merge::mark_trunk_intent_awaiting_resubmit`,
+    // which the fall-through below calls.
+    //
+    // The gate is [`trunk_eviction_fix_concluded`]: the spawned CI-fix
+    // revision has reached a terminal state *it can actually reach while the
+    // parent PR is still open* — `in_review` (the normal revision terminal)
+    // or `done` (only when the parent PR has already merged/closed, at which
+    // point the resubmit is moot anyway). It deliberately does NOT require
+    // `done` alone: a revision on an open PR can never reach `done`, because
+    // every writer of that status (`flip_in_review_revisions_to_done`,
+    // `WorkerPrCompletionTarget::Done`) fires only once the parent PR is
+    // merged or closed. Requiring it made this resubmit depend on the very
+    // merge it exists to cause — a circular dependency that stranded a real
+    // PR out of the queue for 50 hours (mono#2673 follow-up). The conflict
+    // lane never had that bug: `conflict_watch::on_resolved` gates on
+    // GitHub reporting the PR mergeable again, a condition observable on an
+    // open PR, and this gate is now modelled on it.
+    //
+    // Gating on the revision's conclusion (not merely on this sweep's
+    // `ci_clean`) is still what prevents a flip-flop: right after eviction
+    // detection the revision is freshly spawned and `todo`/`active`, so this
     // check fails until the revision's own push-and-review cycle actually
     // concludes. `merge_queue_rebounce` (GitHub-native) has no such hook —
     // GitHub's own queue automatically re-tries an evicted-but-still-armed
@@ -2050,8 +2111,7 @@ pub async fn on_ci_resolved(
             && attempt
                 .as_ref()
                 .and_then(|a| a.revision_task_id.as_deref())
-                .and_then(|id| work_db.get_work_item(id).ok())
-                .is_some_and(|item| matches!(item, WorkItem::Task(t) if t.status == TaskStatus::Done));
+                .is_some_and(|id| trunk_eviction_fix_concluded(work_db, id));
         if !revision_landed {
             if let Some(active) = attempt.as_ref() {
                 record_declined_evaluation(candidate, active, None, "queue_failure_not_cleared_by_head_ci_clean");
@@ -2101,8 +2161,9 @@ pub async fn on_ci_resolved(
                 // Close the revision task this attempt spawned so a retired
                 // attempt never leaves a stale todo/active/blocked row
                 // behind — mirrors conflict_watch::on_resolved. No-op for
-                // the trunk-eviction case above: that revision already
-                // reached `done` before this branch was reachable.
+                // the trunk-eviction case above: that revision already came
+                // to rest at `in_review`/`done` before this branch was
+                // reachable, and `close_moot_revision_task` refuses both.
                 close_superseded_moot_revision(
                     work_db,
                     &candidate.work_item_id,
@@ -2134,6 +2195,58 @@ pub async fn on_ci_resolved(
                     "ci_watch: failed to mark ci_remediation succeeded",
                 );
             }
+        }
+    }
+
+    // CI is green for this work item's PR, so EVERY *non-queue-side* attempt
+    // still open against it is moot — not just the one
+    // `active_ci_remediation_for_work_item` happened to return. That read is
+    // `LIMIT 1` over `created_at DESC`, so an older `pending` row is
+    // invisible to it and, before this sweep existed, was retired by nothing
+    // at all: it outlived its episode, kept `sendListCiRemediations`
+    // re-arming the "ci failing" badge on every app restart, and its revision
+    // (if any) stayed dispatchable. Runs after the retire above so the
+    // selected attempt is already `succeeded` and this only catches the rows
+    // it masked.
+    //
+    // A queue-side row must NOT be swept on this evidence alone: head CI is
+    // green *by construction* when the failure lived on the queue's
+    // synthetic commit, so a green head-branch probe says nothing about
+    // whether the queue-side issue is resolved — the same invariant
+    // `is_queue_side_failure_kind` enforces above and in
+    // `on_ci_in_flight_supersedes_failure`. The one exception is when the
+    // attempt just retired above was itself queue-side (this function
+    // already required its fix revision to have concluded to get here) —
+    // the back-to-back-eviction case, where sweeping an older queue-side
+    // episode is correct because the newer episode's resolution supersedes
+    // it.
+    if attempt_transitioned {
+        let include_queue_side = is_queue_side_failure_kind(failure_kind);
+        match work_db.abandon_active_ci_remediations_for_work_item(
+            &candidate.work_item_id,
+            "superseded_by_resolved_ci",
+            include_queue_side,
+        ) {
+            Ok(masked) => {
+                for row in &masked {
+                    tracing::info!(
+                        work_item_id = %candidate.work_item_id,
+                        attempt_id = %row.id,
+                        "ci_watch: abandoned an older active attempt masked by the newest one; CI is green",
+                    );
+                    close_superseded_moot_revision(
+                        work_db,
+                        &candidate.work_item_id,
+                        row.revision_task_id.as_deref(),
+                        "an older CI remediation attempt was superseded; CI is green on the PR head",
+                    );
+                }
+            }
+            Err(err) => tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                ?err,
+                "ci_watch: failed to sweep older active ci_remediations after retire",
+            ),
         }
     }
 
@@ -2233,8 +2346,8 @@ pub async fn on_ci_resolved(
         }
     }
     if is_trunk_eviction && attempt_transitioned {
-        // The fix landed and this attempt just retired — tell the
-        // TrunkQueueProbe it's clear to resubmit (design §"Eviction: a
+        // The fix revision concluded, head CI is green, and this attempt just
+        // retired — tell the TrunkQueueProbe it's clear to resubmit (design §"Eviction: a
         // first-class failure signal", step 4). Scoped to the eviction
         // sub-state only: a conflict episode
         // (`TRUNK_INTENT_SUPERSEDED_BY_CONFLICT`) can be live on the same
@@ -2411,18 +2524,20 @@ pub async fn rescue_stranded_ci_remediation_attempt(
 /// re-set the "ci failing" badge on every app restart, even after the
 /// task is `done`.
 pub async fn on_pr_merged(work_db: &WorkDb, publisher: &dyn ExecutionPublisher, candidate: &PendingMergeCheck) {
-    let count = match work_db.abandon_active_ci_remediations_for_work_item(&candidate.work_item_id) {
-        Ok(n) => n,
-        Err(err) => {
-            tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                ?err,
-                "ci_watch: failed to abandon active ci_remediations on PR merge; badge may persist",
-            );
-            return;
-        }
-    };
+    let abandoned =
+        match work_db.abandon_active_ci_remediations_for_work_item(&candidate.work_item_id, "pr_merged", true) {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    ?err,
+                    "ci_watch: failed to abandon active ci_remediations on PR merge; badge may persist",
+                );
+                return;
+            }
+        };
+    let count = abandoned.len();
     if count > 0 {
         publisher
             .publish_frontend_event_on_product(
