@@ -1106,3 +1106,30 @@ fn resolve_pr_body_is_none_when_neither_flag_supplied() {
     assert_eq!(resolved.text, None);
     assert_eq!(resolved.file_path, None);
 }
+
+#[test]
+fn followup_pr_body_precedes_summary_for_review_findings() {
+    let context = crate::app::pr::FollowupPrContext {
+        kind: "review findings".to_owned(),
+        origin_pr_url: "https://github.com/spinyfin/mono/pull/2685".to_owned(),
+    };
+    let body = crate::app::pr::render_pr_body(Some("## Summary\n\nFix the finding."), Some(&context)).unwrap();
+
+    assert_eq!(
+        body,
+        "## Boss follow-up\n\nThis `review findings` follow-up derives from [the origin PR](https://github.com/spinyfin/mono/pull/2685).\n\n## Summary\n\nFix the finding."
+    );
+}
+
+#[test]
+fn followup_pr_body_covers_an_unlisted_derived_kind() {
+    let context = crate::app::pr::FollowupPrContext {
+        kind: "policy remediation".to_owned(),
+        origin_pr_url: "https://github.com/spinyfin/mono/pull/2710".to_owned(),
+    };
+    let body = crate::app::pr::render_pr_body(Some("## Summary\n\nApply the remediation."), Some(&context)).unwrap();
+
+    assert!(body.starts_with("## Boss follow-up\n\nThis `policy remediation` follow-up"));
+    assert!(body.contains("https://github.com/spinyfin/mono/pull/2710"));
+    assert!(body.find("## Boss follow-up").unwrap() < body.find("## Summary").unwrap());
+}

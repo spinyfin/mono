@@ -17,7 +17,7 @@ use crate::work::{WorkDb, WorkExecution, WorkItem};
 use boss_protocol::{ExecutionStatus, WorkItemBinding};
 
 use super::prompt::structured_output_env_vars;
-use super::work_item::{work_item_id, work_item_name, work_item_task_kind};
+use super::work_item::{followup_pr_environment_for_work_item, work_item_id, work_item_name, work_item_task_kind};
 use super::worker_spawn::{ComposedWorkerSpawn, WorkerSpawnOpts, compose_worker_spawn};
 use super::{ExecutionRunner, RunOutcome, RunWaitState, bound_events_socket_path};
 
@@ -934,6 +934,10 @@ impl ExecutionRunner for PaneSpawnRunner {
                 initial_input,
                 extra_env: {
                     let mut env = structured_output_env;
+                    env.extend(followup_pr_environment_for_work_item(
+                        work_item,
+                        &execution.repo_remote_url,
+                    )?);
                     if let Some(dir) = worker_bin_dir.as_ref() {
                         env.push((
                             boss_engine_worker_bin::WORKER_BIN_DIR_ENV.to_owned(),

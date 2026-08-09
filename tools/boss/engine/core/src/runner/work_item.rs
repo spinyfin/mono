@@ -1,8 +1,13 @@
 //! [`WorkItem`] accessor helpers: names, ids, task-kind, PR-URL binding, and
 //! canonical PR-URL extraction from free text.
 
+use anyhow::{Result, bail};
+
 use crate::work::{Project, Task, WorkItem};
 use boss_protocol::TaskKind;
+
+const FOLLOWUP_ORIGIN_PR_URL_ENV: &str = "BOSS_FOLLOWUP_ORIGIN_PR_URL";
+const FOLLOWUP_KIND_ENV: &str = "BOSS_FOLLOWUP_KIND";
 
 pub(crate) fn work_item_name(work_item: &WorkItem) -> &str {
     match work_item {
@@ -36,6 +41,51 @@ pub(crate) fn work_item_task_kind_enum(work_item: &WorkItem) -> Option<&TaskKind
     match work_item {
         WorkItem::Task(task) | WorkItem::Chore(task) => Some(&task.kind),
         WorkItem::Product(_) | WorkItem::Project(_) => None,
+    }
+}
+
+/// Resolve the engine-owned environment that makes `cube pr create` prepend
+/// a provenance header. This intentionally keys on durable origin provenance,
+/// not on execution kind: any future task kind that carries an origin PR gets
+/// the same behaviour without a new dispatch branch.
+///
+/// `followup` is the one task kind whose contract requires an origin PR. A
+/// missing number or an unparseable remote is therefore a dispatch error, not
+/// a reason to publish an unlinked PR.
+pub(crate) fn followup_pr_environment(
+    task_kind: &TaskKind,
+    origin_pr_number: Option<i64>,
+    repo_remote_url: &str,
+) -> Result<Vec<(String, String)>> {
+    let Some(pr_number) = origin_pr_number else {
+        if *task_kind == TaskKind::Followup {
+            bail!("followup task has no origin PR number; refusing to open an unlinked derived PR");
+        }
+        return Ok(Vec::new());
+    };
+    if pr_number <= 0 {
+        bail!("followup task has invalid origin PR number {pr_number}; refusing to open an unlinked derived PR");
+    }
+    let slug = crate::completion::parse_repo_slug(repo_remote_url)
+        .map_err(|err| anyhow::anyhow!("could not resolve origin PR URL for followup task: {err}"))?;
+    Ok(vec![
+        (
+            FOLLOWUP_ORIGIN_PR_URL_ENV.to_owned(),
+            format!("https://github.com/{slug}/pull/{pr_number}"),
+        ),
+        (FOLLOWUP_KIND_ENV.to_owned(), task_kind.as_str().to_owned()),
+    ])
+}
+
+pub(crate) fn followup_pr_environment_for_work_item(
+    work_item: &WorkItem,
+    repo_remote_url: &str,
+) -> Result<Vec<(String, String)>> {
+    match work_item {
+        WorkItem::Task(task) | WorkItem::Chore(task) => {
+            followup_pr_environment(&task.kind, task.origin_pr_number, repo_remote_url)
+        }
+        WorkItem::Product(_) | WorkItem::Project(_) => Ok(Vec::new()),
     }
 }
 
@@ -190,4 +240,39 @@ fn task_details(task: &Task) -> Option<String> {
         lines.push(format!("  - pr_url: {}", pr_url.trim()));
     }
     (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+#[cfg(test)]
+mod followup_pr_environment_tests {
+    use super::followup_pr_environment;
+    use boss_protocol::TaskKind;
+
+    #[test]
+    fn review_findings_followup_gets_a_full_origin_pr_url() {
+        let env = followup_pr_environment(&TaskKind::Followup, Some(2685), "git@github.com:spinyfin/mono.git").unwrap();
+        assert_eq!(
+            env,
+            vec![
+                (
+                    "BOSS_FOLLOWUP_ORIGIN_PR_URL".to_owned(),
+                    "https://github.com/spinyfin/mono/pull/2685".to_owned()
+                ),
+                ("BOSS_FOLLOWUP_KIND".to_owned(), "followup".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn unlisted_task_kind_with_origin_provenance_inherits_the_header() {
+        let env =
+            followup_pr_environment(&TaskKind::Chore, Some(2710), "https://github.com/spinyfin/mono.git").unwrap();
+        assert_eq!(env[0].1, "https://github.com/spinyfin/mono/pull/2710");
+        assert_eq!(env[1].1, "chore");
+    }
+
+    #[test]
+    fn followup_without_an_origin_fails_loudly() {
+        let error = followup_pr_environment(&TaskKind::Followup, None, "git@github.com:spinyfin/mono.git").unwrap_err();
+        assert!(error.to_string().contains("has no origin PR number"));
+    }
 }
