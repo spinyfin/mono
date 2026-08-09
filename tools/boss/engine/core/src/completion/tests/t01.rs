@@ -883,6 +883,315 @@ async fn recheck_for_pr_uses_staged_pr_url_and_skips_detector() {
     }
 }
 
+/// Case 1 regression (staged-URL recheck mid-turn reap): a live worker
+/// stages a PR URL mid-turn (`activity: Working` after `cube pr update`),
+/// then a merge-poller sweep runs immediately. The execution must **not**
+/// terminalize; the staged URL is retained for the worker's own Stop.
+#[tokio::test]
+async fn recheck_for_pr_staged_url_defers_while_worker_mid_turn() {
+    let workspace = tempdir().unwrap();
+    let parent_pr_url = "https://github.com/spinyfin/mono/pull/1342";
+    let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (_dir, db, _product_id, revision_id, execution_id) =
+        revision_fixture(workspace.path(), parent_pr_url, head_before);
+
+    let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+    staged_pr_urls.record_if_unset(&execution_id, parent_pr_url);
+
+    let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+    live_states.register_spawn(
+        1,
+        &execution_id,
+        "claude-opus-5",
+        std::process::id() as i32,
+        Some(boss_protocol::WorkItemBinding {
+            work_item_id: revision_id.clone(),
+            work_item_name: "revision mid-turn".to_owned(),
+            execution_id: execution_id.clone(),
+        }),
+    );
+    // PostToolUse of cube pr update leaves activity at Working until Stop.
+    live_states.apply_event(
+        1,
+        &boss_protocol::WorkerEvent::PreToolUse {
+            session_id: "s".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+        },
+    );
+    live_states.apply_event(
+        1,
+        &boss_protocol::WorkerEvent::PostToolUse {
+            session_id: "s".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+            tool_response: serde_json::Value::Null,
+        },
+    );
+    assert_eq!(
+        live_states.activity_for_run(&execution_id),
+        Some(boss_protocol::WorkerActivity::Working),
+        "fixture must model the mid-turn state observed at teardown",
+    );
+
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), detector.clone());
+    let handler = handler
+        .with_staged_pr_urls(staged_pr_urls.clone())
+        .with_live_worker_states(live_states);
+
+    let outcome = handler.recheck_for_pr(&execution_id).await;
+    assert_eq!(
+        outcome,
+        StopOutcome::AwaitingInput,
+        "mid-turn staged-URL recheck must defer, not terminalize; got {outcome:?}",
+    );
+    let execution = db.get_execution(&execution_id).unwrap();
+    assert!(
+        execution.status.is_live(),
+        "execution must stay live while the worker is mid-turn; status={:?}",
+        execution.status,
+    );
+    match db.get_work_item(&revision_id).unwrap() {
+        WorkItem::Task(t) => assert_eq!(
+            t.status,
+            TaskStatus::Active,
+            "revision must not advance to in_review mid-turn",
+        ),
+        other => panic!("expected task, got {other:?}"),
+    }
+    assert_eq!(
+        staged_pr_urls.get(&execution_id).as_deref(),
+        Some(parent_pr_url),
+        "staged URL must be retained for the worker's own Stop boundary",
+    );
+    assert!(
+        cube.release_calls.lock().await.is_empty(),
+        "must not tear down / release the lease mid-turn",
+    );
+    assert_eq!(
+        detector.call_count(),
+        0,
+        "deferral must not fall through to the detector"
+    );
+}
+
+/// Bound: once the staged URL ages past the mid-turn deferral horizon,
+/// recheck finalizes even if activity is still Working — a worker that
+/// never reaches Stop must not hang forever.
+#[tokio::test]
+async fn recheck_for_pr_staged_url_finalizes_mid_turn_after_defer_horizon() {
+    let workspace = tempdir().unwrap();
+    let parent_pr_url = "https://github.com/spinyfin/mono/pull/1343";
+    let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (_dir, db, _product_id, revision_id, execution_id) =
+        revision_fixture(workspace.path(), parent_pr_url, head_before);
+
+    let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+    staged_pr_urls.record_if_unset(&execution_id, parent_pr_url);
+
+    let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+    live_states.register_spawn(
+        2,
+        &execution_id,
+        "claude-opus-5",
+        std::process::id() as i32,
+        Some(boss_protocol::WorkItemBinding {
+            work_item_id: revision_id.clone(),
+            work_item_name: "revision horizon".to_owned(),
+            execution_id: execution_id.clone(),
+        }),
+    );
+    live_states.apply_event(
+        2,
+        &boss_protocol::WorkerEvent::PreToolUse {
+            session_id: "s".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+        },
+    );
+
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), detector);
+    // Horizon 0 → age is never strictly less than the bound → finalize.
+    let handler = handler
+        .with_staged_pr_urls(staged_pr_urls)
+        .with_live_worker_states(live_states)
+        .with_staged_pr_mid_turn_defer_secs(0);
+
+    let outcome = handler.recheck_for_pr(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == parent_pr_url),
+        "after the deferral horizon, staged-URL recheck must finalize; got {outcome:?}",
+    );
+    match db.get_work_item(&revision_id).unwrap() {
+        WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::InReview),
+        other => panic!("expected task, got {other:?}"),
+    }
+    assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+}
+
+/// Non-revision (chore) staged path without mid-turn activity keeps
+/// its current behaviour: finalize immediately via the staged URL.
+#[tokio::test]
+async fn recheck_for_pr_staged_url_finalizes_non_revision_when_not_mid_turn() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    let pr_url = "https://github.com/spinyfin/mono/pull/460";
+    let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+    staged_pr_urls.record_if_unset(&execution_id, pr_url);
+
+    // Live registry present but activity is Idle (parked at turn boundary).
+    let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+    live_states.register_spawn(
+        3,
+        &execution_id,
+        "claude-opus-5",
+        std::process::id() as i32,
+        Some(boss_protocol::WorkItemBinding {
+            work_item_id: chore_id.clone(),
+            work_item_name: "chore idle".to_owned(),
+            execution_id: execution_id.clone(),
+        }),
+    );
+    live_states.apply_event(
+        3,
+        &boss_protocol::WorkerEvent::Stop {
+            session_id: "s".into(),
+            stop_hook_active: false,
+            stop_reason: boss_protocol::StopReason::Completed,
+        },
+    );
+    assert_eq!(
+        live_states.activity_for_run(&execution_id),
+        Some(boss_protocol::WorkerActivity::Idle),
+    );
+
+    let detector = StubPrDetector::err("jj broken");
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+    let handler = handler
+        .with_staged_pr_urls(staged_pr_urls)
+        .with_live_worker_states(live_states)
+        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(
+            &execution_id,
+            &BranchNaming::BossExecPrefix,
+            None,
+        )));
+
+    let outcome = handler.recheck_for_pr(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::ReviewerEnqueued { pr_url: ref got } if got == pr_url),
+        "non-revision idle staged path must still finalize; got {outcome:?}",
+    );
+    match db.get_work_item(&chore_id).unwrap() {
+        WorkItem::Chore(t) => {
+            assert_eq!(t.pr_url.as_deref(), Some(pr_url));
+        }
+        other => panic!("expected chore, got {other:?}"),
+    }
+}
+
+/// `pr_review` executions keep current behaviour: recheck returns
+/// AlreadyTerminal and never finalizes via the staged-URL path.
+#[tokio::test]
+async fn recheck_for_pr_skips_pr_review_even_with_staged_url_and_mid_turn() {
+    let workspace = tempdir().unwrap();
+    let (dir, db, _product_id, _chore_id, pr_review_exec_id, _pr_url) = pr_review_exec_fixture(workspace.path(), None);
+    let _dir = dir;
+
+    let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+    staged_pr_urls.record_if_unset(&pr_review_exec_id, "https://github.com/spinyfin/mono/pull/999");
+
+    let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+    live_states.register_spawn(4, &pr_review_exec_id, "claude-opus-5", std::process::id() as i32, None);
+    live_states.apply_event(
+        4,
+        &boss_protocol::WorkerEvent::PreToolUse {
+            session_id: "s".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+        },
+    );
+
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), detector);
+    let handler = handler
+        .with_staged_pr_urls(staged_pr_urls)
+        .with_live_worker_states(live_states);
+
+    let outcome = handler.recheck_for_pr(&pr_review_exec_id).await;
+    assert_eq!(
+        outcome,
+        StopOutcome::AlreadyTerminal,
+        "pr_review recheck must keep the early-return behaviour; got {outcome:?}",
+    );
+    assert!(cube.release_calls.lock().await.is_empty());
+}
+
+/// Mid-turn deferral must still complete later via the worker's own Stop
+/// boundary (`stop_staged`) — never drop the finalization.
+#[tokio::test]
+async fn recheck_defers_mid_turn_then_on_stop_finalizes_staged_url() {
+    let workspace = tempdir().unwrap();
+    let parent_pr_url = "https://github.com/spinyfin/mono/pull/1344";
+    let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (_dir, db, _product_id, revision_id, execution_id) =
+        revision_fixture(workspace.path(), parent_pr_url, head_before);
+
+    let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+    staged_pr_urls.record_if_unset(&execution_id, parent_pr_url);
+
+    let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+    live_states.register_spawn(
+        5,
+        &execution_id,
+        "claude-opus-5",
+        std::process::id() as i32,
+        Some(boss_protocol::WorkItemBinding {
+            work_item_id: revision_id.clone(),
+            work_item_name: "revision then stop".to_owned(),
+            execution_id: execution_id.clone(),
+        }),
+    );
+    live_states.apply_event(
+        5,
+        &boss_protocol::WorkerEvent::PreToolUse {
+            session_id: "s".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+        },
+    );
+
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), detector);
+    let handler = handler
+        .with_staged_pr_urls(staged_pr_urls.clone())
+        .with_live_worker_states(live_states.clone());
+
+    let recheck_outcome = handler.recheck_for_pr(&execution_id).await;
+    assert_eq!(recheck_outcome, StopOutcome::AwaitingInput);
+
+    // Worker reaches its own Stop boundary → activity Idle; on_stop finalizes.
+    live_states.apply_event(
+        5,
+        &boss_protocol::WorkerEvent::Stop {
+            session_id: "s".into(),
+            stop_hook_active: false,
+            stop_reason: boss_protocol::StopReason::Completed,
+        },
+    );
+    let stop_outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(stop_outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == parent_pr_url),
+        "Stop boundary must finalize the retained staged URL; got {stop_outcome:?}",
+    );
+    match db.get_work_item(&revision_id).unwrap() {
+        WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::InReview),
+        other => panic!("expected task, got {other:?}"),
+    }
+    assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+}
+
 #[tokio::test]
 async fn recheck_for_pr_staged_url_rejected_on_branch_mismatch() {
     // Regression: a staged URL whose PR belongs to a

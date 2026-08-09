@@ -29,10 +29,12 @@
 //!   arbitrary Bash/shell output that happens to mention a PR URL does
 //!   not stage the wrong PR.
 //! - [`StagedPrUrlCache`] — a thread-safe `HashMap<execution_id,
-//!   pr_url>` that callers populate from progress events and the
+//!   StagedPrUrlEntry>` that callers populate from progress events and the
 //!   `on_stop` handler reads on Stop. First-writer-wins semantics
-//!   so a worker that re-runs `gh pr view` after `gh pr create`
-//!   can't overwrite the legitimate first URL.
+//!   so a worker that re-runs `gh pr edit` after `gh pr create`
+//!   can't overwrite the legitimate first URL. Each entry also
+//!   stamps `staged_at` so the merge-poller recheck can bound
+//!   mid-turn deferral.
 //!
 //! The reconciliation path (`completion::detect_pr` →
 //! `jj_candidate_commit_shas` → GitHub commits/{sha}/pulls) is
@@ -47,6 +49,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use boss_engine_gh_invocation::{GhNoun, classify};
 use boss_engine_structured_output::pr_url::find_first_pr_url;
@@ -287,12 +290,17 @@ fn peel_shell_c_payload(command: &str) -> Option<&str> {
 }
 
 /// Check whether a shell command string is a deliberate `gh pr` /
-/// `cube pr` invocation (create, view, list, or edit).
+/// `cube pr` invocation that can arm PR-URL staging (create, edit, or
+/// cube wrappers — not read-only view/list).
 ///
 /// Returns `true` only when the command is a `gh pr <subcommand>`
-/// invocation whose subcommand can legitimately surface a PR URL for
-/// the worker's own PR, or a `cube pr create|update|ensure` wrapper.
-/// Handles environment-variable prefixes such as
+/// invocation whose subcommand is evidence the worker is producing or
+/// mutating its own PR (`create` / `edit`), or a
+/// `cube pr create|update|ensure` wrapper. Read-only `view` / `list`
+/// are deliberately excluded: they print a PR URL as a side effect of
+/// inspection, not of completion, and used to arm the merge-poller's
+/// staged-URL recheck against a still-running worker. Handles
+/// environment-variable prefixes such as
 /// `GIT_DIR=.jj/repo/store/git gh pr create ...` via the shared
 /// [`classify`] matcher, and Codex-style shell wrappers
 /// (`/bin/zsh -lc 'gh pr …'`) via [`peel_shell_c_payload`].
@@ -319,7 +327,7 @@ pub fn is_gh_pr_command_str(command: &str) -> bool {
         classify(command),
         Some(inv)
             if inv.noun == GhNoun::Pr
-                && matches!(inv.subcommand.as_str(), "create" | "view" | "list" | "edit")
+                && matches!(inv.subcommand.as_str(), "create" | "edit")
     )
 }
 
@@ -343,17 +351,29 @@ pub enum StagePrUrlOutcome {
     AlreadyStaged,
 }
 
+/// One staged PR URL plus the wall-clock instant it was first recorded.
+/// The merge-poller recheck path uses [`StagedPrUrlEntry::staged_at`] to
+/// bound mid-turn deferral: a staged URL is evidence the worker *has* a
+/// PR, not that it is *done*, so a live mid-turn worker must not be
+/// finalized immediately — but a worker that never reaches a Stop still
+/// needs a finite bound.
+#[derive(Debug, Clone)]
+pub struct StagedPrUrlEntry {
+    pub pr_url: String,
+    pub staged_at: Instant,
+}
+
 /// In-memory `execution_id → pr_url` staging cache. Populated by the
 /// `PostToolUse` hook dispatcher when a Bash event surfaces a PR
 /// URL; consumed by `WorkerCompletionHandler::on_stop` on the
 /// matching Stop hook.
 ///
 /// First-writer-wins. A worker that pushes, opens a PR (URL latched),
-/// then later runs `gh pr view <other-PR>` while editing — the later
-/// `view` doesn't clobber the legitimate first `create`.
+/// then later runs `gh pr edit` (or another create) while finishing —
+/// the later URL doesn't clobber the legitimate first `create`.
 #[derive(Debug, Default)]
 pub struct StagedPrUrlCache {
-    inner: Mutex<HashMap<String, String>>,
+    inner: Mutex<HashMap<String, StagedPrUrlEntry>>,
 }
 
 impl StagedPrUrlCache {
@@ -368,7 +388,13 @@ impl StagedPrUrlCache {
         if guard.contains_key(execution_id) {
             StagePrUrlOutcome::AlreadyStaged
         } else {
-            guard.insert(execution_id.to_owned(), pr_url.to_owned());
+            guard.insert(
+                execution_id.to_owned(),
+                StagedPrUrlEntry {
+                    pr_url: pr_url.to_owned(),
+                    staged_at: Instant::now(),
+                },
+            );
             StagePrUrlOutcome::Staged
         }
     }
@@ -377,6 +403,17 @@ impl StagedPrUrlCache {
     /// remove the entry — callers that want to clear should call
     /// [`Self::forget`].
     pub fn get(&self, execution_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("StagedPrUrlCache mutex poisoned")
+            .get(execution_id)
+            .map(|entry| entry.pr_url.clone())
+    }
+
+    /// Read the full staged entry (URL + stage time) for `execution_id`.
+    /// Used by the merge-poller recheck path to enforce the mid-turn
+    /// deferral horizon without a second map lookup.
+    pub fn get_entry(&self, execution_id: &str) -> Option<StagedPrUrlEntry> {
         self.inner
             .lock()
             .expect("StagedPrUrlCache mutex poisoned")
@@ -787,15 +824,16 @@ mod tests {
     }
 
     #[test]
-    fn gh_pr_view_is_a_gh_pr_command() {
-        assert!(is_gh_pr_command(&json!({
+    fn gh_pr_view_is_not_a_staging_command() {
+        // Read-only: prints a URL as inspection, not completion evidence.
+        assert!(!is_gh_pr_command(&json!({
             "command": "GIT_DIR=.jj/repo/store/git gh pr view"
         })));
     }
 
     #[test]
-    fn gh_pr_list_is_a_gh_pr_command() {
-        assert!(is_gh_pr_command(&json!({ "command": "gh pr list --state open" })));
+    fn gh_pr_list_is_not_a_staging_command() {
+        assert!(!is_gh_pr_command(&json!({ "command": "gh pr list --state open" })));
     }
 
     #[test]
@@ -869,16 +907,30 @@ mod tests {
         // Codex envelope: whole command is `/bin/zsh -lc 'gh pr …'`.
         // Peel must expose the inner gh invocation to classify.
         assert!(is_gh_pr_command_str("/bin/zsh -lc 'gh pr create --title t --body b'"));
-        assert!(is_gh_pr_command_str("/bin/zsh -lc 'gh pr view'"));
-        assert!(is_gh_pr_command_str("/bin/zsh -lc 'gh pr list --state open'"));
         assert!(is_gh_pr_command_str("/bin/zsh -lc 'gh pr edit 42 --add-label foo'"));
+        // Read-only verbs deliberately do not stage: they print a URL as
+        // inspection output, not as completion evidence.
+        assert!(!is_gh_pr_command_str("/bin/zsh -lc 'gh pr view'"));
+        assert!(!is_gh_pr_command_str("/bin/zsh -lc 'gh pr list --state open'"));
     }
 
     #[test]
     fn bash_c_and_sh_c_wrapped_gh_pr_are_gh_pr_commands() {
         assert!(is_gh_pr_command_str(r#"bash -c "gh pr create --title t""#));
-        assert!(is_gh_pr_command_str("/usr/bin/bash -c 'gh pr view'"));
-        assert!(is_gh_pr_command_str("sh -c 'gh pr list'"));
+        assert!(!is_gh_pr_command_str("/usr/bin/bash -c 'gh pr view'"));
+        assert!(!is_gh_pr_command_str("sh -c 'gh pr list'"));
+    }
+
+    #[test]
+    fn read_only_gh_pr_view_and_list_do_not_arm_staging() {
+        assert!(!is_gh_pr_command_str("gh pr view 1342"));
+        assert!(!is_gh_pr_command_str("gh pr list --state open"));
+        assert!(!is_gh_pr_command(&json!({ "command": "gh pr view" })));
+        assert!(!is_gh_pr_command(&json!({ "command": "gh pr list" })));
+        // Write-side verbs still stage.
+        assert!(is_gh_pr_command_str("gh pr create --title t"));
+        assert!(is_gh_pr_command_str("gh pr edit 42 --body b"));
+        assert!(is_gh_pr_command_str("cube pr update --branch boss/exec_x"));
     }
 
     #[test]
