@@ -86,7 +86,9 @@ fn golden_grok_pane_command_never_emits_worktree_flags() {
     // `GrokDriver::spawn_invocation`.
     let request = SpawnRequest {
         model: "grok-4.5",
-        effort: Some("xhigh"),
+        // Use a live-accepted effort value so this golden stays aligned with
+        // what GrokDriver actually emits for Large/Max (both map to `high`).
+        effort: Some("high"),
         settings_path: None,
         non_opus_auto_mode: false,
         permission_mode_override: None,

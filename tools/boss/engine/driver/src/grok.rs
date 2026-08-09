@@ -98,9 +98,9 @@ static GROK_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     agent_rules_filename: "AGENTS.md",
     initial_prompt_filename: "initial-prompt.txt",
     model_menu: ModelMenu {
-        // Sole model on `grok models` (0.2.112, 2026-07-27). Step-5
-        // fall-through and every classified row both resolve here until a
-        // second SKU appears.
+        // Sole model on `grok models` (0.2.112, 2026-07-27; re-verified
+        // unchanged on 1.0.0, 2026-08-09). Step-5 fall-through and every
+        // classified row both resolve here until a second SKU appears.
         engine_default: "grok-4.5",
         effort_value_for_level: model_menu::effort_value_for_level,
         default_model_for_level: model_menu::default_model_for_level,
@@ -166,6 +166,10 @@ pub fn build_grok_pane_command(request: &SpawnRequest<'_>, workspace: &Path, ses
     cmd.push_str(" --model ");
     cmd.push_str(&shell_quote(model));
     if let Some(e) = effort {
+        debug_assert!(
+            matches!(*e, "low" | "medium" | "high"),
+            "grok rejects effort {e:?} at request time; only low|medium|high are accepted",
+        );
         cmd.push_str(" --reasoning-effort ");
         cmd.push_str(&shell_quote(e));
     }
@@ -1211,14 +1215,31 @@ mod tests {
     }
 
     #[test]
-    fn grok_model_menu_is_single_sku_five_of_seven_effort() {
+    fn grok_model_menu_is_single_sku_three_rung_effort() {
         let driver = GrokDriver::default();
         let menu = &driver.descriptor().model_menu;
+        // Live grok 1.0.0 / grok-4.5 accepts only low|medium|high. Large and
+        // Max must land on `high` (Grok's ceiling), never on Claude/Codex's
+        // `xhigh`/`max` — those fail the first turn in-pane after spawn.
         assert_eq!((menu.effort_value_for_level)(EffortLevel::Trivial), Some("low"));
         assert_eq!((menu.effort_value_for_level)(EffortLevel::Small), Some("medium"));
         assert_eq!((menu.effort_value_for_level)(EffortLevel::Medium), Some("high"));
-        assert_eq!((menu.effort_value_for_level)(EffortLevel::Large), Some("xhigh"));
-        assert_eq!((menu.effort_value_for_level)(EffortLevel::Max), Some("max"));
+        assert_eq!((menu.effort_value_for_level)(EffortLevel::Large), Some("high"));
+        assert_eq!((menu.effort_value_for_level)(EffortLevel::Max), Some("high"));
+        // Guard: do not re-introduce the Claude/Codex vocabulary on Grok.
+        for level in [
+            EffortLevel::Trivial,
+            EffortLevel::Small,
+            EffortLevel::Medium,
+            EffortLevel::Large,
+            EffortLevel::Max,
+        ] {
+            let v = (menu.effort_value_for_level)(level).expect("every level maps");
+            assert!(
+                matches!(v, "low" | "medium" | "high"),
+                "Grok effort for {level:?} must be one of low|medium|high, got {v:?}",
+            );
+        }
         // Both reasoning modes share the sole SKU.
         assert_eq!((menu.model_for_reasoning)(ReasoningMode::Standard), "grok-4.5");
         assert_eq!((menu.model_for_reasoning)(ReasoningMode::Investigation), "grok-4.5");
