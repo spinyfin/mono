@@ -1,6 +1,5 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
-use globset::{Glob, GlobSet, GlobSetBuilder};
 use regex::Regex;
 use serde::Deserialize;
 use std::path::Path;
@@ -20,6 +19,11 @@ use crate::output::{CheckResult, Finding, Location, Severity};
 ///    a list item).
 /// 2. An opening paragraph after the H1 that runs on far longer than a
 ///    short lead-in should.
+///
+/// Repo policy (which doc trees are gated) is expressed with the framework
+/// check-entry `include` / `exclude` keys, not check config. This check's
+/// only intrinsic path filter is the `.md` extension gate — Markdown is the
+/// subject matter, not a repo-local scope choice.
 #[derive(Debug, Default)]
 pub struct DocStructureCheck;
 
@@ -41,7 +45,7 @@ impl Check for DocStructureCheck {
 #[async_trait]
 impl ConfiguredCheck for CompiledDocStructureConfig {
     fn applicable_file_count(&self, changeset: &ChangeSet) -> usize {
-        count_applicable(changeset, |path| self.applies_to(path))
+        count_applicable(changeset, is_markdown_file)
     }
 
     async fn run_with_progress(
@@ -53,7 +57,7 @@ impl ConfiguredCheck for CompiledDocStructureConfig {
         let findings = run_per_text_file(
             changeset,
             tree,
-            |path| self.applies_to(path),
+            is_markdown_file,
             &*on_file_processed,
             |changed_file, contents, findings| {
                 self.check_smooshed_metadata(changed_file, contents, findings);
@@ -69,10 +73,8 @@ impl ConfiguredCheck for CompiledDocStructureConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DocStructureConfig {
-    include_globs: Vec<String>,
-    #[serde(default)]
-    exclude_globs: Vec<String>,
     #[serde(default)]
     metadata_prefixes: Option<Vec<String>>,
     #[serde(default)]
@@ -82,8 +84,6 @@ struct DocStructureConfig {
 }
 
 struct CompiledDocStructureConfig {
-    include_globs: GlobSet,
-    exclude_globs: Option<GlobSet>,
     metadata_line: Regex,
     max_first_paragraph_chars: usize,
     severity: Severity,
@@ -97,19 +97,14 @@ static NON_PROSE_BLOCK_START: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*(?:#|>|\||```|[-*+]\s|\d+[.)]\s)").expect("valid regex"));
 static H1: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^#\s+\S").expect("valid regex"));
 
-impl CompiledDocStructureConfig {
-    fn applies_to(&self, path: &Path) -> bool {
-        if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
-            return false;
-        }
-        if let Some(exclude_globs) = &self.exclude_globs
-            && exclude_globs.is_match(path)
-        {
-            return false;
-        }
-        self.include_globs.is_match(path)
-    }
+/// Intrinsic subject-matter gate: only Markdown files. Repo policy about which
+/// doc trees are in scope is the framework `include` / `exclude` on the check
+/// entry, applied before this check runs.
+fn is_markdown_file(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("md")
+}
 
+impl CompiledDocStructureConfig {
     fn check_smooshed_metadata(
         &self,
         changed_file: &crate::input::ChangedFile,
@@ -253,10 +248,11 @@ fn first_paragraph_after_h1(contents: &str) -> Option<ParagraphBlock<'_>> {
 }
 
 fn parse_config(config: &toml::Value) -> Result<CompiledDocStructureConfig> {
+    // Empty config is valid: scope lives on the check entry (`include` /
+    // `exclude`), not inside this blob. Reject leftover bespoke scope keys via
+    // `deny_unknown_fields` so a forgotten `include_globs` becomes a hard error
+    // rather than a silent widen to every Markdown file.
     let parsed: DocStructureConfig = config.clone().try_into().context("invalid md/doc-structure config")?;
-    if parsed.include_globs.is_empty() {
-        bail!("md/doc-structure config must contain at least one `include_globs` entry");
-    }
 
     let metadata_prefixes = parsed
         .metadata_prefixes
@@ -270,29 +266,12 @@ fn parse_config(config: &toml::Value) -> Result<CompiledDocStructureConfig> {
         Regex::new(&format!(r"^\s*(?:{alternation}):")).context("invalid metadata_prefixes alternation")?;
 
     Ok(CompiledDocStructureConfig {
-        include_globs: compile_globs("include_globs", &parsed.include_globs)?,
-        exclude_globs: if parsed.exclude_globs.is_empty() {
-            None
-        } else {
-            Some(compile_globs("exclude_globs", &parsed.exclude_globs)?)
-        },
         metadata_line,
         max_first_paragraph_chars: parsed
             .max_first_paragraph_chars
             .unwrap_or(DEFAULT_MAX_FIRST_PARAGRAPH_CHARS),
         severity: Severity::parse_with_default(parsed.severity.as_deref(), Severity::Error),
     })
-}
-
-fn compile_globs(field_name: &str, patterns: &[String]) -> Result<GlobSet> {
-    let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
-        let glob = Glob::new(pattern).with_context(|| format!("invalid `{field_name}` glob pattern: {pattern}"))?;
-        builder.add(glob);
-    }
-    builder
-        .build()
-        .with_context(|| format!("failed to compile `{field_name}` globs"))
 }
 
 #[cfg(test)]
@@ -322,9 +301,7 @@ mod tests {
                     old_path: None,
                 }]),
                 &tree,
-                &toml::Value::Table(toml::toml! {
-                    include_globs = ["docs/investigations/**"]
-                }),
+                &toml::Value::Table(toml::map::Map::new()),
             )
             .await
             .expect("run check");
@@ -394,13 +371,28 @@ mod tests {
                     old_path: None,
                 }]),
                 &tree,
-                &toml::Value::Table(toml::toml! {
-                    include_globs = ["docs/investigations/**"]
-                }),
+                &toml::Value::Table(toml::map::Map::new()),
             )
             .await
             .expect("run check");
 
         assert!(result.findings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_legacy_include_globs_key() {
+        let check = DocStructureCheck;
+        let result = check.configure(&toml::Value::Table(toml::toml! {
+            include_globs = ["docs/**/*.md"]
+        }));
+        let err = match result {
+            Ok(_) => panic!("legacy include_globs must not be accepted"),
+            Err(err) => err,
+        };
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("include_globs") || message.contains("unknown field"),
+            "expected deny_unknown_fields diagnostic, got: {message}"
+        );
     }
 }

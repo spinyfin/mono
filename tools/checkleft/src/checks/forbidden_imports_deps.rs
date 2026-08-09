@@ -104,8 +104,17 @@ struct ForbiddenImportsDepsConfig {
 struct ForbiddenImportsDepsRuleConfig {
     pattern: String,
     message: String,
+    /// Per-rule positive path selection, nested under the rule. Uses the
+    /// framework's word (`include`) rather than a bespoke spelling. Rules that
+    /// share one scope should hoist this to the check-entry framework `include`
+    /// key instead; keep it here only when rules in the same instance genuinely
+    /// differ. Matches repo-root-relative paths.
     #[serde(default)]
-    include_globs: Vec<String>,
+    include: Vec<String>,
+    /// Per-rule negative selection. **Out of scope for the framework-include
+    /// migration** — this remains config-dir-relative via `strip_prefix`
+    /// (`is_excluded` below) while sibling `include` is repo-relative. Do not
+    /// rename, rewrite, or "fix" the coordinate here.
     #[serde(default, alias = "exclude_globs")]
     exclude_files: Vec<String>,
     #[serde(default)]
@@ -126,7 +135,7 @@ impl CompiledForbiddenImportsDepsConfig {
 
 struct CompiledRule {
     pattern: Regex,
-    include_globs: Option<GlobSet>,
+    include: Option<GlobSet>,
     exclude_files: Option<GlobSet>,
     config_dir: PathBuf,
     message: String,
@@ -141,8 +150,8 @@ impl CompiledRule {
         {
             return false;
         }
-        if let Some(include_globs) = &self.include_globs {
-            return include_globs.is_match(path);
+        if let Some(include) = &self.include {
+            return include.is_match(path);
         }
         true
     }
@@ -167,7 +176,7 @@ fn parse_config(config: &toml::Value, config_dir: &Path) -> Result<CompiledForbi
         let pattern = Regex::new(&rule.pattern).with_context(|| format!("invalid rule regex: {}", rule.pattern))?;
         rules.push(CompiledRule {
             pattern,
-            include_globs: compile_globs("include_globs", &rule.include_globs)?,
+            include: compile_globs("include", &rule.include)?,
             exclude_files: compile_globs("exclude_files", &rule.exclude_files)?,
             config_dir: config_dir.to_path_buf(),
             message: rule.message,
@@ -240,7 +249,7 @@ mod tests {
                     rules = [{
                         pattern = "\\bfetch\\(url\\(",
                         message = "Use frontend api/* modules for backend calls.",
-                        include_globs = ["frontend/src/**/*.ts", "frontend/src/**/*.tsx"],
+                        include = ["frontend/src/**/*.ts", "frontend/src/**/*.tsx"],
                         exclude_globs = ["frontend/src/api/**"]
                     }]
                 }),
@@ -275,7 +284,7 @@ mod tests {
                     rules = [{
                         pattern = "\\bfetch\\(url\\(",
                         message = "Use frontend api/* modules for backend calls.",
-                        include_globs = ["frontend/src/**/*.ts", "frontend/src/**/*.tsx"],
+                        include = ["frontend/src/**/*.ts", "frontend/src/**/*.tsx"],
                         exclude_files = ["frontend/src/api/**"]
                     }]
                 }),
@@ -310,7 +319,7 @@ mod tests {
                     rules = [{
                         pattern = "\\bfetch\\(url\\(",
                         message = "Use frontend api/* modules for backend calls.",
-                        include_globs = ["frontend/src/**/*.ts", "frontend/src/**/*.tsx"],
+                        include = ["frontend/src/**/*.ts", "frontend/src/**/*.tsx"],
                         exclude_globs = ["frontend/src/api/**"]
                     }]
                 }),
