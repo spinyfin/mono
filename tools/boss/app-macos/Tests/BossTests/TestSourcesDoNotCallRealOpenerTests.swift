@@ -1,7 +1,7 @@
 import XCTest
 
 /// Regression guard for the
-/// "tests pop the user's browser during `swift test`" class of bug.
+/// "tests present real UI during `swift test`" class of bug.
 ///
 /// The original incident: `ProjectDesignDocAffordanceTests` called
 /// `model.openProjectDesignDoc(project)` while `ChatViewModel`'s only
@@ -27,7 +27,7 @@ final class TestSourcesDoNotCallRealOpenerTests: XCTestCase {
         // that instead of re-deriving the source directory at runtime.
         XCTAssertEqual(
             GeneratedRealOpenerScanResult.offenders, [],
-            "Tests must not invoke the real OS URL opener:\n\(GeneratedRealOpenerScanResult.offenders.joined(separator: "\n"))"
+            "Tests must not invoke real OS presentation APIs:\n\(GeneratedRealOpenerScanResult.offenders.joined(separator: "\n"))"
         )
         return
         #else
@@ -47,6 +47,10 @@ final class TestSourcesDoNotCallRealOpenerTests: XCTestCase {
             // invocation. Allowed inside the production `Sources/` tree
             // where the real opener has to live; banned in tests.
             ["Open", "URLAction"].joined(),
+            [".", "orderFront("].joined(),
+            [".", "makeKeyAndOrderFront("].joined(),
+            [".", "runModal("].joined(),
+            [".", "beginSheet("].joined(),
         ]
 
         let fileManager = FileManager.default
@@ -81,7 +85,7 @@ final class TestSourcesDoNotCallRealOpenerTests: XCTestCase {
                 }
                 for symbol in banned where line.contains(symbol) {
                     offenders.append(
-                        "\(fileURL.lastPathComponent):\(lineIndex + 1) uses banned symbol `\(symbol)` — route through `ChatViewModel.urlOpener` (production) and a recording stub (tests)."
+                        "\(fileURL.lastPathComponent):\(lineIndex + 1) uses banned real-OS presentation symbol `\(symbol)` — inject a test stub or exercise the UI headlessly."
                     )
                 }
             }
@@ -89,7 +93,7 @@ final class TestSourcesDoNotCallRealOpenerTests: XCTestCase {
 
         XCTAssertEqual(
             offenders, [],
-            "Tests must not invoke the real OS URL opener:\n\(offenders.joined(separator: "\n"))"
+            "Tests must not invoke real OS presentation APIs:\n\(offenders.joined(separator: "\n"))"
         )
     }
 }

@@ -14,6 +14,10 @@ set -euo pipefail
 banned_symbols=(
   'NSWorkspace.shared.open'
   'OpenURLAction'
+  '.orderFront('
+  '.makeKeyAndOrderFront('
+  '.runModal('
+  '.beginSheet('
 )
 
 offenders=()
@@ -28,7 +32,7 @@ for f in "$@"; do
     esac
     for symbol in "${banned_symbols[@]}"; do
       if [[ "$line" == *"$symbol"* ]]; then
-        offenders+=("$base:$line_no uses banned symbol \`$symbol\` — route through \`ChatViewModel.urlOpener\` (production) and a recording stub (tests).")
+        offenders+=("$base:$line_no uses banned real-OS presentation symbol \`$symbol\` — inject a test stub or exercise the UI headlessly.")
       fi
     done
   done < "$f"

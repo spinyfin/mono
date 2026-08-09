@@ -13,12 +13,14 @@ import XCTest
 /// reach them. These tests measure the real AppKit scroll geometry the
 /// document renders into, so a regression that strands a column fails here.
 ///
-/// Every case is hosted in a real `NSWindow`. That is not incidental: a bare
-/// offscreen `NSHostingView` never gives its scroll views real scroll
+/// Every case is laid out by a real, non-presented `NSWindow`. That is not
+/// incidental: a bare `NSHostingView` never gives its scroll views real scroll
 /// geometry (its document view stays zero-width, measured), so the layout it
 /// renders is not the layout a user sees. Screenshots taken that way are what
 /// kept this symptom alive across several rounds of review — see the capture
-/// limits in `tools/boss/app-macos/README.md`.
+/// limits in `tools/boss/app-macos/README.md`. The window must remain ordered
+/// out: tests may use AppKit for layout, but must never put UI on the operator's
+/// screen.
 @MainActor
 final class MarkdownTableOverflowTests: XCTestCase {
     /// The table from the review screenshots, reconstructed from the README
@@ -74,6 +76,13 @@ final class MarkdownTableOverflowTests: XCTestCase {
         }
     }
 
+    /// Retains both sides of AppKit's window/content-view relationship for the
+    /// duration of each assertion without ordering the window onscreen.
+    private struct HostedDocument {
+        let window: NSWindow
+        let hosting: NSView
+    }
+
     private func settle(_ hosting: NSView) {
         for _ in 0..<12 {
             hosting.layoutSubtreeIfNeeded()
@@ -81,17 +90,16 @@ final class MarkdownTableOverflowTests: XCTestCase {
         }
     }
 
-    /// Hosts a document in a real `NSWindow`, the way the app runs it.
-    private func inWindow(_ source: String, width: CGFloat) -> NSView {
+    /// Lays out a document in a real `NSWindow` without presenting it.
+    private func inWindow(_ source: String, width: CGFloat) -> HostedDocument {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: width, height: 820),
             styleMask: [.titled, .resizable], backing: .buffered, defer: false)
         let hosting = NSHostingView(rootView: chrome(source))
         hosting.frame = NSRect(x: 0, y: 0, width: width, height: 820)
         window.contentView = hosting
-        window.orderFront(nil)
         settle(hosting)
-        return hosting
+        return HostedDocument(window: window, hosting: hosting)
     }
 
     private func chrome(_ source: String) -> MarkdownDocumentChrome {
@@ -119,10 +127,14 @@ final class MarkdownTableOverflowTests: XCTestCase {
 
     /// The table's own horizontal scroll view: the innermost one, i.e. the
     /// scroll view nested inside the document's vertical scroll view.
-    private func tableMetrics(in root: NSView, file: StaticString = #filePath, line: UInt = #line)
+    private func tableMetrics(
+        in document: HostedDocument, file: StaticString = #filePath, line: UInt = #line
+    )
         throws -> Metrics
     {
-        let nested = scrollViews(in: root).filter(hasScrollViewAncestor)
+        XCTAssertFalse(
+            document.window.isVisible, "layout window must never be presented", file: file, line: line)
+        let nested = scrollViews(in: document.hosting).filter(hasScrollViewAncestor)
         let scroll = try XCTUnwrap(
             nested.last, "no nested (table) scroll view found", file: file, line: line)
         let content = try XCTUnwrap(
