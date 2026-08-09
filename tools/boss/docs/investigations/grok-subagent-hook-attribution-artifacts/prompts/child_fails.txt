@@ -1,0 +1,10 @@
+Do exactly this and nothing else.
+
+1. Call the `spawn_subagent` tool exactly once (blocking, background false) with subagent_type "general-purpose", description "failing child", and this prompt text:
+
+   Run these two shell commands with run_terminal_command, in order, and do not stop early if one fails:
+   (a) sleep 25 && exit 7
+   (b) echo CHILD_RECOVERED > child_recovered.txt
+   Then reply with exactly: CHILD_FAILED_THEN_RECOVERED
+
+2. After the subagent returns, reply with exactly: PARENT_DONE

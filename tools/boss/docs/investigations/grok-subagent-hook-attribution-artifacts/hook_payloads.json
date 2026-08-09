@@ -1,0 +1,156 @@
+{
+  "subagent.session_end": {
+    "env_excerpt": {
+      "CLAUDE_PROJECT_DIR": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd",
+      "GROK_HOME": "/Users/brianduff/.cache/grok-subagent-hook-probe/home",
+      "GROK_HOOK_EVENT": "session_end",
+      "GROK_HOOK_NAME": "global/boss-hooks:session_end[0].hooks[0]",
+      "GROK_SESSION_ID": "019fe548-fe57-7873-b7b3-705dcc6f3c58",
+      "GROK_WORKSPACE_ROOT": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd"
+    },
+    "stdin": {
+      "hookEventName": "session_end",
+      "sessionId": "019fe548-fe57-7873-b7b3-705dcc6f3c58",
+      "cwd": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd",
+      "workspaceRoot": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd",
+      "timestamp": "2026-08-09T06:51:05.507336+00:00",
+      "transcriptPath": "/Users/brianduff/.cache/grok-subagent-hook-probe/home/sessions/%2FUsers%2Fbrianduff%2F.cache%2Fgrok-subagent-hook-probe%2Fevidence%2Ftui_bg_outlives%2Fcwd/019fe548-fe57-7873-b7b3-705dcc6f3c58/updates.jsonl",
+      "permissionMode": "bypassPermissions",
+      "reason": "shutdown"
+    }
+  },
+  "top_level.session_end": {
+    "env_excerpt": {
+      "CLAUDE_PROJECT_DIR": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd",
+      "GROK_HOME": "/Users/brianduff/.cache/grok-subagent-hook-probe/home",
+      "GROK_HOOK_EVENT": "session_end",
+      "GROK_HOOK_NAME": "global/boss-hooks:session_end[0].hooks[0]",
+      "GROK_SESSION_ID": "167b7b11-e6b2-49cc-8cda-075b8eb3a32f",
+      "GROK_WORKSPACE_ROOT": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd"
+    },
+    "stdin": {
+      "hookEventName": "session_end",
+      "sessionId": "167b7b11-e6b2-49cc-8cda-075b8eb3a32f",
+      "cwd": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd",
+      "workspaceRoot": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd",
+      "timestamp": "2026-08-09T06:51:58.544649+00:00",
+      "transcriptPath": "/Users/brianduff/.cache/grok-subagent-hook-probe/home/sessions/%2FUsers%2Fbrianduff%2F.cache%2Fgrok-subagent-hook-probe%2Fevidence%2Ftui_bg_outlives%2Fcwd/167b7b11-e6b2-49cc-8cda-075b8eb3a32f/updates.jsonl",
+      "permissionMode": "bypassPermissions",
+      "reason": "shutdown"
+    }
+  },
+  "subagent_start": {
+    "env_excerpt": {
+      "CLAUDE_PROJECT_DIR": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd",
+      "GROK_HOME": "/Users/brianduff/.cache/grok-subagent-hook-probe/home",
+      "GROK_HOOK_EVENT": "subagent_start",
+      "GROK_HOOK_NAME": "global/boss-hooks:subagent_start[0].hooks[0]",
+      "GROK_SESSION_ID": "167b7b11-e6b2-49cc-8cda-075b8eb3a32f",
+      "GROK_WORKSPACE_ROOT": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd"
+    },
+    "stdin": {
+      "hookEventName": "subagent_start",
+      "sessionId": "167b7b11-e6b2-49cc-8cda-075b8eb3a32f",
+      "cwd": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd",
+      "workspaceRoot": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd",
+      "timestamp": "2026-08-09T06:49:54.017113+00:00",
+      "transcriptPath": "/Users/brianduff/.cache/grok-subagent-hook-probe/home/sessions/%2FUsers%2Fbrianduff%2F.cache%2Fgrok-subagent-hook-probe%2Fevidence%2Ftui_bg_outlives%2Fcwd/167b7b11-e6b2-49cc-8cda-075b8eb3a32f/updates.jsonl",
+      "permissionMode": "bypassPermissions",
+      "subagentId": "019fe548-fe57-7873-b7b3-705dcc6f3c58",
+      "subagentType": "general-purpose",
+      "description": "slow child"
+    }
+  },
+  "subagent_stop": {
+    "env_excerpt": {
+      "CLAUDE_PROJECT_DIR": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd",
+      "GROK_HOME": "/Users/brianduff/.cache/grok-subagent-hook-probe/home",
+      "GROK_HOOK_EVENT": "subagent_stop",
+      "GROK_HOOK_NAME": "global/boss-hooks:subagent_stop[0].hooks[0]",
+      "GROK_SESSION_ID": "019fe548-fe57-7873-b7b3-705dcc6f3c58",
+      "GROK_WORKSPACE_ROOT": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd"
+    },
+    "stdin": {
+      "hookEventName": "subagent_stop",
+      "sessionId": "019fe548-fe57-7873-b7b3-705dcc6f3c58",
+      "cwd": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd",
+      "workspaceRoot": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd",
+      "timestamp": "2026-08-09T06:51:02.734563+00:00",
+      "transcriptPath": "/Users/brianduff/.cache/grok-subagent-hook-probe/home/sessions/%2FUsers%2Fbrianduff%2F.cache%2Fgrok-subagent-hook-probe%2Fevidence%2Ftui_bg_outlives%2Fcwd/019fe548-fe57-7873-b7b3-705dcc6f3c58/updates.jsonl",
+      "promptId": "019fe549-458e-7cc3-9984-0c94e85adccb",
+      "permissionMode": "bypassPermissions",
+      "phase": "gate",
+      "subagentId": "019fe548-fe57-7873-b7b3-705dcc6f3c58",
+      "subagentType": "general-purpose",
+      "stopHookActive": false,
+      "lastAssistantMessage": "CHILD_SLOW_DONE"
+    }
+  },
+  "subagent.user_prompt_submit": {
+    "env_excerpt": {
+      "CLAUDE_PROJECT_DIR": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd",
+      "GROK_HOME": "/Users/brianduff/.cache/grok-subagent-hook-probe/home",
+      "GROK_HOOK_EVENT": "user_prompt_submit",
+      "GROK_HOOK_NAME": "global/boss-hooks:user_prompt_submit[0].hooks[0]",
+      "GROK_SESSION_ID": "019fe548-fe57-7873-b7b3-705dcc6f3c58",
+      "GROK_WORKSPACE_ROOT": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd"
+    },
+    "stdin": {
+      "hookEventName": "user_prompt_submit",
+      "sessionId": "019fe548-fe57-7873-b7b3-705dcc6f3c58",
+      "cwd": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd",
+      "workspaceRoot": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd",
+      "timestamp": "2026-08-09T06:50:12.277892+00:00",
+      "promptId": "019fe549-458e-7cc3-9984-0c94e85adccb",
+      "permissionMode": "bypassPermissions",
+      "prompt": "Run this single shell command with run_terminal_command and wait for it to finish: sleep 45 && echo SLOW_CHILD > slow_child.txt\n   Then reply with exactly: CHILD_SLOW_DONE"
+    }
+  },
+  "top_level.stop_with_live_background_subagent": {
+    "env_excerpt": {
+      "CLAUDE_PROJECT_DIR": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd",
+      "GROK_HOME": "/Users/brianduff/.cache/grok-subagent-hook-probe/home",
+      "GROK_HOOK_EVENT": "stop",
+      "GROK_HOOK_NAME": "global/boss-hooks:stop[0].hooks[0]",
+      "GROK_SESSION_ID": "167b7b11-e6b2-49cc-8cda-075b8eb3a32f",
+      "GROK_WORKSPACE_ROOT": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd"
+    },
+    "stdin": {
+      "hookEventName": "stop",
+      "sessionId": "167b7b11-e6b2-49cc-8cda-075b8eb3a32f",
+      "cwd": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd",
+      "workspaceRoot": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd",
+      "timestamp": "2026-08-09T06:49:56.882344+00:00",
+      "transcriptPath": "/Users/brianduff/.cache/grok-subagent-hook-probe/home/sessions/%2FUsers%2Fbrianduff%2F.cache%2Fgrok-subagent-hook-probe%2Fevidence%2Ftui_bg_outlives%2Fcwd/167b7b11-e6b2-49cc-8cda-075b8eb3a32f/updates.jsonl",
+      "promptId": "562dfb49-e684-45d7-9d05-a0f2d0111aca",
+      "permissionMode": "bypassPermissions",
+      "reason": "end_turn",
+      "stopHookActive": false,
+      "lastAssistantMessage": "PARENT_DONE_EARLY",
+      "backgroundTasks": [],
+      "sessionCrons": []
+    }
+  },
+  "top_level.notification_idle_prompt": {
+    "env_excerpt": {
+      "CLAUDE_PROJECT_DIR": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd",
+      "GROK_HOME": "/Users/brianduff/.cache/grok-subagent-hook-probe/home",
+      "GROK_HOOK_EVENT": "notification",
+      "GROK_HOOK_NAME": "global/boss-hooks:notification[0].hooks[0]",
+      "GROK_SESSION_ID": "167b7b11-e6b2-49cc-8cda-075b8eb3a32f",
+      "GROK_WORKSPACE_ROOT": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd"
+    },
+    "stdin": {
+      "hookEventName": "notification",
+      "sessionId": "167b7b11-e6b2-49cc-8cda-075b8eb3a32f",
+      "cwd": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd",
+      "workspaceRoot": "/Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_bg_outlives/cwd",
+      "timestamp": "2026-08-09T06:50:58.510200+00:00",
+      "transcriptPath": "/Users/brianduff/.cache/grok-subagent-hook-probe/home/sessions/%2FUsers%2Fbrianduff%2F.cache%2Fgrok-subagent-hook-probe%2Fevidence%2Ftui_bg_outlives%2Fcwd/167b7b11-e6b2-49cc-8cda-075b8eb3a32f/updates.jsonl",
+      "permissionMode": "bypassPermissions",
+      "notificationType": "idle_prompt",
+      "message": "Turn complete",
+      "level": "info"
+    }
+  }
+}

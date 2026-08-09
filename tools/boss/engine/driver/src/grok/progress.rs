@@ -495,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn session_end_maps_onto_worker_event_despite_being_unobserved_in_the_spike() {
+    fn session_end_maps_onto_worker_event() {
         let raw = json!({
             "hookEventName": "session_end",
             "sessionId": "s-1",
@@ -507,6 +507,80 @@ mod tests {
                 session_id: "s-1".into(),
                 reason: "exit".into(),
             }
+        );
+    }
+
+    /// Why `--no-subagents` (`super::super::build_grok_pane_command`) cannot
+    /// be lifted yet, pinned in code rather than only in prose.
+    ///
+    /// Measured against `grok 1.0.0` in Boss's own pane shape
+    /// (`docs/investigations/grok-subagent-hook-attribution-2026-08-09.md`):
+    /// a subagent finishing mid-turn emits a `session_end` whose key set and
+    /// `reason` are identical to the one the top-level session emits when it
+    /// really does end. Both payloads below are verbatim from that probe.
+    ///
+    /// This module normalises them into `WorkerEvent::SessionEnd` values that
+    /// differ **only** in `session_id` — and nothing between here and
+    /// `live_worker_state::apply_event` (which is keyed by slot, not by
+    /// session) compares that field. So the subagent's event is applied as
+    /// `WorkerActivity::Terminated` for a worker that is alive.
+    ///
+    /// If a future change makes these two distinguishable — a `SubagentStop`
+    /// variant, a session-identity filter at ingress, a new payload field —
+    /// this test should fail and be rewritten, and lifting the flag becomes
+    /// a live question again.
+    #[test]
+    fn a_subagents_session_end_is_indistinguishable_from_the_top_level_sessions() {
+        let subagent = json!({
+            "hookEventName": "session_end",
+            "sessionId": "019fe548-fe57-7873-b7b3-705dcc6f3c58",
+            "cwd": "/probe/cwd",
+            "workspaceRoot": "/probe/cwd",
+            "timestamp": "2026-08-09T06:51:05.507336+00:00",
+            "transcriptPath": "/probe/home/sessions/%2Fprobe%2Fcwd/019fe548-fe57-7873-b7b3-705dcc6f3c58/updates.jsonl",
+            "permissionMode": "bypassPermissions",
+            "reason": "shutdown",
+        });
+        let top_level = json!({
+            "hookEventName": "session_end",
+            "sessionId": "167b7b11-e6b2-49cc-8cda-075b8eb3a32f",
+            "cwd": "/probe/cwd",
+            "workspaceRoot": "/probe/cwd",
+            "timestamp": "2026-08-09T06:51:58.544649+00:00",
+            "transcriptPath": "/probe/home/sessions/%2Fprobe%2Fcwd/167b7b11-e6b2-49cc-8cda-075b8eb3a32f/updates.jsonl",
+            "permissionMode": "bypassPermissions",
+            "reason": "shutdown",
+        });
+
+        // Same key set on the wire: there is no `subagentId`, no depth, no
+        // distinguishing `reason` to branch on.
+        let keys = |v: &serde_json::Value| {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        assert_eq!(keys(&subagent), keys(&top_level));
+
+        let WorkerEvent::SessionEnd {
+            session_id: subagent_session,
+            reason: subagent_reason,
+        } = session().normalize_progress_event(&subagent).unwrap()
+        else {
+            panic!("expected SessionEnd");
+        };
+        let WorkerEvent::SessionEnd {
+            session_id: top_level_session,
+            reason: top_level_reason,
+        } = session().normalize_progress_event(&top_level).unwrap()
+        else {
+            panic!("expected SessionEnd");
+        };
+
+        assert_eq!(subagent_reason, "shutdown");
+        assert_eq!(subagent_reason, top_level_reason);
+        assert_ne!(
+            subagent_session, top_level_session,
+            "session id is the ONLY discriminator, and no consumer reads it"
         );
     }
 

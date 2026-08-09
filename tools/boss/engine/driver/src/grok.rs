@@ -179,16 +179,32 @@ pub fn build_grok_pane_command(request: &SpawnRequest<'_>, workspace: &Path, ses
     cmd.push_str(&shell_quote(session_id));
     cmd.push_str(" --cwd ");
     cmd.push_str(&shell_quote(&workspace.display().to_string()));
-    // Explicit v1 posture, not a pane-usability or lifecycle blocker:
-    // Boss injects none of Grok's MCP/plugin/skill/subagent surface, and
-    // the driver disables what it does not use rather than inheriting
-    // defaults — a subagent is state Boss does not model (design
-    // `grok-as-a-first-class-interactive-agent-driver.md` G-11 / T-07).
-    // Claude declares no equivalent flag because its subagents emit
-    // through the hook stream Boss already reads; whether a Grok subagent
-    // picks up the global `$GROK_HOME/hooks/` set (so its tool calls are
-    // intercepted and its turns attributed) is unmeasured, so lifting
-    // this needs a probe first.
+    // Kept because of a MEASURED progress-attribution defect, not merely as
+    // v1 posture. Probed against `grok 1.0.0` in this exact pane shape —
+    // `docs/investigations/grok-subagent-hook-attribution-2026-08-09.md`:
+    //
+    // - A subagent DOES inherit the global `$GROK_HOME/hooks/` set, and its
+    //   tool calls ARE intercepted: a `PreToolUse` `deny` blocked a
+    //   subagent's shell call exactly as it blocks the top-level session's.
+    //   There is no safety gap, and that is not why this flag is here.
+    // - It also fires `session_end` at its own turn end, with a payload
+    //   whose key set and `reason` ("shutdown") are IDENTICAL to the
+    //   top-level session's — only the `sessionId` value differs. Boss
+    //   routes hook events by `_boss_run_id` (`events_socket.rs:340-370`),
+    //   which is the same for both, and `live_worker_state.rs:1015` applies
+    //   `SessionEnd` by slot, so a finishing subagent flips a live worker to
+    //   `WorkerActivity::Terminated` and publishes `AnswerAgentDied`. For a
+    //   background subagent that outlives the parent's turn, that wrong
+    //   state is also the slot's LAST state.
+    // - `background_children.rs` cannot compensate: a Grok subagent is
+    //   in-process (every hook forks from the same `grok` pid), so
+    //   `count_live_descendants` reads 0 across the subagent's think/model
+    //   windows. `Stop.backgroundTasks` — the documented alternative — was
+    //   empirically `[]` with a background subagent already in flight.
+    //
+    // Removing this flag needs session-identity filtering at ingress and a
+    // tracked `SubagentStart`/`SubagentStop` pair first; see the
+    // investigation's "What would have to change" section.
     cmd.push_str(" --no-subagents");
     cmd.push_str(" --no-memory");
     // Prompt from file via command substitution — briefs run to tens of KB.
@@ -1426,6 +1442,12 @@ mod tests {
             cmd.contains("--cwd ") && cmd.contains("/tmp/ws-spawn-test"),
             "has absolute --cwd from provision stamp: {cmd}"
         );
+        // Not cosmetic posture: a finishing subagent emits a `session_end`
+        // Boss cannot tell from the worker's own. See the rationale at the
+        // `--no-subagents` call site and
+        // `docs/investigations/grok-subagent-hook-attribution-2026-08-09.md`,
+        // plus `grok::progress`'s
+        // `a_subagents_session_end_is_indistinguishable_from_the_top_level_sessions`.
         assert!(cmd.contains("--no-subagents"), "has --no-subagents: {cmd}");
         assert!(cmd.contains("--no-memory"), "has --no-memory: {cmd}");
         assert!(

@@ -1,0 +1,1 @@
+Run the shell command `echo SMOKE_OK > smoke.txt` and then reply exactly SMOKE_DONE. Do not use any other tools.
