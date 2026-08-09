@@ -722,6 +722,9 @@ impl WorkDb {
         // was decided under). New table plus one additive column, independent
         // of every migration above.
         migrate_execution_driver_decisions_table(conn)?;
+        // Correct the older decision records for execution kinds whose pool
+        // overrides row/product pins. The backfill is self-idempotent.
+        migrate_backfill_pool_driver_decisions(conn)?;
         // Fold a superseded `codex_dispatch_percentage` value into the
         // equivalent three-way split and drop the legacy key. Data-only,
         // self-idempotent — see the function doc comment.

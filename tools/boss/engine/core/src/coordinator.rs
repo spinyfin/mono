@@ -1492,7 +1492,7 @@ pub fn slot_id_from_worker_id(worker_id: &str) -> Option<u8> {
 /// so the reason is legible at every call site: reviews stay on Opus, and
 /// Opus is a Claude model, so the reviewer driver is Claude — never inherited
 /// from (and never varying with) the row under review.
-const REVIEWER_POOL_DRIVER: &str = "claude";
+pub(crate) const REVIEWER_POOL_DRIVER: &str = "claude";
 
 /// Driver + model-tier dispatch policy for a pool-level worker
 /// (review or automation).

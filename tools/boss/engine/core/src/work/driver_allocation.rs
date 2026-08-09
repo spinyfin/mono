@@ -40,7 +40,9 @@
 //! capability:
 //!
 //! - **A row with an explicit pin** — see below.
-//! - **An execution whose driver is pinned by the pool it will run on**
+//! - **An execution whose driver is pinned by the pool it will run on** — its
+//!   decision records that pool driver with reason `pool`, rather than an
+//!   allocation or a row/product pin.
 //!   (`pr_review`, `automation_triage`, and any execution whose work item
 //!   came from an automation): those dispatch on
 //!   [`crate::coordinator::pool_dispatch_policy_for_worker_id`]'s fixed
@@ -106,11 +108,12 @@ pub(crate) const REASON_EXPLICIT: &str = "explicit";
 /// Recorded whichever driver it landed on, so "allocated to claude" stays
 /// distinguishable from "allocation never ran".
 pub(crate) const REASON_ALLOCATION: &str = "allocation";
+/// `execution_driver_decisions.reason`: the execution dispatches on a
+/// pool's fixed driver, which overrides every row and product pin.
+pub(crate) const REASON_POOL: &str = "pool";
 /// `execution_driver_decisions.reason`: allocation did not decide this
-/// execution — it is not bound to a `tasks` row, or its driver comes from
-/// the pool it dispatches on rather than from the row (see
-/// [`decide_execution_driver`]). No override; the row resolves through the
-/// ordinary precedence chain.
+/// execution — it is not bound to a `tasks` row. No override; the row
+/// resolves through the ordinary precedence chain.
 pub(crate) const REASON_DEFAULT: &str = "default";
 
 /// The reason value written by the superseded single-Codex-percentage
@@ -121,9 +124,10 @@ pub(crate) const REASON_LEGACY_PERCENTAGE: &str = "percentage";
 
 /// The routing decision for one execution. `driver` is `None` only for
 /// [`REASON_DEFAULT`] — an ineligible row, which falls through to the normal
-/// row → product → engine default resolution. `split_at_decision` is set for
-/// [`REASON_ALLOCATION`] so a later analysis can tell which split a given
-/// row was placed against.
+/// row → product → engine default resolution. [`REASON_POOL`] names the
+/// fixed driver the execution will actually run on. `split_at_decision` is
+/// set for [`REASON_ALLOCATION`] so a later analysis can tell which split a
+/// given row was placed against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DriverDecision {
     pub driver: Option<String>,
@@ -136,6 +140,14 @@ impl DriverDecision {
         Self {
             driver: Some(driver),
             reason: REASON_EXPLICIT,
+            split_at_decision: None,
+        }
+    }
+
+    fn pool(driver: &'static str) -> Self {
+        Self {
+            driver: Some(driver.to_owned()),
+            reason: REASON_POOL,
             split_at_decision: None,
         }
     }
@@ -317,6 +329,7 @@ pub(crate) fn get_execution_driver_decision_conn(
             let reason = match reason_raw.as_str() {
                 REASON_EXPLICIT => REASON_EXPLICIT,
                 REASON_ALLOCATION => REASON_ALLOCATION,
+                REASON_POOL => REASON_POOL,
                 REASON_LEGACY_PERCENTAGE => REASON_LEGACY_PERCENTAGE,
                 _ => REASON_DEFAULT,
             };
@@ -370,9 +383,11 @@ pub(crate) fn driver_clears_dispatch_gate(
 /// (never `WorkDb::connect()` — see `load_driver_traffic_split_conn`).
 ///
 /// Precedence:
-/// 1. The work item's own explicit `driver` column wins **when that driver
-///    clears the capability gate for this execution kind**.
-/// 2. Otherwise the product's `default_driver` wins under the same gate
+/// 1. If the execution dispatches on a pool with a fixed driver, record that
+///    pool driver. It overrides all row/product pins, matching dispatch.
+/// 2. Otherwise the work item's own explicit `driver` column wins **when
+///    that driver clears the capability gate for this execution kind**.
+/// 3. Otherwise the product's `default_driver` wins under the same gate
 ///    check. Both of these are an operator saying "this work goes there";
 ///    allocation only decides rows that expressed no honourable preference.
 ///    A pin the gate refuses for this execution (e.g. `tasks.driver =
@@ -381,16 +396,16 @@ pub(crate) fn driver_clears_dispatch_gate(
 ///    instead of stalling at the spawn-time gate. Respecting a pin that
 ///    *does* clear the gate is also what makes the shipped default split
 ///    byte-for-byte behaviour-preserving for ordinary kinds.
-/// 3. Otherwise, if the execution's driver comes from a worker pool rather
-///    than from its row, allocation declines (no override). Two shapes:
+///    Pool-bound executions take precedence because recording a row pin
+///    would name a driver the worker never ran on. Two shapes:
 ///    [`crate::coordinator::kind_always_dispatches_on_pool_driver`] covers
 ///    `pr_review` and `automation_triage`; `tasks.source_automation_id`
 ///    covers ordinary implementation work that came from an automation and
 ///    therefore runs on the automation pool
 ///    (`ClaudeCoordinator::execution_targets_automation_pool`). Both pools
 ///    pin `pool_dispatch_policy_for_worker_id`'s driver, which overrides the
-///    row's, so allocating them would write a decision record naming a
-///    driver the worker never ran on — and the events-socket resolver
+///    row's. Their `pool` decision names the driver the worker actually ran
+///    on — and the events-socket resolver
 ///    ([`crate::work::driver_lookup`]) would then decode that worker's hook
 ///    payloads with the wrong driver's normaliser.
 ///
@@ -449,6 +464,13 @@ pub(crate) fn decide_execution_driver(
     };
     let task_kind_raw = row.task_kind;
     let task_kind: Result<TaskKind, _> = task_kind_raw.parse();
+    let automation_sourced = row.source_automation_id.is_some_and(|id| !id.trim().is_empty());
+    if crate::coordinator::kind_always_dispatches_on_pool_driver(&kind) || automation_sourced {
+        // Pool dispatch overrides row/product pins. Persist its fixed driver
+        // rather than the pin, so this durable record always names the
+        // driver the worker actually runs on.
+        return Ok(DriverDecision::pool(crate::coordinator::REVIEWER_POOL_DRIVER));
+    }
     let pinned = row
         .explicit_driver
         .filter(|s| !s.trim().is_empty())
@@ -478,10 +500,6 @@ pub(crate) fn decide_execution_driver(
             "dropping driver pin that fails the capability gate for this execution kind; \
              allocating among eligible drivers instead",
         );
-    }
-    let automation_sourced = row.source_automation_id.is_some_and(|id| !id.trim().is_empty());
-    if crate::coordinator::kind_always_dispatches_on_pool_driver(&kind) || automation_sourced {
-        return Ok(DriverDecision::default_no_override());
     }
     let task_kind: TaskKind = task_kind.map_err(|err| {
         anyhow::anyhow!(

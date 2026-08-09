@@ -221,16 +221,24 @@ fn reasoning_does_not_gate_allocation() {
 }
 
 /// A PR review dispatches on the review pool's pinned driver, not on the
-/// row's — so allocation declines it rather than recording a driver the
-/// reviewer never ran on. Deliberate: the pool pin is what keeps who
+/// row's — so its decision must record that actual driver and the pool
+/// override, never a row pin. Deliberate: the pool pin is what keeps who
 /// authored a change from deciding who reviews it
 /// (`coordinator::pool_dispatch_policy_for_worker_id`).
 #[test]
-fn pr_review_executions_are_not_allocated() {
+fn pr_review_executions_record_the_pool_driver_over_a_row_pin() {
     let (_dir, db) = open_db();
     db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100)).unwrap();
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, &product.id, "reviewed chore");
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            driver: Some(DRIVER_SLUG_CODEX.to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let review = db
         .create_execution(
             CreateExecutionInput::builder()
@@ -242,15 +250,52 @@ fn pr_review_executions_are_not_allocated() {
         .unwrap();
 
     let decision = db.get_execution_driver_decision(&review.id).unwrap().unwrap();
-    assert_eq!(decision.driver, None);
-    assert_eq!(decision.reason, REASON_DEFAULT);
+    assert_eq!(decision.driver.as_deref(), Some(DRIVER_SLUG_CLAUDE));
+    assert_eq!(decision.reason, REASON_POOL);
+    assert_eq!(
+        db.get_execution_driver_slug(&review.id).unwrap().as_deref(),
+        decision.driver.as_deref(),
+        "the persisted review decision must name the driver dispatch uses",
+    );
 
-    // The implementation execution for the same row still allocates — it is
-    // the review that is pool-pinned, not the work item.
+    // The implementation execution for the same row still honours its pin —
+    // it is the review that is pool-pinned, not the work item.
     let implementation = create_ready_chore_execution(&db, &chore.id);
     let decision = db.get_execution_driver_decision(&implementation.id).unwrap().unwrap();
-    assert_eq!(decision.reason, REASON_ALLOCATION);
+    assert_eq!(decision.reason, REASON_EXPLICIT);
     assert_eq!(decision.driver.as_deref(), Some(DRIVER_SLUG_CODEX));
+}
+
+#[test]
+fn pool_driver_backfill_corrects_old_review_decisions_idempotently() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, &product.id, "legacy reviewed chore");
+    let review = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE execution_driver_decisions
+         SET driver = ?1, reason = ?2
+         WHERE execution_id = ?3",
+        params![DRIVER_SLUG_CODEX, REASON_EXPLICIT, &review.id],
+    )
+    .unwrap();
+    migrate_backfill_pool_driver_decisions(&conn).unwrap();
+    migrate_backfill_pool_driver_decisions(&conn).unwrap();
+    drop(conn);
+
+    let decision = db.get_execution_driver_decision(&review.id).unwrap().unwrap();
+    assert_eq!(decision.driver.as_deref(), Some(DRIVER_SLUG_CLAUDE));
+    assert_eq!(decision.reason, REASON_POOL);
 }
 
 /// Conflict resolution and CI remediation ARE still allocated (unlike a
@@ -419,10 +464,10 @@ fn ordinary_chore_implementation_still_honours_a_codex_task_pin() {
 
 /// Work that came from an automation runs on the automation pool, which
 /// pins the same driver the review pool does
-/// (`ClaudeCoordinator::execution_targets_automation_pool`). Allocation
-/// declines it for the same reason it declines a review.
+/// (`ClaudeCoordinator::execution_targets_automation_pool`). Its decision
+/// records that fixed pool driver for the same reason it does for a review.
 #[test]
-fn automation_sourced_rows_are_not_allocated() {
+fn automation_sourced_rows_record_the_pool_driver() {
     let (_dir, db) = open_db();
     db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100)).unwrap();
     let product = create_test_product(&db);
@@ -453,8 +498,8 @@ fn automation_sourced_rows_are_not_allocated() {
 
     let execution = create_ready_chore_execution(&db, &chore.id);
     let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
-    assert_eq!(decision.driver, None);
-    assert_eq!(decision.reason, REASON_DEFAULT);
+    assert_eq!(decision.driver.as_deref(), Some(DRIVER_SLUG_CLAUDE));
+    assert_eq!(decision.reason, REASON_POOL);
 }
 
 /// A restricted eligible set holding no share at all is a loud failure, not

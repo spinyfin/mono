@@ -2637,8 +2637,9 @@ pub(crate) fn migrate_backfill_cancelled_moot_revision_tombstones(conn: &Connect
 }
 
 /// Create `execution_driver_decisions`: one row per `work_executions` row,
-/// recording which driver traffic allocation chose for it and why
-/// (`explicit` | `allocation` | `default`) — see `work::driver_allocation`.
+/// recording which driver traffic allocation or its dispatch pool chose for
+/// it and why (`explicit` | `allocation` | `pool` | `default`) — see
+/// `work::driver_allocation`.
 /// A dedicated side table rather than columns on `work_executions` itself:
 /// the decision is written once, read by two narrow lookups keyed on
 /// `execution_id`, and joins cleanly for after-the-fact analysis ("how much
@@ -2672,6 +2673,26 @@ pub(crate) fn migrate_execution_driver_decisions_table(conn: &Connection) -> Res
             [],
         )?;
     }
+    Ok(())
+}
+
+/// Correct historical decisions for executions whose kind always dispatches
+/// on the review/automation pool. Earlier versions evaluated a row/product
+/// pin first and consequently persisted that pin as `explicit`, although the
+/// pool always ran the execution on Claude. The update is self-idempotent:
+/// once a row carries the pool's driver and reason it no longer matches.
+pub(crate) fn migrate_backfill_pool_driver_decisions(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE execution_driver_decisions
+         SET driver = ?1, reason = 'pool', split_at_decision = NULL
+         WHERE (driver IS NOT ?1 OR reason <> 'pool' OR split_at_decision IS NOT NULL)
+           AND EXISTS (
+               SELECT 1 FROM work_executions we
+               WHERE we.id = execution_driver_decisions.execution_id
+                 AND we.kind IN ('pr_review', 'automation_triage')
+           )",
+        params![crate::coordinator::REVIEWER_POOL_DRIVER],
+    )?;
     Ok(())
 }
 
