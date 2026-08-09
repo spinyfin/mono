@@ -27,6 +27,11 @@ rust_library(
         # src/conformance/claude_goldens.rs.
         "src/conformance/goldens/settings_standard.json.golden",
         "src/conformance/goldens/claude_md_standard.md.golden",
+        # Planner breakdown-authority regression: verbatim copy of the design
+        # doc that was force-split into ten invented tasks (include_str!'d from
+        # planner unit tests). Keep in sync with
+        # tools/boss/docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md.
+        "testdata/operator_forced_dispatch_design.md",
     ],
     crate_name = "boss_engine",
     crate_root = "src/lib.rs",

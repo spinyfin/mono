@@ -61,11 +61,20 @@
 //! (`tasks`, `edges`) back into an array, when the string itself parses as
 //! one, before schema validation runs; (3) if validation still fails,
 //! [`plan_with_call`] retries (bounded by [`PLANNER_VALIDATION_ATTEMPTS`])
-//! with the validation error fed back into the prompt; (4) if the *final*
-//! attempt is still schema-invalid, it falls back to the last schema-valid
-//! proposal an earlier attempt produced (if any) rather than discarding a
-//! stageable plan — only when no attempt ever produced a schema-valid output
-//! does the run fail whole ([`PlannerOutcome::InvalidOutput`]).
+//! with the validation error fed back into the prompt; only when no attempt
+//! ever produced a schema-valid output does the run fail whole
+//! ([`PlannerOutcome::InvalidOutput`]).
+//!
+//! ## Breakdown authority (not a decomposition engine)
+//!
+//! The design doc's implementation-task breakdown is authoritative: entry
+//! count in, row count out. The user prompt surfaces a discrete inventory of
+//! parsed `###` (or numbered) entries so the model cannot freely re-segment a
+//! single Scope paragraph. Dependency edges come only from what each entry
+//! declares (`Dependencies: none` → no edges). A prior "oversize task"
+//! re-prompt that forced multi-layer / multi-clause entries into invented
+//! per-subsystem DAGs is deliberately retired — that path undid design-time
+//! breakdown honesty (one entry → ten invented rows).
 //!
 //! ## Bounded model / effort / timeout
 //!
@@ -83,7 +92,6 @@ use boss_protocol::{PlannerInput, PlannerOutput, planner_output_schema};
 
 use crate::claude_client::{self, CallConfig, ClaudeError, MessagesResponse, RetryPolicy};
 use crate::utility_model::{UtilityCall, UtilityModel, UtilityTask};
-use boss_engine_planner_validation::{OversizeFinding, detect_oversize_tasks};
 
 /// The model the Planner runs on. A direct API call needs a concrete model
 /// id (the `--model` family aliases used for worker dispatch are resolved by
@@ -129,31 +137,26 @@ pub const PLANNER_ATTEMPTS: u32 = 2;
 pub const PLANNER_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Total attempts across the outer output-acceptance retry loop in
-/// [`Planner::plan`]. Two distinct rejection modes share this one bounded
-/// loop, each re-prompting with the rejection reason fed back to the model:
-///
-/// 1. **Schema-invalid output** — a model occasionally emits a tool call that
-///    violates [`planner_output_schema`] (observed: an array-typed field like
-///    `edges` emitted as a single JSON-encoded string; historically also
-///    `effort_audit`, before the model stopped being asked to emit it — see
-///    the module doc). That is model flakiness, not a transient transport
-///    error, so [`PLANNER_ATTEMPTS`]'s 429/5xx retry never sees it and a
-///    single miss used to fail the whole proposal.
-/// 2. **Oversize tasks (the decomposition gate)** — a schema-valid proposal
-///    that packs a monolithic "project in disguise" task
-///    ([`detect_oversize_tasks`]). The retry asks the model to decompose it
-///    into dependency-ordered, single-subsystem, single-PR tasks.
+/// [`Planner::plan`]. The loop re-prompts only for **schema-invalid output** —
+/// a model occasionally emits a tool call that violates
+/// [`planner_output_schema`] (observed: an array-typed field like `edges`
+/// emitted as a single JSON-encoded string; historically also `effort_audit`,
+/// before the model stopped being asked to emit it — see the module doc).
+/// That is model flakiness, not a transient transport error, so
+/// [`PLANNER_ATTEMPTS`]'s 429/5xx retry never sees it and a single miss used
+/// to fail the whole proposal.
 ///
 /// Bounded at 2 (one retry): the retry re-sends the request with the
-/// rejection reason appended to the prompt, so the model can see and correct
-/// exactly what it got wrong. An oversize proposal that survives the budget
-/// is accepted best-effort (the valid, operator-reviewed plan is not worth
-/// discarding over an imperfect split). A schema failure that survives the
-/// budget falls back to the last schema-valid proposal seen on an earlier
-/// attempt, if any (same best-effort policy — a validation-clean, merely
-/// oversize proposal from attempt 1 must not be thrown away just because
-/// attempt 2 flaked on schema); only when NO attempt ever produced a
-/// schema-valid output does the run fail ([`PlannerOutcome::InvalidOutput`]).
+/// validation error appended to the prompt, so the model can see and correct
+/// exactly what it got wrong. Only when no attempt produces a schema-valid
+/// output does the run fail ([`PlannerOutcome::InvalidOutput`]).
+///
+/// **Not** a decomposition gate. A prior oversize re-prompt path forced the
+/// model to invent tasks by splitting multi-clause / multi-layer design
+/// entries the author had already sized; that undid design-time breakdown
+/// honesty and is deliberately gone. The design doc's entry count is
+/// authoritative — an over-large single row is cheap to fix by hand; ten
+/// invented rows with a fabricated dependency graph are not.
 pub const PLANNER_VALIDATION_ATTEMPTS: u32 = 2;
 
 /// Name of the forced tool whose `input_schema` is [`planner_output_schema`].
@@ -228,19 +231,19 @@ impl PlannerOutcome {
     }
 }
 
-/// Audit of the decomposition gate's activity during one [`Planner::plan`]
-/// call, carried alongside [`PlannerOutcome`] so the caller (the Populator)
-/// can surface it to the operator without re-deriving it from logs. Purely
-/// observational — it does not change the gate's behaviour (design/T298
-/// lineage), only exposes what [`plan_with_call`] already computes.
+/// Historical audit of the retired oversize decomposition re-prompt.
+///
+/// Always zero after the planner stopped re-prompting to split design-doc
+/// entries (the design doc's breakdown is authoritative; entry count in,
+/// row count out). Kept so callers that still destructure
+/// [`DecompositionAudit`] (Populator attention copy, plan-run summaries)
+/// compile without a breaking shape change — the fields are now inert.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DecompositionAudit {
-    /// Number of attempts on which [`detect_oversize_tasks`] found an
-    /// oversize task (0 = the gate never triggered).
+    /// Always 0. Retained for wire/API compatibility with older populator
+    /// attention copy that keys on this field.
     pub oversize_attempts: u32,
-    /// Tasks still oversize when a proposal was accepted best-effort after
-    /// exhausting [`PLANNER_VALIDATION_ATTEMPTS`]. 0 if the gate never
-    /// triggered, or triggered but a later retry resolved cleanly.
+    /// Always 0. Retained for wire/API compatibility.
     pub oversize_remaining: usize,
 }
 
@@ -278,37 +281,30 @@ impl Planner {
 }
 
 /// Why the previous attempt's output was rejected, carried into the next
-/// attempt's prompt so the model can see and fix exactly what was wrong. The
-/// two rejection modes share the one bounded acceptance loop
-/// ([`PLANNER_VALIDATION_ATTEMPTS`]).
+/// attempt's prompt so the model can see and fix exactly what was wrong.
+/// Only schema-invalid output is re-prompted ([`PLANNER_VALIDATION_ATTEMPTS`]).
 enum RetryFeedback {
     /// The tool call failed [`planner_output_schema`] validation.
     Schema(String),
-    /// The proposal was schema-valid but one or more tasks tripped the
-    /// decomposition gate ([`detect_oversize_tasks`]).
-    Oversize(Vec<OversizeFinding>),
 }
 
 /// Core of [`Planner::plan`] with the resolved [`UtilityCall`] injected so
 /// tests can drive it against a mock server. Hands each attempt's request to the shared
 /// [`crate::claude_client`] pipeline (which owns 429/5xx/transport
-/// retry/backoff) and, on a rejection — a schema-validation failure OR an
-/// oversize proposal the decomposition gate catches — rebuilds the request
+/// retry/backoff) and, on a schema-validation failure, rebuilds the request
 /// with the reason fed back into the prompt and tries again, bounded by
-/// [`PLANNER_VALIDATION_ATTEMPTS`], before failing safe / accepting
-/// best-effort.
+/// [`PLANNER_VALIDATION_ATTEMPTS`], before failing safe.
+///
+/// Schema-valid proposals are accepted as-is. The planner does **not** re-prompt
+/// to split multi-clause or multi-layer tasks — the design doc's breakdown is
+/// authoritative (entry count in, row count out).
 async fn plan_with_call(call: &UtilityCall, input: &PlannerInput) -> (PlannerOutcome, DecompositionAudit) {
     let config = CallConfig::new(PLANNER_TIMEOUT)
         .with_retry(RetryPolicy::new(PLANNER_ATTEMPTS, PLANNER_BACKOFF, PLANNER_BACKOFF))
         .with_endpoint(call.endpoint.clone());
 
     let mut feedback: Option<RetryFeedback> = None;
-    let mut audit = DecompositionAudit::default();
-    // The last schema-valid proposal seen on an earlier attempt (with its
-    // oversize-finding count), kept so a *later* attempt's schema failure can
-    // fall back to it instead of discarding a stageable plan — see the
-    // fallback branch below and [`PLANNER_VALIDATION_ATTEMPTS`]'s doc comment.
-    let mut last_valid: Option<(PlannerOutput, usize)> = None;
+    let audit = DecompositionAudit::default();
     for attempt in 1..=PLANNER_VALIDATION_ATTEMPTS {
         let body = match &feedback {
             None => build_request_body(input, &call.model),
@@ -317,59 +313,10 @@ async fn plan_with_call(call: &UtilityCall, input: &PlannerInput) -> (PlannerOut
         match claude_client::send_messages_raw(&call.api_key, &body, &config).await {
             Ok(response) => match planner_output_from_response(&response) {
                 Ok(output) => {
-                    // Decomposition gate (design brief deliverable 1): reject a
-                    // schema-valid proposal that ships a monolithic
-                    // "project in disguise" task and re-prompt for a split,
-                    // bounded by the same retry budget. On the final attempt
-                    // accept the best-effort output rather than discard a valid
-                    // (if imperfectly-decomposed) plan — the staged tasks are
-                    // still operator-reviewed before dispatch, and the prompt's
-                    // sizing contract already pushed hard for the split.
-                    let findings = detect_oversize_tasks(&output);
-                    if findings.is_empty() {
-                        return (PlannerOutcome::Success(output), audit);
-                    }
-                    audit.oversize_attempts += 1;
-                    if attempt >= PLANNER_VALIDATION_ATTEMPTS {
-                        audit.oversize_remaining = findings.len();
-                        tracing::warn!(
-                            attempt,
-                            oversize = findings.len(),
-                            "planner: oversize task(s) remain after decomposition retries; accepting best-effort proposal",
-                        );
-                        return (PlannerOutcome::Success(output), audit);
-                    }
-                    tracing::warn!(
-                        attempt,
-                        oversize = findings.len(),
-                        "planner: proposal packs oversize task(s); re-prompting for decomposition",
-                    );
-                    last_valid = Some((output, findings.len()));
-                    feedback = Some(RetryFeedback::Oversize(findings));
+                    return (PlannerOutcome::Success(output), audit);
                 }
                 Err(msg) => {
                     if attempt >= PLANNER_VALIDATION_ATTEMPTS {
-                        // Final attempt is schema-invalid. Rather than discard
-                        // the run outright, fall back to the last schema-valid
-                        // proposal an earlier attempt already produced (if
-                        // any) and accept it best-effort — symmetric with the
-                        // oversize best-effort acceptance above. This is the
-                        // exact incident this budget failed to handle: attempt
-                        // 1 produced a valid-but-oversize proposal, attempt
-                        // 2's only retry was already spent on the oversize
-                        // re-prompt, and the model's final response flaked on
-                        // schema (`effort_audit` as a JSON-encoded string) —
-                        // the valid attempt-1 plan was discarded instead of
-                        // staged.
-                        if let Some((output, oversize_remaining)) = last_valid {
-                            audit.oversize_remaining = oversize_remaining;
-                            tracing::warn!(
-                                attempt,
-                                err = %msg,
-                                "planner: final attempt schema-invalid; falling back to last schema-valid proposal",
-                            );
-                            return (PlannerOutcome::Success(output), audit);
-                        }
                         return (PlannerOutcome::InvalidOutput(msg), audit);
                     }
                     tracing::warn!(
@@ -384,9 +331,8 @@ async fn plan_with_call(call: &UtilityCall, input: &PlannerInput) -> (PlannerOut
             Err(err) => return (outcome_from_error(err), audit),
         }
     }
-    // Unreachable in practice: the final iteration returns in every branch
-    // (Ok → Success/best-effort, Err → InvalidOutput/fallback-Success). Kept
-    // as a fail-safe.
+    // Unreachable in practice: the final iteration returns in every branch.
+    // Kept as a fail-safe.
     (
         PlannerOutcome::InvalidOutput("exhausted planner validation retries".to_owned()),
         audit,
@@ -416,7 +362,8 @@ pub fn build_request_body(input: &PlannerInput, model: &str) -> Value {
 }
 
 /// Build the user message: project/product context, the task cap, the
-/// existing-task dedup hint, and the full design doc to read.
+/// existing-task dedup hint, a structured inventory of breakdown entries
+/// (when parseable), and the full design doc to read.
 pub fn build_user_prompt(input: &PlannerInput) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -455,10 +402,40 @@ pub fn build_user_prompt(input: &PlannerInput) -> String {
         out.push('\n');
     }
 
+    // Discrete entry inventory: entry boundaries are a hard unit of work.
+    // Passing only free prose let the model re-segment a single entry's Scope
+    // paragraph into many invented tasks; listing the parsed entries first
+    // makes the entry count and per-entry Dependencies field explicit.
+    let entries = extract_breakdown_entries(&input.design_doc);
+    if !entries.is_empty() {
+        out.push_str(&format!(
+            "--- AUTHORITATIVE BREAKDOWN ENTRIES ({N} entr{plural}) ---\n\
+             These were parsed from the design doc's implementation task \
+             breakdown. By default emit **exactly one task per entry** and \
+             **only the dependency edges each entry states**. Do not split an \
+             entry's Scope paragraph into multiple tasks. Do not invent edges \
+             the entry does not declare (if it says `Dependencies: none`, emit \
+             no edges for it).\n\n",
+            N = entries.len(),
+            plural = if entries.len() == 1 { "y" } else { "ies" },
+        ));
+        for (i, entry) in entries.iter().enumerate() {
+            out.push_str(&format!("### Entry {} — {}\n", i + 1, entry.title));
+            if !entry.body.trim().is_empty() {
+                out.push_str(entry.body.trim());
+                out.push('\n');
+            }
+            out.push('\n');
+        }
+        out.push_str("--- END AUTHORITATIVE BREAKDOWN ENTRIES ---\n\n");
+    }
+
     out.push_str(
         "Below is the full merged design document. Read its implementation \
          breakdown and call the `emit_task_graph` tool with the proposed \
-         task graph.\n\n",
+         task graph. Prefer the authoritative entry inventory above when it \
+         is present; use the full doc for context and for any entries the \
+         inventory could not parse.\n\n",
     );
     out.push_str(&format!("--- BEGIN DESIGN DOC ({}) ---\n", input.design_doc_ref.path));
     out.push_str(&input.design_doc);
@@ -467,6 +444,182 @@ pub fn build_user_prompt(input: &PlannerInput) -> String {
     }
     out.push_str("--- END DESIGN DOC ---\n");
     out
+}
+
+/// One discrete unit from a design doc's implementation task breakdown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreakdownEntry {
+    /// Entry title (`###` heading text, or the first line of a numbered item).
+    pub title: String,
+    /// Remainder of the entry (Scope, Effort hint, Dependencies, free prose).
+    pub body: String,
+}
+
+/// Headings that open a design-doc implementation breakdown section.
+const BREAKDOWN_HEADINGS: &[&str] = &[
+    "proposed implementation task breakdown",
+    "follow-up implementation chores",
+    "implementation plan",
+    "implementation task breakdown",
+];
+
+/// Locate the breakdown section body (text after the matching `##` heading
+/// until the next `##` heading, or EOF). Returns `None` when no recognised
+/// breakdown heading is present.
+pub fn extract_breakdown_section(doc: &str) -> Option<&str> {
+    // Walk line-by-line so we match only ATX headings, not prose mentions.
+    let all_lines: Vec<&str> = doc.lines().collect();
+    let mut section_start: Option<usize> = None;
+    for (idx, line) in all_lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("## ") {
+            let heading = rest.trim().to_ascii_lowercase();
+            if BREAKDOWN_HEADINGS.iter().any(|h| heading == *h) {
+                // Body starts on the next line.
+                section_start = Some(idx + 1);
+                break;
+            }
+        }
+    }
+    let start_line = section_start?;
+    let start_byte = line_byte_offset(doc, start_line);
+    // End at the next ## heading (not ###).
+    let mut end_byte = doc.len();
+    for (idx, line) in all_lines.iter().enumerate().skip(start_line) {
+        let trimmed = line.trim();
+        if trimmed.starts_with("## ") && !trimmed.starts_with("### ") {
+            end_byte = line_byte_offset(doc, idx);
+            break;
+        }
+    }
+    if start_byte > end_byte {
+        return None;
+    }
+    Some(doc.get(start_byte..end_byte).unwrap_or("").trim())
+}
+
+/// Byte offset of the start of line `line_idx` (0-based) in `doc`.
+fn line_byte_offset(doc: &str, line_idx: usize) -> usize {
+    if line_idx == 0 {
+        return 0;
+    }
+    let mut seen = 0usize;
+    for (byte_idx, ch) in doc.char_indices() {
+        if ch == '\n' {
+            seen += 1;
+            if seen == line_idx {
+                return byte_idx + 1;
+            }
+        }
+    }
+    doc.len()
+}
+
+/// Parse discrete breakdown entries from a design doc.
+///
+/// Prefers `###` ATX headings inside the breakdown section (the modern
+/// design-directive shape). Falls back to top-level numbered list items
+/// (`1. …`) when the section has no `###` entries. Returns an empty vec when
+/// no breakdown section or no entries are found — the planner still receives
+/// the full doc and can fall back to free-form extraction.
+pub fn extract_breakdown_entries(doc: &str) -> Vec<BreakdownEntry> {
+    let Some(section) = extract_breakdown_section(doc) else {
+        return Vec::new();
+    };
+    let heading_entries = parse_hash_entries(section);
+    if !heading_entries.is_empty() {
+        return heading_entries;
+    }
+    parse_numbered_entries(section)
+}
+
+/// Split a breakdown section on `###` headings into entries. Skips a leading
+/// `Breakdown size: N entries …` prose line (not an entry).
+fn parse_hash_entries(section: &str) -> Vec<BreakdownEntry> {
+    let mut entries = Vec::new();
+    let mut current_title: Option<String> = None;
+    let mut body_lines: Vec<&str> = Vec::new();
+
+    for line in section.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("### ") {
+            if let Some(title) = current_title.take() {
+                entries.push(BreakdownEntry {
+                    title,
+                    body: body_lines.join("\n"),
+                });
+                body_lines.clear();
+            }
+            current_title = Some(rest.trim().to_owned());
+            continue;
+        }
+        if current_title.is_some() {
+            body_lines.push(line);
+        }
+        // Lines before the first ### (e.g. Breakdown size: …) are ignored.
+    }
+    if let Some(title) = current_title {
+        entries.push(BreakdownEntry {
+            title,
+            body: body_lines.join("\n"),
+        });
+    }
+    entries
+}
+
+/// Fallback: numbered list items (`1. Title` / `1. Title — scope`) as entries.
+fn parse_numbered_entries(section: &str) -> Vec<BreakdownEntry> {
+    let mut entries = Vec::new();
+    let mut current_title: Option<String> = None;
+    let mut body_lines: Vec<&str> = Vec::new();
+
+    for line in section.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = strip_numbered_item(trimmed) {
+            if let Some(title) = current_title.take() {
+                entries.push(BreakdownEntry {
+                    title,
+                    body: body_lines.join("\n"),
+                });
+                body_lines.clear();
+            }
+            // First line may be "Title. Scope continues…" — keep whole line
+            // as title when short, otherwise title = first sentence-ish.
+            current_title = Some(rest.to_owned());
+            continue;
+        }
+        if current_title.is_some() {
+            body_lines.push(line);
+        }
+    }
+    if let Some(title) = current_title {
+        entries.push(BreakdownEntry {
+            title,
+            body: body_lines.join("\n"),
+        });
+    }
+    entries
+}
+
+/// If `line` is a numbered list item (`1. foo` / `12. foo`), return the text
+/// after the marker; otherwise `None`.
+fn strip_numbered_item(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    if bytes.is_empty() || !bytes[0].is_ascii_digit() {
+        return None;
+    }
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 0 || i >= bytes.len() || bytes[i] != b'.' {
+        return None;
+    }
+    let rest = line[i + 1..].trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    Some(rest)
 }
 
 /// Build the retry request body: identical to [`build_request_body`] except
@@ -485,9 +638,7 @@ fn build_retry_request_body(input: &PlannerInput, feedback: &RetryFeedback, mode
     body
 }
 
-/// The retry user turn: the normal prompt plus an explicit rejection notice.
-/// The notice differs by rejection mode — a schema-type error, or the
-/// decomposition gate's list of oversize tasks to split.
+/// The retry user turn: the normal prompt plus an explicit schema-rejection notice.
 fn retry_user_prompt(input: &PlannerInput, feedback: &RetryFeedback) -> String {
     let mut out = build_user_prompt(input);
     match feedback {
@@ -499,26 +650,6 @@ fn retry_user_prompt(input: &PlannerInput, feedback: &RetryFeedback) -> String {
                  particular, array fields (`tasks`, `edges`) must be emitted as a JSON \
                  array, never as a single JSON-encoded string containing one. Call \
                  `emit_task_graph` again with a schema-valid payload that fixes this.\n\
-                 --- END REJECTION NOTICE ---\n"
-            ));
-        }
-        RetryFeedback::Oversize(findings) => {
-            let list = findings
-                .iter()
-                .map(|f| format!("- {}", f.describe()))
-                .collect::<Vec<_>>()
-                .join("\n");
-            out.push_str(&format!(
-                "\n--- YOUR PREVIOUS emit_task_graph CALL WAS REJECTED: OVERSIZE TASK(S) ---\n\
-                 One or more proposed tasks are too large for a single worker session / a \
-                 single reviewable PR. Decompose EACH of the following into dependency-ordered \
-                 tasks — single-subsystem, single-PR each — and wire the `edges` between them. \
-                 Lift any embedded fan-out (\"validate/sweep/migrate all N X\", an all-lists \
-                 reconciliation, a corpus-wide sweep) into its OWN dependent task. When a task \
-                 embeds unknown-format discovery, emit a separate `investigation` task before \
-                 the implementation task that consumes it:\n\
-                 {list}\n\
-                 Call `emit_task_graph` again with the decomposed graph.\n\
                  --- END REJECTION NOTICE ---\n"
             ));
         }
@@ -597,7 +728,7 @@ const EFFORT_AUDIT_PREFIX: &str = "[effort-classification]";
 ///
 /// One entry per task, same order as `tasks` (an empty string for a task
 /// whose description has no audit line), so callers that index it against
-/// `tasks` by position (e.g. [`detect_oversize_tasks`]) stay aligned.
+/// `tasks` by position stay aligned.
 fn derive_effort_audit(output: &mut PlannerOutput) {
     output.effort_audit = output
         .tasks
@@ -674,9 +805,10 @@ fn unescape_over_escaped(s: &str) -> String {
 }
 
 /// The Planner's system prompt. Encodes the coordinator policy a human would
-/// otherwise apply by hand: the Q4 effort heuristic, the kind conventions,
-/// the parallelism-maximising edge guidance, and the `[effort-classification]`
-/// emission contract. See design §2 "Encodes coordinator policy".
+/// otherwise apply by hand: the design-doc breakdown is authoritative, the Q4
+/// effort heuristic, the kind conventions, the doc-stated edge guidance, and
+/// the `[effort-classification]` emission contract. See design §2 "Encodes
+/// coordinator policy".
 const SYSTEM_PROMPT: &str = "\
 You are the Boss Planner — a mini-coordinator. You read a merged software \
 design document and propose the project's implementation task graph: the \
@@ -693,12 +825,19 @@ call with the proposed graph. Do not call any other tool.\n\
 \n\
 Most design docs end with a section enumerating the implementation work — \
 headings like \"Proposed implementation task breakdown\", \"Follow-up \
-Implementation Chores\", or \"Implementation Plan\", usually a numbered or \
-bulleted list where each item is one bite-sized unit of work (roughly one PR \
-each). Extract those items as `tasks`.\n\
+Implementation Chores\", or \"Implementation Plan\". Each entry is typically \
+a `###` heading (or a numbered list item) with a short name, a Scope \
+paragraph, an Effort hint, and a Dependencies line. **The design doc's \
+breakdown is authoritative.** It has already been through design review; \
+the author decided what the units of work are. Your job is to materialise \
+that decision, not to re-litigate it. Entry count in, row count out.\n\
 \n\
 - If the doc contains such a breakdown, set `breakdown_found` to true and \
-emit one task per enumerated item.\n\
+emit **exactly one task per enumerated entry** (each `###` heading or each \
+top-level numbered item is one entry).\n\
+- If the user message includes an \"AUTHORITATIVE BREAKDOWN ENTRIES\" \
+inventory, treat that list as the discrete units of work: one task per \
+inventory entry by default.\n\
 - If the doc is pure design rationale with NO enumerable implementation \
 breakdown, set `breakdown_found` to false, return an empty `tasks` array and \
 empty `edges`, and explain in `notes`. This is a clean, valid result — not \
@@ -716,6 +855,8 @@ Do NOT propose:\n\
 - Any task whose name duplicates one already in the project (the existing \
 names are listed in the user message).\n\
 - More than the task cap stated in the user message.\n\
+- Tasks invented by re-segmenting one entry's Scope paragraph into clauses, \
+layers, files, or subsystems the author already chose to keep together.\n\
 \n\
 ## scope tiers — in-scope vs deferred\n\
 \n\
@@ -779,37 +920,41 @@ touches a repo file), still emit the task but scope its `description` to \
 the repo-side portion only, and note in `notes` that the coordinator-only \
 portion was excluded and why.\n
 
-## task sizing contract — one reviewable PR per task\n\
+## breakdown authority — do not re-expand entries\n\
 \n\
-Every task you propose must be single-subsystem, single-PR, and completable \
-by one worker in roughly one session. Size each item down to that \
-granularity: when a doc's own breakdown item is bigger than that, SPLIT it \
-into several dependency-ordered tasks rather than transcribing it whole. A \
-single monolithic \"project in disguise\" task is exactly the failure mode \
-this guards against.\n\
+**Default: one row per breakdown entry, zero invented work.** The entry \
+boundary is a hard boundary. Transcribe each entry as one task whose `name` \
+comes from the entry title and whose `description` is the entry's Scope (plus \
+the `[effort-classification]` line). A one-entry breakdown produces one row \
+and an empty edge set when that entry declares no dependencies.\n\
 \n\
-- **Multi-subsystem scope is several tasks.** A task that spans multiple \
-subsystems (engine + cli + protocol + app + …) must be emitted as one task \
-per subsystem with dependency edges — never one task that touches them all.\n\
-- **Multi-phase scope is several tasks.** \"parse (i)… and (ii)… and emit… \
-and validate…\" is a chain of phases: emit each phase as its own task and \
-wire the `edges` between them. Never pack the phases into one task.\n\
-- **Embedded fan-out is its own dependent task.** \"validate/sweep/migrate \
-all N X\", an all-lists reconciliation, or a corpus-wide sweep is a separate \
-task that depends on the implementation it validates. Do not fold the sweep \
-into the implementer.\n\
-- **If a breakdown item needs a paragraph to describe, it is almost \
-certainly several tasks** — decompose it.\n\
-- **Unknown-format discovery becomes an INVESTIGATION task.** When an item \
-embeds format discovery / reverse-engineering (verbs like study, dump, \
-reverse-engineer, characterise, reconcile-against-source), emit a separate \
-`investigation` task for that discovery, sequenced (via an edge) BEFORE the \
-implementation task that consumes its findings. This is the T298 lesson: the \
-single biggest chunk of that run was format discovery, not implementation — \
-ideal investigation-task shape.\n\
+The following are **not** reasons to split an entry into multiple tasks:\n\
+- a Scope paragraph with several clauses, or that names several files, \
+directories, or subsystems;\n\
+- an entry that spans more than one layer (protocol, engine, CLI, app) — a \
+thin change across layers is still one reviewable PR when the design author \
+kept it as one entry;\n\
+- an entry that mentions tests alongside the behaviour they cover;\n\
+- an entry longer than some number of words or characters;\n\
+- any comparison against a target or typical entry count.\n\
 \n\
-A proposal that ships an oversize task will be rejected and you will be \
-re-prompted to decompose it, so split it up front.\n\
+**The one permitted exception — a high bar.** You may split an entry only \
+where there is a *strong, articulable* reason to believe that entry is \
+genuinely too large to execute as a single task (for example: two unrelated \
+deliverables that cannot ship or be reviewed together, with no shared PR \
+boundary). Multi-clause Scope, multi-layer scope, and length alone never \
+meet this bar. When you do split, you **must** say so explicitly in \
+`notes` — name the entry, the reason the bar was met, and what you split it \
+into — so the decision is visible and reviewable rather than silent. When \
+in doubt, do **not** split: emit one row and raise the concern in `notes` \
+instead. An over-large single row is cheap to fix; ten invented rows with a \
+fabricated dependency graph are not.\n\
+\n\
+- **Unknown-format discovery may stay an `investigation` kind** when the \
+entry itself is framed as research / reverse-engineering — that is a kind \
+choice for that entry, not a licence to invent extra entries.\n\
+- Do **not** invent sibling tasks for subsystems, phases, or test sweeps \
+named inside one entry's Scope.\n\
 \n\
 ## handles\n\
 \n\
@@ -867,40 +1012,33 @@ format (backticks around the level and the rule; double-quoted reasons):\n\
 rest of the description by a blank line.\n\
 - The `level` in the line MUST equal the task's `effort`.\n\
 \n\
-## dependency edges — maximise safe parallelism\n\
+## dependency edges — only what the doc states\n\
 \n\
-Add an edge ONLY for a true prerequisite: B genuinely cannot start until A \
-has landed (e.g. \"engine RPC handler\" depends on \"protocol types\"). \
-Leave independently-startable tasks unedged so they dispatch in parallel. Do \
-NOT chain tasks into a single line just because they are listed in order — \
-`ordinal` already carries the soft ordering hint, and over-edging serializes \
-work that could run concurrently.\n\
+**Edges come only from what the design doc states.** Read each entry's \
+`Dependencies:` line (or equivalent prose such as \"Depends on …\" / \
+\"Depends on: none\").\n\
 \n\
-The common healthy shape is: a shared schema / protocol / contract task as \
-the root, then a fan-out of independent consumer tasks that each depend only \
-on that root, then an integration / end-to-end task that depends on the \
-fan-out. Edges MUST form a DAG — never introduce a cycle.\n\
+- If an entry says `Dependencies: none` (or equivalent), emit **no edges** \
+for that entry. Do not invent ordering from Scope prose, layer names, or a \
+\"healthy\" fan-out shape.\n\
+- If an entry names other entries as prerequisites, emit exactly those edges \
+(map prerequisite names to the handles you assigned those entries).\n\
+- Do **not** synthesise a schema-root / fan-out / integration DAG the doc did \
+not declare. Do **not** chain tasks into a line just because they are listed \
+in order — `ordinal` already carries the soft ordering hint.\n\
+- Edges MUST form a DAG — never introduce a cycle.\n\
 \n\
-When you decide parallelism, weigh not just **functional** independence but \
-also **file** overlap. Two tasks can be independent in design yet edit the \
-same files — e.g. a compact-view task and a detail-view task that both edit \
-the same component/container, or two tasks that both touch one shared route / \
-config / module. Parallelising edit-overlapping siblings schedules a \
-forward-port conflict, and each such conflict is a chance for the later \
-resolution to silently drop the earlier one's work. So: when — and only when \
-— two otherwise-parallel tasks are **clearly and substantially** likely to \
-co-edit the same file(s), add an entry to `merge_order_hints` naming the pair \
-and the file(s)/surface you expect them to co-edit. Do NOT over-index on \
-this — a little incidental overlap is not enough; if you flag every pair that \
-shares a file, the hint stops being useful. Emit a hint only on clear, \
-substantial overlap.\n\
+When the doc *does* leave two tasks independently startable and they are \
+**clearly and substantially** likely to co-edit the same file(s), you may \
+add a `merge_order_hints` entry naming the pair and the file(s)/surface — \
+not a hard edge. A little incidental overlap is not enough.\n\
 \n\
 **A `merge_order_hints` entry is NOT a dependency edge and must never gate \
 dispatch.** Both tasks stay independently startable — the hint only lets a \
 later merge-time step order the two PRs and require the later one to \
 forward-port the sibling's changes preservingly (integrate, never delete). \
 Never use a `blocks` edge for file overlap alone; `edges` is reserved for \
-true functional prerequisites (design's \"Parallel throughput stays the \
+doc-stated functional prerequisites (design's \"Parallel throughput stays the \
 default\").\n\
 \n\
 Each edge is { \"dependent\": <handle that waits>, \"prerequisite\": <handle \
@@ -930,8 +1068,12 @@ review regardless — but it flags the result for scrutiny.)\n\
 \n\
 ## notes\n\
 \n\
-Put a short free-text rationale in `notes`: which section you read, how you \
-chose the edges, and anything a human reviewer should know.\
+Put a short free-text rationale in `notes`: which section you read, the \
+entry count you materialised, how you chose the edges (must cite doc-stated \
+dependencies), and anything a human reviewer should know. If you split an \
+entry under the high-bar exception, name the entry, the reason, and the \
+split results here. If you kept a large multi-layer entry as one row but \
+worry it is oversized, say so here rather than inventing a split.\
 ";
 
 #[cfg(test)]
@@ -1075,34 +1217,42 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("investigation"));
         assert!(SYSTEM_PROMPT.contains("first matching rule wins"));
         assert!(SYSTEM_PROMPT.contains("Never emit `max`"));
-        assert!(SYSTEM_PROMPT.contains("maximise safe parallelism"));
+        assert!(SYSTEM_PROMPT.contains("only what the doc states"));
         assert!(SYSTEM_PROMPT.contains("breakdown_found"));
         assert!(SYSTEM_PROMPT.contains("DAG"));
-        // P5-lite (incident-002, reconciled with T2253): the planner must
-        // weigh file overlap, but only emit a soft merge_order_hints entry —
-        // never a `blocks` edge — on clear/substantial overlap, so throughput
-        // stays the default and dispatch is never gated by file overlap
-        // alone.
-        assert!(SYSTEM_PROMPT.contains("file** overlap"));
+        // P5-lite (incident-002): soft merge_order_hints on clear file
+        // overlap only — never a hard edge that gates dispatch.
         assert!(SYSTEM_PROMPT.contains("merge_order_hints"));
         assert!(SYSTEM_PROMPT.contains("forward-port the sibling's changes preservingly"));
         assert!(SYSTEM_PROMPT.contains("is NOT a dependency edge and must never gate"));
         assert!(SYSTEM_PROMPT.contains("Never use a `blocks` edge for file overlap alone"));
     }
 
-    /// The decomposition gate's prompt half (design brief deliverable 1): the
-    /// sizing contract must instruct the model to split multi-subsystem /
-    /// multi-phase / fan-out scope and to emit investigation tasks for
-    /// embedded discovery, so breakdowns arrive pre-split.
+    /// Breakdown authority: the design doc's entries are the units of work.
+    /// The prompt must forbid re-expanding multi-clause / multi-layer Scope
+    /// into invented tasks, and must require doc-stated dependencies only.
     #[test]
-    fn system_prompt_encodes_the_sizing_contract() {
-        assert!(SYSTEM_PROMPT.contains("task sizing contract"));
-        assert!(SYSTEM_PROMPT.contains("single-subsystem, single-PR"));
-        assert!(SYSTEM_PROMPT.contains("project in disguise"));
-        assert!(SYSTEM_PROMPT.contains("Multi-phase scope is several tasks"));
-        assert!(SYSTEM_PROMPT.contains("Embedded fan-out is its own dependent task"));
-        assert!(SYSTEM_PROMPT.contains("INVESTIGATION task"));
-        assert!(SYSTEM_PROMPT.contains("re-prompted to decompose"));
+    fn system_prompt_encodes_breakdown_authority() {
+        assert!(SYSTEM_PROMPT.contains("breakdown is authoritative"));
+        assert!(SYSTEM_PROMPT.contains("exactly one task per enumerated entry"));
+        assert!(SYSTEM_PROMPT.contains("not** reasons to split"));
+        assert!(SYSTEM_PROMPT.contains("high bar"));
+        assert!(SYSTEM_PROMPT.contains("Dependencies: none"));
+        assert!(SYSTEM_PROMPT.contains("only what the doc states"));
+        assert!(SYSTEM_PROMPT.contains("do not re-expand entries"));
+        // The retired sizing contract must not reappear as split-forcing policy.
+        assert!(
+            !SYSTEM_PROMPT.contains("re-prompted to decompose"),
+            "must not threaten decomposition re-prompts"
+        );
+        assert!(
+            !SYSTEM_PROMPT.contains("If a breakdown item needs a paragraph to describe, it is almost"),
+            "must not treat paragraph-length Scope as an automatic split signal"
+        );
+        assert!(
+            !SYSTEM_PROMPT.contains("Multi-subsystem scope is several tasks"),
+            "must not force multi-layer entries into per-subsystem tasks"
+        );
     }
 
     /// The Planner must not mint fully-startable tasks for design-doc items
@@ -1611,233 +1761,111 @@ mod tests {
         assert_eq!(outcome.tag(), "api_error");
     }
 
-    /// A schema-valid tool_use response whose single task is T298-shaped: a
-    /// paragraph of multi-table parsing across sections/slots, an emit step,
-    /// a projected_impact seed, and an all-lists validation sweep, with an
-    /// effort_audit line that literally calls it "a project in disguise". This
-    /// trips the decomposition gate ([`detect_oversize_tasks`]).
-    fn oversize_tool_use_response() -> Value {
+    /// Faithful one-row materialisation of a multi-clause, multi-layer Scope
+    /// with `Dependencies: none` — the failure shape that used to be force-split
+    /// by the oversize re-prompt. Must be accepted on the first attempt with
+    /// zero edges and no second API call.
+    fn single_multi_clause_entry_tool_use_response() -> Value {
         json!({
             "content": [{
                 "type": "tool_use",
                 "name": TOOL_NAME,
                 "input": {
                     "tasks": [{
-                        "handle": "national-rolling-points",
-                        "name": "Full national rolling-points PDF detail parse",
-                        "description": "Parse the multi-table PDF across sections and slots, emit the \
-                            event-type slot mapping, seed the projected_impact path, and validate every \
-                            fixture in the all-lists reconciliation sweep.\n\n\
-                            [effort-classification] level=`large` matched-rule=`rule 2` reasons=\"a project in disguise\"",
+                        "handle": "pause-only-forced-dispatch",
+                        "name": "Implement pause-only forced dispatch end to end",
+                        "description": "Add the shared read-only admission evaluation, distinct pause-override \
+                            intent, and entry-point provenance to the protocol and engine, with the evaluator \
+                            and mutating request using the same reason-producing function. Add `--force` only \
+                            to `bossctl work start`. Before a macOS drag-to-Doing requests execution, call the \
+                            evaluator. Add Bazel test coverage for the protocol and engine admission behavior, \
+                            bossctl parsing and engine boundary, and macOS confirmation.\n\n\
+                            [effort-classification] level=`medium` matched-rule=`rule 3 (multi-subsystem)` \
+                            reasons=\"names protocol + engine + bossctl + macOS surfaces\"",
                         "kind": "project_task",
-                        "effort": "large",
+                        "effort": "medium",
                         "ordinal": 0,
                         "deferred": false
                     }],
                     "edges": [],
                     "confidence": "high",
                     "breakdown_found": true,
-                    "notes": "One big task.",
-                    "effort_audit": [
-                        "[effort-classification] level=`large` matched-rule=`rule 2` reasons=\"a project in disguise\""
-                    ]
-                }
-            }]
-        })
-    }
-
-    /// The decomposed answer a re-prompted model returns: an investigation
-    /// task, a parser task, and a validation-sweep task — each well-sized,
-    /// wired with dependency edges. Passes the gate cleanly.
-    fn decomposed_tool_use_response() -> Value {
-        json!({
-            "content": [{
-                "type": "tool_use",
-                "name": TOOL_NAME,
-                "input": {
-                    "tasks": [{
-                        "handle": "format-investigation",
-                        "name": "Reverse-engineer the detail-table format",
-                        "description": "Document the closed vocabulary of the detail tables.",
-                        "kind": "investigation",
-                        "effort": "large",
-                        "ordinal": 0,
-                        "deferred": false
-                    }, {
-                        "handle": "detail-parser",
-                        "name": "Implement the detail-table parser",
-                        "description": "Implement the parser against the documented format.",
-                        "kind": "project_task",
-                        "effort": "medium",
-                        "ordinal": 1,
-                        "deferred": false
-                    }, {
-                        "handle": "fixture-sweep",
-                        "name": "Add the fixture reconciliation test",
-                        "description": "Add the reconciliation test over the committed fixtures.",
-                        "kind": "project_task",
-                        "effort": "small",
-                        "ordinal": 2,
-                        "deferred": false
-                    }],
-                    "edges": [
-                        { "dependent": "detail-parser", "prerequisite": "format-investigation" },
-                        { "dependent": "fixture-sweep", "prerequisite": "detail-parser" }
-                    ],
-                    "confidence": "high",
-                    "breakdown_found": true,
-                    "notes": "Split into investigation, parser, and validation.",
-                    "effort_audit": [
-                        "[effort-classification] level=`large` matched-rule=`rule 1 (investigation)` reasons=\"format discovery\"",
-                        "[effort-classification] level=`medium` matched-rule=`rule 6` reasons=\"single-subsystem parser\"",
-                        "[effort-classification] level=`small` matched-rule=`rule 5` reasons=\"one test\""
-                    ]
+                    "notes": "One entry, Dependencies: none — materialised as one row, zero edges.",
+                    "effort_audit": []
                 }
             }]
         })
     }
 
     #[tokio::test]
-    async fn oversize_proposal_triggers_decomposition_reprompt() {
-        // The T298 case end to end: the first tool call ships one monolithic
-        // task; the gate rejects it and re-prompts; the model returns the
-        // decomposed graph, which is staged. The plan visible to the caller
-        // is the split (multiple dependency-ordered tasks), not the monolith.
+    async fn multi_clause_single_entry_is_accepted_without_reprompt() {
+        // The reproduced failure: a design doc with one long multi-clause
+        // Scope (protocol + engine + bossctl + macOS) and Dependencies: none.
+        // The planner must accept a faithful one-row, zero-edge emission and
+        // must NOT re-prompt for decomposition.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(oversize_tool_use_response()))
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(decomposed_tool_use_response()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(single_multi_clause_entry_tool_use_response()))
             .mount(&server)
             .await;
 
         let (outcome, audit) = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
         match outcome {
             PlannerOutcome::Success(out) => {
-                assert_eq!(out.tasks.len(), 3, "the decomposed plan must replace the monolith");
-                assert_eq!(out.edges.len(), 2, "decomposed tasks must be dependency-ordered");
-                assert!(
-                    out.tasks
-                        .iter()
-                        .any(|t| t.kind == boss_protocol::TaskKind::Investigation)
-                );
+                assert_eq!(out.tasks.len(), 1, "one entry → one row");
+                assert_eq!(out.edges.len(), 0, "Dependencies: none → zero edges");
+                assert_eq!(out.tasks[0].handle, "pause-only-forced-dispatch");
             }
-            other => panic!("expected Success with the decomposed plan, got {other:?}"),
+            other => panic!("expected Success with the single-entry plan, got {other:?}"),
         }
-        // The gate triggered once and resolved cleanly on retry — the audit
-        // must reflect that even though the run succeeded outright.
+        assert_eq!(audit, DecompositionAudit::default());
         assert_eq!(
-            audit,
-            DecompositionAudit {
-                oversize_attempts: 1,
-                oversize_remaining: 0,
-            }
+            server.received_requests().await.expect("requests recorded").len(),
+            1,
+            "must not re-prompt to split a multi-clause single entry",
         );
+    }
 
-        // Exactly one re-prompt, and it must feed the oversize rejection back
-        // to the model.
+    #[tokio::test]
+    async fn schema_invalid_then_valid_succeeds_without_oversize_path() {
+        // Schema retry still works: first response missing required field,
+        // second is valid. No oversize decomposition path involved.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(missing_confidence_tool_use_response()))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(single_multi_clause_entry_tool_use_response()))
+            .mount(&server)
+            .await;
+
+        let (outcome, audit) = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
+        match outcome {
+            PlannerOutcome::Success(out) => {
+                assert_eq!(out.tasks.len(), 1);
+                assert!(out.edges.is_empty());
+            }
+            other => panic!("expected Success after schema retry, got {other:?}"),
+        }
+        assert_eq!(audit, DecompositionAudit::default());
         let requests = server.received_requests().await.expect("requests recorded");
-        assert_eq!(requests.len(), 2, "expected exactly one decomposition retry");
+        assert_eq!(requests.len(), 2);
         let retry_body: Value = requests[1].body_json().expect("retry body is JSON");
         let retry_prompt = retry_body["messages"][0]["content"]
             .as_str()
             .expect("retry content is a string");
         assert!(
-            retry_prompt.contains("REJECTED: OVERSIZE TASK(S)"),
-            "retry prompt must name the decomposition rejection: {retry_prompt}",
+            retry_prompt.contains("Schema validation error"),
+            "retry must be schema feedback, not oversize: {retry_prompt}",
         );
         assert!(
-            retry_prompt.contains("national-rolling-points"),
-            "retry prompt must name the offending task handle: {retry_prompt}",
-        );
-    }
-
-    #[tokio::test]
-    async fn oversize_proposal_accepted_best_effort_after_exhausting_retries() {
-        // If the model keeps returning an oversize task, the run does NOT
-        // fail — the valid (if imperfectly-split) plan is staged best-effort
-        // for operator review, after exactly PLANNER_VALIDATION_ATTEMPTS calls.
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(oversize_tool_use_response()))
-            .mount(&server)
-            .await;
-
-        let (outcome, audit) = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
-        assert!(
-            matches!(outcome, PlannerOutcome::Success(_)),
-            "an unsplittable oversize proposal is accepted best-effort, not failed: {outcome:?}",
-        );
-        assert_eq!(
-            server.received_requests().await.expect("requests recorded").len(),
-            PLANNER_VALIDATION_ATTEMPTS as usize,
-            "must stop after exactly PLANNER_VALIDATION_ATTEMPTS calls",
-        );
-        // The best-effort acceptance must be visible to the caller so it can
-        // surface it to the operator, not just logged.
-        assert_eq!(
-            audit,
-            DecompositionAudit {
-                oversize_attempts: PLANNER_VALIDATION_ATTEMPTS,
-                oversize_remaining: 1,
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn final_attempt_schema_failure_falls_back_to_earlier_valid_oversize_proposal() {
-        // Regression test for the live incident this fix addresses: attempt 1
-        // produces a fully schema-valid, merely-oversize proposal (consuming
-        // the only retry to re-prompt for a split); attempt 2 — the final
-        // attempt — comes back schema-invalid (the model's `effort_audit`
-        // stringified-array flake, or any other schema miss). The run must
-        // NOT discard attempt 1's stageable plan: it falls back and accepts
-        // it best-effort, exactly like the existing oversize best-effort
-        // path, with the oversize attention item (`oversize_remaining`)
-        // still reported.
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(oversize_tool_use_response()))
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(missing_confidence_tool_use_response()))
-            .mount(&server)
-            .await;
-
-        let (outcome, audit) = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
-        match outcome {
-            PlannerOutcome::Success(out) => {
-                assert_eq!(
-                    out.tasks.len(),
-                    1,
-                    "must stage attempt 1's oversize-but-valid proposal, not discard it"
-                );
-                assert_eq!(out.tasks[0].handle, "national-rolling-points");
-            }
-            other => panic!("expected best-effort fallback to attempt 1's proposal, got {other:?}"),
-        }
-        assert_eq!(
-            audit,
-            DecompositionAudit {
-                oversize_attempts: 1,
-                oversize_remaining: 1,
-            },
-            "the fallback must still surface the oversize attention item",
-        );
-        assert_eq!(
-            server.received_requests().await.expect("requests recorded").len(),
-            PLANNER_VALIDATION_ATTEMPTS as usize,
-            "must stop after exactly PLANNER_VALIDATION_ATTEMPTS calls",
+            !retry_prompt.contains("OVERSIZE"),
+            "must not re-introduce oversize decomposition feedback",
         );
     }
 
@@ -1854,5 +1882,171 @@ mod tests {
         );
         assert_eq!(PlannerOutcome::Transport("boom".into()).tag(), "transport_error",);
         assert_eq!(PlannerOutcome::InvalidOutput("nope".into()).tag(), "invalid_output",);
+    }
+
+    /// Fixture matching the reproduced failure doc shape: one `###` entry with
+    /// a long multi-clause Scope and `Dependencies: none`.
+    const SINGLE_ENTRY_DOC: &str = "\
+# Operator force bypasses only the observed global dispatch pause\n\
+\n\
+## Goals\n\
+\n\
+- Dispatch one item while global pause remains.\n\
+\n\
+## Proposed implementation task breakdown\n\
+\n\
+### Implement pause-only forced dispatch end to end\n\
+\n\
+Scope: Add the shared read-only admission evaluation, distinct pause-override intent, and \
+entry-point provenance to the protocol and engine, with the evaluator and mutating request \
+using the same reason-producing function. Add `--force` only to `bossctl work start`, map it \
+to that pause-only intent with CLI provenance, and surface engine refusal messages and JSON \
+results without mapping it to the existing pool-growth bit. Before a macOS drag-to-Doing \
+requests execution, call the evaluator, render the pause reason and any non-overridable \
+blockers, and send the confirmed pause generation with app-drag provenance through the \
+existing board gesture. Add Bazel test coverage for the protocol and engine admission \
+behavior, `bossctl` parsing and engine boundary, and macOS confirmation, cancellation, \
+changed or lifted pause, blockers, and refusal bounce-back.\n\
+\n\
+Effort hint: medium\n\
+\n\
+Dependencies: none\n\
+";
+
+    #[test]
+    fn extracts_one_hash_entry_from_single_entry_breakdown() {
+        let entries = extract_breakdown_entries(SINGLE_ENTRY_DOC);
+        assert_eq!(entries.len(), 1, "exactly one ### entry");
+        assert_eq!(entries[0].title, "Implement pause-only forced dispatch end to end");
+        assert!(
+            entries[0].body.to_ascii_lowercase().contains("dependencies: none"),
+            "body must carry Dependencies: none: {}",
+            entries[0].body
+        );
+        assert!(
+            entries[0].body.contains("protocol") && entries[0].body.contains("bossctl"),
+            "long multi-clause Scope must stay on the single entry"
+        );
+    }
+
+    #[test]
+    fn extracts_n_hash_entries() {
+        let doc = "\
+## Proposed implementation task breakdown\n\
+\n\
+### Protocol types\n\
+\n\
+Scope: Add the contract.\n\
+\n\
+Dependencies: none\n\
+\n\
+### Engine handler\n\
+\n\
+Scope: Wire the handler.\n\
+\n\
+Dependencies: Protocol types\n\
+\n\
+### CLI flag\n\
+\n\
+Scope: Expose --force.\n\
+\n\
+Dependencies: Engine handler\n\
+";
+        let entries = extract_breakdown_entries(doc);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].title, "Protocol types");
+        assert_eq!(entries[1].title, "Engine handler");
+        assert_eq!(entries[2].title, "CLI flag");
+        assert!(entries[1].body.contains("Dependencies: Protocol types"));
+    }
+
+    #[test]
+    fn extracts_numbered_list_entries_when_no_hash_headings() {
+        let doc = "\
+## Proposed implementation task breakdown\n\
+\n\
+1. Protocol types. Add the contract.\n\
+2. Engine handler. Depends on 1.\n\
+3. CLI surface.\n\
+";
+        let entries = extract_breakdown_entries(doc);
+        assert_eq!(entries.len(), 3);
+        assert!(entries[0].title.starts_with("Protocol types"));
+        assert!(entries[1].title.starts_with("Engine handler"));
+    }
+
+    #[test]
+    fn user_prompt_lists_authoritative_single_entry_inventory() {
+        let mut input = sample_input();
+        input.design_doc = SINGLE_ENTRY_DOC.to_owned();
+        input.design_doc_ref.path =
+            "tools/boss/docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md".to_owned();
+        let prompt = build_user_prompt(&input);
+        assert!(
+            prompt.contains("AUTHORITATIVE BREAKDOWN ENTRIES (1 entry)"),
+            "must surface the discrete entry count: {prompt}"
+        );
+        assert!(prompt.contains("Implement pause-only forced dispatch end to end"));
+        assert!(prompt.contains("Dependencies: none"));
+        assert!(prompt.contains("exactly one task per entry"));
+        // Full doc still present for context.
+        assert!(prompt.contains("--- BEGIN DESIGN DOC ("));
+        assert!(prompt.contains("operator-forced-dispatch-while-dispatch-is-paused.md"));
+    }
+
+    #[test]
+    fn real_operator_forced_dispatch_doc_parses_as_one_entry() {
+        // Re-run against the real design doc (fixture copy of the reproduced
+        // failure doc; see engine/core/testdata/ and BUILD.bazel compile_data).
+        let doc = include_str!("../testdata/operator_forced_dispatch_design.md");
+        let entries = extract_breakdown_entries(doc);
+        assert_eq!(
+            entries.len(),
+            1,
+            "real doc must yield exactly one breakdown entry, got {}: {:?}",
+            entries.len(),
+            entries.iter().map(|e| e.title.as_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(entries[0].title, "Implement pause-only forced dispatch end to end");
+        assert!(
+            entries[0]
+                .body
+                .lines()
+                .any(|l| l.trim().eq_ignore_ascii_case("Dependencies: none")),
+            "real doc entry must declare Dependencies: none"
+        );
+    }
+
+    #[test]
+    fn faithful_single_entry_output_validates_with_zero_edges() {
+        // Ground-truth PlannerOutput for the single-entry doc: one row, zero
+        // edges — what the materializer must receive after a correct plan.
+        use boss_protocol::{EffortLevel, ProposedTask, TaskKind};
+        let output = PlannerOutput {
+            tasks: vec![ProposedTask {
+                handle: "pause-only-forced-dispatch".to_owned(),
+                name: "Implement pause-only forced dispatch end to end".to_owned(),
+                description: format!(
+                    "{}\n\n[effort-classification] level=`medium` matched-rule=`rule 3` reasons=\"multi-layer thin change\"",
+                    extract_breakdown_entries(SINGLE_ENTRY_DOC)[0].body.trim()
+                ),
+                kind: TaskKind::ProjectTask,
+                effort: EffortLevel::Medium,
+                ordinal: 0,
+                deferred: false,
+            }],
+            edges: vec![],
+            merge_order_hints: vec![],
+            confidence: Confidence::High,
+            breakdown_found: true,
+            notes: "1 entry, Dependencies: none.".to_owned(),
+            effort_audit: vec![],
+        };
+        assert_eq!(output.tasks.len(), 1);
+        assert!(output.edges.is_empty());
+        match boss_engine_planner_validation::validate(&output, 30) {
+            boss_engine_planner_validation::ValidationResult::Valid { .. } => {}
+            other => panic!("faithful single-entry plan must validate: {other:?}"),
+        }
     }
 }

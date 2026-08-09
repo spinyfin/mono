@@ -67,11 +67,12 @@ fn design_guidance_block(design_guidance: Option<&str>) -> String {
 /// invent its own.
 ///
 /// The breakdown block's split rules used to be one-directional: they named
-/// a concrete penalty for under-splitting (an oversize entry the scheduler
-/// rejects and re-plans) and no cost at all for over-splitting, so a worker
-/// unsure about a boundary was correctly reading "split" as the safe move.
-/// Counting entries in the merged design docs under `docs/designs/` showed
-/// where that lands: 31, 24, 24, 20, 14, 12, 9, 9, 8, 5, 4, 3 — a median
+/// a concrete penalty for under-splitting (an oversize entry the *planner*
+/// would re-prompt to force-split — a behaviour since retired because it
+/// re-expanded design-reviewed entries) and no cost at all for over-splitting,
+/// so a worker unsure about a boundary was correctly reading "split" as the
+/// safe move. Counting entries in the merged design docs under `docs/designs/`
+/// showed where that lands: 31, 24, 24, 20, 14, 12, 9, 9, 8, 5, 4, 3 — a median
 /// near 10 but four of twelve at 20 or more, a tail as heavy as the
 /// materialised `project_task` counts, so the over-production originates in
 /// the breakdown step rather than in later accretion. The large ones blow up
@@ -82,8 +83,9 @@ fn design_guidance_block(design_guidance: Option<&str>) -> String {
 /// to pad a band, anchor bands that include a one-entry outcome, an explicit
 /// "the rules add, they do not multiply", and a required `Breakdown size:`
 /// line that makes the author defend N from the change (not from a band).
-/// No cap: a design that genuinely needs twenty entries may still propose
-/// twenty.
+/// The planner now trusts the breakdown one-for-one (entry count in, row
+/// count out); design-time honesty is the only control. No cap: a design that
+/// genuinely needs twenty entries may still propose twenty.
 pub(super) fn compose_design_directive(parent_project: Option<&Project>, design_guidance: Option<&str>) -> String {
     let mut out = String::new();
     out.push_str(&design_guidance_block(design_guidance));
@@ -110,14 +112,14 @@ pub(super) fn compose_design_directive(parent_project: Option<&Project>, design_
     out.push_str("    - an **effort hint**: one of `trivial | small | medium | large`.\n");
     out.push_str("    - **explicit dependencies** — which other entries in this list gate this one (use the task names; \"none\" if it can start immediately).\n");
     out.push_str("    - a **scope tag** — exactly one of `Scope: in-scope` or `Scope: deferred (future / not a v1 blocker)`. Use this exact `Scope:` line (own line, this literal wording) on every entry — downstream scheduling keys off it verbatim, so free prose like \"this is a stretch goal\" instead of the tag will not be recognised. Tag an entry `deferred` when it is explicitly out of scope for v1, a stretch goal, or something you are deliberately not proposing for immediate implementation; follow the tag with a short inline reason (e.g. `Scope: deferred (future / not a v1 blocker) — needs the batch API landing in phase 2`).\n");
-    out.push_str("  - **size each entry to one reviewable PR by one worker in one session.** This is the granularity scheduling materialises into tasks, so pre-split the work here — an oversize entry forces the scheduler to reject and re-plan it:\n");
-    out.push_str("    - keep each entry single-subsystem and single-PR. Scope that spans several subsystems (for example, a client, service, shared data model, and user interface) is several entries with dependency edges, not one.\n");
-    out.push_str("    - multi-phase scope (\"parse (i)… and (ii)… and emit… and validate…\") is several entries — list each phase separately with explicit dependencies, never one entry that does it all.\n");
-    out.push_str("    - sweeps and validation campaigns (\"validate/sweep/migrate all N X\", an all-lists reconciliation, a corpus-wide fixture sweep) are separate dependent entries, listed after the implementation they validate — do not fold them into the implementer.\n");
-    out.push_str("    - unknown-format discovery (study / dump / reverse-engineer / reconcile-against-source) is its own investigation entry, sequenced before the implementation that consumes its findings.\n");
-    out.push_str("    - if an entry needs a paragraph to describe, it is probably several tasks — split it.\n");
+    out.push_str("  - **size each entry to one reviewable PR by one worker in one session.** This is the granularity scheduling materialises into tasks **one-for-one** — the planner trusts this breakdown and does not re-expand entries, so pre-split only where the work genuinely needs cutting:\n");
+    out.push_str("    - keep each entry single-subsystem and single-PR when the seams are real review boundaries. Scope that spans several subsystems (for example, a client, service, shared data model, and user interface) is several entries with dependency edges when each subsystem is its own reviewable unit — but a thin change across layers that belongs in one PR is one entry, not one per layer.\n");
+    out.push_str("    - multi-phase scope (\"parse (i)… and (ii)… and emit… and validate…\") is several entries when each phase is a separate reviewable PR — list each phase separately with explicit dependencies; leave adjacent phases that would ship together as one entry.\n");
+    out.push_str("    - sweeps and validation campaigns (\"validate/sweep/migrate all N X\", an all-lists reconciliation, a corpus-wide fixture sweep) are separate dependent entries when they are independently reviewable work, listed after the implementation they validate — do not invent a sweep entry solely because the implementer mentions tests.\n");
+    out.push_str("    - unknown-format discovery (study / dump / reverse-engineer / reconcile-against-source) is its own investigation entry when discovery is a real gate before implementation.\n");
+    out.push_str("    - a multi-clause Scope paragraph, multi-layer naming, or length alone is not automatic grounds to split — if the work is one reviewable PR, keep one entry.\n");
     out.push_str("  - **size the breakdown as a whole to the size of the problem.** The rules above tell you where to cut; this tells you how many cuts the problem is worth. Both directions of miscalibration — and inventing work that is not in the problem — cost something real:\n");
-    out.push_str("    - **too few entries** — an oversize entry forces the scheduler to reject and re-plan it (the failure the split rules above exist to prevent).\n");
+    out.push_str("    - **too few entries** — an oversize entry becomes one large task on the board (the planner will not re-split it for you). Prefer honest pre-splitting at design time when the seams are real.\n");
     out.push_str("    - **too many entries** — each entry becomes its own worker session, PR, and review cycle. Entries carved below one reviewable unit serialise changes that belonged in a single PR, put sibling workers into merge conflicts over the same files, and bury the real critical path in bookkeeping. Splitting a one-seam change into eight entries is exactly as wrong as folding four subsystems into one; when you are unsure about a boundary, neither side is automatically safe.\n");
     out.push_str("    - **fabricated entries** — never invent tasks the requested change does not need in order to reach a band, look thorough, or pad a breakdown. Speculative, future, or \"nice to have\" work that the change does not require must not be added — neither as `Scope: in-scope` entries nor as `Scope: deferred` ones. A deferred entry for work nobody asked for is scope creep with a later timestamp: it still materialises as a row somebody has to triage. Derive every entry from the design's actual seams and callers; if the doc's non-goals or chosen approach already put a topic out of scope, do not reintroduce it as a deferred entry.\n");
     out.push_str("    - **one entry is a valid and expected outcome.** When the change is genuinely one reviewable PR by one worker in one session — a single seam and its only thin callers, a flag-plus-confirmation, a bounded fix with no intermediate contract worth reviewing alone — a single-entry breakdown is the correct answer, not a sign the design under-analysed the problem. Do not split solely so the count lands inside a multi-entry band.\n");

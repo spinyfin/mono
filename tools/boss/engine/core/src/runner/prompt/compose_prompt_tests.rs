@@ -2569,22 +2569,28 @@ fn design_directive_requires_the_scope_tag() {
     );
 }
 /// The breakdown block must carry proportionality calibration, not just
-/// split rules: a named cost for over-splitting to balance the scheduler
-/// rejection named for under-splitting, a ban on fabricating entries to
-/// pad a band, anchor bands that include a one-entry outcome, and a
-/// `Breakdown size:` self-check line the author must defend N from the
-/// change (not from a band). Without these the guidance is one-directional
-/// and designs over-produce or invent entries — see
-/// `compose_design_directive`'s docs for the measured distribution that
+/// split rules: a named cost for over-splitting, honesty that the planner
+/// materialises entries one-for-one (it will not re-split an oversize entry),
+/// a ban on fabricating entries to pad a band, anchor bands that include a
+/// one-entry outcome, and a `Breakdown size:` self-check line the author
+/// must defend N from the change (not from a band). Without these the
+/// guidance is one-directional and designs over-produce or invent entries —
+/// see `compose_design_directive`'s docs for the measured distribution that
 /// motivated the calibration, and the one-entry / no-fabricate rules that
 /// close the remaining floor-and-symmetry gaps.
 #[test]
 fn design_directive_calibrates_breakdown_size_to_problem_size() {
     let directive = compose_design_directive(None, None);
-    // The split rules this calibration must not displace.
+    // The split rules this calibration must not displace — tempered so a
+    // thin multi-layer change may stay one entry, and so the planner is not
+    // claimed to re-expand oversize entries.
     assert!(directive.contains("keep each entry single-subsystem"), "{directive}");
     assert!(
-        directive.contains("an oversize entry forces the scheduler to reject and re-plan it"),
+        directive.contains("the planner trusts this breakdown and does not re-expand entries"),
+        "{directive}"
+    );
+    assert!(
+        directive.contains("the planner will not re-split it for you"),
         "{directive}"
     );
     // The symmetric cost for over-splitting.

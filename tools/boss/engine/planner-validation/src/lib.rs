@@ -253,11 +253,16 @@ fn detect_cycle<'a>(handles: &HashSet<&'a str>, edges: &'a [ProposedEdge]) -> Op
 //
 // This is a *per-task* sizing check, distinct from the graph-level
 // [`validate`] above: it inspects each [`ProposedTask`]'s scope for signals
-// that the task packs more than one reviewable-PR-per-session unit of work.
-// The Planner ([`crate::planner`]) runs it on its own output and re-prompts
-// for a decomposed graph when it trips (bounded, feedback fed back to the
-// model), so oversize proposals are split before they are ever staged.
-// Like everything else in this module it is a pure, no-I/O function.
+// that historically flagged "more than one reviewable PR" of work.
+//
+// **Not a planner rejection gate.** The Planner used to re-prompt for
+// decomposition when this tripped; that forced re-expansion of design-doc
+// entries the author had already sized (multi-clause Scope, multi-layer
+// thin changes, etc.) and is deliberately retired. The design doc's
+// breakdown is authoritative — entry count in, row count out. This helper
+// remains available for offline analysis and tests; the planner no longer
+// calls it. Like everything else in this module it is a pure, no-I/O
+// function.
 
 /// A substantive scope description (excluding its trailing
 /// `[effort-classification]` audit line) longer than this many characters
@@ -414,12 +419,13 @@ const FAN_OUT_MARKERS: &[&str] = &[
 const PROJECT_IN_DISGUISE_MARKERS: &[&str] = &["project in disguise", "in disguise"];
 
 /// Scan a whole [`PlannerOutput`] and return one [`OversizeFinding`] per task
-/// that trips the decomposition gate (empty when every task is well-sized).
+/// that trips the historical sizing heuristics (empty when every task is
+/// well-sized under those heuristics).
 ///
-/// Pure and side-effect-free. The Planner calls this on its own structured
-/// output and, when it is non-empty, re-prompts the model to decompose the
-/// offending tasks into dependency-ordered, single-subsystem, single-PR
-/// units before the proposal is ever staged.
+/// Pure and side-effect-free. **The Planner no longer calls this as a
+/// rejection gate** — design-doc breakdown entries are authoritative, and
+/// multi-clause / multi-layer / long Scope alone must not force a split.
+/// Kept for offline analysis and unit tests of the heuristic itself.
 pub fn detect_oversize_tasks(output: &PlannerOutput) -> Vec<OversizeFinding> {
     output
         .tasks
