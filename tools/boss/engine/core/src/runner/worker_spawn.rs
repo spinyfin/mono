@@ -721,6 +721,13 @@ pub(crate) async fn compose_worker_spawn(
         )
     };
     let spawn_input = SpawnResolutionInput::builder()
+        // Deliberately keep the owning row's size signal for pool workers.
+        // Review/automation capability is selected independently by the pool's
+        // strong model tier; effort stays proportional to the likely amount of
+        // material to inspect instead of raising every small review's spend.
+        // For PR reviews this is only a size proxy, not a claim that small
+        // diffs are low risk: the rubric applies the same correctness bar at
+        // every level.
         .maybe_effort_level(row_effort)
         .maybe_model_override(row_model_override.as_deref())
         .maybe_pool_model_override(pool_policy.map(|p| p.model_tier))
