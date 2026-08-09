@@ -2,9 +2,9 @@
 
 - **Date:** 2026-08-08 (America/Chicago). Focal pair on flunge PR #1342 between ~15:23 and ~15:41; the same finalization path had been active for at least two days prior (a retention-bounded floor — see §3).
 - **Severity:** High — silent work loss on live revision workers, plus false-success board status for revisions that produced nothing. Measured over the retained trace window: **63 mid-turn reaps out of 64 staged-path finalizations (98.4%)** — 6 total losses, 57 partial losses, and **5 work items still sitting in review status having contributed nothing** (§4). Includes a case where a revision minted to fix live production regressions was reaped before push while the board reported success.
-- **Status:** Documented. Mid-turn guard for the staged path landed as [mono#2685](https://github.com/spinyfin/mono/pull/2685) (merged 2026-08-09). Further action items in §11 remain open. This postmortem is doc-only.
+- **Status:** Documented. Mid-turn guard for the staged path landed as [mono#2685](https://github.com/spinyfin/mono/pull/2685) (merged 2026-08-09); it defers only within the 45-minute `staged_pr_mid_turn_defer_secs` horizon (default 2,700 s). Further action items in §11 remain open. This postmortem is doc-only.
 - **Class:** Race between merge-poller PR recheck and a still-working agent: a staged PR URL is treated as "worker done," terminalizing and reaping a live mid-turn execution. Related prior: the 2026-07-14 SHA-delta absorption incident whose protection this fast path bypasses.
-- **Related:** [`incident-001-pr-fan-out.md`](incident-001-pr-fan-out.md) (wrong-PR finalization killing live workers); 2026-07-14 SHA-delta baseline absorption (guard comment at `completion/recheck.rs:152-166`); introducing change [mono#465](https://github.com/spinyfin/mono/pull/465) (2026-05-13).
+- **Related:** [`incident-001-pr-fan-out.md`](incident-001-pr-fan-out.md) (wrong-PR finalization killing live workers); 2026-07-14 SHA-delta baseline absorption (guard comment at `completion/recheck.rs:144-175`); introducing change [mono#465](https://github.com/spinyfin/mono/pull/465) (2026-05-13).
 
 ## 1. Verdict
 
@@ -20,10 +20,10 @@ The defect is a property of `recheck_for_pr`'s structure, not of the staged code
 
 On 2026-08-08, two consecutive revision workers on flunge PR #1342 were reaped by the engine while mid-turn:
 
-| Revision | Execution                  | Driver | Outcome                                                                                                                                                                                                                           |
-| -------- | -------------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| R1       | `exec_18c9ee2925032810_47` | codex  | Pushed successfully, then reaped **2.4 s** later mid-prompt. Code reached [flunge#1342](https://github.com/brianduff/flunge/pull/1342); post-push steps (including the required findings-status comment) never ran.               |
-| R2       | `exec_18c9ee9f79ea3c08_4f` | claude | Reaped **before any push**. Local fix never reached the PR; lease released. Shared flunge jj store was searched this revision and the unrecovered object was **not found** (see §12). Board still moved the item as review-ready. |
+| Revision | Execution                  | Driver | Outcome                                                                                                                                                                                                                                                                                                                        |
+| -------- | -------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| R1       | `exec_18c9ee2925032810_47` | codex  | Pushed successfully, then reaped **2.4 s** later mid-prompt. Code reached [flunge#1342](https://github.com/brianduff/flunge/pull/1342); post-push steps (including the required findings-status comment) never ran.                                                                                                            |
+| R2       | `exec_18c9ee9f79ea3c08_4f` | claude | Reaped **before any push**. Local fix never reached the PR; lease released. A `jj` search of the shared flunge store (including `flunge-agent-001`, the workspace that ran R2) found no unrecovered R2 object; only the later recovery commit `c1e2c6d101bd` is present (see §12). Board still moved the item as review-ready. |
 
 Occurrence is not driver-specific — though severity is (see §3) — nor is it product-specific. The two cases used different drivers and different workspaces, and the measured window confirms both: occurrences split mono 31 / flunge 32, and by driver claude 56 / grok 4 / codex 3, which tracks the traffic split.
 
@@ -47,7 +47,7 @@ R2 committed fixes locally (`jj describe` at 15:40:56) but never pushed. At 15:4
 
 The work item was nonetheless advanced as being in review. The board reported success for a revision that produced nothing, while live production regressions the revision existed to fix remained on the branch.
 
-**R2 local-commit recoverability (re-checked this revision).** Agents on this machine share product jj stores across cubes; recoverability is not "outside available material" — it is searchable with `jj`. This revision searched the shared flunge store (including `flunge-agent-001`, the workspace that ran R2) for commits around the 15:40 CDT window and for layout/theme-regression messages matching the work R2 was doing. The only related commit present is the later recovery push `c1e2c6d101bd` ("Fix layout/theme leak…", landed via `reconcile_revision` follow-up at ~16:14 CDT). **R2's unrecovered local object was not found.** That is "searched and absent," not "not looked at." Whether the object was never durable, was GC'd, or lives only under an unguessable change-id remains open; it should not be restated as inaccessible evidence.
+**R2 local-commit recoverability.** Agents on this machine share product jj stores across cubes; recoverability is not "outside available material" — it is searchable with `jj`. A `jj` search of the shared flunge store (including `flunge-agent-001`, the workspace that ran R2) found no unrecovered R2 object; only the later recovery commit `c1e2c6d101bd` ("Fix layout/theme leak…", landed via `reconcile_revision` follow-up at ~16:14 CDT) is present. **R2's unrecovered local object was not found.** That is "searched and absent," not "not looked at." Whether the object was never durable, was GC'd, or lives only under an unguessable change-id remains open; it should not be restated as inaccessible evidence.
 
 ### Measured blast radius
 
@@ -112,7 +112,7 @@ What was still lost on those runs:
 | Worker-proposed followups / attentions / structured proposals the agent would have filed later in the turn | **Unknown, plausibly lost** — nothing in the engine records "what the agent was about to raise"; a premature reap can skip those side effects with no residual |
 | Board / review status                                                                                      | Misleads only mildly for pure partials (head did move); still hides missing post-push checklist items                                                          |
 
-So partial loss is **not** "we lost the code." It is "we lost the rest of the turn" — and some of that rest is operationally load-bearing (findings-status comments, description accuracy) while some is invisible (followups never filed).
+So partial loss is **not** "we lost the code." It is "we lost the rest of the turn" — and some of that rest is operationally load-bearing (findings-status comments, description accuracy) while some is invisible (followups never filed). The retained trace is the only record that pairs each reap's finalization source and activity with its execution; the ordinary execution ledger does not retain those fields or a per-prompt completion marker. **AI-10** therefore requires a coordinator-generated per-execution inventory for the 57 partial losses before reinstatement review can be completed.
 
 ##### What "total loss" means, and how bad each case is
 
@@ -124,7 +124,7 @@ Total loss means the execution never moved the PR head. That is **not** uniform 
 | **B — Content lost until re-authored** | Unique review-response work never pushed; a later agent must redo the reasoning. The parent PR may still be open.                                                 | R2 on [flunge#1342](https://github.com/brianduff/flunge/pull/1342) (later recovered by a follow-up execution, not by restoring R2's object); [mono#2681](https://github.com/spinyfin/mono/pull/2681) four findings |
 | **C — False success**                  | Board/status says reviewed while nothing landed; can block or skip real recovery. Orthogonal to A/B and present in every total loss here.                         | All six total losses; mono#2651 is the clearest loop                                                                                                                                                               |
 
-Tier A is still a real incident (wasted capacity, false success), but it is **not** the same as permanent loss of unique work. Reviewer guidance: categorize along these dimensions rather than treating every total loss as equally catastrophic.
+Tier A is still a real incident (wasted capacity, false success), but it is **not** the same as permanent loss of unique work. Categorize losses along these dimensions rather than treating every total loss as equally catastrophic.
 
 The six total losses, by PR (GitHub links for reinstatement inspection):
 
@@ -186,7 +186,7 @@ The counts in the table are determined. The trend characterization ("flat, load-
 
 ## 4. Remediation list — work items that read as reviewed but contributed nothing
 
-This is the actionable output of the measurement. **Five work items currently claim review status while nothing from their execution ever reached the PR head.** Each has exactly one completed execution and no recovery run in flight. Verified against GitHub 2026-08-08 16:14 CDT (determined); status notes below refreshed 2026-08-09 where marked. They are identified here by PR (with links) and by task description.
+This is the actionable output of the measurement. **Five work items currently claim review status while nothing from their execution ever reached the PR head.** Each has exactly one completed execution and no recovery run in flight. Verified against GitHub 2026-08-08 16:14 CDT; PR states refreshed 2026-08-09. They are identified here by PR (with links) and by task description.
 
 Severity tag: **A** = deterministically re-doable (merge conflict / same brief); **B** = unique review work not landed; **C** = false-success status (all five carry C).
 
@@ -223,7 +223,7 @@ The defect did not begin on 2026-08-08. It was introduced and then repeatedly la
 | **2026-07-14**              | [mono#1977](https://github.com/spinyfin/mono/pull/1977) + SHA-delta absorption comment                                      | Explicit “do not absorb a possibly in-flight push” lesson written into the SHA-delta arm — the invariant this incident re-violates via the short-circuit above it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | **2026-07-29**              | [mono#2522](https://github.com/spinyfin/mono/pull/2522)                                                                     | Grok gains working PR-URL capture feed — Grok sessions can now arm the same staged path.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | **2026-08-06 12:42 CDT**    | Earliest retained `engine-trace` record in the measurement window                                                           | Measurement floor only; see §3 log-access caveat.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| **2026-08-09**              | [mono#2685](https://github.com/spinyfin/mono/pull/2685)                                                                     | Guard: defer staged-PR-URL recheck finalization while the worker is mid-turn. **Remediation for the fast path** (landed after the focal incident).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| **2026-08-09**              | [mono#2685](https://github.com/spinyfin/mono/pull/2685)                                                                     | Guard: defer staged-PR-URL recheck finalization while the worker is mid-turn, but only within `staged_pr_mid_turn_defer_secs` (default 45 minutes / 2,700 s). **Remediation for the fast path** (landed after the focal incident).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 
 ### 5.2 Focal pair — 2026-08-08 (America/Chicago)
 
@@ -278,6 +278,8 @@ A postmortem root cause that stops at “the short-circuit is wrong” is incomp
 ### 6.1 The mechanism — what “staged” means (not git staging)
 
 Verified against this checkout.
+
+The line references and snippets are against base commit `f58448d7`, which predates the [mono#2685](https://github.com/spinyfin/mono/pull/2685) guard; they show the defect as it existed during the incident, not current main.
 
 **“Staged” here is not `git add` / `jj` staging.** It is an in-memory engine cache (`StagedPrUrlCache`: `execution_id → pr_url`). Population path:
 
@@ -393,7 +395,7 @@ R2 was reaped off a **`gh pr edit`**. A read-only **`gh pr view`** would arm the
 
 This is not an accident of one careless regex. The introducing PR ([mono#465](https://github.com/spinyfin/mono/pull/465)) **explicitly** listed `gh pr create` / `view` / `edit` as the stdout sources that print a PR URL, and designed capture around that set so the engine would stop depending on jj/GitHub reconstruction. [mono#594](https://github.com/spinyfin/mono/pull/594) then _kept_ `view|list|edit` when it added `is_gh_pr_command`, because the immediate incident it fixed was _wrong_ URLs staged from non-`gh pr` shell output (chore descriptions, `bossctl` dumps) — the fix was “only deliberate `gh pr …` commands,” not “only commands that mean the worker is done.”
 
-**Transcript access for the introducing agent:** this revision worker has a read-only `boss` CLI (`boss task`, `boss pr`, `boss cost`, `boss context`, …) but **no verb that loads a historical execution transcript** by exec id or PR. Transcript files live under coordinator paths (`~/.claude/projects/…`, Grok session dirs) described in `tools/boss/docs/forensic-surfaces.md`, which workers must not open under Application Support, and which are not exposed via `boss engine …` here. **We therefore cannot quote the introducing agent’s private transcript.** The public PR body and commit message for #465 _are_ available and are sufficient to explain the breadth choice above. If the coordinator needs agent-turn-level detail beyond that, that investigation is not available to this worker and should be filed as a revision against the forensic surfaces / transcript CLI gap.
+**Transcript access for the introducing agent:** Boss's read-only worker `boss` CLI (`boss task`, `boss pr`, `boss cost`, `boss context`, …) has **no verb that loads a historical execution transcript** by exec id or PR. Transcript files live under coordinator paths (`~/.claude/projects/…`, Grok session dirs) described in `tools/boss/docs/forensic-surfaces.md`, which workers must not open under Application Support, and which are not exposed via `boss engine …` here. **The introducing agent’s private transcript cannot therefore be quoted.** The public PR body and commit message for #465 _are_ available and are sufficient to explain the breadth choice above. If the coordinator needs agent-turn-level detail beyond that, the forensic-surfaces / transcript-CLI gap must be addressed separately.
 
 Coupling “any URL-printing `gh pr` command” to “finalize and reap” should not have survived review. Capture breadth optimized for binding recovery is the wrong breadth for a path that kills the worker.
 
@@ -426,7 +428,7 @@ Proxies that failed here:
 | Stop hook               | Correct boundary when it fires; the staged recheck path did not wait for it |
 | Board `PendingReview`   | Written by the bad finalization itself                                      |
 
-Boss has repeatedly filed and partially shipped work in this neighborhood (e.g. historical “detect worker task completion and move to In-Review,” metadata-only finalize attempts, `NO_CHANGES_NEEDED` / nothing-to-do finalization, mid-turn deferral in [mono#2685](https://github.com/spinyfin/mono/pull/2685)). **The durable product gap remains:** an explicit execution outcome (delivered change / metadata-only change / nothing-to-do / blocked) that the engine requires before terminalizing. Until that lands, danger and complexity continue on every path that guesses done-ness from side effects. See action items 3 and 6.
+Boss has repeatedly filed and partially shipped work in this neighborhood (e.g. historical “detect worker task completion and move to In-Review,” metadata-only finalize attempts, `NO_CHANGES_NEEDED` / nothing-to-do finalization, mid-turn deferral in [mono#2685](https://github.com/spinyfin/mono/pull/2685)). **The durable product gap remains:** an explicit execution outcome (delivered change / metadata-only change / nothing-to-do / blocked) that the engine requires before terminalizing. Until that lands, danger and complexity continue on every path that guesses done-ness from side effects. See AI-3 and AI-6.
 
 ### 7.2 Post-push deliverables live only in the prompt
 
@@ -468,7 +470,7 @@ The only field that distinguishes a mid-turn reap from a legitimate idle finaliz
 - Nothing in the running system partitions `pr_recheck_staged` finalizations into "safe idle" vs "destructive working." The partition in §3 exists only because the raw trace was pulled offline and each finalization was hand-paired to its registry-clear record.
 - **Prevalence was measurable, but only by bespoke offline reconstruction** — and only within the visible window. It was not visible to anyone operating the system, which is why a 98.4% failure rate ran for the full measured window without raising anything.
 
-Severity was worse. The engine records a head SHA _before_ an execution runs but never _after_ teardown, so "did this execution actually push?" had to be reconstructed from the _next_ execution's `pr_head_before` snapshot or a live GitHub read. That is why one row is permanently unresolvable and why one engine `sha_unchanged` verdict turned out to be a stale-read false negative (both in §3). See action item 5.
+Severity was worse. The engine records a head SHA _before_ an execution runs but never _after_ teardown, so "did this execution actually push?" had to be reconstructed from the _next_ execution's `pr_head_before` snapshot or a live GitHub read. That is why one row is permanently unresolvable and why one engine `sha_unchanged` verdict turned out to be a stale-read false negative (both in §3). See AI-5.
 
 ### 7.6 Source-reference verification notes
 
@@ -539,7 +541,7 @@ This document is the response artifact for the investigation. Staged-path mid-tu
 
 ## 11. Action items
 
-Owners are **surfaces** (files / subsystems), not people. None of these are implemented by this document. Item 1's staged-path guard **landed** as [mono#2685](https://github.com/spinyfin/mono/pull/2685); remaining items are open work.
+Owners are **surfaces** (files / subsystems), not people. **AI-N** means action item _N_ in this section and is used for every cross-reference. None of these are implemented by this document. AI-1's staged-path guard **landed** as [mono#2685](https://github.com/spinyfin/mono/pull/2685); remaining items are open work.
 
 These are engineering fixes to the defect. They are **not** a substitute for the recovery work in §4: the five work items listed there are already broken and will not be repaired by any code change here.
 
@@ -547,7 +549,7 @@ These are engineering fixes to the defect. They are **not** a substitute for the
 
 1. **Guard `recheck_for_pr` — the whole function, not just the staged arm — so no path through it can finalize a still-working live worker.** Surface: `tools/boss/engine/core/src/completion/recheck.rs` staged arm (`:55-72`) **and its detector branch**, coordinated with `finalize_pr_transition` / teardown in `completion/pr_transition.rs` and `completion/teardown.rs`. Inherit the 2026-07-14 invariant already written at `recheck.rs:144-175` (defer to the worker's own Stop boundary while mid-session). The measurement in §3 found a mid-turn reap through the detector branch as well (`pr_recheck`, 1 working / 0 idle), so **a fix scoped to the staged block alone would leave a live path open.**
 
-   **Status:** staged-path mid-turn deferral **landed** as [mono#2685](https://github.com/spinyfin/mono/pull/2685) (merged 2026-08-09; task tracking “Staged-PR-URL recheck fast path reaps live workers mid-turn”). **Follow-through still required:** confirm the landed scope covers the **detector branch** as well as the staged arm, and that regression tests assert `activity: working` cannot terminalize on either path. Do not redesign that work in this doc PR.
+   **Status:** staged-path mid-turn deferral **landed** as [mono#2685](https://github.com/spinyfin/mono/pull/2685) (merged 2026-08-09; task tracking “Staged-PR-URL recheck fast path reaps live workers mid-turn”). The deferral is intentionally bounded by `staged_pr_mid_turn_defer_secs`, defaulting to 45 minutes (2,700 s); after that horizon, the staged path finalizes even when activity remains `working`. **Follow-through still required:** confirm the landed scope covers the **detector branch** as well as the staged arm, confirm the bound is retained as the anti-hang control, and assert in regression tests that `activity: working` cannot terminalize on either path before the horizon.
 
 ### Near-term — staging predicate
 
@@ -565,7 +567,7 @@ These are engineering fixes to the defect. They are **not** a substitute for the
 
 4. **Emit a first-class metric (and preferably an attention item) when a `pr_recheck_staged` finalization clears a slot with `activity != idle` (or equivalent mid-turn signal).** Surfaces: `live_worker_state.rs` (`release_slot`, `:654-662`), completion teardown path, merge-poller / completion metrics registry. Goal: make mid-turn reap **countable and alertable in-system**. The §3 measurement shows this is achievable from data the engine already emits — but only offline, by hand, and only back as far as log retention. Prevalence should not require a forensic exercise to see.
 
-5. **Record a `pr_head_after` on the teardown record, read at the moment the fast path decides to terminalize.** Surfaces: `completion/pr_transition.rs` (`finalize_pr_transition`) and `completion/teardown.rs`. The engine records a head SHA before an execution and never after it, so every severity determination in §3 had to be reconstructed from the _next_ execution's `pr_head_before` snapshot or a live GitHub read — which is why one row (flunge #1296) is permanently unresolvable and why one `sha_unchanged` verdict (flunge #1327) was a stale-read false negative. A `pr_head_after` field makes "did this execution move the head?" a single query, and it incidentally hands the fast path the very signal it needs to decide correctly (cf. action item 3).
+5. **Record a `pr_head_after` on the teardown record, read at the moment the fast path decides to terminalize.** Surfaces: `completion/pr_transition.rs` (`finalize_pr_transition`) and `completion/teardown.rs`. The engine records a head SHA before an execution and never after it, so every severity determination in §3 had to be reconstructed from the _next_ execution's `pr_head_before` snapshot or a live GitHub read — which is why one row (flunge #1296) is permanently unresolvable and why one `sha_unchanged` verdict (flunge #1327) was a stale-read false negative. A `pr_head_after` field makes "did this execution move the head?" a single query, and it incidentally hands the fast path the very signal it needs to decide correctly (cf. AI-3).
 
 ### Structural — prompt vs engine ownership of post-push work
 
@@ -573,7 +575,7 @@ These are engineering fixes to the defect. They are **not** a substitute for the
 
 ### Structural — turn-loop predicate
 
-7. **If recheck continues to gate on worker liveness shape, extend the predicate beyond `is_live && kind != PrReview`.** Surface: `completion.rs` `worker_owns_turn_loop` (`:2113-2115`) and call sites in `recheck.rs` / `stop.rs`. Mid-turn vs idle must be visible to any path that can reap. Note: this is **not** a substitute for action item 1 if the staged path still short-circuits the gate.
+7. **If recheck continues to gate on worker liveness shape, extend the predicate beyond `is_live && kind != PrReview`.** Surface: `completion.rs` `worker_owns_turn_loop` (`:2113-2115`) and call sites in `recheck.rs` / `stop.rs`. Mid-turn vs idle must be visible to any path that can reap. Note: this is **not** a substitute for AI-1 if the staged path still short-circuits the gate.
 
 ### Forensic — log retention / pre-window truth
 
@@ -583,14 +585,19 @@ These are engineering fixes to the defect. They are **not** a substitute for the
 
 9. **If public PR text for [mono#465](https://github.com/spinyfin/mono/pull/465) is insufficient for process review, coordinator retrieves the authoring execution transcript** (Claude/Grok session JSONL via `work_runs.transcript_path` or equivalent). This worker has no read-transcript CLI. Not required to understand the mechanism; useful only for deeper process archaeology.
 
+### Forensic — partial-loss reinstatement inventory
+
+10. **Coordinator-side: publish a per-execution inventory for the 57 partial losses before reinstatement review.** Source it from the retained trace join that pairs `pr_recheck_staged` finalization with the `activity: working` slot-clear record, then record the PR link, execution id, timestamp, driver, and any prompt steps demonstrably unreached. The worker execution ledger retains a PR and execution association but not that join or prompt-step completion, so it cannot safely reconstruct the inventory from its own records. This inventory is required to inspect every partial-loss PR for missing post-push deliverables and reinstate them where appropriate.
+
 ## 12. Incomplete evidence (stated plainly)
 
-- **R2 local commit recoverability:** re-checked with jj on the shared flunge store this revision. R2’s unrecovered object was **not found**; the later recovery commit `c1e2c6d101bd` _was_ found. Do not assert “outside available material.” Still do not assert durable recovery of R2’s original object — only that search returned absence, while the work item later recovered via redo (§4).
+- **R2 local commit recoverability:** A `jj` search of the shared flunge store (including `flunge-agent-001`, the workspace that ran R2) found no unrecovered R2 object; only the later recovery commit `c1e2c6d101bd` is present. Do not assert “outside available material.” Still do not assert durable recovery of R2’s original object — only that search returned absence, while the work item later recovered via redo (§4).
 - **Pre-window log availability is unproven either way.** The original measurement’s earliest record is 08-06 12:42 CDT; that is consistent with either a wiped log root or with rotated/audit surfaces the worker could not read. **This is an analysis gap**, not a demonstrated data-loss finding. AI-8 owns the coordinator check. Until then, counts remain a floor on a _visible_ window only.
 - **One severity row is unresolvable.** A revision on [flunge#1296](https://github.com/brianduff/flunge/pull/1296) routed via `pr_review cycle bound reached`, skipping the SHA check, and the branch has since been force-pushed. The head at reap time is unrecoverable, so it cannot be assigned to total or partial loss. It may be a seventh total loss.
 - **Per-driver severity rates are estimated, not determined.** grok 4/4 and codex 1/3 are exact counts over tiny denominators; the resulting 100% and 33% carry no useful precision. Grok’s concentration is **confounded** by in-development driver support during the period (§3 control). The proposed timing mechanism (non-claude drivers surfacing a `gh pr` URL earlier relative to their push) remains a **hypothesis**.
 - **Why `reconcile_revision` recovered [flunge#1342](https://github.com/brianduff/flunge/pull/1342) and not the five items in §4:** unexplained. Nothing in the measured data distinguishes them. This is the largest open product question left by the measurement.
 - **Introducing-agent private transcript:** not readable from this worker (§6.3). Public PR #465 text used instead.
+- **Partial-loss reinstatement inventory:** the 57 rows remain unenumerated because the worker-visible execution ledger lacks the source/activity join and prompt-completion data required to classify them safely. AI-10 owns a coordinator-generated inventory before per-PR reinstatement review.
 - **Engine-side design of the guard fix:** landed as [mono#2685](https://github.com/spinyfin/mono/pull/2685); detector-branch coverage still to confirm (AI-1).
 
 ## 13. Lessons
