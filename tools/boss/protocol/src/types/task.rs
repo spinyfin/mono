@@ -1020,11 +1020,13 @@ pub struct Task {
     /// (populated by the doc detector from the PR's changed files) into
     /// the same `ProjectDesignDocState` the kanban already renders.
     ///
-    /// This is a derived projection set by the engine's `get_work_tree`
-    /// path (not a stored DB column, and never set for design tasks —
-    /// those keep using the per-project resolution path). `None` when
-    /// the item has no per-task pointer (the common case), which hides
-    /// the affordance exactly like `ProjectDesignDocState::NotSet`.
+    /// A derived projection the engine resolves on the read paths that
+    /// return a task (`get_work_tree`, `get_work_item`,
+    /// `get_work_item_by_short_id`) and on `set_task_doc`'s return — not
+    /// a stored DB column, and never set for design tasks that have a
+    /// project. `None` when the item has no per-task pointer (the common
+    /// case), which hides the affordance exactly like
+    /// `ProjectDesignDocState::NotSet`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc_link_state: Option<ProjectDesignDocState>,
 

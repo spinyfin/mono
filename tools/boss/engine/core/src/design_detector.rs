@@ -357,10 +357,10 @@ pub(crate) fn task_uses_per_task_doc(kind: &TaskKind, has_project: bool) -> bool
 }
 
 /// Per-task analogue of [`on_design_pr_detected`] for project-less
-/// docs-backed items (investigations). Fired on the `in_review`
-/// transition. Scans the PR's changed files for a single
-/// `docs/designs/*.md`, `docs/design-docs/*.md`, or
-/// `docs/investigations/*.md` and populates the task's own `doc_*`
+/// docs-backed items (investigations and postmortems). Fired on the
+/// `in_review` transition. Scans the PR's changed files for a single
+/// `docs/designs/*.md`, `docs/design-docs/*.md`, `docs/investigations/*.md`,
+/// or `docs/postmortems/*.md` and populates the task's own `doc_*`
 /// columns (or, when already set, updates `doc_branch` to the PR
 /// **head** branch so the in-app viewer can fetch the doc while the PR
 /// is open).
@@ -782,11 +782,7 @@ fn is_investigation_doc_path(path: &str) -> bool {
 
 /// Direct-child markdown under any `docs/postmortems/` directory — where a
 /// postmortem's deliverable doc lives (e.g. `docs/postmortems/foo.md`,
-/// `tools/boss/docs/postmortems/incident-004-....md`). Established
-/// convention with prior incidents already committed under
-/// `tools/boss/docs/postmortems/`; the detector previously had no matcher
-/// for this directory at all, so postmortem PRs never auto-populated a doc
-/// pointer.
+/// `tools/boss/docs/postmortems/incident-004-....md`).
 fn is_postmortem_doc_path(path: &str) -> bool {
     is_doc_path_under(path, "postmortems")
 }
@@ -820,8 +816,8 @@ mod tests {
         assert!(is_design_doc_path("docs/designs/top-level.md"));
     }
 
-    /// T285/P284 regression: flunge's repo convention is `docs/design-docs/`,
-    /// not `docs/designs/`. Both directory names must resolve to the same
+    /// Regression: flunge's repo convention is `docs/design-docs/`, not
+    /// `docs/designs/`. Both directory names must resolve to the same
     /// logical design-doc location.
     #[test]
     fn design_doc_path_matches_design_docs_convention() {

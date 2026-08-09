@@ -916,17 +916,8 @@ impl WorkDb {
         let mut resolved = 0usize;
         let mut doc_pointer_queries = 0u64;
         for task in &mut tasks {
-            if !crate::design_detector::task_uses_per_task_doc(&task.kind, task.project_id.is_none()) {
-                continue;
-            }
-            resolved += 1;
-            match resolve_task_doc_pointer(&conn, &task.id, |_| None, &mut doc_pointer_queries) {
-                Ok(state) => task.doc_link_state = state,
-                Err(err) => tracing::warn!(
-                    task_id = %task.id,
-                    ?err,
-                    "get_work_tree: failed to resolve task doc-link state; leaving affordance hidden"
-                ),
+            if attach_task_doc_link_state(&conn, task, "get_work_tree", &mut doc_pointer_queries) {
+                resolved += 1;
             }
         }
         trace.record_nplus1(segment::DB_DOC_POINTERS, elapsed_ms(t), resolved, doc_pointer_queries);
@@ -988,22 +979,11 @@ impl WorkDb {
                     .filter(|task| task.deleted_at.is_none())
                     .with_context(|| format!("unknown task: {id}"))?;
                 // Surface the per-task doc pointer on the single-item read
-                // path, mirroring get_work_tree's attach step below — the
+                // path, mirroring get_work_tree's attach step — the
                 // project-less docs-backed kinds (investigation, project-less
                 // design) are the only ones that carry `tasks.doc_*` at all.
-                // Errors are non-fatal — log and leave the field None
-                // (affordance hidden), same as the kanban path.
-                if crate::design_detector::task_uses_per_task_doc(&task.kind, task.project_id.is_none()) {
-                    let mut doc_pointer_queries = 0u64;
-                    match resolve_task_doc_pointer(&conn, &task.id, |_| None, &mut doc_pointer_queries) {
-                        Ok(state) => task.doc_link_state = state,
-                        Err(err) => tracing::warn!(
-                            task_id = %task.id,
-                            ?err,
-                            "get_work_item: failed to resolve task doc-link state; leaving affordance hidden"
-                        ),
-                    }
-                }
+                let mut doc_pointer_queries = 0u64;
+                attach_task_doc_link_state(&conn, &mut task, "get_work_item", &mut doc_pointer_queries);
                 Ok(task_to_item(task))
             }
             // Answer-agent executions bind a comment id, but comments are not
@@ -1138,17 +1118,13 @@ impl WorkDb {
         {
             // Same doc-link resolution as get_work_item — this is the other
             // single-item read path (`boss task show <short-id>`).
-            if crate::design_detector::task_uses_per_task_doc(&task.kind, task.project_id.is_none()) {
-                let mut doc_pointer_queries = 0u64;
-                match resolve_task_doc_pointer(&conn, &task.id, |_| None, &mut doc_pointer_queries) {
-                    Ok(state) => task.doc_link_state = state,
-                    Err(err) => tracing::warn!(
-                        task_id = %task.id,
-                        ?err,
-                        "get_work_item_by_short_id: failed to resolve task doc-link state; leaving affordance hidden"
-                    ),
-                }
-            }
+            let mut doc_pointer_queries = 0u64;
+            attach_task_doc_link_state(
+                &conn,
+                &mut task,
+                "get_work_item_by_short_id",
+                &mut doc_pointer_queries,
+            );
             return Ok(Some(task_to_item(task)));
         }
         if let Some(project) = conn
