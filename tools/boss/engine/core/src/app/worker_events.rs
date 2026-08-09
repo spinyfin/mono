@@ -574,8 +574,8 @@ pub(super) async fn dispatch_live_worker_state(
             server_state.live_status_manager.notify(slot_id, Trigger::PostToolUse);
         }
         // Primary-path PR URL capture. Every worker that opens a
-        // PR does it via a shell `gh pr create` / `cube pr create`
-        // (and also `gh pr view` / `gh pr edit`); the PR URL is
+        // PR does it via a shell `gh pr create` / `gh pr edit` /
+        // `cube pr create|update|ensure`; the PR URL is
         // printed on the command's output. The *driver* supplies
         // the free-text slice (and command string) via
         // `AgentDriver::pr_url_capture_feed` — Claude from the
@@ -650,12 +650,10 @@ pub(super) async fn dispatch_live_worker_state(
                                 );
                             }
                             crate::pr_url_capture::StagePrUrlOutcome::AlreadyStaged => {
-                                // Worker emitted another PR URL after
-                                // already staging one — typically a
-                                // `gh pr view` follow-up referencing a
-                                // different PR. First-writer-wins so
-                                // the original (the worker's own
-                                // `gh pr create`) is kept.
+                                // Worker emitted a different URL from a
+                                // second staging command after already
+                                // staging one. First-writer-wins so the
+                                // original URL is kept.
                                 tracing::debug!(
                                     execution_id = run_id,
                                     pr_url = %pr_url,

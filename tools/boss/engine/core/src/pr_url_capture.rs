@@ -421,6 +421,15 @@ impl StagedPrUrlCache {
             .cloned()
     }
 
+    /// Backdate a staged entry for a deterministic deferral-horizon test.
+    #[cfg(test)]
+    pub fn backdate_for_test(&self, execution_id: &str, age: std::time::Duration) {
+        let mut guard = self.inner.lock().expect("StagedPrUrlCache mutex poisoned");
+        if let Some(entry) = guard.get_mut(execution_id) {
+            entry.staged_at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+        }
+    }
+
     /// Drop any staged URL for `execution_id`. Idempotent.
     pub fn forget(&self, execution_id: &str) {
         self.inner

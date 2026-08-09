@@ -20,7 +20,7 @@ So: **a wrong indicator is an engine bug, essentially always.** The app is a fai
 
 ## The row must not disagree with the pane
 
-The two inputs above are not peers. `LiveWorkerState.activity` is fed event-by-event from the worker's own hook stream and is the authority on moment-to-moment activity. `work_executions.status` is the durable projection of it, and it is what every other consumer reads — dispatch admission, the liveness sweeps, the reaper, attention surfacing, the kanban's fallback path, and every CLI/JSON reader. A projection does not get to contradict what it projects.
+The two inputs above are not peers. `LiveWorkerState.activity` is fed event-by-event from the worker's own hook stream and is the authority on moment-to-moment activity. `work_executions.status` is the durable projection of it, and it is what every other consumer reads — dispatch admission, the liveness sweeps, the reaper, attention surfacing, the kanban's fallback path, and every CLI/JSON reader. The merge-poller's staged-URL recheck also reads `activity` directly to gate revision finalization while a worker is `Working`. A projection does not get to contradict what it projects.
 
 Until mono#2673 it did. `PaneSpawnRunner` stamped `waiting_human` on the row the instant the pane came up and nothing ever cleared it, so a worker mid-`Bash`-call stored `waiting_human` for its entire life:
 
