@@ -40,6 +40,7 @@
 //! [`WorkDb::mark_chore_pr_merged`] for any chore in `in_review`
 //! whose `pr_url` is now in a merged GitHub state.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
@@ -464,6 +465,45 @@ pub trait PrDetector: Send + Sync {
     /// logic clean. Errors are reserved for tool failures (`gh` auth
     /// broken, network blips, etc.).
     async fn detect_pr(&self, repo_remote_url: &str, expected_branch: &str) -> Result<PrStatus>;
+}
+
+/// Verifies whether a worker's current working-copy commit contains a diff.
+///
+/// A no-op marker is a statement about the workspace, not merely about the
+/// absence of a PR. The check is kept behind a trait so the Stop-boundary
+/// gate can fail closed on command errors while unit tests remain
+/// deterministic.
+#[async_trait]
+pub trait WorkspaceDiffVerifier: Send + Sync {
+    /// Returns `true` only when the current working-copy commit has no diff.
+    /// Errors mean the workspace could not be verified and must refuse a
+    /// no-op completion.
+    async fn is_working_copy_empty(&self, workspace_path: &Path) -> Result<bool>;
+}
+
+/// Production verifier for [`WorkspaceDiffVerifier`].
+#[derive(Debug, Default)]
+pub struct CommandWorkspaceDiffVerifier;
+
+#[async_trait]
+impl WorkspaceDiffVerifier for CommandWorkspaceDiffVerifier {
+    async fn is_working_copy_empty(&self, workspace_path: &Path) -> Result<bool> {
+        let output = tokio::process::Command::new("jj")
+            .args(["diff", "--summary"])
+            .current_dir(workspace_path)
+            .output()
+            .await
+            .with_context(|| format!("failed to run `jj diff --summary` in {}", workspace_path.display()))?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "`jj diff --summary` exited with {} in {}: {}",
+                output.status,
+                workspace_path.display(),
+                String::from_utf8_lossy(&output.stderr).trim(),
+            );
+        }
+        Ok(output.stdout.iter().all(u8::is_ascii_whitespace))
+    }
 }
 
 /// `PrDetector` that shells out to `gh pr list --head <branch>`. The
@@ -1276,6 +1316,9 @@ impl BackgroundNudgeTracker {
 pub struct WorkerCompletionHandler {
     work_db: Arc<WorkDb>,
     pr_detector: Arc<dyn PrDetector>,
+    /// Verifies the worker's recorded workspace is genuinely empty before a
+    /// primary implementation's `NO_CHANGES_NEEDED` claim can release it.
+    workspace_diff_verifier: Arc<dyn WorkspaceDiffVerifier>,
     cube_client: Arc<dyn CubeClient>,
     publisher: Arc<dyn ExecutionPublisher>,
     pane_releaser: Arc<dyn WorkerPaneReleaser>,

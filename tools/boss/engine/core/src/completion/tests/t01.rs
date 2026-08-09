@@ -2839,6 +2839,52 @@ async fn no_op_marker_is_refused_when_a_command_was_left_unobserved() {
 }
 
 #[tokio::test]
+async fn no_op_marker_is_refused_when_the_working_copy_has_a_diff() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    write_assistant_transcript(
+        &db,
+        workspace.path(),
+        &execution_id,
+        "## Summary\nThe requested change is already present.\n\nNO_CHANGES_NEEDED\n",
+    );
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+    let handler = handler.with_workspace_diff_verifier(StubWorkspaceDiffVerifier::dirty());
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(matches!(outcome, StopOutcome::AwaitingInput));
+    assert_eq!(probes.snapshot(), [(execution_id.clone(), PROBE_NO_PR.to_owned())]);
+    match db.get_work_item(&chore_id).unwrap() {
+        WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Active),
+        other => panic!("expected chore, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn no_op_marker_is_refused_when_the_working_copy_cannot_be_verified() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    write_assistant_transcript(
+        &db,
+        workspace.path(),
+        &execution_id,
+        "## Summary\nThe requested change is already present.\n\nNO_CHANGES_NEEDED\n",
+    );
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+    let handler = handler.with_workspace_diff_verifier(StubWorkspaceDiffVerifier::err("jj unavailable"));
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(matches!(outcome, StopOutcome::AwaitingInput));
+    assert_eq!(probes.snapshot(), [(execution_id.clone(), PROBE_NO_PR.to_owned())]);
+    match db.get_work_item(&chore_id).unwrap() {
+        WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Active),
+        other => panic!("expected chore, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn no_op_marker_is_accepted_on_a_later_clean_turn_after_an_earlier_unobserved_command() {
     // A long-lived, multi-turn Codex session fires a Stop at every turn
     // boundary, not once at process exit. A command abandoned on an early
