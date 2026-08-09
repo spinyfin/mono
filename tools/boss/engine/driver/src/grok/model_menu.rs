@@ -28,19 +28,41 @@ use boss_protocol::{EffortLevel, ReasoningMode};
 
 /// Map a Boss effort level onto Grok's `--reasoning-effort` vocabulary.
 ///
-/// Grok's documented ladder is seven rungs (`none`, `minimal`, `low`,
-/// `medium`, `high`, `xhigh`, `max`). Boss's five [`EffortLevel`]s map
-/// onto the top five, leaving `none` / `minimal` unreachable by design —
-/// a Boss worker should never run with reasoning disabled. Mirrors
-/// Claude's five-rung ladder so operator-facing effort names stay
-/// consistent across drivers.
+/// **Live ladder (grok CLI 1.0.0 / model `grok-4.5`, probed 2026-08-09):**
+/// only `low`, `medium`, and `high` are accepted. Anything else is rejected
+/// at request time (not at flag parse) with:
+///
+/// ```text
+/// --effort/--reasoning-effort: unknown effort level '…'; use one of: high, medium, low
+/// ```
+///
+/// Older design notes claimed a seven-rung ladder (`none`/`minimal`/`low`/
+/// `medium`/`high`/`xhigh`/`max`). That list is **not** what the installed
+/// CLI accepts today — passing `xhigh` or `max` fails the turn in-pane after
+/// spawn succeeds (spawn itself does not validate the value). Boss must
+/// therefore use a deliberate **per-driver** three-rung collapse rather than
+/// Claude/Codex's five-value vocabulary.
+///
+/// | Boss [`EffortLevel`] | Grok `--reasoning-effort` | Notes |
+/// | -------------------- | ------------------------- | ----- |
+/// | `Trivial`            | `low`                     | floor |
+/// | `Small`              | `medium`                  |       |
+/// | `Medium`             | `high`                    | Grok ceiling |
+/// | `Large`              | `high`                    | Grok ceiling (no `xhigh`) |
+/// | `Max`                | `high`                    | Grok ceiling (no `max`) |
+///
+/// `Medium` / `Large` / `Max` share `high` because Grok has no higher rung.
+/// That is an explicit capability limit, not a silent demotion of the Boss
+/// row: operator-facing `effort_level` stays as classified; only the driver
+/// knob value is capped at Grok's real maximum. When the CLI grows more
+/// rungs, re-probe and re-spread this table (refresh path in the module
+/// docs).
 pub(super) fn effort_value_for_level(level: EffortLevel) -> Option<&'static str> {
     Some(match level {
         EffortLevel::Trivial => "low",
         EffortLevel::Small => "medium",
-        EffortLevel::Medium => "high",
-        EffortLevel::Large => "xhigh",
-        EffortLevel::Max => "max",
+        // Grok's live ceiling is `high` — Medium/Large/Max all land there.
+        EffortLevel::Medium | EffortLevel::Large | EffortLevel::Max => "high",
     })
 }
 
