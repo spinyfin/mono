@@ -42,6 +42,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -467,36 +468,61 @@ pub trait PrDetector: Send + Sync {
     async fn detect_pr(&self, repo_remote_url: &str, expected_branch: &str) -> Result<PrStatus>;
 }
 
-/// Verifies whether a worker's current working-copy commit contains a diff.
+/// Verifies whether a worker workspace carries a contribution beyond trunk.
 ///
 /// A no-op marker is a statement about the workspace, not merely about the
 /// absence of a PR. The check is kept behind a trait so the Stop-boundary
 /// gate can fail closed on command errors while unit tests remain
-/// deterministic.
+/// deterministic. The production implementation compares `main@origin` to
+/// `@`, so committed changes below an otherwise-empty working-copy commit
+/// are still a non-empty workspace contribution.
 #[async_trait]
 pub trait WorkspaceDiffVerifier: Send + Sync {
-    /// Returns `true` only when the current working-copy commit has no diff.
+    /// Returns `true` only when the workspace has no contribution beyond
+    /// `main@origin`.
     /// Errors mean the workspace could not be verified and must refuse a
     /// no-op completion.
-    async fn is_working_copy_empty(&self, workspace_path: &Path) -> Result<bool>;
+    async fn is_workspace_contribution_empty(&self, workspace_path: &Path) -> Result<bool>;
 }
 
 /// Production verifier for [`WorkspaceDiffVerifier`].
 #[derive(Debug, Default)]
 pub struct CommandWorkspaceDiffVerifier;
 
+/// Upper bound on verifying the contribution in a worker workspace.
+///
+/// `jj diff` snapshots the working copy and can wait for the shared repo
+/// lock. A no-op claim is refused when that evidence cannot be gathered;
+/// it must not stall the Stop handler indefinitely.
+const WORKSPACE_CONTRIBUTION_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[async_trait]
 impl WorkspaceDiffVerifier for CommandWorkspaceDiffVerifier {
-    async fn is_working_copy_empty(&self, workspace_path: &Path) -> Result<bool> {
-        let output = tokio::process::Command::new("jj")
-            .args(["diff", "--summary"])
-            .current_dir(workspace_path)
-            .output()
-            .await
-            .with_context(|| format!("failed to run `jj diff --summary` in {}", workspace_path.display()))?;
+    async fn is_workspace_contribution_empty(&self, workspace_path: &Path) -> Result<bool> {
+        let command = "jj diff --from main@origin --to @ --summary";
+        let output = tokio::time::timeout(
+            WORKSPACE_CONTRIBUTION_CHECK_TIMEOUT,
+            tokio::process::Command::new("jj")
+                .args(["diff", "--from", "main@origin", "--to", "@", "--summary"])
+                .current_dir(workspace_path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "`{command}` timed out after {} seconds in {}",
+                WORKSPACE_CONTRIBUTION_CHECK_TIMEOUT.as_secs(),
+                workspace_path.display(),
+            )
+        })?
+        .with_context(|| format!("failed to run `{command}` in {}", workspace_path.display()))?;
         if !output.status.success() {
             anyhow::bail!(
-                "`jj diff --summary` exited with {} in {}: {}",
+                "`{command}` exited with {} in {}: {}",
                 output.status,
                 workspace_path.display(),
                 String::from_utf8_lossy(&output.stderr).trim(),

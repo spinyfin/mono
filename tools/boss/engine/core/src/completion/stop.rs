@@ -1357,14 +1357,15 @@ must not be asked to open one",
                 }
                 // Sanctioned no-op terminal: a primary-implementation
                 // worker (chore / task) that investigated and found the work
-                // ALREADY DONE — the change is already on `main`, `jj diff -r @`
-                // is empty, nothing to commit/push. We are at a real Stop
-                // boundary (`waiting_human`), there is no PR on this branch
-                // (PrStatus::None) and none bound to the chore (the
-                // resolve_bound_pr_url branch above returned), so the structural
-                // state confirms an empty contribution. If the worker emitted the
-                // sanctioned NO_CHANGES_NEEDED marker, this is a SUCCESS, not a
-                // failure to be nudged: close the task as done without a PR.
+                // ALREADY DONE. The marker is a self-report: alongside the real
+                // Stop boundary (`waiting_human`), no PR on this branch
+                // (PrStatus::None), and none bound to the chore (the
+                // resolve_bound_pr_url branch above returned), we require positive
+                // `workspace_diff_verifier` evidence that `jj diff --from
+                // main@origin --to @ --summary` is empty. Negative or unavailable
+                // evidence refuses the claim. If all checks pass, the sanctioned
+                // NO_CHANGES_NEEDED marker is a SUCCESS, not a failure to be
+                // nudged: close the task as done without a PR.
                 //
                 // Requiring the explicit marker is what distinguishes "verified
                 // already done" from "gave up without trying": a worker that
@@ -1406,7 +1407,7 @@ must not be asked to open one",
                     } else if let Some(workspace_path) = execution.workspace_path.as_deref() {
                         match self
                             .workspace_diff_verifier
-                            .is_working_copy_empty(std::path::Path::new(workspace_path))
+                            .is_workspace_contribution_empty(std::path::Path::new(workspace_path))
                             .await
                         {
                             Ok(true) => {
@@ -1414,7 +1415,7 @@ must not be asked to open one",
                                     execution_id,
                                     expected_branch = %expected_branch,
                                     kind = %execution.kind,
-                                    "stop event: worker emitted NO_CHANGES_NEEDED with an empty working copy and no PR produced — work already done; closing task as a no-op (no PR, no nudge)"
+                                    "stop event: worker emitted NO_CHANGES_NEEDED with no workspace contribution and no PR produced — work already done; closing task as a no-op (no PR, no nudge)"
                                 );
                                 return self.finalize_no_op_completion(&execution).await;
                             }
@@ -1422,14 +1423,14 @@ must not be asked to open one",
                                 execution_id,
                                 expected_branch = %expected_branch,
                                 kind = %execution.kind,
-                                "stop event: worker emitted NO_CHANGES_NEEDED but the working copy has a diff — refusing the no-op claim; falling through to the produce-a-PR nudge instead",
+                                "stop event: worker emitted NO_CHANGES_NEEDED but the workspace has a contribution — refusing the no-op claim; falling through to the produce-a-PR nudge instead",
                             ),
                             Err(err) => tracing::error!(
                                 execution_id,
                                 expected_branch = %expected_branch,
                                 kind = %execution.kind,
                                 ?err,
-                                "stop event: could not verify whether the working copy is empty — refusing the no-op claim; falling through to the produce-a-PR nudge instead",
+                                "stop event: could not verify whether the workspace has a contribution — refusing the no-op claim; falling through to the produce-a-PR nudge instead",
                             ),
                         }
                     } else {

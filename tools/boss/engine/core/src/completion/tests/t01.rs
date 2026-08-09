@@ -2839,7 +2839,10 @@ async fn no_op_marker_is_refused_when_a_command_was_left_unobserved() {
 }
 
 #[tokio::test]
-async fn no_op_marker_is_refused_when_the_working_copy_has_a_diff() {
+async fn no_op_marker_is_refused_when_a_committed_stack_has_a_contribution() {
+    // An empty `@` does not imply the workspace is clean: `jj commit` and
+    // `jj new` leave committed changes below it. The verifier reports that
+    // whole-stack contribution as non-empty, so the marker must be refused.
     let workspace = tempdir().unwrap();
     let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
     write_assistant_transcript(
@@ -2874,6 +2877,35 @@ async fn no_op_marker_is_refused_when_the_working_copy_cannot_be_verified() {
     let detector = StubPrDetector::ok(None);
     let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
     let handler = handler.with_workspace_diff_verifier(StubWorkspaceDiffVerifier::err("jj unavailable"));
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(matches!(outcome, StopOutcome::AwaitingInput));
+    assert_eq!(probes.snapshot(), [(execution_id.clone(), PROBE_NO_PR.to_owned())]);
+    match db.get_work_item(&chore_id).unwrap() {
+        WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Active),
+        other => panic!("expected chore, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn no_op_marker_is_refused_without_a_recorded_workspace_path() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    write_assistant_transcript(
+        &db,
+        workspace.path(),
+        &execution_id,
+        "## Summary\nThe requested change is already present.\n\nNO_CHANGES_NEEDED\n",
+    );
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET workspace_path = NULL WHERE id = ?1",
+            [&execution_id],
+        )
+        .unwrap();
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
 
     let outcome = handler.on_stop(&execution_id).await;
     assert!(matches!(outcome, StopOutcome::AwaitingInput));

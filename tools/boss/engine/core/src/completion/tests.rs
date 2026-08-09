@@ -120,7 +120,7 @@ impl StubWorkspaceDiffVerifier {
 
 #[async_trait]
 impl WorkspaceDiffVerifier for StubWorkspaceDiffVerifier {
-    async fn is_working_copy_empty(&self, _workspace_path: &Path) -> Result<bool> {
+    async fn is_workspace_contribution_empty(&self, _workspace_path: &Path) -> Result<bool> {
         self.result.clone().map_err(anyhow::Error::msg)
     }
 }
