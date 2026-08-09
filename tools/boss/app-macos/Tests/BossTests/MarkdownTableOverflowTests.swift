@@ -19,14 +19,14 @@ import XCTest
 /// renders is not the layout a user sees. Screenshots taken that way are what
 /// kept this symptom alive across several rounds of review — see the capture
 /// limits in `tools/boss/app-macos/README.md`. The window must remain ordered
-/// out: tests may use AppKit for layout, but must never put UI on the operator's
-/// screen.
+/// out: tests may use AppKit for layout, but must never put UI on screen
+/// during a test run.
 @MainActor
 final class MarkdownTableOverflowTests: XCTestCase {
     /// The table from the review screenshots, reconstructed from the README
     /// "Overrides" list it was generated from: six columns, monospaced
-    /// identifiers, and a prose `Notes` column — the case the operator
-    /// reported as clipped.
+    /// identifiers, and a prose `Notes` column — the case where the Notes
+    /// column was clipped.
     static let proseTable = """
     # Settings reference
 
@@ -91,14 +91,20 @@ final class MarkdownTableOverflowTests: XCTestCase {
     }
 
     /// Lays out a document in a real `NSWindow` without presenting it.
-    private func inWindow(_ source: String, width: CGFloat) -> HostedDocument {
+    private func inWindow(
+        _ source: String, width: CGFloat, file: StaticString = #filePath, line: UInt = #line
+    ) -> HostedDocument {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: width, height: 820),
             styleMask: [.titled, .resizable], backing: .buffered, defer: false)
         let hosting = NSHostingView(rootView: chrome(source))
         hosting.frame = NSRect(x: 0, y: 0, width: width, height: 820)
         window.contentView = hosting
+        XCTAssertFalse(
+            window.isVisible, "layout window must never be presented", file: file, line: line)
         settle(hosting)
+        XCTAssertFalse(
+            window.isVisible, "layout window must never be presented", file: file, line: line)
         return HostedDocument(window: window, hosting: hosting)
     }
 
@@ -132,8 +138,6 @@ final class MarkdownTableOverflowTests: XCTestCase {
     )
         throws -> Metrics
     {
-        XCTAssertFalse(
-            document.window.isVisible, "layout window must never be presented", file: file, line: line)
         let nested = scrollViews(in: document.hosting).filter(hasScrollViewAncestor)
         let scroll = try XCTUnwrap(
             nested.last, "no nested (table) scroll view found", file: file, line: line)

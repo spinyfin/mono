@@ -15,9 +15,13 @@ banned_symbols=(
   'NSWorkspace.shared.open'
   'OpenURLAction'
   '.orderFront('
+  '.orderFrontRegardless('
   '.makeKeyAndOrderFront('
   '.runModal('
   '.beginSheet('
+  '.presentAsSheet('
+  '.presentAsModalWindow('
+  '.showWindow('
 )
 
 offenders=()
@@ -32,7 +36,7 @@ for f in "$@"; do
     esac
     for symbol in "${banned_symbols[@]}"; do
       if [[ "$line" == *"$symbol"* ]]; then
-        offenders+=("$base:$line_no uses banned real-OS presentation symbol \`$symbol\` — inject a test stub or exercise the UI headlessly.")
+        offenders+=("$base:$line_no uses banned real-OS presentation symbol \`$symbol\` — inject a test stub or exercise the UI headlessly (for URL opening, route through \`ChatViewModel.urlOpener\` and a recording stub).")
       fi
     done
   done < "$f"

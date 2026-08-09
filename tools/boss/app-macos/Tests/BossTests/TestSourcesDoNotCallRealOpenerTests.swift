@@ -48,9 +48,13 @@ final class TestSourcesDoNotCallRealOpenerTests: XCTestCase {
             // where the real opener has to live; banned in tests.
             ["Open", "URLAction"].joined(),
             [".", "orderFront("].joined(),
+            [".", "orderFrontRegardless("].joined(),
             [".", "makeKeyAndOrderFront("].joined(),
             [".", "runModal("].joined(),
             [".", "beginSheet("].joined(),
+            [".", "presentAsSheet("].joined(),
+            [".", "presentAsModalWindow("].joined(),
+            [".", "showWindow("].joined(),
         ]
 
         let fileManager = FileManager.default
@@ -85,7 +89,7 @@ final class TestSourcesDoNotCallRealOpenerTests: XCTestCase {
                 }
                 for symbol in banned where line.contains(symbol) {
                     offenders.append(
-                        "\(fileURL.lastPathComponent):\(lineIndex + 1) uses banned real-OS presentation symbol `\(symbol)` — inject a test stub or exercise the UI headlessly."
+                        "\(fileURL.lastPathComponent):\(lineIndex + 1) uses banned real-OS presentation symbol `\(symbol)` — inject a test stub or exercise the UI headlessly (for URL opening, route through `ChatViewModel.urlOpener` and a recording stub)."
                     )
                 }
             }
