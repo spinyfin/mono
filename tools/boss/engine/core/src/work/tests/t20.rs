@@ -291,27 +291,21 @@ fn mark_chore_pr_merged_retires_moot_ci_fix_revision() {
     );
 }
 
-/// Regression: a merge-conflict-resolution revision that a human cancelled
-/// (e.g. because they resolved the conflict another way) *before* the
-/// parent PR merged used to sit forever with `status = 'cancelled'` and no
-/// tombstone — `block_pending_revisions_on_parent_close` lumped `cancelled`
-/// in with `done`/`archived`/`in_review` as "nothing to do" and never
-/// revisited it. Once the parent PR merges, a cancelled moot revision is
-/// exactly as resolved as one the engine itself would have archived, so it
-/// must now be tombstoned in place — `status` stays `cancelled` (the true
-/// historical record of what happened), only `deleted_at` is new.
+/// A manually archived merge-conflict revision is already disposed of when
+/// its parent PR merges: it must remain archived and must not produce a
+/// redundant standalone chore.
 #[test]
-fn mark_chore_pr_merged_tombstones_cancelled_moot_merge_conflict_revision() {
-    let db = WorkDb::open(temp_db_path("rev-cancelled-moot-merge-conflict")).unwrap();
-    let product_id = make_revision_product(&db, "cancelled-moot-crz");
+fn mark_chore_pr_merged_leaves_archived_moot_merge_conflict_revision_closed() {
+    let db = WorkDb::open(temp_db_path("rev-archived-moot-merge-conflict")).unwrap();
+    let product_id = make_revision_product(&db, "archived-moot-crz");
     let pr_url = "https://github.com/spinyfin/mono/pull/2473";
     let parent_id = make_in_review_chore(&db, &product_id, pr_url);
 
-    let crz_id = "crz_fake_for_cancelled_moot_test";
+    let crz_id = "crz_fake_for_archived_moot_test";
     let rev_id = insert_conflict_revision_row(&db, &product_id, &parent_id, crz_id);
     let conn = db.connect().unwrap();
     conn.execute(
-        "UPDATE tasks SET status = 'cancelled' WHERE id = ?1",
+        "UPDATE tasks SET status = 'archived' WHERE id = ?1",
         rusqlite::params![rev_id],
     )
     .unwrap();
@@ -321,16 +315,16 @@ fn mark_chore_pr_merged_tombstones_cancelled_moot_merge_conflict_revision() {
 
     assert_eq!(
         task_status(&db, &rev_id),
-        "cancelled",
-        "cancel is the human's real historical record and must not be overwritten",
+        "archived",
+        "manual archival must remain the terminal record",
     );
     let conn = db.connect().unwrap();
     let deleted_at: Option<String> = conn
         .query_row("SELECT deleted_at FROM tasks WHERE id = ?1", [&rev_id], |r| r.get(0))
         .unwrap();
     assert!(
-        deleted_at.is_some(),
-        "cancelled moot revision must be tombstoned once the parent PR merges"
+        deleted_at.is_none(),
+        "manual archival keeps the row queryable rather than soft-deleting it"
     );
     drop(conn);
 
@@ -338,25 +332,25 @@ fn mark_chore_pr_merged_tombstones_cancelled_moot_merge_conflict_revision() {
     let chores = db.list_chores(&product_id, None, false).unwrap();
     assert!(
         !chores.iter().any(|c| c.id != parent_id),
-        "no new chore must be created for a cancelled moot revision; chores: {chores:?}",
+        "no new chore must be created for an archived moot revision; chores: {chores:?}",
     );
 
     let tree = db.get_work_tree(&product_id).unwrap();
     assert!(
         !tree.tasks.iter().any(|t| t.id == rev_id),
-        "tombstoned cancelled moot revision must not appear in get_work_tree output",
+        "archived moot revision must not appear in get_work_tree output",
     );
 }
 
-/// Negative case for the above: a revision cancelled by a human that
+/// Negative case for the above: a revision archived by a human that
 /// carries real review feedback (`pr_review:*`, non-moot) must be left
 /// completely alone when the parent PR merges — no tombstone, no status
-/// change. The discriminator is `created_via`, never the row's cancelled
+/// change. The discriminator is `created_via`, never the row's archived
 /// status or its name.
 #[test]
-fn mark_chore_pr_merged_leaves_cancelled_pr_review_revision_untouched() {
-    let db = WorkDb::open(temp_db_path("rev-cancelled-pr-review")).unwrap();
-    let product_id = make_revision_product(&db, "cancelled-pr-review");
+fn mark_chore_pr_merged_leaves_archived_pr_review_revision_untouched() {
+    let db = WorkDb::open(temp_db_path("rev-archived-pr-review")).unwrap();
+    let product_id = make_revision_product(&db, "archived-pr-review");
     let pr_url = "https://github.com/spinyfin/mono/pull/2474";
     let parent_id = make_in_review_chore(&db, &product_id, pr_url);
 
@@ -366,14 +360,14 @@ fn mark_chore_pr_merged_leaves_cancelled_pr_review_revision_untouched() {
             CreateRevisionInput::builder()
                 .parent_task_id(parent_id.clone())
                 .description("Address review feedback: fix the off-by-one in the paginator.")
-                .created_via(format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_cancelled_review"))
+                .created_via(format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_archived_review"))
                 .build(),
             &checker,
         )
         .unwrap();
     let conn = db.connect().unwrap();
     conn.execute(
-        "UPDATE tasks SET status = 'cancelled' WHERE id = ?1",
+        "UPDATE tasks SET status = 'archived' WHERE id = ?1",
         rusqlite::params![revision.id],
     )
     .unwrap();
@@ -383,8 +377,8 @@ fn mark_chore_pr_merged_leaves_cancelled_pr_review_revision_untouched() {
 
     assert_eq!(
         task_status(&db, &revision.id),
-        "cancelled",
-        "a human-cancelled review-feedback revision must not be touched"
+        "archived",
+        "a human-archived review-feedback revision must not be touched"
     );
     let conn = db.connect().unwrap();
     let deleted_at: Option<String> = conn
@@ -394,7 +388,7 @@ fn mark_chore_pr_merged_leaves_cancelled_pr_review_revision_untouched() {
         .unwrap();
     assert!(
         deleted_at.is_none(),
-        "a non-moot cancelled revision must never be swept — only merge-conflict/CI-fix rows are"
+        "a non-moot archived revision must never be swept — only merge-conflict/CI-fix rows are"
     );
 }
 

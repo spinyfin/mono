@@ -144,7 +144,7 @@ const TASKS_STATUS_CHECK_COLUMNS: &[(&str, &str)] = &[
     ("description", "description TEXT NOT NULL DEFAULT ''"),
     (
         "status",
-        "status TEXT NOT NULL CHECK (status IN ('todo', 'active', 'blocked', 'in_review', 'done', 'archived', 'cancelled'))",
+        "status TEXT NOT NULL CHECK (status IN ('todo', 'active', 'blocked', 'in_review', 'done', 'archived'))",
     ),
     ("ordinal", "ordinal INTEGER"),
     ("pr_url", "pr_url TEXT"),
@@ -300,7 +300,8 @@ const TASKS_STATUS_CHECK_INDEXES: &str = "\
 /// single startup.
 pub(crate) fn migrate_projects_tasks_status_check(conn: &Connection) -> Result<()> {
     let projects_constrained = table_has_status_check(conn, "projects")?;
-    let tasks_constrained = table_has_status_check(conn, "tasks")?;
+    let tasks_constrained =
+        table_has_status_check(conn, "tasks")? && !table_status_check_includes(conn, "tasks", "cancelled")?;
     let scratch_present = table_exists(conn, "projects_v2")? || table_exists(conn, "tasks_v2")?;
     if projects_constrained && tasks_constrained && !scratch_present {
         return Ok(());
@@ -323,6 +324,24 @@ pub(crate) fn migrate_projects_tasks_status_check(conn: &Connection) -> Result<(
     };
     rebuilt?;
     restored?;
+    Ok(())
+}
+
+/// Collapse retired task status data before rebuilding the status constraint.
+/// The existing `archived_reason` is intentionally retained as the one
+/// provenance surface for both automatic archival and this historical
+/// migration; no second terminal state or extra column is needed.
+pub(crate) fn migrate_tasks_cancelled_status_to_archived(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE tasks
+         SET status = 'archived',
+             archived_reason = COALESCE(NULLIF(archived_reason, ''), 'migrated from legacy cancelled status'),
+             completed_at = COALESCE(completed_at, created_at),
+             merge_queue_state = NULL,
+             merge_queue_detail = NULL
+         WHERE status = 'cancelled'",
+        [],
+    )?;
     Ok(())
 }
 
@@ -504,6 +523,17 @@ fn table_has_status_check(conn: &Connection, table: &str) -> Result<bool> {
             collapsed.contains("CHECK ( status IN") || collapsed.contains("CHECK (status IN")
         })
         .unwrap_or(false))
+}
+
+fn table_status_check_includes(conn: &Connection, table: &str, value: &str) -> Result<bool> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(sql.is_some_and(|sql| sql.contains(&format!("'{value}'"))))
 }
 
 /// The column names `table` actually has right now, in schema order.

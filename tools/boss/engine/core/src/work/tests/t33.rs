@@ -139,14 +139,13 @@ fn list_abandoned_excludes_closed_task_statuses() {
     let db = WorkDb::open(temp_db_path("abandoned-pr-closed")).unwrap();
     make_terminal_chore(&db, "abandoned-pr-done", "done", GRACE_SECS + 60);
     make_terminal_chore(&db, "abandoned-pr-archived", "archived", GRACE_SECS + 60);
-    make_terminal_chore(&db, "abandoned-pr-cancelled", "cancelled", GRACE_SECS + 60);
 
     let candidates = db
         .list_abandoned_pushed_branch_candidates(GRACE_SECS, LOOKBACK_SECS)
         .unwrap();
     assert!(
         candidates.is_empty(),
-        "an explicit close decision (done/archived/cancelled) must never be auto-recovered"
+        "an explicit close decision (done/archived) must never be auto-recovered"
     );
 }
 

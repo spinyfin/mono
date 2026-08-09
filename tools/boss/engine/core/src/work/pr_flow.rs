@@ -93,9 +93,15 @@ impl WorkDb {
                  last_status_actor  = 'engine',
                  blocked_reason     = ?5,
                  blocked_attempt_id = NULL,
-                 completed_at       = COALESCE(completed_at, CASE WHEN ?2 IN ('done','archived','cancelled') THEN ?4 END)
+                 completed_at       = COALESCE(completed_at, CASE WHEN ?2 IN ('done','archived') THEN ?4 END)
              WHERE id = ?1",
-            params![task.id, new_status.as_str(), pr_url_for_task, now, blocked_reason_for_task],
+            params![
+                task.id,
+                new_status.as_str(),
+                pr_url_for_task,
+                now,
+                blocked_reason_for_task
+            ],
         )?;
 
         let mut pending = PendingEvents::new();
@@ -178,7 +184,7 @@ impl WorkDb {
     /// [`crate::no_op_signal`]). In a single transaction:
     ///   - the linked task/chore moves to `done` (with **no** `pr_url` —
     ///     there is no PR), unless it is already terminal (`done` /
-    ///     `archived` / `cancelled`), in which case its status is left
+    ///     `archived`), in which case its status is left
     ///     alone;
     ///   - the execution transitions from `waiting_human` (or `running`)
     ///     to `completed`, the cube workspace lease columns are cleared,
@@ -225,7 +231,7 @@ impl WorkDb {
 
         let now = now_string();
         // A no-op completion closes the task as done. If it is already
-        // terminal (done / archived / cancelled), leave the status alone.
+        // terminal (done / archived), leave the status alone.
         // `pr_url` is left untouched — a no-op produced none, and the
         // worker correctly refused to fabricate one.
         let new_status = if task.status.is_terminal() {
@@ -240,7 +246,7 @@ impl WorkDb {
                  last_status_actor  = 'engine',
                  blocked_reason     = NULL,
                  blocked_attempt_id = NULL,
-                 completed_at       = COALESCE(completed_at, CASE WHEN ?2 IN ('done','archived','cancelled') THEN ?3 END)
+                 completed_at       = COALESCE(completed_at, CASE WHEN ?2 IN ('done','archived') THEN ?3 END)
              WHERE id = ?1",
             params![task.id, new_status.as_str(), now],
         )?;
@@ -670,7 +676,7 @@ impl WorkDb {
     ///
     /// Excludes `cancelled` executions (explicit human/engine cancel — no
     /// business auto-recovering a PR for abandoned-on-purpose work) and
-    /// `t.status IN ('done', 'archived', 'cancelled')` (an explicit close
+    /// `t.status IN ('done', 'archived')` (an explicit close
     /// decision the auto-heal path must never overwrite). `workspace_path
     /// IS NOT NULL` mirrors the late-PR query: the absence of a workspace
     /// path means the execution never reached pane-spawn and therefore never
@@ -708,7 +714,7 @@ impl WorkDb {
                AND CAST(we.finished_at AS INTEGER) >= ?2
                AND t.deleted_at IS NULL
                AND t.kind IN ({CHORE_LIKE_KINDS_SQL})
-               AND t.status NOT IN ('done', 'archived', 'cancelled')
+               AND t.status NOT IN ('done', 'archived')
                AND (t.pr_url IS NULL OR t.pr_url = '')
                AND NOT EXISTS (
                  SELECT 1 FROM work_executions live
@@ -738,11 +744,11 @@ impl WorkDb {
     ///
     /// Like [`Self::bind_pr_to_active_task_from_terminal_execution`] but
     /// relaxes the `status = 'active'` gate to `status NOT IN ('done',
-    /// 'archived', 'cancelled')` — [`crate::abandoned_branch_pr_sweep`]
+    /// 'archived')` — [`crate::abandoned_branch_pr_sweep`]
     /// detects state directly off the execution row and must be able to
     /// recover a work item regardless of whether it fell back to `todo`,
     /// stayed `active`, or is sitting `blocked`. Refuses only an explicit
-    /// close decision (`done`/`archived`/`cancelled`), which the auto-heal
+    /// close decision (`done`/`archived`), which the auto-heal
     /// path must never overwrite.
     ///
     /// Returns `Ok(true)` if the task was updated, `Ok(false)` if it was
@@ -764,7 +770,7 @@ impl WorkDb {
                  blocked_attempt_id = NULL
              WHERE id = ?1
                AND deleted_at IS NULL
-               AND status NOT IN ('done', 'archived', 'cancelled')
+               AND status NOT IN ('done', 'archived')
                AND (pr_url IS NULL OR pr_url = '')
                AND NOT EXISTS (
                  SELECT 1 FROM work_executions live
@@ -1350,7 +1356,7 @@ impl WorkDb {
              FROM tasks
              WHERE product_id = ?1
                AND merge_queue_state = 'queued'
-               AND status NOT IN ('done', 'archived', 'cancelled')
+               AND status NOT IN ('done', 'archived')
                AND deleted_at IS NULL",
         )?;
         let rows = stmt.query_map(params![product_id], |row| {

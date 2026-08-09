@@ -997,10 +997,7 @@ pub(super) fn terminal_chore_execution(work_db: &WorkDb, item: &WorkItem) -> Opt
         WorkItem::Task(t) | WorkItem::Chore(t) => t,
         _ => return None,
     };
-    if !matches!(
-        task.status,
-        TaskStatus::Done | TaskStatus::Archived | TaskStatus::Cancelled
-    ) {
+    if !matches!(task.status, TaskStatus::Done | TaskStatus::Archived) {
         return None;
     }
     match work_db.latest_execution_for_work_item(&task.id) {

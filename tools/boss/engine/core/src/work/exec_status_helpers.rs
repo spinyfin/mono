@@ -189,7 +189,7 @@ pub(crate) fn task_accepts_execution(task: &Task) -> bool {
     // calls `reconcile_product_executions` for the product, and without
     // this check `reconcile_work_item_execution` would create a `ready`
     // execution for the `in_review` task. The same guard closes the
-    // loophole for `archived` and `cancelled` tasks.
+    // loophole for archived tasks.
     //
     // NOTE: `blocked` is intentionally absent here. Dependency-blocked
     // tasks (status = `blocked`) still need `reconcile_work_item_execution`
@@ -200,7 +200,7 @@ pub(crate) fn task_accepts_execution(task: &Task) -> bool {
     // prerequisites are complete.
     if matches!(
         task.status,
-        TaskStatus::Done | TaskStatus::Archived | TaskStatus::Cancelled | TaskStatus::InReview
+        TaskStatus::Done | TaskStatus::Archived | TaskStatus::InReview
     ) {
         return false;
     }
@@ -580,12 +580,7 @@ mod tests {
 
     #[test]
     fn task_accepts_execution_rejects_non_dispatchable_statuses() {
-        for status in [
-            TaskStatus::Done,
-            TaskStatus::Archived,
-            TaskStatus::Cancelled,
-            TaskStatus::InReview,
-        ] {
+        for status in [TaskStatus::Done, TaskStatus::Archived, TaskStatus::InReview] {
             assert!(
                 !task_accepts_execution(&task(status.clone(), true, None)),
                 "{status} should not accept execution"

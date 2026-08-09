@@ -1591,10 +1591,10 @@ fn execution_status_waiting_review_and_merge_are_unclassified() {
 /// [`all_execution_statuses`].
 fn all_task_statuses() -> Vec<TaskStatus> {
     use TaskStatus::*;
-    let all = vec![Todo, Active, Blocked, InReview, Done, Archived, Cancelled];
+    let all = vec![Todo, Active, Blocked, InReview, Done, Archived];
     for status in &all {
         match status {
-            Todo | Active | Blocked | InReview | Done | Archived | Cancelled => {}
+            Todo | Active | Blocked | InReview | Done | Archived => {}
         }
     }
     all
@@ -1603,7 +1603,7 @@ fn all_task_statuses() -> Vec<TaskStatus> {
 #[test]
 fn task_status_is_terminal_marks_only_closed_states() {
     use TaskStatus::*;
-    for status in [Done, Archived, Cancelled] {
+    for status in [Done, Archived] {
         assert!(status.is_terminal(), "{status} should be terminal");
     }
     for status in [Todo, Active, Blocked, InReview] {
@@ -1617,7 +1617,7 @@ fn task_status_is_live_marks_only_in_progress_states() {
     for status in [Active, InReview] {
         assert!(status.is_live(), "{status} should be live");
     }
-    for status in [Todo, Blocked, Done, Archived, Cancelled] {
+    for status in [Todo, Blocked, Done, Archived] {
         assert!(!status.is_live(), "{status} should not be live");
     }
 }
@@ -1641,12 +1641,7 @@ fn task_status_display_label_renames_board_columns() {
 
 #[test]
 fn task_status_display_label_matches_as_str_for_unrenamed_states() {
-    for status in [
-        TaskStatus::Blocked,
-        TaskStatus::Done,
-        TaskStatus::Archived,
-        TaskStatus::Cancelled,
-    ] {
+    for status in [TaskStatus::Blocked, TaskStatus::Done, TaskStatus::Archived] {
         assert_eq!(
             status.display_label(),
             status.as_str(),

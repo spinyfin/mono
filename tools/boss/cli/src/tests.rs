@@ -110,76 +110,6 @@ fn archived_tasks_hidden_from_list_by_default_but_shown_on_request() {
     );
 }
 
-#[test]
-fn cancelled_tasks_hidden_from_list_by_default_but_shown_on_request() {
-    let cancelled = Task::builder()
-        .id("task_cancelled")
-        .product_id("prod_1")
-        .kind(TaskKind::Chore)
-        .name("n")
-        .description("")
-        .status(TaskStatus::Cancelled)
-        .created_at("")
-        .updated_at("")
-        .build();
-    let live = Task::builder()
-        .id("task_live")
-        .product_id("prod_1")
-        .kind(TaskKind::Chore)
-        .name("n")
-        .description("")
-        .status(TaskStatus::Todo)
-        .created_at("")
-        .updated_at("")
-        .build();
-
-    // Default view: cancelled is hidden, live rows still show.
-    let visible = apply_task_list_filters(
-        vec![cancelled.clone(), live.clone()],
-        TaskListCriteria::builder()
-            .statuses(&[])
-            .priorities(&[])
-            .ids(&[])
-            .include_archived(false)
-            .build(),
-        None,
-        None,
-    );
-    assert_eq!(visible.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["task_live"]);
-
-    // `--include-archived` surfaces it alongside everything else.
-    let visible = apply_task_list_filters(
-        vec![cancelled.clone(), live.clone()],
-        TaskListCriteria::builder()
-            .statuses(&[])
-            .priorities(&[])
-            .ids(&[])
-            .include_archived(true)
-            .build(),
-        None,
-        None,
-    );
-    assert_eq!(visible.len(), 2);
-
-    // An explicit `--status cancelled` filter also surfaces it, without
-    // needing `--include-archived` too.
-    let visible = apply_task_list_filters(
-        vec![cancelled, live],
-        TaskListCriteria::builder()
-            .statuses(&[TaskStatusArg::Cancelled])
-            .priorities(&[])
-            .ids(&[])
-            .include_archived(false)
-            .build(),
-        None,
-        None,
-    );
-    assert_eq!(
-        visible.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
-        ["task_cancelled"]
-    );
-}
-
 /// Filter-test row: `dummy_task` with the fields the list filters
 /// actually read dialled in. Everything else keeps the
 /// `dummy_task` defaults.
@@ -618,13 +548,13 @@ fn project_dependency_is_satisfied_by_done_or_archived() {
     assert!(dependency_status_is_satisfied("proj_1", "archived"));
 }
 
-/// Q4 / Q10: tasks and chores satisfy on `done` only — archiving a
-/// task does *not* clear it as a prereq, unlike a project.
+/// Q4 / Q10: tasks and chores satisfy on `done` or `archived`; a
+/// prerequisite that will not run must release its dependents.
 #[test]
-fn task_dependency_is_satisfied_only_by_done() {
+fn task_dependency_is_satisfied_by_done_or_archived() {
     for id in ["task_1", "chore_1"] {
         assert!(dependency_status_is_satisfied(id, "done"));
-        assert!(!dependency_status_is_satisfied(id, "archived"));
+        assert!(dependency_status_is_satisfied(id, "archived"));
     }
 }
 
@@ -633,7 +563,7 @@ fn task_dependency_is_satisfied_only_by_done() {
 #[test]
 fn unfinished_dependencies_are_never_satisfied() {
     for id in ["proj_1", "task_1", "chore_1"] {
-        for status in ["todo", "active", "blocked", "in_review", "cancelled"] {
+        for status in ["todo", "active", "blocked", "in_review"] {
             assert!(
                 !dependency_status_is_satisfied(id, status),
                 "{id} @ {status} should still gate its dependent"
@@ -735,25 +665,6 @@ fn task_status_accepts_legacy_aliases_on_input() {
 }
 
 #[test]
-fn task_status_arg_accepts_cancelled() {
-    let cli = Cli::parse_from(["boss", "task", "update", "task_1", "--status", "cancelled"]);
-    match cli.command {
-        Commands::Task {
-            command: TaskCommand::Update(args),
-        } => assert!(matches!(args.status, Some(TaskStatusArg::Cancelled))),
-        _ => panic!("expected task update command"),
-    }
-    let cli = Cli::parse_from(["boss", "task", "list", "--status", "cancelled"]);
-    match cli.command {
-        Commands::Task {
-            command: TaskCommand::List(args),
-        } => assert!(matches!(args.status.as_slice(), [TaskStatusArg::Cancelled])),
-        _ => panic!("expected task list command"),
-    }
-    assert_eq!(TaskStatusArg::Cancelled.as_str(), "cancelled");
-}
-
-#[test]
 fn move_target_accepts_board_name_primary() {
     let cli = Cli::parse_from(["boss", "task", "move", "task_1", "--to", "backlog"]);
     match cli.command {
@@ -765,36 +676,11 @@ fn move_target_accepts_board_name_primary() {
 }
 
 #[test]
-fn move_target_accepts_cancelled() {
-    let cli = Cli::parse_from(["boss", "task", "move", "task_1", "--to", "cancelled"]);
-    match cli.command {
-        Commands::Task {
-            command: TaskCommand::Move(args),
-        } => assert!(matches!(args.target, MoveTarget::Cancelled)),
-        _ => panic!("expected task move command"),
-    }
-}
-
-#[test]
-fn parses_task_cancel_command() {
-    let cli = Cli::parse_from(["boss", "task", "cancel", "T441"]);
-    match cli.command {
-        Commands::Task {
-            command: TaskCommand::Cancel(args),
-        } => assert_eq!(args.id, "T441"),
-        _ => panic!("expected task cancel command"),
-    }
-}
-
-#[test]
-fn parses_chore_cancel_command() {
-    let cli = Cli::parse_from(["boss", "chore", "cancel", "task_1"]);
-    match cli.command {
-        Commands::Chore {
-            command: ChoreCommand::Cancel(args),
-        } => assert_eq!(args.id, "task_1"),
-        _ => panic!("expected chore cancel command"),
-    }
+fn cancelled_status_and_verb_are_rejected() {
+    assert!(Cli::try_parse_from(["boss", "task", "update", "task_1", "--status", "cancelled"]).is_err());
+    assert!(Cli::try_parse_from(["boss", "task", "move", "task_1", "--to", "cancelled"]).is_err());
+    assert!(Cli::try_parse_from(["boss", "task", "cancel", "task_1"]).is_err());
+    assert!(Cli::try_parse_from(["boss", "chore", "cancel", "task_1"]).is_err());
 }
 
 #[test]

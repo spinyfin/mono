@@ -296,8 +296,6 @@ fn migrate_clear_merge_queue_state_on_terminal_tasks_clears_orphans_preserves_li
     seed(&done_id, "done");
     let archived_id = next_id("task");
     seed(&archived_id, "archived");
-    let cancelled_id = next_id("task");
-    seed(&cancelled_id, "cancelled");
     let live_id = next_id("task");
     seed(&live_id, "in_review");
 
@@ -315,7 +313,7 @@ fn migrate_clear_merge_queue_state_on_terminal_tasks_clears_orphans_preserves_li
             .unwrap()
     };
 
-    for id in [&done_id, &archived_id, &cancelled_id] {
+    for id in [&done_id, &archived_id] {
         let (state, detail) = read_queue(id);
         assert!(state.is_none(), "terminal row {id} must have merge_queue_state cleared");
         assert!(
@@ -536,22 +534,17 @@ fn migration_re_adds_reasoning_column_and_leaves_existing_rows_null() {
     );
 }
 
-/// One-time backfill (mono#… "merge-conflict/CI-fix rows should be
-/// tombstoned automatically once their underlying PR merges"): a
-/// `merge-conflict:*` revision that a human cancelled while its chain
-/// root's PR was still open, then the PR going on to merge *before* this
-/// backfill existed, left the revision stuck at `status = 'cancelled'`
-/// with no tombstone forever — `mark_chore_pr_merged` only reconciles a
-/// chain at the moment its own PR transitions to merged, and that moment
-/// had already passed. Re-opening the DB must sweep it in.
+/// Legacy cancelled task rows must migrate to archived without losing their
+/// row identity, historical terminal timestamp, or existing tombstone.
 #[test]
-fn migrate_backfill_cancelled_moot_revision_tombstones_sweeps_stuck_row_after_merge() {
+fn migrate_cancelled_task_statuses_to_archived_with_provenance() {
     // disk_db_path required: the test re-opens the DB to trigger the migration.
     let (_dir, path) = disk_db_path("migration-backfill-cancelled-moot");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Backfill", Some("git@example.com:backfill.git"));
 
     let conn = db.connect().unwrap();
+    conn.execute_batch("PRAGMA ignore_check_constraints = ON;").unwrap();
     let now = now_string();
 
     // Chain root: already `done` (its PR merged).
@@ -562,7 +555,8 @@ fn migrate_backfill_cancelled_moot_revision_tombstones_sweeps_stuck_row_after_me
         params![root_id, product.id, now],
     ).unwrap();
 
-    // Stuck revision: cancelled by a human, moot kind, never tombstoned.
+    // Legacy cancelled revision: a merged root means the old backfill first
+    // tombstones it, then the status migration preserves both facts.
     let stuck_id = next_id("task");
     conn.execute(
         "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, autostart, priority, created_via, parent_task_id)
@@ -570,8 +564,7 @@ fn migrate_backfill_cancelled_moot_revision_tombstones_sweeps_stuck_row_after_me
         params![stuck_id, product.id, now, format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}crz_stuck"), root_id],
     ).unwrap();
 
-    // Control 1: cancelled moot revision whose chain root is still open —
-    // no merge signal yet, must be left alone.
+    // Control 1: a live root does not change the migration outcome.
     let open_root_id = next_id("task");
     conn.execute(
         "INSERT INTO tasks (id, product_id, kind, name, description, status, pr_url, created_at, updated_at, autostart, priority, created_via)
@@ -585,8 +578,7 @@ fn migrate_backfill_cancelled_moot_revision_tombstones_sweeps_stuck_row_after_me
         params![not_yet_id, product.id, now, format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}crz_open"), open_root_id],
     ).unwrap();
 
-    // Control 2: cancelled *non-moot* revision under the merged root — real
-    // review feedback, must never be swept regardless of the merge signal.
+    // Control 2: a non-moot revision is also migrated rather than lost.
     let non_moot_id = next_id("task");
     conn.execute(
         "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, autostart, priority, created_via, parent_task_id)
@@ -601,37 +593,44 @@ fn migrate_backfill_cancelled_moot_revision_tombstones_sweeps_stuck_row_after_me
     let db2 = WorkDb::open(path.clone()).unwrap();
     let conn2 = db2.connect().unwrap();
 
-    let (stuck_status, stuck_deleted_at): (String, Option<String>) = conn2
+    let (stuck_status, stuck_deleted_at, stuck_reason): (String, Option<String>, Option<String>) = conn2
+        .query_row(
+            "SELECT status, deleted_at, archived_reason FROM tasks WHERE id = ?1",
+            [&stuck_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(stuck_status, "archived");
+    assert_eq!(stuck_reason.as_deref(), Some("migrated from legacy cancelled status"));
+    assert!(
+        stuck_deleted_at.is_none(),
+        "migration changes status without deleting the legacy row"
+    );
+
+    let (not_yet_status, not_yet_deleted_at): (String, Option<String>) = conn2
         .query_row(
             "SELECT status, deleted_at FROM tasks WHERE id = ?1",
-            [&stuck_id],
+            [&not_yet_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(stuck_status, "cancelled", "status must remain the human's real record");
-    assert!(
-        stuck_deleted_at.is_some(),
-        "a cancelled moot revision whose chain root already merged must be tombstoned by the backfill"
-    );
-
-    let not_yet_deleted_at: Option<String> = conn2
-        .query_row("SELECT deleted_at FROM tasks WHERE id = ?1", [&not_yet_id], |row| {
-            row.get(0)
-        })
-        .unwrap();
+    assert_eq!(not_yet_status, "archived");
     assert!(
         not_yet_deleted_at.is_none(),
-        "a cancelled moot revision whose chain root is still open must not be touched"
+        "migration must not turn a live legacy row into a tombstone"
     );
 
-    let non_moot_deleted_at: Option<String> = conn2
-        .query_row("SELECT deleted_at FROM tasks WHERE id = ?1", [&non_moot_id], |row| {
-            row.get(0)
-        })
+    let (non_moot_status, non_moot_deleted_at): (String, Option<String>) = conn2
+        .query_row(
+            "SELECT status, deleted_at FROM tasks WHERE id = ?1",
+            [&non_moot_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
         .unwrap();
+    assert_eq!(non_moot_status, "archived");
     assert!(
         non_moot_deleted_at.is_none(),
-        "a cancelled non-moot (review-feedback) revision must never be swept by the backfill"
+        "migration must not delete non-moot legacy rows"
     );
 
     drop(conn2);

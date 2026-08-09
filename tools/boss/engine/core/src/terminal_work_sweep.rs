@@ -57,8 +57,8 @@
 //!
 //! The operator's primary constraint is: never reap a worker that is
 //! actively doing things. This sweep reaps ONLY on strong, positive
-//! evidence of terminality — the bound work item is `done` / `archived` /
-//! `cancelled`, or the execution itself is `completed` / `failed` /
+//! evidence of terminality — the bound work item is `done` / `archived`, or
+//! the execution itself is `completed` / `failed` /
 //! `cancelled` / `orphaned`. A `done` task means the PR already merged: the
 //! work provably landed, so there is nothing active to destroy. An
 //! `in_review` task (PR open, awaiting review) is NOT terminal and is left
@@ -312,7 +312,7 @@ pub async fn run_one_pass(
         );
 
         // The O'Brien signal: the bound work item is terminal (done /
-        // archived / cancelled) even though the worker — and possibly its
+        // archived) even though the worker — and possibly its
         // execution — is still alive. A work-item lookup failure falls back
         // to the execution signal alone rather than guessing, UNLESS the
         // failure is because the row itself is confirmed gone (deleted out
@@ -1158,7 +1158,7 @@ mod tests {
 
         let live_states = Arc::new(LiveWorkerStateRegistry::new());
         register_live_worker(&live_states, 7, &execution_id, &work_item_id);
-        set_work_item_status(&db, &work_item_id, "cancelled");
+        set_work_item_status(&db, &work_item_id, "archived");
 
         // tear_down = false: the reap is recorded but the live state is left
         // in place, modelling an app that did not actually release the pane.

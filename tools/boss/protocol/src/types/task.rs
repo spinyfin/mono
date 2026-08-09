@@ -25,7 +25,6 @@ pub enum TaskStatus {
     InReview,
     Done,
     Archived,
-    Cancelled,
 }
 
 impl TaskStatus {
@@ -37,14 +36,13 @@ impl TaskStatus {
             Self::InReview => "in_review",
             Self::Done => "done",
             Self::Archived => "archived",
-            Self::Cancelled => "cancelled",
         }
     }
 
     /// True for statuses that represent terminal/closed states where no further
     /// engine action is expected.
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Done | Self::Archived | Self::Cancelled)
+        matches!(self, Self::Done | Self::Archived)
     }
 
     /// True for statuses that represent work in progress (engine-owned dispatch
@@ -66,7 +64,6 @@ impl TaskStatus {
             Self::InReview => "review",
             Self::Done => "done",
             Self::Archived => "archived",
-            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -87,10 +84,9 @@ impl std::str::FromStr for TaskStatus {
             "in_review" => Ok(Self::InReview),
             "done" => Ok(Self::Done),
             "archived" => Ok(Self::Archived),
-            "cancelled" => Ok(Self::Cancelled),
             other => Err(format!(
                 "unknown task status: `{other}`; expected one of: \
-                 todo, active, blocked, in_review, done, archived, cancelled"
+                 todo, active, blocked, in_review, done, archived"
             )),
         }
     }
@@ -730,8 +726,8 @@ pub struct Task {
     pub ci_required_state: Option<String>,
 
     /// Unix epoch seconds (decimal string) at which this task last
-    /// transitioned into a terminal status (`done`, `archived`, or
-    /// `cancelled`). Set once on transition; cleared when the task is
+    /// transitioned into a terminal status (`done` or `archived`). Set once
+    /// on transition; cleared when the task is
     /// re-opened. `None` for non-terminal rows. Existing terminal rows
     /// are backfilled with `created_at` by `migrate_tasks_completed_at`
     /// (NOT `updated_at`, which is re-stamped by any mutation).
