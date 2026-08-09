@@ -721,6 +721,16 @@ pub(crate) async fn compose_worker_spawn(
         )
     };
     let spawn_input = SpawnResolutionInput::builder()
+        // Effort always comes from the owning row, for pool and main-pool workers alike.
+        // For review/automation pools this is deliberate: capability comes from the pool's
+        // strong model tier below, while effort stays proportional to the likely material to
+        // inspect instead of raising every small review's spend. The automated-reviewer
+        // design §5 defines that override; §10 keeps production effort/model selection unchanged.
+        // `resolve_spawn_config` documents their independent precedence, and
+        // `pool_override_does_not_change_effort_or_addendum` pins the separation.
+        // For PR reviews this is only a size proxy, not a claim that small
+        // diffs are low risk: the rubric applies the same correctness bar at
+        // every level.
         .maybe_effort_level(row_effort)
         .maybe_model_override(row_model_override.as_deref())
         .maybe_pool_model_override(pool_policy.map(|p| p.model_tier))
