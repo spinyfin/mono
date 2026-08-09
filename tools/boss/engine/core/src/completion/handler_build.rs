@@ -24,6 +24,7 @@ impl WorkerCompletionHandler {
             stop_locks: Default::default(),
             work_db,
             pr_detector,
+            workspace_diff_verifier: Arc::new(CommandWorkspaceDiffVerifier),
             cube_client,
             publisher,
             pane_releaser,
@@ -309,6 +310,14 @@ impl WorkerCompletionHandler {
     #[cfg(test)]
     pub(super) fn with_staged_pr_mid_turn_defer_secs(mut self, horizon_secs: i64) -> Self {
         self.staged_pr_mid_turn_defer_secs = horizon_secs;
+        self
+    }
+
+    /// Override the working-copy diff verifier. Tests use this to exercise
+    /// the no-op completion gate without spawning `jj`.
+    #[cfg(test)]
+    pub(super) fn with_workspace_diff_verifier(mut self, verifier: Arc<dyn WorkspaceDiffVerifier>) -> Self {
+        self.workspace_diff_verifier = verifier;
         self
     }
 
