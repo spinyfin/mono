@@ -2589,6 +2589,14 @@ fn design_directive_calibrates_breakdown_size_to_problem_size() {
         directive.contains("the planner trusts this breakdown and does not re-expand entries"),
         "{directive}"
     );
+    // Each entry must carry the `###` heading the parser keys off of —
+    // without this mandate, a doc that uses bullets or bold-numbered items
+    // instead parses to zero entries and silently loses the hard entry
+    // boundary this whole calibration exists to enforce.
+    assert!(
+        directive.contains("each entry must open with `### <task name>`"),
+        "{directive}"
+    );
     assert!(
         directive.contains("the planner will not re-split it for you"),
         "{directive}"

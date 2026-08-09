@@ -1,0 +1,12 @@
+package(default_visibility = ["//visibility:private"])
+
+# Exposes individual design docs that a regression test `include_str!`s
+# directly, so the test reads the source of truth rather than a testdata
+# copy that can silently drift from it. Add docs here one at a time as
+# tests need them — do not glob the whole designs/ directory into one
+# broadly-visible target.
+filegroup(
+    name = "operator_forced_dispatch_design_doc",
+    srcs = ["designs/operator-forced-dispatch-while-dispatch-is-paused.md"],
+    visibility = ["//tools/boss/engine/core:__pkg__"],
+)

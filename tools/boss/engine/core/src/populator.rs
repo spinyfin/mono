@@ -59,7 +59,7 @@ use boss_protocol::{
 
 use crate::coordinator::ExecutionPublisher;
 use crate::materializer::Materializer;
-use crate::planner::{DecompositionAudit, PLANNER_MODEL, Planner, PlannerOutcome};
+use crate::planner::{PLANNER_MODEL, Planner, PlannerOutcome};
 use crate::utility_model::{UtilityModel, UtilityTask};
 use crate::work::{ClaimPlannerRunInput, PlannerRunPatch, WorkDb};
 use boss_design_doc_fetcher::{DocFetchOutcome, fetch_design_doc};
@@ -123,10 +123,8 @@ pub trait PopulatorSteps: Send + Sync {
     /// Fetch the design doc live from GitHub at the merged ref.
     async fn fetch_doc(&self, repo_remote_url: &str, doc_path: &str, git_ref: &str) -> DocFetchOutcome;
 
-    /// Run the Planner (LLM inference) over the assembled input. The second
-    /// element of the return tuple is the decomposition-gate audit for this
-    /// call (design brief: surface the gate's activity to the operator).
-    async fn plan(&self, input: &PlannerInput) -> (PlannerOutcome, DecompositionAudit);
+    /// Run the Planner (LLM inference) over the assembled input.
+    async fn plan(&self, input: &PlannerInput) -> PlannerOutcome;
 
     /// The model [`Self::plan`] will run on. Recorded on the `planner_runs`
     /// audit row *before* the (slow) call, so it has to be askable separately
@@ -152,7 +150,7 @@ impl PopulatorSteps for LivePopulatorSteps {
         fetch_design_doc(repo_remote_url, doc_path, git_ref).await
     }
 
-    async fn plan(&self, input: &PlannerInput) -> (PlannerOutcome, DecompositionAudit) {
+    async fn plan(&self, input: &PlannerInput) -> PlannerOutcome {
         Planner::plan(self.utility.as_ref(), input).await
     }
 
@@ -251,7 +249,6 @@ enum PlanAttempt {
     Valid {
         output: PlannerOutput,
         low_confidence: bool,
-        decomposition: DecompositionAudit,
     },
 }
 
@@ -544,11 +541,9 @@ impl Populator {
                 Self::finish(db, ctx, run_id, patch, title, body, publisher).await;
                 Ok(outcome)
             }
-            PlanAttempt::Valid {
-                output,
-                low_confidence,
-                decomposition,
-            } => Self::apply_and_stage(db, ctx, run_id, &output, low_confidence, decomposition, publisher).await,
+            PlanAttempt::Valid { output, low_confidence } => {
+                Self::apply_and_stage(db, ctx, run_id, &output, low_confidence, publisher).await
+            }
         }
     }
 
@@ -716,7 +711,7 @@ impl Populator {
         }
 
         // 5. Plan (the one LLM step).
-        let (plan_outcome, decomposition) = steps.plan(&planner_input).await;
+        let plan_outcome = steps.plan(&planner_input).await;
         let output = match plan_outcome {
             PlannerOutcome::Success(output) => output,
             failure => {
@@ -808,11 +803,7 @@ impl Populator {
                 "dependency cycle: {}",
                 cycle.join(" → ")
             ))),
-            ValidationResult::Valid { low_confidence } => Ok(PlanAttempt::Valid {
-                output,
-                low_confidence,
-                decomposition,
-            }),
+            ValidationResult::Valid { low_confidence } => Ok(PlanAttempt::Valid { output, low_confidence }),
         }
     }
 
@@ -850,7 +841,6 @@ impl Populator {
         run_id: &str,
         output: &PlannerOutput,
         low_confidence: bool,
-        decomposition: DecompositionAudit,
         publisher: &dyn ExecutionPublisher,
     ) -> anyhow::Result<PopulateOutcome> {
         let result = match Materializer::apply(db, &ctx.project_id, run_id, output) {
@@ -890,13 +880,7 @@ impl Populator {
         let created = result.created.len();
         let edges = result.edges_created;
         let skipped = result.skipped.len();
-        let mut summary = format!("staged {created} task(s), {edges} edge(s), {skipped} deduped");
-        if decomposition.oversize_attempts > 0 {
-            summary.push_str(&format!(
-                "; oversize decomposition: {} attempt(s) triggered, {} task(s) still oversize after retries",
-                decomposition.oversize_attempts, decomposition.oversize_remaining
-            ));
-        }
+        let summary = format!("staged {created} task(s), {edges} edge(s), {skipped} deduped");
         tracing::info!(
             project_id = %ctx.project_id,
             run_id,
@@ -904,8 +888,6 @@ impl Populator {
             edges,
             skipped,
             low_confidence,
-            oversize_attempts = decomposition.oversize_attempts,
-            oversize_remaining = decomposition.oversize_remaining,
             "populator: staged tasks",
         );
 
@@ -942,7 +924,7 @@ impl Populator {
             }
         }
 
-        let (mut title, mut body) = if low_confidence {
+        let (title, body) = if low_confidence {
             (
                 "Auto-populate: review staged tasks (low confidence)",
                 format!(
@@ -963,31 +945,6 @@ impl Populator {
                 ),
             )
         };
-
-        // Surface the oversize decomposition gate's activity (design brief:
-        // don't let this go unnoticed in trace WARNs only). Triggers whenever
-        // the gate rejected at least one oversize task during this run,
-        // whether or not the retry ultimately resolved it cleanly.
-        if decomposition.oversize_attempts > 0 {
-            if decomposition.oversize_remaining > 0 {
-                title = "Auto-populate: review staged tasks (oversize after decomposition)";
-                body.push_str(&format!(
-                    "\n\nThe planner's proposal packed oversize task(s); the decomposition gate re-prompted \
-                     it {} time(s), but {} task(s) still exceeded the single-PR sizing contract when the \
-                     retry budget was exhausted and were staged best-effort. Give those tasks extra \
-                     scrutiny — they may still need to be split by hand. See `boss project plan-runs \
-                     <project>` (run `{run_id}`) for the full planner audit trail.",
-                    decomposition.oversize_attempts, decomposition.oversize_remaining
-                ));
-            } else {
-                body.push_str(&format!(
-                    "\n\nThe planner's proposal packed oversize task(s); the decomposition gate re-prompted \
-                     it {} time(s) and the retry produced a cleanly split, correctly-sized plan. See \
-                     `boss project plan-runs <project>` (run `{run_id}`) for the full planner audit trail.",
-                    decomposition.oversize_attempts
-                ));
-            }
-        }
 
         Self::finish(
             db,
@@ -1022,7 +979,7 @@ impl Populator {
     ///
     /// Raised as a `followup`-kind attention (not the legacy
     /// `work_attention_items` table) so every populate outcome — success,
-    /// low-confidence, oversize-decomposition, or an outright failure —
+    /// low-confidence, or an outright failure —
     /// lands on the first-class surface `boss attention list` actually reads.
     /// `title`/`body` double as the followup's `proposed_name` /
     /// `proposed_description`: actioning the group files a task with that
@@ -1194,7 +1151,6 @@ mod tests {
     struct FakeSteps {
         doc: DocFetchOutcomeKind,
         plan: PlannerOutcomeKind,
-        decomposition: DecompositionAudit,
     }
 
     /// Cloneable descriptors the fake maps to real (non-Clone) outcome enums.
@@ -1220,12 +1176,11 @@ mod tests {
             }
         }
 
-        async fn plan(&self, _input: &PlannerInput) -> (PlannerOutcome, DecompositionAudit) {
-            let outcome = match &self.plan {
+        async fn plan(&self, _input: &PlannerInput) -> PlannerOutcome {
+            match &self.plan {
                 PlannerOutcomeKind::Success(out) => PlannerOutcome::Success(out.clone()),
                 PlannerOutcomeKind::NoApiKey => PlannerOutcome::NoApiKey,
-            };
-            (outcome, self.decomposition)
+            }
         }
     }
 
@@ -1261,23 +1216,7 @@ mod tests {
     }
 
     fn steps_with(doc: DocFetchOutcomeKind, plan: PlannerOutcomeKind) -> FakeSteps {
-        FakeSteps {
-            doc,
-            plan,
-            decomposition: DecompositionAudit::default(),
-        }
-    }
-
-    fn steps_with_decomposition(
-        doc: DocFetchOutcomeKind,
-        plan: PlannerOutcomeKind,
-        decomposition: DecompositionAudit,
-    ) -> FakeSteps {
-        FakeSteps {
-            doc,
-            plan,
-            decomposition,
-        }
+        FakeSteps { doc, plan }
     }
 
     /// Count of open/partially-answered `followup` attention *members* the
@@ -1472,92 +1411,6 @@ mod tests {
             }
         );
         assert_eq!(open_attention_count(&db, &product_id, &design_id), 1);
-    }
-
-    /// Observability gap this module closes: when the oversize decomposition
-    /// gate accepted a best-effort proposal, that fact must land on a
-    /// first-class operator-visible surface (the attention item body and the
-    /// `planner_runs.result_summary` the `plan-runs` CLI table shows) rather
-    /// than only a trace WARN.
-    #[tokio::test]
-    async fn oversize_best_effort_acceptance_surfaces_to_the_operator() {
-        let db = open();
-        let (product_id, project_id, design_id) = seed(&db);
-        let output = plan_output(
-            (0..15).map(|i| ptask(&format!("h{i}"), &format!("Task {i}"))).collect(),
-            vec![],
-            Confidence::High,
-            true,
-        );
-        let steps = steps_with_decomposition(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::Success(output),
-            DecompositionAudit {
-                oversize_attempts: 2,
-                oversize_remaining: 9,
-            },
-        );
-        let outcome = Populator::run(
-            &db,
-            &steps,
-            &ctx(&product_id, &project_id, &design_id),
-            DEFAULT_MAX_TASKS,
-            &RecordingPublisher::default(),
-        )
-        .await;
-        assert!(matches!(outcome, PopulateOutcome::Staged { created: 15, .. }));
-
-        let run = db.live_planner_run_for_project(&project_id).unwrap().unwrap();
-        let summary = run.result_summary.expect("result_summary set");
-        assert!(
-            summary.contains("oversize") && summary.contains('9'),
-            "result_summary must record the oversize decomposition outcome, got: {summary}"
-        );
-
-        let member = populate_attention_member(&db, &product_id, &design_id);
-        let description = member.proposed_description.expect("proposed_description set");
-        assert!(
-            description.contains("oversize") && description.contains('9'),
-            "attention must describe the oversize decomposition outcome, got: {description}",
-        );
-        assert!(
-            description.contains(&run.id),
-            "attention must point at the planner_runs row, got: {description}",
-        );
-    }
-
-    /// A decomposition retry that resolves cleanly (no oversize tasks
-    /// remain) must still be mentioned — the operator learns the gate fired
-    /// at all, not just when it degraded to best-effort.
-    #[tokio::test]
-    async fn oversize_decomposition_resolved_cleanly_still_surfaces() {
-        let db = open();
-        let (product_id, project_id, design_id) = seed(&db);
-        let output = plan_output(vec![ptask("a", "Task A")], vec![], Confidence::High, true);
-        let steps = steps_with_decomposition(
-            DocFetchOutcomeKind::Content("# doc".to_owned()),
-            PlannerOutcomeKind::Success(output),
-            DecompositionAudit {
-                oversize_attempts: 1,
-                oversize_remaining: 0,
-            },
-        );
-        let outcome = Populator::run(
-            &db,
-            &steps,
-            &ctx(&product_id, &project_id, &design_id),
-            DEFAULT_MAX_TASKS,
-            &RecordingPublisher::default(),
-        )
-        .await;
-        assert!(matches!(outcome, PopulateOutcome::Staged { .. }));
-
-        let member = populate_attention_member(&db, &product_id, &design_id);
-        let description = member.proposed_description.expect("proposed_description set");
-        assert!(
-            description.contains("decomposition gate"),
-            "attention must mention the decomposition gate fired even though it resolved cleanly, got: {description}",
-        );
     }
 
     // ---- idempotency -------------------------------------------------------

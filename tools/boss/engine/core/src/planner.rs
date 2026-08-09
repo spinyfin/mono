@@ -231,22 +231,6 @@ impl PlannerOutcome {
     }
 }
 
-/// Historical audit of the retired oversize decomposition re-prompt.
-///
-/// Always zero after the planner stopped re-prompting to split design-doc
-/// entries (the design doc's breakdown is authoritative; entry count in,
-/// row count out). Kept so callers that still destructure
-/// [`DecompositionAudit`] (Populator attention copy, plan-run summaries)
-/// compile without a breaking shape change — the fields are now inert.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DecompositionAudit {
-    /// Always 0. Retained for wire/API compatibility with older populator
-    /// attention copy that keys on this field.
-    pub oversize_attempts: u32,
-    /// Always 0. Retained for wire/API compatibility.
-    pub oversize_remaining: usize,
-}
-
 /// The Planner. A zero-sized entry point so callers write the
 /// `Planner::plan(..)` shape the design names; the Planner holds no state
 /// (it is a pure transform).
@@ -267,13 +251,11 @@ impl Planner {
     /// (transport errors and HTTP 429/5xx/overloaded) once before failing safe;
     /// a non-retryable 4xx, a decode failure, or output that fails schema
     /// validation is surfaced immediately, mapped into a [`PlannerOutcome`].
-    /// The second element of the return tuple is the decomposition-gate audit
-    /// ([`DecompositionAudit`]) for this call.
-    pub async fn plan(utility: &dyn UtilityModel, input: &PlannerInput) -> (PlannerOutcome, DecompositionAudit) {
+    pub async fn plan(utility: &dyn UtilityModel, input: &PlannerInput) -> PlannerOutcome {
         match utility.resolve(UtilityTask::Planner) {
             Err(err) => {
                 tracing::error!(%err, "planner: skipped — no utility-model credential");
-                (PlannerOutcome::NoApiKey, DecompositionAudit::default())
+                PlannerOutcome::NoApiKey
             }
             Ok(call) => plan_with_call(&call, input).await,
         }
@@ -298,13 +280,12 @@ enum RetryFeedback {
 /// Schema-valid proposals are accepted as-is. The planner does **not** re-prompt
 /// to split multi-clause or multi-layer tasks — the design doc's breakdown is
 /// authoritative (entry count in, row count out).
-async fn plan_with_call(call: &UtilityCall, input: &PlannerInput) -> (PlannerOutcome, DecompositionAudit) {
+async fn plan_with_call(call: &UtilityCall, input: &PlannerInput) -> PlannerOutcome {
     let config = CallConfig::new(PLANNER_TIMEOUT)
         .with_retry(RetryPolicy::new(PLANNER_ATTEMPTS, PLANNER_BACKOFF, PLANNER_BACKOFF))
         .with_endpoint(call.endpoint.clone());
 
     let mut feedback: Option<RetryFeedback> = None;
-    let audit = DecompositionAudit::default();
     for attempt in 1..=PLANNER_VALIDATION_ATTEMPTS {
         let body = match &feedback {
             None => build_request_body(input, &call.model),
@@ -313,11 +294,11 @@ async fn plan_with_call(call: &UtilityCall, input: &PlannerInput) -> (PlannerOut
         match claude_client::send_messages_raw(&call.api_key, &body, &config).await {
             Ok(response) => match planner_output_from_response(&response) {
                 Ok(output) => {
-                    return (PlannerOutcome::Success(output), audit);
+                    return PlannerOutcome::Success(output);
                 }
                 Err(msg) => {
                     if attempt >= PLANNER_VALIDATION_ATTEMPTS {
-                        return (PlannerOutcome::InvalidOutput(msg), audit);
+                        return PlannerOutcome::InvalidOutput(msg);
                     }
                     tracing::warn!(
                         attempt,
@@ -328,15 +309,12 @@ async fn plan_with_call(call: &UtilityCall, input: &PlannerInput) -> (PlannerOut
                     feedback = Some(RetryFeedback::Schema(msg));
                 }
             },
-            Err(err) => return (outcome_from_error(err), audit),
+            Err(err) => return outcome_from_error(err),
         }
     }
     // Unreachable in practice: the final iteration returns in every branch.
     // Kept as a fail-safe.
-    (
-        PlannerOutcome::InvalidOutput("exhausted planner validation retries".to_owned()),
-        audit,
-    )
+    PlannerOutcome::InvalidOutput("exhausted planner validation retries".to_owned())
 }
 
 /// Assemble the Anthropic Messages request body. Public so tests and future
@@ -519,9 +497,13 @@ fn line_byte_offset(doc: &str, line_idx: usize) -> usize {
 ///
 /// Prefers `###` ATX headings inside the breakdown section (the modern
 /// design-directive shape). Falls back to top-level numbered list items
-/// (`1. …`) when the section has no `###` entries. Returns an empty vec when
-/// no breakdown section or no entries are found — the planner still receives
-/// the full doc and can fall back to free-form extraction.
+/// (`1. …`, optionally `**1. …**`) when the section has no `###` entries,
+/// then to `- **Name.** …` bold-bullet entries. Returns an empty vec when no
+/// breakdown section or no entries are found — the planner still receives
+/// the full doc and can fall back to free-form extraction, but that fallback
+/// is a silent degradation from the hard entry boundary this function
+/// exists to provide, so callers that build the authoritative-entries prompt
+/// block log when a recognised section yields zero entries.
 pub fn extract_breakdown_entries(doc: &str) -> Vec<BreakdownEntry> {
     let Some(section) = extract_breakdown_section(doc) else {
         return Vec::new();
@@ -530,17 +512,54 @@ pub fn extract_breakdown_entries(doc: &str) -> Vec<BreakdownEntry> {
     if !heading_entries.is_empty() {
         return heading_entries;
     }
-    parse_numbered_entries(section)
+    let numbered_entries = parse_numbered_entries(section);
+    if !numbered_entries.is_empty() {
+        return numbered_entries;
+    }
+    let bullet_entries = parse_bullet_entries(section);
+    if bullet_entries.is_empty() {
+        tracing::warn!(
+            "planner: design doc has a recognised breakdown section but no entries parsed \
+             from it (no ### headings, numbered items, or bold bullets) — falling back to \
+             free-form extraction from prose"
+        );
+    }
+    bullet_entries
+}
+
+/// True when `line`, trimmed, opens or closes a fenced code block (``` or
+/// ~~~, at least 3 chars). Callers toggle an `in_fence` flag on this so a
+/// `### `/numbered-looking line inside a fence is never mistaken for an
+/// entry marker — mirrors the fence handling in
+/// `boss_engine_editorial::split_markdown_segments`.
+fn is_fence_delimiter(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
 }
 
 /// Split a breakdown section on `###` headings into entries. Skips a leading
-/// `Breakdown size: N entries …` prose line (not an entry).
+/// `Breakdown size: N entries …` prose line (not an entry), and ignores
+/// anything inside a fenced code block.
 fn parse_hash_entries(section: &str) -> Vec<BreakdownEntry> {
     let mut entries = Vec::new();
     let mut current_title: Option<String> = None;
     let mut body_lines: Vec<&str> = Vec::new();
+    let mut in_fence = false;
 
     for line in section.lines() {
+        if is_fence_delimiter(line) {
+            in_fence = !in_fence;
+            if current_title.is_some() {
+                body_lines.push(line);
+            }
+            continue;
+        }
+        if in_fence {
+            if current_title.is_some() {
+                body_lines.push(line);
+            }
+            continue;
+        }
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("### ") {
             if let Some(title) = current_title.take() {
@@ -567,15 +586,33 @@ fn parse_hash_entries(section: &str) -> Vec<BreakdownEntry> {
     entries
 }
 
-/// Fallback: numbered list items (`1. Title` / `1. Title — scope`) as entries.
+/// Fallback: numbered list items (`1. Title` / `1. Title — scope`, optionally
+/// wrapped in `**…**`/`__…__` emphasis) as entries. An indented line (a
+/// sub-step nested under a real entry) is never promoted to a top-level
+/// entry; a fenced code block's contents are never scanned for markers.
 fn parse_numbered_entries(section: &str) -> Vec<BreakdownEntry> {
     let mut entries = Vec::new();
     let mut current_title: Option<String> = None;
     let mut body_lines: Vec<&str> = Vec::new();
+    let mut in_fence = false;
 
     for line in section.lines() {
+        if is_fence_delimiter(line) {
+            in_fence = !in_fence;
+            if current_title.is_some() {
+                body_lines.push(line);
+            }
+            continue;
+        }
+        if in_fence {
+            if current_title.is_some() {
+                body_lines.push(line);
+            }
+            continue;
+        }
+        let is_indented = line.starts_with(' ') || line.starts_with('\t');
         let trimmed = line.trim();
-        if let Some(rest) = strip_numbered_item(trimmed) {
+        if !is_indented && let Some(rest) = strip_numbered_item(trimmed) {
             if let Some(title) = current_title.take() {
                 entries.push(BreakdownEntry {
                     title,
@@ -583,8 +620,6 @@ fn parse_numbered_entries(section: &str) -> Vec<BreakdownEntry> {
                 });
                 body_lines.clear();
             }
-            // First line may be "Title. Scope continues…" — keep whole line
-            // as title when short, otherwise title = first sentence-ish.
             current_title = Some(rest.to_owned());
             continue;
         }
@@ -601,10 +636,77 @@ fn parse_numbered_entries(section: &str) -> Vec<BreakdownEntry> {
     entries
 }
 
-/// If `line` is a numbered list item (`1. foo` / `12. foo`), return the text
-/// after the marker; otherwise `None`.
+/// Second fallback: `- **Name.** rest of line…` bullet entries, e.g.
+/// `- **6f-4: protocol additions.** protocol additions are described...`.
+/// The bold span is the title; text after the closing emphasis on the same
+/// line, plus any indented continuation lines, becomes the body.
+fn parse_bullet_entries(section: &str) -> Vec<BreakdownEntry> {
+    let mut entries = Vec::new();
+    let mut current_title: Option<String> = None;
+    let mut body_lines: Vec<String> = Vec::new();
+    let mut in_fence = false;
+
+    for line in section.lines() {
+        if is_fence_delimiter(line) {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let is_indented = line.starts_with(' ') || line.starts_with('\t');
+        let trimmed = line.trim();
+        if !is_indented && let Some((title, rest)) = strip_bullet_bold_item(trimmed) {
+            if let Some(prev_title) = current_title.take() {
+                entries.push(BreakdownEntry {
+                    title: prev_title,
+                    body: body_lines.join("\n"),
+                });
+                body_lines.clear();
+            }
+            current_title = Some(title.to_owned());
+            if !rest.trim().is_empty() {
+                body_lines.push(rest.trim().to_owned());
+            }
+            continue;
+        }
+        if current_title.is_some() && !trimmed.is_empty() {
+            body_lines.push(trimmed.to_owned());
+        }
+    }
+    if let Some(title) = current_title {
+        entries.push(BreakdownEntry {
+            title,
+            body: body_lines.join("\n"),
+        });
+    }
+    entries
+}
+
+/// If `line` is a `- **Bold title.** rest…` bullet, return `(title, rest)`.
+fn strip_bullet_bold_item(line: &str) -> Option<(&str, &str)> {
+    let after_dash = line.strip_prefix("- ")?;
+    let after_open = after_dash.strip_prefix("**")?;
+    let close_idx = after_open.find("**")?;
+    let title = after_open[..close_idx].trim().trim_end_matches('.').trim();
+    if title.is_empty() {
+        return None;
+    }
+    let rest = &after_open[close_idx + 2..];
+    Some((title, rest))
+}
+
+/// If `line` is a numbered list item (`1. foo` / `12. foo`), optionally
+/// wrapped in leading `*`/`_` emphasis markers (`**1. foo**`), return the
+/// text after the marker (with a matching trailing emphasis marker
+/// stripped); otherwise `None`. Requires a literal space after the `.` so
+/// prose like `2.5x faster than before` never parses as an entry.
 fn strip_numbered_item(line: &str) -> Option<&str> {
-    let bytes = line.as_bytes();
+    let mut rest_line = line;
+    while let Some(stripped) = rest_line.strip_prefix('*').or_else(|| rest_line.strip_prefix('_')) {
+        rest_line = stripped;
+    }
+    let bytes = rest_line.as_bytes();
     if bytes.is_empty() || !bytes[0].is_ascii_digit() {
         return None;
     }
@@ -615,11 +717,19 @@ fn strip_numbered_item(line: &str) -> Option<&str> {
     if i == 0 || i >= bytes.len() || bytes[i] != b'.' {
         return None;
     }
-    let rest = line[i + 1..].trim_start();
+    if bytes.get(i + 1) != Some(&b' ') {
+        return None;
+    }
+    let rest = rest_line[i + 1..].trim_start();
     if rest.is_empty() {
         return None;
     }
-    Some(rest)
+    let rest = rest
+        .strip_suffix("**")
+        .or_else(|| rest.strip_suffix("__"))
+        .unwrap_or(rest);
+    let rest = rest.trim_end();
+    if rest.is_empty() { None } else { Some(rest) }
 }
 
 /// Build the retry request body: identical to [`build_request_body`] except
@@ -1220,8 +1330,8 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("only what the doc states"));
         assert!(SYSTEM_PROMPT.contains("breakdown_found"));
         assert!(SYSTEM_PROMPT.contains("DAG"));
-        // P5-lite (incident-002): soft merge_order_hints on clear file
-        // overlap only — never a hard edge that gates dispatch.
+        // File-overlap coupling must stay a soft merge_order_hints entry —
+        // never a hard edge that gates dispatch.
         assert!(SYSTEM_PROMPT.contains("merge_order_hints"));
         assert!(SYSTEM_PROMPT.contains("forward-port the sibling's changes preservingly"));
         assert!(SYSTEM_PROMPT.contains("is NOT a dependency edge and must never gate"));
@@ -1356,7 +1466,7 @@ mod tests {
     fn effort_audit_is_empty_for_a_task_with_no_audit_line() {
         // A task description with no `[effort-classification]` line derives
         // an empty entry rather than failing, and stays index-aligned with
-        // `tasks` (relied on by `detect_oversize_tasks`).
+        // `tasks`.
         let response = response_from(json!({
             "content": [{
                 "type": "tool_use",
@@ -1542,10 +1652,9 @@ mod tests {
     #[tokio::test]
     async fn plan_returns_no_api_key_when_key_missing() {
         let keyless = crate::utility_model::AnthropicUtilityModel::from_lookup(None, |_| None);
-        let (outcome, audit) = Planner::plan(&keyless, &sample_input()).await;
+        let outcome = Planner::plan(&keyless, &sample_input()).await;
         assert!(matches!(outcome, PlannerOutcome::NoApiKey));
         assert_eq!(outcome.tag(), "no_api_key");
-        assert_eq!(audit, DecompositionAudit::default());
     }
 
     #[tokio::test]
@@ -1559,7 +1668,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (outcome, audit) = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
+        let outcome = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
 
         match outcome {
             PlannerOutcome::Success(out) => {
@@ -1569,7 +1678,6 @@ mod tests {
             }
             other => panic!("expected Success, got {other:?}"),
         }
-        assert_eq!(audit, DecompositionAudit::default());
     }
 
     #[tokio::test]
@@ -1588,7 +1696,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (outcome, _audit) = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
+        let outcome = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
         assert!(
             matches!(outcome, PlannerOutcome::Success(_)),
             "expected success after one retry, got {outcome:?}",
@@ -1661,12 +1769,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (outcome, audit) = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
+        let outcome = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
         match outcome {
             PlannerOutcome::Success(out) => assert_eq!(out.effort_audit.len(), 1),
             other => panic!("expected Success via derivation, got {other:?}"),
         }
-        assert_eq!(audit, DecompositionAudit::default());
         assert_eq!(
             server.received_requests().await.expect("requests recorded").len(),
             1,
@@ -1693,13 +1800,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (outcome, audit) = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
+        let outcome = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
         assert!(
             matches!(outcome, PlannerOutcome::Success(_)),
             "expected success after the validation retry, got {outcome:?}",
         );
         // A schema-invalid retry never trips the oversize gate.
-        assert_eq!(audit, DecompositionAudit::default());
 
         let requests = server.received_requests().await.expect("requests recorded");
         assert_eq!(requests.len(), 2, "expected exactly one validation retry");
@@ -1729,7 +1835,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (outcome, _audit) = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
+        let outcome = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
         assert!(
             matches!(outcome, PlannerOutcome::InvalidOutput(_)),
             "expected InvalidOutput after exhausting retries, got {outcome:?}",
@@ -1753,7 +1859,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (outcome, _audit) = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
+        let outcome = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
         match outcome {
             PlannerOutcome::ApiError { status, .. } => assert_eq!(status, 401),
             other => panic!("expected ApiError, got {other:?}"),
@@ -1810,7 +1916,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (outcome, audit) = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
+        let outcome = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
         match outcome {
             PlannerOutcome::Success(out) => {
                 assert_eq!(out.tasks.len(), 1, "one entry → one row");
@@ -1819,7 +1925,6 @@ mod tests {
             }
             other => panic!("expected Success with the single-entry plan, got {other:?}"),
         }
-        assert_eq!(audit, DecompositionAudit::default());
         assert_eq!(
             server.received_requests().await.expect("requests recorded").len(),
             1,
@@ -1844,7 +1949,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (outcome, audit) = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
+        let outcome = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
         match outcome {
             PlannerOutcome::Success(out) => {
                 assert_eq!(out.tasks.len(), 1);
@@ -1852,7 +1957,6 @@ mod tests {
             }
             other => panic!("expected Success after schema retry, got {other:?}"),
         }
-        assert_eq!(audit, DecompositionAudit::default());
         let requests = server.received_requests().await.expect("requests recorded");
         assert_eq!(requests.len(), 2);
         let retry_body: Value = requests[1].body_json().expect("retry body is JSON");
@@ -1976,6 +2080,116 @@ Dependencies: Engine handler\n\
     }
 
     #[test]
+    fn extracts_numbered_entries_wrapped_in_bold_emphasis() {
+        // `**1. Title**` shape (e.g. the tmux-in-coordinator design doc):
+        // strip_numbered_item must skip the leading emphasis marker before
+        // the digit test, and drop the matching trailing marker from the
+        // title.
+        let doc = "\
+## Proposed implementation task breakdown\n\
+\n\
+**1. `boss-tmux` control crate**\n\
+\n\
+Scope: new crate.\n\
+\n\
+**2. tmux preflight gate**\n\
+\n\
+Scope: hard-dependency check.\n\
+";
+        let entries = extract_breakdown_entries(doc);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].title, "`boss-tmux` control crate");
+        assert_eq!(entries[1].title, "tmux preflight gate");
+    }
+
+    #[test]
+    fn extracts_bold_bullet_entries_when_no_hash_or_numbered_headings() {
+        // `- **Name.** rest of line…` shape (e.g. engine-app-rpc.md's
+        // "Implementation plan" section) — third fallback.
+        let doc = "\
+## Implementation plan\n\
+\n\
+- **6f-4: protocol additions.** Adds RegisterAppSession and friends.\n\
+- **6f-5: engine-side dispatch.** ServerState tracks sessions.\n\
+";
+        let entries = extract_breakdown_entries(doc);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].title, "6f-4: protocol additions");
+        assert!(entries[0].body.contains("Adds RegisterAppSession"));
+        assert_eq!(entries[1].title, "6f-5: engine-side dispatch");
+    }
+
+    #[test]
+    fn numbered_fallback_rejects_decimals_and_indented_subitems() {
+        // A standalone `2.5x faster than before` line must not parse as a
+        // new entry "5x faster than before" (no space after the dot), and
+        // an indented sub-step nested under a real entry must not be
+        // promoted to a top-level entry — both must stay part of the
+        // preceding entry's body.
+        // Not built with the file's usual `"\` line-continuation style: that
+        // escape also strips leading whitespace from the continued line,
+        // which would silently erase the indentation this test exists to
+        // check.
+        let doc = "## Proposed implementation task breakdown\n\n1. Protocol types.\n2.5x faster than before.\n   1. nested sub-step, not a top-level entry\n2. Engine handler.\n";
+        let entries = extract_breakdown_entries(doc);
+        assert_eq!(entries.len(), 2, "got {entries:?}");
+        assert!(entries[0].title.starts_with("Protocol types"));
+        assert!(
+            entries[0].body.contains("2.5x faster than before"),
+            "the decimal-numbered line must stay part of the preceding entry's body: {:?}",
+            entries[0].body
+        );
+        assert!(
+            entries[0].body.contains("nested sub-step"),
+            "the indented sub-step must stay part of the preceding entry's body: {:?}",
+            entries[0].body
+        );
+        assert!(entries[1].title.starts_with("Engine handler"));
+    }
+
+    #[test]
+    fn hash_and_numbered_fallbacks_skip_fenced_code_blocks() {
+        // A `### ` (or numbered) line inside a fenced code block must not be
+        // mistaken for an entry marker.
+        let doc = "\
+## Proposed implementation task breakdown\n\
+\n\
+### Real entry\n\
+\n\
+Scope: does the thing.\n\
+\n\
+```text\n\
+### not an entry\n\
+1. also not an entry\n\
+```\n\
+\n\
+More scope prose after the fence.\n\
+";
+        let entries = extract_breakdown_entries(doc);
+        assert_eq!(entries.len(), 1, "got {entries:?}");
+        assert_eq!(entries[0].title, "Real entry");
+        assert!(entries[0].body.contains("### not an entry"));
+        assert!(entries[0].body.contains("More scope prose after the fence"));
+    }
+
+    #[test]
+    fn empty_entries_from_a_recognised_section_are_logged() {
+        // A recognised heading whose body has no ###, numbered, or bullet
+        // entries must still return an empty vec (free-prose fallback) —
+        // this doc's "breakdown" is just a paragraph, not a list. The
+        // silent-fallback case itself is covered by the `tracing::warn!` in
+        // `extract_breakdown_entries`; this test pins the empty-vec return
+        // contract that warn depends on.
+        let doc = "\
+## Proposed implementation task breakdown\n\
+\n\
+Just do the thing, no explicit entries here.\n\
+";
+        let entries = extract_breakdown_entries(doc);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
     fn user_prompt_lists_authoritative_single_entry_inventory() {
         let mut input = sample_input();
         input.design_doc = SINGLE_ENTRY_DOC.to_owned();
@@ -1996,9 +2210,11 @@ Dependencies: Engine handler\n\
 
     #[test]
     fn real_operator_forced_dispatch_doc_parses_as_one_entry() {
-        // Re-run against the real design doc (fixture copy of the reproduced
-        // failure doc; see engine/core/testdata/ and BUILD.bazel compile_data).
-        let doc = include_str!("../testdata/operator_forced_dispatch_design.md");
+        // Re-run against the real design doc itself, via the
+        // //tools/boss/docs:operator_forced_dispatch_design_doc filegroup
+        // (see BUILD.bazel compile_data) — not a testdata copy, so this test
+        // can never silently drift from the doc it claims to cover.
+        let doc = include_str!(env!("BOSS_OPERATOR_FORCED_DISPATCH_DESIGN_DOC"));
         let entries = extract_breakdown_entries(doc);
         assert_eq!(
             entries.len(),
