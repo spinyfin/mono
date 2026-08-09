@@ -1,6 +1,6 @@
 # Incident 004 — Engine reaped live revision workers mid-turn, discarding their work
 
-- **Date:** 2026-08-08 (America/Chicago). Focal pair on flunge PR #1342 between ~15:23 and ~15:41; the same finalization path had been active for at least three days prior.
+- **Date:** 2026-08-08 (America/Chicago). Focal pair on flunge PR #1342 between ~15:23 and ~15:41; the same finalization path had been active for at least two days prior (a retention-bounded floor — see §3).
 - **Severity:** High — silent work loss on live revision workers, plus false-success board status for revisions that produced nothing. Measured over the retained trace window: **63 mid-turn reaps out of 64 staged-path finalizations (98.4%)** — 6 total losses, 57 partial losses, and **5 work items still sitting in review status having contributed nothing** (§4). Includes a case where a revision minted to fix live production regressions was reaped before push while the board reported success.
 - **Status:** Documented. Guard remediation for the fast path is already in flight as separate work and is not redesigned here. This postmortem is doc-only.
 - **Class:** Race between merge-poller PR recheck and a still-working agent: a staged PR URL is treated as "worker done," terminalizing and reaping a live mid-turn execution. Related prior: the 2026-07-14 SHA-delta absorption incident whose protection this fast path bypasses.
@@ -20,12 +20,12 @@ The defect is a property of `recheck_for_pr`'s structure, not of the staged code
 
 On 2026-08-08, two consecutive revision workers on flunge PR #1342 were reaped by the engine while mid-turn:
 
-| Revision | Execution                  | Driver | Outcome                                                                                                                                                       |
-| -------- | -------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| R1       | `exec_18c9ee2925032810_47` | codex  | Pushed successfully, then reaped **2.4 s** later mid-prompt. Code reached the PR; post-push steps (including the required findings-status comment) never ran. |
-| R2       | `exec_18c9ee9f79ea3c08_4f` | claude | Reaped **before any push**. Entire local fix commit discarded with the released workspace. Board still moved the work item as if review-ready.                |
+| Revision | Execution                  | Driver | Outcome                                                                                                                                                                                           |
+| -------- | -------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| R1       | `exec_18c9ee2925032810_47` | codex  | Pushed successfully, then reaped **2.4 s** later mid-prompt. Code reached the PR; post-push steps (including the required findings-status comment) never ran.                                     |
+| R2       | `exec_18c9ee9f79ea3c08_4f` | claude | Reaped **before any push**. The local fix commit never reached the PR and the workspace lease was released (recoverability unknown; see §12). Board still moved the work item as if review-ready. |
 
-This is not driver-specific and not product-specific. The two cases used different drivers and different workspaces, and the measured window confirms both: occurrences split mono 31 / flunge 32, and by driver claude 56 / grok 4 / codex 3, which tracks the traffic split.
+Occurrence is not driver-specific — though severity is (see §3) — nor is it product-specific. The two cases used different drivers and different workspaces, and the measured window confirms both: occurrences split mono 31 / flunge 32, and by driver claude 56 / grok 4 / codex 3, which tracks the traffic split.
 
 The focal pair is a calibration case, not the incident. Across the 2 d 3 h 24 m of retained engine trace, **64 finalizations took the staged fast path and 63 of them reaped a worker that was still mid-turn (98.4%)** — 6 total losses and 57 partial losses. Five work items are still sitting in review status having contributed nothing; they are listed in §4. The full measurement, its limits, and its labelling are in §3.
 
@@ -102,6 +102,8 @@ One row is genuinely **unresolvable**. A revision on flunge #1296 routed via `pr
 
 #### Breakdowns — determined counts
 
+All breakdowns below cover the **63 staged-path mid-turn reaps**; the detector-branch occurrence is counted separately.
+
 - **By repo:** mono 31 · flunge 32. Essentially even — this is not product-specific.
 - **By execution kind:** revision_implementation 50 · chore_implementation 10 · investigation_implementation 1 · project_design 1 · task_implementation 1.
 - **By driver:** claude 56 · grok 4 · codex 3. This tracks the traffic split, so **occurrence is not driver-specific.**
@@ -140,7 +142,7 @@ This is the actionable output of the measurement. **Five work items currently cl
 
 ### mono #2651 is the worst case and the clearest demonstration of the failure mode
 
-Three merge-conflict revisions, across three different drivers, at 15:52, 16:02 and 16:04 CDT on 08-08. Each was reaped the instant it typed a `gh pr` command. Each was recorded as successful. None of them moved the head.
+Three merge-conflict revisions in quick succession, at 15:52, 16:02 and 16:04 CDT on 08-08. Each was reaped the instant it typed a `gh pr` command. Each was recorded as successful. None of them moved the head.
 
 **The defect manufactures a retry loop that consumes a worker every few minutes and can never converge**, because the recorded outcome of every attempt is success. Nothing in the system can distinguish "the conflict was resolved" from "the resolver was killed before it pushed," so the item is re-minted, re-reaped, and re-recorded as done, indefinitely.
 
@@ -388,7 +390,7 @@ Severity was worse. The engine records a head SHA _before_ an execution runs but
 | Operator-facing banner when a revision finalizes with `sha_unchanged` | **No**    | R2 looked successful on the board                                      |
 | Head SHA recorded _after_ teardown                                    | **No**    | "Did this execution push?" is not answerable from engine records alone |
 
-Discovery of this incident was from a **symptom** (missing findings-status comment on R1), not from an engine-raised attention item. R2's total loss was found by forensic follow-up on the same PR, not by the board. Nothing in this table fired for any of the other 62 mid-turn reaps either — the measurement in §3 came from pulling raw trace off-box, not from any operator-facing surface.
+Discovery of this incident was from a **symptom** (missing findings-status comment on R1), not from an engine-raised attention item. R2's total loss was found by forensic follow-up on the same PR, not by the board. Nothing in this table fired for any of the other 61 staged-path mid-turn reaps or the separately counted detector-branch reap — the measurement in §3 came from pulling raw trace off-box, not from any operator-facing surface.
 
 ### Response
 
@@ -442,7 +444,7 @@ These are engineering fixes to the defect. They are **not** a substitute for the
 3. **Read/edit/view must not arm teardown.** Capture breadth optimized for recovery of missed PR opens is the wrong breadth for a path that kills the worker.
 4. **Prompt steps after the push are optional under a race.** If the engine can finalize on push-related signals, post-push prompt work is best-effort only.
 5. **False success is worse than visible failure** when the board hides total work loss and live production regressions. Worse still, it is self-perpetuating: mono #2651 (§4) shows a false-success loop re-minting the same revision every few minutes, forever, because each failure is recorded as a win.
-6. **If the only distinguishing field is a log attribute, prevalence is invisible until it is a metric.** The data was there the whole time — 63 mid-turn reaps sitting in trace — and it took a hand reconstruction to see any of it. "Not aggregated" and "not happening" are indistinguishable from the operator's chair.
+6. **If the only distinguishing field is a log attribute, prevalence is invisible until it is a metric.** The data was there the whole time — 63 staged-path mid-turn reaps sitting in trace, plus the separately counted detector-branch reap — and it took a hand reconstruction to see any of it. "Not aggregated" and "not happening" are indistinguishable from the operator's chair.
 7. **Record state after the action, not only before it.** Without a post-teardown head SHA, the engine cannot answer its own most important question — did this execution deliver anything? — which left one row permanently unresolvable and one verdict wrong.
 8. **A phase race measured is rarely a coin flip.** This one was assumed roughly 50/50 from two cases and turned out to be 98.4%. Estimate the rate before deciding a race is tolerable.
 
