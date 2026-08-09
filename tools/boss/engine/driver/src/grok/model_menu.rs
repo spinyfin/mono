@@ -1,7 +1,7 @@
 //! Grok model / effort menu tables.
 //!
-//! Sourced from `grok models` on grok 0.2.112 (2026-07-27). Catalog
-//! snapshot at that revision is a single SKU:
+//! Sourced from `grok models` on grok 0.2.112 (2026-07-27); re-verified
+//! unchanged on 1.0.0 (2026-08-09). Catalog snapshot is a single SKU:
 //!
 //! ```text
 //! Default model: grok-4.5

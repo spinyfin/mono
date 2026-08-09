@@ -6,7 +6,7 @@
 - **Structural template:** [codex-as-a-first-class-agent-driver.md](codex-as-a-first-class-agent-driver.md) (PR #2285). This doc mirrors its section list deliberately; where the two reach different conclusions, the difference is called out rather than smoothed over.
 - **Gating spike:** [ghostty-grok-pane-viability.md](../investigations/ghostty-grok-pane-viability.md) (PR #2458, 2026-07-27). Its executed evidence is authoritative over anything in this doc's framing.
 - **Boss tree verified at:** `6b2a4ee6` (`main`), 2026-07-27
-- **Grok verified at:** `grok 0.2.112 (9bbd559437aa) [stable]`, macOS arm64, `~/.grok/bin/grok`
+- **Grok verified at:** `grok 0.2.112 (9bbd559437aa) [stable]`, macOS arm64, `~/.grok/bin/grok`; catalog re-verified unchanged on `grok 1.0.0` (2026-08-09)
 - **Absorbed row:** the abstraction project's one remaining blocked item — _"agent-driver: ControlVerbs trait surface + call classify_error"_ — is in scope here and appears as [T-04](#t-04-controlverbs-trait-surface-plus-route-error-classification-through-it).
 
 ## TL;DR / verdict
@@ -338,7 +338,7 @@ Per-driver table (deliberate three-into-five collapse; `Medium`/`Large`/`Max` sh
 | `Large`            | `high`                    |
 | `Max`              | `high`                    |
 
-This is a capability limit, not a silent demotion of the Boss row: operator-facing `effort_level` stays as classified; only the driver knob is capped. Re-probe when the CLI grows more rungs and re-spread the table.
+This is a capability limit, not a silent demotion of the Boss row: operator-facing `effort_level` stays as classified; only the driver knob is capped. `Medium` already mapped to Grok's valid `high` value in live rows, so it deliberately remains there rather than moving down as in Copilot's different three-rung collapse. Re-probe when the CLI grows more rungs and re-spread the table.
 
 **The menu must not be hard-frozen.** A single-model table today will be wrong the moment xAI ships a second SKU, and the Codex project's experience is that model catalogs move faster than driver code. `grok models` is machine-readable enough to be the refresh source; at minimum the descriptor needs a documented refresh path and a conformance assertion that the pinned menu still matches the live one ([A-12](#proposed-abstraction-amendments), [T-20](#t-20-conformance-grok-goldens-and-version-pin)).
 
@@ -410,7 +410,7 @@ So Grok does **not** need the Claude extraction to land first. It routes around 
 
 Fits the `ModelMenu` struct as-is. `menu_for_driver_in` already resolves per slug through `DriverRegistry` and returns `UnknownDriverError` rather than silently falling back to Claude's table (`effort/src/lib.rs`), so registering `"grok"` at `registry.rs:46-47` is the whole integration.
 
-The menu itself is thin: one model, a five-of-seven effort mapping. `engine_default` is `grok-4.5`; `model_for_reasoning` returns `grok-4.5` for both `Standard` and `Investigation`, because there is no second tier to choose. That is honest rather than degenerate — and it is the field most likely to be wrong within a quarter, hence the refresh path.
+The menu itself is thin: one model, a three-rung effort mapping (`low`/`medium`/`high`) collapsed from Boss's five levels. `engine_default` is `grok-4.5`; `model_for_reasoning` returns `grok-4.5` for both `Standard` and `Investigation`, because there is no second tier to choose. That is honest rather than degenerate — and it is the field most likely to be wrong within a quarter, hence the refresh path.
 
 ### G-5 `ProgressObservation` — solved transport, unsolved destination
 
@@ -872,7 +872,7 @@ Distinguish "merge this hooks map into the worker settings file" from "the drive
 
 ### T-06 `GrokDriver` skeleton: descriptor, capability set, model menu, registry entry
 
-The crate and struct: `DriverDescriptor` (slug `grok`, binary `grok`, config dir `.grok`, agent-rules filename, initial-prompt filename), the `ModelMenu` (`grok-4.5` default, the five-of-seven effort mapping from this doc), the capability set per the declaration section, and registration alongside `claude` and `codex`. No spawning, no wiring, no hooks. Every capability omission carries its `AbsenceDisposition` and rationale as a comment, following the Codex driver's precedent.
+The crate and struct: `DriverDescriptor` (slug `grok`, binary `grok`, config dir `.grok`, agent-rules filename, initial-prompt filename), the `ModelMenu` (`grok-4.5` default, the three-rung effort mapping from this doc), the capability set per the declaration section, and registration alongside `claude` and `codex`. No spawning, no wiring, no hooks. Every capability omission carries its `AbsenceDisposition` and rationale as a comment, following the Codex driver's precedent.
 
 - **Effort:** `medium`
 - **Depends on:** none — may run in parallel with T-04 and T-05; touches a new file plus the registry, not the trait

@@ -1047,6 +1047,20 @@ mod tests {
     }
 
     #[test]
+    fn grok_large_and_max_resolve_to_the_supported_high_effort() {
+        for level in [EffortLevel::Large, EffortLevel::Max] {
+            let cfg = resolve_spawn_config(
+                &SpawnResolutionInput::builder()
+                    .effort_level(level)
+                    .task_driver("grok")
+                    .build(),
+            )
+            .unwrap();
+            assert_eq!(cfg.effort_value, Some("high"), "{level:?} must use Grok's ceiling");
+        }
+    }
+
+    #[test]
     fn null_row_falls_through_to_engine_default() {
         let cfg = resolve_spawn_config(&SpawnResolutionInput::builder().build()).unwrap();
         assert_eq!(cfg.effort_level, None);
