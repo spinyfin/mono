@@ -883,7 +883,7 @@ async fn recheck_for_pr_uses_staged_pr_url_and_skips_detector() {
     }
 }
 
-/// Case 1 regression (staged-URL recheck mid-turn reap): a live worker
+/// Regression: a live worker
 /// stages a PR URL mid-turn (`activity: Working` after `cube pr update`),
 /// then a merge-poller sweep runs immediately. The execution must **not**
 /// terminalize; the staged URL is retained for the worker's own Stop.
@@ -938,7 +938,8 @@ async fn recheck_for_pr_staged_url_defers_while_worker_mid_turn() {
     let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), detector.clone());
     let handler = handler
         .with_staged_pr_urls(staged_pr_urls.clone())
-        .with_live_worker_states(live_states);
+        .with_live_worker_states(live_states)
+        .with_staged_pr_mid_turn_defer_secs(60);
 
     let outcome = handler.recheck_for_pr(&execution_id).await;
     assert_eq!(
@@ -989,6 +990,7 @@ async fn recheck_for_pr_staged_url_finalizes_mid_turn_after_defer_horizon() {
 
     let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
     staged_pr_urls.record_if_unset(&execution_id, parent_pr_url);
+    staged_pr_urls.backdate_for_test(&execution_id, std::time::Duration::from_secs(61));
 
     let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
     live_states.register_spawn(
@@ -1013,11 +1015,12 @@ async fn recheck_for_pr_staged_url_finalizes_mid_turn_after_defer_horizon() {
 
     let detector = StubPrDetector::ok(None);
     let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), detector);
-    // Horizon 0 → age is never strictly less than the bound → finalize.
+    // A positive horizon makes this an aged-entry test, rather than merely
+    // proving that zero disables deferral.
     let handler = handler
         .with_staged_pr_urls(staged_pr_urls)
         .with_live_worker_states(live_states)
-        .with_staged_pr_mid_turn_defer_secs(0);
+        .with_staged_pr_mid_turn_defer_secs(60);
 
     let outcome = handler.recheck_for_pr(&execution_id).await;
     assert!(
@@ -1031,17 +1034,18 @@ async fn recheck_for_pr_staged_url_finalizes_mid_turn_after_defer_horizon() {
     assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
 }
 
-/// Non-revision (chore) staged path without mid-turn activity keeps
-/// its current behaviour: finalize immediately via the staged URL.
+/// Non-revision (chore) staged path keeps its current behavior: even a
+/// live mid-turn worker finalizes immediately via the staged URL.
 #[tokio::test]
-async fn recheck_for_pr_staged_url_finalizes_non_revision_when_not_mid_turn() {
+async fn recheck_for_pr_staged_url_finalizes_non_revision_while_mid_turn() {
     let workspace = tempdir().unwrap();
     let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
     let pr_url = "https://github.com/spinyfin/mono/pull/460";
     let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
     staged_pr_urls.record_if_unset(&execution_id, pr_url);
 
-    // Live registry present but activity is Idle (parked at turn boundary).
+    // Live registry present and activity is Working, but only revisions
+    // receive the staged-URL mid-turn deferral.
     let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
     live_states.register_spawn(
         3,
@@ -1056,15 +1060,15 @@ async fn recheck_for_pr_staged_url_finalizes_non_revision_when_not_mid_turn() {
     );
     live_states.apply_event(
         3,
-        &boss_protocol::WorkerEvent::Stop {
+        &boss_protocol::WorkerEvent::PreToolUse {
             session_id: "s".into(),
-            stop_hook_active: false,
-            stop_reason: boss_protocol::StopReason::Completed,
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
         },
     );
     assert_eq!(
         live_states.activity_for_run(&execution_id),
-        Some(boss_protocol::WorkerActivity::Idle),
+        Some(boss_protocol::WorkerActivity::Working),
     );
 
     let detector = StubPrDetector::err("jj broken");
@@ -1081,7 +1085,7 @@ async fn recheck_for_pr_staged_url_finalizes_non_revision_when_not_mid_turn() {
     let outcome = handler.recheck_for_pr(&execution_id).await;
     assert!(
         matches!(outcome, StopOutcome::ReviewerEnqueued { pr_url: ref got } if got == pr_url),
-        "non-revision idle staged path must still finalize; got {outcome:?}",
+        "non-revision mid-turn staged path must still finalize; got {outcome:?}",
     );
     match db.get_work_item(&chore_id).unwrap() {
         WorkItem::Chore(t) => {

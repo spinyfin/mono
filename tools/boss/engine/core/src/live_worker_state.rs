@@ -898,14 +898,21 @@ impl LiveWorkerStateRegistry {
     /// running `run_id`, or `None` if no such slot exists. Used by the
     /// merge-poller staged-URL recheck path to decide whether a live
     /// worker is mid-turn (`Working`) — finalizing while mid-turn reaps
-    /// the worker before its remaining prompt steps run.
+    /// the worker before its remaining prompt steps run. If duplicate live
+    /// slots exist for a run, prefers `Working` conservatively.
     pub fn activity_for_run(&self, run_id: &str) -> Option<WorkerActivity> {
         let guard = self.inner.lock().expect("registry mutex poisoned");
-        guard
-            .values()
-            .map(|entry| &entry.state)
-            .find(|state| !state.activity.is_terminal() && state.run_id == run_id)
-            .map(|state| state.activity)
+        let mut first = None;
+        for state in guard.values().map(|entry| &entry.state) {
+            if state.activity.is_terminal() || state.run_id != run_id {
+                continue;
+            }
+            if state.activity == WorkerActivity::Working {
+                return Some(WorkerActivity::Working);
+            }
+            first.get_or_insert(state.activity);
+        }
+        first
     }
 
     /// Apply a hook event to the state for `slot_id`. Returns `true`
@@ -1396,6 +1403,31 @@ mod tests {
         assert!(state.work_item_id.is_none());
         assert!(state.work_item_name.is_none());
         assert!(state.execution_id.is_none());
+    }
+
+    #[test]
+    fn activity_for_run_prefers_working_across_duplicate_live_slots() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        reg.register_spawn(2, "run-1", "claude-opus-4-7", 2, None);
+        reg.apply_event(
+            1,
+            &WorkerEvent::Stop {
+                session_id: "s".into(),
+                stop_hook_active: false,
+                stop_reason: StopReason::Completed,
+            },
+        );
+        reg.apply_event(
+            2,
+            &WorkerEvent::PreToolUse {
+                session_id: "s".into(),
+                tool_name: "Bash".into(),
+                tool_input: serde_json::Value::Null,
+            },
+        );
+
+        assert_eq!(reg.activity_for_run("run-1"), Some(WorkerActivity::Working));
     }
 
     #[test]

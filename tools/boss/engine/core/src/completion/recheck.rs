@@ -66,7 +66,9 @@ impl WorkerCompletionHandler {
             // `staged_pr_mid_turn_defer_secs` (measured from
             // `StagedPrUrlEntry::staged_at`), finalize anyway so a worker
             // that never reaches Stop cannot hang forever.
-            if self.should_defer_staged_pr_recheck(execution_id) {
+            if execution.kind == ExecutionKind::RevisionImplementation
+                && self.should_defer_staged_pr_recheck(execution_id)
+            {
                 tracing::info!(
                     execution_id,
                     pr_url = %staged_url,
@@ -315,7 +317,7 @@ impl WorkerCompletionHandler {
     }
 
     /// True when the staged-URL recheck must **not** finalize yet:
-    /// the live-state registry reports the worker as mid-turn
+    /// a revision worker is mid-turn: the live-state registry reports
     /// ([`boss_protocol::WorkerActivity::Working`]) **and** the staged
     /// entry is still within the deferral horizon.
     ///
@@ -324,7 +326,13 @@ impl WorkerCompletionHandler {
     /// cannot distinguish a parked pane from one mid-tool-call. When no
     /// registry is wired (unit tests) or the run has no live slot, this
     /// returns `false` so the staged path keeps its historical
-    /// finalize-immediately behaviour.
+    /// finalize-immediately behaviour. Non-revision executions also keep
+    /// that behavior; this guard is only applied to revision executions.
+    ///
+    /// `WaitingForInput` is deliberately treated as parked rather than
+    /// mid-turn. It can represent a pending notification after Stop, so
+    /// deferring it here could retain a genuinely parked worker for the
+    /// full horizon.
     ///
     /// Bound: enforced here against
     /// [`crate::pr_url_capture::StagedPrUrlEntry::staged_at`] vs
