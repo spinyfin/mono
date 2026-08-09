@@ -7,6 +7,7 @@ import SwiftUI
 struct CommentTextEditor: NSViewRepresentable {
     @Binding var text: String
     var onSubmit: () -> Void
+    var onTextViewCreated: (NSTextView) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -35,6 +36,7 @@ struct CommentTextEditor: NSViewRepresentable {
         scrollView.borderType = .noBorder
 
         context.coordinator.textView = textView
+        onTextViewCreated(textView)
 
         return scrollView
     }
