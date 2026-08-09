@@ -623,7 +623,24 @@ impl WorkDb {
         }
 
         let conn = self.connect()?;
-        query_task(&conn, &input.task_id).require("task", &input.task_id)
+        let mut task = query_task(&conn, &input.task_id).require("task", &input.task_id)?;
+        // Surface the just-written pointer immediately, mirroring
+        // get_work_item/get_work_item_by_short_id's attach step — without
+        // this, `set-doc` echoes only the raw Task columns (none of which
+        // carry doc_path) and the caller has no way to see the write took
+        // effect until a separate `task show`.
+        if crate::design_detector::task_uses_per_task_doc(&task.kind, task.project_id.is_none()) {
+            let mut doc_pointer_queries = 0u64;
+            match resolve_task_doc_pointer(&conn, &task.id, |_| None, &mut doc_pointer_queries) {
+                Ok(state) => task.doc_link_state = state,
+                Err(err) => tracing::warn!(
+                    task_id = %task.id,
+                    ?err,
+                    "set_task_doc: failed to resolve task doc-link state; leaving affordance hidden"
+                ),
+            }
+        }
+        Ok(task)
     }
 
     /// Read a task's stored `doc_path` (the load-bearing pointer field).
