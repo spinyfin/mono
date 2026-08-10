@@ -67,7 +67,9 @@ pub(crate) fn work_item_task_kind_enum(work_item: &WorkItem) -> Option<&TaskKind
 ///
 /// `followup` is the one task kind whose contract requires an origin PR. A
 /// missing number or an unparseable remote is therefore a dispatch error, not
-/// a reason to publish an unlinked PR.
+/// a reason to publish an unlinked PR. Other kinds that merely record an
+/// origin PR number (plain chores) lose only the provenance header when the
+/// remote is not a github.com URL — they stay dispatchable.
 pub(crate) fn followup_pr_environment(
     task_kind: &TaskKind,
     created_via: &str,
@@ -83,8 +85,18 @@ pub(crate) fn followup_pr_environment(
     if pr_number <= 0 {
         bail!("followup task has invalid origin PR number {pr_number}; refusing to open an unlinked derived PR");
     }
-    let slug = crate::completion::parse_repo_slug(repo_remote_url)
-        .map_err(|err| anyhow::anyhow!("could not resolve origin PR URL for followup task: {err}"))?;
+    let slug = match crate::completion::parse_repo_slug(repo_remote_url) {
+        Ok(slug) => slug,
+        Err(err) if *task_kind == TaskKind::Followup => {
+            bail!("could not resolve origin PR URL for followup task: {err}");
+        }
+        Err(_) => {
+            // Non-followup kinds (e.g. a chore that merely records an origin
+            // PR number on a non-github product remote) skip the provenance
+            // header rather than becoming undispatchable.
+            return Ok(Vec::new());
+        }
+    };
     Ok(vec![
         (
             FOLLOWUP_ORIGIN_PR_URL_ENV.to_owned(),
@@ -329,5 +341,27 @@ mod followup_pr_environment_tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("has no origin PR number"));
+    }
+
+    #[test]
+    fn followup_with_non_github_remote_fails_loudly() {
+        let error = followup_pr_environment(
+            &TaskKind::Followup,
+            "pr_review:exec_test",
+            Some(42),
+            "git@example.com:foo.git",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("could not resolve origin PR URL"));
+    }
+
+    #[test]
+    fn chore_with_origin_pr_and_non_github_remote_skips_provenance_header() {
+        // Plain chores that merely record an origin PR number on a
+        // non-github product remote lose only the provenance header —
+        // they stay dispatchable instead of hard-failing at spawn.
+        let env =
+            followup_pr_environment(&TaskKind::Chore, "engine_auto", Some(42), "git@example.com:foo.git").unwrap();
+        assert!(env.is_empty());
     }
 }

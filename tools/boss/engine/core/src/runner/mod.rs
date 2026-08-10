@@ -26,7 +26,7 @@ use boss_protocol::ExecutionStatus;
 
 mod pane_spawn;
 mod prompt;
-mod work_item;
+pub(crate) mod work_item;
 mod worker_spawn;
 
 pub use pane_spawn::PaneSpawnRunner;

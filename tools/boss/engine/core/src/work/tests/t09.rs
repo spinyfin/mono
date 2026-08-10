@@ -95,6 +95,80 @@ fn pr_review_revision_creates_followup_with_correct_kind_and_provenance() {
         followup.description.contains("closing this follow-up"),
         "followup description must contain 'closing this follow-up'",
     );
+
+    // Derivation must survive conversion: the revision's `pr_review:` prefix
+    // is stamped onto the followup (not overwritten with `engine_auto`), so
+    // dispatch emits the human "review findings" kind label.
+    assert!(
+        followup.created_via.starts_with(CREATED_VIA_PR_REVIEW_PREFIX),
+        "followup must carry the revision's pr_review: created_via; got {:?}",
+        followup.created_via,
+    );
+    let env = crate::runner::work_item::followup_pr_environment(
+        &followup.kind,
+        &followup.created_via,
+        followup.origin_pr_number,
+        "git@github.com:spinyfin/mono.git",
+    )
+    .expect("followup with origin PR and github remote must yield env");
+    let kind = env
+        .iter()
+        .find(|(k, _)| k == "BOSS_FOLLOWUP_KIND")
+        .map(|(_, v)| v.as_str());
+    assert_eq!(
+        kind,
+        Some("review findings"),
+        "chain-helpers conversion must yield BOSS_FOLLOWUP_KIND=review findings; env={env:?}"
+    );
+}
+
+/// When the chain root's PR URL cannot yield an origin PR number, a
+/// pr_review revision must fall back to a plain `chore` rather than mint
+/// an un-spawnable `Followup` with `origin_pr_number = None`.
+#[test]
+fn pr_review_revision_without_parseable_origin_pr_falls_back_to_chore() {
+    let db = WorkDb::open(temp_db_path("followup-no-origin")).unwrap();
+    let product_id = make_revision_product(&db, "fu-no-origin");
+    // Issues URL is accepted as a bound URL for gate/check purposes but
+    // extract_pr_number_from_url rejects it (no `/pull/<n>` segment).
+    let pr_url = "https://github.com/spinyfin/mono/issues/1537";
+    let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    db.create_revision(
+        CreateRevisionInput::builder()
+            .parent_task_id(parent_id.clone())
+            .description("Address ALL findings before finalising this revision.")
+            .created_via(format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_no_origin"))
+            .build(),
+        &checker,
+    )
+    .unwrap();
+
+    db.mark_chore_pr_merged(&parent_id, pr_url).unwrap();
+
+    let chores = db.list_chores(&product_id, None, false).unwrap();
+    let followups: Vec<_> = chores
+        .iter()
+        .filter(|c| c.id != parent_id && c.kind == TaskKind::Followup)
+        .collect();
+    assert!(
+        followups.is_empty(),
+        "must not mint Followup without a parseable origin PR; got {followups:?}"
+    );
+    let chore = chores
+        .iter()
+        .find(|c| c.id != parent_id && c.kind == TaskKind::Chore)
+        .expect("pr_review revision without origin PR must fall back to a plain chore");
+    assert!(
+        chore.origin_pr_number.is_none(),
+        "fallback chore must not invent an origin_pr_number; got {:?}",
+        chore.origin_pr_number
+    );
+    assert_eq!(
+        chore.created_via, CREATED_VIA_ENGINE_AUTO,
+        "fallback chore keeps the historical engine_auto created_via"
+    );
 }
 
 /// A pr_review revision in the `active` (WIP) state must produce an autostart

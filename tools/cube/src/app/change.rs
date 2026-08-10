@@ -151,6 +151,15 @@ pub(super) fn is_stdin_path(path: &str) -> bool {
     matches!(path, "/dev/stdin" | "-" | "/dev/fd/0")
 }
 
+/// Write `text` to a uniquely-named temp file in the shape `gh pr create`
+/// expects (`cube-pr-body-<uuid>.md`), for callers that materialize a PR
+/// body they generated themselves rather than read from `--body-file`.
+pub(super) fn write_temp_pr_body(text: &str) -> Result<PathBuf> {
+    let tmp_path = std::env::temp_dir().join(format!("cube-pr-body-{}.md", Uuid::new_v4()));
+    std::fs::write(&tmp_path, text.as_bytes()).map_err(CubeError::Io)?;
+    Ok(tmp_path)
+}
+
 /// Resolve `--body-file <path>` to a concrete filesystem path, materialising
 /// stdin and pipe/FIFO sources eagerly.
 ///
@@ -161,15 +170,6 @@ pub(super) fn is_stdin_path(path: &str) -> bool {
 ///
 /// Fails loudly if the body source is empty — an empty description is almost
 /// certainly a bug, not intentional.
-/// Write `text` to a uniquely-named temp file in the shape `gh pr create`
-/// expects (`cube-pr-body-<uuid>.md`), for callers that materialize a PR
-/// body they generated themselves rather than read from `--body-file`.
-pub(super) fn write_temp_pr_body(text: &str) -> Result<PathBuf> {
-    let tmp_path = std::env::temp_dir().join(format!("cube-pr-body-{}.md", Uuid::new_v4()));
-    std::fs::write(&tmp_path, text.as_bytes()).map_err(CubeError::Io)?;
-    Ok(tmp_path)
-}
-
 pub(super) fn resolve_body_file(path: &str) -> Result<(String, Option<PathBuf>)> {
     use std::io::Read;
 
