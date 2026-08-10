@@ -93,6 +93,8 @@ pub mod ipc_log;
 pub mod ladder_lease_heartbeat;
 pub mod ladder_lease_reap;
 pub mod ladder_lease_registry;
+#[cfg(target_os = "macos")]
+pub(crate) mod libproc;
 pub mod live_status;
 pub mod live_status_loop;
 pub mod live_worker_state;

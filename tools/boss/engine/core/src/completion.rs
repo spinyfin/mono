@@ -1060,10 +1060,104 @@ impl ProbeQueuer for NoopProbeQueuer {
 /// [`crate::pr_url_capture::StagedPrUrlEntry::staged_at`].
 pub const DEFAULT_STAGED_PR_MID_TURN_DEFER_SECS: i64 = DEFAULT_BUILD_WAIT_HORIZON_SECS;
 
-/// Orchestrates the on-Stop completion flow: detect PR, transition
-/// state in the work DB, release the cube lease, publish the right
-/// invalidation events. Stateless — keeps the wiring side at the call
-/// site (`app.rs`) thin.
+#[derive(Clone)]
+struct BackgroundNudgeIntent {
+    probe_text: String,
+    fingerprint: String,
+    bound_pr_url: Option<String>,
+    proceed_outcome: StopOutcome,
+    activity_watermark: Option<String>,
+}
+
+#[derive(Default)]
+struct BackgroundNudgeRegistry {
+    inner: std::sync::Mutex<std::collections::HashMap<String, BackgroundNudgeIntent>>,
+}
+
+impl BackgroundNudgeRegistry {
+    fn record(&self, execution_id: &str, intent: BackgroundNudgeIntent) {
+        self.inner
+            .lock()
+            .expect("BackgroundNudgeRegistry mutex poisoned")
+            .insert(execution_id.to_owned(), intent);
+    }
+
+    fn get(&self, execution_id: &str) -> Option<BackgroundNudgeIntent> {
+        self.inner
+            .lock()
+            .expect("BackgroundNudgeRegistry mutex poisoned")
+            .get(execution_id)
+            .cloned()
+    }
+
+    fn execution_ids(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .expect("BackgroundNudgeRegistry mutex poisoned")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn forget(&self, execution_id: &str) {
+        self.inner
+            .lock()
+            .expect("BackgroundNudgeRegistry mutex poisoned")
+            .remove(execution_id);
+    }
+}
+
+pub struct BackgroundNudgeTracker {
+    horizon: Arc<BuildWaitTracker>,
+    intents: BackgroundNudgeRegistry,
+}
+
+impl BackgroundNudgeTracker {
+    fn new(horizon: Arc<BuildWaitTracker>) -> Self {
+        Self {
+            horizon,
+            intents: BackgroundNudgeRegistry::default(),
+        }
+    }
+
+    fn record(&self, execution_id: &str, now_epoch_secs: i64, horizon_secs: i64) -> BuildWaitDecision {
+        self.horizon.record(execution_id, now_epoch_secs, horizon_secs)
+    }
+
+    fn record_intent(&self, execution_id: &str, intent: BackgroundNudgeIntent) {
+        self.intents.record(execution_id, intent);
+    }
+
+    fn intent(&self, execution_id: &str) -> Option<BackgroundNudgeIntent> {
+        self.intents.get(execution_id)
+    }
+
+    fn execution_ids(&self) -> Vec<String> {
+        self.intents.execution_ids()
+    }
+
+    fn forget_intent(&self, execution_id: &str) {
+        self.intents.forget(execution_id);
+    }
+
+    /// Clear only the wait-duration horizon, leaving any recorded intent
+    /// alone. Used when the probe/horizon says suppression is no longer in
+    /// effect (no descendants, horizon elapsed, probe indeterminate) but the
+    /// nudge itself then gets debounced — the intent must survive that so
+    /// the recurring recheck sweep can still find and re-evaluate it later.
+    fn forget_horizon(&self, execution_id: &str) {
+        self.horizon.forget(execution_id);
+    }
+
+    fn forget(&self, execution_id: &str) {
+        self.horizon.forget(execution_id);
+        self.intents.forget(execution_id);
+    }
+}
+
+/// Orchestrates the on-Stop completion flow: detect PR, transition state in
+/// the work DB, release the cube lease, and publish the right invalidation
+/// events. Keeps the wiring side at the call site (`app.rs`) thin.
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
 pub struct WorkerCompletionHandler {
@@ -1171,7 +1265,8 @@ pub struct WorkerCompletionHandler {
     /// [`Self::with_build_wait_horizon_secs`].
     build_wait_horizon_secs: i64,
     /// Reports whether an execution's worker process tree still has live
-    /// descendant processes at Stop boundary — e.g. a backgrounded
+    /// descendants outside the driver runtime's foreground process group at
+    /// Stop boundary — e.g. a backgrounded
     /// subagent spawned via the harness Agent tool that has not yet
     /// reported back (observed live 2026-07-17). See
     /// [`crate::background_children`] for the process-tree scan this
@@ -1180,17 +1275,16 @@ pub struct WorkerCompletionHandler {
     /// wires in the real [`crate::background_children::RegistryBackgroundActivityProbe`]
     /// via [`Self::with_background_activity_probe`].
     background_activity_probe: Arc<dyn crate::background_children::BackgroundActivityProbe>,
-    /// Time-bounded suppression tracker for the background-children
-    /// signal, mirroring [`Self::build_wait_tracker`]'s role for the
-    /// build-wait signal — same generic bounded-suppression primitive,
-    /// a separate instance because the two are independent signals (one
-    /// text-narration-based, one process-tree-based) that can each start
-    /// and expire on their own schedule. Trust is not indefinite: a
-    /// descendant that never exits (a genuinely wedged subagent) still
-    /// eventually falls back to the normal nudge/park flow once
-    /// [`Self::background_children_horizon_secs`] elapses.
-    background_children_tracker: Arc<BuildWaitTracker>,
-    /// How long a continuously-reported live-descendant sighting is
+    /// Time horizon and exact nudge suppressed by a delegated-background
+    /// child sighting. It mirrors [`Self::build_wait_tracker`] with a
+    /// separate bounded state: the merge poller's recurring sweep replays the
+    /// intent when the child exits or the horizon elapses, unless hook
+    /// activity proves the worker resumed. This in-memory intent does not
+    /// survive an engine restart; DB-backed pending-PR recovery still covers
+    /// no-PR executions, while a future driver-owned delegation signal must
+    /// make bound-PR recovery durable too.
+    background_children_tracker: Arc<BackgroundNudgeTracker>,
+    /// How long a continuously-reported delegated-descendant sighting is
     /// trusted before [`Self::nudge_or_park`] stops suppressing and falls
     /// back to the normal nudge/park flow. Defaults to
     /// [`crate::background_children::DEFAULT_BACKGROUND_CHILDREN_HORIZON_SECS`];
@@ -1725,6 +1819,10 @@ pub enum StopOutcome {
     /// instead of being nudged again. `reason` is the human-readable
     /// explanation recorded on the attention item.
     NudgeBreakerParked { reason: String },
+    /// The nudge breaker rejected an otherwise valid probe because the same
+    /// fingerprint was queued too recently. No probe was delivered; a
+    /// recurring background-child recheck retains its intent and retries.
+    NudgeDebounced,
     /// The worker emitted an `[effort-escalation]` or `[blocked]` marker on
     /// a prior Stop and the filed attention item is still unresolved: the
     /// "produce a PR" auto-nudge is suppressed for this execution (never
@@ -1749,19 +1847,29 @@ pub enum StopOutcome {
     /// horizon elapses, the normal nudge/park flow resumes automatically
     /// (no coordinator action required — unlike [`StopOutcome::EscalationPending`]).
     BuildWaitPending { waited_secs: i64 },
-    /// The worker's Stop-boundary process tree still has live descendant
-    /// processes — e.g. a backgrounded subagent spawned via the harness
+    /// The worker's Stop-boundary process tree still has live delegated
+    /// descendants — e.g. a backgrounded subagent spawned via the harness
     /// Agent tool that has not yet reported back (observed live
-    /// 2026-07-17). Same suppression shape as [`Self::BuildWaitPending`] (checked before
-    /// [`crate::nudge_breaker`] is even consulted, so this Stop does not
-    /// burn any of its cap) but a distinct signal: process-tree-based
-    /// rather than text-narration-based. `descendant_count` is how many
-    /// live descendants [`crate::background_children`] found;
-    /// `waited_secs` is how long this execution has been continuously
-    /// reporting live descendants. The execution stays `waiting_human`;
-    /// no probe is sent, nothing is parked. Once
+    /// 2026-07-17). Same suppression shape as [`Self::BuildWaitPending`]
+    /// (checked before [`crate::nudge_breaker`] is even consulted, so this
+    /// Stop does not burn any of its cap) but a distinct signal:
+    /// process-tree-based rather than text-narration-based.
+    /// `descendant_count` is how many delegated descendants
+    /// [`crate::background_children`] found; `waited_secs` is how long this
+    /// execution has been continuously reporting delegated descendants. The
+    /// execution stays `waiting_human`; no probe is sent, nothing is parked. Once
     /// [`Self::background_children_horizon_secs`] elapses, the normal
     /// nudge/park flow resumes automatically.
+    ///
+    /// **Currently unreachable in production.** The process-group
+    /// discriminator this variant's `descendant_count` used to come from
+    /// was disproved (driver helpers and ordinary tool subprocesses may
+    /// legitimately run in their own process group, indistinguishable from
+    /// a delegated child) and removed — see
+    /// [`crate::background_children`]'s module doc. The production probe
+    /// now reports indeterminate on every Stop, so this variant only fires
+    /// today from a test-supplied probe, pending a driver/harness-owned
+    /// delegated-work signal to replace the process-group walk.
     BackgroundChildrenPending { descendant_count: usize, waited_secs: i64 },
     /// An operator placed an explicit hold on this execution via
     /// `bossctl agents hold` (see [`crate::hold_registry`]). The

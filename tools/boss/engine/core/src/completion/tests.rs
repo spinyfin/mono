@@ -1138,8 +1138,41 @@ impl MergeProbe for FixedStateProbe {
 /// "still working" arm).
 struct FixedDescendantProbe(usize);
 impl crate::background_children::BackgroundActivityProbe for FixedDescendantProbe {
-    fn live_descendant_count(&self, _execution_id: &str) -> usize {
-        self.0
+    fn live_delegated_descendant_count(&self, _execution_id: &str) -> std::result::Result<usize, String> {
+        Ok(self.0)
+    }
+}
+
+struct FailingDescendantProbe;
+impl crate::background_children::BackgroundActivityProbe for FailingDescendantProbe {
+    fn live_delegated_descendant_count(&self, _execution_id: &str) -> std::result::Result<usize, String> {
+        Err("synthetic process-table failure".to_owned())
+    }
+}
+
+struct WatermarkedDescendantProbe {
+    watermark: std::sync::Mutex<String>,
+}
+
+impl WatermarkedDescendantProbe {
+    fn new(watermark: &str) -> Arc<Self> {
+        Arc::new(Self {
+            watermark: std::sync::Mutex::new(watermark.to_owned()),
+        })
+    }
+
+    fn set_watermark(&self, watermark: &str) {
+        *self.watermark.lock().expect("watermark mutex poisoned") = watermark.to_owned();
+    }
+}
+
+impl crate::background_children::BackgroundActivityProbe for WatermarkedDescendantProbe {
+    fn live_delegated_descendant_count(&self, _execution_id: &str) -> std::result::Result<usize, String> {
+        Ok(1)
+    }
+
+    fn activity_watermark(&self, _execution_id: &str) -> Option<String> {
+        Some(self.watermark.lock().expect("watermark mutex poisoned").clone())
     }
 }
 
