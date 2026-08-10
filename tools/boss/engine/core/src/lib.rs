@@ -4,6 +4,7 @@ pub mod abandoned_branch_pr_sweep;
 pub mod agent_jsonl_progress;
 pub mod answer_agent;
 pub mod answer_agent_completion_sweep;
+pub mod answer_agent_observability;
 pub mod app;
 pub mod attention_lifecycle;
 pub mod attention_reconcile_sweep;

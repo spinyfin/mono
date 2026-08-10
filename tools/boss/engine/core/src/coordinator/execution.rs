@@ -822,6 +822,31 @@ impl ExecutionCoordinator {
             }
         };
 
+        // The answer-agent run is already bound to this execution before it
+        // can reach the dispatcher. Stamp the lease immediately so comment
+        // inspection has the same workspace pivot as dispatch diagnostics.
+        if execution.kind == ExecutionKind::AnswerAgent {
+            match self
+                .work_db
+                .set_answer_agent_execution_lease(&execution.id, &lease.lease_id)
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => tracing::warn!(
+                    execution_id = %execution.id,
+                    comment_id = %execution.work_item_id,
+                    workspace_lease_id = %lease.lease_id,
+                    "answer-agent lease acquired but no bound run exists for the execution",
+                ),
+                Err(err) => tracing::warn!(
+                    execution_id = %execution.id,
+                    comment_id = %execution.work_item_id,
+                    workspace_lease_id = %lease.lease_id,
+                    err = %err,
+                    "answer-agent lease acquired but failed to persist the run lease pivot",
+                ),
+            }
+        }
+
         // Recovery, cube-first (see `reconcile_workspace_recovery`). Runs
         // before the run starts so the worker's prompt can read the marker
         // this drops. A no-op for every non-resume dispatch.
@@ -1192,6 +1217,20 @@ impl ExecutionCoordinator {
         ) {
             Ok((execution, run)) => {
                 let worker_id_owned = worker_id.to_owned();
+                let queue_wait_ms = execution
+                    .started_epoch()
+                    .zip(execution.created_epoch())
+                    .map(|(started, created)| (started.saturating_sub(created).max(0) as u64).saturating_mul(1_000))
+                    .unwrap_or(0);
+                if execution.kind == ExecutionKind::AnswerAgent {
+                    crate::answer_agent_observability::record_started(&self.metrics, queue_wait_ms);
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        comment_id = %execution.work_item_id,
+                        queue_wait_ms,
+                        "answer-agent execution started after queue wait",
+                    );
+                }
                 tracing::info!(
                     execution_id = %execution.id,
                     run_id = %run.id,
@@ -1213,6 +1252,8 @@ impl ExecutionCoordinator {
                             .with_cube_workspace(&lease.workspace_id)
                             .with_details(serde_json::json!({
                                 "run_id": run.id,
+                                "execution_kind": execution.kind.as_str(),
+                                "queue_wait_ms": queue_wait_ms,
                             })),
                     )
                     .await;

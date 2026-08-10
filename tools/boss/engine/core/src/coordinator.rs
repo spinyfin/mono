@@ -1749,6 +1749,7 @@ fn default_coordinator_metrics() -> Arc<Registry> {
     let metrics = Arc::new(Registry::new());
     register_metrics(&metrics);
     crate::dispatch_metrics::register_metrics(&metrics);
+    crate::answer_agent_observability::register_metrics(&metrics);
     metrics
 }
 
@@ -2049,6 +2050,7 @@ mod scheduler;
 
 pub use dispatch_admission::pause_bypass_decision;
 pub use run::PANE_SPAWN_FAILED_ATTENTION_KIND;
+pub use scheduler::ANSWER_AGENT_READY_AGE_ATTENTION_KIND;
 
 /// Copy a [`crate::cube_commands::CubeCliError`]'s structured exit code +
 /// stderr into a dispatch-event `details` object when the failure was a

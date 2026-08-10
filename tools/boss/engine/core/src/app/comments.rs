@@ -498,6 +498,7 @@ async fn record_answer_agent_spawn_failure(
         );
         return;
     }
+    crate::answer_agent_observability::record_failed(&server_state.metrics, error_kind);
     publish_comment_invalidation(
         server_state,
         session_id,
@@ -555,34 +556,94 @@ async fn finish_answer_agent_spawn(
         }
     };
 
-    if let Err(err) = work_db.create_answer_agent_execution(&comment.id, repo_remote_url) {
+    let execution = match work_db.create_answer_agent_execution(&comment.id, repo_remote_url) {
+        Ok(execution) => execution,
+        Err(err) => {
+            tracing::error!(
+                comment_id = %comment.id,
+                err = %err,
+                "answer-agent spawn: comment flipped to 'answering' and run row created, but execution creation failed",
+            );
+            if let Err(err) = work_db.complete_answer_agent_run(
+                &run.id,
+                ANSWER_AGENT_RUN_STATUS_FAILED,
+                None,
+                Some("spawn_execution_create_failed"),
+            ) {
+                tracing::warn!(
+                    comment_id = %comment.id,
+                    run_id = %run.id,
+                    err = %err,
+                    "answer-agent spawn: failed to mark the orphaned run row 'failed' after execution creation failure",
+                );
+            } else {
+                crate::answer_agent_observability::record_failed(
+                    &server_state.metrics,
+                    "spawn_execution_create_failed",
+                );
+            }
+            if let Err(err) = compensate(work_db, &comment.id) {
+                tracing::warn!(
+                    comment_id = %comment.id,
+                    err = %err,
+                    "answer-agent spawn: failed to compensate 'answering' back after execution creation failure",
+                );
+            }
+            return;
+        }
+    };
+
+    if let Err(err) = work_db.bind_answer_agent_run_execution(&run.id, &execution.id) {
         tracing::error!(
             comment_id = %comment.id,
+            run_id = %run.id,
+            execution_id = %execution.id,
             err = %err,
-            "answer-agent spawn: comment flipped to 'answering' and run row created, but execution creation failed",
+            "answer-agent spawn: execution was created but could not be bound to its run",
         );
-        if let Err(err) = work_db.complete_answer_agent_run(
+        if let Err(complete_err) = work_db.complete_answer_agent_run(
             &run.id,
             ANSWER_AGENT_RUN_STATUS_FAILED,
             None,
-            Some("spawn_execution_create_failed"),
+            Some("spawn_execution_bind_failed"),
         ) {
             tracing::warn!(
                 comment_id = %comment.id,
                 run_id = %run.id,
-                err = %err,
-                "answer-agent spawn: failed to mark the orphaned run row 'failed' after execution creation failure",
+                err = %complete_err,
+                "answer-agent spawn: failed to mark the unbound run 'failed'",
             );
+        } else {
+            crate::answer_agent_observability::record_failed(&server_state.metrics, "spawn_execution_bind_failed");
         }
-        if let Err(err) = compensate(work_db, &comment.id) {
+        if let Err(cancel_err) = work_db.cancel_execution(&execution.id) {
             tracing::warn!(
                 comment_id = %comment.id,
-                err = %err,
-                "answer-agent spawn: failed to compensate 'answering' back after execution creation failure",
+                execution_id = %execution.id,
+                err = %cancel_err,
+                "answer-agent spawn: failed to cancel the unbound execution",
+            );
+        }
+        if let Err(compensate_err) = compensate(work_db, &comment.id) {
+            tracing::warn!(
+                comment_id = %comment.id,
+                err = %compensate_err,
+                "answer-agent spawn: failed to compensate 'answering' after execution-bind failure",
             );
         }
         return;
     }
+
+    crate::answer_agent_observability::record_enqueued(&server_state.metrics);
+    tracing::info!(
+        comment_id = %comment.id,
+        run_id = %run.id,
+        execution_id = %execution.id,
+        intent_confidence = ?comment.intent_confidence,
+        pool = "main",
+        dispatch_class = "other_work",
+        "answer-agent enqueued",
+    );
 
     server_state.execution_coordinator.kick();
 
@@ -1312,11 +1373,14 @@ async fn rehome_reclassified_comment(
 /// genuinely beat this call, not the override write.
 async fn stand_down_answer_agent(server_state: &Arc<ServerState>, work_db: &Arc<WorkDb>, comment_id: &str) {
     match work_db.stand_down_answer_agent_run(comment_id) {
-        Ok(Some(run)) => tracing::info!(
-            comment_id,
-            run_id = %run.id,
-            "comment reclassified away from 'question': answer-agent run superseded",
-        ),
+        Ok(Some(run)) => {
+            crate::answer_agent_observability::record_superseded(&server_state.metrics, "reclassified");
+            tracing::info!(
+                comment_id,
+                run_id = %run.id,
+                "comment reclassified away from 'question': answer-agent run superseded",
+            );
+        }
         Ok(None) => tracing::debug!(
             comment_id,
             "comment reclassified away from 'question': no running answer-agent run to stand down",
@@ -1538,6 +1602,7 @@ pub(super) async fn handle_comments_post_answer(ctx: Dispatch, req: FrontendRequ
         send_work_error(&sink, &request_id, &err);
         return;
     }
+    crate::answer_agent_observability::record_replied(&server_state.metrics);
 
     if let Err(err) = work_db.create_comment_thread_entry(
         &comment_id,
@@ -1695,7 +1760,7 @@ mod tests {
             .unwrap();
         work_db.set_comment_intent(&comment.id, INTENT_QUESTION, 0.9).unwrap();
         work_db.transition_comment_to_answering(&comment.id).unwrap();
-        work_db
+        let run = work_db
             .create_answer_agent_run(
                 &comment.id,
                 &comment.artifact_kind,
@@ -1707,6 +1772,7 @@ mod tests {
         let execution = work_db
             .create_answer_agent_execution(&comment.id, &product.repo_remote_url.unwrap())
             .unwrap();
+        work_db.bind_answer_agent_run_execution(&run.id, &execution.id).unwrap();
         (comment.id, execution.id)
     }
 
@@ -1753,6 +1819,14 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "the run must no longer be 'running' after a reply is posted",
+        );
+        assert_eq!(
+            server_state
+                .metrics
+                .counter_snapshot_one("answer_agent.replied")
+                .map(|snapshot| snapshot.value),
+            Some(1),
+            "posting a reply must increment the answer-agent reply metric",
         );
 
         // The success response should have been enqueued, not a WorkError.
@@ -2324,6 +2398,14 @@ mod tests {
 
         set_intent(&server_state, &work_db, &sink, &comment_id, INTENT_REVISION).await;
         let _ = sink.next().await; // drain the reclassification's own reply
+        assert_eq!(
+            server_state
+                .metrics
+                .counter_snapshot_one("answer_agent.superseded.reclassified")
+                .map(|snapshot| snapshot.value),
+            Some(1),
+            "reclassification must increment the answer-agent supersession metric",
+        );
 
         // The stood-down agent's process was still alive and posts anyway.
         handle_comments_post_answer(
@@ -2368,14 +2450,26 @@ mod tests {
             reloaded.status, COMMENT_STATUS_ANSWERING,
             "the sidebar should show 'Thinking…'"
         );
-        let run = work_db.running_answer_agent_run_for_comment(&comment.id).unwrap();
-        assert!(run.is_some(), "a fresh answer-agent run must be tracking the question");
-        assert!(
-            work_db
-                .live_answer_agent_execution_for_comment(&comment.id)
-                .unwrap()
-                .is_some(),
-            "an execution must be queued for the coordinator to dispatch",
+        let run = work_db
+            .running_answer_agent_run_for_comment(&comment.id)
+            .unwrap()
+            .expect("a fresh answer-agent run must be tracking the question");
+        let execution = work_db
+            .live_answer_agent_execution_for_comment(&comment.id)
+            .unwrap()
+            .expect("an execution must be queued for the coordinator to dispatch");
+        assert_eq!(
+            run.execution_id.as_deref(),
+            Some(execution.id.as_str()),
+            "the run must expose the execution pivot before it is dispatched",
+        );
+        assert_eq!(
+            server_state
+                .metrics
+                .counter_snapshot_one("answer_agent.enqueued")
+                .map(|snapshot| snapshot.value),
+            Some(1),
+            "spawning the execution must increment the enqueue metric",
         );
     }
 

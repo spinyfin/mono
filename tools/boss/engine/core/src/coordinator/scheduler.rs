@@ -3,6 +3,15 @@
 //! `coordinator` module split; see [`super`] for the struct and shared types.
 use super::*;
 
+/// A queued answer agent older than this is unusual enough to require an
+/// operator-visible signal. This observes the existing queue only; it does
+/// not alter pool selection, dispatch class, priority, or concurrency.
+pub const ANSWER_AGENT_READY_AGE_ALARM_THRESHOLD: Duration = Duration::from_secs(15 * 60);
+
+/// Execution-scoped attention kind for an answer agent waiting beyond
+/// [`ANSWER_AGENT_READY_AGE_ALARM_THRESHOLD`].
+pub const ANSWER_AGENT_READY_AGE_ATTENTION_KIND: &str = "answer_agent_ready_age";
+
 impl ExecutionCoordinator {
     /// Wake the scheduler. Every call site that just enqueued a `ready`
     /// execution — a kanban drag, a reconciler sweep, the heartbeat, an
@@ -168,6 +177,7 @@ impl ExecutionCoordinator {
                          may have dropped a wakeup; re-kicking now",
                     );
                 }
+                coordinator.raise_ready_answer_agent_alarms(ANSWER_AGENT_READY_AGE_ALARM_THRESHOLD);
                 // NOT `kick()`: when `enable_dispatch_ready_bus` is on,
                 // `kick()` only publishes to the event bus and returns —
                 // routing the heartbeat through it would make the bus the
@@ -223,6 +233,107 @@ impl ExecutionCoordinator {
                 Some((exec.id, age_ms))
             })
             .collect()
+    }
+
+    /// Emit a question-specific queue-age warning and file one durable
+    /// attention per overdue answer-agent execution. This deliberately does
+    /// not reuse or filter the generic heartbeat warning: generic stuck-row
+    /// telemetry has a distinct diagnostic purpose and must remain intact.
+    pub(super) fn raise_ready_answer_agent_alarms(&self, threshold: Duration) {
+        let ready = match self.work_db.list_ready_executions() {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(?err, "answer-agent ready-age alarm: failed to list ready executions",);
+                return;
+            }
+        };
+        let now_secs = boss_engine_utils::epoch_time::now_epoch_secs() as u64;
+        let threshold_ms = threshold.as_millis() as u64;
+        for execution in ready
+            .into_iter()
+            .filter(|execution| execution.kind == ExecutionKind::AnswerAgent)
+        {
+            let Some(created_at_secs) = execution.created_at.parse::<u64>().ok() else {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    comment_id = %execution.work_item_id,
+                    created_at = %execution.created_at,
+                    "answer-agent ready-age alarm: execution has an invalid creation time",
+                );
+                continue;
+            };
+            let ready_age_ms = now_secs.saturating_sub(created_at_secs).saturating_mul(1_000);
+            if ready_age_ms < threshold_ms {
+                continue;
+            }
+
+            let (artifact_kind, artifact_id) = match self.work_db.get_comment(&execution.work_item_id) {
+                Ok(Some(comment)) => (comment.artifact_kind, comment.artifact_id),
+                Ok(None) => ("unknown".to_owned(), "unknown".to_owned()),
+                Err(err) => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        comment_id = %execution.work_item_id,
+                        ?err,
+                        "answer-agent ready-age alarm: failed to load the bound question",
+                    );
+                    ("unknown".to_owned(), "unknown".to_owned())
+                }
+            };
+            let document = format!("{artifact_kind}:{artifact_id}");
+            tracing::warn!(
+                execution_id = %execution.id,
+                comment_id = %execution.work_item_id,
+                document = %document,
+                ready_age_ms,
+                threshold_ms,
+                "answer-agent ready-age alarm: question is awaiting dispatch",
+            );
+
+            match self
+                .work_db
+                .reraise_open_execution_attention(&execution.id, ANSWER_AGENT_READY_AGE_ATTENTION_KIND)
+            {
+                Ok(Some(attention_id)) => tracing::debug!(
+                    attention_id,
+                    execution_id = %execution.id,
+                    "answer-agent ready-age alarm: refreshed existing attention",
+                ),
+                Ok(None) => match self.work_db.create_attention_item(CreateAttentionItemInput {
+                    execution_id: Some(execution.id.clone()),
+                    work_item_id: None,
+                    kind: ANSWER_AGENT_READY_AGE_ATTENTION_KIND.to_owned(),
+                    status: None,
+                    title: "Answer agent has waited in the dispatch queue".to_owned(),
+                    body_markdown: format!(
+                        "Question comment `{}` on document `{document}` has been ready for {} ms without starting. \\
+                         Use `bossctl dispatch diagnose {}` to inspect its dispatch timeline.",
+                        execution.work_item_id, ready_age_ms, execution.id,
+                    ),
+                    resolved_at: None,
+                }) {
+                    Ok(attention) => tracing::info!(
+                        attention_id = %attention.id,
+                        execution_id = %execution.id,
+                        comment_id = %execution.work_item_id,
+                        document = %document,
+                        "answer-agent ready-age alarm: raised attention",
+                    ),
+                    Err(err) => tracing::warn!(
+                        execution_id = %execution.id,
+                        comment_id = %execution.work_item_id,
+                        ?err,
+                        "answer-agent ready-age alarm: failed to persist attention",
+                    ),
+                },
+                Err(err) => tracing::warn!(
+                    execution_id = %execution.id,
+                    comment_id = %execution.work_item_id,
+                    ?err,
+                    "answer-agent ready-age alarm: failed to check existing attention",
+                ),
+            }
+        }
     }
 
     /// Skip-the-queue dispatch for `bossctl agents launch` and the
@@ -1020,6 +1131,7 @@ impl ExecutionCoordinator {
                                 .with_details(serde_json::json!({
                                     "reason": "interactive_concurrency_cap",
                                     "pool": pool_label,
+                                    "execution_kind": execution.kind.as_str(),
                                     "live_workers": live_workers,
                                     "cap": cap,
                                 })),
@@ -1083,6 +1195,7 @@ impl ExecutionCoordinator {
                         .with_details(serde_json::json!({
                             "preferred_workspace_id": preferred_workspace_id,
                             "pool": pool_label,
+                            "execution_kind": execution.kind.as_str(),
                             "dispatch_class": dispatch_class.as_ordinal(),
                             "dispatch_class_label": dispatch_class.label(),
                             "pool_ready_count": pool_ready_count,
@@ -1142,6 +1255,8 @@ impl ExecutionCoordinator {
                                 .with_work_item(&execution.work_item_id)
                                 .with_details(serde_json::json!({
                                     "reason": event_reason,
+                                    "pool": pool_label,
+                                    "execution_kind": execution.kind.as_str(),
                                     "review_held": review_held,
                                     "live_sibling_execution_id": sibling.id,
                                     "live_sibling_work_item_id": sibling.work_item_id,
@@ -1185,6 +1300,8 @@ impl ExecutionCoordinator {
                                 .with_work_item(&execution.work_item_id)
                                 .with_details(serde_json::json!({
                                     "chain_hold_bypassed": "review_yields_to_conflict_fix",
+                                    "pool": pool_label,
+                                    "execution_kind": execution.kind.as_str(),
                                     "review_held": true,
                                     "live_sibling_execution_id": sibling.id,
                                     "live_sibling_work_item_id": sibling.work_item_id,
@@ -1263,6 +1380,8 @@ impl ExecutionCoordinator {
                                     .with_work_item(&execution.work_item_id)
                                     .with_details(serde_json::json!({
                                         "reason": "merge_order_stagger",
+                                        "pool": pool_label,
+                                        "execution_kind": execution.kind.as_str(),
                                         "not_before": not_before,
                                         "stagger_secs": self.merge_order_stagger_secs,
                                     })),
@@ -1377,6 +1496,7 @@ impl ExecutionCoordinator {
                             .with_details(serde_json::json!({
                                 "reason": "pool_exhausted",
                                 "pool": pool_label,
+                                "execution_kind": execution.kind.as_str(),
                                 "pool_capacity": pool_capacity,
                             })),
                     )
@@ -1441,6 +1561,7 @@ impl ExecutionCoordinator {
                             .with_details(serde_json::json!({
                                 "reason": "pool_exhausted",
                                 "pool": "automation",
+                                "execution_kind": execution.kind.as_str(),
                                 "pool_capacity": pool_capacity,
                                 "spill_attempted": true,
                             })),
@@ -1834,6 +1955,7 @@ impl ExecutionCoordinator {
                     .with_worker(worker_id)
                     .with_details(serde_json::json!({
                         "pool": pool_label,
+                        "execution_kind": execution.kind.as_str(),
                         "slot_id": claimed_slot,
                         "page": claimed_page,
                         "spilled": spilled,

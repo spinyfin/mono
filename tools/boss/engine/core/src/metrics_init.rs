@@ -23,6 +23,8 @@ use boss_metrics::Registry;
 /// its handles so duplicate-name panics surface at boot rather than
 /// at the first increment (design §"Risks / open questions" item 6).
 pub fn init_all(registry: &Registry) {
+    // Question → answer-agent lifecycle counters and queue-wait histogram.
+    crate::answer_agent_observability::register_metrics(registry);
     // Phase 3: PR URL capture path counters.
     crate::completion::register_metrics(registry);
     // Phase 3: Dependency-unblock sweep gauge.
@@ -104,6 +106,21 @@ mod tests {
             "cube_workspace_lease.attempts",
             "cube_workspace_lease.success",
             "cube_workspace_lease.failure",
+        ] {
+            assert!(
+                names.contains(&expected.to_owned()),
+                "init_all must register {expected}"
+            );
+        }
+        // Answer-agent lifecycle counters. Error-kind, reclassification, and
+        // queue-wait buckets are dynamically registered on first observation.
+        for expected in [
+            "answer_agent.enqueued",
+            "answer_agent.started",
+            "answer_agent.replied",
+            "answer_agent.failed",
+            "answer_agent.superseded",
+            "answer_agent.queue_wait_ms",
         ] {
             assert!(
                 names.contains(&expected.to_owned()),
@@ -264,8 +281,8 @@ mod tests {
         );
         assert_eq!(
             names.len(),
-            93,
-            "expected 6 pr_url_capture + 4 worker_proposals fallback_hit + 3 cube_workspace_lease + \
+            99,
+            "expected 6 answer_agent + 6 pr_url_capture + 4 worker_proposals fallback_hit + 3 cube_workspace_lease + \
              10 dispatcher + 15 merge_poller + 18 external_tracker + 2 speculative_conflict + \
              1 stacked_pr_structuring + 1 dispatch_metrics + 9 trunk_queue_poller + \
              9 worker_proposals submit + 1 worker_proposals channel_error + \

@@ -347,16 +347,17 @@ impl WorkerCompletionHandler {
         let comment_id = execution.work_item_id.clone();
         let replied = match self.work_db.running_answer_agent_run_for_comment(&comment_id) {
             Ok(Some(run)) => {
-                if let Err(err) = self
+                match self
                     .work_db
                     .recover_unanswered_comment(&comment_id, Some(&run.id), "no_reply_posted")
                 {
-                    tracing::warn!(
+                    Ok(_) => crate::answer_agent_observability::record_failed(&self.metrics, "no_reply_posted"),
+                    Err(err) => tracing::warn!(
                         execution_id = %execution.id,
                         run_id = %run.id,
                         ?err,
                         "answer-agent finalizer: failed to recover the comment from its unanswered run",
-                    );
+                    ),
                 }
                 false
             }

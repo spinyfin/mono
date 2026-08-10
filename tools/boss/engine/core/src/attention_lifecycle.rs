@@ -218,6 +218,13 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          direct evidence the pane-spawn problem is no longer blocking it — the same reasoning as \
          `driver_terminal_error`, one stage earlier in the run's lifecycle.",
     ),
+    entry(
+        crate::coordinator::ANSWER_AGENT_READY_AGE_ATTENTION_KIND,
+        ClearedBy::WorkResumed,
+        "Names a specific question that waited beyond the answer-agent queue-age threshold. A run start \
+         for that question proves the queue wait ended; the scheduler also refreshes this signal while \
+         the execution remains ready so an operator can distinguish an active wait from stale history.",
+    ),
     // ── Cleared by a later completed pass of the same kind ──────────────
     entry(
         crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND,
@@ -554,6 +561,7 @@ mod tests {
             crate::completion::REVISION_NO_OP_ATTENTION_KIND,
             crate::completion::MID_TURN_REAP_ATTENTION_KIND,
             crate::coordinator::PANE_SPAWN_FAILED_ATTENTION_KIND,
+            crate::coordinator::ANSWER_AGENT_READY_AGE_ATTENTION_KIND,
             crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND,
             crate::worker_escalation::WORKER_ESCALATION_ATTENTION_KIND,
             crate::worker_escalation::WORKER_BLOCKED_ATTENTION_KIND,

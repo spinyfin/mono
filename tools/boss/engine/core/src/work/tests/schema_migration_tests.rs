@@ -40,6 +40,37 @@ fn migration_re_adds_deferred_column_defaulting_to_zero() {
     }
 }
 
+/// Existing answer-agent tracking rows predate the dispatch-diagnostics
+/// pivot. Reopening that database must add the nullable binding column and
+/// its lookup index without fabricating execution ids for historical rows.
+#[test]
+fn migration_adds_answer_agent_execution_pivot() {
+    let (_dir, path) = disk_db_path("migration-answer-agent-execution-pivot");
+    let db = WorkDb::open(path.clone()).unwrap();
+    {
+        let conn = db.connect().unwrap();
+        conn.execute("DROP INDEX answer_agent_runs_by_execution", []).unwrap();
+        conn.execute("ALTER TABLE answer_agent_runs DROP COLUMN execution_id", [])
+            .unwrap();
+        assert!(!table_has_column(&conn, "answer_agent_runs", "execution_id").unwrap());
+    }
+    drop(db);
+
+    let db = WorkDb::open(path).expect("opening an existing database should run the additive migration");
+    let conn = db.connect().unwrap();
+    assert!(table_has_column(&conn, "answer_agent_runs", "execution_id").unwrap());
+    let has_index = conn
+        .query_row(
+            "SELECT 1 FROM pragma_index_list('answer_agent_runs') WHERE name = 'answer_agent_runs_by_execution'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .unwrap()
+        .is_some();
+    assert!(has_index, "the execution pivot must remain indexed");
+}
+
 /// Drop the effort/model columns (simulating a pre-PR-370 DB)
 /// and re-open: the migration's ALTER TABLE path must re-add
 /// them and leave existing rows with NULL on each new column.

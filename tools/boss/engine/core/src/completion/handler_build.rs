@@ -19,6 +19,7 @@ impl WorkerCompletionHandler {
         // "counter not registered" in a test context.
         let local_metrics = Arc::new(Registry::new());
         register_metrics(&local_metrics);
+        crate::answer_agent_observability::register_metrics(&local_metrics);
         Self {
             work_db,
             pr_detector,

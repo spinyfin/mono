@@ -167,6 +167,14 @@ impl WorkDb {
         query_comments(&conn, artifact_kind, artifact_id, include_resolved)
     }
 
+    /// List comments across every artifact. This is intentionally separate
+    /// from artifact resolution so operators can diagnose unanswered
+    /// questions without knowing which document contains them.
+    pub fn list_all_comments(&self, include_resolved: bool) -> Result<Vec<WorkComment>> {
+        let conn = self.connect()?;
+        query_all_comments(&conn, include_resolved)
+    }
+
     /// Fetch a single comment by id.
     pub fn get_comment(&self, comment_id: &str) -> Result<Option<WorkComment>> {
         let conn = self.connect()?;
@@ -185,6 +193,18 @@ impl WorkDb {
         include_resolved: bool,
     ) -> Result<Vec<CommentWithThread>> {
         let comments = self.list_comments(artifact_kind, artifact_id, include_resolved)?;
+        self.comments_with_thread(comments)
+    }
+
+    /// [`Self::list_all_comments`], paired with thread entries and answer-agent
+    /// state. The work happens through the same formatter as the single
+    /// artifact query to keep both read paths semantically identical.
+    pub fn list_all_comments_with_thread(&self, include_resolved: bool) -> Result<Vec<CommentWithThread>> {
+        let comments = self.list_all_comments(include_resolved)?;
+        self.comments_with_thread(comments)
+    }
+
+    fn comments_with_thread(&self, comments: Vec<WorkComment>) -> Result<Vec<CommentWithThread>> {
         comments
             .into_iter()
             .map(|comment| {
@@ -981,6 +1001,18 @@ pub(crate) fn query_comments(
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![artifact_kind, artifact_id], map_comment)?;
+    collect_rows(rows)
+}
+
+pub(crate) fn query_all_comments(conn: &Connection, include_resolved: bool) -> Result<Vec<WorkComment>> {
+    let filter = if include_resolved {
+        ""
+    } else {
+        " WHERE status NOT IN ('resolved', 'dismissed')"
+    };
+    let sql = format!("SELECT {COMMENT_COLUMNS} FROM work_comments{filter} ORDER BY created_at ASC, id ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], map_comment)?;
     collect_rows(rows)
 }
 
@@ -2117,5 +2149,19 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert!(!list[0].answer_agent_running);
         assert!(list[0].thread_entries.is_empty());
+    }
+
+    #[test]
+    fn list_all_comments_with_thread_spans_artifacts() {
+        let db = mem_db();
+        let first = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        let second = db.create_comment(input("t2", "beta", "", "")).unwrap();
+        db.set_comment_intent(&second.id, "question", 0.95).unwrap();
+
+        let all = db.list_all_comments_with_thread(false).unwrap();
+        let ids: Vec<_> = all.iter().map(|entry| entry.comment.id.as_str()).collect();
+        assert!(ids.contains(&first.id.as_str()));
+        assert!(ids.contains(&second.id.as_str()));
+        assert_eq!(all.len(), 2);
     }
 }

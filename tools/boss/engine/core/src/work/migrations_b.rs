@@ -1353,10 +1353,28 @@ pub(crate) fn migrate_answer_agent_runs_table(conn: &Connection) -> Result<()> {
              reply_body         TEXT,
              error_kind         TEXT,
              created_at         TEXT NOT NULL,
-             completed_at       TEXT
+             completed_at       TEXT,
+             execution_id       TEXT REFERENCES work_executions(id) ON DELETE SET NULL
          );
          CREATE INDEX IF NOT EXISTS answer_agent_runs_by_comment
              ON answer_agent_runs(comment_id, created_at);",
+    )?;
+    Ok(())
+}
+
+/// Add the execution pivot to databases created before answer-agent queue
+/// observability existed. Nullable so already-completed historical runs remain
+/// faithfully represented rather than being assigned a guessed execution.
+pub(crate) fn migrate_answer_agent_runs_execution_id_column(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "answer_agent_runs", "execution_id")? {
+        conn.execute(
+            "ALTER TABLE answer_agent_runs ADD COLUMN execution_id TEXT REFERENCES work_executions(id) ON DELETE SET NULL",
+            [],
+        )?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS answer_agent_runs_by_execution ON answer_agent_runs(execution_id)",
+        [],
     )?;
     Ok(())
 }

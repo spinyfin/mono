@@ -343,6 +343,10 @@ pub struct BlockedNow {
     /// used to drop entirely (see [`compute_wait_stats`]). Feeds
     /// `bossctl dispatch stats`'s per-pool queue summary.
     pub pool: String,
+    /// Execution kind recorded when dispatch first picked up this row. This
+    /// lets `bossctl dispatch stats` distinguish queued answer agents from
+    /// the broader `other_work` dispatch class.
+    pub execution_kind: String,
 }
 
 /// count / p50 / p95 / max dispatch wait, bucketed by the defer
@@ -432,6 +436,18 @@ pub fn compute_wait_stats(events: &[DispatchEvent], now_ms: u128, since_ms: Opti
             })
             .unwrap_or("unknown")
             .to_owned();
+        let execution_kind = evs
+            .iter()
+            .find(|e| e.stage == "request_recorded")
+            .and_then(|e| e.details.get("execution_kind"))
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                evs.iter()
+                    .rev()
+                    .find_map(|e| e.details.get("execution_kind").and_then(|v| v.as_str()))
+            })
+            .unwrap_or("unknown")
+            .to_owned();
 
         let last_defer_reason_upto = |upto_ts: Option<u128>| -> String {
             evs.iter()
@@ -469,6 +485,7 @@ pub fn compute_wait_stats(events: &[DispatchEvent], now_ms: u128, since_ms: Opti
                     wait_so_far_ms: now_ms.saturating_sub(ready_ts),
                     reason,
                     pool,
+                    execution_kind,
                 });
             }
             // A terminal error before ever claiming a slot means dispatch
@@ -514,6 +531,17 @@ pub struct PoolQueueSummary {
     pub oldest_wait_ms: u128,
 }
 
+/// Per-execution-kind rollup of the currently-blocked queue. This is kept
+/// alongside the per-pool view because a dispatch class can intentionally
+/// group several operationally distinct kinds (notably `answer_agent`) into
+/// the same `other_work` class.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ExecutionKindQueueSummary {
+    pub execution_kind: String,
+    pub queued: usize,
+    pub oldest_wait_ms: u128,
+}
+
 /// Roll [`DispatchWaitReport::blocked_now`] up by pool, sorted by `queued`
 /// descending then pool name ascending. `pool` is `"unknown"` for entries
 /// whose timeline has no `request_recorded` event yet — see
@@ -534,6 +562,31 @@ pub fn summarize_queue_by_pool(blocked_now: &[BlockedNow]) -> Vec<PoolQueueSumma
         })
         .collect();
     out.sort_by(|a, b| b.queued.cmp(&a.queued).then_with(|| a.pool.cmp(&b.pool)));
+    out
+}
+
+/// Roll [`DispatchWaitReport::blocked_now`] up by execution kind, sorted by
+/// queued count descending then kind ascending.
+pub fn summarize_queue_by_execution_kind(blocked_now: &[BlockedNow]) -> Vec<ExecutionKindQueueSummary> {
+    let mut by_kind: BTreeMap<&str, (usize, u128)> = BTreeMap::new();
+    for entry in blocked_now {
+        let bucket = by_kind.entry(entry.execution_kind.as_str()).or_insert((0, 0));
+        bucket.0 += 1;
+        bucket.1 = bucket.1.max(entry.wait_so_far_ms);
+    }
+    let mut out: Vec<ExecutionKindQueueSummary> = by_kind
+        .into_iter()
+        .map(|(execution_kind, (queued, oldest_wait_ms))| ExecutionKindQueueSummary {
+            execution_kind: execution_kind.to_owned(),
+            queued,
+            oldest_wait_ms,
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.queued
+            .cmp(&a.queued)
+            .then_with(|| a.execution_kind.cmp(&b.execution_kind))
+    });
     out
 }
 
@@ -1401,6 +1454,7 @@ mod tests {
             wait_so_far_ms,
             reason: "pool_exhausted".to_owned(),
             pool: pool.to_owned(),
+            execution_kind: "other_work".to_owned(),
         }
     }
 
@@ -1431,6 +1485,25 @@ mod tests {
         // Tied queue depth (1 each) -> alphabetical.
         assert_eq!(summary[0].pool, "automation");
         assert_eq!(summary[1].pool, "review");
+    }
+
+    #[test]
+    fn summarize_queue_by_execution_kind_keeps_answer_agents_distinct() {
+        let mut answer_agent = blocked("exec-answer", 9_000, "main");
+        answer_agent.execution_kind = "answer_agent".to_owned();
+        let entries = vec![
+            answer_agent,
+            blocked("exec-work-a", 5_000, "main"),
+            blocked("exec-work-b", 2_000, "main"),
+        ];
+
+        let summary = summarize_queue_by_execution_kind(&entries);
+        assert_eq!(summary.len(), 2);
+        assert_eq!(summary[0].execution_kind, "other_work");
+        assert_eq!(summary[0].queued, 2);
+        assert_eq!(summary[1].execution_kind, "answer_agent");
+        assert_eq!(summary[1].queued, 1);
+        assert_eq!(summary[1].oldest_wait_ms, 9_000);
     }
 
     #[test]
