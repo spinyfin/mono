@@ -55,8 +55,7 @@ pub enum WorkerKind {
 #[builder(on(String, into))]
 pub struct PermissionInput {
     /// Worker posture — determines the per-kind deny rules (reviewer read-only,
-    /// triage blanket-write deny, standard implementation no extras) and the
-    /// `fastMode` setting for latency-sensitive review passes.
+    /// triage blanket-write deny, standard implementation no extras).
     pub worker_kind: WorkerKind,
     /// Workspace path. Needed by the reviewer deny rules: file-write denies are
     /// scoped to the workspace-parent so out-of-tree artifact writes are allowed.
