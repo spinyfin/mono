@@ -96,6 +96,7 @@ impl ExecutionCoordinator {
             live_worker_states: None,
             refused_workspaces: Mutex::new(HashMap::new()),
             max_concurrent_interactive_workers: AtomicUsize::new(MAX_CONCURRENT_INTERACTIVE_WORKERS),
+            pause_state_changed: tokio::sync::watch::channel(0).0,
         }
     }
 
@@ -475,11 +476,22 @@ impl ExecutionCoordinator {
     /// to `state.db` so it survives an engine restart — see the
     /// `handle_set_dispatch_paused` handler in `app/engine_meta.rs`.
     pub fn pause_dispatch(&self, paused_since_epoch_s: u64, origin: DispatchPauseOrigin, reason: PauseReason) {
-        *self.dispatch_pause.lock().unwrap() = Some(DispatchPause {
+        let pause = DispatchPause {
             origin,
             since_epoch_s: paused_since_epoch_s,
             reason: reason.into(),
-        });
+        };
+        let mut current = self.dispatch_pause.lock().unwrap();
+        // Only a real change in what an observer would render is worth a
+        // notification — re-pausing with byte-identical state (the breaker
+        // re-tripping on the same rule, a restore that matches memory) is a
+        // no-op, not a fresh event.
+        let changed = current.as_ref() != Some(&pause);
+        *current = Some(pause);
+        drop(current);
+        if changed {
+            self.notify_pause_state_changed();
+        }
     }
 
     /// Resume global dispatch, clearing the entire pause episode — flag,
@@ -490,7 +502,10 @@ impl ExecutionCoordinator {
     /// The caller is responsible for persisting the new state to
     /// `state.db` — see `handle_set_dispatch_paused` in `app/engine_meta.rs`.
     pub fn resume_dispatch(&self) {
-        *self.dispatch_pause.lock().unwrap() = None;
+        let was_paused = self.dispatch_pause.lock().unwrap().take().is_some();
+        if was_paused {
+            self.notify_pause_state_changed();
+        }
     }
 
     /// The current pause as one consistent snapshot, or `None` when dispatch
@@ -653,10 +668,17 @@ impl ExecutionCoordinator {
     /// `reason`) to `state.db` so it survives an engine restart — see
     /// `handle_set_automation_paused` in `app/engine_meta.rs`.
     pub fn pause_automation(&self, paused_since_epoch_s: u64, reason: PauseReason) {
-        self.automation_paused.store(true, Ordering::Release);
-        self.automation_paused_since_epoch_s
-            .store(paused_since_epoch_s, Ordering::Release);
-        *self.automation_paused_reason.lock().unwrap() = Some(reason.into());
+        let was_paused = self.automation_paused.swap(true, Ordering::AcqRel);
+        let prior_since = self
+            .automation_paused_since_epoch_s
+            .swap(paused_since_epoch_s, Ordering::AcqRel);
+        let reason: String = reason.into();
+        let prior_reason = self.automation_paused_reason.lock().unwrap().replace(reason.clone());
+        let changed =
+            !was_paused || prior_since != paused_since_epoch_s || prior_reason.as_deref() != Some(reason.as_str());
+        if changed {
+            self.notify_pause_state_changed();
+        }
     }
 
     /// Resume automation-originated activity. Clears the pause flag, the
@@ -667,14 +689,45 @@ impl ExecutionCoordinator {
     /// `state.db` — see `handle_set_automation_paused` in
     /// `app/engine_meta.rs`.
     pub fn resume_automation(&self) {
-        self.automation_paused.store(false, Ordering::Release);
-        self.automation_paused_since_epoch_s.store(0, Ordering::Release);
-        *self.automation_paused_reason.lock().unwrap() = None;
+        let was_paused = self.automation_paused.swap(false, Ordering::AcqRel);
+        let prior_since = self.automation_paused_since_epoch_s.swap(0, Ordering::AcqRel);
+        let prior_reason = self.automation_paused_reason.lock().unwrap().take();
+        if was_paused || prior_since != 0 || prior_reason.is_some() {
+            self.notify_pause_state_changed();
+        }
     }
 
     /// `true` when automation-originated activity is globally paused.
     pub fn is_automation_paused(&self) -> bool {
         self.automation_paused.load(Ordering::Acquire)
+    }
+
+    /// Bump the pause-state generation counter, waking every
+    /// [`Self::subscribe_pause_state`] receiver. Called by — and only by —
+    /// the four pause/resume transitions above, so the notification can
+    /// never be missed by a caller that forgot to fire it.
+    ///
+    /// Infallible by construction: `send_modify` does not care whether any
+    /// receiver exists, so pausing before the broadcaster task is spawned
+    /// (engine boot restoring a persisted pause) and pausing in a test with
+    /// no subscribers at all are both plain no-ops rather than errors.
+    fn notify_pause_state_changed(&self) {
+        self.pause_state_changed.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
+    }
+
+    /// Subscribe to pause-state transitions. The value is an opaque
+    /// generation counter — subscribers re-read the authoritative flags
+    /// ([`Self::is_dispatch_paused`] and friends) rather than trusting it,
+    /// which is what makes coalescing two rapid toggles into one wakeup
+    /// safe.
+    ///
+    /// The returned receiver starts already-seen, so `changed()` first
+    /// resolves on the next transition after subscribing; a subscriber that
+    /// needs the current state at startup reads it directly.
+    pub fn subscribe_pause_state(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.pause_state_changed.subscribe()
     }
 
     /// The epoch-seconds timestamp at which automation was last paused, or

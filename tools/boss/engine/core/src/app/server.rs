@@ -1848,6 +1848,14 @@ pub async fn serve_with_merge_probe(
     // stays the backstop either way. See
     // `ExecutionCoordinator::spawn_dispatch_ready_subscriber`.
     let _dispatch_ready_subscriber_handle = server_state.execution_coordinator.spawn_dispatch_ready_subscriber();
+
+    // Pause-state → engine-health push. Keyed to the coordinator's
+    // pause/resume *transition*, so the app's banner tracks a pause
+    // whatever set it — `bossctl dispatch pause`, the app's own toggle, the
+    // spawn-capability circuit breaker, or any future programmatic pauser.
+    // See `ServerState::spawn_pause_state_health_broadcaster` for why this
+    // must not live in the individual pausers.
+    let _pause_state_health_handle = server_state.spawn_pause_state_health_broadcaster();
     if _dispatch_ready_subscriber_handle.is_some() {
         // Boot-time sanity check that the bus injected via `set_event_bus`
         // in `app.rs` is the same one the subscriber just attached to —
