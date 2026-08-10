@@ -558,12 +558,12 @@ fn ordinary_chore_implementation_still_honours_a_codex_task_pin() {
     );
 }
 
-/// Work that came from an automation runs on the automation pool, which
-/// pins the same driver the review pool does
-/// (`ClaudeCoordinator::execution_targets_automation_pool`). Its decision
-/// records that fixed pool driver for the same reason it does for a review.
+/// Work that came from an automation prefers the automation pool, but may
+/// spill to an ordinary worker. Its durable decision therefore remains the
+/// row's own driver decision; the lookup uses the claimed worker slot to
+/// select the home-pool override only when it actually landed there.
 #[test]
-fn automation_sourced_rows_record_the_pool_driver() {
+fn automation_sourced_rows_record_their_own_driver_decision() {
     let (_dir, db) = open_db();
     db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100)).unwrap();
     let product = create_test_product(&db);
@@ -594,22 +594,21 @@ fn automation_sourced_rows_record_the_pool_driver() {
 
     let execution = create_ready_chore_execution(&db, &chore.id);
     let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
-    assert_eq!(decision.driver.as_deref(), Some(DRIVER_SLUG_CLAUDE));
-    assert_eq!(decision.reason, REASON_POOL);
+    assert_eq!(decision.driver.as_deref(), Some(DRIVER_SLUG_CODEX));
+    assert_eq!(decision.reason, REASON_ALLOCATION);
     assert_eq!(
         db.get_execution_driver_slug(&execution.id).unwrap().as_deref(),
-        decision.driver.as_deref(),
-        "the events-socket resolver must agree with the recorded pool decision \
-         for an automation-sourced execution, even though its ExecutionKind \
-         is not itself pool-bound",
+        Some(DRIVER_SLUG_CODEX),
+        "before a slot is claimed, automation provenance does not pretend \
+         the execution has already landed on the automation pool",
     );
 }
 
-/// A live `tasks.driver = codex` pin on an automation-sourced row must not
-/// win at lookup: `decide_execution_driver` and `get_execution_driver_slug`
-/// must both short-circuit to the pool driver before either reads the pin.
+/// A live `tasks.driver = codex` pin still wins the durable decision for an
+/// automation-sourced row. A claimed `auto-worker-N` slot, however, is the
+/// authoritative evidence that the worker ran on the automation pool.
 #[test]
-fn automation_sourced_rows_ignore_a_live_pin_at_lookup() {
+fn automation_sourced_rows_use_pool_driver_when_claimed_by_automation_worker() {
     let (_dir, db) = open_db();
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, &product.id, "automation-sourced pinned chore");
@@ -646,10 +645,79 @@ fn automation_sourced_rows_ignore_a_live_pin_at_lookup() {
     drop(conn);
 
     let execution = create_ready_chore_execution(&db, &chore.id);
+    db.create_run(CreateRunInput {
+        execution_id: execution.id.clone(),
+        agent_id: "auto-worker-1".to_owned(),
+        status: Some("active".to_owned()),
+        error_text: None,
+        result_summary: None,
+        transcript_path: None,
+        artifacts_path: None,
+        started_at: None,
+        finished_at: None,
+    })
+    .unwrap();
     assert_eq!(
         db.get_execution_driver_slug(&execution.id).unwrap().as_deref(),
         Some(DRIVER_SLUG_CLAUDE),
-        "a live codex pin on an automation-sourced row must not win at lookup",
+        "the claimed automation slot overrides the row pin at lookup",
+    );
+}
+
+#[test]
+fn automation_sourced_rows_use_live_pin_when_spilled_to_ordinary_worker() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, &product.id, "spilled automation chore");
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            driver: Some(DRIVER_SLUG_CODEX.to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let automation = db
+        .create_automation(boss_protocol::CreateAutomationInput {
+            product_id: product.id.clone(),
+            name: "Fix clippy".to_owned(),
+            repo_remote_url: None,
+            trigger: boss_protocol::AutomationTrigger::Schedule {
+                cron: "0 14 * * 1-5".to_owned(),
+                timezone: "America/Los_Angeles".to_owned(),
+            },
+            standing_instruction: "Fix any new clippy warnings.".to_owned(),
+            open_task_limit: 1,
+            catch_up_window_secs: None,
+            enabled: true,
+            created_via: None,
+        })
+        .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE tasks SET source_automation_id = ?1 WHERE id = ?2",
+        params![&automation.id, &chore.id],
+    )
+    .unwrap();
+    drop(conn);
+
+    let execution = create_ready_chore_execution(&db, &chore.id);
+    db.create_run(CreateRunInput {
+        execution_id: execution.id.clone(),
+        agent_id: "worker-1".to_owned(),
+        status: Some("active".to_owned()),
+        error_text: None,
+        result_summary: None,
+        transcript_path: None,
+        artifacts_path: None,
+        started_at: None,
+        finished_at: None,
+    })
+    .unwrap();
+    assert_eq!(
+        db.get_execution_driver_slug(&execution.id).unwrap().as_deref(),
+        Some(DRIVER_SLUG_CODEX),
+        "a spilled automation execution must resolve like compose_worker_spawn for worker-N",
     );
 }
 

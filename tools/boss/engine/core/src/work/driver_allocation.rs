@@ -37,9 +37,8 @@
 //! kind list here.
 //!
 //! **An execution whose driver is pinned by the pool it will run on** is
-//! decided before allocation ever runs (`pr_review`, `automation_triage`,
-//! and any execution whose work item came from an automation): those
-//! dispatch on
+//! decided before allocation ever runs (`pr_review` and `automation_triage`):
+//! those dispatch on
 //! [`crate::coordinator::pool_dispatch_policy_for_worker_id`]'s fixed
 //! driver, so `decide_execution_driver` records that pool driver with
 //! reason `pool` up front, rather than an allocation or a row/product pin.
@@ -355,7 +354,6 @@ struct AllocationRow {
     explicit_driver: Option<String>,
     model_override: Option<String>,
     task_kind: String,
-    source_automation_id: Option<String>,
     product_default_driver: Option<String>,
 }
 
@@ -387,15 +385,10 @@ pub(crate) fn driver_clears_dispatch_gate(
 /// 1. If the execution dispatches on a pool with a fixed driver, record that
 ///    pool driver. It overrides all row/product pins, matching dispatch.
 ///    Pool-bound executions take precedence because recording a row pin
-///    would name a driver the worker never ran on. Two shapes:
+///    would name a driver the worker never ran on:
 ///    [`crate::coordinator::kind_always_dispatches_on_pool_driver`] covers
-///    `pr_review` and `automation_triage`; `tasks.source_automation_id`
-///    covers ordinary implementation work that came from an automation and
-///    therefore runs on the automation pool
-///    (`ClaudeCoordinator::execution_targets_automation_pool`). Both pools
-///    pin `pool_dispatch_policy_for_worker_id`'s driver, which overrides the
-///    row's. Their `pool` decision names the driver the worker actually ran
-///    on, matching what the events-socket resolver
+///    `pr_review` and `automation_triage`. Their `pool` decision names the
+///    driver the worker actually ran on, matching what the events-socket resolver
 ///    ([`crate::work::driver_lookup::WorkDb::get_execution_driver_slug`])
 ///    independently returns for these kinds — see that function's doc.
 ///
@@ -438,7 +431,7 @@ pub(crate) fn decide_execution_driver(
 ) -> Result<DriverDecision> {
     let row = conn
         .query_row(
-            "SELECT t.driver, t.model_override, t.kind, t.source_automation_id, p.default_driver
+            "SELECT t.driver, t.model_override, t.kind, p.default_driver
                FROM tasks t
                LEFT JOIN products p ON p.id = t.product_id
               WHERE t.id = ?1",
@@ -448,8 +441,7 @@ pub(crate) fn decide_execution_driver(
                     explicit_driver: row.get(0)?,
                     model_override: row.get(1)?,
                     task_kind: row.get(2)?,
-                    source_automation_id: row.get(3)?,
-                    product_default_driver: row.get(4)?,
+                    product_default_driver: row.get(3)?,
                 })
             },
         )
@@ -461,7 +453,6 @@ pub(crate) fn decide_execution_driver(
     };
     let task_kind_raw = row.task_kind;
     let task_kind: Result<TaskKind, _> = task_kind_raw.parse();
-    let automation_sourced = row.source_automation_id.is_some_and(|id| !id.trim().is_empty());
     // Pool dispatch overrides row/product pins. Persist its fixed driver
     // rather than the pin, so this durable record always names the driver
     // the worker actually runs on. Routed through the same named accessors
@@ -470,9 +461,6 @@ pub(crate) fn decide_execution_driver(
     // constant here.
     if let Some(pool_driver) = crate::coordinator::pool_driver_slug_for_execution_kind(&kind) {
         return Ok(DriverDecision::pool(pool_driver));
-    }
-    if automation_sourced {
-        return Ok(DriverDecision::pool(crate::coordinator::automation_pool_driver_slug()));
     }
     let pinned = row
         .explicit_driver

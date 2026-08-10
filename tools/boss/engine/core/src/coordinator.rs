@@ -1559,12 +1559,10 @@ pub fn pool_dispatch_policy_for_worker_id(worker_id: &str) -> Option<PoolDispatc
 /// that does not describe where the worker actually ran.
 ///
 /// `pr_review` (review pool) and `automation_triage` (automation pool) are
-/// the two kinds that are *always* pool-bound by kind alone. The automation
-/// pool additionally takes ordinary implementation executions whose work
-/// item came from an automation
-/// (`ClaudeCoordinator::execution_targets_automation_pool`); that half
-/// cannot be decided from the kind and is checked against
-/// `tasks.source_automation_id` at the allocation site.
+/// the two kinds that are *always* pool-bound by kind alone. Ordinary work
+/// originating from an automation prefers the automation pool, but can spill
+/// to an ordinary `worker-N` slot, so provenance alone is not a pool-driver
+/// guarantee and is intentionally not included here.
 ///
 /// Also a second site to update if a future kind joins the pool-bound set:
 /// [`crate::work::migrations_b::migrate_backfill_pool_driver_decisions`]
@@ -1597,17 +1595,6 @@ pub fn kind_always_dispatches_on_pool_driver(kind: &ExecutionKind) -> bool {
 /// cannot select the wrong normaliser for the reviewer worker's hook stream.
 pub fn pool_driver_slug_for_execution_kind(kind: &ExecutionKind) -> Option<&'static str> {
     kind_always_dispatches_on_pool_driver(kind).then_some(REVIEWER_POOL_DRIVER)
-}
-
-/// Driver slug an automation-sourced execution dispatches on — the
-/// companion of [`pool_driver_slug_for_execution_kind`] for the other
-/// pool-bound shape, which is decided from `tasks.source_automation_id`
-/// rather than from the execution's own [`ExecutionKind`] and so cannot be
-/// looked up through that function. Same fixed driver
-/// ([`REVIEWER_POOL_DRIVER`]): the automation pool pins it exactly like the
-/// review pool (see [`pool_dispatch_policy_for_worker_id`]).
-pub(crate) fn automation_pool_driver_slug() -> &'static str {
-    REVIEWER_POOL_DRIVER
 }
 
 /// Derive the canonical worker-id string for a pane slot id.

@@ -13,37 +13,34 @@
 use super::*;
 
 /// The columns [`WorkDb::get_execution_driver_slug`] reads to resolve an
-/// execution's driver: the two kinds it short-circuits pool dispatch on, the
-/// row/product pin, and the automation provenance that says the driver comes
-/// from a pool instead. A named row rather than a five-wide tuple so each
+/// execution's driver: the two kinds it short-circuits pool dispatch on and
+/// the row/product pin. A named row rather than a five-wide tuple so each
 /// column is read back by name at the point it is used.
 struct ExecutionDriverRow {
     exec_kind_raw: String,
     task_kind_raw: String,
     task_driver: Option<String>,
     product_default_driver: Option<String>,
-    source_automation_id: Option<String>,
 }
 
 impl WorkDb {
     /// Resolve the driver slug for `execution_id`'s worker, applying the
-    /// same precedence used at spawn time (mirrors
-    /// [`crate::work::driver_allocation::decide_execution_driver`]'s
-    /// precedence exactly, so the durable `pool` decision it records always
-    /// names the same driver this resolves):
+    /// same precedence used at spawn time. A claimed worker slot is the
+    /// authoritative pool-dispatch input; before a slot exists this mirrors
+    /// [`crate::work::driver_allocation::decide_execution_driver`]'s durable
+    /// row decision and home-pool handling:
     ///
-    /// 1. Pool-bound executions — `pr_review` / `automation_triage` via
-    ///    [`crate::coordinator::pool_driver_slug_for_execution_kind`], or any
-    ///    execution whose work item has a non-empty
-    ///    `tasks.source_automation_id` via
-    ///    [`crate::coordinator::automation_pool_driver_slug`] — resolve to
-    ///    the review/automation pool's fixed driver, so a reviewed or
-    ///    automation-sourced row's live `tasks.driver` cannot select the
-    ///    wrong normaliser.
-    /// 2. A live pin (`tasks.driver`, then `products.default_driver`) that
+    /// 1. A claimed review/automation worker slot resolves to that pool's
+    ///    fixed driver via [`crate::coordinator::pool_dispatch_policy_for_worker_id`].
+    ///    A claimed ordinary `worker-N` slot deliberately has no pool policy,
+    ///    including work that spilled from automation, and therefore falls
+    ///    through to its own driver resolution.
+    /// 2. Before a worker slot is claimed, `pr_review` and
+    ///    `automation_triage` resolve to their home pool's fixed driver.
+    /// 3. A live pin (`tasks.driver`, then `products.default_driver`) that
     ///    clears the capability gate for this execution kind.
-    /// 3. A recorded traffic-allocation decision.
-    /// 4. [`boss_engine_effort::ENGINE_DEFAULT_DRIVER`] via
+    /// 4. A recorded traffic-allocation decision.
+    /// 5. [`boss_engine_effort::ENGINE_DEFAULT_DRIVER`] via
     ///    [`boss_engine_effort::resolve_driver`].
     ///
     /// Returns `Ok(None)` only when the execution row itself cannot be found,
@@ -60,6 +57,14 @@ impl WorkDb {
     /// An `automation_triage` execution binds to an automation id; the
     /// non-task path still returns the pool driver.
     pub fn get_execution_driver_slug(&self, execution_id: &str) -> Result<Option<String>> {
+        let claimed_worker_id = self.latest_run_agent_id_for_execution(execution_id)?;
+        if let Some(pool_driver) = claimed_worker_id
+            .as_deref()
+            .and_then(crate::coordinator::pool_dispatch_policy_for_worker_id)
+            .map(|policy| policy.driver)
+        {
+            return Ok(Some(pool_driver.to_owned()));
+        }
         // Scoped so the pooled connection is released before the non-task-bound
         // fallback below, which re-enters `WorkDb` methods that take the same
         // (non-reentrant) connection lock.
@@ -69,13 +74,9 @@ impl WorkDb {
             // short-circuit to the pool driver before any row pin can win, and
             // a pin that fails the capability gate for this execution kind
             // must yield (same substitution the spawn path applies).
-            // `t.source_automation_id` is needed for the same reason: an
-            // automation-sourced ordinary implementation execution is
-            // pool-bound too (see `decide_execution_driver`), even though its
-            // `ExecutionKind` is not one of the two pool-bound kinds.
             let row: Option<ExecutionDriverRow> = conn
                 .query_row(
-                    "SELECT e.kind, t.kind, t.driver, p.default_driver, t.source_automation_id
+                    "SELECT e.kind, t.kind, t.driver, p.default_driver
                        FROM work_executions e
                        JOIN tasks t ON t.id = e.work_item_id
                        LEFT JOIN products p ON p.id = t.product_id
@@ -87,7 +88,6 @@ impl WorkDb {
                             task_kind_raw: row.get(1)?,
                             task_driver: row.get(2)?,
                             product_default_driver: row.get(3)?,
-                            source_automation_id: row.get(4)?,
                         })
                     },
                 )
@@ -97,27 +97,19 @@ impl WorkDb {
                 task_kind_raw,
                 task_driver,
                 product_default_driver,
-                source_automation_id,
             }) = row
             {
                 let exec_kind: ExecutionKind = exec_kind_raw.parse().map_err(|err| {
                     anyhow::anyhow!("execution {execution_id} has unrecognised kind {exec_kind_raw:?}: {err}")
                 })?;
-                // Pool-bound kinds (pr_review, automation_triage) always run
-                // on the pool's fixed driver. The tasks join matches for
-                // pr_review because work_item_id is the producing task — so
-                // without this short-circuit a codex-authored row's live pin
-                // would select the wrong normaliser for the Claude reviewer
-                // worker's hook stream.
-                if let Some(pool_driver) = crate::coordinator::pool_driver_slug_for_execution_kind(&exec_kind) {
+                // Before a worker slot is claimed, pool-bound kinds resolve
+                // to their home pool. Once a slot exists, the branch at the
+                // top of this method used its actual policy instead: a spill
+                // into an ordinary worker must honour the row's own driver.
+                if claimed_worker_id.is_none()
+                    && let Some(pool_driver) = crate::coordinator::pool_driver_slug_for_execution_kind(&exec_kind)
+                {
                     return Ok(Some(pool_driver.to_owned()));
-                }
-                // Automation-sourced ordinary implementation executions are
-                // pool-bound the same way, but by provenance rather than
-                // kind — mirrors `decide_execution_driver`'s
-                // `automation_sourced` branch.
-                if source_automation_id.is_some_and(|id| !id.trim().is_empty()) {
-                    return Ok(Some(crate::coordinator::automation_pool_driver_slug().to_owned()));
                 }
 
                 // Precedence: a LIVE explicit pin (`tasks.driver`, then
@@ -188,18 +180,24 @@ impl WorkDb {
 
             // No `tasks` row. Either the execution does not exist at all, or it
             // is one of the kinds that binds to something other than a task.
-            query_execution(&conn, execution_id)?.map(|execution| (execution.kind, execution.work_item_id))
+            query_execution(&conn, execution_id)?
+                .map(|execution| (execution.kind, execution.work_item_id, execution.driver))
         };
-        let Some((kind, work_item_id)) = binding else {
+        let Some((kind, work_item_id, launched_driver)) = binding else {
             return Ok(None);
         };
         match kind {
             ExecutionKind::AnswerAgent => Ok(Some(self.answer_agent_driver_slug(&work_item_id))),
+            // A triage execution has no task row to supply a pin/allocation
+            // ladder. If it spilled into an ordinary worker, its frozen
+            // launch configuration is the only truthful driver source; do
+            // not reassert the automation pool's driver from provenance.
+            ExecutionKind::AutomationTriage if claimed_worker_id.is_some() => Ok(launched_driver),
             // `automation_triage` binds to an `automations.id`, so the tasks
             // join above never matches. Its driver is still the automation
             // pool's fixed pin — return that rather than `None`, which would
             // drop every hook event the triage worker sends.
-            kind if crate::coordinator::kind_always_dispatches_on_pool_driver(&kind) => {
+            kind if claimed_worker_id.is_none() && crate::coordinator::kind_always_dispatches_on_pool_driver(&kind) => {
                 Ok(crate::coordinator::pool_driver_slug_for_execution_kind(&kind).map(str::to_owned))
             }
             _ => Ok(None),
