@@ -312,7 +312,20 @@ const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed 
      carries `exit_code`. Writing commands through stdin is not. Do not end the\n\
      turn or claim a gate result without the real `exit_code`. Give a command\n\
      that might hang its own foreground timeout so expiry returns a nonzero\n\
-     status instead of polling forever.";
+     status instead of polling forever.\n\
+     \n\
+     **Do not invent a budget.** Nothing in this session meters your runtime,\n\
+     your turns, or your tokens, and you are not the accountant for any of\n\
+     them. Never infer a budget from your own context usage or from how long\n\
+     the run has taken, and never shorten, narrow, defer, or abandon required\n\
+     work — a full suite, a validation gate, a verification step — because it\n\
+     \"would take too long\" or because the session feels long. Wait for slow\n\
+     commands and poll them to their real `exit_code`. Ending the run with the\n\
+     work unfinished is a failed run; a partial result reported as a blocker\n\
+     is still a failed run. A blocker is reportable only when something\n\
+     external forced it: a command that ran and failed, a missing credential,\n\
+     a genuinely conflicting instruction. Say so plainly and show the\n\
+     evidence when that happens — and complete the work when it has not.";
 
 /// Single-pattern gitignore for the workspace-local `.codex/` config dir
 /// (prompt + agent-rules copies). Engine-injected files must not appear in

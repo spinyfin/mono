@@ -692,9 +692,9 @@ fn bazel_prepush_gate_block(workspace_path: &Path, seam_enabled: bool) -> Option
 /// told to call a verb the engine won't yet honor proposals-first.
 pub(crate) fn bazel_prepush_gate_text(seam_enabled: bool) -> String {
     let failure_sentence = if seam_enabled {
-        "If the build or tests fail, time out, or you cannot make them pass within this run, do NOT push red code and do NOT idle waiting on them. Call `boss propose blocked --reason \"...\"` naming the failing/timed-out command and its output, and stop (see \"If you are blocked or the work is bigger than estimated\" below for the exact syntax). Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
+        "If the build or tests actually fail or actually time out — a real command that ran and returned a failing or timed-out result — do NOT push red code and do NOT idle waiting on them. Deciding on your own that the run has gone on long enough is not a failure or a timeout, and is never a reason to stop short of a clean result. Call `boss propose blocked --reason \"...\"` naming the failing/timed-out command and its output, and stop (see \"If you are blocked or the work is bigger than estimated\" below for the exact syntax). Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
     } else {
-        "If the build or tests fail, time out, or you cannot make them pass within this run, do NOT push red code and do NOT idle waiting on them. Emit a `[blocked] reason=\"...\"` marker in your final response naming the failing/timed-out command and its output, and stop (see \"If you are blocked or the work is bigger than estimated\" below for the exact syntax). Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
+        "If the build or tests actually fail or actually time out — a real command that ran and returned a failing or timed-out result — do NOT push red code and do NOT idle waiting on them. Deciding on your own that the run has gone on long enough is not a failure or a timeout, and is never a reason to stop short of a clean result. Emit a `[blocked] reason=\"...\"` marker in your final response naming the failing/timed-out command and its output, and stop (see \"If you are blocked or the work is bigger than estimated\" below for the exact syntax). Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
     };
     format!(
         "\n## Pre-push build gate (Bazel workspace)\n\
@@ -962,6 +962,11 @@ pub(crate) fn worker_escalation_protocol_directive(seam_enabled: bool) -> String
      ```\n\
      [blocked] reason=\"bazel build fails with E0583 for a newly added file, survives clean --expunge; need guidance or explicit direction before proceeding\"\n\
      ```\n\n\
+     `<why>` must name an external fact — a command that ran and failed (with its output), a \
+     missing credential, an instruction that genuinely conflicts with another. Citing the run's \
+     own duration, your own context usage, your own decision to stop, or that a required step \
+     \"was not completed\" is not a valid reason: none of those are blockers, they are you \
+     choosing to stop, and this marker is not a channel for that.\n\n\
      A marker missing `requested_level=`/`reason=\"...\"` is still detected but flagged \
      malformed to the coordinator — include both fields so it's processed automatically instead \
      of by hand. Do NOT stop silently or push code you know is broken to work around a blocker: \
@@ -987,6 +992,11 @@ pub(crate) fn worker_escalation_protocol_directive(seam_enabled: bool) -> String
      ```\n\
      boss propose blocked --reason \"bazel build fails with E0583 for a newly added file, survives clean --expunge; need guidance or explicit direction before proceeding\"\n\
      ```\n\n\
+     `--reason` must name an external fact — a command that ran and failed (with its output), a \
+     missing credential, an instruction that genuinely conflicts with another. Citing the run's \
+     own duration, your own context usage, your own decision to stop, or that a required step \
+     \"was not completed\" is not a valid reason: none of those are blockers, they are you \
+     choosing to stop, and this call is not a channel for that.\n\n\
      Either call files a coordinator-visible attention item immediately and pauses the \"produce a \
      PR\" auto-nudge loop for this run until a coordinator acks it, so you will not be re-prompted \
      to \"produce a PR\" while one is pending. Do NOT stop silently or push code you know is broken \
