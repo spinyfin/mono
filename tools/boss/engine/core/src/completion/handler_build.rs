@@ -50,27 +50,7 @@ impl WorkerCompletionHandler {
             pr_state_checker: Arc::new(crate::work::GhPrStateChecker),
             structured_output_dir: crate::structured_output::default_dir(),
             now_fn: Arc::new(std::time::Instant::now),
-            live_worker_states: None,
-            staged_pr_mid_turn_defer_secs: DEFAULT_STAGED_PR_MID_TURN_DEFER_SECS,
         }
-    }
-
-    /// Wire the engine-global [`crate::live_worker_state::LiveWorkerStateRegistry`]
-    /// so the merge-poller staged-URL recheck can read real mid-turn
-    /// activity. `app.rs` shares the same instance the event dispatcher
-    /// and sweeps use. Tests that omit this call leave the gate open
-    /// (no registry → not mid-turn → staged path finalizes as before).
-    pub fn with_live_worker_states(mut self, registry: Arc<crate::live_worker_state::LiveWorkerStateRegistry>) -> Self {
-        self.live_worker_states = Some(registry);
-        self
-    }
-
-    /// Override the mid-turn staged-URL deferral horizon. Tests set this
-    /// low (or to `0`) so a still-Working worker can be forced past the
-    /// bound without sleeping for the production default.
-    pub fn with_staged_pr_mid_turn_defer_secs(mut self, secs: i64) -> Self {
-        self.staged_pr_mid_turn_defer_secs = secs;
-        self
     }
 
     /// Point structured-output reads at `dir` instead of the process-wide

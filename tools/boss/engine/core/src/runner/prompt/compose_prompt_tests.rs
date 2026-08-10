@@ -1982,8 +1982,12 @@ fn revision_directive_requires_findings_status_comment() {
         "revision directive must require every finding to appear, including unaddressed ones:\n{prompt}",
     );
     assert!(
-        prompt.contains("SKIP this step entirely"),
-        "revision directive must instruct skipping the comment (not an empty table) when there are no review findings:\n{prompt}",
+        prompt.contains("SKIP the comment entirely"),
+        "revision directive must instruct skipping the comment (not posting an empty table) when there are no review findings:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("findings-status comment was not applicable"),
+        "a legitimate no-op must be explicit in the worker's recorded final response:\n{prompt}",
     );
     assert!(
         prompt.contains("gh pr comment 77 -R org/repo --body-file"),
@@ -1996,6 +2000,14 @@ fn revision_directive_requires_findings_status_comment() {
     assert!(
         prompt.contains("does not substitute for the PR description update"),
         "the findings comment must be required in addition to, not instead of, the PR description reconciliation:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("finish them before your final response"),
+        "prompt-owned post-push steps must precede the worker's completion boundary:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("a push or staged PR URL alone does not mean the revision is done"),
+        "the revision directive must state the completion contract explicitly:\n{prompt}",
     );
 }
 

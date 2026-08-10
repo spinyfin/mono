@@ -1222,7 +1222,6 @@ impl ServerState {
                     live_worker_states_for_completion.clone(),
                 ),
             ))
-            .with_live_worker_states(live_worker_states_for_completion)
             .with_hold_registry(hold_registry)
             .with_teardown_registry(teardown_registry),
         );

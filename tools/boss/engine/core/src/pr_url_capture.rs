@@ -39,18 +39,20 @@
 //!
 //! The reconciliation path (`completion::detect_pr` →
 //! `jj_candidate_commit_shas` → GitHub commits/{sha}/pulls) is
-//! preserved as the engine-restart recovery fallback. If the engine
-//! restarts after a worker pushed but before Stop fired, the staged
-//! URL is lost from this cache (it lives in memory only) and the
-//! fallback path runs on the next sweep. The staging cache is the
-//! hot path; the reconstruction path is the cold path.
+//! preserved as the engine-restart recovery fallback for primary
+//! implementations. If the engine restarts after a worker opened a PR but
+//! before Stop fired, the staged URL is lost from this cache (it lives in
+//! memory only) and the fallback path runs on the next sweep. Revision
+//! executions do not equate either URL channel with completion: they remain
+//! live until their own Stop path records the contributed head. The staging
+//! cache is the hot path; reconstruction is the primary-implementation cold
+//! path.
 //!
 //! **Not** a GitHub branch→PR poll: that is a different mechanism with
 //! different failure modes and must not mask a broken extraction path.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
-use std::time::Instant;
 
 use boss_engine_gh_invocation::{GhNoun, classify};
 use boss_engine_structured_output::pr_url::find_first_pr_url;
@@ -444,14 +446,14 @@ impl StagedPrUrlCache {
         if guard.contains_key(execution_id) {
             StagePrUrlOutcome::AlreadyStaged
         } else {
-            guard.insert(
-                execution_id.to_owned(),
-                StagedPrUrlEntry {
-                    pr_url: pr_url.to_owned(),
-                    staged_at: Instant::now(),
+             guard.insert(
+                 execution_id.to_owned(),
+                 StagedPrUrlEntry {
+                     pr_url: pr_url.to_owned(),
+                     staged_at: Instant::now(),
                     finalization_armed: true,
-                },
-            );
+                 },
+             );
             StagePrUrlOutcome::Staged
         }
     }
@@ -467,9 +469,7 @@ impl StagedPrUrlCache {
             .map(|entry| entry.pr_url.clone())
     }
 
-    /// Read the full staged entry (URL + stage time) for `execution_id`.
-    /// Used by the merge-poller recheck path to enforce the mid-turn
-    /// deferral horizon without a second map lookup.
+    /// Read the complete staged entry without removing it.
     pub fn get_entry(&self, execution_id: &str) -> Option<StagedPrUrlEntry> {
         self.inner
             .lock()
