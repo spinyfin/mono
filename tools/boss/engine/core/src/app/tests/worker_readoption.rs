@@ -652,6 +652,137 @@ async fn a_hook_callback_run_reports_that_there_was_no_tail_to_restore() {
     );
 }
 
+/// Seed an answer-agent execution bound to a comment (`work_item_id = cmt_…`)
+/// in the post-spawn shape, then orphan it the way a mis-fired reap does.
+/// Returns `(comment_id, execution_id)`.
+fn stranded_answer_agent_worker(server_state: &ServerState, shell_pid: i64) -> (String, String) {
+    use boss_protocol::{COMMENT_STATUS_ANSWERING, CreateCommentInput, CreateInvestigationInput};
+
+    let db = server_state.work_db.as_ref();
+    let product = create_test_product(db);
+    let investigation = db
+        .create_investigation(
+            CreateInvestigationInput::builder()
+                .product_id(product.id.clone())
+                .name("Investigate the thing")
+                .build(),
+        )
+        .unwrap();
+    let doc_repo = product.repo_remote_url.as_deref().unwrap();
+    db.set_task_doc_pointer(&investigation.id, Some(doc_repo), Some("main"), Some("docs/design.md"))
+        .unwrap();
+    let artifact_id = format!("pr_doc:{doc_repo}:main:docs/design.md");
+    let comment = db
+        .create_comment(CreateCommentInput {
+            artifact_kind: "pr_doc".to_owned(),
+            artifact_id,
+            doc_version: "v1".to_owned(),
+            anchor: boss_protocol::CommentAnchor {
+                exact: "the quoted text".to_owned(),
+                prefix: String::new(),
+                suffix: String::new(),
+            },
+            body: "why does this retry three times?".to_owned(),
+            author: "operator".to_owned(),
+            plain_text_projection_version: 0,
+        })
+        .unwrap();
+    // Bound work is still open: answer-agent is mid-flight.
+    db.transition_comment_to_answering(&comment.id).unwrap();
+    assert_eq!(
+        db.get_comment(&comment.id).unwrap().unwrap().status,
+        COMMENT_STATUS_ANSWERING
+    );
+
+    let execution = db.create_answer_agent_execution(&comment.id, doc_repo).unwrap();
+    let started_at = boss_engine_utils::epoch_time::now_epoch_secs()
+        .saturating_sub(300)
+        .max(0);
+    db.force_started_at_for_test(&execution.id, started_at).unwrap();
+    let (_exec, run) = db
+        .start_execution_run(&execution.id, "worker-1", "repo-1", "lease-1", "ws-1", "/tmp/ws")
+        .unwrap();
+    assert!(db.set_run_shell_pid_for_execution(&execution.id, shell_pid).unwrap());
+    finish_run_worker_pane_alive(db, &execution.id, &run.id, Some("Spawned answer-agent pane."));
+    db.mark_execution_orphaned(&execution.id, "spawn-ack timeout; worker presumed dead")
+        .unwrap();
+    (comment.id, execution.id)
+}
+
+/// **Regression: answer-agent executions bind a comment id (`cmt_…`).**
+///
+/// Before the parser accepted `cmt_` and closedness derived from the comment's
+/// own status, every recon pass returned `work_item_lookup_failed` with
+/// `unknown work item id format`. With an open (`answering`) comment the
+/// contradiction must resolve to a real readopt, not a lookup failure.
+#[tokio::test]
+async fn answer_agent_orphaned_execution_with_open_comment_is_readopted() {
+    let (server_state, _dir) = test_server_state();
+    let (comment_id, execution_id) = stranded_answer_agent_worker(&server_state, i64::from(std::process::id()));
+    assert!(
+        comment_id.starts_with("cmt_"),
+        "precondition: work_item_id must be a comment id, got {comment_id}"
+    );
+    assert_eq!(
+        server_state.work_db.get_execution(&execution_id).unwrap().work_item_id,
+        comment_id,
+    );
+    assert_eq!(
+        server_state.work_db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Orphaned,
+    );
+
+    let verdict = server_state
+        .converge_terminal_execution(
+            &server_state.work_db.get_execution(&execution_id).unwrap(),
+            "hook_after_terminal",
+        )
+        .await;
+    assert_eq!(
+        verdict, "readopt",
+        "open comment must yield a real verdict, not work_item_lookup_failed",
+    );
+    assert_eq!(
+        server_state.work_db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Running,
+        "orphaned answer-agent with answering comment must be re-adopted",
+    );
+}
+
+/// Closed comment (`resolved`) is authoritative: an orphaned answer-agent
+/// execution is reaped, not re-adopted — the same WorkItemTerminal rule tasks
+/// use when the bound card is done.
+#[tokio::test]
+async fn answer_agent_orphaned_execution_with_resolved_comment_is_reaped() {
+    let (server_state, _dir) = test_server_state();
+    // Dead pid: this test only asserts the verdict path; a live pid would
+    // make reap signal the test process group.
+    let (comment_id, execution_id) = stranded_answer_agent_worker(&server_state, dead_pid());
+    server_state
+        .work_db
+        .set_comment_status(&comment_id, boss_protocol::COMMENT_STATUS_RESOLVED, Some("operator"))
+        .unwrap();
+    assert!(boss_protocol::comment_status_is_closed(
+        &server_state.work_db.get_comment(&comment_id).unwrap().unwrap().status
+    ));
+
+    let verdict = server_state
+        .converge_terminal_execution(
+            &server_state.work_db.get_execution(&execution_id).unwrap(),
+            "hook_after_terminal",
+        )
+        .await;
+    assert_eq!(
+        verdict, "reap",
+        "resolved comment must yield WorkItemTerminal reap, not work_item_lookup_failed",
+    );
+    assert_eq!(
+        server_state.work_db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Orphaned,
+        "row stays terminal after a WorkItemTerminal reap",
+    );
+}
+
 /// Convergence is serialized per run. A worker mid-turn emits several hooks a
 /// second, and each one reaching this path independently would race writes
 /// against the same execution row and fan out `ListHostedPanes` round-trips at

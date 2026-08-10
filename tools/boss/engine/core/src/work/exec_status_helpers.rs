@@ -38,6 +38,10 @@ pub(crate) fn execution_kind_for_work_item(conn: &Connection, work_item_id: &str
                 .with_context(|| format!("unknown task: {work_item_id}"))?;
             execution_kind_for_task_kind(&task.kind)
         }
+        // Answer-agent executions are created via
+        // `create_answer_agent_execution`, not `request_execution` — this
+        // helper only maps product/project/task ids.
+        ItemKind::Comment => bail!("comment ids do not map to a primary execution kind: {work_item_id}"),
     })
 }
 
@@ -275,6 +279,10 @@ pub(crate) fn product_id_for_work_item(conn: &Connection, work_item_id: &str) ->
             .filter(|task| task.deleted_at.is_none())
             .map(|task| task.product_id)
             .with_context(|| format!("unknown task: {work_item_id}")),
+        // Comments are not product-owned rows. Callers that need a product for
+        // an answer-agent execution resolve via the comment's doc owner
+        // (`WorkDb::resolve_doc_owner`), not this helper.
+        ItemKind::Comment => bail!("comment ids are not product-scoped work items: {work_item_id}"),
     }
 }
 
@@ -298,6 +306,7 @@ pub(crate) fn product_id_for_work_item_including_deleted(conn: &Connection, work
         ItemKind::Task => query_task(conn, work_item_id)?
             .map(|task| task.product_id)
             .with_context(|| format!("unknown task: {work_item_id}")),
+        ItemKind::Comment => bail!("comment ids are not product-scoped work items: {work_item_id}"),
     }
 }
 

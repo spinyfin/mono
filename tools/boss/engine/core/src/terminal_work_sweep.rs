@@ -301,28 +301,27 @@ pub async fn run_one_pass(
 
         let execution_terminal = execution.status.is_terminal();
 
-        // `AutomationTriage`'s `work_item_id` is an automation id and
-        // `AnswerAgent`'s is a comment id — neither is a product/project/task,
-        // so `get_work_item` can never resolve them; skip the lookup (and its
-        // per-minute WARN) for these kinds and fall back to the execution
-        // signal alone, exactly as the `Err` arm below already does.
-        let never_task_bound = matches!(
-            execution.kind,
-            boss_protocol::ExecutionKind::AutomationTriage | boss_protocol::ExecutionKind::AnswerAgent
-        );
+        // `AutomationTriage`'s `work_item_id` is an automation id — not a
+        // product/project/task/comment — so bound-item closedness cannot be
+        // established; skip the lookup (and its per-minute WARN) and fall
+        // back to the execution signal alone. Answer-agent executions bind a
+        // real comment id (`cmt_…`) and go through the normal closed check
+        // via `is_bound_work_item_closed`.
+        let never_bound_work_item = matches!(execution.kind, boss_protocol::ExecutionKind::AutomationTriage);
 
         // The O'Brien signal: the bound work item is terminal (done /
-        // archived) even though the worker — and possibly its
-        // execution — is still alive. A work-item lookup failure falls back
-        // to the execution signal alone rather than guessing, UNLESS the
-        // failure is because the row itself is confirmed gone (deleted out
-        // from under this execution) — see `work_item_missing` below.
+        // archived / comment resolved|dismissed|answered) even though the
+        // worker — and possibly its execution — is still alive. A work-item
+        // lookup failure falls back to the execution signal alone rather
+        // than guessing, UNLESS the failure is because the row itself is
+        // confirmed gone (deleted out from under this execution) — see
+        // `work_item_missing` below.
         let mut work_item_missing = false;
-        let work_item_terminal = if never_task_bound {
+        let work_item_terminal = if never_bound_work_item {
             false
         } else {
-            match work_db.get_work_item(&execution.work_item_id) {
-                Ok(item) => work_item_is_terminal(&item),
+            match work_db.is_bound_work_item_closed(&execution.work_item_id) {
+                Ok(closed) => closed,
                 Err(err) => match work_db.work_item_row_missing(&execution.work_item_id) {
                     // The Deleting-a-work-item-orphans-its-worker case: the
                     // row is confirmed gone (never existed, or soft-deleted
@@ -340,7 +339,7 @@ pub async fn run_one_pass(
                         false
                     }
                     // Either the row genuinely still exists (so the
-                    // `get_work_item` error was something else entirely) or
+                    // closedness error was something else entirely) or
                     // we couldn't confirm either way — stay conservative and
                     // retry next pass, exactly as before this case existed.
                     Ok(false) | Err(_) => {
@@ -569,18 +568,6 @@ struct ReapCandidate {
     /// terminalizes the row, and drivers may key their out-of-workspace
     /// state off the persisted runtime state alone.
     workspace_path: Option<String>,
-}
-
-/// Whether a bound work item is in a terminal status. Only task-shaped
-/// work items (tasks and chores) are dispatched to workers; product /
-/// project bindings are treated as non-terminal so the sweep never reaps on
-/// a binding shape it does not model.
-fn work_item_is_terminal(item: &boss_protocol::WorkItem) -> bool {
-    use boss_protocol::WorkItem;
-    match item {
-        WorkItem::Task(task) | WorkItem::Chore(task) => task.status.is_terminal(),
-        WorkItem::Product(_) | WorkItem::Project(_) => false,
-    }
 }
 
 #[cfg(test)]
