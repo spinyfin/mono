@@ -615,7 +615,7 @@ dependencies = [
  "boss-pr-review",
  "boss-protocol",
  "boss-ssh-transport",
- "fs4",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

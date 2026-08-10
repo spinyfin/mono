@@ -1,11 +1,15 @@
 //! Fail-fast capability checks for the scoped Grok worker environment.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 
 use super::environment::GrokProcessEnvironment;
+
+/// Wall-clock limit for the OAuth-sensitive `grok models` probe.
+const GROK_MODELS_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct PreflightOutput {
     success: bool,
@@ -36,18 +40,11 @@ impl PreflightRunner for RealPreflightRunner {
         workspace: &Path,
         environment: &GrokProcessEnvironment,
     ) -> anyhow::Result<PreflightOutput> {
-        // Hold Grok's auth.json.lock (shared) for the OAuth probe so a concurrent
-        // refresh cannot truncate auth.json under us. See
-        // `GrokProcessEnvironment::lock_auth_for_oauth_probe`.
-        let _auth_lock = if program == "grok" {
-            Some(
-                environment
-                    .lock_auth_for_oauth_probe()
-                    .context("locking shared Grok OAuth credential for preflight")?,
-            )
-        } else {
-            None
-        };
+        if program == "grok" {
+            environment
+                .wait_for_auth_ready_for_oauth_probe()
+                .context("waiting for a Grok OAuth refresh before preflight")?;
+        }
         let mut command = match &self.macos_seatbelt_profile {
             Some(profile) => {
                 let mut command = Command::new("/usr/bin/sandbox-exec");
@@ -62,15 +59,48 @@ impl PreflightRunner for RealPreflightRunner {
         } else {
             environment.apply_tool_sandbox_environment(&mut command);
         }
-        let output = command
-            .output()
-            .with_context(|| format!("starting Grok worker preflight capability `{program}`"))?;
+        let output = if program == "grok" {
+            run_grok_models_with_timeout(&mut command)?
+        } else {
+            command
+                .output()
+                .with_context(|| format!("starting Grok worker preflight capability `{program}`"))?
+        };
         Ok(PreflightOutput {
             success: output.status.success(),
             status: output.status.to_string(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
+    }
+}
+
+fn run_grok_models_with_timeout(command: &mut Command) -> anyhow::Result<Output> {
+    let mut child = command
+        .spawn()
+        .context("starting Grok worker preflight capability `grok`")?;
+    let deadline = Instant::now() + GROK_MODELS_TIMEOUT;
+    loop {
+        if child
+            .try_wait()
+            .context("waiting for Grok worker preflight capability `grok`")?
+            .is_some()
+        {
+            return child
+                .wait_with_output()
+                .context("collecting Grok worker preflight capability `grok`");
+        }
+        if Instant::now() >= deadline {
+            child
+                .kill()
+                .context("killing timed-out Grok worker preflight capability `grok`")?;
+            let _ = child.wait();
+            bail!(
+                "grok models did not complete while waiting for OAuth refresh coordination within {}s",
+                GROK_MODELS_TIMEOUT.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 

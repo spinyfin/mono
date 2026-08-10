@@ -740,36 +740,33 @@ pub fn assert_inspect_json_posture(
 /// project settings path under a cube workspace (or the scoped process HOME).
 ///
 /// `grok inspect` reports sources like
-/// `"/Users/op/.claude/settings.local.json (settings)"`. Matching on
-/// `source.contains($HOME)` alone false-positives on
-/// `$HOME/.local/share/cube/workspaces/<id>/.claude/settings.local.json`.
+/// `"/Users/op/.claude/settings.local.json (settings)"`. We remove the
+/// display annotation and canonicalize paths so equivalent home spellings do
+/// not evade the leak check, while workspace settings remain distinct.
 fn is_operator_claude_settings_source(source: &str, operator_home: &str, process_home: &Path) -> bool {
-    if source.is_empty() || !source.contains(".claude/settings") {
+    let source = source.strip_suffix(" (settings)").unwrap_or(source);
+    if source.is_empty() {
         return false;
     }
-    let process_home_s = process_home.display().to_string();
-    if !process_home_s.is_empty() && source.contains(&process_home_s) {
+    let source_path = canonical_or_original(Path::new(source));
+    let process_home = canonical_or_original(process_home);
+    if source_path.starts_with(&process_home) {
         return false;
     }
-    let home = operator_home.trim_end_matches('/');
-    if home.is_empty() {
+    let operator_home = operator_home.trim();
+    if operator_home.is_empty() {
         return false;
     }
-    // Require the operator Claude config directory specifically.
-    let operator_claude_settings = format!("{home}/.claude/settings");
-    if source.contains(&operator_claude_settings) {
-        return true;
-    }
-    // macOS sometimes surfaces the same home via /System/Volumes/Data/Users/...
-    // when $HOME is /Users/... — keep the check tight: only the `.claude/settings`
-    // leaf under a Users/<name> home, never an arbitrary $HOME prefix.
-    if let Some(stripped) = home.strip_prefix("/Users/") {
-        let data_volume = format!("/System/Volumes/Data/Users/{stripped}/.claude/settings");
-        if source.contains(&data_volume) {
-            return true;
-        }
-    }
-    false
+    let settings_dir = canonical_or_original(&Path::new(operator_home).join(".claude"));
+    source_path.starts_with(settings_dir)
+        && source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("settings"))
+}
+
+fn canonical_or_original(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Refuse teardown paths outside the Boss-owned homes root.

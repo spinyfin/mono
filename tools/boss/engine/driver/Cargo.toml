@@ -9,7 +9,7 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
 boss-codex-auth = { path = "../../codex_auth" }
-fs4 = { workspace = true }
+libc = { workspace = true }
 boss-engine-codex-hook-trust = { path = "../codex-hook-trust" }
 boss-engine-codex-rollout = { path = "../codex-rollout" }
 boss-log-files = { path = "../../log-files" }
