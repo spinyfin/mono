@@ -177,14 +177,15 @@ async fn main() -> Result<()> {
 
     // JSON layer: structured JSONL for the macOS Activity Log viewer.
     // Best-effort — silently skipped if the file cannot be opened.
-    // On startup the existing trace file (if any) is rotated to a
-    // timestamped backup; a size-based rotation fires mid-run when the
-    // threshold is crossed.
+    // Rotation is purely size-based: startup only rotates the existing
+    // trace file if it's already at or over the threshold (so a restart
+    // storm can't evict retained history on its own), and the same
+    // threshold rotation fires mid-run when it's crossed.
     let (trace_max_bytes, trace_max_files) = trace_rotation::trace_rotation_config();
     let (json_trace_path, json_state_arc) = match engine_trace_jsonl_path(&isolation) {
         None => (PathBuf::new(), Arc::new(Mutex::new(None))),
         Some(path) => {
-            trace_rotation::rotate_on_startup(&path, trace_max_files);
+            trace_rotation::rotate_on_startup(&path, trace_max_bytes, trace_max_files);
             let state = match trace_rotation::open_trace_file(&path) {
                 Ok(file) => Some(RotatingState::new(file)),
                 Err(err) => {

@@ -27,9 +27,10 @@ row", "what surface issued this change").
 
 - Small, effectively unrotated for months of typical use.
 - Measured 2026-07-26: ~1.3 MB back to 2026-05-08.
-- Contrast: `engine-trace.jsonl*` only holds ~2 days (rotates at
-  100 MB, keeps 5) and will usually have rotated past the window you
-  care about.
+- Contrast: `engine-trace.jsonl*` holds ~4 days under normal write
+  volume (rotates at 100 MB, keeps 10, purely size-based — a restart no
+  longer rotates a file that isn't yet full) and can still have rotated
+  past the window you care about during a high-volume incident.
 
 Lifecycle event shapes (`start` / `socket_bound` / `shutdown`) are also
 documented in [`tools/boss/app-macos/README.md`](../app-macos/README.md)
