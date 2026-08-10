@@ -33,7 +33,17 @@ struct CommentPopover: View {
             CommentTextEditor(
                 text: $commentBody,
                 onSubmit: submit,
-                onTextViewCreated: layer.setCommentTextView,
+                onTextViewCreated: { textView in
+                    // Drain buffered keys before registering the live view. This
+                    // gives typeahead one consumer and prevents an asynchronous
+                    // state update from racing a later direct NSTextView insertion.
+                    let typeahead = layer.drainPendingTypeahead()
+                    commentBody = typeahead
+                    textView.string = typeahead
+                    textView.setSelectedRange(
+                        NSRange(location: (typeahead as NSString).length, length: 0))
+                    layer.setCommentTextView(textView)
+                },
                 // Always request focus while the popover is mounted; the layer
                 // no-ops claimCommentTextFocus once the claim has stuck, so the
                 // Cancel/Comment buttons remain reachable via Tab.
@@ -65,14 +75,6 @@ struct CommentPopover: View {
         }
         .padding(16)
         .frame(width: 320)
-        .onChange(of: layer.pendingTypeahead) { _, newValue in
-            // Absorb typeahead that arrived after init but before the text view
-            // could take insertText (e.g. second/third key of a fast burst).
-            // Never shrink the body — the live text view may already be ahead.
-            if newValue.count > commentBody.count {
-                commentBody = newValue
-            }
-        }
     }
 
     private func submit() {

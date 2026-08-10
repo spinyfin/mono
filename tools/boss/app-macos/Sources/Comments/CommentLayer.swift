@@ -16,7 +16,7 @@ private let coordLog = Logger(subsystem: "com.boss.markdown", category: "coordin
 /// Owns the comment array for a single markdown viewer instance and
 /// coordinates the selection → authoring → sidebar → highlight flow.
 ///
-/// Since P529 Phase 2 the layer is engine-backed: when [`configure`] is given an
+/// The layer is engine-backed: when [`configure`] is given an
 /// artifact id and a [`CommentBackend`], comments load via `comments_list`,
 /// persist via `comments_create`/`comments_dismiss`, re-anchor via
 /// `comments_resolve`, and stay live via the `comments.artifact.*` subscription
@@ -337,9 +337,17 @@ final class CommentLayer: NSObject, ObservableObject {
         claimCommentTextFocus()
     }
 
+    /// Returns all typeahead buffered before the form view existed, then clears
+    /// it so later keystrokes have exactly one destination: the live text view.
+    func drainPendingTypeahead() -> String {
+        let typeahead = pendingTypeahead
+        pendingTypeahead = ""
+        return typeahead
+    }
+
     /// Attempts to make the comment text view first responder. Safe to call
     /// repeatedly; no-ops until the text view has a window, and clears
-    /// `needsCommentTextFocus` once the claim is observed to stick.
+    /// `needsCommentTextFocus` once the claim can receive events in its key window.
     ///
     /// - Parameter force: When true (e.g. from `popoverDidShow` after AppKit's
     ///   key-window transition may have reset first responder), re-open the
@@ -350,19 +358,25 @@ final class CommentLayer: NSObject, ObservableObject {
         guard let textView = commentTextView else { return }
         guard let window = textView.window else { return }
         if window.firstResponder === textView {
-            needsCommentTextFocus = false
+            // A popover can accept a first-responder claim before it becomes key.
+            // Keep buffering host-window events until AppKit can actually deliver
+            // them to this text view.
+            if window.isKeyWindow {
+                needsCommentTextFocus = false
+            }
             return
         }
         guard force || needsCommentTextFocus else { return }
         if force { needsCommentTextFocus = true }
         window.makeFirstResponder(textView)
-        if window.firstResponder === textView {
+        if window.firstResponder === textView, window.isKeyWindow {
             needsCommentTextFocus = false
         }
     }
 
     /// Whether the comment form's text view currently holds first responder in
-    /// its window. Used by the key monitor to decide when to stop buffering.
+    /// its window. The key monitor additionally verifies that its event targets
+    /// that window before it stops buffering.
     var isCommentTextViewFirstResponder: Bool {
         guard let textView = commentTextView,
               let window = textView.window else { return false }
@@ -1010,13 +1024,19 @@ final class CommentLayer: NSObject, ObservableObject {
         guard !suppressTypeToComment else { return false }
 
         if isShowingPopover {
-            // Text view already has focus — stop intercepting; AppKit owns delivery.
-            if isCommentTextViewFirstResponder {
+            // Stop intercepting only when this event will reach the focused text
+            // view. During the popover animation its window may already have a
+            // first responder but host-window events still need forwarding.
+            if isCommentTextViewFirstResponder, commentTextView?.window === window {
                 needsCommentTextFocus = false
                 return false
             }
+            if isCommentTextViewFirstResponder {
+                return forwardKeystrokeToPendingComment(chars: chars, mods: mods)
+            }
             // Dead window: popover is up (or animating) but the form is not yet
             // first responder. Forward typeable characters into the buffer.
+            guard needsCommentTextFocus else { return false }
             return forwardKeystrokeToPendingComment(chars: chars, mods: mods)
         }
 
@@ -1044,6 +1064,7 @@ final class CommentLayer: NSObject, ObservableObject {
            window === popoverWindow {
             return true
         }
+        if isShowingPopover, window === commentTextView?.window { return true }
         return false
     }
 
@@ -1086,9 +1107,9 @@ final class CommentLayer: NSObject, ObservableObject {
         } else {
             pendingTypeahead.append(char)
         }
-        // Keep trying to land focus; force because a prior claim may have been
-        // cleared by AppKit's key-window transition even though needs was false.
-        claimCommentTextFocus(force: true)
+        // Retry only while the initial focus claim is pending. Once it has landed,
+        // do not steal focus back from Cancel or Comment after the user tabs away.
+        claimCommentTextFocus()
         return true
     }
 

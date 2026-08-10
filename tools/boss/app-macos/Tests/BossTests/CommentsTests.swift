@@ -3,7 +3,7 @@ import SwiftUI
 import XCTest
 @testable import Boss
 
-/// Tests for the comment system. Since P529 Phase 2 the layer is engine-backed;
+/// Tests for the comment system. The layer is engine-backed;
 /// these exercise both the in-memory fallback (bare `CommentLayer`) and the
 /// engine path (a `FakeCommentBackend`), plus the W3C anchoring, the wire
 /// Codable mirrors, and the SwiftUI layout of the sidebar/popover.
@@ -140,6 +140,61 @@ final class CommentLayerTests: XCTestCase {
             layer.shouldConsumeKeyEvent(chars: "x", mods: [], window: host),
             "monitor must not swallow keys once the form is first responder")
         XCTAssertEqual(layer.pendingTypeahead, "", "focused path must not append typeahead")
+    }
+
+    /// A responder claim in a non-key popover window must not stop forwarding
+    /// host-window keys during the show animation.
+    func testKeyMonitorForwardsHostEventsWhilePopoverWindowIsNotKey() {
+        let layer = CommentLayer()
+        let host = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 200),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        let popoverWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 200),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 100, height: 40))
+        textView.string = "h"
+        textView.setSelectedRange(NSRange(location: 1, length: 0))
+        popoverWindow.contentView = textView
+        XCTAssertTrue(popoverWindow.makeFirstResponder(textView))
+
+        layer.setHostWindow(host)
+        layer.isShowingPopover = true
+        layer.setCommentTextView(textView)
+
+        XCTAssertFalse(popoverWindow.isKeyWindow)
+        XCTAssertTrue(layer.isCommentTextViewFirstResponder)
+        XCTAssertTrue(layer.shouldConsumeKeyEvent(chars: "e", mods: [], window: host))
+        XCTAssertEqual(textView.string, "he")
+    }
+
+    /// Once the initial claim has landed, events in the form window must pass
+    /// through even when a sibling control (such as Cancel) owns focus.
+    func testKeyMonitorDoesNotStealFocusFromPopoverSibling() {
+        let layer = CommentLayer()
+        let host = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 200),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        let popoverWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 200),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 100, height: 40))
+        let buttonStandIn = NSView(frame: .zero)
+        let container = NSView(frame: popoverWindow.contentView?.bounds ?? .zero)
+        container.addSubview(textView)
+        container.addSubview(buttonStandIn)
+        popoverWindow.contentView = container
+        XCTAssertTrue(popoverWindow.makeFirstResponder(buttonStandIn))
+
+        layer.setHostWindow(host)
+        layer.isShowingPopover = true
+        layer.setCommentTextView(textView)
+        XCTAssertTrue(popoverWindow.makeFirstResponder(buttonStandIn))
+        layer.needsCommentTextFocus = false
+
+        XCTAssertFalse(layer.shouldConsumeKeyEvent(chars: " ", mods: [], window: popoverWindow))
+        XCTAssertEqual(textView.string, "")
+        XCTAssertTrue(popoverWindow.firstResponder === buttonStandIn)
     }
 
     /// Direct insert into a live text view (no pendingTypeahead) when keys arrive
