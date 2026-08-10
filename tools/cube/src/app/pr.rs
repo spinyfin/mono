@@ -17,20 +17,6 @@ use crate::app::gh_pr;
 use crate::app::jj::run_jj_push;
 use crate::app::stage::run_stage;
 
-/// Engine-injected provenance for a PR that is derived from another PR.
-///
-/// Cube owns the final `gh pr create` invocation, so it is the one place that
-/// can make this header independent of the body a worker happens to author.
-/// The engine only sets these for a work item with durable origin provenance.
-const FOLLOWUP_ORIGIN_PR_URL_ENV: &str = "BOSS_FOLLOWUP_ORIGIN_PR_URL";
-const FOLLOWUP_KIND_ENV: &str = "BOSS_FOLLOWUP_KIND";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct FollowupPrContext {
-    pub(super) kind: String,
-    pub(super) origin_pr_url: String,
-}
-
 /// Resolved context for a PR create/update operation: the workspace, the
 /// github.com remote name + `owner/repo` slug, and the validated branch name.
 struct PrContext {
@@ -215,7 +201,8 @@ fn list_open_pr(ctx: &PrContext, runner: &dyn CommandRunner) -> Result<Option<St
 }
 
 /// The PR body cube is about to submit, resolved once up front from
-/// whichever of `--body`/`--body-file` was supplied (or neither).
+/// whichever of `--body`/`--body-file` was supplied, with an optional
+/// caller-provided `--body-prefix` (or neither).
 ///
 /// Resolving this once — rather than letting [`gh_create_pr`] re-derive it
 /// from `args` — matters for two reasons: (1) `--body-file` pointing at
@@ -238,73 +225,16 @@ pub(super) struct ResolvedPrBody {
     tmp_path: Option<PathBuf>,
 }
 
-fn followup_pr_context_from_env() -> Result<Option<FollowupPrContext>> {
-    let origin_pr_url = match std::env::var(FOLLOWUP_ORIGIN_PR_URL_ENV) {
-        Ok(value) => Some(value),
-        Err(std::env::VarError::NotPresent) => None,
-        Err(err) => {
-            return Err(CubeError::InvalidArgument(format!(
-                "could not read {FOLLOWUP_ORIGIN_PR_URL_ENV}: {err}"
-            )));
-        }
-    };
-    let kind = std::env::var(FOLLOWUP_KIND_ENV).ok();
-    followup_pr_context_from_values(origin_pr_url, kind)
-}
-
-/// Pure core of [`followup_pr_context_from_env`], factored out so its
-/// empty-URL / missing-kind / empty-kind refusals are unit-testable without
-/// mutating process-global env vars (which would race across parallel
-/// tests).
-pub(super) fn followup_pr_context_from_values(
-    origin_pr_url: Option<String>,
-    kind: Option<String>,
-) -> Result<Option<FollowupPrContext>> {
-    let origin_pr_url = match origin_pr_url {
-        Some(value) if !value.trim().is_empty() => value,
-        Some(_) => {
-            return Err(CubeError::InvalidArgument(format!(
-                "{FOLLOWUP_ORIGIN_PR_URL_ENV} is empty; refusing to open a derived PR without its origin link"
-            )));
-        }
-        None => return Ok(None),
-    };
-    let kind = kind
-        .ok_or_else(|| {
-            CubeError::InvalidArgument(format!(
-                "{FOLLOWUP_KIND_ENV} is missing; refusing to open a derived PR without its follow-up kind"
-            ))
-        })?
-        .trim()
-        .to_owned();
-    if kind.is_empty() {
-        return Err(CubeError::InvalidArgument(format!(
-            "{FOLLOWUP_KIND_ENV} is empty; refusing to open a derived PR without its follow-up kind"
-        )));
-    }
-    Ok(Some(FollowupPrContext {
-        kind,
-        origin_pr_url: origin_pr_url.trim().to_owned(),
-    }))
-}
-
-/// Prepend the engine-owned provenance header before every worker-authored
-/// section. `context` is only present for a PR that derives from another PR.
-pub(super) fn render_pr_body(worker_body: Option<&str>, context: Option<&FollowupPrContext>) -> Option<String> {
-    let context = context?;
-    let header = format!(
-        "## Boss follow-up\n\nThis `{}` follow-up derives from [the origin PR]({}).",
-        context.kind, context.origin_pr_url
-    );
-    match worker_body {
-        Some(body) if !body.is_empty() => Some(format!("{header}\n\n{body}")),
-        // Deliberate: for a follow-up PR, always submit an explicit body
-        // (header alone if the worker gave nothing), even though that means
-        // `gh pr create` no longer falls back to deriving a body from the
-        // branch's commits. A follow-up PR must always carry visible
-        // provenance to its origin PR, so a header-only body is preferred
-        // over gh's commit-derived default losing that link.
-        _ => Some(header),
+/// Combine opaque caller-supplied text with an optional PR body.
+///
+/// Cube deliberately does not inspect, parse, or validate the prefix. It
+/// treats the prefix and body as ordinary markdown text and joins supplied
+/// values with one blank line.
+pub(super) fn render_pr_body(body_prefix: Option<&str>, body: Option<&str>) -> Option<String> {
+    match (body_prefix, body) {
+        (Some(prefix), Some(body)) => Some(format!("{prefix}\n\n{body}")),
+        (Some(prefix), None) => Some(prefix.to_owned()),
+        (None, body) => body.map(str::to_owned),
     }
 }
 
@@ -327,13 +257,14 @@ impl Drop for ResolvedPrBody {
 
 /// Resolve the PR body cube is about to submit from `--body`/`--body-file`.
 pub(super) fn resolve_pr_body(args: &PrCreateArgs) -> Result<ResolvedPrBody> {
-    let followup_context = followup_pr_context_from_env()?;
     if let Some(f) = &args.body_file {
         let (resolved, tmp) = resolve_body_file(f)?;
         let text = std::fs::read_to_string(&resolved).map_err(CubeError::Io)?;
-        if let Some(rendered) = render_pr_body(Some(&text), followup_context.as_ref()) {
+        if args.body_prefix.is_some() {
+            let rendered = render_pr_body(args.body_prefix.as_deref(), Some(&text))
+                .expect("a supplied body prefix always produces a PR body");
             // `tmp` (if any) was the stdin/pipe-sourced temp file materialized
-            // by `resolve_body_file`; it is being superseded by the rendered
+            // by `resolve_body_file`; it is being superseded by the combined
             // body's own temp file below, so remove it now rather than
             // leaking it — `ResolvedPrBody::drop` only tracks the new path.
             if let Some(p) = &tmp {
@@ -347,7 +278,9 @@ pub(super) fn resolve_pr_body(args: &PrCreateArgs) -> Result<ResolvedPrBody> {
             tmp_path: tmp,
         });
     }
-    if let Some(rendered) = render_pr_body(args.body.as_deref(), followup_context.as_ref()) {
+    if args.body_prefix.is_some() {
+        let rendered = render_pr_body(args.body_prefix.as_deref(), args.body.as_deref())
+            .expect("a supplied body prefix always produces a PR body");
         return materialize_pr_body(rendered);
     }
     Ok(ResolvedPrBody {

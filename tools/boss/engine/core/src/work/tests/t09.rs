@@ -104,21 +104,18 @@ fn pr_review_revision_creates_followup_with_correct_kind_and_provenance() {
         "followup must carry the revision's pr_review: created_via; got {:?}",
         followup.created_via,
     );
-    let env = crate::runner::work_item::followup_pr_environment(
+    let prefix = crate::runner::work_item::followup_pr_body_prefix(
         &followup.kind,
         &followup.created_via,
         followup.origin_pr_number,
         "git@github.com:spinyfin/mono.git",
     )
-    .expect("followup with origin PR and github remote must yield env");
-    let kind = env
-        .iter()
-        .find(|(k, _)| k == "BOSS_FOLLOWUP_KIND")
-        .map(|(_, v)| v.as_str());
+    .expect("followup with origin PR and github remote must yield a body prefix")
+    .expect("followup must have a provenance body prefix");
     assert_eq!(
-        kind,
-        Some("review findings"),
-        "chain-helpers conversion must yield BOSS_FOLLOWUP_KIND=review findings; env={env:?}"
+        prefix,
+        "## Boss follow-up\n\nThis `review findings` follow-up derives from [the origin PR](https://github.com/spinyfin/mono/pull/1537).",
+        "chain-helpers conversion must yield the complete review-findings provenance prefix"
     );
 }
 

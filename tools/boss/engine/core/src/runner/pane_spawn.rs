@@ -17,7 +17,7 @@ use crate::work::{WorkDb, WorkExecution, WorkItem};
 use boss_protocol::{ExecutionStatus, WorkItemBinding};
 
 use super::prompt::structured_output_env_vars;
-use super::work_item::{followup_pr_environment_for_work_item, work_item_id, work_item_name, work_item_task_kind};
+use super::work_item::{followup_pr_body_prefix_for_work_item, work_item_id, work_item_name, work_item_task_kind};
 use super::worker_spawn::{ComposedWorkerSpawn, WorkerSpawnOpts, compose_worker_spawn};
 use super::{ExecutionRunner, RunOutcome, RunWaitState, bound_events_socket_path};
 
@@ -456,13 +456,14 @@ fn check_initial_input_length(line: &str, driver_name: &str) -> Result<()> {
 /// The write itself is atomic (temp sibling + rename) via
 /// [`boss_engine_worker_bin::write_boss_launcher`].
 ///
-/// The directory holds exactly one executable — `boss` — which `exec`s
-/// the already-built CLI belonging to this engine, resolved by absolute
-/// path via [`boss_engine_worker_bin::resolve_boss_cli`]. That resolver
-/// never searches `PATH`; when it comes up empty the launcher is still
-/// written, and running `boss` then fails immediately with a named
-/// diagnostic instead of falling through to a repobin shim that spends
-/// ~30 seconds on `bazel build` before reporting anything.
+/// The directory always holds a `boss` launcher and can additionally hold a
+/// `cube` wrapper for a provenanced derived PR. The `boss` launcher `exec`s
+/// the already-built CLI belonging to this engine, resolved by absolute path
+/// via [`boss_engine_worker_bin::resolve_boss_cli`]. That resolver never
+/// searches `PATH`; when it comes up empty the launcher is still written, and
+/// running `boss` then fails immediately with a named diagnostic instead of
+/// falling through to a repobin shim that spends ~30 seconds on `bazel build`
+/// before reporting anything.
 ///
 /// `bossctl` is deliberately absent: this directory is prepended to the
 /// worker's `PATH`, and the Boss-tier control surface stays Boss-tier.
@@ -853,7 +854,21 @@ impl ExecutionRunner for PaneSpawnRunner {
         // shell rebuilding PATH; BOSS_BIN_DIR's own prepend is a bare
         // directory and is a no-op in dev mode, where the user's `~/bin`
         // repobin shim was winning.
+        let pr_body_prefix = followup_pr_body_prefix_for_work_item(work_item, &execution.repo_remote_url)?;
         let worker_bin_dir = ensure_worker_bin_dir(&settings_dir, workspace_path);
+        if let Some(body_prefix) = pr_body_prefix {
+            let dir = worker_bin_dir.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "refusing to spawn a derived PR worker without installing its required cube body-prefix wrapper"
+                )
+            })?;
+            boss_engine_worker_bin::write_cube_pr_body_prefix_launcher(dir, &body_prefix).with_context(|| {
+                format!(
+                    "installing the required cube body-prefix wrapper for execution {}",
+                    execution.id
+                )
+            })?;
+        }
         let env_prefix: String = spawn_plan.env.iter().map(render_env_directive).collect();
         let assembled_command = format!(
             "{}{}{env_prefix}{}",
@@ -934,10 +949,6 @@ impl ExecutionRunner for PaneSpawnRunner {
                 initial_input,
                 extra_env: {
                     let mut env = structured_output_env;
-                    env.extend(followup_pr_environment_for_work_item(
-                        work_item,
-                        &execution.repo_remote_url,
-                    )?);
                     if let Some(dir) = worker_bin_dir.as_ref() {
                         env.push((
                             boss_engine_worker_bin::WORKER_BIN_DIR_ENV.to_owned(),

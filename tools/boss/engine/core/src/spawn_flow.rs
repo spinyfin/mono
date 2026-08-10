@@ -63,11 +63,6 @@ const WORKER_EXTRA_ENV_ALLOWLIST: &[&str] = &[
     // / followups) and the PR URL. See `crate::structured_output`.
     "BOSS_PR_URL_OUTPUT",
     "BOSS_STRUCTURED_OUTPUT",
-    // Provenance required by cube to prefix a newly-created follow-up PR with
-    // the full URL of the PR it derives from. These are supplied only by the
-    // engine's durable follow-up provenance resolver.
-    "BOSS_FOLLOWUP_ORIGIN_PR_URL",
-    "BOSS_FOLLOWUP_KIND",
     // Engine-owned directory holding this workspace's `boss` launcher
     // (and nothing else — notably not `bossctl`). Prepended to the
     // worker's PATH so a bare `boss` runs the CLI shipped with this

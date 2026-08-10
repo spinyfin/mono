@@ -35,11 +35,12 @@
 //!
 //! Two properties are load-bearing:
 //!
-//! * **The launcher dir holds `boss` and nothing else.** Unlike
+//! * **The launcher dir holds only worker-safe launchers.** Unlike
 //!   prepending `$BOSS_BIN_DIR` (a bundle directory that also contains
 //!   `bossctl`, `cube` and the engine), a dedicated dir cannot leak
 //!   Boss-tier tooling into a worker session. `bossctl` is Boss-tier and
-//!   stays off the worker's `PATH` — see [`launcher_names`].
+//!   stays off the worker's `PATH`. A derived-PR worker also gets a `cube`
+//!   wrapper that passes an engine-owned opaque prefix to `cube pr create`.
 //! * **An unresolvable `boss` fails loudly and instantly.** When
 //!   resolution comes up empty the launcher is still written, but it
 //!   prints a specific diagnostic and exits 127 immediately. It never
@@ -58,6 +59,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Basename of the launcher the engine writes for workers.
 const BOSS_LAUNCHER_NAME: &str = "boss";
+
+/// Basename of the optional wrapper that adds an engine-owned body prefix to
+/// PR-creating cube calls for a single worker session.
+const CUBE_LAUNCHER_NAME: &str = "cube";
 
 /// Basename of the repobin multiplexer. A candidate that resolves to
 /// this is a build-from-source shim, not a built binary — see
@@ -84,8 +89,9 @@ pub const WORKER_BIN_DIR_ENV: &str = "BOSS_WORKER_BIN_DIR";
 /// operators use it; it is honoured before every filesystem candidate.
 pub const BOSS_CLI_BIN_ENV: &str = "BOSS_CLI_BIN";
 
-/// Every executable name the engine will ever write into the launcher
-/// dir. Exactly one entry, and it is not `bossctl`.
+/// Every executable name the engine may write into the launcher directory.
+/// The optional `cube` wrapper preserves engine-owned PR provenance; neither
+/// entry exposes the Boss-tier `bossctl` control surface.
 ///
 /// The engine deliberately keeps `bossctl` off the worker `PATH`: it is
 /// the Boss-tier control surface (host registry, agent fleet, engine
@@ -94,7 +100,7 @@ pub const BOSS_CLI_BIN_ENV: &str = "BOSS_CLI_BIN";
 /// distinction; a launcher dir can, and this constant is what the test
 /// suite pins it to.
 pub fn launcher_names() -> &'static [&'static str] {
-    &[BOSS_LAUNCHER_NAME]
+    &[BOSS_LAUNCHER_NAME, CUBE_LAUNCHER_NAME]
 }
 
 /// Path / env inputs shared by every engine-binary resolution.
@@ -355,17 +361,38 @@ $BUILD_WORKSPACE_DIRECTORY/bazel-bin/tools/boss/cli/boss, and its own
 sibling directory, and found none of them. Build it
 (`bazel build //tools/boss/cli:boss`) or set BOSS_CLI_BIN.";
 
-/// Write the per-workspace launcher dir: create `dir`, then atomically
-/// replace `<dir>/boss` with mode 0755. Returns the launcher's absolute
-/// path.
+/// Write the per-workspace `boss` launcher, atomically replacing an older
+/// launcher with mode 0755. Returns the launcher's absolute path.
 ///
 /// Rewritten unconditionally on every spawn so a worker never inherits a
 /// launcher pointing at a previous engine's binary. The write is atomic
 /// (temp sibling + `rename`) so a concurrent reader/`exec` of `boss`
 /// never observes a truncated file.
 pub fn write_boss_launcher(dir: &Path, resolved: Option<&Path>) -> io::Result<PathBuf> {
+    let path = write_launcher(dir, BOSS_LAUNCHER_NAME, &launcher_script(resolved))?;
+    let prefix_launcher = dir.join(CUBE_LAUNCHER_NAME);
+    match std::fs::remove_file(&prefix_launcher) {
+        Ok(()) => Ok(path),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(path),
+        Err(err) => Err(err),
+    }
+}
+
+/// Write the optional per-worker `cube` wrapper that passes `body_prefix` to
+/// `cube pr create` and the deprecated `cube pr ensure` alias. The wrapper
+/// removes its own directory from `PATH` before delegating so it cannot
+/// recurse into itself.
+pub fn write_cube_pr_body_prefix_launcher(dir: &Path, body_prefix: &str) -> io::Result<PathBuf> {
+    write_launcher(
+        dir,
+        CUBE_LAUNCHER_NAME,
+        &cube_pr_body_prefix_launcher_script(body_prefix),
+    )
+}
+
+fn write_launcher(dir: &Path, launcher_name: &str, script: &str) -> io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
-    let path = dir.join(BOSS_LAUNCHER_NAME);
+    let path = dir.join(launcher_name);
 
     // Unique sibling so concurrent writers (different pids / threads)
     // do not clobber each other's temp files before rename.
@@ -373,10 +400,10 @@ pub fn write_boss_launcher(dir: &Path, resolved: Option<&Path>) -> io::Result<Pa
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp = dir.join(format!(".{}.{}.{}.tmp", BOSS_LAUNCHER_NAME, std::process::id(), nanos));
+    let tmp = dir.join(format!(".{launcher_name}.{}.{}.tmp", std::process::id(), nanos));
 
     let result = (|| {
-        std::fs::write(&tmp, launcher_script(resolved))?;
+        std::fs::write(&tmp, script)?;
         set_executable(&tmp)?;
         // rename is atomic on the same filesystem; replaces an existing
         // `boss` without an O_TRUNC window that concurrent execs could see.
@@ -406,6 +433,27 @@ fn set_executable(_path: &Path) -> io::Result<()> {
 /// evaluable.
 fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+fn cube_pr_body_prefix_launcher_script(body_prefix: &str) -> String {
+    format!(
+        "#!/bin/sh\n\
+         if [ -n \"${{{WORKER_BIN_DIR_ENV}:-}}\" ]; then\n\
+             PATH=\"${{PATH#\"${{{WORKER_BIN_DIR_ENV}}}:\"}}\"\n\
+             export PATH\n\
+         fi\n\
+         if [ \"$1\" = \"pr\" ]; then\n\
+             case \"$2\" in\n\
+                 create|ensure)\n\
+                     subcommand=\"$2\"\n\
+                     shift 2\n\
+                     exec cube pr \"$subcommand\" --body-prefix {} \"$@\"\n\
+                     ;;\n\
+             esac\n\
+         fi\n\
+         exec cube \"$@\"\n",
+        sh_quote(body_prefix)
+    )
 }
 
 #[cfg(test)]
@@ -732,10 +780,10 @@ mod tests {
         }
     }
 
-    // ── write_boss_launcher ─────────────────────────────────────────────────
+    // ── worker launchers ────────────────────────────────────────────────────
 
     #[test]
-    fn writes_only_boss_and_never_bossctl() {
+    fn writes_boss_without_bossctl() {
         // The Boss-tier / worker-tier distinction: this directory is
         // prepended to the worker's PATH, so anything written here is
         // handed to the worker. `bossctl` must never be.
@@ -749,10 +797,60 @@ mod tests {
             .collect();
         entries.sort();
         assert_eq!(entries, vec!["boss".to_owned()]);
-        assert_eq!(launcher_names(), ["boss"]);
+        assert_eq!(launcher_names(), ["boss", "cube"]);
         assert!(
             !launcher_names().contains(&"bossctl"),
             "bossctl is Boss-tier and must stay off the worker PATH"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cube_prefix_launcher_passes_opaque_text_to_pr_create() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wrapper_dir = tmp.path().join("worker-bin");
+        let real_bin = tmp.path().join("real-bin");
+        let captured = tmp.path().join("captured-args");
+        let real_cube = real_bin.join("cube");
+        std::fs::create_dir_all(&real_bin).expect("mkdir real bin");
+        std::fs::write(
+            &real_cube,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CUBE_CAPTURED_ARGS\"\n",
+        )
+        .expect("write fake cube");
+        std::fs::set_permissions(&real_cube, std::fs::Permissions::from_mode(0o755)).expect("chmod fake cube");
+
+        let prefix = "## Context\n\nKeep `$(this text)` literal.";
+        let launcher = write_cube_pr_body_prefix_launcher(&wrapper_dir, prefix).expect("write wrapper");
+        let path = format!("{}:{}:/usr/bin:/bin", wrapper_dir.display(), real_bin.display());
+        let status = std::process::Command::new(&launcher)
+            .args(["pr", "create", "--title", "Example"])
+            .env(WORKER_BIN_DIR_ENV, &wrapper_dir)
+            .env("PATH", path)
+            .env("CUBE_CAPTURED_ARGS", &captured)
+            .status()
+            .expect("run wrapper");
+        assert!(status.success());
+
+        assert_eq!(
+            std::fs::read_to_string(&captured).expect("read captured args"),
+            format!("pr\ncreate\n--body-prefix\n{prefix}\n--title\nExample\n")
+        );
+    }
+
+    #[test]
+    fn refreshing_boss_launcher_removes_a_stale_cube_prefix_wrapper() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("bin");
+        write_cube_pr_body_prefix_launcher(&dir, "## Stale").expect("write prefix wrapper");
+        write_boss_launcher(&dir, Some(Path::new("/opt/boss/bin/boss"))).expect("refresh boss launcher");
+
+        assert!(dir.join(BOSS_LAUNCHER_NAME).exists());
+        assert!(
+            !dir.join(CUBE_LAUNCHER_NAME).exists(),
+            "a non-derived worker must not inherit a prior worker's prefix wrapper"
         );
     }
 

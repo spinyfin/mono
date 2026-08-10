@@ -371,7 +371,7 @@ pub(crate) fn resolve_revision_on_parent_close(
 
     // For PR-review revisions, emit a `followup` with provenance when the
     // chain root still has a parseable origin PR. Only tag `Followup` when
-    // that number is present — `followup_pr_environment` treats the kind as
+    // that number is present — `followup_pr_body_prefix` treats the kind as
     // a hard origin-PR contract and bails at dispatch otherwise, so minting
     // a Followup with `origin_pr_number = None` (missing/soft-deleted root
     // or unparseable `pr_url`) would permanently wedge the task. Fall back

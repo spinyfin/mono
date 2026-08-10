@@ -484,7 +484,7 @@ impl WorkDb {
         );
 
         // Only tag this as a `Followup` when it actually carries an origin PR
-        // number: `followup_pr_environment` treats `TaskKind::Followup` as a
+        // number: `followup_pr_body_prefix` treats `TaskKind::Followup` as a
         // hard contract that an origin PR exists, and bails at dispatch time
         // otherwise. A source task with no PR yet (doc-only work pushed
         // straight to main, an investigation, or scope deferred before ever

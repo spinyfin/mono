@@ -1068,19 +1068,20 @@ fn pr_number_from_url_returns_none_for_non_numeric_suffix() {
     );
 }
 
-fn pr_create_args(body: Option<&str>, body_file: Option<&str>) -> crate::cli::PrCreateArgs {
+fn pr_create_args(body_prefix: Option<&str>, body: Option<&str>, body_file: Option<&str>) -> crate::cli::PrCreateArgs {
     crate::cli::PrCreateArgs {
         branch: None,
         title: None,
         body: body.map(str::to_string),
         body_file: body_file.map(str::to_string),
+        body_prefix: body_prefix.map(str::to_string),
         draft: false,
     }
 }
 
 #[test]
 fn resolve_pr_body_uses_inline_body_flag() {
-    let args = pr_create_args(Some("PR body text"), None);
+    let args = pr_create_args(None, Some("PR body text"), None);
     let resolved = crate::app::pr::resolve_pr_body(&args).unwrap();
     assert_eq!(resolved.text.as_deref(), Some("PR body text"));
     assert_eq!(resolved.file_path, None);
@@ -1093,7 +1094,7 @@ fn resolve_pr_body_reads_body_file_from_regular_file() {
     std::fs::write(&path, "body from file\n").unwrap();
 
     let path_str = path.to_str().unwrap();
-    let args = pr_create_args(None, Some(path_str));
+    let args = pr_create_args(None, None, Some(path_str));
     let resolved = crate::app::pr::resolve_pr_body(&args).unwrap();
     assert_eq!(resolved.text.as_deref(), Some("body from file\n"));
     assert_eq!(resolved.file_path.as_deref(), Some(path_str));
@@ -1101,99 +1102,43 @@ fn resolve_pr_body_reads_body_file_from_regular_file() {
 
 #[test]
 fn resolve_pr_body_is_none_when_neither_flag_supplied() {
-    let args = pr_create_args(None, None);
+    let args = pr_create_args(None, None, None);
     let resolved = crate::app::pr::resolve_pr_body(&args).unwrap();
     assert_eq!(resolved.text, None);
     assert_eq!(resolved.file_path, None);
 }
 
 #[test]
-fn followup_pr_body_precedes_summary_for_review_findings() {
-    let context = crate::app::pr::FollowupPrContext {
-        kind: "review findings".to_owned(),
-        origin_pr_url: "https://github.com/spinyfin/mono/pull/2685".to_owned(),
-    };
-    let body = crate::app::pr::render_pr_body(Some("## Summary\n\nFix the finding."), Some(&context)).unwrap();
-
-    assert_eq!(
-        body,
-        "## Boss follow-up\n\nThis `review findings` follow-up derives from [the origin PR](https://github.com/spinyfin/mono/pull/2685).\n\n## Summary\n\nFix the finding."
-    );
-}
-
-#[test]
-fn followup_pr_body_covers_an_unlisted_derived_kind() {
-    let context = crate::app::pr::FollowupPrContext {
-        kind: "policy remediation".to_owned(),
-        origin_pr_url: "https://github.com/spinyfin/mono/pull/2710".to_owned(),
-    };
-    let body = crate::app::pr::render_pr_body(Some("## Summary\n\nApply the remediation."), Some(&context)).unwrap();
-
-    assert!(body.starts_with("## Boss follow-up\n\nThis `policy remediation` follow-up"));
-    assert!(body.contains("https://github.com/spinyfin/mono/pull/2710"));
-    assert!(body.find("## Boss follow-up").unwrap() < body.find("## Summary").unwrap());
-}
-
-#[test]
-fn followup_pr_body_pins_the_generic_kind_the_engine_actually_sends() {
-    // `followup_kind_label` in the engine falls back to `TaskKind::as_str()`
-    // ("followup") for any `created_via` shape it does not special-case, so
-    // this is the real degenerate value that can reach `gh pr create` — pin
-    // it here rather than only exercising the human-readable labels.
-    let context = crate::app::pr::FollowupPrContext {
-        kind: "followup".to_owned(),
-        origin_pr_url: "https://github.com/spinyfin/mono/pull/2702".to_owned(),
-    };
-    let body = crate::app::pr::render_pr_body(Some("## Summary\n\nFix the finding."), Some(&context)).unwrap();
-
-    assert_eq!(
-        body,
-        "## Boss follow-up\n\nThis `followup` follow-up derives from [the origin PR](https://github.com/spinyfin/mono/pull/2702).\n\n## Summary\n\nFix the finding."
-    );
-}
-
-#[test]
-fn followup_pr_context_from_values_is_none_when_origin_url_is_absent() {
-    let context = crate::app::pr::followup_pr_context_from_values(None, Some("review findings".to_owned())).unwrap();
-    assert_eq!(context, None);
-}
-
-#[test]
-fn followup_pr_context_from_values_rejects_an_empty_origin_url() {
-    let error =
-        crate::app::pr::followup_pr_context_from_values(Some(String::new()), Some("review findings".to_owned()))
-            .unwrap_err();
-    assert!(error.to_string().contains("BOSS_FOLLOWUP_ORIGIN_PR_URL is empty"));
-}
-
-#[test]
-fn followup_pr_context_from_values_rejects_a_missing_kind() {
-    let error = crate::app::pr::followup_pr_context_from_values(
-        Some("https://github.com/spinyfin/mono/pull/2702".to_owned()),
-        None,
+fn body_prefix_precedes_an_ordinary_body() {
+    let body = crate::app::pr::render_pr_body(
+        Some("<!-- generated context -->"),
+        Some("## Summary\n\nAdd a user setting."),
     )
-    .unwrap_err();
-    assert!(error.to_string().contains("BOSS_FOLLOWUP_KIND is missing"));
-}
-
-#[test]
-fn followup_pr_context_from_values_rejects_an_empty_kind() {
-    let error = crate::app::pr::followup_pr_context_from_values(
-        Some("https://github.com/spinyfin/mono/pull/2702".to_owned()),
-        Some("   ".to_owned()),
-    )
-    .unwrap_err();
-    assert!(error.to_string().contains("BOSS_FOLLOWUP_KIND is empty"));
-}
-
-#[test]
-fn followup_pr_context_from_values_trims_url_and_kind() {
-    let context = crate::app::pr::followup_pr_context_from_values(
-        Some("  https://github.com/spinyfin/mono/pull/2702  ".to_owned()),
-        Some("  review findings  ".to_owned()),
-    )
-    .unwrap()
     .unwrap();
-    assert_eq!(context.kind, "review findings");
-    assert_eq!(context.origin_pr_url, "https://github.com/spinyfin/mono/pull/2702");
+
+    assert_eq!(body, "<!-- generated context -->\n\n## Summary\n\nAdd a user setting.");
+}
+
+#[test]
+fn body_prefix_is_the_body_when_no_body_is_supplied() {
+    let body = crate::app::pr::render_pr_body(Some("_Generated notice._"), None).unwrap();
+
+    assert_eq!(body, "_Generated notice._");
+}
+
+#[test]
+fn body_prefix_is_opaque_markdown() {
+    let prefix = "## Context\n\nUse `$(safe)` exactly as written.";
+    let body = crate::app::pr::render_pr_body(Some(prefix), None).unwrap();
+
+    assert_eq!(body, prefix);
+}
+
+#[test]
+fn resolve_pr_body_materializes_a_prefix_without_a_worker_body() {
+    let args = pr_create_args(Some("## Context"), None, None);
+    let resolved = crate::app::pr::resolve_pr_body(&args).unwrap();
+
+    assert_eq!(resolved.text.as_deref(), Some("## Context"));
+    assert!(resolved.file_path.is_some());
 }
