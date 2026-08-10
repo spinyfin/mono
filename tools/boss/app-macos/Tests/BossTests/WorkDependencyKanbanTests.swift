@@ -89,6 +89,7 @@ final class WorkDependencyKanbanTests: XCTestCase {
             status: "archived",
             lastStatusActor: "human"
         )
+        model.invalidateWorkCache(.dependencies)
         XCTAssertFalse(model.isAutoBlocked(phase4))
         XCTAssertEqual(model.gatingPrereqs(for: phase4.id), [])
         XCTAssertEqual(model.dependencyPrereqs(for: phase4.id).map(\.status), ["archived"])
