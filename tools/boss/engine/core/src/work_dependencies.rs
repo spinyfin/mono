@@ -237,21 +237,14 @@ fn map_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItemDependency> {
 }
 
 /// Whether `status` counts as a "satisfied" prerequisite for the
-/// dependency rule (Q4 / Q10). Tasks and chores satisfy on `done`;
-/// projects also satisfy on `archived` (a wound-down project should
-/// not perpetually gate downstream work). The function is on `id`
-/// prefix because `tasks.kind` is not visible to callers that walk
-/// the edge table.
+/// dependency rule (Q4 / Q10). `done` and `archived` both satisfy: archived
+/// work will never complete, so it must not perpetually gate downstream work.
 ///
 /// This is the default (non-revision-aware) form. For a
 /// revision-specific gate check, use
 /// [`status_satisfies_for_dependent`] instead.
-pub fn status_satisfies(work_item_id: &str, status: &str) -> bool {
-    if work_item_id.starts_with("proj_") {
-        matches!(status, "done" | "archived")
-    } else {
-        status == "done"
-    }
+pub fn status_satisfies(status: &str) -> bool {
+    matches!(status, "done" | "archived")
 }
 
 /// Whether `prereq_status` counts as a satisfied prerequisite when
@@ -264,14 +257,13 @@ pub fn status_satisfies(work_item_id: &str, status: &str) -> bool {
 /// Waiting for `done` (merged) is a hard deadlock because by the
 /// time the PR merges the revision can no longer push to it.
 ///
-/// For all non-revision dependents the standard rules apply: task
-/// prereqs satisfy on `done`; project prereqs satisfy on
-/// `done`/`archived`.
-pub fn status_satisfies_for_dependent(prereq_id: &str, prereq_status: &str, dependent_kind: Option<&str>) -> bool {
+/// For all non-revision dependents the standard `done`/`archived` rules
+/// apply.
+pub fn status_satisfies_for_dependent(prereq_status: &str, dependent_kind: Option<&str>) -> bool {
     if dependent_kind == Some("revision") && prereq_status == "in_review" {
         return true;
     }
-    status_satisfies(prereq_id, prereq_status)
+    status_satisfies(prereq_status)
 }
 
 /// Look up the `kind` column for a task row. Returns `None` for
@@ -326,8 +318,7 @@ pub fn lookup_work_item_status(conn: &Connection, work_item_id: &str) -> Result<
 /// The satisfaction check is revision-aware: for `kind = 'revision'`
 /// dependents a prerequisite also satisfies when it reaches
 /// `in_review` (the PR is open and the revision can push to it).
-/// For all other dependents the standard `done`/`archived` rules
-/// apply.
+/// For all other dependents the standard `done`/`archived` rules apply.
 pub fn gating_prereqs_for(conn: &Connection, work_item_id: &str) -> Result<Vec<String>> {
     let dependent_kind = lookup_work_item_kind(conn, work_item_id)?;
     let edges = prerequisites_of(conn, work_item_id, Some(RELATION_BLOCKS))?;
@@ -335,7 +326,7 @@ pub fn gating_prereqs_for(conn: &Connection, work_item_id: &str) -> Result<Vec<S
     for edge in edges {
         let status = lookup_work_item_status(conn, &edge.prerequisite_id)?;
         match status {
-            Some(s) if status_satisfies_for_dependent(&edge.prerequisite_id, &s, dependent_kind.as_deref()) => {}
+            Some(s) if status_satisfies_for_dependent(&s, dependent_kind.as_deref()) => {}
             _ => gating.push(edge.prerequisite_id),
         }
     }
@@ -542,21 +533,25 @@ mod tests {
 
     // ── status_satisfies_for_dependent / revision-gate semantics ────────────
 
-    /// A non-revision dependent still requires `done` from a task prereq;
-    /// `in_review` must NOT satisfy it.
+    /// A non-revision dependent accepts terminal `done` or `archived` from a
+    /// task prereq; `in_review` must NOT satisfy it.
     #[test]
     fn in_review_does_not_satisfy_non_revision_dependent() {
         assert!(
-            !status_satisfies_for_dependent("task_prereq", "in_review", Some("chore")),
+            !status_satisfies_for_dependent("in_review", Some("chore")),
             "chore dependent: in_review must NOT satisfy"
         );
         assert!(
-            !status_satisfies_for_dependent("task_prereq", "in_review", None),
+            !status_satisfies_for_dependent("in_review", None),
             "no kind: in_review must NOT satisfy"
         );
         assert!(
-            status_satisfies_for_dependent("task_prereq", "done", Some("chore")),
+            status_satisfies_for_dependent("done", Some("chore")),
             "chore dependent: done must satisfy"
+        );
+        assert!(
+            status_satisfies_for_dependent("archived", Some("chore")),
+            "chore dependent: archived must release the dependent"
         );
     }
 
@@ -565,19 +560,19 @@ mod tests {
     #[test]
     fn in_review_satisfies_revision_dependent() {
         assert!(
-            status_satisfies_for_dependent("task_prereq", "in_review", Some("revision")),
+            status_satisfies_for_dependent("in_review", Some("revision")),
             "revision dependent: in_review must satisfy"
         );
         assert!(
-            status_satisfies_for_dependent("task_prereq", "done", Some("revision")),
+            status_satisfies_for_dependent("done", Some("revision")),
             "revision dependent: done must also satisfy"
         );
         assert!(
-            !status_satisfies_for_dependent("task_prereq", "todo", Some("revision")),
+            !status_satisfies_for_dependent("todo", Some("revision")),
             "revision dependent: todo must NOT satisfy"
         );
         assert!(
-            !status_satisfies_for_dependent("task_prereq", "active", Some("revision")),
+            !status_satisfies_for_dependent("active", Some("revision")),
             "revision dependent: active must NOT satisfy"
         );
     }
@@ -587,8 +582,8 @@ mod tests {
     /// status machine, but guard anyway).
     #[test]
     fn project_prereq_satisfies_on_done_or_archived() {
-        assert!(status_satisfies_for_dependent("proj_x", "done", Some("revision")));
-        assert!(status_satisfies_for_dependent("proj_x", "archived", Some("revision")));
-        assert!(!status_satisfies_for_dependent("proj_x", "active", Some("revision")));
+        assert!(status_satisfies_for_dependent("done", Some("revision")));
+        assert!(status_satisfies_for_dependent("archived", Some("revision")));
+        assert!(!status_satisfies_for_dependent("active", Some("revision")));
     }
 }

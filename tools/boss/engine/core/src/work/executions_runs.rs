@@ -1041,7 +1041,7 @@ impl WorkDb {
                          WHERE child.parent_task_id = ?1
                            AND child.kind = 'revision'
                            AND child.deleted_at IS NULL
-                           AND child.status NOT IN ('done', 'archived', 'cancelled')
+                           AND child.status NOT IN ('done', 'archived')
                      )
                  )
                )",

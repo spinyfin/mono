@@ -408,7 +408,7 @@ pub(crate) enum ProjectCommand {
 
 /// Subcommands under `boss task ...`.
 ///
-/// The kind-agnostic verbs (`show`, `update`, `move`, `cancel`, `delete`,
+/// The kind-agnostic verbs (`show`, `update`, `move`, `delete`,
 /// `restore`, `depend`, `bind-pr`) operate on any leaf work item by id. A chore
 /// *is* a kind of task — the engine already knows the kind from the
 /// id, so the noun is permissive. The same verbs are mirrored under
@@ -476,10 +476,6 @@ pub(crate) enum TaskCommand {
     Complete(TaskCompleteArgs),
     /// Move any leaf work item (task or chore) into a different status.
     Move(TaskMoveArgs),
-    /// Cancel any leaf work item (task or chore) by id. Shorthand for
-    /// `boss task move --to cancelled`: sets the terminal `Cancelled`
-    /// status without soft-deleting the row (unlike `delete`).
-    Cancel(TaskIdArg),
     /// Delete any leaf work item (task or chore) by id.
     Delete(TaskDeleteArgs),
     /// Restore a soft-deleted leaf work item (task or chore) — the
@@ -577,8 +573,6 @@ pub(crate) enum ChoreCommand {
     Update(Box<TaskUpdateArgs>),
     /// Alias for `boss task move`. Accepts any leaf work item id.
     Move(TaskMoveArgs),
-    /// Alias for `boss task cancel`. Accepts any leaf work item id.
-    Cancel(TaskIdArg),
     /// Alias for `boss task delete`. Accepts any leaf work item id.
     Delete(TaskDeleteArgs),
     /// Alias for `boss task restore`. Accepts any leaf work item id.
@@ -2337,12 +2331,9 @@ pub(crate) struct TaskListArgs {
     #[arg(long = "deleted", alias = "include-deleted")]
     pub(crate) include_deleted: bool,
 
-    /// Include archived *and* cancelled tasks in the listing. Both are
-    /// terminal statuses hidden from the default view (and, for
-    /// `archived`, from the kanban board) the same way tombstoned rows
-    /// are, but — unlike delete — they are never resurrected; this flag
-    /// is the only way to see them again short of `--status archived` /
-    /// `--status cancelled`.
+    /// Include archived tasks in the listing. Archived rows are hidden from
+    /// the default view and kanban board, but unlike deleted rows they retain
+    /// their history and can be reopened.
     #[arg(long = "include-archived")]
     pub(crate) include_archived: bool,
 
@@ -2614,7 +2605,7 @@ pub(crate) struct RevisionListArgs {
     #[arg(long = "deleted", alias = "include-deleted")]
     pub(crate) include_deleted: bool,
 
-    /// Include archived/cancelled revisions in the listing. See
+    /// Include archived revisions in the listing. See
     /// `boss task list --help`.
     #[arg(long = "include-archived")]
     pub(crate) include_archived: bool,
@@ -2709,7 +2700,7 @@ pub(crate) struct ChoreListArgs {
     #[arg(long = "deleted", alias = "include-deleted")]
     pub(crate) include_deleted: bool,
 
-    /// Include archived/cancelled chores in the listing. See
+    /// Include archived chores in the listing. See
     /// `boss task list --help`.
     #[arg(long = "include-archived")]
     pub(crate) include_archived: bool,

@@ -966,7 +966,7 @@ pub async fn on_conflict_detected_with(
 ///       finalize_conflict_resolution_attempt never ran), leaving the crz
 ///       `pending` with `revision_task_id` set against an old head; or
 ///   (b) the linked revision task is dead — either it reached a terminal
-///       status (in_review/done/cancelled) without the crz ever being
+///       status (in_review/done/archived) without the crz ever being
 ///       finalised (same orphan-sweep abandonment scenario, head SHA
 ///       unchanged), or its execution died outright (e.g. an engine
 ///       restart) while the task itself never progressed past a live

@@ -178,9 +178,8 @@ where
 }
 
 /// Set of work item ids that have at least one `blocks` edge to a
-/// prerequisite that has not reached a satisfied status. Tasks /
-/// chores satisfy on `status = 'done'`; projects also satisfy on
-/// `archived` (Q4 / Q10). Computed via two SQL joins so the helper
+/// prerequisite that has not reached a satisfied status. `done` and
+/// `archived` satisfy for every work item (Q4 / Q10). Computed via two SQL joins so the helper
 /// does one round-trip regardless of the dependent count.
 pub(crate) fn compute_gated_work_item_ids(conn: &Connection) -> Result<HashSet<String>> {
     let mut ids: HashSet<String> = HashSet::new();
@@ -190,7 +189,7 @@ pub(crate) fn compute_gated_work_item_ids(conn: &Connection) -> Result<HashSet<S
          JOIN tasks t ON t.id = d.prerequisite_id
          WHERE d.relation = 'blocks'
            AND t.deleted_at IS NULL
-           AND t.status != 'done'",
+           AND t.status NOT IN ('done', 'archived')",
     )?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     for row in rows {
@@ -522,7 +521,7 @@ pub(crate) fn cascade_dependents_after_prereq_status_change(
     // full gating list via `gating_prereqs_for`, which is revision-
     // aware, so non-revision dependents are not inadvertently unblocked
     // by an `in_review` transition.
-    let might_satisfy = deps::status_satisfies(prereq_id, new_prereq_status) || new_prereq_status == "in_review";
+    let might_satisfy = deps::status_satisfies(new_prereq_status) || new_prereq_status == "in_review";
     if !might_satisfy {
         return Ok(());
     }

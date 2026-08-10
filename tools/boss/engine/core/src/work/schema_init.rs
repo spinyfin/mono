@@ -710,13 +710,6 @@ impl WorkDb {
         // The spawn path does not use these columns until the tmux-hosting
         // rollout lands.
         migrate_work_runs_tmux_columns(conn)?;
-        // Backfill: tombstone `merge-conflict:*` / `ci-fix:*` revisions that
-        // were cancelled by a human before their chain root's PR merged or
-        // closed, and never revisited afterward because
-        // `block_pending_revisions_on_parent_close` used to treat `cancelled`
-        // as already-terminal. Data-only, self-idempotent — see the function
-        // doc comment.
-        migrate_backfill_cancelled_moot_revision_tombstones(conn)?;
         // `execution_driver_decisions`: one row per execution recording the
         // driver traffic allocation decision (driver + reason + the split it
         // was decided under). New table plus one additive column, independent
@@ -760,6 +753,7 @@ impl WorkDb {
         // first — the constraint migration's table rebuild would
         // otherwise reject any still-corrupt row.
         migrate_repair_invalid_project_status(conn)?;
+        migrate_tasks_cancelled_status_to_archived(conn)?;
         migrate_projects_tasks_status_check(conn)?;
         // Project lifecycle provenance: the current row states why its status
         // was selected, and the existing append-only property audit retains

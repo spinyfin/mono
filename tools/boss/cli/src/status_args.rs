@@ -173,7 +173,6 @@ pub(crate) enum TaskStatusArg {
     Review,
     Done,
     Archived,
-    Cancelled,
 }
 
 /// `boss task|chore move --to`. Same board-name-primary,
@@ -190,7 +189,6 @@ pub(crate) enum MoveTarget {
     Done,
     Blocked,
     Archived,
-    Cancelled,
 }
 
 impl ProductStatus {
@@ -253,7 +251,6 @@ impl TaskStatusArg {
             Self::Review => "review",
             Self::Done => "done",
             Self::Archived => "archived",
-            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -276,7 +273,6 @@ impl MoveTarget {
             Self::Done => "done",
             Self::Blocked => "blocked",
             Self::Archived => "archived",
-            Self::Cancelled => "cancelled",
         }
     }
 }

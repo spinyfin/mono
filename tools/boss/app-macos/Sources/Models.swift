@@ -218,8 +218,8 @@ struct WorkTask: Identifiable, Hashable {
     var originPrNumber: Int? = nil
 
     /// Unix epoch seconds (decimal string) at which this task last
-    /// transitioned into a terminal status (`done`, `archived`, or
-    /// `cancelled`). `nil` for non-terminal rows and for terminal rows
+    /// transitioned into a terminal status (`done` or `archived`).
+    /// `nil` for non-terminal rows and for terminal rows
     /// pre-dating the engine migration (those get `created_at` as a
     /// conservative backfill). The Done-lane bucketing groups by this
     /// field so a bulk mutation that re-stamps `updated_at` on many done

@@ -1955,7 +1955,7 @@ pub(crate) fn format_dependency_edge_line(edge: &DependencyEdge, mark_incomplete
     } else {
         format!(" \"{}\"", edge.name)
     };
-    let suffix = if mark_incomplete && !dependency_status_is_satisfied(&edge.id, &edge.status) {
+    let suffix = if mark_incomplete && !dependency_status_is_satisfied(&edge.status) {
         "  ← INCOMPLETE"
     } else {
         ""
@@ -1971,16 +1971,12 @@ pub(crate) fn format_dependency_edge_line(edge: &DependencyEdge, mark_incomplete
 }
 
 /// Whether `status` counts as "this prereq is no longer gating its
-/// dependent." Mirrors the engine-side rule (Q4 / Q10): tasks /
-/// chores satisfy on `done`; projects also satisfy on `archived`.
+/// dependent." Mirrors the engine-side rule (Q4 / Q10): `done` and
+/// `archived` satisfy for every work item.
 /// The dependent annotator uses the inverse to print
 /// `← INCOMPLETE`.
-pub(crate) fn dependency_status_is_satisfied(id: &str, status: &str) -> bool {
-    if id.starts_with("proj_") {
-        matches!(status, "done" | "archived")
-    } else {
-        status == "done"
-    }
+pub(crate) fn dependency_status_is_satisfied(status: &str) -> bool {
+    matches!(status, "done" | "archived")
 }
 
 pub(crate) async fn reorder_project_tasks(

@@ -432,7 +432,7 @@ impl WorkDb {
     ///
     /// A no-op (`Ok(None)`) when:
     /// - the task can't be found, or
-    /// - it is already terminal (`done`/`archived`/`cancelled`) or
+    /// - it is already terminal (`done`/`archived`) or
     ///   `in_review` (its commit will ride the eventual merge via
     ///   [`flip_in_review_revisions_to_done`] instead), or
     /// - a worker is still genuinely driving it (a `running` /
@@ -452,7 +452,7 @@ impl WorkDb {
         if rev.deleted_at.is_some()
             || matches!(
                 rev.status,
-                TaskStatus::Done | TaskStatus::Archived | TaskStatus::Cancelled | TaskStatus::InReview
+                TaskStatus::Done | TaskStatus::Archived | TaskStatus::InReview
             )
         {
             return Ok(None);

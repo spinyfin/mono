@@ -1208,11 +1208,12 @@ fn dispatcher_holds_gated_dependents_in_waiting_dependency() {
     let exec_b = db.list_executions(Some(&b.id)).unwrap().pop().unwrap();
     assert_eq!(exec_b.status, ExecutionStatus::Ready);
 
-    // Move B to done. Reconcile then promotes A's execution to ready.
+    // Archiving B disposes of a prerequisite that will never complete, so it
+    // must release A and promote its waiting execution to ready.
     db.update_work_item(
         &b.id,
         WorkItemPatch {
-            status: Some("done".to_owned()),
+            status: Some("archived".to_owned()),
             ..WorkItemPatch::default()
         },
     )

@@ -696,7 +696,7 @@ pub(crate) fn reconcile_revision_execution(
             .optional()?;
         let is_terminal = fresh_status
             .as_deref()
-            .is_none_or(|s| matches!(s, "done" | "archived" | "cancelled" | "in_review"));
+            .is_none_or(|s| matches!(s, "done" | "archived" | "in_review"));
         let already_closed =
             fresh_status.as_deref() == Some("blocked") && task.blocked_reason.as_deref() == Some("parent_pr_closed");
         if is_terminal || already_closed {
@@ -910,7 +910,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
     let preferred_workspace_id = normalize_optional_text(preferred_workspace_id);
     let kind = execution_kind_for_work_item(conn, &work_item_id)?;
 
-    // Refuse explicit dispatch against a terminal (done/archived/cancelled)
+    // Refuse explicit dispatch against a terminal (done/archived)
     // work item instead of silently creating a `ready` execution that can
     // never run — the row is closed, so nothing will ever pick it up, and
     // the next reconcile tick that revisits a terminal revision archives it
@@ -1339,7 +1339,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
 ///
 /// Refuses (returns `Err`) when:
 /// - the work item is unknown or soft-deleted,
-/// - the work item's status is terminal (`done`/`archived`/`cancelled`) —
+/// - the work item's status is terminal (`done`/`archived`) —
 ///   nothing left to review,
 /// - `pr_url` is unset — the item has no PR yet,
 /// - the live PR-state probe reports the PR merged or closed — nothing to

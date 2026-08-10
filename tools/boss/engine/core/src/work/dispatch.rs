@@ -236,7 +236,7 @@ impl WorkDb {
 
     /// Reconciliation sweep: abandon any `queued` / `ready` /
     /// `waiting_dependency` execution whose work item is a task in a
-    /// terminal status (`done` / `archived` / `cancelled`) or soft-deleted.
+    /// terminal status (`done` / `archived`) or soft-deleted.
     /// A dispatchable execution has no business existing against a closed
     /// row — it can never be picked up (the dispatcher only surfaces
     /// non-terminal work items) and just confuses `bossctl agents list` /
@@ -257,7 +257,7 @@ impl WorkDb {
                  FROM work_executions we
                  JOIN tasks t ON t.id = we.work_item_id
                  WHERE we.status IN ('queued', 'ready', 'waiting_dependency')
-                   AND (t.status IN ('done', 'archived', 'cancelled') OR t.deleted_at IS NOT NULL)",
+                   AND (t.status IN ('done', 'archived') OR t.deleted_at IS NOT NULL)",
             )?;
             stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
@@ -818,7 +818,7 @@ impl WorkDb {
              FROM tasks t
              JOIN work_executions we ON we.work_item_id = t.id
              WHERE t.deleted_at IS NULL
-               AND t.status NOT IN ('done', 'archived', 'cancelled')
+               AND t.status NOT IN ('done', 'archived')
                AND t.pr_url IS NOT NULL AND t.pr_url != ''
                AND we.kind = 'pr_review'
                AND we.status IN ('orphaned', 'abandoned', 'failed', 'cancelled')

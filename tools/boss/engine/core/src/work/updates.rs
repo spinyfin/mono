@@ -44,7 +44,7 @@ fn project_task_completion_counts(conn: &Connection, project_id: &str) -> Result
     conn.query_row(
         "SELECT COUNT(*),
                 COALESCE(SUM(CASE
-                    WHEN status IN ('done', 'archived', 'cancelled') THEN 0
+                    WHEN status IN ('done', 'archived') THEN 0
                     ELSE 1
                 END), 0)
          FROM tasks
@@ -537,7 +537,7 @@ impl WorkDb {
         }
         // Human-driven close ritual: moving to `done` requires a non-empty
         // completion_summary (supplied by `boss task complete --summary`).
-        // Archive/cancel remain ordinary escapes and do not require a summary.
+        // Archival remains an ordinary escape and does not require a summary.
         if status_changed && task.status == TaskStatus::Done && task.human_driven {
             let summary_ok = task.completion_summary.as_deref().is_some_and(|s| !s.trim().is_empty());
             if !summary_ok {
@@ -574,7 +574,7 @@ impl WorkDb {
                  effort_matched_rule = ?24, effort_reasons = ?25, project_id = ?26, kind = ?27,
                  last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END,
                  completed_at = CASE
-                     WHEN ?4 IN ('done', 'archived', 'cancelled') THEN COALESCE(completed_at, ?7)
+                     WHEN ?4 IN ('done', 'archived') THEN COALESCE(completed_at, ?7)
                      ELSE NULL
                  END
              WHERE id = ?1",

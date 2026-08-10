@@ -72,6 +72,31 @@ final class WorkDependencyKanbanTests: XCTestCase {
         XCTAssertEqual(model.dependencyPrereqs(for: dependent.id).first?.status, "active")
     }
 
+    /// An archived task prereq must satisfy gating the same as a done
+    /// one — mirrors the engine's `status_satisfies` rule, which treats
+    /// `done` and `archived` identically for every work item kind.
+    /// Regression coverage for the app's hand-written mirrors of that
+    /// rule falling out of sync after the engine started accepting
+    /// `archived` as a satisfying status.
+    func testArchivedPrereqSatisfiesGating() {
+        let model = makeFixture()
+        guard let phase2 = model.taskByName("Phase 2"),
+              let phase4 = model.taskByName("Phase 4")
+        else {
+            XCTFail("expected fixture tasks"); return
+        }
+        model.upsertTaskForTest(
+            id: phase2.id,
+            name: phase2.name,
+            status: "archived",
+            lastStatusActor: "human"
+        )
+        model.invalidateWorkCache(.dependencies)
+        XCTAssertFalse(model.isAutoBlocked(phase4))
+        XCTAssertEqual(model.gatingPrereqs(for: phase4.id), [])
+        XCTAssertEqual(model.dependencyPrereqs(for: phase4.id).map(\.status), ["archived"])
+    }
+
     /// Drag refusal: dropping a gated row out of Blocked must be
     /// rejected and surface an inline notice keyed to the source
     /// card's id. The lane never sees the move; the warning replaces

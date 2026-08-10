@@ -84,7 +84,7 @@ fn has_in_flight_ci_fix_revision_true_for_each_live_status() {
 }
 
 /// (3) The CI-fix revision reaching a terminal status (`in_review`, `done`,
-/// `cancelled`) drops it out of the live set → false. This is the gate's whole
+/// `archived`) drops it out of the live set → false. This is the gate's whole
 /// point: once the worker has pushed and moved on, a fresh attempt may proceed.
 #[test]
 fn has_in_flight_ci_fix_revision_false_for_terminal_status() {
@@ -93,7 +93,7 @@ fn has_in_flight_ci_fix_revision_false_for_terminal_status() {
     let chore = make_chore_root(&db, &product_id, "terminal-rev");
     let revision = insert_ci_fix_revision_row(&db, &product_id, &chore, "rem_2");
 
-    for status in ["in_review", "done", "cancelled"] {
+    for status in ["in_review", "done", "archived"] {
         set_status(&db, &revision, status);
         assert!(
             !db.has_in_flight_ci_fix_revision(&chore).unwrap(),

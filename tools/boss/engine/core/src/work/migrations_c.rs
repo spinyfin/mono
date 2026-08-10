@@ -144,7 +144,7 @@ const TASKS_STATUS_CHECK_COLUMNS: &[(&str, &str)] = &[
     ("description", "description TEXT NOT NULL DEFAULT ''"),
     (
         "status",
-        "status TEXT NOT NULL CHECK (status IN ('todo', 'active', 'blocked', 'in_review', 'done', 'archived', 'cancelled'))",
+        "status TEXT NOT NULL CHECK (status IN ('todo', 'active', 'blocked', 'in_review', 'done', 'archived'))",
     ),
     ("ordinal", "ordinal INTEGER"),
     ("pr_url", "pr_url TEXT"),
@@ -300,7 +300,8 @@ const TASKS_STATUS_CHECK_INDEXES: &str = "\
 /// single startup.
 pub(crate) fn migrate_projects_tasks_status_check(conn: &Connection) -> Result<()> {
     let projects_constrained = table_has_status_check(conn, "projects")?;
-    let tasks_constrained = table_has_status_check(conn, "tasks")?;
+    let tasks_constrained =
+        table_has_status_check(conn, "tasks")? && !table_status_check_includes(conn, "tasks", "cancelled")?;
     let scratch_present = table_exists(conn, "projects_v2")? || table_exists(conn, "tasks_v2")?;
     if projects_constrained && tasks_constrained && !scratch_present {
         return Ok(());
@@ -323,6 +324,24 @@ pub(crate) fn migrate_projects_tasks_status_check(conn: &Connection) -> Result<(
     };
     rebuilt?;
     restored?;
+    Ok(())
+}
+
+/// Collapse retired task status data before rebuilding the status constraint.
+/// The existing `archived_reason` is intentionally retained as the one
+/// provenance surface for both automatic archival and this historical
+/// migration; no second terminal state or extra column is needed.
+pub(crate) fn migrate_tasks_cancelled_status_to_archived(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE tasks
+         SET status = 'archived',
+             archived_reason = COALESCE(NULLIF(archived_reason, ''), 'migrated from legacy cancelled status'),
+             completed_at = COALESCE(completed_at, created_at),
+             merge_queue_state = NULL,
+             merge_queue_detail = NULL
+         WHERE status = 'cancelled'",
+        [],
+    )?;
     Ok(())
 }
 
@@ -506,6 +525,50 @@ fn table_has_status_check(conn: &Connection, table: &str) -> Result<bool> {
         .unwrap_or(false))
 }
 
+/// `true` if `value` appears as a quoted literal inside `table`'s status
+/// `CHECK (status IN (...))` clause specifically — not merely somewhere in
+/// the table's full DDL. Scoping to the clause matters because other
+/// columns on the same table (e.g. an execution- or merge-queue-mirroring
+/// status column) can legitimately carry the same literal; a whole-DDL
+/// substring match would trip on those and never re-arm.
+fn table_status_check_includes(conn: &Connection, table: &str, value: &str) -> Result<bool> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(sql
+        .and_then(|sql| status_check_clause(&sql))
+        .is_some_and(|clause| clause.contains(&format!("'{value}'"))))
+}
+
+/// Extract the `CHECK (status IN (...))` clause from `sql` (a table's live
+/// DDL), whitespace-collapsed so a clause written across multiple lines
+/// still matches. Returns `None` if the table has no status CHECK clause.
+fn status_check_clause(sql: &str) -> Option<String> {
+    let collapsed = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    let start = collapsed
+        .find("CHECK (status IN")
+        .or_else(|| collapsed.find("CHECK ( status IN"))?;
+    let open_idx = start + collapsed[start..].find('(')?;
+    let mut depth = 0usize;
+    for (offset, ch) in collapsed[open_idx..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(collapsed[start..open_idx + offset + 1].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The column names `table` actually has right now, in schema order.
 fn live_column_names(conn: &Connection, table: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -513,4 +576,52 @@ fn live_column_names(conn: &Connection, table: &str) -> Result<Vec<String>> {
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<String>>>()?;
     Ok(names)
+}
+
+#[cfg(test)]
+mod status_check_clause_tests {
+    use super::status_check_clause;
+
+    /// A literal that only appears outside the `CHECK (status IN (...))`
+    /// clause — e.g. a default on an unrelated column carrying the same
+    /// word as a status value — must not be mistaken for part of the
+    /// status vocabulary. This is the regression the whole-DDL substring
+    /// match used to miss.
+    #[test]
+    fn ignores_literal_outside_the_status_clause() {
+        let sql = "CREATE TABLE tasks (\n  \
+             status TEXT NOT NULL CHECK (status IN ('todo', 'active', 'done', 'archived')),\n  \
+             merge_queue_state TEXT DEFAULT 'cancelled'\n\
+             )";
+        let clause = status_check_clause(sql).expect("status CHECK clause must be found");
+        assert!(!clause.contains("'cancelled'"));
+        assert!(clause.contains("'archived'"));
+    }
+
+    /// A literal genuinely inside the status vocabulary must still match.
+    #[test]
+    fn finds_literal_inside_the_status_clause() {
+        let sql = "CREATE TABLE tasks (\n  \
+             status TEXT NOT NULL CHECK (status IN ('todo', 'cancelled'))\n\
+             )";
+        let clause = status_check_clause(sql).expect("status CHECK clause must be found");
+        assert!(clause.contains("'cancelled'"));
+    }
+
+    /// Whitespace layout (the clause split across lines) must not change
+    /// the extracted boundaries.
+    #[test]
+    fn collapses_whitespace_across_lines() {
+        let sql = "CREATE TABLE tasks (\n  status TEXT NOT NULL CHECK (\n    status IN ('todo', 'done')\n  )\n)";
+        let clause = status_check_clause(sql).expect("status CHECK clause must be found");
+        assert_eq!(clause, "CHECK ( status IN ('todo', 'done') )");
+    }
+
+    /// A table with no status CHECK clause at all yields `None` rather
+    /// than false-matching on unrelated parens.
+    #[test]
+    fn returns_none_when_no_status_check_present() {
+        let sql = "CREATE TABLE widgets (id TEXT PRIMARY KEY, kind TEXT CHECK (kind IN ('a', 'b')))";
+        assert!(status_check_clause(sql).is_none());
+    }
 }
