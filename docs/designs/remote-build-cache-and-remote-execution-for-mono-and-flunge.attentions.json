@@ -1,0 +1,34 @@
+[
+  {
+    "question_type": "yes_no",
+    "prompt": "Accept the recommendation to build no shared remote cache and no remote execution cluster now, and instead land the local fixes (disk-cache retention cap, Bazel concurrency bound, invocation instrumentation)?",
+    "anchor": "verdict"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Is a second machine expected to start running Boss workers in the next quarter? The remote-cache entries are gated on that event, so a 'yes' moves them from deferred to near-term.",
+    "anchor": "interaction-with-distributed-agent-execution"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "If the eviction study concludes the two repos' working set does not fit in a local cache, which backend should the shared remote cache use?",
+    "choices": [
+      "bazel-remote on an existing owned Linux CI host (empiricist / zoologist / diziet)",
+      "BuildBuddy cache-only, reusing the account flunge CI already has",
+      "NativeLink self-hosted, if macOS executors are also wanted later",
+      "Decide then, not now"
+    ],
+    "anchor": "cost-and-hosting"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Should any additional Mac hardware serve as a Boss agent host or as a macOS RBE executor? The design measures the agent-host role as strictly more valuable per machine.",
+    "choices": [
+      "Agent host (the design's recommendation)",
+      "macOS RBE executor",
+      "Both roles on the same machine",
+      "No additional Mac is planned"
+    ],
+    "anchor": "interaction-with-distributed-agent-execution"
+  }
+]
