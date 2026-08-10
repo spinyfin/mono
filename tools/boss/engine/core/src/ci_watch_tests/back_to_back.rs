@@ -41,7 +41,7 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
         &db,
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
-        Some("feature"),
+        "pr-head-1",
         "sha-merge-1",
         &[],
         &one_failure(),
@@ -102,7 +102,7 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
         &db,
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
-        Some("feature"),
+        "pr-head-1",
         "sha-merge-1",
         &[],
         &one_failure(),
@@ -131,7 +131,7 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
         assert_eq!(r, 1, "sha1 replay must not spawn a second revision");
     }
 
-    // Step 4b: same sweep also sees SHA_2 — a genuinely NEW failing merge SHA.
+    // Step 4b: same sweep also sees SHA_2 for a genuinely new PR head.
     // INSERT succeeds (new key); the chore is in_review (SHA_1 replay was a
     // no-op), so mark_chore_blocked_ci_failure flips it to blocked and the
     // fresh attempt gets its own revision immediately.
@@ -139,7 +139,7 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
         &db,
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
-        Some("feature"),
+        "pr-head-2",
         "sha-merge-2",
         &[],
         &one_failure(),
@@ -147,15 +147,15 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
     .await;
     assert!(
         sha2_detect,
-        "sha2 is a new failing merge SHA — it must bounce the in_review chore to blocked"
+        "a new PR head with a new failing queue run must bounce the chore"
     );
-    // SHA_2's ci_remediations row must exist as pending with revision_task_id stamped.
+    // PR head 2's ci_remediations row must be pending with a revision stamped.
     let sha2_attempt = {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         let pending: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM ci_remediations
-                  WHERE work_item_id = ?1 AND head_sha_at_trigger = 'sha-merge-2'
+                  WHERE work_item_id = ?1 AND head_sha_at_trigger = 'pr-head-2'
                     AND status = 'pending'",
                 rusqlite::params![&chore],
                 |r| r.get(0),

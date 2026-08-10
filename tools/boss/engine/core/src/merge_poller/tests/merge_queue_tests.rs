@@ -5,13 +5,23 @@ use super::*;
 /// FAILED_CHECKS.  The parser must accept the lowercase form.
 #[test]
 fn parse_dequeue_event_nodes_accepts_lowercase_failed_checks() {
+    // Replay of mono#2692's timeline: the PR head precedes the failed queue
+    // synthetic commit in the ordered connection.
     let nodes = serde_json::json!([
-        {"reason": "failed_checks", "beforeCommit": {"oid": "abc123def456"}}
+        {"__typename": "PullRequestCommit", "commit": {"oid": "0d9dab33152f553bfe6072ccbd6f33fad7dd9d2d"}},
+        {"__typename": "RemovedFromMergeQueueEvent", "reason": "failed_checks", "beforeCommit": {"oid": "e005ddece2a840a944f5ffdfa7bad640d54af9c1"}}
     ]);
     let events = parse_dequeue_event_nodes(nodes.as_array().unwrap());
     assert_eq!(events.len(), 1, "lowercase 'failed_checks' must be surfaced");
     assert_eq!(events[0].reason, "failed_checks");
-    assert_eq!(events[0].before_commit_oid.as_deref(), Some("abc123def456"));
+    assert_eq!(
+        events[0].pr_head_oid.as_deref(),
+        Some("0d9dab33152f553bfe6072ccbd6f33fad7dd9d2d")
+    );
+    assert_eq!(
+        events[0].before_commit_oid.as_deref(),
+        Some("e005ddece2a840a944f5ffdfa7bad640d54af9c1")
+    );
 }
 
 /// The schema-documented uppercase form must also be accepted for
@@ -19,10 +29,12 @@ fn parse_dequeue_event_nodes_accepts_lowercase_failed_checks() {
 #[test]
 fn parse_dequeue_event_nodes_accepts_uppercase_failed_checks() {
     let nodes = serde_json::json!([
-        {"reason": "FAILED_CHECKS", "beforeCommit": {"oid": "def456abc789"}}
+        {"__typename": "HeadRefForcePushedEvent", "afterCommit": {"oid": "forced-head"}},
+        {"__typename": "RemovedFromMergeQueueEvent", "reason": "FAILED_CHECKS", "beforeCommit": {"oid": "def456abc789"}}
     ]);
     let events = parse_dequeue_event_nodes(nodes.as_array().unwrap());
     assert_eq!(events.len(), 1, "uppercase 'FAILED_CHECKS' must also be surfaced");
+    assert_eq!(events[0].pr_head_oid.as_deref(), Some("forced-head"));
     assert_eq!(events[0].before_commit_oid.as_deref(), Some("def456abc789"));
 }
 
@@ -52,6 +64,23 @@ fn parse_dequeue_event_nodes_handles_null_before_commit() {
     let events = parse_dequeue_event_nodes(nodes.as_array().unwrap());
     assert_eq!(events.len(), 1, "null beforeCommit must not drop the event");
     assert!(events[0].before_commit_oid.is_none());
+    assert!(events[0].pr_head_oid.is_none());
+}
+
+/// The parser snapshots the head at each dequeue rather than applying a
+/// later force-push retroactively to an older queue failure.
+#[test]
+fn parse_dequeue_event_nodes_attributes_each_event_to_its_contemporaneous_head() {
+    let nodes = serde_json::json!([
+        {"__typename": "PullRequestCommit", "commit": {"oid": "head-before"}},
+        {"__typename": "RemovedFromMergeQueueEvent", "reason": "failed_checks", "beforeCommit": {"oid": "queue-1"}},
+        {"__typename": "HeadRefForcePushedEvent", "afterCommit": {"oid": "head-after"}},
+        {"__typename": "RemovedFromMergeQueueEvent", "reason": "failed_checks", "beforeCommit": {"oid": "queue-2"}}
+    ]);
+    let events = parse_dequeue_event_nodes(nodes.as_array().unwrap());
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].pr_head_oid.as_deref(), Some("head-before"));
+    assert_eq!(events[1].pr_head_oid.as_deref(), Some("head-after"));
 }
 
 /// An empty nodes array returns an empty vec without panicking.
@@ -85,6 +114,8 @@ fn build_batch_query_with_dequeue_events_fields_requests_timeline_items() {
          leaving it inferable from the gap between two `remaining` readings"
     );
     assert!(query.contains("REMOVED_FROM_MERGE_QUEUE_EVENT"));
+    assert!(query.contains("PULL_REQUEST_COMMIT"));
+    assert!(query.contains("HEAD_REF_FORCE_PUSHED_EVENT"));
     assert!(
         !query.contains("statusCheckRollup"),
         "must not pull in the PR-probe field set"
@@ -104,7 +135,8 @@ fn walk_batch_response_locates_timeline_items_per_pr() {
                 "pr0": {
                     "timelineItems": {
                         "nodes": [
-                            {"reason": "failed_checks", "beforeCommit": {"oid": "sha9"}}
+                            {"__typename": "PullRequestCommit", "commit": {"oid": "head9"}},
+                            {"__typename": "RemovedFromMergeQueueEvent", "reason": "failed_checks", "beforeCommit": {"oid": "sha9"}}
                         ]
                     }
                 }
@@ -117,7 +149,68 @@ fn walk_batch_response_locates_timeline_items_per_pr() {
     let nodes = node.unwrap()["timelineItems"]["nodes"].as_array().cloned().unwrap();
     let events = parse_dequeue_event_nodes(&nodes);
     assert_eq!(events.len(), 1);
+    assert_eq!(events[0].pr_head_oid.as_deref(), Some("head9"));
     assert_eq!(events[0].before_commit_oid.as_deref(), Some("sha9"));
+}
+
+/// GitHub's squash-mode queue commit is ancestry-diverged from the PR head
+/// even when it tested that exact head. An unchanged PR-head probe must keep
+/// the queue remediation active and must not let the green PR rollup rewrite
+/// the work item's combined CI state to success.
+#[tokio::test]
+async fn unchanged_pr_head_keeps_queue_failure_active_and_visible() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/2692";
+    let (product_id, chore) = make_chore_in_review(&db, "C-queue-squash", pr);
+    let publisher = Arc::new(RecordingPublisher::default());
+    let candidate = PendingMergeCheck {
+        work_item_id: chore.clone(),
+        product_id,
+        pr_url: pr.to_owned(),
+    };
+
+    assert!(
+        ci_watch::on_merge_queue_rebounce_detected(
+            &db,
+            publisher.as_ref(),
+            &candidate,
+            "pr-head-under-test",
+            "synthetic-squash-commit",
+            &[],
+            &[RequiredCheckFailure {
+                name: "buildkite/checks".to_owned(),
+                conclusion: "FAILURE".to_owned(),
+                target_url: "https://buildkite.com/foo/bar/builds/1".to_owned(),
+                provider: CiProvider::Buildkite,
+                provider_job_id: None,
+            }],
+        )
+        .await
+    );
+
+    let probe = StubProbe::new();
+    probe.set_with_base_head(
+        pr,
+        PrLifecycleState::Open(OpenPrStatus::clean()),
+        "base-head",
+        "pr-head-under-test",
+    );
+    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
+
+    let active = db
+        .active_ci_remediation_for_work_item(&chore)
+        .unwrap()
+        .expect("unchanged PR head must keep the queue failure active");
+    assert_eq!(active.head_sha_at_trigger, "pr-head-under-test");
+    assert_eq!(active.before_commit_sha.as_deref(), Some("synthetic-squash-commit"));
+    match db.get_work_item(&chore).unwrap() {
+        WorkItem::Chore(task) => {
+            assert_eq!(task.status, TaskStatus::InReview);
+            assert_eq!(task.ci_required_state.as_deref(), Some("fail"));
+        }
+        other => panic!("expected chore, got {other:?}"),
+    }
 }
 
 // ----- GitHub API quota throttling -----

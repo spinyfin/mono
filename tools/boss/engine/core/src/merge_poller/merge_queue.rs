@@ -4,6 +4,13 @@ use super::*;
 #[derive(Debug, Clone)]
 pub struct MergeQueueDequeueEvent {
     pub reason: String,
+    /// PR head that was in effect when this timeline event was emitted.
+    /// Derived from the preceding `PullRequestCommit` /
+    /// `HeadRefForcePushedEvent` in the same ordered timeline connection.
+    /// `None` means the bounded timeline window did not carry enough
+    /// evidence to attribute the queue failure to a PR head, so callers
+    /// must not mint a CI-failure revision from it.
+    pub pr_head_oid: Option<String>,
     /// `beforeCommit.oid` — the synthetic merge SHA that failed CI.
     /// `None` when GitHub omitted it (edge case for non-CI reasons).
     pub before_commit_oid: Option<String>,
@@ -11,11 +18,16 @@ pub struct MergeQueueDequeueEvent {
 
 /// Timeline-events selection set for [`build_batch_query`]'s `fields`
 /// parameter, used by [`fetch_merge_queue_dequeue_events_batch`]. Requests
-/// the last 20 `RemovedFromMergeQueueEvent` timeline entries — enough to
-/// cover any realistically plausible burst of re-enqueue/dequeue cycles on
-/// a single PR within one poll pass.
+/// the last 20 PR-head / dequeue timeline entries. Including PR commits and
+/// force-pushes is what ties a failed queue run to the exact PR head it
+/// tested; the synthetic squash-mode queue commit is not a descendant of
+/// the PR head and therefore cannot establish that relationship through
+/// Git ancestry.
 pub(crate) const DEQUEUE_EVENTS_FIELDS: &str = concat!(
-    "timelineItems(itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT], last: 20) { nodes { ",
+    "timelineItems(itemTypes: [PULL_REQUEST_COMMIT, HEAD_REF_FORCE_PUSHED_EVENT, ",
+    "REMOVED_FROM_MERGE_QUEUE_EVENT], last: 20) { nodes { __typename ",
+    "... on PullRequestCommit { commit { oid } } ",
+    "... on HeadRefForcePushedEvent { afterCommit { oid } } ",
     "... on RemovedFromMergeQueueEvent { reason beforeCommit { oid } } } }",
 );
 
@@ -126,9 +138,9 @@ pub(crate) async fn fetch_merge_queue_dequeue_events_batch(
     out
 }
 
-/// Shared node-level parser for a `timelineItems.nodes` array (whichever
-/// shape the caller located it in — [`fetch_merge_queue_dequeue_events_batch`]'s
-/// per-PR aliased node). Returns events with `reason == "failed_checks"`
+/// Shared node-level parser for an ordered `timelineItems.nodes` array.
+/// Tracks PR-commit / force-push nodes as the head provenance for subsequent
+/// dequeue nodes, then returns events with `reason == "failed_checks"`
 /// (case-insensitive; GitHub's API returns the lowercase form even though
 /// the GraphQL schema documents the enum as uppercase `FAILED_CHECKS`).
 /// Events for other reasons (`MANUAL_REMOVAL`, `MERGE_CONFLICT`, etc.) are
@@ -138,7 +150,23 @@ pub(crate) async fn fetch_merge_queue_dequeue_events_batch(
 /// unit-tested without a live `gh` call.
 pub(crate) fn parse_dequeue_event_nodes(nodes: &[serde_json::Value]) -> Vec<MergeQueueDequeueEvent> {
     let mut events = Vec::new();
+    let mut pr_head_oid: Option<String> = None;
     for node in nodes {
+        match node["__typename"].as_str() {
+            Some("PullRequestCommit") => {
+                if let Some(oid) = node["commit"]["oid"].as_str() {
+                    pr_head_oid = Some(oid.to_owned());
+                }
+                continue;
+            }
+            Some("HeadRefForcePushedEvent") => {
+                if let Some(oid) = node["afterCommit"]["oid"].as_str() {
+                    pr_head_oid = Some(oid.to_owned());
+                }
+                continue;
+            }
+            _ => {}
+        }
         let reason = match node["reason"].as_str() {
             Some(r) => r.to_owned(),
             None => continue,
@@ -154,6 +182,7 @@ pub(crate) fn parse_dequeue_event_nodes(nodes: &[serde_json::Value]) -> Vec<Merg
         let before_commit_oid = node["beforeCommit"]["oid"].as_str().map(|s| s.to_owned());
         events.push(MergeQueueDequeueEvent {
             reason,
+            pr_head_oid: pr_head_oid.clone(),
             before_commit_oid,
         });
     }
@@ -203,7 +232,18 @@ pub(crate) async fn check_merge_queue_rebounce(
     if events.is_empty() {
         return;
     }
-    for event in events {
+    // Newest first: repeated enqueue attempts of the same unchanged PR head
+    // share one remediation budget, and the freshest synthetic run is the
+    // most useful CI evidence to retain on that row.
+    for event in events.iter().rev() {
+        let Some(pr_head_sha) = event.pr_head_oid.as_deref() else {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                "merge poller: FAILED_CHECKS dequeue event has no attributable PR head; skipping",
+            );
+            continue;
+        };
         let Some(before_commit_sha) = event.before_commit_oid.as_deref() else {
             tracing::debug!(
                 work_item_id = %candidate.work_item_id,
@@ -221,11 +261,12 @@ pub(crate) async fn check_merge_queue_rebounce(
         // live (historically 1000+ re-fetches for a single PR episode).
         // `on_merge_queue_rebounce_detected`'s INSERT OR IGNORE is the
         // authoritative no-op; this just avoids the surrounding work.
-        match work_db.ci_remediation_exists_for_head_sha_at_trigger(&candidate.work_item_id, before_commit_sha) {
+        match work_db.ci_remediation_exists_for_head_sha_at_trigger(&candidate.work_item_id, pr_head_sha) {
             Ok(true) => {
                 tracing::debug!(
                     work_item_id = %candidate.work_item_id,
                     pr_url = %candidate.pr_url,
+                    pr_head_sha,
                     before_commit_sha,
                     "merge poller: rebounce episode already recorded; skipping re-fetch",
                 );
@@ -260,7 +301,7 @@ pub(crate) async fn check_merge_queue_rebounce(
             work_db,
             publisher,
             candidate,
-            None, // head_ref_name not available without a probe round-trip
+            pr_head_sha,
             before_commit_sha,
             &[], // labels not available here; opt-out check uses product flag only
             &failures,

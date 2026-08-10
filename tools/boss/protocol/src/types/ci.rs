@@ -71,7 +71,9 @@ pub struct CiBudgetSnapshot {
 /// after the parent's branch is recycled. `head_sha_at_trigger` is
 /// the discriminator that the UNIQUE key
 /// (`(work_item_id, head_sha_at_trigger, attempt_kind)`) uses to
-/// keep two probes on the same failure from creating two rows.
+/// keep two probes on the same failure from creating two rows. For a
+/// merge-queue rebounce this is the PR head attributed to the dequeue event;
+/// `before_commit_sha` separately stores the synthetic merged-result commit.
 /// `head_sha_after` brackets the worker's push (`None` on failure
 /// or for re-trigger-only attempts).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]

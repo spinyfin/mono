@@ -536,6 +536,7 @@ impl WorkDb {
             "UPDATE tasks
                 SET status            = 'blocked',
                     blocked_reason    = 'ci_failure_exhausted',
+                    ci_required_state = 'fail',
                     last_status_actor = 'engine',
                     updated_at        = ?3
               WHERE id = ?1
@@ -573,6 +574,7 @@ impl WorkDb {
                 SET status             = 'blocked',
                     blocked_reason     = ?4,
                     blocked_attempt_id = COALESCE(?3, blocked_attempt_id),
+                    ci_required_state  = 'fail',
                     last_status_actor  = 'engine',
                     updated_at         = ?5
               WHERE id = ?1

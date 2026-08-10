@@ -2062,7 +2062,7 @@ async fn rebounce_settles_then_conflicting_base_rebuckets_via_sweep() {
         &db,
         publisher.as_ref(),
         &rebounce_candidate,
-        Some("feature-branch"),
+        "original-pr-head",
         "synthetic-merge-sha",
         &[],
         // A failing check from the synthetic merge commit: a queue-side
@@ -2152,11 +2152,11 @@ async fn rebounce_settles_then_conflicting_base_rebuckets_via_sweep() {
     }
 }
 
-/// A GitHub queue commit is not part of the PR branch. Once a fix push makes
-/// the current PR head diverge from that synthetic commit, the old queue
-/// attempt must retire before failure detection evaluates the new head.
+/// Once a fix push advances the PR head beyond the head attributed to the
+/// queue event, the old queue attempt must retire before failure detection
+/// evaluates the new head.
 #[tokio::test]
-async fn diverged_queue_attempt_retires_and_new_head_failure_mints_again() {
+async fn advanced_pr_head_retires_queue_attempt_and_new_failure_mints_again() {
     let dir = tempdir().unwrap();
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
     let pr = "https://github.com/foo/bar/pull/2650";
@@ -2173,7 +2173,7 @@ async fn diverged_queue_attempt_retires_and_new_head_failure_mints_again() {
             &db,
             publisher.as_ref(),
             &candidate,
-            Some("feature-branch"),
+            "original-pr-head",
             "synthetic-queue-commit",
             &[],
             &[RequiredCheckFailure {
@@ -2224,8 +2224,6 @@ async fn diverged_queue_attempt_retires_and_new_head_failure_mints_again() {
         "base-head",
         "new-pr-head",
     );
-    probe.set_commit_relation("new-pr-head", "synthetic-queue-commit", CommitRelation::Diverged);
-
     let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(
         outcome.ci_flagged, 1,

@@ -1023,7 +1023,7 @@ pub async fn on_merge_queue_rebounce_detected(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
     candidate: &PendingMergeCheck,
-    head_ref_name: Option<&str>,
+    pr_head_sha: &str,
     before_commit_sha: &str,
     labels: &[String],
     failures: &[RequiredCheckFailure],
@@ -1032,9 +1032,14 @@ pub async fn on_merge_queue_rebounce_detected(
         work_db,
         publisher,
         candidate,
-        head_ref_name,
+        None,
         QueueSideFailureEpisode {
-            discriminator: before_commit_sha,
+            // A squash-mode GitHub merge-queue commit has only the base
+            // commit as its parent, so it is not a descendant of the PR
+            // head. Key the remediation on the PR head captured from the
+            // ordered timeline instead; keep the synthetic commit in
+            // `before_commit_sha` for CI-log lookup and provenance.
+            discriminator: pr_head_sha,
             before_commit_sha: Some(before_commit_sha),
             failure_kind: "merge_queue_rebounce",
             labels,
@@ -1269,8 +1274,9 @@ async fn on_queue_side_failure_detected(
 
     // `discriminator` serves as `head_sha_at_trigger` so the unique key
     // `(work_item_id, head_sha_at_trigger, attempt_kind)` naturally
-    // deduplicates on this episode: two polls that see the same event hit
-    // the same key and the second `INSERT OR IGNORE` is a no-op.
+    // deduplicates on the PR contribution that failed in the queue. A
+    // retry of the same PR head must not spend another remediation budget;
+    // a real fix push advances the head and admits a new attempt.
     let insert_result = work_db.insert_ci_remediation(CiRemediationInsertInput {
         product_id: candidate.product_id.clone(),
         work_item_id: candidate.work_item_id.clone(),
@@ -1804,18 +1810,13 @@ pub async fn on_ci_in_flight_supersedes_failure(
     //      from a CI run that is no longer current.
     match work_db.active_ci_remediation_for_work_item(&candidate.work_item_id) {
         Ok(Some(active)) => {
-            // A queue-side failure (merge-queue rebounce or a Trunk queue
-            // eviction) lives on a synthetic/ephemeral commit
-            // (`head_sha_at_trigger` is the synthetic merge sha or the
-            // `trunk:<id>@<stateChangedAt>` discriminator), never on the PR
-            // head. A head-branch InFlight probe is therefore not evidence
-            // the failure cleared, and the stale-head comparison below would
-            // ALWAYS read "stale" (that discriminator can never equal the PR
-            // head) — so it would abandon the attempt and clear the block on
-            // every poll, fighting the detector which re-blocks on the next
-            // sweep. That tug-of-war is the observed blocked<->in_review
-            // flap. Leave a queue-side block to its terminal signal (worker
-            // marks the attempt succeeded, or a new failing episode).
+            // A queue-side failure lives on a merged-result CI surface, not
+            // the PR-head rollup. Merge-queue rebounces now key
+            // `head_sha_at_trigger` on the attributed PR head (while Trunk
+            // uses its episode discriminator), but an InFlight head-branch
+            // probe is still not evidence the queue failure cleared. Leave a
+            // queue-side block to its terminal signal or the dedicated
+            // PR-head-advance reaper.
             // Mirrors the identical guard in `on_ci_resolved`.
             if is_queue_side_failure_kind(active.failure_kind.as_deref()) {
                 record_declined_evaluation(

@@ -18,14 +18,12 @@ use crate::work::{
 
 struct StubProbe {
     states: std::sync::Mutex<std::collections::HashMap<String, Result<PrLifecycleProbe, String>>>,
-    commit_relations: std::sync::Mutex<std::collections::HashMap<(String, String), CommitRelation>>,
 }
 
 impl StubProbe {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             states: std::sync::Mutex::new(Default::default()),
-            commit_relations: std::sync::Mutex::new(Default::default()),
         })
     }
 
@@ -84,13 +82,6 @@ impl StubProbe {
     fn set_err(&self, url: &str, msg: &str) {
         self.states.lock().unwrap().insert(url.to_owned(), Err(msg.to_owned()));
     }
-
-    fn set_commit_relation(&self, base: &str, head: &str, relation: CommitRelation) {
-        self.commit_relations
-            .lock()
-            .unwrap()
-            .insert((base.to_owned(), head.to_owned()), relation);
-    }
 }
 
 #[async_trait]
@@ -107,15 +98,6 @@ impl MergeProbe for StubProbe {
                 .review(PrReviewState::Unknown)
                 .build()),
         }
-    }
-
-    async fn compare_commits(&self, _repo_slug: &str, base: &str, head: &str) -> Result<CommitRelation> {
-        self.commit_relations
-            .lock()
-            .unwrap()
-            .get(&(base.to_owned(), head.to_owned()))
-            .copied()
-            .ok_or_else(|| anyhow!("no stubbed commit relation for {base}...{head}"))
     }
 }
 
