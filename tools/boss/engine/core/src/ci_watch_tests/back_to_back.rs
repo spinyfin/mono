@@ -155,7 +155,7 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
         let pending: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM ci_remediations
-                  WHERE work_item_id = ?1 AND head_sha_at_trigger = 'pr-head-2'
+                  WHERE work_item_id = ?1 AND head_sha_at_trigger = 'mq:pr-head-2'
                     AND status = 'pending'",
                 rusqlite::params![&chore],
                 |r| r.get(0),

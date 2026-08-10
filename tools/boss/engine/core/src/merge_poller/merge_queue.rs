@@ -266,14 +266,12 @@ pub(crate) async fn check_merge_queue_rebounce(
             );
             continue;
         };
-        if let Some(current) = current_pr_head.as_deref()
-            && pr_head_sha != current
-        {
+        if !dequeue_event_is_for_current_pr_head(event, current_pr_head.as_deref()) {
             tracing::debug!(
                 work_item_id = %candidate.work_item_id,
                 pr_url = %candidate.pr_url,
                 pr_head_sha,
-                current_pr_head = current,
+                current_pr_head = current_pr_head.as_deref(),
                 before_commit_sha,
                 "merge poller: rebounce event attributed to superseded PR head; skipping",
             );
@@ -349,6 +347,20 @@ pub(crate) async fn check_merge_queue_rebounce(
             // Just aggregate the sweep metric.
             outcome.merge_queue_rebounced += 1;
         }
+    }
+}
+
+/// A historical dequeue is actionable only while it is attributed to the
+/// freshly-polled PR head. Missing current-head state is tolerated for the
+/// first pass after an older database row; an explicit mismatch is stale.
+pub(crate) fn dequeue_event_is_for_current_pr_head(
+    event: &MergeQueueDequeueEvent,
+    current_pr_head: Option<&str>,
+) -> bool {
+    match (event.pr_head_oid.as_deref(), current_pr_head) {
+        (Some(event_head), Some(current_head)) => event_head == current_head,
+        (Some(_), None) => true,
+        (None, _) => false,
     }
 }
 

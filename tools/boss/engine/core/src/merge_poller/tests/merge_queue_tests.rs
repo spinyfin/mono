@@ -202,7 +202,7 @@ async fn unchanged_pr_head_keeps_queue_failure_active_and_visible() {
         .active_ci_remediation_for_work_item(&chore)
         .unwrap()
         .expect("unchanged PR head must keep the queue failure active");
-    assert_eq!(active.head_sha_at_trigger, "pr-head-under-test");
+    assert_eq!(active.head_sha_at_trigger, "mq:pr-head-under-test");
     assert_eq!(active.before_commit_sha.as_deref(), Some("synthetic-squash-commit"));
     match db.get_work_item(&chore).unwrap() {
         WorkItem::Chore(task) => {
@@ -277,6 +277,160 @@ async fn legacy_queue_attempt_with_live_revision_stays_pending_when_head_advance
     assert_eq!(still.id, attempt.id);
     assert_eq!(still.status, "pending");
     assert_eq!(still.head_sha_at_trigger, "synthetic-legacy-sha");
+}
+
+/// A legacy synthetic-key row must retire after its linked fix revision
+/// reaches `in_review`, the normal concluded state while the parent PR stays
+/// open. Retiring releases the synthetic failure pin back to the clean
+/// PR-head rollup.
+#[tokio::test]
+async fn legacy_queue_attempt_with_concluded_revision_retires_and_unpins() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/legacy-concluded";
+    let (product_id, chore) = make_chore_in_review(&db, "C-legacy-concluded", pr);
+    let publisher = Arc::new(RecordingPublisher::default());
+    let candidate = PendingMergeCheck {
+        work_item_id: chore.clone(),
+        product_id,
+        pr_url: pr.to_owned(),
+    };
+    assert!(
+        ci_watch::on_merge_queue_rebounce_detected(
+            &db,
+            publisher.as_ref(),
+            &candidate,
+            "original-pr-head",
+            "synthetic-legacy-sha",
+            &[],
+            &[],
+        )
+        .await
+    );
+    let attempt = db
+        .active_ci_remediation_for_work_item(&chore)
+        .unwrap()
+        .expect("rebounce attempt");
+    let revision_id = attempt.revision_task_id.as_deref().expect("linked revision");
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    conn.execute(
+        "UPDATE ci_remediations
+            SET head_sha_at_trigger = 'synthetic-legacy-sha',
+                before_commit_sha = 'synthetic-legacy-sha'
+          WHERE id = ?1",
+        rusqlite::params![&attempt.id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+        rusqlite::params![revision_id],
+    )
+    .unwrap();
+
+    let probe = StubProbe::new();
+    probe.set_with_base_head(
+        pr,
+        PrLifecycleState::Open(OpenPrStatus::clean()),
+        "base-head",
+        "current-pr-head",
+    );
+    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
+
+    let attempts = db.list_ci_remediations(None, &[], Some(&chore), None).unwrap();
+    assert!(attempts.iter().any(|row| {
+        row.id == attempt.id
+            && row.status == "abandoned"
+            && row.failure_reason.as_deref() == Some("merge_queue_trigger_superseded")
+    }));
+    match db.get_work_item(&chore).unwrap() {
+        WorkItem::Chore(task) => assert_eq!(task.ci_required_state.as_deref(), Some("success")),
+        other => panic!("expected chore, got {other:?}"),
+    }
+}
+
+/// The raw PR-head UNIQUE key is shared with ordinary branch-CI attempts.
+/// Rebounces namespace their key so both failure surfaces can be recorded.
+#[tokio::test]
+async fn rebounce_at_a_head_with_branch_ci_remediation_still_mints_attempt() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/rebounce-collision";
+    let (product_id, chore) = make_chore_in_review(&db, "C-rebounce-collision", pr);
+    db.insert_ci_remediation(crate::work::CiRemediationInsertInput {
+        product_id: product_id.clone(),
+        work_item_id: chore.clone(),
+        pr_url: pr.to_owned(),
+        pr_number: 1,
+        head_branch: "feature".to_owned(),
+        head_sha_at_trigger: "shared-pr-head".to_owned(),
+        attempt_kind: "fix".to_owned(),
+        consumes_budget: 1,
+        failed_checks: "[]".to_owned(),
+        failure_kind: "pr_branch_ci".to_owned(),
+        before_commit_sha: None,
+    })
+    .unwrap()
+    .expect("branch CI remediation");
+    assert!(
+        !db.ci_remediation_exists_for_merge_queue_episode(&chore, "shared-pr-head", "synthetic-queue-sha",)
+            .unwrap()
+    );
+    let publisher = Arc::new(RecordingPublisher::default());
+    let candidate = PendingMergeCheck {
+        work_item_id: chore.clone(),
+        product_id,
+        pr_url: pr.to_owned(),
+    };
+    assert!(
+        ci_watch::on_merge_queue_rebounce_detected(
+            &db,
+            publisher.as_ref(),
+            &candidate,
+            "shared-pr-head",
+            "synthetic-queue-sha",
+            &[],
+            &[],
+        )
+        .await
+    );
+    let attempts = db.list_ci_remediations(None, &[], Some(&chore), None).unwrap();
+    assert!(attempts.iter().any(|row| {
+        row.failure_kind.as_deref() == Some("merge_queue_rebounce") && row.head_sha_at_trigger == "mq:shared-pr-head"
+    }));
+}
+
+/// Superseded events must not consume a remediation attempt. A same-head
+/// event passes the gate and is then able to mint its rebounce attempt.
+#[tokio::test]
+async fn dequeue_event_head_gate_skips_superseded_and_admits_current_head() {
+    let stale = MergeQueueDequeueEvent {
+        reason: "failed_checks".to_owned(),
+        pr_head_oid: Some("head-1".to_owned()),
+        before_commit_oid: Some("queue-1".to_owned()),
+    };
+    assert!(!dequeue_event_is_for_current_pr_head(&stale, Some("head-2")));
+
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/current-head-gate";
+    let (product_id, chore) = make_chore_in_review(&db, "C-current-head-gate", pr);
+    assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 0);
+    let current = MergeQueueDequeueEvent {
+        pr_head_oid: Some("head-2".to_owned()),
+        ..stale
+    };
+    assert!(dequeue_event_is_for_current_pr_head(&current, Some("head-2")));
+    let publisher = Arc::new(RecordingPublisher::default());
+    let candidate = PendingMergeCheck {
+        work_item_id: chore.clone(),
+        product_id,
+        pr_url: pr.to_owned(),
+    };
+    assert!(
+        ci_watch::on_merge_queue_rebounce_detected(&db, publisher.as_ref(), &candidate, "head-2", "queue-1", &[], &[],)
+            .await
+    );
+    assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 1);
 }
 
 /// Empty `failed_checks = "[]"` is an explicitly reachable insert state for

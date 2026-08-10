@@ -961,9 +961,11 @@ impl WorkDb {
 
     /// Merge-queue rebounce episode dedup during the head-key transition.
     ///
-    /// Current writers store the attributed PR head in `head_sha_at_trigger`
-    /// and the synthetic queue commit in `before_commit_sha`. Pre-transition
-    /// rows stored the synthetic commit in **both** columns (and human
+    /// Current writers store a namespaced attributed PR head in
+    /// `head_sha_at_trigger` and the synthetic queue commit in
+    /// `before_commit_sha`. The raw-head writer immediately before that
+    /// transition and pre-transition rows storing the synthetic commit in
+    /// **both** columns (and human
     /// suppressions / UNIQUE inserts keyed on that synthetic value). Match
     /// either SHA against either column so already-handled ejections and
     /// suppressions continue to short-circuit after deploy instead of
@@ -979,8 +981,10 @@ impl WorkDb {
             "SELECT EXISTS(
                  SELECT 1 FROM ci_remediations
                   WHERE work_item_id = ?1
+                    AND failure_kind = 'merge_queue_rebounce'
                     AND (
-                         head_sha_at_trigger = ?2
+                         head_sha_at_trigger = 'mq:' || ?2
+                      OR head_sha_at_trigger = ?2
                       OR head_sha_at_trigger = ?3
                       OR before_commit_sha = ?2
                       OR before_commit_sha = ?3

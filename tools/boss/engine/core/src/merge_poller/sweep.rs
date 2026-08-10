@@ -1354,11 +1354,9 @@ async fn reap_superseded_merge_queue_attempt(
     // Rows created before the queue detector began storing the PR head used
     // the synthetic commit as both fields. There is no reliable way to
     // reconstruct the tested PR head from such a squash commit. Fail closed
-    // while a linked revision is still live (do not re-mint mid-fix), but
-    // retire once the revision is terminal — or was never linked — so a
-    // closed/abandoned legacy attempt cannot pin `ci_required_state` to
-    // `fail` forever. Re-detection under the new PR-head key covers any
-    // still-actionable current-head failure.
+    // while a linked revision is still live (do not re-mint mid-fix). A
+    // concluded linked revision is the only safe escape: a never-linked or
+    // unreadable row remains pinned and is retried on the next sweep.
     if active.before_commit_sha.as_deref() == Some(active.head_sha_at_trigger.as_str()) {
         if legacy_merge_queue_attempt_may_retire(work_db, &active) {
             let retired = ci_watch::retire_superseded_merge_queue_attempt(
@@ -1366,7 +1364,7 @@ async fn reap_superseded_merge_queue_attempt(
                 publisher,
                 candidate,
                 &active,
-                current_head_sha,
+                ci_watch::MergeQueueAttemptRetirementReason::LegacyTriggerRevisionConcluded,
             )
             .await;
             return if retired { None } else { Some(active) };
@@ -1379,7 +1377,7 @@ async fn reap_superseded_merge_queue_attempt(
         );
         return Some(active);
     }
-    if active.head_sha_at_trigger == current_head_sha {
+    if ci_watch::merge_queue_rebounce_pr_head(&active.head_sha_at_trigger) == current_head_sha {
         ci_watch::record_declined_evaluation(
             candidate,
             &active,
@@ -1388,23 +1386,42 @@ async fn reap_superseded_merge_queue_attempt(
         );
         return Some(active);
     }
-    let retired =
-        ci_watch::retire_superseded_merge_queue_attempt(work_db, publisher, candidate, &active, current_head_sha).await;
+    let retired = ci_watch::retire_superseded_merge_queue_attempt(
+        work_db,
+        publisher,
+        candidate,
+        &active,
+        ci_watch::MergeQueueAttemptRetirementReason::PrHeadAdvanced { current_head_sha },
+    )
+    .await;
     if retired { None } else { Some(active) }
 }
 
 /// Whether a pre-head-key merge-queue remediation may leave the fail-closed
-/// legacy branch: no linked revision, or the linked revision is terminal /
-/// missing. Keeps an in-flight fix revision's attempt active so the pin and
-/// worker stay coherent until the revision finishes.
+/// legacy branch once its linked fix revision concludes. Keeps a missing,
+/// unreadable, or still-live revision fail-closed so a legacy queue failure
+/// cannot be cleared without evidence that its remediation ran.
 fn legacy_merge_queue_attempt_may_retire(work_db: &WorkDb, active: &CiRemediation) -> bool {
     let Some(revision_id) = active.revision_task_id.as_deref() else {
-        return true;
+        return false;
     };
     match work_db.get_work_item(revision_id) {
-        Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => task.status.is_terminal(),
-        Ok(_) => true,
-        Err(_) => true,
+        Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => matches!(
+            task.status,
+            crate::work::TaskStatus::InReview
+                | crate::work::TaskStatus::Done
+                | crate::work::TaskStatus::Archived
+                | crate::work::TaskStatus::Cancelled
+        ),
+        Ok(_) => false,
+        Err(err) => {
+            tracing::warn!(
+                revision_task_id = revision_id,
+                ?err,
+                "merge poller: failed to read legacy merge-queue fix revision; retaining attempt",
+            );
+            false
+        }
     }
 }
 

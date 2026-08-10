@@ -75,7 +75,7 @@ async fn rebounce_flips_in_review_to_blocked_ci_failure() {
         .unwrap()
         .expect("active attempt row");
     assert_eq!(attempt.failure_kind.as_deref(), Some("merge_queue_rebounce"));
-    assert_eq!(attempt.head_sha_at_trigger, "pr-head-at-trigger");
+    assert_eq!(attempt.head_sha_at_trigger, "mq:pr-head-at-trigger");
     assert_eq!(attempt.before_commit_sha.as_deref(), Some("synthetic-merge-sha-abc"));
     assert!(
         attempt.revision_task_id.is_some(),
@@ -212,7 +212,7 @@ async fn rebounce_with_empty_failures_still_flips_with_generic_directive() {
     .await;
     assert!(!again, "already-recorded empty-evidence rebounce must not re-flip");
     assert!(
-        db.ci_remediation_exists_for_head_sha_at_trigger(&chore, "pr-head-at-trigger")
+        db.ci_remediation_exists_for_head_sha_at_trigger(&chore, "mq:pr-head-at-trigger")
             .unwrap(),
         "dedup key must be present for the merge-queue pre-fetch short-circuit"
     );
