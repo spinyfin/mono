@@ -25,9 +25,10 @@
 //!   free text or a Claude-shaped `tool_response` object. There is
 //!   exactly one extraction algorithm; drivers only change what feeds
 //!   it.
-//! - [`is_gh_pr_command`] / [`is_gh_pr_command_str`] — Layer-1 gate so
-//!   arbitrary Bash/shell output that happens to mention a PR URL does
-//!   not stage the wrong PR.
+//! - [`is_pr_url_binding_command`] / [`is_pr_url_binding_command_str`] —
+//!   Layer-1 gate so arbitrary Bash/shell output that happens to mention a
+//!   PR URL does not bind the wrong PR. A narrower finalization gate keeps
+//!   read-only and metadata commands from authorizing a recheck teardown.
 //! - [`StagedPrUrlCache`] — a thread-safe `HashMap<execution_id,
 //!   StagedPrUrlEntry>` that callers populate from progress events and the
 //!   `on_stop` handler reads on Stop. First-writer-wins semantics
@@ -289,27 +290,23 @@ fn peel_shell_c_payload(command: &str) -> Option<&str> {
     Some(&inner[..close])
 }
 
-/// Check whether a shell command string is a deliberate `gh pr` /
-/// `cube pr` invocation that can arm PR-URL staging (create, edit, or
-/// cube wrappers — not read-only view/list).
+/// Check whether a shell command string is a deliberate `gh pr` / `cube pr`
+/// invocation whose output may bind a PR URL to the execution.
 ///
-/// Returns `true` only when the command is a `gh pr <subcommand>`
-/// invocation whose subcommand is evidence the worker is producing or
-/// mutating its own PR (`create` / `edit`), or a
-/// `cube pr create|update|ensure` wrapper. Read-only `view` / `list`
-/// are deliberately excluded: they print a PR URL as a side effect of
-/// inspection, not of completion, and used to arm the merge-poller's
-/// staged-URL recheck against a still-running worker. Handles
-/// environment-variable prefixes such as
+/// This intentionally accepts `gh pr create|view|list|edit` as well as
+/// `cube pr create|update|ensure`: each is a supported source of a PR URL
+/// for binding recovery. It does *not* decide whether observing that command
+/// may finalize the execution; use [`is_pr_url_finalization_command_str`]
+/// for that narrower question. Handles environment-variable prefixes such as
 /// `GIT_DIR=.jj/repo/store/git gh pr create ...` via the shared
 /// [`classify`] matcher, and Codex-style shell wrappers
 /// (`/bin/zsh -lc 'gh pr …'`) via [`peel_shell_c_payload`].
 ///
-/// Use this as the Layer-1 gate in the progress-event capture path:
+/// Use this as the binding gate in the progress-event capture path:
 /// arbitrary shell commands whose output happens to contain a PR URL
-/// (file reads, test runs, chore descriptions echoed via shell) must
-/// not stage a wrong PR against the running execution.
-pub fn is_gh_pr_command_str(command: &str) -> bool {
+/// (file reads, test runs, chore descriptions echoed via shell) must not bind
+/// a wrong PR against the running execution.
+pub fn is_pr_url_binding_command_str(command: &str) -> bool {
     // `cube pr create` / `cube pr update` (and the deprecated `cube pr
     // ensure` alias) are the jj-aware wrappers that output a PR URL as their
     // only stdout line — treat them the same as `gh pr create` for capture
@@ -327,18 +324,41 @@ pub fn is_gh_pr_command_str(command: &str) -> bool {
         classify(command),
         Some(inv)
             if inv.noun == GhNoun::Pr
-                && matches!(inv.subcommand.as_str(), "create" | "edit")
+                && matches!(inv.subcommand.as_str(), "create" | "view" | "list" | "edit")
     )
 }
 
 /// Claude-shaped wrapper: read `tool_input.command` and delegate to
-/// [`is_gh_pr_command_str`]. Prefer the string form when the command
+/// [`is_pr_url_binding_command_str`]. Prefer the string form when the command
 /// already came from a [`boss_engine_driver::PrUrlCaptureFeed`].
-pub fn is_gh_pr_command(tool_input: &serde_json::Value) -> bool {
+pub fn is_pr_url_binding_command(tool_input: &serde_json::Value) -> bool {
     let Some(command) = tool_input.get("command").and_then(|v| v.as_str()) else {
         return false;
     };
-    is_gh_pr_command_str(command)
+    is_pr_url_binding_command_str(command)
+}
+
+/// Check whether a command that printed a PR URL is evidence that the worker
+/// published or pushed that PR and may therefore arm recheck finalization.
+///
+/// This is deliberately narrower than [`is_pr_url_binding_command_str`].
+/// `gh pr view`, `gh pr list`, and `gh pr edit` may all report a useful URL,
+/// but none demonstrates that this execution pushed work. `gh pr create` and
+/// the `cube pr` publishing wrappers do demonstrate that.
+pub fn is_pr_url_finalization_command_str(command: &str) -> bool {
+    if command.contains("cube pr create") || command.contains("cube pr update") || command.contains("cube pr ensure") {
+        return true;
+    }
+    let command = peel_shell_c_payload(command).unwrap_or(command);
+    matches!(classify(command), Some(inv) if inv.noun == GhNoun::Pr && inv.subcommand == "create")
+}
+
+/// Claude-shaped wrapper for [`is_pr_url_finalization_command_str`].
+pub fn is_pr_url_finalization_command(tool_input: &serde_json::Value) -> bool {
+    let Some(command) = tool_input.get("command").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    is_pr_url_finalization_command_str(command)
 }
 
 /// Outcome of [`StagedPrUrlCache::record_if_unset`].
@@ -361,6 +381,10 @@ pub enum StagePrUrlOutcome {
 pub struct StagedPrUrlEntry {
     pub pr_url: String,
     pub staged_at: Instant,
+    /// Whether the command that bound this URL also demonstrated that the
+    /// worker published or pushed it. Binding alone is not permission for the
+    /// merge-poller recheck to finalize and reap a live execution.
+    pub finalization_armed: bool,
 }
 
 /// In-memory `execution_id → pr_url` staging cache. Populated by the
@@ -368,9 +392,9 @@ pub struct StagedPrUrlEntry {
 /// URL; consumed by `WorkerCompletionHandler::on_stop` on the
 /// matching Stop hook.
 ///
-/// First-writer-wins. A worker that pushes, opens a PR (URL latched),
-/// then later runs `gh pr edit` (or another create) while finishing —
-/// the later URL doesn't clobber the legitimate first `create`.
+/// First-writer-wins for the URL itself. A later publish command may promote
+/// a binding-only observation to finalizable, but it cannot replace the
+/// original bound URL.
 #[derive(Debug, Default)]
 pub struct StagedPrUrlCache {
     inner: Mutex<HashMap<String, StagedPrUrlEntry>>,
@@ -393,6 +417,7 @@ impl StagedPrUrlCache {
                 StagedPrUrlEntry {
                     pr_url: pr_url.to_owned(),
                     staged_at: Instant::now(),
+                    finalization_armed: true,
                 },
             );
             StagePrUrlOutcome::Staged
@@ -419,6 +444,30 @@ impl StagedPrUrlCache {
             .expect("StagedPrUrlCache mutex poisoned")
             .get(execution_id)
             .cloned()
+    }
+
+    /// Bind a URL observed in command output, optionally granting recheck
+    /// finalization permission when that command published or pushed work.
+    ///
+    /// URLs remain first-writer-wins. A later publishing command can upgrade
+    /// a binding-only entry to finalizable, but a read-only/metadata command
+    /// can never downgrade an already-published observation.
+    pub fn record_command_observation(&self, execution_id: &str, pr_url: &str, finalization_armed: bool) {
+        let mut guard = self.inner.lock().expect("StagedPrUrlCache mutex poisoned");
+        match guard.get_mut(execution_id) {
+            Some(entry) if finalization_armed => entry.finalization_armed = true,
+            Some(_) => {}
+            None => {
+                guard.insert(
+                    execution_id.to_owned(),
+                    StagedPrUrlEntry {
+                        pr_url: pr_url.to_owned(),
+                        staged_at: Instant::now(),
+                        finalization_armed,
+                    },
+                );
+            }
+        }
     }
 
     /// Backdate a staged entry for a deterministic deferral-horizon test.
@@ -475,7 +524,7 @@ mod tests {
     fn driver_feed_plus_shared_regex_captures_codex_aggregated_output() {
         // End-to-end of the non-Claude primary path without a second
         // extraction algorithm: driver feed → extract_pr_url_from_text
-        // → is_gh_pr_command_str. No GitHub poll.
+        // → is_pr_url_binding_command_str. No GitHub poll.
         let feed = crate::driver::default_pr_url_capture_feed(
             "Bash",
             &json!("/bin/zsh -lc 'cube pr create --branch boss/exec_x --title t'"),
@@ -484,7 +533,7 @@ mod tests {
         .expect("codex-shaped feed");
         let url = extract_pr_url_from_text(&feed.output_text).expect("url");
         assert_eq!(url, "https://github.com/spinyfin/mono/pull/99");
-        assert!(is_gh_pr_command_str(&feed.command));
+        assert!(is_pr_url_binding_command_str(&feed.command));
     }
 
     #[test]
@@ -580,7 +629,7 @@ mod tests {
             Some("https://github.com/spinyfin/mono/pull/9"),
         );
         assert!(
-            is_gh_pr_command_str(&feed.command),
+            is_pr_url_binding_command_str(&feed.command),
             "Layer-1 must see the originating `cube pr create`, not the cell script: {:?}",
             feed.command
         );
@@ -600,7 +649,7 @@ mod tests {
         let url = extract_pr_url_from_text(&feed.output_text).expect("url");
         assert_eq!(url, "https://github.com/spinyfin/mono/pull/101");
         assert!(
-            is_gh_pr_command_str(&feed.command),
+            is_pr_url_binding_command_str(&feed.command),
             "zsh -lc-wrapped bare gh pr must pass Layer-1 after peel"
         );
     }
@@ -617,7 +666,10 @@ mod tests {
             extract_pr_url_from_text(&feed.output_text),
             extract_pr_url_from_bash_response(&response),
         );
-        assert_eq!(is_gh_pr_command_str(&feed.command), is_gh_pr_command(&input));
+        assert_eq!(
+            is_pr_url_binding_command_str(&feed.command),
+            is_pr_url_binding_command(&input)
+        );
     }
 
     #[test]
@@ -814,147 +866,106 @@ mod tests {
         assert_eq!(cache.get("never-staged"), None);
     }
 
-    // ── is_gh_pr_command ──────────────────────────────────────────
+    // ── PR URL binding and finalization gates ───────────────────────
 
     #[test]
-    fn gh_pr_create_is_a_gh_pr_command() {
-        assert!(is_gh_pr_command(&json!({
-            "command": "gh pr create --head boss/exec_abc --base main --title 'fix: something'"
-        })));
+    fn read_only_and_metadata_commands_bind_without_arming_finalization() {
+        for command in ["gh pr view 1342", "gh pr edit 1342 --add-label bug"] {
+            assert!(is_pr_url_binding_command_str(command), "{command} must bind its URL");
+            assert!(
+                !is_pr_url_finalization_command_str(command),
+                "{command} must not arm finalization"
+            );
+        }
+
+        let cache = StagedPrUrlCache::new();
+        cache.record_command_observation("exec_abc", "https://github.com/spinyfin/mono/pull/458", false);
+        let entry = cache.get_entry("exec_abc").expect("URL must be bound");
+        assert_eq!(entry.pr_url, "https://github.com/spinyfin/mono/pull/458");
+        assert!(!entry.finalization_armed);
     }
 
     #[test]
-    fn gh_pr_create_with_git_dir_prefix_is_a_gh_pr_command() {
-        // Workers use GIT_DIR=.jj/repo/store/git because jj-backed
-        // workspaces lack a top-level .git directory.
-        assert!(is_gh_pr_command(&json!({
+    fn publishing_commands_bind_and_arm_finalization() {
+        for command in [
+            "gh pr create --title t",
+            "cube pr create --branch boss/exec_x",
+            "cube pr update --branch boss/exec_x",
+            "cube pr ensure --branch boss/exec_x",
+        ] {
+            assert!(is_pr_url_binding_command_str(command), "{command} must bind its URL");
+            assert!(
+                is_pr_url_finalization_command_str(command),
+                "{command} must arm finalization"
+            );
+        }
+    }
+
+    #[test]
+    fn a_later_publishing_command_arms_an_existing_binding() {
+        let cache = StagedPrUrlCache::new();
+        cache.record_command_observation("exec_abc", "https://github.com/spinyfin/mono/pull/458", false);
+        cache.record_command_observation("exec_abc", "https://github.com/spinyfin/mono/pull/458", true);
+        assert!(cache.get_entry("exec_abc").expect("bound URL").finalization_armed);
+    }
+
+    #[test]
+    fn binding_gate_handles_shell_wrappers_and_rejects_non_pr_commands() {
+        assert!(is_pr_url_binding_command_str("/bin/zsh -lc 'gh pr view'"));
+        assert!(is_pr_url_binding_command_str(
+            "/usr/bin/bash -c 'gh pr edit 42 --body b'"
+        ));
+        assert!(is_pr_url_finalization_command_str(
+            r#"bash -c "gh pr create --title t""#
+        ));
+        assert!(!is_pr_url_binding_command_str("/bin/zsh -lc 'cat chore.md'"));
+        assert!(!is_pr_url_binding_command_str(
+            r#"jj describe -m "gh pr create --title t""#
+        ));
+        assert!(!is_pr_url_binding_command(&json!({ "timeout": 30000 })));
+    }
+
+    #[test]
+    fn binding_gate_accepts_create_with_environment_prefix() {
+        assert!(is_pr_url_binding_command(&json!({
             "command": "GIT_DIR=.jj/repo/store/git gh pr create --head boss/exec_abc --base main"
         })));
     }
 
     #[test]
-    fn gh_pr_view_is_not_a_staging_command() {
-        // Read-only: prints a URL as inspection, not completion evidence.
-        assert!(!is_gh_pr_command(&json!({
+    fn binding_gate_accepts_view_and_list() {
+        assert!(is_pr_url_binding_command(&json!({
             "command": "GIT_DIR=.jj/repo/store/git gh pr view"
         })));
+        assert!(is_pr_url_binding_command(
+            &json!({ "command": "gh pr list --state open" })
+        ));
     }
 
     #[test]
-    fn gh_pr_list_is_not_a_staging_command() {
-        assert!(!is_gh_pr_command(&json!({ "command": "gh pr list --state open" })));
+    fn binding_gate_rejects_non_pr_commands() {
+        for command in [
+            "bossctl task show task_123",
+            "cat chore.md",
+            "grep -r 'pull/' . | head -5",
+            "gh issue list",
+        ] {
+            assert!(!is_pr_url_binding_command(&json!({ "command": command })));
+        }
+        assert!(!is_pr_url_binding_command(&json!(null)));
     }
 
     #[test]
-    fn gh_pr_edit_is_a_gh_pr_command() {
-        assert!(is_gh_pr_command(&json!({ "command": "gh pr edit 42 --add-label foo" })));
-    }
-
-    #[test]
-    fn cube_pr_create_is_a_gh_pr_command() {
-        // `cube pr create` outputs a PR URL as its only stdout line and
-        // must be captured the same way as `gh pr create`.
-        assert!(is_gh_pr_command(&json!({
-            "command": "cube pr create --branch boss/exec_abc123_01 --title 'my feature'"
-        })));
-    }
-
-    #[test]
-    fn cube_pr_update_is_a_gh_pr_command() {
-        // `cube pr update` also prints the PR URL as its only stdout line.
-        assert!(is_gh_pr_command(&json!({
-            "command": "cube pr update --branch boss/exec_abc123_01"
-        })));
-    }
-
-    #[test]
-    fn deprecated_cube_pr_ensure_is_a_gh_pr_command() {
-        assert!(is_gh_pr_command(&json!({
-            "command": "cube pr ensure --branch boss/exec_abc123_01 --title 'my feature'"
-        })));
-    }
-
-    #[test]
-    fn non_gh_command_is_not_a_gh_pr_command() {
-        // Bash command that outputs PR URLs (e.g. reading a chore
-        // description that mentions a prior PR) must not trigger capture.
-        assert!(!is_gh_pr_command(&json!({
-            "command": "bossctl task show task_123"
-        })));
-    }
-
-    #[test]
-    fn cat_command_with_pr_url_content_is_not_a_gh_pr_command() {
-        assert!(!is_gh_pr_command(&json!({ "command": "cat chore.md" })));
-    }
-
-    #[test]
-    fn grep_command_is_not_a_gh_pr_command() {
-        assert!(!is_gh_pr_command(&json!({
-            "command": "grep -r 'pull/' . | head -5"
-        })));
-    }
-
-    #[test]
-    fn gh_issue_is_not_a_gh_pr_command() {
-        // `gh issue` is not a PR command.
-        assert!(!is_gh_pr_command(&json!({ "command": "gh issue list" })));
-    }
-
-    #[test]
-    fn missing_command_field_returns_false() {
-        assert!(!is_gh_pr_command(&json!({ "timeout": 30000 })));
-    }
-
-    #[test]
-    fn null_tool_input_returns_false() {
-        assert!(!is_gh_pr_command(&json!(null)));
-    }
-
-    #[test]
-    fn zsh_lc_wrapped_bare_gh_pr_create_is_a_gh_pr_command() {
-        // Codex envelope: whole command is `/bin/zsh -lc 'gh pr …'`.
-        // Peel must expose the inner gh invocation to classify.
-        assert!(is_gh_pr_command_str("/bin/zsh -lc 'gh pr create --title t --body b'"));
-        assert!(is_gh_pr_command_str("/bin/zsh -lc 'gh pr edit 42 --add-label foo'"));
-        // Read-only verbs deliberately do not stage: they print a URL as
-        // inspection output, not as completion evidence.
-        assert!(!is_gh_pr_command_str("/bin/zsh -lc 'gh pr view'"));
-        assert!(!is_gh_pr_command_str("/bin/zsh -lc 'gh pr list --state open'"));
-    }
-
-    #[test]
-    fn bash_c_and_sh_c_wrapped_gh_pr_are_gh_pr_commands() {
-        assert!(is_gh_pr_command_str(r#"bash -c "gh pr create --title t""#));
-        assert!(!is_gh_pr_command_str("/usr/bin/bash -c 'gh pr view'"));
-        assert!(!is_gh_pr_command_str("sh -c 'gh pr list'"));
-    }
-
-    #[test]
-    fn read_only_gh_pr_view_and_list_do_not_arm_staging() {
-        assert!(!is_gh_pr_command_str("gh pr view 1342"));
-        assert!(!is_gh_pr_command_str("gh pr list --state open"));
-        assert!(!is_gh_pr_command(&json!({ "command": "gh pr view" })));
-        assert!(!is_gh_pr_command(&json!({ "command": "gh pr list" })));
-        // Write-side verbs still stage.
-        assert!(is_gh_pr_command_str("gh pr create --title t"));
-        assert!(is_gh_pr_command_str("gh pr edit 42 --body b"));
-        assert!(is_gh_pr_command_str("cube pr update --branch boss/exec_x"));
-    }
-
-    #[test]
-    fn zsh_lc_wrapped_non_gh_is_not_a_gh_pr_command() {
-        assert!(!is_gh_pr_command_str("/bin/zsh -lc 'cat chore.md'"));
-        assert!(!is_gh_pr_command_str("/bin/zsh -lc 'gh issue list'"));
-        assert!(!is_gh_pr_command_str("/bin/zsh -lc 'bossctl task show t'"));
-    }
-
-    #[test]
-    fn quoted_gh_pr_inside_commit_message_is_not_a_shell_c_peel_false_positive() {
-        // Not a shell -c wrapper: peel must not fire, and classify's quote
-        // strip must keep the commit-message phrase from matching.
-        assert!(!is_gh_pr_command_str(r#"jj describe -m "gh pr create --title t""#));
-        assert!(!is_gh_pr_command_str("jj describe -m 'gh pr create'"));
+    fn shell_wrappers_preserve_the_split_gate() {
+        let view = "/bin/zsh -lc 'gh pr view'";
+        let edit = "/bin/zsh -lc 'gh pr edit 42 --add-label foo'";
+        let create = "/bin/zsh -lc 'gh pr create --title t --body b'";
+        for command in [view, edit, create] {
+            assert!(is_pr_url_binding_command_str(command));
+        }
+        assert!(!is_pr_url_finalization_command_str(view));
+        assert!(!is_pr_url_finalization_command_str(edit));
+        assert!(is_pr_url_finalization_command_str(create));
     }
 
     #[test]

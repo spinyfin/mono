@@ -883,6 +883,48 @@ async fn recheck_for_pr_uses_staged_pr_url_and_skips_detector() {
     }
 }
 
+/// A URL observed from `gh pr view` or `gh pr edit` binds the execution, but
+/// those commands do not prove this worker published anything. The recheck
+/// must therefore leave the live execution alone rather than finalizing it.
+#[tokio::test]
+async fn recheck_for_pr_binding_only_url_does_not_finalize_or_reap() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    let pr_url = "https://github.com/spinyfin/mono/pull/459";
+    let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+    staged_pr_urls.record_command_observation(&execution_id, pr_url, false);
+
+    let detector = StubPrDetector::err("must not inspect a binding-only URL");
+    let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), detector.clone());
+    let outcome = handler
+        .with_staged_pr_urls(staged_pr_urls.clone())
+        .recheck_for_pr(&execution_id)
+        .await;
+
+    assert_eq!(outcome, StopOutcome::RunningNoStagedPr);
+    assert_eq!(staged_pr_urls.get(&execution_id).as_deref(), Some(pr_url));
+    assert!(
+        !staged_pr_urls
+            .get_entry(&execution_id)
+            .expect("bound URL")
+            .finalization_armed,
+        "a view/edit observation must bind without arming finalization"
+    );
+    assert_eq!(
+        detector.call_count(),
+        0,
+        "binding-only URLs must not enter the fallback detector"
+    );
+    assert!(
+        cube.release_calls.lock().await.is_empty(),
+        "binding-only URLs must not reap the worker"
+    );
+    match db.get_work_item(&chore_id).unwrap() {
+        WorkItem::Chore(t) => assert!(t.pr_url.is_none(), "the task waits for the worker's Stop boundary"),
+        other => panic!("expected chore, got {other:?}"),
+    }
+}
+
 /// Regression: a live worker
 /// stages a PR URL mid-turn (`activity: Working` after `cube pr update`),
 /// then a merge-poller sweep runs immediately. The execution must **not**

@@ -44,6 +44,23 @@ impl WorkerCompletionHandler {
         // disk and still readable on the next sweep.
         self.stage_pr_url_from_artifact(&execution);
 
+        // A URL observed through `gh pr view|list|edit` is useful binding
+        // evidence, but it is not evidence that this execution published or
+        // pushed work. Do not let that observation enter the staged recheck
+        // finalization path; the worker's own Stop boundary may still use the
+        // bound URL after it finishes.
+        if self
+            .staged_pr_urls
+            .get_entry(execution_id)
+            .is_some_and(|entry| !entry.finalization_armed)
+        {
+            tracing::debug!(
+                execution_id,
+                "pr-recheck: bound PR URL lacks publish/push evidence; skipping finalization",
+            );
+            return StopOutcome::RunningNoStagedPr;
+        }
+
         // Then: if the PostToolUse dispatcher already
         // captured this execution's PR URL from the worker's hook
         // stream, finalize via that URL and skip the detector. Layer-2
@@ -58,7 +75,7 @@ impl WorkerCompletionHandler {
         {
             // A staged URL is evidence the worker *has* a PR, not that it
             // is *done*. Finalizing here reaps a live mid-turn worker
-            // (PostToolUse of `cube pr update` / `gh pr edit` leaves
+            // (PostToolUse of `cube pr update` / `gh pr create` leaves
             // activity at Working until the worker's own Stop). Defer to
             // the Stop-boundary path (`stop_staged`) while mid-turn —
             // same shape as the SHA-delta arm's unattributed-Contributed
