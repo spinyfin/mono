@@ -296,3 +296,165 @@ async fn ci_remediation_debounced_nudge_does_not_double_fail_or_republish() {
         "a debounced nudge must keep the execution tracked for the recurring recheck sweep",
     );
 }
+
+/// incident-004 AI-4: when `finalize_pr_transition` tears down a worker
+/// whose live activity is still `Working` (mid-turn) — here, the same
+/// past-horizon staged-URL finalize as `t01`'s
+/// `recheck_for_pr_staged_url_finalizes_mid_turn_after_defer_horizon` — it
+/// must bump the aggregate and per-source mid-turn-reap counters and file
+/// an operator-visible attention item on the execution, so the prevalence
+/// the postmortem measured only by an offline trace sweep is answerable
+/// from the running system.
+#[tokio::test]
+async fn finalize_pr_transition_records_mid_turn_reap_when_worker_is_working() {
+    let workspace = tempdir().unwrap();
+    let parent_pr_url = "https://github.com/spinyfin/mono/pull/1344";
+    let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (_dir, db, _product_id, revision_id, execution_id) =
+        revision_fixture(workspace.path(), parent_pr_url, head_before);
+
+    let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+    staged_pr_urls.record_if_unset(&execution_id, parent_pr_url);
+    staged_pr_urls.backdate_for_test(&execution_id, std::time::Duration::from_secs(61));
+
+    let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+    live_states.register_spawn(
+        3,
+        &execution_id,
+        "claude-opus-5",
+        std::process::id() as i32,
+        Some(boss_protocol::WorkItemBinding {
+            work_item_id: revision_id.clone(),
+            work_item_name: "revision mid-turn metric".to_owned(),
+            execution_id: execution_id.clone(),
+        }),
+    );
+    live_states.apply_event(
+        3,
+        &boss_protocol::WorkerEvent::PreToolUse {
+            session_id: "s".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+        },
+    );
+    assert_eq!(
+        live_states.activity_for_run(&execution_id),
+        Some(boss_protocol::WorkerActivity::Working),
+        "fixture must model the mid-turn state observed at teardown",
+    );
+
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+    let handler = handler
+        .with_staged_pr_urls(staged_pr_urls)
+        .with_live_worker_states(live_states)
+        .with_staged_pr_mid_turn_defer_secs(60);
+
+    assert_eq!(
+        handler.metrics.counter_value("completion.mid_turn_reap.total"),
+        Some(0),
+        "must start at zero before any finalize",
+    );
+
+    let outcome = handler.recheck_for_pr(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == parent_pr_url),
+        "past the deferral horizon the staged path must still finalize; got {outcome:?}",
+    );
+
+    assert_eq!(
+        handler.metrics.counter_value("completion.mid_turn_reap.total"),
+        Some(1),
+        "a mid-turn finalize must bump the aggregate counter exactly once",
+    );
+    assert_eq!(
+        handler
+            .metrics
+            .counter_value("completion.mid_turn_reap.pr_recheck_staged.count"),
+        Some(1),
+        "the per-source counter must be keyed on the finalize source that reaped this worker",
+    );
+
+    let items = db.list_attention_items(&execution_id).unwrap();
+    assert!(
+        items.iter().any(|i| i.kind == MID_TURN_REAP_ATTENTION_KIND),
+        "a mid-turn reap must file its own attention item; got {items:?}",
+    );
+}
+
+/// Negative control for the test above: the same past-horizon staged-URL
+/// finalize, but the worker's own `Stop` already landed before this
+/// finalize runs (the ordinary, non-defective case — see `t01`'s
+/// `recheck_for_pr_staged_url_finalizes_non_revision_while_mid_turn` and
+/// the `stop_staged` majority in the incident-004 measurement). No
+/// mid-turn signal must be raised.
+#[tokio::test]
+async fn finalize_pr_transition_does_not_record_mid_turn_reap_when_worker_is_idle() {
+    let workspace = tempdir().unwrap();
+    let parent_pr_url = "https://github.com/spinyfin/mono/pull/1345";
+    let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (_dir, db, _product_id, revision_id, execution_id) =
+        revision_fixture(workspace.path(), parent_pr_url, head_before);
+
+    let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+    staged_pr_urls.record_if_unset(&execution_id, parent_pr_url);
+    staged_pr_urls.backdate_for_test(&execution_id, std::time::Duration::from_secs(61));
+
+    let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+    live_states.register_spawn(
+        4,
+        &execution_id,
+        "claude-opus-5",
+        std::process::id() as i32,
+        Some(boss_protocol::WorkItemBinding {
+            work_item_id: revision_id.clone(),
+            work_item_name: "revision idle at finalize".to_owned(),
+            execution_id: execution_id.clone(),
+        }),
+    );
+    live_states.apply_event(
+        4,
+        &boss_protocol::WorkerEvent::PreToolUse {
+            session_id: "s".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+        },
+    );
+    live_states.apply_event(
+        4,
+        &boss_protocol::WorkerEvent::Stop {
+            session_id: "s".into(),
+            stop_hook_active: false,
+            stop_reason: boss_protocol::StopReason::Completed,
+        },
+    );
+    assert_eq!(
+        live_states.activity_for_run(&execution_id),
+        Some(boss_protocol::WorkerActivity::Idle),
+        "fixture must model the worker having already reached its own Stop boundary",
+    );
+
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+    let handler = handler
+        .with_staged_pr_urls(staged_pr_urls)
+        .with_live_worker_states(live_states)
+        .with_staged_pr_mid_turn_defer_secs(60);
+
+    let outcome = handler.recheck_for_pr(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == parent_pr_url),
+        "finalize must still succeed for an idle worker; got {outcome:?}",
+    );
+
+    assert_eq!(
+        handler.metrics.counter_value("completion.mid_turn_reap.total"),
+        Some(0),
+        "an idle finalize must not be counted as a mid-turn reap",
+    );
+    let items = db.list_attention_items(&execution_id).unwrap();
+    assert!(
+        !items.iter().any(|i| i.kind == MID_TURN_REAP_ATTENTION_KIND),
+        "an idle finalize must not file a mid-turn-reap attention item; got {items:?}",
+    );
+}

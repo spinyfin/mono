@@ -305,6 +305,15 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          human's call; later runs do not answer it.",
     ),
     entry(
+        crate::completion::MID_TURN_REAP_ATTENTION_KIND,
+        ClearedBy::HumanDecision,
+        "Records that this execution's worker was torn down while still mid-turn (activity=working) \
+         instead of at its own Stop boundary — unpushed work or unrun post-push steps may be lost \
+         (incident-004). The execution this happened to is already terminal by the time the item is \
+         filed, so no later run of it can supply contradicting evidence; whether the lost work needs \
+         redoing is the operator's call, same reasoning as `revision_no_changes_needed`.",
+    ),
+    entry(
         crate::merge_mechanism::PUSH_RESTRICTION_ATTENTION_KIND,
         ClearedBy::HumanDecision,
         "A repository permission the engine cannot change or observe changing. Nothing the engine \
@@ -543,6 +552,7 @@ mod tests {
             crate::completion::REVIEW_RESULT_GIVEUP_ATTENTION_KIND,
             crate::completion::DRIVER_TERMINAL_ERROR_ATTENTION_KIND,
             crate::completion::REVISION_NO_OP_ATTENTION_KIND,
+            crate::completion::MID_TURN_REAP_ATTENTION_KIND,
             crate::coordinator::PANE_SPAWN_FAILED_ATTENTION_KIND,
             crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND,
             crate::worker_escalation::WORKER_ESCALATION_ATTENTION_KIND,
