@@ -49,9 +49,22 @@ async fn create_product(client: &mut BossClient) -> Result<String> {
 }
 
 async fn create_chore_named(client: &mut BossClient, product_id: &str, name: &str) -> Result<Task> {
+    create_chore_named_with_autostart(client, product_id, name, true).await
+}
+
+async fn create_chore_named_with_autostart(
+    client: &mut BossClient,
+    product_id: &str,
+    name: &str,
+    autostart: bool,
+) -> Result<Task> {
     match client
         .send_request(&FrontendRequest::CreateChore {
-            input: CreateChoreInput::builder().product_id(product_id).name(name).build(),
+            input: CreateChoreInput::builder()
+                .product_id(product_id)
+                .name(name)
+                .autostart(autostart)
+                .build(),
         })
         .await?
     {
@@ -174,6 +187,92 @@ async fn work_start_force_refuses_dependency_gated_item_no_residue() -> Result<(
         before.len(),
         after.len(),
         "a dependency-refused forced request must leave the pre-existing row set unchanged"
+    );
+    Ok(())
+}
+
+/// A confirmed drag (`MoveWorkItemOnBoard` with `bypass_dispatch_pause`)
+/// that carries a stale pause generation — the pause was re-raised between
+/// confirmation and the engine's re-check — must refuse with a work error,
+/// leave the card at its previous status (not stranded in `active`), and
+/// create no execution row.
+#[tokio::test]
+async fn board_drag_force_with_stale_pause_generation_refuses_without_activating() -> Result<()> {
+    use boss_protocol::{BoardColumn, BoardDropTarget};
+
+    let engine = spawn_engine().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let product_id = create_product(&mut client).await?;
+    // autostart:false so the card sits in Backlog; a default autostart:true
+    // chore already renders in Doing, and a drop onto Doing is then a
+    // status-preserving reorder that never reaches the force path.
+    let chore = create_chore_named_with_autostart(&mut client, &product_id, "Stale gen drag", false).await?;
+
+    match client
+        .send_request(&FrontendRequest::SetDispatchPaused {
+            paused: true,
+            reason: Some("investigating worker failures".to_owned()),
+        })
+        .await?
+    {
+        FrontendEvent::DispatchStateResult {
+            paused,
+            paused_since_epoch_s,
+            ..
+        } => {
+            assert!(paused, "precondition: dispatch must be paused");
+            assert!(
+                paused_since_epoch_s.is_some(),
+                "precondition: a paused state must report a generation"
+            );
+        }
+        other => return Err(anyhow!("unexpected response to SetDispatchPaused: {other:?}")),
+    }
+
+    // Echo a deliberately stale generation — as if the pause was re-raised
+    // after the confirmation dialog observed an older one.
+    let response = client
+        .send_request(&FrontendRequest::MoveWorkItemOnBoard {
+            id: chore.id.clone(),
+            target: BoardDropTarget::new(BoardColumn::Doing, None),
+            bypass_dispatch_pause: true,
+            observed_pause_since_epoch_s: Some(1),
+        })
+        .await?;
+    match response {
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            assert!(
+                message.to_lowercase().contains("changed")
+                    || message.to_lowercase().contains("pause")
+                    || message.to_lowercase().contains("force")
+                    || message.to_lowercase().contains("cannot"),
+                "refusal must explain why the force drag was rejected, got: {message}"
+            );
+        }
+        other => return Err(anyhow!("expected a refusal WorkError, got: {other:?}")),
+    }
+
+    // Re-read the row: must still be at its previous (non-active) status.
+    match client
+        .send_request(&FrontendRequest::GetWorkItem { id: chore.id.clone() })
+        .await?
+    {
+        FrontendEvent::WorkItemResult {
+            item: WorkItem::Chore(t) | WorkItem::Task(t),
+        } => {
+            assert_ne!(
+                t.status,
+                boss_protocol::TaskStatus::Active,
+                "a refused force drag must not leave the card active with no execution"
+            );
+        }
+        other => return Err(anyhow!("unexpected response re-reading work item: {other:?}")),
+    }
+
+    let executions = list_executions_for(&mut client, &chore.id).await?;
+    assert!(
+        executions.is_empty(),
+        "a refused force drag must create no execution row; got {executions:?}"
     );
     Ok(())
 }

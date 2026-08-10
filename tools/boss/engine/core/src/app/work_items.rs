@@ -406,8 +406,8 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
 ///
 /// [`MoveWorkItemOnBoard`]: boss_protocol::FrontendRequest::MoveWorkItemOnBoard
 #[derive(Debug, Clone, Copy)]
-struct BoardDragPauseBypass {
-    observed_pause_since_epoch_s: Option<u64>,
+pub(super) struct BoardDragPauseBypass {
+    pub(super) observed_pause_since_epoch_s: Option<u64>,
 }
 
 /// A kanban drag landed on the board. Resolve what the drop *meant* against
@@ -542,7 +542,12 @@ fn board_row_for_id(work_db: &WorkDb, id: &str) -> Result<BoardRow> {
 /// [`handle_update_work_item`] (an explicit status/field edit) and
 /// [`handle_move_work_item_on_board`] (a drag whose meaning the engine just
 /// resolved).
-async fn apply_work_item_patch(
+///
+/// `pub(super)` so unit tests can drive the pause-bypass re-check refusal
+/// arm directly (the board-handler pre-check normally refuses before the
+/// status patch, so the in-request TOCTOU revert is unreachable over pure
+/// RPC without a concurrent mutation race).
+pub(super) async fn apply_work_item_patch(
     ctx: Dispatch,
     id: String,
     patch: WorkItemPatch,
@@ -787,10 +792,14 @@ async fn apply_work_item_patch(
                                 );
                                 if let Some(prev_status) = &previous_task_status {
                                     let revert_patch = WorkItemPatch::builder().status(prev_status.as_str()).build();
+                                    // Engine-initiated rollback, not a human
+                                    // edit — stamp `last_status_actor` as
+                                    // engine so dependency-cascade heuristics
+                                    // that key off the actor stay honest.
                                     match work_db.update_work_item_as_actor(
                                         &work_item_id_for_event,
                                         revert_patch,
-                                        actor,
+                                        boss_protocol::LAST_STATUS_ACTOR_ENGINE,
                                     ) {
                                         Ok(reverted) => item = reverted,
                                         Err(revert_err) => {
@@ -862,12 +871,27 @@ async fn apply_work_item_patch(
                     let exec_for_event = dispatched_execution_id
                         .clone()
                         .unwrap_or_else(|| work_item_id_for_event.clone());
+                    // When the pause-bypass re-check refused and we rolled
+                    // the row back, the surviving status is the previous
+                    // one — not `active`. Report that so engine-audit /
+                    // dispatch-diagnosis do not claim a transition that
+                    // did not survive the request.
+                    let status_reverted = dispatch_failure_response.is_some();
+                    let to_status = if status_reverted {
+                        from_status
+                            .as_ref()
+                            .map(|s| s.as_str().to_owned())
+                            .unwrap_or_else(|| "active".to_owned())
+                    } else {
+                        "active".to_owned()
+                    };
                     let details = serde_json::json!({
                         "from_status": from_status,
-                        "to_status": "active",
+                        "to_status": to_status,
                         "did_dispatch": did_dispatch,
                         "reason_if_skipped": skip_reason,
                         "dispatched_execution_id": dispatched_execution_id,
+                        "status_reverted": status_reverted,
                     });
                     server_state
                         .dispatch_events

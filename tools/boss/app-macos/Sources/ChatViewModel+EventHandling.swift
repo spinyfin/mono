@@ -199,19 +199,6 @@ extension ChatViewModel {
                 workErrorMessage = message
             }
         case .error(let message):
-            if pendingDragAdmissionCheck != nil {
-                // A malformed/undecodable `dispatch_admission_evaluated`
-                // reply (EngineClient emits `.error`, never
-                // `.dispatchAdmissionEvaluated`, when the payload fails to
-                // decode) would otherwise leave the card optimistically
-                // rendered in Doing forever — nothing else ever clears
-                // `pendingDragAdmissionCheck` for a reply that never
-                // arrives in the expected shape. Bounce it back exactly as
-                // a hard-blocker refusal would.
-                pendingDragAdmissionCheck = nil
-                bounceBackOptimisticMoves(message: message)
-                return
-            }
             if Self.isSocketTransportError(message) {
                 // Transport errors fire continuously while the engine
                 // is unreachable (every reconnect attempt re-emits a
@@ -221,7 +208,28 @@ extension ChatViewModel {
                 // banner in the main chrome is the user-facing signal
                 // for this state — see `showConnectionLostBanner` in
                 // ContentView.
+                //
+                // Must run BEFORE the pending-admission bounce below:
+                // an unrelated `socket waiting:` line while an
+                // EvaluateDispatchAdmission is in flight must not kill
+                // a still-valid drag. Disconnect (`.disconnected`)
+                // already clears `pendingDragAdmissionCheck` when the
+                // link actually drops and no reply can arrive.
                 appendSystemMessage(message)
+                return
+            }
+            if pendingDragAdmissionCheck != nil {
+                // A malformed/undecodable `dispatch_admission_evaluated`
+                // reply (EngineClient emits `.error`, never
+                // `.dispatchAdmissionEvaluated`, when the payload fails to
+                // decode) would otherwise leave the card optimistically
+                // rendered in Doing forever — nothing else ever clears
+                // `pendingDragAdmissionCheck` for a reply that never
+                // arrives in the expected shape. Bounce it back exactly as
+                // a hard-blocker refusal would. Transport errors are
+                // handled above so they never reach this arm.
+                pendingDragAdmissionCheck = nil
+                bounceBackOptimisticMoves(message: message)
                 return
             }
             workErrorMessage = message

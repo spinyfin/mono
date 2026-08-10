@@ -231,6 +231,54 @@ final class PauseOverrideConfirmationTests: XCTestCase {
                        "a human-driven drag must forward the drop directly, exactly like the non-Doing path")
     }
 
+    // MARK: - Unrelated / transport error while admission is in flight
+
+    func testSocketTransportErrorDoesNotBouncePendingAdmissionCheck() {
+        // A continuous `socket waiting:` line while EvaluateDispatchAdmission
+        // is in flight must not kill a still-valid drag — disconnect
+        // handling already clears the pending check when the link actually
+        // drops. Routing transport errors through the bounce would also
+        // discard the real admission reply that arrives next (stale-reply
+        // guard sees pending == nil).
+        let model = makeModel()
+        let task = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [task]]
+
+        _ = model.attemptDrop(task.id, onColumn: .doing, group: nil)
+        XCTAssertNotNil(model.pendingDragAdmissionCheck)
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing)
+
+        model.applyEventForTest(.error(message: "socket waiting: Connection refused"))
+
+        XCTAssertNotNil(model.pendingDragAdmissionCheck,
+                        "a transport error must leave the pending admission check in place")
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing,
+                       "a transport error must not bounce an in-flight drag-to-Doing")
+        XCTAssertNil(model.dragRefusalNotice,
+                     "transport errors surface via the connection banner, not a drag refusal")
+        XCTAssertNil(model.workErrorMessage,
+                     "transport errors must not open the work-error modal either")
+    }
+
+    func testInvalidAdmissionPayloadErrorBouncesPendingCheck() {
+        // EngineClient emits `.error` (never `.dispatchAdmissionEvaluated`)
+        // when a dispatch_admission_evaluated payload fails to decode —
+        // that reply can never clear the pending check in the expected
+        // shape, so the card must bounce rather than strand in Doing.
+        let model = makeModel()
+        let task = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [task]]
+
+        _ = model.attemptDrop(task.id, onColumn: .doing, group: nil)
+        XCTAssertNotNil(model.pendingDragAdmissionCheck)
+
+        model.applyEventForTest(.error(message: "received invalid dispatch_admission_evaluated payload"))
+
+        XCTAssertNil(model.pendingDragAdmissionCheck)
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .backlog,
+                       "an undecodable admission reply must bounce the card back")
+    }
+
     // MARK: - Stale reply: superseded by a later drag
 
     func testStaleReplyForASupersededDragIsIgnored() {
