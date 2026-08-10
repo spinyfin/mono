@@ -1736,13 +1736,20 @@ async fn attach_description_context(
     };
     let change_id = resolve_change_id(env);
     let repository = resolve_repository(vcs);
-    let pr_description = resolve_pr_description(repository.as_deref(), change_id.as_deref(), env, vcs).await?;
+    let pr_resolution = resolve_pr_description(repository.as_deref(), change_id.as_deref(), env, vcs).await?;
+    // Always-visible status so "scanned and clean" is distinguishable from
+    // "PR surface not applicable" without reading source (both otherwise look
+    // like `checks: no findings`). Unavailable is also logged; the check that
+    // scans the PR description emits an error finding for that case.
+    eprintln!("{}", pr_resolution.status_line());
+    let (pr_description, pr_unavailable) = pr_resolution.into_changeset_fields();
     Ok(changeset
         .with_commit_description(tip_description)
         .with_bypass_commit_descriptions(bypass_commit_descriptions)
         .with_change_id(change_id)
         .with_repository(repository)
-        .with_pr_description(pr_description))
+        .with_pr_description(pr_description)
+        .with_pr_description_unavailable_reason(pr_unavailable))
 }
 
 /// Resolve the PR/change identifier used to fetch the PR description.
@@ -1794,21 +1801,67 @@ fn resolve_repository(vcs: &Vcs) -> Option<String> {
         .or_else(|| normalize_optional_description(vcs.remote_repo_slug()))
 }
 
+/// Outcome of resolving the PR description for a check run.
+///
+/// Distinguishes three cases that used to collapse into `Option<String>`:
+/// * [`Self::Resolved`] — body obtained (may be empty); surface was scanned.
+/// * [`Self::NotApplicable`] — no associated open PR; surface does not apply.
+/// * [`Self::Unavailable`] — a PR was identified but the body could not be
+///   fetched; checks that scan the PR description must fail, not report clean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PrDescriptionResolution {
+    Resolved(String),
+    NotApplicable,
+    Unavailable { reason: String },
+}
+
+impl PrDescriptionResolution {
+    fn into_changeset_fields(self) -> (Option<String>, Option<String>) {
+        match self {
+            Self::Resolved(body) => (Some(body), None),
+            Self::NotApplicable => (None, None),
+            Self::Unavailable { reason } => (None, Some(reason)),
+        }
+    }
+
+    /// Always-on human status line so "scanned and clean" is distinguishable
+    /// from "not scanned" without reading source.
+    fn status_line(&self) -> String {
+        match self {
+            Self::Resolved(body) => format!("checkleft: PR description surface: scanned ({} bytes)", body.len()),
+            Self::NotApplicable => {
+                "checkleft: PR description surface: not applicable (no open PR for this change)".to_owned()
+            }
+            Self::Unavailable { reason } => {
+                format!("checkleft: PR description surface: UNAVAILABLE — {reason}")
+            }
+        }
+    }
+}
+
+fn pr_description_fetch_failed_reason(repository: &str, pr_id: &str) -> String {
+    format!(
+        "GitHub API did not return a description for PR {pr_id} in {repository} \
+         (missing/expired token, rate limit, non-success status, or transport error). \
+         A check that requires the PR description cannot pass without it."
+    )
+}
+
 async fn resolve_pr_description(
     repository: Option<&str>,
     change_id: Option<&str>,
     env: &CiEnvironment,
     vcs: &Vcs,
-) -> Result<Option<String>> {
+) -> Result<PrDescriptionResolution> {
     // Explicit override: highest precedence, no network call needed.
     if let Ok(raw) = std::env::var(CHECKS_PR_DESCRIPTION_ENV)
         && !raw.trim().is_empty()
     {
-        return Ok(Some(raw));
+        return Ok(PrDescriptionResolution::Resolved(raw));
     }
 
     let Some(repository) = repository else {
-        return Ok(None);
+        return Ok(PrDescriptionResolution::NotApplicable);
     };
     let github_base_url = github_api_base_url();
     let github = GithubApiContext::production(&github_base_url);
@@ -1818,18 +1871,20 @@ async fn resolve_pr_description(
         eprintln!("{}", github_auth_unavailable_warning(repository));
     }
 
-    // Levels 1 & 2: fetch description using the already-resolved change_id.
+    // Levels 1 & 2: a concrete PR number is already known. Failure to fetch
+    // its body is Unavailable — never silent clean.
     if let Some(change_id) = change_id {
         info!(
             repository = repository,
             change_id = change_id,
             "fetching PR description by change id"
         );
-        if let Some(desc) =
-            github_pull_request_description(github, repository, change_id, github_token.as_deref()).await?
-        {
-            return Ok(Some(desc));
-        }
+        return match github_pull_request_description(github, repository, change_id, github_token.as_deref()).await? {
+            Some(desc) => Ok(PrDescriptionResolution::Resolved(desc)),
+            None => Ok(PrDescriptionResolution::Unavailable {
+                reason: pr_description_fetch_failed_reason(repository, change_id),
+            }),
+        };
     }
 
     // Level 3a: a GitHub merge-queue build's branch is a synthetic value
@@ -1847,22 +1902,27 @@ async fn resolve_pr_description(
             "resolved PR numbers from merge-queue branch name"
         );
         let mut descriptions = Vec::new();
-        for pr_number in merge_queue_pr_numbers {
-            if let Some(description) =
-                github_pull_request_description(github, repository, &pr_number, github_token.as_deref()).await?
-            {
-                descriptions.push(description);
+        let mut failed_ids = Vec::new();
+        for pr_number in &merge_queue_pr_numbers {
+            match github_pull_request_description(github, repository, pr_number, github_token.as_deref()).await? {
+                Some(description) => descriptions.push(description),
+                None => failed_ids.push(pr_number.clone()),
             }
         }
-        return Ok((!descriptions.is_empty()).then(|| descriptions.join("\n\n")));
+        if !descriptions.is_empty() {
+            return Ok(PrDescriptionResolution::Resolved(descriptions.join("\n\n")));
+        }
+        return Ok(PrDescriptionResolution::Unavailable {
+            reason: pr_description_fetch_failed_reason(repository, &failed_ids.join(",")),
+        });
     }
 
     // Level 3b: no PR number from env — detect the current branch and look up
-    // the open PR via the GitHub API. Best-effort: missing token, no open PR,
-    // or non-timeout network failure all silently yield None. Timeouts are
-    // fatal because proceeding without mandatory GitHub inputs is unsafe.
+    // the open PR via the GitHub API. No open PR (empty list / branch not
+    // found) is NotApplicable. Once a PR number is known, a failed body fetch
+    // is Unavailable. Timeouts remain fatal (propagated as Err).
     let Some(branch) = detect_current_branch(env, vcs) else {
-        return Ok(None);
+        return Ok(PrDescriptionResolution::NotApplicable);
     };
     info!(
         repository = repository,
@@ -1871,7 +1931,11 @@ async fn resolve_pr_description(
     );
     let Some(pr_number) = github_pr_number_for_branch(github, repository, &branch, github_token.as_deref()).await?
     else {
-        return Ok(None);
+        // Could not establish that an open PR exists. Missing token on a
+        // private repo can also yield this shape; we cannot tell "no PR"
+        // from "auth failed looking for a PR" without a known PR number, and
+        // failing every non-PR local build is not acceptable. Treat as N/A.
+        return Ok(PrDescriptionResolution::NotApplicable);
     };
     info!(
         repository = repository,
@@ -1879,7 +1943,12 @@ async fn resolve_pr_description(
         pr_number = pr_number,
         "fetching PR description for branch-resolved PR"
     );
-    github_pull_request_description(github, repository, &pr_number, github_token.as_deref()).await
+    match github_pull_request_description(github, repository, &pr_number, github_token.as_deref()).await? {
+        Some(desc) => Ok(PrDescriptionResolution::Resolved(desc)),
+        None => Ok(PrDescriptionResolution::Unavailable {
+            reason: pr_description_fetch_failed_reason(repository, &pr_number),
+        }),
+    }
 }
 
 /// Detect the name of the current branch for Level 3b PR lookup (branch→PR

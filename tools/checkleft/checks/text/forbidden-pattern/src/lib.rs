@@ -54,12 +54,20 @@
 //!   message only (not the full `base..HEAD` range — the host keeps that
 //!   range for BYPASS parsing on a separate field so intermediate historical
 //!   commit messages cannot false-fail leakage checks when GitHub MQ/squash
-//!   re-embeds them). `pr_description` depends on the host having resolved
-//!   the PR (it is reliably absent, for example, when running from a jj
-//!   workspace with no `.git` at its root — see
-//!   `tools/checkleft/docs/investigations/locationless-and-virtual-path-finding-rendering.md`).
-//!   A check run must not treat an absent PR description as "clean"; it
-//!   simply means that surface was not scanned this run.
+//!   re-embeds them). The PR description surface is a three-state host
+//!   contract (see
+//!   `tools/checkleft/docs/investigations/locationless-and-virtual-path-finding-rendering.md`
+//!   for the locationless-finding background):
+//!   * `pr_description: Some(_)` — body was resolved; this check scans it.
+//!   * `pr_description: None` and `pr_description_unavailable_reason: None`
+//!     — no associated open PR for this run; the PR surface does **not**
+//!     apply. That is not a "clean scan". The host also emits an always-on
+//!     status line so the case is distinguishable from "scanned and clean"
+//!     without reading source.
+//!   * `pr_description_unavailable_reason: Some(reason)` — a PR was
+//!     identified but its description could not be fetched. This check
+//!     **must fail** with an error finding naming the reason; silence (a
+//!     clean pass on text that was never read) is forbidden.
 //!
 //! `surfaces` entries are additive — `["files", "changeset"]` scans both;
 //! `["changeset"]` scans only the PR/commit text and skips file content
@@ -213,9 +221,7 @@ pub fn forbidden_pattern_check(input: CheckInput) -> Vec<Finding> {
     }
 
     if surfaces.contains(&Surface::Changeset) {
-        if let Some(pr_description) = &input.changeset.pr_description {
-            scan_changeset_text(pr_description, ChangesetSource::PrDescription, &patterns, &mut findings);
-        }
+        scan_pr_description_surface(&input.changeset, &patterns, &mut findings);
         if let Some(commit_description) = &input.changeset.commit_description {
             scan_changeset_text(
                 commit_description,
@@ -252,6 +258,32 @@ fn scan_files(changeset: &ChangeSet, patterns: &[CompiledPattern], findings: &mu
                 }
             }
         }
+    }
+}
+
+/// Apply the PR-description surface contract for `surfaces: [changeset]`.
+///
+/// * Resolved body → scan for forbidden patterns.
+/// * Unavailable (host could not fetch a known PR's body) → error finding.
+/// * Not applicable (no open PR) → no finding from this surface; the host
+///   status line already makes that case distinguishable from a clean scan.
+fn scan_pr_description_surface(changeset: &ChangeSet, patterns: &[CompiledPattern], findings: &mut Vec<Finding>) {
+    if let Some(reason) = &changeset.pr_description_unavailable_reason {
+        findings.push(
+            Finding::error(format!(
+                "PR description could not be resolved; refusing to report clean. {reason}"
+            ))
+            .on_surface(FindingSurface::PrDescription)
+            .with_remediation(
+                "Ensure GitHub authentication is available (CHECKLEFT_GH_TOKEN / CHECKS_GITHUB_TOKEN / \
+                 GH_TOKEN / GITHUB_TOKEN, or `gh auth login`) and the API is reachable, then re-run. \
+                 A check that cannot read the PR description must not pass.",
+            ),
+        );
+        return;
+    }
+    if let Some(pr_description) = &changeset.pr_description {
+        scan_changeset_text(pr_description, ChangesetSource::PrDescription, patterns, findings);
     }
 }
 
@@ -371,6 +403,7 @@ mod tests {
                 file_diffs: vec![],
                 commit_description: None,
                 pr_description: None,
+                pr_description_unavailable_reason: None,
                 change_id: None,
                 repository: None,
                 base_files: vec![],
@@ -385,12 +418,22 @@ mod tests {
         commit_description: Option<&str>,
         config_json: &str,
     ) -> CheckInput {
+        make_changeset_input_with_unavailable(pr_description, None, commit_description, config_json)
+    }
+
+    fn make_changeset_input_with_unavailable(
+        pr_description: Option<&str>,
+        pr_description_unavailable_reason: Option<&str>,
+        commit_description: Option<&str>,
+        config_json: &str,
+    ) -> CheckInput {
         CheckInput::__from_parts(
             ChangeSet {
                 changed_files: vec![],
                 file_diffs: vec![],
                 commit_description: commit_description.map(str::to_owned),
                 pr_description: pr_description.map(str::to_owned),
+                pr_description_unavailable_reason: pr_description_unavailable_reason.map(str::to_owned),
                 change_id: None,
                 repository: None,
                 base_files: vec![],
@@ -629,12 +672,104 @@ mod tests {
 
     #[test]
     fn changeset_scope_with_no_descriptions_present_yields_no_findings() {
+        // Not applicable: no open PR, no commit message. Distinct from
+        // "scanned and clean" via the host status line; the check itself
+        // produces no findings so non-PR builds still pass.
         let findings = forbidden_pattern_check(make_changeset_input(
             None,
             None,
             r#"{"surfaces":["changeset"],"patterns":[{"name":"work-item-id","pattern":"\\bZZ\\d{4,}\\b","message":"nope"}]}"#,
         ));
         assert!(findings.is_empty());
+    }
+
+    /// Case: description resolves and is clean → no findings.
+    #[test]
+    fn changeset_scope_resolved_clean_pr_description_yields_no_findings() {
+        let findings = forbidden_pattern_check(make_changeset_input(
+            Some("A perfectly ordinary PR description with no forbidden text."),
+            None,
+            r#"{"surfaces":["changeset"],"patterns":[{"name":"work-item-id","pattern":"\\bZZ\\d{4,}\\b","message":"nope"}]}"#,
+        ));
+        assert!(
+            findings.is_empty(),
+            "scanned and clean must produce no findings; got: {findings:?}"
+        );
+    }
+
+    /// Case: description resolves and violates → locationless error on PR surface.
+    #[test]
+    fn changeset_scope_resolved_violating_pr_description_emits_finding() {
+        let findings = forbidden_pattern_check(make_changeset_input(
+            Some("this fixes ZZ3124"),
+            None,
+            r#"{"surfaces":["changeset"],"patterns":[{"name":"work-item-id","pattern":"\\bZZ\\d{4,}\\b","message":"Internal work-item ids must not leak."}]}"#,
+        ));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert_eq!(findings[0].surface, Some(FindingSurface::PrDescription));
+    }
+
+    /// Case: PR known but description unobtainable → must not pass silently.
+    #[test]
+    fn changeset_scope_unavailable_pr_description_emits_error_finding() {
+        let findings = forbidden_pattern_check(make_changeset_input_with_unavailable(
+            None,
+            Some(
+                "GitHub API did not return a description for PR 42 in example/repo \
+                 (missing/expired token, rate limit, non-success status, or transport error).",
+            ),
+            Some("clean tip commit message"),
+            r#"{"surfaces":["changeset"],"patterns":[{"name":"work-item-id","pattern":"\\bZZ\\d{4,}\\b","message":"nope"}]}"#,
+        ));
+
+        assert!(
+            findings.iter().any(|f| {
+                f.severity == Severity::Error
+                    && f.surface == Some(FindingSurface::PrDescription)
+                    && f.message.contains("could not be resolved")
+                    && f.message.contains("refusing to report clean")
+            }),
+            "unavailable PR description must emit an error finding; got: {findings:?}"
+        );
+        // Commit surface still scanned when present.
+        assert!(
+            findings
+                .iter()
+                .filter(|f| f.surface == Some(FindingSurface::CommitMessage))
+                .count()
+                == 0,
+            "clean commit must not add pattern findings; got: {findings:?}"
+        );
+    }
+
+    /// Case: no PR at all (not applicable) → may pass; no unavailable error.
+    #[test]
+    fn changeset_scope_not_applicable_pr_description_does_not_fail() {
+        let findings = forbidden_pattern_check(make_changeset_input(
+            None,
+            Some("clean tip only"),
+            r#"{"surfaces":["changeset"],"patterns":[{"name":"work-item-id","pattern":"\\bZZ\\d{4,}\\b","message":"nope"}]}"#,
+        ));
+        assert!(
+            findings.iter().all(|f| !f.message.contains("could not be resolved")),
+            "not-applicable must not emit unavailable error; got: {findings:?}"
+        );
+        assert!(findings.is_empty());
+    }
+
+    /// Unavailable reason is consulted even when a stale Some body is also
+    /// present is not expected from the host, but prefer fail-loud if reason set.
+    #[test]
+    fn changeset_scope_unavailable_reason_takes_precedence_over_body() {
+        let findings = forbidden_pattern_check(make_changeset_input_with_unavailable(
+            Some("would have been scanned"),
+            Some("forced unavailable"),
+            None,
+            r#"{"surfaces":["changeset"],"patterns":[{"name":"work-item-id","pattern":"\\bZZ\\d{4,}\\b","message":"nope"}]}"#,
+        ));
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("forced unavailable"));
     }
 
     /// Host responsibility: only the tip commit message is placed on

@@ -1407,6 +1407,7 @@ fn lower_changeset(changeset: &ChangeSet, source_tree: &dyn SourceTree) -> wit_t
             .collect(),
         commit_description: changeset.commit_description.clone(),
         pr_description: changeset.pr_description.clone(),
+        pr_description_unavailable_reason: changeset.pr_description_unavailable_reason.clone(),
         change_id: changeset.change_id.clone(),
         repository: changeset.repository.clone(),
         base_files,

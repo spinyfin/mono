@@ -99,6 +99,13 @@ interface types {
         file-diffs: list<file-diff>,
         commit-description: option<string>,
         pr-description: option<string>,
+        /// When set, the host identified a PR whose description was required
+        /// but could not be fetched (auth, rate limit, transport, non-success
+        /// API status). Mutually exclusive with a present `pr-description`.
+        /// Checks that scan the PR description must treat this as a hard
+        /// failure, not a clean pass. A missing `pr-description` with this
+        /// also absent means the PR surface does not apply (no open PR).
+        pr-description-unavailable-reason: option<string>,
         change-id: option<string>,
         repository: option<string>,
         /// Base-revision content for deleted and modified files.

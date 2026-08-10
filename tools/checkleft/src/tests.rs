@@ -10,13 +10,13 @@ use checkleft::change_detection::merge_queue::{pr_number_from_branch, pr_numbers
 use checkleft::external::FixInvocationOutcome;
 
 use super::{
-    ColorLevel, ExternalProviderMode, FixCheckPlan, FixPlan, OutputStyle, TRUNCATE_HEAD_LINES, TRUNCATE_MAX_LINE_LEN,
-    TRUNCATE_TAIL_LINES, branch_from_ci_env, ci_from_env, compute_fix_plan, distinct_applied_files,
-    github_auth_unavailable_warning, invocation_root_from, normalize_optional_description,
-    parse_external_provider_mode, parse_github_ref_pr_number, pr_numbers_for_description, render_fix_results,
-    render_human_footer, render_human_results, render_no_checks_ran, resolve_github_token_from_sources,
-    resolve_ref_for_upload, should_show_progress, sort_results_for_output, still_failing_from_verify,
-    truncate_tool_output,
+    ColorLevel, ExternalProviderMode, FixCheckPlan, FixPlan, OutputStyle, PrDescriptionResolution, TRUNCATE_HEAD_LINES,
+    TRUNCATE_MAX_LINE_LEN, TRUNCATE_TAIL_LINES, branch_from_ci_env, ci_from_env, compute_fix_plan,
+    distinct_applied_files, github_auth_unavailable_warning, invocation_root_from, normalize_optional_description,
+    parse_external_provider_mode, parse_github_ref_pr_number, pr_description_fetch_failed_reason,
+    pr_numbers_for_description, render_fix_results, render_human_footer, render_human_results, render_no_checks_ran,
+    resolve_github_token_from_sources, resolve_ref_for_upload, should_show_progress, sort_results_for_output,
+    still_failing_from_verify, truncate_tool_output,
 };
 
 #[test]
@@ -993,6 +993,60 @@ fn github_auth_unavailable_warning_lists_checkleft_gh_token_first() {
         checkleft_pos < checks_pos,
         "CHECKLEFT_GH_TOKEN must appear before CHECKS_GITHUB_TOKEN in the warning"
     );
+}
+
+// --- PrDescriptionResolution (PR description three-state contract) ---
+
+#[test]
+fn pr_description_resolution_status_lines_are_distinguishable() {
+    let resolved = PrDescriptionResolution::Resolved("hello".to_owned());
+    let not_applicable = PrDescriptionResolution::NotApplicable;
+    let unavailable = PrDescriptionResolution::Unavailable {
+        reason: "boom".to_owned(),
+    };
+
+    let resolved_line = resolved.status_line();
+    let n_a_line = not_applicable.status_line();
+    let unavail_line = unavailable.status_line();
+
+    assert!(resolved_line.contains("scanned"), "{resolved_line}");
+    assert!(resolved_line.contains("5 bytes"), "{resolved_line}");
+    assert!(n_a_line.contains("not applicable"), "{n_a_line}");
+    assert!(n_a_line.contains("no open PR"), "{n_a_line}");
+    assert!(unavail_line.contains("UNAVAILABLE"), "{unavail_line}");
+    assert!(unavail_line.contains("boom"), "{unavail_line}");
+
+    // The three lines must not collapse to the same text — that was the core harm.
+    assert_ne!(resolved_line, n_a_line);
+    assert_ne!(resolved_line, unavail_line);
+    assert_ne!(n_a_line, unavail_line);
+}
+
+#[test]
+fn pr_description_resolution_into_changeset_fields_three_states() {
+    assert_eq!(
+        PrDescriptionResolution::Resolved("body".to_owned()).into_changeset_fields(),
+        (Some("body".to_owned()), None)
+    );
+    assert_eq!(
+        PrDescriptionResolution::NotApplicable.into_changeset_fields(),
+        (None, None)
+    );
+    assert_eq!(
+        PrDescriptionResolution::Unavailable {
+            reason: "no token".to_owned()
+        }
+        .into_changeset_fields(),
+        (None, Some("no token".to_owned()))
+    );
+}
+
+#[test]
+fn pr_description_fetch_failed_reason_names_repo_and_pr() {
+    let reason = pr_description_fetch_failed_reason("owner/repo", "99");
+    assert!(reason.contains("owner/repo"), "{reason}");
+    assert!(reason.contains("99"), "{reason}");
+    assert!(reason.contains("cannot pass without it"), "{reason}");
 }
 
 // --- truncate_tool_output ---
