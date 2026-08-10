@@ -19,11 +19,13 @@ use super::*;
 #[builder(on(String, into))]
 pub(crate) struct DispatchAdmissionFacts {
     pub resolved_work_item_id: String,
-    /// `Some(reason)` when the work item's status makes it ineligible for
-    /// dispatch outright (unknown, deleted, terminal, `in_review`, or
-    /// human-driven) — mirrors the `bail!` conditions
-    /// `request_execution_in_tx_with_live_check` enforces before ever
-    /// creating a row.
+    /// `Some(reason)` when the work item is ineligible for dispatch
+    /// outright — unknown, not a dispatchable kind, deleted, terminal,
+    /// human-driven, or (once the status axis clears) no resolvable repo —
+    /// mirrors the `bail!` conditions `request_execution_in_tx_with_live_check`
+    /// enforces before ever creating a row. Deliberately does NOT include
+    /// `in_review`: see `status_ineligibility`'s doc for why that stays
+    /// eligible on both the ordinary and the forced path.
     pub ineligible_reason: Option<String>,
     /// Work items gating this one, per [`WorkDb::gating_prereqs_for`].
     /// Always empty when `ineligible_reason` is `Some` (there is no point
@@ -48,6 +50,14 @@ pub(crate) struct DispatchAdmissionFacts {
     /// automation-sourced) — the only pool the concurrency cap governs.
     #[builder(default)]
     pub targets_main_pool: bool,
+    /// `true` when a fresh execution for this work item would route to
+    /// the dedicated review pool (i.e. `pr_review`) — the only pool an
+    /// operator-originated dispatch pause exempts (`drain_ready_queue`
+    /// holds only `paused && !is_review`). Used by
+    /// `ExecutionCoordinator::evaluate_dispatch_admission` to report no
+    /// pause in effect for such rows, rather than a bypassable one.
+    #[builder(default)]
+    pub exempt_from_operator_pause: bool,
 }
 
 impl WorkDb {
@@ -94,24 +104,45 @@ impl WorkDb {
                         .build());
                 };
                 let status: TaskStatus = status_str.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-                let ineligible_reason = if deleted != 0 {
-                    Some(format!("{resolved_work_item_id} is deleted"))
-                } else if status.is_terminal() {
-                    let reason_suffix = archived_reason.map(|r| format!(" — {r}")).unwrap_or_default();
-                    Some(format!(
-                        "{resolved_work_item_id} is `{status_str}`{reason_suffix} — terminal work items cannot be \
-                         dispatched"
-                    ))
-                } else if status == TaskStatus::InReview {
-                    Some(format!(
-                        "{resolved_work_item_id} is `in_review` — a worker already produced a PR for this item"
-                    ))
+                // Shares `status_ineligibility` with
+                // `request_execution_in_tx_with_live_check` (see its doc)
+                // so this read-only evaluator can never diverge from what
+                // the mutating request path actually enforces on the
+                // status axis.
+                let ineligible_reason = if let Some(ineligibility) =
+                    status_ineligibility(&status, archived_reason.as_deref(), deleted != 0)
+                {
+                    Some(match ineligibility {
+                        StatusIneligibility::Deleted => format!("{resolved_work_item_id} is deleted"),
+                        StatusIneligibility::Terminal {
+                            status,
+                            archived_reason,
+                        } => {
+                            let reason_suffix = archived_reason.map(|r| format!(" — {r}")).unwrap_or_default();
+                            format!(
+                                "{resolved_work_item_id} is `{status}`{reason_suffix} — terminal work items \
+                                 cannot be dispatched"
+                            )
+                        }
+                    })
                 } else if work_item_is_human_driven(&conn, &resolved_work_item_id)? {
                     Some(format!(
                         "{resolved_work_item_id} is human-driven — no agent worker will run"
                     ))
                 } else {
-                    None
+                    // Mirrors the request path's unresolved-repo bail
+                    // (`dispatch_helpers::request_execution_in_tx_with_live_check`)
+                    // so this evaluator can't report `would_dispatch: true`
+                    // for an item the mutating request would then reject —
+                    // read-only, so unlike that path this never records the
+                    // sticky repo-unresolved attention item itself.
+                    match resolve_repo_for_work_item(&conn, &resolved_work_item_id)? {
+                        Some(_) => None,
+                        None => {
+                            let label = repo_unresolved_kind_label(&conn, &resolved_work_item_id)?;
+                            Some(repo_unresolved_attention_body(&resolved_work_item_id, label))
+                        }
+                    }
                 };
                 let churn_guard_parked: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM work_attention_items WHERE work_item_id = ?1 AND kind = ?2 AND status = 'open'",
@@ -119,7 +150,23 @@ impl WorkDb {
                     |row| row.get(0),
                 )?;
                 let autostart_disabled = autostart == 0 && status == TaskStatus::Todo;
-                let kind = execution_kind_for_work_item(&conn, &resolved_work_item_id)?;
+                // Mirrors the request path's own idempotency/re-dispatch
+                // guard (`request_execution_in_tx_with_live_check`'s
+                // "governing" execution): a non-terminal execution already
+                // present for this work item — notably a `ready`
+                // `pr_review` execution — is REUSED rather than a fresh one
+                // being created, so its own kind (not the task's kind-
+                // derived hypothetical fresh-execution kind) is what
+                // actually governs pool routing and the operator-pause
+                // review exemption. Falls back to the fresh-execution kind
+                // when no non-terminal execution exists yet.
+                let live = query_live_execution_for_work_item(&conn, &resolved_work_item_id)?;
+                let latest = query_latest_execution_for_work_item(&conn, &resolved_work_item_id)?;
+                let governing = live.or(latest).filter(|e| !e.status.is_terminal());
+                let kind = match governing {
+                    Some(execution) => execution.kind,
+                    None => execution_kind_for_work_item(&conn, &resolved_work_item_id)?,
+                };
                 RawFacts {
                     resolved_work_item_id,
                     ineligible_reason,
@@ -135,6 +182,7 @@ impl WorkDb {
         } else {
             Vec::new()
         };
+        let exempt_from_operator_pause = raw.kind == Some(ExecutionKind::PrReview);
         let targets_main_pool = match raw.kind {
             Some(kind) => {
                 kind != ExecutionKind::PrReview
@@ -153,6 +201,7 @@ impl WorkDb {
             .churn_guard_parked(raw.churn_guard_parked)
             .autostart_disabled(raw.autostart_disabled)
             .targets_main_pool(targets_main_pool)
+            .exempt_from_operator_pause(exempt_from_operator_pause)
             .build())
     }
 }

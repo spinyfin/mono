@@ -112,7 +112,7 @@ extension ChatViewModel {
             invalidateWorkCache()
         }
 
-        if !staysPut, column == .doing {
+        if !staysPut, column == .doing, !task.humanDriven {
             // Entering Doing may request execution. Check dispatch
             // admission before sending the drop so a paused engine offers
             // a confirmation instead of either silently queuing the card
@@ -120,10 +120,16 @@ extension ChatViewModel {
             // dispatching around an operator's pause with no heads-up. See
             // `EvaluateDispatchAdmission` /
             // docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md.
-            // A false-positive check (the drop turns out to be a reorder,
-            // or the item is human-driven) is harmless — evaluation is
-            // read-only and the reply handler just forwards the drop
-            // unchanged when there is nothing to override.
+            //
+            // Human-driven items are excluded: `dispatch_admission_facts`
+            // reports human-driven as a hard blocker (no agent worker will
+            // ever run for it), but entering Doing without a worker is
+            // this item's normal, fully-supported transition — see
+            // `work_items.rs`'s "Human-driven rows enter Doing without a
+            // worker". Routing it through the admission check would bounce
+            // an ordinary drag on the hard-blocker check even with no
+            // pause active at all, so it skips evaluation entirely and
+            // goes straight to the normal drop below.
             pendingDragAdmissionCheck = PendingDragAdmissionCheck(taskID: taskID, column: column, group: group)
             engine.sendEvaluateDispatchAdmission(workItemId: taskID)
             return true
@@ -145,21 +151,31 @@ extension ChatViewModel {
         }
         pendingDragAdmissionCheck = nil
 
-        // Mirrors `pause_bypass_decision`'s order on the engine side exactly
-        // (coordinator/dispatch_admission.rs): a hard blocker refuses
-        // outright regardless of pause state, checked BEFORE "is there even
-        // a pause to override" — a dependency-gated or capped item must
-        // bounce back even when dispatch isn't paused at all.
-        let hardBlockers = admission.hardBlockers
-        if !hardBlockers.isEmpty {
-            bounceBackOptimisticMoves(message: hardBlockers.map(\.message).joined(separator: "; "))
-            return
-        }
-
+        // Check "is there even a pause to override" FIRST. When there is
+        // no active pause, this evaluation exists only to decide whether a
+        // confirmation is needed — the engine's ordinary (non-bypass)
+        // `RequestExecution` path already owns refusal for every other
+        // reason (dependency gating, the interactive cap, an ineligible
+        // status), exactly as it did before this evaluation existed. A
+        // hard blocker must only ever suppress the confirmation dialog
+        // when there is a pause it would otherwise be offered for — see
+        // docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md,
+        // "If there is no active pause, the drag follows the normal path
+        // without an alert."
         if !admission.pause.active {
             // Nothing to override — forward the drop exactly as the
             // non-Doing path already does.
             engine.sendMoveWorkItemOnBoard(id: pending.taskID, column: pending.column, group: pending.group)
+            return
+        }
+
+        // A pause IS active: mirrors `pause_bypass_decision`'s order on the
+        // engine side (coordinator/dispatch_admission.rs) — a hard blocker
+        // refuses outright regardless of the pause's overridability, since
+        // force never lifts a hard blocker either.
+        let hardBlockers = admission.hardBlockers
+        if !hardBlockers.isEmpty {
+            bounceBackOptimisticMoves(message: hardBlockers.map(\.message).joined(separator: "; "))
             return
         }
 

@@ -429,6 +429,70 @@ async fn force_start_bypasses_autostart_and_churn_guard_informationally() {
     wait_for_execution_status(db.as_ref(), &dispatched.id, ExecutionStatus::Running).await;
 }
 
+/// A `pr_review` row is exempt from an operator-originated pause
+/// (`drain_ready_queue` only holds `paused && !is_review`), so
+/// `EvaluateDispatchAdmission` must report no pause in effect at all for
+/// it — `would_dispatch: true`, `pause.active: false` — even while an
+/// operator pause is active for everything else. `bossctl work start
+/// --force` against such a row must then proceed as an ordinary start:
+/// no `dispatch_pause_override` event, since there was nothing to
+/// override. See the design doc's "Pools" section.
+#[tokio::test]
+async fn evaluate_dispatch_admission_exempts_pr_review_from_operator_pause() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let (_, chore_id) = make_pr_review_fixture(&db, None);
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+
+    let cube = Arc::new(FakeCubeClient::default());
+    let runner = Arc::new(FakeExecutionRunner::default());
+    let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let mut coord = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+        .with_dispatch_events(recording.clone());
+    coord.set_review_pool(WorkerPool::new_review(1));
+    let coordinator = Arc::new(coord);
+
+    coordinator.pause_dispatch(
+        1_700_000_000,
+        DispatchPauseOrigin::Operator,
+        PauseReason::new("test: operator pause").unwrap(),
+    );
+
+    let admission = coordinator.evaluate_dispatch_admission(&chore_id).await.unwrap();
+    assert!(
+        admission.would_dispatch,
+        "a pr_review row must be reported as dispatchable despite the operator pause: {admission:?}"
+    );
+    assert!(
+        !admission.pause.active,
+        "no pause should be reported for a review-pool row exempt from it: {admission:?}"
+    );
+
+    let result = coordinator
+        .dispatch_with_pause_bypass(force_input(&chore_id, None), live_states())
+        .await;
+    let dispatched = result.expect("a pr_review row must dispatch under force exactly as it would ordinarily");
+    wait_for_execution_status(db.as_ref(), &dispatched.id, ExecutionStatus::Running).await;
+    assert_eq!(dispatched.id, execution.id);
+
+    let events = recording.events_for(&execution.id).await;
+    assert!(
+        events.iter().all(
+            |e| e.stage != crate::dispatch_events::Stage::DispatchPauseOverride.as_str()
+                && e.stage != crate::dispatch_events::Stage::DispatchPauseOverrideRefused.as_str()
+        ),
+        "force against an exempt review row must not record an override event, got: {events:?}"
+    );
+}
+
 /// `EvaluateDispatchAdmission` reports an active, overridable pause with
 /// its reason/origin/generation, and reports `would_dispatch = true` once
 /// the pause is lifted and nothing else blocks.

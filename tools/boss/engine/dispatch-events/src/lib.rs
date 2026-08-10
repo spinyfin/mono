@@ -549,14 +549,18 @@ pub enum Stage {
     /// actually admitted through an active, overridable (operator-origin)
     /// global dispatch pause — see
     /// `docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md`.
-    /// Fires only on the successful dispatch itself, never merely on
-    /// passing the pause gate — a bypassed row that then loses to the
-    /// interactive concurrency cap or another admission constraint emits
-    /// [`Stage::DispatchPauseOverrideRefused`] instead, not this stage,
-    /// so this stage's presence always means a worker actually spawned.
-    /// The `details` object carries `entry_point` (`"cli"` /
-    /// `"app_drag"`), and the overridden pause's `origin`, `reason`, and
-    /// `paused_since_epoch_s`.
+    /// Fires only once the row is claimed past the pause gate: a bypassed
+    /// row that then loses to the interactive concurrency cap or another
+    /// admission constraint emits [`Stage::DispatchPauseOverrideRefused`]
+    /// instead, not this stage. This stage's presence means the row was
+    /// claimed for dispatch, NOT that a worker has actually spawned yet —
+    /// the emit site deliberately does not await the spawn tail (cube
+    /// repo/workspace setup, which can take its own multi-retry budget);
+    /// whether that tail then succeeds or fails is owned by the engine's
+    /// ordinary retry/backoff machinery, exactly as for a claim an
+    /// unpaused drain pass made. The `details` object carries
+    /// `entry_point` (`"cli"` / `"app_drag"`), and the overridden pause's
+    /// `origin`, `reason`, and `paused_since_epoch_s`.
     DispatchPauseOverride,
     /// A `RequestExecution { bypass_dispatch_pause: true, .. }` request was
     /// refused — either the pause itself was not overridable (breaker

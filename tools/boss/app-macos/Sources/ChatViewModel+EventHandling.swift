@@ -86,6 +86,14 @@ extension ChatViewModel {
             // without this, a disconnect mid-request leaves the row
             // permanently disabled since no work_error will ever arrive.
             deferredScopeActionInFlightIDs.removeAll()
+            // Same reasoning for a drag-to-Doing admission check in
+            // flight: the socket drop means no `dispatch_admission_evaluated`
+            // reply is ever coming, so nothing else would clear
+            // `pendingDragAdmissionCheck` or the optimistic move it guards.
+            if pendingDragAdmissionCheck != nil {
+                pendingDragAdmissionCheck = nil
+                bounceBackOptimisticMoves(message: nil)
+            }
             scheduleConnectionLostBannerCheck()
         case .workInvalidated(let topic, let productId, let itemIDs):
             if CommentEngineBridge.isCommentTopic(topic) {
@@ -191,6 +199,19 @@ extension ChatViewModel {
                 workErrorMessage = message
             }
         case .error(let message):
+            if pendingDragAdmissionCheck != nil {
+                // A malformed/undecodable `dispatch_admission_evaluated`
+                // reply (EngineClient emits `.error`, never
+                // `.dispatchAdmissionEvaluated`, when the payload fails to
+                // decode) would otherwise leave the card optimistically
+                // rendered in Doing forever — nothing else ever clears
+                // `pendingDragAdmissionCheck` for a reply that never
+                // arrives in the expected shape. Bounce it back exactly as
+                // a hard-blocker refusal would.
+                pendingDragAdmissionCheck = nil
+                bounceBackOptimisticMoves(message: message)
+                return
+            }
             if Self.isSocketTransportError(message) {
                 // Transport errors fire continuously while the engine
                 // is unreachable (every reconnect attempt re-emits a

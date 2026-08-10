@@ -404,8 +404,17 @@ pub enum DispatchAdmissionEntryPoint {
 
 /// Stable reason code naming one constraint [`DispatchAdmission`] (or a
 /// refused pause-bypass [`RequestExecutionInput`]) reports as blocking
-/// dispatch. These are exactly the constraints a pause-only override never
-/// bypasses — see the design doc's "Exactly what force overrides" section.
+/// dispatch. This list mixes two different kinds of constraint — see the
+/// design doc's "Exactly what force overrides" section:
+///
+/// - `INTERACTIVE_CONCURRENCY_CAP`, `UNMET_DEPENDENCY`, and
+///   `INELIGIBLE_STATUS` are genuinely enforced: force never bypasses them.
+/// - `CHURN_GUARD_PARKED` and `AUTOSTART_DISABLED` are informational only
+///   (see `INFORMATIONAL_ONLY_BLOCKER_CODES` in
+///   `coordinator/dispatch_admission.rs`) — an explicit dispatch request has
+///   always cleared both, forced or not, so they are reported here purely
+///   for confirmation-dialog transparency, never as a refusal reason.
+///
 /// The dispatch pause itself is reported separately via
 /// [`DispatchPauseSnapshot`], not as a blocker code, since a pause is the
 /// one thing that *can* be overridden.
@@ -461,9 +470,14 @@ pub struct DispatchAdmission {
     /// at all (not paused, and `blockers` is empty).
     pub would_dispatch: bool,
     pub pause: DispatchPauseSnapshot,
-    /// Every non-overridable blocker currently present, independent of the
-    /// pause. Force never clears any of these — the app renders them as
-    /// reasons a confirmation cannot promise to overcome.
+    /// Every blocker currently present, independent of the pause — a mix
+    /// of enforced and informational-only codes; see the
+    /// `ADMISSION_BLOCKER_*` doc above for which is which. Force never
+    /// clears an enforced one; it has always cleared the informational-only
+    /// ones regardless of force. The app renders the enforced subset (the
+    /// Swift `DispatchAdmission.hardBlockers` computed property) as reasons
+    /// a confirmation cannot promise to overcome, and the rest for
+    /// transparency only.
     #[serde(default)]
     #[builder(default)]
     pub blockers: Vec<DispatchAdmissionBlocker>,

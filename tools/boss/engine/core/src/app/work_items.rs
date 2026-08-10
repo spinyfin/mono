@@ -636,7 +636,15 @@ async fn apply_work_item_patch(
         }
         let actor = resolve_status_actor(&server_state, peer_pid);
         match work_db.update_work_item_as_actor(&id, patch, actor) {
-            Ok(item) => {
+            Ok(mut item) => {
+                // Set only by the pause-bypass dispatch arm below when the
+                // authoritative re-check refuses: the status patch already
+                // landed, so we revert it and answer this request with a
+                // `work_error` (which `ChatViewModel`'s existing
+                // `.workError` handler bounces the optimistic move on)
+                // instead of a success response that would otherwise leave
+                // the card in Doing with no execution and no visible error.
+                let mut dispatch_failure_response: Option<String> = None;
                 let product_id = item.product_id().to_string();
                 let mut topics = vec![work_product_topic(&product_id)];
                 if matches!(item, WorkItem::Product(_)) {
@@ -759,7 +767,45 @@ async fn apply_work_item_patch(
                             .await
                         {
                             Ok(execution) => (Some(execution.id), true, None),
-                            Err(err) => (None, false, Some(format!("{err:#}"))),
+                            Err(err) => {
+                                // The pre-check in `handle_move_work_item_on_board`
+                                // already cleared this drag before the status
+                                // patch above ever applied — reaching a refusal
+                                // here means the pause was re-raised (or the
+                                // interactive cap filled) in the window between
+                                // that confirmation and this authoritative
+                                // re-check. The status patch already landed, so
+                                // revert it rather than leaving the card
+                                // stranded in Doing with no execution and no
+                                // visible error.
+                                let reason = format!("{err:#}");
+                                tracing::warn!(
+                                    work_item_id = %work_item_id_for_event,
+                                    ?err,
+                                    "UpdateWorkItem → active: pause-bypass dispatch refused at the \
+                                     authoritative re-check; reverting status, no worker spawned",
+                                );
+                                if let Some(prev_status) = &previous_task_status {
+                                    let revert_patch = WorkItemPatch::builder().status(prev_status.as_str()).build();
+                                    match work_db.update_work_item_as_actor(
+                                        &work_item_id_for_event,
+                                        revert_patch,
+                                        actor,
+                                    ) {
+                                        Ok(reverted) => item = reverted,
+                                        Err(revert_err) => {
+                                            tracing::warn!(
+                                                work_item_id = %work_item_id_for_event,
+                                                ?revert_err,
+                                                "UpdateWorkItem → active: failed to revert status after \
+                                                 pause-bypass dispatch refusal",
+                                            );
+                                        }
+                                    }
+                                }
+                                dispatch_failure_response = Some(reason.clone());
+                                (None, false, Some(reason))
+                            }
                         }
                     } else if needs_dispatch {
                         let live_states = server_state.live_worker_states.clone();
@@ -910,7 +956,16 @@ async fn apply_work_item_patch(
                     vec![work_item_id(&item)],
                 )
                 .await;
-                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
+                if let Some(reason) = dispatch_failure_response {
+                    // The status patch was reverted above; answer this
+                    // request with a refusal (not the reverted item as a
+                    // success) so the client's `.workError` handler
+                    // bounces the optimistic card back instead of the
+                    // "dragged it and nothing happened" shape.
+                    send_work_error(&sink, &request_id, reason);
+                } else {
+                    send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
+                }
             }
             Err(err) => {
                 send_work_error(&sink, &request_id, &err);

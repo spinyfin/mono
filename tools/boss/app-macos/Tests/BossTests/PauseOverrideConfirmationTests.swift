@@ -158,7 +158,17 @@ final class PauseOverrideConfirmationTests: XCTestCase {
         XCTAssertNotNil(model.dragRefusalNotice, "the refusal must surface an inline notice")
     }
 
-    func testHardBlockerBouncesImmediatelyEvenWithoutAPause() {
+    func testHardBlockerWithNoPauseForwardsTheDropUnchanged() {
+        // Regression test: a hard blocker (e.g. the interactive
+        // concurrency cap, or a dependency gate) must NOT bounce the card
+        // when there is no pause active at all — the engine's ordinary
+        // (non-bypass) RequestExecution path already owns refusal for
+        // every non-pause reason, exactly as it did before this
+        // evaluation existed. Only when a pause IS active does a hard
+        // blocker suppress the confirmation dialog. See
+        // docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md,
+        // "If there is no active pause, the drag follows the normal path
+        // without an alert."
         let model = makeModel()
         let task = makeTask(status: "todo")
         model.choresByProductID = ["prod_test": [task]]
@@ -171,8 +181,54 @@ final class PauseOverrideConfirmationTests: XCTestCase {
         model.applyEventForTest(.dispatchAdmissionEvaluated(admission: evaluated))
 
         XCTAssertNil(model.pendingPauseOverrideConfirmation)
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing,
+                       "a hard blocker with no pause active must forward the drop, not bounce it — the ordinary "
+                           + "RequestExecution path (not this evaluation) owns refusing it")
+    }
+
+    func testHardBlockerWithActivePauseStillBounces() {
+        // The hard-blocker check still applies once there IS a pause to
+        // suppress a confirmation for — force never lifts a hard blocker
+        // either, so offering a confirmation the mutating request would
+        // just refuse anyway would be misleading.
+        let model = makeModel()
+        let task = makeTask(status: "todo")
+        model.choresByProductID = ["prod_test": [task]]
+
+        _ = model.attemptDrop(task.id, onColumn: .doing, group: nil)
+        var evaluated = admission(workItemID: task.id, wouldDispatch: false, pauseActive: true, overridable: true)
+        evaluated.blockers = [
+            DispatchAdmissionBlocker(code: "interactive_concurrency_cap", message: "cap reached (12/12)"),
+        ]
+        model.applyEventForTest(.dispatchAdmissionEvaluated(admission: evaluated))
+
+        XCTAssertNil(model.pendingPauseOverrideConfirmation)
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .backlog,
-                       "a hard blocker must bounce the card back even with no pause active")
+                       "a hard blocker must still bounce the card back once a pause is active")
+    }
+
+    // MARK: - Human-driven items: never routed through admission at all
+
+    func testHumanDrivenDragSkipsAdmissionEvaluationEntirely() {
+        // Human-driven -> Doing is an explicitly supported transition
+        // that intentionally spawns no worker (see `work_items.rs`'s
+        // "Human-driven rows enter Doing without a worker"), and
+        // `dispatch_admission_facts` reports human-driven as a hard
+        // blocker. Routing it through the admission check at all would
+        // bounce this ordinary drag even with no pause active — see the
+        // regression this guards against.
+        let model = makeModel()
+        let task = makeTask(status: "todo", humanDriven: true)
+        model.choresByProductID = ["prod_test": [task]]
+
+        let accepted = model.attemptDrop(task.id, onColumn: .doing, group: nil)
+
+        XCTAssertTrue(accepted)
+        XCTAssertNil(model.pendingDragAdmissionCheck,
+                     "a human-driven drag must never be routed through EvaluateDispatchAdmission")
+        XCTAssertNil(model.pendingPauseOverrideConfirmation)
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing,
+                       "a human-driven drag must forward the drop directly, exactly like the non-Doing path")
     }
 
     // MARK: - Stale reply: superseded by a later drag
@@ -219,8 +275,8 @@ final class PauseOverrideConfirmationTests: XCTestCase {
         )
     }
 
-    private func makeTask(status: String, autostart: Bool = false, id: String? = nil) -> WorkTask {
-        WorkTask(
+    private func makeTask(status: String, autostart: Bool = false, id: String? = nil, humanDriven: Bool = false) -> WorkTask {
+        var task = WorkTask(
             id: id ?? "task_\(UUID().uuidString)",
             productID: "prod_test",
             projectID: nil,
@@ -236,6 +292,8 @@ final class PauseOverrideConfirmationTests: XCTestCase {
             updatedAt: "2026-06-01T00:00:00Z",
             autostart: autostart
         )
+        task.humanDriven = humanDriven
+        return task
     }
 
     private func makeProduct() -> WorkProduct {

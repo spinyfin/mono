@@ -157,7 +157,20 @@ impl ExecutionCoordinator {
                 });
             }
         }
-        let pause = self.dispatch_pause_snapshot();
+        let mut pause = self.dispatch_pause_snapshot();
+        if facts.exempt_from_operator_pause && pause.overridable {
+            // `drain_ready_queue` only holds `paused && !is_review` — an
+            // operator-originated pause exempts review-pool executions
+            // entirely (see `pool_for_execution` / the pause gate in
+            // `coordinator/scheduler.rs`), so this row would dispatch
+            // right now regardless of the pause. Report no pause in
+            // effect for it at all, per the design doc's "Pools" section:
+            // force is normally meaningless for reviews and the
+            // evaluation reports that no pause override is needed —
+            // rather than a bypassable pause that would let
+            // `pause_bypass_decision` record a bogus override.
+            pause = DispatchPauseSnapshot::default();
+        }
         let would_dispatch = !Self::has_hard_blocker(&blockers) && !pause.active;
         Ok(DispatchAdmission::builder()
             .work_item_id(facts.resolved_work_item_id)
