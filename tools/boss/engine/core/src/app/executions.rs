@@ -340,7 +340,7 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
                 return;
             }
         };
-        let probe_id = server_state.queue_probe(run_id.clone(), text, urgent);
+        let probe_id = server_state.queue_probe_resolving_worker_signal(run_id.clone(), text, urgent);
         // `probe_delivery_expectation` above confirmed a slot mapping existed,
         // but that check and this insert are not atomic with
         // `release_worker_pane`'s teardown drain: if the run's pane was
@@ -388,11 +388,12 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
         // probe subsequently settles `Abandoned`/`Orphaned` and the
         // acknowledgement text never reaches the worker — the exact
         // asymmetry [`crate::app::probes::PROBE_UNDELIVERED_ATTENTION_KIND`]
-        // exists to stop repeating. Tag the probe instead: the resolution
-        // fires from [`ServerState::set_probe_lifecycle_detail`] the moment
-        // this probe's own delivery state actually confirms the worker got
-        // it, and never fires at all if it doesn't.
-        server_state.mark_probe_for_worker_signal_resolution(&probe_id, &run_id);
+        // exists to stop repeating. The probe was tagged atomically inside
+        // `queue_probe_resolving_worker_signal` above, before it became
+        // visible to any dispatcher: the resolution fires from
+        // [`ServerState::set_probe_lifecycle_detail`] the moment this
+        // probe's own delivery state actually confirms the worker got it,
+        // and never fires at all if it doesn't.
         // Deliver the probe right now if the worker's pane will take a
         // write — parked (no boundary is coming on its own) or mid-turn on
         // a driver that buffers pane input (the composer takes it while the

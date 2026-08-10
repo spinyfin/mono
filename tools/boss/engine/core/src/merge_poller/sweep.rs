@@ -974,7 +974,12 @@ pub(crate) async fn sweep_pending_pr(
         // receives (it has no live Stop event to read a reason from) —
         // covered for exhaustiveness.
         | StopOutcome::DriverTerminalError { .. }
-        | StopOutcome::DbError => {}
+        | StopOutcome::DbError
+        // DeferredForProbeTurn is only reachable via `on_stop_inner`'s
+        // probe-delivery gate on the on-Stop path (it depends on this same
+        // boundary's pre-completion probe pass), never from a PR-detection
+        // recheck — covered for exhaustiveness.
+        | StopOutcome::DeferredForProbeTurn => {}
     }
 }
 
@@ -1058,7 +1063,11 @@ pub(crate) async fn sweep_late_pr(
         // DriverTerminalError is only reachable via `on_stop_inner`'s early
         // gate on the driver-supplied TurnEnd, never from a late-PR recheck.
         | StopOutcome::DriverTerminalError { .. }
-        | StopOutcome::DbError => {}
+        | StopOutcome::DbError
+        // DeferredForProbeTurn is only reachable via `on_stop_inner`'s
+        // probe-delivery gate on the on-Stop path, never from a late-PR
+        // recheck — covered for exhaustiveness.
+        | StopOutcome::DeferredForProbeTurn => {}
     }
 }
 

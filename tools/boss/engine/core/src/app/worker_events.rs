@@ -156,14 +156,19 @@ pub(super) async fn dispatch_worker_event_fanout(
     // act on what was written — that's a written-but-inert instruction, not a
     // delivered one. So when the pre-pass actually delivered the probe (the
     // worker's CLI took it as a prompt, or a buffering driver queued it in its
-    // composer), this boundary's completion decision is skipped entirely:
-    // the worker gets the turn it needs to act on the instruction, and
-    // completion is re-evaluated fresh at the `Stop` that turn produces. The
-    // existing nudge/stale sweeps are the backstop if that `Stop` never
+    // composer), this boundary's completion handler still runs in full —
+    // the stale-Stop guard, the `stop_seen` stamp, `StopReason::Other`
+    // handling, and every kind-specific finalizer all execute exactly as
+    // they would otherwise — but the generic PR-detection/nudge/park
+    // decision inside it is withheld (`StopOutcome::DeferredForProbeTurn`):
+    // the worker gets the turn it needs to act on the instruction, and that
+    // one decision is re-evaluated fresh at the `Stop` that turn produces.
+    // The existing nudge/stale sweeps are the backstop if that `Stop` never
     // comes. When the pre-pass did not deliver (nothing was queued, no
-    // injectable posture, etc.) completion runs exactly as before.
+    // injectable posture, etc.) completion runs exactly as before, with
+    // nothing withheld.
     //
-    // *After* completion — only reached when the pre-pass did not deliver —
+    // *After* completion — regardless of whether the pre-pass delivered —
     // for a probe the completion handler queued during this same fan-out
     // (e.g. PROBE_NO_PR). Those must go out on the Stop that triggered them
     // rather than waiting for the next one, which for a now-idle worker never
@@ -176,15 +181,16 @@ pub(super) async fn dispatch_worker_event_fanout(
     // post-completion pass did before, since a pre-existing probe already sat
     // ahead of the nudge in the queue.
     let pre_pass = dispatch_probe_on_stop(server_state, incoming).await;
-    if pre_pass_delivered_a_probe(pre_pass) {
+    let defer_finalization = pre_pass_delivered_a_probe(pre_pass);
+    if defer_finalization {
         tracing::info!(
             run_id = incoming.run_id.as_deref(),
-            "completion skipped for this boundary: a probe was just delivered into the pane and the \
-             worker is entitled to a turn to act on it before completion re-evaluates",
+            "completion's PR-detection/nudge/park decision deferred for this boundary: a probe was \
+             just delivered into the pane and the worker is entitled to a turn to act on it before \
+             that decision re-evaluates; every other completion side effect still runs",
         );
-    } else {
-        dispatch_completion_on_stop(server_state, incoming).await;
     }
+    dispatch_completion_on_stop(server_state, incoming, defer_finalization).await;
     let _ = dispatch_probe_on_stop(server_state, incoming).await;
 }
 
@@ -2410,6 +2416,7 @@ pub(super) fn extract_last_assistant_text(
 pub(super) async fn dispatch_completion_on_stop(
     server_state: &Arc<ServerState>,
     incoming: &crate::events_socket::IncomingHookEvent,
+    defer_finalization: bool,
 ) {
     if !incoming.is_turn_boundary() {
         return;
@@ -2419,7 +2426,7 @@ pub(super) async fn dispatch_completion_on_stop(
     };
     let outcome = server_state
         .completion_handler
-        .on_stop_with_turn_end(run_id, incoming.turn_boundary())
+        .on_stop_with_turn_end_deferrable(run_id, incoming.turn_boundary(), defer_finalization)
         .await;
     // Info-level so non-success outcomes (DetectorFailed, AwaitingInput,
     // StalePr, EmptyDiffPr) appear in the engine log without enabling

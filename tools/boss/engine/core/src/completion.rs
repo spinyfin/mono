@@ -1865,6 +1865,18 @@ pub enum StopOutcome {
     DriverTerminalError { detail: String },
     /// Unexpected DB failure while recording completion.
     DbError,
+    /// The pre-completion probe pass in
+    /// [`crate::app::worker_events::dispatch_worker_event_fanout`] delivered
+    /// a probe into the pane for this boundary, so the worker is entitled to
+    /// a turn to act on it before the generic PR-detection/nudge/park
+    /// decision runs — that decision is deferred to the `Stop` the granted
+    /// turn produces. Everything upstream of that decision inside
+    /// `on_stop_inner` — the stale-Stop supersession guard, the `stop_seen`
+    /// stamp, `StopReason::Other` driver-fatal-error handling, and every
+    /// kind-specific finalizer (`automation_triage`, `answer_agent`,
+    /// `pr_review`, the CI-remediation flaky-retrigger park) — still ran
+    /// normally for this boundary; only the terminal decision was withheld.
+    DeferredForProbeTurn,
 }
 
 /// Number of transcript-read attempts [`WorkerCompletionHandler::read_final_triage_message`]

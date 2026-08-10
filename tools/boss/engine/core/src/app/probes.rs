@@ -220,6 +220,30 @@ impl ServerState {
     /// `PostToolUse`, then at every `Stop`). One probe is delivered per
     /// reply cycle: see [`Self::has_in_flight_probe`].
     pub fn queue_probe(&self, run_id: String, text: String, urgent: bool) -> String {
+        self.queue_probe_inner(run_id, text, urgent, false)
+    }
+
+    /// Same as [`Self::queue_probe`], but additionally tags the minted probe
+    /// for [`Self::mark_probe_for_worker_signal_resolution`] — atomically,
+    /// under the same critical section that makes the probe visible to
+    /// concurrent dispatchers.
+    ///
+    /// A caller that instead calls `queue_probe` followed by a separate
+    /// `mark_probe_for_worker_signal_resolution` opens a window: the probe
+    /// becomes dispatchable the moment `queue_probe` inserts it into
+    /// `pending_probes`, and a concurrent `Stop`/`PostToolUse` fan-out on
+    /// another task can claim and deliver it — running
+    /// `set_probe_lifecycle_detail(Consumed)` — before the tag is inserted.
+    /// `resolve_worker_signal_attentions_if_pending` finds nothing to
+    /// resolve, and because the tag is inserted only afterwards, the
+    /// worker-signal attention this probe was meant to ack never resolves.
+    /// Use this method for any probe whose delivery is meant to ack an
+    /// open `worker_signal` attention item.
+    pub fn queue_probe_resolving_worker_signal(&self, run_id: String, text: String, urgent: bool) -> String {
+        self.queue_probe_inner(run_id, text, urgent, true)
+    }
+
+    fn queue_probe_inner(&self, run_id: String, text: String, urgent: bool, resolves_worker_signal: bool) -> String {
         let probe_id = self.allocate_probe_id();
         let probe = PendingProbe {
             probe_id: probe_id.clone(),
@@ -242,6 +266,14 @@ impl ServerState {
                     detail: None,
                 },
             );
+        // Tag for worker-signal resolution BEFORE the probe is inserted into
+        // `pending_probes` below — i.e. before any concurrent dispatcher can
+        // possibly see and deliver it. See the doc on
+        // [`Self::queue_probe_resolving_worker_signal`] for why ordering
+        // this after the insert would be a race.
+        if resolves_worker_signal {
+            self.mark_probe_for_worker_signal_resolution(&probe_id, &run_id);
+        }
         let mut guard = self.pending_probes.lock().expect("pending_probes mutex poisoned");
         let queue = guard.entry(run_id).or_default();
         if urgent {
@@ -775,6 +807,17 @@ impl ServerState {
         drop(guard);
         if state.is_delivered() {
             self.resolve_worker_signal_attentions_if_pending(probe_id);
+        } else if state.is_undeliverable() {
+            // This probe will never reach `is_delivered()` now, so its
+            // worker-signal tag (if any) would otherwise sit in
+            // `probe_worker_signal_resolution` for the life of the engine
+            // process — never resolving an attention (correctly, since the
+            // probe never landed) but never freed either. Drop the tag
+            // without touching any attention item.
+            self.probe_worker_signal_resolution
+                .lock()
+                .expect("probe_worker_signal_resolution mutex poisoned")
+                .remove(probe_id);
         }
     }
 
@@ -782,9 +825,12 @@ impl ServerState {
     /// reaches [`ProbeDeliveryState::is_delivered`], the run's open
     /// `worker_signal` attention items are resolved.
     ///
-    /// Called from `handle_probe_run` for every human/coordinator-issued
-    /// probe: acceptance alone is not the ack gesture, delivery is — see the
-    /// field doc on [`ServerState::probe_worker_signal_resolution`] for the
+    /// Called from [`Self::queue_probe_resolving_worker_signal`] — the entry
+    /// point `handle_probe_run` uses for every human/coordinator-issued
+    /// probe — under the same critical section that queues the probe, so
+    /// the tag exists before the probe is visible to any dispatcher.
+    /// Acceptance alone is not the ack gesture, delivery is — see the field
+    /// doc on [`ServerState::probe_worker_signal_resolution`] for the
     /// asymmetry this closes.
     pub(super) fn mark_probe_for_worker_signal_resolution(&self, probe_id: &str, run_id: &str) {
         self.probe_worker_signal_resolution
