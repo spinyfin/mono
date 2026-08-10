@@ -106,7 +106,7 @@ pub(super) fn compose_design_directive(parent_project: Option<&Project>, design_
     out.push_str(&design_discipline_block());
     out.push_str("- the **Proposed implementation task breakdown** section must:\n");
     out.push_str("  - use exactly that heading (`## Proposed implementation task breakdown`) so a downstream parser can locate it reliably.\n");
-    out.push_str("  - **each entry must open with `### <task name>`** — a `###` ATX heading, one per entry, in dependency order. This is the entry boundary a downstream parser keys off of; bullets, bold-prefixed numbers, or plain numbered lines are not recognised as entries and silently degrade the handoff to free-form prose. Put the task name text directly after `### ` (no bold wrapping needed — the heading itself is the boundary).\n");
+    out.push_str("  - **each entry must open with `### <task name>`** — a `###` ATX heading, one per entry, in dependency order. This is the entry boundary a downstream parser keys off of and the only shape guaranteed to be recognised; other shapes (numbered items, bold-prefixed numbers, bold bullets) are best-effort fallbacks only, and any other shape degrades the handoff to free-form prose. Put the task name text directly after `### ` (no bold wrapping needed — the heading itself is the boundary).\n");
     out.push_str("  - list PR-sized tasks in dependency order, where each entry contains:\n");
     out.push_str("    - a short **task name** (one line).\n");
     out.push_str("    - a one-paragraph **scope** description.\n");

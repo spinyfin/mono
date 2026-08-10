@@ -69,7 +69,8 @@
 //!
 //! The design doc's implementation-task breakdown is authoritative: entry
 //! count in, row count out. The user prompt surfaces a discrete inventory of
-//! parsed `###` (or numbered) entries so the model cannot freely re-segment a
+//! parsed entries (`###` headings, or a numbered / bold-bullet fallback) so the
+//! model cannot freely re-segment a
 //! single Scope paragraph. Dependency edges come only from what each entry
 //! declares (`Dependencies: none` → no edges). A prior "oversize task"
 //! re-prompt that forced multi-layer / multi-clause entries into invented
@@ -649,9 +650,15 @@ fn parse_bullet_entries(section: &str) -> Vec<BreakdownEntry> {
     for line in section.lines() {
         if is_fence_delimiter(line) {
             in_fence = !in_fence;
+            if current_title.is_some() {
+                body_lines.push(line.to_owned());
+            }
             continue;
         }
         if in_fence {
+            if current_title.is_some() {
+                body_lines.push(line.to_owned());
+            }
             continue;
         }
         let is_indented = line.starts_with(' ') || line.starts_with('\t');
@@ -2110,12 +2117,17 @@ Scope: hard-dependency check.\n\
 ## Implementation plan\n\
 \n\
 - **6f-4: protocol additions.** Adds RegisterAppSession and friends.\n\
+```rust\n\
+struct RegisterAppSession;\n\
+```\n\
 - **6f-5: engine-side dispatch.** ServerState tracks sessions.\n\
 ";
         let entries = extract_breakdown_entries(doc);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].title, "6f-4: protocol additions");
         assert!(entries[0].body.contains("Adds RegisterAppSession"));
+        assert!(entries[0].body.contains("```rust"));
+        assert!(entries[0].body.contains("struct RegisterAppSession;"));
         assert_eq!(entries[1].title, "6f-5: engine-side dispatch");
     }
 
@@ -2173,13 +2185,11 @@ More scope prose after the fence.\n\
     }
 
     #[test]
-    fn empty_entries_from_a_recognised_section_are_logged() {
+    fn recognised_section_with_no_entries_returns_empty() {
         // A recognised heading whose body has no ###, numbered, or bullet
         // entries must still return an empty vec (free-prose fallback) —
         // this doc's "breakdown" is just a paragraph, not a list. The
-        // silent-fallback case itself is covered by the `tracing::warn!` in
-        // `extract_breakdown_entries`; this test pins the empty-vec return
-        // contract that warn depends on.
+        // This test pins the empty-vec contract for a free-prose breakdown.
         let doc = "\
 ## Proposed implementation task breakdown\n\
 \n\
