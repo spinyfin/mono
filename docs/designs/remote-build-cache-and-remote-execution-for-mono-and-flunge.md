@@ -1,4 +1,4 @@
-# Remote build cache and RBE for mono and flunge: measured laptop offload is ~0%
+# Remote build cache and RBE for mono and flunge: prefer agent hosts over executor-only Macs
 
 - **Date:** 2026-08-10
 - **Status:** design (not implemented); supersedes the earlier attempt in [mono#2715](https://github.com/spinyfin/mono/pull/2715)
@@ -6,13 +6,13 @@
 - **Related:** [Distributed agent execution](../../tools/boss/docs/designs/distributed-agent-execution-register-and-dispatch-to-remote-ssh-hosts.md) · [Linux CI agent runbook](../../.buildkite/linux-agents-runbook.md) · [Xcode pinning runbook](../../tools/boss/docs/mac-toolchain-xcode-pinning.md) · [checkleft CI timing](../investigations/checkleft-checks-ci-timing.md)
 - **Measurement artifacts:** all figures below were produced on the coordinator laptop on 2026-08-10; every command is reproduced in [Method](#method-re-runnable)
 
-The contested property this design rests on: **for builds that run on the coordinator's laptop, a shared remote cache and a Linux RBE cluster would each move approximately none of the load.** Not "less than hoped" — approximately none, for two measured reasons that are each sufficient on their own.
+The platform-aware result this design rests on: **for builds that run on the coordinator's laptop, a shared remote cache and a Linux RBE cluster would each move approximately none of the load, while a compatible Darwin RBE cluster could move most of the measured compile critical path.** RBE is not assumed to mean Linux; the two executor platforms are evaluated separately below.
 
-Those two reasons: every action in both repos' laptop builds targets `darwin_arm64`, so no Linux worker can execute any of them; and the handful of actions that do execute are either already served by a cache these workers share, or are compiles of the crate the agent just edited, which no peer can have built.
+Linux RBE is 0% for the current configuration because both repos' laptop builds select `darwin_arm64` toolchains and declare no Linux-execution-compatible cross-toolchain. Darwin RBE has a much higher ceiling — up to 120.4 of 125.5 seconds in the measured incremental edit — but still leaves loading and analysis, policy-pinned local tests, the Bazel server, and the agent itself on the laptop. A Mac used as a whole-agent host removes all of those costs, so the recommendation is still to spend scarce Mac capacity on distributed agents rather than executor-only workers.
 
 ## Verdict
 
-**Do not build a shared remote cache or a remote execution cluster for laptop relief.** Fix the local shared cache's retention window, bound local Bazel concurrency, and put the effort into distributed agent execution, which is the only mechanism measured here that removes work from the machine.
+**Do not build a shared remote cache or a remote execution cluster for laptop relief now.** Linux RBE cannot execute the current laptop action graph; Darwin RBE can execute much of it, but a Mac assigned to whole-agent distribution removes more load than the same Mac assigned only to remote actions. Fix the local shared cache's retention window, bound local Bazel concurrency, and put the next Mac capacity into distributed agent execution.
 
 A shared remote cache becomes genuinely valuable at exactly one moment: when a second machine starts running Boss workers. Design it now; build it then. That sequencing is a dependency on distributed agent execution, not a hedge.
 
@@ -221,8 +221,8 @@ For the real edit: **120.4 of 125.5 seconds is a single `aarch64-apple-darwin` `
 The offload arithmetic for this scenario is not an estimate:
 
 - **Shared remote cache: 0 s.** The executed action's inputs include the line the agent just wrote. No peer can have its result. This is not a low hit rate; it is a structurally impossible hit.
-- **Linux RBE: 0 s.** The action's target platform is `aarch64-apple-darwin`. Executing it on a Linux worker requires a Rust toolchain with exec = Linux and target = Apple Silicon, which requires an Apple SDK and linker on the worker. That is neither hermetically distributable nor licensed for Linux hosts.
-- **macOS RBE: up to 120.4 s** — the whole build — if macOS executors existed with a matching toolchain, minus input upload and output download for a large crate.
+- **Linux RBE as currently configured: 0 s.** The selected toolchain requires Darwin execution; neither repo defines a Linux-exec/Darwin-target cross-toolchain. Creating one could make some pure Rust compile actions eligible for Linux workers, but a complete Apple-target build would still require a hermetic Apple SDK and linker that cannot be licensed for Linux hosts.
+- **Darwin RBE: up to 120.4 s** — nearly the whole build — if Darwin executors existed with a matching toolchain and SDK, minus input upload and output download for a large crate.
 - **Whole-agent distribution: 125.5 s**, plus the agent process, plus that worker's share of the `fseventsd` and Gatekeeper overhead, plus its Bazel server's 190 MB and its analysis cost.
 
 ### 5. Test run
@@ -291,7 +291,7 @@ Configuration facts, verified by reading the repo:
 
 ### 7. The offload table — the answer to the decisive question
 
-| Workload                                                                                                | Where it runs today       |                                 Shared remote cache |                      Linux RBE |             macOS RBE | Whole-agent distribution |
+| Workload                                                                                                | Where it runs today       |                                 Shared remote cache |                      Linux RBE |            Darwin RBE | Whole-agent distribution |
 | ------------------------------------------------------------------------------------------------------- | ------------------------- | --------------------------------------------------: | -----------------------------: | --------------------: | -----------------------: |
 | Laptop: incremental agent edit (measured 125.5 s, 4 actions)                                            | laptop                    |                                              **0%** |                         **0%** |            up to ~96% |                 **100%** |
 | Laptop: newly-leased mono workspace, unmodified target (measured 567 s, 4 of 706 actions executed)      | laptop                    |                                             **≲1%** |                         **0%** | ~59% of critical path |                 **100%** |
@@ -303,9 +303,15 @@ Configuration facts, verified by reading the repo:
 | Flunge Linux CI                                                                                         | already on BuildBuddy RBE |                                             already |      **already in production** |                   n/a |                      n/a |
 | mono Linux CI (`bazel-any` Linux agents)                                                                | 3 owned Linux hosts       |                                      plausible gain |                 plausible gain |                   n/a |                      n/a |
 
-**The headline number: under Linux RBE, ~0% of the laptop's Bazel CPU leaves the machine — in every scenario, for both repos.** That column is zero because both repos' laptop builds materialise only `darwin_arm64` configurations, which is a structural fact about toolchain resolution rather than a hit-rate estimate.
+**The platform split is the headline: Linux RBE moves ~0% of the laptop's Bazel CPU with the toolchains configured today; Darwin RBE could move up to ~96% of the measured incremental build's critical path.** The Linux column is zero because both repos' laptop builds materialise only `darwin_arm64` configurations and provide no Linux-execution-compatible cross-toolchain. The Darwin column is not zero because a Darwin worker can advertise the matching execution platform and SDK. Its limit is scope: analysis, local-policy test actions, the Bazel server, and the agent process do not move with the remote compile.
 
 **Under a shared remote cache, ≲1% today**, because the only other machines that could populate darwin action keys are CI Macs that do not build these targets. The flunge row is the important qualifier: there _is_ a large body of re-executed work on this laptop, but it is work a **sibling worker on the same machine** already did and the local cache evicted. That is a local-capacity failure with a local fix, and reaching for a network cache to solve it would be paying for reach to solve a retention problem.
+
+### Executor platform is a decision, not an assumption
+
+The Remote Execution API is platform-neutral. An action carries execution-platform requirements, and a scheduler routes it to a worker that advertises compatible properties. This design includes Linux RBE because mono already has Linux CI capacity and flunge already uses Linux BuildBuddy executors; it includes Darwin RBE because that is the compatible way to remote the laptop's current action graph. They are different infrastructure choices with different offload ceilings, costs, and failure modes.
+
+A Darwin cluster therefore changes the answer from "cannot execute these actions" to "can execute most measured compile time." It does not change the chosen approach: the same owned Macs are candidates for distributed agent execution, where they remove the compile plus loading, analysis, local tests, Bazel-server memory, filesystem-security overhead, and the agent process. Darwin RBE remains the next action-level option if distributed agents ship and compile load still saturates the laptop.
 
 ---
 
@@ -323,11 +329,11 @@ Mono's `Cargo.lock` contains no `openssl-sys` and no `native-tls`. The `*-sys` c
 
 So the named pain point is real in general but largely absent from mono's graph — and where it _is_ present, flunge has already solved it the standard way, by baking `libssl-dev` and `pkg-config` into the RBE image. This is worth stating plainly because it removes system-library hermeticity as an argument either for or against the recommendation here: it is not what is blocking laptop offload.
 
-### Toolchain hermeticity under RBE — a genuine argument _for_ RBE, on Linux only
+### Toolchain hermeticity under RBE — containers on Linux, managed images on Darwin
 
-mono's history of Xcode / `apple_support` pin mismatches requiring `bazel clean --expunge` is exactly the failure class that container-defined toolchains eliminate: under RBE the toolchain is the image digest, and a host that drifts cannot half-build against the wrong SDK. That argument is sound, and flunge's production setup is the proof.
+mono's history of Xcode / `apple_support` pin mismatches requiring `bazel clean --expunge` is exactly the failure class that container-defined Linux toolchains eliminate: the toolchain is part of the worker image, and a host that drifts cannot half-build against the wrong SDK. That argument is sound for Linux RBE, and flunge's production setup is the proof.
 
-It does not transfer to the case at hand. The drift incidents were on **macOS** hosts, and a licensed Xcode stack cannot be put in a portable Linux container. Linux RBE would harden mono's Linux CI toolchain; it would do nothing for the Xcode class of fragility, and nothing for the laptop.
+Darwin RBE cannot use that portable-container model, but it can still route actions only to workers provisioned with the pinned Xcode and SDK versions. That makes executor bootstrap, image rollout, and drift detection part of the service rather than eliminating them. Linux RBE would harden mono's Linux CI toolchain but cannot serve the current laptop build; Darwin RBE could serve it, at the higher operational burden evaluated in Alternative C.
 
 ### Additional constraints found
 
