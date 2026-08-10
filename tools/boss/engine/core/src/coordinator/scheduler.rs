@@ -159,7 +159,19 @@ impl ExecutionCoordinator {
             tokio::time::sleep(interval).await;
             let interval_ms = interval.as_millis() as u64;
             loop {
-                let stranded = coordinator.stranded_ready_executions(interval_ms);
+                let ready = match coordinator.work_db.list_ready_executions() {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        tracing::warn!(
+                            ?err,
+                            "scheduler heartbeat: failed to list ready executions; skipping pass"
+                        );
+                        coordinator.note_dispatch_ready();
+                        tokio::time::sleep(interval).await;
+                        continue;
+                    }
+                };
+                let stranded = coordinator.stranded_ready_executions(&ready, interval_ms);
                 if !stranded.is_empty() {
                     tracing::warn!(
                         count = stranded.len(),
@@ -177,7 +189,7 @@ impl ExecutionCoordinator {
                          may have dropped a wakeup; re-kicking now",
                     );
                 }
-                coordinator.raise_ready_answer_agent_alarms(ANSWER_AGENT_READY_AGE_ALARM_THRESHOLD);
+                coordinator.raise_ready_answer_agent_alarms(&ready, ANSWER_AGENT_READY_AGE_ALARM_THRESHOLD);
                 // NOT `kick()`: when `enable_dispatch_ready_bus` is on,
                 // `kick()` only publishes to the event bus and returns —
                 // routing the heartbeat through it would make the bus the
@@ -195,21 +207,11 @@ impl ExecutionCoordinator {
     /// milliseconds. Used by [`spawn_scheduler_heartbeat`] to surface
     /// stranded rows; kept as a separate method so the heartbeat path
     /// is testable without involving any timers.
-    pub(super) fn stranded_ready_executions(&self, min_age_ms: u64) -> Vec<(String, u64)> {
-        let ready = match self.work_db.list_ready_executions() {
-            Ok(rows) => rows,
-            Err(err) => {
-                tracing::warn!(
-                    ?err,
-                    "scheduler heartbeat: failed to list ready executions; skipping pass",
-                );
-                return Vec::new();
-            }
-        };
+    pub(super) fn stranded_ready_executions(&self, ready: &[WorkExecution], min_age_ms: u64) -> Vec<(String, u64)> {
         let now_secs = boss_engine_utils::epoch_time::now_epoch_secs() as u64;
         let cutoff_ms = min_age_ms;
         ready
-            .into_iter()
+            .iter()
             .filter_map(|exec| {
                 let created_at_secs: u64 = exec.created_at.parse().ok()?;
                 let age_ms = now_secs.saturating_sub(created_at_secs).saturating_mul(1000);
@@ -230,7 +232,7 @@ impl ExecutionCoordinator {
                 ) {
                     return None;
                 }
-                Some((exec.id, age_ms))
+                Some((exec.id.clone(), age_ms))
             })
             .collect()
     }
@@ -239,18 +241,11 @@ impl ExecutionCoordinator {
     /// attention per overdue answer-agent execution. This deliberately does
     /// not reuse or filter the generic heartbeat warning: generic stuck-row
     /// telemetry has a distinct diagnostic purpose and must remain intact.
-    pub(super) fn raise_ready_answer_agent_alarms(&self, threshold: Duration) {
-        let ready = match self.work_db.list_ready_executions() {
-            Ok(rows) => rows,
-            Err(err) => {
-                tracing::warn!(?err, "answer-agent ready-age alarm: failed to list ready executions",);
-                return;
-            }
-        };
+    pub(super) fn raise_ready_answer_agent_alarms(&self, ready: &[WorkExecution], threshold: Duration) {
         let now_secs = boss_engine_utils::epoch_time::now_epoch_secs() as u64;
         let threshold_ms = threshold.as_millis() as u64;
         for execution in ready
-            .into_iter()
+            .iter()
             .filter(|execution| execution.kind == ExecutionKind::AnswerAgent)
         {
             let Some(created_at_secs) = execution.created_at.parse::<u64>().ok() else {
@@ -281,18 +276,9 @@ impl ExecutionCoordinator {
                 }
             };
             let document = format!("{artifact_kind}:{artifact_id}");
-            tracing::warn!(
-                execution_id = %execution.id,
-                comment_id = %execution.work_item_id,
-                document = %document,
-                ready_age_ms,
-                threshold_ms,
-                "answer-agent ready-age alarm: question is awaiting dispatch",
-            );
-
             match self
                 .work_db
-                .reraise_open_execution_attention(&execution.id, ANSWER_AGENT_READY_AGE_ATTENTION_KIND)
+                .reraise_open_work_item_attention(&execution.work_item_id, ANSWER_AGENT_READY_AGE_ATTENTION_KIND)
             {
                 Ok(Some(attention_id)) => tracing::debug!(
                     attention_id,
@@ -300,24 +286,25 @@ impl ExecutionCoordinator {
                     "answer-agent ready-age alarm: refreshed existing attention",
                 ),
                 Ok(None) => match self.work_db.create_attention_item(CreateAttentionItemInput {
-                    execution_id: Some(execution.id.clone()),
-                    work_item_id: None,
+                    execution_id: None,
+                    work_item_id: Some(execution.work_item_id.clone()),
                     kind: ANSWER_AGENT_READY_AGE_ATTENTION_KIND.to_owned(),
                     status: None,
                     title: "Answer agent has waited in the dispatch queue".to_owned(),
                     body_markdown: format!(
-                        "Question comment `{}` on document `{document}` has been ready for {} ms without starting. \\
-                         Use `bossctl dispatch diagnose {}` to inspect its dispatch timeline.",
-                        execution.work_item_id, ready_age_ms, execution.id,
+                        "Question comment `{}` on document `{document}` was first seen waiting more than {} without starting. See the engine log for the current age.\n\nUse `bossctl dispatch diagnose {}` to inspect its dispatch timeline.",
+                        execution.work_item_id, format_duration_ms(ready_age_ms), execution.id,
                     ),
                     resolved_at: None,
                 }) {
-                    Ok(attention) => tracing::info!(
+                    Ok(attention) => tracing::warn!(
                         attention_id = %attention.id,
                         execution_id = %execution.id,
                         comment_id = %execution.work_item_id,
                         document = %document,
-                        "answer-agent ready-age alarm: raised attention",
+                        ready_age_ms,
+                        threshold_ms,
+                        "answer-agent ready-age alarm: question is awaiting dispatch",
                     ),
                     Err(err) => tracing::warn!(
                         execution_id = %execution.id,
@@ -2078,5 +2065,18 @@ impl ExecutionCoordinator {
                 }
             }
         });
+    }
+}
+
+fn format_duration_ms(milliseconds: u64) -> String {
+    let seconds = milliseconds / 1_000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 60 * 60 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 24 * 60 * 60 {
+        format!("{}h", seconds / (60 * 60))
+    } else {
+        format!("{}d", seconds / (24 * 60 * 60))
     }
 }

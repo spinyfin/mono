@@ -20,7 +20,7 @@ pub(super) use tempfile::tempdir;
 pub(super) use tokio::sync::Mutex;
 pub(super) use tokio::time::sleep;
 
-pub(super) use boss_protocol::{EngineToAppError, ExecutionStatus};
+pub(super) use boss_protocol::{CreateRunInput, EngineToAppError, ExecutionStatus};
 
 pub(super) use crate::runner::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
 pub(super) use crate::work::{

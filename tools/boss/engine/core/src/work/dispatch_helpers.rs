@@ -89,7 +89,16 @@ pub(crate) fn attention_target_from_input(
             Ok((Some(execution_id.to_owned()), None))
         }
         (None, Some(work_item_id)) => {
-            let _ = product_id_for_work_item(conn, work_item_id)?;
+            if let Err(task_err) = product_id_for_work_item(conn, work_item_id) {
+                let is_comment: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM work_comments WHERE id = ?1)",
+                    [work_item_id],
+                    |row| row.get(0),
+                )?;
+                if !is_comment {
+                    return Err(task_err);
+                }
+            }
             Ok((None, Some(work_item_id.to_owned())))
         }
         (Some(_), Some(_)) => {

@@ -2138,7 +2138,8 @@ async fn stranded_ready_executions_only_returns_rows_past_the_threshold() {
 
     // Threshold far in the future: the freshly-inserted row is too
     // young to count as stranded.
-    let fresh = coordinator.stranded_ready_executions(60_000);
+    let ready = db.list_ready_executions().unwrap();
+    let fresh = coordinator.stranded_ready_executions(&ready, 60_000);
     assert!(
         fresh.is_empty(),
         "row younger than the threshold must not be flagged as stranded: {fresh:?}",
@@ -2146,7 +2147,7 @@ async fn stranded_ready_executions_only_returns_rows_past_the_threshold() {
 
     // Threshold of zero: any ready row should appear. The
     // execution we just inserted is in the queue with age >= 0.
-    let any = coordinator.stranded_ready_executions(0);
+    let any = coordinator.stranded_ready_executions(&ready, 0);
     assert!(
         any.iter().any(|(id, _)| id == &execution_id),
         "with min_age_ms=0 the helper must surface the freshly-inserted ready row; \
@@ -2194,18 +2195,57 @@ fn overdue_ready_answer_agent_files_one_question_specific_attention() {
         Arc::new(FakeCubeClient::default()),
         Arc::new(FakeExecutionRunner::default()),
     );
-    coordinator.raise_ready_answer_agent_alarms(Duration::ZERO);
-    coordinator.raise_ready_answer_agent_alarms(Duration::ZERO);
+    let ready = db.list_ready_executions().unwrap();
+    coordinator.raise_ready_answer_agent_alarms(&ready, Duration::ZERO);
+    coordinator.raise_ready_answer_agent_alarms(&ready, Duration::ZERO);
 
-    let attentions = db.list_attention_items(&execution.id).unwrap();
+    let conn = db.connect().unwrap();
+    let attentions: Vec<(String, String, String)> = {
+        let mut statement = conn
+            .prepare("SELECT id, kind, body_markdown FROM work_attention_items WHERE work_item_id = ?1")
+            .unwrap();
+        statement
+            .query_map([&comment.id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
     assert_eq!(
         attentions.len(),
         1,
         "repeated scheduler passes must deduplicate the alarm"
     );
-    assert_eq!(attentions[0].kind, ANSWER_AGENT_READY_AGE_ATTENTION_KIND);
-    assert!(attentions[0].body_markdown.contains(&comment.id));
-    assert!(attentions[0].body_markdown.contains(&comment.artifact_id));
+    assert_eq!(attentions[0].1, ANSWER_AGENT_READY_AGE_ATTENTION_KIND);
+    assert_eq!(
+        attentions[0].2,
+        format!(
+            "Question comment `{}` on document `pr_doc:{}` was first seen waiting more than 0s without starting. See the engine log for the current age.\n\nUse `bossctl dispatch diagnose {}` to inspect its dispatch timeline.",
+            comment.id, comment.artifact_id, execution.id,
+        )
+    );
+    drop(conn);
+
+    db.create_run(
+        CreateRunInput::builder()
+            .agent_id("answer-agent")
+            .execution_id(&execution.id)
+            .started_at(boss_engine_utils::epoch_time::now_epoch_secs().to_string())
+            .build(),
+    )
+    .unwrap();
+    db.reconcile_stale_attention_signals().unwrap();
+    let conn = db.connect().unwrap();
+    let status: String = conn
+        .query_row(
+            "SELECT status FROM work_attention_items WHERE id = ?1",
+            [&attentions[0].0],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        status, "resolved",
+        "the answer-agent run start must clear its queue-age attention"
+    );
 }
 
 #[tokio::test]

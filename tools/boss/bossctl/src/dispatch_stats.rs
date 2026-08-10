@@ -35,7 +35,7 @@ struct DispatchStatsOutput {
 /// Parse a `--since` value into an absolute epoch-ms cutoff. Accepts a
 /// bare non-negative integer with a `s`/`m`/`h`/`d` suffix (e.g.
 /// `30m`, `6h`, `2d`), measured back from `now_ms`.
-fn parse_since(value: &str, now_ms: u128) -> Result<u128> {
+pub(crate) fn parse_duration_ms(value: &str) -> Result<u128> {
     let value = value.trim();
     let (digits, unit_ms) = match value.chars().last() {
         Some('s') => (&value[..value.len() - 1], 1_000u128),
@@ -47,7 +47,11 @@ fn parse_since(value: &str, now_ms: u128) -> Result<u128> {
     let count: u128 = digits
         .parse()
         .with_context(|| format!("invalid --since `{value}`: expected a number followed by s/m/h/d"))?;
-    Ok(now_ms.saturating_sub(count.saturating_mul(unit_ms)))
+    Ok(count.saturating_mul(unit_ms))
+}
+
+fn parse_since(value: &str, now_ms: u128) -> Result<u128> {
+    Ok(now_ms.saturating_sub(parse_duration_ms(value)?))
 }
 
 pub(crate) fn dispatch_stats(json: bool, state_root: Option<PathBuf>, since: Option<&str>, top: usize) -> Result<()> {

@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use boss_protocol::{AnswerAgentRun, CommentWithThread, WorkComment};
 use clap::Subcommand;
 
-use super::open_state_db;
+use super::{dispatch_stats::parse_duration_ms, open_state_db};
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum CommentsAction {
@@ -48,11 +48,12 @@ pub(crate) enum CommentsAction {
         /// Restrict results to this classified intent (for example `question`).
         #[arg(long)]
         intent: Option<String>,
-        /// Restrict results to questions with a live answer-agent run.
+        /// Restrict results to unanswered questions, including ones whose
+        /// answer-agent spawn failed before a live run began.
         #[arg(long)]
         awaiting_answer: bool,
-        /// With `--awaiting-answer`, only include runs queued longer than this
-        /// duration (for example `15m`, `2h`, or `1d`).
+        /// With `--awaiting-answer`, only include questions awaiting an
+        /// answer longer than this duration (for example `15m`, `2h`, or `1d`).
         #[arg(long)]
         older_than: Option<String>,
         /// Override the Boss state-root directory.
@@ -138,9 +139,7 @@ pub(crate) fn comments_list(json: bool, options: CommentsListOptions) -> Result<
                 older_than,
             },
     } = options;
-    if older_than.is_some() && !awaiting_answer {
-        bail!("--older-than requires --awaiting-answer");
-    }
+    validate_comment_filters(older_than.as_deref(), awaiting_answer)?;
     let artifact = resolve_comments_artifact(task, artifact, artifact_kind)?;
     let db = open_state_db(state_root)?;
     // `pr_doc` artifact ids are stored with the repo component as the full
@@ -168,7 +167,7 @@ pub(crate) fn comments_list(json: bool, options: CommentsListOptions) -> Result<
     };
 
     if intent.is_some() || awaiting_answer {
-        let minimum_age_secs = older_than.as_deref().map(parse_duration_secs).transpose()?;
+        let minimum_age_ms = older_than.as_deref().map(parse_duration_ms).transpose()?;
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("system clock is before the Unix epoch")?
@@ -176,33 +175,25 @@ pub(crate) fn comments_list(json: bool, options: CommentsListOptions) -> Result<
         comments = comments
             .into_iter()
             .filter_map(|entry| {
-                if let Some(intent) = &intent
-                    && entry.comment.intent.as_deref() != Some(intent)
-                {
-                    return None;
-                }
-                if !awaiting_answer {
-                    return Some(Ok(entry));
-                }
-                let run = match db.running_answer_agent_run_for_comment(&entry.comment.id) {
-                    Ok(Some(run)) => run,
-                    Ok(None) => return None,
-                    Err(err) => return Some(Err(err)),
-                };
-                let age_secs = match run.created_at.parse::<i64>() {
-                    Ok(created_at) => now_secs.saturating_sub(created_at),
-                    Err(err) => {
-                        return Some(Err(anyhow::anyhow!(
-                            "invalid answer-agent run creation time {}: {err}",
-                            run.created_at
-                        )));
+                let run_created_at = if entry.answer_agent_running {
+                    match db.running_answer_agent_run_for_comment(&entry.comment.id) {
+                        Ok(Some(run)) => Some(run.created_at),
+                        Ok(None) => None,
+                        Err(err) => return Some(Err(err)),
                     }
-                };
-                if minimum_age_secs.is_none_or(|minimum| age_secs >= minimum) {
-                    Some(Ok(entry))
                 } else {
                     None
-                }
+                };
+                matches_question_filters(
+                    &entry,
+                    intent.as_deref(),
+                    awaiting_answer,
+                    minimum_age_ms,
+                    now_secs,
+                    run_created_at.as_deref(),
+                )
+                .map(|matches| matches.then_some(entry))
+                .transpose()
             })
             .collect::<Result<Vec<_>>>()?;
     }
@@ -346,15 +337,25 @@ fn print_comment_detail(c: &WorkComment) {
     }
 }
 
+fn answer_agent_workspace(db: &boss_engine::work::WorkDb, run: &AnswerAgentRun) -> Option<String> {
+    let execution_id = run.execution_id.as_deref()?;
+    match db.get_execution(execution_id) {
+        Ok(execution) => execution.cube_workspace_id,
+        Err(err) => {
+            eprintln!(
+                "failed to load execution {execution_id} for answer-agent run {}: {err:#}",
+                run.id
+            );
+            Some("<error>".to_owned())
+        }
+    }
+}
+
 fn answer_agent_run_views(db: &boss_engine::work::WorkDb, runs: &[AnswerAgentRun]) -> Vec<serde_json::Value> {
     runs.iter()
         .map(|run| {
             let mut value = serde_json::to_value(run).expect("AnswerAgentRun serializes");
-            let workspace = run
-                .execution_id
-                .as_deref()
-                .and_then(|execution_id| db.get_execution(execution_id).ok())
-                .and_then(|execution| execution.cube_workspace_id);
+            let workspace = answer_agent_workspace(db, run);
             value
                 .as_object_mut()
                 .expect("AnswerAgentRun serializes to an object")
@@ -373,12 +374,7 @@ fn print_answer_agent_runs(db: &boss_engine::work::WorkDb, runs: &[AnswerAgentRu
     for run in runs {
         let err = run.error_kind.as_deref().unwrap_or("-");
         let execution_id = run.execution_id.as_deref().unwrap_or("-");
-        let workspace = run
-            .execution_id
-            .as_deref()
-            .and_then(|execution_id| db.get_execution(execution_id).ok())
-            .and_then(|execution| execution.cube_workspace_id)
-            .unwrap_or_else(|| "-".to_owned());
+        let workspace = answer_agent_workspace(db, run).unwrap_or_else(|| "-".to_owned());
         println!(
             "  {}  [{}]  execution={}  workspace={}  turn={}  created={}  error={}",
             run.id, run.status, execution_id, workspace, run.thread_turn, run.created_at, err,
@@ -415,26 +411,84 @@ pub(crate) fn comments_runs(json: bool, state_root: Option<PathBuf>, comment_id:
     Ok(())
 }
 
-fn parse_duration_secs(value: &str) -> Result<i64> {
-    let split = value.find(|c: char| !c.is_ascii_digit()).unwrap_or(value.len());
-    let (amount, unit) = value.split_at(split);
-    if amount.is_empty() || unit.len() > 1 {
-        bail!("invalid duration {value:?}; use a positive number followed by s, m, h, or d");
+fn matches_question_filters(
+    entry: &CommentWithThread,
+    intent: Option<&str>,
+    awaiting_answer: bool,
+    minimum_age_ms: Option<u128>,
+    now_secs: i64,
+    running_run_created_at: Option<&str>,
+) -> Result<bool> {
+    matches_question_filter_values(QuestionFilterInput {
+        comment: QuestionCommentState {
+            intent: entry.comment.intent.as_deref(),
+            status: &entry.comment.status,
+            has_answer_thread_entry: entry.thread_entries.iter().any(|thread| thread.entry_kind == "answer"),
+        },
+        filter: QuestionFilter {
+            intent,
+            awaiting_answer,
+        },
+        age: QuestionAge {
+            minimum_age_ms,
+            now_secs,
+            created_at: running_run_created_at.unwrap_or(&entry.comment.created_at),
+        },
+    })
+}
+
+fn validate_comment_filters(older_than: Option<&str>, awaiting_answer: bool) -> Result<()> {
+    if older_than.is_some() && !awaiting_answer {
+        bail!("--older-than requires --awaiting-answer");
     }
-    let amount = amount
+    Ok(())
+}
+
+struct QuestionFilterInput<'a> {
+    comment: QuestionCommentState<'a>,
+    filter: QuestionFilter<'a>,
+    age: QuestionAge<'a>,
+}
+
+struct QuestionCommentState<'a> {
+    intent: Option<&'a str>,
+    status: &'a str,
+    has_answer_thread_entry: bool,
+}
+
+struct QuestionFilter<'a> {
+    intent: Option<&'a str>,
+    awaiting_answer: bool,
+}
+
+struct QuestionAge<'a> {
+    minimum_age_ms: Option<u128>,
+    now_secs: i64,
+    created_at: &'a str,
+}
+
+fn matches_question_filter_values(input: QuestionFilterInput<'_>) -> Result<bool> {
+    if let Some(intent) = input.filter.intent
+        && input.comment.intent != Some(intent)
+    {
+        return Ok(false);
+    }
+    if !input.filter.awaiting_answer {
+        return Ok(true);
+    }
+    let unanswered = input.comment.intent == Some("question")
+        && !matches!(input.comment.status, "resolved" | "dismissed")
+        && !input.comment.has_answer_thread_entry;
+    if !unanswered {
+        return Ok(false);
+    }
+    let created_at = input
+        .age
+        .created_at
         .parse::<i64>()
-        .with_context(|| format!("invalid duration {value:?}"))?;
-    if amount <= 0 {
-        bail!("duration must be positive: {value:?}");
-    }
-    let multiplier = match unit {
-        "s" => 1,
-        "m" => 60,
-        "h" => 60 * 60,
-        "d" => 24 * 60 * 60,
-        _ => bail!("invalid duration {value:?}; use a positive number followed by s, m, h, or d"),
-    };
-    amount.checked_mul(multiplier).context("duration is too large")
+        .with_context(|| format!("invalid answer-agent/question creation time {}", input.age.created_at))?;
+    let age_ms = (input.age.now_secs.saturating_sub(created_at) as u128).saturating_mul(1_000);
+    Ok(input.age.minimum_age_ms.is_none_or(|minimum| age_ms >= minimum))
 }
 
 #[cfg(test)]
@@ -495,13 +549,50 @@ mod tests {
     }
 
     #[test]
-    fn parse_duration_supports_operator_facing_units() {
-        assert_eq!(parse_duration_secs("15s").unwrap(), 15);
-        assert_eq!(parse_duration_secs("2m").unwrap(), 120);
-        assert_eq!(parse_duration_secs("3h").unwrap(), 10_800);
-        assert_eq!(parse_duration_secs("1d").unwrap(), 86_400);
-        assert!(parse_duration_secs("0m").is_err());
-        assert!(parse_duration_secs("15").is_err());
-        assert!(parse_duration_secs("1w").is_err());
+    fn awaiting_answer_filter_covers_unanswered_and_age_boundaries() {
+        let now = 10_000;
+        let matches = |input| matches_question_filter_values(input);
+        let input = |intent, status, has_answer, minimum_age_ms, created_at| QuestionFilterInput {
+            comment: QuestionCommentState {
+                intent,
+                status,
+                has_answer_thread_entry: has_answer,
+            },
+            filter: QuestionFilter {
+                intent: None,
+                awaiting_answer: true,
+            },
+            age: QuestionAge {
+                minimum_age_ms,
+                now_secs: now,
+                created_at,
+            },
+        };
+        assert!(
+            !matches(input(Some("revision"), "active", false, None, "9000")).unwrap(),
+            "non-question intents are not awaiting answers"
+        );
+        assert!(
+            matches(input(Some("question"), "active", false, None, "9000")).unwrap(),
+            "a question with no run remains awaiting an answer"
+        );
+        assert!(
+            !matches(input(Some("question"), "active", false, Some(2_000), "9999")).unwrap(),
+            "a younger question is below the age bound"
+        );
+        assert!(
+            matches(input(Some("question"), "active", false, Some(1_000), "9999")).unwrap(),
+            "the age bound is inclusive"
+        );
+        assert!(matches(input(Some("question"), "active", false, None, "not-a-time")).is_err());
+        assert!(
+            !matches(input(Some("question"), "answered", true, None, "9000")).unwrap(),
+            "a replied question is not awaiting an answer"
+        );
+    }
+
+    #[test]
+    fn older_than_requires_awaiting_answer() {
+        assert!(validate_comment_filters(Some("15m"), false).is_err());
     }
 }

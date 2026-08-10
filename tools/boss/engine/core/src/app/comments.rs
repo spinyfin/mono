@@ -635,13 +635,18 @@ async fn finish_answer_agent_spawn(
     }
 
     crate::answer_agent_observability::record_enqueued(&server_state.metrics);
+    let pool = server_state.execution_coordinator.attributed_pool_label(&execution);
+    let dispatch_class = work_db
+        .classify_work_item_for_dispatch(&execution.work_item_id)
+        .unwrap_or(crate::work::DispatchClass::OtherWork);
     tracing::info!(
         comment_id = %comment.id,
         run_id = %run.id,
         execution_id = %execution.id,
         intent_confidence = ?comment.intent_confidence,
-        pool = "main",
-        dispatch_class = "other_work",
+        pool,
+        dispatch_class = dispatch_class.as_ordinal(),
+        dispatch_class_label = dispatch_class.label(),
         "answer-agent enqueued",
     );
 
