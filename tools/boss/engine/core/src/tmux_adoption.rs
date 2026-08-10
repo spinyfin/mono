@@ -454,7 +454,7 @@ async fn adopt_one<S>(
 
     spawner
         .worker_registry()
-        .register_run_slot(execution_id.to_owned(), slot_id);
+        .register_tmux_run_slot(execution_id.to_owned(), slot_id, session_name);
     spawner.worker_registry().register(shell_pid, execution_id.to_owned());
 
     if !coordinator.reclaim_slot(&handle.agent_id, execution_id).await {

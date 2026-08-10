@@ -46,6 +46,8 @@ pub enum SendInputError {
     App(EngineToAppError),
     #[error(transparent)]
     Send(#[from] SendToAppError),
+    #[error("tmux pane delivery failed: {0:#}")]
+    Tmux(#[source] anyhow::Error),
     #[error("app returned unexpected response: {0}")]
     ResponseKindMismatch(String),
 }
@@ -61,6 +63,8 @@ pub enum InterruptPaneError {
     App(EngineToAppError),
     #[error(transparent)]
     Send(#[from] SendToAppError),
+    #[error("tmux pane delivery failed: {0:#}")]
+    Tmux(#[source] anyhow::Error),
     #[error("app returned unexpected response: {0}")]
     ResponseKindMismatch(String),
 }
@@ -237,6 +241,7 @@ impl ServerState {
             PaneInjectOutcome::NotAcceptingInput { activity } => Err(SendInputError::NotAcceptingInput { activity }),
             PaneInjectOutcome::SendFailed(PaneSendFailure::App(err)) => Err(SendInputError::App(err)),
             PaneInjectOutcome::SendFailed(PaneSendFailure::Send(err)) => Err(SendInputError::Send(err)),
+            PaneInjectOutcome::SendFailed(PaneSendFailure::Tmux(err)) => Err(SendInputError::Tmux(err)),
             PaneInjectOutcome::SendFailed(PaneSendFailure::ResponseKindMismatch(msg)) => {
                 Err(SendInputError::ResponseKindMismatch(msg))
             }
@@ -270,12 +275,31 @@ impl ServerState {
                 .prepare_interrupt_recovery(run_id)
                 .map(|snapshot| (driver, snapshot))
         });
-        let request = EngineToAppRequest::InterruptWorkerPane(InterruptWorkerPaneInput { slot_id });
-        let result = match self.send_to_app(request, Duration::from_secs(5)).await {
-            Ok(EngineToAppResponse::InterruptWorkerPane { result: Ok(_) }) => Ok(slot_id),
-            Ok(EngineToAppResponse::InterruptWorkerPane { result: Err(err) }) => Err(InterruptPaneError::App(err)),
-            Ok(other) => Err(InterruptPaneError::ResponseKindMismatch(format!("{other:?}"))),
-            Err(err) => Err(InterruptPaneError::Send(err)),
+        let result = match self.worker_registry.pane_for_run(run_id) {
+            Some(pane) if pane.tmux_hosted => match pane.tmux_session_name {
+                Some(session_name) => match self.tmux_for_pane_delivery() {
+                    Ok(tmux) => tmux
+                        .send_key(&session_name, "Escape")
+                        .await
+                        .map(|_| slot_id)
+                        .map_err(InterruptPaneError::Tmux),
+                    Err(err) => Err(InterruptPaneError::Tmux(err)),
+                },
+                None => Err(InterruptPaneError::Tmux(anyhow::anyhow!(
+                    "tmux-hosted pane has no session name"
+                ))),
+            },
+            _ => {
+                let request = EngineToAppRequest::InterruptWorkerPane(InterruptWorkerPaneInput { slot_id });
+                match self.send_to_app(request, Duration::from_secs(5)).await {
+                    Ok(EngineToAppResponse::InterruptWorkerPane { result: Ok(_) }) => Ok(slot_id),
+                    Ok(EngineToAppResponse::InterruptWorkerPane { result: Err(err) }) => {
+                        Err(InterruptPaneError::App(err))
+                    }
+                    Ok(other) => Err(InterruptPaneError::ResponseKindMismatch(format!("{other:?}"))),
+                    Err(err) => Err(InterruptPaneError::Send(err)),
+                }
+            }
         };
         if result.is_ok()
             && let Some((driver, snapshot)) = recovery_prep

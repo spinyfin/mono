@@ -169,6 +169,40 @@ async fn send_input_to_worker_round_trips_to_app() {
     assert_eq!(slot, 7);
 }
 
+#[tokio::test]
+async fn send_input_to_tmux_worker_does_not_require_an_app_session() {
+    let (server_state, _dir) = test_server_state();
+    register_idle_worker(&server_state, "run-tmux-send", 7);
+    server_state
+        .worker_registry
+        .register_tmux_run_slot("run-tmux-send", 7, "boss-tmux-send");
+    *server_state.tmux_preflight.write().unwrap() = crate::tmux_preflight::TmuxPreflight::Ready {
+        program: std::path::PathBuf::from("/usr/bin/true"),
+        version: boss_tmux::MINIMUM_VERSION,
+    };
+
+    // No app session is registered. A legacy SendToPane attempt would fail
+    // immediately; success after the hook confirmation proves the direct
+    // tmux transport is the path in use.
+    let server_clone = server_state.clone();
+    let send = tokio::spawn(async move { server_clone.send_input_to_worker("run-tmux-send", "/help".into()).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    dispatch_live_worker_state(
+        &server_state,
+        &crate::events_socket::IncomingHookEvent::for_test(
+            crate::protocol::WorkerEvent::UserPromptSubmit {
+                session_id: "tmux-sess-1".into(),
+                prompt: "/help".into(),
+            },
+            Some("run-tmux-send".to_owned()),
+            None,
+        ),
+    )
+    .await;
+
+    assert_eq!(send.await.expect("send task").expect("tmux send succeeds"), 7);
+}
+
 #[tokio::test(start_paused = true)]
 async fn send_input_to_worker_records_unconfirmed_without_probe_fallback() {
     // Regression test, corrected understanding (2026-07-13): the
@@ -556,6 +590,26 @@ async fn interrupt_worker_pane_round_trips_to_app() {
 
     let slot = interrupt.await.expect("interrupt task").expect("interrupt ok");
     assert_eq!(slot, 6);
+}
+
+#[tokio::test]
+async fn interrupt_tmux_worker_does_not_require_an_app_session() {
+    let (server_state, _dir) = test_server_state();
+    server_state
+        .worker_registry
+        .register_tmux_run_slot("run-tmux-interrupt", 6, "boss-tmux-interrupt");
+    *server_state.tmux_preflight.write().unwrap() = crate::tmux_preflight::TmuxPreflight::Ready {
+        program: std::path::PathBuf::from("/usr/bin/true"),
+        version: boss_tmux::MINIMUM_VERSION,
+    };
+
+    assert_eq!(
+        server_state
+            .interrupt_worker_pane("run-tmux-interrupt")
+            .await
+            .expect("tmux interrupt succeeds"),
+        6
+    );
 }
 
 #[tokio::test]

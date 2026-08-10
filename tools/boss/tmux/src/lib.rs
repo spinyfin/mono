@@ -225,6 +225,18 @@ impl Tmux {
         self.invoke(args).await.map(|_| ())
     }
 
+    /// Sends one named tmux key without submitting text. This is for control
+    /// input such as `Escape`; callers that need a text prompt should use
+    /// [`Self::send_keys`], which deliberately follows the literal text with
+    /// a separate Return keypress.
+    pub async fn send_key(&self, session: &str, key: &str) -> Result<()> {
+        validate_value("session name", session)?;
+        validate_value("tmux key", key)?;
+        let mut args = self.server_args();
+        args.extend(["send-keys".into(), "-t".into(), session.into(), key.into()]);
+        self.invoke(args).await.map(|_| ())
+    }
+
     /// Captures the visible text of a detached session's pane.
     pub async fn capture_pane(&self, session: &str) -> Result<String> {
         validate_value("session name", session)?;

@@ -272,6 +272,16 @@ async fn send_keys_marks_dash_prefixed_literal_input_as_an_argument() {
     );
 }
 
+#[tokio::test]
+async fn send_key_uses_a_single_named_keypress_without_return() {
+    let (tmux, runner) = tmux([success("")]);
+    tmux.send_key("boss-1", "Escape").await.unwrap();
+    assert_eq!(
+        runner.calls(),
+        vec![vec!["-L", "boss", "send-keys", "-t", "boss-1", "Escape"]]
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn send_keys_never_sends_a_standalone_semicolon_chunk() {
     let text = format!("{};", "x".repeat(DEFAULT_SEND_CHUNK_BYTES));

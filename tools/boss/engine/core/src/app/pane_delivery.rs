@@ -71,6 +71,7 @@
 
 use super::*;
 use boss_protocol::WorkerActivity;
+use boss_tmux::Tmux;
 
 /// Whether a pane write is permitted for a given `(activity, driver)` pair,
 /// and if so at which of the two delivery postures.
@@ -212,6 +213,7 @@ pub(crate) enum PaneInjectOutcome {
 pub(crate) enum PaneSendFailure {
     App(EngineToAppError),
     Send(SendToAppError),
+    Tmux(anyhow::Error),
     ResponseKindMismatch(String),
 }
 
@@ -258,6 +260,14 @@ async fn transcript_shows_text(transcript_path: &str, offset_bytes: u64, text: &
 }
 
 impl ServerState {
+    pub(super) fn tmux_for_pane_delivery(&self) -> anyhow::Result<Tmux> {
+        let preflight = self.tmux_preflight.read().expect("tmux preflight lock poisoned");
+        let crate::tmux_preflight::TmuxPreflight::Ready { program, .. } = &*preflight else {
+            anyhow::bail!("tmux is unavailable for pane delivery")
+        };
+        Tmux::from_path(program.clone()).context("creating tmux pane-delivery controller")
+    }
+
     /// Register a one-shot waiter for the next `UserPromptSubmit` hook
     /// on `run_id` that matches `match_text`. Returns a token that
     /// identifies exactly this waiter among any others concurrently
@@ -438,27 +448,36 @@ impl ServerState {
         }
 
         let (token, waiter) = self.register_delivery_waiter(run_id, &text);
-        let request = EngineToAppRequest::SendToPane(SendToPaneInput {
-            slot_id,
-            text: text.clone(),
-        });
-        match self.send_to_app(request, Duration::from_secs(5)).await {
-            Ok(EngineToAppResponse::SendToPane { result: Ok(_) }) => {}
-            Ok(EngineToAppResponse::SendToPane { result: Err(err) }) => {
-                self.take_delivery_waiter(run_id, token);
-                tracing::warn!(?err, run_id, slot_id, "pane injection rejected by app");
-                return PaneInjectOutcome::SendFailed(PaneSendFailure::App(err));
+        let send_result = match self.worker_registry.pane_for_run(run_id) {
+            Some(pane) if pane.tmux_hosted => match pane.tmux_session_name {
+                Some(session_name) => match self.tmux_for_pane_delivery() {
+                    Ok(tmux) => tmux
+                        .send_keys(&session_name, &text)
+                        .await
+                        .map_err(PaneSendFailure::Tmux),
+                    Err(err) => Err(PaneSendFailure::Tmux(err)),
+                },
+                None => Err(PaneSendFailure::Tmux(anyhow::anyhow!(
+                    "tmux-hosted pane has no session name"
+                ))),
+            },
+            _ => {
+                let request = EngineToAppRequest::SendToPane(SendToPaneInput {
+                    slot_id,
+                    text: text.clone(),
+                });
+                match self.send_to_app(request, Duration::from_secs(5)).await {
+                    Ok(EngineToAppResponse::SendToPane { result: Ok(_) }) => Ok(()),
+                    Ok(EngineToAppResponse::SendToPane { result: Err(err) }) => Err(PaneSendFailure::App(err)),
+                    Ok(other) => Err(PaneSendFailure::ResponseKindMismatch(format!("{other:?}"))),
+                    Err(err) => Err(PaneSendFailure::Send(err)),
+                }
             }
-            Ok(other) => {
-                self.take_delivery_waiter(run_id, token);
-                tracing::warn!(run_id, slot_id, ?other, "pane injection: unexpected app response shape");
-                return PaneInjectOutcome::SendFailed(PaneSendFailure::ResponseKindMismatch(format!("{other:?}")));
-            }
-            Err(err) => {
-                self.take_delivery_waiter(run_id, token);
-                tracing::warn!(?err, run_id, slot_id, "pane injection transport failed");
-                return PaneInjectOutcome::SendFailed(PaneSendFailure::Send(err));
-            }
+        };
+        if let Err(err) = send_result {
+            self.take_delivery_waiter(run_id, token);
+            tracing::warn!(?err, run_id, slot_id, "pane injection transport failed");
+            return PaneInjectOutcome::SendFailed(err);
         }
         match timeout(verify_timeout, waiter).await {
             Ok(Ok(_prompt)) => PaneInjectOutcome::Confirmed,

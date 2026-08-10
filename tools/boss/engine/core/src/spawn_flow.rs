@@ -755,9 +755,15 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     //    follow-up `SendToPane` requests (e.g., probe injection) can
     //    route by run id.
     if tmux_hosted {
-        spawner
-            .worker_registry()
-            .register_tmux_run_slot(input.run_id.clone(), slot_id);
+        spawner.worker_registry().register_tmux_run_slot(
+            input.run_id.clone(),
+            slot_id,
+            input
+                .tmux_host
+                .as_ref()
+                .expect("tmux host checked above")
+                .session_name(),
+        );
     } else {
         spawner
             .worker_registry()
