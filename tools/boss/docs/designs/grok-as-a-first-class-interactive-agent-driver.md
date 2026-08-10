@@ -1,30 +1,40 @@
 # Grok as a first-class interactive agent driver
 
-- **Date:** 2026-07-27
+- **Date:** 2026-07-27 (design); 2026-08-10 (reconciled to as-built)
+- **Status:** **Shipped for local interactive-TUI workers.** Grok dispatches chores, project tasks, and the document-producing kinds (`Design` / `Investigation` / `DesignPostmortem`) end-to-end on the Claude topology. Residual constraints: review-pool driver pin, `CommandOutcomeObservation` required-strict for conflict-resolution / CI-remediation, and triage / answer-agent still deferred.
 - **Project:** Grok as a first-class interactive agent driver
 - **Runs in parallel with:** the [agent-driver abstraction](agent-driver-abstraction-decouple-boss-from-claude-code-capabilities-oriented-mix-and-match.md) close-out and the [Codex driver](codex-as-a-first-class-agent-driver.md) project. **No dependency edges on either.**
 - **Structural template:** [codex-as-a-first-class-agent-driver.md](codex-as-a-first-class-agent-driver.md) (PR #2285). This doc mirrors its section list deliberately; where the two reach different conclusions, the difference is called out rather than smoothed over.
 - **Gating spike:** [ghostty-grok-pane-viability.md](../investigations/ghostty-grok-pane-viability.md) (PR #2458, 2026-07-27). Its executed evidence is authoritative over anything in this doc's framing.
-- **Boss tree verified at:** `6b2a4ee6` (`main`), 2026-07-27
-- **Grok verified at:** `grok 0.2.112 (9bbd559437aa) [stable]`, macOS arm64, `~/.grok/bin/grok`; catalog re-verified unchanged on `grok 1.0.0` (2026-08-09)
-- **Absorbed row:** the abstraction project's one remaining blocked item — _"agent-driver: ControlVerbs trait surface + call classify_error"_ — is in scope here and appears as [T-04](#t-04-controlverbs-trait-surface-plus-route-error-classification-through-it).
+- **Boss tree verified at (original):** `6b2a4ee6` (`main`), 2026-07-27
+- **Grok verified at:** `grok 0.2.112` → auto-updated through `0.2.114` / `0.2.117` during implementation; catalog and effort ladder re-verified on `grok 1.0.0` (2026-08-09)
+- **Absorbed row:** the abstraction project's one remaining blocked item — _"agent-driver: ControlVerbs trait surface + call classify_error"_ — landed here as [T-04](#t-04-controlverbs-trait-surface-plus-route-error-classification-through-it) (mono#2472).
+- **Shipped in:** mono#2468–#2472, #2482–#2483, #2490, #2498, #2511, #2513, #2516–#2517, #2520, #2522, #2525, #2529, #2537, #2543, #2551, #2570, #2584, #2597, #2624, #2700 (and the gating spike #2458). Per-task PR links live on each breakdown entry below.
 
 ## TL;DR / verdict
 
 **Grok is the easiest of the three drivers to land, and the reason is structural: it is the same execution topology Boss already runs.** An interactive TUI in a GhosttyKit pane, seeded by a positional prompt, alive across turns, interruptible with Esc, probeable with typed input. Everything the Codex project had to invent — a transport for pane-hosted progress, a resume-as-new-process probe model, a way to reason about a worker that exits between turns — Grok simply does not need.
 
-**The single highest-severity conclusion of the Codex project does not apply here.** That doc's verdict was: _"`ProgressObservation` abstracts event normalisation but not event transport, and the transport for pane-hosted workers into the engine is still an open seam."_ For Grok that seam is closed by construction. Boss owns `GROK_HOME`; global hooks under `$GROK_HOME/hooks/` run **unconditionally** (Grok's folder-trust gate applies to _project_ hooks, not to the driver's own home); Grok fires the Claude-shaped lifecycle event set; and every payload carries `transcriptPath`. So Grok reuses `ProgressIngress::HookCallback`, the existing `boss-event` shim, and the existing events socket — the same channel Claude uses in production today. **No new transport, no rollout tail, no app→engine IPC.**
+**The single highest-severity conclusion of the Codex project does not apply here.** That doc's verdict was: _"`ProgressObservation` abstracts event normalisation but not event transport, and the transport for pane-hosted workers into the engine is still an open seam."_ For Grok that seam is closed by construction. Boss owns `GROK_HOME`; global hooks under `$GROK_HOME/hooks/` run **unconditionally** (Grok's folder-trust gate applies to _project_ hooks, not to the driver's own home); Grok fires the Claude-shaped lifecycle event set; and every payload carries `transcriptPath`. So Grok reuses `ProgressIngress::HookCallback` with `HookWiringDestination::DriverOwned`, the existing `boss-event` shim, and the existing events socket — the same channel Claude uses in production today. **No new transport, no rollout tail, no app→engine IPC.**
 
-**But the reuse stops at the transport.** The brief assumed Grok would inherit Claude's five `PreToolUse` guard scripts unmodified, as Codex did. **It cannot.** Grok's hook payloads are camelCase with snake_case event values and Grok-native tool names — `hookEventName: "pre_tool_use"`, `toolName: "write"`, `toolInput`, `stopHookActive` — while `normalize_hook_event` (`protocol/src/worker_event.rs:107-152`) requires `hook_event_name` / `tool_name` / `tool_input`, and all five guard scripts read `inp.get('tool_input',{})` (`driver/src/claude.rs:194`, `:305`, `:354`; `core/src/worker_setup.rs:1085-1099`, `:1384-1389`). A Grok worker wired to those scripts today would have **every guard silently no-op** — they would read an empty command string and approve. This is the one place where "Grok is just Claude" is false and dangerous, and it is why [T-02](#t-02-investigation-grok-pretooluse-decision-vocabulary-and-tool-name-map) and [T-09](#t-09-grok-hook-wiring-progress-forwarder-plus-guard-script-canonicalisation) exist.
+**But the reuse stops at the transport — and that finding held.** Grok's hook payloads are camelCase with snake_case event values and Grok-native tool names (`hookEventName: "pre_tool_use"`, `toolName: "write"` / `"run_terminal_command"`, `toolInput`, `toolResult`). Boss's five guard scripts and `normalize_hook_event` expect snake_case Claude vocabulary. As shipped, a single driver-owned canonicalisation adapter (mono#2490) rewrites the payload, execs the **unchanged** guard scripts, and translates Boss `block`/`approve` into Grok `deny`/`allow` — because [T-02](../investigations/grok-pretooluse-decision-vocabulary-and-tool-name-map.md) proved that **`{"decision":"block"}` fails open on Grok** while only `deny` and exit-2 block.
 
-**One hazard the spike did not reach, found while writing this doc, and it is a gate.** `grok inspect --json` run under a _fresh, empty, isolated_ `GROK_HOME` reports `permissions.sources: ["/Users/<user>/.claude/settings.local.json (settings)"], loaded: 1`. Setting the spike's full `[compat.claude]` disable block flips the Claude _instructions_ file to `compatibilityStatus: "disabled"` but leaves that permission source **still loaded**. `GROK_HOME` isolates state; it does not isolate Claude-compat permission discovery. A Boss Grok worker would therefore run with the machine owner's personal Claude allow/deny rules layered into its permission posture, invisibly. See [Config discovery and isolation](#config-discovery-and-isolation--where-isolation-stops) and [T-01](#t-01-investigation-claude-permission-settings-leakage-into-an-isolated-grok_home).
+**Permission isolation was the second gate, and its answer was scoped `HOME`, not a config key.** `GROK_HOME` alone does not stop Claude-compat permission discovery: under a fresh empty home, `~/.claude/settings.local.json` still loads and is **enforced** under `--always-approve` (mono#2471). There is no `permissions` cell in the compat matrix. The shipped posture scopes the worker process `HOME` to a per-run `process-home/`, keeps OAuth on `GROK_AUTH_PATH` (so credentials do not move with `HOME`), and then **bridges** only the host state `gh` / `ssh` / `git` / `cube` need into that home (mono#2482, mono#2517) — because an empty scoped `HOME` otherwise makes `cube pr create` impossible.
 
-**Two corrections to the project framing**, both load-bearing for sequencing:
+**What actually shipped, against that verdict.**
 
-1. **The pane monitor is not a liveness signal.** The brief states that `GhosttyTerminalView.swift:1104-1111` "determines worker liveness and busy-ness". It does not. `ClaudeMonitorState` is app-local: it feeds a _fallback_ status pill in `WorkersDetailView.swift:275-283`, explicitly used only _"until the worker's first hook fires"_, after which engine-supplied `LiveWorkerState` takes over. A Grok TUI reading as `notDetected` is a UI-fidelity defect for the first few seconds of a run, not a lifecycle blocker. The monitor still becomes driver-supplied per the settled decision — but it comes **off the critical path** for the first Grok worker.
-2. **Esc-cancelled turns skip the `Stop` hook.** The spike records this in one line ([Q8](../investigations/ghostty-grok-pane-viability.md)); it is the sharpest lifecycle hazard in the project. Boss's turn boundary for a hook-driven driver _is_ `Stop` (`driver/src/claude.rs:615-632`). An interrupted Grok worker emits `turn_ended outcome=cancelled` to its session files and **nothing to the engine**, leaving the slot pinned at `Working` forever. Interrupt is a control verb Boss actually uses, so this must be solved in the same project that puts interrupt on the trait — [T-12](#t-12-turn-end-recovery-for-esc-cancelled-grok-turns).
+- The interactive-TUI topology, Boss-owned per-run `$TMPDIR/boss-grok-homes/<run>/` container (`grok-home` + `process-home`), driver-owned hooks, adapter, progress normaliser, PR-URL capture, structured-output file contract, transcript dialect, control verbs, Esc turn-end recovery via `events.jsonl`, and the driver-supplied pane monitor all landed.
+- Local macOS sandboxes diverge from the original "use Grok's built-in profiles" sketch: every non-`off` built-in Grok Seatbelt template blocks login-keychain IPC that `gh` needs, so Boss wraps the pane in a Boss-owned `sandbox-exec` profile and runs Grok with `--sandbox off` inside it, still layering `--deny` rules and (on non-macOS / remote) custom `sandbox.toml` profiles (mono#2513).
+- Two silent production bugs were found only on the real end-to-end path: the events socket resolved a single `ENGINE_DEFAULT_DRIVER` for every connection (Grok payloads normalised as Claude and dropped — mono#2520), and the hook adapter initially asserted `GROK_AGENT`, which the runner does not inject (every tool call denied — mono#2597). Both are closed.
+- Subagents stay disabled (`--no-subagents`), but for a **measured** reason rather than posture alone: a finishing child emits a top-level-shaped `session_end` that can mark the live slot `Terminated` while the parent is still alive (mono#2700).
+- Review is **not** Grok-dispatchable today: the review pool hardcodes `REVIEWER_POOL_DRIVER = "claude"`. Conflict-resolution / CI-remediation later gained a `CommandOutcomeObservation` required-strict escalation that Grok does not declare, so those execution kinds refuse Grok at the capability gate even though Phase 3 verified sandbox write/deny properties.
 
-**Model menu is settled, and smaller than the brief assumed.** Re-run on 2026-07-27: `grok models` reports `grok-4.5` as both default and the entire available list. **`grok-build-0.1` is not on the menu on this account.** The default is `grok-4.5`, which is what the settled scope asked for; the open question about `grok-build-0.1` is resolved as "not applicable today, and the driver must not hard-freeze a table that will change."
+**Two framing corrections from the original design still hold, and both landed:**
+
+1. **The pane monitor is not a liveness signal** — only a pre-hook fallback pill. It is now driver-supplied end-to-end (mono#2483) with Grok's measured markers under `--no-alt-screen` (mono#2470): `Shift+Tab:mode` / `always-approve` / `Grok 4`, busy `Esc:cancel` / `[stop]`, starting `Starting session`, prompt `│ ❯`.
+2. **Esc-cancelled turns skip the `Stop` hook.** Recovery tails the constructible `events.jsonl` for `turn_ended outcome=cancelled`, with a bounded synthesis fallback (mono#2525).
+
+**Model menu stayed single-SKU.** `grok-4.5` is the only entry; `grok-build-0.1` is not on the account menu. The live effort ladder is only `low` / `medium` / `high` — the original seven-rung sketch (`xhigh` / `max` included) was wrong for the installed CLI and would fail the turn after spawn.
 
 ## Goals
 
@@ -46,13 +56,15 @@
 
 ## Method
 
-Everything about Grok in this doc is either (a) quoted from the gating spike, which ran it, or (b) established by running `grok 0.2.112` on this host on 2026-07-27. Claims of the second kind that came from `--help` or an argument-parse probe rather than a completed agent turn are marked **_(surface probe)_** — they establish that a flag exists and parses, not that it behaves as named. Nothing here is recalled.
+Everything about Grok in the original design pass was either (a) quoted from the gating spike, which ran it, or (b) established by running `grok 0.2.112` on this host on 2026-07-27. Claims of the second kind that came from `--help` or an argument-parse probe rather than a completed agent turn are marked **_(surface probe)_** — they establish that a flag exists and parses, not that it behaves as named. Nothing here is recalled.
 
 Where this doc and the spike disagree, **the spike wins and the disagreement is stated**. There is one such case ([grok-build-0.1](#model-and-effort)) and it is a resolution rather than a conflict. Where this doc adds facts the spike did not record, they are marked as new and attributed to the probe that produced them.
 
-Boss-side claims were verified against `6b2a4ee6` by locating symbols, not by trusting line numbers. **The brief's ground truth has already drifted** in two places: `claude.rs:635-701` (the guard-script wiring) is now `:635-701` for the wiring but the scripts themselves live at `:190`, `:305`, `:354` and `worker_setup.rs:1064`, `:1250`; and `codex.rs:734-774` (the Codex capability set) is now `:909-948`. Treat the line numbers in _this_ doc the same way.
+Boss-side claims in the original pass were verified against `6b2a4ee6` by locating symbols, not by trusting line numbers. Treat line numbers in _this_ doc the same way — they drift; symbols do not.
 
 The spike's harness — an AppKit host linked against the same pinned GhosttyKit prebuilt Boss uses (`ghosttykit-5659cef`), driving `ghostty_surface_new` / `ghostty_surface_read_text` / `ghostty_surface_text` / `ghostty_surface_key` — is reproduced in [Appendix A](#appendix-a-reproducing-the-spike). The hard apparatus rule from that spike carries into this doc: **pane verdicts come from GhosttyKit-hosted panes only.**
+
+**The as-built reconciliation (2026-08-10) has a different method, stated so the two are not confused.** Sections marked as landed, corrected, or superseded were written against the merged implementation PRs listed above and the code they left behind — not against a fresh Grok run. Where an as-built claim rests on a live measurement, that measurement was taken by the PR that made it and is cited to its investigation doc under `tools/boss/docs/investigations/grok-*`. Nothing in the original empirical sections was silently rewritten to match the implementation: where the implementation contradicts an earlier plan, both are stated.
 
 ---
 
@@ -235,34 +247,34 @@ Grok's hook runner injects five reserved variables into every hook: `GROK_HOOK_E
 
 ### Config discovery and isolation — where isolation stops
 
-`GROK_HOME` is a complete state root: auth, hooks, sessions, config, trust store, leader socket. The spike verified per-worker isolation works, and the design uses a Boss-owned `GROK_HOME` under the execution runtime dir, exactly parallel to Codex's `CODEX_HOME`.
+`GROK_HOME` is a complete state root: hooks, sessions, config, trust store, leader socket. As shipped, each run gets a Boss-owned container under `$TMPDIR/boss-grok-homes/<run_id>/` (override via `BOSS_GROK_HOMES_DIR`), holding sibling `grok-home/` and `process-home/` directories — not under the cube workspace, and never the operator's interactive `~/.grok`. Per-run homes past retention are reclaimed by a periodic sweep mirroring Codex (mono#2570; defaults 14 days / 500 MiB, env `BOSS_GROK_HOME_RETENTION_DAYS` / `BOSS_GROK_HOME_MAX_BYTES`, `bossctl grok-homes`).
 
 Layering, in the order Grok resolves it:
 
-- `$GROK_HOME/config.toml` — the user layer Boss owns.
-- `$GROK_HOME/trusted_folders.toml` — folder-trust store, keyed by absolute path with a `decided_at` epoch. **macOS needs both `/tmp/…` and `/private/tmp/…` forms**, and by extension both forms of any symlinked workspace root.
-- `$GROK_HOME/hooks/*.json` — global hooks, always trusted.
-- `$GROK_HOME/sandbox.toml` — custom sandbox profiles _(surface probe)_.
-- Project `<proj>/.grok/` — hooks, config, sandbox profiles. **Trust-gated**, and attacker-controllable in Boss's threat model since it lives in the repo under work. The driver must not depend on it.
+- `$GROK_HOME/config.toml` — the user layer Boss owns (full `[compat.claude]` and `[compat.cursor]` disable block).
+- `$GROK_HOME/trusted_folders.toml` — folder-trust store, keyed by absolute path with a `decided_at` epoch. **macOS stamps both `/tmp`↔`/private/tmp` and `/var`↔`/private/var` forms** of the workspace path and its canonical root.
+- `$GROK_HOME/hooks/*.json` — global hooks, always trusted (Boss writes the adapter + guards + `boss-event` forwarder here).
+- `$GROK_HOME/sandbox.toml` — Boss custom profiles (`boss-workspace` / `boss-read-only`) on non-macOS-local paths; local macOS uses external Seatbelt instead (see [G-3](#g-3-permissionpolicy)).
+- Process `HOME` → per-run `process-home/` — empty of Claude state; host `gh` / `ssh` / `git` / `cube` state is **bridged in** (symlinks / env redirects), not copied.
+- Auth → `GROK_AUTH_PATH` pointing at the host credential (`~/.grok/auth.json` or `BOSS_GROK_AUTH_SOURCE`); not a per-home copy, so concurrent workers share one refresh lock.
+- Project `<proj>/.grok/` — hooks, config, sandbox profiles. **Trust-gated**, and attacker-controllable in Boss's threat model. The driver does not depend on it.
 - CLI flags — highest precedence.
 
-**Where isolation stops, and this is D-1.** `GROK_HOME` does not scope Claude-compat _discovery_. Under a fresh empty home, `grok inspect --json` still resolves `~/.claude/Claude.md` as a project instruction and `~/.claude/settings.local.json` as a loaded permission source, and probes `/Library/Application Support/ClaudeCode/managed-settings.json` for managed settings. The `[compat.claude]` block disables the instructions pickup (`compatibilityStatus` flips to `"disabled"`) but **not** the permission source.
+**Where isolation stops — D-1, resolved by scoped HOME (mono#2471 / mono#2482).** `GROK_HOME` alone does not scope Claude-compat _discovery_. Under a fresh empty home, `grok inspect --json` still resolves `~/.claude/settings.local.json` as a loaded permission source, and those rules are **enforced** under `--always-approve`. There is no `permissions` cell in the compat matrix (an undocumented `permissions = false` is a no-op). Project `<cwd>/.claude/settings.json` still loads when the folder is trusted, independent of `HOME` scoping. Managed settings always probe `/Library/Application Support/ClaudeCode/managed-settings.json`.
 
-In a real Boss workspace the instruction surface is broader still — `grok inspect --json` from this workspace resolves three project-instruction files: the repo's tracked `AGENTS.md`, the user's global `~/.claude/Claude.md`, and the engine-written `.claude/CLAUDE.md` inside the workspace. The last is the Claude worker-rules file; it names Claude's mechanisms and would be read by a Grok worker under compat. The `[compat.claude] rules = false` setting disables both Claude-vendored entries, verified. The permission source is the one that survives.
-
-**Consequence:** Boss cannot honestly declare `PermissionPolicy` for Grok until this is closed. It is [T-01](#t-01-investigation-claude-permission-settings-leakage-into-an-isolated-grok_home), a `small` investigation, and it gates spawn — the same shape of gate the Codex project put on hook trust.
+**The lever that works is a worker-scoped `HOME`** (empty `~/.claude` under `process-home/`), with auth kept on `GROK_AUTH_PATH` so credentials do not move with `HOME`. The `[compat.claude] rules = false` setting still disables Claude-vendored instruction files. Pre-spawn `grok inspect --json` asserts the resulting posture (compat cells off, hooks inventory present, no host Claude permission source under the scoped home).
 
 ### Auth and coexistence
 
 Auth is the host `auth.json` selected through `GROK_AUTH_PATH` (grok.com OAuth on this host). Grok config and session state remain inside the isolated `GROK_HOME`, but the credential path is deliberately shared:
 
-- Every worker must use the same explicit credential path. Grok places `auth.json.lock` beside that path, so this also gives concurrent workers one refresh lock. A per-home symlink is not sufficient: an atomic refresh replaces the symlink with a private file while each home still uses a different lock.
+- Every worker uses the same explicit credential path. Grok places `auth.json.lock` beside that path, so concurrent workers share one refresh lock. A per-home symlink is not sufficient: an atomic refresh replaces the symlink with a private file while each home still uses a different lock.
 - Boss disables API-key auth and removes an inherited `XAI_API_KEY`; an OAuth refresh failure must not silently switch credential families or endpoints.
-- The scoped process HOME delegates gh/Cube/jj/git state, while the local macOS process runs under Boss's own Seatbelt policy. Grok's built-in profiles block login-keychain IPC and make `gh` silently fall back to the invalid file credential; a keychain-file symlink alone cannot repair that kernel policy.
+- **Scoped process HOME + credential bridge (mono#2517).** The empty `process-home/` that closes D-1 also strips every credential `cube pr create` needs. As shipped, the driver bridges host `gh` config, login-keychain material, `ssh`, `git` user config, and cube data/config into `process-home` (and/or via env redirects such as `GH_CONFIG_DIR`, `CUBE_DATA_DIR`). Local macOS workers additionally run under a Boss-owned Seatbelt policy that preserves keychain IPC — Grok's built-in profiles block that IPC and make `gh` silently fall back to an invalid file credential; a keychain-file symlink alone cannot repair the kernel policy.
 - **No collision with `unset ANTHROPIC_API_KEY`** at the shared spawn wrapper — it is inert for Grok. It remains a Claude-ism in driver-generic code and belongs behind the driver.
 - `grok models` requires login, which makes it a cheap liveness check on the credential without an inference call.
 - **Concurrency is not entitlement-blocked at Boss's target scale**: the spike ran 16 concurrent sessions to completion, 16/16, ~12–16s each. That does not prove unlimited quota; it proves the design's premise is not immediately dead.
-- **Uncharacterised: the leader process.** `--leader-socket` and `grok leader` exist, defaulting to `~/.grok/leader.sock`. Whether concurrent workers share a leader — and how that interacts with per-run `GROK_HOME` isolation and with SIGTERM reap — is unknown. Since the socket path is derived from `GROK_HOME`, per-run isolation _should_ give each worker its own leader; that is an assumption, not a measurement, and it is [OQ-4](#oq-4-the-leader-process).
+- **Leader process — characterised (mono#2537).** Per-run `GROK_HOME` **does** isolate the leader (`$GROK_HOME/leader.sock` / `leader.lock`). Boss never enables `[cli] use_leader = true`, so a Boss-shaped TUI worker does not spawn a leader today. If a leader is started, it reparents to launchd and **escapes pane process-group SIGTERM** (own process group). Latent, not live — both conditions that would make it real are one config change away.
 
 ### Sandbox and approval
 
@@ -310,7 +322,7 @@ Configuration lives in `$GROK_HOME/hooks/*.json` (JSON files, one or more, event
 This is the same fail-open posture Claude has in production today, so it is not a regression — but two specifics matter for the driver:
 
 - **`updatedInput` does not rewrite.** Same conclusion as Codex, reached by different evidence. The editorial `AllowWithRewrite { updated_command: Some(..) }` path is unreachable; see [the editorial case](#the-editorial-case-precisely).
-- **Boss's guards emit `{"decision": "block"|"approve"}`** (`worker_setup.rs:1064-1069`, `:1250-1255`). The spike proved `"deny"` blocks and exit-2 blocks. **`"block"` is unverified on Grok**, and `"approve"` is unverified as a non-blocking allow. If `"block"` is not recognised, every adapted guard fails open. This is the single most important unknown in the guardrail path and it is the first half of [T-02](#t-02-investigation-grok-pretooluse-decision-vocabulary-and-tool-name-map).
+- **Boss's guards emit `{"decision": "block"|"approve"}`.** [T-02](../investigations/grok-pretooluse-decision-vocabulary-and-tool-name-map.md) (mono#2469) proved that on Grok PreToolUse **`block` fails open** (hook runs, attack file still created); only `{"decision":"deny"}` and exit-2 block. Unrecognised decision values also fail open. The official bundled hooks guide documents PreToolUse as `allow`/`deny` only — `block` is the Stop-gate vocabulary. The shipped adapter therefore translates Boss `block`→`deny` and `approve`→`allow` (or empty allow).
 
 ### Model and effort
 
@@ -360,23 +372,21 @@ Plus the ambient one: **`CLAUDE_PROJECT_DIR` is exported to native Grok hooks.**
 
 Classification per the house convention: **(a)** implementable against the current trait, **(b)** needs a trait signature change, **(c)** needs new engine machinery, **(d)** genuinely absent.
 
-| #    | Capability              | What Grok offers natively                            | Class    | Verdict                                                    |
-| ---- | ----------------------- | ---------------------------------------------------- | -------- | ---------------------------------------------------------- |
-| G-1  | `Spawn`                 | interactive TUI + positional prompt + flags          | **(a)**  | Fits `SpawnRequest`/`SpawnPlan` as landed                  |
-| G-2  | `WorkspaceProvisioning` | `GROK_HOME`, `trusted_folders.toml`, `--trust`       | **(a)**  | Fits; blocked by driver-generic Claude pre-trust           |
-| G-3  | `PermissionPolicy`      | `--sandbox`, `--allow`/`--deny`, `--permission-mode` | **(a)**† | Richest of the three drivers; **gated on the compat leak** |
-| G-4  | `ModelAndEffortMenu`    | `-m`, `--reasoning-effort`, `grok models`            | **(a)**  | Single-model menu; needs a refresh path                    |
-| G-5  | `ProgressObservation`   | hooks under a Boss-owned home                        | **(b)**  | **Transport is solved**; wiring _destination_ is the gap   |
-| G-6  | `ToolUseInterception`   | `PreToolUse` deny, fail-open, deny-only              | **(b)**  | Works, but **payload dialect breaks the guards**           |
-| G-7  | `TurnBoundary`          | `Stop` hook with `reason` / `stopHookActive`         | **(c)**  | Maps directly — **except after an interrupt**              |
-| G-8  | `StructuredOutput`      | file contract; `--json-schema` unproven for TUI      | **(a)**  | File contract suffices; native flag is a bonus             |
-| G-9  | `TranscriptAccess`      | `transcriptPath` on every payload                    | **(a)**  | Best of the three; container reuse, own parser             |
-| G-10 | `ControlVerbs`          | Esc, typed input, `/quit`, SIGTERM                   | **(b)**  | **The absorbed row.** Trait has one method, uncalled       |
-| G-11 | `ToolProvisioning`      | MCP, plugins, skills, subagents                      | **(a)**  | Unused in v1, as designed. No gap                          |
-| G-12 | `PromptComposition`     | agent-rules file + preamble                          | **(a)**  | Fits; shared body's mechanism prose stays true             |
-| G-13 | `AwaitingInputSignal`   | `Notification` with `notificationType` / `level`     | **(a)**‡ | Plausible but **uncharacterised**; not declared in v1      |
-
-† G-3 is class (a) on mechanism and blocked on isolation, not on capability. ‡ G-13 is implementable; the doc declines to declare it until the notification vocabulary is characterised — see [G-13](#g-13-awaitinginputsignal).
+| #    | Capability              | What Grok offers natively                            | Class   | As-built verdict                                                               |
+| ---- | ----------------------- | ---------------------------------------------------- | ------- | ------------------------------------------------------------------------------ |
+| G-1  | `Spawn`                 | interactive TUI + positional prompt + flags          | **(a)** | **Shipped** — `SpawnRequest`/`SpawnPlan` as designed                           |
+| G-2  | `WorkspaceProvisioning` | `GROK_HOME`, `trusted_folders.toml`, `--trust`       | **(a)** | **Shipped** — scoped HOME + bridge; pre-trust driver-supplied; retention added |
+| G-3  | `PermissionPolicy`      | `--sandbox`, `--allow`/`--deny`, `--permission-mode` | **(a)** | **Shipped** — D-1 closed via scoped HOME; local macOS uses Boss Seatbelt       |
+| G-4  | `ModelAndEffortMenu`    | `-m`, `--reasoning-effort`, `grok models`            | **(a)** | **Shipped** — single SKU; effort collapsed to `low`/`medium`/`high`            |
+| G-5  | `ProgressObservation`   | hooks under a Boss-owned home                        | **(b)** | **Shipped** — destination named; normaliser live; per-connection socket fix    |
+| G-6  | `ToolUseInterception`   | `PreToolUse` deny, fail-open, deny-only              | **(b)** | **Shipped** — adapter translates `block`→`deny` + tool names                   |
+| G-7  | `TurnBoundary`          | `Stop` hook with `reason` / `stopHookActive`         | **(c)** | **Shipped** — normal `Stop`; Esc recovery via `events.jsonl`                   |
+| G-8  | `StructuredOutput`      | file contract; `--json-schema` unusable for TUI      | **(a)** | **Shipped** — file contract only; empty transcript fallback                    |
+| G-9  | `TranscriptAccess`      | `transcriptPath` on every payload                    | **(a)** | **Shipped** — ACP dialect + bossctl path                                       |
+| G-10 | `ControlVerbs`          | Esc, typed input, `/quit`, SIGTERM                   | **(b)** | **Shipped** — trait + Grok verbs; `mid_turn` stays `Rejects`                   |
+| G-11 | `ToolProvisioning`      | MCP, plugins, skills, subagents                      | **(a)** | Unused; `--no-subagents` load-bearing (session_end attribution)                |
+| G-12 | `PromptComposition`     | agent-rules file + preamble                          | **(a)** | **Shipped**                                                                    |
+| G-13 | `AwaitingInputSignal`   | `Notification` with `notificationType` / `level`     | **(a)** | **Characterised, undeclared** — blocked population empty under Boss flags      |
 
 ### G-1 `Spawn`
 
@@ -388,23 +398,21 @@ The shared wrapper at the pane spawn site still hardcodes `unset ANTHROPIC_API_K
 
 ### G-2 `WorkspaceProvisioning`
 
-Fits the current trait. The Grok driver writes `.grok/initial-prompt.txt`, its agent-rules file, a per-run `GROK_HOME` (config, hooks, and `trusted_folders.toml` pre-stamped with **both** the `/tmp` and `/private/tmp` forms of the workspace path), delegates OAuth through the shared `GROK_AUTH_PATH`, and asserts the result with `grok inspect --json` plus live capability preflights.
+**Shipped (mono#2482, mono#2498, mono#2517, mono#2570).** Fits the current trait. The Grok driver writes `.grok/initial-prompt.txt`, its agent-rules file, a per-run container under `$TMPDIR/boss-grok-homes/<run_id>/` (`grok-home` + scoped `process-home`), `trusted_folders.toml` pre-stamped with `/tmp`↔`/private/tmp` and `/var`↔`/private/var` forms, full compat-disable `config.toml`, provisional-then-real global hooks, OAuth via `GROK_AUTH_PATH`, host-tool bridging into `process-home`, and pre-spawn `grok inspect --json` plus live capability preflights.
 
-**The gap is not in the trait; it is in the driver-generic caller.** `core/src/worker_setup.rs:1702` calls `pre_trust_workspace(&input.workspace_path)` — which writes Claude's `~/.claude.json` — and `:1718` writes `CLAUDE_DIR_GITIGNORE`, both unconditionally, for every driver, from `write_workspace_files`. For a Grok worker these produce a Claude trust record for a workspace Claude will never run in, and a `.gitignore` inside a `.claude/` directory the driver did not create. Harmless today, incoherent, and it is exactly the residual coupling this project inherits. **Must fix**, not route around: [T-25](#t-25-make-pre-trust-and-config-dir-gitignore-driver-supplied).
+**Driver-generic Claude pre-trust is closed (mono#2498 / T-25).** `pre_trust_workspace` and `config_dir_gitignore` are now `AgentDriver` methods. Defaults are no-op / catch-all `*\n`; only `ClaudeDriver` overrides. Codex and Grok self-trust inside their own provisioning.
 
-Teardown remains unhooked on the trait, same as for Codex. Grok's per-run `GROK_HOME` accumulates a session tree per worker; because the home lives under the run directory it dies with the run, so this is materially less pressing than Codex's rollout accumulation. Noted, not filed.
+**Home retention shipped after the original design called teardown "noted, not filed" (mono#2570).** Per-run homes do not die with the cube workspace — they live under a temp root — so a Codex-shaped retention sweep was required and landed (`grok-home-retention` crate, engine periodic task, `bossctl grok-homes`).
 
 ### G-3 `PermissionPolicy`
 
-Grok is the best-equipped of the three drivers here and simultaneously the only one with an isolation defect.
+**Shipped (mono#2471 characterisation, mono#2513 implementation).** Grok is still the best-equipped of the three drivers on native levers, and the isolation defect (D-1) is closed by scoped `HOME` rather than a config key.
 
-`ClaudeDriver::write_permission_config` is still a **functional no-op** returning `PermissionArtifacts::default()` (`claude.rs:552-564`); the real Claude renderer remains in `core/src/worker_setup.rs`. `CodexDriver` implements the method for real (`codex.rs:1091-1131`), writing into its run-private home. **Grok follows Codex**: it writes `$GROK_HOME/config.toml`, `$GROK_HOME/hooks/boss.json`, the platform sandbox policy, and `$GROK_HOME/trusted_folders.toml`, and returns `PermissionArtifacts { config_files, extra_args, env }` with `--sandbox` / `--deny` / `--allow` in `extra_args` and `GROK_HOME` in `env`.
+`ClaudeDriver::write_permission_config` remains a **functional no-op** returning `PermissionArtifacts::default()`; the real Claude renderer still sits in `core/src/worker_setup.rs`. **Grok follows Codex**: `write_permission_config` is real. It writes hook wiring into `$GROK_HOME/hooks/`, and on non-macOS-local paths a Boss-owned `$GROK_HOME/sandbox.toml` (`boss-workspace` / `boss-read-only` extending the built-in bases), returning `PermissionArtifacts { config_files, extra_args, env }` with `--sandbox` / structural `--deny` rules in `extra_args`.
 
-On local macOS workers the platform policy is a Boss-owned `sandbox-exec` profile and Grok itself runs with `--sandbox off` inside it. This is not a relaxation of the filesystem posture: the Boss profile reconstructs workspace/read-only writes, protects the Boss data directory and Grok's global hooks, and retains the CLI deny rules. It replaces Grok's built-in Seatbelt template because every non-off built-in profile blocks the Security.framework mach services `gh` needs to read its login-keychain credential; adding the keychain file as a writable path does not grant that IPC capability. Remote workers and non-macOS hosts continue to use Grok's built-in/custom `sandbox.toml` path.
+**Local macOS diverges from the original "use Grok profiles" sketch — load-bearing.** Every non-`off` built-in Grok Seatbelt template blocks Security.framework mach services `gh` needs for the login keychain (and IOKit power-management Bazel needs at startup). As shipped, local macOS workers run under a **Boss-owned `sandbox-exec` wrapper** with Grok itself at `--sandbox off` inside it. That is not a relaxation of the filesystem posture: the Boss profile reconstructs workspace / read-only write rules, protects the Boss data directory and Grok's global hooks, and retains the CLI `--deny` rules. Remote workers get bare built-in profile names (`workspace` / `read-only`) with no local `sandbox.toml`. Non-macOS local workers use the custom `sandbox.toml` path.
 
-So Grok does **not** need the Claude extraction to land first. It routes around it. The extraction stays open, and the fact that a third driver has now routed around it is itself the argument for finishing it — filed as deferred rather than silently dropped ([T-28](#t-28-extract-claudes-permission-rendering-into-the-driver-crate)).
-
-**The blocker is D-1.** Boss cannot declare that it applies Boss's permission policy while a Grok worker is also loading the machine owner's `~/.claude/settings.local.json`. [T-01](#t-01-investigation-claude-permission-settings-leakage-into-an-isolated-grok_home) must establish either a config key that stops it, a `HOME`-scoping strategy that does, or that the loaded rules are provably additive-and-restrictive-only (in which case the risk is bounded and the gate can be relaxed by an explicit decision rather than by assumption).
+So Grok does **not** need the Claude extraction to land first. It routes around it. The extraction stays deferred ([T-28](#t-28-extract-claudes-permission-rendering-into-the-driver-crate)).
 
 ### G-4 `ModelAndEffortMenu`
 
@@ -412,39 +420,36 @@ Fits the `ModelMenu` struct as-is. `menu_for_driver_in` already resolves per slu
 
 The menu itself is thin: one model, a three-rung effort mapping (`low`/`medium`/`high`) collapsed from Boss's five levels. `engine_default` is `grok-4.5`; `model_for_reasoning` returns `grok-4.5` for both `Standard` and `Investigation`, because there is no second tier to choose. That is honest rather than degenerate — and it is the field most likely to be wrong within a quarter, hence the refresh path.
 
-### G-5 `ProgressObservation` — solved transport, unsolved destination
+### G-5 `ProgressObservation` — transport solved; destination named and shipped
 
-**The Codex project's top gap does not reproduce.** Its finding was that `ProgressObservation` abstracts normalisation but not transport, and that pane-hosted workers had no engine ingress. Grok's ingress is the events socket, via hooks Boss installs in a home Boss owns, which are unconditionally trusted. That is the same production path Claude uses. Nothing new is built.
+**The Codex project's top gap does not reproduce.** Grok's ingress is the events socket, via hooks Boss installs in a home Boss owns, which are unconditionally trusted. That is the same production path Claude uses.
 
-**What _is_ a gap is smaller and concrete: `ProgressIngress::HookCallback` does not say where its wiring goes.** The variant carries only `ProgressObservationWiring { hooks: serde_json::Map }` (`driver/src/lib.rs:784-790`), and `hooks_map_for_ingress` (`worker_setup.rs:647-652`) merges that map into the **Claude settings.json** the engine renders. Grok's hooks live in `$GROK_HOME/hooks/*.json`, written by the driver in `write_permission_config`. If Grok returns `HookCallback`, its map is written to a file Grok never reads; if it returns `StdoutJsonl` to dodge that, it lies about its transport and — worse — `pre_tool_use_array` (`worker_setup.rs:597`) then inserts the _interception guards_ into that same unread settings file, which is the silent-guardrail-loss failure again by a different route.
+**Hook-wiring destination shipped (mono#2472 / T-05).** `ProgressObservationWiring` carries `HookWiringDestination` (`WorkerSettingsFile` | `DriverOwned`). Engine merge of hooks + interception guards into the Claude settings file is conditional on `WorkerSettingsFile`. Grok declares `DriverOwned` and writes `$GROK_HOME/hooks/` itself. Claude keeps `WorkerSettingsFile` with byte-identical settings composition.
 
-**Fix in the abstraction:** name the destination. Either a fourth variant (`HookCallbackDriverWritten`) or a `destination` field on `ProgressObservationWiring` distinguishing "merge into the worker settings file" from "the driver writes this itself". The second is preferable: it keeps one hook-callback concept and makes the engine's merge conditional on a declared property rather than on a variant match. [A-1](#proposed-abstraction-amendments) / [T-05](#t-05-progressingress-name-the-hook-wiring-destination).
+**Progress normaliser shipped (mono#2511 / T-10).** `GrokProgressSession` canonicalises camelCase payloads into the snake_case shape `normalize_hook_event` already expects, then delegates. `source: "new"` reaches `SessionStartSource::Other` with no protocol widening. Unknown event names are ignored-with-logging.
 
-`progress_fidelity()` is `Rich` for Grok — per-tool `PreToolUse`/`PostToolUse` events, same tier as Claude — and it is already consulted by the stale-worker sweep, so declaring it has real effect.
+**Integration bug found only on the real path (mono#2520).** The events-socket accept loop originally resolved a single `ENGINE_DEFAULT_DRIVER`-slug driver for every connection. Grok forwarders fired, but every payload was normalised as Claude and dropped on `MissingField`. Fix: per-connection resolution from the payload's `_boss_run_id` via `WorkDb::get_execution_driver_slug` (`events_socket.rs`'s `resolve_connection_driver`), mirroring the stdout/JSONL ingress precedent.
+
+`progress_fidelity()` is `Rich` for Grok — per-tool `PreToolUse`/`PostToolUse` events, same tier as Claude. Grok does **not** declare `CommandOutcomeObservation` (added later by the Codex project to split outcome fidelity out of the cadence tier), even though Bash `toolResult` carries `exit_code` on the wire — see [Phase eligibility](#which-work-item-kinds-are-grok-eligible).
 
 ### G-6 `ToolUseInterception`
 
-**Declared, deny-only, and gated on the payload adapter.**
+**Shipped, deny-only (mono#2469 / mono#2490 / mono#2597).** Declared for real once the adapter and its negative tests landed.
 
-The mechanism works: `PreToolUse` fires, `{"decision":"deny"}` blocks, exit-2 blocks, and the global-hook location means it is always armed. Two limits carry over from the spike and one is new to this doc:
+The mechanism works: `PreToolUse` fires, `{"decision":"deny"}` blocks, exit-2 blocks, and the global-hook location means it is always armed. Limits:
 
-- **Deny-only.** `updatedInput` did not rewrite in either the native or the Claude-shaped form. The trait's rewrite path is unreachable, same conclusion as Codex.
+- **Deny-only.** `updatedInput` did not rewrite in either the native or the Claude-shaped form. Editorial inline-`--body` is denied-with-reason rather than rewritten — same call as Codex.
 - **Fail-open on crash / malformed output / timeout.** Identical to Claude's production posture; not a regression.
-- **The payload dialect breaks the guards** ([above](#payload-shape--the-reuse-boundary)). This is the new one, and it is the reason the capability is _gated_ rather than simply declared. A capability Boss declares is one Boss promises to enforce; with unadapted guards, Boss would be declaring enforcement it is not performing.
+- **`block` fails open; adapter translates.** Boss guards emit `block`/`approve`; Grok honours `deny`/`allow` only. The adapter (`$GROK_HOME/hooks/boss-grok-hook-adapter.py`) rewrites the field/tool-name map (`run_terminal_command`→`Bash`, `write`→`Write`, `search_replace`→`Edit`, …), execs the unchanged guard via `sh -c`, and translates decisions.
+- **Fail-closed identity is runner-injected keys, not `GROK_AGENT` (mono#2597).** An early adapter revision asserted `GROK_AGENT`, which the runner does not inject (it appeared in spike env excerpts only as harness inheritance). The shipped identity check requires `GROK_HOOK_EVENT` / `GROK_HOOK_NAME` / `GROK_SESSION_ID` / `GROK_WORKSPACE_ROOT`.
 
-**The chosen fix is a single driver-owned canonicalisation adapter, not five script edits.** A small executable that reads the driver's stdin payload, rewrites it into Boss's canonical snake_case shape with canonical tool names, execs the unchanged guard script, and translates the script's `{"decision": "block"|"approve"}` output into whatever vocabulary the driver honours. Rationale:
-
-- The five guard scripts stay byte-identical across drivers — one source of truth for what Boss blocks, which is the property that actually matters for safety review.
-- The adapter is reusable by driver #4 by construction.
-- Output translation is where the `"block"` vs `"deny"` uncertainty is absorbed, so an answer from [T-02](#t-02-investigation-grok-pretooluse-decision-vocabulary-and-tool-name-map) changes one file.
-
-The alternative — parameterising every script on key names — was rejected: it multiplies the surface where a guard can be silently wrong, in the code whose correctness matters most.
+Acceptance criterion remains a **negative** test: a fixture that attempts each blocked command and is demonstrably refused.
 
 ### G-7 `TurnBoundary`
 
-`Stop` maps directly onto `WorkerEvent::Stop`. The payload carries `reason` (`"end_turn"` observed), `stopHookActive` → `TurnEnd::continuation`, and `lastAssistantMessage`. Structurally identical to Claude's; no synthesizer needed.
+`Stop` maps directly onto `WorkerEvent::Stop`. The payload carries `reason` (`"end_turn"` observed), `stopHookActive` → `TurnEnd::continuation`, and `lastAssistantMessage`. Structurally identical to Claude's; no synthesizer needed for a normal turn.
 
-**Except after an interrupt, and this is the sharpest lifecycle hazard in the project.** The spike records that Esc-cancelled turns **skip `Stop` hooks** entirely — the cancellation appears only in the session files:
+**Except after an interrupt — the sharpest lifecycle hazard, now closed.** Esc-cancelled turns **skip `Stop` hooks** entirely; the cancellation appears only in the session files:
 
 ```json
 {
@@ -457,43 +462,35 @@ The alternative — parameterising every script on key names — was rejected: i
 
 Boss uses interrupt. `bossctl` sends one; transient recovery sends one; a human sends one. Under this design an interrupted Grok worker would emit nothing to the engine after its last `PostToolUse`, and its slot would sit at `Working` until the stale-activity sweep eventually intervened — with the worker actually idle at its prompt, ready for input, the whole time.
 
-Three candidate resolutions, evaluated in [T-12](#t-12-turn-end-recovery-for-esc-cancelled-grok-turns):
+**Shipped as (2) with (1) as bounded fallback (mono#2525 / T-12).** `grok/turn_end_recovery.rs` constructs the run's `events.jsonl` path from `GROK_HOME` + workspace cwd + stamped session UUID (percent-encoding confirmed against real session trees). Engine-side `interrupt_recovery.rs` owns the bounded tail-with-fallback executor. The three candidates evaluated were:
 
-1. **Engine-side synthesis on interrupt.** The engine knows it sent the Esc; it can synthesise a `TurnEnd { reason: Interrupted }` after a bounded settle window. Cheapest, needs no new transport, but it asserts a state it did not observe — and if the Esc did not take (vim mode, a modal), the engine's model is now wrong in the optimistic direction.
-2. **Tail `events.jsonl` for `turn_ended`.** Observes the real thing. Costs an `AgentJsonlFile`-style tail — which for Grok is _cheap_, because the path is fully constructible from `GROK_HOME` + `--cwd` + the assigned `-s` UUID. No glob, no correlation.
-3. **`StopFailure`.** Documented as an event but never observed firing; the spike's `Stop`-skip note suggests it is not the interrupt path. Must be tested before being relied on.
-
-**Recommendation: (2), with (1) as a bounded fallback.** It is the only option that observes rather than assumes, and Grok is the one driver where the file is nameable in advance rather than discoverable after the fact. This is also the honest answer to the brief's question about whether Grok has "a better option" than Codex's rollout tail: it does — but the reason to use it is interrupt correctness, not primary progress.
+1. **Engine-side synthesis on interrupt** — cheapest, asserts a state it did not observe; kept only as settle-window fallback.
+2. **Tail `events.jsonl` for `turn_ended`** — observes the real thing; path fully constructible — **chosen primary**.
+3. **`StopFailure`** — never observed as the interrupt path; not relied on.
 
 ### G-8 `StructuredOutput`
 
-The shared `BOSS_STRUCTURED_OUTPUT` env-file contract is driver-neutral and works for Grok unchanged — it is a file path the worker writes, not a mechanism the agent must support.
+**Shipped on the file contract; `--json-schema` evaluated and rejected for the TUI (mono#2522 / T-18).** The shared `BOSS_STRUCTURED_OUTPUT` / `BOSS_PR_URL_OUTPUT` env-file contract is the mechanism. A live pty probe of `--json-schema` under the interactive flags confirmed it is a headless notion (implies `--output-format json`); it is not wired. `structured_output_fallback` returns an empty `Vec` for every kind — a failed artifact write has no transcript recovery for Grok (relevant for review if the pool pin ever lifts).
 
-`--json-schema` is the interesting unknown ([D-5](#deltas-that-change-a-tasks-scope)). It would give Grok the same native, enforced contract Codex has and Claude lacks. Its `--help` text says it implies `--output-format json`, which is a headless notion, so its behaviour in an interactive TUI session is unestablished. [T-18](#t-18-structured-output-for-grok) evaluates it and falls back to the file contract, which is sufficient on its own.
-
-PR-URL capture is `PostToolUse`-derived and reads `tool_response.stdout`. Grok sends `toolResult`. The adapter's canonicalisation covers the shape; whether Grok's shell tool nests its stdout the same way is a normaliser detail settled in [T-19](#t-19-pr-url-capture-for-the-grok-dialect).
+**PR-URL capture shipped (mono#2522 / T-19).** Grok's Bash `toolResult` is `{type: "Bash", output: [<bytes>], output_for_prompt: "…", exit_code: …}` — not Claude's `stdout`/`stderr` keys. `pr_url_capture_feed` reads `output_for_prompt` (with a lossy `output` byte-array fallback). The shared URL matcher and command gates are unchanged.
 
 ### G-9 `TranscriptAccess`
 
-**The best of the three drivers.** `transcript_path_for_session` is already on the trait and already called by `live_status_loop`; Grok's `transcriptPath` is stamped on every hook payload, so the implementation is a key rename. No glob (Codex), no derivation, no dir watch.
+**Shipped (mono#2516 / T-11; bossctl rendering mono#2584).** `transcript_path_for_session` reads `transcriptPath` from the raw hook payload — a key rename, no glob. `grok/transcript.rs` owns the ACP `sessionUpdate` dialect; `GrokTranscriptSession` correlates `tool_call` / `tool_call_update` by `toolCallId`. Container-level reuse of `engine/transcript-tail` only. `bossctl agents transcript` falls through the run's resolved driver normaliser for non-Claude/Codex dialects rather than rendering empty.
 
-The line schema is Grok's ACP `sessionUpdate` dialect. Reuse `engine/transcript-tail` at container level; write a separate `TranscriptSessionNormalizer`. The tool-call/tool-result correlation the trait's per-tail state exists for is genuinely needed here: `tool_call` and `tool_call_update` are separate records.
+### G-10 `ControlVerbs` — the absorbed row, shipped
 
-### G-10 `ControlVerbs` — the absorbed row
+**Trait surface + call-site routing shipped (mono#2472 / T-04); Grok verbs + classify shipped (mono#2525 / T-13).** `AgentDriver` now carries `probe` / `interrupt` / `stop` / `reap` returning driver-neutral delivery plans. Claude and Codex implementations are the existing behaviour moved behind the seam. `transient_recovery` routes through the resolved driver's `classify_error` (unresolvable drivers fail closed to `Indeterminate`).
 
-Current state, verified: the trait has `classify_error` (`driver/src/lib.rs:1613`) and `mid_turn_pane_input` (`:1624`). **probe, interrupt, stop and reap are absent entirely.** `classify_error` is implemented by all three drivers and **called by none** — `core/src/transient_recovery.rs:339` calls `classify_claude_error` directly, bypassing the seam for every driver including Codex.
+| Verb               | Grok mechanism                             | As-built                                          | Qualification                                                |
+| ------------------ | ------------------------------------------ | ------------------------------------------------- | ------------------------------------------------------------ |
+| **probe**          | pane text + Return                         | pane-delivered                                    | Post-turn and post-Esc proven; mid-turn still unproven       |
+| **interrupt**      | Esc (`0x35`)                               | pane-delivered; pairs with T-12 recovery          | Skips the `Stop` hook; no-op in fullscreen vim mode          |
+| **stop**           | `/quit` via SendToPane                     | pane-delivered then process release               | Graceful path only                                           |
+| **reap**           | SIGTERM → SIGKILL on the process group     | process-group reap                                | Tool child shells need group reap; leader escapes if enabled |
+| **classify_error** | Grok/xAI shapes (`grok/classify_error.rs`) | grounded in Grok's bundled `StopFailure` taxonomy | Not routed through `classify_claude_error`                   |
 
-Grok is the first driver that makes all four verbs meaningful _and_ different enough from Claude's to be worth abstracting, because it is the first driver where they are all present but individually qualified:
-
-| Verb               | Grok mechanism                               | Evidence                                                                                         | Qualification                                                 |
-| ------------------ | -------------------------------------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------- |
-| **probe**          | `ghostty_surface_text` + Return              | spike Q8: `GKIT_PROBE_OK`, and a tool-style inject produced a real shell side-effect             | Post-turn and post-Esc proven; **mid-turn unproven**          |
-| **interrupt**      | `ghostty_surface_key` Esc (`0x35`)           | spike Q8: `turn_ended outcome=cancelled`, `trigger: "esc"`, process survives, next turn accepted | **Skips the `Stop` hook** (G-7); no-op in fullscreen vim mode |
-| **stop**           | `/quit` via SendToPane                       | spike Q8: `grok_exit=0`, shell returns                                                           | Graceful path only                                            |
-| **reap**           | pane release, SIGTERM → SIGKILL on the group | spike Q8: headless SIGTERM → exit 143                                                            | Tool child shells need group reap                             |
-| **classify_error** | xAI/Grok-specific error shapes               | —                                                                                                | **Must not** route through `classify_claude_error`            |
-
-`mid_turn_pane_input` should structurally be `Buffers`: Grok is a long-lived interactive TUI that owns the pty for the whole session and does not exit between turns, so the `codex exec` footgun (bytes lingering for the shell after the process exits) cannot occur. **But the spike's probes were post-turn and post-Esc, not mid-turn.** The default is `Rejects` for exactly this reason (`lib.rs:659-664`), and the driver must not declare `Buffers` on a structural argument alone. [T-13](#t-13-grok-control-verb-implementation) proves it or leaves it at `Rejects`.
+`mid_turn_pane_input` stays at the safe default **`Rejects`** — no empirical mid-turn stdin-consumption evidence was gathered, so the driver deliberately does not claim `Buffers`.
 
 ### G-11 `ToolProvisioning`
 
@@ -501,7 +498,7 @@ Grok has the richest surface of the three — MCP servers, plugins with a market
 
 The v1 posture is a _decision_, though, not an absence: the driver should explicitly disable what it does not use (`--no-subagents`, `--no-memory`) rather than inheriting defaults, because a subagent or a memory carried across sessions is state Boss does not model and cannot reason about. Noted in [T-07](#t-07-grok-config-isolation-and-workspace-provisioning).
 
-**Amendment 2026-08-09 — `--no-subagents` is now a measured requirement, not just posture.** Probed against `grok 1.0.0` in this project's own pane shape: subagents DO inherit the global `$GROK_HOME/hooks/` set and their tool calls ARE intercepted by the `PreToolUse` guards (no safety gap), but a finishing subagent emits a `session_end` whose payload is shape-identical to the top-level session's — same keys, same `reason: "shutdown"` — which Boss applies by slot as `WorkerActivity::Terminated` for a live worker. A Grok subagent is also **in-process**, so `background_children.rs`'s descendant walk cannot compensate, and `Stop.backgroundTasks` is empirically empty when a background subagent is in flight. Full evidence, the failure timeline, and what would have to change first: [`../investigations/grok-subagent-hook-attribution-2026-08-09.md`](../investigations/grok-subagent-hook-attribution-2026-08-09.md). This turns a **(a) unused-by-design** cell into a real, if narrow, `ProgressObservation` gap — recorded against [G-5](#g-5-progressobservation--solved-transport-unsolved-destination), where session identity belongs, rather than reopening G-11.
+**Amendment 2026-08-09 — `--no-subagents` is now a measured requirement, not just posture.** Probed against `grok 1.0.0` in this project's own pane shape: subagents DO inherit the global `$GROK_HOME/hooks/` set and their tool calls ARE intercepted by the `PreToolUse` guards (no safety gap), but a finishing subagent emits a `session_end` whose payload is shape-identical to the top-level session's — same keys, same `reason: "shutdown"` — which Boss applies by slot as `WorkerActivity::Terminated` for a live worker. A Grok subagent is also **in-process**, so `background_children.rs`'s descendant walk cannot compensate, and `Stop.backgroundTasks` is empirically empty when a background subagent is in flight. Full evidence, the failure timeline, and what would have to change first: [`../investigations/grok-subagent-hook-attribution-2026-08-09.md`](../investigations/grok-subagent-hook-attribution-2026-08-09.md) (mono#2700). This turns a **(a) unused-by-design** cell into a real, if narrow, `ProgressObservation` gap — recorded against [G-5](#g-5-progressobservation--transport-solved-destination-named-and-shipped), where session identity belongs, rather than reopening G-11.
 
 ### G-12 `PromptComposition`
 
@@ -513,11 +510,16 @@ One Grok-specific wrinkle: because Grok resolves the workspace's `.claude/CLAUDE
 
 ### G-13 `AwaitingInputSignal`
 
-Grok fires `Notification` with `notificationType`, `message`, and `level` — the right shape for the capability, and the interactive topology means there are real states to signal (permission prompts, tool approvals, the folder-trust dialog).
+**Characterised; stays undeclared — negative result, and the correct one (mono#2537 / T-24).**
 
-**Not declared in v1, deliberately.** The capability's own doc comment is unusually strict: absence is `Degrade`, **never** `Synthesize`, because a fabricated `WaitingForInput` is worse than an honest `Working`. Declaring it requires knowing _which_ `notificationType` values mean "blocked on a human", and the spike observed `Notification` firing without characterising the vocabulary. Under `--always-approve` / `bypassPermissions` most prompts are suppressed and `--trust` pre-empts the trust dialog, so the population of genuine awaiting-input events for a Boss worker may be near-empty — which is worth knowing before writing a mapping.
+The lifecycle `Notification` hook is a **separate channel** from `[ui.notifications]` terminal notifications (`$GROK_EVENT` / `$GROK_MESSAGE` were null on every hook invocation). Measured vocabulary under live probes:
 
-The cost of omission is bounded and correct: a Grok worker shows `Working` / `Idle` and never `WaitingForInput`. [T-24](#t-24-characterise-grok-notification-types-and-earn-awaitinginputsignal) earns the declaration with a cheap characterisation, and it does not gate the acceptance sweep. This is flagged for a human decision in the questions manifest.
+| `notificationType`  | Means "blocked on a human"? | Reachable under Boss flags?                                      |
+| ------------------- | --------------------------- | ---------------------------------------------------------------- |
+| `permission_prompt` | **Yes**                     | **No** — `--always-approve` suppresses the prompt that raises it |
+| `task_complete`     | No — informational          | **Yes**                                                          |
+
+Under Boss's spawn flags the only observed `Notification` is `task_complete`. Mapping the capability onto that would fabricate `WaitingForInput`. The declaration becomes earnable only if Boss ever spawns Grok without `--always-approve`, at which point `permission_prompt` is the already-measured mapping. A Grok worker shows `Working` / `Idle` and never a fabricated `WaitingForInput`.
 
 ---
 
@@ -598,15 +600,18 @@ Skip hooks for progress and tail `updates.jsonl` from the engine, mirroring the 
 
 ## Chosen approach
 
-Drive **`grok` as a full interactive TUI in a GhosttyKit pane**, seeded by a positional prompt from a file on disk, with a Boss-owned per-run `GROK_HOME` for isolation, **Claude-shaped hooks under that home as the progress transport** (the same events-socket path Claude uses in production), a **driver-owned canonicalisation adapter** in front of Boss's five unchanged guard scripts, `--sandbox` and `--deny` as defence in depth, and a **narrow `events.jsonl` tail** solely to observe Esc-cancelled turns.
+Drive **`grok` as a full interactive TUI in a GhosttyKit pane**, seeded by a positional prompt from a file on disk, with a Boss-owned per-run home container for isolation, **Claude-shaped hooks under that home as the progress transport** (the same events-socket path Claude uses in production), a **driver-owned canonicalisation adapter** in front of Boss's five unchanged guard scripts, platform sandbox + `--deny` as defence in depth, and a **narrow `events.jsonl` tail** solely to observe Esc-cancelled turns. **This is what shipped.**
 
 ### Execution shape
 
 ```sh
-export GROK_HOME=<run-dir>/grok-home
+export GROK_HOME=$TMPDIR/boss-grok-homes/<run_id>/grok-home
+export HOME=$TMPDIR/boss-grok-homes/<run_id>/process-home   # scoped; host tools bridged in
+export GROK_AUTH_PATH=<host>/.grok/auth.json                # shared credential + refresh lock
+# local macOS: the shell command is wrapped in Boss sandbox-exec; Grok sees --sandbox off
 grok \
   --model grok-4.5 \
-  --reasoning-effort <resolved-from-effort-level> \
+  --reasoning-effort <low|medium|high> \
   --no-alt-screen \
   --always-approve \
   --trust \
@@ -614,32 +619,33 @@ grok \
   --cwd <workspace> \
   --no-subagents \
   --no-memory \
-  --sandbox <profile>                      # after T-16 validates the profile set
+  --sandbox <off|boss-workspace|boss-read-only|workspace|read-only> \
+  --deny <structural-rules…> \
   "$(cat <workspace>/.grok/initial-prompt.txt)"
 ```
 
 Notes on each non-obvious element:
 
-- **Prompt from a file, not inline.** The spike verified brief-sized prompts (~41.6 KiB) through `--prompt-file` headless, and explicitly cautions against pasting tens of KB through `initial_input`. `$(cat …)` is the Claude pattern and it transfers.
-- **`--trust` _and_ a pre-seeded `trusted_folders.toml`.** Redundant on purpose: `--trust` is hidden from `--help` (D-3), so the file is the belt that survives its removal. `GROK_FOLDER_TRUST=0` is rejected — it also ungates project hooks and MCP.
-- **`--no-alt-screen`.** The spike verified both modes work under GhosttyKit and recommends inline for scrape and scrollback sanity. Whether `--minimal` is better still is an open decision for the human, flagged in the questions manifest.
-- **`--always-approve`** rather than `--permission-mode bypassPermissions`: the observed payloads already report `permissionMode: "bypassPermissions"` under it, and it is the flag the spike executed.
+- **Prompt from a file, not inline.** The spike verified brief-sized prompts through `--prompt-file` headless, and explicitly cautions against pasting tens of KB through `initial_input`. `$(cat …)` is the Claude pattern and it transfers.
+- **`--trust` _and_ a pre-seeded `trusted_folders.toml`.** Redundant on purpose: `--trust` is hidden from `--help` (D-3), so the file is the belt that survives its removal. Conformance still fail-closes if the flag stops parsing. `GROK_FOLDER_TRUST=0` is rejected — it also ungates project hooks and MCP.
+- **`--no-alt-screen` settled (mono#2470).** `--minimal` has **no** busy `Esc:cancel` chrome (0 hits) — rejected for v1 monitor. Default fullscreen shares live markers but alt-screen teardown drops viewport chrome on exit. Inline is the recommended pane mode.
+- **`--always-approve`** rather than `--permission-mode bypassPermissions`: observed payloads already report `permissionMode: "bypassPermissions"` under it. Answer-agent would additionally force `--permission-mode dontAsk` if ever dispatched.
+- **Sandbox is platform-split.** Local macOS → Boss `sandbox-exec` + Grok `--sandbox off`. Non-macOS local → `--sandbox boss-workspace` / `boss-read-only` via `$GROK_HOME/sandbox.toml`. Remote → bare built-in `workspace` / `read-only`.
 - **No `-w` / `--worktree`, ever.** Cube owns workspace provisioning.
-- **`--no-subagents` / `--no-memory`** are explicit posture, not defaults inherited by accident. `--no-subagents` additionally became load-bearing on 2026-08-09: see the [G-11 amendment](#g-11-toolprovisioning).
+- **`--no-subagents` / `--no-memory`** are explicit; `--no-subagents` is load-bearing for progress attribution (see [G-11](#g-11-toolprovisioning)).
 - **Vim mode must never be enabled** — Esc does not cancel in fullscreen vim mode, which would silently break interrupt.
 
-The pane launch itself is unchanged from Claude's: the engine composes this as a shell command, the app hosts it via `SpawnWorkerPane` with `initial_input`, and the engine holds only `shell_pid`.
+The pane launch itself is unchanged from Claude's: the engine composes this as a shell command, the app hosts it via `SpawnWorkerPane` with `initial_input` and optional `pane_monitor`, and the engine holds only `shell_pid`.
 
-### The engine seams this needs
+### The engine seams this needed — all landed
 
-Four, and only the first is a genuine abstraction change:
+1. **Hook-wiring destination** ([G-5](#g-5-progressobservation--transport-solved-destination-named-and-shipped)) — `HookWiringDestination::DriverOwned` (mono#2472).
+2. **Driver-owned payload canonicalisation** ([G-6](#g-6-tooluseinterception)) — adapter + negative tests (mono#2490, mono#2597).
+3. **`ControlVerbs` on the trait, and actually called** ([G-10](#g-10-controlverbs--the-absorbed-row-shipped)) — mono#2472 + mono#2525.
+4. **Narrow interrupt observer** ([G-7](#g-7-turnboundary)) — `events.jsonl` tail + synthesis fallback (mono#2525).
+5. **Per-connection events-socket driver resolution** — not in the original seam list; found only end-to-end (mono#2520).
 
-1. **A destination for hook-callback wiring** ([G-5](#g-5-progressobservation--solved-transport-unsolved-destination)). `ProgressIngress::HookCallback` must distinguish "merge into the worker settings file" from "the driver writes this itself", so Grok's hooks land in `$GROK_HOME/hooks/` and the interception guards follow them there rather than into an unread settings.json.
-2. **A driver-supplied hook-payload canonicalisation** ([G-6](#g-6-tooluseinterception)). One adapter executable, driver-configured, in front of the five unchanged guard scripts. Not a trait change so much as a driver-supplied artifact plus a place to declare it.
-3. **`ControlVerbs` on the trait, and actually called** ([G-10](#g-10-controlverbs--the-absorbed-row)). probe / interrupt / stop / reap, plus routing `transient_recovery.rs:339` through `classify_error` instead of `classify_claude_error`.
-4. **A narrow interrupt observer** ([G-7](#g-7-turnboundary)). A bounded tail of `$GROK_HOME/sessions/<pct-encoded-cwd>/<sid>/events.jsonl` looking for `turn_ended` with `outcome: "cancelled"`, active only around an interrupt. This reuses the existing `AgentJsonlFile` reader shape without adopting it as the progress transport.
-
-Everything else — the events socket, the `boss-event` shim, the ordered fan-out, `LiveWorkerState`, the stale-worker sweep, the dispatch gate, the registry, the effort resolution — is reused unmodified.
+Everything else — the `boss-event` shim, the ordered fan-out, `LiveWorkerState`, the stale-worker sweep, the dispatch gate, the registry, the effort resolution — is reused unmodified.
 
 ### Pane and embedder role — the driver-supplied monitor
 
@@ -673,35 +679,45 @@ The engine fills it from a new `AgentDriver::pane_monitor_spec() -> Option<PaneM
 
 **Why declarative markers rather than shipping behaviour.** The tracker's _structure_ (tail-change detection, prompt-submitted heuristic, idle debounce) is genuinely driver-agnostic; only the strings and one tuning constant are not. Shipping data keeps the state machine in one place, keeps the wire format trivially serialisable, and means driver #4 adds a Rust literal rather than a Swift branch.
 
-**Grok's actual marker strings are not known.** The spike scraped for its own injected canaries, not for Grok's TUI chrome, and this doc will not invent them — a wrong `busy_marker` produces a monitor that is confidently incorrect, which is worse than the honest `notDetected` Grok gets today. Capturing them is [T-03](#t-03-investigation-grok-tui-liveness-markers-under-ghosttykit), a `small` GhosttyKit-hosted observation, and it must precede the Swift work. The spike also warns that markers can leave the viewport after scroll and that alt-screen teardown drops chrome entirely, so T-03 must record markers that are _stably_ present, not merely observed once.
+**Grok's markers are measured and shipped (mono#2470 / mono#2483).** Under `--no-alt-screen`:
 
-### Capability declaration for `GrokDriver` (v1)
+| Field                 | Value                                         |
+| --------------------- | --------------------------------------------- |
+| `agent_markers`       | `Shift+Tab:mode`, `always-approve`, `Grok 4`  |
+| `busy_markers`        | `Esc:cancel`, `[stop]`                        |
+| `starting_markers`    | `Starting session`                            |
+| `prompt_prefixes`     | `│ ❯` (boxed; bare `❯` collides with history) |
+| `idle_debounce_polls` | `2`                                           |
+
+T-14 (protocol/engine) and T-15 (Swift) landed as **one PR** (mono#2483) rather than the planned split — the file-overlap serialisation was cheaper than two review cycles. Claude's spec reproduces the historical literals exactly; `None` on the wire keeps Claude defaults.
+
+### Capability declaration for `GrokDriver` (as shipped)
 
 **Provided (11):** `Spawn`, `WorkspaceProvisioning`, `PermissionPolicy`, `ModelAndEffortMenu`, `ProgressObservation`, `ToolUseInterception` (deny-only), `TurnBoundary`, `StructuredOutput`, `TranscriptAccess`, `ControlVerbs`, `PromptComposition`.
 
-**Not provided (2):**
+**Not provided (3):**
 
-- **`ToolProvisioning`** → default `Degrade`. Unused in v1 for every driver, including Claude, which declares it and injects nothing. Grok has MCP, plugins, skills and subagents; Boss injects none of them, and the driver explicitly disables subagents and memory. Declaring it would overclaim. `Degrade` is correct: no dispatch refusal, no synthesised tooling.
-- **`AwaitingInputSignal`** → default `Degrade`, **never** `Synthesize`. The signal shape exists (`Notification` with `notificationType` / `level`) but its vocabulary is uncharacterised, and the capability's contract forbids guessing. A Grok worker shows `Working` / `Idle` and never a fabricated `WaitingForInput`. [T-24](#t-24-characterise-grok-notification-types-and-earn-awaitinginputsignal) earns it; the omission gates nothing.
+- **`ToolProvisioning`** → default `Degrade`. Unused in v1 for every driver. Grok has MCP / plugins / skills / subagents; Boss injects none and explicitly disables subagents and memory.
+- **`AwaitingInputSignal`** → default `Degrade`, **never** `Synthesize`. Characterised (mono#2537); blocked population empty under Boss flags.
+- **`CommandOutcomeObservation`** → default `Degrade`, **never** `Synthesize`. Added by the Codex project after this design's original capability table; Claude declares it, Grok/Codex do not. Grok's Bash `toolResult` does carry `exit_code` on the wire — the omission is a declaration gap relative to what the dialect exposes, and it now interacts with Phase 3 (below).
 
-Two conditions attach to declarations rather than qualifying them, and both are the driver's to satisfy before the declaration is honest:
-
-- **`ToolUseInterception` is gated on the canonicalisation adapter** ([T-09](#t-09-grok-hook-wiring-progress-forwarder-plus-guard-script-canonicalisation)) and on the decision-vocabulary answer ([T-02](#t-02-investigation-grok-pretooluse-decision-vocabulary-and-tool-name-map)). Without them the guards fire and approve, which is a declaration Boss would not be honouring.
-- **`PermissionPolicy` is gated on the compat-leak answer** ([T-01](#t-01-investigation-claude-permission-settings-leakage-into-an-isolated-grok_home)). Boss cannot claim to apply its policy while an un-scoped `~/.claude/settings.local.json` is also loaded.
-
-`mid_turn_pane_input` starts at the safe default `Rejects` and moves to `Buffers` only if [T-13](#t-13-grok-control-verb-implementation) proves mid-turn injection is consumed by the agent.
+The original gates on `ToolUseInterception` (adapter) and `PermissionPolicy` (compat leak) are **closed**. `mid_turn_pane_input` remains `Rejects`.
 
 ### Which work-item kinds are Grok-eligible
 
-Phased, with an acceptance criterion per phase, expressed through `KindRequirements`. Refusals are about **output-contract maturity**, not guardrails — guardrails are uniform across all kinds once the adapter lands.
+Phased as planned; as-built status per phase:
 
-**Phase 1 — chores and project tasks.** The plain "make a change, open a PR" loop. Acceptance: 10 consecutive chores dispatched `--driver grok` reach an open PR with green CI, no engine intervention, and PR-URL capture on the primary path (not a `jj log` reconstruction fallback).
+**Phase 1 — chores and project tasks. Loop works; formal 10-chore acceptance sweep (T-21) was never executed as such.** Individual Grok dispatches reach open PRs with primary-path PR-URL capture (the integration bugs that would have made the sweep fail — events-socket driver, scoped-HOME credential strip, adapter identity — were each found and fixed by other means). Phases 2 and 3 were enabled without a recorded ten-consecutive-chores criterion. Same pattern the Codex postmortem recorded: a gate placed at the end of Phase 1 can only hold back Phase 2, and "Phase 1 is not yet accepted" was never a state that stopped work.
 
-**Phase 2 — design, investigation, postmortem.** Document-producing kinds, dependent on the `BOSS_STRUCTURED_OUTPUT` file contract and followups parsing. Acceptance: a Grok-authored design doc lands with a correctly parsed task-breakdown section and its followups materialise. Note that `TaskKind::Design` marks `StructuredOutput` and `ToolUseInterception` required-strict (`lib.rs:461`), so both must be genuinely declared — not merely present — before this phase.
+**Phase 2 — design, investigation, postmortem. Enabled (mono#2551 / T-22).** `KindRequirements` escalates `StructuredOutput` + `ToolUseInterception` to required-strict for all three document-producing kinds. Grok declares both. Downstream design/investigation/postmortem parsing is driver-agnostic.
 
-**Phase 3 — review and conflict resolution.** Review needs `--sandbox read-only` verified as a real reviewer-read-only equivalent (including that the worker demonstrably _cannot_ write), plus structured `ReviewResult` output. Conflict resolution needs write access and the merge-conflict telemetry path.
+**Phase 3 — review and conflict resolution. Sandbox properties verified; dispatch still blocked on two independent pins (mono#2624 / T-23).**
 
-**Phase 4 — triage and the answer agent. Reachable for Grok, unlike Codex.** The Codex project deferred these indefinitely because the answer agent depends on `UserPromptSubmit`-based delivery confirmation that Codex does not have, and because triage is transcript-scraped. **Grok has `UserPromptSubmit`** and is a live interactive session, so `pane_delivery`'s confirmation path works structurally. Triage remains blocked on the prose-scrape consumers that construct `ClaudeDriver` concretely ([T-26](#t-26-route-prose-scrape-fallback-consumers-through-the-resolved-driver)) rather than on anything Grok lacks. This is a genuine capability difference between the two non-Claude drivers and it should not be lost by copying the Codex phasing wholesale.
+- Reviewer `boss-read-only` / Boss Seatbelt genuinely denies workspace writes (live denial, not model politeness). `ReviewResult` round-trips under that sandbox (artifact path is under the system temp tree, always writable). Standard-kind sandbox permits workspace writes.
+- **`PrReview` cannot dispatch on Grok:** every such execution routes to the review pool, whose `REVIEWER_POOL_DRIVER = "claude"` overrides the row's driver. Changing that is a deliberate product decision (configurable reviewer model / load balancing), not a capability gap in this driver.
+- **`ConflictResolution` / `CiRemediation` refuse Grok at the capability gate** once `KindRequirements` marks `CommandOutcomeObservation` required-strict for those execution kinds. That escalation landed with the Codex capability split and post-dates the Phase 3 sandbox verification, which had concluded that the `TaskKind` gate already cleared. Main-pool conflict resolution for Grok is therefore not dispatchable today without either declaring the capability (if exit-code observation is considered honest for Grok) or revisiting the required-strict set.
+
+**Phase 4 — triage and the answer agent. Still deferred (T-31).** Prose-scrape consumers now resolve the driver (mono#2529 / T-26), so that particular block is cleared. Remaining work is product enablement, not a missing Grok mechanism — Grok has `UserPromptSubmit` and is a live interactive session, so `pane_delivery`'s confirmation path works structurally (a genuine Grok-vs-Codex difference).
 
 ### Load-balancing seams
 
@@ -724,54 +740,56 @@ Design _for_, do not design _now_. Four attachment points, three shared with the
 
 ## Risks / open questions
 
+Original OQs with as-built outcomes. Residual open items are called out explicitly.
+
 <a id="oq-1-claude-permission-settings-leak"></a>
-**OQ-1 — Can Claude permission-settings discovery be scoped out of an isolated `GROK_HOME`?** The sharpest open question in the project and the one gate on spawn. `[compat.claude]` disables instructions, agents, skills, plugins and rules, and leaves `permissions.sources` loading `~/.claude/settings.local.json`. Options to evaluate: an undocumented config key; scoping `HOME` for the worker process (heavy-handed, and it would also move the credential); accepting the leak if the loaded rules are provably restrictive-only. **A fourth possibility must be tested and would change the severity entirely: that the reported source is discovered-and-listed but not _applied_ under `--always-approve`.** `grok inspect` says `loaded: 1`, which suggests applied, but "loaded" and "in force" are not the same claim. → [T-01](#t-01-investigation-claude-permission-settings-leakage-into-an-isolated-grok_home).
+**OQ-1 — Can Claude permission-settings discovery be scoped out of an isolated `GROK_HOME`?** **Resolved (mono#2471 / mono#2482).** Rules are **enforced** under `--always-approve` (not merely listed). No compat key stops them. Scoped process `HOME` is the lever that works; auth stays on `GROK_AUTH_PATH`. Host-tool bridging into `process-home` (mono#2517) is the necessary follow-on so `cube pr create` still authenticates.
 
 <a id="oq-2-decision-vocabulary"></a>
-**OQ-2 — Does Grok honour `{"decision":"block"}`, and what is the canonical tool-name map?** Boss's five guard scripts emit `block` / `approve`; the spike proved `deny` and exit-2 block. If `block` is not recognised, every adapted guard fails open — the worst failure mode in this design, because it is indistinguishable from healthy operation. The tool-name half is equally load-bearing: the guards branch on `tool_name != "Bash"`, and Grok sends `run_terminal_command` / `write` / others. → [T-02](#t-02-investigation-grok-pretooluse-decision-vocabulary-and-tool-name-map).
+**OQ-2 — Does Grok honour `{"decision":"block"}`, and what is the canonical tool-name map?** **Resolved (mono#2469 / mono#2490).** `block` fails open; only `deny` and exit-2 block. Tool map: `run_terminal_command`→`Bash`, `write`→`Write`, `search_replace`→`Edit`. Adapter translates decisions and names.
 
 <a id="oq-3-interrupt-without-stop"></a>
-**OQ-3 — What ends a turn that was cancelled with Esc?** Esc-cancelled turns skip the `Stop` hook, so the engine's only turn-boundary signal never fires. Three candidate answers are laid out in [G-7](#g-7-turnboundary); the recommendation is to observe `events.jsonl` rather than synthesise, because Grok is the one driver whose session-file path is nameable in advance. A human should confirm that trade (a small new tail, versus an assumed state) before implementation. → [T-12](#t-12-turn-end-recovery-for-esc-cancelled-grok-turns).
+**OQ-3 — What ends a turn that was cancelled with Esc?** **Resolved (mono#2525).** Observe `events.jsonl` for `turn_ended outcome=cancelled`; bounded synthesis fallback if no record appears in the settle window.
 
 <a id="oq-4-the-leader-process"></a>
-**OQ-4 — The leader process.** `--leader-socket` defaults to `~/.grok/leader.sock` and `grok leader` manages running leaders. It is _assumed_ that a per-run `GROK_HOME` gives each worker its own leader — the socket path is home-derived — but this is unmeasured. If leaders are shared, or if one outlives its worker, then SIGTERM reap may not fully reap, and 16 concurrent workers may be sharing a process the engine does not know about. Uncharacterised in the spike and listed there as an open question.
+**OQ-4 — The leader process.** **Resolved as latent (mono#2537).** Per-run home isolates the leader; Boss does not enable leader mode today; a leader that is started escapes pane process-group reap. No live fix warranted while `use_leader` stays off.
 
-**OQ-5 — Is `--minimal` a better pane mode than `--no-alt-screen`?** `--minimal` prints finalized blocks into native scrollback with a small pinned region, which sounds strictly better for surface scrape than either alt-screen or plain inline. It is described as experimental. The spike tested alt-screen and `--no-alt-screen`, not `--minimal`. This affects the pane monitor's marker stability ([T-03](#t-03-investigation-grok-tui-liveness-markers-under-ghosttykit)) and is worth resolving before the marker set is captured, not after. Flagged for a human decision.
+**OQ-5 — Is `--minimal` a better pane mode than `--no-alt-screen`?** **Resolved: no for v1 (mono#2470).** `--minimal` has no stable busy interrupt chrome. `--no-alt-screen` is the recommended pane mode.
 
-**OQ-6 — Does `--json-schema` do anything useful in an interactive TUI session?** Its `--help` text implies `--output-format json`, a headless concept. If it works for a TUI, Grok gains a native structured-output contract stronger than Claude's. If not, the file contract is sufficient and nothing is lost. → [T-18](#t-18-structured-output-for-grok).
+**OQ-6 — Does `--json-schema` do anything useful in an interactive TUI session?** **Resolved: no (mono#2522).** File contract only; native flag not wired.
 
-**Risk — the guards fail open in a way that looks healthy.** Stated once, plainly: a Grok worker with unadapted guards runs every blocked command while its hooks fire, log, and report success. Every other risk in this project degrades toward a stuck or noisy worker; this one degrades toward an unguarded one. The mitigations are the adapter being a single file, its acceptance criterion being a **negative** test, and `grok inspect --json` asserting registration pre-spawn. It is why [T-02](#t-02-investigation-grok-pretooluse-decision-vocabulary-and-tool-name-map) and [T-09](#t-09-grok-hook-wiring-progress-forwarder-plus-guard-script-canonicalisation) gate real work rather than merely preceding it.
+**Residual — review-pool driver pin.** `PrReview` (and automation-pool conflict resolution) force `driver = "claude"`. Not a Grok-driver defect; a product policy that blocks Phase 3 review enablement regardless of capability declarations.
 
-**Risk — hook fail-open is inherited, not introduced.** Grok's crash / malformed / timeout behaviour is fail-open, identical to Claude's production posture. This is not a Grok regression and this project does not fix it. The `PATH`-shim follow-on project from the Codex analysis remains the right structural answer for all three drivers, and it is still unstarted.
+**Residual — `CommandOutcomeObservation` vs conflict-resolution.** Required-strict for `ConflictResolution` / `CiRemediation`; Grok does not declare it. Blocks main-pool Grok conflict resolution at the capability gate. Grok's Bash `toolResult` carries `exit_code` — whether that is enough to declare the capability honestly is an open product/engineering call, not a measurement gap.
 
-**Risk — one version, one day of evidence.** Grok 0.2.112 is the only version anyone has characterised, and the design already depends on one flag hidden from `--help`. Pin, capture goldens, gate upgrades on the harness — and expect at least one surprise on the first upgrade, because the Codex project found four in eight minor versions with more history to go on.
+**Risk — the guards fail open in a way that looks healthy.** Mitigated by the shipped adapter + negative tests + pre-spawn `grok inspect` hook inventory, but the residual fail-open on crash / malformed / timeout is inherited from Claude and unchanged. The `PATH`-shim follow-on project remains the structural answer for all three drivers and is still unstarted.
 
-**Materialised 2026-08-01, and the mitigation was the wrong shape.** Grok auto-updated 0.2.114 → 0.2.117 on its own, and the hard version pin turned that single automatic bump into a fail-closed provisioning outage for every Grok execution — the predicted surprise, except a hard version gate cannot "gate an upgrade" Boss never chose to make. The pin was removed; drift is now observed and logged (`LAST_CHARACTERISED_GROK_VERSION`) rather than gated. The hidden-flag risk this paragraph also names is unaffected and still mitigated by the (still fail-closed) `--trust`-flag and `grok models` conformance checks.
+**Risk — one version, one day of evidence → materialised, wrong mitigation.** Grok auto-updated on its own; the hard version pin turned drift into a fail-closed provisioning outage. Pin removed; `grokVersion` is observed/logged (`LAST_CHARACTERISED_GROK_VERSION`) and recorded on the execution. Hidden-`--trust` and `grok models` menu assertions remain fail-closed.
 
-**Risk — the Swift work is small and lands last, which is when it is most likely to be dropped.** The monitor fix is genuinely off the critical path, which makes it the easiest thing to defer indefinitely once Grok workers are producing PRs. It should not be: the whole point of the settled decision is to stop the hardcoding compounding at driver #4. [T-15](#t-15-driver-supplied-pane-monitor-swift-half) gates the acceptance sweep for exactly this reason.
+**Risk — Swift monitor work dropped.** Did not materialise; mono#2483 landed the full driver-supplied path (Rust + Swift) before Phase 1 acceptance.
 
 ---
 
-## Proposed abstraction amendments
+## Abstraction amendments (as shipped)
 
-Discrete and filed-work-item-sized. These are amendments to the agent-driver abstraction, feeding back the way the Codex project's amendment table did.
+| #    | Name                                                                     | Status                         | PR / note                                                                                            |
+| ---- | ------------------------------------------------------------------------ | ------------------------------ | ---------------------------------------------------------------------------------------------------- |
+| A-1  | `ProgressIngress`: name the hook-wiring destination                      | **Shipped**                    | mono#2472 — `HookWiringDestination`                                                                  |
+| A-2  | Driver-supplied hook-payload canonicalisation                            | **Shipped**                    | mono#2490 (+ identity fix #2597)                                                                     |
+| A-3  | `ControlVerbs` + call `classify_error`                                   | **Shipped**                    | mono#2472 (trait) + mono#2525 (Grok verbs)                                                           |
+| A-4  | Turn boundary must survive interrupt with no `Stop`                      | **Shipped**                    | mono#2525 — `events.jsonl` tail + fallback                                                           |
+| A-5  | Driver-supplied pane-monitor spec on engine↔app spawn RPC                | **Shipped**                    | mono#2483 (Rust + Swift together)                                                                    |
+| A-6  | `PermissionPolicy`: complete the Claude extraction                       | **Still deferred**             | Grok/Codex route around Claude's no-op                                                               |
+| A-7  | Driver-generic workspace provisioning must stop writing Claude artifacts | **Shipped**                    | mono#2498                                                                                            |
+| A-8  | Prose-scrape fallback consumers must resolve the driver                  | **Shipped**                    | mono#2529 (pool-aware)                                                                               |
+| A-9  | Remote/SSH dispatch must resolve the driver                              | **Still deferred**             | Local dispatch is the shipped target                                                                 |
+| A-10 | Conformance harness: third driver + live-CLI pin                         | **Shipped, then pin softened** | mono#2543; version gate removed after auto-update outages; `--trust` + models menu still fail-closed |
+| A-11 | `ModelMenu` documented refresh path                                      | **Documented**                 | module docs + conformance menu check; still a static table, not a live parse                         |
+| A-12 | `mid_turn_pane_input` provable fixture                                   | **Still deferred**             | Grok remains at `Rejects`                                                                            |
 
-| #    | Proposed name                                                                           | Effort    | Amends / new                                                      | Brief                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| ---- | --------------------------------------------------------------------------------------- | --------- | ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| A-1  | `ProgressIngress`: name the hook-wiring destination                                     | `small`   | **New**                                                           | `HookCallback` carries a hooks map with no statement of where it goes; `hooks_map_for_ingress` merges it into the Claude settings file and `pre_tool_use_array` appends the interception guards there too. A driver whose agent reads hooks from its own home gets both written to a file the agent never reads — silently. Add a declared destination so the merge is conditional on a property, not on a variant match. |
-| A-2  | Driver-supplied hook-payload canonicalisation                                           | `medium`  | **New**                                                           | Boss's five guard scripts parse Claude's snake_case payload shape and Claude's tool names. Grok's are camelCase with native tool names, so the guards fire and approve. Make canonicalisation a driver-supplied artifact in front of unchanged scripts, so the scripts stay one source of truth and driver #4 supplies an adapter rather than editing safety code.                                                        |
-| A-3  | `ControlVerbs`: probe / interrupt / stop / reap on the trait, and call `classify_error` | `medium`  | **Absorbs the abstraction project's blocked row**                 | The trait has `classify_error` and nothing calls it — `transient_recovery.rs:339` calls `classify_claude_error` directly for every driver. The four verbs are absent entirely. Grok is the first driver where all four are present, meaningful, and individually qualified, so this is where the seam becomes real.                                                                                                       |
-| A-4  | Turn boundary must survive an interrupt that emits no turn-end event                    | `medium`  | **New**                                                           | Boss's turn boundary for hook-driven drivers is the `Stop` hook. Grok skips it on Esc-cancelled turns, pinning the slot at `Working`. The abstraction needs a way for a driver to report a turn end observed on a channel other than its primary progress ingress.                                                                                                                                                        |
-| A-5  | Driver-supplied pane-monitor spec on the engine↔app spawn RPC                           | `medium`  | **New** — first engine/app protocol surface for a driver property | `GhosttyTerminalView.swift` hardcodes five Claude literals plus a Claude-shaped state machine. Add an optional `PaneMonitorSpec` to `SpawnWorkerPaneInput`, sourced from a new trait method. `None` preserves today's behaviour exactly.                                                                                                                                                                                  |
-| A-6  | `PermissionPolicy`: complete the Claude extraction                                      | `medium`  | **Amends the abstraction project's extraction row**               | `ClaudeDriver::write_permission_config` still returns `PermissionArtifacts::default()` — a functional no-op — while the real renderer sits in `core/src/worker_setup.rs`. Two drivers have now routed around it. The workaround is now the pattern, which is the argument for finishing it.                                                                                                                               |
-| A-7  | Driver-generic workspace provisioning must stop writing Claude artifacts                | `small`   | **New**                                                           | `write_workspace_files` calls `pre_trust_workspace()` (writes Claude's `~/.claude.json`) and `CLAUDE_DIR_GITIGNORE` unconditionally for every driver. Both belong behind the driver.                                                                                                                                                                                                                                      |
-| A-8  | Prose-scrape fallback consumers must resolve the driver                                 | `medium`  | **New**                                                           | `completion/stop.rs:227`, `completion/finalize_passes.rs:44` and `:530`, and `attentions_detector.rs:503` each construct `crate::driver::ClaudeDriver` concretely for PR-URL, triage, `ReviewResult` and followups fallbacks. Blocks Grok for the design, review and triage kinds.                                                                                                                                        |
-| A-9  | Remote/SSH dispatch must resolve the driver                                             | `large`   | **New** — deferred                                                | `core/src/app/worker_events.rs:619` hardcodes `ClaudeDriver.capabilities()` on the remote path. Generalising remote dispatch carries its own auth-distribution problem (`GROK_HOME` on remote hosts). Local dispatch is the v1 target.                                                                                                                                                                                    |
-| A-10 | Conformance harness: a third driver, and a per-driver version pin                       | `medium`  | **Amends the harness**                                            | `core/src/conformance/` has `boundary_equivalence`, `ingress_equivalence`, `claude_goldens`, `version_pin` and a goldens tree — all shaped for Claude and Codex. Grok adds a third ingress dialect and a second live-CLI pin, including a hidden-flag assertion that `--help` would not catch.                                                                                                                            |
-| A-11 | `ModelMenu` needs a documented refresh path                                             | `trivial` | **New**                                                           | Grok's menu is one model today and will not stay that way; Codex's moved twice in eight minor versions. A hardcoded table with no refresh story is a latent bug in every driver, not just this one.                                                                                                                                                                                                                       |
-| A-12 | `mid_turn_pane_input` should be provable, not asserted                                  | `trivial` | **New** — deferred                                                | The enum defaults to `Rejects` so a new driver is safe until it establishes otherwise, which is right. What is missing is a shared way to _establish_ it — a fixture that proves mid-turn bytes reach the agent rather than the shell. Each driver currently argues it in a doc comment.                                                                                                                                  |
+**Additional seam found only end-to-end (not in the original amendment table):** events-socket per-connection driver resolution (mono#2520). The accept loop resolved a single `ENGINE_DEFAULT_DRIVER` for every connection, so Grok payloads were normalised as Claude and dropped. Fix resolves the driver from `_boss_run_id` via `WorkDb::get_execution_driver_slug`.
 
-**Verdict on the inherited residual coupling**, as required: `write_permission_config`'s Claude no-op is **routed around** (Grok implements the method for real, as Codex does) and filed as deferred. `pre_trust_workspace` / `CLAUDE_DIR_GITIGNORE` **must be fixed** — they actively write Claude artifacts into a Grok workspace. The prose-scrape `ClaudeDriver` constructions **must be fixed** before the design / review / triage kinds, and are sequenced with those phases rather than ahead of Phase 1. The remote/SSH hardcode is **routed around** by scoping v1 to local dispatch. **This claim was false against the code as written and has since been fixed**: the events-socket accept loop resolved a single `ENGINE_DEFAULT_DRIVER`-slug driver for every connection, injected rather than hardcoded, but never re-resolved per connection — so every Grok hook event was normalised as Claude and dropped with `MissingField`. Injection made the accept loop _testable_; it did not make per-run resolution happen. The fix resolves the driver per connection from the payload's `_boss_run_id` via `WorkDb::get_execution_driver_slug` (`events_socket.rs`'s `resolve_connection_driver`), mirroring the precedent already used for stdout/JSONL ingress (`stdout_progress.rs`'s `driver_slug`-taking entry points).
+**Verdict on inherited residual coupling (as-built):** Claude's `write_permission_config` no-op is still routed around (A-6 deferred). Pre-trust / config-dir gitignore are fixed (A-7). Prose-scrape constructions are fixed and pool-aware (A-8). Remote/SSH remains out of v1 scope (A-9).
 
 ---
 
@@ -828,275 +846,277 @@ grok --trust --cwd /tmp -p x       # runs
 
 ---
 
-## Proposed implementation task breakdown
+## Implementation task breakdown (as shipped)
 
-Dependency-ordered. Each entry is sized to one reviewable PR by one worker in one session.
+Original dependency order preserved for history. Each in-scope entry carries a **Shipped** line recording the PR that closed it and any divergence from the entry as written. Scope that was **added during implementation** (not in the original ladder) is listed at the end.
 
 ### T-01 Investigation: Claude permission-settings leakage into an isolated `GROK_HOME`
 
-Establish whether `~/.claude/settings.local.json` (reported by `grok inspect --json` as a loaded permission source even under a fresh isolated home with the full `[compat.claude]` disable block) is actually _in force_ for a Grok run, and if so how to scope it out. Test at minimum: an undocumented compat or permissions config key; a scoped `HOME` for the worker process; and a direct behavioural test — write a restrictive deny rule into a throwaway `~/.claude/settings.local.json` and observe whether a Grok run under an isolated home honours it. Also determine whether the probed `/Library/Application Support/ClaudeCode/managed-settings.json` path can affect a run. Output is a written finding plus a reproducible harness, not code.
+Establish whether `~/.claude/settings.local.json` is actually _in force_ for a Grok run under an isolated home, and how to scope it out.
 
 - **Effort:** `small`
 - **Depends on:** none
-- **Scope: in-scope** — gates T-07 and everything downstream; Boss cannot honestly declare `PermissionPolicy` until this is answered
+- **Scope: in-scope**
+- **Shipped:** mono#2471 (findings + harness). Rules enforced under `--always-approve`; scoped `HOME` is the working lever; no compat `permissions` cell.
 
 ### T-02 Investigation: Grok `PreToolUse` decision vocabulary and tool-name map
 
-Two questions, both blocking the guardrail path. First: does Grok honour `{"decision":"block"}` and `{"decision":"approve"}` — the vocabulary Boss's five guard scripts emit — or only `{"decision":"deny"}` and exit-2, which is all the gating spike proved? Second: enumerate the tool names Grok sends in `toolName` for the tools Boss's guards care about (shell execution, file write, file edit), and produce the canonical map from Grok's names to the names the guards branch on. Output is a written finding plus a fixture set of real payloads, not code.
+Does Grok honour Boss `block`/`approve`? What are the on-the-wire tool names?
 
 - **Effort:** `small`
 - **Depends on:** none
-- **Scope: in-scope** — gates T-09; a wrong answer here means every guard fails open while appearing healthy
+- **Scope: in-scope**
+- **Shipped:** mono#2469. `block` fails open; map `run_terminal_command`→`Bash`, `write`→`Write`, `search_replace`→`Edit`.
 
 ### T-03 Investigation: Grok TUI liveness markers under GhosttyKit
 
-Capture the surface strings that stably indicate, for a Grok TUI in a GhosttyKit-hosted pane, that (a) the agent is present, (b) a turn is in flight, (c) the session is still starting, and (d) the input prompt line prefix. Must be run under the pinned GhosttyKit prebuilt, not a standalone terminal. Record marker _stability_, not just presence — the gating spike warns that markers leave the viewport after scroll and that alt-screen teardown drops chrome entirely. Capture under each candidate pane mode (`--no-alt-screen`, `--minimal`, default) so the mode decision and the marker set are settled together. Output is the concrete `PaneMonitorSpec` field values, not code.
+Capture stable `PaneMonitorSpec` field values under GhosttyKit; settle pane mode.
 
 - **Effort:** `small`
 - **Depends on:** none
-- **Scope: in-scope** — gates T-15; the design deliberately does not invent these strings
+- **Scope: in-scope**
+- **Shipped:** mono#2470. `--no-alt-screen` recommended; `--minimal` rejected (no busy chrome). Marker set in [pane section](#pane-and-embedder-role--the-driver-supplied-monitor).
 
 ### T-04 `ControlVerbs` trait surface, plus route error classification through it
 
-Put probe / interrupt / stop / reap on the `AgentDriver` trait with driver-neutral signatures, and change `core/src/transient_recovery.rs:339` to call `classify_error` through the resolved driver instead of `classify_claude_error` directly. Driver-agnostic work with no Grok dependency: Claude and Codex implementations are the existing behaviour moved behind the seam. This is the absorbed row from the agent-driver abstraction project.
+probe / interrupt / stop / reap on the trait; route `transient_recovery` through `classify_error`.
 
 - **Effort:** `medium`
 - **Depends on:** none
 - **Scope: in-scope**
+- **Shipped:** mono#2472 (with T-05 in the same PR — file-overlap serialisation inverted: both landed together).
 
 ### T-05 `ProgressIngress`: name the hook-wiring destination
 
-Distinguish "merge this hooks map into the worker settings file" from "the driver writes this wiring itself", so a driver whose agent reads hooks from its own home does not have both its forwarder and its interception guards written into a file the agent never opens. Update `hooks_map_for_ingress` and `pre_tool_use_array` to respect the declaration. Claude's behaviour must be byte-identical afterwards.
+`HookWiringDestination` on `ProgressObservationWiring`; engine merge conditional on `WorkerSettingsFile`.
 
 - **Effort:** `small`
-- **Depends on:** T-04 — **file overlap**, not logical dependency: both edit `driver/src/lib.rs`. Land T-04 first and forward-port its trait additions preservingly.
+- **Depends on:** T-04 (file overlap)
 - **Scope: in-scope**
+- **Shipped:** mono#2472.
 
 ### T-06 `GrokDriver` skeleton: descriptor, capability set, model menu, registry entry
 
-The crate and struct: `DriverDescriptor` (slug `grok`, binary `grok`, config dir `.grok`, agent-rules filename, initial-prompt filename), the `ModelMenu` (`grok-4.5` default, the three-rung effort mapping from this doc), the capability set per the declaration section, and registration alongside `claude` and `codex`. No spawning, no wiring, no hooks. Every capability omission carries its `AbsenceDisposition` and rationale as a comment, following the Codex driver's precedent.
+Slug `grok`, config dir `.grok`, `grok-4.5` menu, capability set, registry.
 
 - **Effort:** `medium`
-- **Depends on:** none — may run in parallel with T-04 and T-05; touches a new file plus the registry, not the trait
+- **Depends on:** none
 - **Scope: in-scope**
+- **Shipped:** mono#2468. Effort table originally claimed a longer ladder including `xhigh`/`max`; live CLI only accepts `low`/`medium`/`high` and the table was corrected (see [Model and effort](#model-and-effort)). Submodule directory layout reserved as planned.
 
 ### T-07 Grok config isolation and workspace provisioning
 
-Implement `provision_workspace`: a per-run Boss-owned `GROK_HOME` under the execution runtime dir, one shared host credential selected through `GROK_AUTH_PATH`, a `config.toml` carrying the full `[compat.claude]` and `[compat.cursor]` disable block plus whatever T-01 established, a `trusted_folders.toml` pre-stamped with both the `/tmp` and `/private/tmp` forms of the workspace path, `.grok/initial-prompt.txt`, and the agent-rules file. Assert the resulting posture with `grok inspect --json`, then require affirmative Grok OAuth, gh keyring, Cube workspace, and jj workspace/remote preflights before returning.
+Per-run home, compat block, trust stamp, inspect assertion, preflights.
 
 - **Effort:** `medium`
 - **Depends on:** T-01, T-06
 - **Scope: in-scope**
+- **Shipped:** mono#2482 (with T-08). Homes under `$TMPDIR/boss-grok-homes/<run>/` (not the cube runtime dir); scoped `process-home` from day one.
 
 ### T-08 `GrokDriver::spawn_invocation` and pane launch
 
-Emit the `SpawnPlan` for the execution shape in this doc: `GROK_HOME` exported via the plan's env directives, the flag set including `--trust`, `--session-id` with a Boss-assigned UUID, `--cwd`, `--no-alt-screen` (or whatever T-03 settles), `--no-subagents`, `--no-memory`, and the positional prompt read from the provisioned file. Must never emit `-w` / `--worktree`. Produces a Grok worker that starts and runs its seeded turn; progress is not yet observed.
+Spawn plan for the interactive TUI shape; never emit worktree flags.
 
 - **Effort:** `medium`
 - **Depends on:** T-07
 - **Scope: in-scope**
+- **Shipped:** mono#2482.
 
 ### T-09 Grok hook wiring: progress forwarder plus guard-script canonicalisation
 
-Write Boss's hook configuration into `$GROK_HOME/hooks/`: the `boss-event` forwarder on every lifecycle event, and the five interception guards. Both go behind a single driver-owned canonicalisation adapter that rewrites Grok's payload into Boss's canonical shape (using T-02's tool-name map) and translates the guards' `block` / `approve` output into whatever vocabulary T-02 established. The five guard scripts themselves must remain byte-identical. **Acceptance is a negative test**: a fixture worker attempts each blocked command and is demonstrably refused — proving the hook _ran_ proves nothing, because the failure mode under an unadapted payload is a hook that runs and approves.
+Adapter + five unchanged guards + `boss-event` forwarder under `$GROK_HOME/hooks/`. Negative-test acceptance.
 
 - **Effort:** `large`
 - **Depends on:** T-02, T-05, T-08
 - **Scope: in-scope**
+- **Shipped:** mono#2490. Identity fix mono#2597 (runner-injected keys, not `GROK_AGENT`).
 
 ### T-10 `GrokDriver` progress normaliser
 
-Map Grok's hook payload dialect onto `WorkerEvent` in a `ProgressSessionNormalizer`: camelCase keys to canonical, `hookEventName` snake values to canonical event names, `toolName` / `toolInput` / `toolResult`, `stopHookActive`, and `sessionId`. Confirm rather than assume that `source: "new"` reaches `SessionStartSource::Other` and that the reducer's `Spawning → Idle` transition fires. Unknown event names must be ignored-with-logging, not rejected — Grok documents fourteen hook events and the spike observed six.
+CamelCase → `WorkerEvent` via shared `normalize_hook_event` after key rewrite.
 
 - **Effort:** `medium`
 - **Depends on:** T-09
 - **Scope: in-scope**
+- **Shipped:** mono#2511.
 
 ### T-11 `TranscriptAccess` for Grok
 
-Implement `transcript_path_for_session` from the `transcriptPath` field stamped on every hook payload, and write a `TranscriptSessionNormalizer` for the ACP `sessionUpdate` dialect in `updates.jsonl`. Reuse `engine/transcript-tail` at container level only; the per-tail correlation state is genuinely needed because `tool_call` and `tool_call_update` arrive as separate records. Do not share a parser with either the Claude or the Codex dialect.
+`transcriptPath` key rename + ACP dialect normaliser with tool-call correlation.
 
 - **Effort:** `medium`
 - **Depends on:** T-10
 - **Scope: in-scope**
+- **Shipped:** mono#2516. Operator-facing rendering follow-on mono#2584.
 
 ### T-12 Turn-end recovery for Esc-cancelled Grok turns
 
-Close the hazard that an Esc-cancelled turn skips the `Stop` hook, leaving the slot pinned at `Working` while the worker sits idle at its prompt. Implement the recommended approach — a bounded tail of `$GROK_HOME/sessions/<pct-encoded-cwd>/<sid>/events.jsonl` for `turn_ended` with `outcome: "cancelled"`, active only around an interrupt — reusing the existing agent-JSONL reader shape. The path is fully constructible from the run's `GROK_HOME`, `--cwd` and Boss-assigned session UUID, so no glob or correlation step is needed. Include the bounded synthesis fallback for the case where no cancellation record appears within the settle window.
+Bounded `events.jsonl` tail for cancelled turns + synthesis fallback.
 
 - **Effort:** `medium`
 - **Depends on:** T-04, T-10
 - **Scope: in-scope**
+- **Shipped:** mono#2525 (with T-13).
 
 ### T-13 Grok control-verb implementation
 
-Implement the four verbs for Grok against the trait surface T-04 established: probe as typed pane input, interrupt as Esc, stop as `/quit` followed by pane release, reap as SIGTERM→SIGKILL on the process group including tool child shells. Implement `classify_error` against Grok/xAI error shapes — explicitly not routed through Claude's classifier. Determine empirically whether mid-turn pane input is consumed by the agent rather than left in the tty, and set `mid_turn_pane_input` accordingly; leave it at the safe `Rejects` default if it is not proven.
+probe / interrupt / stop / reap + `classify_error`; mid-turn left at `Rejects` if unproven.
 
 - **Effort:** `medium`
 - **Depends on:** T-12
 - **Scope: in-scope**
+- **Shipped:** mono#2525. `mid_turn_pane_input` remains `Rejects`.
 
-### T-14 Driver-supplied pane-monitor spec: protocol and engine half
+### T-14 / T-15 Driver-supplied pane monitor (protocol + Swift)
 
-Add `PaneMonitorSpec` to `boss-protocol` and an optional `pane_monitor` field to `SpawnWorkerPaneInput`, plus an `AgentDriver::pane_monitor_spec()` trait method, and populate it at the pane-spawn call site from the resolved driver. Claude's spec reproduces today's five literals and its two-poll idle debounce exactly. `None` on the wire must preserve current app behaviour, so an older app paired with a newer engine is unaffected. Rust only — no Swift in this PR.
+`PaneMonitorSpec` on spawn RPC; Swift renames and spec lookups; Grok markers from T-03.
 
-- **Effort:** `medium`
-- **Depends on:** T-06
+- **Effort:** `medium` each (planned as two PRs)
+- **Depends on:** T-06; T-15 also T-03 + T-14
 - **Scope: in-scope**
-
-### T-15 Driver-supplied pane monitor: Swift half
-
-Rename `ClaudeMonitorSnapshot` / `ClaudeMonitorTracker` / `ClaudeMonitorState` to driver-neutral `PaneMonitor*` names, replace the five hardcoded literals in `makeClaudeSnapshot` with lookups against the spec delivered on the spawn message, make the idle-debounce constant spec-supplied, and relabel the status pill driver-neutrally. Absent spec falls back to today's Claude literals so no existing path changes behaviour. Uses the marker values T-03 captured.
-
-- **Effort:** `medium`
-- **Depends on:** T-03, T-14
-- **Scope: in-scope**
+- **Shipped:** mono#2483 as a **single** Rust+Swift PR (planned split collapsed).
 
 ### T-16 Investigation: Grok sandbox profiles and allow/deny rule grammar
 
-Characterise the two permission levers that only surface probes have touched. For `--sandbox`: what the built-in profiles (`workspace`, `read-only`, `strict`, `off`, `none`) actually enforce, whether `read-only` is a genuine reviewer-read-only equivalent, what the `sandbox.toml` custom-profile schema accepts, and what "direct global-hook write protection" covers. For rules: whether the grammar accepts Claude's `Bash(rm -rf:*)` spelling, Grok's native tool names, or both — and what happens to a malformed rule, given that `--deny '(((('` is accepted at parse time without complaint. Output is a written finding plus fixtures.
+Built-in profiles, custom `sandbox.toml`, rule grammar, fail-closed behaviour.
 
 - **Effort:** `small`
 - **Depends on:** none
-- **Scope: in-scope** — gates T-17; the design must not rely on a mechanism whose grammar is unvalidated
+- **Scope: in-scope**
+- **Shipped:** mono#2471 (combined with T-01 findings doc).
 
 ### T-17 `GrokDriver::write_permission_config`
 
-Render Grok's permission artifacts into the per-run home: the platform sandbox selection (including reviewer read-only), the `--deny` / `--allow` rule set expressing Boss's structural deny set, and the `--permission-mode` selection — returned as `PermissionArtifacts { config_files, extra_args, env }`. Non-macOS and remote workers use Grok's native profiles. Local macOS workers run inside a Boss-owned Seatbelt policy that preserves keychain IPC while enforcing the same filesystem posture. Follows the Codex driver's precedent of implementing the method for real rather than routing around it.
+Platform sandbox + structural `--deny` rules as real `PermissionArtifacts`.
 
 - **Effort:** `medium`
 - **Depends on:** T-07, T-16
 - **Scope: in-scope**
+- **Shipped:** mono#2513. Local macOS uses Boss Seatbelt + Grok `--sandbox off` (divergence from "Grok profiles only").
 
 ### T-18 Structured output for Grok
 
-Wire the shared `BOSS_STRUCTURED_OUTPUT` env-file contract for Grok, which is driver-neutral and sufficient on its own. Separately evaluate whether `--json-schema` is meaningful for an interactive TUI session, given that its documented behaviour implies `--output-format json` — a headless concept. If it works, surface it as the stronger native contract; if not, record the negative result so a later pass does not re-investigate.
+File contract + evaluate `--json-schema` for TUI.
 
 - **Effort:** `medium`
 - **Depends on:** T-10
 - **Scope: in-scope**
+- **Shipped:** mono#2522 (with T-19). `--json-schema` negative; file contract only; empty transcript fallback.
 
 ### T-19 PR-URL capture for the Grok dialect
 
-PR-URL capture is triggered by `PostToolUse` and reads the tool response's stdout. Supply the Grok-dialect feed text — `toolResult`, canonicalised by the adapter — to the shared URL matcher and command gates, and verify the shell tool's output nests stdout where the extractor expects. The PR URL is the acceptance criterion for nearly every work item, so this must work on the primary path rather than via the reconstruction fallback.
+Grok Bash `toolResult` feed into the shared matcher.
 
 - **Effort:** `small`
 - **Depends on:** T-10
 - **Scope: in-scope**
+- **Shipped:** mono#2522. Reads `output_for_prompt` (not `stdout`).
 
 ### T-20 Conformance: Grok goldens and version pin
 
-Extend `core/src/conformance/` with a third driver: Grok payload goldens, an ingress-equivalence assertion that Grok's hook ingress produces the same `WorkerEvent` sequence shape as Claude's for equivalent activity, a boundary-equivalence assertion that a turn boundary drives completion identically, and a live-CLI version pin. The pin must assert the **hidden** `--trust` flag still parses — a `--help` diff would not catch its removal — and that `grok models` still matches the descriptor's menu. Soft-skip when the binary is absent, with an opt-in env var to require it, following the existing Codex pin's pattern. A validation campaign over the implementations above, deliberately sequenced after them.
-
-**Superseded 2026-08-01 — the live-CLI _version_ pin was removed (operator decision).** It fired on every one of Grok's own automatic updates — 0.2.114 → 0.2.117 broke it within days of landing — turning routine drift into a fail-closed provisioning outage before any worker was even attempted, which is not a useful thing for a hard gate to do to a CLI Boss does not control the update cadence of. `grok::home::assert_inspect_json_posture` now only observes `grokVersion` and logs a `tracing::warn!` on drift from `LAST_CHARACTERISED_GROK_VERSION`; it never gates, `bail!`s, or fails a test. The observed version is recorded on the execution record (`GrokRuntimeState::grok_version`) rather than discarded. The hidden `--trust` flag and `grok models` menu assertions this item also called for are unaffected and still fail closed — see `version_pin::hidden_trust_flag_still_parses_on_installed_grok` and `version_pin::grok_models_menu_matches_pinned_descriptor`.
+Third-driver goldens, ingress/boundary equivalence, live-CLI pin.
 
 - **Effort:** `medium`
 - **Depends on:** T-11, T-13, T-17, T-18, T-19
 - **Scope: in-scope**
+- **Shipped:** mono#2543. **Version pin later removed** (auto-update outages); observe/log only. Hidden `--trust` and `grok models` menu assertions still fail closed.
 
 ### T-21 Phase-1 acceptance sweep: 10 Grok chores to green PRs
 
-Dispatch 10 consecutive chores with `--driver grok` and verify each reaches an open PR with green CI, no engine intervention, and primary-path PR-URL capture. Record per-run wall-clock and any manual intervention so the "quality and speed" premise of the project has evidence behind it. A sweep, not an implementation — listed separately and after the work it validates.
+Ten consecutive chores, primary-path PR-URL, no engine intervention.
 
 - **Effort:** `medium`
 - **Depends on:** T-15, T-20
 - **Scope: in-scope**
+- **Status: not executed as a formal sweep.** Individual Grok chores reach PRs; the integration failures that would have failed the sweep were fixed opportunistically (mono#2517, #2520, #2597). Phases 2–3 enabled without this gate firing. Same structural observation as the Codex postmortem: a gate at the end of Phase 1 only blocks what comes after, and nothing treated "Phase 1 unaccepted" as a stop state.
 
 ### T-22 Grok eligibility for design / investigation / postmortem kinds
 
-Phase 2: enable the document-producing kinds via `KindRequirements` and verify a Grok-authored design doc's task-breakdown section parses and its followups materialise. Note that the design kind marks `StructuredOutput` and `ToolUseInterception` required-strict, so both must be genuinely declared and honoured before this phase can be enabled.
+Enable document-producing kinds via `KindRequirements`.
 
 - **Effort:** `medium`
-- **Depends on:** T-21, T-26
+- **Depends on:** T-21, T-26 (planned); landed without waiting on T-21
 - **Scope: in-scope**
+- **Shipped:** mono#2551.
 
 ### T-23 Grok eligibility for review and conflict-resolution kinds
 
-Phase 3: verify `--sandbox read-only` is a genuine reviewer-read-only equivalent — including that the worker demonstrably _cannot_ write to the workspace, not merely that it declines to — and that structured `ReviewResult` output round-trips. Conflict resolution additionally needs write access and the merge-conflict telemetry path exercised.
+Verify reviewer sandbox + `ReviewResult`; conflict-resolution write + telemetry.
 
 - **Effort:** `medium`
 - **Depends on:** T-22
 - **Scope: in-scope**
+- **Shipped as verification, not enablement:** mono#2624. Sandbox denial, `ReviewResult` round-trip, and Standard write access proven live. `PrReview` remains pinned to Claude via the review pool. Later `CommandOutcomeObservation` required-strict additionally refuses Grok for `ConflictResolution` / `CiRemediation` at the capability gate.
 
 ### T-24 Characterise Grok `Notification` types and earn `AwaitingInputSignal`
 
-Determine which `notificationType` / `level` values positively mean "blocked awaiting a human" as opposed to informational, and whether any of them can occur for a Boss worker at all given `--always-approve` and pre-seeded folder trust. If a genuine awaiting-input signal exists, declare the capability and map it; if the population is empty in practice, record that and leave the capability undeclared. The capability's contract forbids synthesising this state from a lower-fidelity channel, so a negative result is a valid and useful outcome.
+Map blocked-on-human notifications, or record a negative result.
 
 - **Effort:** `small`
 - **Depends on:** T-10
-- **Scope: in-scope** — does not gate the acceptance sweep; a Grok worker shows `Working` / `Idle` meanwhile
+- **Scope: in-scope**
+- **Shipped:** mono#2537 (with T-27). Negative result: capability stays undeclared.
 
 ### T-25 Make pre-trust and config-dir gitignore driver-supplied
 
-`write_workspace_files` calls `pre_trust_workspace()` — which writes Claude's `~/.claude.json` — and writes `CLAUDE_DIR_GITIGNORE` unconditionally for every driver. For a Grok worker both produce Claude artifacts for a workspace Claude will never run in. Move both behind the driver so each supplies its own pre-trust action and its own config-dir gitignore content.
+Move Claude-only workspace writes behind the driver.
 
 - **Effort:** `small`
 - **Depends on:** T-07
 - **Scope: in-scope**
+- **Shipped:** mono#2498.
 
 ### T-26 Route prose-scrape fallback consumers through the resolved driver
 
-`completion/stop.rs:227`, `completion/finalize_passes.rs:44` and `:530`, and `attentions_detector.rs:503` each construct `crate::driver::ClaudeDriver` concretely for the PR-URL, triage, `ReviewResult` and followups fallbacks. Replace each with a registry resolution. Sequenced with the Phase 2/3 kinds rather than ahead of Phase 1, because chores reach a PR on the primary capture path without touching these fallbacks.
+Replace concrete `ClaudeDriver` constructions with registry resolution (pool-aware).
 
 - **Effort:** `medium`
 - **Depends on:** T-19
 - **Scope: in-scope**
+- **Shipped:** mono#2529. Also fixed `one_turn_per_process` misclassification for pool-dispatched reviewers.
 
 ### T-27 Investigation: the Grok leader process under concurrent workers
 
-Characterise `grok leader` / `--leader-socket`: whether per-run `GROK_HOME` isolation gives each worker its own leader (the socket path is home-derived, so it should, but this is unmeasured), whether a leader outlives its worker, and whether SIGTERM reap of the pane process group actually reaps it. Listed as an open question by the gating spike and unresolved here. A leader that is shared or that survives reap would mean Boss has an unmodelled process per worker.
+Isolation, lifetime, reap behaviour.
 
 - **Effort:** `small`
 - **Depends on:** T-13
-- **Scope: deferred (future / not a v1 blocker)** — a leaked helper process is an operational annoyance rather than a correctness failure, and per-run home isolation makes sharing unlikely; promote if reap proves unreliable in the acceptance sweep
+- **Scope: was deferred; characterisation still landed**
+- **Shipped:** mono#2537. Isolated per home; not spawned under Boss flags; escapes process-group reap if enabled.
 
 ### T-28 Extract Claude's permission rendering into the driver crate
 
-`ClaudeDriver::write_permission_config` still returns `PermissionArtifacts::default()` — a functional no-op — while the real settings.json, deny-rule and hooks rendering lives in `core/src/worker_setup.rs`. Two drivers have now implemented the method for real and routed around Claude's no-op. Port the rendering across the one-way `core → driver` boundary and complete the extraction.
-
 - **Effort:** `medium`
 - **Depends on:** none
-- **Scope: deferred (future / not a v1 blocker)** — Grok implements the method for real and does not need Claude's extraction to land; filed so the workaround becoming the pattern stays visible rather than silently accepted
+- **Scope: deferred (future / not a v1 blocker)** — still open; Grok and Codex implement the method for real and route around Claude's no-op.
 
 ### T-29 Remote/SSH dispatch for Grok
 
-The remote path hardcodes `ClaudeDriver.capabilities()` and the remote runner script is Claude-shaped end to end. Generalising it carries its own auth-distribution problem — each remote host would need an isolated `GROK_HOME` plus a durable shared credential path and refresh lock.
-
 - **Effort:** `large`
 - **Depends on:** T-21
-- **Scope: deferred (future / not a v1 blocker)** — local dispatch is the v1 target
+- **Scope: deferred (future / not a v1 blocker)** — still open; local dispatch is the shipped target.
 
 ### T-30 Per-driver capacity and rate-limit accounting seams
 
-Attach per-driver in-flight accounting at the dispatch gate, and record per-turn usage against the driver where a channel carries it. Grok's hook payloads carry no token usage, so this must also establish whether the session `summary.json` or `events.jsonl` does — and if neither, record the asymmetry explicitly so a future balancer does not assume symmetry across the three drivers. Seams only; no routing policy.
-
 - **Effort:** `medium`
 - **Depends on:** T-21
-- **Scope: deferred (future / not a v1 blocker)** — load balancing is explicitly out of scope; this only ensures the seams exist and are not foreclosed
+- **Scope: deferred (future / not a v1 blocker)** — still open; load balancing remains out of scope.
 
 ### T-31 Grok eligibility for triage and the answer agent
 
-Phase 4. The Codex project deferred these indefinitely because the answer agent depends on `UserPromptSubmit`-based delivery confirmation Codex does not have. **Grok has it**, and is a live interactive session, so the confirmation path works structurally. What remains is triage's transcript-scraped decision parsing, which is blocked on T-26 rather than on anything Grok lacks. Listed as its own entry so this genuine Grok-vs-Codex capability difference is not lost by copying the Codex phasing.
-
 - **Effort:** `medium`
 - **Depends on:** T-23, T-26
-- **Scope: deferred (future / not a v1 blocker)** — Phase 4 by sequencing, not by capability; promote once Phase 3 lands
+- **Scope: deferred (future / not a v1 blocker)** — still open. T-26's prose-scrape block is cleared; product enablement remains.
 
-### Parallelism and file-overlap cautions
+### Scope added during implementation (not in the original ladder)
 
-**Depth 0 — six entries, genuinely independent, may run concurrently:** T-01, T-02, T-03, T-04, T-06, T-16. Also T-28, which is unblocked but deferred.
+| Addition                                                           | PR        | Why it was not optional                                                                       |
+| ------------------------------------------------------------------ | --------- | --------------------------------------------------------------------------------------------- |
+| Per-connection events-socket driver resolution                     | mono#2520 | Without it every Grok hook event was normalised as Claude and dropped                         |
+| Bridge `gh` / `ssh` / `git` / cube state into scoped `HOME`        | mono#2517 | Scoped HOME closed D-1 and simultaneously made `cube pr create` impossible                    |
+| Grok per-run home retention sweep                                  | mono#2570 | Homes live under a temp root, not the cube workspace; without reclaim they accumulate forever |
+| `bossctl agents transcript` driver normaliser path                 | mono#2584 | Grok ACP dialect has no top-level schema field the Claude/Codex direct path expects           |
+| Adapter identity: runner-injected keys, not `GROK_AGENT`           | mono#2597 | Wrong identity made every tool call fail closed                                               |
+| Keep `--no-subagents` with measured session_end attribution defect | mono#2700 | Subagent `session_end` can mark the parent slot `Terminated`                                  |
 
-Start **T-01 and T-02 first regardless of slack.** They are both `small`, and they gate the two things that would otherwise be discovered late and expensively: whether Boss's permission posture is actually in force, and whether Boss's guards actually block. T-03 and T-16 are also `small` and gate later work, but a wrong answer there is visible rather than silent.
-
-**Depth 1:** T-05 (after T-04), T-07 (after T-01 + T-06), T-14 (after T-06). T-07 and T-14 may run concurrently.
-
-**Depth 2 onward:** T-08 → T-09 → T-10 fan out into T-11, T-12, T-18, T-19 and T-24, which are mutually independent and may run in parallel. T-15 (after T-03 + T-14) is independent of the entire progress chain and may run alongside any of them.
-
-**File-overlap cautions — order these rather than running them concurrently:**
-
-- **T-04 and T-05** both edit `driver/src/lib.rs` substantially: T-04 adds four trait methods, T-05 changes an enum and its consumers. The dependency edge is file overlap, not logic. Land T-04 first; T-05 forward-ports its additions preservingly rather than replacing them.
-- **T-09 and T-17** both write into `$GROK_HOME` from the driver — T-09 the hooks, T-17 the permission artifacts. They are logically independent but will co-edit the driver's home-provisioning helpers. Land T-09 first (it is on the critical path and larger); T-17 integrates.
-- **T-11, T-12, T-18, T-19 and T-24** all edit the Grok driver module. The overlap is incidental rather than substantial — different methods, different files once the driver is split into a `grok/` submodule directory the way `claude/` and `codex/` already are — so they stay parallel. **T-06 should create that submodule directory** rather than a single `grok.rs`, precisely so this fan-out does not serialise on one file.
-- **T-25 and T-07** both touch workspace provisioning, from opposite sides: T-07 adds Grok's, T-25 removes Claude's from the driver-generic path. The edge serialises them; keep it.
-
-**Not in this graph:** the `PATH`-shim project inherited from the Codex analysis is independent of everything above and remains the right structural answer to hook fail-open for all three drivers.
+**Not in this graph:** the `PATH`-shim project inherited from the Codex analysis remains independent and unstarted — still the right structural answer to hook fail-open for all three drivers.
