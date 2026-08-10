@@ -693,13 +693,6 @@ fn settings_value(
     // `pre_tool_use_hooks` has ended.
     value["hooks"] = serde_json::Value::Object(hooks);
 
-    // Reviewer sessions are latency-sensitive review passes: fast mode
-    // keeps Opus quality while cutting turnaround. Scoped to reviewers
-    // only — implementation/design/investigation workers are unaffected.
-    if input.worker_kind == WorkerKind::Reviewer {
-        value["fastMode"] = serde_json::json!(true);
-    }
-
     value
 }
 

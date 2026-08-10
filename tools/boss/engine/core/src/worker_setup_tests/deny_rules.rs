@@ -140,24 +140,29 @@ fn reviewer_kind_adds_write_and_push_deny_rules_standard_does_not() {
 }
 
 #[test]
-fn reviewer_settings_json_has_fast_mode_standard_does_not() {
-    // Reviewer workers are latency-sensitive: fastMode must be true.
+fn reviewer_settings_json_has_same_top_level_shape_as_standard() {
     let mut rev_input = sample_input();
     rev_input.worker_kind = WorkerKind::Reviewer;
     let rev_parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&rev_input, &ClaudeDriver)).unwrap();
-    assert_eq!(
-        rev_parsed["fastMode"],
-        serde_json::json!(true),
-        "reviewer settings.json must have fastMode:true",
-    );
 
-    // Standard workers must NOT have fastMode set at all.
     let std_input = sample_input();
     let std_parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&std_input, &ClaudeDriver)).unwrap();
+
+    let reviewer_keys: std::collections::BTreeSet<&str> = rev_parsed
+        .as_object()
+        .expect("reviewer settings must be a JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let standard_keys: std::collections::BTreeSet<&str> = std_parsed
+        .as_object()
+        .expect("standard settings must be a JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect();
     assert!(
-        std_parsed.get("fastMode").is_none() || std_parsed["fastMode"] == serde_json::json!(null),
-        "standard worker settings.json must not carry fastMode (got {:?})",
-        std_parsed.get("fastMode"),
+        reviewer_keys == standard_keys,
+        "reviewer settings must not add top-level settings: reviewer={reviewer_keys:?}, standard={standard_keys:?}",
     );
 }
 
