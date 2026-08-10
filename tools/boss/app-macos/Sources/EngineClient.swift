@@ -423,6 +423,18 @@ final class EngineClient: @unchecked Sendable {
                             taskTitle: taskTitle
                         ))
                     ))
+                case "attach_coordinator_pane":
+                    let sessionName = request["session_name"] as? String ?? ""
+                    let spawnToken = request["spawn_token"] as? String ?? ""
+                    let model = request["model"] as? String ?? ""
+                    emit(.engineRequest(
+                        requestId: requestId,
+                        request: .attachCoordinatorPane(EngineCoordinatorAttachRequest(
+                            sessionName: sessionName,
+                            spawnToken: spawnToken,
+                            model: model
+                        ))
+                    ))
                 case "detach_worker_pane":
                     let slotId = (request["slot_id"] as? NSNumber)?.intValue ?? 0
                     emit(.engineRequest(requestId: requestId, request: .detachWorkerPane(slotId: slotId)))

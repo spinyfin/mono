@@ -550,6 +550,10 @@ struct ServerState {
     /// the preflighted executable; tests inject a command runner.
     #[builder(default = Arc::new(std::sync::RwLock::new(None)))]
     pane_delivery_tmux_override: Arc<std::sync::RwLock<Option<boss_tmux::Tmux>>>,
+    /// Serializes coordinator session creation/recovery across app reconnects
+    /// and the independent child-exit supervisor.
+    #[builder(default = Arc::new(Mutex::new(())))]
+    coordinator_tmux_lock: Arc<Mutex<()>>,
     /// Per-slot trigger fan-in for the live-status summarizer. Started
     /// when `spawn_flow` calls `start_live_status_slot`; torn down
     /// in `release_worker_pane`.
@@ -2396,6 +2400,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::RecordProducerSideConflict { .. } => {
                 conflict_resolution::handle_record_producer_side_conflict(ctx, r).await
             }
+            r @ FrontendRequest::RecreateCoordinator { .. } => sessions::handle_recreate_coordinator(ctx, r).await,
             r @ FrontendRequest::RegisterAppSession => sessions::handle_register_app_session(ctx, r).await,
             r @ FrontendRequest::RegisterBossSession { .. } => sessions::handle_register_boss_session(ctx, r).await,
             r @ FrontendRequest::RegisterCapabilities { .. } => engine_meta::handle_register_capabilities(ctx, r).await,

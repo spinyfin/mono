@@ -85,7 +85,8 @@ final class WorkersWorkspaceModel: ObservableObject {
 
     /// Called when a worker pane dies before the engine could observe it
     /// any other way — its shell process exited (`onChildExited`, which only
-    /// worker panes wire up; the Boss pane instead restarts itself).
+    /// worker panes wire up; the coordinator's engine-owned tmux lifecycle is
+    /// independent of its attached Boss-pane client).
     /// `ContentView` installs this closure to forward the death to the engine
     /// via `sendWorkerPaneDied` so reconciliation fires immediately instead of
     /// waiting for the periodic dead-pid sweep. The `runId` is the raw

@@ -662,6 +662,16 @@ extension EngineClient {
         ])
     }
 
+    /// Request the engine-owned, explicitly confirmed replacement of the
+    /// coordinator tmux session. The token guards against a delayed UI action
+    /// destroying a newer session after recovery.
+    func sendRecreateCoordinator(expectedSpawnToken: String) {
+        sendLine([
+            "type": "recreate_coordinator",
+            "expected_spawn_token": expectedSpawnToken,
+        ])
+    }
+
     /// Report the real shell pid for a worker pane after the libghostty
     /// surface initializes. The engine uses this to wire process tracking
     /// so the dead-pid sweep and `bossctl agents stop` can observe and

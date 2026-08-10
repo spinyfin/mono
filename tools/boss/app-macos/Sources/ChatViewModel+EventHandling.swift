@@ -61,7 +61,6 @@ extension ChatViewModel {
             handleResyncRequired() // socket never went down; see ChatViewModel+Connection.swift
         case .appSessionRegistered:
             isAppSessionRegistered = true
-            maybeRegisterBossSession()
             engine.sendRegisterCapabilities(capabilityIds: CapabilityRegistry.shared.all)
             // The engine drops the recorded selection on every app-session
             // registration (it belongs to the app session that reported it),
@@ -271,6 +270,7 @@ extension ChatViewModel {
             trunkTokenQueueCheck = queueCheck
             trunkTokenNote = note
         case .enginePoolConfig(let workerSlots, let automationSlots, let reviewSlots, let coordinatorModel):
+            coordinatorModelConfigured(coordinatorModel)
             panePoolConfigHandler?(workerSlots, automationSlots, reviewSlots, coordinatorModel)
         case .settingsList(let settings):
             engineSettings = settings
@@ -592,6 +592,12 @@ extension ChatViewModel {
         case .attachWorkerPane(let attach):
             let result = paneAttachHandler.map { $0(attach) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
             engine.sendAttachWorkerPaneResponse(requestId: requestId, result: result)
+        case .attachCoordinatorPane(let attach):
+            let result = coordinatorPaneAttachHandler.map { $0(attach) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
+            if case .success = result {
+                coordinatorPaneAttached(attach)
+            }
+            engine.sendAttachCoordinatorPaneResponse(requestId: requestId, result: result)
         case .detachWorkerPane(let slotId):
             let result = paneDetachHandler.map { $0(slotId) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
             engine.sendDetachWorkerPaneResponse(requestId: requestId, result: result)

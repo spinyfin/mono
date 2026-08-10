@@ -2140,6 +2140,7 @@ final class ChatViewModel: ObservableObject {
     var paneSpawnHandler: ((EngineSpawnRequest) -> EngineSpawnResult)?
     var paneReleaseHandler: ((Int, UInt32) -> EngineReleaseResult)?
     var paneAttachHandler: ((EngineAttachRequest) -> EngineAttachResult)?
+    var coordinatorPaneAttachHandler: ((EngineCoordinatorAttachRequest) -> EngineCoordinatorAttachResult)?
     var paneDetachHandler: ((Int) -> EngineReleaseResult)?
     var paneSendHandler: ((Int, String) -> EngineSendResult)?
     var paneFocusHandler: ((Int) -> EngineFocusResult)?
@@ -2151,19 +2152,22 @@ final class ChatViewModel: ObservableObject {
     /// allocator to enumerate.
     var paneListHostedHandler: (() -> [EngineHostedPaneEntry])?
     /// Invoked when the engine pushes `engine_pool_config`: forwards pool sizes to
-    /// `WorkersWorkspaceModel` and coordinator model to `BossPaneModel`.
+    /// `WorkersWorkspaceModel` and records the engine's desired coordinator model.
     /// Parameters: workerSlots, automationSlots, reviewSlots, coordinatorModel.
     var panePoolConfigHandler: ((Int, Int, Int, String) -> Void)?
+
+    /// The model the engine would use for the next coordinator creation.
+    /// Paired with `attachedCoordinatorModel` to make a replacement explicitly
+    /// destructive instead of silently restarting a live conversation.
+    var requestedCoordinatorModel: String?
+    var attachedCoordinatorModel: String?
+    var attachedCoordinatorSpawnToken: String?
+    @Published var coordinatorModelRecreateConfirmation: CoordinatorModelRecreateConfirmation?
 
     /// Whether the engine has confirmed this client is the registered app session.
     /// Reset on disconnect (see [[ChatViewModel+EventHandling.swift]]); set when
     /// `appSessionRegistered` is received.
     var isAppSessionRegistered = false
-    /// Returns the Boss pane's current shell pid from
-    /// `ghostty_surface_foreground_pid`. Injected by ContentView (GhosttyKit
-    /// build only). Returns 0 when the surface is not yet live.
-    var bossPaneShellPidProvider: (() -> Int32)?
-
     // MARK: - Lookups and shared helpers
 
     var currentSelectedProductID: String? {

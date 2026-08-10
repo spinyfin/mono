@@ -37,6 +37,7 @@ pub mod conflict_remediation;
 pub mod conflict_stop_gate;
 pub mod conflict_watch;
 pub mod coordinator;
+pub(crate) mod coordinator_tmux;
 pub mod cost_pricing;
 pub mod cost_report;
 pub mod cube_commands;

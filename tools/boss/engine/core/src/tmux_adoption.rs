@@ -263,6 +263,13 @@ where
     let mut live_tokens: HashMap<String, String> = HashMap::new();
     let mut session_schemas: HashMap<String, Option<Result<(), SchemaGuardFailure>>> = HashMap::new();
     for session in &sessions {
+        // The coordinator shares the private server but is represented by a
+        // metadata singleton rather than a worker run. Its lifecycle is
+        // reconciled by `coordinator_tmux`; never feed its token into the
+        // worker leaked-session path.
+        if session.name == crate::coordinator_tmux::COORDINATOR_SESSION_NAME {
+            continue;
+        }
         match tmux.show_environment(&session.name, TMUX_SPAWN_TOKEN_ENV).await {
             Ok(Some(token)) => {
                 let schema_check = match tmux.show_environment(&session.name, TMUX_SESSION_SCHEMA_ENV).await {
@@ -1578,14 +1585,22 @@ mod tests {
         assert!(sink.events().await.is_empty());
     }
 
-    /// A tmux session with no `BOSS_SPAWN_TOKEN` at all (e.g. the
-    /// coordinator's own session, sharing the same `-L boss` server) must
-    /// never be treated as a candidate.
+    /// The coordinator's session shares the worker tmux server but must
+    /// never be adopted as a worker, even when it has the normal durable
+    /// token and schema environment.
     #[tokio::test]
-    async fn session_without_a_spawn_token_is_ignored() {
+    async fn coordinator_session_is_ignored_by_worker_adoption() {
         let (_dir, db) = open_db_arc();
-        let (tmux, _tmux_server) = fake_tmux(FakeTmuxServer {
+        let execution_id = start_local_run(&db, "worker-1");
+        assert!(
+            db.record_tmux_spawn_intent_for_execution(&execution_id, "boss", "boss-coordinator", "coordinator-token")
+                .unwrap()
+        );
+        let (tmux, tmux_server) = fake_tmux(FakeTmuxServer {
             sessions: vec!["boss-coordinator".to_owned()],
+            tokens: HashMap::from([("boss-coordinator".to_owned(), "coordinator-token".to_owned())]),
+            schemas: supported_schema("boss-coordinator"),
+            pane_pids: HashMap::from([("boss-coordinator".to_owned(), "1234".to_owned())]),
             ..Default::default()
         });
         let coordinator = coordinator_with_one_slot(db.clone());
@@ -1605,6 +1620,7 @@ mod tests {
 
         assert!(outcome.adopted_execution_ids.is_empty());
         assert_eq!(outcome.terminal_handoffs, 0);
+        assert!(tmux_server.killed_sessions.lock().unwrap().is_empty());
     }
 
     #[test]

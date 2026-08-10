@@ -148,6 +148,178 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
                 coordinator_model: server_state.coordinator_model.clone(),
             },
         );
+        // The engine, rather than the app, owns the coordinator's detached
+        // tmux session. Do this after the registration/config pushes so the
+        // app has installed its pane handlers before the attach RPC arrives.
+        let state = server_state.clone();
+        tokio::spawn(async move {
+            attach_coordinator_to_registered_app(state).await;
+        });
+    }
+}
+
+async fn attach_coordinator_to_registered_app(server_state: Arc<ServerState>) {
+    let program = match server_state.tmux_preflight.read() {
+        Ok(guard) => match &*guard {
+            crate::tmux_preflight::TmuxPreflight::Ready { program, .. } => program.clone(),
+            crate::tmux_preflight::TmuxPreflight::Unavailable { reason } => {
+                tracing::warn!(%reason, "coordinator tmux attach skipped: tmux preflight is unavailable");
+                return;
+            }
+        },
+        Err(_) => {
+            tracing::error!("coordinator tmux attach skipped: preflight lock poisoned");
+            return;
+        }
+    };
+    let tmux = match boss_tmux::Tmux::from_path(program) {
+        Ok(tmux) => tmux,
+        Err(error) => {
+            tracing::error!(%error, "coordinator tmux attach skipped: resolved tmux path is invalid");
+            return;
+        }
+    };
+    let record = {
+        let _guard = server_state.coordinator_tmux_lock.lock().await;
+        let state = match crate::coordinator_tmux::ensure_for_attach(
+            server_state.work_db.as_ref(),
+            &tmux,
+            &server_state.coordinator_model,
+        )
+        .await
+        {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::error!(error = %format!("{error:#}"), "failed to create or recover coordinator tmux session");
+                return;
+            }
+        };
+        match state {
+            crate::coordinator_tmux::CoordinatorState::Running(record)
+            | crate::coordinator_tmux::CoordinatorState::ModelChangeRequiresConfirmation(record) => record,
+        }
+    };
+    request_coordinator_attachment(server_state, &tmux, record).await;
+}
+
+pub(super) async fn request_coordinator_attachment(
+    server_state: Arc<ServerState>,
+    tmux: &boss_tmux::Tmux,
+    record: crate::work::CoordinatorTmuxRecord,
+) {
+    match crate::coordinator_tmux::pane_pid(tmux, &record).await {
+        Ok(pid) => server_state.set_boss_pid(pid),
+        Err(error) => tracing::warn!(%error, "could not refresh coordinator trust-root pid"),
+    }
+    match server_state
+        .send_to_app(
+            EngineToAppRequest::AttachCoordinatorPane(boss_protocol::AttachCoordinatorPaneInput {
+                session_name: record.session_name,
+                spawn_token: record.spawn_token,
+                model: record.model,
+            }),
+            Duration::from_secs(5),
+        )
+        .await
+    {
+        Ok(EngineToAppResponse::AttachCoordinatorPane { result: Ok(_) }) => {
+            tracing::info!("attached app Boss pane to coordinator tmux session");
+        }
+        Ok(response) => tracing::warn!(
+            ?response,
+            "coordinator session exists but app did not attach its viewer"
+        ),
+        Err(error) => tracing::debug!(%error, "coordinator session exists without an app viewer"),
+    }
+}
+
+/// Replace the durable coordinator only after the app has shown the operator
+/// the loss-of-conversation confirmation. The app cannot choose a session
+/// name or model here; both remain engine-owned configuration.
+pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        sink,
+        session_id,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::RecreateCoordinator { expected_spawn_token } = req else {
+        unreachable!()
+    };
+    let app_session_id = server_state
+        .app_session
+        .lock()
+        .await
+        .as_ref()
+        .map(|handle| handle.session_id.clone());
+    if app_session_id.as_deref() != Some(session_id.as_str()) {
+        send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::Error {
+                message: "recreate_coordinator: only the app session may replace the coordinator".to_owned(),
+            },
+        );
+        return;
+    }
+    let program = match server_state.tmux_preflight.read() {
+        Ok(guard) => match &*guard {
+            crate::tmux_preflight::TmuxPreflight::Ready { program, .. } => program.clone(),
+            crate::tmux_preflight::TmuxPreflight::Unavailable { reason } => {
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::Error {
+                        message: format!("recreate_coordinator: tmux is unavailable: {reason}"),
+                    },
+                );
+                return;
+            }
+        },
+        Err(_) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::Error {
+                    message: "recreate_coordinator: tmux preflight lock is unavailable".to_owned(),
+                },
+            );
+            return;
+        }
+    };
+    let tmux = match boss_tmux::Tmux::from_path(program) {
+        Ok(tmux) => tmux,
+        Err(error) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::Error {
+                    message: format!("recreate_coordinator: invalid tmux path: {error}"),
+                },
+            );
+            return;
+        }
+    };
+    let replacement = {
+        let _guard = server_state.coordinator_tmux_lock.lock().await;
+        crate::coordinator_tmux::recreate_after_confirmation(
+            server_state.work_db.as_ref(),
+            &tmux,
+            &server_state.coordinator_model,
+            &expected_spawn_token,
+        )
+        .await
+    };
+    match replacement {
+        Ok(record) => request_coordinator_attachment(server_state, &tmux, record).await,
+        Err(error) => send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::Error {
+                message: format!("recreate_coordinator: {error:#}"),
+            },
+        ),
     }
 }
 

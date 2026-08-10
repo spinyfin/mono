@@ -64,10 +64,7 @@ struct GhosttyTerminalView: NSViewRepresentable {
 final class GhosttyTerminalHostView: NSView {
     let runtime: GhosttyRuntime
     let session: TerminalPaneSession
-    /// The launch spec used for the next `restartSurface()` call.
-    /// Mutable so the Boss pane can update the coordinator model before
-    /// a restart without tearing down the whole view hierarchy.
-    var launchSpec: TerminalLaunchSpec
+    let launchSpec: TerminalLaunchSpec
     private(set) var surface: ghostty_surface_t?
 
     private var trackingAreaRef: NSTrackingArea?
@@ -223,8 +220,8 @@ final class GhosttyTerminalHostView: NSView {
         case .created(let surface):
             self.surface = surface
             removeScreenObserver()
-            // A surface came up: clear the failure latch so a later teardown +
-            // failed recreation (e.g. a Boss-pane restart) can report again.
+            // A surface came up: clear the failure latch so a later teardown and
+            // recreation can report a new failure.
             reportedSurfaceCreationFailure = false
             session.statusMessage = nil
             session.attach(hostView: self)
@@ -565,23 +562,6 @@ final class GhosttyTerminalHostView: NSView {
             // Release the keep-alive reference on the main thread so this
             // NSView's deinit runs on the main thread, never on teardownQueue.
             DispatchQueue.main.async { withExtendedLifetime(self) {} }
-        }
-    }
-
-    /// Tear down and recreate the libghostty surface, restarting the
-    /// child process from the original launchSpec. Called by the Boss
-    /// pane's restart closure when Claude Code exits unexpectedly so
-    /// the coordinator relaunches without dropping the user to a shell.
-    func restartSurface() {
-        tearDown()
-        attemptSurfaceCreation()
-        // Re-apply focus so the restarted pane receives keyboard input
-        // immediately if it already owns first-responder status.
-        if let surface, window?.firstResponder === self {
-            let box = SurfaceBox(surface: surface)
-            Self.focusQueue.async {
-                ghostty_surface_set_focus(box.surface, true)
-            }
         }
     }
 

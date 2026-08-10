@@ -432,6 +432,56 @@ pub async fn serve_with_merge_probe(
         .write()
         .expect("tmux preflight lock poisoned") = tmux_preflight;
 
+    // A coordinator has no worker run to pull it through the ordinary tmux
+    // adoption pass. Watch its singleton independently so an exited Claude
+    // child is recreated by the engine even while the app is closed. The
+    // helper never creates an absent singleton; first creation remains tied
+    // to app registration, after that app has prepared the session files.
+    let coordinator_supervisor_state = server_state.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            tick.tick().await;
+            let program = match coordinator_supervisor_state.tmux_preflight.read() {
+                Ok(guard) => match &*guard {
+                    crate::tmux_preflight::TmuxPreflight::Ready { program, .. } => program.clone(),
+                    crate::tmux_preflight::TmuxPreflight::Unavailable { .. } => continue,
+                },
+                Err(_) => {
+                    tracing::error!("coordinator tmux supervisor stopped: preflight lock poisoned");
+                    return;
+                }
+            };
+            let Ok(tmux) = boss_tmux::Tmux::from_path(program) else {
+                tracing::error!("coordinator tmux supervisor stopped: preflight supplied an invalid path");
+                return;
+            };
+            let replacement = {
+                let _guard = coordinator_supervisor_state.coordinator_tmux_lock.lock().await;
+                crate::coordinator_tmux::restart_if_dead(
+                    coordinator_supervisor_state.work_db.as_ref(),
+                    &tmux,
+                    &coordinator_supervisor_state.coordinator_model,
+                )
+                .await
+            };
+            match replacement {
+                Ok(Some(record)) => {
+                    crate::app::sessions::request_coordinator_attachment(
+                        coordinator_supervisor_state.clone(),
+                        &tmux,
+                        record,
+                    )
+                    .await;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "coordinator tmux supervisor pass failed");
+                }
+            }
+        }
+    });
+
     // GitHub API usage telemetry: install the process-wide sink and start
     // its batching writer.
     //

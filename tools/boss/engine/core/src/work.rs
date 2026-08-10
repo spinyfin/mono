@@ -443,6 +443,7 @@ mod chain_helpers;
 mod comment_thread_entries;
 mod comments;
 mod conflict_res;
+mod coordinator_tmux;
 mod cost_report_db;
 mod create_entities;
 mod decisions;
@@ -495,6 +496,7 @@ mod workitems;
 // reaches for the in-tx variant; every other caller uses the public,
 // tx-owning `WorkDb::create_attention`.
 pub(crate) use attention_filing::reraise_open_work_item_attention;
+pub(crate) use coordinator_tmux::CoordinatorTmuxRecord;
 // pub(crate), not pub: no consumer outside boss-engine-core exists, and the
 // intra-doc links to it from the crate-public `attention_lifecycle` module
 // (rustdoc's `private_intra_doc_links` warns on those, not `broken_intra_doc_links`

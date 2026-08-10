@@ -146,8 +146,9 @@ enum EngineEvent {
     /// its slot ranges before any `SpawnWorkerPane` request arrives.
     /// This is the single source of truth: the engine's runtime config
     /// drives the app's capacity check so they can never drift out of sync.
-    /// `coordinatorModel` is the `--model` slug the Boss pane must use —
-    /// derived from `effort=max` so it follows the effort table automatically.
+    /// `coordinatorModel` is the engine's requested model for coordinator
+    /// creation. A live coordinator with a different model is preserved until
+    /// the operator confirms its destructive replacement.
     case enginePoolConfig(workerSlots: Int, automationSlots: Int, reviewSlots: Int, coordinatorModel: String)
     /// Response to `get_settings` — snapshot of every per-installation
     /// setting and its current value. Drives the Settings window.

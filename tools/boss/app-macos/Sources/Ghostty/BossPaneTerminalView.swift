@@ -8,8 +8,15 @@ struct BossPaneTerminalView: View {
     @ObservedObject var boss: BossPaneModel
 
     var body: some View {
-        BossTerminalSurface(runtime: boss.runtime, session: boss.session)
-            .background(Color(nsColor: .black))
+        Group {
+            if let session = boss.session {
+                BossTerminalSurface(runtime: boss.runtime, session: session)
+                    .id(session.id)
+            } else {
+                Color(nsColor: .black)
+            }
+        }
+        .background(Color(nsColor: .black))
     }
 }
 

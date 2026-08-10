@@ -79,9 +79,10 @@ struct TerminalLaunchSpec {
     /// Env vars to set on the spawned shell, layered over the app's
     /// inherited env. The engine builds a strict allowlist for worker
     /// spawns (sanitized PATH excluding `bossctl`, plus
-    /// `BOSS_EVENTS_SOCKET` / `BOSS_LEASE_ID`); the Boss pane passes
-    /// `bossSessionEnv()` to set `BOSS_BIN_DIR`, `BOSS_BIN`, and an
-    /// initial PATH prepend; ad-hoc test panes pass an empty array.
+    /// `BOSS_EVENTS_SOCKET` / `BOSS_LEASE_ID`). The Boss pane is only a
+    /// tmux client; the engine configures the detached coordinator's
+    /// environment when it creates the session. Ad-hoc test panes pass an
+    /// empty array.
     let env: [(String, String)]
 
     init(
@@ -261,14 +262,14 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
         return true
     }
     private var paneMonitorTracker: PaneMonitorTracker
-    /// Called on the main actor when the pane's child process exits.
-    /// Boss pane sets this to a restart closure; worker panes leave it nil.
+    /// Called on the main actor when a worker pane's child process exits.
+    /// The coordinator pane leaves this unset because the engine owns its
+    /// detached tmux lifecycle.
     var onChildExited: (() -> Void)?
     /// Called on the main actor each time a libghostty surface is
     /// successfully attached to this session. Fires on initial creation
-    /// and on every restart (the surface is torn down and re-created
-    /// when the child exits). Boss pane uses this to re-register the
-    /// Boss trust root after a restart produces a new shell pid.
+    /// and on every surface recreation. Worker panes use this to report a
+    /// shell pid once Ghostty has finished its asynchronous startup.
     var onSurfaceAttached: (() -> Void)?
     /// Called on the main actor when this session's libghostty surface
     /// FAILS to create (`ghostty_surface_new` returned NULL — typically the
