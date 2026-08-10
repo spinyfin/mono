@@ -77,7 +77,7 @@ pub(crate) async fn restart_if_dead(
         }
         return Ok(None);
     }
-    tmux.kill_session(&record.session_name)
+    tmux.kill_session_verified(&record.session_name, &record.spawn_token)
         .await
         .context("removing dead coordinator tmux session before restart")?;
     start_new(work_db, tmux, requested_model, working_directory)
@@ -104,7 +104,7 @@ pub(crate) async fn recreate_after_confirmation(
     if session_exists(tmux, &record.session_name).await? {
         match tmux.show_environment(&record.session_name, SPAWN_TOKEN_ENV).await? {
             Some(token) if token == record.spawn_token => {
-                tmux.kill_session(&record.session_name)
+                tmux.kill_session_verified(&record.session_name, &record.spawn_token)
                     .await
                     .context("destroying the confirmed coordinator session")?;
             }
@@ -137,7 +137,7 @@ async fn reconcile_existing(
                 .trim()
                 == "1"
             {
-                tmux.kill_session(&record.session_name)
+                tmux.kill_session_verified(&record.session_name, &record.spawn_token)
                     .await
                     .context("removing dead coordinator tmux session before restart")?;
                 return start_new(work_db, tmux, requested_model, working_directory).await;
