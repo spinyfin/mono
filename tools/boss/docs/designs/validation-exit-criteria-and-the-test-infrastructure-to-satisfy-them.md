@@ -8,9 +8,9 @@
 
 ## TL;DR
 
-Boss does not have a unit-testing problem — it has an **evidence** problem and a **seam** problem. The system-test substrate largely exists already (an in-process engine on a real socket, a hermetic Bazel sandbox, a driver trait with a conformance harness). What is missing is a fake outside world, a way to prove a validation claim actually ran, and any notion of test tiers.
+Boss does not have a unit-testing problem — it has an **evidence** problem and a **seam** problem. The system-test substrate largely exists already (an in-process engine on a real socket, a hermetic Bazel sandbox, a driver trait with a conformance harness). What is missing is a fake outside world, a way to prove validation claims from tool-produced evidence, and any notion of test tiers.
 
-This design proposes: a four-value validation taxonomy declared **on the work item at filing time** and evidenced at PR time; an **engine-recorded** evidence channel so a claim like "passed `checkleft run`" is backed by a captured exit code rather than a worker's sentence; a `testkit` crate that brings up a fully isolated Boss instance with a scripted fake agent driver, fake `gh`, and fake `cube`; Bazel test tiers expressed as tags with a separate CI lane; and driveable/capturable remote control of the macOS app.
+This design proposes: four validation modes, of which a non-trivial work item declares **one or more at filing time** and evidences at PR time; automatic evidence adapters for tools such as Bazel, with an **engine-recorded** command wrapper where no native evidence exists; a `testkit` crate that brings up a fully isolated Boss instance with a scripted fake agent driver, fake `gh`, and fake `cube`; Bazel test tiers expressed as tags with a separate CI lane; and driveable/capturable remote control of the macOS app.
 
 ## Method
 
@@ -36,13 +36,15 @@ The first deliverable of the parent project was an inventory before design. Ever
 | Schema migration tests                                              | `engine/core/src/work/{migrations_a,migrations_b,migrations_boothby}.rs`, `work/tests/schema_migration_tests.rs` | Migrations are tested; the _invariants_ are not snapshotted (see §1.2).                                                                                                                                                                                                                         |
 | Forensic dispatch-event stream                                      | `engine/dispatch-events/`, per-execution mirror at `<root>/executions/<id>/dispatch.jsonl`                       | Rich enough to reconstruct failures after the fact.                                                                                                                                                                                                                                             |
 
+**Post-inventory update:** [PR #2621](https://github.com/spinyfin/mono/pull/2621) landed on 2026-08-08 and added `boss attach`: workers can submit PNG/JPEG evidence to an engine-owned, content-addressed store and put the resulting per-work-item gallery URL in the PR. The chosen approach below treats that as existing infrastructure rather than proposing another screenshot store.
+
 **138 `rust_test` targets, 9 `macos_unit_test`, 3 `sh_test`.** Of the Rust targets, ten in `engine/core` are integration-style (`tests/*.rs`); the rest are `#[cfg(test)]` unit tests. So system testing is not absent — it is **unowned, unnamed, and unenforced**.
 
 ### 1.2 The gaps, mapped to the six failures
 
 | Failure from the brief                                                    | Root gap                                                                                                                                                                                                                                                                      | Evidence in tree                                                                                |
 | ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| Worker self-reported a truncated `checkleft run` as passing               | No machine-observed record of a validation command's exit code. Nothing in the tree records argv + status + output for a claimed validation step.                                                                                                                             | — (absence)                                                                                     |
+| Worker self-reported a truncated `checkleft run` as passing               | The command invocation yielded only partial output and a live session handle; no terminal result containing an exit code was ever observed, but the worker later claimed the check passed. Nothing in the tree records argv + status + output for a claimed validation step.  | — (absence)                                                                                     |
 | `worker_blocked` attention items invisible for two months                 | **Writes are tested; reads are not.** `completion/tests/t02.rs` asserts "exactly one `worker_blocked` attention item must be filed" — by inspecting the store. Nothing asserts a _client's actual query_ returns it.                                                          | `engine/core/src/completion/tests/t02.rs:1084`                                                  |
 | Crash-recovery apply never ran (flag defaulted false on one of two paths) | No multi-path coverage requirement; no test drives both dispatch paths. `BOSS_RECOVERY_DIR` is process-global, which forces the recovery tests into an awkward serialised shape.                                                                                              | `engine/core/src/coordinator_tests/recovery.rs:8`                                               |
 | Dispatch sink corrupted records under concurrency                         | **Still present.** `JsonlFileSink::append_line` writes body and newline as two separate `write_all` calls on an `O_APPEND` fd, and `emit` holds no lock. Two concurrent emits can interleave a body between another record's body and its newline.                            | `engine/dispatch-events/src/lib.rs:783-791`                                                     |
@@ -70,7 +72,7 @@ The first deliverable of the parent project was an inventory before design. Ever
 
 ## 2. Goals
 
-- Every non-trivial work item **declares**, at filing time, which validation tier it must satisfy.
+- Every non-trivial work item **declares**, at filing time, one or more validation requirements it must satisfy.
 - A validation claim is backed by **machine-collected evidence**, not by a sentence in a PR body.
 - Boss can bring up a **fully isolated instance** — engine, app, fake externals, fake agent driver — from one command, in a test or on a developer's machine, with nothing leaking into production state.
 - The default CI lane stays fast; slower and riskier tests live in a named tier with their own lane and their own flakiness accounting.
@@ -80,7 +82,7 @@ The first deliverable of the parent project was an inventory before design. Ever
 ## 3. Non-goals
 
 - **Back-filling exit criteria onto already-filed work.** Explicitly out of scope per the project brief.
-- **Replacing unit tests.** Tier 1 remains the right answer for most changes; the point is to stop it being the _only_ answer.
+- **Replacing unit tests.** The `unit` mode remains the right requirement for most changes; the point is to stop it being the _only_ requirement available.
 - **A coverage mandate.** See §4.2 for why coverage is rejected as the gate.
 - **Testing against real GitHub, real Buildkite, real cube, or real models in any per-PR lane.** A nightly live-smoke lane is proposed as deferred scope, not v1.
 - **Re-designing test-instance isolation.** [`test-instance-isolation.md`](test-instance-isolation.md) already proposes `BOSS_PROFILE` and a path resolver. This project _consumes_ that; it does not re-litigate it.
@@ -119,48 +121,59 @@ Add `if cfg.test_mode { … }` branches so production paths can be short-circuit
 
 **Rejected, emphatically.** The crash-recovery failure _was_ a path-dependent flag default: one of two dispatch paths silently defaulted a flag to false, and the recovery apply path never ran in production for 108 patches. Adding more test-only branches multiplies precisely that failure mode. **The invariant for this design: fakes substitute at existing trait or process boundaries, and the code path under test is byte-for-byte the production path.** The scripted driver is a registered driver, not a bypass. The fake `gh` is a different binary, not a different branch.
 
+### 4.6 Wrapper-only command recording vs tool-native evidence
+
+One option is to require every validation command to run through `boss validate run`. It gives Boss a uniform record for any executable and captures the terminal exit status even when the worker transcript is truncated. Its weakness is behavioural: workers will sometimes forget the wrapper. Rejecting an unrecorded claim catches the omission, but only after spending a review cycle on avoidable process failure.
+
+The alternative is to consume diagnostics the tool already produces. Bazel's Build Event Protocol and test-result artifacts can identify the invocation, selected targets, and outcomes without any special worker behaviour. The current products using Boss are Bazel workspaces, so supporting Bazel first is useful rather than speculative coupling. The costs are that this is build-system-specific, local Bazel logs need a configured durable destination rather than relying on an overwritten `command.log`, and tools such as `checkleft` do not yet expose an equivalent receipt.
+
+**Chosen: an adapter-based hybrid.** An evidence-provider interface lets Boss import tool-native records automatically, with a Bazel provider first. CI already guarantees that affected Bazel test targets are selected, so the validation declaration names the target and criterion while the provider verifies the PR-head CI result; the worker does not separately attest that the target "ran." `boss validate run` remains the generic fallback for commands with no native provider. This keeps the engine adaptable beyond Bazel while removing the forgettable wrapper from the common Bazel path.
+
 ---
 
 ## 5. Chosen approach
 
 ### 5.1 The taxonomy and where the declaration lives
 
-Four values, on a `validation_tier` column on the work item (`tasks` table, plumbed through `boss-protocol`'s `Task`):
+Four modes, represented as a collection of `validation_requirements` on the work item (child rows in the database, plumbed through `boss-protocol`'s `Task`). Each requirement records a mode and the observable criterion it covers. The three substantive modes are composable: a UI change can require unit coverage for its state transformation, an integration test for engine↔app wiring, **and** a manually inspected screenshot. `exempt` is the only exclusive value and cannot coexist with another requirement.
 
-| Value       | Meaning                                                                                   | Evidence required                                                                        |
-| ----------- | ----------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| `unit`      | Purely functional; a unit test exercises the observable behaviour and that is sufficient. | Named Bazel target(s) that ran green in the PR's CI.                                     |
-| `automated` | Covered by a checked-in system or integration test that fails when a criterion regresses. | Named Bazel target(s) at tier S or I, plus a statement of _which criterion_ each covers. |
-| `manual`    | Not reliably testable by any automated means; validated by hand.                          | A captured artifact in the execution's forensic directory (§5.2).                        |
-| `exempt`    | Trivial. No validation required.                                                          | None — but the tier must be explicitly set, not left empty.                              |
+| Mode        | Meaning                                                                                     | Evidence required                                                                               |
+| ----------- | ------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `unit`      | A purely functional criterion is exercised observably by a unit test.                       | Named Bazel target(s), the criterion each covers, and a green PR-head CI result.                |
+| `automated` | A criterion is covered by a checked-in system or integration test that fails on regression. | Named Bazel target(s) at tier S or I, the criterion each covers, and a green PR-head CI result. |
+| `manual`    | A criterion is not reliably testable by automated means and must be validated by hand.      | A captured artifact that the reviewer can inspect (§5.2).                                       |
+| `exempt`    | The entire work item is trivial, so no validation is required.                              | None — but exemption must be explicit and is mutually exclusive with all other modes.           |
 
-**Declared at filing time, by the coordinator.** This is the load-bearing choice. The coordinator authors most briefs and knows what "done" means before a worker starts; discovering the criteria at PR time means discovering them _after_ the design decisions that made them hard to satisfy. The column is nullable on legacy rows and defaults to unset; unset on a non-trivial row is a review-lane finding, not a hard engine error.
+**Declared at filing time, by the coordinator.** Filing time is the load-bearing decision; selecting exactly one mode is not. The coordinator authors most briefs and knows what "done" means before a worker starts; discovering the criteria at PR time means discovering them _after_ the design decisions that made them hard to satisfy. Requirements are absent on legacy rows; an empty requirement set on a non-trivial row is a review-lane finding, not a hard engine error.
 
-**Definition of "non-trivial"** — fail closed. A work item is non-trivial **unless** it is one of: documentation/comment-only; a pure rename or move with no behaviour delta; a dependency/lockfile/version bump with no code change; or explicitly filed at `effort: trivial` by a human. Everything else needs a tier.
+**Definition of "non-trivial"** — fail closed. A work item is non-trivial **unless** it is one of: documentation/comment-only; a pure rename or move with no behaviour delta; a dependency/lockfile/version bump with no code change; or explicitly filed at `effort: trivial` by a human. Everything else needs at least one substantive validation requirement.
 
 The **`## Validation` PR-body section** remains required — but its role is to _name the evidence_, not to be it. Format:
 
 ```
 ## Validation
-Tier: automated
-- //tools/boss/engine/core:attention_reachability_test — asserts a worker_blocked
-  item filed against an execution is returned by the coordinator's actual list query.
-- Evidence: exec_18c69b1661cdafe0_4c/validation/checkleft-run.json (exit 0)
+Requirements:
+- unit — parser rejects a terminal result with no exit code
+  - //tools/boss/engine/core:validation_parser_test
+- automated — an execution-keyed attention is visible through the coordinator's read API
+  - //tools/boss/engine/core:attention_reachability_test
+- manual — the app renders the validation requirements and their evidence links
+  - Evidence: screenshot gallery URL from `boss attach`
 ```
 
 ### 5.2 Evidence, not assertion
 
-Three evidence channels, in descending order of strength. **A PR body claim with no matching evidence record is a review-lane finding.**
+Three evidence channels can be combined just like the requirements. **A PR body claim with no matching evidence record is a review-lane finding.**
 
-**(a) Bazel target attestation.** The PR body names targets. A checker resolves each name against the `bazel-testlogs/**/test.xml` artifacts the `bazel-build-test` step already uploads (`.buildkite/pipeline.yml` has `artifact_paths` for them) and confirms the target (i) exists, (ii) ran, (iii) passed on the PR's head SHA. A named target that did not run is a finding. This is cheap — the artifacts are already there.
+**(a) Bazel evidence provider.** The PR body names targets so the reviewer can judge whether each target covers its stated criterion. A checker confirms each label exists and that the applicable PR-head CI lane is green, importing the Build Event Protocol or `bazel-testlogs/**/test.xml` artifacts that the `bazel-build-test` step already uploads when it needs target-level detail. It does not ask the worker to assert that each target ran: the existing affected-target CI machinery owns selection and already guarantees that affected tests execute.
 
-**(b) Recorded validation commands.** A new `boss validate run -- <cmd…>` wrapper executes the command, captures argv, full stdout/stderr, exit status, and wall-clock, and writes a JSON record to `<state root>/executions/<execution_id>/validation/<slug>.json`. The worker prompt instructs workers to run validation steps _through_ it. The PR body cites the record; the review lane resolves it and reads the **actual exit code**.
+**(b) Tool-native command evidence, with an explicit fallback.** Evidence providers automatically import durable diagnostics where a tool exposes them; Bazel is the first provider. For commands without such a source, `boss validate run -- <cmd…>` executes the command, captures argv, full stdout/stderr, exit status, and wall-clock, and writes a JSON record to `<state root>/executions/<execution_id>/validation/<slug>.json`. The worker prompt uses the wrapper only for these uncovered commands. The PR body cites the resulting provider record; the review lane resolves it and reads the **actual exit code**.
 
-This is the direct fix for the truncated-`checkleft` failure: the worker's transcript can be truncated, the pane can scroll, the model can hallucinate — the recorded exit status is written by the engine-side wrapper and the worker never touches it. Absence of a record for a claimed command is itself the finding.
+This is the direct fix for the truncated-`checkleft` failure described in §1.2: the command returned partial output plus a still-live session handle, the worker never polled that handle to a terminal result with an exit code, and nevertheless reported that `checkleft run` passed. A tool-native receipt or the fallback wrapper makes the terminal result independent of transcript truncation, pane scrollback, and worker interpretation. Absence of any provider record for a claimed command is itself the finding. The wrapper can still be forgotten for a tool without native evidence; that omission becomes a review finding, while the adapter-first design avoids that failure mode for Bazel, the common case.
 
-**(c) Captured artifacts for tier `manual`.** A PNG from the app's scripted capture mode (§5.6), an engine RPC trace, or a slice of the dispatch-event stream — all written under `executions/<id>/validation/`. The existing per-execution forensic directory is already the right home ([`forensic-surfaces.md`](../forensic-surfaces.md)); this adds a `validation/` subdirectory with a small manifest.
+**(c) Captured artifacts for a `manual` requirement.** PNG/JPEG evidence reuses the shipped [`boss attach` mechanism](https://github.com/spinyfin/mono/blob/main/tools/boss/docs/designs/worker-screenshot-evidence-attachments.md): the engine validates and stores the image outside the recyclable workspace, associates it with the execution and work item, and returns a gallery URL for the PR's `## Evidence` section. A checker resolves the attachment row rather than trusting the URL alone. Non-image evidence such as an engine RPC trace or a dispatch-event slice remains under `executions/<id>/validation/`, with a small manifest in the existing per-execution forensic directory ([`forensic-surfaces.md`](../forensic-surfaces.md)).
 
-**Who checks:** the automated reviewer already runs on every agent-authored PR. It gains a deterministic pre-pass — a Rust checker that resolves the claims _before_ the LLM sees the diff — so "the named target didn't run" is a mechanical finding, not a judgement call.
+**Who checks:** the automated reviewer already runs on every agent-authored PR. It gains a deterministic pre-pass — a Rust checker that resolves the claims _before_ the LLM sees the diff — so a nonexistent Bazel label, a red PR-head CI result, an absent command record, or a missing attachment is a mechanical finding, not a judgement call.
 
 ### 5.3 Test tiers, in Bazel terms
 
@@ -201,7 +214,7 @@ A new `tools/boss/testkit` crate (`testonly`), which:
 - Brings up a full isolated instance: state root, socket, DB, events socket, control token, dispatch-event root, feature-flags file, recovery dir — all under one tempdir, all routed through `IsolationPaths::derive` so the existing guard is the thing being exercised.
 - Wires the fakes: scripted driver registered, fake `gh` and fake `cube` state seeded, clock injectable.
 - Exposes assertion helpers over the **read surfaces**, not the store: `instance.client().list_attentions(…)` rather than `instance.db().query(…)`.
-- Ships a `bazel run //tools/boss/testkit:instance -- --root <dir>` binary so a developer (or a worker doing tier-`manual` validation) can bring the same instance up by hand and point the app at it.
+- Ships a `bazel run //tools/boss/testkit:instance -- --root <dir>` binary so a developer (or a worker satisfying a `manual` requirement) can bring the same instance up by hand and point the app at it.
 
 `BOSS_RECOVERY_DIR` being process-global (`coordinator_tests/recovery.rs:8`) is a known wart that forces serialisation; `testkit` should thread it through config rather than env where it can, and mark the tests that still need process-global state as `tags = ["exclusive"]`.
 
@@ -213,7 +226,7 @@ A new `tools/boss/testkit` crate (`testonly`), which:
 
 1. **Scriptable drive mode.** `--script <file.json>` alongside the existing `--capture-to`: an ordered list of actions executed on the main actor — `select_work_item`, `open_viewer`, `set_filter`, `wait_for`, `capture`, `dump_state` — each producing a PNG and/or a JSON view-state dump. This is deliberately _not_ XCUITest: it runs in-process via the same `cacheDisplay` path `BossCapture.swift` already uses, so it needs no screen-recording permission, takes no focus, and works headless in CI.
 2. **Stable element identity.** Accessibility identifiers on the views a script needs to address, so scripts refer to `taskList.row[short_id=3907]` rather than coordinates. Without this, scripts are unmaintainable.
-3. **A one-command wrapper.** `boss ui capture --script … --out …` that brings up a `testkit` instance, seeds it, drives the app, and drops artifacts into `executions/<id>/validation/`. This is what makes tier `manual` evidence cheap enough that workers will actually produce it.
+3. **A one-command wrapper.** `boss ui capture --script … --out …` that brings up a `testkit` instance, seeds it, drives the app, submits image output through the existing `boss attach` API, and records any non-image trace under `executions/<id>/validation/`. This is what makes `manual` evidence cheap enough that workers will actually produce it.
 
 The existing safety interlock — capture refuses to run unless `BOSS_SOCKET_PATH` is non-production (`BossCapture.swift:96`) — extends to script mode unchanged.
 
@@ -223,7 +236,7 @@ The existing safety interlock — capture refuses to run unless `BOSS_SOCKET_PAT
 
 **Concurrency hammer + verifier.** A `testkit` helper that runs N concurrent emitters against a sink for M iterations, then **re-reads and parses every record**. The dispatch-sink bug is caught the moment the verifier requires every line of `current.jsonl` to be valid JSON and the record count to match. Applied to every append-only writer: the dispatch sink, the audit log, the engine trace, the per-execution mirror. Run under `#[tokio::test(flavor = "multi_thread")]` at tier S.
 
-**Multi-path coverage as an explicit obligation.** The recovery failure was two dispatch paths where only one set a flag. Where a capability is reachable by more than one route, the test must be **parameterised over the routes**, not written against whichever one the author had in mind. This cannot be fully mechanised, so it is a review-lane prompt: for tier `automated`, the PR body states which paths reach the behaviour and the reviewer checks the test covers each. Where the routes are enumerable in code (dispatch kinds, driver slugs, task kinds), the test iterates the enum so a new variant fails closed — the pattern `conformance/native_transcript.rs` already uses.
+**Multi-path coverage as an explicit obligation.** The recovery failure was two dispatch paths where only one set a flag. Where a capability is reachable by more than one route, the test must be **parameterised over the routes**, not written against whichever one the author had in mind. This cannot be fully mechanised, so it is a review-lane prompt: for an `automated` requirement, the PR body states which paths reach the behaviour and the reviewer checks the test covers each. Where the routes are enumerable in code (dispatch kinds, driver slugs, task kinds), the test iterates the enum so a new variant fails closed — the pattern `conformance/native_transcript.rs` already uses.
 
 **Fault injection.** The fakes are the injection points: `fake-gh` can return a rate-limit, a 500, a truncated body; the scripted driver can die mid-turn or stall. No new production seams required.
 
@@ -278,7 +291,7 @@ Enforcement of the _choice_ (matrix vs driver-agnostic) is scoped, not universal
 
 | Failure                                        | Mechanism that catches it                                                             |
 | ---------------------------------------------- | ------------------------------------------------------------------------------------- |
-| Truncated `checkleft run` reported as passing  | §5.2(b) recorded validation commands — engine-side exit code, worker cannot author it |
+| Truncated `checkleft run` reported as passing  | §5.2(b) tool-native receipt or wrapped terminal status — worker cannot author it      |
 | Invisible `worker_blocked` attention items     | §5.9 surface registry — fails closed on an undeclared row kind                        |
 | Crash-recovery apply never ran                 | §5.7 multi-path obligation + §5.4 scripted driver can actually kill a worker mid-turn |
 | Dispatch sink concurrency corruption           | §5.7 hammer + re-parse verifier                                                       |
@@ -291,7 +304,7 @@ All six. That was the bar the brief set.
 
 ## 6. Risks and open questions
 
-**The declaration could still become a checkbox.** The design's answer is that tiers `unit`/`automated` resolve to Bazel targets checked against real testlogs, and tier `manual` resolves to an artifact file that exists or does not. The residual risk is a worker naming a target that ran but does not actually cover the criterion. Nothing mechanical catches that — it is what the reviewer LLM is for, and it is why the PR body must state _which criterion each target covers_, not just the target name.
+**The declaration could still become a checkbox.** The design's answer is that `unit`/`automated` requirements resolve to Bazel targets and green PR-head CI evidence, while `manual` requirements resolve to an inspectable artifact. The residual risk is a worker naming a green target that does not actually cover the criterion. Nothing mechanical catches that — it is what the reviewer LLM is for, and it is why each requirement records the criterion and the PR body maps every target to one, rather than listing labels without meaning.
 
 **The scripted driver could drift from real drivers.** A fake that diverges from reality is worse than no fake. Mitigation: the scripted driver is subject to the same conformance harness as the real ones (`native_transcript`, ingress equivalence). Open question: should there be a periodic real-agent comparison run to detect divergence?
 
@@ -468,69 +481,69 @@ Check in a small set of anonymised DBs in real historical shapes and migrate eac
 - Dependencies: Schema golden and migrate-vs-fresh equivalence test
 - Scope: in-scope
 
-### 20. `validation_tier` column: schema, migration, and protocol type
+### 20. `validation_requirements`: schema, migration, and protocol types
 
-Add the nullable column to the `tasks` table with a migration, the corresponding field on `boss-protocol`'s `Task` (per the builder convention: `#[builder(default)]` alongside `#[serde(default)]`), and explicit mapping in `work.rs`'s struct-literal DB mappers. Protocol/engine only — no CLI or app surface in this entry.
+Add child rows storing each work item's validation mode and criterion, plus the corresponding `ValidationRequirement` collection on `boss-protocol`'s `Task` (per the builder convention: `#[builder(default)]` alongside `#[serde(default)]`). Enforce that `exempt` cannot coexist with substantive requirements. Protocol/engine only — no CLI or app surface in this entry.
 
 - Effort hint: `medium`
 - Dependencies: none
 - Scope: in-scope
 - Parallel with entries 1–19.
 
-### 21. CLI and `bossctl` surfaces for `validation_tier`
+### 21. CLI and `bossctl` surfaces for `validation_requirements`
 
-Set/read the tier from `boss task update`, `boss task create`, and the corresponding `bossctl` verbs; include it in `boss context` output so a worker can see its own obligation.
-
-- Effort hint: `small`
-- Dependencies: `validation_tier` column: schema, migration, and protocol type
-- Scope: in-scope
-
-### 22. Display `validation_tier` in the macOS app
-
-Surface the tier on the work-item detail view and as a filter on the board. App-only; parallel with entry 21 (different subsystem, no file overlap).
+Set/read the requirement collection from `boss task update`, `boss task create`, and the corresponding `bossctl` verbs; include it in `boss context` output so a worker can see every obligation.
 
 - Effort hint: `small`
-- Dependencies: `validation_tier` column: schema, migration, and protocol type
+- Dependencies: `validation_requirements`: schema, migration, and protocol types
 - Scope: in-scope
 
-### 23. `boss validate run` command recorder
+### 22. Display `validation_requirements` in the macOS app
 
-A wrapper that executes a validation command and writes argv, full stdout/stderr, exit status, and duration to `<state root>/executions/<id>/validation/<slug>.json`. The record is written engine-side so a worker cannot author its own exit code.
+Surface all requirements on the work-item detail view and expose mode filters on the board. App-only; parallel with entry 21 (different subsystem, no file overlap).
+
+- Effort hint: `small`
+- Dependencies: `validation_requirements`: schema, migration, and protocol types
+- Scope: in-scope
+
+### 23. Validation evidence providers and generic command recorder
+
+Introduce the provider interface from §4.6 and a Bazel provider that imports durable PR-head CI diagnostics without worker action. Add `boss validate run` as the fallback for uncovered commands; it writes argv, full stdout/stderr, exit status, and duration to `<state root>/executions/<id>/validation/<slug>.json` so the worker cannot author its own exit code.
 
 - Effort hint: `medium`
-- Dependencies: `validation_tier` column: schema, migration, and protocol type
+- Dependencies: `validation_requirements`: schema, migration, and protocol types
 - Scope: in-scope
 
 ### 24. Worker prompt instructions for the validation contract
 
-Update the composed worker prompt so workers run validation steps through `boss validate run` and emit the `## Validation` PR-body section in the specified format. Golden diffs from entry 11 make the change reviewable.
+Update the composed worker prompt so workers name every validation requirement and its evidence in the `## Validation` PR-body section, and use `boss validate run` only when no tool-native provider covers the command. Golden diffs from entry 11 make the change reviewable.
 
 - Effort hint: `small`
-- Dependencies: `boss validate run` command recorder; Composed-prompt golden corpus with `BLESS` regeneration
+- Dependencies: Validation evidence providers and generic command recorder; Composed-prompt golden corpus with `BLESS` regeneration
 - Scope: in-scope
 
 ### 25. `## Validation` section parser and deterministic evidence checker
 
-Parse the PR-body section, resolve each named Bazel target against the `bazel-testlogs/**/test.xml` artifacts for the head SHA, resolve each cited validation record, and emit mechanical findings for missing/unrun targets and absent records — a deterministic pre-pass ahead of the reviewer LLM.
+Parse the PR-body section, map every filed requirement to cited evidence, resolve Bazel labels and the applicable green PR-head CI result, and resolve command-provider records and attachment rows. Emit mechanical findings for missing labels, red CI, absent records, and uncovered requirements — a deterministic pre-pass ahead of the reviewer LLM.
 
 - Effort hint: `medium`
-- Dependencies: `boss validate run` command recorder; CLI and `bossctl` surfaces for `validation_tier`
+- Dependencies: Validation evidence providers and generic command recorder; CLI and `bossctl` surfaces for `validation_requirements`
 - Scope: in-scope
 
 ### 26. Wire the evidence checker into the review lane
 
-Feed the checker's findings into the existing automated-reviewer pass so an unbacked validation claim becomes a review finding, and an unset tier on a non-trivial item is flagged. Gate on the tier semantics from §5.1.
+Feed the checker's findings into the existing automated-reviewer pass so an unbacked validation claim becomes a review finding, and an empty requirement set on a non-trivial item is flagged. Gate on the composability and exemption semantics from §5.1.
 
 - Effort hint: `small`
 - Dependencies: `## Validation` section parser and deterministic evidence checker
 - Scope: in-scope
 
-### 27. Coordinator brief template: author the tier at filing time
+### 27. Coordinator brief template: author requirements at filing time
 
-Update the coordinator's task-filing prompt and templates so `validation_tier` is chosen when the brief is written, with the §5.1 "non-trivial" definition stated inline.
+Update the coordinator's task-filing prompt and templates so one or more `validation_requirements` are written with the brief, with the §5.1 "non-trivial" definition and composability stated inline.
 
 - Effort hint: `small`
-- Dependencies: CLI and `bossctl` surfaces for `validation_tier`
+- Dependencies: CLI and `bossctl` surfaces for `validation_requirements`
 - Scope: in-scope
 
 ### 28. Accessibility identifiers on driveable app views
@@ -552,7 +565,7 @@ Extend `BossCapture.swift` with an ordered JSON action list (`select_work_item`,
 
 ### 30. `boss ui capture` wrapper
 
-One command that brings up a `testkit` instance, seeds fixture state, drives the app with a script, and writes artifacts into `executions/<id>/validation/` — making tier-`manual` evidence cheap enough to actually be produced.
+One command that brings up a `testkit` instance, seeds fixture state, drives the app with a script, submits PNG/JPEG output through the existing attachment API, and writes non-image traces into `executions/<id>/validation/` — making `manual` evidence cheap enough to actually be produced.
 
 - Effort hint: `small`
 - Dependencies: App scripted drive mode (`--script`); Full-instance isolation in `testkit`
@@ -614,12 +627,12 @@ A `bk`-backed view of flake rates per target over time, so the quarantine budget
 - Dependencies: Nightly flake-detection lane
 - Scope: deferred (future / not a v1 blocker) — the auto-filed chores from entry 32 are sufficient signal for v1.
 
-### 38. Back-fill `validation_tier` on existing work items
+### 38. Back-fill `validation_requirements` on existing work items
 
-A sweep setting the tier on already-filed rows.
+A sweep setting requirements on already-filed rows.
 
 - Effort hint: `large`
-- Dependencies: CLI and `bossctl` surfaces for `validation_tier`
+- Dependencies: CLI and `bossctl` surfaces for `validation_requirements`
 - Scope: deferred (future / not a v1 blocker) — **explicitly out of scope per the project brief**; listed so the decision is visible rather than silently omitted.
 
 ### 39. Coverage instrumentation as a diagnostic
