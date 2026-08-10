@@ -340,10 +340,16 @@ impl ExecutionCoordinator {
     /// the auto-dispatcher uses. Returns the worker id we landed on so
     /// callers can echo it back to the human.
     ///
-    /// "Force" bypasses *admission gating* only — the dispatch pause and the
-    /// interactive-pool concurrency cap, which is exactly what both callers
-    /// need (a human explicitly skipping the queue; a probe that must run
-    /// even while dispatch is breaker-paused). It never bypasses *pool
+    /// "Force" bypasses the interactive-pool concurrency cap outright, and
+    /// the dispatch pause only as far as the caller's [`DispatchAdmission`]
+    /// allows — it is NOT a blanket pause bypass. `bossctl agents launch`
+    /// passes [`DispatchAdmission::OperatorForced`] and does override the
+    /// pause; the breaker's recovery canary passes
+    /// [`DispatchAdmission::BreakerRecoveryProbe`], which
+    /// [`Self::dispatch_hold_for`] admits only under a Breaker-origin pause
+    /// and never for a `pr_review` row. Passing the admission down rather
+    /// than assuming one is what stopped this function from being a hole in
+    /// the pause. It never bypasses *pool
     /// correctness*: a `pr_review` still claims a `review-` worker id (so it
     /// resolves the pinned Opus reviewer policy via
     /// [`pool_dispatch_policy_for_worker_id`] and never counts against the
@@ -357,9 +363,10 @@ impl ExecutionCoordinator {
     /// the forced worker always keeps its pool's dispatch policy.
     ///
     /// Errors when the execution is not in `ready` (already claimed by
-    /// the auto-dispatcher in a race, terminal, or unknown), or when
-    /// the target pool is already at its hard cap with no idle slot.
-    pub async fn force_dispatch(self: &Arc<Self>, execution_id: &str) -> Result<String> {
+    /// the auto-dispatcher in a race, terminal, or unknown), when the
+    /// active pause does not admit `admission`, or when the target pool is
+    /// already at its hard cap with no idle slot.
+    pub async fn force_dispatch(self: &Arc<Self>, execution_id: &str, admission: DispatchAdmission) -> Result<String> {
         if let Some(reason) = self.dispatch_preflight_block_reason() {
             return Err(anyhow!("local dispatch is unavailable: {reason}"));
         }
@@ -372,6 +379,13 @@ impl ExecutionCoordinator {
                 "execution {execution_id} is in status {status:?}, not ready — cannot force-dispatch",
                 status = execution.status,
             ));
+        }
+        // Refuse before claiming a slot, so a held force-dispatch never has
+        // to hand a worker back. `schedule_execution` re-checks — it is the
+        // chokepoint and owns the guarantee — but answering here keeps the
+        // error the caller sees precise and costs nothing.
+        if let Some(hold) = self.dispatch_hold_for(&execution, admission) {
+            return Err(anyhow!("{hold}"));
         }
         // `ready` is necessary but not sufficient: the auto-dispatcher may
         // already have handed this row (or a duplicate of it) off, and it
@@ -401,7 +415,7 @@ impl ExecutionCoordinator {
                     cap = pool.hard_cap(),
                 )
             })?;
-        if let Err(err) = self.schedule_execution(&execution, &worker_id).await {
+        if let Err(err) = self.schedule_execution(&execution, &worker_id, admission).await {
             pool.release_worker(&worker_id, preferred_workspace_id.as_deref()).await;
             return Err(err);
         }
@@ -845,15 +859,21 @@ impl ExecutionCoordinator {
             tracing::error!(%reason, "local dispatch held by startup preflight");
             return DrainOutcome::QueueEmpty;
         }
-        // Global pause gate. `pr_review` executions are the lifecycle of a
-        // change already in flight, not new work, so an operator-originated
-        // pause exempts them — they keep draining into the review pool while
+        // Global pause gate, read once as a snapshot so "are we paused" and
+        // "what does this pause hold" cannot disagree mid-pass. The scope
+        // itself is decided by `dispatch_hold_for` (the single authority) —
+        // this is the cheap early exit that keeps a paused engine from
+        // walking the queue and claiming slots it would only hand back.
+        // `pr_review` executions are the lifecycle of a change already in
+        // flight, not new work, so an operator-originated pause exempts
+        // them — they keep draining into the review pool while
         // main/automation rows are held. A breaker-originated pause (the
         // app's spawn path itself is broken — see `spawn_health.rs`) exempts
         // nothing, since dispatching a review would just burn another spawn
         // attempt against the same dead path.
-        let paused = self.dispatch_paused.load(Ordering::Acquire);
-        let reviews_exempt_from_pause = paused && self.dispatch_pause_exempts_reviews.load(Ordering::Acquire);
+        let pause = self.dispatch_pause();
+        let paused = pause.is_some();
+        let reviews_exempt_from_pause = pause.as_ref().is_some_and(|p| !p.reviews_held());
         // Automation-pause gate — independent of `paused` above (see
         // `FrontendRequest::SetAutomationPaused`). Checked per-row below
         // alongside `paused`, rather than short-circuiting the whole drain
@@ -2046,7 +2066,10 @@ impl ExecutionCoordinator {
                     return;
                 }
             };
-            match coordinator.schedule_execution(&execution, &worker_id).await {
+            match coordinator
+                .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+                .await
+            {
                 Ok(()) => {
                     tracing::info!(
                         execution_id = %execution.id,

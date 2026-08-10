@@ -146,6 +146,33 @@ async fn get_automation_state_raw(socket_path: &Option<String>) -> Result<Automa
     }
 }
 
+/// The scope block `dispatch state` prints under a live pause: what the
+/// pause holds, and every route that can still reach a worker spawn while it
+/// holds.
+///
+/// Kept as one function returning the whole block so the scope claim and its
+/// exceptions can never be edited apart. The engine-side counterpart is
+/// `ExecutionCoordinator::dispatch_hold_for`, which is the single authority
+/// these lines describe — if a bypass is added there it belongs here too.
+pub(super) fn dispatch_scope_lines(reviews_exempt: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    if reviews_exempt {
+        lines.push("  origin: operator".to_owned());
+        lines.push("  reviews: exempt — PR-review executions keep dispatching (a review is the".to_owned());
+        lines.push("           lifecycle of a change already in flight, not new work)".to_owned());
+    } else {
+        lines.push("  origin: breaker (spawn-capability circuit breaker)".to_owned());
+        lines.push("  reviews: held — every pool is held, PR reviews included; the breaker tripped".to_owned());
+        lines.push("           on the worker-spawn path itself, which reviews depend on too".to_owned());
+        lines.push("  bypass: one recovery canary may be admitted periodically to test whether the".to_owned());
+        lines.push("          spawn path recovered — never a PR review, one at a time, on a backoff.".to_owned());
+        lines.push("          Look for `breaker_recovery_probe_admitted` in `bossctl dispatch tail`.".to_owned());
+    }
+    lines.push("  bypass: `bossctl agents launch <id>` force-dispatches one execution through".to_owned());
+    lines.push("          the pause — an explicit operator override, by design.".to_owned());
+    lines
+}
+
 /// One-line summary printed by `dispatch pause`/`dispatch resume` and
 /// reused by the unified `bossctl pause`/`bossctl resume`.
 pub(super) fn format_dispatch_set_line(state: &DispatchPauseState) -> String {
@@ -159,6 +186,8 @@ pub(super) fn format_dispatch_set_line(state: &DispatchPauseState) -> String {
         } else {
             " — PR reviews are held too (spawn-capability breaker)"
         };
+        // `bossctl agents launch` overrides any pause by design; see
+        // `dispatch_state` below for the long-form scope report.
         let reason_str = state
             .reason
             .as_deref()
@@ -238,10 +267,14 @@ pub(super) async fn dispatch_state(socket_path: &Option<String>, json: bool) -> 
         if let Some(reason) = &state.reason {
             println!("  reason: {reason}");
         }
-        if state.reviews_exempt {
-            println!("  reviews: exempt — PR-review executions keep dispatching");
-        } else {
-            println!("  reviews: held — spawn-capability breaker pause");
+        // The scope and the bypasses are printed together and unconditionally.
+        // Announcing one scope while behaving as another is the failure this
+        // output exists to prevent (mono#2303: a breaker pause reported
+        // `reviews: held` while the breaker's own recovery canary was
+        // spending PR-review rows), so every route through a pause is named
+        // here — including the ones that are deliberate.
+        for line in dispatch_scope_lines(state.reviews_exempt) {
+            println!("{line}");
         }
     } else {
         println!("state: running");

@@ -270,6 +270,44 @@ fn format_dispatch_set_line_flags_non_exempt_breaker_pause() {
     );
 }
 
+/// A breaker pause holds PR reviews, and the scope block must say so — plus
+/// name every route that can still reach a spawn while it holds. The
+/// 2026-08-10 incident was a breaker pause printing `reviews: held` while
+/// its own recovery canary spent PR-review rows; the canary is now
+/// review-ineligible, and the bypass that remains is declared here rather
+/// than left for an operator to discover from a dispatch tail.
+#[test]
+fn dispatch_scope_lines_declare_a_breaker_pause_scope_and_its_bypasses() {
+    let block = pause::dispatch_scope_lines(false).join("\n");
+    assert!(block.contains("origin: breaker"), "{block}");
+    assert!(block.contains("reviews: held"), "{block}");
+    assert!(
+        block.contains("never a PR review"),
+        "the canary bypass must state that it cannot spend a review: {block}"
+    );
+    assert!(
+        block.contains("bossctl agents launch"),
+        "the explicit operator override must be declared: {block}"
+    );
+}
+
+/// An operator pause genuinely exempts reviews, so the same block must say
+/// *that* — the honesty requirement runs in both directions.
+#[test]
+fn dispatch_scope_lines_declare_an_operator_pause_review_exemption() {
+    let block = pause::dispatch_scope_lines(true).join("\n");
+    assert!(block.contains("origin: operator"), "{block}");
+    assert!(block.contains("reviews: exempt"), "{block}");
+    assert!(
+        !block.contains("recovery canary"),
+        "an operator pause is never auto-probed, so it must not advertise a canary: {block}"
+    );
+    assert!(
+        block.contains("bossctl agents launch"),
+        "the explicit operator override applies to every pause mode: {block}"
+    );
+}
+
 #[test]
 fn format_automation_set_line_matches_existing_automation_pause_text() {
     let paused = pause::AutomationPauseState {

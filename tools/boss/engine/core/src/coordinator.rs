@@ -1753,9 +1753,9 @@ fn default_coordinator_metrics() -> Arc<Registry> {
     metrics
 }
 
-/// Why dispatch is currently paused. Determines whether `drain_ready_queue`
-/// exempts `pr_review` executions from the pause — see
-/// [`ExecutionCoordinator::dispatch_pause_exempts_reviews`].
+/// Why dispatch is currently paused. Determines the pause's **scope** —
+/// whether `pr_review` executions are held along with everything else. See
+/// [`DispatchPause::reviews_held`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchPauseOrigin {
     /// An operator toggled `bossctl dispatch pause` / the app's pause
@@ -1790,6 +1790,125 @@ impl DispatchPauseOrigin {
             Some("operator") => DispatchPauseOrigin::Operator,
             _ => DispatchPauseOrigin::Breaker,
         }
+    }
+}
+
+/// A live dispatch pause: the whole of it, as one value.
+///
+/// Held behind a single lock inside [`ExecutionCoordinator`] and read as a
+/// unit, so "is dispatch paused" and "what does this pause hold" can never be
+/// answered from different instants — and so a resume clears the entire
+/// episode rather than leaving one field behind. Before this was a value,
+/// the pause lived in four independent fields and `resume_dispatch` cleared
+/// three of them: `reviews_exempt` kept its last value forever, so
+/// `GetDispatchState` reported a scope for a pause that no longer existed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchPause {
+    /// Who paused, which determines [`Self::reviews_held`].
+    pub origin: DispatchPauseOrigin,
+    /// Epoch seconds at which this pause episode began.
+    pub since_epoch_s: u64,
+    /// Why. Non-empty by construction ([`boss_protocol::PauseReason`]):
+    /// dispatch must never be found paused with no record of who paused it
+    /// or why.
+    pub reason: String,
+}
+
+impl DispatchPause {
+    /// Whether this pause holds `pr_review` executions too.
+    ///
+    /// An operator pause does not: a review is the lifecycle of a change
+    /// already in flight, not new work, so reviews keep draining while the
+    /// operator holds new work back. A breaker pause does: the thing the
+    /// breaker tripped on is the worker-spawn path, which reviews depend on
+    /// exactly as much as anything else, so dispatching one would just burn
+    /// another attempt against the same dead path.
+    pub fn reviews_held(&self) -> bool {
+        self.origin != DispatchPauseOrigin::Operator
+    }
+
+    /// One-line scope description, phrased for an operator. Kept next to
+    /// [`Self::reviews_held`] so the words and the behaviour cannot drift:
+    /// anything that renders a pause's scope for a human renders this.
+    pub fn scope_description(&self) -> &'static str {
+        match self.origin {
+            DispatchPauseOrigin::Operator => {
+                "new work is held; PR reviews are exempt and keep dispatching (a review is the \
+                 lifecycle of a change already in flight)"
+            }
+            DispatchPauseOrigin::Breaker => {
+                "every pool is held, PR reviews included — the breaker tripped on the worker-spawn \
+                 path itself, which reviews depend on too"
+            }
+        }
+    }
+}
+
+/// Why a dispatch is being admitted. Every path that can reach a worker
+/// spawn names one, and [`ExecutionCoordinator::dispatch_hold_for`] decides
+/// from it — so a pause check cannot be forgotten by the next dispatch entry
+/// point somebody adds. The gate lives at
+/// [`ExecutionCoordinator::schedule_execution`], the single chokepoint every
+/// spawn passes through, rather than at each caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchAdmission {
+    /// The ordinary path: this row came off the ready queue via
+    /// `drain_ready_queue`. Fully subject to the pause.
+    Queued,
+    /// A human explicitly skipped the queue: `bossctl agents launch`, i.e.
+    /// `RequestExecutionInput.force`. An operator naming one specific
+    /// execution by hand overrides their own pause — including a breaker
+    /// pause, which they may well be probing deliberately. Long-standing
+    /// behaviour, preserved deliberately, and declared in
+    /// `bossctl dispatch state` rather than left implicit.
+    ///
+    /// Not to be confused with the narrower per-request pause override
+    /// designed in
+    /// `tools/boss/docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md`
+    /// (`bossctl work start --force`), which deliberately does NOT apply to
+    /// a breaker pause and does not grow the pool. That override wants its
+    /// own variant here — one more arm in
+    /// [`ExecutionCoordinator::dispatch_hold_for`], admitted only when
+    /// `pause.origin == Operator` — not a reuse of this one.
+    OperatorForced,
+    /// The spawn-capability breaker's half-open recovery canary (see
+    /// [`crate::spawn_health::maybe_admit_recovery_probe`]). Admitted only
+    /// under a Breaker-origin pause, one at a time, on an exponential
+    /// backoff, and never for a `pr_review` row — see
+    /// [`ExecutionCoordinator::dispatch_hold_for`].
+    BreakerRecoveryProbe,
+}
+
+impl DispatchAdmission {
+    /// Stable string for dispatch-event `details`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DispatchAdmission::Queued => "queued",
+            DispatchAdmission::OperatorForced => "operator_forced",
+            DispatchAdmission::BreakerRecoveryProbe => "breaker_recovery_probe",
+        }
+    }
+}
+
+/// A refusal from [`ExecutionCoordinator::dispatch_hold_for`]: this
+/// execution may not spawn right now, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchHold {
+    /// The pause doing the holding.
+    pub pause: DispatchPause,
+    /// The admission that was refused.
+    pub admission: DispatchAdmission,
+    /// Whether the held row targets the review pool — the discriminator for
+    /// both the operator review exemption and the canary's review
+    /// ineligibility, so a reader never has to re-derive it.
+    pub targets_review_pool: bool,
+    /// Operator-facing explanation, already naming the pause reason.
+    pub detail: String,
+}
+
+impl std::fmt::Display for DispatchHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
     }
 }
 
@@ -1932,42 +2051,32 @@ pub struct ExecutionCoordinator {
     /// [`Self::set_automation_preemptor`].
     #[builder(default = Arc::new(NoopAutomationPreemptor))]
     automation_preemptor: Arc<dyn AutomationPreemptor>,
-    /// Global dispatch-pause flag. When `true`, `drain_ready_queue` exits
-    /// immediately without claiming any slots. Seeded from the `dispatch_paused`
-    /// metadata key at engine startup; persisted there on every toggle so the
-    /// pause survives an engine restart.
+    /// The global dispatch pause, as one value: `None` when dispatch is
+    /// running, `Some` while it is held. Every question about the pause —
+    /// is it on, who set it, when, why, and does it hold reviews — is
+    /// answered from this one snapshot, so no two of those answers can come
+    /// from different instants and a resume cannot leave part of an episode
+    /// behind. Seeded from the `dispatch_paused*` metadata keys at engine
+    /// startup; persisted there on every toggle so the pause survives an
+    /// engine restart.
+    ///
+    /// [`Self::pause_dispatch`] takes a [`PauseReason`] (a validated
+    /// non-empty string) rather than an `Option<String>`, so there is no
+    /// code path that can set this to `Some` without a recorded reason —
+    /// dispatch must never be found paused anonymously.
+    ///
+    /// A plain `std::sync::Mutex` rather than the `tokio::sync::Mutex` used
+    /// elsewhere in this struct: every access is a quick read-or-replace
+    /// with no `.await` in between, so a blocking lock avoids forcing every
+    /// caller (including the many sync `is_dispatch_paused()`-style call
+    /// sites) to become `async`.
     #[builder(default)]
-    dispatch_paused: AtomicBool,
-    /// Epoch seconds when dispatch was last paused. Zero means "not paused".
-    /// Seeded at startup from `dispatch_paused_since_epoch_s` in `state.db`.
-    #[builder(default)]
-    dispatch_paused_since_epoch_s: AtomicU64,
-    /// Whether the current pause exempts `pr_review` executions from
-    /// `drain_ready_queue`'s pause gate — `true` when the pause originated
-    /// from [`DispatchPauseOrigin::Operator`], `false` for
-    /// [`DispatchPauseOrigin::Breaker`]. Only meaningful while
-    /// `dispatch_paused` is `true`; set on every `pause_dispatch` call and
-    /// otherwise left at its last value.
-    #[builder(default)]
-    dispatch_pause_exempts_reviews: AtomicBool,
-    /// Why dispatch is currently paused. `None` whenever `dispatch_paused`
-    /// is `false` — [`Self::resume_dispatch`] always clears it, so a
-    /// subsequent pause can never inherit a stale reason. `Some` whenever
-    /// `dispatch_paused` is `true`: [`Self::pause_dispatch`] requires a
-    /// [`PauseReason`] (a validated non-empty string) rather than an
-    /// `Option<String>`, so there is no code path that can set
-    /// `dispatch_paused = true` without also setting this. A plain
-    /// `std::sync::Mutex` rather than the `tokio::sync::Mutex` used
-    /// elsewhere in this struct: every access here is a quick
-    /// read-or-replace with no `.await` in between, so a blocking lock
-    /// avoids forcing every caller (including the many sync
-    /// `is_dispatch_paused()`-style call sites) to become `async`.
-    #[builder(default)]
-    dispatch_paused_reason: std::sync::Mutex<Option<String>>,
+    dispatch_pause: std::sync::Mutex<Option<DispatchPause>>,
     /// Execution ids `drain_ready_queue`'s pause gate must let through this
-    /// pass even though `dispatch_paused` is `true` — the in-memory,
-    /// never-persisted mechanism behind the pause-only forced-dispatch
-    /// override (`RequestExecutionInput::bypass_dispatch_pause`; see
+    /// pass even though [`Self::is_dispatch_paused`] is `true` — the
+    /// in-memory, never-persisted mechanism behind the pause-only
+    /// forced-dispatch override (`RequestExecutionInput::
+    /// bypass_dispatch_pause`; see
     /// `docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md`
     /// and `coordinator/dispatch_admission.rs`). An id is inserted only
     /// after `ExecutionCoordinator::evaluate_dispatch_admission` has
