@@ -692,9 +692,9 @@ fn bazel_prepush_gate_block(workspace_path: &Path, seam_enabled: bool) -> Option
 /// told to call a verb the engine won't yet honor proposals-first.
 pub(crate) fn bazel_prepush_gate_text(seam_enabled: bool) -> String {
     let failure_sentence = if seam_enabled {
-        "If the build or tests actually fail or actually time out — a real command that ran and returned a failing or timed-out result — do NOT push red code and do NOT idle waiting on them. Deciding on your own that the run has gone on long enough is not a failure or a timeout, and is never a reason to stop short of a clean result. Call `boss propose blocked --reason \"...\"` naming the failing/timed-out command and its output, and stop (see \"If you are blocked or the work is bigger than estimated\" below for the exact syntax). Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
+        "If the build or tests actually fail or actually time out — a real command that ran and returned a failing or timed-out result — do NOT push red code and do NOT idle waiting on them. Deciding on your own that the run has gone on long enough is not a failure or a timeout, and is never a reason to stop short of a clean result. A command still producing output is slow, not wedged — wait for it. A command producing no output and no progress is wedged: re-run it wrapped in an explicit `timeout` so it returns a real result you can act on, rather than waiting on it or guessing. Call `boss propose blocked --reason \"...\"` naming the failing/timed-out command and its output, and stop (see \"If you are blocked or the work is bigger than estimated\" below for the exact syntax). Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
     } else {
-        "If the build or tests actually fail or actually time out — a real command that ran and returned a failing or timed-out result — do NOT push red code and do NOT idle waiting on them. Deciding on your own that the run has gone on long enough is not a failure or a timeout, and is never a reason to stop short of a clean result. Emit a `[blocked] reason=\"...\"` marker in your final response naming the failing/timed-out command and its output, and stop (see \"If you are blocked or the work is bigger than estimated\" below for the exact syntax). Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
+        "If the build or tests actually fail or actually time out — a real command that ran and returned a failing or timed-out result — do NOT push red code and do NOT idle waiting on them. Deciding on your own that the run has gone on long enough is not a failure or a timeout, and is never a reason to stop short of a clean result. A command still producing output is slow, not wedged — wait for it. A command producing no output and no progress is wedged: re-run it wrapped in an explicit `timeout` so it returns a real result you can act on, rather than waiting on it or guessing. Emit a `[blocked] reason=\"...\"` marker in your final response naming the failing/timed-out command and its output, and stop (see \"If you are blocked or the work is bigger than estimated\" below for the exact syntax). Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
     };
     format!(
         "\n## Pre-push build gate (Bazel workspace)\n\
@@ -742,9 +742,9 @@ fn bazel_conflict_resolution_gate_block(workspace_path: &Path, seam_enabled: boo
 /// and [`bazel_prepush_gate_text`] for what `seam_enabled` selects.
 pub(crate) fn bazel_conflict_resolution_gate_text(seam_enabled: bool) -> String {
     let failure_sentence = if seam_enabled {
-        "If `bazel build` fails (the merge does not compile) and you cannot make it compile within this run, do NOT push. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; call `boss propose blocked --reason \"...\"` naming the failure and stop.\n"
+        "If `bazel build` fails (the merge does not compile) and you cannot make it compile, do NOT push. Deciding on your own that the run has gone on long enough is not a build failure, and is never a reason to stop short of a clean build. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; call `boss propose blocked --reason \"...\"` naming the failure and stop.\n"
     } else {
-        "If `bazel build` fails (the merge does not compile) and you cannot make it compile within this run, do NOT push. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; emit a `[blocked] reason=\"...\"` marker naming the failure and stop.\n"
+        "If `bazel build` fails (the merge does not compile) and you cannot make it compile, do NOT push. Deciding on your own that the run has gone on long enough is not a build failure, and is never a reason to stop short of a clean build. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; emit a `[blocked] reason=\"...\"` marker naming the failure and stop.\n"
     };
     format!(
         "\n## Pre-push gate for conflict resolution (Bazel workspace) — merge correctness first, then push\n\
@@ -907,8 +907,8 @@ fn pr_terminal_directive() -> String {
 /// reads for the engine's read path, threaded here so the two halves of the
 /// migration move together: a worker must never be taught a verb the engine
 /// won't yet read proposals-first for, and flipping the flag off must
-/// restore today's behavior exactly, prompt included, not just the engine's
-/// read side.
+/// restore the marker-only vocabulary on the prompt side, not just the
+/// engine's read side.
 ///
 /// `seam_enabled = true` documents the two sanctioned `boss propose` verbs a
 /// worker calls when it cannot proceed unassisted: `effort-escalation` (the
@@ -928,12 +928,14 @@ fn pr_terminal_directive() -> String {
 /// is still surfaced, never silently dropped, but new workers are only ever
 /// taught the verb.
 ///
-/// `seam_enabled = false` reproduces the pre-migration directive verbatim:
-/// both `[effort-escalation]` and `[blocked]` as markers, no `boss propose`
-/// mention. Incident 2026-07-02 (`exec_18b5243e65ff188_2d`) is why
-/// the marker syntax is spelled out explicitly rather than left implicit —
-/// a worker hit a bazel blocker it could not resolve, did the right thing
-/// by stopping instead of pushing broken code, and emitted a bare
+/// `seam_enabled = false` renders the marker-grammar variant of this
+/// directive: both `[effort-escalation]` and `[blocked]` as markers, no
+/// `boss propose` mention anywhere. Shared guidance that names no verb
+/// (e.g. what makes a reason valid) is carried by both branches. Incident
+/// 2026-07-02 (`exec_18b5243e65ff188_2d`) is why the marker syntax is
+/// spelled out explicitly rather than left implicit — a worker hit a
+/// bazel blocker it could not resolve, did the right thing by stopping
+/// instead of pushing broken code, and emitted a bare
 /// `[effort-escalation]` line with neither `requested_level` nor `reason`,
 /// which the coordinator's documented parser treats as malformed.
 ///
