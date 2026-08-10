@@ -825,6 +825,31 @@ impl WorkDb {
     }
 }
 
+/// Resolve and attach [`Task::doc_link_state`] for a single task when it is a
+/// per-task-doc kind (`task_uses_per_task_doc`). Shared by the work-tree loop,
+/// single-item read paths, and `set_task_doc`'s return so a change to the
+/// resolution contract only needs to land once.
+///
+/// Returns `true` when the kind gate passed and resolution was attempted
+/// (so `get_work_tree` can keep its N+1 `resolved` count accurate). Errors
+/// are non-fatal: log with `caller` as the message prefix and leave the
+/// field `None` (affordance hidden). The workspace lookup is always `|_| None`:
+/// cube is not consulted on these paths.
+pub(crate) fn attach_task_doc_link_state(conn: &Connection, task: &mut Task, caller: &str, queries: &mut u64) -> bool {
+    if !crate::design_detector::task_uses_per_task_doc(&task.kind, task.project_id.is_none()) {
+        return false;
+    }
+    match resolve_task_doc_pointer(conn, &task.id, |_| None, queries) {
+        Ok(state) => task.doc_link_state = state,
+        Err(err) => tracing::warn!(
+            task_id = %task.id,
+            ?err,
+            "{caller}: failed to resolve task doc-link state; leaving affordance hidden"
+        ),
+    }
+    true
+}
+
 /// Resolve a task's per-task doc pointer (`doc_*` columns) into a
 /// [`ProjectDesignDocState`], the same wire shape the kanban already
 /// renders for project design docs. Returns `Ok(None)` when the task
@@ -850,31 +875,6 @@ impl WorkDb {
 /// [`crate::work::dispatch_helpers::query_task_runtime`], so N+1 callers
 /// like `get_work_tree`'s `db.doc_pointers` segment can report an accurate
 /// aggregate statement count.
-/// Resolve and attach [`Task::doc_link_state`] for a single task when it is a
-/// per-task-doc kind (`task_uses_per_task_doc`). Shared by the work-tree loop,
-/// single-item read paths, and `set_task_doc`'s return so a change to the
-/// resolution contract only needs to land once.
-///
-/// Returns `true` when the kind gate passed and resolution was attempted
-/// (so `get_work_tree` can keep its N+1 `resolved` count accurate). Errors
-/// are non-fatal: log with `caller` as the message prefix and leave the
-/// field `None` (affordance hidden). Pass `|_| None` is implicit — cube is
-/// not consulted on these paths.
-pub(crate) fn attach_task_doc_link_state(conn: &Connection, task: &mut Task, caller: &str, queries: &mut u64) -> bool {
-    if !crate::design_detector::task_uses_per_task_doc(&task.kind, task.project_id.is_none()) {
-        return false;
-    }
-    match resolve_task_doc_pointer(conn, &task.id, |_| None, queries) {
-        Ok(state) => task.doc_link_state = state,
-        Err(err) => tracing::warn!(
-            task_id = %task.id,
-            ?err,
-            "{caller}: failed to resolve task doc-link state; leaving affordance hidden"
-        ),
-    }
-    true
-}
-
 pub(crate) fn resolve_task_doc_pointer(
     conn: &Connection,
     task_id: &str,
