@@ -8,10 +8,22 @@ import SwiftUI
 ///   - Plain Return submits (via CommentTextEditor's key handler).
 ///   - Shift+Return inserts a newline so multi-line comments are still possible.
 ///   - Cancel clears state without adding a comment.
+///   - Initial body is seeded from `layer.pendingTypeahead` (the type-to-comment
+///     opener plus any keystrokes buffered before the text view existed). Further
+///     dead-window keystrokes are inserted into the live `NSTextView` by
+///     `CommentLayer.forwardKeystrokeToPendingComment`.
 struct CommentPopover: View {
     @ObservedObject var layer: CommentLayer
 
-    @State private var commentBody: String = ""
+    @State private var commentBody: String
+
+    init(layer: CommentLayer) {
+        _layer = ObservedObject(wrappedValue: layer)
+        // Seed from any typeahead already buffered before the first frame so
+        // `CommentTextEditor.makeNSView` / `updateNSView` see the character(s)
+        // immediately instead of starting empty and racing a later onAppear.
+        _commentBody = State(initialValue: layer.pendingTypeahead)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -21,7 +33,22 @@ struct CommentPopover: View {
             CommentTextEditor(
                 text: $commentBody,
                 onSubmit: submit,
-                onTextViewCreated: layer.setCommentTextView
+                onTextViewCreated: { textView in
+                    // Drain buffered keys before registering the live view. This
+                    // gives typeahead one consumer and prevents an asynchronous
+                    // state update from racing a later direct NSTextView insertion.
+                    let typeahead = layer.drainPendingTypeahead()
+                    commentBody = typeahead
+                    textView.string = typeahead
+                    textView.setSelectedRange(
+                        NSRange(location: (typeahead as NSString).length, length: 0))
+                    layer.setCommentTextView(textView)
+                },
+                // Always request focus while the popover is mounted; the layer
+                // no-ops claimCommentTextFocus once the claim has stuck, so the
+                // Cancel/Comment buttons remain reachable via Tab.
+                wantsFocus: true,
+                onClaimFocus: { layer.claimCommentTextFocus() }
             )
                 .frame(minHeight: 80, maxHeight: 160)
                 .overlay(
@@ -36,6 +63,9 @@ struct CommentPopover: View {
                 }
                 .keyboardShortcut(.cancelAction)
 
+                // Disable is based on a local snapshot of emptiness only — avoid
+                // re-reading observed layer fields that would force an extra
+                // representable update cycle per keystroke.
                 Button("Comment") {
                     submit()
                 }
@@ -45,11 +75,6 @@ struct CommentPopover: View {
         }
         .padding(16)
         .frame(width: 320)
-        .onAppear {
-            if let first = layer.pendingFirstChar {
-                commentBody = String(first)
-            }
-        }
     }
 
     private func submit() {

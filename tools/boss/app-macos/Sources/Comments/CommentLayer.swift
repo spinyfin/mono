@@ -16,7 +16,7 @@ private let coordLog = Logger(subsystem: "com.boss.markdown", category: "coordin
 /// Owns the comment array for a single markdown viewer instance and
 /// coordinates the selection → authoring → sidebar → highlight flow.
 ///
-/// Since P529 Phase 2 the layer is engine-backed: when [`configure`] is given an
+/// The layer is engine-backed: when [`configure`] is given an
 /// artifact id and a [`CommentBackend`], comments load via `comments_list`,
 /// persist via `comments_create`/`comments_dismiss`, re-anchor via
 /// `comments_resolve`, and stay live via the `comments.artifact.*` subscription
@@ -28,8 +28,11 @@ final class CommentLayer: NSObject, ObservableObject {
     @Published var comments: [Comment] = []
     @Published var isShowingPopover: Bool = false
     @Published var pendingQuotedText: String = ""
-    /// Character that seeded the form via type-to-comment entry path.
-    @Published var pendingFirstChar: Character? = nil
+    /// Keystrokes that opened the form (type-to-comment) plus any further characters
+    /// typed before the popover text view exists. `CommentPopover` seeds its body from
+    /// this; once the text view is live, additional dead-window keystrokes are inserted
+    /// directly into the `NSTextView` instead (see `forwardKeystrokeToPendingComment`).
+    @Published var pendingTypeahead: String = ""
     /// Anchor of the comment just clicked in the sidebar; clears after the flash.
     @Published var flashingAnchor: CommentAnchor? = nil
     /// Soft-dismiss "show resolved" sidebar toggle (design § "Soft-dismiss").
@@ -74,6 +77,13 @@ final class CommentLayer: NSObject, ObservableObject {
     /// The comment form's explicitly-designated typing target. Keeping this separate
     /// from `anchorTextView` avoids relying on the hosting view's subview order.
     private weak var commentTextView: NSTextView?
+
+    /// True while the popover is open and the comment text view has not yet been
+    /// observed as first responder. `CommentTextEditor` re-asserts focus on each
+    /// `updateNSView` while this is set — same pattern as the find bar's
+    /// `@FocusState`, which re-asserts on subsequent renders rather than firing once.
+    /// Cleared the first time `claimCommentTextFocus` observes a successful claim.
+    var needsCommentTextFocus: Bool = false
 
     /// The engine's `[Revise]`-banner summary, fetched via `CommentsBannerState`
     /// alongside every `reload()`. `nil` until the first fetch lands, or always
@@ -281,11 +291,17 @@ final class CommentLayer: NSObject, ObservableObject {
     func requestNewComment(firstChar: Character? = nil) {
         pendingQuotedText = captureCurrentSelection() ?? ""
         pendingOccurrenceIndex = computeOccurrenceIndex(for: pendingQuotedText)
-        pendingFirstChar = firstChar
+        // Seed typeahead with the key that opened the form (if any). Further
+        // keystrokes during the show-animation dead window append here (or insert
+        // directly into the text view once it exists) so nothing is dropped.
+        pendingTypeahead = firstChar.map { String($0) } ?? ""
         commentTextView = nil
+        needsCommentTextFocus = true
 
         guard let (posRect, posView) = resolveAnchor() else {
             anchorLog.error("requestNewComment: resolveAnchor returned nil — popover not shown")
+            needsCommentTextFocus = false
+            pendingTypeahead = ""
             return
         }
 
@@ -305,12 +321,66 @@ final class CommentLayer: NSObject, ObservableObject {
         isShowingPopover = true
 
         popover.show(relativeTo: posRect, of: posView, preferredEdge: .maxY)
+        // Claim immediately if the text view was already created by the hosting
+        // controller's synchronous view load. Usually the text view arrives a
+        // moment later via `setCommentTextView`; either way we re-assert until
+        // first responder sticks (see `needsCommentTextFocus`).
+        claimCommentTextFocus()
     }
 
-    /// Registers the comment form's text view as the target to focus once the popover
-    /// has completed its key-window transition.
+    /// Registers the comment form's text view and claims first responder immediately.
+    /// Focus is also re-asserted from `CommentTextEditor.updateNSView` while
+    /// `needsCommentTextFocus` remains true, and again from `popoverDidShow` after
+    /// AppKit's key-window transition (which can reset first responder).
     func setCommentTextView(_ textView: NSTextView) {
         commentTextView = textView
+        claimCommentTextFocus()
+    }
+
+    /// Returns all typeahead buffered before the form view existed, then clears
+    /// it so later keystrokes have exactly one destination: the live text view.
+    func drainPendingTypeahead() -> String {
+        let typeahead = pendingTypeahead
+        pendingTypeahead = ""
+        return typeahead
+    }
+
+    /// Attempts to make the comment text view first responder. Safe to call
+    /// repeatedly; no-ops until the text view has a window, and clears
+    /// `needsCommentTextFocus` once the claim can receive events in its key window.
+    ///
+    /// - Parameter force: When true (e.g. from `popoverDidShow` after AppKit's
+    ///   key-window transition may have reset first responder), re-open the
+    ///   claim even if a prior call already cleared `needsCommentTextFocus`.
+    ///   When false, a completed claim is left alone so the user can tab to
+    ///   Cancel/Comment without the text view stealing focus back.
+    func claimCommentTextFocus(force: Bool = false) {
+        guard let textView = commentTextView else { return }
+        guard let window = textView.window else { return }
+        if window.firstResponder === textView {
+            // A popover can accept a first-responder claim before it becomes key.
+            // Keep buffering host-window events until AppKit can actually deliver
+            // them to this text view.
+            if window.isKeyWindow {
+                needsCommentTextFocus = false
+            }
+            return
+        }
+        guard force || needsCommentTextFocus else { return }
+        if force { needsCommentTextFocus = true }
+        window.makeFirstResponder(textView)
+        if window.firstResponder === textView, window.isKeyWindow {
+            needsCommentTextFocus = false
+        }
+    }
+
+    /// Whether the comment form's text view currently holds first responder in
+    /// its window. The key monitor additionally verifies that its event targets
+    /// that window before it stops buffering.
+    var isCommentTextViewFirstResponder: Bool {
+        guard let textView = commentTextView,
+              let window = textView.window else { return false }
+        return window.firstResponder === textView
     }
 
     func addComment(quoted: String, body: String) {
@@ -357,7 +427,9 @@ final class CommentLayer: NSObject, ObservableObject {
         isShowingPopover = false
         pendingQuotedText = ""
         pendingOccurrenceIndex = 0
-        pendingFirstChar = nil
+        pendingTypeahead = ""
+        needsCommentTextFocus = false
+        commentTextView = nil
     }
 
     func cancelNewComment() {
@@ -932,24 +1004,112 @@ final class CommentLayer: NSObject, ObservableObject {
 
     // MARK: - Event handling (called from monitor closures via MainActor.assumeIsolated)
 
-    /// Returns true if the key event should be consumed (opens the comment form).
+    /// Returns true if the key event should be consumed by this layer.
+    ///
+    /// Two roles, both required to close the show-animation dead window:
+    /// 1. **Open** — with a live selection and no open popover, a typeable key
+    ///    opens the comment form and seeds the first character.
+    /// 2. **Forward** — while the popover is showing but the text view is not
+    ///    yet first responder, further typeable keys are inserted into the
+    ///    pending comment buffer (not dropped on the read-only document view).
+    ///
+    /// Once the comment text view is first responder, returns `false` so AppKit
+    /// delivers keystrokes to it normally. Does not disable the monitor.
     func shouldConsumeKeyEvent(
         chars: String?,
         mods: NSEvent.ModifierFlags,
         window: NSWindow?
     ) -> Bool {
-        guard window === hostWindow else { return false }
-        guard !isShowingPopover, !suppressTypeToComment else { return false }
+        guard isKeyEventForThisLayer(window) else { return false }
+        guard !suppressTypeToComment else { return false }
+
+        if isShowingPopover {
+            // Stop intercepting only when this event will reach the focused text
+            // view. During the popover animation its window may already have a
+            // first responder but host-window events still need forwarding.
+            if isCommentTextViewFirstResponder, commentTextView?.window === window {
+                needsCommentTextFocus = false
+                return false
+            }
+            if isCommentTextViewFirstResponder {
+                return forwardKeystrokeToPendingComment(chars: chars, mods: mods)
+            }
+            // Dead window: popover is up (or animating) but the form is not yet
+            // first responder. Forward typeable characters into the buffer.
+            guard needsCommentTextFocus else { return false }
+            return forwardKeystrokeToPendingComment(chars: chars, mods: mods)
+        }
+
         let cleanMods = mods.intersection(.deviceIndependentFlagsMask)
         guard cleanMods.isSubset(of: [.shift, .capsLock]) else { return false }
         guard
             let str = chars,
             str.count == 1,
             let char = str.first,
-            char.isLetter || char.isNumber || char.isPunctuation || char.isSymbol
+            Self.isTypeToCommentOpener(char)
         else { return false }
         guard hasCurrentSelection() else { return false }
         requestNewComment(firstChar: char)
+        return true
+    }
+
+    /// Whether a key event's window belongs to this layer's host or its open
+    /// comment popover. Local monitors fire for every window in the app; during
+    /// the show animation events still target the host, and once the popover
+    /// becomes key they target the popover window.
+    private func isKeyEventForThisLayer(_ window: NSWindow?) -> Bool {
+        if window === hostWindow { return true }
+        if isShowingPopover,
+           let popoverWindow = activePopover?.contentViewController?.view.window,
+           window === popoverWindow {
+            return true
+        }
+        if isShowingPopover, window === commentTextView?.window { return true }
+        return false
+    }
+
+    /// Characters that open the form via type-to-comment (selection + key).
+    /// Space is excluded so it does not steal from normal document scrolling.
+    private static func isTypeToCommentOpener(_ char: Character) -> Bool {
+        char.isLetter || char.isNumber || char.isPunctuation || char.isSymbol
+    }
+
+    /// Characters accepted into the pending comment buffer during the dead window.
+    /// Includes space so multi-word typing is preserved; excludes newlines (Return
+    /// should not submit until the form actually has focus).
+    private static func isPendingCommentChar(_ char: Character) -> Bool {
+        isTypeToCommentOpener(char) || char == " "
+    }
+
+    /// Inserts a typeable keystroke into the comment form while the popover is
+    /// visible but the text view is not yet first responder. Prefer a live
+    /// `NSTextView.insertText` when the view exists (binding-independent);
+    /// otherwise append to `pendingTypeahead` for the popover to seed from.
+    @discardableResult
+    func forwardKeystrokeToPendingComment(
+        chars: String?,
+        mods: NSEvent.ModifierFlags
+    ) -> Bool {
+        let cleanMods = mods.intersection(.deviceIndependentFlagsMask)
+        guard cleanMods.isSubset(of: [.shift, .capsLock]) else { return false }
+        guard
+            let str = chars,
+            str.count == 1,
+            let char = str.first,
+            Self.isPendingCommentChar(char)
+        else { return false }
+
+        if let textView = commentTextView {
+            textView.insertText(
+                String(char),
+                replacementRange: NSRange(location: NSNotFound, length: 0)
+            )
+        } else {
+            pendingTypeahead.append(char)
+        }
+        // Retry only while the initial focus claim is pending. Once it has landed,
+        // do not steal focus back from Cancel or Comment after the user tabs away.
+        claimCommentTextFocus()
         return true
     }
 
@@ -989,18 +1149,16 @@ final class CommentLayer: NSObject, ObservableObject {
 // MARK: - NSPopoverDelegate
 
 extension CommentLayer: NSPopoverDelegate {
-    /// Grabs first responder for the comment text view. This must happen here rather than
-    /// in the view's own setup: AppKit runs the popover's key-window transition
-    /// asynchronously after `NSPopover.show(...)` returns, and that transition resets first
-    /// responder to the popover's default, so any earlier claim is discarded.
-    /// `popoverDidShow` fires after the transition, so the claim sticks.
+    /// Re-asserts first responder after AppKit's popover key-window transition.
+    /// Earlier claims (from `setCommentTextView` / `updateNSView`) can be reset by
+    /// that transition; this is one of several claim sites, not the sole one-shot.
+    /// Keystrokes arriving before this fires are preserved by
+    /// `forwardKeystrokeToPendingComment`, not by waiting for this callback.
     nonisolated func popoverDidShow(_ notification: Notification) {
         MainActor.assumeIsolated {
-            guard let contentView = activePopover?.contentViewController?.view,
-                  let window = contentView.window,
-                  let textView = commentTextView
-            else { return }
-            window.makeFirstResponder(textView)
+            // Force: the key-window transition may have wiped an earlier claim
+            // that already cleared needsCommentTextFocus.
+            self.claimCommentTextFocus(force: true)
         }
     }
 
@@ -1011,9 +1169,10 @@ extension CommentLayer: NSPopoverDelegate {
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.isShowingPopover = false
-            self.pendingFirstChar = nil
+            self.pendingTypeahead = ""
             self.pendingQuotedText = ""
             self.pendingOccurrenceIndex = 0
+            self.needsCommentTextFocus = false
             self.activePopover = nil
             self.commentTextView = nil
             self.anchorInteractionScreenPoint = nil

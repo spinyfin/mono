@@ -4,10 +4,18 @@ import SwiftUI
 /// A text editor that submits on plain Return and inserts a newline on Shift+Return.
 /// Replaces SwiftUI's TextEditor (which treats all Return keys as newlines) for the
 /// comment entry form.
+///
+/// Focus: when `wantsFocus` is true, every `updateNSView` re-asserts first responder
+/// via `onClaimFocus` — the same re-assertion pattern as the find bar's `@FocusState`,
+/// rather than a single one-shot `makeFirstResponder` that AppKit can discard during
+/// the popover key-window transition.
 struct CommentTextEditor: NSViewRepresentable {
     @Binding var text: String
     var onSubmit: () -> Void
     var onTextViewCreated: (NSTextView) -> Void
+    /// While true, re-claim first responder on each update until the claim sticks.
+    var wantsFocus: Bool = false
+    var onClaimFocus: () -> Void = {}
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -36,24 +44,63 @@ struct CommentTextEditor: NSViewRepresentable {
         scrollView.borderType = .noBorder
 
         context.coordinator.textView = textView
+        // Apply any seed text before the first layout so the caret lands at end.
+        if !text.isEmpty {
+            textView.string = text
+            textView.setSelectedRange(NSRange(location: (text as NSString).length, length: 0))
+        }
         onTextViewCreated(textView)
 
         return scrollView
     }
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
-        guard let textView = scrollView.documentView as? NSTextView else { return }
-        if textView.string != text {
-            let wasEmpty = textView.string.isEmpty
-            let sel = textView.selectedRanges
-            textView.string = text
+        // Always refresh the coordinator's parent so textDidChange / onSubmit see
+        // the latest bindings and closures from this render, not makeCoordinator's.
+        context.coordinator.parent = self
 
-            if wasEmpty && !text.isEmpty {
-                // Initial text being set; position cursor at the end
-                textView.setSelectedRange(NSRange(location: text.utf16.count, length: 0))
+        guard let textView = scrollView.documentView as? NSTextView else { return }
+
+        if textView.string != text {
+            let isFirstResponder = textView.window?.firstResponder === textView
+            if isFirstResponder {
+                // Live editing: trust the text view. A stale binding (e.g. from an
+                // @ObservedObject re-render of the popover mid-keystroke) must not
+                // overwrite the user's characters or caret. textDidChange keeps the
+                // binding in sync from the view side.
+                //
+                // Exception: the binding is a strict extension of the current string
+                // (typeahead buffer applied via @State before insertText ran) — pull
+                // the missing suffix in so nothing is lost either direction.
+                if text.hasPrefix(textView.string) && text.count > textView.string.count {
+                    let addition = String(text.dropFirst(textView.string.count))
+                    textView.insertText(
+                        addition,
+                        replacementRange: NSRange(location: NSNotFound, length: 0)
+                    )
+                }
+            } else if text.isEmpty && !textView.string.isEmpty {
+                // Binding has not yet caught up to content seeded on the text view
+                // (or inserted during the dead window). Do not clobber.
             } else {
-                textView.selectedRanges = sel
+                let wasEmpty = textView.string.isEmpty
+                let sel = textView.selectedRanges
+                textView.string = text
+
+                if wasEmpty && !text.isEmpty {
+                    // Initial seed: caret at end so continued typing appends.
+                    textView.setSelectedRange(NSRange(location: (text as NSString).length, length: 0))
+                } else {
+                    textView.selectedRanges = sel
+                }
             }
+        }
+
+        // Re-assert focus every update while the layer still needs it. AppKit's
+        // popover key-window transition can discard an earlier claim; one-shot
+        // timing is not enough under load.
+        if wantsFocus {
+            onClaimFocus()
         }
     }
 
