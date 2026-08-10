@@ -731,6 +731,22 @@ struct ServerState {
     /// no-auto-redelivery behavior. See [`ProbeRecord`].
     #[builder(default)]
     probe_lifecycle: StdMutex<HashMap<String, ProbeRecord>>,
+    /// `probe_id` → `run_id` for a probe queued through the human/coordinator
+    /// `ProbeRun` RPC, whose acceptance is the documented ack gesture for a
+    /// worker-declared effort-escalation/blocker signal. Resolving the
+    /// run's open `worker_signal` attention items at *accept* time — rather
+    /// than at actual delivery — created an asymmetry worse than either half
+    /// alone: the auto-nudge suppression lifted because the attention read
+    /// resolved, while the acknowledgement text itself could still be
+    /// abandoned/orphaned and never reach the worker. An entry here is
+    /// resolved (and removed) the moment that probe's lifecycle first
+    /// reaches [`ProbeDeliveryState::is_delivered`] in
+    /// [`ServerState::set_probe_lifecycle_detail`] — the single choke point
+    /// every settlement path already writes through — so a probe that never
+    /// gets delivered leaves the attention exactly as open as the signal it
+    /// answers.
+    #[builder(default)]
+    probe_worker_signal_resolution: StdMutex<HashMap<String, String>>,
     /// One-shot waiters for the next `UserPromptSubmit` hook on a
     /// run, keyed by `run_id`. Each run can have *multiple* waiters
     /// registered concurrently (an urgent probe and a chore-update

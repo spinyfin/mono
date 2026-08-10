@@ -293,7 +293,6 @@ pub(super) async fn handle_get_run(ctx: Dispatch, req: FrontendRequest) {
 pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
-        work_db,
         sink,
         request_id,
         peer_pid,
@@ -382,28 +381,18 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
         );
         // A human/coordinator probe on this run IS the documented ack
         // gesture for a worker-declared escalation/blocker (e.g.
-        // `bossctl probe <agent> "[effort-escalation-ack] …"`) — resolve any
-        // open worker-signal attention items so the completion handler's
-        // suppressed "produce a PR" auto-nudge resumes on the run's next
-        // Stop. Best-effort: a DB failure here must never block the probe
-        // itself.
-        match work_db.resolve_worker_signal_attentions_for_execution(&run_id) {
-            Ok(0) => {}
-            Ok(resolved) => {
-                tracing::info!(
-                    run_id = %run_id,
-                    resolved,
-                    "probe_run: resolved unresolved worker-escalation/blocker attention item(s)",
-                );
-            }
-            Err(err) => {
-                tracing::warn!(
-                    run_id = %run_id,
-                    ?err,
-                    "probe_run: failed to resolve worker-escalation attention items",
-                );
-            }
-        }
+        // `bossctl probe <agent> "[effort-escalation-ack] …"`) — but
+        // acceptance is not delivery. Resolving the open worker-signal
+        // attention items here, at accept time, would lift the completion
+        // handler's "produce a PR" auto-nudge suppression even when this
+        // probe subsequently settles `Abandoned`/`Orphaned` and the
+        // acknowledgement text never reaches the worker — the exact
+        // asymmetry [`crate::app::probes::PROBE_UNDELIVERED_ATTENTION_KIND`]
+        // exists to stop repeating. Tag the probe instead: the resolution
+        // fires from [`ServerState::set_probe_lifecycle_detail`] the moment
+        // this probe's own delivery state actually confirms the worker got
+        // it, and never fires at all if it doesn't.
+        server_state.mark_probe_for_worker_signal_resolution(&probe_id, &run_id);
         // Deliver the probe right now if the worker's pane will take a
         // write — parked (no boundary is coming on its own) or mid-turn on
         // a driver that buffers pane input (the composer takes it while the

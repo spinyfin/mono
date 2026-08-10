@@ -37,6 +37,18 @@ use crate::work::CreateAttentionItemInput;
 /// Registered in [`crate::attention_lifecycle::ATTENTION_LIFECYCLES`] as
 /// [`crate::attention_lifecycle::ClearedBy::HumanDecision`] — see there for
 /// why no automatic evidence lowers it.
+///
+/// **Deliberately one row per abandoned probe, not deduped onto a single
+/// open row per `(execution, kind)`** the way `work/attention_filing.rs`'s
+/// module doc otherwise documents as the filing contract (see
+/// `reraise_open_execution_attention`). Each lost probe is a distinct
+/// instruction a coordinator issued and must individually decide what to do
+/// about — a run that lost three different probes needs three answers, and
+/// collapsing them onto one row would silently drop the second and third
+/// probe ids from view the moment the first row existed. If this ever proves
+/// noisy in practice (the same run repeatedly losing probes), the dedup
+/// should key on the *probe*, not the execution: fold a probe's own retries
+/// onto its own row, never a sibling probe's.
 pub const PROBE_UNDELIVERED_ATTENTION_KIND: &str = "probe_undelivered";
 
 /// Adapter so the completion handler can queue probes onto
@@ -537,7 +549,13 @@ impl ServerState {
             Some(ProbeDeliveryState::Consumed | ProbeDeliveryState::Buffered | ProbeDeliveryState::Unconfirmed) => {}
             // `Replied` already has the worker's answer; `Injected` means the
             // write is still in flight on another task and that task records
-            // its own outcome; anything else is already settled.
+            // its own outcome — via `record_pane_write_outcome`, which
+            // rechecks the run's slot mapping before it claims
+            // `Consumed`/`Buffered` and downgrades to `Orphaned` when this
+            // very teardown has already cleared it, so the in-flight
+            // reservation `take_in_flight_probe` just removed above is not
+            // the only thing standing between that write and a
+            // `Consumed`-forever record; anything else is already settled.
             _ => return None,
         }
         tracing::warn!(
@@ -753,6 +771,61 @@ impl ServerState {
                 state = state.as_str(),
                 "probe lifecycle transition for an id that was never queued; dropping",
             ),
+        }
+        drop(guard);
+        if state.is_delivered() {
+            self.resolve_worker_signal_attentions_if_pending(probe_id);
+        }
+    }
+
+    /// Tag `probe_id` (targeting `run_id`) so that once its lifecycle first
+    /// reaches [`ProbeDeliveryState::is_delivered`], the run's open
+    /// `worker_signal` attention items are resolved.
+    ///
+    /// Called from `handle_probe_run` for every human/coordinator-issued
+    /// probe: acceptance alone is not the ack gesture, delivery is — see the
+    /// field doc on [`ServerState::probe_worker_signal_resolution`] for the
+    /// asymmetry this closes.
+    pub(super) fn mark_probe_for_worker_signal_resolution(&self, probe_id: &str, run_id: &str) {
+        self.probe_worker_signal_resolution
+            .lock()
+            .expect("probe_worker_signal_resolution mutex poisoned")
+            .insert(probe_id.to_owned(), run_id.to_owned());
+    }
+
+    /// Resolve the run's open `worker_signal` attention items if `probe_id`
+    /// was tagged by [`Self::mark_probe_for_worker_signal_resolution`] and
+    /// has not already resolved them. Idempotent: the tag is removed on the
+    /// first delivered transition, so a later `Replied` (or a duplicate
+    /// `Consumed`/`Buffered` write) is a no-op here.
+    fn resolve_worker_signal_attentions_if_pending(&self, probe_id: &str) {
+        let run_id = self
+            .probe_worker_signal_resolution
+            .lock()
+            .expect("probe_worker_signal_resolution mutex poisoned")
+            .remove(probe_id);
+        let Some(run_id) = run_id else {
+            return;
+        };
+        match self.work_db.resolve_worker_signal_attentions_for_execution(&run_id) {
+            Ok(0) => {}
+            Ok(resolved) => {
+                tracing::info!(
+                    run_id,
+                    probe_id,
+                    resolved,
+                    "probe delivered: resolved unresolved worker-escalation/blocker attention \
+                     item(s) now that the acknowledgement actually reached the worker",
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    run_id,
+                    probe_id,
+                    ?err,
+                    "probe delivered: failed to resolve worker-escalation attention items",
+                );
+            }
         }
     }
 

@@ -863,6 +863,17 @@ async fn a_write_into_a_pane_whose_process_is_gone_is_not_recorded_as_consumed()
         .update_shell_pid(&run_id, a_definitely_dead_pid())
         .expect("fixture precondition: the run must have a live-state entry");
 
+    let watch_session_id = "session-dead-pid-watch".to_owned();
+    let watch_sink = make_session_sink();
+    server_state
+        .topic_broker
+        .register_session(&watch_session_id, watch_sink.clone())
+        .await;
+    server_state
+        .topic_broker
+        .subscribe(&watch_session_id, &[probe_topic(&run_id)])
+        .await;
+
     let responder = app_session_capturing_one_send(&server_state).await;
     let probe_id = server_state.queue_probe(run_id.clone(), "anyone home?".into(), false);
     let outcome = dispatch_probe_on_stop(&server_state, &stop_event(&run_id)).await;
@@ -883,6 +894,39 @@ async fn a_write_into_a_pane_whose_process_is_gone_is_not_recorded_as_consumed()
     assert!(
         !state.is_delivered(),
         "`delivered` is what a caller trusts; an orphaned write delivered nothing",
+    );
+
+    // The engine must not just record this correctly and tell nobody — the
+    // same defect `surface_undelivered_probe` exists to close for the
+    // teardown-orphan path must not survive on the oldest orphan path.
+    let pushed = tokio::time::timeout(Duration::from_secs(2), watch_sink.next())
+        .await
+        .expect("a dead-pid orphan must be pushed, not left for a probe-status query")
+        .expect("the probe topic must carry the push");
+    match pushed.payload {
+        FrontendEvent::ProbeDeliveryEscalated {
+            probe_id: escalated,
+            reason,
+            ..
+        } => {
+            assert_eq!(escalated, probe_id);
+            assert!(
+                reason.contains("orphaned"),
+                "the push must name the terminal state: {reason}",
+            );
+        }
+        other => panic!("expected ProbeDeliveryEscalated on the probe topic, got {other:?}"),
+    }
+    let items = server_state
+        .work_db
+        .list_attention_items(&run_id)
+        .expect("the execution's attention items must be readable");
+    assert!(
+        items
+            .iter()
+            .any(|item| item.kind == crate::app::probes::PROBE_UNDELIVERED_ATTENTION_KIND
+                && item.body_markdown.contains(&probe_id)),
+        "a dead-pid orphan must also be filed as an attention item, not only pushed on the topic",
     );
 }
 
@@ -1126,12 +1170,19 @@ async fn a_folded_codex_turn_completes_the_probe_cycle_on_its_single_boundary() 
     );
 }
 
-/// The queue is non-empty at the pre-pop peek but empty at the pop: another
-/// dispatch path already holds the run's single delivery slot. Simulated
-/// deterministically by claiming that slot directly before driving the Stop
+/// Another dispatch path already holds the run's single delivery slot when
+/// `dispatch_probe_on_stop` runs — the routine shape of the pre/post-completion
+/// pass pairing in `dispatch_worker_event_fanout`, where the pre-completion
+/// pass claims the probe and the post-completion pass then finds the queue
+/// still non-empty (a completion-queued nudge sitting behind it). This must
+/// be named `AlreadyInFlight`, not `RacedToEmpty`: the latter is an
+/// anomaly-shaped outcome reserved for the peek-then-claim window actually
+/// racing out from under this call, which the `has_in_flight_probe` guard
+/// added ahead of the peek now catches before it gets that far. Simulated
+/// deterministically by claiming the slot directly before driving the Stop
 /// path, rather than relying on real concurrency.
 #[tokio::test]
-async fn stop_drain_names_raced_to_empty_when_another_path_holds_the_slot() {
+async fn stop_drain_reports_already_in_flight_when_another_path_holds_the_slot() {
     let (server_state, _dir) = test_server_state();
     let run_id = register_working_worker_with_driver(&server_state, 5, None);
     server_state.live_worker_states.apply_event(
@@ -1153,11 +1204,11 @@ async fn stop_drain_names_raced_to_empty_when_another_path_holds_the_slot() {
     assert_eq!(claimed.probe_id, first);
 
     let outcome = dispatch_probe_on_stop(&server_state, &stop_event(&run_id)).await;
-    assert_eq!(outcome, ProbeDispatchOutcome::RacedToEmpty);
+    assert_eq!(outcome, ProbeDispatchOutcome::AlreadyInFlight);
     assert_eq!(
         server_state.probe_lifecycle_state(&second),
         Some(ProbeDeliveryState::Queued),
-        "the probe that lost the race stays queued rather than being lost",
+        "the probe deferred behind the in-flight slot stays queued rather than being lost",
     );
 }
 
