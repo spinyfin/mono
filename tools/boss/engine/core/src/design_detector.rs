@@ -357,10 +357,10 @@ pub(crate) fn task_uses_per_task_doc(kind: &TaskKind, has_project: bool) -> bool
 }
 
 /// Per-task analogue of [`on_design_pr_detected`] for project-less
-/// docs-backed items (investigations). Fired on the `in_review`
-/// transition. Scans the PR's changed files for a single
-/// `docs/designs/*.md`, `docs/design-docs/*.md`, or
-/// `docs/investigations/*.md` and populates the task's own `doc_*`
+/// docs-backed items (investigations and postmortems). Fired on the
+/// `in_review` transition. Scans the PR's changed files for a single
+/// `docs/designs/*.md`, `docs/design-docs/*.md`, `docs/investigations/*.md`,
+/// or `docs/postmortems/*.md` and populates the task's own `doc_*`
 /// columns (or, when already set, updates `doc_branch` to the PR
 /// **head** branch so the in-app viewer can fetch the doc while the PR
 /// is open).
@@ -378,9 +378,9 @@ pub async fn on_task_doc_pr_detected(work_db: &WorkDb, task_id: &str, product_id
             work_db,
             task_id,
             "\n[doc-detector] no doc pointer auto-populated for this PR — zero or ambiguous \
-             docs/designs/*.md, docs/design-docs/*.md, or docs/investigations/*.md matches among \
-             the changed files. Add/rename the doc file and re-push, or set the pointer manually \
-             with `boss task set-doc`.",
+             docs/designs/*.md, docs/design-docs/*.md, docs/investigations/*.md, or \
+             docs/postmortems/*.md matches among the changed files. Add/rename the doc file and \
+             re-push, or set the pointer manually with `boss task set-doc`.",
         ) {
             tracing::warn!(
                 task_id,
@@ -590,15 +590,15 @@ pub(crate) async fn scan_pr(task_id: &str, pr_url: &str) -> Option<PrScanResult>
 }
 
 /// Like [`scan_pr`] but selects the doc among the PR's changed files with
-/// the project-less matcher (`docs/designs/*.md` OR
-/// `docs/investigations/*.md`). Used by the per-task detector that serves
-/// investigations and project-less design tasks.
+/// the project-less matcher (`docs/designs/*.md`, `docs/investigations/*.md`,
+/// OR `docs/postmortems/*.md`). Used by the per-task detector that serves
+/// investigations, postmortems, and project-less design tasks.
 pub(crate) async fn scan_pr_for_task_doc(task_id: &str, pr_url: &str) -> Option<PrScanResult> {
     match fetch_pr_view_json(pr_url).await {
         Ok(root) => Some(parse_pr_scan_matching(
             &root,
             is_project_less_doc_path,
-            "docs/designs/*.md, docs/design-docs/*.md, or docs/investigations/*.md",
+            "docs/designs/*.md, docs/design-docs/*.md, docs/investigations/*.md, or docs/postmortems/*.md",
         )),
         Err(err) => {
             tracing::warn!(task_id, pr_url, ?err, "doc detector: failed to scan PR files");
@@ -780,12 +780,19 @@ fn is_investigation_doc_path(path: &str) -> bool {
     is_doc_path_under(path, "investigations")
 }
 
+/// Direct-child markdown under any `docs/postmortems/` directory — where a
+/// postmortem's deliverable doc lives (e.g. `docs/postmortems/foo.md`,
+/// `tools/boss/docs/postmortems/incident-004-....md`).
+fn is_postmortem_doc_path(path: &str) -> bool {
+    is_doc_path_under(path, "postmortems")
+}
+
 /// Matches a **project-less** docs-backed item's deliverable: a single
-/// `docs/designs/*.md` OR `docs/investigations/*.md`. Used by the
-/// per-task detector, which serves both project-less design tasks and
-/// investigations.
+/// `docs/designs/*.md`, `docs/investigations/*.md`, or
+/// `docs/postmortems/*.md`. Used by the per-task detector, which serves
+/// project-less design tasks, investigations, and postmortems.
 fn is_project_less_doc_path(path: &str) -> bool {
-    is_design_doc_path(path) || is_investigation_doc_path(path)
+    is_design_doc_path(path) || is_investigation_doc_path(path) || is_postmortem_doc_path(path)
 }
 
 #[cfg(test)]
@@ -809,8 +816,8 @@ mod tests {
         assert!(is_design_doc_path("docs/designs/top-level.md"));
     }
 
-    /// T285/P284 regression: flunge's repo convention is `docs/design-docs/`,
-    /// not `docs/designs/`. Both directory names must resolve to the same
+    /// Regression: flunge's repo convention is `docs/design-docs/`, not
+    /// `docs/designs/`. Both directory names must resolve to the same
     /// logical design-doc location.
     #[test]
     fn design_doc_path_matches_design_docs_convention() {
@@ -1083,8 +1090,50 @@ mod tests {
         assert!(is_project_less_doc_path("tools/boss/docs/designs/foo.md"));
         assert!(is_project_less_doc_path("docs/design-docs/foo.md"));
         assert!(is_project_less_doc_path("docs/investigations/foo.md"));
+        assert!(is_project_less_doc_path("docs/postmortems/foo.md"));
         assert!(!is_project_less_doc_path("README.md"));
         assert!(!is_project_less_doc_path("docs/other/foo.md"));
+    }
+
+    /// Regression: `tools/boss/docs/postmortems/` is an established
+    /// convention (README.md plus three prior incidents on `main`) that the
+    /// detector never recognised. Confirms the nested doc-root case (not
+    /// only a repo-root `docs/postmortems/`) works the same way the other
+    /// two directories already do.
+    #[test]
+    fn postmortem_doc_path_matches_direct_child_including_nested_root() {
+        assert!(is_postmortem_doc_path(
+            "tools/boss/docs/postmortems/incident-004-live-revision-workers-reaped-mid-turn.md"
+        ));
+        assert!(is_postmortem_doc_path("docs/postmortems/top-level.md"));
+        assert!(is_postmortem_doc_path("docs/postmortems/x.markdown"));
+        assert!(!is_postmortem_doc_path("tools/boss/docs/postmortems/sub/doc.md"));
+        assert!(!is_postmortem_doc_path("tools/boss/docs/postmortems/doc.txt"));
+        assert!(!is_postmortem_doc_path("tools/boss/docs/other/doc.md"));
+        // A postmortem doc must not be picked up by the design/investigation
+        // matchers — each directory stays its own logical location.
+        assert!(!is_design_doc_path("tools/boss/docs/postmortems/foo.md"));
+        assert!(!is_investigation_doc_path("tools/boss/docs/postmortems/foo.md"));
+    }
+
+    /// A PR whose only doc-shaped file is a postmortem must resolve
+    /// unambiguously through the per-task scanner (the real PR #2684 shape:
+    /// code files plus one direct-child `docs/postmortems/*.md`).
+    #[test]
+    fn parse_pr_scan_matching_selects_single_postmortem_doc() {
+        let root = serde_json::json!({
+            "files": files_json(&[
+                "tools/boss/engine/core/src/runner.rs",
+                "tools/boss/docs/postmortems/incident-004-live-revision-workers-reaped-mid-turn.md",
+            ]),
+            "headRefName": "boss/exec_postmortem_1",
+            "baseRefName": "main",
+        });
+        let scan = parse_pr_scan_matching(&root, is_project_less_doc_path, "label");
+        assert_eq!(
+            scan.doc_path.as_deref(),
+            Some("tools/boss/docs/postmortems/incident-004-live-revision-workers-reaped-mid-turn.md")
+        );
     }
 
     /// If a repo happens to have matching files under both `docs/designs/`

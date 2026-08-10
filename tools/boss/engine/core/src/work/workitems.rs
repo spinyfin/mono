@@ -916,17 +916,8 @@ impl WorkDb {
         let mut resolved = 0usize;
         let mut doc_pointer_queries = 0u64;
         for task in &mut tasks {
-            if !crate::design_detector::task_uses_per_task_doc(&task.kind, task.project_id.is_none()) {
-                continue;
-            }
-            resolved += 1;
-            match resolve_task_doc_pointer(&conn, &task.id, |_| None, &mut doc_pointer_queries) {
-                Ok(state) => task.doc_link_state = state,
-                Err(err) => tracing::warn!(
-                    task_id = %task.id,
-                    ?err,
-                    "get_work_tree: failed to resolve task doc-link state; leaving affordance hidden"
-                ),
+            if attach_task_doc_link_state(&conn, task, "get_work_tree", &mut doc_pointer_queries) {
+                resolved += 1;
             }
         }
         trace.record_nplus1(segment::DB_DOC_POINTERS, elapsed_ms(t), resolved, doc_pointer_queries);
@@ -983,10 +974,18 @@ impl WorkDb {
             ItemKind::Project => query_project(&conn, id)?
                 .map(WorkItem::Project)
                 .with_context(|| format!("unknown project: {id}")),
-            ItemKind::Task => query_task(&conn, id)?
-                .filter(|task| task.deleted_at.is_none())
-                .map(task_to_item)
-                .with_context(|| format!("unknown task: {id}")),
+            ItemKind::Task => {
+                let mut task = query_task(&conn, id)?
+                    .filter(|task| task.deleted_at.is_none())
+                    .with_context(|| format!("unknown task: {id}"))?;
+                // Surface the per-task doc pointer on the single-item read
+                // path, mirroring get_work_tree's attach step — the
+                // project-less docs-backed kinds (investigation, project-less
+                // design) are the only ones that carry `tasks.doc_*` at all.
+                let mut doc_pointer_queries = 0u64;
+                attach_task_doc_link_state(&conn, &mut task, "get_work_item", &mut doc_pointer_queries);
+                Ok(task_to_item(task))
+            }
             // Answer-agent executions bind a comment id, but comments are not
             // a `WorkItem` wire variant. Use [`Self::get_comment`] for the row
             // and [`Self::is_bound_work_item_closed`] for recon closedness.
@@ -1107,7 +1106,7 @@ impl WorkDb {
     /// both tables for a given product.
     pub fn get_work_item_by_short_id(&self, product_id: &str, short_id: i64) -> Result<Option<WorkItem>> {
         let conn = self.connect()?;
-        if let Some(task) = conn
+        if let Some(mut task) = conn
             .query_row(
                 "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, parent_task_id, origin_task_short_id, origin_pr_number, completed_at, archived_reason, dispatch_failed_reason, dispatch_failed_error, dispatch_failed_at, blocked_detail, deferred, tags, human_driven, completion_summary, effort_matched_rule, effort_reasons
                  FROM tasks
@@ -1117,6 +1116,15 @@ impl WorkDb {
             )
             .optional()?
         {
+            // Same doc-link resolution as get_work_item — this is the other
+            // single-item read path (`boss task show <short-id>`).
+            let mut doc_pointer_queries = 0u64;
+            attach_task_doc_link_state(
+                &conn,
+                &mut task,
+                "get_work_item_by_short_id",
+                &mut doc_pointer_queries,
+            );
             return Ok(Some(task_to_item(task)));
         }
         if let Some(project) = conn

@@ -586,10 +586,9 @@ impl WorkDb {
     /// validation / canonicalisation / column writes the detector
     /// uses); `unset = true` clears all three columns.
     ///
-    /// Returns the updated `Task` so callers can refresh without a
-    /// second round-trip. Does not attach `doc_link_state` (that is a
-    /// `get_work_tree` projection); CLI / tests re-resolve via the
-    /// work tree when they need the affordance state.
+    /// Returns the updated `Task`, with `doc_link_state` resolved from the
+    /// just-written `doc_*` columns for the kinds that carry a per-task
+    /// pointer, so the caller can observe the write without a second read.
     pub fn set_task_doc(&self, input: SetTaskDocPointerInput) -> Result<Task> {
         let conn = self.connect()?;
         let _ = query_task(&conn, &input.task_id).require("task", &input.task_id)?;
@@ -623,7 +622,14 @@ impl WorkDb {
         }
 
         let conn = self.connect()?;
-        query_task(&conn, &input.task_id).require("task", &input.task_id)
+        let mut task = query_task(&conn, &input.task_id).require("task", &input.task_id)?;
+        // Surface the just-written pointer immediately — without this,
+        // `set-doc` echoes only the raw Task columns (none of which carry
+        // doc_path) and the caller has no way to see the write took effect
+        // until a separate `task show`.
+        let mut doc_pointer_queries = 0u64;
+        attach_task_doc_link_state(&conn, &mut task, "set_task_doc", &mut doc_pointer_queries);
+        Ok(task)
     }
 
     /// Read a task's stored `doc_path` (the load-bearing pointer field).
@@ -817,6 +823,31 @@ impl WorkDb {
         })?;
         collect_rows(rows)
     }
+}
+
+/// Resolve and attach [`Task::doc_link_state`] for a single task when it is a
+/// per-task-doc kind (`task_uses_per_task_doc`). Shared by the work-tree loop,
+/// single-item read paths, and `set_task_doc`'s return so a change to the
+/// resolution contract only needs to land once.
+///
+/// Returns `true` when the kind gate passed and resolution was attempted
+/// (so `get_work_tree` can keep its N+1 `resolved` count accurate). Errors
+/// are non-fatal: log with `caller` as the message prefix and leave the
+/// field `None` (affordance hidden). The workspace lookup is always `|_| None`:
+/// cube is not consulted on these paths.
+pub(crate) fn attach_task_doc_link_state(conn: &Connection, task: &mut Task, caller: &str, queries: &mut u64) -> bool {
+    if !crate::design_detector::task_uses_per_task_doc(&task.kind, task.project_id.is_none()) {
+        return false;
+    }
+    match resolve_task_doc_pointer(conn, &task.id, |_| None, queries) {
+        Ok(state) => task.doc_link_state = state,
+        Err(err) => tracing::warn!(
+            task_id = %task.id,
+            ?err,
+            "{caller}: failed to resolve task doc-link state; leaving affordance hidden"
+        ),
+    }
+    true
 }
 
 /// Resolve a task's per-task doc pointer (`doc_*` columns) into a

@@ -517,7 +517,11 @@ pub(crate) use migrations_a::*;
 pub(crate) use migrations_b::*;
 pub(crate) use migrations_boothby::*;
 pub(crate) use migrations_c::*;
-pub(crate) use products_design::{parse_pr_doc_artifact_id, resolve_task_doc_pointer};
+pub(crate) use products_design::{attach_task_doc_link_state, parse_pr_doc_artifact_id};
+// Only the unit-test suite (and the resolver itself) call this directly;
+// production attach sites go through `attach_task_doc_link_state`.
+#[cfg(test)]
+pub(crate) use products_design::resolve_task_doc_pointer;
 pub(crate) use proposal_apply::*;
 pub(crate) use query_ensure::*;
 pub(crate) use review_verdicts::query_latest_informative_review_verdicts;

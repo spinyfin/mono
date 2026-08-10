@@ -396,10 +396,14 @@ fn set_task_doc_pointer_branch_only_keeps_path() {
     }
 }
 
-/// Operator CLI path (`boss task set-doc`): set via `set_task_doc`,
-/// assert `get_work_tree` surfaces a resolved `doc_link_state`, then
-/// `--unset` clears the affordance. Round-trips the same write path
-/// the detector uses (`set_task_doc_pointer`) under a structured input.
+/// Operator CLI path (`boss task set-doc`): set via `set_task_doc`, assert
+/// every read path that returns a `Task` surfaces a resolved
+/// `doc_link_state` (`set_task_doc` itself, `get_work_item`,
+/// `get_work_item_by_short_id`, `get_work_tree`), then `--unset` clears the
+/// affordance on all of them. Also pins that non-per-task-doc kinds keep
+/// `doc_link_state == None` so the `task_uses_per_task_doc` gate is not
+/// silently dropped. Round-trips the same write path the detector uses
+/// (`set_task_doc_pointer`) under a structured input.
 #[test]
 fn set_task_doc_round_trip_exposes_doc_link_in_work_tree() {
     let db = WorkDb::open(temp_db_path("task-doc-cli-roundtrip")).unwrap();
@@ -419,6 +423,42 @@ fn set_task_doc_round_trip_exposes_doc_link_in_work_tree() {
         db.task_doc_path(&task.id).unwrap().as_deref(),
         Some("docs/investigations/manual.md"),
     );
+    // (a) set_task_doc's own return attaches the just-written pointer.
+    assert_doc_link_resolved(
+        updated.doc_link_state.as_ref(),
+        "docs/investigations/manual.md",
+        "boss/exec_manual_1",
+        "set_task_doc return",
+    );
+
+    // (b) get_work_item (canonical-id / `boss task show <id>` path).
+    let by_id = match db.get_work_item(&task.id).unwrap() {
+        WorkItem::Task(t) => t,
+        other => panic!("expected WorkItem::Task, got {other:?}"),
+    };
+    assert_doc_link_resolved(
+        by_id.doc_link_state.as_ref(),
+        "docs/investigations/manual.md",
+        "boss/exec_manual_1",
+        "get_work_item",
+    );
+
+    // (c) get_work_item_by_short_id (`boss task show <short-id>` path).
+    let short_id = task.short_id.expect("seeded investigation must have a short_id");
+    let by_short = match db
+        .get_work_item_by_short_id(&product.id, short_id)
+        .unwrap()
+        .expect("short_id must resolve")
+    {
+        WorkItem::Task(t) => t,
+        other => panic!("expected WorkItem::Task, got {other:?}"),
+    };
+    assert_doc_link_resolved(
+        by_short.doc_link_state.as_ref(),
+        "docs/investigations/manual.md",
+        "boss/exec_manual_1",
+        "get_work_item_by_short_id",
+    );
 
     let tree = db.get_work_tree(&product.id).unwrap();
     let found = tree
@@ -426,17 +466,12 @@ fn set_task_doc_round_trip_exposes_doc_link_in_work_tree() {
         .iter()
         .find(|t| t.id == task.id)
         .expect("investigation must appear in work tree");
-    match found
-        .doc_link_state
-        .as_ref()
-        .expect("set_task_doc must surface resolved doc_link_state via get_work_tree")
-    {
-        ProjectDesignDocState::Resolved { resolved, .. } => {
-            assert_eq!(resolved.path, "docs/investigations/manual.md");
-            assert_eq!(resolved.branch, "boss/exec_manual_1");
-        }
-        other => panic!("expected Resolved, got {other:?}"),
-    }
+    assert_doc_link_resolved(
+        found.doc_link_state.as_ref(),
+        "docs/investigations/manual.md",
+        "boss/exec_manual_1",
+        "get_work_tree",
+    );
 
     // Path validation matches project design docs (Q8).
     let err = db
@@ -450,7 +485,8 @@ fn set_task_doc_round_trip_exposes_doc_link_in_work_tree() {
         .to_string();
     assert!(err.contains("repo-relative"), "got: {err}");
 
-    // --unset clears all three columns and hides the affordance.
+    // --unset clears all three columns and hides the affordance on every
+    // read path (d).
     let cleared = db
         .set_task_doc(SetTaskDocPointerInput {
             task_id: task.id.clone(),
@@ -459,7 +495,33 @@ fn set_task_doc_round_trip_exposes_doc_link_in_work_tree() {
         })
         .unwrap();
     assert_eq!(cleared.id, task.id);
+    assert!(
+        cleared.doc_link_state.is_none(),
+        "set_task_doc --unset return must clear doc_link_state",
+    );
     assert!(db.task_doc_path(&task.id).unwrap().is_none());
+
+    let cleared_by_id = match db.get_work_item(&task.id).unwrap() {
+        WorkItem::Task(t) => t,
+        other => panic!("expected WorkItem::Task, got {other:?}"),
+    };
+    assert!(
+        cleared_by_id.doc_link_state.is_none(),
+        "get_work_item after unset must hide doc_link_state",
+    );
+    let cleared_by_short = match db
+        .get_work_item_by_short_id(&product.id, short_id)
+        .unwrap()
+        .expect("short_id must still resolve")
+    {
+        WorkItem::Task(t) => t,
+        other => panic!("expected WorkItem::Task, got {other:?}"),
+    };
+    assert!(
+        cleared_by_short.doc_link_state.is_none(),
+        "get_work_item_by_short_id after unset must hide doc_link_state",
+    );
+
     let tree_cleared = db.get_work_tree(&product.id).unwrap();
     let found_cleared = tree_cleared
         .tasks
@@ -470,6 +532,57 @@ fn set_task_doc_round_trip_exposes_doc_link_in_work_tree() {
         found_cleared.doc_link_state.is_none(),
         "unset must hide the doc-link affordance",
     );
+
+    // Gate pin: non-per-task-doc kinds must not get a doc_link_state even
+    // when read through the same attach helper.
+    let chore = db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Ordinary chore")
+                .build(),
+        )
+        .unwrap();
+    let chore_item = match db.get_work_item(&chore.id).unwrap() {
+        WorkItem::Chore(t) | WorkItem::Task(t) => t,
+        other => panic!("expected chore WorkItem, got {other:?}"),
+    };
+    assert!(
+        chore_item.doc_link_state.is_none(),
+        "chore must not receive doc_link_state (task_uses_per_task_doc gate)",
+    );
+
+    let (_prod2, project) = seed_project_for_design_doc(&db);
+    // create_project with no_design_task=false seeds a Design task under the
+    // project — that kind has a project, so it must keep using the
+    // project-level design_doc pointer, not Task.doc_link_state.
+    let tree_with_project = db.get_work_tree(&project.product_id).unwrap();
+    let design_with_project = tree_with_project
+        .tasks
+        .iter()
+        .find(|t| t.kind == TaskKind::Design && t.project_id.as_deref() == Some(project.id.as_str()))
+        .expect("project-seeded design task");
+    let design_item = match db.get_work_item(&design_with_project.id).unwrap() {
+        WorkItem::Task(t) => t,
+        other => panic!("expected WorkItem::Task for design, got {other:?}"),
+    };
+    assert!(
+        design_item.doc_link_state.is_none(),
+        "design task WITH a project must not receive per-task doc_link_state",
+    );
+}
+
+fn assert_doc_link_resolved(state: Option<&ProjectDesignDocState>, path: &str, branch: &str, where_: &str) {
+    let Some(state) = state else {
+        panic!("{where_} must surface resolved doc_link_state");
+    };
+    match state {
+        ProjectDesignDocState::Resolved { resolved, .. } => {
+            assert_eq!(resolved.path, path, "{where_} path");
+            assert_eq!(resolved.branch, branch, "{where_} branch");
+        }
+        other => panic!("{where_}: expected Resolved, got {other:?}"),
+    }
 }
 
 #[test]
