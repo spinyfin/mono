@@ -85,6 +85,124 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertEqual(layer.pendingQuotedText, "")
     }
 
+    // MARK: - Popover show-animation dead window (keystroke buffer + focus)
+
+    /// While the popover is showing but the text view is not yet first responder,
+    /// typeable keystrokes must be consumed into the pending typeahead buffer —
+    /// not dropped on the read-only document view. This is the chars-2..N half of
+    /// the select-text-then-type race.
+    func testKeystrokesBufferedWhilePopoverShowingWithoutTextViewFocus() {
+        let layer = CommentLayer()
+        let host = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 200),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        layer.setHostWindow(host)
+        layer.isShowingPopover = true
+        layer.needsCommentTextFocus = true
+        layer.pendingTypeahead = "h"
+
+        XCTAssertTrue(
+            layer.shouldConsumeKeyEvent(chars: "e", mods: [], window: host),
+            "second keystroke during dead window must be consumed")
+        XCTAssertEqual(layer.pendingTypeahead, "he")
+
+        XCTAssertTrue(layer.shouldConsumeKeyEvent(chars: "l", mods: [], window: host))
+        XCTAssertTrue(layer.shouldConsumeKeyEvent(chars: "l", mods: [], window: host))
+        XCTAssertTrue(layer.shouldConsumeKeyEvent(chars: "o", mods: [], window: host))
+        XCTAssertEqual(layer.pendingTypeahead, "hello")
+
+        // Space is preserved during the dead window (multi-word comments).
+        XCTAssertTrue(layer.shouldConsumeKeyEvent(chars: " ", mods: [], window: host))
+        XCTAssertEqual(layer.pendingTypeahead, "hello ")
+    }
+
+    /// Once the comment text view is first responder, the monitor must stop
+    /// consuming so AppKit delivers keystrokes to the text view normally.
+    func testKeyMonitorStopsConsumingWhenTextViewIsFirstResponder() {
+        let layer = CommentLayer()
+        let host = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 200),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 100, height: 40))
+        host.contentView = textView
+        layer.setHostWindow(host)
+        layer.isShowingPopover = true
+        layer.setCommentTextView(textView)
+        // Put the text view in a window and make it first responder so the
+        // "already focused" branch of shouldConsumeKeyEvent fires.
+        XCTAssertTrue(host.makeFirstResponder(textView))
+        // claimCommentTextFocus should have cleared needs once first responder sticks.
+        layer.claimCommentTextFocus()
+        XCTAssertTrue(layer.isCommentTextViewFirstResponder)
+        XCTAssertFalse(layer.needsCommentTextFocus)
+
+        XCTAssertFalse(
+            layer.shouldConsumeKeyEvent(chars: "x", mods: [], window: host),
+            "monitor must not swallow keys once the form is first responder")
+        XCTAssertEqual(layer.pendingTypeahead, "", "focused path must not append typeahead")
+    }
+
+    /// Direct insert into a live text view (no pendingTypeahead) when keys arrive
+    /// after the view exists but before first responder sticks.
+    func testForwardedKeystrokesInsertIntoLiveTextView() {
+        let layer = CommentLayer()
+        let host = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 200),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 100, height: 40))
+        textView.string = "h"
+        textView.setSelectedRange(NSRange(location: 1, length: 0))
+        // A sibling view holds first responder so the text view exists but is
+        // not focused — the show-animation dead window.
+        let decoy = NSView(frame: .zero)
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 200))
+        container.addSubview(textView)
+        container.addSubview(decoy)
+        host.contentView = container
+        host.makeFirstResponder(decoy)
+        layer.setHostWindow(host)
+        layer.isShowingPopover = true
+        layer.needsCommentTextFocus = true
+        // Register the text view without letting claimCommentTextFocus steal
+        // first responder back (claim would make the dead-window case vanish).
+        layer.setCommentTextView(textView)
+        host.makeFirstResponder(decoy)
+        layer.needsCommentTextFocus = true
+        XCTAssertFalse(layer.isCommentTextViewFirstResponder)
+
+        // Bypass shouldConsumeKeyEvent's claim-on-forward so we only assert
+        // the insert path; call the buffer helper directly.
+        XCTAssertTrue(layer.forwardKeystrokeToPendingComment(chars: "i", mods: []))
+        XCTAssertEqual(textView.string, "hi")
+        XCTAssertEqual(layer.pendingTypeahead, "", "live insert must not double-buffer into typeahead")
+    }
+
+    /// Events from a foreign window must not be buffered into this layer's form.
+    func testKeystrokesFromOtherWindowNotBuffered() {
+        let layer = CommentLayer()
+        let host = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 100, height: 100),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        let other = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 100, height: 100),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        layer.setHostWindow(host)
+        layer.isShowingPopover = true
+        layer.pendingTypeahead = "a"
+
+        XCTAssertFalse(layer.shouldConsumeKeyEvent(chars: "b", mods: [], window: other))
+        XCTAssertEqual(layer.pendingTypeahead, "a")
+    }
+
+    func testForwardKeystrokeRejectsModifiedKeys() {
+        let layer = CommentLayer()
+        layer.isShowingPopover = true
+        XCTAssertFalse(
+            layer.forwardKeystrokeToPendingComment(chars: "a", mods: .command),
+            "⌘A must not be swallowed into the comment buffer")
+        XCTAssertEqual(layer.pendingTypeahead, "")
+    }
+
     // MARK: - Window-scoped event handling (cross-window event bleed regression)
 
     /// Regression test: a markdown viewer's `CommentLayer` must judge "is there
