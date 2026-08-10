@@ -854,17 +854,20 @@ impl ExecutionRunner for PaneSpawnRunner {
         // shell rebuilding PATH; BOSS_BIN_DIR's own prepend is a bare
         // directory and is a no-op in dev mode, where the user's `~/bin`
         // repobin shim was winning.
-        let pr_body_prefix = followup_pr_body_prefix_for_work_item(work_item, &execution.repo_remote_url)?;
+        // Compose the origin header engine-side. The PATH `cube` wrapper
+        // joins it with the worker's ordinary body and passes the full text
+        // through cube's existing `--body-file` path — cube gains no feature.
+        let pr_body_header = followup_pr_body_prefix_for_work_item(work_item, &execution.repo_remote_url)?;
         let worker_bin_dir = ensure_worker_bin_dir(&settings_dir, workspace_path);
-        if let Some(body_prefix) = pr_body_prefix {
+        if let Some(body_header) = pr_body_header {
             let dir = worker_bin_dir.as_ref().ok_or_else(|| {
                 anyhow!(
-                    "refusing to spawn a derived PR worker without installing its required cube body-prefix wrapper"
+                    "refusing to spawn a derived PR worker without installing its required cube body-compose wrapper"
                 )
             })?;
-            boss_engine_worker_bin::write_cube_pr_body_prefix_launcher(dir, &body_prefix).with_context(|| {
+            boss_engine_worker_bin::write_cube_pr_body_compose_launcher(dir, &body_header).with_context(|| {
                 format!(
-                    "installing the required cube body-prefix wrapper for execution {}",
+                    "installing the required cube body-compose wrapper for execution {}",
                     execution.id
                 )
             })?;

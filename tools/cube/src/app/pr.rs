@@ -10,7 +10,7 @@ use serde_json::json;
 use crate::cli::{PrCreateArgs, PrPushArgs, PrUpdateArgs};
 use crate::command_runner::{CommandRunner, RealCommandRunner};
 
-use crate::app::change::{resolve_body_file, write_temp_pr_body};
+use crate::app::change::resolve_body_file;
 use crate::app::checkleft_gate::run_checkleft_gate;
 use crate::app::errors::{CubeError, Result, RunResult};
 use crate::app::gh_pr;
@@ -201,8 +201,7 @@ fn list_open_pr(ctx: &PrContext, runner: &dyn CommandRunner) -> Result<Option<St
 }
 
 /// The PR body cube is about to submit, resolved once up front from
-/// whichever of `--body`/`--body-file` was supplied, with an optional
-/// caller-provided `--body-prefix` (or neither).
+/// whichever of `--body`/`--body-file` was supplied (or neither).
 ///
 /// Resolving this once — rather than letting [`gh_create_pr`] re-derive it
 /// from `args` — matters for two reasons: (1) `--body-file` pointing at
@@ -225,28 +224,6 @@ pub(super) struct ResolvedPrBody {
     tmp_path: Option<PathBuf>,
 }
 
-/// Combine opaque caller-supplied text with an optional PR body.
-///
-/// Cube deliberately does not inspect, parse, or validate the prefix. It
-/// treats the prefix and body as ordinary markdown text and joins supplied
-/// values with one blank line.
-pub(super) fn render_pr_body(body_prefix: Option<&str>, body: Option<&str>) -> Option<String> {
-    match (body_prefix, body) {
-        (Some(prefix), Some(body)) => Some(format!("{prefix}\n\n{body}")),
-        (Some(prefix), None) => Some(prefix.to_owned()),
-        (None, body) => body.map(str::to_owned),
-    }
-}
-
-fn materialize_pr_body(text: String) -> Result<ResolvedPrBody> {
-    let path = write_temp_pr_body(&text)?;
-    Ok(ResolvedPrBody {
-        text: Some(text),
-        file_path: Some(path.display().to_string()),
-        tmp_path: Some(path),
-    })
-}
-
 impl Drop for ResolvedPrBody {
     fn drop(&mut self) {
         if let Some(p) = &self.tmp_path {
@@ -260,28 +237,11 @@ pub(super) fn resolve_pr_body(args: &PrCreateArgs) -> Result<ResolvedPrBody> {
     if let Some(f) = &args.body_file {
         let (resolved, tmp) = resolve_body_file(f)?;
         let text = std::fs::read_to_string(&resolved).map_err(CubeError::Io)?;
-        if args.body_prefix.is_some() {
-            let rendered = render_pr_body(args.body_prefix.as_deref(), Some(&text))
-                .expect("a supplied body prefix always produces a PR body");
-            // `tmp` (if any) was the stdin/pipe-sourced temp file materialized
-            // by `resolve_body_file`; it is being superseded by the combined
-            // body's own temp file below, so remove it now rather than
-            // leaking it — `ResolvedPrBody::drop` only tracks the new path.
-            if let Some(p) = &tmp {
-                let _ = std::fs::remove_file(p);
-            }
-            return materialize_pr_body(rendered);
-        }
         return Ok(ResolvedPrBody {
             text: Some(text),
             file_path: Some(resolved),
             tmp_path: tmp,
         });
-    }
-    if args.body_prefix.is_some() {
-        let rendered = render_pr_body(args.body_prefix.as_deref(), args.body.as_deref())
-            .expect("a supplied body prefix always produces a PR body");
-        return materialize_pr_body(rendered);
     }
     Ok(ResolvedPrBody {
         text: args.body.clone(),

@@ -606,10 +606,6 @@ pub struct PrCreateArgs {
     /// passed shell-safely, so backticks and $(...) in the body are never evaluated.
     #[arg(long, conflicts_with = "body")]
     pub body_file: Option<String>,
-    /// Opaque text to prepend to the PR body. When a body is also supplied,
-    /// cube separates the prefix and body with a blank line.
-    #[arg(long)]
-    pub body_prefix: Option<String>,
     /// Open the PR as a draft.
     #[arg(long)]
     pub draft: bool,
@@ -1348,7 +1344,6 @@ mod tests {
                         title,
                         body,
                         body_file,
-                        body_prefix: _,
                         draft,
                     }),
             } => {
@@ -1374,7 +1369,6 @@ mod tests {
                         title,
                         body,
                         body_file,
-                        body_prefix: _,
                         draft,
                     }),
             } => {
@@ -1410,7 +1404,6 @@ mod tests {
                         title,
                         body,
                         body_file,
-                        body_prefix: _,
                         draft,
                     }),
             } => {

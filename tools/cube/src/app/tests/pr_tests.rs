@@ -1068,20 +1068,19 @@ fn pr_number_from_url_returns_none_for_non_numeric_suffix() {
     );
 }
 
-fn pr_create_args(body_prefix: Option<&str>, body: Option<&str>, body_file: Option<&str>) -> crate::cli::PrCreateArgs {
+fn pr_create_args(body: Option<&str>, body_file: Option<&str>) -> crate::cli::PrCreateArgs {
     crate::cli::PrCreateArgs {
         branch: None,
         title: None,
         body: body.map(str::to_string),
         body_file: body_file.map(str::to_string),
-        body_prefix: body_prefix.map(str::to_string),
         draft: false,
     }
 }
 
 #[test]
 fn resolve_pr_body_uses_inline_body_flag() {
-    let args = pr_create_args(None, Some("PR body text"), None);
+    let args = pr_create_args(Some("PR body text"), None);
     let resolved = crate::app::pr::resolve_pr_body(&args).unwrap();
     assert_eq!(resolved.text.as_deref(), Some("PR body text"));
     assert_eq!(resolved.file_path, None);
@@ -1094,7 +1093,7 @@ fn resolve_pr_body_reads_body_file_from_regular_file() {
     std::fs::write(&path, "body from file\n").unwrap();
 
     let path_str = path.to_str().unwrap();
-    let args = pr_create_args(None, None, Some(path_str));
+    let args = pr_create_args(None, Some(path_str));
     let resolved = crate::app::pr::resolve_pr_body(&args).unwrap();
     assert_eq!(resolved.text.as_deref(), Some("body from file\n"));
     assert_eq!(resolved.file_path.as_deref(), Some(path_str));
@@ -1102,43 +1101,8 @@ fn resolve_pr_body_reads_body_file_from_regular_file() {
 
 #[test]
 fn resolve_pr_body_is_none_when_neither_flag_supplied() {
-    let args = pr_create_args(None, None, None);
+    let args = pr_create_args(None, None);
     let resolved = crate::app::pr::resolve_pr_body(&args).unwrap();
     assert_eq!(resolved.text, None);
     assert_eq!(resolved.file_path, None);
-}
-
-#[test]
-fn body_prefix_precedes_an_ordinary_body() {
-    let body = crate::app::pr::render_pr_body(
-        Some("<!-- generated context -->"),
-        Some("## Summary\n\nAdd a user setting."),
-    )
-    .unwrap();
-
-    assert_eq!(body, "<!-- generated context -->\n\n## Summary\n\nAdd a user setting.");
-}
-
-#[test]
-fn body_prefix_is_the_body_when_no_body_is_supplied() {
-    let body = crate::app::pr::render_pr_body(Some("_Generated notice._"), None).unwrap();
-
-    assert_eq!(body, "_Generated notice._");
-}
-
-#[test]
-fn body_prefix_is_opaque_markdown() {
-    let prefix = "## Context\n\nUse `$(safe)` exactly as written.";
-    let body = crate::app::pr::render_pr_body(Some(prefix), None).unwrap();
-
-    assert_eq!(body, prefix);
-}
-
-#[test]
-fn resolve_pr_body_materializes_a_prefix_without_a_worker_body() {
-    let args = pr_create_args(Some("## Context"), None, None);
-    let resolved = crate::app::pr::resolve_pr_body(&args).unwrap();
-
-    assert_eq!(resolved.text.as_deref(), Some("## Context"));
-    assert!(resolved.file_path.is_some());
 }
