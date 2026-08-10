@@ -317,12 +317,18 @@ impl WorkDb {
     /// without ever posting a reply: mark `run_id` (if still `running`)
     /// `failed` with `error_kind`, post the no-reply apology thread entry, and
     /// transition the comment out of `answering`
-    /// ([`Self::transition_comment_to_answered`] folds a reclassified comment
-    /// straight into `active` instead of `answered`). Shared by
+    /// ([`Self::transition_comment_to_answer_failed`] folds a reclassified
+    /// comment straight into `active` instead of `answer_failed`). Shared by
     /// `CompletionHandler::finalize_answer_agent` (Stop fired, run still
     /// `running`) and `stranded_answering_sweep::recover` (Stop never fired at
     /// all) — the two paths differ only in `error_kind` and whether `run_id`
     /// is still around to mark `failed`.
+    ///
+    /// Deliberately lands on `answer_failed`, never `answered`: no reply ever
+    /// existed for this run, so the apology thread entry standing in for it
+    /// must not read as a real answer to an operator glancing at the
+    /// sidebar. [`Self::transition_comment_to_answered`] is reserved for the
+    /// two callers with a genuine reply in hand.
     pub(crate) fn recover_unanswered_comment(
         &self,
         comment_id: &str,
@@ -347,7 +353,7 @@ impl WorkDb {
             tracing::warn!(comment_id, ?err, "failed to post the no-reply-posted thread entry");
         }
 
-        self.transition_comment_to_answered(comment_id)
+        self.transition_comment_to_answer_failed(comment_id)
     }
 }
 

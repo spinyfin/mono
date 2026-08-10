@@ -63,15 +63,25 @@ pub const COMMENT_STATUS_IN_REVISION: &str = "in_revision";
 /// Bucket-2 track (P3b): a `question`-classified comment has spawned a
 /// read-only answer-agent run that is still in flight. Entered from `active`
 /// when the classifier resolves `intent = question`; exits to
-/// [`COMMENT_STATUS_ANSWERED`] when the run posts its reply (or fails without
-/// one — see `finalize_answer_agent`). Mutually exclusive with the
-/// bucket-1&3 track (`active`/`in_revision`/`resolved`) at any instant.
+/// [`COMMENT_STATUS_ANSWERED`] when the run posts a real reply, or to
+/// [`COMMENT_STATUS_ANSWER_FAILED`] when the run ends with no reply ever
+/// posted — see `finalize_answer_agent` and `stranded_answering_sweep`.
+/// Mutually exclusive with the bucket-1&3 track
+/// (`active`/`in_revision`/`resolved`) at any instant.
 pub const COMMENT_STATUS_ANSWERING: &str = "answering";
-/// Bucket-2 track (P3b): the answer agent posted its reply (or the run ended
-/// without one). Awaits an operator follow-up (phase 3c reclassifies it back
-/// into `answering` for another question, or into `active` for a
-/// revision bridge into the revision path).
+/// Bucket-2 track (P3b): the answer agent posted a real reply. Awaits an
+/// operator follow-up (phase 3c reclassifies it back into `answering` for
+/// another question, or into `active` for a revision bridge into the
+/// revision path).
 pub const COMMENT_STATUS_ANSWERED: &str = "answered";
+/// Bucket-2 track (P3b): the answer-agent run assigned to this comment ended
+/// without ever posting a reply — a Stop hook that fired with the run still
+/// `running` (`finalize_answer_agent`'s no-reply-posted path) or a Stop that
+/// never arrived at all (`stranded_answering_sweep`). Deliberately distinct
+/// from [`COMMENT_STATUS_ANSWERED`]: the apology thread entry standing in
+/// for the missing answer is not an answer, and a comment that never got one
+/// must never read as `answered` to an operator glancing at the sidebar.
+pub const COMMENT_STATUS_ANSWER_FAILED: &str = "answer_failed";
 /// Bucket-2 track (P3c): an operator has posted an `entry_kind =
 /// 'operator_followup'` reply on an `answered` comment; the reply is being
 /// (re)classified. Exits back to [`COMMENT_STATUS_ANSWERING`] if the
@@ -447,7 +457,7 @@ pub struct WorkComment {
     pub plain_text_projection_version: i64,
 
     /// `active` | `resolved` | `orphaned` | `dismissed` | `in_revision` |
-    /// `answering` | `answered` | `awaiting_followup`.
+    /// `answering` | `answered` | `answer_failed` | `awaiting_followup`.
     #[serde(default = "default_comment_status")]
     #[builder(default = default_comment_status())]
     pub status: String,

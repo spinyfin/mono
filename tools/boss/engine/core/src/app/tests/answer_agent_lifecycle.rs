@@ -223,7 +223,7 @@ async fn an_agent_that_never_replied_still_completes_on_the_turn_boundary() {
     assert_eq!(run.status, crate::work::ANSWER_AGENT_RUN_STATUS_FAILED);
     assert_eq!(
         server_state.work_db.get_comment(&comment_id).unwrap().unwrap().status,
-        "answered",
-        "an unanswered question must still leave the 'in flight' state",
+        "answer_failed",
+        "an unanswered question must still leave the 'in flight' state, but must never read as answered",
     );
 }

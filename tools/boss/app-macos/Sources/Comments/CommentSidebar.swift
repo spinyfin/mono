@@ -448,10 +448,14 @@ private struct CommentRow: View {
     /// `resolved`/`inRevision`/`orphaned`/`dismissed` render nothing here —
     /// that track has its own `RevisionChip` instead.
     ///
-    /// `answerAgentFailed` (`Comment.answerAgentFailed`) takes priority over
-    /// each status's default rendering in `.answering`/`.awaitingFollowup`/
-    /// `.active`: those are exactly the statuses a failed spawn can leave a
-    /// `question`-classified comment sitting in (see
+    /// `.answerFailed` is its own terminal status (the engine's
+    /// `transition_comment_to_answer_failed`) — a run that ended with no
+    /// reply ever posted — and always renders the failed indicator, the same
+    /// as the `answerAgentFailed` flag does for the statuses a failed
+    /// *spawn* (never even reaching `running`) can leave a comment sitting
+    /// in: `answerAgentFailed` (`Comment.answerAgentFailed`) takes priority
+    /// over each of those statuses' default rendering in
+    /// `.answering`/`.awaitingFollowup`/`.active` (see
     /// `record_answer_agent_spawn_failure` in the engine), and without this
     /// check they'd render either nothing or a perpetual in-progress
     /// indicator for a run that already gave up.
@@ -471,6 +475,8 @@ private struct CommentRow: View {
                     .foregroundStyle(.green)
                 FollowupComposer(comment: comment, layer: layer)
             }
+        case .answerFailed:
+            AnswerFailedIndicatorView()
         case .awaitingFollowup:
             if comment.answerAgentFailed {
                 AnswerFailedIndicatorView()
