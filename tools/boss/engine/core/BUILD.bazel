@@ -27,6 +27,11 @@ rust_library(
         # src/conformance/claude_goldens.rs.
         "src/conformance/goldens/settings_standard.json.golden",
         "src/conformance/goldens/claude_md_standard.md.golden",
+        # Planner breakdown-authority regression: the real design doc that was
+        # force-split into ten invented tasks, include_str!'d directly from
+        # planner unit tests via this filegroup so the test can never drift
+        # from the source of truth (no testdata copy to fall out of sync).
+        "//tools/boss/docs:operator_forced_dispatch_design_doc",
     ],
     crate_name = "boss_engine",
     crate_root = "src/lib.rs",
@@ -43,6 +48,12 @@ rust_library(
         # source file's compile-time path is rooted under bazel-out, not the
         # real source tree, so `../../../CHECKS.yaml` doesn't resolve there.
         "BOSS_CHECKS_YAML": "$(execpath //:CHECKS.yaml)",
+        # Absolute path to the real operator-forced-dispatch design doc, read
+        # by the planner breakdown-authority regression test via
+        # include_str!(env!(...)) — same cross-package-boundary reason as
+        # BOSS_CHECKS_YAML above. Keeps the test reading the source of truth
+        # instead of a testdata copy that can silently drift.
+        "BOSS_OPERATOR_FORCED_DISPATCH_DESIGN_DOC": "$(execpath //tools/boss/docs:operator_forced_dispatch_design_doc)",
         # Canonical `bazel run` command for the engine target, so worker-facing
         # guidance (worker_setup.rs, agent_launch_guard.rs) can't drift from
         # the real target label the way the pre-split `//tools/boss/engine:engine`

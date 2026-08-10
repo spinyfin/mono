@@ -49,7 +49,7 @@ use boss_protocol::{
 use boss_design_doc_fetcher::DocFetchOutcome;
 use boss_engine::coordinator::NoopExecutionPublisher;
 use boss_engine::materializer::Materializer;
-use boss_engine::planner::{DecompositionAudit, PLANNER_MODEL, PlannerOutcome, build_request_body, build_user_prompt};
+use boss_engine::planner::{PLANNER_MODEL, PlannerOutcome, build_request_body, build_user_prompt};
 use boss_engine::populator::{DEFAULT_MAX_TASKS, PopulateContext, PopulateOutcome, Populator, PopulatorSteps};
 use boss_engine::work::WorkDb;
 use boss_engine_planner_validation::{ValidationResult, validate};
@@ -426,12 +426,11 @@ impl PopulatorSteps for FakeSteps {
         }
     }
 
-    async fn plan(&self, _input: &PlannerInput) -> (PlannerOutcome, DecompositionAudit) {
-        let outcome = match &self.plan {
+    async fn plan(&self, _input: &PlannerInput) -> PlannerOutcome {
+        match &self.plan {
             FakePlan::Success(out) => PlannerOutcome::Success(out.clone()),
             FakePlan::NoApiKey => PlannerOutcome::NoApiKey,
-        };
-        (outcome, DecompositionAudit::default())
+        }
     }
 }
 
