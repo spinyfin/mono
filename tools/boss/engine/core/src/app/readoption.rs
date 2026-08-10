@@ -117,9 +117,13 @@ impl ServerState {
             .ok()
             .flatten()
             .map(|live| live.id);
-        let work_item_terminal = match self.work_db.get_work_item(&execution.work_item_id) {
-            Ok(boss_protocol::WorkItem::Task(task) | boss_protocol::WorkItem::Chore(task)) => task.status.is_terminal(),
-            Ok(boss_protocol::WorkItem::Product(_) | boss_protocol::WorkItem::Project(_)) => false,
+        // Resolves task_/chore_ *and* cmt_ (answer-agent) bindings. Comments
+        // are not a `WorkItem` variant, so this path must not go through
+        // `get_work_item` alone — that used to yield `unknown work item id
+        // format` and a permanent `work_item_lookup_failed` verdict for every
+        // answer-agent contradiction.
+        let work_item_terminal = match self.work_db.is_bound_work_item_closed(&execution.work_item_id) {
+            Ok(closed) => closed,
             Err(item_err) => match self.work_db.work_item_row_missing(&execution.work_item_id) {
                 Ok(true) => true,
                 Ok(false) | Err(_) => {

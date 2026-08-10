@@ -563,6 +563,7 @@ impl WorkDb {
             ItemKind::Product => self.update_product(id, patch),
             ItemKind::Project => self.update_project(id, patch, actor),
             ItemKind::Task => self.update_task(id, patch, actor),
+            ItemKind::Comment => bail!("comment ids are not product/project/task work items: {id}"),
         }
     }
 
@@ -643,6 +644,7 @@ impl WorkDb {
             }
             ItemKind::Product => bail!("product deletion is not supported; archive it instead"),
             ItemKind::Project => bail!("project deletion is not supported; archive it instead"),
+            ItemKind::Comment => bail!("comment ids are not product/project/task work items: {id}"),
         }
     }
 
@@ -764,6 +766,7 @@ impl WorkDb {
             ItemKind::Project => {
                 bail!("projects are archived, not soft-deleted; nothing to restore")
             }
+            ItemKind::Comment => bail!("comment ids are not product/project/task work items: {canonical}"),
         }
     }
 
@@ -984,6 +987,44 @@ impl WorkDb {
                 .filter(|task| task.deleted_at.is_none())
                 .map(task_to_item)
                 .with_context(|| format!("unknown task: {id}")),
+            // Answer-agent executions bind a comment id, but comments are not
+            // a `WorkItem` wire variant. Use [`Self::get_comment`] for the row
+            // and [`Self::is_bound_work_item_closed`] for recon closedness.
+            ItemKind::Comment => bail!(
+                "comment id {id} is not a product/project/task work item; \
+                 use get_comment / is_bound_work_item_closed"
+            ),
+        }
+    }
+
+    /// Whether the entity bound by an execution's `work_item_id` is closed.
+    ///
+    /// Accepts the same id shapes as [`classify_id`]: `task_` / `prod_` /
+    /// `proj_` / `cmt_`. For tasks and chores this is
+    /// [`TaskStatus::is_terminal`]; products and projects are never closed
+    /// for this check; for comments it is
+    /// [`boss_protocol::comment_status_is_closed`].
+    ///
+    /// Returns `Err` when the id format is unknown or the row cannot be
+    /// loaded — callers that must distinguish "row gone" from "lookup
+    /// failed" use [`Self::work_item_row_missing`] after an error, the same
+    /// pattern as the pre-comment recon path.
+    pub fn is_bound_work_item_closed(&self, id: &str) -> Result<bool> {
+        match classify_id(id)? {
+            ItemKind::Product | ItemKind::Project => Ok(false),
+            ItemKind::Task => {
+                let conn = self.connect()?;
+                let task = query_task(&conn, id)?
+                    .filter(|task| task.deleted_at.is_none())
+                    .with_context(|| format!("unknown task: {id}"))?;
+                Ok(task.status.is_terminal())
+            }
+            ItemKind::Comment => {
+                let comment = self
+                    .get_comment(id)?
+                    .with_context(|| format!("unknown comment: {id}"))?;
+                Ok(boss_protocol::comment_status_is_closed(&comment.status))
+            }
         }
     }
 
@@ -991,25 +1032,30 @@ impl WorkDb {
     /// row was ever inserted, or (for a task/chore) its `deleted_at`
     /// tombstone is set by [`Self::delete_work_item`]'s soft-delete.
     /// Products and projects can't be deleted (`delete_work_item`
-    /// rejects both), so this is always `Ok(false)` for them.
+    /// rejects both), so this is always `Ok(false)` for them. Comments
+    /// are hard-deleted when removed, so a missing `work_comments` row
+    /// is `Ok(true)`.
     ///
     /// [`get_work_item`] collapses "row never existed" and "DB query
     /// failed" into the same generic `unknown …` error, which is fine
     /// for most callers but not for a reconciler that must reap on
     /// "confirmed gone" while staying conservative on "DB hiccuped".
-    /// The terminal-work sweep calls this after a `get_work_item`
+    /// The terminal-work sweep calls this after a bound-item lookup
     /// failure to tell the two cases apart: `Ok(true)` means the
     /// binding is a genuine orphan (the row was deleted out from under
     /// a live execution); `Ok(false)` or `Err` means treat the failure
     /// the old conservative way and retry next pass.
     pub fn work_item_row_missing(&self, id: &str) -> Result<bool> {
-        let conn = self.connect()?;
         match classify_id(id)? {
-            ItemKind::Task => Ok(match query_task(&conn, id)? {
-                None => true,
-                Some(task) => task.deleted_at.is_some(),
-            }),
+            ItemKind::Task => {
+                let conn = self.connect()?;
+                Ok(match query_task(&conn, id)? {
+                    None => true,
+                    Some(task) => task.deleted_at.is_some(),
+                })
+            }
             ItemKind::Product | ItemKind::Project => Ok(false),
+            ItemKind::Comment => Ok(self.get_comment(id)?.is_none()),
         }
     }
 

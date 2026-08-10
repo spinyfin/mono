@@ -105,6 +105,28 @@ pub fn default_comment_status() -> String {
     COMMENT_STATUS_ACTIVE.to_owned()
 }
 
+/// Whether a comment status means the bound work is closed for reconciliation.
+///
+/// Answer-agent executions bind a comment id into `work_executions.work_item_id`.
+/// The engine's closed-check for those rows must answer from the comment's own
+/// status, not skip the check:
+///
+/// * [`COMMENT_STATUS_RESOLVED`] / [`COMMENT_STATUS_DISMISSED`] — operator
+///   terminal signals; nobody is waiting for an answer (see
+///   `end_answer_agent_on_thread_terminal`).
+/// * [`COMMENT_STATUS_ANSWERED`] — the answer agent already posted (or the run
+///   ended without a reply); the bound answer-agent work is done.
+///
+/// Everything else (`active`, `answering`, `awaiting_followup`, `in_revision`,
+/// `orphaned`) remains open: a live worker may still be needed, or a later
+/// path will reclassify/re-dispatch.
+pub fn comment_status_is_closed(status: &str) -> bool {
+    matches!(
+        status,
+        COMMENT_STATUS_RESOLVED | COMMENT_STATUS_DISMISSED | COMMENT_STATUS_ANSWERED
+    )
+}
+
 /// The outcome of resolving one comment's anchor against a doc's current
 /// plain-text projection. `start`/`length` are character offsets (Unicode
 /// scalar count) of the `exact` span within the plain text; both are `None`

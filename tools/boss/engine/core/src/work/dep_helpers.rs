@@ -21,6 +21,13 @@ pub(crate) enum ItemKind {
     Product,
     Project,
     Task,
+    /// A `work_comments` row id (`cmt_…`). Answer-agent executions bind the
+    /// comment they answer into `work_executions.work_item_id`; reconciliation
+    /// must classify that id rather than fail with "unknown work item id
+    /// format". Comments are not product/project/task work items — callers
+    /// that need the row use [`WorkDb::get_comment`]; closedness for recon
+    /// uses [`WorkDb::is_bound_work_item_closed`].
+    Comment,
 }
 
 /// If `id` looks like a friendly work-item selector (`T42`, `t42`, `P7`,
@@ -85,6 +92,9 @@ pub(crate) fn classify_id(id: &str) -> Result<ItemKind> {
     }
     if id.starts_with("task_") {
         return Ok(ItemKind::Task);
+    }
+    if id.starts_with("cmt_") {
+        return Ok(ItemKind::Comment);
     }
     bail!("unknown work item id format: {id}")
 }
@@ -744,6 +754,7 @@ mod tests {
         assert!(matches!(classify_id("prod_abc").unwrap(), ItemKind::Product));
         assert!(matches!(classify_id("proj_abc").unwrap(), ItemKind::Project));
         assert!(matches!(classify_id("task_abc").unwrap(), ItemKind::Task));
+        assert!(matches!(classify_id("cmt_abc").unwrap(), ItemKind::Comment));
     }
 
     #[test]
