@@ -1015,7 +1015,7 @@
           "FILE:@@//tools/boss/engine/utility-model/Cargo.toml 6049148fb4a1250aa3d9943f6db98c94cc63de7a0da12c4a9709141a9e72f1fc",
           "FILE:@@//tools/boss/engine/day-rotated-log/Cargo.toml 73818b98f1f059c89cfa881b1f8617c7750fb9e1aaf79079bf10a18f991d7165",
           "FILE:@@//tools/boss/engine/design-docs/Cargo.toml b4a80363765b4e57bff91003e44844161197de7bd09e01b700b0ed1a4dabeb54",
-          "FILE:@@//tools/boss/engine/driver/Cargo.toml 8f0605bbb41cb9c5bc4369ca4cc54c97b15e64c781333cede66764f5c140ed66",
+          "FILE:@@//tools/boss/engine/driver/Cargo.toml 39f351f8cd1638b9b7c00264ae2e7b15fb75ede8f42be1f3000479df9dcd48c5",
           "FILE:@@//tools/boss/engine/codex-hook-trust/Cargo.toml 6fdfa0b62d0620d8048d8d39f7fded22e9c111c8816d0d487cb713749bf9a34a",
           "FILE:@@//tools/boss/engine/codex-rollout/Cargo.toml 1fa71cc15b9bee399a461c56c43ad361e51bc997aaeade4cd86e42569b6612fa",
           "FILE:@@//tools/boss/engine/structured-output/Cargo.toml 5144c7aeaac9d00617ae9f23284faaa7985d8d20324d7ecdddc87f573bcc5fcb",
