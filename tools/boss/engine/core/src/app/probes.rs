@@ -22,6 +22,35 @@
 
 use super::*;
 
+use crate::work::CreateAttentionItemInput;
+
+/// `work_attention_items.kind` for a probe the engine accepted and then never
+/// delivered.
+///
+/// Filed against the *execution* the probe targeted, so the abandonment is
+/// visible in that run's own history rather than only through a
+/// `bossctl probe-status <probe-id>` query the issuer has no reason to make.
+/// That asymmetry was the defect: the engine recorded the terminal state
+/// correctly and told nobody, so a coordinator whose instruction was dropped
+/// carried on as if it had landed.
+///
+/// Registered in [`crate::attention_lifecycle::ATTENTION_LIFECYCLES`] as
+/// [`crate::attention_lifecycle::ClearedBy::HumanDecision`] — see there for
+/// why no automatic evidence lowers it.
+///
+/// **Deliberately one row per abandoned probe, not deduped onto a single
+/// open row per `(execution, kind)`** the way `work/attention_filing.rs`'s
+/// module doc otherwise documents as the filing contract (see
+/// `reraise_open_execution_attention`). Each lost probe is a distinct
+/// instruction a coordinator issued and must individually decide what to do
+/// about — a run that lost three different probes needs three answers, and
+/// collapsing them onto one row would silently drop the second and third
+/// probe ids from view the moment the first row existed. If this ever proves
+/// noisy in practice (the same run repeatedly losing probes), the dedup
+/// should key on the *probe*, not the execution: fold a probe's own retries
+/// onto its own row, never a sibling probe's.
+pub const PROBE_UNDELIVERED_ATTENTION_KIND: &str = "probe_undelivered";
+
 /// Adapter so the completion handler can queue probes onto
 /// `ServerState::pending_probes` without depending on `ServerState`
 /// directly. Same late-bind dance as `ServerStatePaneReleaser` — the
@@ -191,6 +220,30 @@ impl ServerState {
     /// `PostToolUse`, then at every `Stop`). One probe is delivered per
     /// reply cycle: see [`Self::has_in_flight_probe`].
     pub fn queue_probe(&self, run_id: String, text: String, urgent: bool) -> String {
+        self.queue_probe_inner(run_id, text, urgent, false)
+    }
+
+    /// Same as [`Self::queue_probe`], but additionally tags the minted probe
+    /// for [`Self::mark_probe_for_worker_signal_resolution`] — atomically,
+    /// under the same critical section that makes the probe visible to
+    /// concurrent dispatchers.
+    ///
+    /// A caller that instead calls `queue_probe` followed by a separate
+    /// `mark_probe_for_worker_signal_resolution` opens a window: the probe
+    /// becomes dispatchable the moment `queue_probe` inserts it into
+    /// `pending_probes`, and a concurrent `Stop`/`PostToolUse` fan-out on
+    /// another task can claim and deliver it — running
+    /// `set_probe_lifecycle_detail(Consumed)` — before the tag is inserted.
+    /// `resolve_worker_signal_attentions_if_pending` finds nothing to
+    /// resolve, and because the tag is inserted only afterwards, the
+    /// worker-signal attention this probe was meant to ack never resolves.
+    /// Use this method for any probe whose delivery is meant to ack an
+    /// open `worker_signal` attention item.
+    pub fn queue_probe_resolving_worker_signal(&self, run_id: String, text: String, urgent: bool) -> String {
+        self.queue_probe_inner(run_id, text, urgent, true)
+    }
+
+    fn queue_probe_inner(&self, run_id: String, text: String, urgent: bool, resolves_worker_signal: bool) -> String {
         let probe_id = self.allocate_probe_id();
         let probe = PendingProbe {
             probe_id: probe_id.clone(),
@@ -213,6 +266,14 @@ impl ServerState {
                     detail: None,
                 },
             );
+        // Tag for worker-signal resolution BEFORE the probe is inserted into
+        // `pending_probes` below — i.e. before any concurrent dispatcher can
+        // possibly see and deliver it. See the doc on
+        // [`Self::queue_probe_resolving_worker_signal`] for why ordering
+        // this after the insert would be a race.
+        if resolves_worker_signal {
+            self.mark_probe_for_worker_signal_resolution(&probe_id, &run_id);
+        }
         let mut guard = self.pending_probes.lock().expect("pending_probes mutex poisoned");
         let queue = guard.entry(run_id).or_default();
         if urgent {
@@ -493,6 +554,185 @@ impl ServerState {
         ids
     }
 
+    /// Settle a probe that was written into `run_id`'s pane but never
+    /// answered, because the run is going away.
+    ///
+    /// [`Self::abandon_pending_probes_for_terminated_run`] covers probes
+    /// still in the *queue*; this covers the one past it. An in-flight probe
+    /// is normally settled by the reply path at the worker's next turn
+    /// boundary — but a run torn down before that boundary produces no reply,
+    /// ever, and the record would sit at `Consumed`/`Buffered` for the life
+    /// of the engine process. Reporting "the worker got it" for text nobody
+    /// acted on is the same class of lie as reporting `queued` for a probe
+    /// nothing will deliver, so it is recorded as
+    /// [`ProbeDeliveryState::Orphaned`]: the bytes did reach the pane, and a
+    /// reply that somehow still arrives corrects the record.
+    ///
+    /// Deliberately does **not** rewrite a probe already at a state the reply
+    /// path settled — only the delivered-but-unanswered states are re-stated.
+    /// The in-flight *slot* is freed either way: the run is going away, so a
+    /// slot held against it can only pin a probe that no longer has anywhere
+    /// to go. Returns the probe id when a state was actually re-stated, so
+    /// the caller surfaces exactly the ones it changed.
+    pub(super) fn orphan_in_flight_probe_for_terminated_run(&self, run_id: &str, cause: &str) -> Option<String> {
+        let in_flight = self.take_in_flight_probe(run_id)?;
+        let probe_id = in_flight.probe_id;
+        match self.probe_lifecycle_state(&probe_id) {
+            Some(ProbeDeliveryState::Consumed | ProbeDeliveryState::Buffered | ProbeDeliveryState::Unconfirmed) => {}
+            // `Replied` already has the worker's answer; `Injected` means the
+            // write is still in flight on another task and that task records
+            // its own outcome — via `record_pane_write_outcome`, which
+            // rechecks the run's slot mapping before it claims
+            // `Consumed`/`Buffered` and downgrades to `Orphaned` when this
+            // very teardown has already cleared it, so the in-flight
+            // reservation `take_in_flight_probe` just removed above is not
+            // the only thing standing between that write and a
+            // `Consumed`-forever record; anything else is already settled.
+            _ => return None,
+        }
+        tracing::warn!(
+            run_id,
+            probe_id = %probe_id,
+            cause,
+            "run terminated with a delivered probe still unanswered; recording orphaned rather \
+             than leaving it reading as consumed",
+        );
+        self.set_probe_lifecycle_detail(
+            &probe_id,
+            ProbeDeliveryState::Orphaned,
+            Some(format!(
+                "{cause}; the text reached the pane but the run ended before the worker produced \
+                 the turn boundary its reply would have arrived on"
+            )),
+        );
+        Some(probe_id)
+    }
+
+    /// Tell somebody that `probe_id` will not be delivered.
+    ///
+    /// `bossctl probe-status` already reports the terminal state correctly.
+    /// What was missing is any reason for the issuer to look: a coordinator
+    /// that was told "accepted" and never told otherwise assumes the text
+    /// landed. So an abandonment is pushed on two surfaces that reach an
+    /// observer without being asked:
+    ///
+    /// * [`FrontendEvent::ProbeDeliveryEscalated`] on the run's probe topic —
+    ///   the same channel an unconfirmed mid-turn write already escalates on,
+    ///   for anything subscribed while the run is live; and
+    /// * a [`PROBE_UNDELIVERED_ATTENTION_KIND`] attention item against the
+    ///   execution — which outlives the run, so the record is still there
+    ///   after the worker and its topic subscribers are gone.
+    ///
+    /// Best-effort on both: a probe that could not be delivered must not also
+    /// fail the teardown it was noticed during.
+    pub(super) async fn surface_undelivered_probe(
+        &self,
+        run_id: &str,
+        probe_id: &str,
+        state: ProbeDeliveryState,
+        cause: &str,
+    ) {
+        debug_assert!(
+            state.is_undeliverable(),
+            "surfacing is for probes the engine gave up on; {} is not one",
+            state.as_str(),
+        );
+        self.topic_broker
+            .publish(
+                &probe_topic(run_id),
+                FrontendEventEnvelope::push(FrontendEvent::ProbeDeliveryEscalated {
+                    run_id: run_id.to_owned(),
+                    probe_id: probe_id.to_owned(),
+                    reason: format!("probe settled {} without reaching the worker: {cause}", state.as_str()),
+                }),
+            )
+            .await;
+        self.file_undelivered_probe_attention(run_id, probe_id, state, cause)
+            .await;
+    }
+
+    /// Convenience for the teardown paths, which settle a whole batch at
+    /// once and hold the ids as a `Vec`.
+    pub(super) async fn surface_undelivered_probes(
+        &self,
+        run_id: &str,
+        probe_ids: &[String],
+        state: ProbeDeliveryState,
+        cause: &str,
+    ) {
+        for probe_id in probe_ids {
+            self.surface_undelivered_probe(run_id, probe_id, state, cause).await;
+        }
+    }
+
+    /// File the durable half of [`Self::surface_undelivered_probe`].
+    ///
+    /// Split out because every step here can legitimately fail on a run the
+    /// engine is already tearing down (the execution row may be gone, the
+    /// work item may have been deleted), and none of those failures may
+    /// escape: the caller is mid-teardown and has nothing useful to do with
+    /// an error.
+    async fn file_undelivered_probe_attention(
+        &self,
+        run_id: &str,
+        probe_id: &str,
+        state: ProbeDeliveryState,
+        cause: &str,
+    ) {
+        let text = self
+            .probe_record(probe_id)
+            .map(|record| record.urgent)
+            .map(|urgent| if urgent { "urgent probe" } else { "probe" })
+            .unwrap_or("probe");
+        let body = format!(
+            "A {text} accepted for this run was never delivered to the worker.\n\n\
+             - probe: `{probe_id}`\n\
+             - execution: `{run_id}`\n\
+             - final delivery state: `{}`\n\n\
+             Why: {cause}.\n\n\
+             Acceptance and delivery are different states. The engine accepted this probe \
+             because the run had a live pane at the time, then the delivery boundary it \
+             committed to never arrived while a worker was there to read the text. Nothing \
+             landed, so re-issuing the same instruction against a live run cannot duplicate it \
+             — but if the instruction was load-bearing (an effort-escalation acknowledgement, a \
+             \"re-read the spec\" nudge after a description edit, a hold on some action), it did \
+             not take effect and the run proceeded without it.\n\n\
+             Full record: `bossctl probe-status {probe_id}`.",
+            state.as_str(),
+        );
+        let input = CreateAttentionItemInput {
+            body_markdown: body,
+            kind: PROBE_UNDELIVERED_ATTENTION_KIND.to_owned(),
+            title: format!("Probe {probe_id} was never delivered to the worker"),
+            execution_id: Some(run_id.to_owned()),
+            resolved_at: None,
+            status: None,
+            work_item_id: None,
+        };
+        let item = match self.work_db.create_attention_item(input) {
+            Ok(item) => item,
+            Err(err) => {
+                tracing::warn!(
+                    run_id,
+                    probe_id,
+                    ?err,
+                    "could not file the undelivered-probe attention item; the abandonment is \
+                     still recorded in probe-status but nothing will surface it to an operator",
+                );
+                return;
+            }
+        };
+        let Ok(execution) = self.work_db.get_execution(run_id) else {
+            return;
+        };
+        let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) else {
+            return;
+        };
+        self.publisher
+            .publish_frontend_event_on_product(work_item.product_id(), FrontendEvent::AttentionItemCreated { item })
+            .await;
+    }
+
     /// Whether the worker process behind `run_id` probes *dead* right now.
     ///
     /// Used to keep [`ProbeDeliveryState::Consumed`] honest: a `SendToPane`
@@ -563,6 +803,75 @@ impl ServerState {
                 state = state.as_str(),
                 "probe lifecycle transition for an id that was never queued; dropping",
             ),
+        }
+        drop(guard);
+        if state.is_delivered() {
+            self.resolve_worker_signal_attentions_if_pending(probe_id);
+        } else if state.is_undeliverable() {
+            // This probe will never reach `is_delivered()` now, so its
+            // worker-signal tag (if any) would otherwise sit in
+            // `probe_worker_signal_resolution` for the life of the engine
+            // process — never resolving an attention (correctly, since the
+            // probe never landed) but never freed either. Drop the tag
+            // without touching any attention item.
+            self.probe_worker_signal_resolution
+                .lock()
+                .expect("probe_worker_signal_resolution mutex poisoned")
+                .remove(probe_id);
+        }
+    }
+
+    /// Tag `probe_id` (targeting `run_id`) so that once its lifecycle first
+    /// reaches [`ProbeDeliveryState::is_delivered`], the run's open
+    /// `worker_signal` attention items are resolved.
+    ///
+    /// Called from [`Self::queue_probe_resolving_worker_signal`] — the entry
+    /// point `handle_probe_run` uses for every human/coordinator-issued
+    /// probe — under the same critical section that queues the probe, so
+    /// the tag exists before the probe is visible to any dispatcher.
+    /// Acceptance alone is not the ack gesture, delivery is — see the field
+    /// doc on [`ServerState::probe_worker_signal_resolution`] for the
+    /// asymmetry this closes.
+    pub(super) fn mark_probe_for_worker_signal_resolution(&self, probe_id: &str, run_id: &str) {
+        self.probe_worker_signal_resolution
+            .lock()
+            .expect("probe_worker_signal_resolution mutex poisoned")
+            .insert(probe_id.to_owned(), run_id.to_owned());
+    }
+
+    /// Resolve the run's open `worker_signal` attention items if `probe_id`
+    /// was tagged by [`Self::mark_probe_for_worker_signal_resolution`] and
+    /// has not already resolved them. Idempotent: the tag is removed on the
+    /// first delivered transition, so a later `Replied` (or a duplicate
+    /// `Consumed`/`Buffered` write) is a no-op here.
+    fn resolve_worker_signal_attentions_if_pending(&self, probe_id: &str) {
+        let run_id = self
+            .probe_worker_signal_resolution
+            .lock()
+            .expect("probe_worker_signal_resolution mutex poisoned")
+            .remove(probe_id);
+        let Some(run_id) = run_id else {
+            return;
+        };
+        match self.work_db.resolve_worker_signal_attentions_for_execution(&run_id) {
+            Ok(0) => {}
+            Ok(resolved) => {
+                tracing::info!(
+                    run_id,
+                    probe_id,
+                    resolved,
+                    "probe delivered: resolved unresolved worker-escalation/blocker attention \
+                     item(s) now that the acknowledgement actually reached the worker",
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    run_id,
+                    probe_id,
+                    ?err,
+                    "probe delivered: failed to resolve worker-escalation attention items",
+                );
+            }
         }
     }
 

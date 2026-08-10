@@ -1123,3 +1123,176 @@ async fn dispatch_probe_on_stop_refuses_when_live_state_missing() {
         .expect("probe must remain queued when Stop refuses");
     assert_eq!(still.probe_id, probe_id);
 }
+
+/// A pane write can be in flight (`Injected`) while a concurrent teardown —
+/// completion, `bossctl agents stop`, a dead-pid sweep — releases the same
+/// run's pane. `orphan_in_flight_probe_for_terminated_run` declines to touch
+/// an `Injected` probe because the write task "records its own outcome", so
+/// that recording must itself notice the pane is gone rather than claiming
+/// `Consumed` for text nobody was left to read. Simulated here by having the
+/// `SendToPane` responder release the worker's pane *before* acknowledging
+/// the write, so `record_pane_write_outcome` runs after the slot mapping is
+/// already gone.
+#[tokio::test]
+async fn a_pane_write_raced_by_concurrent_teardown_settles_orphaned_not_consumed() {
+    use crate::protocol::WorkerEvent;
+
+    let (server_state, _dir) = test_server_state();
+    let run_id = execution_id_with_driver(&server_state, None);
+    register_idle_worker(&server_state, &run_id, 9);
+    let probe_id = server_state.queue_probe(run_id.clone(), "status?".into(), false);
+
+    let app_sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), app_sink.clone())
+        .await;
+    let server_for_app = server_state.clone();
+    let run_id_for_app = run_id.to_owned();
+    let app_responder = tokio::spawn(async move {
+        let envelope = app_sink.next().await.expect("SendToPane must arrive");
+        let request_id = match &envelope.payload {
+            FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
+            other => panic!("expected EngineRequest, got {other:?}"),
+        };
+        // Teardown wins the race: the run's slot mapping is cleared — the
+        // exact side effect `release_worker_pane` performs, isolated from
+        // its probe-draining steps so this test targets only the recheck
+        // `record_pane_write_outcome` itself must perform — while the write
+        // is still in flight, before the engine acknowledges it.
+        server_for_app.worker_registry.take_slot_for_run(&run_id_for_app);
+        server_for_app
+            .deliver_app_response(
+                "session-app",
+                &request_id,
+                EngineToAppResponse::SendToPane {
+                    result: Ok(crate::protocol::SendToPaneResult {}),
+                },
+            )
+            .await;
+    });
+
+    let stop = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
+            session_id: "sess-1".into(),
+            stop_hook_active: false,
+            stop_reason: crate::protocol::StopReason::Completed,
+        },
+        Some(run_id.to_owned()),
+        None,
+    );
+    let outcome = dispatch_probe_on_stop(&server_state, &stop).await;
+    tokio::time::timeout(Duration::from_secs(2), app_responder)
+        .await
+        .expect("timed out waiting for the racing teardown + SendToPane ack")
+        .expect("app_responder panicked");
+
+    assert_eq!(
+        outcome,
+        ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Orphaned),
+        "a write raced by a concurrent teardown must settle orphaned, not report a delivery \
+         nobody was left to act on",
+    );
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Orphaned),
+        "the lifecycle record must not read consumed forever",
+    );
+
+    let items = server_state
+        .work_db
+        .list_attention_items(&run_id)
+        .expect("the execution's attention items must be readable");
+    assert!(
+        items
+            .iter()
+            .any(|item| item.kind == crate::app::probes::PROBE_UNDELIVERED_ATTENTION_KIND),
+        "an orphaned-by-race probe must also be surfaced, not just recorded",
+    );
+}
+
+// ── The effort-escalation acknowledgement asymmetry ─────────────────────────
+//
+// Issuing a probe is the documented ack gesture for a worker-declared
+// escalation/blocker, but *acceptance* of that probe is not the same as
+// *delivery* of it. Resolving the run's open worker-signal attention items
+// as soon as the probe is queued lifts the completion handler's suppressed
+// auto-nudge before the worker has necessarily seen anything — worse than
+// never resolving at all, because the suppression that was protecting the
+// worker from a premature "produce a PR" nudge is gone while the actual
+// acknowledgement text may still never arrive.
+
+fn open_worker_escalation_attention(server_state: &ServerState, run_id: &str) -> String {
+    server_state
+        .work_db
+        .create_attention_item(crate::work::CreateAttentionItemInput {
+            body_markdown: "worker declared an effort escalation".to_owned(),
+            kind: crate::worker_escalation::WORKER_ESCALATION_ATTENTION_KIND.to_owned(),
+            title: "effort escalation".to_owned(),
+            execution_id: Some(run_id.to_owned()),
+            resolved_at: None,
+            status: None,
+            work_item_id: None,
+        })
+        .expect("attention item must be creatable")
+        .id
+}
+
+fn attention_status(server_state: &ServerState, run_id: &str, attention_id: &str) -> String {
+    server_state
+        .work_db
+        .list_attention_items(run_id)
+        .expect("attention items must be listable")
+        .into_iter()
+        .find(|item| item.id == attention_id)
+        .expect("the attention item must still exist")
+        .status
+}
+
+/// A probe tagged for worker-signal resolution must not resolve the
+/// attention item merely for being queued — only once its own delivery
+/// state actually confirms the worker got it.
+#[test]
+fn a_marked_probe_does_not_resolve_worker_signal_attentions_until_delivered() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = execution_id_with_driver(&server_state, None);
+    let attention_id = open_worker_escalation_attention(&server_state, &run_id);
+
+    let probe_id = server_state.queue_probe(run_id.clone(), "[effort-escalation-ack] proceed".into(), false);
+    server_state.mark_probe_for_worker_signal_resolution(&probe_id, &run_id);
+
+    assert_eq!(
+        attention_status(&server_state, &run_id, &attention_id),
+        "open",
+        "queuing (accepting) the probe must not itself resolve the attention item",
+    );
+
+    server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Consumed);
+
+    assert_eq!(
+        attention_status(&server_state, &run_id, &attention_id),
+        "resolved",
+        "the attention item must resolve once the probe is actually confirmed delivered",
+    );
+}
+
+/// The converse: a marked probe that settles undeliverable must leave the
+/// attention item open — the acknowledgement never reached the worker, so
+/// the auto-nudge suppression it protects must not lift.
+#[test]
+fn a_marked_probe_that_never_delivers_leaves_worker_signal_attentions_open() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = execution_id_with_driver(&server_state, None);
+    let attention_id = open_worker_escalation_attention(&server_state, &run_id);
+
+    let probe_id = server_state.queue_probe(run_id.clone(), "[effort-escalation-ack] proceed".into(), false);
+    server_state.mark_probe_for_worker_signal_resolution(&probe_id, &run_id);
+
+    server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Abandoned);
+
+    assert_eq!(
+        attention_status(&server_state, &run_id, &attention_id),
+        "open",
+        "a probe that settles undeliverable must not resolve the attention item it was meant to \
+         acknowledge — the auto-nudge suppression must stay in effect",
+    );
+}

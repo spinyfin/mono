@@ -41,7 +41,29 @@ impl WorkerCompletionHandler {
         execution_id: &str,
         turn_end: Option<&crate::driver::TurnEnd>,
     ) -> StopOutcome {
-        let outcome = self.on_stop_inner(execution_id, turn_end).await;
+        self.on_stop_with_turn_end_deferrable(execution_id, turn_end, false)
+            .await
+    }
+
+    /// Same as [`Self::on_stop_with_turn_end`], but lets the caller withhold
+    /// only the terminal PR-detection/nudge/park decision inside
+    /// `on_stop_inner` — everything upstream of that decision (the
+    /// stale-Stop guard, the `stop_seen` stamp, `StopReason::Other`
+    /// handling, and the kind-specific finalizers) still runs.
+    ///
+    /// `defer_finalization` is `true` only when the pre-completion probe
+    /// pass in
+    /// [`crate::app::worker_events::dispatch_worker_event_fanout`] delivered
+    /// a probe for this same boundary — see that function's doc comment for
+    /// why the terminal decision (and only the terminal decision) must wait
+    /// for the turn the delivered probe earns the worker.
+    pub(crate) async fn on_stop_with_turn_end_deferrable(
+        &self,
+        execution_id: &str,
+        turn_end: Option<&crate::driver::TurnEnd>,
+        defer_finalization: bool,
+    ) -> StopOutcome {
+        let outcome = self.on_stop_inner(execution_id, turn_end, defer_finalization).await;
         // `ci_remediation` (retrigger-kind only; fix-kind now dispatches through
         // revision_implementation) gets the catch-all finalizer on Stop.
         if let Ok(execution) = self.work_db.get_execution(execution_id) {
@@ -319,6 +341,7 @@ impl WorkerCompletionHandler {
         &self,
         execution_id: &str,
         turn_end: Option<&crate::driver::TurnEnd>,
+        defer_finalization: bool,
     ) -> StopOutcome {
         let execution = match self.work_db.get_execution(execution_id) {
             Ok(execution) => execution,
@@ -485,6 +508,26 @@ impl WorkerCompletionHandler {
                     );
                 }
             }
+        }
+
+        // Deferred-for-probe-turn: the pre-completion probe pass delivered a
+        // probe into the pane for this same boundary, so the worker is
+        // entitled to a turn to act on it before the generic
+        // PR-detection/nudge/park decision below runs — that decision is
+        // re-evaluated fresh at the `Stop` the granted turn produces.
+        // Everything above this point (the stale-Stop guard, the
+        // `stop_seen` stamp, `StopReason::Other` handling, and every
+        // kind-specific finalizer) has already run unconditionally for this
+        // boundary; only the terminal decision below is withheld. See
+        // [`crate::app::worker_events::dispatch_worker_event_fanout`]'s doc
+        // comment for the full rationale.
+        if defer_finalization {
+            tracing::info!(
+                execution_id,
+                "stop event: deferring the PR-detection/nudge/park decision to the Stop the \
+                 just-delivered probe's turn produces",
+            );
+            return StopOutcome::DeferredForProbeTurn;
         }
 
         // Primary channel: the structured-output PR-URL artifact the worker

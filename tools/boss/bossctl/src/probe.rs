@@ -8,6 +8,15 @@
 //! warning and exit 0: the whole point is that "queued, arriving shortly" and
 //! "never going to arrive" have to look different from the outside, since
 //! acting on the difference means either waiting or restarting the worker.
+//!
+//! There is a third answer between those two, and it is the one that bit:
+//! *accepted, but the engine cannot promise the delivery boundary will ever
+//! arrive.* The engine reports it as
+//! [`boss_protocol::ProbeDeliveryExpectation::is_best_effort`], and
+//! [`probe_run`] prints the caveat on stderr at issue time rather than
+//! leaving the caller to discover it from a `probe-status` query it has no
+//! reason to run. Exit stays 0 — the probe genuinely may land, and refusing
+//! outright would remove the surface without fixing the capability.
 
 use anyhow::{Context, Result, bail};
 use boss_protocol::{FrontendEvent, FrontendRequest};
@@ -41,6 +50,11 @@ pub async fn probe_run(
             urgent: is_urgent,
             expected_delivery,
         } => {
+            // Acceptance is not delivery, and for some drivers it is not even
+            // a promise of delivery — see `ProbeDeliveryExpectation::
+            // is_best_effort`. An engine too old to report an expectation is
+            // treated as best-effort: "we don't know" must warn, not reassure.
+            let best_effort = expected_delivery.is_none_or(|e| e.is_best_effort());
             if json {
                 println!(
                     "{}",
@@ -50,6 +64,7 @@ pub async fn probe_run(
                         "probe_id": probe_id,
                         "urgent": is_urgent,
                         "expected_delivery": expected_delivery.map(|e| e.as_str()),
+                        "best_effort": best_effort,
                     })
                 );
             } else {
@@ -61,6 +76,20 @@ pub async fn probe_run(
                 let label = if is_urgent { "urgent probe" } else { "probe" };
                 println!("{label} accepted for run {returned} (probe_id={probe_id}); {when}");
                 println!("check delivery with: bossctl probe-status {probe_id}");
+            }
+            // On stderr in both modes, so `--json` stdout stays parseable and
+            // a caller who only reads the exit code and stdout still sees it
+            // in a terminal. Exit stays 0: the engine did accept, and the
+            // probe may well land — the caller is being told that "accepted"
+            // is weaker here than it looks, not that the call failed.
+            if best_effort {
+                let caveat = expected_delivery
+                    .and_then(boss_protocol::ProbeDeliveryExpectation::caveat)
+                    .unwrap_or(
+                        "this engine did not report a delivery expectation, so the engine cannot say \
+                     whether the text will reach the worker.",
+                    );
+                eprintln!("warning: delivery of probe {probe_id} is best-effort and may never occur: {caveat}");
             }
             Ok(())
         }
@@ -103,12 +132,14 @@ pub async fn probe_run(
 /// worker (queued but never written, or the run went away first), so nothing
 /// landed and re-issuing cannot duplicate an instruction. `orphaned` is
 /// undeliverable too but is a different case: the write reached the pane, and
-/// only a fragile `kill(pid, 0)` liveness check says nobody was left to read
-/// it — a reply that does arrive still corrects the record to `Replied`. So
-/// `orphaned` gets its own, more cautious stderr line instead of the
-/// safe-to-reissue one. These states exist so that a probe the engine stopped
-/// trying to deliver stops reporting `queued` — `queued` is a live promise,
-/// and a probe stuck on it against a finished run was the bug.
+/// either a fragile `kill(pid, 0)` liveness check says nobody was left to read
+/// it, or the run's pane was released before the worker produced the boundary
+/// its reply would have arrived on. Neither is conclusive — a reply that does
+/// arrive still corrects the record to `Replied` — so `orphaned` gets its own,
+/// more cautious stderr line instead of the safe-to-reissue one. These states
+/// exist so that a probe the engine stopped trying to deliver stops reporting
+/// `queued` — `queued` is a live promise, and a probe stuck on it against a
+/// finished run was the bug.
 ///
 /// `unconfirmed` still gets an explanatory line on stderr: the engine wrote
 /// the text but could not prove the worker took it. That is deliberately
@@ -176,9 +207,10 @@ pub async fn probe_status(socket_path: &Option<String>, json: bool, probe_id: St
             } else if state == boss_protocol::ProbeDeliveryState::Orphaned {
                 eprintln!(
                     "warning: probe {returned} is orphaned (state=orphaned): the write reached the pane but \
-                     the worker's recorded process had already exited. It most likely went unread, but the pid \
-                     identity is not conclusive — check the worker's transcript before re-issuing, since a \
-                     reply that does arrive still corrects the record to `replied`.",
+                     nothing was left to act on it — the worker's recorded process had already exited, or its \
+                     run was torn down before it answered. It most likely went unread, but neither verdict is \
+                     conclusive — check the worker's transcript before re-issuing, since a reply that does \
+                     arrive still corrects the record to `replied`.",
                 );
             }
             Ok(())

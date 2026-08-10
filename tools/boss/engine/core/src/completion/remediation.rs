@@ -281,6 +281,11 @@ impl WorkerCompletionHandler {
             // failed too rather than leaving it `running` forever; there is
             // no live worker left to retrigger or push anything.
             StopOutcome::DriverTerminalError { .. } => true,
+            // The terminal PR-detection/nudge/park decision was withheld for
+            // this boundary because a probe was just delivered — the
+            // worker's turn loop is still live and will produce another
+            // Stop, which re-runs this finalizer. Not a failure.
+            StopOutcome::DeferredForProbeTurn => false,
         };
         if !should_mark_failed {
             return;

@@ -88,7 +88,10 @@ mod pane_ops;
 mod panes;
 mod planner_ops;
 mod pr_status;
-mod probes;
+// `pub(crate)` so `crate::attention_lifecycle` can bind
+// `PROBE_UNDELIVERED_ATTENTION_KIND` rather than re-spelling the string.
+// Individual items stay `pub(super)`; only the module path is widened.
+pub(crate) mod probes;
 mod products;
 mod projects;
 pub(crate) mod proposals;
@@ -728,6 +731,22 @@ struct ServerState {
     /// no-auto-redelivery behavior. See [`ProbeRecord`].
     #[builder(default)]
     probe_lifecycle: StdMutex<HashMap<String, ProbeRecord>>,
+    /// `probe_id` → `run_id` for a probe queued through the human/coordinator
+    /// `ProbeRun` RPC, whose acceptance is the documented ack gesture for a
+    /// worker-declared effort-escalation/blocker signal. Resolving the
+    /// run's open `worker_signal` attention items at *accept* time — rather
+    /// than at actual delivery — created an asymmetry worse than either half
+    /// alone: the auto-nudge suppression lifted because the attention read
+    /// resolved, while the acknowledgement text itself could still be
+    /// abandoned/orphaned and never reach the worker. An entry here is
+    /// resolved (and removed) the moment that probe's lifecycle first
+    /// reaches [`ProbeDeliveryState::is_delivered`] in
+    /// [`ServerState::set_probe_lifecycle_detail`] — the single choke point
+    /// every settlement path already writes through — so a probe that never
+    /// gets delivered leaves the attention exactly as open as the signal it
+    /// answers.
+    #[builder(default)]
+    probe_worker_signal_resolution: StdMutex<HashMap<String, String>>,
     /// One-shot waiters for the next `UserPromptSubmit` hook on a
     /// run, keyed by `run_id`. Each run can have *multiple* waiters
     /// registered concurrently (an urgent probe and a chore-update
@@ -1542,7 +1561,25 @@ impl ServerState {
         // no-slot early return below: a run that never finished spawning can
         // have probes queued against it too (`dispatch_probe_if_idle` leaves
         // them there when no slot is mapped yet).
-        self.abandon_pending_probes_for_terminated_run(run_id, "worker pane released");
+        let abandoned = self.abandon_pending_probes_for_terminated_run(run_id, "worker pane released");
+        self.surface_undelivered_probes(
+            run_id,
+            &abandoned,
+            ProbeDeliveryState::Abandoned,
+            "the worker's pane was released before the probe's delivery boundary arrived",
+        )
+        .await;
+        // The probe past the queue, if any. Its reply would have arrived at
+        // the worker's next turn boundary, and there is not going to be one.
+        if let Some(orphaned) = self.orphan_in_flight_probe_for_terminated_run(run_id, "worker pane released") {
+            self.surface_undelivered_probe(
+                run_id,
+                &orphaned,
+                ProbeDeliveryState::Orphaned,
+                "the worker's pane was released before it answered the probe",
+            )
+            .await;
+        }
         let Some(slot_id) = self.worker_registry.take_slot_for_run(run_id) else {
             // No slot mapping does not imply no process. The registry is
             // in-memory and is cleared unconditionally at the end of this very
@@ -1569,7 +1606,15 @@ impl ServerState {
         // that the slot mapping is actually gone, re-run the drain so that
         // probe does not strand reading `queued` forever. Idempotent: a no-op
         // when nothing landed in the window.
-        self.abandon_pending_probes_for_terminated_run(run_id, "worker pane released");
+        let abandoned_late = self.abandon_pending_probes_for_terminated_run(run_id, "worker pane released");
+        self.surface_undelivered_probes(
+            run_id,
+            &abandoned_late,
+            ProbeDeliveryState::Abandoned,
+            "the probe was queued in the window between the teardown drain and the slot mapping \
+             being taken, against a run that was already going away",
+        )
+        .await;
         // Snapshot the worker's recorded shell pid *before* we drop the
         // live-state entry further down — the engine-side reap backstop
         // below needs it. `0` means "pid not reported by the app yet",

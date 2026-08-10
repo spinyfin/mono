@@ -267,6 +267,14 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     ),
     // ── Only a human can lower these ────────────────────────────────────
     entry(
+        crate::app::probes::PROBE_UNDELIVERED_ATTENTION_KIND,
+        ClearedBy::HumanDecision,
+        "Records that a specific instruction never reached the worker. The run it targeted is over \
+         by the time this is filed, so a later run of the same item cannot deliver that probe — it \
+         is a different worker with a different prompt. Whether the instruction still needs to be \
+         given, and through which channel, is the issuer's call.",
+    ),
+    entry(
         crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND,
         ClearedBy::HumanDecision,
         "The deferred remainder still exists after any number of successful runs. Closing it is a \
@@ -530,6 +538,7 @@ mod tests {
             crate::tmux_adoption::TMUX_ADOPTION_SCHEMA_SKEW_ATTENTION_KIND,
             crate::spawn_ack_sweep::DRIVER_START_ATTENTION_KIND,
             crate::app::readoption::PROGRESS_INGRESS_UNRECOVERABLE_ATTENTION_KIND,
+            crate::app::probes::PROBE_UNDELIVERED_ATTENTION_KIND,
             crate::completion::NUDGE_BREAKER_ATTENTION_KIND,
             crate::completion::REVIEW_RESULT_GIVEUP_ATTENTION_KIND,
             crate::completion::DRIVER_TERMINAL_ERROR_ATTENTION_KIND,

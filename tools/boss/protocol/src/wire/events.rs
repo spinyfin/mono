@@ -262,8 +262,12 @@ pub enum FrontendEvent {
     /// `run_id`) and query progress via [`FrontendRequest::ProbeStatus`].
     ///
     /// An undeliverable probe produces [`FrontendEvent::ProbeRefused`]
-    /// instead, so receiving this event means the engine has committed to a
-    /// specific delivery boundary rather than merely having stored the text.
+    /// instead, so receiving this event means the engine has named a specific
+    /// delivery boundary rather than merely having stored the text. Naming a
+    /// boundary is not the same as guaranteeing one arrives: check
+    /// [`ProbeDeliveryExpectation::is_best_effort`] on `expected_delivery`
+    /// and surface the caveat, because a caller told only "accepted" for a
+    /// best-effort probe will assume the text landed.
     ProbeQueued {
         run_id: String,
         probe_id: String,
@@ -287,7 +291,12 @@ pub enum FrontendEvent {
     /// blocking condition (no live pane, a terminal worker, …). A probe that
     /// merely has to wait — a driver that takes no mid-turn input, a worker
     /// still spawning — is accepted with the matching
-    /// [`ProbeDeliveryExpectation`], not refused: it will arrive.
+    /// [`ProbeDeliveryExpectation`], not refused: there is a live worker and
+    /// a boundary to aim at.
+    ///
+    /// Refusing the waiting case instead would remove the surface without
+    /// fixing the capability, which is why it is reported through
+    /// [`ProbeDeliveryExpectation::is_best_effort`] rather than as a failure.
     ///
     /// Clients must treat this as a failure — a non-zero exit for a CLI. An
     /// accepted-but-undeliverable probe is indistinguishable from one about
