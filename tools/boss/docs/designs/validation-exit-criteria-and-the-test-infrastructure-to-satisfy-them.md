@@ -4,7 +4,7 @@
 - **Product:** Boss
 - **Project:** Validation exit criteria and the test infrastructure to satisfy them (`proj_18c69b165e60a088_4a`)
 - **Status:** proposed — design only, no implementation in this PR
-- **Related designs:** [`test-instance-isolation.md`](test-instance-isolation.md), [`agent-driver-abstraction-decouple-boss-from-claude-code-capabilities-oriented-mix-and-match.md`](agent-driver-abstraction-decouple-boss-from-claude-code-capabilities-oriented-mix-and-match.md), [`automated-reviewer-pass-on-every-agent-authored-pr.md`](automated-reviewer-pass-on-every-agent-authored-pr.md), [`engine-dispatch-instrumentation.md`](engine-dispatch-instrumentation.md)
+- **Related designs:** [`test-instance-isolation.md`](test-instance-isolation.md), [`agent-driver-abstraction-decouple-boss-from-claude-code-capabilities-oriented-mix-and-match.md`](agent-driver-abstraction-decouple-boss-from-claude-code-capabilities-oriented-mix-and-match.md), [`automated-reviewer-pass-on-every-agent-authored-pr.md`](automated-reviewer-pass-on-every-agent-authored-pr.md), [`engine-dispatch-instrumentation.md`](engine-dispatch-instrumentation.md), [`worker-screenshot-evidence-attachments.md`](worker-screenshot-evidence-attachments.md)
 
 ## TL;DR
 
@@ -77,7 +77,7 @@ The first deliverable of the parent project was an inventory before design. Ever
 - Boss can bring up a **fully isolated instance** — engine, app, fake externals, fake agent driver — from one command, in a test or on a developer's machine, with nothing leaking into production state.
 - The default CI lane stays fast; slower and riskier tests live in a named tier with their own lane and their own flakiness accounting.
 - **Token cost is a first-class constraint**: no test in any per-PR lane spawns a real model.
-- The six failure classes in the brief are each caught by a specific, named mechanism in this design (see §7).
+- The six failure classes in the brief are each caught by a specific, named mechanism in this design (see §5.14).
 
 ## 3. Non-goals
 
@@ -158,20 +158,20 @@ Requirements:
 - automated — an execution-keyed attention is visible through the coordinator's read API
   - //tools/boss/engine/core:attention_reachability_test
 - manual — the app renders the validation requirements and their evidence links
-  - Evidence: screenshot gallery URL from `boss attach`
+  - Evidence: see this PR's `## Evidence` section (screenshot gallery URL from `boss attach`)
 ```
 
 ### 5.2 Evidence, not assertion
 
 Three evidence channels can be combined just like the requirements. **A PR body claim with no matching evidence record is a review-lane finding.**
 
-**(a) Bazel evidence provider.** The PR body names targets so the reviewer can judge whether each target covers its stated criterion. A checker confirms each label exists and that the applicable PR-head CI lane is green, importing the Build Event Protocol or `bazel-testlogs/**/test.xml` artifacts that the `bazel-build-test` step already uploads when it needs target-level detail. It does not ask the worker to assert that each target ran: the existing affected-target CI machinery owns selection and already guarantees that affected tests execute.
+**(a) Automatic provider evidence, Bazel first.** Evidence providers automatically import durable diagnostics where a tool exposes them; Bazel is the first provider. The PR body names targets so the reviewer can judge whether each target covers its stated criterion. A checker confirms each label exists and that the applicable PR-head CI lane is green, importing the Build Event Protocol or `bazel-testlogs/**/test.xml` artifacts that the `bazel-build-test` step already uploads when it needs target-level detail. It does not ask the worker to assert that each target ran: the existing affected-target CI machinery owns selection and already guarantees that affected tests execute.
 
-**(b) Tool-native command evidence, with an explicit fallback.** Evidence providers automatically import durable diagnostics where a tool exposes them; Bazel is the first provider. For commands without such a source, `boss validate run -- <cmd…>` executes the command, captures argv, full stdout/stderr, exit status, and wall-clock, and writes a JSON record to `<state root>/executions/<execution_id>/validation/<slug>.json`. The worker prompt uses the wrapper only for these uncovered commands. The PR body cites the resulting provider record; the review lane resolves it and reads the **actual exit code**.
+**(b) `boss validate run`: the generic fallback.** For commands with no provider — `checkleft` does not yet expose an equivalent receipt — `boss validate run -- <cmd…>` executes the command, captures argv, full stdout/stderr, exit status, and wall-clock, and writes a JSON record to `<state root>/executions/<execution_id>/validation/<slug>.json`. The worker prompt uses the wrapper only for these uncovered commands. The PR body cites the resulting provider record; the review lane resolves it and reads the **actual exit code**.
 
 This is the direct fix for the truncated-`checkleft` failure described in §1.2: the command returned partial output plus a still-live session handle, the worker never polled that handle to a terminal result with an exit code, and nevertheless reported that `checkleft run` passed. A tool-native receipt or the fallback wrapper makes the terminal result independent of transcript truncation, pane scrollback, and worker interpretation. Absence of any provider record for a claimed command is itself the finding. The wrapper can still be forgotten for a tool without native evidence; that omission becomes a review finding, while the adapter-first design avoids that failure mode for Bazel, the common case.
 
-**(c) Captured artifacts for a `manual` requirement.** PNG/JPEG evidence reuses the shipped [`boss attach` mechanism](https://github.com/spinyfin/mono/blob/main/tools/boss/docs/designs/worker-screenshot-evidence-attachments.md): the engine validates and stores the image outside the recyclable workspace, associates it with the execution and work item, and returns a gallery URL for the PR's `## Evidence` section. A checker resolves the attachment row rather than trusting the URL alone. Non-image evidence such as an engine RPC trace or a dispatch-event slice remains under `executions/<id>/validation/`, with a small manifest in the existing per-execution forensic directory ([`forensic-surfaces.md`](../forensic-surfaces.md)).
+**(c) Captured artifacts for a `manual` requirement.** PNG/JPEG evidence reuses the shipped [`boss attach` mechanism](worker-screenshot-evidence-attachments.md): the engine validates and stores the image outside the recyclable workspace, associates it with the execution and work item, and returns a gallery URL for the PR's `## Evidence` section. A checker resolves the attachment row rather than trusting the URL alone. Non-image evidence such as an engine RPC trace or a dispatch-event slice remains under `executions/<id>/validation/`, with a small manifest in the existing per-execution forensic directory ([`forensic-surfaces.md`](../forensic-surfaces.md)).
 
 **Who checks:** the automated reviewer already runs on every agent-authored PR. It gains a deterministic pre-pass — a Rust checker that resolves the claims _before_ the LLM sees the diff — so a nonexistent Bazel label, a red PR-head CI result, an absent command record, or a missing attachment is a mechanical finding, not a judgement call.
 
@@ -310,9 +310,9 @@ All six. That was the bar the brief set.
 
 **Tier I lane cost on macOS.** App-involving integration tests need a macOS agent, and the `macos-arm64` queue is the scarcer resource. If the tier-I lane grows, PR latency grows. Mitigation: keep app tests to the record/replay path (tier U, no engine) wherever possible and reserve tier I for flows that genuinely need two processes.
 
-**A new column on `Task` is a schema migration and a protocol change.** It touches `boss-protocol`, the DB mappers (which per repo convention stay struct-literal), the CLI, and the app. It is deliberately split across several tasks in §7 for that reason.
+**A new child-row table plus a `ValidationRequirement` collection on `Task` is a schema migration and a protocol change.** It touches `boss-protocol`, the DB mappers (which per repo convention stay struct-literal), the CLI, and the app. It is deliberately split across several tasks in the implementation breakdown below for that reason.
 
-**Adding evidence obligations slows workers down.** Every worker now runs validation through a wrapper and writes a structured `## Validation` section. That is real friction. The bet is that it is cheaper than the half-day the Xcode-gate failure cost. Worth revisiting after a month of data.
+**Adding evidence obligations slows workers down.** Workers now author a `## Validation` mapping from each filed requirement to its evidence, and use the wrapper only for commands with no tool-native provider. That is real friction, though narrower than a universal wrapper requirement would be. The bet is that it is cheaper than the half-day the Xcode-gate failure cost. Worth revisiting after a month of data.
 
 **`BOSS_RECOVERY_DIR` process-global state** forces some tests to serialise. Fixing it properly means threading it through config, which is a small refactor of a production path — in scope, but it is production code changing for testability, and that should be a conscious call.
 

@@ -1,19 +1,29 @@
 [
   {
     "question_type": "multiple_choice",
-    "prompt": "Where should the validation tier be authoritative? The design proposes a `validation_tier` column authored by the coordinator at filing time, with the PR body naming evidence against it.",
+    "prompt": "Where should the validation requirement collection be authoritative? The design proposes `validation_requirements` as child rows authored by the coordinator at filing time, with the PR body naming evidence against each filed requirement.",
     "choices": [
-      "Work-item column, authored at filing time (as designed)",
+      "Work-item child rows, authored at filing time (as designed)",
       "PR-body section only, enforced by the review lane",
-      "Both, with the column authoritative and the PR body required to match",
-      "Both, with the PR body allowed to override the filed tier when the worker justifies it"
+      "Both, with the filed rows authoritative and the PR body required to cite evidence for each",
+      "Both, with the PR body allowed to add requirements beyond those filed, when the worker justifies it"
     ],
     "anchor": "51-the-taxonomy-and-where-the-declaration-lives"
   },
   {
     "question_type": "yes_no",
-    "prompt": "Should tier `unit`/`automated` evidence require naming specific Bazel targets that are then mechanically resolved against the PR's bazel-testlogs artifacts? This is the strongest anti-self-report mechanism but adds friction to every PR.",
+    "prompt": "Under the adapter-first evidence model, `unit`/`automated` evidence resolves named Bazel targets against Build Event Protocol or `bazel-testlogs/**/test.xml` artifacts plus a green PR-head CI result (§5.2(a)), instead of a worker self-report that the target ran. Is that resolution mechanism sufficient, or should it also require the specific target's per-test XML to exist (stronger, but couples the checker to test-runner output shape rather than the coarser commit-status signal)?",
     "anchor": "52-evidence-not-assertion"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "§4.6 chooses an adapter-first hybrid — evidence providers (Bazel first) import diagnostics automatically, and `boss validate run` covers only commands with no provider. Is that the right default, or should the wrapper remain mandatory for every validation command regardless of provider coverage, for uniform auditability at the cost of the friction §4.6 was written to avoid?",
+    "choices": [
+      "Adapter-first hybrid, wrapper only for uncovered commands (as designed)",
+      "Wrapper mandatory for every command, even where a provider exists",
+      "Adapter-first for Bazel only in v1; require the wrapper for every other tool until a second provider ships"
+    ],
+    "anchor": "46-wrapper-only-command-recording-vs-tool-native-evidence"
   },
   {
     "question_type": "multiple_choice",
