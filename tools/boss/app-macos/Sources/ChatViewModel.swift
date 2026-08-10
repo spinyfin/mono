@@ -209,9 +209,12 @@ final class ChatViewModel: ObservableObject {
     /// Each mounted card observes one keyed cell from the store, so hovering
     /// an "In revision" badge does not invalidate every board section.
     let revisionHighlightStore = WorkBoardRevisionHighlightStore()
+    /// Last parent id delivered to `setRevisionBadgeHover`. A repeated enter
+    /// for the same parent is a no-op string compare before any revision scan.
+    var lastRevisionHoverParentID: String?
 
-    /// Read-only compatibility surface for helper tests and diagnostics.
-    /// This is intentionally not `@Published`; views observe keyed cells.
+    /// Read-only aggregate used by tests; views observe keyed cells and must
+    /// not read this. Intentionally not `@Published`.
     var revisionHighlightIDs: Set<String> {
         revisionHighlightStore.highlightedIDs
     }
@@ -2288,12 +2291,11 @@ final class ChatViewModel: ObservableObject {
     /// means "invalidated — rebuild on next read". Before this cache
     /// existed, both accessors re-scanned every project's tasks and every
     /// product's revisions on EVERY call, and the kanban calls both once
-    /// per visible card on every render. Before revision hover moved to keyed
-    /// per-card state, that highlight lived on this `@Published` view model,
-    /// so a single badge hover during a scroll re-rendered the whole board
-    /// and re-ran that O(total tasks) scan per card — a measured main-thread
-    /// hot leaf during hover-while-scroll jank. Rebuilt lazily, same pattern
-    /// as `cachedGatingPrereqs`.
+    /// per visible card on every render. Any broad `@Published` change on
+    /// this view model re-renders the whole board, so without this cache
+    /// each such change re-runs an O(total tasks) scan once per card — a
+    /// measured main-thread hot leaf during hover-while-scroll jank.
+    /// Rebuilt lazily, same pattern as `cachedGatingPrereqs`.
     var cachedInReviewRevisionsByParentID: [String: [WorkTask]]?
     var cachedDoneRevisionsByParentID: [String: [WorkTask]]?
     /// Backing storage for `workBoardRepoMode` (ChatViewModel+BoardHelpers).

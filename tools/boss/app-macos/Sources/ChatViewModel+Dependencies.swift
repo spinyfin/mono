@@ -204,9 +204,12 @@ extension ChatViewModel {
     ///
     /// Routed through per-task observable cells rather than an `@Published`
     /// property on `ChatViewModel`. A genuine transition therefore updates
-    /// only the revision cards whose chrome changes; repeated hit-test events
-    /// remain equality-gated inside the store.
+    /// only the revision cards whose chrome changes. Repeated enter events
+    /// for the same parent short-circuit on `lastRevisionHoverParentID`
+    /// before scanning revisions; the store still equality-gates the set.
     func setRevisionBadgeHover(_ taskID: String?) {
+        guard taskID != lastRevisionHoverParentID else { return }
+        lastRevisionHoverParentID = taskID
         let next: Set<String> = taskID
             .map { Set(activeRevisions(forParentID: $0).map(\.id)) } ?? []
         revisionHighlightStore.setHighlightedIDs(next)

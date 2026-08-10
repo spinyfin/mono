@@ -24,6 +24,11 @@ final class WorkBoardRevisionHighlightState: ObservableObject {
 /// lifetime of `ChatViewModel`; mounted views retain the cells they observe.
 @MainActor
 final class WorkBoardRevisionHighlightStore {
+    /// Sweep zeroed weak entries after this many allocations. Large enough
+    /// that a full board of mounted cards never prunes mid-hover, small enough
+    /// that churn without strong holders cannot grow the registry unbounded.
+    private static let pruneAfterCreations = 256
+
     private final class WeakState {
         weak var value: WorkBoardRevisionHighlightState?
 
@@ -36,6 +41,14 @@ final class WorkBoardRevisionHighlightStore {
     private var statesCreatedSincePrune = 0
     private(set) var highlightedIDs: Set<String> = []
 
+    /// Live (non-zeroed) registry entries. Used by tests to assert the weak
+    /// lifetime contract without racing MainActor deallocation timing.
+    var liveRegisteredStateCount: Int {
+        statesByTaskID.values.reduce(0) { partial, box in
+            partial + (box.value != nil ? 1 : 0)
+        }
+    }
+
     func state(for taskID: String) -> WorkBoardRevisionHighlightState {
         if let existing = statesByTaskID[taskID]?.value {
             return existing
@@ -46,7 +59,7 @@ final class WorkBoardRevisionHighlightStore {
         )
         statesByTaskID[taskID] = WeakState(state)
         statesCreatedSincePrune += 1
-        if statesCreatedSincePrune >= 256 {
+        if statesCreatedSincePrune >= Self.pruneAfterCreations {
             statesByTaskID = statesByTaskID.filter { $0.value.value != nil }
             statesCreatedSincePrune = 0
         }

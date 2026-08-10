@@ -45,11 +45,10 @@ struct UIUpdateCounterSample: Codable, Sendable, Equatable {
 
 /// Atomic UI-update counters flushed on a 1 Hz timer.
 ///
-/// Hot path is a single unfair-lock increment per call site. The 1 Hz flush
-/// exchanges counters and
-/// emits a sample **only when something incremented**, so idle ticks
-/// pay a five-field zero check and nothing else (no signpost, no ring
-/// append).
+/// Hot path is a single unfair-lock increment per call site. The 1 Hz
+/// flush exchanges counters and emits a sample **only when something
+/// incremented**, so idle ticks pay a five-field zero check and nothing
+/// else (no signpost, no ring append).
 ///
 /// Lives on the existing [[PopulationTimingLog]] / `os_signpost` rails:
 /// samples ride the `com.boss.app` / `population` signposter under

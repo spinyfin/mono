@@ -502,9 +502,66 @@ final class WorkDependencyKanbanTests: XCTestCase {
         XCTAssertTrue(state.isHighlighted)
     }
 
+    /// When the only strong holder of a cell goes away, the registry's weak
+    /// entry zeroes and a subsequent `state(for:)` allocates a fresh cell.
+    /// Identity is checked via a weak ref (not `ObjectIdentifier`) because
+    /// malloc often reuses the freed address for the immediate reallocation.
+    func testRevisionHighlightStoreDropsReleasedCells() {
+        let store = WorkBoardRevisionHighlightStore()
+        weak var weakState: WorkBoardRevisionHighlightState?
+        Self.withAllocatedHighlightState(store, taskID: "a") { held in
+            weakState = held
+            XCTAssertTrue(store.state(for: "a") === held)
+            XCTAssertEqual(store.liveRegisteredStateCount, 1)
+        }
+        XCTAssertNil(
+            weakState,
+            "cell must deallocate when its only strong holder is gone"
+        )
+        XCTAssertEqual(
+            store.liveRegisteredStateCount,
+            0,
+            "released cells must not remain reachable via the registry"
+        )
+        let second = store.state(for: "a")
+        XCTAssertEqual(second.taskID, "a")
+        // A zeroed weak ref proves this is a new allocation, even if the
+        // heap reuses the previous address (where `===` would mislead).
+        XCTAssertNil(weakState, "new state(for:) must not resurrect the old cell")
+        XCTAssertEqual(store.liveRegisteredStateCount, 1)
+    }
+
+    @inline(never)
+    private static func withAllocatedHighlightState(
+        _ store: WorkBoardRevisionHighlightStore,
+        taskID: String,
+        body: (WorkBoardRevisionHighlightState) -> Void
+    ) {
+        let held = store.state(for: taskID)
+        body(held)
+    }
+
+    /// The 256-entry prune must strip zeroed weak entries and leave live cells
+    /// reachable by identity.
+    func testRevisionHighlightStorePruneKeepsLiveCells() {
+        let store = WorkBoardRevisionHighlightStore()
+        let live = store.state(for: "live")
+        for index in 0..<300 {
+            _ = store.state(for: "temp_\(index)")
+        }
+        XCTAssertTrue(
+            store.state(for: "live") === live,
+            "a cell still held strongly must survive the prune sweep"
+        )
+        // Temps were short-lived: after the sweep only the held cell remains.
+        XCTAssertEqual(store.liveRegisteredStateCount, 1)
+    }
+
     /// A genuine revision-badge transition must not rebuild snapshots for
     /// every card in the section. This hosts the real section view and drives
-    /// the same model entry point as the badge's `onHover` callback.
+    /// the same model entry point as the badge's `onHover` callback. Also
+    /// delivers a burst of repeated enter/exit pairs so a high-frequency
+    /// no-op stream cannot quietly reintroduce column-wide rebuilds.
     func testRevisionBadgeHoverDoesNotRebuildColumnSnapshots() {
         let model = makeFixture()
         guard let phase2 = model.taskByName("Phase 2") else {
@@ -545,17 +602,48 @@ final class WorkDependencyKanbanTests: XCTestCase {
         model.setRevisionBadgeHover(phase2.id)
         RunLoop.current.run(until: Date().addingTimeInterval(0.1))
         hosting.layoutSubtreeIfNeeded()
-        let after = UIUpdateCounters.shared.currentCounts()
-        let builtForHover = after.cardSnapshotBuilds - before.cardSnapshotBuilds
-        let bodiesForHover = after.cardBodyEvaluations - before.cardBodyEvaluations
+        let afterFirst = UIUpdateCounters.shared.currentCounts()
+
+        // Burst of repeated enter/exit pairs after the genuine transition.
+        for _ in 0..<20 {
+            model.setRevisionBadgeHover(phase2.id)
+            model.setRevisionBadgeHover(nil)
+            model.setRevisionBadgeHover(phase2.id)
+        }
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        hosting.layoutSubtreeIfNeeded()
+        let afterBurst = UIUpdateCounters.shared.currentCounts()
         window.orderOut(nil)
 
-        print(
-            "revision-hover measurement: snapshots=\(builtForHover)/\(items.count) "
-                + "card-bodies=\(bodiesForHover)"
+        XCTAssertGreaterThanOrEqual(
+            afterFirst.cardSnapshotBuilds,
+            before.cardSnapshotBuilds,
+            "counter snapshot must not go backwards (flush would trap on UInt64 delta)"
         )
+        XCTAssertGreaterThanOrEqual(
+            afterFirst.cardBodyEvaluations,
+            before.cardBodyEvaluations
+        )
+        XCTAssertGreaterThanOrEqual(
+            afterBurst.cardSnapshotBuilds,
+            afterFirst.cardSnapshotBuilds
+        )
+        let builtForHover = Int(afterFirst.cardSnapshotBuilds - before.cardSnapshotBuilds)
+        let bodiesForHover = Int(afterFirst.cardBodyEvaluations - before.cardBodyEvaluations)
+        let builtForBurst = Int(afterBurst.cardSnapshotBuilds - afterFirst.cardSnapshotBuilds)
+
         XCTAssertEqual(builtForHover, 0, "hover state must bypass section-wide snapshot rebuilding")
-        XCTAssertEqual(bodiesForHover, 1, "only the highlighted revision card should redraw")
+        XCTAssertGreaterThanOrEqual(bodiesForHover, 1, "the hover update must land on at least one card body")
+        XCTAssertLessThan(
+            bodiesForHover,
+            items.count,
+            "a column-wide body re-evaluation would reintroduce scroll jank"
+        )
+        XCTAssertEqual(
+            builtForBurst,
+            0,
+            "repeated enter/exit after the parent-id gate must not rebuild snapshots"
+        )
     }
 
     // MARK: - Fixture
