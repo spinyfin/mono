@@ -1411,7 +1411,6 @@ fn legacy_merge_queue_attempt_may_retire(work_db: &WorkDb, active: &CiRemediatio
             crate::work::TaskStatus::InReview
                 | crate::work::TaskStatus::Done
                 | crate::work::TaskStatus::Archived
-                | crate::work::TaskStatus::Cancelled
         ),
         Ok(_) => false,
         Err(err) => {
