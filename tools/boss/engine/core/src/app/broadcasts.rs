@@ -51,13 +51,12 @@ impl ServerState {
     /// It deliberately subscribes to
     /// [`ExecutionCoordinator::subscribe_pause_state`](
     /// crate::coordinator::ExecutionCoordinator::subscribe_pause_state) —
-    /// the *state change* — rather than being invoked by each pauser:
-    /// before this existed the push lived inside the two `Set*Paused` RPC
-    /// handlers, so `bossctl dispatch pause` updated the running app while
-    /// the spawn-capability circuit breaker's programmatic pause left it
-    /// showing nothing, and the operator had to go to the CLI to discover
-    /// dispatch had been held for hours. Any future programmatic pauser is
-    /// covered here for free; none of them needs to know this exists.
+    /// the pause-state *transition* — rather than being called by each
+    /// pauser: every pauser, the `Set*Paused` RPC handlers, the
+    /// spawn-capability circuit breaker, and any future programmatic one,
+    /// pushes a fresh health snapshot through here without knowing this
+    /// exists. A pause that only reached the CLI would leave the app's
+    /// banner silently stale.
     ///
     /// The app's connect-time `get_engine_health` still covers the
     /// start-into-a-pause case — this task is purely about transitions

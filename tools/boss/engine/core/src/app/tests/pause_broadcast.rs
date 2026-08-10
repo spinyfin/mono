@@ -1,18 +1,12 @@
 // Regression coverage for the engine→app dispatch-pause banner.
 //
 // The macOS app's pause banner is driven entirely by `engine.health`
-// pushes. That push used to be emitted by the two `Set*Paused` RPC
-// *handlers* — i.e. keyed to one particular caller — so a pause set through
-// `bossctl dispatch pause` updated a running app while a pause set
-// programmatically by the spawn-capability circuit breaker left the app
-// showing nothing at all until it next reconnected. The operator reported
-// that twice.
-//
-// So these tests deliberately drive a **programmatic** pauser
+// pushes. These tests deliberately drive a **programmatic** pauser
 // (`trip_spawn_capability_circuit` / `resume_dispatch_after_breaker_recovery`)
-// rather than the CLI verb: a fix that only re-wires the RPC handler passes
-// a CLI-path test and still ships the bug. They assert on what a subscribed
-// frontend actually receives, not on internal coordinator state.
+// rather than the CLI verb, because a fix wired only into the RPC handler
+// would pass a CLI-path test and still leave breaker-originated pauses
+// invisible. They assert on what a subscribed frontend actually receives,
+// not on internal coordinator state.
 
 use super::*;
 
@@ -109,7 +103,7 @@ async fn breaker_pause_pushes_engine_health_to_a_running_app() {
     assert!(
         issue.body.contains("spawn-capability circuit breaker tripped"),
         "the banner must carry the reason, not just the paused fact — otherwise the \
-         operator still has to go to the CLI to find out why: {}",
+         banner shows a pause with no reason and the cause is only discoverable from the CLI: {}",
         issue.body,
     );
 }

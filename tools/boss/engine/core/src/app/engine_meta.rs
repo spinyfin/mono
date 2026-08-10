@@ -692,9 +692,9 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
         // report itself. `coordinator.pause_dispatch` / `resume_dispatch`
         // above already notified every subscriber of the pause-state
         // transition, and `ServerState::spawn_pause_state_health_broadcaster`
-        // turns that into the engine-health push. Re-adding a broadcast here
-        // would restore the caller-keyed shape that left breaker-originated
-        // pauses invisible in the running app.
+        // turns that into the engine-health push. Broadcasting here would
+        // double-push and would tempt the next programmatic pauser to add
+        // its own call; the transition subscriber is the single seam.
     }
 }
 

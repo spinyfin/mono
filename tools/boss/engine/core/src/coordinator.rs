@@ -2196,15 +2196,11 @@ pub struct ExecutionCoordinator {
     /// receivers.
     ///
     /// This is keyed to the **state transition**, deliberately not to any
-    /// caller. Before it existed, the engine→app health push lived in the
-    /// two `Set*Paused` RPC handlers, so a pause set through `bossctl` /
-    /// the app's toggle updated the running app while a pause set
-    /// programmatically — the spawn-capability circuit breaker
-    /// ([`crate::spawn_health::trip_spawn_capability_circuit`]) — left the
-    /// app showing no pause at all until it next reconnected. Adding a
-    /// second broadcast call beside the breaker would have left the same
-    /// trap for the next programmatic pauser; hooking the transition covers
-    /// every present and future one by construction. See
+    /// caller: every pauser — the `Set*Paused` RPC handlers, the
+    /// spawn-capability circuit breaker
+    /// ([`crate::spawn_health::trip_spawn_capability_circuit`]), or any
+    /// future programmatic one — is observed by construction and none of
+    /// them needs to fire a notification itself. See
     /// `ServerState::spawn_pause_state_health_broadcaster`.
     ///
     /// A `watch` (not the engine [`EventBus`]) because this is
