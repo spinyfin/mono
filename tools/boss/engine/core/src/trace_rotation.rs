@@ -23,12 +23,15 @@
 //! already written land safely in the renamed file before the old `File`
 //! handle is dropped.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use boss_log_files::{next_rotated_path, rotated_segments};
+use crate::rotating_file;
+use boss_log_files::next_rotated_path;
+#[cfg(test)]
+use boss_log_files::rotated_segments;
 
 pub const TRACE_MAX_BYTES_ENV: &str = "BOSS_ENGINE_TRACE_MAX_BYTES";
 pub const TRACE_MAX_FILES_ENV: &str = "BOSS_ENGINE_TRACE_MAX_FILES";
@@ -66,12 +69,7 @@ pub fn rotate_on_startup(path: &Path, max_files: usize) {
 /// Open (or create) the trace file for appending.  The directory is
 /// created if needed.  Called both at startup and after each rotation.
 pub fn open_trace_file(path: &Path) -> io::Result<File> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    OpenOptions::new().create(true).append(true).open(path)
+    rotating_file::open_append_file(path)
 }
 
 /// Delete the oldest rotated backups, keeping at most `max_files`.
@@ -82,16 +80,7 @@ pub fn open_trace_file(path: &Path) -> io::Result<File> {
 /// leading slice. The rotated-segment format and ordering both live in
 /// `boss-log-files` — this writer never re-encodes them.
 pub fn prune_old_rotated(active_path: &Path, max_files: usize) {
-    let backups = rotated_segments(active_path);
-    if backups.len() <= max_files {
-        return;
-    }
-    let to_delete = backups.len() - max_files;
-    for path in &backups[..to_delete] {
-        if let Err(err) = std::fs::remove_file(path) {
-            eprintln!("boss-engine: could not prune old trace file {}: {err}", path.display());
-        }
-    }
+    rotating_file::prune_old_rotated(active_path, max_files, "trace file")
 }
 
 /// Mutable state held inside the writer's mutex — the current open file

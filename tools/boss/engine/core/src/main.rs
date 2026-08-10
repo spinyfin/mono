@@ -1,4 +1,3 @@
-use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -13,20 +12,33 @@ use boss_engine::app::{self, DEFAULT_SOCKET_PATH, isolation::IsolationPaths};
 use boss_engine::audit::{self, StartContext};
 use boss_engine::build_info;
 use boss_engine::cli::Cli;
-use boss_engine::trace_rotation::{self, RotatingJsonlWriter, RotatingState};
+use boss_engine::rotating_file::{RotatingFileWriter, RotatingState as TextLogState, open_append_file};
+use boss_engine::trace_rotation::{self, RotatingJsonlWriter, RotatingState as TraceRotatingState};
 
 const DEFAULT_LOG_PATH: &str = "/tmp/boss-engine.log";
+const TEXT_LOG_MAX_BYTES_ENV: &str = "BOSS_ENGINE_LOG_MAX_BYTES";
+const TEXT_LOG_MAX_FILES_ENV: &str = "BOSS_ENGINE_LOG_MAX_FILES";
+/// Keep 20 100 MiB text-log backups plus the active segment: enough history
+/// for incident forensics, with a finite 2.1 GiB upper bound.
+const DEFAULT_TEXT_LOG_MAX_BYTES: u64 = 100 * 1024 * 1024;
+const DEFAULT_TEXT_LOG_MAX_FILES: usize = 20;
 
 struct DualLogWriter {
     stderr: io::Stderr,
-    file: Option<Arc<Mutex<File>>>,
+    file: Option<Arc<Mutex<Option<TextLogState>>>>,
+    path: PathBuf,
+    max_bytes: u64,
+    max_files: usize,
 }
 
 impl DualLogWriter {
-    fn new(file: Option<Arc<Mutex<File>>>) -> Self {
+    fn new(file: Option<Arc<Mutex<Option<TextLogState>>>>, path: PathBuf, max_bytes: u64, max_files: usize) -> Self {
         Self {
             stderr: io::stderr(),
             file,
+            path,
+            max_bytes,
+            max_files,
         }
     }
 }
@@ -34,20 +46,30 @@ impl DualLogWriter {
 impl Write for DualLogWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.stderr.write_all(buf)?;
-        if let Some(file) = &self.file
-            && let Ok(mut file) = file.lock()
-        {
-            let _ = file.write_all(buf);
+        if let Some(state) = &self.file {
+            let mut writer = RotatingFileWriter {
+                path: self.path.clone(),
+                state: state.clone(),
+                max_bytes: self.max_bytes,
+                max_files: self.max_files,
+                log_name: "engine text log",
+            };
+            let _ = writer.write_all(buf);
         }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
         self.stderr.flush()?;
-        if let Some(file) = &self.file
-            && let Ok(mut file) = file.lock()
-        {
-            let _ = file.flush();
+        if let Some(state) = &self.file {
+            let mut writer = RotatingFileWriter {
+                path: self.path.clone(),
+                state: state.clone(),
+                max_bytes: self.max_bytes,
+                max_files: self.max_files,
+                log_name: "engine text log",
+            };
+            let _ = writer.flush();
         }
         Ok(())
     }
@@ -102,18 +124,19 @@ fn resolve_log_path(isolation: &IsolationPaths) -> PathBuf {
         .unwrap_or(resolved)
 }
 
-fn open_log_file(path: &Path) -> Result<File> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create log directory {}", parent.display()))?;
-    }
+fn text_log_rotation_config() -> (u64, usize) {
+    let max_bytes = boss_engine_utils::env_parse::env_parsed_or(TEXT_LOG_MAX_BYTES_ENV, DEFAULT_TEXT_LOG_MAX_BYTES);
+    let max_files = boss_engine_utils::env_parse::env_parsed_or(TEXT_LOG_MAX_FILES_ENV, DEFAULT_TEXT_LOG_MAX_FILES);
+    (max_bytes.max(1), max_files)
+}
 
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+fn open_log_file(path: &Path, max_files: usize) -> Result<TextLogState> {
+    // A restart normally continues appending to the active segment, so prune
+    // here as well as on rotation. Otherwise a restart storm could retain
+    // arbitrarily many segments without ever writing enough to rotate again.
+    boss_engine::rotating_file::prune_old_rotated(path, max_files, "engine text log");
+    open_append_file(path)
+        .map(TextLogState::new)
         .with_context(|| format!("failed to open engine log file {}", path.display()))
 }
 
@@ -135,8 +158,9 @@ async fn main() -> Result<()> {
     let isolation = IsolationPaths::derive(cli.socket_path.as_deref().unwrap_or(DEFAULT_SOCKET_PATH));
 
     let log_path = resolve_log_path(&isolation);
-    let file_writer = match open_log_file(&log_path) {
-        Ok(file) => Some(Arc::new(Mutex::new(file))),
+    let (text_max_bytes, text_max_files) = text_log_rotation_config();
+    let file_writer = match open_log_file(&log_path, text_max_files) {
+        Ok(file) => Some(Arc::new(Mutex::new(Some(file)))),
         Err(err) => {
             eprintln!(
                 "boss-engine: could not enable file logging at {}: {err}",
@@ -148,11 +172,21 @@ async fn main() -> Result<()> {
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    // Text layer: compact human-readable output to stderr + rolling log file.
+    // Text layer: compact human-readable output to stderr + a bounded rolling
+    // log. This is retained for incident forensics, but is not an unbounded
+    // durable surface: 20 100 MiB backups plus the active segment are kept.
+    let text_log_path = log_path.clone();
     let text_layer = tracing_subscriber::fmt::layer()
         .compact()
         .with_target(false)
-        .with_writer(move || DualLogWriter::new(file_writer.clone()));
+        .with_writer(move || {
+            DualLogWriter::new(
+                file_writer.clone(),
+                text_log_path.clone(),
+                text_max_bytes,
+                text_max_files,
+            )
+        });
 
     // JSON layer: structured JSONL for the macOS Activity Log viewer.
     // Best-effort — silently skipped if the file cannot be opened.
@@ -165,7 +199,7 @@ async fn main() -> Result<()> {
         Some(path) => {
             trace_rotation::rotate_on_startup(&path, trace_max_files);
             let state = match trace_rotation::open_trace_file(&path) {
-                Ok(file) => Some(RotatingState::new(file)),
+                Ok(file) => Some(TraceRotatingState::new(file)),
                 Err(err) => {
                     eprintln!(
                         "boss-engine: could not open engine-trace JSONL at {}: {err}",
