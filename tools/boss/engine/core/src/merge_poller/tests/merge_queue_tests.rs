@@ -415,21 +415,39 @@ async fn dequeue_event_head_gate_skips_superseded_and_admits_current_head() {
     let pr = "https://github.com/foo/bar/pull/current-head-gate";
     let (product_id, chore) = make_chore_in_review(&db, "C-current-head-gate", pr);
     assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 0);
+    // Mirror the preceding poll pass, which records the live PR head before
+    // the rebounce pass consumes timeline events.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_head_sha = 'head-2' WHERE id = ?1",
+            rusqlite::params![&chore],
+        )
+        .unwrap();
+    let publisher = Arc::new(RecordingPublisher::default());
+    let candidate = PendingMergeCheck {
+        work_item_id: chore.clone(),
+        product_id: product_id.clone(),
+        pr_url: pr.to_owned(),
+    };
+    let mut stale_events = HashMap::new();
+    stale_events.insert(pr.to_owned(), vec![stale.clone()]);
+    let mut outcome = SweepOutcome::default();
+    check_merge_queue_rebounce(&db, publisher.as_ref(), &candidate, &stale_events, &mut outcome).await;
+    assert!(
+        db.list_ci_remediations(None, &[], Some(&chore), None)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 0);
     let current = MergeQueueDequeueEvent {
         pr_head_oid: Some("head-2".to_owned()),
         ..stale
     };
     assert!(dequeue_event_is_for_current_pr_head(&current, Some("head-2")));
-    let publisher = Arc::new(RecordingPublisher::default());
-    let candidate = PendingMergeCheck {
-        work_item_id: chore.clone(),
-        product_id,
-        pr_url: pr.to_owned(),
-    };
-    assert!(
-        ci_watch::on_merge_queue_rebounce_detected(&db, publisher.as_ref(), &candidate, "head-2", "queue-1", &[], &[],)
-            .await
-    );
+    let mut current_events = HashMap::new();
+    current_events.insert(pr.to_owned(), vec![current]);
+    check_merge_queue_rebounce(&db, publisher.as_ref(), &candidate, &current_events, &mut outcome).await;
     assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 1);
 }
 

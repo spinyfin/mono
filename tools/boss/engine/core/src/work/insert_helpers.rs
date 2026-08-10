@@ -32,6 +32,10 @@ pub(crate) fn record_ci_failure_suppression_in_tx(conn: &Connection, work_item_i
         )
         .optional()?;
     if let Some(head_sha) = head_sha {
+        // A merge-queue rebounce uses `mq:<pr-head>` as its database
+        // discriminator. Suppressions are keyed by real heads so both the
+        // rebounce detector and ordinary CI paths can honour a human veto.
+        let head_sha = crate::ci_watch::merge_queue_rebounce_pr_head(&head_sha);
         conn.execute(
             "INSERT OR REPLACE INTO ci_failure_suppressions
                  (work_item_id, head_sha, created_at)

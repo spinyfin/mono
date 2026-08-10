@@ -2180,7 +2180,10 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
     if is_rebounce && let Some(ref sha) = attempt.before_commit_sha {
         out.push_str(&format!("**Synthetic merge SHA** (fetch CI logs from here): `{sha}`\n",));
     }
-    out.push_str(&format!("**Head sha at trigger**: `{}`\n", attempt.head_sha_at_trigger,));
+    out.push_str(&format!(
+        "**Head sha at trigger**: `{}`\n",
+        crate::ci_watch::merge_queue_rebounce_pr_head(&attempt.head_sha_at_trigger),
+    ));
     out.push_str(&format!("**Attempt id**: `{}`\n\n", attempt.id));
 
     out.push_str("### Failing required checks\n\n");
@@ -2580,7 +2583,10 @@ fn compose_ci_remediation_prompt(
     if !attempt.head_branch.is_empty() {
         prompt.push_str(&format!("**Branch**: `{}`\n", attempt.head_branch));
     }
-    prompt.push_str(&format!("**Head sha at trigger**: `{}`\n", attempt.head_sha_at_trigger,));
+    prompt.push_str(&format!(
+        "**Head sha at trigger**: `{}`\n",
+        crate::ci_watch::merge_queue_rebounce_pr_head(&attempt.head_sha_at_trigger),
+    ));
     prompt.push_str(&format!("**Workspace**: `{}`\n", workspace_path.display()));
     prompt.push_str(&format!("**Attempt id**: `{}`\n", attempt.id));
     prompt.push_str(&format!("**Execution id**: `{}`\n", execution.id));
