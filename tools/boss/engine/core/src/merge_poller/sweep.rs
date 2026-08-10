@@ -1408,9 +1408,7 @@ fn legacy_merge_queue_attempt_may_retire(work_db: &WorkDb, active: &CiRemediatio
     match work_db.get_work_item(revision_id) {
         Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => matches!(
             task.status,
-            crate::work::TaskStatus::InReview
-                | crate::work::TaskStatus::Done
-                | crate::work::TaskStatus::Archived
+            crate::work::TaskStatus::InReview | crate::work::TaskStatus::Done | crate::work::TaskStatus::Archived
         ),
         Ok(_) => false,
         Err(err) => {
