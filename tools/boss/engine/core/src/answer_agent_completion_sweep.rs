@@ -12,9 +12,10 @@
 //! engine restart across the boundary) makes it *silently* never arrive. The
 //! execution then sits `waiting_human` — the status pane spawn stamps — holding
 //! a main-pool worker slot and its cube lease with nothing left to do, and no
-//! reaper picks it up: [`crate::terminal_work_sweep`] classes `AnswerAgent` as
-//! "never task bound" and so reaps it only on execution terminality (which is
-//! exactly what never happens), and [`crate::stranded_answering_sweep`] is
+//! general reaper picks it up: [`crate::terminal_work_sweep`] deliberately
+//! leaves `AnswerAgent` to this sweep so completion can use the answer-agent
+//! finalizer and file the lost-signal attention item, and
+//! [`crate::stranded_answering_sweep`] is
 //! comment-driven — it recovers a comment stuck `answering`, and never touches
 //! `work_executions` at all.
 //!

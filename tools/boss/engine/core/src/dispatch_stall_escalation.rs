@@ -370,6 +370,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_one_pass_skips_answer_agent_execution_without_error() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let investigation = db
+            .create_investigation(
+                boss_protocol::CreateInvestigationInput::builder()
+                    .product_id(product.id)
+                    .name("Investigate answer")
+                    .build(),
+            )
+            .unwrap();
+        db.set_task_doc_pointer(
+            &investigation.id,
+            Some("git@github.com:spinyfin/mono.git"),
+            Some("main"),
+            Some("docs/design.md"),
+        )
+        .unwrap();
+        let comment = db
+            .create_comment(crate::work::CreateCommentInput {
+                artifact_kind: "pr_doc".to_owned(),
+                artifact_id: "pr_doc:git@github.com:spinyfin/mono.git:main:docs/design.md".to_owned(),
+                doc_version: "v1".to_owned(),
+                anchor: boss_protocol::CommentAnchor {
+                    exact: "the quoted text".to_owned(),
+                    prefix: String::new(),
+                    suffix: String::new(),
+                },
+                body: "why?".to_owned(),
+                author: "operator".to_owned(),
+                plain_text_projection_version: 0,
+            })
+            .unwrap();
+        let execution = db
+            .create_answer_agent_execution(&comment.id, "git@github.com:spinyfin/mono.git")
+            .unwrap();
+        let root = emit_stalled_event(&execution.id).await;
+
+        let outcome = run_one_pass(
+            &SharedTimelineIndex::new(root.path()),
+            &db,
+            Duration::from_millis(300_000),
+        )
+        .unwrap();
+        assert_eq!(outcome.filed, 0);
+        assert_eq!(outcome.skipped_not_work_item, 1);
+        assert!(
+            outcome.errors.is_empty(),
+            "answer-agent stalls must not error the sweep"
+        );
+    }
+
+    #[tokio::test]
     async fn run_one_pass_skips_stall_with_no_execution_row() {
         // A dispatch mirror that outlived its DB row (retention-swept) must
         // not keep being escalated.

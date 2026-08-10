@@ -115,7 +115,9 @@ pub fn default_comment_status() -> String {
 ///   terminal signals; nobody is waiting for an answer (see
 ///   `end_answer_agent_on_thread_terminal`).
 /// * [`COMMENT_STATUS_ANSWERED`] — the answer agent already posted (or the run
-///   ended without a reply); the bound answer-agent work is done.
+///   ended without a reply); a terminal execution must not be re-adopted.
+///   Live answer-agent reaping remains owned by the completion sweep, because
+///   this status is written by the worker's reply RPC before its turn ends.
 ///
 /// Everything else (`active`, `answering`, `awaiting_followup`, `in_revision`,
 /// `orphaned`) remains open: a live worker may still be needed, or a later
