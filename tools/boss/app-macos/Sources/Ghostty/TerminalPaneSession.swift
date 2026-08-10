@@ -289,7 +289,15 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     /// per-work-item guard never will. Misclassifying here is what let the
     /// 2026-07 no-active-display incident burn 818 executions across 79
     /// work items with the breaker never fed once.
-    var onSurfaceCreationFailed: ((_ reason: String) -> Void)?
+    /// Called once when `ghostty_surface_new` returns NULL. Carries the
+    /// measured host snapshot (and the input diagnostic block) taken at
+    /// rejection time so the durable spawn log cannot disagree with the
+    /// reason string if the display state changes moments later.
+    var onSurfaceCreationFailed: ((
+        _ reason: String,
+        _ host: HostDisplaySnapshot,
+        _ diagnostic: String
+    ) -> Void)?
 
 
     init(
