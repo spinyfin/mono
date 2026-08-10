@@ -544,31 +544,28 @@ fn project_list_repo_selector_gates_on_the_parent_product() {
 /// to clear the dependency.
 #[test]
 fn project_dependency_is_satisfied_by_done_or_archived() {
-    assert!(dependency_status_is_satisfied("proj_1", "done"));
-    assert!(dependency_status_is_satisfied("proj_1", "archived"));
+    assert!(dependency_status_is_satisfied("done"));
+    assert!(dependency_status_is_satisfied("archived"));
 }
 
 /// Q4 / Q10: tasks and chores satisfy on `done` or `archived`; a
-/// prerequisite that will not run must release its dependents.
+/// prerequisite that will not run must release its dependents. The
+/// rule applies uniformly regardless of work item kind.
 #[test]
 fn task_dependency_is_satisfied_by_done_or_archived() {
-    for id in ["task_1", "chore_1"] {
-        assert!(dependency_status_is_satisfied(id, "done"));
-        assert!(dependency_status_is_satisfied(id, "archived"));
-    }
+    assert!(dependency_status_is_satisfied("done"));
+    assert!(dependency_status_is_satisfied("archived"));
 }
 
 /// Every other status leaves the prereq gating — this inverse is
 /// what drives the `← INCOMPLETE` annotation on the dependent.
 #[test]
 fn unfinished_dependencies_are_never_satisfied() {
-    for id in ["proj_1", "task_1", "chore_1"] {
-        for status in ["todo", "active", "blocked", "in_review"] {
-            assert!(
-                !dependency_status_is_satisfied(id, status),
-                "{id} @ {status} should still gate its dependent"
-            );
-        }
+    for status in ["todo", "active", "blocked", "in_review"] {
+        assert!(
+            !dependency_status_is_satisfied(status),
+            "{status} should still gate its dependent"
+        );
     }
 }
 

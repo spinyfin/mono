@@ -1955,7 +1955,7 @@ pub(crate) fn format_dependency_edge_line(edge: &DependencyEdge, mark_incomplete
     } else {
         format!(" \"{}\"", edge.name)
     };
-    let suffix = if mark_incomplete && !dependency_status_is_satisfied(&edge.id, &edge.status) {
+    let suffix = if mark_incomplete && !dependency_status_is_satisfied(&edge.status) {
         "  ← INCOMPLETE"
     } else {
         ""
@@ -1975,7 +1975,7 @@ pub(crate) fn format_dependency_edge_line(edge: &DependencyEdge, mark_incomplete
 /// `archived` satisfy for every work item.
 /// The dependent annotator uses the inverse to print
 /// `← INCOMPLETE`.
-pub(crate) fn dependency_status_is_satisfied(_id: &str, status: &str) -> bool {
+pub(crate) fn dependency_status_is_satisfied(status: &str) -> bool {
     matches!(status, "done" | "archived")
 }
 

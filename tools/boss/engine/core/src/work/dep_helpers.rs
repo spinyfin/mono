@@ -521,7 +521,7 @@ pub(crate) fn cascade_dependents_after_prereq_status_change(
     // full gating list via `gating_prereqs_for`, which is revision-
     // aware, so non-revision dependents are not inadvertently unblocked
     // by an `in_review` transition.
-    let might_satisfy = deps::status_satisfies(prereq_id, new_prereq_status) || new_prereq_status == "in_review";
+    let might_satisfy = deps::status_satisfies(new_prereq_status) || new_prereq_status == "in_review";
     if !might_satisfy {
         return Ok(());
     }

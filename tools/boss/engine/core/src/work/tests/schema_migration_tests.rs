@@ -539,7 +539,7 @@ fn migration_re_adds_reasoning_column_and_leaves_existing_rows_null() {
 #[test]
 fn migrate_cancelled_task_statuses_to_archived_with_provenance() {
     // disk_db_path required: the test re-opens the DB to trigger the migration.
-    let (_dir, path) = disk_db_path("migration-backfill-cancelled-moot");
+    let (_dir, path) = disk_db_path("migration-cancelled-to-archived");
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Backfill", Some("git@example.com:backfill.git"));
 
@@ -555,8 +555,8 @@ fn migrate_cancelled_task_statuses_to_archived_with_provenance() {
         params![root_id, product.id, now],
     ).unwrap();
 
-    // Legacy cancelled revision: a merged root means the old backfill first
-    // tombstones it, then the status migration preserves both facts.
+    // Legacy cancelled revision under a merged chain root: the status
+    // migration must move it to `archived` and leave `deleted_at` alone.
     let stuck_id = next_id("task");
     conn.execute(
         "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, autostart, priority, created_via, parent_task_id)

@@ -296,17 +296,13 @@ extension ChatViewModel {
         cachedGatingPrereqs = gating
     }
 
-    /// Row-status equivalent of `isWorkItemSatisfied(_:)`: a task/chore is
-    /// satisfied at `done`; a project at `done` or `archived`. An unresolved
-    /// prereq (kind `.unknown`, status `"unknown"`) is treated as unsatisfied,
-    /// matching the id-based helper's nil-lookup behaviour.
+    /// Row-status equivalent of `isWorkItemSatisfied(_:)`: mirrors the
+    /// engine's `status_satisfies` rule — every work item kind (task,
+    /// chore, or project) is satisfied at `done` or `archived`. An
+    /// unresolved prereq (kind `.unknown`, status `"unknown"`) is treated
+    /// as unsatisfied, matching the id-based helper's nil-lookup behaviour.
     private func isWorkItemRowSatisfied(_ row: WorkDependencyRow) -> Bool {
-        switch row.kind {
-        case .project:
-            return row.status == "done" || row.status == "archived"
-        case .task, .chore, .unknown:
-            return row.status == "done"
-        }
+        return row.status == "done" || row.status == "archived"
     }
 
     private func workDependencyRow(forID id: String) -> WorkDependencyRow {
@@ -337,17 +333,17 @@ extension ChatViewModel {
         return task(withID: id)?.name
     }
 
-    /// Mirrors the engine's `status_satisfies` rule: a task/chore is
-    /// satisfied at `done`; a project is satisfied at `done` or
-    /// `archived`. Used to hide already-finished prereqs from the
-    /// "Blocked by …" label on the off-chance an edge survives a
-    /// status change momentarily.
+    /// Mirrors the engine's `status_satisfies` rule: every work item kind
+    /// (task, chore, or project) is satisfied at `done` or `archived`.
+    /// Used to hide already-finished prereqs from the "Blocked by …"
+    /// label on the off-chance an edge survives a status change
+    /// momentarily.
     private func isWorkItemSatisfied(_ id: String) -> Bool {
         if id.hasPrefix("proj_") {
             guard let status = project(withID: id)?.status else { return false }
             return status == "done" || status == "archived"
         }
         guard let status = task(withID: id)?.status else { return false }
-        return status == "done"
+        return status == "done" || status == "archived"
     }
 }

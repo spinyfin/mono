@@ -988,7 +988,7 @@ pub(super) fn task_transitioned_to_active(previous_status: &Option<TaskStatus>, 
 }
 
 /// If `item` is a task or chore that has just landed in a terminal
-/// status (`done`, `archived`, `cancelled`), return the id of its
+/// status (`done`, `archived`), return the id of its
 /// most recent execution so the caller can tear down its worker pane
 /// and cube workspace. Returns `None` for non-task work items, for
 /// non-terminal statuses, and when the work item has no executions.
