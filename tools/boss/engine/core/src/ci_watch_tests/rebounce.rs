@@ -23,7 +23,7 @@ async fn rebounce_flips_in_review_to_blocked_ci_failure() {
         &db,
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
-        Some("feature-branch"),
+        "pr-head-at-trigger",
         "synthetic-merge-sha-abc",
         &[],
         &one_failure(),
@@ -75,6 +75,7 @@ async fn rebounce_flips_in_review_to_blocked_ci_failure() {
         .unwrap()
         .expect("active attempt row");
     assert_eq!(attempt.failure_kind.as_deref(), Some("merge_queue_rebounce"));
+    assert_eq!(attempt.head_sha_at_trigger, "mq:pr-head-at-trigger");
     assert_eq!(attempt.before_commit_sha.as_deref(), Some("synthetic-merge-sha-abc"));
     assert!(
         attempt.revision_task_id.is_some(),
@@ -132,7 +133,7 @@ async fn rebounce_with_legacy_status_context_failures_flips_the_row() {
         &db,
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
-        Some("feature-branch"),
+        "pr-head-at-trigger",
         discriminator,
         &[],
         &failures,
@@ -175,7 +176,7 @@ async fn rebounce_with_empty_failures_still_flips_with_generic_directive() {
         &db,
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
-        Some("feature"),
+        "pr-head-at-trigger",
         sha,
         &[],
         &[],
@@ -203,7 +204,7 @@ async fn rebounce_with_empty_failures_still_flips_with_generic_directive() {
         &db,
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
-        Some("feature"),
+        "pr-head-at-trigger",
         sha,
         &[],
         &[],
@@ -211,7 +212,8 @@ async fn rebounce_with_empty_failures_still_flips_with_generic_directive() {
     .await;
     assert!(!again, "already-recorded empty-evidence rebounce must not re-flip");
     assert!(
-        db.ci_remediation_exists_for_head_sha_at_trigger(&chore, sha).unwrap(),
+        db.ci_remediation_exists_for_head_sha_at_trigger(&chore, "mq:pr-head-at-trigger")
+            .unwrap(),
         "dedup key must be present for the merge-queue pre-fetch short-circuit"
     );
 }
@@ -241,7 +243,7 @@ async fn rebounce_stores_failing_checks_from_failures_slice() {
         &db,
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
-        Some("feature-branch"),
+        "pr-head-at-trigger",
         "synthetic-merge-sha-xyz",
         &[],
         &failures,
@@ -294,7 +296,7 @@ async fn rebounce_block_not_cleared_by_clean_head_branch_ci() {
         &db,
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
-        Some("feature-branch"),
+        "pr-head-at-trigger",
         "synthetic-sha-xyz",
         &[],
         &one_failure(),
@@ -330,13 +332,9 @@ async fn rebounce_block_not_cleared_by_clean_head_branch_ci() {
 /// Defect #3 (the un-block side fighting the block): an InFlight head-branch
 /// CI probe must NOT clear a `merge_queue_rebounce` block.
 ///
-/// The PR's own branch CI is green for a queue failure, and the rebounce
-/// attempt's `head_sha_at_trigger` is the synthetic merge commit — which never
-/// equals the PR head — so `on_ci_in_flight_supersedes_failure`'s stale-head
-/// heuristic would otherwise read "stale", abandon the attempt, and clear the
-/// block. The next sweep's rebounce check would re-block it: the observed
-/// blocked<->in_review flap. The block must stand and the attempt must stay
-/// pending (so `on_ci_resolved`'s guard keeps holding too).
+/// The PR's own branch CI is green for a queue failure, but an InFlight
+/// observation is not evidence that the queue-side failure recovered. The
+/// queue remediation must remain pending until the PR head actually changes.
 #[tokio::test]
 async fn rebounce_block_not_cleared_by_inflight_head_branch_ci() {
     let dir = tempdir().unwrap();
@@ -349,7 +347,7 @@ async fn rebounce_block_not_cleared_by_inflight_head_branch_ci() {
         &db,
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
-        Some("feature-branch"),
+        "pr-head-at-trigger",
         "synthetic-sha-inflight",
         &[],
         &one_failure(),
@@ -358,14 +356,13 @@ async fn rebounce_block_not_cleared_by_inflight_head_branch_ci() {
     assert!(flipped);
 
     // Merge poller's next sweep probes the PR head and finds CI InFlight.
-    // `current_head_sha` (PR head) differs from the synthetic merge SHA the
-    // attempt was keyed on — exactly the condition that used to mis-fire.
+    // `current_head_sha` is still the PR head attributed to the queue event.
     let cleared = on_ci_in_flight_supersedes_failure(
         &db,
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
         &[],
-        Some("pr-head-sha-different"),
+        Some("pr-head-at-trigger"),
     )
     .await;
     assert!(
@@ -412,7 +409,16 @@ async fn rebounce_does_not_flap_across_repeated_sweeps() {
     let mut bounce_count = 0;
     for cycle in 0..5 {
         // The rebounce pass re-sees the same dequeue event on every sweep.
-        if on_merge_queue_rebounce_detected(&db, pub_.as_ref(), &cand, Some("feature"), sha, &[], &one_failure()).await
+        if on_merge_queue_rebounce_detected(
+            &db,
+            pub_.as_ref(),
+            &cand,
+            "pr-head-at-trigger",
+            sha,
+            &[],
+            &one_failure(),
+        )
+        .await
         {
             bounce_count += 1;
         }
@@ -441,7 +447,7 @@ async fn rebounce_does_not_flap_across_repeated_sweeps() {
     );
 }
 
-/// A second probe of the same dequeue event (same `before_commit_sha`)
+/// A second probe of the same dequeue event (same PR head and synthetic SHA)
 /// is idempotent: the INSERT OR IGNORE is a no-op, but the chore stays
 /// blocked and no new execution is created.
 #[tokio::test]
@@ -457,7 +463,7 @@ async fn rebounce_detection_idempotent_on_same_sha() {
         &db,
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
-        Some("feature"),
+        "pr-head-at-trigger",
         "sha-A",
         &[],
         &one_failure(),
@@ -469,7 +475,7 @@ async fn rebounce_detection_idempotent_on_same_sha() {
         &db,
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
-        Some("feature"),
+        "pr-head-at-trigger",
         "sha-A",
         &[],
         &one_failure(),
@@ -524,7 +530,7 @@ async fn rebounce_block_clears_after_worker_succeeds() {
         &db,
         pub_.as_ref(),
         &candidate(&product, &chore, pr),
-        Some("feature"),
+        "pr-head-at-trigger",
         "sha-Q",
         &[],
         &one_failure(),

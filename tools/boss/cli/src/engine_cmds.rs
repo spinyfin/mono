@@ -860,7 +860,13 @@ pub(crate) fn print_ci_remediation_detail(attempt: &CiRemediation) {
         .row("pr_url", &attempt.pr_url)
         .row("pr_number", attempt.pr_number.to_string())
         .row("head_branch", &attempt.head_branch)
-        .row("head_sha_at_trigger", &attempt.head_sha_at_trigger)
+        .row(
+            "head_sha_at_trigger",
+            attempt
+                .head_sha_at_trigger
+                .strip_prefix("mq:")
+                .unwrap_or(&attempt.head_sha_at_trigger),
+        )
         .opt_row("head_sha_after", attempt.head_sha_after.clone())
         .opt_row("triage_class", attempt.triage_class.clone())
         .opt_row("failure_reason", attempt.failure_reason.clone())

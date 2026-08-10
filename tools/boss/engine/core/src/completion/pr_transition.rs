@@ -578,7 +578,7 @@ impl WorkerCompletionHandler {
             tokio::spawn(async move {
                 match probe.probe(&candidate.pr_url).await {
                     Ok(lifecycle_probe) => {
-                        update_pr_poll_state(&work_db, publisher.as_ref(), &candidate, &lifecycle_probe).await;
+                        update_pr_poll_state(&work_db, publisher.as_ref(), &candidate, &lifecycle_probe, None).await;
                     }
                     Err(err) => {
                         tracing::debug!(

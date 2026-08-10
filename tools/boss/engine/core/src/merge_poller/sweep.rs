@@ -415,7 +415,6 @@ pub async fn run_one_pass_observed(
         }
         sweep_one(
             work_db,
-            probe,
             &snapshot.results,
             publisher,
             (cube_client, completion_handler, remediation),
@@ -688,7 +687,6 @@ pub async fn reconcile_batch(
         }
         sweep_one(
             work_db,
-            probe,
             &probe_results,
             publisher,
             (cube_client, completion_handler, remediation),
@@ -1094,7 +1092,6 @@ pub(crate) async fn sweep_late_pr(
 
 pub(crate) async fn sweep_one(
     work_db: &WorkDb,
-    probe: &dyn MergeProbe,
     probe_results: &HashMap<String, std::result::Result<PrLifecycleProbe, String>>,
     publisher: &dyn ExecutionPublisher,
     // (cube_client, completion_handler, remediation) — bundled to keep the
@@ -1128,6 +1125,12 @@ pub(crate) async fn sweep_one(
             return;
         }
     };
+    // Populated in the Open arm so the post-match poll-state write can
+    // reuse the reaper's active-attempt snapshot instead of re-querying.
+    // `None` outside Open (or if the reaper was not run); `Some(…)` is the
+    // still-active merge-queue remediation after the reaper (inner `None`
+    // when none remains).
+    let mut known_active_queue_failure: Option<Option<CiRemediation>> = None;
     match &probe_result.state {
         PrLifecycleState::Merged => {
             if mark_merged(work_db, publisher, completion_handler, candidate, &probe_result).await {
@@ -1147,7 +1150,8 @@ pub(crate) async fn sweep_one(
             stop_active_revision_executions(work_db, completion_handler, &candidate.work_item_id, outcome).await;
         }
         PrLifecycleState::Open(open) => {
-            reap_superseded_merge_queue_attempt(work_db, probe, publisher, candidate, &probe_result).await;
+            known_active_queue_failure =
+                Some(reap_superseded_merge_queue_attempt(work_db, publisher, candidate, &probe_result).await);
             // Design §Q1: conflict pre-empts CI — the conflict-resolver
             // owns the slot first, and CI will be re-evaluated against
             // the new base once the rebase pushes. Both clean drives
@@ -1311,7 +1315,14 @@ pub(crate) async fn sweep_one(
     // Merged / closed-unmerged probes are skipped — the row will
     // transition away from `in_review` and the indicators become moot.
     if matches!(probe_result.state, PrLifecycleState::Open(_)) {
-        update_pr_poll_state(work_db, publisher, candidate, &probe_result).await;
+        update_pr_poll_state(
+            work_db,
+            publisher,
+            candidate,
+            &probe_result,
+            known_active_queue_failure.as_ref().map(|inner| inner.as_ref()),
+        )
+        .await;
         // Trunk merge-queue episodes Boss did not initiate. Runs for every
         // open PR regardless of which mergeability arm above fired: a
         // merge-side eviction lands on a CONFLICTING PR and a test-failure
@@ -1325,75 +1336,111 @@ pub(crate) async fn sweep_one(
     }
 }
 
-/// Reap an active GitHub merge-queue remediation once the synthetic queue
-/// commit no longer contains the PR's current head. This is deliberately
-/// independent of the current CI rollup: a failing run must not have to pass
-/// through a brief `InFlight` observation before the old attempt can retire.
+/// Reap an active GitHub merge-queue remediation once the PR head advances
+/// beyond the head captured by the ordered dequeue timeline. This is
+/// deliberately independent of the current CI rollup: PR-head checks are a
+/// different surface and are normally green throughout a queue-side failure.
+///
+/// Do not compare the synthetic queue commit to the PR head through Git
+/// ancestry. GitHub's squash-mode queue commit has only the base commit as
+/// its parent, so the compare API reports `diverged` even when that exact PR
+/// head produced the failing merged result.
+///
+/// Returns the still-active merge-queue remediation after the reaper runs
+/// (or `None` when none was active / the reaper retired it), so
+/// [`update_pr_poll_state`] can reuse the row without a second sqlite
+/// connection on the same sweep pass.
 async fn reap_superseded_merge_queue_attempt(
     work_db: &WorkDb,
-    probe: &dyn MergeProbe,
     publisher: &dyn ExecutionPublisher,
     candidate: &PendingMergeCheck,
     probe_result: &PrLifecycleProbe,
-) {
+) -> Option<CiRemediation> {
     let active = match work_db.active_ci_remediation_for_work_item(&candidate.work_item_id) {
         Ok(Some(active)) if active.failure_kind.as_deref() == Some("merge_queue_rebounce") => active,
-        Ok(_) => return,
+        Ok(_) => return None,
         Err(err) => {
             tracing::warn!(
                 work_item_id = %candidate.work_item_id,
                 ?err,
                 "merge poller: failed to inspect active merge-queue remediation",
             );
-            return;
+            return None;
         }
     };
     let Some(current_head_sha) = probe_result.head_ref_oid.as_deref() else {
         ci_watch::record_declined_evaluation(candidate, &active, None, "merge_queue_reaper_missing_current_head");
-        return;
+        return Some(active);
     };
-    let Some(repo_slug) = repo_from_pr_url(&candidate.pr_url) else {
-        ci_watch::record_declined_evaluation(
-            candidate,
-            &active,
-            Some(current_head_sha),
-            "merge_queue_reaper_unparseable_pr_url",
-        );
-        return;
-    };
-    let relation = match probe
-        .compare_commits(repo_slug, current_head_sha, &active.head_sha_at_trigger)
-        .await
-    {
-        Ok(relation) => relation,
-        Err(err) => {
-            tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                attempt_id = %active.id,
-                head_sha_at_trigger = %active.head_sha_at_trigger,
-                current_head_sha,
-                ?err,
-                "merge poller: failed to compare merge-queue trigger with current PR head",
-            );
-            ci_watch::record_declined_evaluation(
+    // Rows created before the queue detector began storing the PR head used
+    // the synthetic commit as both fields. There is no reliable way to
+    // reconstruct the tested PR head from such a squash commit. Fail closed
+    // while a linked revision is still live (do not re-mint mid-fix). A
+    // concluded linked revision is the only safe escape: a never-linked or
+    // unreadable row remains pinned and is retried on the next sweep.
+    if active.before_commit_sha.as_deref() == Some(active.head_sha_at_trigger.as_str()) {
+        if legacy_merge_queue_attempt_may_retire(work_db, &active) {
+            let retired = ci_watch::retire_superseded_merge_queue_attempt(
+                work_db,
+                publisher,
                 candidate,
                 &active,
-                Some(current_head_sha),
-                "merge_queue_reaper_compare_unavailable",
-            );
-            return;
+                ci_watch::MergeQueueAttemptRetirementReason::LegacyTriggerRevisionConcluded,
+            )
+            .await;
+            return if retired { None } else { Some(active) };
         }
-    };
-    if matches!(relation, CommitRelation::Ahead | CommitRelation::Identical) {
         ci_watch::record_declined_evaluation(
             candidate,
             &active,
             Some(current_head_sha),
-            "merge_queue_trigger_still_contains_current_head",
+            "merge_queue_reaper_legacy_trigger_has_no_pr_head",
         );
-        return;
+        return Some(active);
     }
-    ci_watch::retire_superseded_merge_queue_attempt(work_db, publisher, candidate, &active, current_head_sha).await;
+    if ci_watch::merge_queue_rebounce_pr_head(&active.head_sha_at_trigger) == current_head_sha {
+        ci_watch::record_declined_evaluation(
+            candidate,
+            &active,
+            Some(current_head_sha),
+            "merge_queue_trigger_head_unchanged",
+        );
+        return Some(active);
+    }
+    let retired = ci_watch::retire_superseded_merge_queue_attempt(
+        work_db,
+        publisher,
+        candidate,
+        &active,
+        ci_watch::MergeQueueAttemptRetirementReason::PrHeadAdvanced { current_head_sha },
+    )
+    .await;
+    if retired { None } else { Some(active) }
+}
+
+/// Whether a pre-head-key merge-queue remediation may leave the fail-closed
+/// legacy branch once its linked fix revision concludes. Keeps a missing,
+/// unreadable, or still-live revision fail-closed so a legacy queue failure
+/// cannot be cleared without evidence that its remediation ran.
+fn legacy_merge_queue_attempt_may_retire(work_db: &WorkDb, active: &CiRemediation) -> bool {
+    let Some(revision_id) = active.revision_task_id.as_deref() else {
+        return false;
+    };
+    match work_db.get_work_item(revision_id) {
+        Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => matches!(
+            task.status,
+            crate::work::TaskStatus::InReview | crate::work::TaskStatus::Done | crate::work::TaskStatus::Archived
+        ),
+        Ok(_) => false,
+        Err(err) => {
+            tracing::warn!(
+                revision_task_id = revision_id,
+                ?err,
+                "merge poller: failed to read legacy merge-queue fix revision; retaining attempt",
+            );
+            false
+        }
+    }
 }
 
 /// Reconcile a single stranded `blocked` parent (NULL scalar
@@ -1867,20 +1914,57 @@ pub(crate) fn review_detail_json(reviewers: &[String]) -> Option<String> {
 /// Persist CI + review + merge-queue poll state and emit a change event
 /// when any field flips value. Called from `sweep_one` for every open PR and
 /// from `completion.rs` after the on-transition initial CI fetch.
+///
+/// `known_active_queue_failure` lets the sweep reaper hand off its already-
+/// loaded merge-queue remediation (or `Some(None)` when it just retired one)
+/// so this function does not open a second sqlite connection for the same
+/// work item on the same pass. Pass `None` when the caller did not run the
+/// reaper — this function self-fetches in that case (e.g. `completion.rs`).
 pub(crate) async fn update_pr_poll_state(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
     candidate: &PendingMergeCheck,
     probe: &PrLifecycleProbe,
+    known_active_queue_failure: Option<Option<&CiRemediation>>,
 ) {
     let PrLifecycleState::Open(open) = &probe.state else {
         return;
     };
 
-    let ci_state = ci_state_str(&open.ci);
+    let fetched_active;
+    let active_queue_failure = match known_active_queue_failure {
+        Some(known) => known.filter(|a| a.failure_kind.as_deref() == Some("merge_queue_rebounce")),
+        None => {
+            fetched_active = match work_db.active_ci_remediation_for_work_item(&candidate.work_item_id) {
+                Ok(Some(attempt)) if attempt.failure_kind.as_deref() == Some("merge_queue_rebounce") => Some(attempt),
+                Ok(_) => None,
+                Err(err) => {
+                    tracing::warn!(
+                        work_item_id = %candidate.work_item_id,
+                        ?err,
+                        "merge poller: failed to inspect queue-side CI state; preserving PR-head classification",
+                    );
+                    None
+                }
+            };
+            fetched_active.as_ref()
+        }
+    };
+    // The PR-head rollup and the merge-queue merged-result rollup are
+    // distinct CI surfaces. While an attributed queue-side remediation is
+    // active, the authoritative combined state is failing even though the
+    // PR-head rollup is normally green. Do not let the latter overwrite the
+    // former on every lifecycle poll.
+    let ci_state = if active_queue_failure.is_some() {
+        "fail"
+    } else {
+        ci_state_str(&open.ci)
+    };
     let review_state = probe.review.as_db_str();
     let mergeable_state = mergeable_state_str(open.mergeability);
-    let ci_detail = ci_detail_json(&open.ci);
+    let ci_detail = active_queue_failure
+        .map(|attempt| queue_failure_detail_json(&attempt.failed_checks))
+        .unwrap_or_else(|| ci_detail_json(&open.ci));
     let review_detail = review_detail_json(probe.review.reviewers());
     let raw_merge_queue_state = merge_queue_state_str(probe.in_merge_queue, probe.auto_merge_enabled);
     let raw_merge_queue_detail = merge_queue_detail_json(probe);
@@ -2046,6 +2130,17 @@ pub(crate) async fn update_pr_poll_state(
             "merge poller: CI recovered to success at current head; \
              broadcast CiFailureCleared to clear any stale ci-failing badge",
         );
+    }
+}
+
+fn queue_failure_detail_json(failed_checks: &str) -> Option<String> {
+    match serde_json::from_str::<serde_json::Value>(failed_checks) {
+        Ok(serde_json::Value::Array(items)) if !items.is_empty() => serde_json::to_string(&items).ok(),
+        _ => serde_json::to_string(&vec![serde_json::json!({
+            "name": "merge queue",
+            "conclusion": "FAILURE",
+        })])
+        .ok(),
     }
 }
 

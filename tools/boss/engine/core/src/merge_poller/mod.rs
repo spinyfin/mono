@@ -60,8 +60,11 @@ use crate::design_detector;
 use crate::metrics::Registry;
 #[cfg(test)]
 use crate::work::TaskStatus;
-use crate::work::{GhPrStateChecker, LatePrCandidate, PendingMergeCheck, PrPollStateInput, PrStateChecker, WorkDb};
-use boss_engine_gh_invocation::{gh_compare_jq, gh_output};
+use crate::work::{
+    CiRemediation, GhPrStateChecker, LatePrCandidate, PendingMergeCheck, PrPollStateInput, PrStateChecker, WorkDb,
+    WorkItem,
+};
+use boss_engine_gh_invocation::gh_output;
 use boss_engine_utils::iso8601::parse_iso8601_lenient;
 // GitHub-call attribution. Every path in this module that reaches GitHub
 // runs inside a `gh_scope`, because "the merge poller" is not a fine

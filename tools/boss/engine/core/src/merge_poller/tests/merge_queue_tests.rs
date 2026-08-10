@@ -5,13 +5,23 @@ use super::*;
 /// FAILED_CHECKS.  The parser must accept the lowercase form.
 #[test]
 fn parse_dequeue_event_nodes_accepts_lowercase_failed_checks() {
+    // Replay of mono#2692's timeline: the PR head precedes the failed queue
+    // synthetic commit in the ordered connection.
     let nodes = serde_json::json!([
-        {"reason": "failed_checks", "beforeCommit": {"oid": "abc123def456"}}
+        {"__typename": "PullRequestCommit", "commit": {"oid": "0d9dab33152f553bfe6072ccbd6f33fad7dd9d2d"}},
+        {"__typename": "RemovedFromMergeQueueEvent", "reason": "failed_checks", "beforeCommit": {"oid": "e005ddece2a840a944f5ffdfa7bad640d54af9c1"}}
     ]);
     let events = parse_dequeue_event_nodes(nodes.as_array().unwrap());
     assert_eq!(events.len(), 1, "lowercase 'failed_checks' must be surfaced");
     assert_eq!(events[0].reason, "failed_checks");
-    assert_eq!(events[0].before_commit_oid.as_deref(), Some("abc123def456"));
+    assert_eq!(
+        events[0].pr_head_oid.as_deref(),
+        Some("0d9dab33152f553bfe6072ccbd6f33fad7dd9d2d")
+    );
+    assert_eq!(
+        events[0].before_commit_oid.as_deref(),
+        Some("e005ddece2a840a944f5ffdfa7bad640d54af9c1")
+    );
 }
 
 /// The schema-documented uppercase form must also be accepted for
@@ -19,10 +29,12 @@ fn parse_dequeue_event_nodes_accepts_lowercase_failed_checks() {
 #[test]
 fn parse_dequeue_event_nodes_accepts_uppercase_failed_checks() {
     let nodes = serde_json::json!([
-        {"reason": "FAILED_CHECKS", "beforeCommit": {"oid": "def456abc789"}}
+        {"__typename": "HeadRefForcePushedEvent", "afterCommit": {"oid": "forced-head"}},
+        {"__typename": "RemovedFromMergeQueueEvent", "reason": "FAILED_CHECKS", "beforeCommit": {"oid": "def456abc789"}}
     ]);
     let events = parse_dequeue_event_nodes(nodes.as_array().unwrap());
     assert_eq!(events.len(), 1, "uppercase 'FAILED_CHECKS' must also be surfaced");
+    assert_eq!(events[0].pr_head_oid.as_deref(), Some("forced-head"));
     assert_eq!(events[0].before_commit_oid.as_deref(), Some("def456abc789"));
 }
 
@@ -52,6 +64,23 @@ fn parse_dequeue_event_nodes_handles_null_before_commit() {
     let events = parse_dequeue_event_nodes(nodes.as_array().unwrap());
     assert_eq!(events.len(), 1, "null beforeCommit must not drop the event");
     assert!(events[0].before_commit_oid.is_none());
+    assert!(events[0].pr_head_oid.is_none());
+}
+
+/// The parser snapshots the head at each dequeue rather than applying a
+/// later force-push retroactively to an older queue failure.
+#[test]
+fn parse_dequeue_event_nodes_attributes_each_event_to_its_contemporaneous_head() {
+    let nodes = serde_json::json!([
+        {"__typename": "PullRequestCommit", "commit": {"oid": "head-before"}},
+        {"__typename": "RemovedFromMergeQueueEvent", "reason": "failed_checks", "beforeCommit": {"oid": "queue-1"}},
+        {"__typename": "HeadRefForcePushedEvent", "afterCommit": {"oid": "head-after"}},
+        {"__typename": "RemovedFromMergeQueueEvent", "reason": "failed_checks", "beforeCommit": {"oid": "queue-2"}}
+    ]);
+    let events = parse_dequeue_event_nodes(nodes.as_array().unwrap());
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].pr_head_oid.as_deref(), Some("head-before"));
+    assert_eq!(events[1].pr_head_oid.as_deref(), Some("head-after"));
 }
 
 /// An empty nodes array returns an empty vec without panicking.
@@ -85,6 +114,8 @@ fn build_batch_query_with_dequeue_events_fields_requests_timeline_items() {
          leaving it inferable from the gap between two `remaining` readings"
     );
     assert!(query.contains("REMOVED_FROM_MERGE_QUEUE_EVENT"));
+    assert!(query.contains("PULL_REQUEST_COMMIT"));
+    assert!(query.contains("HEAD_REF_FORCE_PUSHED_EVENT"));
     assert!(
         !query.contains("statusCheckRollup"),
         "must not pull in the PR-probe field set"
@@ -104,7 +135,8 @@ fn walk_batch_response_locates_timeline_items_per_pr() {
                 "pr0": {
                     "timelineItems": {
                         "nodes": [
-                            {"reason": "failed_checks", "beforeCommit": {"oid": "sha9"}}
+                            {"__typename": "PullRequestCommit", "commit": {"oid": "head9"}},
+                            {"__typename": "RemovedFromMergeQueueEvent", "reason": "failed_checks", "beforeCommit": {"oid": "sha9"}}
                         ]
                     }
                 }
@@ -117,7 +149,475 @@ fn walk_batch_response_locates_timeline_items_per_pr() {
     let nodes = node.unwrap()["timelineItems"]["nodes"].as_array().cloned().unwrap();
     let events = parse_dequeue_event_nodes(&nodes);
     assert_eq!(events.len(), 1);
+    assert_eq!(events[0].pr_head_oid.as_deref(), Some("head9"));
     assert_eq!(events[0].before_commit_oid.as_deref(), Some("sha9"));
+}
+
+/// GitHub's squash-mode queue commit is ancestry-diverged from the PR head
+/// even when it tested that exact head. An unchanged PR-head probe must keep
+/// the queue remediation active and must not let the green PR rollup rewrite
+/// the work item's combined CI state to success.
+#[tokio::test]
+async fn unchanged_pr_head_keeps_queue_failure_active_and_visible() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/2692";
+    let (product_id, chore) = make_chore_in_review(&db, "C-queue-squash", pr);
+    let publisher = Arc::new(RecordingPublisher::default());
+    let candidate = PendingMergeCheck {
+        work_item_id: chore.clone(),
+        product_id,
+        pr_url: pr.to_owned(),
+    };
+
+    assert!(
+        ci_watch::on_merge_queue_rebounce_detected(
+            &db,
+            publisher.as_ref(),
+            &candidate,
+            "pr-head-under-test",
+            "synthetic-squash-commit",
+            &[],
+            &[RequiredCheckFailure {
+                name: "buildkite/checks".to_owned(),
+                conclusion: "FAILURE".to_owned(),
+                target_url: "https://buildkite.com/foo/bar/builds/1".to_owned(),
+                provider: CiProvider::Buildkite,
+                provider_job_id: None,
+            }],
+        )
+        .await
+    );
+
+    let probe = StubProbe::new();
+    probe.set_with_base_head(
+        pr,
+        PrLifecycleState::Open(OpenPrStatus::clean()),
+        "base-head",
+        "pr-head-under-test",
+    );
+    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
+
+    let active = db
+        .active_ci_remediation_for_work_item(&chore)
+        .unwrap()
+        .expect("unchanged PR head must keep the queue failure active");
+    assert_eq!(active.head_sha_at_trigger, "mq:pr-head-under-test");
+    assert_eq!(active.before_commit_sha.as_deref(), Some("synthetic-squash-commit"));
+    match db.get_work_item(&chore).unwrap() {
+        WorkItem::Chore(task) => {
+            assert_eq!(task.status, TaskStatus::InReview);
+            assert_eq!(task.ci_required_state.as_deref(), Some("fail"));
+        }
+        other => panic!("expected chore, got {other:?}"),
+    }
+}
+
+/// Pre-transition rows stored the synthetic queue SHA in both
+/// `head_sha_at_trigger` and `before_commit_sha`. While a linked revision is
+/// still live, the reaper must fail closed (keep the attempt pending) even
+/// when the current PR head differs — do not re-mint mid-fix.
+#[tokio::test]
+async fn legacy_queue_attempt_with_live_revision_stays_pending_when_head_advances() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/legacy-reaper";
+    let (product_id, chore) = make_chore_in_review(&db, "C-legacy-reaper", pr);
+    let publisher = Arc::new(RecordingPublisher::default());
+    let candidate = PendingMergeCheck {
+        work_item_id: chore.clone(),
+        product_id,
+        pr_url: pr.to_owned(),
+    };
+
+    assert!(
+        ci_watch::on_merge_queue_rebounce_detected(
+            &db,
+            publisher.as_ref(),
+            &candidate,
+            "original-pr-head",
+            "synthetic-legacy-sha",
+            &[],
+            &[],
+        )
+        .await
+    );
+    let attempt = db
+        .active_ci_remediation_for_work_item(&chore)
+        .unwrap()
+        .expect("rebounce attempt");
+    assert!(
+        attempt.revision_task_id.is_some(),
+        "detection must link a live fix revision"
+    );
+    // Rewrite to the pre-transition shape: synthetic SHA in both columns.
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    conn.execute(
+        "UPDATE ci_remediations
+            SET head_sha_at_trigger = 'synthetic-legacy-sha',
+                before_commit_sha = 'synthetic-legacy-sha'
+          WHERE id = ?1",
+        rusqlite::params![&attempt.id],
+    )
+    .unwrap();
+
+    let probe = StubProbe::new();
+    probe.set_with_base_head(
+        pr,
+        PrLifecycleState::Open(OpenPrStatus::clean()),
+        "base-head",
+        "advanced-pr-head",
+    );
+    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
+
+    let still = db
+        .active_ci_remediation_for_work_item(&chore)
+        .unwrap()
+        .expect("legacy attempt with live revision must stay pending (fail-closed)");
+    assert_eq!(still.id, attempt.id);
+    assert_eq!(still.status, "pending");
+    assert_eq!(still.head_sha_at_trigger, "synthetic-legacy-sha");
+}
+
+/// A legacy synthetic-key row must retire after its linked fix revision
+/// reaches `in_review`, the normal concluded state while the parent PR stays
+/// open. Retiring releases the synthetic failure pin back to the clean
+/// PR-head rollup.
+#[tokio::test]
+async fn legacy_queue_attempt_with_concluded_revision_retires_and_unpins() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/legacy-concluded";
+    let (product_id, chore) = make_chore_in_review(&db, "C-legacy-concluded", pr);
+    let publisher = Arc::new(RecordingPublisher::default());
+    let candidate = PendingMergeCheck {
+        work_item_id: chore.clone(),
+        product_id,
+        pr_url: pr.to_owned(),
+    };
+    assert!(
+        ci_watch::on_merge_queue_rebounce_detected(
+            &db,
+            publisher.as_ref(),
+            &candidate,
+            "original-pr-head",
+            "synthetic-legacy-sha",
+            &[],
+            &[],
+        )
+        .await
+    );
+    let attempt = db
+        .active_ci_remediation_for_work_item(&chore)
+        .unwrap()
+        .expect("rebounce attempt");
+    let revision_id = attempt.revision_task_id.as_deref().expect("linked revision");
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    conn.execute(
+        "UPDATE ci_remediations
+            SET head_sha_at_trigger = 'synthetic-legacy-sha',
+                before_commit_sha = 'synthetic-legacy-sha'
+          WHERE id = ?1",
+        rusqlite::params![&attempt.id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+        rusqlite::params![revision_id],
+    )
+    .unwrap();
+
+    let probe = StubProbe::new();
+    probe.set_with_base_head(
+        pr,
+        PrLifecycleState::Open(OpenPrStatus::clean()),
+        "base-head",
+        "current-pr-head",
+    );
+    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
+
+    let attempts = db.list_ci_remediations(None, &[], Some(&chore), None).unwrap();
+    assert!(attempts.iter().any(|row| {
+        row.id == attempt.id
+            && row.status == "abandoned"
+            && row.failure_reason.as_deref() == Some("merge_queue_trigger_superseded")
+    }));
+    match db.get_work_item(&chore).unwrap() {
+        WorkItem::Chore(task) => assert_eq!(task.ci_required_state.as_deref(), Some("success")),
+        other => panic!("expected chore, got {other:?}"),
+    }
+}
+
+/// The raw PR-head UNIQUE key is shared with ordinary branch-CI attempts.
+/// Rebounces namespace their key so both failure surfaces can be recorded.
+#[tokio::test]
+async fn rebounce_at_a_head_with_branch_ci_remediation_still_mints_attempt() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/rebounce-collision";
+    let (product_id, chore) = make_chore_in_review(&db, "C-rebounce-collision", pr);
+    db.insert_ci_remediation(crate::work::CiRemediationInsertInput {
+        product_id: product_id.clone(),
+        work_item_id: chore.clone(),
+        pr_url: pr.to_owned(),
+        pr_number: 1,
+        head_branch: "feature".to_owned(),
+        head_sha_at_trigger: "shared-pr-head".to_owned(),
+        attempt_kind: "fix".to_owned(),
+        consumes_budget: 1,
+        failed_checks: "[]".to_owned(),
+        failure_kind: "pr_branch_ci".to_owned(),
+        before_commit_sha: None,
+    })
+    .unwrap()
+    .expect("branch CI remediation");
+    assert!(
+        !db.ci_remediation_exists_for_merge_queue_episode(&chore, "shared-pr-head", "synthetic-queue-sha",)
+            .unwrap()
+    );
+    let publisher = Arc::new(RecordingPublisher::default());
+    let candidate = PendingMergeCheck {
+        work_item_id: chore.clone(),
+        product_id,
+        pr_url: pr.to_owned(),
+    };
+    assert!(
+        ci_watch::on_merge_queue_rebounce_detected(
+            &db,
+            publisher.as_ref(),
+            &candidate,
+            "shared-pr-head",
+            "synthetic-queue-sha",
+            &[],
+            &[],
+        )
+        .await
+    );
+    let attempts = db.list_ci_remediations(None, &[], Some(&chore), None).unwrap();
+    assert!(attempts.iter().any(|row| {
+        row.failure_kind.as_deref() == Some("merge_queue_rebounce") && row.head_sha_at_trigger == "mq:shared-pr-head"
+    }));
+}
+
+/// Superseded events must not consume a remediation attempt. A same-head
+/// event passes the gate and is then able to mint its rebounce attempt.
+#[tokio::test]
+async fn dequeue_event_head_gate_skips_superseded_and_admits_current_head() {
+    let stale = MergeQueueDequeueEvent {
+        reason: "failed_checks".to_owned(),
+        pr_head_oid: Some("head-1".to_owned()),
+        before_commit_oid: Some("queue-1".to_owned()),
+    };
+    assert!(!dequeue_event_is_for_current_pr_head(&stale, Some("head-2")));
+
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/current-head-gate";
+    let (product_id, chore) = make_chore_in_review(&db, "C-current-head-gate", pr);
+    assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 0);
+    // Mirror the preceding poll pass, which records the live PR head before
+    // the rebounce pass consumes timeline events.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_head_sha = 'head-2' WHERE id = ?1",
+            rusqlite::params![&chore],
+        )
+        .unwrap();
+    let publisher = Arc::new(RecordingPublisher::default());
+    let candidate = PendingMergeCheck {
+        work_item_id: chore.clone(),
+        product_id: product_id.clone(),
+        pr_url: pr.to_owned(),
+    };
+    let mut stale_events = HashMap::new();
+    stale_events.insert(pr.to_owned(), vec![stale.clone()]);
+    let mut outcome = SweepOutcome::default();
+    check_merge_queue_rebounce(&db, publisher.as_ref(), &candidate, &stale_events, &mut outcome).await;
+    assert!(
+        db.list_ci_remediations(None, &[], Some(&chore), None)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 0);
+    let current = MergeQueueDequeueEvent {
+        pr_head_oid: Some("head-2".to_owned()),
+        ..stale
+    };
+    assert!(dequeue_event_is_for_current_pr_head(&current, Some("head-2")));
+    let mut current_events = HashMap::new();
+    current_events.insert(pr.to_owned(), vec![current]);
+    check_merge_queue_rebounce(&db, publisher.as_ref(), &candidate, &current_events, &mut outcome).await;
+    assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 1);
+}
+
+/// Empty `failed_checks = "[]"` is an explicitly reachable insert state for
+/// rebounce (confirmed failed_checks ejection with no check-run enrichment).
+/// The pin path must surface a generic merge-queue failure blob, not `[]`.
+#[tokio::test]
+async fn queue_failure_detail_falls_back_when_failed_checks_empty() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/empty-checks";
+    let (product_id, chore) = make_chore_in_review(&db, "C-empty-checks", pr);
+    let publisher = Arc::new(RecordingPublisher::default());
+    let candidate = PendingMergeCheck {
+        work_item_id: chore.clone(),
+        product_id,
+        pr_url: pr.to_owned(),
+    };
+
+    assert!(
+        ci_watch::on_merge_queue_rebounce_detected(
+            &db,
+            publisher.as_ref(),
+            &candidate,
+            "pr-head-empty-checks",
+            "synthetic-empty-checks",
+            &[],
+            &[], // lands failed_checks = "[]"
+        )
+        .await
+    );
+
+    let probe = StubProbe::new();
+    probe.set_with_base_head(
+        pr,
+        PrLifecycleState::Open(OpenPrStatus::clean()),
+        "base-head",
+        "pr-head-empty-checks",
+    );
+    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
+
+    match db.get_work_item(&chore).unwrap() {
+        WorkItem::Chore(task) => {
+            assert_eq!(task.ci_required_state.as_deref(), Some("fail"));
+            let detail = task
+                .ci_required_detail
+                .as_deref()
+                .expect("queue failure must write ci_required_detail");
+            let parsed: serde_json::Value = serde_json::from_str(detail).expect("valid JSON");
+            assert_eq!(
+                parsed,
+                serde_json::json!([{"name": "merge queue", "conclusion": "FAILURE"}]),
+                "empty failed_checks must fall back to the generic merge-queue blob"
+            );
+        }
+        other => panic!("expected chore, got {other:?}"),
+    }
+}
+
+/// When a queue attempt retires after a head advance and the new head's PR
+/// rollup is clean, `ci_required_state` must un-pin from `fail` back to the
+/// rollup value (success) — the operator-visible half of the pin.
+#[tokio::test]
+async fn advanced_pr_head_with_clean_rollup_unpins_ci_required_state() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/2650-unpin";
+    let (product_id, chore) = make_chore_in_review(&db, "C-queue-unpin", pr);
+    let publisher = Arc::new(RecordingPublisher::default());
+    let candidate = PendingMergeCheck {
+        work_item_id: chore.clone(),
+        product_id,
+        pr_url: pr.to_owned(),
+    };
+
+    assert!(
+        ci_watch::on_merge_queue_rebounce_detected(
+            &db,
+            publisher.as_ref(),
+            &candidate,
+            "original-pr-head",
+            "synthetic-queue-commit",
+            &[],
+            &[RequiredCheckFailure {
+                name: "ci/test".to_owned(),
+                conclusion: "FAILURE".to_owned(),
+                target_url: "https://buildkite.com/foo/bar/builds/1".to_owned(),
+                provider: CiProvider::Buildkite,
+                provider_job_id: Some("job-old".to_owned()),
+            }],
+        )
+        .await
+    );
+
+    let probe = StubProbe::new();
+    probe.set_with_base_head(
+        pr,
+        PrLifecycleState::Open(OpenPrStatus::clean()),
+        "base-head",
+        "original-pr-head",
+    );
+    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
+    match db.get_work_item(&chore).unwrap() {
+        WorkItem::Chore(task) => {
+            assert_eq!(task.ci_required_state.as_deref(), Some("fail"));
+        }
+        other => panic!("expected chore, got {other:?}"),
+    }
+
+    probe.set_with_base_head(
+        pr,
+        PrLifecycleState::Open(OpenPrStatus::clean()),
+        "base-head",
+        "new-pr-head",
+    );
+    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
+
+    let attempts = db.list_ci_remediations(None, &[], Some(&chore), None).unwrap();
+    assert!(
+        attempts
+            .iter()
+            .any(|a| a.status == "abandoned" && a.failure_reason.as_deref() == Some("merge_queue_trigger_superseded")),
+        "queue attempt must be retired after head advance: {attempts:?}"
+    );
+    match db.get_work_item(&chore).unwrap() {
+        WorkItem::Chore(task) => {
+            assert_eq!(
+                task.ci_required_state.as_deref(),
+                Some("success"),
+                "retiring the queue attempt must un-pin ci_required_state to the green PR-head rollup"
+            );
+        }
+        other => panic!("expected chore, got {other:?}"),
+    }
+}
+
+/// Dual-key episode dedup must treat a pre-transition row (synthetic SHA in
+/// `head_sha_at_trigger`) as already handled for the same beforeCommit.
+#[test]
+fn merge_queue_episode_dedup_matches_legacy_synthetic_key() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/dedup-legacy";
+    let (product_id, chore) = make_chore_in_review(&db, "C-dedup-legacy", pr);
+    db.insert_ci_remediation(crate::work::CiRemediationInsertInput {
+        product_id,
+        work_item_id: chore.clone(),
+        pr_url: pr.to_owned(),
+        pr_number: 1,
+        head_branch: "feature".to_owned(),
+        head_sha_at_trigger: "synthetic-old-key".to_owned(),
+        attempt_kind: "fix".to_owned(),
+        consumes_budget: 1,
+        failed_checks: "[]".to_owned(),
+        failure_kind: "merge_queue_rebounce".to_owned(),
+        before_commit_sha: Some("synthetic-old-key".to_owned()),
+    })
+    .unwrap()
+    .expect("legacy row");
+
+    assert!(
+        db.ci_remediation_exists_for_merge_queue_episode(&chore, "current-pr-head", "synthetic-old-key")
+            .unwrap(),
+        "legacy synthetic key must match via before_commit_sha / head_sha_at_trigger"
+    );
+    assert!(
+        !db.ci_remediation_exists_for_merge_queue_episode(&chore, "current-pr-head", "other-synthetic")
+            .unwrap(),
+        "unrelated synthetic must not match"
+    );
 }
 
 // ----- GitHub API quota throttling -----
@@ -415,7 +915,7 @@ async fn mid_queue_member_leaving_renumbers_remaining_siblings_via_update_pr_pol
         product_id: product.id.clone(),
         pr_url: "https://github.com/foo/bar/pull/2".to_owned(),
     };
-    update_pr_poll_state(&db, &publisher, &candidate, &left_queue_probe).await;
+    update_pr_poll_state(&db, &publisher, &candidate, &left_queue_probe, None).await;
 
     let (t2_state, t2_detail) = merge_queue_columns(&db, &t2);
     assert!(t2_state.is_none(), "T2 must leave the queued set once it's dequeued");
@@ -474,7 +974,7 @@ async fn update_pr_poll_state_demotes_merging_when_required_ci_fails() {
         pr_url: "https://github.com/foo/bar/pull/1".to_owned(),
     };
     let publisher = RecordingPublisher::default();
-    update_pr_poll_state(&db, &publisher, &candidate, &probe).await;
+    update_pr_poll_state(&db, &publisher, &candidate, &probe, None).await;
 
     let (state, detail) = merge_queue_columns(&db, &t);
     assert!(
@@ -516,7 +1016,7 @@ async fn update_pr_poll_state_restores_merging_once_ci_recovers() {
 
     let mut failing_probe = probe_with_queue_fields(false, None, None, None, true, Some("2026-07-10T11:54:54Z"));
     failing_probe.state = PrLifecycleState::Open(OpenPrStatus::ci_failing(vec![failure("ci/test", "FAILURE")]));
-    update_pr_poll_state(&db, &publisher, &candidate, &failing_probe).await;
+    update_pr_poll_state(&db, &publisher, &candidate, &failing_probe, None).await;
     let (demoted_state, _) = merge_queue_columns(&db, &t);
     assert!(
         demoted_state.is_none(),
@@ -526,7 +1026,7 @@ async fn update_pr_poll_state_restores_merging_once_ci_recovers() {
     // GitHub auto-merge is still armed on the next poll — same probe
     // flags — but required CI now reads clean.
     let recovered_probe = probe_with_queue_fields(false, None, None, None, true, Some("2026-07-10T11:54:54Z"));
-    update_pr_poll_state(&db, &publisher, &candidate, &recovered_probe).await;
+    update_pr_poll_state(&db, &publisher, &candidate, &recovered_probe, None).await;
 
     let (state, detail) = merge_queue_columns(&db, &t);
     assert_eq!(
@@ -567,7 +1067,7 @@ async fn update_pr_poll_state_leaves_queued_row_untouched_when_required_ci_fails
         pr_url: "https://github.com/foo/bar/pull/1".to_owned(),
     };
     let publisher = RecordingPublisher::default();
-    update_pr_poll_state(&db, &publisher, &candidate, &probe).await;
+    update_pr_poll_state(&db, &publisher, &candidate, &probe, None).await;
 
     let (state, detail) = merge_queue_columns(&db, &t);
     assert_eq!(
@@ -630,7 +1130,7 @@ async fn update_pr_poll_state_preserves_trunk_owned_merge_queue_state() {
         pr_url: "https://github.com/foo/bar/pull/1".to_owned(),
     };
     let publisher = RecordingPublisher::default();
-    update_pr_poll_state(&db, &publisher, &candidate, &probe).await;
+    update_pr_poll_state(&db, &publisher, &candidate, &probe, None).await;
 
     let (state, stored_detail) = merge_queue_columns(&db, &t);
     assert_eq!(

@@ -1954,7 +1954,7 @@ async fn pure_rebase_skip_gate_skips_ci_fix_via_live_base_ref() {
         workspace.path(),
         &format!("{CREATED_VIA_CI_FIX_PREFIX}cir_test1"),
         pr_number,
-        head_before,
+        &format!("mq:{head_before}"),
         None, // ci_remediations never records a base
     );
 

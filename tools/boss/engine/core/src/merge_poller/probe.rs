@@ -244,23 +244,6 @@ pub trait MergeProbe: Send + Sync {
         }
         out
     }
-
-    /// Ask GitHub how `head` relates to `base`. The queue-attempt reaper
-    /// uses `base = current PR head` and `head = synthetic queue commit`:
-    /// `Ahead` means the queue commit still contains the current PR head;
-    /// every other successful relation means a later force-push made that
-    /// queue episode stale.
-    async fn compare_commits(&self, _repo_slug: &str, _base: &str, _head: &str) -> Result<CommitRelation> {
-        anyhow::bail!("commit comparison is unavailable for this probe")
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommitRelation {
-    Ahead,
-    Behind,
-    Diverged,
-    Identical,
 }
 
 /// `MergeProbe` that always returns an error — used as the default in
@@ -365,21 +348,6 @@ impl MergeProbe for CommandMergeProbe {
 
     async fn probe_batch(&self, pr_urls: &[String]) -> HashMap<String, std::result::Result<PrLifecycleProbe, String>> {
         self.probe_batch_via_graphql(pr_urls).await
-    }
-
-    async fn compare_commits(&self, repo_slug: &str, base: &str, head: &str) -> Result<CommitRelation> {
-        let status = gh_scope(
-            callers::MERGE_POLLER_MERGE_QUEUE,
-            gh_compare_jq(repo_slug, base, head, ".status"),
-        )
-        .await?;
-        match status.as_str() {
-            "ahead" => Ok(CommitRelation::Ahead),
-            "behind" => Ok(CommitRelation::Behind),
-            "diverged" => Ok(CommitRelation::Diverged),
-            "identical" => Ok(CommitRelation::Identical),
-            other => anyhow::bail!("unexpected GitHub compare status {other:?}"),
-        }
     }
 }
 

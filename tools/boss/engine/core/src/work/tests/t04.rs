@@ -1299,7 +1299,7 @@ fn manual_override_writes_ci_failure_suppression() {
         pr_url: pr_url.clone(),
         pr_number: 77,
         head_branch: "feature".into(),
-        head_sha_at_trigger: "head-aaa".into(),
+        head_sha_at_trigger: "mq:head-aaa".into(),
         attempt_kind: "fix".into(),
         consumes_budget: 1,
         failed_checks: "[]".into(),
@@ -1324,7 +1324,7 @@ fn manual_override_writes_ci_failure_suppression() {
 
     assert!(
         db.is_ci_failure_suppressed(&chore.id, "head-aaa").unwrap(),
-        "suppression row must be keyed on the most recent ci_remediations head sha",
+        "a namespaced rebounce attempt must suppress its real PR head",
     );
     // Budget reset on manual override.
     assert_eq!(db.get_ci_attempts_used(&chore.id).unwrap(), 0);

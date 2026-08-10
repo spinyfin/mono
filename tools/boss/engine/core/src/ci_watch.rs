@@ -158,19 +158,31 @@ pub(crate) fn record_declined_evaluation(
     );
 }
 
-/// Retire a GitHub merge-queue attempt after GitHub's compare API proves
-/// that its synthetic trigger commit no longer contains the current PR
-/// head. Queue commits live on `gh-readonly-queue/*` and never become part
-/// of the PR branch, so equality with `head_sha_at_trigger` cannot be the
-/// retirement test. The caller performs the reachability query; this
-/// function owns the attempt/signal transition and its UI events.
+/// Why a merge-queue remediation has become obsolete.
+pub(crate) enum MergeQueueAttemptRetirementReason<'a> {
+    PrHeadAdvanced { current_head_sha: &'a str },
+    LegacyTriggerRevisionConcluded,
+}
+
+/// Retire a merge-queue attempt after the caller establishes that its
+/// episode is obsolete. This function owns the attempt/signal transition and
+/// its UI events.
 pub(crate) async fn retire_superseded_merge_queue_attempt(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
     candidate: &PendingMergeCheck,
     active: &CiRemediation,
-    current_head_sha: &str,
+    reason: MergeQueueAttemptRetirementReason<'_>,
 ) -> bool {
+    let (moot_revision_reason, current_head_sha) = match reason {
+        MergeQueueAttemptRetirementReason::PrHeadAdvanced { current_head_sha } => (
+            "superseded by a PR head advance past the merge-queue attempt's attributed head",
+            Some(current_head_sha),
+        ),
+        MergeQueueAttemptRetirementReason::LegacyTriggerRevisionConcluded => {
+            ("retired after the legacy synthetic-trigger revision concluded", None)
+        }
+    };
     let retired = match work_db.mark_ci_remediation_abandoned(&active.id, "merge_queue_trigger_superseded") {
         Ok(Some(row)) => row,
         Ok(None) => return false,
@@ -196,7 +208,7 @@ pub(crate) async fn retire_superseded_merge_queue_attempt(
         work_db,
         &candidate.work_item_id,
         active.revision_task_id.as_deref(),
-        "superseded by a PR head that is no longer contained by the merge-queue trigger",
+        moot_revision_reason,
     );
     publisher
         .publish_work_item_changed(
@@ -215,15 +227,25 @@ pub(crate) async fn retire_superseded_merge_queue_attempt(
             },
         )
         .await;
-    tracing::info!(
-        work_item_id = %candidate.work_item_id,
-        pr_url = %candidate.pr_url,
-        attempt_id = %retired.id,
-        attempt_kind = %retired.attempt_kind,
-        head_sha_at_trigger = %retired.head_sha_at_trigger,
-        current_head_sha,
-        "ci_watch: retired merge-queue remediation whose trigger no longer contains the PR head",
-    );
+    match current_head_sha {
+        Some(current_head_sha) => tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            attempt_id = %retired.id,
+            attempt_kind = %retired.attempt_kind,
+            head_sha_at_trigger = %retired.head_sha_at_trigger,
+            current_head_sha,
+            "ci_watch: retired merge-queue remediation after PR head advanced past attributed head",
+        ),
+        None => tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            attempt_id = %retired.id,
+            attempt_kind = %retired.attempt_kind,
+            head_sha_at_trigger = %retired.head_sha_at_trigger,
+            "ci_watch: retired legacy merge-queue remediation after its linked revision concluded",
+        ),
+    }
     true
 }
 
@@ -1023,18 +1045,24 @@ pub async fn on_merge_queue_rebounce_detected(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
     candidate: &PendingMergeCheck,
-    head_ref_name: Option<&str>,
+    pr_head_sha: &str,
     before_commit_sha: &str,
     labels: &[String],
     failures: &[RequiredCheckFailure],
 ) -> bool {
+    let discriminator = merge_queue_rebounce_discriminator(pr_head_sha);
     on_queue_side_failure_detected(
         work_db,
         publisher,
         candidate,
-        head_ref_name,
+        None,
         QueueSideFailureEpisode {
-            discriminator: before_commit_sha,
+            // Keep rebounces disjoint from ordinary `pr_branch_ci` rows,
+            // whose UNIQUE key also uses a raw PR head SHA. The raw head is
+            // still retained as the event's provenance for the reaper and
+            // suppression migration below.
+            discriminator: &discriminator,
+            suppression_discriminator: pr_head_sha,
             before_commit_sha: Some(before_commit_sha),
             failure_kind: "merge_queue_rebounce",
             labels,
@@ -1050,6 +1078,10 @@ pub async fn on_merge_queue_rebounce_detected(
 struct QueueSideFailureEpisode<'a> {
     /// The dedup key stored as `ci_remediations.head_sha_at_trigger`.
     discriminator: &'a str,
+    /// The key used for human CI-failure suppressions. Merge-queue
+    /// discriminators are namespaced for database uniqueness, while existing
+    /// suppressions are keyed by the raw PR head.
+    suppression_discriminator: &'a str,
     /// The `ci_remediations.before_commit_sha` provenance column — `Some`
     /// for a merge-queue rebounce (the synthetic merge SHA), `None` for a
     /// Trunk eviction (no equivalent commit is persisted).
@@ -1078,6 +1110,7 @@ async fn on_queue_side_failure_detected(
 ) -> bool {
     let QueueSideFailureEpisode {
         discriminator,
+        suppression_discriminator,
         before_commit_sha,
         failure_kind,
         labels,
@@ -1177,7 +1210,16 @@ async fn on_queue_side_failure_detected(
 
     // Suppression check: if the human manually moved the chore out of
     // `blocked: ci_failure` for this episode's discriminator, honour it.
-    match work_db.is_ci_failure_suppressed(&candidate.work_item_id, discriminator) {
+    // Merge-queue rebounce also matches a suppression recorded against
+    // the synthetic queue commit (pre-transition key) so human overrides
+    // survive the head-key migration.
+    let suppressed = match (failure_kind, before_commit_sha) {
+        ("merge_queue_rebounce", Some(before)) => {
+            work_db.is_ci_failure_suppressed_for_either(&candidate.work_item_id, suppression_discriminator, before)
+        }
+        _ => work_db.is_ci_failure_suppressed(&candidate.work_item_id, suppression_discriminator),
+    };
+    match suppressed {
         Ok(true) => {
             tracing::debug!(
                 work_item_id = %candidate.work_item_id,
@@ -1269,8 +1311,9 @@ async fn on_queue_side_failure_detected(
 
     // `discriminator` serves as `head_sha_at_trigger` so the unique key
     // `(work_item_id, head_sha_at_trigger, attempt_kind)` naturally
-    // deduplicates on this episode: two polls that see the same event hit
-    // the same key and the second `INSERT OR IGNORE` is a no-op.
+    // deduplicates on the PR contribution that failed in the queue. A
+    // retry of the same PR head must not spend another remediation budget;
+    // a real fix push advances the head and admits a new attempt.
     let insert_result = work_db.insert_ci_remediation(CiRemediationInsertInput {
         product_id: candidate.product_id.clone(),
         work_item_id: candidate.work_item_id.clone(),
@@ -1538,6 +1581,19 @@ pub(crate) fn is_queue_side_failure_kind(kind: Option<&str>) -> bool {
     matches!(kind, Some("merge_queue_rebounce") | Some("trunk_queue_eviction"))
 }
 
+/// Namespace a GitHub merge-queue episode's PR-head key so it cannot collide
+/// with an ordinary `pr_branch_ci` remediation for the same head.
+pub(crate) fn merge_queue_rebounce_discriminator(pr_head_sha: &str) -> String {
+    format!("mq:{pr_head_sha}")
+}
+
+/// Recover the PR head from a namespaced rebounce discriminator. Rows written
+/// before namespacing used the raw head directly, so callers must preserve
+/// that representation during the transition.
+pub(crate) fn merge_queue_rebounce_pr_head(discriminator: &str) -> &str {
+    discriminator.strip_prefix("mq:").unwrap_or(discriminator)
+}
+
 /// The composite per-episode discriminator a Trunk eviction is keyed on —
 /// see [`on_trunk_queue_eviction_detected`]'s doc comment. `trunk:` prefixed
 /// so it can never collide with a real git SHA (which `pr_branch_ci`/rebounce
@@ -1568,14 +1624,14 @@ pub(crate) fn trunk_eviction_discriminator(trunk_entry_id: &str, trunk_state_cha
 /// investigation (`id` was measured to be per-PR-stable, not
 /// per-episode, so the pair is load-bearing, not belt-and-braces).
 /// Folded into `head_sha_at_trigger` (mirroring how
-/// [`on_merge_queue_rebounce_detected`] overloads that column with the
-/// synthetic merge sha) so the existing `(work_item_id,
-/// head_sha_at_trigger, attempt_kind)` UNIQUE key does the deduplication
-/// with no schema change. `trunk_pr_sha` is deliberately NOT part of the
-/// key or persisted: the investigation found it is re-read live from the
-/// PR's current head and can mutate mid-episode with no corresponding
-/// state or timestamp change, making it unsafe as a provenance field for a
-/// single episode.
+/// [`on_merge_queue_rebounce_detected`] stores the attributed PR head in
+/// that column and keeps the synthetic queue SHA in `before_commit_sha`)
+/// so the existing `(work_item_id, head_sha_at_trigger, attempt_kind)`
+/// UNIQUE key does the deduplication with no schema change.
+/// `trunk_pr_sha` is deliberately NOT part of the key or persisted: the
+/// investigation found it is re-read live from the PR's current head and
+/// can mutate mid-episode with no corresponding state or timestamp change,
+/// making it unsafe as a provenance field for a single episode.
 ///
 /// Returns `true` when the parent transitions to `blocked: ci_failure`.
 pub async fn on_trunk_queue_eviction_detected(
@@ -1595,6 +1651,7 @@ pub async fn on_trunk_queue_eviction_detected(
         head_branch,
         QueueSideFailureEpisode {
             discriminator: &discriminator,
+            suppression_discriminator: &discriminator,
             before_commit_sha: None,
             failure_kind: "trunk_queue_eviction",
             labels: &[],
@@ -1804,18 +1861,13 @@ pub async fn on_ci_in_flight_supersedes_failure(
     //      from a CI run that is no longer current.
     match work_db.active_ci_remediation_for_work_item(&candidate.work_item_id) {
         Ok(Some(active)) => {
-            // A queue-side failure (merge-queue rebounce or a Trunk queue
-            // eviction) lives on a synthetic/ephemeral commit
-            // (`head_sha_at_trigger` is the synthetic merge sha or the
-            // `trunk:<id>@<stateChangedAt>` discriminator), never on the PR
-            // head. A head-branch InFlight probe is therefore not evidence
-            // the failure cleared, and the stale-head comparison below would
-            // ALWAYS read "stale" (that discriminator can never equal the PR
-            // head) — so it would abandon the attempt and clear the block on
-            // every poll, fighting the detector which re-blocks on the next
-            // sweep. That tug-of-war is the observed blocked<->in_review
-            // flap. Leave a queue-side block to its terminal signal (worker
-            // marks the attempt succeeded, or a new failing episode).
+            // A queue-side failure lives on a merged-result CI surface, not
+            // the PR-head rollup. Merge-queue rebounces now key
+            // `head_sha_at_trigger` on the attributed PR head (while Trunk
+            // uses its episode discriminator), but an InFlight head-branch
+            // probe is still not evidence the queue failure cleared. Leave a
+            // queue-side block to its terminal signal or the dedicated
+            // PR-head-advance reaper.
             // Mirrors the identical guard in `on_ci_resolved`.
             if is_queue_side_failure_kind(active.failure_kind.as_deref()) {
                 record_declined_evaluation(
