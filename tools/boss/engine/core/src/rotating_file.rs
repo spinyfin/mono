@@ -48,6 +48,12 @@ pub struct RotatingState {
 }
 
 impl RotatingState {
+    /// Create state from an already-open file. Seeds the byte counter
+    /// from the file's current size. Startup normally leaves an
+    /// under-threshold file in place, so the counter must continue from
+    /// what is already on disk — otherwise a restart would reset it and
+    /// the file could grow well past `max_bytes` before the writer
+    /// rotates.
     pub fn new(file: File) -> Self {
         let bytes_written = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
         Self { file, bytes_written }

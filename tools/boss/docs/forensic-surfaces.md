@@ -27,10 +27,14 @@ row", "what surface issued this change").
 
 - Small, effectively unrotated for months of typical use.
 - Measured 2026-07-26: ~1.3 MB back to 2026-05-08.
-- Contrast: `engine-trace.jsonl*` holds ~4 days under normal write
-  volume (rotates at 100 MB, keeps 10, purely size-based — a restart no
-  longer rotates a file that isn't yet full) and can still have rotated
-  past the window you care about during a high-volume incident.
+- Contrast: `engine-trace.jsonl*` retention is purely size-based
+  (rotates at 100 MiB, keeps 10 backups; a restart no longer rotates a
+  file that isn't yet full). Bound is 10 × 100 MiB of rotated volume —
+  wall-clock coverage depends on write rate and is expected to be well
+  over a week at observed volumes. Worst case on disk: 11 × 100 MiB
+  ≈ 1.1 GiB (active + 10 backups); tune with
+  `BOSS_ENGINE_TRACE_MAX_FILES` / `BOSS_ENGINE_TRACE_MAX_BYTES`. A
+  high-volume incident can still rotate past the window you care about.
 
 Lifecycle event shapes (`start` / `socket_bound` / `shutdown`) are also
 documented in [`tools/boss/app-macos/README.md`](../app-macos/README.md)
