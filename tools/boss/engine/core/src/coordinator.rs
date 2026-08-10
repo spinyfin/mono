@@ -1963,6 +1963,23 @@ pub struct ExecutionCoordinator {
     /// `is_dispatch_paused()`-style call sites) to become `async`.
     #[builder(default)]
     dispatch_paused_reason: std::sync::Mutex<Option<String>>,
+    /// Execution ids `drain_ready_queue`'s pause gate must let through this
+    /// pass even though `dispatch_paused` is `true` — the in-memory,
+    /// never-persisted mechanism behind the pause-only forced-dispatch
+    /// override (`RequestExecutionInput::bypass_dispatch_pause`; see
+    /// `docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md`
+    /// and `coordinator/dispatch_admission.rs`). An id is inserted only
+    /// after `ExecutionCoordinator::evaluate_dispatch_admission` has
+    /// confirmed the pause is operator-originated and every other
+    /// constraint already clears, and is always removed again (dispatched
+    /// or not) by the single drain pass
+    /// `dispatch_with_pause_bypass` awaits — so membership never outlives
+    /// one request, and the DB row itself never records that an override
+    /// happened. This is deliberately NOT a `work_executions` column: the
+    /// design's "Persistence" note is explicit that force must leave no
+    /// durable badge on the row.
+    #[builder(default)]
+    dispatch_pause_bypass_execution_ids: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Startup capability gate for the local tmux runtime. Unlike the
     /// operator/breaker pause state this is not user-resumable: a worker
     /// cannot be dispatched until the engine has recorded a passing probe.
@@ -2025,10 +2042,12 @@ pub struct ExecutionCoordinator {
 }
 
 mod config;
+mod dispatch_admission;
 mod execution;
 mod run;
 mod scheduler;
 
+pub use dispatch_admission::pause_bypass_decision;
 pub use run::PANE_SPAWN_FAILED_ATTENTION_KIND;
 
 /// Copy a [`crate::cube_commands::CubeCliError`]'s structured exit code +

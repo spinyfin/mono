@@ -313,6 +313,25 @@ struct ContentView: View {
                 Text(model.workErrorMessage ?? "")
             }
         )
+        .alert(
+            "Dispatch is paused",
+            isPresented: Binding(
+                get: { model.pendingPauseOverrideConfirmation != nil },
+                set: { newValue in
+                    if !newValue {
+                        model.cancelPauseOverrideDrag()
+                    }
+                }
+            ),
+            presenting: model.pendingPauseOverrideConfirmation,
+            actions: { _ in
+                Button("Cancel", role: .cancel) { model.cancelPauseOverrideDrag() }
+                Button("Start Anyway") { model.confirmPauseOverrideDrag() }
+            },
+            message: { confirmation in
+                Text(confirmation.alertMessage)
+            }
+        )
         .sheet(item: $model.pendingWorkCreateRequest) { request in
             WorkCreateSheet(
                 request: request,

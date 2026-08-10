@@ -47,6 +47,12 @@ enum EngineEvent {
     /// per-project `ProjectDesignDocState` the kanban consumes to
     /// pick the right icon affordance and open dispatch.
     case projectDesignDocResolved(output: ResolveProjectDesignDocOutput)
+    /// Engine reply to `EvaluateDispatchAdmission` — whether a work item
+    /// would dispatch right now, the current dispatch-pause snapshot, and
+    /// every non-overridable blocker. Drives the drag-to-Doing pause
+    /// confirmation; see
+    /// `docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md`.
+    case dispatchAdmissionEvaluated(admission: DispatchAdmission)
     /// Engine reply to `ListProductDesignDocs` — the markdown listing
     /// at HEAD of the product's repo, or the classified reason there
     /// isn't one. Consumed by the Designs tab.

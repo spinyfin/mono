@@ -46,6 +46,26 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
     let FrontendRequest::RequestExecution { input } = req else {
         unreachable!()
     };
+    if input.bypass_dispatch_pause {
+        // Pause-only forced dispatch (`bossctl work start --force`, or a
+        // confirmed app-drag going through `MoveWorkItemOnBoard` instead
+        // of this RPC directly). Distinct from `force` (pool growth,
+        // below): this never grows a pool, never skips the interactive
+        // cap, and is refused outright when any non-overridable
+        // constraint blocks it — see
+        // `docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md`.
+        let coordinator = server_state.execution_coordinator.clone();
+        let live_states = server_state.live_worker_states.clone();
+        match coordinator.dispatch_with_pause_bypass(input, live_states).await {
+            Ok(execution) => {
+                send_response(&sink, &request_id, FrontendEvent::ExecutionRequested { execution });
+            }
+            Err(err) => {
+                send_work_error(&sink, &request_id, &err);
+            }
+        }
+        return;
+    }
     {
         // Live-worker awareness: when the work item already has
         // a non-terminal execution, the engine reuses it only
@@ -122,6 +142,39 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
             Err(err) => {
                 send_work_error(&sink, &request_id, &err);
             }
+        }
+    }
+}
+
+/// Read-only: `EvaluateDispatchAdmission`. See
+/// `ExecutionCoordinator::evaluate_dispatch_admission` — the same
+/// function `handle_request_execution`'s `bypass_dispatch_pause` path
+/// consults, so this preview can never promise something the mutating
+/// request doesn't also honor.
+pub(super) async fn handle_evaluate_dispatch_admission(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::EvaluateDispatchAdmission { work_item_id } = req else {
+        unreachable!()
+    };
+    match server_state
+        .execution_coordinator
+        .evaluate_dispatch_admission(&work_item_id)
+        .await
+    {
+        Ok(admission) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::DispatchAdmissionEvaluated { admission },
+            );
+        }
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
         }
     }
 }

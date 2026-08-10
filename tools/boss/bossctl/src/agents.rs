@@ -1060,16 +1060,18 @@ pub(crate) async fn work_start(
     work_item_id: String,
     priority: Option<i64>,
     preferred_workspace_id: Option<String>,
+    force: bool,
 ) -> Result<()> {
     let mut client = connect(socket_path).await?;
+    let input = RequestExecutionInput::builder()
+        .work_item_id(work_item_id.clone())
+        .maybe_priority(priority)
+        .maybe_preferred_workspace_id(preferred_workspace_id)
+        .bypass_dispatch_pause(force)
+        .maybe_entry_point(force.then_some(DispatchAdmissionEntryPoint::Cli))
+        .build();
     let response = client
-        .send_request(&FrontendRequest::RequestExecution {
-            input: RequestExecutionInput::builder()
-                .work_item_id(work_item_id.clone())
-                .maybe_priority(priority)
-                .maybe_preferred_workspace_id(preferred_workspace_id)
-                .build(),
-        })
+        .send_request(&FrontendRequest::RequestExecution { input })
         .await
         .context("sending RequestExecution")?;
     match response {
@@ -1080,6 +1082,22 @@ pub(crate) async fn work_start(
             Ok(())
         }
         FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            // Surface the engine's refusal reason in both human (stderr,
+            // via `main`'s `bail!` propagation) and `--json` output — a
+            // forced refusal names the specific non-overridable blocker
+            // (interactive cap, unmet dependency, ineligible status, or a
+            // non-overridable breaker pause) rather than silently no-op'ing.
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "refused",
+                        "work_item_id": work_item_id,
+                        "forced": force,
+                        "reason": message,
+                    })
+                );
+            }
             bail!("engine rejected work start: {message}")
         }
         other => bail!("engine returned unexpected response: {other:?}"),

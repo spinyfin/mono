@@ -162,32 +162,34 @@ pub const CI_CHURN_WINDOW_SECS: i64 = 60 * 60;
 pub const CI_CHURN_LIMIT: i64 = 5;
 
 pub use boss_protocol::{
-    ANSWER_AGENT_RUN_STATUS_FAILED, ANSWER_AGENT_RUN_STATUS_REPLIED, ANSWER_AGENT_RUN_STATUS_RUNNING,
-    ANSWER_AGENT_RUN_STATUS_SUPERSEDED, AddDependencyInput, AnswerAgentRun, Attention, AttentionGroup, AttentionMerge,
-    Automation, AutomationPatch, AutomationRun, AutomationTrigger, BOOTHBY_REVERSIBILITY_IRREVERSIBLE,
-    BOOTHBY_TARGET_ATTENTION, BOOTHBY_TARGET_ATTENTION_ITEM, BOOTHBY_TARGET_PROJECT, BOOTHBY_TARGET_TASK,
-    BlockedSignal, BoothbyAction, BoothbyCursor, BoothbyFinding, BoothbyPass, BranchNaming, COMMENT_STATUS_ACTIVE,
-    COMMENT_STATUS_ANSWERED, COMMENT_STATUS_ANSWERING, COMMENT_STATUS_AWAITING_FOLLOWUP, COMMENT_STATUS_DISMISSED,
-    COMMENT_STATUS_IN_REVISION, COMMENT_STATUS_ORPHANED, COMMENT_STATUS_RESOLVED, CREATED_VIA_ATTENTION,
-    CREATED_VIA_BOOTHBY_PREFIX, CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_DOC_COMMENT_PREFIX, CREATED_VIA_ENGINE_AUTO,
+    ADMISSION_BLOCKER_AUTOSTART_DISABLED, ADMISSION_BLOCKER_CHURN_GUARD_PARKED, ADMISSION_BLOCKER_INELIGIBLE_STATUS,
+    ADMISSION_BLOCKER_INTERACTIVE_CONCURRENCY_CAP, ADMISSION_BLOCKER_UNMET_DEPENDENCY, ANSWER_AGENT_RUN_STATUS_FAILED,
+    ANSWER_AGENT_RUN_STATUS_REPLIED, ANSWER_AGENT_RUN_STATUS_RUNNING, ANSWER_AGENT_RUN_STATUS_SUPERSEDED,
+    AddDependencyInput, AnswerAgentRun, Attention, AttentionGroup, AttentionMerge, Automation, AutomationPatch,
+    AutomationRun, AutomationTrigger, BOOTHBY_REVERSIBILITY_IRREVERSIBLE, BOOTHBY_TARGET_ATTENTION,
+    BOOTHBY_TARGET_ATTENTION_ITEM, BOOTHBY_TARGET_PROJECT, BOOTHBY_TARGET_TASK, BlockedSignal, BoothbyAction,
+    BoothbyCursor, BoothbyFinding, BoothbyPass, BranchNaming, COMMENT_STATUS_ACTIVE, COMMENT_STATUS_ANSWERED,
+    COMMENT_STATUS_ANSWERING, COMMENT_STATUS_AWAITING_FOLLOWUP, COMMENT_STATUS_DISMISSED, COMMENT_STATUS_IN_REVISION,
+    COMMENT_STATUS_ORPHANED, COMMENT_STATUS_RESOLVED, CREATED_VIA_ATTENTION, CREATED_VIA_BOOTHBY_PREFIX,
+    CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_DOC_COMMENT_PREFIX, CREATED_VIA_ENGINE_AUTO,
     CREATED_VIA_MERGE_CONFLICT_PREFIX, CREATED_VIA_PR_REVIEW_PREFIX, CREATED_VIA_UNKNOWN, CiBudgetSnapshot,
     CiRemediation, CommentAnchor, CommentResolution, CommentThreadEntry, CommentWithThread, CommentsBannerState,
     ConflictClassCount, ConflictFileFrequency, ConflictFilePairFrequency, ConflictHotspotReport, ConflictResolution,
     CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput,
     CreateDecisionInput, CreateExecutionInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput,
     CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput, Decision, DecisionKind, DecisionStatus,
-    DeferredScopeAttention, DependencyDirection, DependencyEdge, DependencyFilter, DocOwner, DocOwnerPrLifecycle,
-    DriverTrafficSplit, EditorialAction, EditorialRules, EffortLevel, EngineAttemptListEntry, ExecutionKind,
-    ExecutionReconcileResult, ExecutionStatus, FinishExecutionRunInput, FollowupMemberOverride, INTENT_QUESTION,
-    INTENT_REVISION, LAST_STATUS_ACTOR_BOOTHBY, LAST_STATUS_ACTOR_HUMAN, ListDependenciesInput, PrWorkItemMatch,
-    Product, Project, ProjectDesignDocState, ProjectStatus, RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY,
-    RESOLVED_WITH_ORPHAN, ReasoningMode, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
-    ResolvedComment, ResolvedDesignDoc, ResolvedDesignDocKind, ReviseDocInput, ReviseDocOutcome,
-    SetProjectDesignDocInput, SetTaskDocPointerInput, StatusActor, THREAD_ENTRY_AUTHOR_ENGINE,
-    THREAD_ENTRY_KIND_ANSWER, THREAD_ENTRY_KIND_NUDGE, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP, Task, TaskKind,
-    TaskRuntime, TaskStatus, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
-    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun, WorkTree,
-    comment_status_is_closed, is_known_created_via,
+    DeferredScopeAttention, DependencyDirection, DependencyEdge, DependencyFilter, DispatchAdmission,
+    DispatchAdmissionBlocker, DispatchPauseSnapshot, DocOwner, DocOwnerPrLifecycle, DriverTrafficSplit,
+    EditorialAction, EditorialRules, EffortLevel, EngineAttemptListEntry, ExecutionKind, ExecutionReconcileResult,
+    ExecutionStatus, FinishExecutionRunInput, FollowupMemberOverride, INTENT_QUESTION, INTENT_REVISION,
+    LAST_STATUS_ACTOR_BOOTHBY, LAST_STATUS_ACTOR_HUMAN, ListDependenciesInput, PrWorkItemMatch, Product, Project,
+    ProjectDesignDocState, ProjectStatus, RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN,
+    ReasoningMode, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment,
+    ResolvedDesignDoc, ResolvedDesignDocKind, ReviseDocInput, ReviseDocOutcome, SetProjectDesignDocInput,
+    SetTaskDocPointerInput, StatusActor, THREAD_ENTRY_AUTHOR_ENGINE, THREAD_ENTRY_KIND_ANSWER, THREAD_ENTRY_KIND_NUDGE,
+    THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP, Task, TaskKind, TaskRuntime, TaskStatus, WorkAttentionItem, WorkComment,
+    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemExternalRef,
+    WorkItemPatch, WorkRun, WorkTree, comment_status_is_closed, is_known_created_via,
 };
 
 /// Outcome of `WorkDb::record_pre_start_failure`. The coordinator uses
@@ -447,6 +449,7 @@ mod decisions;
 mod dep_helpers;
 mod design_postmortem;
 mod dispatch;
+mod dispatch_admission;
 mod dispatch_class;
 mod dispatch_helpers;
 mod driver_allocation;

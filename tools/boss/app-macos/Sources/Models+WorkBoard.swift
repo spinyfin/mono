@@ -695,3 +695,69 @@ struct ExternalRefLinkPresentation: Equatable {
         return "↗ \(canonicalID)"
     }
 }
+
+// ===========================================================================
+// Pause-only forced dispatch — mirrors `boss_protocol::DispatchAdmission`
+// and friends. See
+// `tools/boss/docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md`.
+// ===========================================================================
+
+/// One non-overridable reason dispatch would currently refuse for,
+/// independent of the dispatch pause. `code` is one of the
+/// `ADMISSION_BLOCKER_*` constants on the Rust side (e.g.
+/// `"interactive_concurrency_cap"`, `"unmet_dependency"`).
+struct DispatchAdmissionBlocker: Codable, Hashable, Identifiable {
+    let code: String
+    let message: String
+
+    var id: String { code }
+}
+
+/// The two blocker codes an explicit start (forced or not) has always
+/// bypassed — reported for transparency, never a reason to bounce a drag
+/// back. Mirrors `INFORMATIONAL_ONLY_BLOCKER_CODES` in
+/// `coordinator/dispatch_admission.rs`.
+let dispatchAdmissionInformationalOnlyBlockerCodes: Set<String> = ["churn_guard_parked", "autostart_disabled"]
+
+/// Snapshot of the global dispatch pause, as `EvaluateDispatchAdmission`
+/// reports it. `pausedSinceEpochS` doubles as the pause's "generation":
+/// echoed back on a confirmed override so the engine can detect a pause
+/// that changed between preview and confirmation.
+struct DispatchPauseSnapshot: Codable, Hashable {
+    var active: Bool
+    var origin: String?
+    var reason: String?
+    var pausedSinceEpochS: UInt64?
+    var overridable: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case active
+        case origin
+        case reason
+        case pausedSinceEpochS = "paused_since_epoch_s"
+        case overridable
+    }
+}
+
+/// Read-only answer to "would this work item dispatch right now, and if
+/// not, why not?" — the reply to `EvaluateDispatchAdmission`.
+struct DispatchAdmission: Codable, Hashable {
+    var workItemID: String
+    var wouldDispatch: Bool
+    var pause: DispatchPauseSnapshot
+    var blockers: [DispatchAdmissionBlocker]
+
+    enum CodingKeys: String, CodingKey {
+        case workItemID = "work_item_id"
+        case wouldDispatch = "would_dispatch"
+        case pause
+        case blockers
+    }
+
+    /// Blockers that actually refuse dispatch even with force — everything
+    /// except the two informational-only codes. Mirrors
+    /// `pause_bypass_decision`'s own filter on the engine side.
+    var hardBlockers: [DispatchAdmissionBlocker] {
+        blockers.filter { !dispatchAdmissionInformationalOnlyBlockerCodes.contains($0.code) }
+    }
+}

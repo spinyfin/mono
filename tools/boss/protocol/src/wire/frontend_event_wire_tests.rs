@@ -21,8 +21,8 @@ use super::*;
 // the `wire` module's import set — bring them in explicitly from the crate root.
 use crate::{
     AttachmentMediaType, AutomationTrigger, Decision, DecisionKind, DecisionStatus, DesignDocEntry, DesignDocTree,
-    EffortLevel, ExecutionKind, ExecutionStatus, ListHostedPanesInput, ProjectDesignDocState, ProposalFieldError,
-    TaskKind, TaskStatus, WorkerTierDenialReason,
+    DispatchAdmissionBlocker, DispatchPauseSnapshot, EffortLevel, ExecutionKind, ExecutionStatus, ListHostedPanesInput,
+    ProjectDesignDocState, ProposalFieldError, TaskKind, TaskStatus, WorkerTierDenialReason,
 };
 
 /// One representative event paired with the exact `"type"` tag it must
@@ -557,6 +557,27 @@ fn tag_cases() -> Vec<TagCase> {
                 execution: work_execution(),
             },
             expected_tag: "execution_requested",
+        },
+        TagCase {
+            label: "DispatchAdmissionEvaluated",
+            event: FrontendEvent::DispatchAdmissionEvaluated {
+                admission: DispatchAdmission::builder()
+                    .work_item_id("task_1")
+                    .would_dispatch(false)
+                    .pause(DispatchPauseSnapshot {
+                        active: true,
+                        origin: Some("operator".into()),
+                        reason: Some("investigating worker failures".into()),
+                        paused_since_epoch_s: Some(1_700_000_000),
+                        overridable: true,
+                    })
+                    .blockers(vec![DispatchAdmissionBlocker {
+                        code: "interactive_concurrency_cap".into(),
+                        message: "interactive concurrency cap reached (12/12 workers live)".into(),
+                    }])
+                    .build(),
+            },
+            expected_tag: "dispatch_admission_evaluated",
         },
         TagCase {
             label: "PrReviewTriggered",
@@ -1906,6 +1927,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::ExecutionResult { .. }
         | FrontendEvent::ExecutionCreated { .. }
         | FrontendEvent::ExecutionRequested { .. }
+        | FrontendEvent::DispatchAdmissionEvaluated { .. }
         | FrontendEvent::PrReviewTriggered { .. }
         | FrontendEvent::RunsList { .. }
         | FrontendEvent::RunResult { .. }

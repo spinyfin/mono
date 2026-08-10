@@ -392,7 +392,22 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
     let FrontendRequest::UpdateWorkItem { id, patch } = req else {
         unreachable!()
     };
-    apply_work_item_patch(ctx, id, patch).await;
+    apply_work_item_patch(ctx, id, patch, None).await;
+}
+
+/// Confirmed pause-only override state carried from a `MoveWorkItemOnBoard`
+/// app-drag into [`apply_work_item_patch`]'s dispatch step. `None` from
+/// every other caller — an explicit `UpdateWorkItem`, and the drop's own
+/// non-active-transition resolutions (`ClearAutostart`) — since those
+/// never request execution with a bypass, so the ordinary
+/// `RequestExecution` path always runs for them regardless of this type's
+/// existence. Entry-point is always `app_drag`: [`MoveWorkItemOnBoard`] is
+/// the drag-only RPC, so it never needs to carry the enum on the wire.
+///
+/// [`MoveWorkItemOnBoard`]: boss_protocol::FrontendRequest::MoveWorkItemOnBoard
+#[derive(Debug, Clone, Copy)]
+pub(super) struct BoardDragPauseBypass {
+    pub(super) observed_pause_since_epoch_s: Option<u64>,
 }
 
 /// A kanban drag landed on the board. Resolve what the drop *meant* against
@@ -413,7 +428,13 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
 /// on a terminal move, auto-dispatch into Doing, the gated-`blocked`
 /// refusal) behaves identically whichever way the status was chosen.
 pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendRequest) {
-    let FrontendRequest::MoveWorkItemOnBoard { id, target } = req else {
+    let FrontendRequest::MoveWorkItemOnBoard {
+        id,
+        target,
+        bypass_dispatch_pause,
+        observed_pause_since_epoch_s,
+    } = req
+    else {
         unreachable!()
     };
     let row = match board_row_for_id(&ctx.work_db, &id) {
@@ -456,12 +477,42 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
             }
         }
         DropResolution::SetStatus(status) => {
+            if bypass_dispatch_pause {
+                // Pre-check before the status patch ever applies, so a
+                // refusal here means the card genuinely never moved — the
+                // "bounce the card back" behavior — rather than needing to
+                // revert a status flip after the fact. Uses the exact same
+                // `pause_bypass_decision` the mutating dispatch step below
+                // re-checks authoritatively, so this can never promise
+                // something that step doesn't also honor; the only gap is
+                // the ordinary TOCTOU window between the two checks, which
+                // the mutating step's own no-residue handling covers.
+                let admission = match ctx
+                    .server_state
+                    .execution_coordinator
+                    .evaluate_dispatch_admission(&id)
+                    .await
+                {
+                    Ok(admission) => admission,
+                    Err(err) => {
+                        send_work_error(&ctx.sink, &ctx.request_id, err);
+                        return;
+                    }
+                };
+                if let Err(reason) = pause_bypass_decision(&admission, observed_pause_since_epoch_s) {
+                    send_work_error(&ctx.sink, &ctx.request_id, format!("cannot start {id}: {reason}"));
+                    return;
+                }
+            }
             let patch = WorkItemPatch::builder().status(status.as_str()).build();
-            apply_work_item_patch(ctx, id, patch).await;
+            let pause_bypass = bypass_dispatch_pause.then_some(BoardDragPauseBypass {
+                observed_pause_since_epoch_s,
+            });
+            apply_work_item_patch(ctx, id, patch, pause_bypass).await;
         }
         DropResolution::ClearAutostart => {
             let patch = WorkItemPatch::builder().autostart(false).build();
-            apply_work_item_patch(ctx, id, patch).await;
+            apply_work_item_patch(ctx, id, patch, None).await;
         }
         DropResolution::Refused { message } => {
             let err = anyhow!(message);
@@ -491,7 +542,17 @@ fn board_row_for_id(work_db: &WorkDb, id: &str) -> Result<BoardRow> {
 /// [`handle_update_work_item`] (an explicit status/field edit) and
 /// [`handle_move_work_item_on_board`] (a drag whose meaning the engine just
 /// resolved).
-async fn apply_work_item_patch(ctx: Dispatch, id: String, patch: WorkItemPatch) {
+///
+/// `pub(super)` so unit tests can drive the pause-bypass re-check refusal
+/// arm directly (the board-handler pre-check normally refuses before the
+/// status patch, so the in-request TOCTOU revert is unreachable over pure
+/// RPC without a concurrent mutation race).
+pub(super) async fn apply_work_item_patch(
+    ctx: Dispatch,
+    id: String,
+    patch: WorkItemPatch,
+    pause_bypass: Option<BoardDragPauseBypass>,
+) {
     let Dispatch {
         server_state,
         work_db,
@@ -580,7 +641,15 @@ async fn apply_work_item_patch(ctx: Dispatch, id: String, patch: WorkItemPatch) 
         }
         let actor = resolve_status_actor(&server_state, peer_pid);
         match work_db.update_work_item_as_actor(&id, patch, actor) {
-            Ok(item) => {
+            Ok(mut item) => {
+                // Set only by the pause-bypass dispatch arm below when the
+                // authoritative re-check refuses: the status patch already
+                // landed, so we revert it and answer this request with a
+                // `work_error` (which `ChatViewModel`'s existing
+                // `.workError` handler bounces the optimistic move on)
+                // instead of a success response that would otherwise leave
+                // the card in Doing with no execution and no visible error.
+                let mut dispatch_failure_response: Option<String> = None;
                 let product_id = item.product_id().to_string();
                 let mut topics = vec![work_product_topic(&product_id)];
                 if matches!(item, WorkItem::Product(_)) {
@@ -683,6 +752,70 @@ async fn apply_work_item_patch(ctx: Dispatch, id: String, patch: WorkItemPatch) 
                                     .to_owned(),
                             ),
                         )
+                    } else if needs_dispatch && let Some(bypass) = pause_bypass {
+                        // Pre-checked in `handle_move_work_item_on_board`
+                        // before this patch ever applied — this is the
+                        // authoritative re-check per the design's
+                        // pause-generation race handling, using the same
+                        // `RequestExecutionInput::bypass_dispatch_pause`
+                        // seam `bossctl work start --force` drives.
+                        let coordinator = server_state.execution_coordinator.clone();
+                        let live_states = server_state.live_worker_states.clone();
+                        let dispatch_input = RequestExecutionInput::builder()
+                            .work_item_id(work_item_id_for_event.clone())
+                            .bypass_dispatch_pause(true)
+                            .entry_point(DispatchAdmissionEntryPoint::AppDrag)
+                            .maybe_observed_pause_since_epoch_s(bypass.observed_pause_since_epoch_s)
+                            .build();
+                        match coordinator
+                            .dispatch_with_pause_bypass(dispatch_input, live_states)
+                            .await
+                        {
+                            Ok(execution) => (Some(execution.id), true, None),
+                            Err(err) => {
+                                // The pre-check in `handle_move_work_item_on_board`
+                                // already cleared this drag before the status
+                                // patch above ever applied — reaching a refusal
+                                // here means the pause was re-raised (or the
+                                // interactive cap filled) in the window between
+                                // that confirmation and this authoritative
+                                // re-check. The status patch already landed, so
+                                // revert it rather than leaving the card
+                                // stranded in Doing with no execution and no
+                                // visible error.
+                                let reason = format!("{err:#}");
+                                tracing::warn!(
+                                    work_item_id = %work_item_id_for_event,
+                                    ?err,
+                                    "UpdateWorkItem → active: pause-bypass dispatch refused at the \
+                                     authoritative re-check; reverting status, no worker spawned",
+                                );
+                                if let Some(prev_status) = &previous_task_status {
+                                    let revert_patch = WorkItemPatch::builder().status(prev_status.as_str()).build();
+                                    // Engine-initiated rollback, not a human
+                                    // edit — stamp `last_status_actor` as
+                                    // engine so dependency-cascade heuristics
+                                    // that key off the actor stay honest.
+                                    match work_db.update_work_item_as_actor(
+                                        &work_item_id_for_event,
+                                        revert_patch,
+                                        boss_protocol::LAST_STATUS_ACTOR_ENGINE,
+                                    ) {
+                                        Ok(reverted) => item = reverted,
+                                        Err(revert_err) => {
+                                            tracing::warn!(
+                                                work_item_id = %work_item_id_for_event,
+                                                ?revert_err,
+                                                "UpdateWorkItem → active: failed to revert status after \
+                                                 pause-bypass dispatch refusal",
+                                            );
+                                        }
+                                    }
+                                }
+                                dispatch_failure_response = Some(reason.clone());
+                                (None, false, Some(reason))
+                            }
+                        }
                     } else if needs_dispatch {
                         let live_states = server_state.live_worker_states.clone();
                         let dispatch_input = RequestExecutionInput::builder()
@@ -738,12 +871,27 @@ async fn apply_work_item_patch(ctx: Dispatch, id: String, patch: WorkItemPatch) 
                     let exec_for_event = dispatched_execution_id
                         .clone()
                         .unwrap_or_else(|| work_item_id_for_event.clone());
+                    // When the pause-bypass re-check refused and we rolled
+                    // the row back, the surviving status is the previous
+                    // one — not `active`. Report that so engine-audit /
+                    // dispatch-diagnosis do not claim a transition that
+                    // did not survive the request.
+                    let status_reverted = dispatch_failure_response.is_some();
+                    let to_status = if status_reverted {
+                        from_status
+                            .as_ref()
+                            .map(|s| s.as_str().to_owned())
+                            .unwrap_or_else(|| "active".to_owned())
+                    } else {
+                        "active".to_owned()
+                    };
                     let details = serde_json::json!({
                         "from_status": from_status,
-                        "to_status": "active",
+                        "to_status": to_status,
                         "did_dispatch": did_dispatch,
                         "reason_if_skipped": skip_reason,
                         "dispatched_execution_id": dispatched_execution_id,
+                        "status_reverted": status_reverted,
                     });
                     server_state
                         .dispatch_events
@@ -832,7 +980,16 @@ async fn apply_work_item_patch(ctx: Dispatch, id: String, patch: WorkItemPatch) 
                     vec![work_item_id(&item)],
                 )
                 .await;
-                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
+                if let Some(reason) = dispatch_failure_response {
+                    // The status patch was reverted above; answer this
+                    // request with a refusal (not the reverted item as a
+                    // success) so the client's `.workError` handler
+                    // bounces the optimistic card back instead of the
+                    // "dragged it and nothing happened" shape.
+                    send_work_error(&sink, &request_id, reason);
+                } else {
+                    send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
+                }
             }
             Err(err) => {
                 send_work_error(&sink, &request_id, &err);

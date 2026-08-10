@@ -35,9 +35,9 @@ mod stream_integrity;
 use boss_engine::dispatch_events::DispatchEvent;
 use boss_engine::dispatch_reader;
 use boss_protocol::{
-    FrontendEvent, FrontendRequest, HostedPaneState, HostedPaneStatus, LiveStatusDebugReport, LiveStatusSlotDebug,
-    LiveWorkerState, MetricLiveEntry, ProposalKind, ProposalState, ROSTER, RequestExecutionInput, WorkExecution,
-    WorkItem, WorkRun, WorkerProposal, WorkspacePoolEntry,
+    DispatchAdmissionEntryPoint, FrontendEvent, FrontendRequest, HostedPaneState, HostedPaneStatus,
+    LiveStatusDebugReport, LiveStatusSlotDebug, LiveWorkerState, MetricLiveEntry, ProposalKind, ProposalState, ROSTER,
+    RequestExecutionInput, WorkExecution, WorkItem, WorkRun, WorkerProposal, WorkspacePoolEntry,
 };
 use clap::{Parser, Subcommand};
 
@@ -873,6 +873,17 @@ enum WorkAction {
         priority: Option<i64>,
         #[arg(long)]
         preferred_workspace_id: Option<String>,
+        /// Bypass an active *operator*-originated global dispatch pause for
+        /// this one request. Distinct from `bossctl agents launch`'s pool
+        /// growth: this never grows a worker pool, never skips the
+        /// interactive concurrency cap, unmet dependencies, or any other
+        /// admission constraint, and a breaker-originated pause is never
+        /// overridable. Refuses outright (with no queued residue left
+        /// behind) when any non-overridable constraint blocks the item —
+        /// see
+        /// `docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md`.
+        #[arg(long)]
+        force: bool,
     },
     /// Cancel a queued or running execution (any non-terminal status).
     ///
@@ -1337,6 +1348,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     work_item_id,
                     priority,
                     preferred_workspace_id,
+                    force,
                 },
         } => {
             agents::work_start(
@@ -1345,6 +1357,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 work_item_id,
                 priority,
                 preferred_workspace_id,
+                force,
             )
             .await
         }

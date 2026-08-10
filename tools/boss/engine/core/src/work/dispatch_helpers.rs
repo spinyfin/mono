@@ -890,6 +890,51 @@ pub(crate) fn reconcile_revision_execution(
     Ok(())
 }
 
+/// Status-based reasons a task/chore cannot be dispatched right now,
+/// independent of gating prereqs, repo resolution, human-driven-ness, or
+/// the dispatch pause. Shared by the mutating
+/// `request_execution_in_tx_with_live_check` (below) and the read-only
+/// `WorkDb::dispatch_admission_facts` (`work/dispatch_admission.rs`) via
+/// [`status_ineligibility`], so a new status-based refusal condition
+/// can't be added to one without the other seeing it — see the design
+/// doc's "one reason-producing function" invariant
+/// (`docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md`).
+///
+/// Deliberately does NOT include `in_review`: re-dispatching an
+/// `in_review` revision whose spawning attempt retired without ever
+/// pushing (e.g. `bossctl work start` after a stuck CI/conflict attempt)
+/// is a real, intentionally supported flow — see
+/// `work::tests::t20::redispatching_in_review_revision_advances_to_active`
+/// — so it must remain eligible on both the ordinary and the forced path.
+pub(crate) enum StatusIneligibility {
+    Deleted,
+    Terminal {
+        status: TaskStatus,
+        archived_reason: Option<String>,
+    },
+}
+
+/// Pure classification — no DB access — so both callers can run it
+/// against whatever row shape their own query already fetched. `None`
+/// means the status itself does not block dispatch (the caller still
+/// owes its own human-driven / gating / repo-resolution checks).
+pub(crate) fn status_ineligibility(
+    status: &TaskStatus,
+    archived_reason: Option<&str>,
+    deleted: bool,
+) -> Option<StatusIneligibility> {
+    if deleted {
+        return Some(StatusIneligibility::Deleted);
+    }
+    if status.is_terminal() {
+        return Some(StatusIneligibility::Terminal {
+            status: status.clone(),
+            archived_reason: archived_reason.map(str::to_owned),
+        });
+    }
+    None
+}
+
 pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
     pending: &mut PendingEvents,
     conn: &Connection,
@@ -905,37 +950,63 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         // creates / refreshes a `ready` row the same way for both
         // forced and queued requests.
         force: _,
+        // The pause-only override intent, its provenance, and the
+        // observed pause generation are all resolved entirely above this
+        // layer, by `ExecutionCoordinator::dispatch_with_pause_bypass`
+        // (see `coordinator/dispatch_admission.rs`) before it ever calls
+        // down into `request_execution_with_live_check`. By the time a
+        // request reaches here it has already been admitted (or refused
+        // and never reached this far) — this DB layer creates / refreshes
+        // a `ready` row identically regardless of how it was admitted.
+        bypass_dispatch_pause: _,
+        entry_point: _,
+        observed_pause_since_epoch_s: _,
         allow_dirty,
     } = input;
 
     let preferred_workspace_id = normalize_optional_text(preferred_workspace_id);
     let kind = execution_kind_for_work_item(conn, &work_item_id)?;
 
-    // Refuse explicit dispatch against a terminal (done/archived)
-    // work item instead of silently creating a `ready` execution that can
-    // never run — the row is closed, so nothing will ever pick it up, and
-    // the next reconcile tick that revisits a terminal revision archives it
-    // straight back out from under the stranded execution (see
-    // proj_18be59fc8d8b2440_363's incident writeup: `bossctl work start` on
-    // an auto-archived revision minted exactly such an orphan). Only tasks
-    // carry executions; projects are exempt.
+    // Refuse explicit dispatch against a status that can't accept one
+    // (terminal or deleted) instead of silently creating a `ready`
+    // execution that can never run — a terminal row is closed, so nothing
+    // will ever pick it up, and the next reconcile tick that revisits a
+    // terminal revision archives it straight back out from under the
+    // stranded execution (see proj_18be59fc8d8b2440_363's incident
+    // writeup: `bossctl work start` on an auto-archived revision minted
+    // exactly such an orphan). Only tasks carry executions; projects are
+    // exempt. Shares [`status_ineligibility`] with `dispatch_admission_facts`
+    // so `bossctl work start --force` can never be more permissive — or
+    // more restrictive — than an ordinary start on the status axis; only
+    // the dispatch pause is allowed to differ. `in_review` is
+    // deliberately not covered here — see `status_ineligibility`'s doc.
     if work_item_id.starts_with("task_") {
-        let terminal_state: Option<(String, Option<String>)> = conn
+        let row: Option<(String, Option<String>, i64)> = conn
             .query_row(
-                "SELECT status, archived_reason FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+                "SELECT status, archived_reason, deleted_at IS NOT NULL FROM tasks WHERE id = ?1",
                 params![work_item_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        if let Some((status, archived_reason)) = terminal_state {
+        if let Some((status, archived_reason, deleted)) = row {
             let parsed: TaskStatus = status.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-            if parsed.is_terminal() {
-                let reason_suffix = archived_reason.map(|r| format!(" — {r}")).unwrap_or_default();
-                bail!(
-                    "cannot start {work_item_id}: item is `{status}`{reason_suffix} — terminal work \
-                     items cannot be dispatched; if this was archived by mistake, reopen it first \
-                     with `boss task move {work_item_id} --to todo`"
-                );
+            if let Some(ineligibility) = status_ineligibility(&parsed, archived_reason.as_deref(), deleted != 0) {
+                match ineligibility {
+                    StatusIneligibility::Deleted => {
+                        bail!("cannot start {work_item_id}: item is deleted");
+                    }
+                    StatusIneligibility::Terminal {
+                        status,
+                        archived_reason,
+                    } => {
+                        let reason_suffix = archived_reason.map(|r| format!(" — {r}")).unwrap_or_default();
+                        bail!(
+                            "cannot start {work_item_id}: item is `{status}`{reason_suffix} — terminal work \
+                             items cannot be dispatched; if this was archived by mistake, reopen it first \
+                             with `boss task move {work_item_id} --to todo`"
+                        );
+                    }
+                }
             }
         }
     }

@@ -897,10 +897,30 @@ impl ExecutionCoordinator {
 
             // Dispatch is paused and this row isn't exempt: leave it `ready`
             // for the next drain after resume. Reached only when
-            // `reviews_exempt_from_pause` is true (a non-exempt pause already
-            // returned above), so this holds every non-review row while
-            // review rows fall through to normal dispatch below.
-            if paused && !is_review {
+            // `reviews_exempt_from_pause` is true (a non-exempt/breaker
+            // pause already returned above, before this loop, so a
+            // breaker pause can never reach the bypass check below —
+            // consistent with a breaker pause never being overridable),
+            // so this holds every non-review row while review rows fall
+            // through to normal dispatch below.
+            //
+            // The ONE exception is a row `ExecutionCoordinator::
+            // dispatch_with_pause_bypass` marked via
+            // `dispatch_pause_bypass_execution_ids` — the pause-only
+            // forced-dispatch override (`RequestExecutionInput::
+            // bypass_dispatch_pause`; see
+            // `docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md`).
+            // Consuming the marker here (not just checking it) makes the
+            // bypass single-shot: whether this row goes on to dispatch or
+            // is held by a later gate in this same pass (the interactive
+            // cap, a chain hold, …), it never remains bypass-eligible on a
+            // future pass while the pause is still active — a later
+            // dispatch would be exactly the "dispatches later by
+            // surprise" residue the design forbids. Every other `ready`
+            // row in this pass is completely unaffected: this consumes at
+            // most one id, for the one execution the caller is
+            // synchronously awaiting the outcome of.
+            if paused && !is_review && !self.take_dispatch_pause_bypass(&execution.id) {
                 continue;
             }
 

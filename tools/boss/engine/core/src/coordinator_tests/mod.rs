@@ -4,6 +4,7 @@
 mod automation;
 mod dispatch;
 mod helpers;
+mod pause_bypass;
 mod pool;
 mod recovery;
 mod review_pause;

@@ -544,15 +544,47 @@ extension EngineClient {
     ///
     /// `group` is `nil` when the drop landed on the column but not on one of
     /// its groups — the column's padding, or a column with no groups.
-    func sendMoveWorkItemOnBoard(id: String, column: WorkBoardColumnKey, group: WorkBoardGroupKey?) {
+    ///
+    /// `bypassDispatchPause` / `observedPauseSinceEpochS` carry a confirmed
+    /// pause-only override — set only after `sendEvaluateDispatchAdmission`
+    /// reported an active, overridable pause and the operator confirmed the
+    /// dialog naming it. `observedPauseSinceEpochS` is the pause generation
+    /// that evaluation observed, so the engine can tell a stale confirmation
+    /// (the pause changed or lifted) from a fresh one — see
+    /// `docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md`.
+    func sendMoveWorkItemOnBoard(
+        id: String,
+        column: WorkBoardColumnKey,
+        group: WorkBoardGroupKey?,
+        bypassDispatchPause: Bool = false,
+        observedPauseSinceEpochS: UInt64? = nil
+    ) {
         var target: [String: Any] = ["column": column.rawValue]
         if let group {
             target["group"] = group.rawValue
         }
-        sendLine([
+        var payload: [String: Any] = [
             "type": "move_work_item_on_board",
             "id": id,
             "target": target,
+            "bypass_dispatch_pause": bypassDispatchPause,
+        ]
+        if let observedPauseSinceEpochS {
+            payload["observed_pause_since_epoch_s"] = observedPauseSinceEpochS
+        }
+        sendLine(payload)
+    }
+
+    /// Read-only: ask whether `workItemId` would dispatch right now, and if
+    /// not, why not — the current dispatch-pause snapshot plus every
+    /// non-overridable blocker. Called before a drag-to-Doing that would
+    /// request execution, so the app can show a pause-only confirmation (or
+    /// bounce the card back) instead of reproducing engine admission rules
+    /// client-side. Reply arrives as `.dispatchAdmissionEvaluated`.
+    func sendEvaluateDispatchAdmission(workItemId: String) {
+        sendLine([
+            "type": "evaluate_dispatch_admission",
+            "work_item_id": workItemId,
         ])
     }
 

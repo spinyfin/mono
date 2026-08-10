@@ -1457,6 +1457,19 @@ async fn seed_unresolvable_chore(client: &mut BossClient) -> Result<boss_protoco
     Ok(chore)
 }
 
+/// `MoveWorkItemOnBoard` with no pause-only override requested — the shape
+/// every drag in this file's fixtures needs. Centralised so the two
+/// override-only fields (`bypass_dispatch_pause`, `observed_pause_since_epoch_s`)
+/// have one call site to update instead of one per test.
+fn move_on_board_request(id: &str, column: BoardColumn, group: Option<BoardGroup>) -> FrontendRequest {
+    FrontendRequest::MoveWorkItemOnBoard {
+        id: id.to_owned(),
+        target: BoardDropTarget::new(column, group),
+        bypass_dispatch_pause: false,
+        observed_pause_since_epoch_s: None,
+    }
+}
+
 async fn list_executions_for(client: &mut BossClient, work_item_id: &str) -> Result<Vec<boss_protocol::WorkExecution>> {
     match client
         .send_request(&FrontendRequest::ListExecutions {
@@ -1645,10 +1658,11 @@ async fn board_drop_inside_merging_group_does_not_complete_the_merge() -> Result
 
     // The gesture from the bug report: a reorder inside the group.
     match client
-        .send_request(&FrontendRequest::MoveWorkItemOnBoard {
-            id: chore.id.clone(),
-            target: BoardDropTarget::new(BoardColumn::Done, Some(BoardGroup::Merging)),
-        })
+        .send_request(&move_on_board_request(
+            &chore.id,
+            BoardColumn::Done,
+            Some(BoardGroup::Merging),
+        ))
         .await?
     {
         FrontendEvent::WorkItemUpdated { item } => match item {
@@ -1672,10 +1686,7 @@ async fn board_drop_inside_merging_group_does_not_complete_the_merge() -> Result
     // A drop that missed every section names the column only. Less intent,
     // not more — it must not be read as a completion either.
     client
-        .send_request(&FrontendRequest::MoveWorkItemOnBoard {
-            id: chore.id.clone(),
-            target: BoardDropTarget::new(BoardColumn::Done, None),
-        })
+        .send_request(&move_on_board_request(&chore.id, BoardColumn::Done, None))
         .await?;
     assert_eq!(
         fetch_task_status(&mut client, &chore.id).await?,
@@ -1686,10 +1697,11 @@ async fn board_drop_inside_merging_group_does_not_complete_the_merge() -> Result
     // Crossing out of Merging into a completion group is a real completion
     // and must keep working — the fix must not blanket-disable Done.
     client
-        .send_request(&FrontendRequest::MoveWorkItemOnBoard {
-            id: chore.id.clone(),
-            target: BoardDropTarget::new(BoardColumn::Done, Some(BoardGroup::Completed)),
-        })
+        .send_request(&move_on_board_request(
+            &chore.id,
+            BoardColumn::Done,
+            Some(BoardGroup::Completed),
+        ))
         .await?;
     assert_eq!(
         fetch_task_status(&mut client, &chore.id).await?,
@@ -1758,10 +1770,7 @@ async fn board_drop_on_own_column_is_a_reorder_for_a_blocked_row() -> Result<()>
     assert_eq!(fetch_task_status(&mut client, &chore.id).await?, TaskStatus::Blocked);
 
     client
-        .send_request(&FrontendRequest::MoveWorkItemOnBoard {
-            id: chore.id.clone(),
-            target: BoardDropTarget::new(BoardColumn::Backlog, None),
-        })
+        .send_request(&move_on_board_request(&chore.id, BoardColumn::Backlog, None))
         .await?;
     assert_eq!(
         fetch_task_status(&mut client, &chore.id).await?,
@@ -1771,10 +1780,7 @@ async fn board_drop_on_own_column_is_a_reorder_for_a_blocked_row() -> Result<()>
 
     // Leaving the column is still a real transition.
     client
-        .send_request(&FrontendRequest::MoveWorkItemOnBoard {
-            id: chore.id.clone(),
-            target: BoardDropTarget::new(BoardColumn::Review, None),
-        })
+        .send_request(&move_on_board_request(&chore.id, BoardColumn::Review, None))
         .await?;
     assert_eq!(
         fetch_task_status(&mut client, &chore.id).await?,
@@ -1828,10 +1834,11 @@ async fn board_drop_into_merging_group_is_refused() -> Result<()> {
     };
 
     match client
-        .send_request(&FrontendRequest::MoveWorkItemOnBoard {
-            id: chore.id.clone(),
-            target: BoardDropTarget::new(BoardColumn::Done, Some(BoardGroup::Merging)),
-        })
+        .send_request(&move_on_board_request(
+            &chore.id,
+            BoardColumn::Done,
+            Some(BoardGroup::Merging),
+        ))
         .await?
     {
         FrontendEvent::WorkError { message } => {
@@ -1917,10 +1924,7 @@ async fn board_drop_from_doing_to_backlog_clears_autostart_on_a_dispatch_pending
     assert!(armed.autostart, "the row must be dispatch-pending to render in Doing");
 
     client
-        .send_request(&FrontendRequest::MoveWorkItemOnBoard {
-            id: chore.id.clone(),
-            target: BoardDropTarget::new(BoardColumn::Backlog, None),
-        })
+        .send_request(&move_on_board_request(&chore.id, BoardColumn::Backlog, None))
         .await?;
 
     let parked = fetch_task(&mut client, &chore.id).await?;

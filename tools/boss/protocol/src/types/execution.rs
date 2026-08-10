@@ -389,6 +389,100 @@ pub struct ExecutionReconcileResult {
     pub updated: Vec<WorkExecution>,
 }
 
+/// Where a pause-only forced-dispatch request originated. Carried as
+/// provenance on [`RequestExecutionInput::entry_point`] so the resulting
+/// override / refusal dispatch event (see
+/// `docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md`)
+/// records which caller exercised the override — `bossctl work start
+/// --force` or a confirmed macOS drag-to-Doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchAdmissionEntryPoint {
+    Cli,
+    AppDrag,
+}
+
+/// Stable reason code naming one constraint [`DispatchAdmission`] (or a
+/// refused pause-bypass [`RequestExecutionInput`]) reports as blocking
+/// dispatch. This list mixes two different kinds of constraint — see the
+/// design doc's "Exactly what force overrides" section:
+///
+/// - `INTERACTIVE_CONCURRENCY_CAP`, `UNMET_DEPENDENCY`, and
+///   `INELIGIBLE_STATUS` are genuinely enforced: force never bypasses them.
+/// - `CHURN_GUARD_PARKED` and `AUTOSTART_DISABLED` are informational only
+///   (see `INFORMATIONAL_ONLY_BLOCKER_CODES` in
+///   `coordinator/dispatch_admission.rs`) — an explicit dispatch request has
+///   always cleared both, forced or not, so they are reported here purely
+///   for confirmation-dialog transparency, never as a refusal reason.
+///
+/// The dispatch pause itself is reported separately via
+/// [`DispatchPauseSnapshot`], not as a blocker code, since a pause is the
+/// one thing that *can* be overridden.
+pub const ADMISSION_BLOCKER_INTERACTIVE_CONCURRENCY_CAP: &str = "interactive_concurrency_cap";
+pub const ADMISSION_BLOCKER_UNMET_DEPENDENCY: &str = "unmet_dependency";
+pub const ADMISSION_BLOCKER_CHURN_GUARD_PARKED: &str = "churn_guard_parked";
+pub const ADMISSION_BLOCKER_AUTOSTART_DISABLED: &str = "autostart_disabled";
+pub const ADMISSION_BLOCKER_INELIGIBLE_STATUS: &str = "ineligible_status";
+
+/// One non-overridable reason [`DispatchAdmission`] found dispatch would
+/// currently refuse for, independent of the dispatch pause.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DispatchAdmissionBlocker {
+    /// One of the `ADMISSION_BLOCKER_*` constants above.
+    pub code: String,
+    /// Operator-facing text naming the blocker, ready to render verbatim.
+    pub message: String,
+}
+
+/// Snapshot of the global dispatch pause as observed by
+/// [`DispatchAdmission`]. `paused_since_epoch_s` doubles as the pause's
+/// "generation": the app echoes it back on
+/// [`RequestExecutionInput::observed_pause_since_epoch_s`] so the engine
+/// can tell a stale confirmation (the pause was lifted, or re-raised with a
+/// different reason) from a fresh one — see the design's "pause-generation
+/// race" handling.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DispatchPauseSnapshot {
+    pub active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_since_epoch_s: Option<u64>,
+    /// `true` only when `active` and `origin == "operator"` — a
+    /// breaker-originated pause is never overridable, since it signals the
+    /// spawn path itself is unhealthy rather than an operator decision to
+    /// hold work back.
+    pub overridable: bool,
+}
+
+/// Read-only answer to "would this work item dispatch right now, and if
+/// not, why not?" — returned by `EvaluateDispatchAdmission` and computed by
+/// the exact same reason-producing function the mutating
+/// `RequestExecution` pause-bypass path consults, so the confirmation this
+/// backs never promises something the mutating request doesn't also honor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct DispatchAdmission {
+    pub work_item_id: String,
+    /// `true` when the work item would dispatch right now with no override
+    /// at all (not paused, and `blockers` is empty).
+    pub would_dispatch: bool,
+    pub pause: DispatchPauseSnapshot,
+    /// Every blocker currently present, independent of the pause — a mix
+    /// of enforced and informational-only codes; see the
+    /// `ADMISSION_BLOCKER_*` doc above for which is which. Force never
+    /// clears an enforced one; it has always cleared the informational-only
+    /// ones regardless of force. The app renders the enforced subset (the
+    /// Swift `DispatchAdmission.hardBlockers` computed property) as reasons
+    /// a confirmation cannot promise to overcome, and the rest for
+    /// transparency only.
+    #[serde(default)]
+    #[builder(default)]
+    pub blockers: Vec<DispatchAdmissionBlocker>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct RequestExecutionInput {
@@ -408,9 +502,43 @@ pub struct RequestExecutionInput {
     /// one slot — bounded by the hard cap `MAX_WORKER_POOL_SIZE` — so
     /// the work item starts immediately even when every configured
     /// slot is busy.
+    ///
+    /// Distinct from [`Self::bypass_dispatch_pause`]: this bit is
+    /// pool-growth only and never touches the dispatch pause; the two
+    /// must never be conflated on the wire or by any CLI flag path.
     #[serde(default)]
     #[builder(default)]
     pub force: bool,
+
+    /// Bypass an active *operator*-originated global dispatch pause for
+    /// this request only — see
+    /// `docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md`.
+    /// Never grows a worker pool, never skips the interactive concurrency
+    /// cap, dependency gating, or any other admission constraint — see
+    /// [`DispatchAdmission`] for the full list this does not touch. A
+    /// breaker-originated pause is never overridable regardless of this
+    /// flag. Requires [`Self::entry_point`] to be set.
+    #[serde(default)]
+    #[builder(default)]
+    pub bypass_dispatch_pause: bool,
+
+    /// Who is asking for [`Self::bypass_dispatch_pause`] — required
+    /// whenever that flag is set, so the resulting override/refusal
+    /// dispatch event carries provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_point: Option<DispatchAdmissionEntryPoint>,
+
+    /// The pause's `paused_since_epoch_s` "generation" the caller observed
+    /// before deciding to bypass it — normally populated from a prior
+    /// `EvaluateDispatchAdmission` response. `None` (the CLI's case, which
+    /// has no prior observation to go stale) means "don't compare, just
+    /// evaluate the current pause fresh." When `Some` and the engine's
+    /// current pause state no longer matches (lifted, or re-raised with a
+    /// different origin/reason/generation), the engine does not treat this
+    /// as a confirmed override of the *current* pause — see the design's
+    /// pause-generation race handling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_pause_since_epoch_s: Option<u64>,
 
     pub preferred_workspace_id: Option<String>,
     pub priority: Option<i64>,
