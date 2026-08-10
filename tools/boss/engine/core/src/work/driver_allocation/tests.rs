@@ -345,12 +345,11 @@ fn pool_driver_backfill_leaves_a_contradicting_launch_record_alone() {
     assert_eq!(decision.reason, REASON_EXPLICIT);
 }
 
-/// A historical `chore_implementation` execution on an automation-sourced
-/// row is pool-bound by the same rule `decide_execution_driver` applies
-/// today (`tasks.source_automation_id`), even though its kind is not one of
-/// the two pool-bound kinds — the backfill must correct it too.
+/// Automation provenance is not durable proof that an ordinary execution
+/// used the automation pool: it may have spilled to an ordinary worker, so
+/// the backfill must preserve its existing decision.
 #[test]
-fn pool_driver_backfill_corrects_automation_sourced_ordinary_executions() {
+fn pool_driver_backfill_leaves_automation_sourced_ordinary_executions_alone() {
     let (_dir, db) = open_db();
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, &product.id, "legacy automation-sourced chore");
@@ -372,8 +371,8 @@ fn pool_driver_backfill_corrects_automation_sourced_ordinary_executions() {
         .unwrap();
     let execution = create_ready_chore_execution(&db, &chore.id);
     let conn = db.connect().unwrap();
-    // Backdate: this row is automation-sourced, but its decision was
-    // recorded before pool-bound automation-sourced rows were recognised.
+    // The source marks an automation preference, not the worker slot this
+    // execution ultimately claimed.
     conn.execute(
         "UPDATE tasks SET source_automation_id = ?1 WHERE id = ?2",
         params![&automation.id, &chore.id],
@@ -390,8 +389,8 @@ fn pool_driver_backfill_corrects_automation_sourced_ordinary_executions() {
     drop(conn);
 
     let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
-    assert_eq!(decision.driver.as_deref(), Some(DRIVER_SLUG_CLAUDE));
-    assert_eq!(decision.reason, REASON_POOL);
+    assert_eq!(decision.driver.as_deref(), Some(DRIVER_SLUG_CODEX));
+    assert_eq!(decision.reason, REASON_EXPLICIT);
 }
 
 /// Conflict resolution and CI remediation ARE still allocated (unlike a
