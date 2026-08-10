@@ -1553,18 +1553,21 @@ pub fn pool_dispatch_policy_for_worker_id(worker_id: &str) -> Option<PoolDispatc
 /// The companion of that function for callers that have a kind but no worker
 /// id yet — chiefly [`crate::work::driver_allocation`], which decides a
 /// row's driver when its execution row is created, long before a pool slot
-/// is claimed. Traffic allocation must decline these executions for exactly
-/// the reason it declines a row with an explicit `--driver`: their driver is
+/// is claimed. Traffic allocation records the pool's fixed driver for these
+/// executions (reason `pool`) rather than allocating them: their driver is
 /// already decided elsewhere, so an allocation would be a decision record
 /// that does not describe where the worker actually ran.
 ///
 /// `pr_review` (review pool) and `automation_triage` (automation pool) are
-/// the two kinds that are *always* pool-bound by kind alone. The automation
-/// pool additionally takes ordinary implementation executions whose work
-/// item came from an automation
-/// (`ClaudeCoordinator::execution_targets_automation_pool`); that half
-/// cannot be decided from the kind and is checked against
-/// `tasks.source_automation_id` at the allocation site.
+/// the two kinds that are *always* pool-bound by kind alone. Ordinary work
+/// originating from an automation prefers the automation pool, but can spill
+/// to an ordinary `worker-N` slot, so provenance alone is not a pool-driver
+/// guarantee and is intentionally not included here.
+///
+/// Also a second site to update if a future kind joins the pool-bound set:
+/// [`crate::work::migrations_b::migrate_backfill_pool_driver_decisions`]
+/// hardcodes the same `pr_review` / `automation_triage` kind list in SQL, and
+/// has no way to build it from this function's match arms.
 pub fn kind_always_dispatches_on_pool_driver(kind: &ExecutionKind) -> bool {
     match kind {
         ExecutionKind::PrReview | ExecutionKind::AutomationTriage => true,

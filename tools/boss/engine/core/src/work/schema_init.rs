@@ -722,14 +722,19 @@ impl WorkDb {
         // was decided under). New table plus one additive column, independent
         // of every migration above.
         migrate_execution_driver_decisions_table(conn)?;
+        // Resolved driver/model/effort values frozen only after a worker has
+        // actually spawned. NULL on earlier rows means not recorded, never a
+        // guessed default. Must run before the backfill below, which reads
+        // `work_executions.driver` to decide which decision rows it may
+        // safely rewrite.
+        migrate_work_executions_launch_config(conn)?;
+        // Correct the older decision records for execution kinds whose pool
+        // overrides row/product pins. The backfill is self-idempotent.
+        migrate_backfill_pool_driver_decisions(conn)?;
         // Fold a superseded `codex_dispatch_percentage` value into the
         // equivalent three-way split and drop the legacy key. Data-only,
         // self-idempotent — see the function doc comment.
         migrate_driver_traffic_split_from_codex_percentage(conn)?;
-        // Resolved driver/model/effort values frozen only after a worker has
-        // actually spawned. NULL on earlier rows means not recorded, never a
-        // guessed default.
-        migrate_work_executions_launch_config(conn)?;
         // `pr_review_verdicts`: durable per-pass review-verdict ledger, written
         // atomically with `record_worker_pr_completion` so a `pr_review` pass
         // can never reach `completed` without a verdict row. Additive,

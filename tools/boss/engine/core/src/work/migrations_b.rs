@@ -2637,8 +2637,9 @@ pub(crate) fn migrate_backfill_cancelled_moot_revision_tombstones(conn: &Connect
 }
 
 /// Create `execution_driver_decisions`: one row per `work_executions` row,
-/// recording which driver traffic allocation chose for it and why
-/// (`explicit` | `allocation` | `default`) — see `work::driver_allocation`.
+/// recording which driver traffic allocation or its dispatch pool chose for
+/// it and why (`explicit` | `allocation` | `pool` | `default`) — see
+/// `work::driver_allocation`.
 /// A dedicated side table rather than columns on `work_executions` itself:
 /// the decision is written once, read by two narrow lookups keyed on
 /// `execution_id`, and joins cleanly for after-the-fact analysis ("how much
@@ -2672,6 +2673,45 @@ pub(crate) fn migrate_execution_driver_decisions_table(conn: &Connection) -> Res
             [],
         )?;
     }
+    Ok(())
+}
+
+/// Correct historical decisions for executions whose kind always dispatches
+/// on the review/automation pool. These are exactly the two `kind_*` arms
+/// [`crate::coordinator::kind_always_dispatches_on_pool_driver`] matches
+/// `true` on — extend both together if a future kind joins them. Ordinary
+/// automation-sourced work is deliberately absent because it can spill to
+/// an ordinary worker. Earlier versions evaluated a row/product pin first
+/// and consequently persisted that pin as `explicit`, although the pool
+/// always ran the execution on
+/// [`crate::coordinator::pool_driver_slug_for_execution_kind`]'s driver.
+///
+/// Only rewrites rows whose `work_executions.driver` — the launch tuple that
+/// actually reached the spawned worker, added by
+/// [`migrate_work_executions_launch_config`] — agrees with (or is silent on)
+/// the pool driver. A row whose recorded launch driver contradicts the pool
+/// driver is left untouched: it is evidence the execution really did run on
+/// a different driver (e.g. before the pool pin existed), and overwriting it
+/// would recreate the same class of false record this migration exists to
+/// fix, just in the opposite direction.
+///
+/// The update is self-idempotent: once a row carries the pool's driver and
+/// reason it no longer matches.
+pub(crate) fn migrate_backfill_pool_driver_decisions(conn: &Connection) -> Result<()> {
+    let pool_driver = crate::coordinator::pool_driver_slug_for_execution_kind(&ExecutionKind::PrReview)
+        .expect("pr_review is always pool-bound");
+    conn.execute(
+        "UPDATE execution_driver_decisions
+         SET driver = ?1, reason = ?2, split_at_decision = NULL
+         WHERE (driver IS NOT ?1 OR reason <> ?2 OR split_at_decision IS NOT NULL)
+           AND EXISTS (
+               SELECT 1 FROM work_executions we
+               WHERE we.id = execution_driver_decisions.execution_id
+                 AND (we.driver IS NULL OR we.driver = ?1)
+                 AND we.kind IN ('pr_review', 'automation_triage')
+           )",
+        params![pool_driver, crate::work::driver_allocation::REASON_POOL],
+    )?;
     Ok(())
 }
 
