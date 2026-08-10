@@ -1877,6 +1877,18 @@ pub enum DispatchAdmission {
     /// backoff, and never for a `pr_review` row — see
     /// [`ExecutionCoordinator::dispatch_hold_for`].
     BreakerRecoveryProbe,
+    /// The narrower per-request pause override
+    /// (`RequestExecutionInput::bypass_dispatch_pause`, driven by
+    /// `bossctl work start --force`; see
+    /// `docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md`).
+    /// [`ExecutionCoordinator::dispatch_with_pause_bypass`] has already
+    /// confirmed the pause is operator-originated and consumed this
+    /// execution's marker in `dispatch_pause_bypass_execution_ids` before
+    /// `drain_ready_queue` ever reaches `schedule_execution` with this
+    /// admission — so, unlike [`Self::OperatorForced`], it is admitted only
+    /// when [`DispatchPauseOrigin::Operator`] still holds; a breaker pause
+    /// refuses it exactly as it would an ordinary [`Self::Queued`] row.
+    PauseBypassOverride,
 }
 
 impl DispatchAdmission {
@@ -1886,6 +1898,7 @@ impl DispatchAdmission {
             DispatchAdmission::Queued => "queued",
             DispatchAdmission::OperatorForced => "operator_forced",
             DispatchAdmission::BreakerRecoveryProbe => "breaker_recovery_probe",
+            DispatchAdmission::PauseBypassOverride => "pause_bypass_override",
         }
     }
 }

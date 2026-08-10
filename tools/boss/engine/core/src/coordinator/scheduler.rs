@@ -971,6 +971,15 @@ impl ExecutionCoordinator {
         // Decks slots in pass 2, after every mainline/review row has had
         // its claim attempt. Queue order is preserved.
         let mut spill_candidates: Vec<WorkExecution> = Vec::new();
+        // Execution ids that cleared the pause gate below via a consumed
+        // `dispatch_pause_bypass_execution_ids` marker rather than an
+        // unpaused pass. `schedule_execution`'s own admission gate
+        // (`dispatch_hold_for`) has no visibility into that marker — it was
+        // already consumed here — so a bypassed row must carry
+        // `DispatchAdmission::OperatorForced` (never held) the rest of the
+        // way to `schedule_execution`, in both Pass 1 and Pass 2, or the
+        // chokepoint would refuse the very row the bypass just admitted.
+        let mut pause_bypass_admitted: HashSet<String> = HashSet::new();
         // At most one automation run may be preempted per drain pass, so a
         // burst of mainline arrivals never cascades into tearing down every
         // spilled automation run at once. The next mainline item waits for
@@ -1044,8 +1053,12 @@ impl ExecutionCoordinator {
             // row in this pass is completely unaffected: this consumes at
             // most one id, for the one execution the caller is
             // synchronously awaiting the outcome of.
-            if paused && !is_review && !self.take_dispatch_pause_bypass(&execution.id) {
-                continue;
+            if paused && !is_review {
+                if self.take_dispatch_pause_bypass(&execution.id) {
+                    pause_bypass_admitted.insert(execution.id.clone());
+                } else {
+                    continue;
+                }
             }
 
             // Automation is paused: hold this row regardless of the global
@@ -1159,7 +1172,12 @@ impl ExecutionCoordinator {
                     );
                     continue;
                 };
-                self.dispatch_claimed_execution(&execution, &worker_id, pool_label, false)
+                let admission = if pause_bypass_admitted.contains(&execution.id) {
+                    DispatchAdmission::PauseBypassOverride
+                } else {
+                    DispatchAdmission::Queued
+                };
+                self.dispatch_claimed_execution(&execution, &worker_id, pool_label, false, admission)
                     .await;
                 continue;
             }
@@ -1524,7 +1542,12 @@ impl ExecutionCoordinator {
                 continue;
             };
 
-            self.dispatch_claimed_execution(&execution, &worker_id, pool_label, false)
+            let admission = if pause_bypass_admitted.contains(&execution.id) {
+                DispatchAdmission::PauseBypassOverride
+            } else {
+                DispatchAdmission::Queued
+            };
+            self.dispatch_claimed_execution(&execution, &worker_id, pool_label, false, admission)
                 .await;
         }
 
@@ -1610,7 +1633,12 @@ impl ExecutionCoordinator {
                 worker_id = %worker_id,
                 "automation spilled into Lower Decks — automation pool full, no mainline work wanted this slot"
             );
-            self.dispatch_claimed_execution(&execution, &worker_id, "automation", true)
+            let admission = if pause_bypass_admitted.contains(&execution.id) {
+                DispatchAdmission::PauseBypassOverride
+            } else {
+                DispatchAdmission::Queued
+            };
+            self.dispatch_claimed_execution(&execution, &worker_id, "automation", true, admission)
                 .await;
         }
 
@@ -1954,6 +1982,7 @@ impl ExecutionCoordinator {
         worker_id: &str,
         pool_label: &str,
         spilled: bool,
+        admission: DispatchAdmission,
     ) {
         // Record the physical slot + page the claim landed on so a later
         // spawn failure on this slot is attributable to Bridge Crew vs
@@ -2066,10 +2095,7 @@ impl ExecutionCoordinator {
                     return;
                 }
             };
-            match coordinator
-                .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
-                .await
-            {
+            match coordinator.schedule_execution(&execution, &worker_id, admission).await {
                 Ok(()) => {
                     tracing::info!(
                         execution_id = %execution.id,

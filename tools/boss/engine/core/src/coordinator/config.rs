@@ -504,6 +504,14 @@ impl ExecutionCoordinator {
     ///   and leaves an open PR permanently unreviewed. It is also what makes
     ///   `reviews: held` true — a breaker pause that spent reviews as
     ///   canaries was not holding them.
+    /// - [`DispatchAdmission::PauseBypassOverride`] — allowed **only** under
+    ///   an Operator-origin pause; a Breaker-origin pause holds it exactly
+    ///   like [`DispatchAdmission::Queued`]. [`Self::dispatch_with_pause_bypass`]
+    ///   has already confirmed the pause was operator-originated and
+    ///   overridable before consuming this execution's
+    ///   `dispatch_pause_bypass_execution_ids` marker, so this arm exists to
+    ///   keep that confirmation honest at the chokepoint rather than to
+    ///   re-derive it.
     pub fn dispatch_hold_for(&self, execution: &WorkExecution, admission: DispatchAdmission) -> Option<DispatchHold> {
         let pause = self.dispatch_pause()?;
         let targets_review_pool = self.execution_targets_review_pool(execution);
@@ -542,6 +550,16 @@ impl ExecutionCoordinator {
                 hold(format!(
                     "dispatch is paused ({origin}): {reason}",
                     origin = pause.origin.as_metadata_str(),
+                    reason = pause.reason,
+                ))
+            }
+            DispatchAdmission::PauseBypassOverride => {
+                if pause.origin == DispatchPauseOrigin::Operator {
+                    return None;
+                }
+                hold(format!(
+                    "dispatch is breaker-paused ({reason}) — the pause-only forced-dispatch override \
+                     applies only to an operator pause",
                     reason = pause.reason,
                 ))
             }
