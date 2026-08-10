@@ -167,7 +167,10 @@ pub(crate) fn comments_list(json: bool, options: CommentsListOptions) -> Result<
     };
 
     if intent.is_some() || awaiting_answer {
-        let minimum_age_ms = older_than.as_deref().map(parse_duration_ms).transpose()?;
+        let minimum_age_ms = older_than
+            .as_deref()
+            .map(|value| parse_duration_ms("--older-than", value))
+            .transpose()?;
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("system clock is before the Unix epoch")?
@@ -175,25 +178,9 @@ pub(crate) fn comments_list(json: bool, options: CommentsListOptions) -> Result<
         comments = comments
             .into_iter()
             .filter_map(|entry| {
-                let run_created_at = if entry.answer_agent_running {
-                    match db.running_answer_agent_run_for_comment(&entry.comment.id) {
-                        Ok(Some(run)) => Some(run.created_at),
-                        Ok(None) => None,
-                        Err(err) => return Some(Err(err)),
-                    }
-                } else {
-                    None
-                };
-                matches_question_filters(
-                    &entry,
-                    intent.as_deref(),
-                    awaiting_answer,
-                    minimum_age_ms,
-                    now_secs,
-                    run_created_at.as_deref(),
-                )
-                .map(|matches| matches.then_some(entry))
-                .transpose()
+                matches_question_filters(&entry, intent.as_deref(), awaiting_answer, minimum_age_ms, now_secs)
+                    .map(|matches| matches.then_some(entry))
+                    .transpose()
             })
             .collect::<Result<Vec<_>>>()?;
     }
@@ -417,7 +404,6 @@ fn matches_question_filters(
     awaiting_answer: bool,
     minimum_age_ms: Option<u128>,
     now_secs: i64,
-    running_run_created_at: Option<&str>,
 ) -> Result<bool> {
     matches_question_filter_values(QuestionFilterInput {
         comment: QuestionCommentState {
@@ -429,10 +415,16 @@ fn matches_question_filters(
             intent,
             awaiting_answer,
         },
+        // Measured uniformly from the question comment's own created_at —
+        // not the answer-agent run's created_at — so a question that has
+        // been waiting for hours isn't hidden by `--older-than` just
+        // because a run for it started a minute ago. The run's own queue
+        // wait is a different question, already answered by
+        // `bossctl dispatch stats`/`diagnose`.
         age: QuestionAge {
             minimum_age_ms,
             now_secs,
-            created_at: running_run_created_at.unwrap_or(&entry.comment.created_at),
+            created_at: &entry.comment.created_at,
         },
     })
 }
@@ -594,5 +586,16 @@ mod tests {
     #[test]
     fn older_than_requires_awaiting_answer() {
         assert!(validate_comment_filters(Some("15m"), false).is_err());
+    }
+
+    /// A malformed `--older-than` value must be reported as `--older-than`,
+    /// not the `--since` flag the shared duration parser originally backed.
+    #[test]
+    fn bad_older_than_value_names_the_older_than_flag() {
+        let err = parse_duration_ms("--older-than", "1w").unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "invalid --older-than `1w`: expected a number followed by s/m/h/d, e.g. `30m`",
+        );
     }
 }

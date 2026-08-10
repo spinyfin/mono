@@ -149,9 +149,26 @@ impl WorkDb {
     /// permissive of tombstoned tasks (e.g. an archived-and-tombstoned
     /// moot revision) so the `revision_archived` attention item raised at
     /// archival time stays reachable afterwards.
+    ///
+    /// `work_item_id` is also allowed to be a `work_comments` id: the
+    /// `answer_agent_ready_age` alarm (see `ANSWER_AGENT_READY_AGE_ATTENTION_KIND`
+    /// in the coordinator's scheduler module) files against the question
+    /// comment rather than a `prod_`/`proj_`/`task_` row, mirroring the
+    /// same fallback [`crate::work::dispatch_helpers::attention_target_from_input`]
+    /// uses on the write side. Without this, a comment-scoped item would be
+    /// writable but never readable through this surface.
     pub fn list_attention_items_for_work_item(&self, work_item_id: &str) -> Result<Vec<WorkAttentionItem>> {
         let conn = self.connect()?;
-        let _ = product_id_for_work_item_including_deleted(&conn, work_item_id)?;
+        if let Err(item_err) = product_id_for_work_item_including_deleted(&conn, work_item_id) {
+            let is_comment: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM work_comments WHERE id = ?1)",
+                [work_item_id],
+                |row| row.get(0),
+            )?;
+            if !is_comment {
+                return Err(item_err);
+            }
+        }
         let mut stmt = conn.prepare(
             "SELECT id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at, converted_task_id
              FROM work_attention_items

@@ -32,26 +32,31 @@ struct DispatchStatsOutput {
     stream_integrity: serde_json::Value,
 }
 
-/// Parse a `--since` value into an absolute epoch-ms cutoff. Accepts a
-/// bare non-negative integer with a `s`/`m`/`h`/`d` suffix (e.g.
-/// `30m`, `6h`, `2d`), measured back from `now_ms`.
-pub(crate) fn parse_duration_ms(value: &str) -> Result<u128> {
+/// Parse a relative duration (e.g. `30m`, `6h`, `2d`) into a millisecond
+/// count. Accepts a bare non-negative integer with a `s`/`m`/`h`/`d`
+/// suffix. Shared by every flag that measures "how long ago" — today
+/// `dispatch stats --since` (which subtracts the result from `now_ms` to
+/// get an absolute cutoff, see [`parse_since`]) and `comments list
+/// --older-than` (which compares it directly against an age). `flag` is
+/// the caller's flag name (e.g. `"--since"`, `"--older-than"`), used only
+/// to make the error message name the flag the caller actually passed.
+pub(crate) fn parse_duration_ms(flag: &str, value: &str) -> Result<u128> {
     let value = value.trim();
     let (digits, unit_ms) = match value.chars().last() {
         Some('s') => (&value[..value.len() - 1], 1_000u128),
         Some('m') => (&value[..value.len() - 1], 60_000u128),
         Some('h') => (&value[..value.len() - 1], 3_600_000u128),
         Some('d') => (&value[..value.len() - 1], 86_400_000u128),
-        _ => bail!("invalid --since `{value}`: expected a number followed by s/m/h/d, e.g. `30m`"),
+        _ => bail!("invalid {flag} `{value}`: expected a number followed by s/m/h/d, e.g. `30m`"),
     };
     let count: u128 = digits
         .parse()
-        .with_context(|| format!("invalid --since `{value}`: expected a number followed by s/m/h/d"))?;
+        .with_context(|| format!("invalid {flag} `{value}`: expected a number followed by s/m/h/d"))?;
     Ok(count.saturating_mul(unit_ms))
 }
 
 fn parse_since(value: &str, now_ms: u128) -> Result<u128> {
-    Ok(now_ms.saturating_sub(parse_duration_ms(value)?))
+    Ok(now_ms.saturating_sub(parse_duration_ms("--since", value)?))
 }
 
 pub(crate) fn dispatch_stats(json: bool, state_root: Option<PathBuf>, since: Option<&str>, top: usize) -> Result<()> {

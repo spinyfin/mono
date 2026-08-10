@@ -8,8 +8,14 @@ use super::*;
 /// not alter pool selection, dispatch class, priority, or concurrency.
 pub const ANSWER_AGENT_READY_AGE_ALARM_THRESHOLD: Duration = Duration::from_secs(15 * 60);
 
-/// Execution-scoped attention kind for an answer agent waiting beyond
-/// [`ANSWER_AGENT_READY_AGE_ALARM_THRESHOLD`].
+/// Work-item-scoped attention kind, filed against the question comment
+/// (a `work_comments` id, not the execution), for an answer agent waiting
+/// beyond [`ANSWER_AGENT_READY_AGE_ALARM_THRESHOLD`]. Filed against the
+/// comment rather than the execution because the execution the item is
+/// about is the one whose *next run start* must clear it, and
+/// `work_resumed_evidence()` excludes execution-scoped rows from that
+/// clearing path — see [`crate::work::WorkDb::list_attention_items_for_work_item`]
+/// for the matching read-side comment-id fallback.
 pub const ANSWER_AGENT_READY_AGE_ATTENTION_KIND: &str = "answer_agent_ready_age";
 
 impl ExecutionCoordinator {

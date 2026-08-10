@@ -2199,31 +2199,25 @@ fn overdue_ready_answer_agent_files_one_question_specific_attention() {
     coordinator.raise_ready_answer_agent_alarms(&ready, Duration::ZERO);
     coordinator.raise_ready_answer_agent_alarms(&ready, Duration::ZERO);
 
-    let conn = db.connect().unwrap();
-    let attentions: Vec<(String, String, String)> = {
-        let mut statement = conn
-            .prepare("SELECT id, kind, body_markdown FROM work_attention_items WHERE work_item_id = ?1")
-            .unwrap();
-        statement
-            .query_map([&comment.id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap()
-    };
+    // Read the item back through the same public API a real surface
+    // (e.g. `handle_list_attention_items_for_work_item`) would use — not a
+    // raw `SELECT ... WHERE work_item_id = ?`, which would pass even if
+    // the comment-id row were unreachable through every other read path.
+    let attentions = db.list_attention_items_for_work_item(&comment.id).unwrap();
     assert_eq!(
         attentions.len(),
         1,
         "repeated scheduler passes must deduplicate the alarm"
     );
-    assert_eq!(attentions[0].1, ANSWER_AGENT_READY_AGE_ATTENTION_KIND);
+    assert_eq!(attentions[0].kind, ANSWER_AGENT_READY_AGE_ATTENTION_KIND);
     assert_eq!(
-        attentions[0].2,
+        attentions[0].body_markdown,
         format!(
             "Question comment `{}` on document `pr_doc:{}` was first seen waiting more than 0s without starting. See the engine log for the current age.\n\nUse `bossctl dispatch diagnose {}` to inspect its dispatch timeline.",
             comment.id, comment.artifact_id, execution.id,
         )
     );
-    drop(conn);
+    let attention_item_id = attentions[0].id.clone();
 
     db.create_run(
         CreateRunInput::builder()
@@ -2234,16 +2228,14 @@ fn overdue_ready_answer_agent_files_one_question_specific_attention() {
     )
     .unwrap();
     db.reconcile_stale_attention_signals().unwrap();
-    let conn = db.connect().unwrap();
-    let status: String = conn
-        .query_row(
-            "SELECT status FROM work_attention_items WHERE id = ?1",
-            [&attentions[0].0],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let resolved = db.list_attention_items_for_work_item(&comment.id).unwrap();
     assert_eq!(
-        status, "resolved",
+        resolved
+            .iter()
+            .find(|item| item.id == attention_item_id)
+            .unwrap()
+            .status,
+        "resolved",
         "the answer-agent run start must clear its queue-age attention"
     );
 }
