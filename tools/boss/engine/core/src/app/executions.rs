@@ -35,6 +35,41 @@ pub(super) async fn handle_create_execution(ctx: Dispatch, req: FrontendRequest)
     }
 }
 
+pub(super) async fn handle_evaluate_execution_admission(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::EvaluateExecutionAdmission {
+        work_item_id,
+        bypass_dispatch_pause,
+        observed_pause_generation,
+    } = req
+    else {
+        unreachable!()
+    };
+    let runtime =
+        crate::execution_admission::AdmissionRuntimeSnapshot::from_coordinator(&server_state.execution_coordinator)
+            .await;
+    let intent = crate::execution_admission::AdmissionIntent {
+        bypass_dispatch_pause,
+        observed_pause_generation,
+    };
+    match crate::execution_admission::evaluate_execution_admission(&work_db, &work_item_id, intent, &runtime) {
+        Ok(evaluation) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::ExecutionAdmissionResult { evaluation },
+            );
+        }
+        Err(err) => send_work_error(&sink, &request_id, &err),
+    }
+}
+
 pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
@@ -66,11 +101,96 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
         // hard cap) when every configured slot is busy, so
         // the launch verb skips the cap-deferral the normal
         // request path would otherwise hit.
+        //
+        // `bypass_dispatch_pause` is a distinct pause-only override
+        // for `bossctl work start --force` / confirmed app drag.
+        // It shares the admission evaluator with the read-only
+        // EvaluateExecutionAdmission RPC and never maps onto pool growth.
         let force = input.force;
+        let bypass_dispatch_pause = input.bypass_dispatch_pause;
+        let entry_point = input.entry_point;
+        let observed_pause_generation = input.observed_pause_generation;
+        let work_item_id_for_events = input.work_item_id.clone();
+
+        // Shared admission gate when the pause-override intent is set.
+        // Runs before any ready-row creation so a refusal leaves no residue.
+        let mut would_override_pause = false;
+        let mut pause_snapshot_for_override: Option<boss_protocol::DispatchPauseSnapshot> = None;
+        if bypass_dispatch_pause {
+            let runtime = crate::execution_admission::AdmissionRuntimeSnapshot::from_coordinator(
+                &server_state.execution_coordinator,
+            )
+            .await;
+            let intent = crate::execution_admission::AdmissionIntent {
+                bypass_dispatch_pause: true,
+                observed_pause_generation,
+            };
+            match crate::execution_admission::evaluate_execution_admission(
+                &work_db,
+                &input.work_item_id,
+                intent,
+                &runtime,
+            ) {
+                Ok(evaluation) if evaluation.would_admit => {
+                    would_override_pause = evaluation.would_override_pause;
+                    if would_override_pause {
+                        pause_snapshot_for_override = Some(evaluation.pause.clone());
+                    }
+                }
+                Ok(evaluation) => {
+                    let message = crate::execution_admission::format_refusal_message(&evaluation);
+                    server_state
+                        .dispatch_events
+                        .emit(
+                            crate::dispatch_events::DispatchEvent::new(
+                                crate::dispatch_events::Stage::DispatchAdmissionRefused,
+                                crate::dispatch_events::Outcome::Error,
+                                "engine",
+                            )
+                            .with_work_item(&evaluation.work_item_id)
+                            .with_details(serde_json::json!({
+                                "reason_codes": crate::execution_admission::blocker_codes(&evaluation),
+                                "bypass_dispatch_pause": true,
+                                "entry_point": entry_point.map(|e| e.as_str()),
+                                "message": message,
+                            })),
+                        )
+                        .await;
+                    send_work_error(&sink, &request_id, message);
+                    return;
+                }
+                Err(err) => {
+                    send_work_error(&sink, &request_id, &err);
+                    return;
+                }
+            }
+        }
+
+        // Resolve before the create so "new ready residue" detection uses
+        // the primary id request_execution will write under.
+        let resolved_for_prior = {
+            let conn = work_db.connect().ok();
+            conn.and_then(|c| {
+                crate::work::resolve_friendly_work_item_id(&c, &work_item_id_for_events)
+                    .ok()
+                    .flatten()
+            })
+            .unwrap_or_else(|| work_item_id_for_events.clone())
+        };
+        let prior_latest = work_db
+            .latest_execution_for_work_item(&resolved_for_prior)
+            .ok()
+            .flatten();
         let live_states = server_state.live_worker_states.clone();
         let result = work_db.request_execution_with_live_check(input, |run_id| live_states.is_run_live(run_id));
         match result {
             Ok(execution) => {
+                let created_new_ready = execution.status == ExecutionStatus::Ready
+                    && prior_latest
+                        .as_ref()
+                        .map(|e| e.id != execution.id || e.status.is_terminal())
+                        .unwrap_or(true);
+
                 if force {
                     // If the request landed on an existing
                     // non-terminal execution (idempotent path
@@ -92,6 +212,78 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
                     // Re-read the execution after force_dispatch
                     // so the response carries the row's now-
                     // running status (and worker / lease ids).
+                    let refreshed = match work_db.get_execution(&execution.id) {
+                        Ok(execution) => execution,
+                        Err(_) => execution,
+                    };
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::ExecutionRequested { execution: refreshed },
+                    );
+                } else if would_override_pause {
+                    // Pause-only override: dispatch now through the
+                    // pool-correct non-growing claim path. On failure,
+                    // cancel a newly-created ready row so nothing
+                    // surprises-dispatches later.
+                    if execution.status == ExecutionStatus::Ready {
+                        let coordinator = server_state.execution_coordinator.clone();
+                        let execution_id = execution.id.clone();
+                        match coordinator.dispatch_ready_skipping_pause(&execution_id).await {
+                            Ok(_worker_id) => {
+                                if let Some(pause) = pause_snapshot_for_override.as_ref() {
+                                    server_state
+                                        .dispatch_events
+                                        .emit(
+                                            crate::dispatch_events::DispatchEvent::new(
+                                                crate::dispatch_events::Stage::DispatchPauseBypassed,
+                                                crate::dispatch_events::Outcome::Ok,
+                                                &execution_id,
+                                            )
+                                            .with_work_item(&execution.work_item_id)
+                                            .with_details(
+                                                serde_json::json!({
+                                                    "entry_point": entry_point.map(|e| e.as_str()),
+                                                    "pause_origin": pause.origin,
+                                                    "pause_reason": pause.reason,
+                                                    "paused_since_epoch_s": pause.paused_since_epoch_s,
+                                                }),
+                                            ),
+                                        )
+                                        .await;
+                                }
+                            }
+                            Err(err) => {
+                                if created_new_ready {
+                                    let _ = work_db.cancel_execution_with(
+                                        &execution_id,
+                                        crate::work::CancelExecutionOpts {
+                                            reason: Some("pause-override dispatch refused; clearing residue".into()),
+                                            queued_only: true,
+                                        },
+                                    );
+                                }
+                                server_state
+                                    .dispatch_events
+                                    .emit(
+                                        crate::dispatch_events::DispatchEvent::new(
+                                            crate::dispatch_events::Stage::DispatchAdmissionRefused,
+                                            crate::dispatch_events::Outcome::Error,
+                                            &execution_id,
+                                        )
+                                        .with_work_item(&execution.work_item_id)
+                                        .with_details(serde_json::json!({
+                                            "bypass_dispatch_pause": true,
+                                            "entry_point": entry_point.map(|e| e.as_str()),
+                                            "message": err.to_string(),
+                                        })),
+                                    )
+                                    .await;
+                                send_work_error(&sink, &request_id, &err);
+                                return;
+                            }
+                        }
+                    }
                     let refreshed = match work_db.get_execution(&execution.id) {
                         Ok(execution) => execution,
                         Err(_) => execution,

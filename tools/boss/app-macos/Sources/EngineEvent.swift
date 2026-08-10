@@ -30,6 +30,9 @@ enum EngineEvent {
     case workItemDeleted(id: String)
     case workError(message: String)
     case error(message: String)
+    /// Reply to `evaluate_execution_admission` — engine-owned eligibility
+    /// for an explicit start / pause-override intent.
+    case executionAdmissionResult(evaluation: ExecutionAdmissionEvaluation)
     /// Snapshot of every allocated worker slot's live runtime state.
     /// Delivered both as a one-shot reply to
     /// `list_worker_live_states` and as a topic push on

@@ -64,6 +64,24 @@ extension ChatViewModel {
             return false
         }
 
+        // Drop into Doing that would request execution: evaluate admission
+        // first so an operator pause can show a force confirmation. The
+        // engine owns eligibility; we do not decide from health caches.
+        if !staysPut, column == .doing {
+            pendingDoingDispatch = PendingDoingDispatch(
+                taskID: taskID,
+                originColumn: origin,
+                observedPauseGeneration: nil,
+                pauseReason: nil,
+                nonOverridableNotes: [],
+                awaitingConfirm: false
+            )
+            // Stash the intended drop group for the confirm path.
+            pendingDoingDropGroup = group
+            engine.sendEvaluateExecutionAdmission(workItemId: task.id)
+            return true
+        }
+
         if !staysPut {
             // Optimistic reposition: draw the card at the drop site until the
             // engine's answer arrives. `bounceBackOptimisticMoves` returns it

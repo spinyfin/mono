@@ -389,6 +389,98 @@ pub struct ExecutionReconcileResult {
     pub updated: Vec<WorkExecution>,
 }
 
+/// Which operator surface requested an explicit execution start.
+/// Distinct from the pool-growth `RequestExecutionInput::force` bit used by
+/// `bossctl agents launch`. Used for audit when
+/// [`RequestExecutionInput::bypass_dispatch_pause`] admits through a pause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionRequestEntryPoint {
+    /// `bossctl work start --force` (or plain start with the intent set).
+    Cli,
+    /// macOS kanban drag-to-Doing after operator confirmation.
+    AppDrag,
+}
+
+impl ExecutionRequestEntryPoint {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::AppDrag => "app_drag",
+        }
+    }
+}
+
+/// Snapshot of the global dispatch-pause state returned by admission
+/// evaluation. Clients render engine-provided fields; they do not re-derive
+/// origin or eligibility from local board/health caches.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct DispatchPauseSnapshot {
+    pub paused: bool,
+    /// `"operator"` or `"breaker"` when paused; omitted when not paused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Generation token: epoch seconds when the current pause began.
+    /// Clients that confirm a force must echo this back as
+    /// [`RequestExecutionInput::observed_pause_generation`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_since_epoch_s: Option<u64>,
+    /// Whether `pr_review` rows keep draining under this pause (operator
+    /// pauses yes; breaker pauses no).
+    #[serde(default)]
+    #[builder(default)]
+    pub reviews_exempt: bool,
+}
+
+/// One constraint that prevents (or would prevent) dispatch right now.
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct ExecutionAdmissionBlocker {
+    /// Stable machine code (`dispatch_paused`, `unmet_dependencies`, …).
+    pub code: String,
+    /// Operator-facing explanation.
+    pub message: String,
+    /// `true` only for an operator-originated global dispatch pause —
+    /// the sole constraint [`RequestExecutionInput::bypass_dispatch_pause`]
+    /// can clear. Every other blocker is always `false`.
+    #[serde(default)]
+    #[builder(default)]
+    pub force_overridable: bool,
+}
+
+/// Shared admission decision: would this work item dispatch under the
+/// evaluated intent, and if not, why? Produced by one engine function used
+/// by both the read-only evaluate RPC and the mutating `RequestExecution`
+/// path so the confirmation dialog cannot drift from the real refusal.
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct ExecutionAdmissionEvaluation {
+    pub work_item_id: String,
+    /// `true` when an explicit start under the evaluated intent would be
+    /// admitted (possibly via a pause override).
+    pub would_admit: bool,
+    pub pause: DispatchPauseSnapshot,
+    /// Whether the active pause (if any) is clearable by
+    /// `bypass_dispatch_pause`. `false` when not paused or breaker-originated.
+    #[serde(default)]
+    #[builder(default)]
+    pub pause_overridable: bool,
+    /// All current blockers. Empty when `would_admit` is true under the
+    /// evaluated intent (overridable pause is omitted from this list when
+    /// `bypass_dispatch_pause` is true and would clear it).
+    #[serde(default)]
+    #[builder(default)]
+    pub blockers: Vec<ExecutionAdmissionBlocker>,
+    /// `true` when admitting would actually skip an active matching
+    /// operator pause (for audit: only then emit a pause-override event).
+    #[serde(default)]
+    #[builder(default)]
+    pub would_override_pause: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct RequestExecutionInput {
@@ -408,9 +500,36 @@ pub struct RequestExecutionInput {
     /// one slot — bounded by the hard cap `MAX_WORKER_POOL_SIZE` — so
     /// the work item starts immediately even when every configured
     /// slot is busy.
+    ///
+    /// **Not** the pause-override flag. Operator force-start while
+    /// dispatch is paused uses [`Self::bypass_dispatch_pause`] instead;
+    /// do not map CLI `--force` on `work start` onto this bit.
     #[serde(default)]
     #[builder(default)]
     pub force: bool,
+
+    /// Bypass an active *operator* global dispatch pause for this
+    /// request only. Does not grow the pool, does not clear the
+    /// interactive concurrency cap, dependencies, churn parking,
+    /// ineligible status, or a breaker-originated pause. Distinct from
+    /// [`Self::force`] (pool growth for `agents launch`).
+    #[serde(default)]
+    #[builder(default)]
+    pub bypass_dispatch_pause: bool,
+
+    /// Operator surface that requested this start (audit on successful
+    /// pause override). Optional for back-compat; callers that set
+    /// `bypass_dispatch_pause` should set this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_point: Option<ExecutionRequestEntryPoint>,
+
+    /// Pause generation (`paused_since_epoch_s`) the client observed when
+    /// confirming a force. When set and the live pause generation differs
+    /// (or the pause origin/reason changed), the engine refuses the stale
+    /// confirmation rather than acting on it. Omit for CLI force-start
+    /// (the flag itself is the confirmation against current state).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_pause_generation: Option<u64>,
 
     pub preferred_workspace_id: Option<String>,
     pub priority: Option<i64>,

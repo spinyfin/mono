@@ -304,6 +304,67 @@ impl ExecutionCoordinator {
         Ok(worker_id)
     }
 
+    /// Dispatch a ready execution immediately while skipping only the global
+    /// pause gate. Uses the pool-correct claim path (`claim_worker`, not
+    /// `claim_worker_force`) and still enforces the interactive concurrency
+    /// cap — the pause-only override must not reintroduce pool-classification
+    /// bypass or grow past configured capacity.
+    ///
+    /// Callers that create a fresh ready row for this request must cancel it
+    /// on `Err` so a refused force leaves no residue that dispatches later.
+    pub async fn dispatch_ready_skipping_pause(self: &Arc<Self>, execution_id: &str) -> Result<String> {
+        if let Some(reason) = self.dispatch_preflight_block_reason() {
+            return Err(anyhow!("local dispatch is unavailable: {reason}"));
+        }
+        let execution = self
+            .work_db
+            .get_execution(execution_id)
+            .with_context(|| format!("failed to look up execution {execution_id}"))?;
+        if execution.status != ExecutionStatus::Ready {
+            return Err(anyhow!(
+                "execution {execution_id} is in status {status:?}, not ready — cannot dispatch",
+                status = execution.status,
+            ));
+        }
+        let Some(_reservation) = self.inflight_dispatches.try_reserve(&execution) else {
+            return Err(anyhow!(
+                "execution {execution_id} (or another execution for its work item) is already \
+                 being dispatched"
+            ));
+        };
+
+        let is_review = self.execution_targets_review_pool(&execution);
+        let is_main = !is_review && !self.execution_targets_automation_pool(&execution);
+        if is_main {
+            let live = self.worker_pool.busy_count().await;
+            let cap = self.max_concurrent_interactive_workers();
+            if live >= cap {
+                return Err(anyhow!(
+                    "interactive concurrency cap reached ({live}/{cap} workers live) — \
+                     force does not grow the pool or queue past the cap while dispatch is paused"
+                ));
+            }
+        }
+
+        let preferred_workspace_id = execution.preferred_workspace_id.clone();
+        let pool = self.pool_for_execution(&execution);
+        let pool_label = self.attributed_pool_label(&execution);
+        let worker_id = pool
+            .claim_worker(&execution.id, preferred_workspace_id.as_deref())
+            .await
+            .ok_or_else(|| {
+                anyhow!(
+                    "{pool_label} pool has no free slot; cannot force-start {execution_id} while \
+                     dispatch is paused (force does not grow the pool)"
+                )
+            })?;
+        if let Err(err) = self.schedule_execution(&execution, &worker_id).await {
+            pool.release_worker(&worker_id, preferred_workspace_id.as_deref()).await;
+            return Err(err);
+        }
+        Ok(worker_id)
+    }
+
     async fn run_scheduler(self: Arc<Self>) {
         // Lossless-wakeup loop. The `scheduling_pending` flag is reset
         // at the top of each iteration so we have a clean "have we

@@ -384,6 +384,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::ReapRun { .. }
         | FrontendRequest::ReleaseReviewTerminal { .. }
         | FrontendRequest::RequestExecution { .. }
+        | FrontendRequest::EvaluateExecutionAdmission { .. }
         | FrontendRequest::RetirePane { .. }
         | FrontendRequest::RevealWorkItem { .. }
         | FrontendRequest::SendInputToWorker { .. }

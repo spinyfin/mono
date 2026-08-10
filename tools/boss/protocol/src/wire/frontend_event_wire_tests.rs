@@ -1539,6 +1539,17 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "dispatch_state_result",
         },
         TagCase {
+            label: "ExecutionAdmissionResult",
+            event: FrontendEvent::ExecutionAdmissionResult {
+                evaluation: crate::ExecutionAdmissionEvaluation::builder()
+                    .work_item_id("task_1")
+                    .would_admit(true)
+                    .pause(crate::DispatchPauseSnapshot::builder().paused(false).build())
+                    .build(),
+            },
+            expected_tag: "execution_admission_result",
+        },
+        TagCase {
             label: "ExternalTrackerSyncStarted",
             event: FrontendEvent::ExternalTrackerSyncStarted {
                 product_id: "prod_1".into(),
@@ -2020,6 +2031,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::DispatchConcurrencyResult { .. }
         | FrontendEvent::DriverTrafficSplitResult { .. }
         | FrontendEvent::DispatchStateResult { .. }
+        | FrontendEvent::ExecutionAdmissionResult { .. }
         | FrontendEvent::ExternalTrackerSyncStarted { .. }
         | FrontendEvent::CiRemediationsList { .. }
         | FrontendEvent::CiRemediation { .. }

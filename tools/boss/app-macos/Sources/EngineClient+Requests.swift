@@ -545,15 +545,39 @@ extension EngineClient {
     /// `group` is `nil` when the drop landed on the column but not on one of
     /// its groups — the column's padding, or a column with no groups.
     func sendMoveWorkItemOnBoard(id: String, column: WorkBoardColumnKey, group: WorkBoardGroupKey?) {
+        sendMoveWorkItemOnBoard(
+            id: id,
+            column: column,
+            group: group,
+            bypassDispatchPause: false,
+            observedPauseGeneration: nil
+        )
+    }
+
+    func sendMoveWorkItemOnBoard(
+        id: String,
+        column: WorkBoardColumnKey,
+        group: WorkBoardGroupKey?,
+        bypassDispatchPause: Bool,
+        observedPauseGeneration: UInt64?
+    ) {
         var target: [String: Any] = ["column": column.rawValue]
         if let group {
             target["group"] = group.rawValue
         }
-        sendLine([
+        var line: [String: Any] = [
             "type": "move_work_item_on_board",
             "id": id,
             "target": target,
-        ])
+        ]
+        if bypassDispatchPause {
+            line["bypass_dispatch_pause"] = true
+            line["entry_point"] = "app_drag"
+        }
+        if let observedPauseGeneration {
+            line["observed_pause_generation"] = observedPauseGeneration
+        }
+        sendLine(line)
     }
 
     /// Ask the engine to schedule an execution for `workItemId`.
@@ -563,10 +587,55 @@ extension EngineClient {
     /// drop-into-Doing flow described in
     /// `tools/boss/docs/designs/work-kanban.md` §1.
     func sendRequestExecution(workItemId: String) {
-        sendLine([
+        sendRequestExecution(
+            workItemId: workItemId,
+            bypassDispatchPause: false,
+            entryPoint: nil,
+            observedPauseGeneration: nil
+        )
+    }
+
+    /// Explicit start with optional pause-only override. `entryPoint`
+    /// is `"cli"` or `"app_drag"`; `observedPauseGeneration` is the
+    /// pause epoch the operator confirmed against.
+    func sendRequestExecution(
+        workItemId: String,
+        bypassDispatchPause: Bool,
+        entryPoint: String?,
+        observedPauseGeneration: UInt64?
+    ) {
+        var line: [String: Any] = [
             "type": "request_execution",
             "work_item_id": workItemId,
-        ])
+        ]
+        if bypassDispatchPause {
+            line["bypass_dispatch_pause"] = true
+        }
+        if let entryPoint {
+            line["entry_point"] = entryPoint
+        }
+        if let observedPauseGeneration {
+            line["observed_pause_generation"] = observedPauseGeneration
+        }
+        sendLine(line)
+    }
+
+    /// Read-only admission preview used before a drag-to-Doing that
+    /// may need a pause-override confirmation.
+    func sendEvaluateExecutionAdmission(
+        workItemId: String,
+        bypassDispatchPause: Bool = false,
+        observedPauseGeneration: UInt64? = nil
+    ) {
+        var line: [String: Any] = [
+            "type": "evaluate_execution_admission",
+            "work_item_id": workItemId,
+            "bypass_dispatch_pause": bypassDispatchPause,
+        ]
+        if let observedPauseGeneration {
+            line["observed_pause_generation"] = observedPauseGeneration
+        }
+        sendLine(line)
     }
 
     func sendDeleteWorkItem(id: String) {

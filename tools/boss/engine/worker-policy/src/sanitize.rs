@@ -253,6 +253,7 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::DispatchConcurrencyResult { .. }
         | FrontendEvent::DriverTrafficSplitResult { .. }
         | FrontendEvent::DispatchStateResult { .. }
+        | FrontendEvent::ExecutionAdmissionResult { .. }
         | FrontendEvent::AutomationStateResult { .. }
         | FrontendEvent::ExternalTrackerSyncStarted { .. }
         | FrontendEvent::CiRemediationsList { .. }

@@ -392,7 +392,7 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
     let FrontendRequest::UpdateWorkItem { id, patch } = req else {
         unreachable!()
     };
-    apply_work_item_patch(ctx, id, patch).await;
+    apply_work_item_patch(ctx, id, patch, DispatchOverride::default()).await;
 }
 
 /// A kanban drag landed on the board. Resolve what the drop *meant* against
@@ -413,7 +413,14 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
 /// on a terminal move, auto-dispatch into Doing, the gated-`blocked`
 /// refusal) behaves identically whichever way the status was chosen.
 pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendRequest) {
-    let FrontendRequest::MoveWorkItemOnBoard { id, target } = req else {
+    let FrontendRequest::MoveWorkItemOnBoard {
+        id,
+        target,
+        bypass_dispatch_pause,
+        entry_point,
+        observed_pause_generation,
+    } = req
+    else {
         unreachable!()
     };
     let row = match board_row_for_id(&ctx.work_db, &id) {
@@ -457,17 +464,35 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
         }
         DropResolution::SetStatus(status) => {
             let patch = WorkItemPatch::builder().status(status.as_str()).build();
-            apply_work_item_patch(ctx, id, patch).await;
+            apply_work_item_patch(
+                ctx,
+                id,
+                patch,
+                DispatchOverride {
+                    bypass_dispatch_pause,
+                    entry_point,
+                    observed_pause_generation,
+                },
+            )
+            .await;
         }
         DropResolution::ClearAutostart => {
             let patch = WorkItemPatch::builder().autostart(false).build();
-            apply_work_item_patch(ctx, id, patch).await;
+            apply_work_item_patch(ctx, id, patch, DispatchOverride::default()).await;
         }
         DropResolution::Refused { message } => {
             let err = anyhow!(message);
             send_work_error(&ctx.sink, &ctx.request_id, &err);
         }
     }
+}
+
+/// Optional pause-override intent carried on a board drag-to-Doing.
+#[derive(Debug, Clone, Default)]
+struct DispatchOverride {
+    bypass_dispatch_pause: bool,
+    entry_point: Option<boss_protocol::ExecutionRequestEntryPoint>,
+    observed_pause_generation: Option<u64>,
 }
 
 /// Read the four columns board layout is derived from. Products and projects
@@ -491,7 +516,7 @@ fn board_row_for_id(work_db: &WorkDb, id: &str) -> Result<BoardRow> {
 /// [`handle_update_work_item`] (an explicit status/field edit) and
 /// [`handle_move_work_item_on_board`] (a drag whose meaning the engine just
 /// resolved).
-async fn apply_work_item_patch(ctx: Dispatch, id: String, patch: WorkItemPatch) {
+async fn apply_work_item_patch(ctx: Dispatch, id: String, patch: WorkItemPatch, dispatch_override: DispatchOverride) {
     let Dispatch {
         server_state,
         work_db,
@@ -502,6 +527,47 @@ async fn apply_work_item_patch(ctx: Dispatch, id: String, patch: WorkItemPatch) 
         ..
     } = ctx;
     {
+        // Pause-override path: re-evaluate before flipping status so a
+        // refusal leaves the card where it was and creates no ready row.
+        if dispatch_override.bypass_dispatch_pause {
+            let runtime = crate::execution_admission::AdmissionRuntimeSnapshot::from_coordinator(
+                &server_state.execution_coordinator,
+            )
+            .await;
+            let intent = crate::execution_admission::AdmissionIntent {
+                bypass_dispatch_pause: true,
+                observed_pause_generation: dispatch_override.observed_pause_generation,
+            };
+            match crate::execution_admission::evaluate_execution_admission(&work_db, &id, intent, &runtime) {
+                Ok(evaluation) if evaluation.would_admit => {}
+                Ok(evaluation) => {
+                    let message = crate::execution_admission::format_refusal_message(&evaluation);
+                    server_state
+                        .dispatch_events
+                        .emit(
+                            crate::dispatch_events::DispatchEvent::new(
+                                crate::dispatch_events::Stage::DispatchAdmissionRefused,
+                                crate::dispatch_events::Outcome::Error,
+                                "engine",
+                            )
+                            .with_work_item(&evaluation.work_item_id)
+                            .with_details(serde_json::json!({
+                                "reason_codes": crate::execution_admission::blocker_codes(&evaluation),
+                                "bypass_dispatch_pause": true,
+                                "entry_point": dispatch_override.entry_point.map(|e| e.as_str()),
+                                "message": message,
+                            })),
+                        )
+                        .await;
+                    send_work_error(&sink, &request_id, message);
+                    return;
+                }
+                Err(err) => {
+                    send_work_error(&sink, &request_id, &err);
+                    return;
+                }
+            }
+        }
         // Capture the task/chore status before the update so we
         // can detect a transition into `active` after the patch
         // applies. We only care about task/chore — products and
@@ -685,15 +751,90 @@ async fn apply_work_item_patch(ctx: Dispatch, id: String, patch: WorkItemPatch) 
                         )
                     } else if needs_dispatch {
                         let live_states = server_state.live_worker_states.clone();
-                        let dispatch_input = RequestExecutionInput::builder()
+                        let mut dispatch_input = RequestExecutionInput::builder()
                             .work_item_id(work_item_id_for_event.clone())
                             .build();
+                        if dispatch_override.bypass_dispatch_pause {
+                            dispatch_input.bypass_dispatch_pause = true;
+                            dispatch_input.entry_point = dispatch_override.entry_point;
+                            dispatch_input.observed_pause_generation = dispatch_override.observed_pause_generation;
+                        }
+                        let prior = work_db
+                            .latest_execution_for_work_item(&work_item_id_for_event)
+                            .ok()
+                            .flatten();
                         match work_db
                             .request_execution_with_live_check(dispatch_input, |run_id| live_states.is_run_live(run_id))
                         {
                             Ok(execution) => {
-                                server_state.execution_coordinator.kick();
-                                (Some(execution.id), true, None)
+                                let created_new = execution.status == boss_protocol::ExecutionStatus::Ready
+                                    && prior
+                                        .as_ref()
+                                        .map(|e| e.id != execution.id || e.status.is_terminal())
+                                        .unwrap_or(true);
+                                if dispatch_override.bypass_dispatch_pause
+                                    && server_state.execution_coordinator.is_dispatch_paused()
+                                    && server_state.execution_coordinator.dispatch_pause_exempts_reviews()
+                                    && execution.status == boss_protocol::ExecutionStatus::Ready
+                                {
+                                    // Operator pause override: dispatch now
+                                    // without growing the pool.
+                                    match server_state
+                                        .execution_coordinator
+                                        .dispatch_ready_skipping_pause(&execution.id)
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            server_state
+                                                .dispatch_events
+                                                .emit(
+                                                    crate::dispatch_events::DispatchEvent::new(
+                                                        crate::dispatch_events::Stage::DispatchPauseBypassed,
+                                                        crate::dispatch_events::Outcome::Ok,
+                                                        &execution.id,
+                                                    )
+                                                    .with_work_item(&execution.work_item_id)
+                                                    .with_details(
+                                                        serde_json::json!({
+                                                            "entry_point": dispatch_override
+                                                                .entry_point
+                                                                .map(|e| e.as_str()),
+                                                            "pause_reason": server_state
+                                                                .execution_coordinator
+                                                                .dispatch_paused_reason(),
+                                                            "paused_since_epoch_s": server_state
+                                                                .execution_coordinator
+                                                                .dispatch_paused_since_epoch_s(),
+                                                        }),
+                                                    ),
+                                                )
+                                                .await;
+                                            (Some(execution.id), true, None)
+                                        }
+                                        Err(err) => {
+                                            if created_new {
+                                                let _ = work_db.cancel_execution_with(
+                                                    &execution.id,
+                                                    crate::work::CancelExecutionOpts {
+                                                        reason: Some(
+                                                            "pause-override dispatch refused; clearing residue".into(),
+                                                        ),
+                                                        queued_only: true,
+                                                    },
+                                                );
+                                            }
+                                            tracing::warn!(
+                                                work_item_id = %work_item_id_for_event,
+                                                ?err,
+                                                "UpdateWorkItem → active: pause-override dispatch refused",
+                                            );
+                                            (None, false, Some(format!("{err:#}")))
+                                        }
+                                    }
+                                } else {
+                                    server_state.execution_coordinator.kick();
+                                    (Some(execution.id), true, None)
+                                }
                             }
                             Err(err) => {
                                 // Deterministic preconditions (no

@@ -168,6 +168,8 @@ extension ChatViewModel {
             if let productID = deletedTask?.productID ?? currentSelectedProductID {
                 scheduleWorkTreeRefetch(productID: productID, flow: .itemRefetch)
             }
+        case .executionAdmissionResult(let evaluation):
+            handleExecutionAdmissionResult(evaluation)
         case .workError(let message):
             // Allow the user to retry any in-flight review terminal or
             // merge-when-ready request that failed.
@@ -182,7 +184,20 @@ extension ChatViewModel {
             if case .loading = reviewTerminalVM.state {
                 reviewTerminalVM.state = .idle
             }
-            if !pendingMoveOriginByTaskID.isEmpty {
+            if pendingDoingDispatch != nil {
+                // Force-start refused after confirm: clear pending and
+                // surface the engine reason (card may have been optimistic).
+                let taskID = pendingDoingDispatch?.taskID
+                pendingDoingDispatch = nil
+                if !pendingMoveOriginByTaskID.isEmpty {
+                    bounceBackOptimisticMoves(message: message)
+                } else if let taskID {
+                    dragRefusalNotice = DragRefusalNotice(taskID: taskID, message: message)
+                    scheduleDragRefusalDismiss(for: taskID)
+                } else {
+                    workErrorMessage = message
+                }
+            } else if !pendingMoveOriginByTaskID.isEmpty {
                 // Error is likely from an in-flight kanban move: bounce the
                 // card(s) back and show an inline non-blocking notice instead
                 // of interrupting with a modal dialog.

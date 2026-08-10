@@ -16,9 +16,9 @@ use crate::types::{
     CreateCommentInput, CreateDecisionInput, CreateExecutionInput, CreateInvestigationInput, CreateManyChoresInput,
     CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput,
     Decision, DeferredScopeAttention, DependencyFilter, DesignDocContent, DesignDocTreeState, DriverTrafficSplit,
-    EditorialAction, EngineAttemptListEntry, FollowupMemberOverride, GitHubAuthStateDto, LinkExternalRefInput,
-    ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch, ProbeDeliveryExpectation, ProbeDeliveryState,
-    Product, Project, ProposalKind, ProposalState, ProposalSubmissionError, RemoveDependencyInput,
+    EditorialAction, EngineAttemptListEntry, ExecutionAdmissionEvaluation, FollowupMemberOverride, GitHubAuthStateDto,
+    LinkExternalRefInput, ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch, ProbeDeliveryExpectation,
+    ProbeDeliveryState, Product, Project, ProposalKind, ProposalState, ProposalSubmissionError, RemoveDependencyInput,
     RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput, ReviseDocOutcome,
     SelectedProductState, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput,
     SetTaskDocPointerInput, Task, TaskRuntime, TranscriptSegment, WorkAttachment, WorkAttentionItem, WorkComment,
@@ -628,6 +628,28 @@ pub enum FrontendRequest {
         body: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
+    },
+
+    /// Read-only: would an explicit start of `work_item_id` be admitted
+    /// right now under the given intent, and if not, why?
+    ///
+    /// Shares the same reason-producing function as the mutating
+    /// [`FrontendRequest::RequestExecution`] path so the macOS
+    /// drag-to-Doing confirmation cannot promise something different
+    /// from what the engine will actually do. Replies with
+    /// [`FrontendEvent::ExecutionAdmissionResult`].
+    EvaluateExecutionAdmission {
+        work_item_id: String,
+        /// When `true`, evaluate as if the client will send
+        /// `bypass_dispatch_pause` on the subsequent request (operator
+        /// pause is not listed as a non-overridable blocker).
+        #[serde(default)]
+        bypass_dispatch_pause: bool,
+        /// Optional pause generation the client observed; when set and
+        /// the live pause has changed, the evaluation reports a stale-
+        /// confirmation blocker.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_pause_generation: Option<u64>,
     },
 
     /// Resolve and render the full transcript for a completed or
@@ -1554,6 +1576,15 @@ pub enum FrontendRequest {
     MoveWorkItemOnBoard {
         id: String,
         target: BoardDropTarget,
+        /// Pause-only override for a confirmed drag-to-Doing while dispatch
+        /// is paused. Forwarded into the auto-`RequestExecution` the engine
+        /// fires on an active transition. Distinct from pool-growth `force`.
+        #[serde(default)]
+        bypass_dispatch_pause: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry_point: Option<crate::types::ExecutionRequestEntryPoint>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_pause_generation: Option<u64>,
     },
 
     /// Boss-tier RPC: ask the macOS app to open `path` (an absolute or

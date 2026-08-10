@@ -2421,6 +2421,9 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::SetProductEditorialRules { .. } => {
                 products::handle_set_product_editorial_rules(ctx, r).await
             }
+            r @ FrontendRequest::EvaluateExecutionAdmission { .. } => {
+                executions::handle_evaluate_execution_admission(ctx, r).await
+            }
             r @ FrontendRequest::EvaluateEditorialRules { .. } => {
                 products::handle_evaluate_editorial_rules(ctx, r).await
             }

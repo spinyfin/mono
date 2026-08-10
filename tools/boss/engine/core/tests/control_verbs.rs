@@ -1648,6 +1648,9 @@ async fn board_drop_inside_merging_group_does_not_complete_the_merge() -> Result
         .send_request(&FrontendRequest::MoveWorkItemOnBoard {
             id: chore.id.clone(),
             target: BoardDropTarget::new(BoardColumn::Done, Some(BoardGroup::Merging)),
+            bypass_dispatch_pause: false,
+            entry_point: None,
+            observed_pause_generation: None,
         })
         .await?
     {
@@ -1675,6 +1678,9 @@ async fn board_drop_inside_merging_group_does_not_complete_the_merge() -> Result
         .send_request(&FrontendRequest::MoveWorkItemOnBoard {
             id: chore.id.clone(),
             target: BoardDropTarget::new(BoardColumn::Done, None),
+            bypass_dispatch_pause: false,
+            entry_point: None,
+            observed_pause_generation: None,
         })
         .await?;
     assert_eq!(
@@ -1689,6 +1695,9 @@ async fn board_drop_inside_merging_group_does_not_complete_the_merge() -> Result
         .send_request(&FrontendRequest::MoveWorkItemOnBoard {
             id: chore.id.clone(),
             target: BoardDropTarget::new(BoardColumn::Done, Some(BoardGroup::Completed)),
+            bypass_dispatch_pause: false,
+            entry_point: None,
+            observed_pause_generation: None,
         })
         .await?;
     assert_eq!(
@@ -1761,6 +1770,9 @@ async fn board_drop_on_own_column_is_a_reorder_for_a_blocked_row() -> Result<()>
         .send_request(&FrontendRequest::MoveWorkItemOnBoard {
             id: chore.id.clone(),
             target: BoardDropTarget::new(BoardColumn::Backlog, None),
+            bypass_dispatch_pause: false,
+            entry_point: None,
+            observed_pause_generation: None,
         })
         .await?;
     assert_eq!(
@@ -1774,6 +1786,9 @@ async fn board_drop_on_own_column_is_a_reorder_for_a_blocked_row() -> Result<()>
         .send_request(&FrontendRequest::MoveWorkItemOnBoard {
             id: chore.id.clone(),
             target: BoardDropTarget::new(BoardColumn::Review, None),
+            bypass_dispatch_pause: false,
+            entry_point: None,
+            observed_pause_generation: None,
         })
         .await?;
     assert_eq!(
@@ -1831,6 +1846,9 @@ async fn board_drop_into_merging_group_is_refused() -> Result<()> {
         .send_request(&FrontendRequest::MoveWorkItemOnBoard {
             id: chore.id.clone(),
             target: BoardDropTarget::new(BoardColumn::Done, Some(BoardGroup::Merging)),
+            bypass_dispatch_pause: false,
+            entry_point: None,
+            observed_pause_generation: None,
         })
         .await?
     {
@@ -1920,6 +1938,9 @@ async fn board_drop_from_doing_to_backlog_clears_autostart_on_a_dispatch_pending
         .send_request(&FrontendRequest::MoveWorkItemOnBoard {
             id: chore.id.clone(),
             target: BoardDropTarget::new(BoardColumn::Backlog, None),
+            bypass_dispatch_pause: false,
+            entry_point: None,
+            observed_pause_generation: None,
         })
         .await?;
 

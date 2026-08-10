@@ -944,6 +944,19 @@ struct ContentView: View {
         }
     }
 
+    private var forceDispatchConfirmTitle: String {
+        "Dispatch is paused"
+    }
+
+    private var forceDispatchConfirmMessage: String {
+        let reason = model.pendingDoingDispatch?.pauseReason ?? "dispatch is paused"
+        var body = "Dispatch is paused: \(reason). Start this item without resuming dispatch?"
+        if let notes = model.pendingDoingDispatch?.nonOverridableNotes, !notes.isEmpty {
+            body += "\n\nForce will not clear: " + notes.joined(separator: "; ")
+        }
+        return body
+    }
+
     private func workBoard() -> some View {
         GeometryReader { geometry in
             let columnWidth: CGFloat = {
@@ -967,6 +980,23 @@ struct ContentView: View {
                 .frame(maxHeight: .infinity, alignment: .top)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .confirmationDialog(
+                forceDispatchConfirmTitle,
+                isPresented: Binding(
+                    get: { model.showForceDispatchConfirm },
+                    set: { model.showForceDispatchConfirm = $0 }
+                ),
+                titleVisibility: .visible
+            ) {
+                Button("Start without resuming dispatch") {
+                    model.confirmForceDispatch()
+                }
+                Button("Cancel", role: .cancel) {
+                    model.cancelForceDispatchConfirm()
+                }
+            } message: {
+                Text(forceDispatchConfirmMessage)
+            }
         }
         .environment(\.kanbanBoardStyle, kanbanBoardStyle)
     }

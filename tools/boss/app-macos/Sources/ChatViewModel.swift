@@ -559,6 +559,25 @@ final class ChatViewModel: ObservableObject {
         let message: String
     }
 
+    /// Drag-to-Doing that is waiting on admission evaluation or on the
+    /// operator confirming a pause-only force start.
+    @Published var pendingDoingDispatch: PendingDoingDispatch?
+
+    /// Drop group stashed while admission evaluation is in flight for a
+    /// board drag (not used for popover Move).
+    var pendingDoingDropGroup: WorkBoardGroupKey?
+
+    /// Binding for the pause-override confirmation dialog.
+    var showForceDispatchConfirm: Bool {
+        get { pendingDoingDispatch?.awaitingConfirm == true }
+        set {
+            if !newValue, pendingDoingDispatch?.awaitingConfirm == true {
+                // Dialog dismissed without confirm — cancel.
+                cancelForceDispatchConfirm()
+            }
+        }
+    }
+
     /// Ask the engine to merge (or queue for merging) the PR for the given
     /// Review-column task. Guards against a duplicate tap while the RPC is
     /// in flight. The engine runs `gh pr merge --auto --squash` and kicks
@@ -1717,18 +1736,123 @@ final class ChatViewModel: ObservableObject {
             return
         }
 
+        let originColumn = effectiveBoardColumn(for: task)
+
+        // Drag-to-Doing that would request execution: ask the engine first
+        // so a global dispatch pause can show a force confirmation. The
+        // app does not decide eligibility from health caches.
+        if targetStatus == "active" {
+            pendingDoingDispatch = PendingDoingDispatch(
+                taskID: taskID,
+                originColumn: originColumn,
+                observedPauseGeneration: nil,
+                pauseReason: nil,
+                nonOverridableNotes: [],
+                awaitingConfirm: false
+            )
+            // Optimistic hold at origin until evaluation returns — do not
+            // flip the card yet when we may need to confirm force.
+            engine.sendEvaluateExecutionAdmission(workItemId: task.id)
+            return
+        }
+
         // Optimistic update: move the card to the destination column immediately
         // before the RPC completes. The engine remains the authority — on failure
         // we bounce back via bounceBackOptimisticMoves.
-        let originColumn = effectiveBoardColumn(for: task)
         pendingMoveOriginByTaskID[taskID] = originColumn
         optimisticColumnByTaskID[taskID] = column
         invalidateWorkCache()
 
         engine.sendUpdateWorkItem(id: task.id, patch: ["status": targetStatus])
+    }
 
-        if targetStatus == "active" {
-            engine.sendRequestExecution(workItemId: task.id)
+    /// Apply a drag-to-Doing after admission said proceed (with or without force).
+    /// Uses the board-gesture path so the engine owns status resolution.
+    func commitDoingDispatch(
+        taskID: String,
+        originColumn: WorkBoardColumnKey,
+        bypassDispatchPause: Bool,
+        observedPauseGeneration: UInt64?
+    ) {
+        guard task(withID: taskID) != nil else {
+            pendingDoingDispatch = nil
+            pendingDoingDropGroup = nil
+            return
+        }
+        pendingMoveOriginByTaskID[taskID] = originColumn
+        optimisticColumnByTaskID[taskID] = .doing
+        invalidateWorkCache()
+        let group = pendingDoingDropGroup
+        pendingDoingDropGroup = nil
+        engine.sendMoveWorkItemOnBoard(
+            id: taskID,
+            column: .doing,
+            group: group,
+            bypassDispatchPause: bypassDispatchPause,
+            observedPauseGeneration: observedPauseGeneration
+        )
+        // Keep pending until work_error / work_item_updated so a refusal
+        // can bounce; clear awaitingConfirm so the dialog closes.
+        if var pending = pendingDoingDispatch {
+            pending.awaitingConfirm = false
+            pendingDoingDispatch = pending
+        }
+        if !bypassDispatchPause {
+            pendingDoingDispatch = nil
+        }
+    }
+
+    func confirmForceDispatch() {
+        guard let pending = pendingDoingDispatch else { return }
+        commitDoingDispatch(
+            taskID: pending.taskID,
+            originColumn: pending.originColumn,
+            bypassDispatchPause: true,
+            observedPauseGeneration: pending.observedPauseGeneration
+        )
+    }
+
+    func cancelForceDispatchConfirm() {
+        guard let pending = pendingDoingDispatch else { return }
+        // Card never left origin optimistically for the confirm path.
+        pendingDoingDispatch = nil
+        pendingDoingDropGroup = nil
+        dragRefusalNotice = DragRefusalNotice(
+            taskID: pending.taskID,
+            message: "Start cancelled — dispatch remains paused."
+        )
+        scheduleDragRefusalDismiss(for: pending.taskID)
+    }
+
+    /// Handle `execution_admission_result` for a pending drag-to-Doing.
+    func handleExecutionAdmissionResult(_ evaluation: ExecutionAdmissionEvaluation) {
+        guard var pending = pendingDoingDispatch,
+              pending.taskID == evaluation.workItemID
+                || task(withID: pending.taskID)?.id == evaluation.workItemID
+        else {
+            // Stale or unrelated evaluation.
+            return
+        }
+
+        switch forceDispatchUIDecision(from: evaluation) {
+        case .proceedNormally:
+            commitDoingDispatch(
+                taskID: pending.taskID,
+                originColumn: pending.originColumn,
+                bypassDispatchPause: false,
+                observedPauseGeneration: nil
+            )
+        case .confirmPauseOverride(let pauseReason, let notes):
+            pending.observedPauseGeneration = evaluation.pause.pausedSinceEpochS
+            pending.pauseReason = pauseReason
+            pending.nonOverridableNotes = notes
+            pending.awaitingConfirm = true
+            pendingDoingDispatch = pending
+        case .refuse(let message):
+            pendingDoingDispatch = nil
+            pendingDoingDropGroup = nil
+            dragRefusalNotice = DragRefusalNotice(taskID: pending.taskID, message: message)
+            scheduleDragRefusalDismiss(for: pending.taskID)
         }
     }
 

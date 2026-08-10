@@ -535,6 +535,17 @@ pub enum Stage {
     /// concrete `triggering_events` (execution id, work item id, slot id,
     /// shell pid, timestamp) that tripped it.
     DispatchPaused,
+    /// An explicit start was admitted through an active operator global
+    /// dispatch pause via `bypass_dispatch_pause`. Details carry
+    /// `entry_point`, `pause_origin`, `pause_reason`,
+    /// `paused_since_epoch_s`, and the work/execution ids. Only emitted
+    /// when a matching pause was actually overridden — never when the
+    /// pause had already been lifted.
+    DispatchPauseBypassed,
+    /// An explicit start (or its admission preview) was refused. Details
+    /// carry stable `reason` code(s) and whether the request asked for
+    /// `bypass_dispatch_pause`. Does not claim an override occurred.
+    DispatchAdmissionRefused,
     /// Dispatch resumed after a [`Stage::DispatchPaused`] — either an
     /// operator toggled dispatch back on, or the spawn-capability breaker's
     /// half-open recovery probe / a fresh app session cleared a
@@ -735,6 +746,8 @@ impl Stage {
             Stage::HuskPaneReconcile => "husk_pane_reconcile",
             Stage::ExecutionLivenessReconcile => "execution_liveness_reconcile",
             Stage::DispatchPaused => "dispatch_paused",
+            Stage::DispatchPauseBypassed => "dispatch_pause_bypassed",
+            Stage::DispatchAdmissionRefused => "dispatch_admission_refused",
             Stage::DispatchResumed => "dispatch_resumed",
             Stage::AutomationPreempted => "automation_preempted",
             Stage::WorkspaceRecovery => "workspace_recovery",
@@ -1505,6 +1518,8 @@ mod tests {
             "execution_liveness_reconcile"
         );
         assert_eq!(Stage::DispatchPaused.as_str(), "dispatch_paused");
+        assert_eq!(Stage::DispatchPauseBypassed.as_str(), "dispatch_pause_bypassed");
+        assert_eq!(Stage::DispatchAdmissionRefused.as_str(), "dispatch_admission_refused");
         assert_eq!(Stage::DispatchResumed.as_str(), "dispatch_resumed");
         assert_eq!(Stage::AutomationPreempted.as_str(), "automation_preempted");
         assert_eq!(Stage::LiveWorkerReadopted.as_str(), "live_worker_readopted");

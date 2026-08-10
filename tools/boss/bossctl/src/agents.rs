@@ -1060,16 +1060,22 @@ pub(crate) async fn work_start(
     work_item_id: String,
     priority: Option<i64>,
     preferred_workspace_id: Option<String>,
+    force: bool,
 ) -> Result<()> {
     let mut client = connect(socket_path).await?;
+    // `--force` maps to pause-only `bypass_dispatch_pause` with CLI
+    // provenance — never to `RequestExecutionInput::force` (pool growth).
+    let mut input = RequestExecutionInput::builder()
+        .work_item_id(work_item_id.clone())
+        .maybe_priority(priority)
+        .maybe_preferred_workspace_id(preferred_workspace_id)
+        .build();
+    if force {
+        input.bypass_dispatch_pause = true;
+        input.entry_point = Some(boss_protocol::ExecutionRequestEntryPoint::Cli);
+    }
     let response = client
-        .send_request(&FrontendRequest::RequestExecution {
-            input: RequestExecutionInput::builder()
-                .work_item_id(work_item_id.clone())
-                .maybe_priority(priority)
-                .maybe_preferred_workspace_id(preferred_workspace_id)
-                .build(),
-        })
+        .send_request(&FrontendRequest::RequestExecution { input })
         .await
         .context("sending RequestExecution")?;
     match response {
@@ -1080,6 +1086,15 @@ pub(crate) async fn work_start(
             Ok(())
         }
         FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "error": message,
+                        "force": force,
+                    })
+                );
+            }
             bail!("engine rejected work start: {message}")
         }
         other => bail!("engine returned unexpected response: {other:?}"),

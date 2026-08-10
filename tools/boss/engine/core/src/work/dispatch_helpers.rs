@@ -899,11 +899,14 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         work_item_id,
         priority,
         preferred_workspace_id,
-        // `force` is purely a dispatcher hint (handled by
-        // `ExecutionCoordinator::force_dispatch`); the DB layer just
-        // creates / refreshes a `ready` row the same way for both
-        // forced and queued requests.
+        // `force` (pool growth) and `bypass_dispatch_pause` / entry_point /
+        // observed_pause_generation are coordinator-level admission hints;
+        // the DB layer just creates / refreshes a `ready` row the same way
+        // for every request that reaches this function.
         force: _,
+        bypass_dispatch_pause: _,
+        entry_point: _,
+        observed_pause_generation: _,
         allow_dirty,
     } = input;
 

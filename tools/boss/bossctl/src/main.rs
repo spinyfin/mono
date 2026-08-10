@@ -873,6 +873,13 @@ enum WorkAction {
         priority: Option<i64>,
         #[arg(long)]
         preferred_workspace_id: Option<String>,
+        /// Bypass an active operator global dispatch pause for this one
+        /// start only. Does not resume global dispatch, grow the worker
+        /// pool, or clear dependencies / concurrency caps / other
+        /// blockers. Maps to the engine's `bypass_dispatch_pause` intent
+        /// (not the pool-growth `force` bit used by `agents launch`).
+        #[arg(long)]
+        force: bool,
     },
     /// Cancel a queued or running execution (any non-terminal status).
     ///
@@ -1337,6 +1344,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     work_item_id,
                     priority,
                     preferred_workspace_id,
+                    force,
                 },
         } => {
             agents::work_start(
@@ -1345,6 +1353,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 work_item_id,
                 priority,
                 preferred_workspace_id,
+                force,
             )
             .await
         }

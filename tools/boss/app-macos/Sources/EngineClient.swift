@@ -333,6 +333,14 @@ final class EngineClient: @unchecked Sendable {
             case "work_error":
                 let message = payload["message"] as? String ?? "unknown work error"
                 emit(.workError(message: message))
+            case "execution_admission_result":
+                if let evalPayload = payload["evaluation"] as? [String: Any],
+                   let evaluation = ExecutionAdmissionEvaluation(payload: evalPayload)
+                {
+                    emit(.executionAdmissionResult(evaluation: evaluation))
+                } else {
+                    emit(.error(message: "received invalid execution_admission_result from engine"))
+                }
             case "error":
                 let message = payload["message"] as? String ?? "unknown engine error"
                 emit(.error(message: message))

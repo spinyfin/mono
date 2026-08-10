@@ -1172,6 +1172,13 @@ pub enum FrontendEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// Response to [`FrontendRequest::EvaluateExecutionAdmission`].
+    /// Engine-owned eligibility decision for an explicit start (and the
+    /// pause-override intent). The app renders these reasons; it does not
+    /// re-derive pause origin or blockers from cached board state.
+    ExecutionAdmissionResult {
+        evaluation: ExecutionAdmissionEvaluation,
+    },
     /// Response to [`FrontendRequest::SetAutomationPaused`] and
     /// [`FrontendRequest::GetAutomationState`]. Carries the current
     /// automation-pause state and, when paused, the epoch-seconds
