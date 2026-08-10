@@ -483,6 +483,16 @@ impl WorkDb {
             source_name = source_task.name,
         );
 
+        // Only tag this as a `Followup` when it actually carries an origin PR
+        // number: `followup_pr_environment` treats `TaskKind::Followup` as a
+        // hard contract that an origin PR exists, and bails at dispatch time
+        // otherwise. A source task with no PR yet (doc-only work pushed
+        // straight to main, an investigation, or scope deferred before ever
+        // opening one) is common here, so falling back to the historical
+        // `chore` kind keeps the task dispatchable instead of permanently
+        // wedging it.
+        let kind_override = pr_number.is_some().then_some(TaskKind::Followup);
+
         let new_task = insert_chore_in_tx(
             &tx,
             CreateChoreInput::builder()
@@ -493,7 +503,7 @@ impl WorkDb {
                 .force_duplicate(true)
                 .maybe_priority(Some(source_task.priority.clone()))
                 .maybe_repo_remote_url(source_task.repo_remote_url.clone())
-                .maybe_kind_override(Some(TaskKind::Followup))
+                .maybe_kind_override(kind_override)
                 .maybe_origin_task_short_id(source_task.short_id)
                 .maybe_origin_pr_number(pr_number)
                 .build(),

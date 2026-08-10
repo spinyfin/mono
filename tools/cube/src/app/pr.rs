@@ -1,9 +1,7 @@
 //! `cube pr create/update/push` — resolving the GitHub remote, pushing the
 //! branch, and creating or advancing the pull request.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use git_utils::pr_bookmark;
 use git_utils::repo_slug::parse_github_remote;
@@ -12,7 +10,7 @@ use serde_json::json;
 use crate::cli::{PrCreateArgs, PrPushArgs, PrUpdateArgs};
 use crate::command_runner::{CommandRunner, RealCommandRunner};
 
-use crate::app::change::resolve_body_file;
+use crate::app::change::{resolve_body_file, write_temp_pr_body};
 use crate::app::checkleft_gate::run_checkleft_gate;
 use crate::app::errors::{CubeError, Result, RunResult};
 use crate::app::gh_pr;
@@ -242,21 +240,37 @@ pub(super) struct ResolvedPrBody {
 
 fn followup_pr_context_from_env() -> Result<Option<FollowupPrContext>> {
     let origin_pr_url = match std::env::var(FOLLOWUP_ORIGIN_PR_URL_ENV) {
-        Ok(value) if !value.trim().is_empty() => value,
-        Ok(_) => {
-            return Err(CubeError::InvalidArgument(format!(
-                "{FOLLOWUP_ORIGIN_PR_URL_ENV} is empty; refusing to open a derived PR without its origin link"
-            )));
-        }
-        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
         Err(err) => {
             return Err(CubeError::InvalidArgument(format!(
                 "could not read {FOLLOWUP_ORIGIN_PR_URL_ENV}: {err}"
             )));
         }
     };
-    let kind = std::env::var(FOLLOWUP_KIND_ENV)
-        .map_err(|_| {
+    let kind = std::env::var(FOLLOWUP_KIND_ENV).ok();
+    followup_pr_context_from_values(origin_pr_url, kind)
+}
+
+/// Pure core of [`followup_pr_context_from_env`], factored out so its
+/// empty-URL / missing-kind / empty-kind refusals are unit-testable without
+/// mutating process-global env vars (which would race across parallel
+/// tests).
+pub(super) fn followup_pr_context_from_values(
+    origin_pr_url: Option<String>,
+    kind: Option<String>,
+) -> Result<Option<FollowupPrContext>> {
+    let origin_pr_url = match origin_pr_url {
+        Some(value) if !value.trim().is_empty() => value,
+        Some(_) => {
+            return Err(CubeError::InvalidArgument(format!(
+                "{FOLLOWUP_ORIGIN_PR_URL_ENV} is empty; refusing to open a derived PR without its origin link"
+            )));
+        }
+        None => return Ok(None),
+    };
+    let kind = kind
+        .ok_or_else(|| {
             CubeError::InvalidArgument(format!(
                 "{FOLLOWUP_KIND_ENV} is missing; refusing to open a derived PR without its follow-up kind"
             ))
@@ -284,35 +298,23 @@ pub(super) fn render_pr_body(worker_body: Option<&str>, context: Option<&Followu
     );
     match worker_body {
         Some(body) if !body.is_empty() => Some(format!("{header}\n\n{body}")),
+        // Deliberate: for a follow-up PR, always submit an explicit body
+        // (header alone if the worker gave nothing), even though that means
+        // `gh pr create` no longer falls back to deriving a body from the
+        // branch's commits. A follow-up PR must always carry visible
+        // provenance to its origin PR, so a header-only body is preferred
+        // over gh's commit-derived default losing that link.
         _ => Some(header),
     }
 }
 
 fn materialize_pr_body(text: String) -> Result<ResolvedPrBody> {
-    // `create_new` makes every candidate exclusive, so this never overwrites
-    // a body from another concurrent cube process.
-    for attempt in 0..32_u8 {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|err| CubeError::InvalidArgument(format!("system clock precedes Unix epoch: {err}")))?
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("cube-pr-body-{}-{nanos}-{attempt}.md", std::process::id()));
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut file) => {
-                file.write_all(text.as_bytes()).map_err(CubeError::Io)?;
-                return Ok(ResolvedPrBody {
-                    text: Some(text),
-                    file_path: Some(path.display().to_string()),
-                    tmp_path: Some(path),
-                });
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(CubeError::Io(err)),
-        }
-    }
-    Err(CubeError::InvalidArgument(
-        "could not allocate a unique temporary PR body file after 32 attempts".to_owned(),
-    ))
+    let path = write_temp_pr_body(&text)?;
+    Ok(ResolvedPrBody {
+        text: Some(text),
+        file_path: Some(path.display().to_string()),
+        tmp_path: Some(path),
+    })
 }
 
 impl Drop for ResolvedPrBody {
@@ -330,6 +332,13 @@ pub(super) fn resolve_pr_body(args: &PrCreateArgs) -> Result<ResolvedPrBody> {
         let (resolved, tmp) = resolve_body_file(f)?;
         let text = std::fs::read_to_string(&resolved).map_err(CubeError::Io)?;
         if let Some(rendered) = render_pr_body(Some(&text), followup_context.as_ref()) {
+            // `tmp` (if any) was the stdin/pipe-sourced temp file materialized
+            // by `resolve_body_file`; it is being superseded by the rendered
+            // body's own temp file below, so remove it now rather than
+            // leaking it — `ResolvedPrBody::drop` only tracks the new path.
+            if let Some(p) = &tmp {
+                let _ = std::fs::remove_file(p);
+            }
             return materialize_pr_body(rendered);
         }
         return Ok(ResolvedPrBody {
