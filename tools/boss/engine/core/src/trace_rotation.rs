@@ -25,10 +25,9 @@
 
 use std::fs::File;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::path::Path;
 
-use crate::rotating_file;
+use crate::rotating_file::{self, RotatingFileWriter};
 use boss_log_files::next_rotated_path;
 #[cfg(test)]
 use boss_log_files::rotated_segments;
@@ -83,79 +82,31 @@ pub fn prune_old_rotated(active_path: &Path, max_files: usize) {
     rotating_file::prune_old_rotated(active_path, max_files, "trace file")
 }
 
-/// Mutable state held inside the writer's mutex — the current open file
-/// and how many bytes have been written to it since the last rotation.
-pub struct RotatingState {
-    pub file: File,
-    pub bytes_written: u64,
-}
-
-impl RotatingState {
-    /// Create state from an already-open file.  Reads the current file
-    /// size so the byte counter is accurate even if the file existed
-    /// before startup rotation ran (e.g. rotation was skipped on error).
-    pub fn new(file: File) -> Self {
-        let bytes_written = file.metadata().map(|m| m.len()).unwrap_or(0);
-        Self { file, bytes_written }
-    }
-}
+pub use crate::rotating_file::RotatingState;
 
 /// `Write` impl for `engine-trace.jsonl` that rotates the file when the
 /// byte threshold is crossed.
 ///
-/// The `Arc<Mutex<Option<RotatingState>>>` is cloned cheaply by the
-/// `move || RotatingJsonlWriter { … }` closure on each log event, so
-/// all instances share the same underlying state and byte counter.
-/// When `state` is `None` (file could not be opened) every write is a
-/// silent no-op, matching the original `JsonlFileWriter` behaviour.
+/// This is a thin JSONL-specific wrapper around [`RotatingFileWriter`]. Its
+/// inner writer rotates after complete records are written, so a JSON line is
+/// never split across segments.
 pub struct RotatingJsonlWriter {
-    pub path: PathBuf,
-    pub state: Arc<Mutex<Option<RotatingState>>>,
-    pub max_bytes: u64,
-    pub max_files: usize,
+    inner: RotatingFileWriter,
+}
+
+impl RotatingJsonlWriter {
+    pub fn new(inner: RotatingFileWriter) -> Self {
+        Self { inner }
+    }
 }
 
 impl Write for RotatingJsonlWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let Ok(mut guard) = self.state.lock() else {
-            return Ok(buf.len()); // poisoned mutex — no-op
-        };
-        let Some(state) = guard.as_mut() else {
-            return Ok(buf.len()); // no file — no-op
-        };
-
-        let _ = state.file.write_all(buf);
-        state.bytes_written = state.bytes_written.saturating_add(buf.len() as u64);
-
-        if state.bytes_written >= self.max_bytes {
-            // Rotate inline while holding the lock so no concurrent
-            // write can race with the rename + re-open sequence.
-            let rotated = next_rotated_path(&self.path);
-            if std::fs::rename(&self.path, &rotated).is_ok() {
-                match open_trace_file(&self.path) {
-                    Ok(new_file) => {
-                        state.file = new_file;
-                        state.bytes_written = 0;
-                        prune_old_rotated(&self.path, self.max_files);
-                    }
-                    Err(err) => {
-                        eprintln!("boss-engine: could not open new trace file after rotation: {err}");
-                    }
-                }
-            }
-        }
-
-        Ok(buf.len())
+        Write::write(&mut self.inner, buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        let Ok(mut guard) = self.state.lock() else {
-            return Ok(());
-        };
-        if let Some(state) = guard.as_mut() {
-            let _ = state.file.flush();
-        }
-        Ok(())
+        Write::flush(&mut self.inner)
     }
 }
 
@@ -163,10 +114,28 @@ impl Write for RotatingJsonlWriter {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     fn tmp_trace(dir: &TempDir) -> PathBuf {
         dir.path().join("engine-trace.jsonl")
+    }
+
+    fn writer(
+        path: PathBuf,
+        state: Arc<Mutex<Option<RotatingState>>>,
+        max_bytes: u64,
+        max_files: usize,
+    ) -> RotatingJsonlWriter {
+        RotatingJsonlWriter::new(RotatingFileWriter {
+            path,
+            state,
+            max_bytes,
+            max_files,
+            log_name: "trace file",
+            rotate_after_write: true,
+        })
     }
 
     #[test]
@@ -235,12 +204,7 @@ mod tests {
         let path = tmp_trace(&dir);
         let file = open_trace_file(&path).unwrap();
         let state = Arc::new(Mutex::new(Some(RotatingState::new(file))));
-        let mut writer = RotatingJsonlWriter {
-            path: path.clone(),
-            state: state.clone(),
-            max_bytes: 10,
-            max_files: 3,
-        };
+        let mut writer = writer(path.clone(), state.clone(), 10, 3);
 
         // 15 bytes exceeds the 10-byte threshold.
         writer.write_all(b"123456789012345").unwrap();
@@ -263,12 +227,7 @@ mod tests {
         }
         let file = open_trace_file(&path).unwrap();
         let state = Arc::new(Mutex::new(Some(RotatingState::new(file))));
-        let mut writer = RotatingJsonlWriter {
-            path: path.clone(),
-            state,
-            max_bytes: 5,
-            max_files: 2,
-        };
+        let mut writer = writer(path.clone(), state, 5, 2);
 
         // 6 bytes exceeds the 5-byte threshold → rotation + prune.
         writer.write_all(b"123456").unwrap();
@@ -287,12 +246,7 @@ mod tests {
         let path = tmp_trace(&dir);
         let file = open_trace_file(&path).unwrap();
         let state = Arc::new(Mutex::new(Some(RotatingState::new(file))));
-        let mut writer = RotatingJsonlWriter {
-            path: path.clone(),
-            state,
-            max_bytes: 100,
-            max_files: 3,
-        };
+        let mut writer = writer(path.clone(), state, 100, 3);
 
         writer.write_all(b"small").unwrap();
 
@@ -307,12 +261,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = tmp_trace(&dir);
         let state: Arc<Mutex<Option<RotatingState>>> = Arc::new(Mutex::new(None));
-        let mut writer = RotatingJsonlWriter {
-            path: path.clone(),
-            state,
-            max_bytes: 10,
-            max_files: 3,
-        };
+        let mut writer = writer(path.clone(), state, 10, 3);
         // Should not panic or create any file.
         let n = writer.write(b"data").unwrap();
         assert_eq!(n, 4);

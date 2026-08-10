@@ -1,8 +1,17 @@
 //! Bounded append-only file writer shared by engine log surfaces.
 //!
-//! Each segment is capped before the next bytes are written. Rotated segments
-//! use `boss-log-files`' collision-safe timestamp naming and are pruned after
-//! every rotation, including rotations caused by a restart.
+//! Rotated segments use `boss-log-files`' collision-safe timestamp naming and
+//! are pruned after every rotation, including rotations caused by a restart.
+//! Record-preserving writers rotate before a record that would not fit, so a
+//! segment can exceed its configured limit by one record rather than splitting
+//! that record across files.
+//!
+//! ## Text log configuration
+//!
+//! | Variable | Default | Meaning |
+//! |---|---|---|
+//! | `BOSS_ENGINE_LOG_MAX_BYTES` | `104857600` (100 MiB) | Rotate before a log record would exceed this size |
+//! | `BOSS_ENGINE_LOG_MAX_FILES` | `20` | Keep at most this many rotated text-log backups |
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -48,12 +57,17 @@ impl RotatingState {
 /// A bounded append-only writer that rotates before a segment can exceed its
 /// configured limit. If rotation fails, it drops file output rather than
 /// continuing to grow the active file without bound; stderr remains live.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct RotatingFileWriter {
     pub path: PathBuf,
     pub state: Arc<Mutex<Option<RotatingState>>>,
     pub max_bytes: u64,
     pub max_files: usize,
     pub log_name: &'static str,
+    /// When true, write a complete record and then rotate if it crosses the
+    /// limit. When false, rotate before a record that would cross the limit.
+    pub rotate_after_write: bool,
 }
 
 impl RotatingFileWriter {
@@ -79,8 +93,9 @@ impl RotatingFileWriter {
 }
 
 impl Write for RotatingFileWriter {
-    fn write(&mut self, mut buf: &[u8]) -> io::Result<usize> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let original_len = buf.len();
+        let max_bytes = self.max_bytes.max(1);
         let Ok(mut guard) = self.state.lock() else {
             return Ok(original_len);
         };
@@ -88,18 +103,24 @@ impl Write for RotatingFileWriter {
             return Ok(original_len);
         };
 
-        while !buf.is_empty() {
-            if state.bytes_written >= self.max_bytes && !Self::rotate(state, &self.path, self.max_files, self.log_name)
+        if self.rotate_after_write {
+            if state.file.write_all(buf).is_ok() {
+                state.bytes_written = state.bytes_written.saturating_add(buf.len() as u64);
+                if state.bytes_written >= max_bytes {
+                    let _ = Self::rotate(state, &self.path, self.max_files, self.log_name);
+                }
+            }
+        } else {
+            let record_would_cross_limit =
+                state.bytes_written > 0 && buf.len() as u64 > max_bytes.saturating_sub(state.bytes_written);
+            if (state.bytes_written >= max_bytes || record_would_cross_limit)
+                && !Self::rotate(state, &self.path, self.max_files, self.log_name)
             {
-                break;
+                return Ok(original_len);
             }
-            let available = (self.max_bytes - state.bytes_written).min(usize::MAX as u64) as usize;
-            let chunk_len = available.min(buf.len());
-            if state.file.write_all(&buf[..chunk_len]).is_err() {
-                break;
+            if state.file.write_all(buf).is_ok() {
+                state.bytes_written = state.bytes_written.saturating_add(buf.len() as u64);
             }
-            state.bytes_written += chunk_len as u64;
-            buf = &buf[chunk_len..];
         }
         Ok(original_len)
     }
@@ -121,7 +142,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn writer_bounds_segments_and_continues_after_rotation() {
+    fn writer_keeps_records_intact_and_prunes_after_rotation() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("engine.log");
         let state = Arc::new(Mutex::new(Some(RotatingState::new(open_append_file(&path).unwrap()))));
@@ -131,14 +152,26 @@ mod tests {
             max_bytes: 5,
             max_files: 2,
             log_name: "test log",
+            rotate_after_write: false,
         };
 
-        writer.write_all(b"first-second-third").unwrap();
+        writer.write_all(b"first").unwrap();
+        writer.write_all(b"second").unwrap();
+        writer.write_all(b"third").unwrap();
+        writer.write_all(b"fourth").unwrap();
 
         let segments = rotated_segments(&path);
         assert_eq!(segments.len(), 2, "retention must prune after repeated rotations");
-        assert!(segments.iter().all(|segment| fs::metadata(segment).unwrap().len() <= 5));
-        assert!(fs::metadata(&path).unwrap().len() <= 5);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "fourth");
+        let contents: Vec<_> = segments
+            .iter()
+            .map(|segment| fs::read_to_string(segment).unwrap())
+            .collect();
+        assert!(
+            contents
+                .iter()
+                .all(|record| ["second", "third"].contains(&record.as_str()))
+        );
     }
 
     #[test]
@@ -152,12 +185,32 @@ mod tests {
             max_bytes: 5,
             max_files: 2,
             log_name: "test log",
+            rotate_after_write: false,
         };
 
         writer.write_all(b"first").unwrap();
         writer.write_all(b"next").unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "next");
+    }
+
+    #[test]
+    fn writer_clamps_zero_max_bytes_without_spinning() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("engine.log");
+        let state = Arc::new(Mutex::new(Some(RotatingState::new(open_append_file(&path).unwrap()))));
+        let mut writer = RotatingFileWriter {
+            path: path.clone(),
+            state,
+            max_bytes: 0,
+            max_files: 2,
+            log_name: "test log",
+            rotate_after_write: false,
+        };
+
+        writer.write_all(b"record").unwrap();
+
+        assert_eq!(fs::read_to_string(path).unwrap(), "record");
     }
 
     #[test]

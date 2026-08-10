@@ -12,8 +12,8 @@ use boss_engine::app::{self, DEFAULT_SOCKET_PATH, isolation::IsolationPaths};
 use boss_engine::audit::{self, StartContext};
 use boss_engine::build_info;
 use boss_engine::cli::Cli;
-use boss_engine::rotating_file::{RotatingFileWriter, RotatingState as TextLogState, open_append_file};
-use boss_engine::trace_rotation::{self, RotatingJsonlWriter, RotatingState as TraceRotatingState};
+use boss_engine::rotating_file::{RotatingFileWriter, RotatingState, open_append_file};
+use boss_engine::trace_rotation::{self, RotatingJsonlWriter};
 
 const DEFAULT_LOG_PATH: &str = "/tmp/boss-engine.log";
 const TEXT_LOG_MAX_BYTES_ENV: &str = "BOSS_ENGINE_LOG_MAX_BYTES";
@@ -25,20 +25,21 @@ const DEFAULT_TEXT_LOG_MAX_FILES: usize = 20;
 
 struct DualLogWriter {
     stderr: io::Stderr,
-    file: Option<Arc<Mutex<Option<TextLogState>>>>,
-    path: PathBuf,
-    max_bytes: u64,
-    max_files: usize,
+    file: Option<RotatingFileWriter>,
 }
 
 impl DualLogWriter {
-    fn new(file: Option<Arc<Mutex<Option<TextLogState>>>>, path: PathBuf, max_bytes: u64, max_files: usize) -> Self {
+    fn new(state: Option<Arc<Mutex<Option<RotatingState>>>>, path: PathBuf, max_bytes: u64, max_files: usize) -> Self {
         Self {
             stderr: io::stderr(),
-            file,
-            path,
-            max_bytes,
-            max_files,
+            file: state.map(|state| RotatingFileWriter {
+                path,
+                state,
+                max_bytes,
+                max_files,
+                log_name: "engine text log",
+                rotate_after_write: false,
+            }),
         }
     }
 }
@@ -46,30 +47,16 @@ impl DualLogWriter {
 impl Write for DualLogWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.stderr.write_all(buf)?;
-        if let Some(state) = &self.file {
-            let mut writer = RotatingFileWriter {
-                path: self.path.clone(),
-                state: state.clone(),
-                max_bytes: self.max_bytes,
-                max_files: self.max_files,
-                log_name: "engine text log",
-            };
-            let _ = writer.write_all(buf);
+        if let Some(file) = &mut self.file {
+            let _ = file.write_all(buf);
         }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
         self.stderr.flush()?;
-        if let Some(state) = &self.file {
-            let mut writer = RotatingFileWriter {
-                path: self.path.clone(),
-                state: state.clone(),
-                max_bytes: self.max_bytes,
-                max_files: self.max_files,
-                log_name: "engine text log",
-            };
-            let _ = writer.flush();
+        if let Some(file) = &mut self.file {
+            let _ = file.flush();
         }
         Ok(())
     }
@@ -130,13 +117,13 @@ fn text_log_rotation_config() -> (u64, usize) {
     (max_bytes.max(1), max_files)
 }
 
-fn open_log_file(path: &Path, max_files: usize) -> Result<TextLogState> {
+fn open_log_file(path: &Path, max_files: usize) -> Result<RotatingState> {
     // A restart normally continues appending to the active segment, so prune
     // here as well as on rotation. Otherwise a restart storm could retain
     // arbitrarily many segments without ever writing enough to rotate again.
     boss_engine::rotating_file::prune_old_rotated(path, max_files, "engine text log");
     open_append_file(path)
-        .map(TextLogState::new)
+        .map(RotatingState::new)
         .with_context(|| format!("failed to open engine log file {}", path.display()))
 }
 
@@ -199,7 +186,7 @@ async fn main() -> Result<()> {
         Some(path) => {
             trace_rotation::rotate_on_startup(&path, trace_max_files);
             let state = match trace_rotation::open_trace_file(&path) {
-                Ok(file) => Some(TraceRotatingState::new(file)),
+                Ok(file) => Some(RotatingState::new(file)),
                 Err(err) => {
                     eprintln!(
                         "boss-engine: could not open engine-trace JSONL at {}: {err}",
@@ -211,14 +198,16 @@ async fn main() -> Result<()> {
             (path, Arc::new(Mutex::new(state)))
         }
     };
-    let json_layer = tracing_subscriber::fmt::layer()
-        .json()
-        .with_writer(move || RotatingJsonlWriter {
+    let json_layer = tracing_subscriber::fmt::layer().json().with_writer(move || {
+        RotatingJsonlWriter::new(RotatingFileWriter {
             path: json_trace_path.clone(),
             state: json_state_arc.clone(),
             max_bytes: trace_max_bytes,
             max_files: trace_max_files,
-        });
+            log_name: "trace file",
+            rotate_after_write: true,
+        })
+    });
 
     tracing_subscriber::registry()
         .with(env_filter)
