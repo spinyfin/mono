@@ -408,26 +408,37 @@ impl WorkDb {
 
     /// Bucket-2 track (P3c): `answered → awaiting_followup`, fired when an
     /// operator posts a reply in the thread (`CommentsPostFollowup`).
-    /// Guarded on `status = 'answered'` — in particular, a comment still
-    /// `answering` (a run already in flight) rejects a second follow-up
-    /// rather than queuing it (design §"Concurrency/idempotency" describes
-    /// queuing as the eventual UX; not yet implemented).
+    /// Guarded on `status IN ('answered', 'answer_failed')` — in particular,
+    /// a comment still `answering` (a run already in flight) rejects a
+    /// second follow-up rather than queuing it (design
+    /// §"Concurrency/idempotency" describes queuing as the eventual UX; not
+    /// yet implemented). `answer_failed` is accepted alongside `answered` so
+    /// a failed run isn't a terminal dead end: posting a follow-up on it
+    /// re-enters the reclassifier exactly like a follow-up on a real answer
+    /// does, which either re-spawns the answer agent (intent stays
+    /// `question`) or bridges straight into the revision path (intent flips
+    /// to `revision`) via
+    /// [`Self::transition_comment_awaiting_followup_to_answering`] /
+    /// [`Self::reclassify_comment_intent`].
     pub fn transition_comment_to_awaiting_followup(&self, comment_id: &str) -> Result<WorkComment> {
         let conn = self.connect()?;
         let now = now_string();
         let n = conn.execute(
             "UPDATE work_comments
              SET status = ?2, status_actor = 'engine', updated_at = ?3
-             WHERE id = ?1 AND status = ?4",
+             WHERE id = ?1 AND status IN (?4, ?5)",
             params![
                 comment_id,
                 COMMENT_STATUS_AWAITING_FOLLOWUP,
                 now,
-                COMMENT_STATUS_ANSWERED
+                COMMENT_STATUS_ANSWERED,
+                COMMENT_STATUS_ANSWER_FAILED,
             ],
         )?;
         if n == 0 {
-            bail!("comment {comment_id} not found, or not 'answered' (expected answered → awaiting_followup)");
+            bail!(
+                "comment {comment_id} not found, or not 'answered'/'answer_failed' (expected answered|answer_failed → awaiting_followup)"
+            );
         }
         query_comment(&conn, comment_id)?
             .with_context(|| format!("missing comment after awaiting_followup transition: {comment_id}"))

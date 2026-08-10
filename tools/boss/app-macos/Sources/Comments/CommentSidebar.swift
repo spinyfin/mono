@@ -450,8 +450,13 @@ private struct CommentRow: View {
     ///
     /// `.answerFailed` is its own terminal status (the engine's
     /// `transition_comment_to_answer_failed`) — a run that ended with no
-    /// reply ever posted — and always renders the failed indicator, the same
-    /// as the `answerAgentFailed` flag does for the statuses a failed
+    /// reply ever posted — and renders the failed indicator alongside a
+    /// `FollowupComposer` so it isn't a dead end: posting a follow-up here
+    /// drives the same `answered → awaiting_followup` engine transition
+    /// (widened to also accept `answer_failed`, see
+    /// `transition_comment_to_awaiting_followup`), which either re-spawns
+    /// the answer agent or bridges into the revision path. This mirrors how
+    /// the `answerAgentFailed` flag renders for the statuses a failed
     /// *spawn* (never even reaching `running`) can leave a comment sitting
     /// in: `answerAgentFailed` (`Comment.answerAgentFailed`) takes priority
     /// over each of those statuses' default rendering in
@@ -476,7 +481,10 @@ private struct CommentRow: View {
                 FollowupComposer(comment: comment, layer: layer)
             }
         case .answerFailed:
-            AnswerFailedIndicatorView()
+            VStack(alignment: .leading, spacing: 4) {
+                AnswerFailedIndicatorView()
+                FollowupComposer(comment: comment, layer: layer)
+            }
         case .awaitingFollowup:
             if comment.answerAgentFailed {
                 AnswerFailedIndicatorView()

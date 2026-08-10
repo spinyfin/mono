@@ -599,6 +599,66 @@ fn migration_repairs_a_falsely_answered_revisable_comment_to_active() {
     let _ = std::fs::remove_file(path);
 }
 
+/// A comment that hit the bug and then received an operator follow-up
+/// before this repair migration ever ran advances past `answered` to
+/// `awaiting_followup` — it must still be repaired, not permanently
+/// excluded just because its status moved on.
+#[test]
+fn migration_repairs_a_falsely_answered_comment_that_already_moved_to_awaiting_followup() {
+    let (_dir, path) = disk_db_path("repair-falsely-answered-awaiting-followup");
+    let db = WorkDb::open(path.clone()).unwrap();
+
+    let comment = db
+        .create_comment(CreateCommentInput {
+            artifact_kind: "work_item".to_owned(),
+            artifact_id: "t1".to_owned(),
+            doc_version: "v0".to_owned(),
+            anchor: CommentAnchor {
+                exact: "alpha".to_owned(),
+                prefix: String::new(),
+                suffix: String::new(),
+            },
+            body: "why does this retry three times?".to_owned(),
+            author: "user:test@example.com".to_owned(),
+            plain_text_projection_version: 0,
+        })
+        .unwrap();
+    db.set_comment_intent(&comment.id, "question", 0.9).unwrap();
+    db.transition_comment_to_answering(&comment.id).unwrap();
+    let run = db
+        .create_answer_agent_run(&comment.id, "work_item", "t1", "v0", 0)
+        .unwrap();
+    db.complete_answer_agent_run(&run.id, "failed", None, Some("stranded_no_stop"))
+        .unwrap();
+
+    // Reproduce the pre-fix bug (status forced to 'answered' with nothing
+    // behind it), then an operator follow-up against the phantom answer
+    // advances it further to 'awaiting_followup'.
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_comments SET status = 'answered', updated_at = '1700000000' WHERE id = ?1",
+            [&comment.id],
+        )
+        .unwrap();
+    }
+    db.transition_comment_to_awaiting_followup(&comment.id).unwrap();
+    let corrupted = db.get_comment(&comment.id).unwrap().unwrap();
+    assert_eq!(corrupted.status, "awaiting_followup");
+    drop(db);
+
+    // Re-opening runs the repair migration.
+    let db = WorkDb::open(path.clone()).unwrap();
+    let repaired = db.get_comment(&comment.id).unwrap().unwrap();
+    assert_eq!(
+        repaired.status, "answer_failed",
+        "a falsely-answered comment must be repaired even after it advanced to awaiting_followup"
+    );
+    assert_eq!(repaired.status_actor.as_deref(), Some("engine"));
+
+    let _ = std::fs::remove_file(path);
+}
+
 /// A comment that legitimately reached `answered` via a real reply must be
 /// left untouched by the repair migration — it is not the bug's shape.
 #[test]

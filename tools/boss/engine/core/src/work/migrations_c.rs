@@ -592,26 +592,33 @@ fn live_column_names(conn: &Connection, table: &str) -> Result<Vec<String>> {
 /// second a bulk sweep closed them out, while their comments read
 /// `answered`.
 ///
-/// Repairs every `work_comments` row still carrying that shape: `status =
-/// 'answered'` whose most recent `answer_agent_runs` row is `failed` with no
-/// `reply_body`. Such a comment can only have reached `answered` through the
-/// now-fixed bug (the real reply path, `CommentsPostAnswer`, always leaves a
-/// `replied` run with a non-null `reply_body` behind), so this is a safe,
-/// general repair rather than one hand-picked to the two rows from the
-/// original incident. A comment whose intent was reclassified to `revision`
-/// mid-flight is repaired to `active` — mirroring
+/// Repairs every `work_comments` row still carrying that shape: `status IN
+/// ('answered', 'awaiting_followup')` whose most recent `answer_agent_runs`
+/// row is `failed` with no `reply_body`. Such a comment can only have
+/// reached `answered` (and, from there, possibly `awaiting_followup` if an
+/// operator posted a follow-up against the falsely-answered comment before
+/// this repair ran) through the now-fixed bug (the real reply path,
+/// `CommentsPostAnswer`, always leaves a `replied` run with a non-null
+/// `reply_body` behind), so this is a safe, general repair rather than one
+/// hand-picked to the two rows from the original incident. `awaiting_followup`
+/// is included alongside `answered` so a comment that already collected an
+/// operator follow-up on top of the phantom answer isn't permanently
+/// excluded from repair — its lineage still traces back to the same
+/// no-reply failed run. A comment whose intent was reclassified to
+/// `revision` mid-flight is repaired to `active` — mirroring
 /// `transition_comment_to_answer_failed`'s fold — so it lands in the
 /// `[Revise]` pool instead of a failure state that no longer applies to it;
 /// every other repaired comment lands on `answer_failed`.
 ///
 /// Idempotent: a comment already corrected (or one that never had the bug)
-/// no longer matches `status = 'answered'` with a failed, reply-less latest
-/// run, so re-running this on every engine startup is a cheap no-op past the
-/// first pass. Must run after `migrate_work_comments_table` and
-/// `migrate_answer_agent_runs_table`, which create the two tables this
-/// reads.
+/// no longer matches `status IN ('answered', 'awaiting_followup')` with a
+/// failed, reply-less latest run, so re-running this on every engine startup
+/// is a cheap no-op past the first pass. Must run after
+/// `migrate_work_comments_table` and `migrate_answer_agent_runs_table`,
+/// which create the two tables this reads.
 pub(crate) fn migrate_correct_falsely_answered_comments_with_failed_runs(conn: &Connection) -> Result<()> {
-    let mut stmt = conn.prepare("SELECT id, intent FROM work_comments WHERE status = 'answered'")?;
+    let mut stmt =
+        conn.prepare("SELECT id, intent FROM work_comments WHERE status IN ('answered', 'awaiting_followup')")?;
     let candidates: Vec<(String, Option<String>)> = stmt
         .query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
