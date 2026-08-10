@@ -49,7 +49,16 @@ pub struct WorkerRegistry {
 #[derive(Default)]
 struct RegistryInner {
     pid_to_run: HashMap<libc::pid_t, String>,
-    run_to_slot: HashMap<String, u8>,
+    run_to_slot: HashMap<String, RegisteredWorkerPane>,
+}
+
+/// The app surface attached to a worker run. `tmux_hosted` selects the
+/// non-owning detach RPC during normal cleanup; it is deliberately retained
+/// alongside the slot so legacy app-owned panes continue to use release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegisteredWorkerPane {
+    pub slot_id: u8,
+    pub tmux_hosted: bool,
 }
 
 impl WorkerRegistry {
@@ -71,11 +80,25 @@ impl WorkerRegistry {
     /// `run_id` in. The engine uses this to route follow-up
     /// `SendToPane` requests by run id.
     pub fn register_run_slot(&self, run_id: impl Into<String>, slot_id: u8) {
-        self.inner
-            .lock()
-            .expect("registry poisoned")
-            .run_to_slot
-            .insert(run_id.into(), slot_id);
+        self.inner.lock().expect("registry poisoned").run_to_slot.insert(
+            run_id.into(),
+            RegisteredWorkerPane {
+                slot_id,
+                tmux_hosted: false,
+            },
+        );
+    }
+
+    /// Record a tmux-hosted worker whose app surface must detach without
+    /// signalling the independently-owned tmux session.
+    pub fn register_tmux_run_slot(&self, run_id: impl Into<String>, slot_id: u8) {
+        self.inner.lock().expect("registry poisoned").run_to_slot.insert(
+            run_id.into(),
+            RegisteredWorkerPane {
+                slot_id,
+                tmux_hosted: true,
+            },
+        );
     }
 
     /// Look up the slot id for `run_id`. Returns `None` if the run
@@ -86,7 +109,7 @@ impl WorkerRegistry {
             .expect("registry poisoned")
             .run_to_slot
             .get(run_id)
-            .copied()
+            .map(|pane| pane.slot_id)
     }
 
     /// Get the slot mapped to `run_id`, allocating a virtual remote slot
@@ -110,14 +133,20 @@ impl WorkerRegistry {
     /// drops the event as it would have before.
     pub fn get_or_allocate_remote_slot(&self, run_id: &str) -> Option<(u8, bool)> {
         let mut inner = self.inner.lock().expect("registry poisoned");
-        if let Some(slot) = inner.run_to_slot.get(run_id) {
-            return Some((*slot, false));
+        if let Some(pane) = inner.run_to_slot.get(run_id) {
+            return Some((pane.slot_id, false));
         }
         let slot = {
             let used = &inner.run_to_slot;
-            (REMOTE_SLOT_BASE..=u8::MAX).find(|s| !used.values().any(|v| v == s))
+            (REMOTE_SLOT_BASE..=u8::MAX).find(|s| !used.values().any(|pane| pane.slot_id == *s))
         }?;
-        inner.run_to_slot.insert(run_id.to_owned(), slot);
+        inner.run_to_slot.insert(
+            run_id.to_owned(),
+            RegisteredWorkerPane {
+                slot_id: slot,
+                tmux_hosted: false,
+            },
+        );
         Some((slot, true))
     }
 
@@ -126,6 +155,13 @@ impl WorkerRegistry {
     /// attempts (e.g. completion-detection plus a manual stop firing
     /// for the same run) see `None` on the second call and skip.
     pub fn take_slot_for_run(&self, run_id: &str) -> Option<u8> {
+        self.take_worker_pane_for_run(run_id).map(|pane| pane.slot_id)
+    }
+
+    /// Atomically remove and return the pane registration for `run_id`.
+    /// Cleanup uses the hosting mode to choose detach for tmux-owned workers
+    /// and release for legacy app-owned processes.
+    pub fn take_worker_pane_for_run(&self, run_id: &str) -> Option<RegisteredWorkerPane> {
         self.inner.lock().expect("registry poisoned").run_to_slot.remove(run_id)
     }
 
@@ -255,6 +291,22 @@ mod tests {
         assert_eq!(reg.take_slot_for_run("run-x"), None);
         // Unregistered run is also None.
         assert_eq!(reg.take_slot_for_run("never-registered"), None);
+    }
+
+    #[test]
+    fn tmux_registration_preserves_hosting_mode_until_cleanup() {
+        let reg = WorkerRegistry::new();
+        reg.register_tmux_run_slot("run-tmux", 4);
+
+        assert_eq!(reg.slot_for_run("run-tmux"), Some(4));
+        assert_eq!(
+            reg.take_worker_pane_for_run("run-tmux"),
+            Some(RegisteredWorkerPane {
+                slot_id: 4,
+                tmux_hosted: true,
+            })
+        );
+        assert_eq!(reg.slot_for_run("run-tmux"), None);
     }
 
     #[test]

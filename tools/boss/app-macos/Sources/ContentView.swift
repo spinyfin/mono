@@ -119,6 +119,12 @@ struct ContentView: View {
             model.paneReleaseHandler = { [workspace = workersWorkspace] slotId, killGrace in
                 workspace.releaseWorkerPane(slotId: slotId, killGraceSeconds: killGrace)
             }
+            model.paneAttachHandler = { [workspace = workersWorkspace] request in
+                workspace.attachWorkerPane(request)
+            }
+            model.paneDetachHandler = { [workspace = workersWorkspace] slotId in
+                workspace.detachWorkerPane(slotId: slotId)
+            }
             model.paneSendHandler = { [workspace = workersWorkspace] slotId, text in
                 workspace.sendToPane(slotId: slotId, text: text)
             }

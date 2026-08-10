@@ -589,6 +589,12 @@ extension ChatViewModel {
         case .releaseWorkerPane(let slotId, let killGrace):
             let result = paneReleaseHandler.map { $0(slotId, killGrace) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
             engine.sendReleaseWorkerPaneResponse(requestId: requestId, result: result)
+        case .attachWorkerPane(let attach):
+            let result = paneAttachHandler.map { $0(attach) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
+            engine.sendAttachWorkerPaneResponse(requestId: requestId, result: result)
+        case .detachWorkerPane(let slotId):
+            let result = paneDetachHandler.map { $0(slotId) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
+            engine.sendDetachWorkerPaneResponse(requestId: requestId, result: result)
         case .sendToPane(let slotId, let text):
             let result = paneSendHandler.map { $0(slotId, text) } ?? .failure(.internalFailure(Self.noPaneAllocatorReason))
             engine.sendSendToPaneResponse(requestId: requestId, result: result)
