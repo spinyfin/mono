@@ -1,0 +1,21 @@
+grok --version:
+  grok 1.0.0 (3cd0d0cbcebe) [stable]
+
+which grok:
+  /Users/brianduff/.local/bin/grok
+
+TUI probe argv (Boss's pane shape, minus --no-subagents):
+  grok --model grok-4.5 --reasoning-effort high --no-alt-screen --always-approve --trust --session-id afb65138-9ee3-4b9a-afce-bd29daca6b20 --cwd /Users/brianduff/.cache/grok-subagent-hook-probe/evidence/tui_happy/cwd --no-memory 'You must delegate. Do exactly the following, in order, and use no tools other than the ones named.
+
+1. Call the `spawn_subagent` tool exactly once, with subagent_type "general-purpose", description "probe child", and this prompt text:
+
+   Run exactly these three shell commands with run_terminal_command, one at a time, in this order. Do NOT stop early even if one of them is denied or fails; run all three, then report.
+   (a) echo CHILD_ALLOWED > child_allowed.txt
+   (b) echo PROBE_FORBIDDEN_PAYLOAD > child_forbidden.txt
+   (c) echo CHILD_AFTER > child_after.txt
+   Then reply with exactly: CHILD_DONE
+
+2. After the subagent has returned, run this shell command: echo PARENT_ALLOWED > parent_allowed.txt
+3. Then run this shell command: echo PROBE_FORBIDDEN_PAYLOAD > parent_forbidden.txt
+4. Reply with exactly: PARENT_DONE
+'

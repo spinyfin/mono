@@ -1,0 +1,9 @@
+Do exactly this and nothing else.
+
+1. Call the `spawn_subagent` tool exactly once with background set to true, subagent_type "general-purpose", description "slow child", and this prompt text:
+
+   Run this single shell command with run_terminal_command and wait for it to finish: sleep 45 && echo SLOW_CHILD > slow_child.txt
+   Then reply with exactly: CHILD_SLOW_DONE
+
+2. Do NOT wait for the subagent. Do NOT call get_command_or_subagent_output. Do NOT call any other tool.
+3. Immediately reply with exactly: PARENT_DONE_EARLY

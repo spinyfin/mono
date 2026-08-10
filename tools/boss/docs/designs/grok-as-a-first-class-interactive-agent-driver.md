@@ -501,6 +501,8 @@ Grok has the richest surface of the three — MCP servers, plugins with a market
 
 The v1 posture is a _decision_, though, not an absence: the driver should explicitly disable what it does not use (`--no-subagents`, `--no-memory`) rather than inheriting defaults, because a subagent or a memory carried across sessions is state Boss does not model and cannot reason about. Noted in [T-07](#t-07-grok-config-isolation-and-workspace-provisioning).
 
+**Amendment 2026-08-09 — `--no-subagents` is now a measured requirement, not just posture.** Probed against `grok 1.0.0` in this project's own pane shape: subagents DO inherit the global `$GROK_HOME/hooks/` set and their tool calls ARE intercepted by the `PreToolUse` guards (no safety gap), but a finishing subagent emits a `session_end` whose payload is shape-identical to the top-level session's — same keys, same `reason: "shutdown"` — which Boss applies by slot as `WorkerActivity::Terminated` for a live worker. A Grok subagent is also **in-process**, so `background_children.rs`'s descendant walk cannot compensate, and `Stop.backgroundTasks` is empirically empty when a background subagent is in flight. Full evidence, the failure timeline, and what would have to change first: [`../investigations/grok-subagent-hook-attribution-2026-08-09.md`](../investigations/grok-subagent-hook-attribution-2026-08-09.md). This turns a **(a) unused-by-design** cell into a real, if narrow, `ProgressObservation` gap — recorded against [G-5](#g-5-progressobservation--solved-transport-unsolved-destination), where session identity belongs, rather than reopening G-11.
+
 ### G-12 `PromptComposition`
 
 Fits. `render_claude_md` already takes `preamble` and `config_dir` from the descriptor (`worker_setup.rs:240`, `:1686-1716`), so the per-session agent-rules file is driver-routed already. Grok's descriptor supplies `config_dir = ".grok"`, its own `agent_rules_filename`, and a Grok-specific preamble.
@@ -623,7 +625,7 @@ Notes on each non-obvious element:
 - **`--no-alt-screen`.** The spike verified both modes work under GhosttyKit and recommends inline for scrape and scrollback sanity. Whether `--minimal` is better still is an open decision for the human, flagged in the questions manifest.
 - **`--always-approve`** rather than `--permission-mode bypassPermissions`: the observed payloads already report `permissionMode: "bypassPermissions"` under it, and it is the flag the spike executed.
 - **No `-w` / `--worktree`, ever.** Cube owns workspace provisioning.
-- **`--no-subagents` / `--no-memory`** are explicit posture, not defaults inherited by accident.
+- **`--no-subagents` / `--no-memory`** are explicit posture, not defaults inherited by accident. `--no-subagents` additionally became load-bearing on 2026-08-09: see the [G-11 amendment](#g-11-toolprovisioning).
 - **Vim mode must never be enabled** — Esc does not cancel in fullscreen vim mode, which would silently break interrupt.
 
 The pane launch itself is unchanged from Claude's: the engine composes this as a shell command, the app hosts it via `SpawnWorkerPane` with `initial_input`, and the engine holds only `shell_pid`.
