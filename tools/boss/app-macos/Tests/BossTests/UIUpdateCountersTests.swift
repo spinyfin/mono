@@ -26,12 +26,14 @@ final class UIUpdateCountersTests: XCTestCase {
         c.recordEngineEventMainActor()
         c.recordEngineEventMainActor()
         c.recordEngineEventMainActor()
+        c.recordCardSnapshotBuild()
         c.recordCardBodyEvaluation()
 
         let counts = c.currentCounts()
         XCTAssertEqual(counts.applyWorkTree, 2)
         XCTAssertEqual(counts.incrementalTaskUpdates, 1)
         XCTAssertEqual(counts.engineEventsMainActor, 3)
+        XCTAssertEqual(counts.cardSnapshotBuilds, 1)
         XCTAssertEqual(counts.cardBodyEvaluations, 1)
         XCTAssertFalse(counts.isEmpty)
     }
@@ -48,6 +50,7 @@ final class UIUpdateCountersTests: XCTestCase {
         for _ in 0..<10 { c.recordApplyWorkTree() }
         for _ in 0..<20 { c.recordIncrementalTaskUpdate() }
         for _ in 0..<30 { c.recordEngineEventMainActor() }
+        for _ in 0..<35 { c.recordCardSnapshotBuild() }
         for _ in 0..<40 { c.recordCardBodyEvaluation() }
 
         let sample = try XCTUnwrap(
@@ -58,10 +61,12 @@ final class UIUpdateCountersTests: XCTestCase {
         XCTAssertEqual(sample.applyWorkTree, 10)
         XCTAssertEqual(sample.incrementalTaskUpdates, 20)
         XCTAssertEqual(sample.engineEventsMainActor, 30)
+        XCTAssertEqual(sample.cardSnapshotBuilds, 35)
         XCTAssertEqual(sample.cardBodyEvaluations, 40)
         XCTAssertEqual(sample.applyWorkTreePerSec, 10.0, accuracy: 0.0001)
         XCTAssertEqual(sample.incrementalTaskUpdatesPerSec, 20.0, accuracy: 0.0001)
         XCTAssertEqual(sample.engineEventsMainActorPerSec, 30.0, accuracy: 0.0001)
+        XCTAssertEqual(sample.cardSnapshotBuildsPerSec, 35.0, accuracy: 0.0001)
         XCTAssertEqual(sample.cardBodyEvaluationsPerSec, 40.0, accuracy: 0.0001)
 
         // Exchange: counters reset so a follow-up flush with no new
@@ -168,10 +173,12 @@ final class UIUpdateCountersTests: XCTestCase {
             applyWorkTreePerSec: 1,
             incrementalTaskUpdatesPerSec: 2,
             engineEventsMainActorPerSec: 3,
+            cardSnapshotBuildsPerSec: 3.5,
             cardBodyEvaluationsPerSec: 4,
             applyWorkTree: 1,
             incrementalTaskUpdates: 2,
             engineEventsMainActor: 3,
+            cardSnapshotBuilds: 3,
             cardBodyEvaluations: 4
         )
         let data = try JSONEncoder().encode(sample)
@@ -180,6 +187,7 @@ final class UIUpdateCountersTests: XCTestCase {
         XCTAssertTrue(json.contains("\"apply_work_tree_per_sec\""))
         XCTAssertTrue(json.contains("\"incremental_task_updates_per_sec\""))
         XCTAssertTrue(json.contains("\"engine_events_main_actor_per_sec\""))
+        XCTAssertTrue(json.contains("\"card_snapshot_builds_per_sec\""))
         XCTAssertTrue(json.contains("\"card_body_evaluations_per_sec\""))
         XCTAssertTrue(json.contains("\"apply_work_tree\""))
 
@@ -199,6 +207,7 @@ final class UIUpdateCountersTests: XCTestCase {
                 c.recordApplyWorkTree()
                 c.recordIncrementalTaskUpdate()
                 c.recordEngineEventMainActor()
+                c.recordCardSnapshotBuild()
                 c.recordCardBodyEvaluation()
                 group.leave()
             }
@@ -208,6 +217,7 @@ final class UIUpdateCountersTests: XCTestCase {
         XCTAssertEqual(counts.applyWorkTree, UInt64(n))
         XCTAssertEqual(counts.incrementalTaskUpdates, UInt64(n))
         XCTAssertEqual(counts.engineEventsMainActor, UInt64(n))
+        XCTAssertEqual(counts.cardSnapshotBuilds, UInt64(n))
         XCTAssertEqual(counts.cardBodyEvaluations, UInt64(n))
     }
 }

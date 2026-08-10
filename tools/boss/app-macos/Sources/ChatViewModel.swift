@@ -205,10 +205,19 @@ final class ChatViewModel: ObservableObject {
     /// leaves the badge. Views observe this to apply a transient
     /// amber border on every frontier card.
     @Published var depFrontierHighlightIDs: Set<String> = []
-    /// Set of revision task IDs to highlight when the pointer is over an
-    /// "In revision" badge. Computed by `setRevisionBadgeHover`; cleared
-    /// on pointer exit. Uses the same green-border overlay as dep frontier.
-    @Published var revisionHighlightIDs: Set<String> = []
+    /// Revision-hover state lives outside this broad `ObservableObject`.
+    /// Each mounted card observes one keyed cell from the store, so hovering
+    /// an "In revision" badge does not invalidate every board section.
+    let revisionHighlightStore = WorkBoardRevisionHighlightStore()
+    /// Last parent id delivered to `setRevisionBadgeHover`. A repeated enter
+    /// for the same parent is a no-op string compare before any revision scan.
+    var lastRevisionHoverParentID: String?
+
+    /// Read-only aggregate used by tests; views observe keyed cells and must
+    /// not read this. Intentionally not `@Published`.
+    var revisionHighlightIDs: Set<String> {
+        revisionHighlightStore.highlightedIDs
+    }
     /// Task id that scroll views should bring into the visible area.
     /// Set by `revealWorkCard`; cleared after a short delay once the
     /// scroll has been triggered. Views observe this via `.onChange`
@@ -2282,12 +2291,11 @@ final class ChatViewModel: ObservableObject {
     /// means "invalidated — rebuild on next read". Before this cache
     /// existed, both accessors re-scanned every project's tasks and every
     /// product's revisions on EVERY call, and the kanban calls both once
-    /// per visible card on every render. Hover-highlight state
-    /// (`revisionHighlightIDs` et al) lives on this `@Published` view model,
-    /// so a single badge hover during a scroll re-renders the whole board
-    /// and re-ran that O(total tasks) scan per card — a measured
-    /// main-thread hot leaf during hover-while-scroll jank. Rebuilt lazily,
-    /// same pattern as `cachedGatingPrereqs`.
+    /// per visible card on every render. Any broad `@Published` change on
+    /// this view model re-renders the whole board, so without this cache
+    /// each such change re-runs an O(total tasks) scan once per card — a
+    /// measured main-thread hot leaf during hover-while-scroll jank.
+    /// Rebuilt lazily, same pattern as `cachedGatingPrereqs`.
     var cachedInReviewRevisionsByParentID: [String: [WorkTask]]?
     var cachedDoneRevisionsByParentID: [String: [WorkTask]]?
     /// Backing storage for `workBoardRepoMode` (ChatViewModel+BoardHelpers).

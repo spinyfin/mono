@@ -202,14 +202,22 @@ extension ChatViewModel {
     /// them with the same green-border overlay used by the dep frontier. On
     /// leave (`nil`), clears.
     ///
-    /// Equality-gated for the same reason as `setDepBadgeHover` above —
-    /// this runs on the hover hit-test path, and a redundant
-    /// `objectWillChange` here re-lays-out the whole column.
+    /// Routed through per-task observable cells rather than an `@Published`
+    /// property on `ChatViewModel`. A genuine transition therefore updates
+    /// only the revision cards whose chrome changes. Repeated enter events
+    /// for the same parent short-circuit on `lastRevisionHoverParentID`
+    /// before scanning revisions; the store still equality-gates the set.
     func setRevisionBadgeHover(_ taskID: String?) {
+        guard taskID != lastRevisionHoverParentID else { return }
+        lastRevisionHoverParentID = taskID
         let next: Set<String> = taskID
             .map { Set(activeRevisions(forParentID: $0).map(\.id)) } ?? []
-        guard next != revisionHighlightIDs else { return }
-        revisionHighlightIDs = next
+        revisionHighlightStore.setHighlightedIDs(next)
+    }
+
+    /// Stable keyed state observed by one mounted work-board card.
+    func revisionHighlightState(for taskID: String) -> WorkBoardRevisionHighlightState {
+        revisionHighlightStore.state(for: taskID)
     }
 
     /// The revision task the "In revision" badge should reveal when tapped:

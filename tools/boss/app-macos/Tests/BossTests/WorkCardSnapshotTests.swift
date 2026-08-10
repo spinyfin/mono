@@ -1200,6 +1200,21 @@ final class WorkCardSnapshotTests: XCTestCase {
         XCTAssertNotEqual(a, b)
     }
 
+    /// Keyed revision-hover state is outside the snapshot but still changes
+    /// card chrome, so it must participate in the leaf view's equality.
+    func testCardViewEquatableTracksRevisionHighlight() {
+        let snapshot = WorkCardSnapshot.build(
+            task: Self.makeTask(name: "Revision"),
+            context: WorkCardSnapshotContext(column: .doing)
+        )
+        let idle = WorkBoardCardView(snapshot: snapshot)
+        let highlighted = WorkBoardCardView(
+            snapshot: snapshot,
+            isRevisionHighlighted: true
+        )
+        XCTAssertNotEqual(idle, highlighted)
+    }
+
     /// Board-style flip must surface on the view so already-mounted
     /// cards re-style instead of keeping previous chrome under
     /// `.equatable()`.

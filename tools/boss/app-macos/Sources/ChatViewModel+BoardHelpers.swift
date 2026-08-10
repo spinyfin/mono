@@ -436,6 +436,7 @@ extension ChatViewModel {
         liveState: WorkerLiveState?,
         now: Date = Date()
     ) -> WorkCardSnapshot {
+        UIUpdateCounters.shared.recordCardSnapshotBuild()
         let runtime = column == .doing ? taskRuntime(for: task.id) : nil
         let liveStatus = WorkCardLiveStatus.resolve(
             task: task,

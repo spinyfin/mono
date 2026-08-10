@@ -1,4 +1,6 @@
+import AppKit
 import Combine
+import SwiftUI
 import XCTest
 @testable import Boss
 
@@ -440,31 +442,208 @@ final class WorkDependencyKanbanTests: XCTestCase {
         XCTAssertEqual(publishes, 2, "a genuine exit still publishes so the highlight clears")
     }
 
-    /// Same gate on the "In revision" badge, which shares the highlight
-    /// overlay and the same hit-test path.
-    func testRevisionBadgeHoverPublishesOnlyOnChange() {
+    /// Revision hover bypasses the broad model publisher and updates only the
+    /// keyed state for the revision card whose chrome changes.
+    func testRevisionBadgeHoverPublishesOnlyAffectedCardState() {
         let model = makeFixture()
         guard let phase2 = model.taskByName("Phase 2") else {
             XCTFail("expected fixture tasks"); return
         }
         model.addActiveRevisionForTest(parentID: phase2.id)
+        let revisionID = "task_rev_of_\(phase2.id)"
+        let revisionState = model.revisionHighlightState(for: revisionID)
+        let unrelatedState = model.revisionHighlightState(for: phase2.id)
 
-        var publishes = 0
-        let token = model.objectWillChange.sink { _ in publishes += 1 }
-        defer { token.cancel() }
+        var modelPublishes = 0
+        var revisionPublishes = 0
+        var unrelatedPublishes = 0
+        let modelToken = model.objectWillChange.sink { _ in modelPublishes += 1 }
+        let revisionToken = revisionState.objectWillChange.sink { _ in revisionPublishes += 1 }
+        let unrelatedToken = unrelatedState.objectWillChange.sink { _ in unrelatedPublishes += 1 }
+        defer {
+            modelToken.cancel()
+            revisionToken.cancel()
+            unrelatedToken.cancel()
+        }
 
         model.setRevisionBadgeHover(nil)
-        XCTAssertEqual(publishes, 0, "clearing an already-empty highlight set must not publish")
+        XCTAssertEqual(modelPublishes, 0)
+        XCTAssertEqual(revisionPublishes, 0)
 
         model.setRevisionBadgeHover(phase2.id)
         XCTAssertEqual(model.revisionHighlightIDs.count, 1, "the revision must actually highlight")
-        XCTAssertEqual(publishes, 1, "the first enter changes the set and must publish")
+        XCTAssertTrue(revisionState.isHighlighted)
+        XCTAssertEqual(modelPublishes, 0, "revision hover must bypass broad model publication")
+        XCTAssertEqual(revisionPublishes, 1, "the affected revision card must publish once")
+        XCTAssertEqual(unrelatedPublishes, 0, "unaffected cards must not publish")
 
         model.setRevisionBadgeHover(phase2.id)
-        XCTAssertEqual(publishes, 1, "re-entering the same badge must not re-publish")
+        XCTAssertEqual(revisionPublishes, 1, "re-entering the same badge must not re-publish")
 
         model.setRevisionBadgeHover(nil)
-        XCTAssertEqual(publishes, 2, "a genuine exit still publishes so the highlight clears")
+        XCTAssertFalse(revisionState.isHighlighted)
+        XCTAssertEqual(modelPublishes, 0)
+        XCTAssertEqual(revisionPublishes, 2, "a genuine exit must clear the affected card")
+        XCTAssertEqual(unrelatedPublishes, 0)
+    }
+
+    /// A state cell first requested after hover entry must reflect the active
+    /// set, which covers an off-screen lazy card becoming mounted mid-hover.
+    func testRevisionHighlightStateCreatedDuringHoverStartsHighlighted() {
+        let model = makeFixture()
+        guard let phase2 = model.taskByName("Phase 2") else {
+            XCTFail("expected fixture tasks"); return
+        }
+        model.addActiveRevisionForTest(parentID: phase2.id)
+        model.setRevisionBadgeHover(phase2.id)
+
+        let state = model.revisionHighlightState(for: "task_rev_of_\(phase2.id)")
+
+        XCTAssertTrue(state.isHighlighted)
+    }
+
+    /// When the only strong holder of a cell goes away, the registry's weak
+    /// entry zeroes and a subsequent `state(for:)` allocates a fresh cell.
+    /// Identity is checked via a weak ref (not `ObjectIdentifier`) because
+    /// malloc often reuses the freed address for the immediate reallocation.
+    func testRevisionHighlightStoreDropsReleasedCells() {
+        let store = WorkBoardRevisionHighlightStore()
+        weak var weakState: WorkBoardRevisionHighlightState?
+        Self.withAllocatedHighlightState(store, taskID: "a") { held in
+            weakState = held
+            XCTAssertTrue(store.state(for: "a") === held)
+            XCTAssertEqual(store.liveRegisteredStateCount, 1)
+        }
+        XCTAssertNil(
+            weakState,
+            "cell must deallocate when its only strong holder is gone"
+        )
+        XCTAssertEqual(
+            store.liveRegisteredStateCount,
+            0,
+            "released cells must not remain reachable via the registry"
+        )
+        let second = store.state(for: "a")
+        XCTAssertEqual(second.taskID, "a")
+        // A zeroed weak ref proves this is a new allocation, even if the
+        // heap reuses the previous address (where `===` would mislead).
+        XCTAssertNil(weakState, "new state(for:) must not resurrect the old cell")
+        XCTAssertEqual(store.liveRegisteredStateCount, 1)
+    }
+
+    @inline(never)
+    private static func withAllocatedHighlightState(
+        _ store: WorkBoardRevisionHighlightStore,
+        taskID: String,
+        body: (WorkBoardRevisionHighlightState) -> Void
+    ) {
+        let held = store.state(for: taskID)
+        body(held)
+    }
+
+    /// The 256-entry prune must strip zeroed weak entries and leave live cells
+    /// reachable by identity.
+    func testRevisionHighlightStorePruneKeepsLiveCells() {
+        let store = WorkBoardRevisionHighlightStore()
+        let live = store.state(for: "live")
+        for index in 0..<300 {
+            _ = store.state(for: "temp_\(index)")
+        }
+        XCTAssertTrue(
+            store.state(for: "live") === live,
+            "a cell still held strongly must survive the prune sweep"
+        )
+        // Temps were short-lived: after the sweep only the held cell remains.
+        XCTAssertEqual(store.liveRegisteredStateCount, 1)
+    }
+
+    /// A genuine revision-badge transition must not rebuild snapshots for
+    /// every card in the section. This hosts the real section view and drives
+    /// the same model entry point as the badge's `onHover` callback. Also
+    /// delivers a burst of repeated enter/exit pairs so a high-frequency
+    /// no-op stream cannot quietly reintroduce column-wide rebuilds.
+    func testRevisionBadgeHoverDoesNotRebuildColumnSnapshots() {
+        let model = makeFixture()
+        guard let phase2 = model.taskByName("Phase 2") else {
+            XCTFail("expected fixture tasks"); return
+        }
+        model.addActiveRevisionForTest(parentID: phase2.id)
+        for index in 0..<20 {
+            model.upsertTaskForTest(
+                id: "task_filler_\(index)",
+                name: "Filler \(index)",
+                status: "active",
+                lastStatusActor: "human"
+            )
+        }
+        let items = model.tasksByProjectID.values.flatMap { $0 }
+        let frame = NSRect(x: 0, y: 0, width: 420, height: CGFloat(items.count * 180))
+        let hosting = NSHostingView(
+            rootView: WorkBoardSectionItemsView(
+                items: items,
+                column: .doing,
+                boardStyle: .classic,
+                model: model,
+                liveStates: model.liveWorkerStates
+            )
+        )
+        hosting.frame = frame
+        let window = NSWindow(
+            contentRect: frame,
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hosting
+        hosting.layoutSubtreeIfNeeded()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+
+        let before = UIUpdateCounters.shared.currentCounts()
+        model.setRevisionBadgeHover(phase2.id)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        hosting.layoutSubtreeIfNeeded()
+        let afterFirst = UIUpdateCounters.shared.currentCounts()
+
+        // Burst of repeated enter/exit pairs after the genuine transition.
+        for _ in 0..<20 {
+            model.setRevisionBadgeHover(phase2.id)
+            model.setRevisionBadgeHover(nil)
+            model.setRevisionBadgeHover(phase2.id)
+        }
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        hosting.layoutSubtreeIfNeeded()
+        let afterBurst = UIUpdateCounters.shared.currentCounts()
+        window.orderOut(nil)
+
+        XCTAssertGreaterThanOrEqual(
+            afterFirst.cardSnapshotBuilds,
+            before.cardSnapshotBuilds,
+            "counter snapshot must not go backwards (flush would trap on UInt64 delta)"
+        )
+        XCTAssertGreaterThanOrEqual(
+            afterFirst.cardBodyEvaluations,
+            before.cardBodyEvaluations
+        )
+        XCTAssertGreaterThanOrEqual(
+            afterBurst.cardSnapshotBuilds,
+            afterFirst.cardSnapshotBuilds
+        )
+        let builtForHover = Int(afterFirst.cardSnapshotBuilds - before.cardSnapshotBuilds)
+        let bodiesForHover = Int(afterFirst.cardBodyEvaluations - before.cardBodyEvaluations)
+        let builtForBurst = Int(afterBurst.cardSnapshotBuilds - afterFirst.cardSnapshotBuilds)
+
+        XCTAssertEqual(builtForHover, 0, "hover state must bypass section-wide snapshot rebuilding")
+        XCTAssertGreaterThanOrEqual(bodiesForHover, 1, "the hover update must land on at least one card body")
+        XCTAssertLessThan(
+            bodiesForHover,
+            items.count,
+            "a column-wide body re-evaluation would reintroduce scroll jank"
+        )
+        XCTAssertEqual(
+            builtForBurst,
+            0,
+            "repeated enter/exit after the parent-id gate must not rebuild snapshots"
+        )
     }
 
     // MARK: - Fixture

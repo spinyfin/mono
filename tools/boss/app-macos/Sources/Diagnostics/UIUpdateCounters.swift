@@ -17,12 +17,14 @@ struct UIUpdateCounterSample: Codable, Sendable, Equatable {
     let applyWorkTreePerSec: Double
     let incrementalTaskUpdatesPerSec: Double
     let engineEventsMainActorPerSec: Double
+    let cardSnapshotBuildsPerSec: Double
     let cardBodyEvaluationsPerSec: Double
 
     /// Raw counts over the interval (absolute fan-out, not rate).
     let applyWorkTree: UInt64
     let incrementalTaskUpdates: UInt64
     let engineEventsMainActor: UInt64
+    let cardSnapshotBuilds: UInt64
     let cardBodyEvaluations: UInt64
 
     enum CodingKeys: String, CodingKey {
@@ -31,22 +33,22 @@ struct UIUpdateCounterSample: Codable, Sendable, Equatable {
         case applyWorkTreePerSec = "apply_work_tree_per_sec"
         case incrementalTaskUpdatesPerSec = "incremental_task_updates_per_sec"
         case engineEventsMainActorPerSec = "engine_events_main_actor_per_sec"
+        case cardSnapshotBuildsPerSec = "card_snapshot_builds_per_sec"
         case cardBodyEvaluationsPerSec = "card_body_evaluations_per_sec"
         case applyWorkTree = "apply_work_tree"
         case incrementalTaskUpdates = "incremental_task_updates"
         case engineEventsMainActor = "engine_events_main_actor"
+        case cardSnapshotBuilds = "card_snapshot_builds"
         case cardBodyEvaluations = "card_body_evaluations"
     }
 }
 
 /// Atomic UI-update counters flushed on a 1 Hz timer.
 ///
-/// Hot path is a single unfair-lock increment per call site — free when
-/// nothing is instrumented yet (this task lands the primitive only; a
-/// sibling wires the call sites). The 1 Hz flush exchanges counters and
-/// emits a sample **only when something incremented**, so idle ticks
-/// pay a four-field zero check and nothing else (no signpost, no ring
-/// append).
+/// Hot path is a single unfair-lock increment per call site. The 1 Hz
+/// flush exchanges counters and emits a sample **only when something
+/// incremented**, so idle ticks pay a five-field zero check and nothing
+/// else (no signpost, no ring append).
 ///
 /// Lives on the existing [[PopulationTimingLog]] / `os_signpost` rails:
 /// samples ride the `com.boss.app` / `population` signposter under
@@ -56,6 +58,7 @@ struct UIUpdateCounterSample: Codable, Sendable, Equatable {
 ///   * `applyWorkTree` — full work-tree applies
 ///   * `incrementalTaskUpdates` — single-task / incremental board updates
 ///   * `engineEventsMainActor` — engine events delivered to the main actor
+///   * `cardSnapshotBuilds` — `workCardSnapshot` calls from board sections
 ///   * `cardBodyEvaluations` — `WorkBoardCardView.body` evaluations
 final class UIUpdateCounters: @unchecked Sendable {
     static let shared = UIUpdateCounters()
@@ -65,17 +68,19 @@ final class UIUpdateCounters: @unchecked Sendable {
         var capacity: Int = 128
     }
 
-    /// Snapshot of the four counters. Public for pure flush tests.
+    /// Snapshot of the five counters. Public for pure flush tests.
     struct Counts: Equatable, Sendable {
         var applyWorkTree: UInt64 = 0
         var incrementalTaskUpdates: UInt64 = 0
         var engineEventsMainActor: UInt64 = 0
+        var cardSnapshotBuilds: UInt64 = 0
         var cardBodyEvaluations: UInt64 = 0
 
         var isEmpty: Bool {
             applyWorkTree == 0
                 && incrementalTaskUpdates == 0
                 && engineEventsMainActor == 0
+                && cardSnapshotBuilds == 0
                 && cardBodyEvaluations == 0
         }
     }
@@ -126,6 +131,11 @@ final class UIUpdateCounters: @unchecked Sendable {
         counts.withLock { $0.engineEventsMainActor &+= 1 }
     }
 
+    /// Count one per-card snapshot construction in a board section.
+    func recordCardSnapshotBuild() {
+        counts.withLock { $0.cardSnapshotBuilds &+= 1 }
+    }
+
     /// Count one card-body evaluation (`WorkBoardCardView.body`).
     func recordCardBodyEvaluation() {
         counts.withLock { $0.cardBodyEvaluations &+= 1 }
@@ -159,12 +169,16 @@ final class UIUpdateCounters: @unchecked Sendable {
             engineEventsMainActorPerSec: TerminalLoopRate.perSecond(
                 delta: snapped.engineEventsMainActor, elapsedNanos: elapsedNanos
             ),
+            cardSnapshotBuildsPerSec: TerminalLoopRate.perSecond(
+                delta: snapped.cardSnapshotBuilds, elapsedNanos: elapsedNanos
+            ),
             cardBodyEvaluationsPerSec: TerminalLoopRate.perSecond(
                 delta: snapped.cardBodyEvaluations, elapsedNanos: elapsedNanos
             ),
             applyWorkTree: snapped.applyWorkTree,
             incrementalTaskUpdates: snapped.incrementalTaskUpdates,
             engineEventsMainActor: snapped.engineEventsMainActor,
+            cardSnapshotBuilds: snapped.cardSnapshotBuilds,
             cardBodyEvaluations: snapped.cardBodyEvaluations
         )
     }
@@ -263,7 +277,7 @@ final class UIUpdateCounters: @unchecked Sendable {
 
         PopulationSignpost.signposter.emitEvent(
             PopulationSignpost.Name.uiUpdateRates,
-            "apply=\(sample.applyWorkTreePerSec) incr=\(sample.incrementalTaskUpdatesPerSec) eng=\(sample.engineEventsMainActorPerSec) card=\(sample.cardBodyEvaluationsPerSec)"
+            "apply=\(sample.applyWorkTreePerSec) incr=\(sample.incrementalTaskUpdatesPerSec) eng=\(sample.engineEventsMainActorPerSec) snap=\(sample.cardSnapshotBuildsPerSec) card=\(sample.cardBodyEvaluationsPerSec)"
         )
     }
 }
