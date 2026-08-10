@@ -46,20 +46,16 @@ impl WorkerCompletionHandler {
 
         // A URL observed through `gh pr view|list|edit` is useful binding
         // evidence, but it is not evidence that this execution published or
-        // pushed work. Do not let that observation enter the staged recheck
-        // finalization path; the worker's own Stop boundary may still use the
-        // bound URL after it finishes.
-        if self
+        // pushed work. Scope that restriction to the *staged-URL finalization
+        // arm only* — an unarmed entry must not disable the SHA-delta gate or
+        // the cold-path branch detector, which are the recovery paths when a
+        // revision pushed via `jj git push` (no URL re-arm) or when an engine
+        // restart lost the in-memory cache after a missed `gh pr create`.
+        // Absence of a staged entry, or an armed one, still takes the arm.
+        let staged_armed = self
             .staged_pr_urls
             .get_entry(execution_id)
-            .is_some_and(|entry| !entry.finalization_armed)
-        {
-            tracing::debug!(
-                execution_id,
-                "pr-recheck: bound PR URL lacks publish/push evidence; skipping finalization",
-            );
-            return StopOutcome::RunningNoStagedPr;
-        }
+            .is_none_or(|entry| entry.finalization_armed);
 
         // Then: if the PostToolUse dispatcher already
         // captured this execution's PR URL from the worker's hook
@@ -69,9 +65,10 @@ impl WorkerCompletionHandler {
         // mismatch means the URL was captured from an unrelated Bash
         // invocation (e.g. reading a chore description that referenced
         // an old PR number) and must be discarded.
-        if let Some(staged_url) = self
-            .verified_staged_pr_url(execution_id, &execution, "pr-recheck")
-            .await
+        if staged_armed
+            && let Some(staged_url) = self
+                .verified_staged_pr_url(execution_id, &execution, "pr-recheck")
+                .await
         {
             // A staged URL is evidence the worker *has* a PR, not that it
             // is *done*. Finalizing here reaps a live mid-turn worker
@@ -108,6 +105,13 @@ impl WorkerCompletionHandler {
                     "pr_recheck_staged",
                 )
                 .await;
+        }
+        if !staged_armed {
+            tracing::debug!(
+                execution_id,
+                "pr-recheck: bound PR URL lacks publish/push evidence; \
+                 skipping staged finalization and falling through to recovery paths",
+            );
         }
 
         // Turn-loop gate mirror (AI #6): the merge-poller's recheck sweep

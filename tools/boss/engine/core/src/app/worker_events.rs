@@ -743,15 +743,30 @@ pub(super) async fn dispatch_live_worker_state(
                     if valid {
                         let finalization_armed =
                             crate::pr_url_capture::is_pr_url_finalization_command_str(&feed.command);
-                        server_state
-                            .staged_pr_urls
-                            .record_command_observation(run_id, &pr_url, finalization_armed);
-                        tracing::info!(
-                            execution_id = run_id,
-                            pr_url = %pr_url,
-                            finalization_armed,
-                            "pr_url_capture: bound PR URL from worker progress stream",
-                        );
+                        let outcome =
+                            server_state
+                                .staged_pr_urls
+                                .record_command_observation(run_id, &pr_url, finalization_armed);
+                        match outcome {
+                            crate::pr_url_capture::RecordCommandObservationOutcome::Bound
+                            | crate::pr_url_capture::RecordCommandObservationOutcome::Armed => {
+                                tracing::info!(
+                                    execution_id = run_id,
+                                    pr_url = %pr_url,
+                                    finalization_armed,
+                                    ?outcome,
+                                    "pr_url_capture: bound PR URL from worker progress stream",
+                                );
+                            }
+                            crate::pr_url_capture::RecordCommandObservationOutcome::Unchanged => {
+                                tracing::debug!(
+                                    execution_id = run_id,
+                                    pr_url = %pr_url,
+                                    finalization_armed,
+                                    "pr_url_capture: re-observation left staged PR URL unchanged",
+                                );
+                            }
+                        }
                     }
                 } // else (is_pr_url_binding_command)
 

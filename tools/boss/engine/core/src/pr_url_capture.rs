@@ -31,11 +31,11 @@
 //!   read-only and metadata commands from authorizing a recheck teardown.
 //! - [`StagedPrUrlCache`] — a thread-safe `HashMap<execution_id,
 //!   StagedPrUrlEntry>` that callers populate from progress events and the
-//!   `on_stop` handler reads on Stop. First-writer-wins semantics
-//!   so a worker that re-runs `gh pr edit` after `gh pr create`
-//!   can't overwrite the legitimate first URL. Each entry also
-//!   stamps `staged_at` so the merge-poller recheck can bound
-//!   mid-turn deferral.
+//!   `on_stop` handler reads on Stop. First-writer-wins among observations
+//!   of equal strength (armed vs armed, unarmed vs unarmed). A later publish
+//!   command may replace a binding-only URL and arm finalization. Each entry
+//!   also stamps `staged_at` so the merge-poller recheck can bound mid-turn
+//!   deferral.
 //!
 //! The reconciliation path (`completion::detect_pr` →
 //! `jj_candidate_commit_shas` → GitHub commits/{sha}/pulls) is
@@ -343,17 +343,33 @@ pub fn is_pr_url_binding_command(tool_input: &serde_json::Value) -> bool {
 ///
 /// This is deliberately narrower than [`is_pr_url_binding_command_str`].
 /// `gh pr view`, `gh pr list`, and `gh pr edit` may all report a useful URL,
-/// but none demonstrates that this execution pushed work. `gh pr create` and
-/// the `cube pr` publishing wrappers do demonstrate that.
+/// but none demonstrates that this execution pushed work.
+///
+/// Built on [`is_revision_push_command_str`] so the two "did this publish?"
+/// predicates cannot drift: `cube pr update` / `cube pr ensure` / `jj git
+/// push` arm finalization for the same reasons they populate the revision
+/// push cache. `jj git push` is included even though it rarely prints a PR
+/// URL — when a URL *is* present in the same observation (wrapper scripts,
+/// echoed links), the push itself is publish evidence and must arm. Create-
+/// shaped commands (`gh pr create`, `cube pr create`) are added on top
+/// because they publish a new PR without going through the revision-push
+/// path.
 pub fn is_pr_url_finalization_command_str(command: &str) -> bool {
-    if command.contains("cube pr create") || command.contains("cube pr update") || command.contains("cube pr ensure") {
+    if is_revision_push_command_str(command) {
+        return true;
+    }
+    // `cube pr create` is publish evidence but is not a revision push
+    // (revisions push to an existing parent PR via update/ensure / jj).
+    if command.contains("cube pr create") {
         return true;
     }
     let command = peel_shell_c_payload(command).unwrap_or(command);
     matches!(classify(command), Some(inv) if inv.noun == GhNoun::Pr && inv.subcommand == "create")
 }
 
-/// Claude-shaped wrapper for [`is_pr_url_finalization_command_str`].
+/// Claude-shaped wrapper for [`is_pr_url_finalization_command_str`]. Prefer
+/// the string form when the command already came from a
+/// [`boss_engine_driver::PrUrlCaptureFeed`].
 pub fn is_pr_url_finalization_command(tool_input: &serde_json::Value) -> bool {
     let Some(command) = tool_input.get("command").and_then(|v| v.as_str()) else {
         return false;
@@ -371,6 +387,21 @@ pub enum StagePrUrlOutcome {
     AlreadyStaged,
 }
 
+/// Outcome of [`StagedPrUrlCache::record_command_observation`].
+///
+/// Callers use this to log at `info` only when the cache actually changed
+/// (new bind or newly armed) and at `debug` for no-op re-observations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordCommandObservationOutcome {
+    /// No entry existed; a new one was created (bound, maybe armed).
+    Bound,
+    /// An existing unarmed entry was promoted to armed (URL may have been
+    /// replaced by the publish observation).
+    Armed,
+    /// Equal-strength re-observation; the entry was left unchanged.
+    Unchanged,
+}
+
 /// One staged PR URL plus the wall-clock instant it was first recorded.
 /// The merge-poller recheck path uses [`StagedPrUrlEntry::staged_at`] to
 /// bound mid-turn deferral: a staged URL is evidence the worker *has* a
@@ -383,7 +414,7 @@ pub struct StagedPrUrlEntry {
     pub staged_at: Instant,
     /// Whether the command that bound this URL also demonstrated that the
     /// worker published or pushed it. Binding alone is not permission for the
-    /// merge-poller recheck to finalize and reap a live execution.
+    /// merge-poller recheck or Stop staged arm to finalize and reap.
     pub finalization_armed: bool,
 }
 
@@ -392,9 +423,10 @@ pub struct StagedPrUrlEntry {
 /// URL; consumed by `WorkerCompletionHandler::on_stop` on the
 /// matching Stop hook.
 ///
-/// First-writer-wins for the URL itself. A later publish command may promote
-/// a binding-only observation to finalizable, but it cannot replace the
-/// original bound URL.
+/// First-writer-wins among observations of equal strength. A later publish
+/// command (`finalization_armed = true`) outranks a binding-only entry: it
+/// overwrites the URL, refreshes `staged_at`, and arms finalization. Equal-
+/// strength armed observations keep the first URL.
 #[derive(Debug, Default)]
 pub struct StagedPrUrlCache {
     inner: Mutex<HashMap<String, StagedPrUrlEntry>>,
@@ -446,17 +478,35 @@ impl StagedPrUrlCache {
             .cloned()
     }
 
-    /// Bind a URL observed in command output, optionally granting recheck
+    /// Bind a URL observed in command output, optionally granting
     /// finalization permission when that command published or pushed work.
     ///
-    /// URLs remain first-writer-wins. A later publishing command can upgrade
-    /// a binding-only entry to finalizable, but a read-only/metadata command
-    /// can never downgrade an already-published observation.
-    pub fn record_command_observation(&self, execution_id: &str, pr_url: &str, finalization_armed: bool) {
+    /// Equal-strength observations are first-writer-wins on the URL. A later
+    /// publishing command (`finalization_armed = true`) outranks a binding-
+    /// only entry: it overwrites `pr_url`, refreshes `staged_at`, and sets
+    /// the armed flag. A read-only/metadata command can never downgrade an
+    /// already-published observation.
+    pub fn record_command_observation(
+        &self,
+        execution_id: &str,
+        pr_url: &str,
+        finalization_armed: bool,
+    ) -> RecordCommandObservationOutcome {
         let mut guard = self.inner.lock().expect("StagedPrUrlCache mutex poisoned");
         match guard.get_mut(execution_id) {
-            Some(entry) if finalization_armed => entry.finalization_armed = true,
-            Some(_) => {}
+            Some(entry) if finalization_armed && !entry.finalization_armed => {
+                // Publish evidence outranks inspection: replace the bound URL.
+                entry.pr_url = pr_url.to_owned();
+                entry.staged_at = Instant::now();
+                entry.finalization_armed = true;
+                RecordCommandObservationOutcome::Armed
+            }
+            Some(entry) if finalization_armed => {
+                // Already armed: keep first URL, no-op.
+                let _ = entry;
+                RecordCommandObservationOutcome::Unchanged
+            }
+            Some(_) => RecordCommandObservationOutcome::Unchanged,
             None => {
                 guard.insert(
                     execution_id.to_owned(),
@@ -466,6 +516,7 @@ impl StagedPrUrlCache {
                         finalization_armed,
                     },
                 );
+                RecordCommandObservationOutcome::Bound
             }
         }
     }
@@ -892,21 +943,145 @@ mod tests {
             "cube pr create --branch boss/exec_x",
             "cube pr update --branch boss/exec_x",
             "cube pr ensure --branch boss/exec_x",
+            "jj git push --bookmark boss/exec_x",
         ] {
-            assert!(is_pr_url_binding_command_str(command), "{command} must bind its URL");
             assert!(
                 is_pr_url_finalization_command_str(command),
                 "{command} must arm finalization"
             );
         }
+        // Create/update/ensure also bind; bare jj git push is publish evidence
+        // for arming but is not a URL-binding command on its own.
+        for command in [
+            "gh pr create --title t",
+            "cube pr create --branch boss/exec_x",
+            "cube pr update --branch boss/exec_x",
+            "cube pr ensure --branch boss/exec_x",
+        ] {
+            assert!(is_pr_url_binding_command_str(command), "{command} must bind its URL");
+        }
+        assert!(!is_pr_url_binding_command_str("jj git push --bookmark boss/exec_x"));
     }
 
     #[test]
     fn a_later_publishing_command_arms_an_existing_binding() {
         let cache = StagedPrUrlCache::new();
-        cache.record_command_observation("exec_abc", "https://github.com/spinyfin/mono/pull/458", false);
-        cache.record_command_observation("exec_abc", "https://github.com/spinyfin/mono/pull/458", true);
+        assert_eq!(
+            cache.record_command_observation("exec_abc", "https://github.com/spinyfin/mono/pull/458", false),
+            RecordCommandObservationOutcome::Bound,
+        );
+        assert_eq!(
+            cache.record_command_observation("exec_abc", "https://github.com/spinyfin/mono/pull/458", true),
+            RecordCommandObservationOutcome::Armed,
+        );
         assert!(cache.get_entry("exec_abc").expect("bound URL").finalization_armed);
+    }
+
+    #[test]
+    fn publish_observation_replaces_a_binding_only_url() {
+        // `gh pr view` of a related PR latches pull/100 unarmed; a later
+        // `cube pr create` that prints pull/200 must overwrite, not merely
+        // arm the wrong URL.
+        let cache = StagedPrUrlCache::new();
+        cache.record_command_observation("exec_abc", "https://github.com/spinyfin/mono/pull/100", false);
+        assert_eq!(
+            cache.record_command_observation("exec_abc", "https://github.com/spinyfin/mono/pull/200", true),
+            RecordCommandObservationOutcome::Armed,
+        );
+        let entry = cache.get_entry("exec_abc").expect("bound URL");
+        assert_eq!(entry.pr_url, "https://github.com/spinyfin/mono/pull/200");
+        assert!(entry.finalization_armed);
+    }
+
+    #[test]
+    fn equal_strength_observations_keep_first_url() {
+        let cache = StagedPrUrlCache::new();
+        cache.record_command_observation("exec_abc", "https://github.com/spinyfin/mono/pull/100", true);
+        assert_eq!(
+            cache.record_command_observation("exec_abc", "https://github.com/spinyfin/mono/pull/200", true),
+            RecordCommandObservationOutcome::Unchanged,
+        );
+        assert_eq!(
+            cache.get("exec_abc").as_deref(),
+            Some("https://github.com/spinyfin/mono/pull/100"),
+        );
+        cache.record_command_observation("exec_b", "https://github.com/spinyfin/mono/pull/1", false);
+        assert_eq!(
+            cache.record_command_observation("exec_b", "https://github.com/spinyfin/mono/pull/2", false),
+            RecordCommandObservationOutcome::Unchanged,
+        );
+        assert_eq!(
+            cache.get("exec_b").as_deref(),
+            Some("https://github.com/spinyfin/mono/pull/1"),
+        );
+    }
+
+    #[test]
+    fn capture_path_gh_pr_view_binds_without_arming() {
+        // Dispatcher wiring: feed → extract → both gates → record.
+        let feed = crate::driver::default_pr_url_capture_feed(
+            "Bash",
+            &json!({ "command": "gh pr view 100" }),
+            &json!({
+                "stdout": "https://github.com/spinyfin/mono/pull/100\n",
+                "stderr": "",
+            }),
+        )
+        .expect("view feed");
+        let url = extract_pr_url_from_text(&feed.output_text).expect("url");
+        assert!(is_pr_url_binding_command_str(&feed.command));
+        assert!(!is_pr_url_finalization_command_str(&feed.command));
+        let cache = StagedPrUrlCache::new();
+        let outcome =
+            cache.record_command_observation("exec_abc", &url, is_pr_url_finalization_command_str(&feed.command));
+        assert_eq!(outcome, RecordCommandObservationOutcome::Bound);
+        let entry = cache.get_entry("exec_abc").expect("bound");
+        assert_eq!(entry.pr_url, "https://github.com/spinyfin/mono/pull/100");
+        assert!(!entry.finalization_armed);
+    }
+
+    #[test]
+    fn capture_path_gh_pr_edit_binds_without_arming() {
+        let feed = crate::driver::default_pr_url_capture_feed(
+            "Bash",
+            &json!({ "command": "gh pr edit 100 --add-label bug" }),
+            &json!({
+                "stdout": "https://github.com/spinyfin/mono/pull/100\n",
+                "stderr": "",
+            }),
+        )
+        .expect("edit feed");
+        let url = extract_pr_url_from_text(&feed.output_text).expect("url");
+        assert!(is_pr_url_binding_command_str(&feed.command));
+        assert!(!is_pr_url_finalization_command_str(&feed.command));
+        let cache = StagedPrUrlCache::new();
+        cache.record_command_observation("exec_abc", &url, is_pr_url_finalization_command_str(&feed.command));
+        assert!(!cache.get_entry("exec_abc").expect("bound").finalization_armed);
+    }
+
+    #[test]
+    fn capture_path_cube_pr_create_binds_and_arms() {
+        let feed = crate::driver::default_pr_url_capture_feed(
+            "Bash",
+            &json!({ "command": "cube pr create --branch boss/exec_x --title t" }),
+            &json!({
+                "stdout": "https://github.com/spinyfin/mono/pull/200\n",
+                "stderr": "",
+            }),
+        )
+        .expect("create feed");
+        let url = extract_pr_url_from_text(&feed.output_text).expect("url");
+        assert!(is_pr_url_binding_command_str(&feed.command));
+        assert!(is_pr_url_finalization_command_str(&feed.command));
+        let cache = StagedPrUrlCache::new();
+        // Prior binding-only observation of an unrelated PR.
+        cache.record_command_observation("exec_abc", "https://github.com/spinyfin/mono/pull/100", false);
+        let outcome =
+            cache.record_command_observation("exec_abc", &url, is_pr_url_finalization_command_str(&feed.command));
+        assert_eq!(outcome, RecordCommandObservationOutcome::Armed);
+        let entry = cache.get_entry("exec_abc").expect("bound");
+        assert_eq!(entry.pr_url, "https://github.com/spinyfin/mono/pull/200");
+        assert!(entry.finalization_armed);
     }
 
     #[test]
@@ -922,7 +1097,36 @@ mod tests {
         assert!(!is_pr_url_binding_command_str(
             r#"jj describe -m "gh pr create --title t""#
         ));
+        // Shell-wrapper peel must still see a real `gh pr list` inside.
+        assert!(is_pr_url_binding_command_str("sh -c 'gh pr list'"));
+        // Single-quoted commit message must not false-positive.
+        assert!(!is_pr_url_binding_command_str("jj describe -m 'gh pr create'"));
         assert!(!is_pr_url_binding_command(&json!({ "timeout": 30000 })));
+    }
+
+    #[test]
+    fn finalization_gate_rejects_false_positives_and_accepts_jj_git_push() {
+        // Commit-message phrase is not publish evidence.
+        assert!(!is_pr_url_finalization_command_str(r#"jj describe -m "gh pr create""#));
+        assert!(!is_pr_url_finalization_command_str("jj describe -m 'gh pr create'"));
+        assert!(!is_pr_url_finalization_command_str("gh pr view 42"));
+        assert!(!is_pr_url_finalization_command_str("gh pr list"));
+        assert!(!is_pr_url_finalization_command_str("gh pr edit 42 --body b"));
+        // Align with is_revision_push_command_str: a real push arms.
+        assert!(is_pr_url_finalization_command_str("jj git push --bookmark b"));
+        assert!(!is_pr_url_finalization_command_str(
+            "jj git push --dry-run --bookmark b"
+        ));
+        // Wrapper parity with the binding pair.
+        assert_eq!(
+            is_pr_url_finalization_command_str("gh pr create --title t"),
+            is_pr_url_finalization_command(&json!({ "command": "gh pr create --title t" })),
+        );
+        assert_eq!(
+            is_pr_url_finalization_command_str("gh pr view 1"),
+            is_pr_url_finalization_command(&json!({ "command": "gh pr view 1" })),
+        );
+        assert!(!is_pr_url_finalization_command(&json!({ "timeout": 30000 })));
     }
 
     #[test]
@@ -949,7 +1153,11 @@ mod tests {
             "cat chore.md",
             "grep -r 'pull/' . | head -5",
             "gh issue list",
+            // zsh-wrapped non-PR commands must still reject.
+            "/bin/zsh -lc 'gh issue list'",
+            "/bin/zsh -lc 'bossctl task show t'",
         ] {
+            assert!(!is_pr_url_binding_command_str(command), "must reject {command}");
             assert!(!is_pr_url_binding_command(&json!({ "command": command })));
         }
         assert!(!is_pr_url_binding_command(&json!(null)));

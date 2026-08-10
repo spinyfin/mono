@@ -1380,8 +1380,9 @@ pub struct PrUrlCaptureFeed {
     /// `command_execution.aggregated_output` string.
     pub output_text: String,
     /// The shell command that produced the output, used for the
-    /// `is_gh_pr_command` / `is_revision_push_command` gates. Empty when
-    /// the observation carries no command surface (the gates then reject).
+    /// `is_pr_url_binding_command` / `is_pr_url_finalization_command_str` /
+    /// `is_revision_push_command` gates. Empty when the observation carries
+    /// no command surface (the gates then reject).
     pub command: String,
 }
 
