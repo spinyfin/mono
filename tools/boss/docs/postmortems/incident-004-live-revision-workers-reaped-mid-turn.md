@@ -1,10 +1,10 @@
 # Incident 004 — Engine reaped live revision workers mid-turn, discarding their work
 
-- **Date:** 2026-08-08 (**America/New_York**). Focal pair on flunge PR #1342 between ~16:23 and ~16:41 EDT. The same finalization path had been firing since at least **2026-07-23**, not "two days prior": the original two-day floor was an **investigator access gap**, not the defect's age (§3).
-- **Severity:** High — silent work loss on live revision workers, plus false-success board status for revisions that produced nothing. The original measurement over the retained trace window — **63 mid-turn reaps out of 64 staged-path finalizations (98.4%)**, 6 total losses, 57 partial losses, and **5 work items still sitting in review status having contributed nothing** (§4) — was subsequently **reproduced exactly** from an independent log surface, and then extended 4.4x: over 2026-07-30 → 2026-08-09, **224 mid-turn reaps across 127 distinct PRs and 223 work items**, of which **33 are confirmed total losses (a floor)**. Includes a case where a revision minted to fix live production regressions was reaped before push while the board reported success.
-- **Status:** Documented. Mid-turn guard for the staged path landed as [mono#2685](https://github.com/spinyfin/mono/pull/2685) (merged 2026-08-09); it defers only within the 45-minute `staged_pr_mid_turn_defer_secs` horizon (default 2,700 s). **Follow-through on AI-1 is now answered and the answer is negative:** the landed guard covers the staged arm only — the detector branch of the same function and `stop_satisfied_clean` are untouched, and the detector branch reaped a mid-turn worker on **6 of 6** occurrences over nine days (§11 AI-1). Further action items in §11 remain open. This postmortem is doc-only.
+- **Date:** 2026-08-08 (UTC anchors throughout; local wall clocks rendered as **EDT** for readability — see timezone note below). Focal pair on flunge PR #1342 between ~20:23 and ~20:41 UTC (~16:23–16:41 EDT). The same finalization path had been firing since at least **2026-07-23**; a short retained-trace floor early in the investigation was an **investigator access gap**, not the defect's age (§3).
+- **Severity:** High — silent work loss on live revision workers, plus false-success board status for revisions that produced nothing. Canonical measurement window **2026-07-30 → 2026-08-09** (9 d 8 h, floor set by when the `pr completion: execution terminalized` discriminator exists): **224 mid-turn reaps across 127 distinct PRs and 223 work items**, of which **33 are confirmed total losses (a floor)**, 151 partial losses, and 40 rows the method structurally cannot classify. `pr_recheck_staged` alone is **96.4% mid-turn** (216/224). **Five work items still sit in review status having contributed nothing** (§4). Includes a case where a revision minted to fix live production regressions was reaped before push while the board reported success.
+- **Status:** Documented. Mid-turn guard for the staged path landed as [mono#2685](https://github.com/spinyfin/mono/pull/2685) (merged 2026-08-09); it defers only within the 45-minute `staged_pr_mid_turn_defer_secs` horizon (default 2,700 s). **Follow-through on AI-1 is now answered and the answer is negative:** the landed guard covers the staged arm only — the detector branch of the same function and `stop_satisfied_clean` are untouched, and the detector branch reaped a mid-turn worker on **6 of 6** occurrences over the measured window (§11 AI-1). Further action items in §11 remain open. This postmortem is doc-only.
 
-> **Timezone correction (revision, 2026-08-10).** The first published version of this document was stamped `America/Chicago` and rendered every wall clock as CDT (UTC-5). The machine's real zone is **America/New_York** (EDT, UTC-4), so every §3 / §4 / §5 wall clock read one hour behind machine local. The UTC anchors and all interval arithmetic were correct — only the offset was wrong. **Every wall-clock time in this document is now EDT.** Worked example: R1's terminalization `2026-08-08T20:28:26.375916Z` is **16:28:26.376 EDT**; it was previously written as 15:28:26.376. The focal pair therefore ran 16:23–16:41 EDT, not 15:23–15:41.
+> **Timezone note.** Engine log and trace records carry **absolute UTC timestamps** (`…Z` / RFC 3339) — they are not wall-clock-local and do not move when the host zone changes. Example: R1's terminalization is `2026-08-08T20:28:26.375916Z` regardless of where the laptop sits. **Local zone labels in this document are presentation only**, derived from those UTC anchors. The host zone is **not** a stable property of the system: the operator moves between timezones, and `/etc/localtime` on this machine has pointed at both America/Chicago and America/New_York during this investigation window. An earlier draft of this postmortem flipped every wall clock between CDT and EDT while arguing about which zone was "the machine's real zone"; that was investigator confusion about presentation, not missing absolute time in the logs. **UTC is ground truth.** Wall clocks below are fixed to **EDT (UTC−4)** for one consistent local reading; re-derive from the UTC anchors if a different local zone is preferred.
 
 - **Class:** Race between merge-poller PR recheck and a still-working agent: a staged PR URL is treated as "worker done," terminalizing and reaping a live mid-turn execution. Related prior: the 2026-07-14 SHA-delta absorption incident whose protection this fast path bypasses.
 - **Related:** [`incident-001-pr-fan-out.md`](incident-001-pr-fan-out.md) (wrong-PR finalization killing live workers); 2026-07-14 SHA-delta baseline absorption (guard comment at `completion/recheck.rs:144-175`); introducing change [mono#465](https://github.com/spinyfin/mono/pull/465) (2026-05-13).
@@ -15,9 +15,9 @@ The engine has a **fast path that treats a staged PR URL as permission to finali
 
 That fast path short-circuits two protections sitting **below** it in the same function: the `worker_owns_turn_loop` gate, and the SHA-delta arm that explicitly refuses to absorb a possibly in-flight push and defers to the worker's own Stop boundary. Those guards were written after an earlier race of the same class; the staged-URL path was added above them without inheriting them.
 
-Whether any given worker survives is a race against the ~60 s full-sweep cadence. Staging just after a sweep can work; staging into a sweep that is about to run does not. The feature is correct when lucky and destructive when not — and measurement of the retained trace window shows the unlucky case is not the exception but the rule: **63 of 64** staged-path finalizations reaped a worker that was still `working` (§3).
+Whether any given worker survives is a race against the ~60 s full-sweep cadence. Staging just after a sweep can work; staging into a sweep that is about to run does not. The feature is correct when lucky and destructive when not — and measurement over the canonical window shows the unlucky case is not the exception but the rule: **216 of 224** staged-path finalizations reaped a worker that was still `working` (**96.4%**, §3).
 
-The defect is a property of `recheck_for_pr`'s structure, not of the staged code block alone. A further occurrence finalized through the same function's _detector_ branch and was also reaped mid-turn. **No arm of that function establishes that the worker is between turns before it terminalizes.**
+The defect is a property of `recheck_for_pr`'s structure, not of the staged code block alone. The same function's _detector_ branch is **6 working / 0 idle** over the measured window, and a third path (`stop_satisfied_clean`) reaped mid-turn twice. **No arm of that function establishes that the worker is between turns before it terminalizes.**
 
 ## 2. Summary
 
@@ -28,11 +28,9 @@ On 2026-08-08, two consecutive revision workers on flunge PR #1342 were reaped b
 | R1       | `exec_18c9ee2925032810_47` | codex  | Pushed successfully, then reaped **2.4 s** later mid-prompt. Code reached [flunge#1342](https://github.com/brianduff/flunge/pull/1342); post-push steps (including the required findings-status comment) never ran.                                                                                                            |
 | R2       | `exec_18c9ee9f79ea3c08_4f` | claude | Reaped **before any push**. Local fix never reached the PR; lease released. A `jj` search of the shared flunge store (including `flunge-agent-001`, the workspace that ran R2) found no unrecovered R2 object; only the later recovery commit `c1e2c6d101bd` is present (see §12). Board still moved the item as review-ready. |
 
-Occurrence is not driver-specific — though severity is (see §3) — nor is it product-specific. The two cases used different drivers and different workspaces, and the measured window confirms both: occurrences split mono 31 / flunge 32, and by driver claude 56 / grok 4 / codex 3 within that window. The driver figure is a **two-day snapshot, not a general profile** — over the full nine-day window the split is codex 79 / claude 64 / grok 7 and it tracks each day's traffic mix rather than any driver's behaviour, which _strengthens_ the "not driver-specific" conclusion while invalidating the specific two-day numbers as a profile (§3).
+Occurrence is not driver-specific — though severity is (see §3) — nor is it product-specific. The two cases used different drivers and different workspaces. Over the canonical nine-day window the 224 mid-turn reaps split by driver **codex 79 · claude 64 · grok 7** (plus 74 rows that predate the `driver` column), tracking each day's traffic mix rather than any driver's behaviour (§3).
 
-The focal pair is a calibration case, not the incident. Across the 2 d 3 h 24 m of retained engine trace, **64 finalizations took the staged fast path and 63 of them reaped a worker that was still mid-turn (98.4%)** — 6 total losses and 57 partial losses. Five work items are still sitting in review status having contributed nothing; they are listed in §4.
-
-That measurement has since been **reproduced exactly** by an independent reconstruction from a different log surface, and then extended to a 9 d 8 h window (4.4x): **224 mid-turn reaps** across **127 distinct PRs and 223 work items**, with 151 partial losses, **33 confirmed total losses (a floor)** and 40 rows the method structurally cannot classify. The extension does not replace the original — it confirms it and shows it was a floor. The full measurement, its limits, and its labelling are in §3.
+The focal pair is a calibration case, not the incident. Over the **canonical measurement window** (2026-07-30 19:09 EDT → 2026-08-09 03:15 EDT, 9 d 8 h — the floor is when the `pr completion: execution terminalized` discriminator exists, not log retention): **224 mid-turn reaps** across **127 distinct PRs and 223 work items**, with 151 partial losses, **33 confirmed total losses (a floor)**, and 40 rows the method structurally cannot classify. `pr_recheck_staged` is **96.4% mid-turn** (216/224). Five work items are still sitting in review status having contributed nothing; they are listed in §4. Counts were reconstructed from both `engine-trace.jsonl` and the independent `/tmp/boss-engine.log` surface and agree. Full measurement, limits, and labelling are in §3.
 
 ## 3. Impact
 
@@ -58,19 +56,23 @@ The work item was nonetheless advanced as being in review. The board reported su
 
 Every figure in this section was counted from engine trace, and each is labelled **determined** (directly counted) or **estimated** (inferred, with the inference stated). The per-driver severity rates are the only substantially estimated figures; everything else here is determined.
 
-#### Observation window — determined (original), and now superseded as a floor
+#### Canonical observation window — determined
 
-The original measurement's window: earliest retained trace record 2026-08-06 13:42:40 EDT, latest 2026-08-08 17:06:12 EDT — a span of **2 d 3 h 24 m** over **92,124 records**, the full stream visible to that agent, with no truncation inside its file set. Queries before 08-06 returned zero records in that run. That window is now known to be an **investigator access gap**, not the defect's lifetime; see below and the extended measurement further down.
+**Floor:** 2026-07-30 19:09:48 EDT — the moment the `pr completion: execution terminalized` line was introduced. Before that the discriminating `activity` record does not exist at all, so earlier staged hits cannot be classified as mid-turn vs idle.
 
-Engine restarts inside the original window (determined): 08-06 13:47:06, 08-07 18:32:08, 08-07 22:29:21, 08-08 16:03:33 EDT.
+**Ceiling:** 2026-08-09 03:15:47 EDT.
 
-#### Correction — the log-loss mechanism, refuted in every particular
+**Span:** **9 d 8 h**, containing **557 PR-completion terminalizations**. Counts were reconstructed from both `engine-trace.jsonl` and the independent pretty-format surface at `/tmp/boss-engine.log` and agree on every finalization-source total that both can see.
 
-The first version of this document stated that "an app update at ~12:38 CDT on 08-06 reset the log root after three failed engine starts," and AI-8 was written to test it. **All three parts of that claim are wrong**, and the coordinator-side check that AI-8 asked for has now been run.
+Engine restarts observed inside the denser late portion of the window (determined): 08-06 13:47:06, 08-07 18:32:08, 08-07 22:29:21, 08-08 16:03:33 EDT (plus the 08-09 02:26 restart that brought up the landed guard).
+
+#### Forensic surfaces and the log-loss mechanism
+
+An early draft of this document claimed "an app update at ~12:38 on 08-06 reset the log root after three failed engine starts." **All three parts of that claim are wrong**, and the coordinator-side check that AI-8 asked for has now been run.
 
 - There were **twelve** failed engine starts, not three, followed by a thirteenth that stuck: **thirteen starts between 2026-08-06 13:36:25 and 13:47:06 EDT — 10 m 41 s**.
 - **No updater deleted anything.** No app-update log-root reset occurred.
-- The real mechanism is **rotation eviction**. `engine-trace.jsonl` rotates on _every engine start_ as well as at ~100 MB, against a keep count of 5. Thirteen starts is thirteen rotations, which evicted every trace file older than 13:36 EDT in under eleven minutes.
+- The real mechanism is **rotation eviction**. `engine-trace.jsonl` rotates on _every engine start_ as well as at ~100 MB, against a keep count of **5** (`DEFAULT_TRACE_MAX_FILES` / `BOSS_ENGINE_TRACE_MAX_FILES`). Thirteen starts is thirteen rotations, which evicted every trace file older than 13:36 EDT in under eleven minutes. **A keep count of 5 is almost certainly too low** for a stream that also rotates on every process start — a short restart storm can erase days of forensics in minutes (AI-8 residual / AI-11).
 
 Evidence — thirteen consecutive `boss-engine logging initialized` records, each failed start emitting only that line plus `starting boss-engine runtime` (UTC as recorded):
 
@@ -86,65 +88,34 @@ Evidence — thirteen consecutive `boss-engine logging initialized` records, eac
 
 Size-based rotation is separately evidenced: `engine-trace.jsonl.1786127630` is 105,104,607 bytes and its last record is followed **1 ms later** by the next file's first record, mid-stream, with no shutdown in between.
 
-**A second eviction happened after this postmortem was first written.** The original measuring agent's earliest record — reported then as "12:42:40 CDT," i.e. 13:42:40 EDT — is start #12 above. The engine restart at **2026-08-09 02:26:49 EDT** minted a sixth rotation and evicted it. The oldest retained JSONL now begins at 13:47:06 EDT. **That agent's stated window can no longer be reproduced from the JSONL surface alone** — which is itself a demonstration of the retention defect described below.
+**A second eviction happened during this investigation.** An early agent's earliest JSONL record at 13:42:40 EDT was start #12 above; the engine restart at **2026-08-09 02:26:49 EDT** minted a sixth rotation and evicted it. That is itself a demonstration of the retention defect.
 
-#### Correction — the pre-window floor was an investigator access gap, not data loss
-
-Of the two failure modes this document originally left open, **failure mode 2 is the correct one**. An **unrotated, append-only copy of the same tracing stream exists outside Application Support**:
+An **unrotated, append-only copy of the same tracing stream** exists outside Application Support and is how the full window was recovered:
 
 ```
-/tmp/boss-engine.log   2,090,647,418 bytes
+/tmp/boss-engine.log   2,090,647,418 bytes   (~2.0 GiB at time of check)
 first: 2026-07-23T19:38:16.568363Z = 2026-07-23 15:38:16 EDT
 last:  2026-08-09T07:17:38.662080Z = 2026-08-09 03:17:38 EDT
 ```
 
-It is the same stream as `engine-trace.jsonl` in pretty format, never rotated, surviving every restart, and it carries every field §3's analysis depends on (`source`, `activity`, `pane_outcome`, `path`). It spans **16 d 11 h** against the JSONL surface's 2 d 13 h — **6.4x** — and is a **strict superset**: all four finalization-source counts reconcile against the JSONL window exactly.
+It is the same stream as `engine-trace.jsonl` in pretty format. Code path: `main.rs` `open_log_file` opens it with `create(true).append(true)` only — **no size rotation, no start rotation, no prune**. It survives every restart, carries every field §3's analysis depends on (`source`, `activity`, `pane_outcome`, `path`), and at check time held **16 d 11 h** of history. **That is a standing disk-exhaustion defect, not a convenience:** while the engine (and Boss) stay up almost continuously, this file is only ever appended. ~2 GiB already; left alone it will grow without bound until the host disk fills (AI-12). Whether the worker sandbox permits reading it is **untested, and explicitly a guess in either direction** — this document does not assert either way (§12).
 
-The original retention caveat rested on "workers are forbidden from reading the Application Support tree." That is true, and it remains true, but **it does not reach this file**. Whether the worker sandbox permits reading `/tmp/boss-engine.log` is **untested, and explicitly a guess in either direction** — this document does not assert that workers can read it, nor that they cannot. That question is now in §12's unknowns.
+Boss's forensic surfaces:
 
-Boss's forensic surfaces, corrected:
+| Surface                | Default path                                | Retention (as measured)                                                                                                                       |
+| ---------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `engine-trace.jsonl*`  | under `~/Library/Application Support/Boss/` | **Rotates on every engine start as well as at ~100 MB, keep 5** (likely too low — AI-11). A restart storm can evict days of trace in minutes. |
+| `/tmp/boss-engine.log` | `/tmp`                                      | Same stream, pretty format, **never rotated**, survives restarts. **~2 GiB and unbounded** (AI-12). Worker readability untested.              |
+| `engine-audit.log`     | Application Support root                    | Intact back to **2026-05-08**. Coarser provenance events. Rotates in-place past 2 MiB.                                                        |
+| `dispatch-events`      | Application Support root                    | Intact back to **2026-05-11**, but the **wrong surface** for this question — see below.                                                       |
 
-| Surface                | Default path                                | Retention (as measured)                                                                                                         |
-| ---------------------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `engine-trace.jsonl*`  | under `~/Library/Application Support/Boss/` | **Rotates on every engine start as well as at ~100 MB, keep 5.** A restart storm can evict days of trace in minutes.            |
-| `/tmp/boss-engine.log` | `/tmp`                                      | Same stream, pretty format, **never rotated**, survives restarts. Held 16 d 11 h at time of check. Worker readability untested. |
-| `engine-audit.log`     | Application Support root                    | Intact back to **2026-05-08**. Coarser provenance events.                                                                       |
-| `dispatch-events`      | Application Support root                    | Intact back to **2026-05-11**, but the **wrong surface** for this question — see below.                                         |
-
-**Log-loss verdict.** Real loss occurred, **but nothing this incident needed was lost.** Those are separate judgements and both belong on the record. As a standing reliability defect the rotation behaviour matters a great deal: a restart storm destroys forensics precisely when they are most wanted, and it did so twice inside this investigation. As a fact about _this_ postmortem, the material was recoverable from another surface all along, and the measurement below was rebuilt from it.
+**Log-loss verdict.** Real loss occurred on the JSONL surface, **but nothing this incident needed was lost** — it was recoverable from `/tmp/boss-engine.log`. Those are separate judgements and both belong on the record. As standing reliability defects: (1) rotate-on-start + keep-5 destroys forensics precisely when they are most wanted; (2) the text log has the opposite problem and will eventually fill the disk. As a fact about _this_ postmortem, the material was recoverable and the measurement below was rebuilt from it.
 
 **`dispatch-events` could never have answered this question.** It is a dispatch-stage ledger: it has no finalization `source` and no `activity` field, so it cannot distinguish a mid-turn reap from a clean idle finalization at all. Its long retention is not a substitute for trace.
 
-**Also not loss: the zero-record hours.** Eleven hours in the window contain no records (2026-08-05 07:00–08:00; 2026-08-08 04:00–11:00 and 12:00–15:00 EDT). This is the signature of **machine sleep** — periodic timers stop dead and resume cleanly, with the engine up throughout and no restart or error at either boundary. That is a **strong inference, not proof**; `pmset -g log` would settle it and has not been run. It is recorded here so nobody re-reads those gaps as further evidence of log destruction.
-
-Because the pre-window floor is now known to be an access gap, **the counts in the original window are a floor on the defect's lifetime, and a demonstrably loose one** — the extended measurement below reaches 4.4x further back and the staged fast path was already firing a week before even that.
+**Also not loss: the zero-record hours.** Eleven hours in the denser late portion contain no records (2026-08-05 07:00–08:00; 2026-08-08 04:00–11:00 and 12:00–15:00 EDT). This is the signature of **machine sleep** — periodic timers stop dead and resume cleanly, with the engine up throughout and no restart or error at either boundary. That is a **strong inference, not proof**; `pmset -g log` would settle it and has not been run. It is recorded here so nobody re-reads those gaps as further evidence of log destruction.
 
 #### Headline — determined
-
-**64** finalizations went through the staged fast path. Of those, **63 were mid-turn reaps** (`activity: 'working'` on the paired live-state registry clear) and **1** was clean: **98.4%**.
-
-Pairing is unambiguous. Every execution had exactly one registry-clear record, median offset **7 ms**, max **1.62 s** — there is no ambiguous attribution anywhere in the set.
-
-The `activity` discriminator validates cleanly against control groups:
-
-| finalization source            | `working` | `idle` |
-| ------------------------------ | --------- | ------ |
-| `stop_staged`                  | 0         | 61     |
-| `stop_sha_delta`               | 0         | 3      |
-| `pr_recheck_staged`            | **63**    | 1      |
-| `pr_recheck` (detector branch) | **1**     | 0      |
-
-Within this window, Stop-boundary paths are **64/64 idle** and recheck paths are **64/65 working**. The signal separates the two families exactly as the mechanism in §6 predicts: finalizing at the worker's own Stop boundary finds an idle worker; finalizing from a poller recheck finds one mid-turn.
-
-**That separation is exact in-window but must not be generalized.** Over the nine-day extended window below, the Stop family is **325/327 idle, not 327/327** — two `stop_satisfied_clean` finalizations reaped a mid-turn worker. See "A third reap path" below.
-
-**Scope finding — the missing guard is not confined to the staged fast path.** One further occurrence finalized through the _detector_ branch of the same function and was also reaped mid-turn: a chore implementation on [mono#2678](https://github.com/spinyfin/mono/pull/2678), 08-07 22:57 EDT, grok driver. The defect is therefore a property of `recheck_for_pr`'s structure — no arm of it establishes that the worker is between turns — not of the one code block quoted in §6.1. A guard applied only to the staged arm would leave the detector branch exposed. **The extended measurement shows the detector branch is 6x more prevalent than this single case suggested, and 100% harmful: `pr_recheck` is 6 working / 0 idle over nine days.** That is now AI-1's answer, and it is negative — see §11.
-
-#### The measurement reproduced exactly, then extended 4.4x — determined
-
-Restricted to the original window above, an **independent reconstruction from a different log surface** (`/tmp/boss-engine.log`) reproduces §3's headline **exactly**: 63 staged + 1 detector = 64; mono 31 / flunge 32; claude 56 / grok 4 / codex 3; revision 50 / chore 10 / investigation 1 / design 1 / task 1; 6 total losses. Every apparent discrepancy between the two reconstructions resolves to whether the separately-counted detector case is folded into the staged total. **The original §3 measurement is confirmed.** That reproduction is a result in its own right and is not superseded by anything below: a hand reconstruction from one surface was reproduced digit-for-digit from another.
-
-The same reconstruction then extends the window. Its floor is **2026-07-30 19:09:48 EDT**, the moment the `pr completion: execution terminalized` line was introduced — before that the discriminating record does not exist at all. Through **2026-08-09 03:15:47 EDT**, that is **9 d 8 h, 4.4x the original window**, containing **557 PR-completion terminalizations**:
 
 | finalization source            | `working` | `idle` |
 | ------------------------------ | --------- | ------ |
@@ -157,9 +128,13 @@ The same reconstruction then extends the window. Its floor is **2026-07-30 19:09
 | `stop_driver_fallback`         | 0         | 1      |
 | `stop_satisfied_merged`        | 0         | 1      |
 
-**224 mid-turn reaps** over nine days — against 64 in the original window — spread across **127 distinct PRs and 223 work items**. `pr_recheck_staged` alone is **96.4% mid-turn** (216/224). Pairing remains unambiguous at this scale: median execution-to-slot-clear offset **10 ms**, max **4.13 s**.
+**224 mid-turn reaps** over the canonical window, spread across **127 distinct PRs and 223 work items**. `pr_recheck_staged` alone is **96.4% mid-turn** (216/224). Pairing is unambiguous: every counted execution has exactly one registry-clear record, median execution-to-slot-clear offset **10 ms**, max **4.13 s**.
 
-##### A third reap path the original measurement did not identify: `stop_satisfied_clean`
+The `activity` discriminator validates cleanly: Stop-boundary paths are **325/327 idle** (not categorically safe — see `stop_satisfied_clean` below); recheck paths are **222/230 working**. Finalizing at the worker's own Stop boundary usually finds an idle worker; finalizing from a poller recheck finds one mid-turn — exactly as the mechanism in §6 predicts.
+
+**Scope finding — the missing guard is not confined to the staged fast path.** The detector branch of the same function is **6 working / 0 idle** over the window — every detector-branch PR-completion terminalization measured reaped a mid-turn worker (earliest 2026-07-31 16:37:57 EDT, `exec_18c7486b45a667c8_18`; includes a chore on [mono#2678](https://github.com/spinyfin/mono/pull/2678), 08-07 22:57 EDT, grok). The defect is a property of `recheck_for_pr`'s structure — no arm of it establishes that the worker is between turns — not of the one code block quoted in §6.1. A guard applied only to the staged arm leaves the detector branch fully exposed. That is now AI-1's answer, and it is negative — see §11.
+
+##### A third reap path: `stop_satisfied_clean`
 
 Two finalizations came through `stop_satisfied_clean`, both terminalizing to `InReview` with a paired `activity="working"` and `pane_outcome=Reaped`:
 
@@ -168,19 +143,19 @@ Two finalizations came through `stop_satisfied_clean`, both terminalizing to `In
 2026-07-31T17:27:28.469Z  execution_id="exec_18c77b5458749660_397" source="stop_satisfied_clean" target=InReview elapsed_ms=0   -> 2026-07-31 13:27:28 EDT
 ```
 
-This is why the in-window "Stop-boundary paths are 64/64 idle" claim must be **softened rather than restated**: the Stop family is not categorically safe, it is 325/327 idle over nine days. **The mechanism behind these two is unestablished at N=2** — `elapsed_ms=0` on both is suggestive but two cases support no conclusion. This is recorded as a **flag, not a finding**, and the guard landed in [mono#2685](https://github.com/spinyfin/mono/pull/2685) does not touch this path either (§11 AI-1).
+The Stop family is therefore not categorically safe: **325/327 idle** over the window. **The mechanism behind these two is unestablished at N=2** — `elapsed_ms=0` on both is suggestive but two cases support no conclusion. This is recorded as a **flag, not a finding**, and the guard landed in [mono#2685](https://github.com/spinyfin/mono/pull/2685) does not touch this path either (§11 AI-1).
 
-##### The staged fast path was firing before any measurement reaches
+##### Staged hits before the join floor
 
-**243 staged fast-path hits** occurred between **2026-07-23 16:13 EDT** and the 2026-07-30 19:09 EDT join floor — 116 on 07-24 alone — earliest `exec_18c5043b60af3f48_7b`. Their **activity-at-teardown is permanently unknowable**: the `pr completion: execution terminalized` record that carries the discriminator did not exist yet, so no amount of later analysis can classify them. These 243 are recorded as an **unknown, not as a liftable floor** — they must not be added to the 224, and they must not be assumed to share its 96.4% mid-turn rate.
+**243 staged fast-path hits** occurred between **2026-07-23 16:13 EDT** and the 2026-07-30 19:09 EDT join floor — 116 on 07-24 alone — earliest `exec_18c5043b60af3f48_7b`. Their **activity-at-teardown is permanently unknowable**: the discriminator record did not exist yet. These 243 are an **unknown, not a liftable floor** — they must not be added to the 224, and they must not be assumed to share its 96.4% mid-turn rate. The defect's presence on that surface is confirmed (the staged path was firing); only the mid-turn rate is unmeasurable.
 
 #### Severity — determined
 
-**6 total loss** (never pushed) and **57 partial loss** (pushed, then killed before finishing the prompt).
+**33 confirmed total losses** (head unmoved — a floor), **151 partial losses** (head moved, turn incomplete), **40 unknown** (no successor execution on the same PR, so the method cannot classify). See the AI-10 inventory below for how severity was assigned and why 33 is a floor.
 
 ##### What "partial loss" actually means
 
-For the 57 in-window partials (151 over the extended window), the **primary code deliverable usually survived**: a commit had already been pushed to the PR head before the reap. The major loss mode the board cares about most (an unpublished fix) was avoided — often by lucky timing relative to the ~60 s sweep, not by design.
+For the 151 partial losses, the **primary code deliverable usually survived**: a commit had already been pushed to the PR head before the reap. The major loss mode the board cares about most (an unpublished fix) was avoided — often by lucky timing relative to the ~60 s sweep, not by design.
 
 What was still lost on those runs:
 
@@ -192,7 +167,7 @@ What was still lost on those runs:
 | Worker-proposed followups / attentions / structured proposals the agent would have filed later in the turn | **Unknown, plausibly lost** — nothing in the engine records "what the agent was about to raise"; a premature reap can skip those side effects with no residual |
 | Board / review status                                                                                      | Misleads only mildly for pure partials (head did move); still hides missing post-push checklist items                                                          |
 
-So partial loss is **not** "we lost the code." It is "we lost the rest of the turn" — and some of that rest is operationally load-bearing (findings-status comments, description accuracy) while some is invisible (followups never filed). The retained trace is the only record that pairs each reap's finalization source and activity with its execution; the ordinary execution ledger does not retain those fields or a per-prompt completion marker. **AI-10** therefore required a coordinator-generated per-execution inventory before reinstatement review could be completed. **That inventory has since been delivered, wider than asked** — 224 rows rather than 57 — and is summarized below.
+So partial loss is **not** "we lost the code." It is "we lost the rest of the turn" — and some of that rest is operationally load-bearing (findings-status comments, description accuracy) while some is invisible (followups never filed). The retained trace is the only record that pairs each reap's finalization source and activity with its execution; the ordinary execution ledger does not retain those fields or a per-prompt completion marker. **AI-10** therefore required a coordinator-generated per-execution inventory before reinstatement review could be completed. **That inventory has since been delivered** — 224 rows covering the full canonical window — and is summarized next.
 
 One thing AI-10 asked for is **not obtainable**, and the action item was written as though it were. AI-10 requested "any prompt steps demonstrably unreached" per row. **No current surface supports that**: the trace has no per-prompt-step marker of any kind. The only available inference is the coarse one — "reaped at `activity: working`, therefore the turn did not complete" — which says nothing about _which_ step was in flight. This is recorded as a limitation in §12 rather than silently dropped.
 
@@ -200,15 +175,15 @@ One thing AI-10 asked for is **not obtainable**, and the action item was written
 
 Total loss means the execution never moved the PR head. That is **not** uniform catastrophe:
 
-| Severity tier                          | Meaning                                                                                                                                                           | Examples in this window                                                                                                                                                                                            |
+| Severity tier                          | Meaning                                                                                                                                                           | Examples                                                                                                                                                                                                           |
 | -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **A — Deterministically re-doable**    | Another agent can re-derive the work from the same brief (merge conflicts, pure metadata). Time and slots are burned; the _content_ is recoverable by re-running. | Merge-conflict revisions on [mono#2321](https://github.com/spinyfin/mono/pull/2321), [mono#2651](https://github.com/spinyfin/mono/pull/2651)                                                                       |
 | **B — Content lost until re-authored** | Unique review-response work never pushed; a later agent must redo the reasoning. The parent PR may still be open.                                                 | R2 on [flunge#1342](https://github.com/brianduff/flunge/pull/1342) (later recovered by a follow-up execution, not by restoring R2's object); [mono#2681](https://github.com/spinyfin/mono/pull/2681) four findings |
-| **C — False success**                  | Board/status says reviewed while nothing landed; can block or skip real recovery. Orthogonal to A/B and present in every total loss here.                         | All six total losses; mono#2651 is the clearest loop                                                                                                                                                               |
+| **C — False success**                  | Board/status says reviewed while nothing landed; can block or skip real recovery. Orthogonal to A/B and present in every total loss here.                         | All total losses; mono#2651 is the clearest loop                                                                                                                                                                   |
 
 Tier A is still a real incident (wasted capacity, false success), but it is **not** the same as permanent loss of unique work. Categorize losses along these dimensions rather than treating every total loss as equally catastrophic.
 
-The six total losses, by PR (GitHub links for reinstatement inspection):
+Hand-verified total losses still outstanding on the board (the §4 remediation list), by PR:
 
 | PR           | URL                                           | Work                                              | Tier             |
 | ------------ | --------------------------------------------- | ------------------------------------------------- | ---------------- |
@@ -222,9 +197,9 @@ Two methodology notes belong with these counts, because both are traps for anyon
 - **`revision_push_capture` is not proof of a push.** One execution staged push evidence from its tool stream _and_ was `sha_unchanged`, with the PR head unmoved. The tool-stream heuristic false-positives; **head-SHA movement is the decisive signal.**
 - **One engine `sha_unchanged` verdict was itself wrong.** On [flunge#1327](https://github.com/brianduff/flunge/pull/1327) the engine recorded `sha_unchanged` at 14:00:56 EDT, but a commit with committer date 14:00:40 — 16 seconds earlier — is in that PR, which merged at 14:02:25 with no other execution able to have pushed it. The engine's head read was stale. Classified as partial: GitHub overrode the engine.
 
-One row is genuinely **unresolvable**. A revision on [flunge#1296](https://github.com/brianduff/flunge/pull/1296) routed via `pr_review cycle bound reached`, which skips the SHA check, and the branch has since been force-pushed, so the head at reap time is unrecoverable. It could be a seventh total loss. It is reported as unresolvable rather than assigned to either bucket.
+One row is genuinely **unresolvable**. A revision on [flunge#1296](https://github.com/brianduff/flunge/pull/1296) routed via `pr_review cycle bound reached`, which skips the SHA check, and the branch has since been force-pushed, so the head at reap time is unrecoverable. It could be an additional total loss. It is reported as unresolvable rather than assigned to either bucket.
 
-##### Extended-window severity — the AI-10 inventory (determined counts, estimated rate)
+##### Severity inventory (AI-10) — determined counts, estimated rate
 
 The delivered AI-10 artifact is a **224-row per-execution inventory** with columns `utc_ts, execution_id, source, pr_url, kind, driver, pr_head_before, next_pr_head_before, verdict`. Severity was assigned by this document's own method — did the PR head move between this execution and the next one on the same PR:
 
@@ -242,7 +217,7 @@ By execution kind, the 224: revision_implementation 175 · chore_implementation 
 
 ##### The retry-loop pathology is far wider than one PR
 
-§4 documents three consecutive reaped revisions on [mono#2651](https://github.com/spinyfin/mono/pull/2651) as the clearest false-success loop. Over the extended window, **27 PRs took three or more mid-turn reaps**:
+§4 documents three consecutive reaped revisions on [mono#2651](https://github.com/spinyfin/mono/pull/2651) as the clearest false-success loop. Across the canonical window, **27 PRs took three or more mid-turn reaps**:
 
 | reaps | PRs                                                                                                                    |
 | ----- | ---------------------------------------------------------------------------------------------------------------------- |
@@ -255,43 +230,36 @@ The mono#2651 loop in §4 is not the pathological outlier it reads as; it is the
 
 #### Breakdowns — determined counts
 
-All breakdowns below cover the **63 staged-path mid-turn reaps**; the detector-branch occurrence is counted separately.
+All breakdowns below cover the **224 mid-turn reaps** in the canonical window (all sources).
 
-- **By repo:** mono 31 · flunge 32. Essentially even — this is not product-specific.
-- **By execution kind:** revision_implementation 50 · chore_implementation 10 · investigation_implementation 1 · project_design 1 · task_implementation 1.
-- **By driver:** claude 56 · grok 4 · codex 3 **within this two-day window only** — see the correction immediately below. This tracks the traffic split, so **occurrence is not driver-specific.**
+- **By execution kind:** revision_implementation 175 · chore_implementation 30 · task_implementation 13 · project_design 3 · investigation_implementation 3.
+- **By driver:** **codex 79 · claude 64 · grok 7**, plus **74 rows that predate the `driver` column entirely** (populated only from 2026-08-02; 07-31 alone contributes 56 nulls). Daily splits track each day's traffic mix — 08-03 and 08-04 are codex-heavy, 08-06 and 08-07 are claude-heavy, and the reap mix follows in both cases. That **strengthens** the conclusion that occurrence is not driver-specific: the same conclusion holds across a period whose traffic mix inverted. Quote the conclusion; do not quote any single-day driver mix as a characterization of the defect.
 
-##### Correction — the driver breakdown is a two-day snapshot, not a profile
+Severity by driver (severity-resolvable rows only; rates estimated):
 
-The claude 56 / grok 4 / codex 3 split above was presented as a general profile of the defect. **It is a two-day snapshot.** Over the full nine-day window the 224 mid-turn reaps split **codex 79 · claude 64 · grok 7**, plus **74 rows that predate the `driver` column entirely** (it is only populated from 2026-08-02; 07-31 alone contributes 56 nulls).
+| driver | severity-resolvable | total loss | rate |
+| ------ | ------------------- | ---------- | ---- |
+| claude | 55                  | 4          | 7.3% |
+| codex  | 64                  | 18         | 28%  |
+| grok   | 3                   | 2          | 67%  |
 
-The daily splits track each day's traffic mix exactly — 08-03 and 08-04 are codex-heavy, 08-06 and 08-07 are claude-heavy, and the reap mix follows in both cases. That **strengthens** this document's conclusion that occurrence is not driver-specific, because the same conclusion now holds across a period whose traffic mix inverted. It simultaneously **invalidates the specific two-day numbers as a general profile** — they describe two claude-heavy days, nothing more. Quote the conclusion; do not quote the 56/4/3 split as a characterization of the defect.
-
-Severity by driver must be read per-driver rather than pooled — and the in-window figures do not survive the extension either:
-
-| driver | in-window occurrences | in-window total loss | in-window rate | full-window severity-resolvable | full-window total loss | full-window rate |
-| ------ | --------------------- | -------------------- | -------------- | ------------------------------- | ---------------------- | ---------------- |
-| claude | 56                    | 1                    | 1.8%           | 55                              | 4                      | 7.3%             |
-| grok   | 4                     | 4                    | **100%**       | 3                               | 2                      | 67%              |
-| codex  | 3                     | 1                    | 33%            | 64                              | 18                     | 28%              |
-
-**"Every grok run that reached this path lost everything" does not survive.** Over nine days there are 7 grok occurrences, of which 3 are severity-resolvable, of which 2 are total losses — 67%, not 100%. The _ordering_ of the three drivers is preserved (grok worst, codex middle, claude best); the _magnitudes_ are not. The 1.8% claude figure in particular was low by 4x.
-
-All counts here remain **determined**; all rates remain **estimated**, and the grok rate should now be **demoted further** than the original document demoted it: N=3 resolvable carries no precision at all, and it sits inside a bucket already known to under-count total losses (the 40-row unknown bucket above). A plausible mechanism, still stated as a **hypothesis and not a finding**: non-claude drivers surface a `gh pr` URL into the tool stream earlier relative to their push, so the fast path catches them further from a completed turn.
+Ordering: grok worst, codex middle, claude best. Magnitudes are soft — the grok rate in particular sits on N=3 resolvable inside a method already known to under-count total losses (the 40-row unknown bucket). A plausible mechanism, still stated as a **hypothesis and not a finding**: non-claude drivers surface a `gh pr` URL into the tool stream earlier relative to their push, so the fast path catches them further from a completed turn.
 
 ##### Control: was Grok driver immaturity a confound?
 
-Grok as a first-class interactive driver was still under active development during and just before the window. Relevant landed work includes [mono#2522](https://github.com/spinyfin/mono/pull/2522) (2026-07-29) — "grok: capture PR URLs and evaluate structured output for the Grok dialect" — which closed the gap where Grok's Bash tool shape never fed the shared `pr_url_capture` path at all. That is **eight days before** the earliest retained trace day.
+Grok as a first-class interactive driver was still under active development during and just before the window. Relevant landed work includes [mono#2522](https://github.com/spinyfin/mono/pull/2522) (2026-07-29) — "grok: capture PR URLs and evaluate structured output for the Grok dialect" — which closed the gap where Grok's Bash tool shape never fed the shared `pr_url_capture` path at all.
 
 Controls applied here:
 
-1. **Occurrence is not Grok-specific.** Claude 56 / Grok 4 / Codex 3 in-window (codex 79 / claude 64 / grok 7 over nine days) tracks traffic share on both scales. The same `pr_recheck_staged` short-circuit fires for mature Claude sessions (including focal R2). A Grok-only driver bug cannot explain the bulk of the 63 — still less the bulk of the 224.
-2. **Severity concentration on Grok is _not_ controlled away, but it is smaller than reported.** All 4 Grok hits in-window were total losses; over nine days it is 2 of 3 severity-resolvable (67%). That is compatible with (a) the shared engine defect plus unlucky pre-push staging timing, (b) residual Grok dialect bugs that stage a URL earlier or fail to push before staging, or (c) both. With N=3 resolvable this postmortem **cannot** separate (a) from (b), and the extension did not narrow the denominator enough to help.
+1. **Occurrence is not Grok-specific.** codex 79 / claude 64 / grok 7 tracks traffic share. The same `pr_recheck_staged` short-circuit fires for mature Claude sessions (including focal R2). A Grok-only driver bug cannot explain the bulk of the 224.
+2. **Severity concentration on Grok is _not_ controlled away, but it is soft.** 2 of 3 severity-resolvable grok rows are total losses (67%). That is compatible with (a) the shared engine defect plus unlucky pre-push staging timing, (b) residual Grok dialect bugs that stage a URL earlier or fail to push before staging, or (c) both. With N=3 resolvable this postmortem **cannot** separate (a) from (b).
 3. **What would control it properly (not done here):** per-execution reconstruction of "first staged URL command" vs "first successful push" latency by driver, restricted to runs after Grok PR-URL capture was known-good, with transcript-backed command timelines.
 
-Until that study exists, treat Grok's total-loss figure as **confounded and imprecise**: useful as a smoke signal, not as a pure measure of the staged-path defect's severity by driver. The original 100% should not be quoted at all — it was an artifact of a four-row denominator inside a two-day window.
+Until that study exists, treat Grok's total-loss figure as **confounded and imprecise**: useful as a smoke signal, not as a pure measure of the staged-path defect's severity by driver.
 
 #### Rate over time — determined counts, estimated trend
+
+Daily mid-turn share across the canonical window runs **34–69%**, with no trend. Illustrative late-window days (determined counts):
 
 | day                | mid-turn reaps | all PR-completion terminalizations | share |
 | ------------------ | -------------- | ---------------------------------- | ----- |
@@ -299,9 +267,9 @@ Until that study exists, treat Grok's total-loss figure as **confounded and impr
 | 08-07              | 23             | 54                                 | 43%   |
 | 08-08 (to 17:06)   | 10             | 15                                 | 73%   |
 
-**The rate is flat and load-driven, not increasing.** Raw daily counts fall only because dispatch volume falls (213 → 164 → 48 spawns). Normalized, the defect fires on roughly half of all PR-completion terminalizations, and on essentially **100% of everything reaching the staged fast path** (63/64). Apparent burstiness is a load artifact: the 08-08 overnight gap has zero spawns, not zero defects — and the eleven zero-record hours are machine sleep, not a lull in the defect (see the log-loss corrections above). There is **no correlation with any of the four engine restarts** — rates are unchanged across all of them.
+**The rate is flat and load-driven, not increasing.** Raw daily counts fall only because dispatch volume falls. Normalized, the defect fires on roughly half of all PR-completion terminalizations, and on **96.4% of everything reaching the staged fast path** (216/224). Apparent burstiness is a load artifact: overnight gaps have zero spawns, not zero defects — and the zero-record hours are machine sleep, not a lull in the defect. There is **no correlation with engine restarts** — rates are unchanged across them.
 
-The counts in the table are determined. The trend characterization ("flat, load-driven") is **estimated**: it rests on three daily points, two of which are partial days, normalized against spawn volume. The nine-day extension is consistent with it — the daily mid-turn share runs **34–69%** across the wider window, with no trend.
+The trend characterization ("flat, load-driven") is **estimated**: it rests on daily points normalized against spawn volume across the nine-day window, with no monotonic trend.
 
 #### Early evidence the landed guard works — small sample, stated as such
 
@@ -382,13 +350,13 @@ The defect did not begin on 2026-08-08. It was introduced and then repeatedly la
 | **2026-07-13**              | [mono#1443](https://github.com/spinyfin/mono/pull/1443)                                                                     | Stopped revisions jumping to in_review at dispatch (`stop_seen`); again does not protect the staged primary path.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | **2026-07-14**              | [mono#1977](https://github.com/spinyfin/mono/pull/1977) + SHA-delta absorption comment                                      | Explicit “do not absorb a possibly in-flight push” lesson written into the SHA-delta arm — the invariant this incident re-violates via the short-circuit above it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | **2026-07-29**              | [mono#2522](https://github.com/spinyfin/mono/pull/2522)                                                                     | Grok gains working PR-URL capture feed — Grok sessions can now arm the same staged path.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| **2026-07-23 15:38 EDT**    | Earliest record on the unrotated `/tmp/boss-engine.log` surface                                                             | The real forensic floor. The staged fast path is already firing by **16:13 EDT the same day** (243 hits before 07-30). Supersedes the original "2026-08-06 12:42 CDT earliest retained record," which was an `engine-trace.jsonl` rotation-eviction artifact, not the defect's age (§3).                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| **2026-07-23 15:38 EDT**    | Earliest record on the unrotated `/tmp/boss-engine.log` surface                                                             | The real forensic floor (`2026-07-23T19:38:16.568363Z`). The staged fast path is already firing by **16:13 EDT the same day** (243 hits before 07-30). An earlier short JSONL floor (~08-06) was a rotation-eviction artifact, not the defect's age (§3).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | **2026-07-30 19:09 EDT**    | `pr completion: execution terminalized` log line introduced                                                                 | **Join floor for activity-paired analysis.** Before this line exists, a finalization cannot be paired to an `activity` value at all, so the 243 earlier staged hits are permanently unclassifiable (§3). Everything measured as a "mid-turn reap" in this document is bounded below by this date, not by log retention.                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | **2026-08-09**              | [mono#2685](https://github.com/spinyfin/mono/pull/2685)                                                                     | Guard: defer staged-PR-URL recheck finalization while the worker is mid-turn, but only within `staged_pr_mid_turn_defer_secs` (default 45 minutes / 2,700 s). **Remediation for the fast path** (landed after the focal incident).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 
-### 5.2 Focal pair — 2026-08-08 (America/New_York)
+### 5.2 Focal pair — 2026-08-08
 
-Anchors are from engine trace and runtime state reproduced for the original writeup. **All times below are EDT** — they were published as CDT and were one hour low; see the timezone correction at the head of this document. The UTC anchors and every interval in this table were and remain correct.
+Anchors are from engine trace and runtime state. **UTC is ground truth** on every log line; wall clocks below are rendered as **EDT** for a fixed local reading (see the timezone note at the head of this document).
 
 | Time         | Event                                                                                                                                       |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -631,7 +599,7 @@ The only field that distinguishes a mid-turn reap from a legitimate idle finaliz
 
 - Operators cannot see a dashboard of mid-turn reaps.
 - Nothing in the running system partitions `pr_recheck_staged` finalizations into "safe idle" vs "destructive working." The partition in §3 exists only because the raw trace was pulled offline and each finalization was hand-paired to its registry-clear record.
-- **Prevalence was measurable, but only by bespoke offline reconstruction** — and only within the visible window. It was not visible to anyone operating the system, which is why a 98.4% failure rate ran for the full measured window without raising anything.
+- **Prevalence was measurable, but only by bespoke offline reconstruction.** It was not visible to anyone operating the system, which is why a **96.4%** staged-path mid-turn rate (216/224) ran for the full measured window without raising anything.
 
 Severity was worse. The engine records a head SHA _before_ an execution runs but never _after_ teardown, so "did this execution actually push?" had to be reconstructed from the _next_ execution's `pr_head_before` snapshot or a live GitHub read. That is why one row is permanently unresolvable and why one engine `sha_unchanged` verdict turned out to be a stale-read false negative (both in §3). See AI-5.
 
@@ -654,8 +622,8 @@ Severity was worse. The engine records a head SHA _before_ an execution runs but
 - **The prior incident left a correct written invariant** in the SHA-delta arm. The right idea was already in the file; the gap is that a newer path does not share it.
 - **Activity-at-clear logging already records the distinguishing signal.** Instrumentation for detection is partially present; it is not aggregated or alerted.
 - **Driver diversity in the failure pair** (codex then claude) rules out a single-driver misconfiguration as the explanation — since confirmed at scale by the occurrence split across all three drivers (§3).
-- **The blast radius turned out to be measurable after all**, from `activity`-at-clear paired against finalization source. The discriminator validates well against control groups — Stop paths are 64/64 idle in-window and 325/327 idle over nine days — so the 63/64 figure rests on a signal that demonstrably separates the two families rather than on inference. (The two exceptions are themselves a finding, not noise in the discriminator: see `stop_satisfied_clean` in §3.)
-- **The measurement reproduced exactly on an independent surface.** A second reconstruction, from a different log file by a different agent, returned §3's headline digit-for-digit: 63 staged + 1 detector, mono 31 / flunge 32, the same kind and driver splits, the same 6 total losses. A hand-built forensic count that survives independent replication is worth more than a larger count that has never been checked — and the replication is what made the 4.4x extension trustworthy.
+- **The blast radius turned out to be measurable after all**, from `activity`-at-clear paired against finalization source. The discriminator validates well against control groups — Stop paths are **325/327 idle** over the canonical window — so the 216/224 staged mid-turn figure rests on a signal that demonstrably separates the two families rather than on inference. (The two Stop-family exceptions are themselves a finding, not noise in the discriminator: see `stop_satisfied_clean` in §3.)
+- **The measurement cross-checked on two independent log surfaces.** Reconstructions from `engine-trace.jsonl` and `/tmp/boss-engine.log` agree on every finalization-source total both can see, which is what makes the 224-row inventory trustworthy.
 
 ## 9. What went wrong
 
@@ -665,7 +633,7 @@ Severity was worse. The engine records a head SHA _before_ an execution runs but
 - Staging treats `gh pr view|list|edit` like a push, so metadata and read commands can arm teardown.
 - Post-push prompt steps are structurally races, not guaranteed deliverables.
 - Board status can report "in review" for a revision that never produced an associated change — false success while production regressions remain. **Five work items are in exactly that state right now** (§4).
-- The race is not an edge case. **63 of 64** staged-path finalizations in the retained window reaped a mid-turn worker; over nine days it is **224 mid-turn reaps across 127 PRs**, with the staged path 96.4% mid-turn. The rate is flat across the whole window and across every engine restart in it.
+- The race is not an edge case. **224 mid-turn reaps across 127 PRs** over the canonical nine-day window, with the staged path **96.4% mid-turn** (216/224). The rate is flat across the whole window and across every engine restart in it.
 - The only mid-turn reap signal is a log field that is not metricked, so nothing raised an alarm while that failure rate ran for at least the nine days that are measurable — and the path was already firing a week before the discriminating record existed at all. Sizing it required an offline trace reconstruction, twice.
 - **The defect plausibly suppresses its own recovery path.** `reconcile_revision` re-fires only when no reconcilable execution exists; a mid-turn reap records success. That is a lead rather than a confirmed mechanism (§4), but the retry-loop pathology it would explain is real and affects **27 PRs**, not one.
 - No head SHA is recorded after teardown, so "did this execution push?" is not answerable from the engine's own records — one severity determination is permanently unresolvable as a result.
@@ -698,28 +666,28 @@ That process story is as important as the mechanism: the same defect class will 
 | Operator-facing banner when a revision finalizes with `sha_unchanged` | **No**    | R2 looked successful on the board                                      |
 | Head SHA recorded _after_ teardown                                    | **No**    | "Did this execution push?" is not answerable from engine records alone |
 
-Discovery of this incident was from a **symptom** (missing findings-status comment on R1), not from an engine-raised attention item. R2's total loss was found by forensic follow-up on the same PR, not by the board. Nothing in this table fired for any of the other 61 staged-path mid-turn reaps in-window, the separately counted detector-branch reap, or the further 160 mid-turn reaps the extended measurement found outside that window — every one of those counts came from pulling raw trace off-box, not from any operator-facing surface.
+Discovery of this incident was from a **symptom** (missing findings-status comment on R1), not from an engine-raised attention item. R2's total loss was found by forensic follow-up on the same PR, not by the board. Nothing in this table fired for any of the other **223** mid-turn reaps in the canonical window — every one of those counts came from pulling raw trace off-box, not from any operator-facing surface.
 
 ### Response
 
-This document is the response artifact for the investigation. Staged-path mid-turn deferral **landed** as [mono#2685](https://github.com/spinyfin/mono/pull/2685). Two follow-ups have since been answered: the log forensic check (AI-8) is **done** and refuted its own premise, and detector-branch coverage (AI-1) was **checked and found absent**. Remaining action items — extending the guard to the detector branch and `stop_satisfied_clean`, the staging predicate, explicit outcomes, metrics, `pr_head_after`, and trace rotation policy — are listed in §11 and are deliberately not redesigned here.
+This document is the response artifact for the investigation. Staged-path mid-turn deferral **landed** as [mono#2685](https://github.com/spinyfin/mono/pull/2685). Two follow-ups have since been answered: the log forensic check (AI-8) is **done** and refuted its own premise, and detector-branch coverage (AI-1) was **checked and found absent**. Remaining action items — extending the guard to the detector branch and `stop_satisfied_clean`, the staging predicate, explicit outcomes, metrics, `pr_head_after`, trace keep-count / rotation policy, and bounding `/tmp/boss-engine.log` — are listed in §11 and are deliberately not redesigned here.
 
 ## 11. Action items
 
-Owners are **surfaces** (files / subsystems), not people. **AI-N** means action item _N_ in this section and is used for every cross-reference. None of these are implemented by this document. AI-1's staged-path guard **landed** as [mono#2685](https://github.com/spinyfin/mono/pull/2685) but covers only one of the three known reap paths; AI-8 and AI-10 are **done** and their status blocks below record what they found. Everything else is open work.
+Owners are **surfaces** (files / subsystems), not people. **AI-N** means action item _N_ in this section and is used for every cross-reference. None of these are implemented by this document. AI-1's staged-path guard **landed** as [mono#2685](https://github.com/spinyfin/mono/pull/2685) but covers only one of the three known reap paths; AI-8 and AI-10 are **✅ done** and their status blocks below record what they found. Everything else is open work.
 
 These are engineering fixes to the defect. They are **not** a substitute for the recovery work in §4: the five work items listed there are already broken and will not be repaired by any code change here.
 
 ### Immediate — completion / recheck
 
-1. **Guard `recheck_for_pr` — the whole function, not just the staged arm — so no path through it can finalize a still-working live worker.** Surface: `tools/boss/engine/core/src/completion/recheck.rs` staged arm (`:55-72`) **and its detector branch**, coordinated with `finalize_pr_transition` / teardown in `completion/pr_transition.rs` and `completion/teardown.rs`. Inherit the 2026-07-14 invariant already written at `recheck.rs:144-175` (defer to the worker's own Stop boundary while mid-session). The measurement in §3 found a mid-turn reap through the detector branch as well (`pr_recheck`, 1 working / 0 idle), so **a fix scoped to the staged block alone would leave a live path open.**
+1. **Guard `recheck_for_pr` — the whole function, not just the staged arm — so no path through it can finalize a still-working live worker.** Surface: `tools/boss/engine/core/src/completion/recheck.rs` staged arm (`:55-72`) **and its detector branch**, coordinated with `finalize_pr_transition` / teardown in `completion/pr_transition.rs` and `completion/teardown.rs`. Inherit the 2026-07-14 invariant already written at `recheck.rs:144-175` (defer to the worker's own Stop boundary while mid-session). The measurement in §3 found mid-turn reaps through the detector branch as well (`pr_recheck`, 6 working / 0 idle), so **a fix scoped to the staged block alone would leave a live path open.**
 
    **Status: PARTIALLY LANDED — detector-branch coverage checked, and it is ABSENT.** Staged-path mid-turn deferral **landed** as [mono#2685](https://github.com/spinyfin/mono/pull/2685) (merged 2026-08-09; task tracking “Staged-PR-URL recheck fast path reaps live workers mid-turn”). The running engine is that fix — `engine_build_sha="818e8bc6cdf67ae6de53c1b24a3f693a94bc6083"`, the merge commit, started 2026-08-09 02:26:53 EDT.
 
    Reading the merged diff, `should_defer_staged_pr_recheck()` is called at **exactly one site**: inside the `verified_staged_pr_url(…)` block at `recheck.rs:56`. Therefore:
 
-   - **No change to the detector branch of `recheck_for_pr`.** That branch is **6 working / 0 idle** over the nine-day window — every detector-branch PR-completion terminalization measured reaped a mid-turn worker, earliest 2026-07-31 16:37:57 EDT (`exec_18c7486b45a667c8_18`). It is 6x more prevalent than the single case originally documented, and it remains fully exposed.
-   - **No change to `stop_satisfied_clean`**, the third reap path identified by the extended measurement (2 working / 10 idle, §3). It was not known when [mono#2685](https://github.com/spinyfin/mono/pull/2685) was written and is not covered by it.
+   - **No change to the detector branch of `recheck_for_pr`.** That branch is **6 working / 0 idle** over the canonical window — every detector-branch PR-completion terminalization measured reaped a mid-turn worker, earliest 2026-07-31 16:37:57 EDT (`exec_18c7486b45a667c8_18`). It remains fully exposed.
+   - **No change to `stop_satisfied_clean`**, the third reap path (2 working / 10 idle, §3). It was not known when [mono#2685](https://github.com/spinyfin/mono/pull/2685) was written and is not covered by it.
    - **The anti-hang bound is retained**, as intended: `staged_pr_mid_turn_defer_secs`, default `DEFAULT_BUILD_WAIT_HORIZON_SECS` = 2,700 s, measured from `StagedPrUrlEntry::staged_at`.
 
    **Remaining work on this item:** extend the guard to the detector branch and to `stop_satisfied_clean`, and assert in regression tests that `activity: working` cannot terminalize on **any** of the three paths before the horizon. Early production evidence that the staged-arm guard itself works is in §3 — five deferrals, zero mid-turn reaps, 15/15 Stop-boundary finalizations in ~49 minutes — but that sample is thin, and **no deferral has yet aged out against the 2,700 s horizon, so the anti-hang bound is untested in production.**
@@ -752,11 +720,11 @@ These are engineering fixes to the defect. They are **not** a substitute for the
 
 ### Forensic — log retention / pre-window truth
 
-8. **Coordinator-side: prove whether pre-2026-08-06 `engine-trace` (and useful audit events) still exist on disk.**
+8. **✅ Coordinator-side: prove whether pre-2026-08-06 `engine-trace` (and useful audit events) still exist on disk.**
 
-   **Status: DONE, and the original hypothesis was wrong in every particular.** The check found (§3): the earlier material _did_ exist, on an unrotated `/tmp/boss-engine.log`; the "app update at ~12:38 CDT reset the log root" story is false — no updater deleted anything; there were **twelve** failed engine starts, not three; and the actual mechanism is **rotation eviction**, because `engine-trace.jsonl` rotates on _every engine start_ as well as at ~100 MB against a keep count of 5. The §3 measurement was re-run across the recovered surface and the floor was lifted 4.4x.
+   **Status: ✅ DONE, and the original hypothesis was wrong in every particular.** The check found (§3): the earlier material _did_ exist, on an unrotated `/tmp/boss-engine.log`; the "app update reset the log root" story is false — no updater deleted anything; there were **twelve** failed engine starts, not three; and the actual mechanism is **rotation eviction**, because `engine-trace.jsonl` rotates on _every engine start_ as well as at ~100 MB against a keep count of 5. The §3 measurement was re-run across the recovered surface over the full join-floor window.
 
-   **The residual reliability defect this item anticipated is real and is now confirmed, with a different cause than assumed.** Rotate-on-every-start means a restart storm destroys forensics precisely when they are most wanted: thirteen starts in 10 m 41 s evicted everything older than 13:36 EDT, and a later single restart evicted the original measurement's own window. Remaining work: **change the rotation policy so engine starts do not consume rotation slots** (or retain completion-critical records separately), and decide whether `/tmp/boss-engine.log` is a deliberate durable surface or an accident that should not be relied on. **Nothing this incident needed was lost** — but that was luck, not design.
+   **The residual reliability defect this item anticipated is real and is now confirmed, with a different cause than assumed.** Rotate-on-every-start means a restart storm destroys forensics precisely when they are most wanted: thirteen starts in 10 m 41 s evicted everything older than 13:36 EDT, and a later single restart evicted an earlier investigator's retained window. Residual engineering work is split into AI-11 (trace keep count / start-rotation policy) and AI-12 (bound the unbounded text log). **Nothing this incident needed was lost** — but that was luck, not design.
 
 ### Forensic — introducing-agent transcript (optional)
 
@@ -764,33 +732,42 @@ These are engineering fixes to the defect. They are **not** a substitute for the
 
 ### Forensic — partial-loss reinstatement inventory
 
-10. **Coordinator-side: publish a per-execution inventory for the partial losses before reinstatement review.** Source it from the retained trace join that pairs finalization source with the `activity: working` slot-clear record, then record the PR link, execution id, timestamp, driver, and severity verdict.
+10. **✅ Coordinator-side: publish a per-execution inventory for the partial losses before reinstatement review.** Source it from the retained trace join that pairs finalization source with the `activity: working` slot-clear record, then record the PR link, execution id, timestamp, driver, and severity verdict.
 
-    **Status: DELIVERED, wider than asked — with one sub-request that turned out to be underivable.** The inventory is **224 rows**, not 57, with columns `utc_ts, execution_id, source, pr_url, kind, driver, pr_head_before, next_pr_head_before, verdict`. Severity by this document's own method: 151 partial · **33 total loss** · 40 unknown. See §3 for the full breakdown, the systematic under-count in the unknown bucket, and the 27 PRs that took three or more mid-turn reaps.
+    **Status: ✅ DELIVERED — with one sub-request that turned out to be underivable.** The inventory is **224 rows** covering the canonical window, with columns `utc_ts, execution_id, source, pr_url, kind, driver, pr_head_before, next_pr_head_before, verdict`. Severity by this document's own method: 151 partial · **33 total loss** · 40 unknown. See §3 for the full breakdown, the systematic under-count in the unknown bucket, and the 27 PRs that took three or more mid-turn reaps.
 
     **Underivable sub-request:** this item asked for "any prompt steps demonstrably unreached" per row. **No current surface can supply that** — the trace carries no per-prompt-step marker, so the only available inference is the coarse "reaped at `activity: working`, therefore the turn did not complete." The item was written as though per-step attribution were obtainable; it is not. Making it obtainable would require the engine to record prompt-step progress, which is new instrumentation, not a query. Recorded in §12.
 
     Reinstatement review of the partial-loss PRs for missing post-push deliverables is still outstanding; the inventory unblocks it.
 
+### Forensic — trace keep count / start-rotation policy
+
+11. **Raise the `engine-trace.jsonl` keep count and stop engine starts from consuming rotation slots.** Surface: `tools/boss/engine/core/src/trace_rotation.rs` (`DEFAULT_TRACE_MAX_FILES = 5`, `rotate_on_startup`). A keep count of **5** is almost certainly too low for a stream that also rotates on every process start: thirteen starts in 10 m 41 s during this incident evicted everything older than those eleven minutes, and a later single restart evicted an investigator's retained window. Change the policy so size-based rotation (or an intentional retention window) governs how much history is kept, and so a restart storm cannot erase forensics on its own. Optionally retain completion-critical records on a longer-lived surface. Related residual from AI-8.
+
+### Forensic — bound `/tmp/boss-engine.log`
+
+12. **Stop `/tmp/boss-engine.log` from growing without bound.** Surface: `tools/boss/engine/core/src/main.rs` (`DEFAULT_LOG_PATH`, `open_log_file` — currently `create(true).append(true)` only; no size cap, no rotation, no prune). At investigation time the file was **~2.0 GiB** and held 16 d 11 h of the pretty-format stream. The engine and Boss stay up almost continuously, so nothing external is truncating it either. **This will eventually fill the host disk.** Options (pick one and implement): size- or time-based rotation with a keep count; truncate-on-start for the text layer (JSONL remains the durable forensic surface); or write the text layer under the Application Support tree with the same rotation policy as the audit log. Decide explicitly whether the pretty text log is a deliberate durable forensic surface or a debug convenience that must not outgrow the disk — today it is the former by accident and the latter by intent. Related residual from AI-8; distinct from AI-11 (JSONL keep-too-low vs text unbounded growth are opposite failure modes).
+
 ## 12. Incomplete evidence (stated plainly)
 
 ### Resolved since first publication
 
-- **~~Pre-window log availability is unproven either way.~~ RESOLVED — it was an investigator access gap, not data loss.** Of the two failure modes this document originally listed, **mode 2 is correct**: an unrotated `/tmp/boss-engine.log` held the same stream back to 2026-07-23, and the measurement was re-run across it (§3). The original "app update wiped the log root" story is refuted in every particular. **Real log loss does occur** — `engine-trace.jsonl` rotates on every engine start, so a restart storm evicts days of trace in minutes, and it did so twice during this investigation — **but nothing this incident needed was lost.** Those two statements are both true and neither cancels the other; the rotation behaviour is carried forward as a standing reliability defect under AI-8.
-- **~~Partial-loss reinstatement inventory is unenumerated.~~ RESOLVED — delivered at 224 rows** (AI-10, §3). Per-PR reinstatement review is still outstanding, but it is no longer blocked on data.
-- **~~Detector-branch coverage of the landed guard is unconfirmed.~~ RESOLVED — coverage is ABSENT** (AI-1, §11). `should_defer_staged_pr_recheck()` has exactly one call site, in the staged arm. The detector branch (6 working / 0 idle) and `stop_satisfied_clean` (2 working / 10 idle) are both still exposed.
+- **~~Pre-window log availability is unproven either way.~~ ✅ RESOLVED — it was an investigator access gap, not data loss.** Of the two failure modes this document originally listed, **mode 2 is correct**: an unrotated `/tmp/boss-engine.log` held the same stream back to 2026-07-23, and the measurement was re-run across it (§3). The original "app update wiped the log root" story is refuted in every particular. **Real log loss does occur** on the JSONL surface — `engine-trace.jsonl` rotates on every engine start against keep 5, so a restart storm evicts days of trace in minutes, and it did so twice during this investigation — **but nothing this incident needed was lost.** Residual defects carried as AI-11 (keep count / start-rotation) and AI-12 (unbounded text log).
+- **~~Partial-loss reinstatement inventory is unenumerated.~~ ✅ RESOLVED — delivered at 224 rows** (AI-10, §3). Per-PR reinstatement review is still outstanding, but it is no longer blocked on data.
+- **~~Detector-branch coverage of the landed guard is unconfirmed.~~ ✅ RESOLVED — coverage is ABSENT** (AI-1, §11). `should_defer_staged_pr_recheck()` has exactly one call site, in the staged arm. The detector branch (6 working / 0 idle) and `stop_satisfied_clean` (2 working / 10 idle) are both still exposed.
+- **~~Do engine timestamps lack absolute timezones?~~ ✅ RESOLVED — they do not.** Log and trace records are stamped in absolute UTC (`…Z`). Local zone labels in this document are presentation only; the host zone moves with the operator and is not a stable system property (timezone note at head of document).
 
 ### Still incomplete
 
 - **R2 local commit recoverability:** A `jj` search of the shared flunge store (including `flunge-agent-001`, the workspace that ran R2) found no unrecovered R2 object; only the later recovery commit `c1e2c6d101bd` is present. Do not assert “outside available material.” Still do not assert durable recovery of R2’s original object — only that search returned absence, while the work item later recovered via redo (§4). **Unchanged and still open.**
 - **Activity-at-teardown for the 243 pre-2026-07-30 staged hits is permanently unknowable.** The `pr completion: execution terminalized` record that carries the discriminator did not exist before 2026-07-30 19:09 EDT. No future analysis can classify those 243 hits, and they must not be assumed to share the measured 96.4% mid-turn rate. This is a hard limit, not a pending task.
 - **Severity of the 40 no-successor rows in the AI-10 inventory is unresolved**, and that bucket **systematically hides total losses** (§3). Resolving it requires live GitHub head reads per PR. AI-5 (`pr_head_after` on the teardown record) fixes this class structurally for future incidents but cannot retroactively fill these rows.
-- **One severity row is unresolvable.** A revision on [flunge#1296](https://github.com/brianduff/flunge/pull/1296) routed via `pr_review cycle bound reached`, skipping the SHA check, and the branch has since been force-pushed. The head at reap time is unrecoverable, so it cannot be assigned to total or partial loss. It may be a seventh total loss.
+- **One severity row is unresolvable.** A revision on [flunge#1296](https://github.com/brianduff/flunge/pull/1296) routed via `pr_review cycle bound reached`, skipping the SHA check, and the branch has since been force-pushed. The head at reap time is unrecoverable, so it cannot be assigned to total or partial loss. It may be an additional total loss.
 - **The mechanism behind the two `stop_satisfied_clean` mid-turn reaps is unestablished.** N=2, both with `elapsed_ms=0` and both terminalizing to `InReview` with `activity="working"`. Recorded in §3 as a **flag, not a finding** — do not reason from it beyond "the Stop family is not categorically safe."
 - **Whether the 2,700 s anti-hang horizon ever finalizes a genuinely-working worker is untested in production.** Zero expiries have been observed since the guard landed. Zero expiries is not evidence of safety; it is evidence the case has not arisen yet.
 - **Whether workers may read `/tmp/boss-engine.log` is untested.** The Application Support prohibition does not reach it, but no worker has attempted the read and no policy statement covers it. This document deliberately asserts nothing in either direction.
 - **Whether the eleven zero-record hours are machine sleep is a strong inference, not proof.** The signature fits (periodic timers stop dead and resume cleanly, engine up throughout, no restart at either boundary). `pmset -g log` would settle it and has not been run.
-- **Per-driver severity rates are estimated, not determined.** The original grok 4/4 (100%) and codex 1/3 (33%) do not survive the extension: over nine days it is claude 4/55 (7.3%), codex 18/64 (28%), grok 2/3 (67%) — ordering preserved, magnitudes not (§3). All of these sit on top of the under-counting unknown bucket. Grok’s concentration remains **confounded** by in-development driver support during the period. The proposed timing mechanism (non-claude drivers surfacing a `gh pr` URL earlier relative to their push) remains a **hypothesis**.
+- **Per-driver severity rates are estimated, not determined.** Canonical window: claude 4/55 (7.3%), codex 18/64 (28%), grok 2/3 (67%) — all sit on top of the under-counting unknown bucket (§3). Grok’s concentration remains **confounded** by in-development driver support during the period. The proposed timing mechanism (non-claude drivers surfacing a `gh pr` URL earlier relative to their push) remains a **hypothesis**.
 - **Per-prompt-step attribution is not derivable from any current surface.** AI-10 asked for "prompt steps demonstrably unreached" per row; the trace has no per-step marker, so the only inference available is the coarse "reaped while `working`, therefore incomplete." Obtaining it requires new instrumentation, not a better query.
 - **Why `reconcile_revision` recovered [flunge#1342](https://github.com/brianduff/flunge/pull/1342) and not the five items in §4:** a **structural difference is now visible** — flunge#1342's task was re-created twice on the same work item, while mono#2651's attempts were three distinct once-only work items (§4). A **candidate mechanism** is recorded there (a mid-turn reap terminalizes toward `PendingReview`/`InReview`, which may read as "reconcilable," suppressing recovery). **It is a lead, not a finding:** confirming it requires reading the `reconcile_revision` predicate in engine source, which has not been done. This remains the largest open product question.
 - **Introducing-agent private transcript:** not readable from this worker (§6.3). Public PR #465 text used instead.
@@ -804,13 +781,14 @@ These are engineering fixes to the defect. They are **not** a substitute for the
 5. **False success is worse than visible failure** when the board hides total work loss and live production regressions. Worse still, it is self-perpetuating: [mono#2651](https://github.com/spinyfin/mono/pull/2651) (§4) shows a false-success loop re-minting the same revision every few minutes, because each failure is recorded as a win — and it is not one PR's misfortune but a pattern across **27 PRs** that took three or more mid-turn reaps. Require an associated _change_ or explicit nothing-to-do — not silence.
 6. **If the only distinguishing field is a log attribute, prevalence is invisible until it is a metric.** The data was there the whole time — 224 mid-turn reaps sitting in trace across nine days — and it took two hand reconstructions to see any of it. "Not aggregated" and "not happening" are indistinguishable from the operator's chair.
 7. **Record state after the action, not only before it.** Without a post-teardown head SHA, the engine cannot answer its own most important question — did this execution deliver anything? — which left one row permanently unresolvable and one verdict wrong.
-8. **A phase race measured is rarely a coin flip.** This one was assumed roughly 50/50 from two cases and turned out to be 98.4%. Estimate the rate before deciding a race is tolerable — and note that the first honest measurement was still a 3.5x under-count of the volume, because the window it could see was set by log rotation rather than by the defect.
+8. **A phase race measured is rarely a coin flip.** This one was assumed roughly 50/50 from two cases and measured at **96.4%** mid-turn on the staged path (216/224). Estimate the rate before deciding a race is tolerable — and measure against the full join-floor window, not whatever log rotation left on disk that day.
 9. **Not every total loss is catastrophic.** Deterministically re-doable work (merge conflicts) wastes capacity; unique unrecovered work loses content; false success corrupts control flow. Categorize along those axes.
 10. **Worker “can’t see logs” is not the same as “logs are gone.”** This document originally reported an app update wiping the log root after three failed starts. The coordinator check found no update, twelve failed starts, and an intact unrotated copy of the whole stream in `/tmp` — the material was there the entire time. The caveat was correctly labelled an analysis gap rather than a finding, and that labelling is the only reason the wrong story never hardened into a fix for a problem that did not exist. **Label inferences as inferences; the discipline pays off exactly when the inference is wrong.**
-11. **Rotate-on-start destroys evidence when evidence matters most.** Trace rotation triggered by engine start means a restart storm — the very event you most want to investigate — evicts its own precursors. It happened twice inside this investigation, the second time deleting the window the first measurement was built on. Retention policy must be indexed to the incident, not to process lifecycle.
-12. **Stamp the timezone, then check it.** Every wall clock in the first version of this document was an hour off because the analysis assumed a zone the machine does not use. The arithmetic was right and the conclusions held, but every cross-reference against an external system — GitHub timestamps, an operator's memory of when they were at the keyboard — would have failed by an hour. Anchor on UTC in evidence blocks and derive local times from it.
-13. **PR prose that contradicts its own tests is a review smell.** #465 said Stop-only; its recheck test required poller finalization. Trust the code path the tests lock in.
+11. **Rotate-on-start destroys evidence when evidence matters most.** Trace rotation triggered by engine start, against a keep count of 5, means a restart storm — the very event you most want to investigate — evicts its own precursors (AI-11). It happened twice inside this investigation. Retention policy must be indexed to the incident, not to process lifecycle.
+12. **An unbounded append-only log will eventually fill the disk.** `/tmp/boss-engine.log` is the same stream in pretty format with no rotation at all; it was already ~2 GiB and growing because the engine almost never stops (AI-12). Opposite failure mode from keep-too-low, same root cause: no deliberate retention policy for that surface.
+13. **UTC is ground truth; local zone labels are presentation.** Engine timestamps already carry absolute UTC (`…Z`). Host zone moves with the operator and must not be treated as a stable system property. Derive any local wall clock from the UTC anchor; do not re-stamp history when `/etc/localtime` changes.
+14. **PR prose that contradicts its own tests is a review smell.** #465 said Stop-only; its recheck test required poller finalization. Trust the code path the tests lock in.
 
 ## 14. Follow-up code changes
 
-This document is **doc-only**. Recommended work is listed in §11 (engineering fixes) and §4 (recovery of the five falsely-reviewed work items) and should be filed as separate chores/tasks against the engine completion, PR-URL capture, merge-poller, and prompt-runner surfaces. The staged-path mid-turn guard (item 1) landed as [mono#2685](https://github.com/spinyfin/mono/pull/2685); do not redesign it here. Detector-branch coverage has now been verified and is **absent**, and a third exposed path (`stop_satisfied_clean`) has since been identified — extending the guard to both, and the trace rotation policy under AI-8, are the highest-value remaining items and should be filed separately.
+This document is **doc-only**. Recommended work is listed in §11 (engineering fixes) and §4 (recovery of the five falsely-reviewed work items) and should be filed as separate chores/tasks against the engine completion, PR-URL capture, merge-poller, prompt-runner, and logging surfaces. The staged-path mid-turn guard (item 1) landed as [mono#2685](https://github.com/spinyfin/mono/pull/2685); do not redesign it here. Detector-branch coverage has now been verified and is **absent**, and a third exposed path (`stop_satisfied_clean`) has since been identified — extending the guard to both, raising the trace keep count / stopping start-rotation (AI-11), and bounding `/tmp/boss-engine.log` (AI-12) are the highest-value remaining items and should be filed separately.
