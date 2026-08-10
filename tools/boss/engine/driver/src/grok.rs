@@ -191,11 +191,13 @@ pub fn build_grok_pane_command(request: &SpawnRequest<'_>, workspace: &Path, ses
     //   whose key set and `reason` ("shutdown") are IDENTICAL to the
     //   top-level session's — only the `sessionId` value differs. Boss
     //   routes hook events by `_boss_run_id` (`events_socket.rs:340-370`),
-    //   which is the same for both, and `live_worker_state.rs:1015` applies
+    //   which is the same for both, and `live_worker_state.rs:1022` applies
     //   `SessionEnd` by slot, so a finishing subagent flips a live worker to
     //   `WorkerActivity::Terminated` and publishes `AnswerAgentDied`. For a
-    //   background subagent that outlives the parent's turn, that wrong
-    //   state is also the slot's LAST state.
+    //   background subagent, the slot sits in `Terminated` from the child's
+    //   `session_end` until the parent's next event — about seven seconds in
+    //   the measured run — refusing nudges, interrupts, and answer delivery
+    //   while `activity_for_run` reports no live worker.
     // - `background_children.rs` cannot compensate: a Grok subagent is
     //   in-process (every hook forks from the same `grok` pid), so
     //   `count_live_descendants` reads 0 across the subagent's think/model

@@ -4,7 +4,7 @@
 - **Kind:** empirical investigation — findings + throwaway harness only; the only engine change it justifies is a comment and a regression test
 - **Pinned version:** `grok 1.0.0 (3cd0d0cbcebe) [stable]` (`~/.local/bin/grok`)
 - **Host:** macOS aarch64
-- **Question:** can `--no-subagents` (`tools/boss/engine/driver/src/grok.rs:192`) be removed?
+- **Question:** can `--no-subagents` (`tools/boss/engine/driver/src/grok.rs:210`) be removed?
 - **Answer:** **No.** Permission interception is sound; **progress attribution is not**.
 - **Related:** [grok-permission-isolation-2026-07-27.md](./grok-permission-isolation-2026-07-27.md) (apparatus rules, `GROK_HOME` + `HOME` scoping), [grok-pretooluse-decision-vocabulary-and-tool-name-map.md](./grok-pretooluse-decision-vocabulary-and-tool-name-map.md) (`deny` is the only vocabulary that blocks), [ghostty-grok-pane-viability.md](./ghostty-grok-pane-viability.md)
 - **Artifacts:** [`grok-subagent-hook-attribution-artifacts/`](./grok-subagent-hook-attribution-artifacts/)
@@ -38,13 +38,13 @@ The only discriminator is the `sessionId` **value**, and Boss never compares it:
 
 - `tools/boss/engine/core/src/events_socket.rs:340-370` routes a connection by `_boss_run_id` (spliced in by the `boss-event` shim from `BOSS_RUN_ID`) — the same value for parent and subagent, because they are the same process under the same env.
 - `tools/boss/engine/driver/src/grok/progress.rs:54` maps `session_end` → `SessionEnd`; `tools/boss/protocol/src/worker_event.rs:149` builds `WorkerEvent::SessionEnd`.
-- `tools/boss/engine/core/src/live_worker_state.rs:1015` applies it **by `slot_id`**, not by session id, and sets `activity = WorkerActivity::Terminated`.
+- `tools/boss/engine/core/src/live_worker_state.rs:1022` applies it **by `slot_id`**, not by session id, and sets `activity = WorkerActivity::Terminated`.
 - `tools/boss/engine/core/src/events_socket.rs:481` additionally publishes `Event::AnswerAgentDied` for the run.
 
 `WorkerActivity::Terminated` is terminal (`tools/boss/protocol/src/live_worker_state.rs:73`), so while the flag is set:
 
 - `accepts_typed_input()` is false — nudges, interrupts and answer delivery are refused for a worker that is alive and working.
-- `activity_for_run` / `has_live_state_for_run` (`live_worker_state.rs:875`, `:894`, `:907`) skip the slot, so a mid-turn finalization guard reads "no live worker".
+- `activity_for_run` / `is_run_live` (`live_worker_state.rs:903`, `:890`) skip the slot, so a mid-turn finalization guard reads "no live worker".
 - `ServerState::list_husk_panes` filters terminal entries out of its live set — the exact 2026-07-26 incident shape that `husk_pane_sweep`'s module docs describe (`tools/boss/engine/core/src/husk_pane_sweep.rs:66-75`), where a spurious `SessionEnd` burst got five live workers SIGTERMed. `live_process_evidence` corroboration (added in response to that incident) would spare the pane here, but it is a backstop against a bug, not a licence to introduce one deterministically.
 
 For a **blocking** subagent the wrong state is transient — the parent's next `pre_tool_use` restores `Working`. For a **background** subagent it is not: the parent's turn has already ended, so `Terminated` is the slot's last observed state until something else arrives.
@@ -53,16 +53,16 @@ For a **blocking** subagent the wrong state is transient — the parent's next `
 
 From [`timelines/tui_bg_outlives.md`](./grok-subagent-hook-attribution-artifacts/timelines/tui_bg_outlives.md), annotated with what Boss's reducer does with each event on the currently-wired set. Every row carries the **same** `_boss_run_id`:
 
-| t      | event                                            | session   | Boss's resulting `WorkerActivity`                                                                                                                    |
-| ------ | ------------------------------------------------ | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| +9.1s  | `stop` (`reason: end_turn`)                      | parent    | `Idle` — correct, the parent's turn did end                                                                                                          |
-| +24.0s | `user_prompt_submit`                             | **child** | `Working` — a turn nobody submitted                                                                                                                  |
-| +26.1s | `pre_tool_use run_terminal_command`              | **child** | `Working`, `current_tool = Bash`                                                                                                                     |
-| +72.4s | `post_tool_use`                                  | **child** | tool ended                                                                                                                                           |
-| +72.3s | `notification` (`idle_prompt` / "Turn complete") | parent    | no-op — `GrokDriver` does not declare `AwaitingInputSignal` (`grok.rs:244-247`), which is the only reason this is not also a false `WaitingForInput` |
-| +77.7s | **`session_end` (`reason: shutdown`)**           | **child** | **`Terminated`** — worker is alive and about to run another turn                                                                                     |
-| +77.6s | `user_prompt_submit`                             | parent    | `Working` (the subagent result injected as a `<system-reminder>`)                                                                                    |
-| +84.9s | `stop` (`reason: end_turn`)                      | parent    | `Idle` — the **second** `Stop` for one human prompt                                                                                                  |
+| t      | event                                            | session   | Boss's resulting `WorkerActivity`                                                                                                                        |
+| ------ | ------------------------------------------------ | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| +9.1s  | `stop` (`reason: end_turn`)                      | parent    | `Idle` — correct, the parent's turn did end                                                                                                              |
+| +24.0s | `user_prompt_submit`                             | **child** | `Working` — a turn nobody submitted                                                                                                                      |
+| +26.1s | `pre_tool_use run_terminal_command`              | **child** | `Working`, `current_tool = Bash`                                                                                                                         |
+| +72.4s | `post_tool_use`                                  | **child** | tool ended                                                                                                                                               |
+| +72.3s | `notification` (`idle_prompt` / "Turn complete") | parent    | no-op — `GrokDriver` does not declare `AwaitingInputSignal` (`grok.rs:229`, `:264`), which is the only reason this is not also a false `WaitingForInput` |
+| +77.7s | **`session_end` (`reason: shutdown`)**           | **child** | **`Terminated`** — worker is alive and about to run another turn                                                                                         |
+| +77.6s | `user_prompt_submit`                             | parent    | `Working` (the subagent result injected as a `<system-reminder>`)                                                                                        |
+| +84.9s | `stop` (`reason: end_turn`)                      | parent    | `Idle` — the **second** `Stop` for one human prompt                                                                                                      |
 
 So one human turn produces two `Stop` events and one spurious `Terminated`, with a `UserPromptSubmit` in between that no human sent.
 
@@ -124,7 +124,7 @@ The denied child call also has a `pre_tool_use` with **no** matching `post_tool_
 Roughly in dependency order. This is the fix sketch, not a design:
 
 1. **Make session identity part of ingress, not just payload decoration.** Boss must know the top-level `sessionId` for a run (it already assigns it — `--session-id`, `grok.rs:178`) and either drop or re-tag hook events whose `session_id` is not it. `extract_session_identity` (`tools/boss/protocol/src/worker_event.rs:166-171`) already surfaces the value; nothing downstream compares it. This is the smallest change that removes the false `Terminated`, and it is driver-generic enough to want a deliberate design rather than a Grok-local hack.
-2. **Wire `SubagentStart` / `SubagentStop`** into `GROK_HOOK_EVENTS` (`grok/hooks.rs:61-71`) and give them `WorkerEvent` variants, so "a subagent is in flight" becomes a state Boss models rather than infers. Both already reach `EVENT_NAME_MAP` (`grok/progress.rs:58-59`) and currently normalise to `UnknownEvent`.
+2. **Wire `SubagentStart` / `SubagentStop`** into `GROK_HOOK_EVENTS` (`grok/hooks.rs:61-69`) and give them `WorkerEvent` variants, so "a subagent is in flight" becomes a state Boss models rather than infers. Both already reach `EVENT_NAME_MAP` (`grok/progress.rs:58-59`) and currently normalise to `UnknownEvent`.
 3. **Replace the descendant-walk assumption for this driver.** `background_children.rs` cannot see an in-process subagent, and `Stop.backgroundTasks` is empty when it matters, so false-idle suppression for a Grok worker with a live background subagent needs the tracked `SubagentStart`/`SubagentStop` pair from (2) as its input instead.
 4. **Decide what a second `Stop` per human turn means** for the completion path, since a background subagent's result is injected as a fresh `UserPromptSubmit` and produces one.
 
@@ -137,8 +137,8 @@ Until at least (1) and (3) exist, enabling subagents trades a capability Boss do
 | Scratch root  | `$HOME/.cache/grok-subagent-hook-probe/` — deliberately **not** under `/tmp` (every sandbox profile makes `/tmp` writable; see the permission-isolation investigation)                                                                                                                                                      |
 | Isolated home | `$PROBE/home` with byte-copied `auth.json`, `config.toml` byte-identical to `render_base_config_toml()` (`grok/home.rs:227`), and a pre-seeded `trusted_folders.toml`                                                                                                                                                       |
 | Scoped `HOME` | `$PROBE/claude_home`, so the operator's `~/.claude` permission rules are not in force                                                                                                                                                                                                                                       |
-| Hook wiring   | `scripts/setup_home.py` — Boss's exact `GROK_HOOK_EVENTS` set (`grok/hooks.rs:61-71`) wired to a dump-all observer, plus `SubagentStart`/`SubagentStop`/`PostToolUseFailure`/`PermissionDenied` to see whether they fire at all; one deny guard appended onto the same `PreToolUse` array, matching `write_hooks`' ordering |
-| Worker shape  | `scripts/run_tui_probe.py` runs the **real pane command** from `build_grok_pane_command` (`grok.rs:155-200`) under a pty — `--no-alt-screen --always-approve --trust --session-id --cwd --no-memory` + positional prompt — with `--no-subagents` omitted, since that is the flag under test                                 |
+| Hook wiring   | `scripts/setup_home.py` — Boss's exact `GROK_HOOK_EVENTS` set (`grok/hooks.rs:61-69`) wired to a dump-all observer, plus `SubagentStart`/`SubagentStop`/`PostToolUseFailure`/`PermissionDenied` to see whether they fire at all; one deny guard appended onto the same `PreToolUse` array, matching `write_hooks`' ordering |
+| Worker shape  | `scripts/run_tui_probe.py` runs the **real pane command** from `build_grok_pane_command` (`grok.rs:155-218`) under a pty — `--no-alt-screen --always-approve --trust --session-id --cwd --no-memory` + positional prompt — with `--no-subagents` omitted, since that is the flag under test                                 |
 | Cross-check   | `scripts/run_probe.sh` runs the same prompts headless (`-p --output-format json`); the event sequence matches the TUI's in every respect that matters here                                                                                                                                                                  |
 | Kill case     | `scripts/run_kill_probe.py` SIGKILLs the `grok` pid a fixed delay after `subagent_start`                                                                                                                                                                                                                                    |
 | Model         | `grok-4.5`. `grok-code-fast-1` is retired and silently redirects — never a probe target                                                                                                                                                                                                                                     |

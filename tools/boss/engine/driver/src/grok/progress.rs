@@ -517,7 +517,8 @@ mod tests {
     /// (`docs/investigations/grok-subagent-hook-attribution-2026-08-09.md`):
     /// a subagent finishing mid-turn emits a `session_end` whose key set and
     /// `reason` are identical to the one the top-level session emits when it
-    /// really does end. Both payloads below are verbatim from that probe.
+    /// really does end. Both payloads below are verbatim from that probe,
+    /// with host paths redacted to `/probe/...`.
     ///
     /// This module normalises them into `WorkerEvent::SessionEnd` values that
     /// differ **only** in `session_id` — and nothing between here and
@@ -525,10 +526,10 @@ mod tests {
     /// session) compares that field. So the subagent's event is applied as
     /// `WorkerActivity::Terminated` for a worker that is alive.
     ///
-    /// If a future change makes these two distinguishable — a `SubagentStop`
-    /// variant, a session-identity filter at ingress, a new payload field —
-    /// this test should fail and be rewritten, and lifting the flag becomes
-    /// a live question again.
+    /// A change to `EVENT_NAME_MAP` or this normalizer's `session_end`
+    /// handling must make this test fail and be reconsidered before lifting
+    /// the flag. A session-identity filter at ingress needs its own guard
+    /// where that filter lives.
     #[test]
     fn a_subagents_session_end_is_indistinguishable_from_the_top_level_sessions() {
         let subagent = json!({
@@ -562,14 +563,14 @@ mod tests {
         assert_eq!(keys(&subagent), keys(&top_level));
 
         let WorkerEvent::SessionEnd {
-            session_id: subagent_session,
+            session_id: _,
             reason: subagent_reason,
         } = session().normalize_progress_event(&subagent).unwrap()
         else {
             panic!("expected SessionEnd");
         };
         let WorkerEvent::SessionEnd {
-            session_id: top_level_session,
+            session_id: _,
             reason: top_level_reason,
         } = session().normalize_progress_event(&top_level).unwrap()
         else {
@@ -577,11 +578,8 @@ mod tests {
         };
 
         assert_eq!(subagent_reason, "shutdown");
+        // Both normalize to `SessionEnd` with equal non-session fields.
         assert_eq!(subagent_reason, top_level_reason);
-        assert_ne!(
-            subagent_session, top_level_session,
-            "session id is the ONLY discriminator, and no consumer reads it"
-        );
     }
 
     #[test]
