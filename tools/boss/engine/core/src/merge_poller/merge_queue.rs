@@ -216,9 +216,10 @@ pub(crate) async fn run_merge_queue_rebounce_pass(
 
 /// Poll the PR's merge-queue timeline for `FAILED_CHECKS` dequeue
 /// events and fire [`ci_watch::on_merge_queue_rebounce_detected`] for
-/// any event whose `beforeCommit.oid` is not yet recorded in
-/// `ci_remediations`. Best-effort: a failed GraphQL call is logged at
-/// debug and skipped; the next sweep will retry.
+/// any event whose attributed PR head is not yet recorded in
+/// `ci_remediations` (with a transition-safe match against the synthetic
+/// `beforeCommit` for pre-head-key rows). Best-effort: a failed GraphQL
+/// call is logged at debug and skipped; the next sweep will retry.
 pub(crate) async fn check_merge_queue_rebounce(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -232,12 +233,25 @@ pub(crate) async fn check_merge_queue_rebounce(
     if events.is_empty() {
         return;
     }
+    // Current PR head from the last poll-state write (updated earlier in
+    // this sweep's `sweep_one` → `update_pr_poll_state`). A historical
+    // dequeue attributed to a superseded head must not mint a fresh
+    // remediation after the key migration — only the live head is actionable.
+    let current_pr_head = work_db
+        .get_pr_status_snapshot(&candidate.work_item_id)
+        .ok()
+        .flatten()
+        .and_then(|snap| snap.head_sha);
     // Newest first: repeated enqueue attempts of the same unchanged PR head
     // share one remediation budget, and the freshest synthetic run is the
     // most useful CI evidence to retain on that row.
     for event in events.iter().rev() {
         let Some(pr_head_sha) = event.pr_head_oid.as_deref() else {
-            tracing::warn!(
+            // Unattributable forever when the bounded timeline window is
+            // crowded out by dequeue events (no PR-head provenance left).
+            // Debug only — a warn per event per candidate per sweep is
+            // operator-visible noise that can never clear.
+            tracing::debug!(
                 work_item_id = %candidate.work_item_id,
                 pr_url = %candidate.pr_url,
                 "merge poller: FAILED_CHECKS dequeue event has no attributable PR head; skipping",
@@ -252,6 +266,19 @@ pub(crate) async fn check_merge_queue_rebounce(
             );
             continue;
         };
+        if let Some(current) = current_pr_head.as_deref()
+            && pr_head_sha != current
+        {
+            tracing::debug!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                pr_head_sha,
+                current_pr_head = current,
+                before_commit_sha,
+                "merge poller: rebounce event attributed to superseded PR head; skipping",
+            );
+            continue;
+        }
         // Per-episode dedup *before* the check-runs/status round trip.
         // The timeline keeps historical `RemovedFromMergeQueueEvent`s
         // forever (including on PRs that have since re-queued and
@@ -259,9 +286,15 @@ pub(crate) async fn check_merge_queue_rebounce(
         // re-fetch CI evidence for already-handled discriminators —
         // log noise and wasted GitHub quota on rows that are no longer
         // live (historically 1000+ re-fetches for a single PR episode).
+        // Match PR head *or* synthetic before_commit so pre-transition
+        // rows (synthetic stored in `head_sha_at_trigger`) still hit.
         // `on_merge_queue_rebounce_detected`'s INSERT OR IGNORE is the
         // authoritative no-op; this just avoids the surrounding work.
-        match work_db.ci_remediation_exists_for_head_sha_at_trigger(&candidate.work_item_id, pr_head_sha) {
+        match work_db.ci_remediation_exists_for_merge_queue_episode(
+            &candidate.work_item_id,
+            pr_head_sha,
+            before_commit_sha,
+        ) {
             Ok(true) => {
                 tracing::debug!(
                     work_item_id = %candidate.work_item_id,

@@ -959,6 +959,39 @@ impl WorkDb {
         Ok(exists)
     }
 
+    /// Merge-queue rebounce episode dedup during the head-key transition.
+    ///
+    /// Current writers store the attributed PR head in `head_sha_at_trigger`
+    /// and the synthetic queue commit in `before_commit_sha`. Pre-transition
+    /// rows stored the synthetic commit in **both** columns (and human
+    /// suppressions / UNIQUE inserts keyed on that synthetic value). Match
+    /// either SHA against either column so already-handled ejections and
+    /// suppressions continue to short-circuit after deploy instead of
+    /// re-minting remediations and burning non-refundable CI budget.
+    pub fn ci_remediation_exists_for_merge_queue_episode(
+        &self,
+        work_item_id: &str,
+        pr_head_sha: &str,
+        before_commit_sha: &str,
+    ) -> Result<bool> {
+        let conn = self.connect()?;
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM ci_remediations
+                  WHERE work_item_id = ?1
+                    AND (
+                         head_sha_at_trigger = ?2
+                      OR head_sha_at_trigger = ?3
+                      OR before_commit_sha = ?2
+                      OR before_commit_sha = ?3
+                    )
+             )",
+            params![work_item_id, pr_head_sha, before_commit_sha],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
+
     /// Read a `ci_remediations` row by id, terminal or not. Returns
     /// `Ok(None)` for an unknown id. Used by the worker-marker
     /// handlers in `app.rs` to echo the post-update row back to the
@@ -1499,6 +1532,30 @@ impl WorkDb {
             "SELECT COUNT(*) FROM ci_failure_suppressions
               WHERE work_item_id = ?1 AND head_sha = ?2",
             params![work_item_id, head_sha],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Like [`Self::is_ci_failure_suppressed`], but true when *either*
+    /// SHA matches a suppression row. Used by merge-queue rebounce so a
+    /// human override recorded against the pre-transition synthetic
+    /// `head_sha_at_trigger` still suppresses after the detector keys
+    /// episodes on the attributed PR head.
+    pub fn is_ci_failure_suppressed_for_either(
+        &self,
+        work_item_id: &str,
+        head_sha_a: &str,
+        head_sha_b: &str,
+    ) -> Result<bool> {
+        if head_sha_a == head_sha_b {
+            return self.is_ci_failure_suppressed(work_item_id, head_sha_a);
+        }
+        let conn = self.connect()?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ci_failure_suppressions
+              WHERE work_item_id = ?1 AND (head_sha = ?2 OR head_sha = ?3)",
+            params![work_item_id, head_sha_a, head_sha_b],
             |row| row.get(0),
         )?;
         Ok(n > 0)

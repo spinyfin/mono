@@ -158,12 +158,9 @@ pub(crate) fn record_declined_evaluation(
     );
 }
 
-/// Retire a GitHub merge-queue attempt after GitHub's compare API proves
-/// that its synthetic trigger commit no longer contains the current PR
-/// head. Queue commits live on `gh-readonly-queue/*` and never become part
-/// of the PR branch, so equality with `head_sha_at_trigger` cannot be the
-/// retirement test. The caller performs the reachability query; this
-/// function owns the attempt/signal transition and its UI events.
+/// Retire a merge-queue attempt once the PR head has advanced past the
+/// head attributed to the dequeue event. The caller owns that comparison;
+/// this function owns the attempt/signal transition and its UI events.
 pub(crate) async fn retire_superseded_merge_queue_attempt(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -196,7 +193,7 @@ pub(crate) async fn retire_superseded_merge_queue_attempt(
         work_db,
         &candidate.work_item_id,
         active.revision_task_id.as_deref(),
-        "superseded by a PR head that is no longer contained by the merge-queue trigger",
+        "superseded by a PR head advance past the merge-queue attempt's attributed head",
     );
     publisher
         .publish_work_item_changed(
@@ -222,7 +219,7 @@ pub(crate) async fn retire_superseded_merge_queue_attempt(
         attempt_kind = %retired.attempt_kind,
         head_sha_at_trigger = %retired.head_sha_at_trigger,
         current_head_sha,
-        "ci_watch: retired merge-queue remediation whose trigger no longer contains the PR head",
+        "ci_watch: retired merge-queue remediation after PR head advanced past attributed head",
     );
     true
 }
@@ -1182,7 +1179,16 @@ async fn on_queue_side_failure_detected(
 
     // Suppression check: if the human manually moved the chore out of
     // `blocked: ci_failure` for this episode's discriminator, honour it.
-    match work_db.is_ci_failure_suppressed(&candidate.work_item_id, discriminator) {
+    // Merge-queue rebounce also matches a suppression recorded against
+    // the synthetic queue commit (pre-transition key) so human overrides
+    // survive the head-key migration.
+    let suppressed = match (failure_kind, before_commit_sha) {
+        ("merge_queue_rebounce", Some(before)) => {
+            work_db.is_ci_failure_suppressed_for_either(&candidate.work_item_id, discriminator, before)
+        }
+        _ => work_db.is_ci_failure_suppressed(&candidate.work_item_id, discriminator),
+    };
+    match suppressed {
         Ok(true) => {
             tracing::debug!(
                 work_item_id = %candidate.work_item_id,
@@ -1574,14 +1580,14 @@ pub(crate) fn trunk_eviction_discriminator(trunk_entry_id: &str, trunk_state_cha
 /// investigation (`id` was measured to be per-PR-stable, not
 /// per-episode, so the pair is load-bearing, not belt-and-braces).
 /// Folded into `head_sha_at_trigger` (mirroring how
-/// [`on_merge_queue_rebounce_detected`] overloads that column with the
-/// synthetic merge sha) so the existing `(work_item_id,
-/// head_sha_at_trigger, attempt_kind)` UNIQUE key does the deduplication
-/// with no schema change. `trunk_pr_sha` is deliberately NOT part of the
-/// key or persisted: the investigation found it is re-read live from the
-/// PR's current head and can mutate mid-episode with no corresponding
-/// state or timestamp change, making it unsafe as a provenance field for a
-/// single episode.
+/// [`on_merge_queue_rebounce_detected`] stores the attributed PR head in
+/// that column and keeps the synthetic queue SHA in `before_commit_sha`)
+/// so the existing `(work_item_id, head_sha_at_trigger, attempt_kind)`
+/// UNIQUE key does the deduplication with no schema change.
+/// `trunk_pr_sha` is deliberately NOT part of the key or persisted: the
+/// investigation found it is re-read live from the PR's current head and
+/// can mutate mid-episode with no corresponding state or timestamp change,
+/// making it unsafe as a provenance field for a single episode.
 ///
 /// Returns `true` when the parent transitions to `blocked: ci_failure`.
 pub async fn on_trunk_queue_eviction_detected(
