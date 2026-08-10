@@ -75,6 +75,19 @@ impl ConfiguredCheck for CompiledDocStructureConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DocStructureConfig {
+    // Framework-owned legacy scope keys remain in the config blob while the
+    // resolver reads and deprecates them. Consume them here so strict parsing
+    // still rejects check-specific stale keys such as `include_globs`.
+    #[serde(default, rename = "include")]
+    _framework_include: Option<toml::Value>,
+    #[serde(default, rename = "exclude")]
+    _framework_exclude: Option<toml::Value>,
+    #[serde(default, rename = "exclude_files")]
+    _framework_exclude_files: Option<toml::Value>,
+    #[serde(default, rename = "exclude_globs")]
+    _framework_exclude_globs: Option<toml::Value>,
+    #[serde(default, rename = "applies_to")]
+    _framework_applies_to: Option<toml::Value>,
     #[serde(default)]
     metadata_prefixes: Option<Vec<String>>,
     #[serde(default)]
@@ -394,5 +407,23 @@ mod tests {
             message.contains("include_globs") || message.contains("unknown field"),
             "expected deny_unknown_fields diagnostic, got: {message}"
         );
+    }
+
+    #[test]
+    fn accepts_framework_owned_legacy_scope_keys() {
+        let check = DocStructureCheck;
+        let config: toml::Value = toml::from_str(
+            r#"
+include = ["docs/**/*.md"]
+exclude = ["docs/generated/**"]
+exclude_files = ["docs/legacy/**"]
+exclude_globs = ["docs/vendor/**"]
+applies_to = ["docs/**/*.md"]
+"#,
+        )
+        .expect("parse framework-owned scope keys");
+        check
+            .configure(&config)
+            .expect("framework-owned legacy scope keys remain accepted");
     }
 }

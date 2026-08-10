@@ -82,8 +82,8 @@ checks:
 
   - id: md/doc-structure
     check: md/doc-structure
-    # Framework include side (was bespoke config.include_globs). The check's
-    # intrinsic .md extension gate still applies on top.
+    # Which doc trees this check gates. The check's intrinsic .md extension
+    # gate applies on top.
     include:
       - "**/docs/investigations/**/*.md"
       - "**/docs/designs/**/*.md"

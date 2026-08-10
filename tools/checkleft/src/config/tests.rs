@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tempfile::tempdir;
 
 use crate::external::ExternalCheckImplementationRef;
+use crate::input::{ChangeKind, ChangeSet, ChangedFile};
 use crate::output::Severity;
+use crate::path_scope::PathScope;
 
 use super::{
     CheckScope, ConfigResolver, StaleExclusionMode, diagnose_unknown_check_fields, levenshtein_distance,
@@ -1892,6 +1894,58 @@ include = ["src/**"]
     let check = checks.get("format/oxc").expect("check exists");
     // Authored as "src/**" in frontend/CHECKS.toml → normalized to "frontend/src/**".
     assert_eq!(check.applies_to_patterns, vec!["frontend/src/**".to_owned()]);
+}
+
+#[test]
+fn doc_structure_framework_include_preserves_legacy_check_scope_selection() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "md/doc-structure"
+include = ["**/docs/investigations/**/*.md", "**/docs/designs/**/*.md"]
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("docs/investigations/example.md"))
+        .expect("resolve checks");
+    let check = checks.get("md/doc-structure").expect("check exists");
+    let framework_scope = checks.effective_matcher_for(check).expect("compile framework scope");
+    let legacy_patterns = vec![
+        "**/docs/investigations/**/*.md".to_owned(),
+        "**/docs/designs/**/*.md".to_owned(),
+    ];
+    let legacy_scope = PathScope::new(&legacy_patterns, &[]).expect("compile legacy scope");
+    let candidates = ChangeSet::new(
+        [
+            "docs/investigations/example.md",
+            "docs/designs/decision.md",
+            "docs/other/notes.md",
+            "src/lib.rs",
+            "docs/investigations/example.txt",
+        ]
+        .into_iter()
+        .map(|path| ChangedFile {
+            path: PathBuf::from(path),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        })
+        .collect(),
+    );
+
+    let selected_paths = |scope: &PathScope| {
+        scope
+            .filter_changeset(&candidates)
+            .changed_files
+            .into_iter()
+            .map(|file| file.path)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(selected_paths(&framework_scope), selected_paths(&legacy_scope));
 }
 
 #[test]

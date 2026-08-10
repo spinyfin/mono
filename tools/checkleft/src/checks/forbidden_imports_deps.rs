@@ -109,12 +109,12 @@ struct ForbiddenImportsDepsRuleConfig {
     /// share one scope should hoist this to the check-entry framework `include`
     /// key instead; keep it here only when rules in the same instance genuinely
     /// differ. Matches repo-root-relative paths.
-    #[serde(default)]
+    #[serde(default, alias = "include_globs")]
     include: Vec<String>,
-    /// Per-rule negative selection. **Out of scope for the framework-include
-    /// migration** — this remains config-dir-relative via `strip_prefix`
-    /// (`is_excluded` below) while sibling `include` is repo-relative. Do not
-    /// rename, rewrite, or "fix" the coordinate here.
+    /// Per-rule negative selection. Matches the CONFIG-DIR-relative path (see
+    /// `is_excluded`), unlike the sibling `include`, which is repo-relative.
+    /// The mismatch is load-bearing for existing configs: changing the
+    /// coordinate changes which files existing rules exclude.
     #[serde(default, alias = "exclude_globs")]
     exclude_files: Vec<String>,
     #[serde(default)]
@@ -223,7 +223,7 @@ mod tests {
     use crate::input::{ChangeKind, ChangeSet, ChangedFile};
     use crate::source_tree::LocalSourceTree;
 
-    use super::ForbiddenImportsDepsCheck;
+    use super::{ForbiddenImportsDepsCheck, parse_config};
 
     #[tokio::test]
     async fn flags_forbidden_pattern_in_included_file() {
@@ -328,5 +328,20 @@ mod tests {
             .expect("run check");
 
         assert!(result.findings.is_empty());
+    }
+
+    #[test]
+    fn include_globs_alias_preserves_per_rule_scope() {
+        let config = toml::Value::Table(toml::toml! {
+            rules = [{
+                pattern = "forbidden",
+                message = "forbidden import",
+                include_globs = ["frontend/src/**/*.ts"]
+            }]
+        });
+
+        let compiled = parse_config(&config, Path::new("")).expect("parse legacy include alias");
+        assert!(compiled.applies_to(Path::new("frontend/src/app.ts")));
+        assert!(!compiled.applies_to(Path::new("backend/src/lib.rs")));
     }
 }

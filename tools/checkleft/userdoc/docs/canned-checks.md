@@ -584,7 +584,7 @@ Per-rule keys:
 
 - `pattern` (required regex string)
 - `message` (required string)
-- `include` (optional array of repo-root-relative globs) — finer-axis rule selection when rules in one instance genuinely need different path scopes. Prefer the check-entry framework `include` key when every rule shares one scope.
+- `include` (optional array of repo-root-relative globs; `include_globs` is a supported alias) — finer-axis rule selection when rules in one instance genuinely need different path scopes. Prefer the check-entry framework `include` key when every rule shares one scope.
 - `exclude_files` (optional array of globs; `exclude_globs` is a supported alias) — per-rule negative selection. Matches config-dir-relative paths (via `strip_prefix` of the CHECKS file directory); this coordinate is intentional-or-legacy and is not the framework `exclude` key.
 - `severity` (optional `error|warning|info`)
 - `remediation` (optional string)

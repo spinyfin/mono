@@ -118,14 +118,7 @@ mod language_scope_tests {
     use super::config::PatternLanguage;
     use super::{language_include_globs, matches_language_path};
 
-    /// The pre-migration gate was a bare extension check. Prove the explicit
-    /// default globs reproduce it on representative paths so a silent coverage
-    /// change cannot land with this rewrite.
-    ///
-    /// Paths whose final component is a leading-dot name with a single period
-    /// (e.g. `.java`) are excluded: `Path::extension` returns `None` for those
-    /// while `**/*.java` matches them. No real Java source tree uses that shape
-    /// as a compilation unit.
+    /// The pre-migration gate was a bare extension check.
     fn legacy_extension_gate(path: &Path, language: PatternLanguage) -> bool {
         match language {
             PatternLanguage::Java => {
@@ -164,5 +157,11 @@ mod language_scope_tests {
                 "path `{sample}`: explicit glob gate ({explicit}) must equal legacy extension gate ({legacy})"
             );
         }
+    }
+
+    #[test]
+    fn java_glob_gate_includes_dot_leading_java_names() {
+        assert!(matches_language_path(Path::new(".java"), PatternLanguage::Java));
+        assert!(matches_language_path(Path::new("src/.java"), PatternLanguage::Java));
     }
 }
