@@ -989,8 +989,12 @@ async fn recheck_for_pr_staged_revision_rejects_stale_stop_evidence() {
     let (_dir, db, _product_id, revision_id, execution_id) =
         revision_fixture(workspace.path(), parent_pr_url, head_before);
 
+    // Unarmed: a read-only/metadata observation, not a publishing command.
+    // This must not authorize the staged arm's direct finalization — it
+    // exists only so the SHA-delta gate below is what actually decides the
+    // outcome, per this test's stale-Stop-evidence claim.
     let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
-    staged_pr_urls.record_if_unset(&execution_id, parent_pr_url);
+    staged_pr_urls.record_command_observation(&execution_id, parent_pr_url, false);
     db.set_execution_stop_seen(&execution_id).unwrap();
 
     let detector = StubPrDetector::ok(None);

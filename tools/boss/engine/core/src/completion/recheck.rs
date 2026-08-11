@@ -56,75 +56,56 @@ impl WorkerCompletionHandler {
             .get_entry(execution_id)
             .is_none_or(|entry| entry.finalization_armed);
 
-        // Then: if the PostToolUse dispatcher already
-        // captured this execution's PR URL from the worker's hook
-        // stream, finalize via that URL and skip the detector. Layer-2
-        // defence-in-depth: verify the staged PR's headRefName matches
-        // this execution's expected branch before trusting the URL. A
-        // mismatch means the URL was captured from an unrelated Bash
-        // invocation (e.g. reading a chore description that referenced
-        // an old PR number) and must be discarded.
         // Then: if the PostToolUse dispatcher already captured this
         // execution's PR URL from the worker's hook stream, verify it before
-        // trusting it. For primary implementations the URL is the completed
-        // deliverable, so recheck may finalize directly and skip the
+        // trusting it. Layer-2 defence-in-depth: verify the staged PR's
+        // headRefName matches this execution's expected branch — a mismatch
+        // means the URL was captured from an unrelated Bash invocation (e.g.
+        // reading a chore description that referenced an old PR number) and
+        // must be discarded. For primary implementations the URL is the
+        // completed deliverable, so recheck finalizes directly and skips the
         // detector.
         //
         // Revisions are different: their prompt deliberately keeps PR
         // description reconciliation and findings-status reporting
         // worker-owned after the push. A staged URL proves only that the PR
-        // exists, not that those judgment-bearing steps ran. Recheck must
-        // therefore leave a revision live until its driver-resolved Stop
-        // boundary. It continues into the SHA-delta recovery gate below,
-        // which may finalize only when `on_stop_inner` already stamped the
-        // exact contributed head. That preserves transient Stop-finalization
-        // recovery without turning a push (or even `gh pr view`) into an
-        // implicit completion signal.
+        // exists, not that those judgment-bearing steps ran. The staged arm
+        // therefore finalizes a revision unless its worker is observed
+        // `Working` within `staged_pr_mid_turn_defer_secs` of `staged_at`
+        // (see `should_defer_staged_pr_recheck`), in which case recheck
+        // defers to the worker's own driver-resolved Stop boundary instead
+        // of turning a push (or even `gh pr view`) into an implicit
+        // completion signal.
         if staged_armed
             && let Some(staged_url) = self
                 .verified_staged_pr_url(execution_id, &execution, "pr-recheck")
                 .await
         {
-            if execution.kind == ExecutionKind::RevisionImplementation {
-                if self.should_defer_staged_pr_recheck(execution_id) {
-                    tracing::debug!(
-                        execution_id,
-                        pr_url = %staged_url,
-                        "pr-recheck: staged PR URL present for a mid-turn revision; retaining it \
-                         for the worker's own Stop boundary before finalization",
-                    );
-                    return StopOutcome::AwaitingInput;
-                }
+            if execution.kind == ExecutionKind::RevisionImplementation
+                && self.should_defer_staged_pr_recheck(execution_id)
+            {
                 tracing::info!(
                     execution_id,
                     pr_url = %staged_url,
-                    "pr-recheck: staged revision PR URL is no longer deferrable; finalizing",
+                    "pr-recheck: staged PR URL present for a mid-turn revision; retaining it \
+                     for the worker's own Stop boundary before finalization",
                 );
-                PR_URL_CAPTURE_PRIMARY_HIT.inc(&self.metrics);
-                return self
-                    .finalize_pr_transition(
-                        execution_id,
-                        staged_url,
-                        WorkerPrCompletionTarget::InReview,
-                        "pr_recheck_staged",
-                    )
-                    .await;
-            } else {
-                tracing::info!(
-                    execution_id,
-                    pr_url = %staged_url,
-                    "pr-recheck: using PR URL captured from worker hook stream (primary path); skipping detector",
-                );
-                PR_URL_CAPTURE_PRIMARY_HIT.inc(&self.metrics);
-                return self
-                    .finalize_pr_transition(
-                        execution_id,
-                        staged_url,
-                        WorkerPrCompletionTarget::InReview,
-                        "pr_recheck_staged",
-                    )
-                    .await;
+                return StopOutcome::AwaitingInput;
             }
+            tracing::info!(
+                execution_id,
+                pr_url = %staged_url,
+                "pr-recheck: using PR URL captured from worker hook stream (primary path); skipping detector",
+            );
+            PR_URL_CAPTURE_PRIMARY_HIT.inc(&self.metrics);
+            return self
+                .finalize_pr_transition(
+                    execution_id,
+                    staged_url,
+                    WorkerPrCompletionTarget::InReview,
+                    "pr_recheck_staged",
+                )
+                .await;
         }
         if !staged_armed {
             tracing::debug!(

@@ -2553,9 +2553,11 @@ fn parse_api_pr_tsv_parses_all_six_fields() {
 /// `revision_stop_contributed_head` itself before `finalize_pr_transition`
 /// commits, not only from the SHA-delta arm. Without that stamp, a
 /// transient `record_worker_pr_completion` failure at Stop stranded the
-/// revision live forever: `recheck_for_pr` declines to use a retained
-/// staged URL for a revision (see the deferral tests above) and its
-/// exact-head recovery gate had no evidence to recover from.
+/// revision: `recheck_for_pr` defers a revision's retained staged URL while
+/// its worker is observed mid-turn (bounded by
+/// `DEFAULT_STAGED_PR_MID_TURN_DEFER_SECS`; see the deferral tests above),
+/// but once that staged entry is gone or unarmed its exact-head recovery
+/// gate had no evidence to recover from.
 ///
 /// This drives the real staged-URL `on_stop` path (not a hand-stamped
 /// `revision_stop_contributed_head` like
@@ -2636,6 +2638,13 @@ async fn on_stop_staged_url_stamps_contributed_head_before_transient_finalize_fa
         .unwrap();
     }
     db.set_execution_stop_seen(&execution_id).unwrap();
+
+    // The staged entry from the earlier `on_stop` attempt is still cached
+    // (finalize failed before `forget`). Clear it before the recovery sweep
+    // so the assertion below proves recovery comes from the stamped
+    // `revision_stop_contributed_head` via the exact-head SHA-delta gate,
+    // not from the staged arm short-circuiting straight to finalization.
+    staged_pr_urls.forget(&execution_id);
 
     let outcome = handler.recheck_for_pr(&execution_id).await;
 

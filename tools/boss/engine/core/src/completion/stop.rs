@@ -640,10 +640,12 @@ impl WorkerCompletionHandler {
             // `revision_stop_contributed_head` itself rather than relying
             // on the SHA-delta arm below, which this staged-URL return
             // never reaches. Without this stamp, a transient
-            // `finalize_pr_transition` failure here strands the revision
-            // live forever: `recheck_for_pr` declines to use a retained
-            // staged URL for a revision and its exact-head recovery gate
-            // has no evidence to recover from.
+            // `finalize_pr_transition` failure here strands the revision:
+            // `recheck_for_pr` defers a revision's retained staged URL only
+            // while its worker is observed mid-turn (bounded by
+            // `DEFAULT_STAGED_PR_MID_TURN_DEFER_SECS`), so once that horizon
+            // expires it needs the stamped head to recover promptly rather
+            // than finalizing against stale evidence.
             if execution.kind == ExecutionKind::RevisionImplementation {
                 self.stamp_revision_stop_contributed_head_from_staged_url(execution_id, &execution, &staged_url)
                     .await;
