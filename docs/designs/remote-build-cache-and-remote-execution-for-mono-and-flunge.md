@@ -1,13 +1,14 @@
 # Remote build cache and remote execution for mono and flunge: scale Bazel off the coordinator
 
 - **Date:** 2026-08-10
-- **Status:** design (not implemented); supersedes the earlier attempt in [mono#2715](https://github.com/spinyfin/mono/pull/2715)
+- **Status:** design (not implemented); supersedes the earlier attempt in [mono#2715](https://github.com/spinyfin/mono/pull/2715). **Merge order:** mono#2715 must be **closed unmerged** (not merged after this). That PR adds a competing design under `tools/boss/docs/designs/` with the opposite verdict; merging both would leave two contradictory docs. Closing #2715 is an operator action — this PR does not close it.
+- **Location:** Lives under top-level `docs/designs/` by choice: the subject spans mono, flunge, and shared Bazel infrastructure, not Boss-only docs under `tools/boss/docs/designs/`.
 - **Repos in scope:** `spinyfin/mono`, `brianduff/flunge`, and future Bazel repos
 - **Related:** [Distributed agent execution](../../tools/boss/docs/designs/distributed-agent-execution-register-and-dispatch-to-remote-ssh-hosts.md) · [Linux CI agent runbook](../../.buildkite/linux-agents-runbook.md) · [Xcode pinning runbook](../../tools/boss/docs/mac-toolchain-xcode-pinning.md) · [checkleft CI timing](../investigations/checkleft-checks-ci-timing.md)
 
 ## Executive answer
 
-**Bazel work is the primary limit on Boss worker scale, and the next capacity must move that work off the coordinator.** At 16 implementation workers plus reviewers, the 12-core laptop was continuously at 0% idle, used 9.96 GiB of 11.26 GiB of swap, and reached load averages near 200. Running 40–50 workers on that fixed CPU budget is not achievable by enlarging a cache or retuning `--jobs`. Those changes may reduce waste, but they cannot add compute.
+**Bazel work is the primary limit on Boss worker scale, and the next capacity must move that work off the coordinator.** At 16 implementation workers plus reviewers, the 12-core laptop was continuously at 0% idle, used 9.96 GiB of 11.26 GiB of swap, and averaged a 1-minute load of 181.6 (peaked near 293). Running 40–50 workers on that fixed CPU budget is not achievable by enlarging a cache or retuning `--jobs`. Those changes may reduce waste, but they cannot add compute.
 
 Proceed with a shared remote cache and remote-execution pilot now. Use **NativeLink as the first implementation to test** because one service can provide the CAS, action cache, scheduler, and Linux/macOS worker support needed by the full design. Run normal Rust compilation and tests on Linux whenever the worker only needs a build or test result; reserve Darwin execution for `Boss.app`, Apple-specific flunge work, and any action whose target or toolchain genuinely requires macOS. An owned or newly purchased Mac mini is a viable Darwin worker and is materially cheaper than continuously renting the cited high-end Mac.
 
@@ -76,7 +77,7 @@ The system-wide sample showed:
 | CPU sys              |     38.5% | 27.2% | 63.2% |
 | Load average (1 min) |     181.6 | 106.9 | 293.2 |
 
-Per-process CPU deltas over 180 seconds included:
+Per-process CPU deltas over 180 seconds (partial list of the largest contributors; eight rows sum to 1,001 CPU-seconds):
 
 | Process                        | CPU-seconds | Cores |
 | ------------------------------ | ----------: | ----: |
@@ -89,7 +90,7 @@ Per-process CPU deltas over 180 seconds included:
 | `syspolicyd`                   |          60 |  0.33 |
 | `XprotectService`              |          26 |  0.15 |
 
-Direct compilers, linkers, and Bazel servers accounted for roughly 39% of the attributed process CPU. Adding `fseventsd` and executable-scanning processes yields a roughly 68% Bazel-associated estimate, but that estimate is **not** a causal attribution: this study did not trace file events back to Bazel, and normal system activity also uses those services. The reliable conclusion is stronger and simpler:
+From the rows above, direct compilers and Bazel servers alone are already the dominant avoidable consumers (`rustc` + `clippy-driver` + Bazel JVMs = 477 of the 1,001 CPU-seconds shown). Adding `fseventsd`, `syspolicyd`, and `XprotectService` (362) raises the combined total to 839 of those 1,001, but that wider total is **not** a causal attribution of filesystem or security-scanner load to Bazel: this study did not trace file events back to Bazel, and normal system activity also uses those services. Percentages against a larger full-process denominator are omitted because that total was not retained in the sample notes. The reliable conclusion is stronger and simpler:
 
 - `rustc` and `clippy-driver` were continuously visible doing the avoidable work.
 - Nearly every non-system process outside Bazel was either a necessary part of the normal machine or Boss/agent orchestration.
@@ -178,13 +179,14 @@ Cold build of `//tools/boss/engine/core:engine_lib`:
 
 A one-line content edit produced:
 
-| Metric            |   Value |
-| ----------------- | ------: |
-| Elapsed           | 125.5 s |
-| Critical path     | 120.4 s |
-| Actions           |      40 |
-| Action-cache hits |      34 |
-| Locally executed  |       4 |
+| Metric                              |   Value |
+| ----------------------------------- | ------: |
+| Elapsed                             | 125.5 s |
+| Critical path                       | 120.4 s |
+| Actions                             |      40 |
+| Action-cache hits                   |      34 |
+| Bazel-internal                      |       2 |
+| Locally executed (`darwin-sandbox`) |       4 |
 
 The critical path was one `aarch64-apple-darwin` Rust compile. A remote cache cannot contain the result of a line that was just authored, but RBE can execute it. A compatible Darwin executor could move nearly the whole measured critical path. A Linux executor can move it if the worker is validating a Linux artifact, or if a supported cross-toolchain makes the action Linux-executable while retaining its required target.
 
@@ -372,6 +374,8 @@ The remote cache acceptance test is end to end: host B must consume an action re
 
 ## Proposed implementation task breakdown
 
+Depth bands are concurrency layers: an entry sits one level deeper than the deepest dependency it lists (same convention as other Boss design breakdowns). The per-entry Dependencies lines are authoritative for dispatch; the headings only group for reading. Entry numbers are stable identifiers, not schedule order.
+
 ### Depth 0 — run in parallel
 
 **1. Persist Bazel invocation telemetry**
@@ -398,14 +402,6 @@ Effort hint: `small`
 
 Dependencies: none
 
-**4. Re-measure flunge at current head**
-
-Lease or otherwise use a current flunge workspace, record the exact revision, and run cold/warm and representative edit/test builds against the shared cache. Report action digests shared with mono, executed actions, platform, and critical path. Do not use a copied stale checkout.
-
-Effort hint: `medium`
-
-Dependencies: Persist Bazel invocation telemetry
-
 **5. Prove NativeLink locally on owned Linux capacity**
 
 Resolve trial licensing, deploy a single-node development instance with bounded storage and authentication, connect one Linux worker, and demonstrate remote execution plus a cross-host cache hit. Record deployment and outage procedures.
@@ -416,37 +412,13 @@ Dependencies: none
 
 ### Depth 1
 
-**6. Define hermetic Linux worker platforms for mono and flunge**
+**4. Re-measure flunge at current head**
 
-Create minimal pinned worker images/toolchains for representative non-Apple Rust compile and test targets. Audit current flunge system-library requirements rather than resurrecting its removed RBE image.
+Lease or otherwise use a current flunge workspace, record the exact revision, and run cold/warm and representative edit/test builds against the shared cache. Report action digests shared with mono, executed actions, platform, and critical path. Do not use a copied stale checkout.
 
-Effort hint: `large`
+Effort hint: `medium`
 
-Dependencies: Prove NativeLink locally on owned Linux capacity; Re-measure flunge at current head
-
-**7. Add opt-in shared remote cache/execution configs**
-
-Add authenticated, opt-in Bazel configs in both repos for the shared service, with platform selection, minimal downloads, timeouts, and local fallback. Acceptance requires a current real edit executed remotely and a demonstrated cross-host cache hit.
-
-Effort hint: `large`
-
-Dependencies: Define hermetic Linux worker platforms for mono and flunge
-
-**8. Prototype the Linux development proxy**
-
-Compare SSH synchronization, NFS, and a VFS/proxy approach for a local agent invoking Bazel on a remote Linux checkout. Measure edit propagation, analysis time, correctness, output download, and failure recovery.
-
-Effort hint: `large`
-
-Dependencies: Add opt-in shared remote cache/execution configs
-
-**9. Make remote test execution preserve the hermetic policy**
-
-Port and verify network, filesystem, tool-path, temp-directory, and credential isolation on Linux RBE. Then remove `local` strategy requirements only for tests whose remote platform satisfies the policy.
-
-Effort hint: `large`
-
-Dependencies: Define hermetic Linux worker platforms for mono and flunge
+Dependencies: Persist Bazel invocation telemetry
 
 **10. Pilot a Darwin NativeLink worker**
 
@@ -458,13 +430,41 @@ Dependencies: Prove NativeLink locally on owned Linux capacity
 
 ### Depth 2
 
-**11. Integrate remote Boss execution with tmux**
+**6. Define hermetic Linux worker platforms for mono and flunge**
 
-Use the tmux transport to run the engine/worker on Linux while presenting the session locally. Compare this with the development-proxy path and whole-agent SSH distribution; converge on one operator workflow rather than maintaining redundant control planes.
+Create minimal pinned worker images/toolchains for representative non-Apple Rust compile and test targets. Audit current flunge system-library requirements rather than resurrecting its removed RBE image.
 
 Effort hint: `large`
 
-Dependencies: Prototype the Linux development proxy
+Dependencies: Prove NativeLink locally on owned Linux capacity; Re-measure flunge at current head
+
+### Depth 3
+
+**7. Add opt-in shared remote cache/execution configs**
+
+Add authenticated, opt-in Bazel configs in both repos for the shared service, with platform selection, minimal downloads, timeouts, and local fallback. Acceptance requires a current real edit executed remotely and a demonstrated cross-host cache hit.
+
+Effort hint: `large`
+
+Dependencies: Define hermetic Linux worker platforms for mono and flunge
+
+**9. Make remote test execution preserve the hermetic policy**
+
+Port and verify network, filesystem, tool-path, temp-directory, and credential isolation on Linux RBE. Then remove `local` strategy requirements only for tests whose remote platform satisfies the policy.
+
+Effort hint: `large`
+
+Dependencies: Define hermetic Linux worker platforms for mono and flunge
+
+### Depth 4
+
+**8. Prototype the Linux development proxy**
+
+Compare SSH synchronization, NFS, and a VFS/proxy approach for a local agent invoking Bazel on a remote Linux checkout. Measure edit propagation, analysis time, correctness, output download, and failure recovery.
+
+Effort hint: `large`
+
+Dependencies: Add opt-in shared remote cache/execution configs
 
 **12. Roll out and size for 40–50 agents**
 
@@ -474,14 +474,26 @@ Effort hint: `large`
 
 Dependencies: Add opt-in shared remote cache/execution configs; Make remote test execution preserve the hermetic policy; Pilot a Darwin NativeLink worker
 
+### Depth 5
+
+**11. Integrate remote Boss execution with tmux**
+
+Use the tmux transport to run the engine/worker on Linux while presenting the session locally. Compare this with the development-proxy path and whole-agent SSH distribution; converge on one operator workflow rather than maintaining redundant control planes.
+
+Effort hint: `large`
+
+Dependencies: Prototype the Linux development proxy
+
 ### Parallelism summary
 
 ```text
-Depth 0: [telemetry] [mono cap] [flunge cap] [NativeLink proof]
-                    -> [current-head flunge measurement]
-Depth 1:             -> [Linux platforms] -> [repo configs] -> [development proxy]
-                                         \-> [remote test policy]
-                      [NativeLink proof]  -> [Darwin worker]
-Depth 2:                                   [remote Boss/tmux]
-                                          [40–50-agent rollout]
+Depth 0: [1 telemetry] [2 mono cap] [3 flunge cap] [5 NativeLink proof]
+Depth 1: [1] -> [4 current-head flunge measurement]
+         [5] -> [10 Darwin worker]
+Depth 2: [5] + [4] -> [6 Linux platforms]
+Depth 3: [6] -> [7 repo configs]
+         [6] -> [9 remote test policy]
+Depth 4: [7] -> [8 development proxy]
+         [7] + [9] + [10] -> [12 40–50-agent rollout]
+Depth 5: [8] -> [11 remote Boss/tmux]
 ```
