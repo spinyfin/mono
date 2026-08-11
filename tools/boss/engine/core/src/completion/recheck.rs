@@ -47,7 +47,10 @@ impl WorkerCompletionHandler {
         // A URL observed through `gh pr view|list|edit` is useful binding
         // evidence, but it is not evidence that this execution published or
         // pushed work. Scope that restriction to the staged-URL finalization
-        // arm only, leaving the recovery paths available.
+        // arm only — an unarmed entry must not disable the SHA-delta gate or
+        // the cold-path branch detector, which recover a revision pushed via
+        // `jj git push` without URL re-arming and an engine restart that lost
+        // the in-memory cache after a missed `gh pr create`.
         let staged_armed = self
             .staged_pr_urls
             .get_entry(execution_id)
@@ -83,12 +86,29 @@ impl WorkerCompletionHandler {
                 .await
         {
             if execution.kind == ExecutionKind::RevisionImplementation {
-                tracing::debug!(
+                if self.should_defer_staged_pr_recheck(execution_id) {
+                    tracing::debug!(
+                        execution_id,
+                        pr_url = %staged_url,
+                        "pr-recheck: staged PR URL present for a mid-turn revision; retaining it \
+                         for the worker's own Stop boundary before finalization",
+                    );
+                    return StopOutcome::AwaitingInput;
+                }
+                tracing::info!(
                     execution_id,
                     pr_url = %staged_url,
-                    "pr-recheck: staged PR URL present for revision; retaining it for the \
-                     worker's own Stop boundary before finalization",
+                    "pr-recheck: staged revision PR URL is no longer deferrable; finalizing",
                 );
+                PR_URL_CAPTURE_PRIMARY_HIT.inc(&self.metrics);
+                return self
+                    .finalize_pr_transition(
+                        execution_id,
+                        staged_url,
+                        WorkerPrCompletionTarget::InReview,
+                        "pr_recheck_staged",
+                    )
+                    .await;
             } else {
                 tracing::info!(
                     execution_id,
@@ -335,6 +355,26 @@ impl WorkerCompletionHandler {
         };
         self.finalize_pr_transition(execution_id, pr_url, target, "pr_recheck")
             .await
+    }
+
+    /// True when the staged-URL recheck must not finalize yet: a revision
+    /// worker is actually mid-turn and the staged entry remains within the
+    /// bounded deferral horizon. Execution status cannot make this distinction
+    /// because it does not separate a parked pane from a mid-tool-call worker.
+    ///
+    /// When no live registry is wired or its slot has gone away, recheck keeps
+    /// the historical finalize-immediately behavior. The same is true after
+    /// the horizon expires, so a pushed worker that never reaches Stop cannot
+    /// leave the execution active forever.
+    fn should_defer_staged_pr_recheck(&self, execution_id: &str) -> bool {
+        if !self.observed_mid_turn(execution_id) {
+            return false;
+        }
+        let Some(entry) = self.staged_pr_urls.get_entry(execution_id) else {
+            return false;
+        };
+        let horizon = std::time::Duration::from_secs(self.staged_pr_mid_turn_defer_secs.max(0) as u64);
+        entry.staged_at.elapsed() < horizon
     }
 
     /// PR-detection recheck for a terminal execution (status

@@ -28,6 +28,7 @@ impl WorkerCompletionHandler {
             probe_queuer,
             staged_pr_urls: Arc::new(crate::pr_url_capture::StagedPrUrlCache::new()),
             live_worker_states: None,
+            staged_pr_mid_turn_defer_secs: DEFAULT_STAGED_PR_MID_TURN_DEFER_SECS,
             staged_revision_pushes: Arc::new(crate::pr_url_capture::StagedRevisionPushCache::new()),
             staged_proposal_channel_errors: Arc::new(crate::proposal_channel_error::ProposalChannelErrorTracker::new()),
             staged_unobserved_commands: Arc::new(crate::codex_unobserved_command::UnobservedCommandTracker::new()),
@@ -228,6 +229,14 @@ impl WorkerCompletionHandler {
     /// Share the app's live worker registry for mid-turn reap detection.
     pub fn with_live_worker_states(mut self, states: Arc<crate::live_worker_state::LiveWorkerStateRegistry>) -> Self {
         self.live_worker_states = Some(states);
+        self
+    }
+
+    /// Override the staged-PR mid-turn deferral horizon for deterministic
+    /// tests. Production uses [`DEFAULT_STAGED_PR_MID_TURN_DEFER_SECS`].
+    #[cfg(test)]
+    pub(super) fn with_staged_pr_mid_turn_defer_secs(mut self, horizon_secs: i64) -> Self {
+        self.staged_pr_mid_turn_defer_secs = horizon_secs;
         self
     }
 

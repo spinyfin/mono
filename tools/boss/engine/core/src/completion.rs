@@ -1068,6 +1068,11 @@ impl ProbeQueuer for NoopProbeQueuer {
     fn clear_pending_probes(&self, _run_id: &str, _reason: &str) {}
 }
 
+/// Maximum period a staged revision PR URL can defer recheck finalization
+/// while its worker is observed mid-turn. This shares the build-wait bound so
+/// a worker that never reaches Stop cannot keep an execution live forever.
+pub const DEFAULT_STAGED_PR_MID_TURN_DEFER_SECS: i64 = DEFAULT_BUILD_WAIT_HORIZON_SECS;
+
 #[derive(Clone)]
 struct BackgroundNudgeIntent {
     probe_text: String,
@@ -1192,6 +1197,12 @@ pub struct WorkerCompletionHandler {
     /// Live worker activity used to distinguish a mid-turn finalization from
     /// one that occurs after the worker reached its Stop boundary.
     live_worker_states: Option<Arc<crate::live_worker_state::LiveWorkerStateRegistry>>,
+    /// How long a staged revision PR URL may defer merge-poller finalization
+    /// while the worker is observed mid-turn. The bound is measured from
+    /// [`crate::pr_url_capture::StagedPrUrlEntry::staged_at`]; after it
+    /// expires, the staged path finalizes so a worker that never reaches Stop
+    /// cannot keep the execution live forever.
+    staged_pr_mid_turn_defer_secs: i64,
     /// In-memory set recording `revision_implementation` executions that ran a
     /// `jj git push` command since their last Stop boundary. Populated by the
     /// `PostToolUse` hook dispatcher; consumed (and cleared) by
