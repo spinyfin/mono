@@ -218,6 +218,63 @@ impl WorkerCompletionHandler {
         branch_ok.then_some(staged_url)
     }
 
+    /// Best-effort: resolve the PR head the given staged URL is about to be
+    /// finalized against and stamp `revision_stop_contributed_head`, so
+    /// `recheck_for_pr`'s exact-head recovery gate has evidence to recover
+    /// from if this Stop's own `finalize_pr_transition` write fails
+    /// transiently. Mirrors the stamp the SHA-delta arm performs for its own
+    /// path (below in this module); the staged-URL arm needs its own copy
+    /// because — for a revision — it is the dominant Stop path and the
+    /// SHA-delta arm is never reached from it. Failures here are logged and
+    /// swallowed: this is a best-effort recovery aid, not a precondition for
+    /// finalizing.
+    async fn stamp_revision_stop_contributed_head_from_staged_url(
+        &self,
+        execution_id: &str,
+        execution: &crate::work::WorkExecution,
+        staged_url: &str,
+    ) {
+        let repo_slug = match parse_repo_slug(&execution.repo_remote_url) {
+            Ok(slug) => slug,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    ?err,
+                    "stop event: cannot parse repo slug; revision_stop_contributed_head not stamped",
+                );
+                return;
+            }
+        };
+        let Some(pr_number) = pr_number_from_url(staged_url) else {
+            tracing::warn!(
+                execution_id,
+                staged_pr_url = %staged_url,
+                "stop event: cannot parse PR number from staged URL; revision_stop_contributed_head not stamped",
+            );
+            return;
+        };
+        let head_now = match self.branch_verifier.fetch_pr_head_oid(&repo_slug, pr_number).await {
+            Ok(oid) => oid,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    staged_pr_url = %staged_url,
+                    ?err,
+                    "stop event: failed to fetch PR head for revision_stop_contributed_head stamp",
+                );
+                return;
+            }
+        };
+        if let Err(err) = self.work_db.set_revision_stop_contributed_head(execution_id, &head_now) {
+            tracing::warn!(
+                execution_id,
+                ?err,
+                "stop event: failed to stamp revision_stop_contributed_head; \
+                 recheck_for_pr transient-failure recovery may not fire",
+            );
+        }
+    }
+
     /// Stage a PR URL the worker delivered over the **structured-output file
     /// contract** — the driver-agnostic primary channel (design: agent-driver
     /// abstraction §1.6). Returns `true` when a URL was newly staged.
@@ -577,6 +634,22 @@ impl WorkerCompletionHandler {
                 "stop event: using PR URL captured from worker hook stream (primary path); skipping detector",
             );
             PR_URL_CAPTURE_PRIMARY_HIT.inc(&self.metrics);
+            // This arm is the dominant Stop path for a revision (the
+            // prompt has it run `gh pr edit`/`gh pr view`, both of which
+            // stage a URL), so it must stamp
+            // `revision_stop_contributed_head` itself rather than relying
+            // on the SHA-delta arm below, which this staged-URL return
+            // never reaches. Without this stamp, a transient
+            // `finalize_pr_transition` failure here strands the revision:
+            // `recheck_for_pr` defers a revision's retained staged URL only
+            // while its worker is observed mid-turn (bounded by
+            // `DEFAULT_STAGED_PR_MID_TURN_DEFER_SECS`), so once that horizon
+            // expires it needs the stamped head to recover promptly rather
+            // than finalizing against stale evidence.
+            if execution.kind == ExecutionKind::RevisionImplementation {
+                self.stamp_revision_stop_contributed_head_from_staged_url(execution_id, &execution, &staged_url)
+                    .await;
+            }
             return self
                 .finalize_pr_transition(
                     execution_id,

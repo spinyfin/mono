@@ -1687,8 +1687,9 @@ fn compose_revision_directive(
         "   a. This applies ONLY when this task's description (above, in \"What this revision \
          should change\") enumerates review findings — look for one or more `### [<severity>] \
          <title>` sections, the shape an automated review pass renders. If this revision is \
-         responding to a plain operator instruction with no such findings, SKIP this step \
-         entirely: do not post a comment, and do not emit a table with zero rows.\n",
+         responding to a plain operator instruction with no such findings, SKIP the comment \
+         entirely: do not post an empty table, and state in your final response that the \
+         findings-status comment was not applicable.\n",
     );
     out.push_str(
         "   b. Every finding from that review pass must appear as a row, including ones you \
@@ -1770,7 +1771,7 @@ fn compose_revision_directive(
         worker_signal_proposals_seam_enabled,
     ));
     out.push_str(&format!(
-        "\nAcceptance criterion: when you believe the work is done, the deliverable is the parent PR URL.\n\
+        "\nAcceptance criterion: when you believe the work is done, the deliverable is the parent PR URL. The post-push steps remain your responsibility: finish them before your final response. The engine treats the driver-resolved boundary after that response as the completion handshake; a push or staged PR URL alone does not mean the revision is done.\n\
          - Push your changes to the parent branch (see step 4 above). Do NOT open a new PR.\n\
          - Update the PR title and description per step 5 above — a stale or contradictory title or description is a defect. If this revision changes or overturns the PR's scope or conclusion, the title MUST reflect the final state.\n\
          - If this revision addressed automated review findings, post the findings-status comment per step 6 above — every finding accounted for, one sentence each.\n\

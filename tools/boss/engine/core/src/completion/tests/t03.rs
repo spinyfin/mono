@@ -2546,3 +2546,120 @@ fn parse_api_pr_tsv_parses_all_six_fields() {
     assert_eq!(pr.additions, 10);
     assert_eq!(pr.deletions, 4);
 }
+
+/// PR #2726 revision regression: the staged-URL Stop arm (`stop_staged`) is
+/// the dominant path for a revision — the prompt has the worker run `gh pr
+/// edit`/`gh pr view`, both of which stage a URL — so it must stamp
+/// `revision_stop_contributed_head` itself before `finalize_pr_transition`
+/// commits, not only from the SHA-delta arm. Without that stamp, a
+/// transient `record_worker_pr_completion` failure at Stop stranded the
+/// revision: `recheck_for_pr` defers a revision's retained staged URL while
+/// its worker is observed mid-turn (bounded by
+/// `DEFAULT_STAGED_PR_MID_TURN_DEFER_SECS`; see the deferral tests above),
+/// but once that staged entry is gone or unarmed its exact-head recovery
+/// gate had no evidence to recover from.
+///
+/// This drives the real staged-URL `on_stop` path (not a hand-stamped
+/// `revision_stop_contributed_head` like
+/// `recheck_for_pr_sha_delta_fires_after_stop_seen` in `t04`), forces
+/// `record_worker_pr_completion` to fail transiently by soft-deleting the
+/// revision task mid-flight, and asserts (a) `on_stop` reports `DbError`
+/// with the execution left live, (b) `revision_stop_contributed_head` was
+/// stamped anyway, and (c) once the transient condition clears, the next
+/// `recheck_for_pr` sweep recovers and finalizes.
+#[tokio::test]
+async fn on_stop_staged_url_stamps_contributed_head_before_transient_finalize_failure() {
+    let workspace = tempdir().unwrap();
+    let parent_pr_url = "https://github.com/spinyfin/mono/pull/1425";
+    let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let head_pushed = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let (_dir, db, _product_id, revision_id, execution_id) =
+        revision_fixture(workspace.path(), parent_pr_url, head_before);
+
+    // Worker pushed and its Stop staged the chain-root PR URL, exactly as
+    // `cube pr update`'s printed URL does.
+    let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+    staged_pr_urls.record_if_unset(&execution_id, parent_pr_url);
+    let verifier = StubBranchVerifier::ok("boss/exec_parent");
+    verifier.set_head_oid(Ok(head_pushed.to_owned())).await;
+
+    // Force `record_worker_pr_completion` to fail transiently: soft-delete
+    // the revision task so `finalize_pr_transition`'s DB write bails.
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET deleted_at = '1' WHERE id = ?1",
+            rusqlite::params![revision_id],
+        )
+        .unwrap();
+    }
+
+    let detector = StubPrDetector::ok(None);
+    let cube = Arc::new(StubCubeClient::default());
+    let publisher = Arc::new(RecordingPublisher::default());
+    let pane = Arc::new(RecordingPaneReleaser::default());
+    let probes = Arc::new(RecordingProbeQueuer::default());
+    let handler = WorkerCompletionHandler::new(
+        db.clone(),
+        detector,
+        cube.clone(),
+        publisher.clone(),
+        pane.clone(),
+        probes.clone(),
+    )
+    .with_branch_verifier(verifier.clone())
+    .with_staged_pr_urls(staged_pr_urls.clone());
+
+    let outcome = handler.on_stop(&execution_id).await;
+
+    assert_eq!(
+        outcome,
+        StopOutcome::DbError,
+        "transient record_worker_pr_completion failure must surface as DbError; got {outcome:?}",
+    );
+    assert!(
+        cube.release_calls.lock().await.is_empty(),
+        "lease must not be released when finalization fails transiently",
+    );
+    assert_eq!(
+        db.get_revision_stop_contributed_head(&execution_id).unwrap().as_deref(),
+        Some(head_pushed),
+        "revision_stop_contributed_head must be stamped from the staged-URL arm \
+         even when finalize_pr_transition fails transiently, so recheck_for_pr can recover",
+    );
+
+    // Clear the transient condition and let the merge poller recover.
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET deleted_at = NULL WHERE id = ?1",
+            rusqlite::params![revision_id],
+        )
+        .unwrap();
+    }
+    db.set_execution_stop_seen(&execution_id).unwrap();
+
+    // The staged entry from the earlier `on_stop` attempt is still cached
+    // (finalize failed before `forget`). Clear it before the recovery sweep
+    // so the assertion below proves recovery comes from the stamped
+    // `revision_stop_contributed_head` via the exact-head SHA-delta gate,
+    // not from the staged arm short-circuiting straight to finalization.
+    staged_pr_urls.forget(&execution_id);
+
+    let outcome = handler.recheck_for_pr(&execution_id).await;
+
+    assert!(
+        matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == parent_pr_url),
+        "recheck_for_pr must recover using the stamped revision_stop_contributed_head \
+         once the transient failure clears; got {outcome:?}",
+    );
+    match db.get_work_item(&revision_id).unwrap() {
+        WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::InReview, "revision must move to in_review"),
+        other => panic!("expected task, got {other:?}"),
+    }
+    assert_eq!(
+        cube.release_calls.lock().await.as_slice(),
+        ["lease-1"],
+        "cube lease must be released once recheck_for_pr finalizes",
+    );
+}

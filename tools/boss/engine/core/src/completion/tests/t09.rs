@@ -298,13 +298,10 @@ async fn ci_remediation_debounced_nudge_does_not_double_fail_or_republish() {
 }
 
 /// incident-004 AI-4: when `finalize_pr_transition` tears down a worker
-/// whose live activity is still `Working` (mid-turn) — here, the same
-/// past-horizon staged-URL finalize as `t01`'s
-/// `recheck_for_pr_staged_url_finalizes_mid_turn_after_defer_horizon` — it
-/// must bump the aggregate and per-source mid-turn-reap counters and file
-/// an operator-visible attention item on the execution, so the prevalence
-/// the postmortem measured only by an offline trace sweep is answerable
-/// from the running system.
+/// whose live activity is still `Working` (mid-turn) must bump the aggregate
+/// and per-source mid-turn-reap counters and file an operator-visible
+/// attention item on the execution, so the prevalence the postmortem measured
+/// only by an offline trace sweep is answerable from the running system.
 #[tokio::test]
 async fn finalize_pr_transition_records_mid_turn_reap_when_worker_is_working() {
     let workspace = tempdir().unwrap();
@@ -312,10 +309,6 @@ async fn finalize_pr_transition_records_mid_turn_reap_when_worker_is_working() {
     let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let (_dir, db, _product_id, revision_id, execution_id) =
         revision_fixture(workspace.path(), parent_pr_url, head_before);
-
-    let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
-    staged_pr_urls.record_if_unset(&execution_id, parent_pr_url);
-    staged_pr_urls.backdate_for_test(&execution_id, std::time::Duration::from_secs(61));
 
     let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
     live_states.register_spawn(
@@ -345,10 +338,7 @@ async fn finalize_pr_transition_records_mid_turn_reap_when_worker_is_working() {
 
     let detector = StubPrDetector::ok(None);
     let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
-    let handler = handler
-        .with_staged_pr_urls(staged_pr_urls)
-        .with_live_worker_states(live_states)
-        .with_staged_pr_mid_turn_defer_secs(60);
+    let handler = handler.with_live_worker_states(live_states);
 
     assert_eq!(
         handler.metrics.counter_value("completion.mid_turn_reap.total"),
@@ -356,10 +346,17 @@ async fn finalize_pr_transition_records_mid_turn_reap_when_worker_is_working() {
         "must start at zero before any finalize",
     );
 
-    let outcome = handler.recheck_for_pr(&execution_id).await;
+    let outcome = handler
+        .finalize_pr_transition(
+            &execution_id,
+            parent_pr_url.to_owned(),
+            WorkerPrCompletionTarget::InReview,
+            "pr_recheck_staged",
+        )
+        .await;
     assert!(
         matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == parent_pr_url),
-        "past the deferral horizon the staged path must still finalize; got {outcome:?}",
+        "the finalization path must complete; got {outcome:?}",
     );
 
     assert_eq!(
@@ -382,12 +379,8 @@ async fn finalize_pr_transition_records_mid_turn_reap_when_worker_is_working() {
     );
 }
 
-/// Negative control for the test above: the same past-horizon staged-URL
-/// finalize, but the worker's own `Stop` already landed before this
-/// finalize runs (the ordinary, non-defective case — see `t01`'s
-/// `recheck_for_pr_staged_url_finalizes_non_revision_while_mid_turn` and
-/// the `stop_staged` majority in the incident-004 measurement). No
-/// mid-turn signal must be raised.
+/// Negative control for the test above: the worker's own `Stop` already landed
+/// before finalization runs, so no mid-turn signal must be raised.
 #[tokio::test]
 async fn finalize_pr_transition_does_not_record_mid_turn_reap_when_worker_is_idle() {
     let workspace = tempdir().unwrap();
@@ -395,10 +388,6 @@ async fn finalize_pr_transition_does_not_record_mid_turn_reap_when_worker_is_idl
     let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let (_dir, db, _product_id, revision_id, execution_id) =
         revision_fixture(workspace.path(), parent_pr_url, head_before);
-
-    let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
-    staged_pr_urls.record_if_unset(&execution_id, parent_pr_url);
-    staged_pr_urls.backdate_for_test(&execution_id, std::time::Duration::from_secs(61));
 
     let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
     live_states.register_spawn(
@@ -436,15 +425,19 @@ async fn finalize_pr_transition_does_not_record_mid_turn_reap_when_worker_is_idl
 
     let detector = StubPrDetector::ok(None);
     let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
-    let handler = handler
-        .with_staged_pr_urls(staged_pr_urls)
-        .with_live_worker_states(live_states)
-        .with_staged_pr_mid_turn_defer_secs(60);
+    let handler = handler.with_live_worker_states(live_states);
 
-    let outcome = handler.recheck_for_pr(&execution_id).await;
+    let outcome = handler
+        .finalize_pr_transition(
+            &execution_id,
+            parent_pr_url.to_owned(),
+            WorkerPrCompletionTarget::InReview,
+            "pr_recheck_staged",
+        )
+        .await;
     assert!(
         matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == parent_pr_url),
-        "finalize must still succeed for an idle worker; got {outcome:?}",
+        "finalization must still succeed for an idle worker; got {outcome:?}",
     );
 
     assert_eq!(

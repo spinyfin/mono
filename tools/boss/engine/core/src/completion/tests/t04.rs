@@ -2548,6 +2548,13 @@ async fn recheck_for_pr_sha_delta_fires_after_stop_seen() {
     db.set_execution_stop_seen(&execution_id).unwrap();
     db.set_revision_stop_contributed_head(&execution_id, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
         .unwrap();
+    // A read-only/metadata command (e.g. `gh pr view`) leaves an unarmed
+    // staged URL behind. It must not block the exact-head Stop attribution
+    // below: `recheck_for_pr` only finalizes straight from the staged arm
+    // when the entry is armed, so an unarmed entry falls through to the
+    // SHA-delta gate this test exercises.
+    let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+    staged_pr_urls.record_command_observation(&execution_id, parent_pr_url, false);
 
     let detector = StubPrDetector::ok(None);
     let cube = Arc::new(StubCubeClient::default());
@@ -2569,7 +2576,8 @@ async fn recheck_for_pr_sha_delta_fires_after_stop_seen() {
         pane.clone(),
         probes.clone(),
     )
-    .with_branch_verifier(verifier);
+    .with_branch_verifier(verifier)
+    .with_staged_pr_urls(staged_pr_urls);
 
     let outcome = handler.recheck_for_pr(&execution_id).await;
 

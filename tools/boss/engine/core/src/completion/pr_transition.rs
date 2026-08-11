@@ -272,9 +272,16 @@ impl WorkerCompletionHandler {
             "pr completion: execution terminalized; teardown in flight",
         );
         // Clear the staged URL now that the DB write succeeded.
-        // Deliberately ordered after `record_worker_pr_completion` so
-        // a failed DB write leaves the cache intact and the next
-        // merge-poller sweep can retry with the same staged URL.
+        // Deliberately ordered after `record_worker_pr_completion` so a
+        // failed DB write leaves the cache intact for the worker's next
+        // Stop. For primary implementations the next merge-poller sweep
+        // also retries from this URL; a revision's sweep defers instead,
+        // while its worker is observed mid-turn within
+        // `staged_pr_mid_turn_defer_secs` of `staged_at` — once that horizon
+        // expires (or the worker is not observed live), it recovers from
+        // the exact head stamped by the Stop that observed the push (see
+        // `revision_stop_contributed_head` and `recheck_for_pr`'s exact-head
+        // gate).
         self.staged_pr_urls.forget(execution_id);
         // The worker contributed a PR — reset any accumulated nudge
         // count so a later unrelated nudge cycle starts clean.

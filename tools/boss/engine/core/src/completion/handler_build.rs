@@ -27,6 +27,8 @@ impl WorkerCompletionHandler {
             pane_releaser,
             probe_queuer,
             staged_pr_urls: Arc::new(crate::pr_url_capture::StagedPrUrlCache::new()),
+            live_worker_states: None,
+            staged_pr_mid_turn_defer_secs: DEFAULT_STAGED_PR_MID_TURN_DEFER_SECS,
             staged_revision_pushes: Arc::new(crate::pr_url_capture::StagedRevisionPushCache::new()),
             staged_proposal_channel_errors: Arc::new(crate::proposal_channel_error::ProposalChannelErrorTracker::new()),
             staged_unobserved_commands: Arc::new(crate::codex_unobserved_command::UnobservedCommandTracker::new()),
@@ -50,27 +52,7 @@ impl WorkerCompletionHandler {
             pr_state_checker: Arc::new(crate::work::GhPrStateChecker),
             structured_output_dir: crate::structured_output::default_dir(),
             now_fn: Arc::new(std::time::Instant::now),
-            live_worker_states: None,
-            staged_pr_mid_turn_defer_secs: DEFAULT_STAGED_PR_MID_TURN_DEFER_SECS,
         }
-    }
-
-    /// Wire the engine-global [`crate::live_worker_state::LiveWorkerStateRegistry`]
-    /// so the merge-poller staged-URL recheck can read real mid-turn
-    /// activity. `app.rs` shares the same instance the event dispatcher
-    /// and sweeps use. Tests that omit this call leave the gate open
-    /// (no registry → not mid-turn → staged path finalizes as before).
-    pub fn with_live_worker_states(mut self, registry: Arc<crate::live_worker_state::LiveWorkerStateRegistry>) -> Self {
-        self.live_worker_states = Some(registry);
-        self
-    }
-
-    /// Override the mid-turn staged-URL deferral horizon. Tests set this
-    /// low (or to `0`) so a still-Working worker can be forced past the
-    /// bound without sleeping for the production default.
-    pub fn with_staged_pr_mid_turn_defer_secs(mut self, secs: i64) -> Self {
-        self.staged_pr_mid_turn_defer_secs = secs;
-        self
     }
 
     /// Point structured-output reads at `dir` instead of the process-wide
@@ -241,6 +223,20 @@ impl WorkerCompletionHandler {
     /// behaviour without a signature break.
     pub fn with_staged_pr_urls(mut self, cache: Arc<crate::pr_url_capture::StagedPrUrlCache>) -> Self {
         self.staged_pr_urls = cache;
+        self
+    }
+
+    /// Share the app's live worker registry for mid-turn reap detection.
+    pub fn with_live_worker_states(mut self, states: Arc<crate::live_worker_state::LiveWorkerStateRegistry>) -> Self {
+        self.live_worker_states = Some(states);
+        self
+    }
+
+    /// Override the staged-PR mid-turn deferral horizon for deterministic
+    /// tests. Production uses [`DEFAULT_STAGED_PR_MID_TURN_DEFER_SECS`].
+    #[cfg(test)]
+    pub(super) fn with_staged_pr_mid_turn_defer_secs(mut self, horizon_secs: i64) -> Self {
+        self.staged_pr_mid_turn_defer_secs = horizon_secs;
         self
     }
 

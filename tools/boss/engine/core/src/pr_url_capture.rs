@@ -39,11 +39,18 @@
 //!
 //! The reconciliation path (`completion::detect_pr` →
 //! `jj_candidate_commit_shas` → GitHub commits/{sha}/pulls) is
-//! preserved as the engine-restart recovery fallback. If the engine
-//! restarts after a worker pushed but before Stop fired, the staged
-//! URL is lost from this cache (it lives in memory only) and the
-//! fallback path runs on the next sweep. The staging cache is the
-//! hot path; the reconstruction path is the cold path.
+//! preserved as the engine-restart recovery fallback for primary
+//! implementations. If the engine restarts after a worker opened a PR but
+//! before Stop fired, the staged URL is lost from this cache (it lives in
+//! memory only) and the fallback path runs on the next sweep. Revision
+//! executions do not equate either URL channel with completion outright:
+//! `recheck_for_pr` defers finalizing a revision's retained staged URL while
+//! its worker is observed `Working` and the entry is younger than
+//! `DEFAULT_STAGED_PR_MID_TURN_DEFER_SECS`, so a mid-turn worker's own Stop
+//! path still gets to record the contributed head first — but once that
+//! horizon expires (or the worker isn't observed live), the staged URL
+//! finalizes without waiting further. The staging cache is the hot path;
+//! reconstruction is the primary-implementation cold path.
 //!
 //! **Not** a GitHub branch→PR poll: that is a different mechanism with
 //! different failure modes and must not mask a broken extraction path.
@@ -467,9 +474,10 @@ impl StagedPrUrlCache {
             .map(|entry| entry.pr_url.clone())
     }
 
-    /// Read the full staged entry (URL + stage time) for `execution_id`.
-    /// Used by the merge-poller recheck path to enforce the mid-turn
-    /// deferral horizon without a second map lookup.
+    /// Read the complete staged entry without removing it. Callers include
+    /// `should_defer_staged_pr_recheck`, which reads `staged_at` to bound
+    /// how long a revision's mid-turn deferral can hold before recheck
+    /// finalizes anyway.
     pub fn get_entry(&self, execution_id: &str) -> Option<StagedPrUrlEntry> {
         self.inner
             .lock()

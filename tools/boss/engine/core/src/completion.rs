@@ -1068,13 +1068,9 @@ impl ProbeQueuer for NoopProbeQueuer {
     fn clear_pending_probes(&self, _run_id: &str, _reason: &str) {}
 }
 
-/// Default mid-turn deferral horizon for the merge-poller staged-URL
-/// fast path. Matches the build-wait / background-children horizon
-/// (45 minutes): long enough for multi-step post-push work, finite so a
-/// wedged mid-tool worker is still finalized by a later sweep rather
-/// than stranded in `active` indefinitely. Enforced in
-/// [`WorkerCompletionHandler::recheck_for_pr`] against
-/// [`crate::pr_url_capture::StagedPrUrlEntry::staged_at`].
+/// Maximum period a staged revision PR URL can defer recheck finalization
+/// while its worker is observed mid-turn. This shares the build-wait bound so
+/// a worker that never reaches Stop cannot keep an execution live forever.
 pub const DEFAULT_STAGED_PR_MID_TURN_DEFER_SECS: i64 = DEFAULT_BUILD_WAIT_HORIZON_SECS;
 
 #[derive(Clone)]
@@ -1198,6 +1194,15 @@ pub struct WorkerCompletionHandler {
     /// the staging path get the same behaviour they always had —
     /// nothing is staged → fall through to `pr_detector`.
     staged_pr_urls: Arc<crate::pr_url_capture::StagedPrUrlCache>,
+    /// Live worker activity used to distinguish a mid-turn finalization from
+    /// one that occurs after the worker reached its Stop boundary.
+    live_worker_states: Option<Arc<crate::live_worker_state::LiveWorkerStateRegistry>>,
+    /// How long a staged revision PR URL may defer merge-poller finalization
+    /// while the worker is observed mid-turn. The bound is measured from
+    /// [`crate::pr_url_capture::StagedPrUrlEntry::staged_at`]; after it
+    /// expires, the staged path finalizes so a worker that never reaches Stop
+    /// cannot keep the execution live forever.
+    staged_pr_mid_turn_defer_secs: i64,
     /// In-memory set recording `revision_implementation` executions that ran a
     /// `jj git push` command since their last Stop boundary. Populated by the
     /// `PostToolUse` hook dispatcher; consumed (and cleared) by
@@ -1376,24 +1381,6 @@ pub struct WorkerCompletionHandler {
     /// each call lands past the debounce window without a real sleep;
     /// dedicated debounce tests wire in a clock they control directly.
     now_fn: Arc<dyn Fn() -> std::time::Instant + Send + Sync>,
-    /// Live per-slot worker activity registry. The merge-poller staged-URL
-    /// recheck consults this for the real mid-turn signal
-    /// ([`boss_protocol::WorkerActivity::Working`]) — execution status
-    /// alone cannot distinguish a parked worker from one mid-tool-call.
-    /// Defaults to `None` so unit tests that don't wire a registry keep
-    /// the pre-gate behaviour (staged URL finalizes immediately).
-    /// Production wires the shared engine registry via
-    /// [`Self::with_live_worker_states`].
-    live_worker_states: Option<Arc<crate::live_worker_state::LiveWorkerStateRegistry>>,
-    /// How long a staged PR URL may defer merge-poller finalization while
-    /// the worker is mid-turn. Bound is measured from
-    /// [`crate::pr_url_capture::StagedPrUrlEntry::staged_at`] and enforced
-    /// in [`WorkerCompletionHandler::recheck_for_pr`]. Defaults to
-    /// [`DEFAULT_STAGED_PR_MID_TURN_DEFER_SECS`]. After the horizon the
-    /// staged path finalizes even if activity is still `Working`, so a
-    /// worker that never reaches Stop cannot hang forever.
-    #[builder(default = DEFAULT_STAGED_PR_MID_TURN_DEFER_SECS)]
-    staged_pr_mid_turn_defer_secs: i64,
 }
 
 /// Outcome of [`WorkerCompletionHandler::try_retire_cleared_blocking_signal`].

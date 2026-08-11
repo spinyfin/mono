@@ -1208,6 +1208,7 @@ impl ServerState {
                 probe_queuer.clone(),
             )
             .with_staged_pr_urls(staged_pr_urls.clone())
+            .with_live_worker_states(live_worker_states_for_completion.clone())
             .with_staged_revision_pushes(staged_revision_pushes.clone())
             .with_staged_proposal_channel_errors(staged_proposal_channel_errors.clone())
             .with_staged_unobserved_commands(staged_unobserved_commands.clone())
@@ -1222,7 +1223,6 @@ impl ServerState {
                     live_worker_states_for_completion.clone(),
                 ),
             ))
-            .with_live_worker_states(live_worker_states_for_completion)
             .with_hold_registry(hold_registry)
             .with_teardown_registry(teardown_registry),
         );
