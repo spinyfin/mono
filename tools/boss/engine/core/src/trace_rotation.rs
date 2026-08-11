@@ -6,12 +6,10 @@
 //! [`rotate_on_startup`] applies that same size check once at process
 //! start — it rotates only if the existing file is already at or over
 //! the threshold, so an engine restart never rotates a file that isn't
-//! full, and a restart storm cannot burn through the retention budget on
-//! its own (thirteen restarts in under eleven minutes previously
-//! evicted the entire retention window because every start rotated
-//! unconditionally). A restart simply keeps appending to whatever active
-//! file it finds, exactly like a write from within the same process
-//! would.
+//! full. Restarts never rotate by themselves — only size growth does, so
+//! retention is a function of trace volume, not restart count. A restart
+//! simply keeps appending to whatever active file it finds, exactly like
+//! a write from within the same process would.
 //!
 //! Rotated files are pruned to the N most recent; older files are
 //! deleted automatically.
@@ -24,14 +22,8 @@
 //! | `BOSS_ENGINE_TRACE_MAX_FILES` | `10` | Keep at most this many rotated backups |
 //!
 //! Retention is `max_files` × `max_bytes` of trace volume (default
-//! 10 × 100 MiB, plus one active file → worst case ~1.1 GiB on disk).
-//! Wall-clock coverage depends on write rate; at observed volumes
-//! (tens of MB across a multi-day corpus under the old restart-cut
-//! regime, so far below the size threshold) a single 100 MiB segment
-//! is expected to span many days, and the full 11-file window well
-//! over a week. Do not treat older "N segments spanned M days"
-//! measurements taken under unconditional rotate-on-start as if they
-//! characterised size-based segments.
+//! 10 × 100 MiB, plus the active file: worst case ~1.1 GiB on disk).
+//! Wall-clock coverage depends on write rate.
 //!
 //! ## Rotation safety
 //!
@@ -79,6 +71,9 @@ pub fn trace_rotation_config() -> (u64, usize) {
 /// Any error is printed to stderr and swallowed — trace rotation must
 /// never block engine startup.
 pub fn rotate_on_startup(path: &Path, max_bytes: u64, max_files: usize) {
+    // Match the mid-run writer's clamp: max_bytes = 0 must not make an
+    // empty file "at or over threshold" on every restart.
+    let max_bytes = max_bytes.max(1);
     let size = match std::fs::metadata(path) {
         Ok(meta) => meta.len(),
         Err(err) if err.kind() == io::ErrorKind::NotFound => return,
@@ -259,10 +254,10 @@ mod tests {
 
     #[test]
     fn restart_storm_with_always_over_threshold_prunes_preexisting_segments() {
-        // Negative control: if every restart *does* rotate (max_bytes of
-        // 0 / always-over-threshold), the same 13-restart burst consumes
-        // rotation slots and prunes pre-existing segments — the behaviour
-        // the size gate removed.
+        // Negative control: if every restart *does* rotate (max_bytes = 1,
+        // so any non-empty file is over threshold), the same 13-restart
+        // burst consumes rotation slots and prunes pre-existing segments —
+        // the behaviour the size gate removed.
         let dir = TempDir::new().unwrap();
         let path = tmp_trace(&dir);
         let max_files = 5;
