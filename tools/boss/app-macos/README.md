@@ -161,6 +161,8 @@ disable the surface — attachments are still stored, but no link is minted.
 - `BOSS_ENGINE_RESTART_MAX_ATTEMPTS`: maximum automatic restart attempts before the app shows a manual-restart banner (default `6`)
 - `BOSS_SHOW_SYSTEM_MESSAGES`: set `1` to include internal system status messages
 - `BOSS_ENGINE_LOG_PATH`: log file path (default `/tmp/boss-engine.log`)
+- `BOSS_ENGINE_LOG_MAX_BYTES`: rotate the text log before a record would exceed this size (default `104857600`, 100 MiB)
+- `BOSS_ENGINE_LOG_MAX_FILES`: number of rotated text-log backups to retain (default `20`)
 - `BOSS_ENGINE_AUDIT_PATH`: audit log file path (default
   `~/Library/Application Support/Boss/engine-audit.log`)
 - `RUST_LOG`: tracing filter for engine logs (default `info`)
