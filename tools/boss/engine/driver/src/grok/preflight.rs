@@ -1,11 +1,16 @@
 //! Fail-fast capability checks for the scoped Grok worker environment.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 
 use super::environment::GrokProcessEnvironment;
+
+/// Wall-clock limit for the OAuth-sensitive `grok models` probe.
+const GROK_MODELS_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct PreflightOutput {
     success: bool,
@@ -36,6 +41,11 @@ impl PreflightRunner for RealPreflightRunner {
         workspace: &Path,
         environment: &GrokProcessEnvironment,
     ) -> anyhow::Result<PreflightOutput> {
+        if program == "grok" {
+            environment
+                .wait_for_auth_ready_for_oauth_probe()
+                .context("waiting for a Grok OAuth refresh before preflight")?;
+        }
         let mut command = match &self.macos_seatbelt_profile {
             Some(profile) => {
                 let mut command = Command::new("/usr/bin/sandbox-exec");
@@ -50,9 +60,13 @@ impl PreflightRunner for RealPreflightRunner {
         } else {
             environment.apply_tool_sandbox_environment(&mut command);
         }
-        let output = command
-            .output()
-            .with_context(|| format!("starting Grok worker preflight capability `{program}`"))?;
+        let output = if program == "grok" {
+            run_grok_models_with_timeout(&mut command, GROK_MODELS_TIMEOUT)?
+        } else {
+            command
+                .output()
+                .with_context(|| format!("starting Grok worker preflight capability `{program}`"))?
+        };
         Ok(PreflightOutput {
             success: output.status.success(),
             status: output.status.to_string(),
@@ -60,6 +74,71 @@ impl PreflightRunner for RealPreflightRunner {
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
     }
+}
+
+/// Run `command` with a wall-clock deadline, capturing stdout/stderr.
+///
+/// `Command::spawn` inherits stdio by default; pipes must be set explicitly so
+/// the OAuth affirmation in stdout is available to the caller. Pipes are drained
+/// on dedicated threads while the parent only polls exit status — otherwise a
+/// child that fills the ~64KiB pipe buffer deadlocks against a non-reading wait.
+fn run_grok_models_with_timeout(command: &mut Command, timeout: Duration) -> anyhow::Result<Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .context("starting Grok worker preflight capability `grok`")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("missing stdout pipe for Grok worker preflight capability `grok`")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("missing stderr pipe for Grok worker preflight capability `grok`")?;
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut reader = stdout;
+        reader.read_to_end(&mut buf).map(|_| buf)
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut reader = stderr;
+        reader.read_to_end(&mut buf).map(|_| buf)
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("waiting for Grok worker preflight capability `grok`")?
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child
+                .kill()
+                .context("killing timed-out Grok worker preflight capability `grok`")?;
+            let _ = child.wait();
+            // Reap drain threads so a timed-out probe does not leak join handles.
+            let _ = stdout_handle.join();
+            let _ = stderr_handle.join();
+            bail!(
+                "grok models did not complete while waiting for OAuth refresh coordination within {}s",
+                timeout.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let stdout = stdout_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("stdout drain thread panicked for Grok preflight"))?
+        .context("reading stdout from Grok worker preflight capability `grok`")?;
+    let stderr = stderr_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("stderr drain thread panicked for Grok preflight"))?
+        .context("reading stderr from Grok worker preflight capability `grok`")?;
+    Ok(Output { status, stdout, stderr })
 }
 
 /// Prove that every capability the worker needs is usable before the pane is
@@ -420,5 +499,54 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("instead of /workspace"), "{error}");
+    }
+
+    #[test]
+    fn run_grok_models_with_timeout_captures_stdout() {
+        let mut command = Command::new("/bin/echo");
+        command.arg("You are logged in with grok.com.");
+        let output = run_grok_models_with_timeout(&mut command, Duration::from_secs(5)).unwrap();
+        assert!(output.status.success(), "status={}", output.status);
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("You are logged in with grok.com."),
+            "stdout={:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    fn run_grok_models_with_timeout_kills_and_reports_deadline() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("5");
+        let error = run_grok_models_with_timeout(&mut command, Duration::from_millis(200))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("within"), "{error}");
+        assert!(error.contains("0s") || error.contains("OAuth refresh"), "{error}");
+    }
+
+    #[test]
+    fn run_grok_models_with_timeout_drains_large_stdout() {
+        // ~200KiB exceeds the typical 64KiB pipe buffer; without concurrent drain
+        // this would deadlock the try_wait poll loop. Prefer pure shell so the
+        // Bazel sandbox need not grant /dev/zero or PATH-resolved helpers.
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            // 4000 * 50 = 200_000 bytes of stdout.
+            "i=0; while [ \"$i\" -lt 4000 ]; do printf '%050d' \"$i\"; i=$((i + 1)); done",
+        ]);
+        let output = run_grok_models_with_timeout(&mut command, Duration::from_secs(30)).unwrap();
+        assert!(
+            output.status.success(),
+            "status={} stderr={:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stdout.len() > 100_000,
+            "expected large captured stdout, got {} bytes",
+            output.stdout.len()
+        );
     }
 }

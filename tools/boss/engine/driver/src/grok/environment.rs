@@ -12,10 +12,16 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 
 use crate::EnvDirective;
+
+/// Longest a preflight waits for a live Grok refresh to release its pidfile.
+const AUTH_LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Retry interval while a live Grok refresh owns its pidfile.
+const AUTH_LOCK_POLL: Duration = Duration::from_millis(50);
 
 pub const GROK_AUTH_PATH_ENV: &str = "GROK_AUTH_PATH";
 const GROK_DISABLE_API_KEY_AUTH_ENV: &str = "GROK_DISABLE_API_KEY_AUTH";
@@ -98,6 +104,26 @@ impl GrokProcessEnvironment {
     /// needs it to probe the session store that lives under it.
     pub fn grok_home(&self) -> &Path {
         &self.grok_home
+    }
+
+    /// Wait for Grok's `auth.json.lock` pidfile to clear, then verify the
+    /// credential is a non-empty JSON object before probing it.
+    ///
+    /// Grok's observed lock protocol is a `pid:timestamp` body, not a Boss
+    ///-owned flock protocol. Boss therefore never creates or modifies that
+    /// file: it waits only while a *fresh* live pid is recorded (timestamp
+    /// within the acquire window), treats a dead pid or an aged timestamp as
+    /// not-in-flight, and then validates `auth.json`. Waiting is an
+    /// optimisation; if a live fresh pid does not clear before the deadline,
+    /// Boss logs a warning and continues to the credential check and the
+    /// bounded `grok models` probe, both of which fail closed on bad state.
+    ///
+    /// This is not a retry-until-pass loop on the preflight itself. Genuine
+    /// logout / cleared credentials still fail closed after a completed or
+    /// stale refresh is observed.
+    pub fn wait_for_auth_ready_for_oauth_probe(&self) -> anyhow::Result<()> {
+        wait_for_grok_auth_refresh(&self.auth_path)?;
+        ensure_auth_file_ready_for_probe(&self.auth_path)
     }
 
     pub fn directives(&self) -> Vec<EnvDirective> {
@@ -325,6 +351,163 @@ impl GrokProcessEnvironment {
             },
         }
     }
+}
+
+/// Wait for a live Grok refresh identified by its CLI-managed `pid:timestamp`
+/// lock body. The lock is foreign state: this function never creates, edits,
+/// or removes it.
+fn wait_for_grok_auth_refresh(auth_path: &Path) -> anyhow::Result<()> {
+    wait_for_grok_auth_refresh_with_timeout(auth_path, AUTH_LOCK_ACQUIRE_TIMEOUT)
+}
+
+fn wait_for_grok_auth_refresh_with_timeout(auth_path: &Path, timeout: Duration) -> anyhow::Result<()> {
+    let lock_path = grok_auth_lock_path(auth_path);
+    let deadline = Instant::now() + timeout;
+    loop {
+        let body = match fs::read_to_string(&lock_path) {
+            Ok(body) => body,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err).with_context(|| format!("reading Grok refresh lock {}", lock_path.display())),
+        };
+        match parse_grok_refresh_lock_body(&body, &lock_path) {
+            Ok((pid, timestamp)) => {
+                if !process_is_live(pid) {
+                    tracing::warn!(
+                        lock = %lock_path.display(),
+                        pid,
+                        "ignoring stale Grok OAuth refresh pidfile (dead pid)"
+                    );
+                    return Ok(());
+                }
+                if !lock_timestamp_is_fresh(timestamp, timeout) {
+                    tracing::warn!(
+                        lock = %lock_path.display(),
+                        pid,
+                        timestamp,
+                        "ignoring aged Grok OAuth refresh pidfile (live pid, timestamp older than wait window)"
+                    );
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    // Waiting is an optimisation, not a safety property. Fall
+                    // through so ensure_auth_file_ready_for_probe and the
+                    // bounded grok models probe can fail closed on real damage.
+                    tracing::warn!(
+                        lock = %lock_path.display(),
+                        pid,
+                        "Grok OAuth refresh pidfile for live pid did not clear within {}s; continuing to credential check",
+                        timeout.as_secs()
+                    );
+                    return Ok(());
+                }
+                tracing::debug!(
+                    lock = %lock_path.display(),
+                    pid,
+                    "waiting for live Grok OAuth refresh pidfile to clear"
+                );
+            }
+            Err(err) => {
+                // Partial writes are observable while Grok creates the pidfile.
+                // Retry until the deadline rather than aborting a spawn on a
+                // single transient read of foreign state.
+                if Instant::now() >= deadline {
+                    return Err(err).context(format!(
+                        "Grok refresh lock {} remained malformed after {}s",
+                        lock_path.display(),
+                        timeout.as_secs()
+                    ));
+                }
+                tracing::debug!(
+                    lock = %lock_path.display(),
+                    error = %err,
+                    "transient Grok OAuth refresh pidfile parse failure; retrying"
+                );
+            }
+        }
+        std::thread::sleep(AUTH_LOCK_POLL);
+    }
+}
+
+/// Parse Grok's `pid:timestamp` lock body. Timestamp is Unix epoch seconds.
+fn parse_grok_refresh_lock_body(body: &str, lock_path: &Path) -> anyhow::Result<(i32, u64)> {
+    let (pid, timestamp) = body.trim().split_once(':').with_context(|| {
+        format!(
+            "Grok refresh lock {} does not contain the expected pid:timestamp body",
+            lock_path.display()
+        )
+    })?;
+    let pid = pid
+        .parse::<i32>()
+        .with_context(|| format!("Grok refresh lock {} has a non-numeric pid", lock_path.display()))?;
+    if pid <= 0 {
+        bail!("Grok refresh lock {} has invalid pid {pid}", lock_path.display());
+    }
+    let timestamp = timestamp
+        .parse::<u64>()
+        .with_context(|| format!("Grok refresh lock {} has a non-numeric timestamp", lock_path.display()))?;
+    Ok((pid, timestamp))
+}
+
+/// True when the pidfile's recorded Unix-seconds timestamp is within `max_age`
+/// of now. An aged record is treated as not-in-flight even if its pid is still
+/// live (interactive Grok sessions have been observed holding the pidfile for
+/// extended windows).
+fn lock_timestamp_is_fresh(timestamp: u64, max_age: Duration) -> bool {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    now.saturating_sub(timestamp) <= max_age.as_secs()
+}
+
+fn process_is_live(pid: i32) -> bool {
+    // kill(pid, 0) asks the kernel whether the pid exists without signalling it.
+    // EPERM still means the process exists but belongs to another user.
+    unsafe { libc::kill(pid, 0) == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied }
+}
+
+/// Path of Grok's CLI-managed refresh lock: `{auth_path}.lock`.
+fn grok_auth_lock_path(auth_path: &Path) -> PathBuf {
+    let mut path = auth_path.as_os_str().to_owned();
+    path.push(".lock");
+    PathBuf::from(path)
+}
+
+/// Fail closed when the shared OAuth credential is missing, empty, or not JSON.
+///
+/// Does not log credential bytes. Used after observing Grok's refresh pidfile
+/// before `grok models` so a mid-refresh empty body cannot be mistaken for a
+/// healthy unauthenticated state that should pass after a soft retry.
+fn ensure_auth_file_ready_for_probe(auth_path: &Path) -> anyhow::Result<()> {
+    let metadata = fs::metadata(auth_path).with_context(|| {
+        format!(
+            "Grok OAuth credential {} is missing; log in once with interactive `grok` \
+             or wait for an in-flight refresh to rewrite the file",
+            auth_path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        bail!("Grok OAuth credential {} is not a regular file", auth_path.display());
+    }
+    if metadata.len() == 0 {
+        bail!(
+            "Grok OAuth credential {} is empty (mid-refresh truncate or cleared credentials); \
+             refusing OAuth preflight until a non-empty credential is present",
+            auth_path.display()
+        );
+    }
+    let bytes =
+        fs::read(auth_path).with_context(|| format!("reading Grok OAuth credential {}", auth_path.display()))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "Grok OAuth credential {} is not valid JSON (mid-refresh or corrupt)",
+            auth_path.display()
+        )
+    })?;
+    if !value.is_object() {
+        bail!("Grok OAuth credential {} must be a JSON object", auth_path.display());
+    }
+    Ok(())
 }
 
 fn require_delegate(source: &Path, destination: &Path, capability: &str) -> anyhow::Result<()> {
@@ -675,5 +858,114 @@ mod tests {
         assert_eq!(resolve_gh_config_dir(), Some(PathBuf::from("/explicit/gh")));
         assert_eq!(resolve_cube_data_dir(), Some(PathBuf::from("/explicit/cube-data")));
         assert_eq!(resolve_cube_config_dir(), Some(PathBuf::from("/explicit/cube-config")));
+    }
+
+    #[test]
+    fn grok_auth_lock_path_is_sibling_dot_lock() {
+        assert_eq!(
+            grok_auth_lock_path(Path::new("/Users/op/.grok/auth.json")),
+            PathBuf::from("/Users/op/.grok/auth.json.lock")
+        );
+    }
+
+    #[test]
+    fn ensure_auth_file_ready_rejects_empty_and_non_json() {
+        let tmp = TempDir::new().unwrap();
+        let auth = tmp.path().join("auth.json");
+
+        fs::write(&auth, b"").unwrap();
+        let err = ensure_auth_file_ready_for_probe(&auth).unwrap_err().to_string();
+        assert!(err.contains("empty"), "{err}");
+
+        fs::write(&auth, b"not-json").unwrap();
+        let err = ensure_auth_file_ready_for_probe(&auth).unwrap_err().to_string();
+        assert!(err.contains("not valid JSON"), "{err}");
+
+        fs::write(&auth, br#"{"accessToken":"x"}"#).unwrap();
+        ensure_auth_file_ready_for_probe(&auth).expect("object body must pass");
+    }
+
+    /// The absent pidfile is not materialized merely by checking readiness.
+    #[test]
+    fn auth_readiness_does_not_create_a_grok_pidfile() {
+        let tmp = TempDir::new().unwrap();
+        let auth = tmp.path().join("auth.json");
+        let lock = grok_auth_lock_path(&auth);
+        fs::write(&auth, br#"{"accessToken":"stable"}"#).unwrap();
+
+        wait_for_grok_auth_refresh(&auth).unwrap();
+        ensure_auth_file_ready_for_probe(&auth).unwrap();
+        assert!(!lock.exists(), "Boss must not create Grok's private pidfile");
+    }
+
+    #[test]
+    fn stale_grok_refresh_pidfile_does_not_block_readiness() {
+        let tmp = TempDir::new().unwrap();
+        let auth = tmp.path().join("auth.json");
+        fs::write(&auth, br#"{"accessToken":"stable"}"#).unwrap();
+        fs::write(grok_auth_lock_path(&auth), "999999:0").unwrap();
+
+        wait_for_grok_auth_refresh(&auth).unwrap();
+    }
+
+    #[test]
+    fn aged_live_pid_pidfile_does_not_block_readiness() {
+        // A live pid with an old timestamp is treated as not-in-flight (e.g. a
+        // long-running interactive Grok session holding the pidfile).
+        let tmp = TempDir::new().unwrap();
+        let auth = tmp.path().join("auth.json");
+        fs::write(&auth, br#"{"accessToken":"stable"}"#).unwrap();
+        let self_pid = std::process::id() as i32;
+        fs::write(grok_auth_lock_path(&auth), format!("{self_pid}:0")).unwrap();
+
+        wait_for_grok_auth_refresh_with_timeout(&auth, Duration::from_millis(200)).unwrap();
+    }
+
+    #[test]
+    fn live_fresh_pidfile_deadline_falls_through() {
+        let tmp = TempDir::new().unwrap();
+        let auth = tmp.path().join("auth.json");
+        fs::write(&auth, br#"{"accessToken":"stable"}"#).unwrap();
+        let self_pid = std::process::id() as i32;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        fs::write(grok_auth_lock_path(&auth), format!("{self_pid}:{now}")).unwrap();
+
+        // Waiting is an optimisation: expiry must not hard-fail the spawn.
+        wait_for_grok_auth_refresh_with_timeout(&auth, Duration::from_millis(150)).unwrap();
+    }
+
+    #[test]
+    fn malformed_grok_refresh_pidfile_fails_closed() {
+        let tmp = TempDir::new().unwrap();
+        let auth = tmp.path().join("auth.json");
+        fs::write(grok_auth_lock_path(&auth), "not-a-pid").unwrap();
+
+        // Parse failures are retried until the deadline; only then fail closed.
+        let started = Instant::now();
+        let err = wait_for_grok_auth_refresh_with_timeout(&auth, Duration::from_millis(120)).unwrap_err();
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "malformed body must be retried until the deadline, not fail on first read"
+        );
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("pid:timestamp") || message.contains("malformed"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn empty_grok_refresh_pidfile_is_retried_then_fails_closed() {
+        let tmp = TempDir::new().unwrap();
+        let auth = tmp.path().join("auth.json");
+        // Empty body is the create-then-write window: open succeeds before write.
+        fs::write(grok_auth_lock_path(&auth), "").unwrap();
+
+        let err = wait_for_grok_auth_refresh_with_timeout(&auth, Duration::from_millis(120)).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("pid:timestamp") || message.contains("malformed"),
+            "unexpected error: {message}"
+        );
     }
 }

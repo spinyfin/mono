@@ -16,8 +16,9 @@ boss-engine-structured-output = { path = "../structured-output" }
 boss-engine-transient-error = { path = "../transient-error" }
 boss-engine-utils = { path = "../utils" }
 boss-protocol = { path = "../../protocol" }
-serde = { workspace = true }
 boss-ssh-transport = { path = "../ssh-transport" }
+libc = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 
