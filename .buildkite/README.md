@@ -87,4 +87,4 @@ Required checks are managed via branch protection rules. The check names buildki
 
 ## Status
 
-The pipeline is canonical — `bazel-build-test` is the source of truth for bazel build+test. `bazel-build-test.sh` uses `--config=ci` which sets `--disk_cache=/var/cache/bazel-mono` (defined in `.bazelrc`).
+The pipeline is canonical — `bazel-build-test` is the source of truth for bazel build+test. `bazel-build-test.sh` uses `--config=ci`, which resolves to `--config=ci-linux` or `--config=ci-darwin` and sets `--disk_cache` to `/mnt/ssd/bazel/disk_cache` (Linux) or `/Volumes/ssd/bazel/disk_cache` (Darwin), defined in `.ci.bazelrc`.
