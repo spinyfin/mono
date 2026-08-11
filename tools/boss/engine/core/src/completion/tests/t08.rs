@@ -532,3 +532,248 @@ async fn on_stop_binding_only_url_does_not_finalize_revision() {
         other => panic!("expected revision task, got {other:?}"),
     }
 }
+
+// -----------------------------------------------------------
+// Incident-004 AI-3: four-case contribution gate on finalize.
+//
+// A revision may terminalize to PendingReview / InReview only when the
+// engine can name which signal allowed it:
+//   1. head SHA moved (pass)
+//   2. metadata-only confirmation (pass)
+//   3. explicit NO_CHANGES_NEEDED (pass — here via finalize_pr_transition)
+//   4. silence after mid-turn reap (no push, no metadata, no noop) → refuse
+// -----------------------------------------------------------
+
+/// Case 1: head moved → finalize_pr_transition may advance to InReview.
+#[tokio::test]
+async fn revision_contribution_gate_allows_head_sha_moved() {
+    let workspace = tempdir().unwrap();
+    let parent_pr_url = "https://github.com/spinyfin/mono/pull/2601";
+    let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let head_after = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let (_dir, db, _product_id, revision_id, execution_id) =
+        revision_fixture(workspace.path(), parent_pr_url, head_before);
+
+    let verifier = StubBranchVerifier::ok("boss/parent");
+    verifier.set_head_oid(Ok(head_after.to_owned())).await;
+    let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let handler = handler.with_branch_verifier(verifier);
+
+    let outcome = handler
+        .finalize_pr_transition(
+            &execution_id,
+            parent_pr_url.to_owned(),
+            WorkerPrCompletionTarget::InReview,
+            "pr_recheck_staged",
+        )
+        .await;
+    assert!(
+        matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == parent_pr_url),
+        "head SHA movement must allow InReview terminalization; got {outcome:?}",
+    );
+    match db.get_work_item(&revision_id).unwrap() {
+        WorkItem::Task(t) | WorkItem::Chore(t) => {
+            assert_eq!(t.status, TaskStatus::InReview, "contributing revision reaches review");
+        }
+        other => panic!("expected task, got {other:?}"),
+    }
+    assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+}
+
+/// Case 2: metadata-fix confirmed, head unchanged → still allowed.
+#[tokio::test]
+async fn revision_contribution_gate_allows_metadata_fix_confirmed() {
+    let workspace = tempdir().unwrap();
+    let parent_pr_url = "https://github.com/spinyfin/mono/pull/2602";
+    let head = "cccccccccccccccccccccccccccccccccccccccc";
+    let (_dir, db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
+    db.mark_execution_metadata_fix_confirmed(&execution_id).unwrap();
+
+    let verifier = StubBranchVerifier::ok("boss/parent");
+    // Head deliberately unchanged — metadata alone must carry the decision.
+    verifier.set_head_oid(Ok(head.to_owned())).await;
+    let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let handler = handler.with_branch_verifier(verifier);
+
+    let outcome = handler
+        .finalize_pr_transition(
+            &execution_id,
+            parent_pr_url.to_owned(),
+            WorkerPrCompletionTarget::InReview,
+            "metadata_only_fix",
+        )
+        .await;
+    assert!(
+        matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == parent_pr_url),
+        "metadata_fix_confirmed must allow InReview without head movement; got {outcome:?}",
+    );
+    match db.get_work_item(&revision_id).unwrap() {
+        WorkItem::Task(t) | WorkItem::Chore(t) => {
+            assert_eq!(t.status, TaskStatus::InReview);
+        }
+        other => panic!("expected task, got {other:?}"),
+    }
+    assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+}
+
+/// Case 3: explicit NO_CHANGES_NEEDED, head unchanged → allowed through the
+/// finalize chokepoint (the Stop path normally uses finalize_no_op instead).
+#[tokio::test]
+async fn revision_contribution_gate_allows_explicit_no_op() {
+    let workspace = tempdir().unwrap();
+    let parent_pr_url = "https://github.com/spinyfin/mono/pull/2603";
+    let head = "dddddddddddddddddddddddddddddddddddddddd";
+    let (_dir, db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
+    write_assistant_transcript(
+        &db,
+        workspace.path(),
+        &execution_id,
+        "## Summary\nFinding already fixed on main.\n\nNO_CHANGES_NEEDED\n",
+    );
+
+    let verifier = StubBranchVerifier::ok("boss/parent");
+    verifier.set_head_oid(Ok(head.to_owned())).await;
+    let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let handler = handler.with_branch_verifier(verifier);
+
+    let outcome = handler
+        .finalize_pr_transition(
+            &execution_id,
+            parent_pr_url.to_owned(),
+            WorkerPrCompletionTarget::InReview,
+            "test_explicit_no_op",
+        )
+        .await;
+    assert!(
+        matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == parent_pr_url),
+        "explicit NO_CHANGES_NEEDED must allow terminalization; got {outcome:?}",
+    );
+    match db.get_work_item(&revision_id).unwrap() {
+        WorkItem::Task(t) | WorkItem::Chore(t) => {
+            assert_eq!(t.status, TaskStatus::InReview);
+        }
+        other => panic!("expected task, got {other:?}"),
+    }
+    assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+}
+
+/// Case 4 (the defect): mid-turn reap path with no push, no metadata marker,
+/// no explicit no-op — must NOT reach review. Couples `sha_unchanged` to
+/// status success.
+#[tokio::test]
+async fn revision_contribution_gate_refuses_silence_after_mid_turn_reap() {
+    let workspace = tempdir().unwrap();
+    let parent_pr_url = "https://github.com/spinyfin/mono/pull/2604";
+    let head = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let (_dir, db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
+
+    // Model the incident: worker still mid-turn when finalize is attempted.
+    let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+    live_states.register_spawn(
+        9,
+        &execution_id,
+        "claude-opus-5",
+        std::process::id() as i32,
+        Some(boss_protocol::WorkItemBinding {
+            work_item_id: revision_id.clone(),
+            work_item_name: "revision silence".to_owned(),
+            execution_id: execution_id.clone(),
+        }),
+    );
+    live_states.apply_event(
+        9,
+        &boss_protocol::WorkerEvent::PreToolUse {
+            session_id: "s".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+        },
+    );
+
+    let verifier = StubBranchVerifier::ok("boss/parent");
+    // Head byte-identical to dispatch snapshot — proven non-contribution.
+    verifier.set_head_oid(Ok(head.to_owned())).await;
+    let TestHarness {
+        handler, cube, pane, ..
+    } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let handler = handler
+        .with_branch_verifier(verifier)
+        .with_live_worker_states(live_states);
+
+    let outcome = handler
+        .finalize_pr_transition(
+            &execution_id,
+            parent_pr_url.to_owned(),
+            WorkerPrCompletionTarget::InReview,
+            "pr_recheck_staged",
+        )
+        .await;
+    assert_eq!(
+        outcome,
+        StopOutcome::AwaitingInput,
+        "silence after mid-turn reap must not terminalize toward review; got {outcome:?}",
+    );
+    match db.get_work_item(&revision_id).unwrap() {
+        WorkItem::Task(t) | WorkItem::Chore(t) => {
+            assert_eq!(
+                t.status,
+                TaskStatus::Active,
+                "revision must stay in Doing — not a false in_review success",
+            );
+        }
+        other => panic!("expected task, got {other:?}"),
+    }
+    let exec = db.get_execution(&execution_id).unwrap();
+    assert!(
+        exec.status.is_live(),
+        "execution must stay live so the worker is not reaped; status={:?}",
+        exec.status,
+    );
+    assert!(
+        cube.release_calls.lock().await.is_empty(),
+        "refused finalize must not release the cube lease",
+    );
+    assert!(
+        pane.calls.lock().await.is_empty(),
+        "refused finalize must not tear down the pane",
+    );
+    // Mid-turn reap accounting must not fire when we refuse (no reap happened).
+    assert_eq!(
+        handler.metrics.counter_value("completion.mid_turn_reap.total"),
+        Some(0),
+        "a refused finalize must not count as a mid-turn reap",
+    );
+}
+
+/// Recheck staged arm is the historical fast path that manufactured the
+/// defect: with head unchanged it must not advance the revision.
+#[tokio::test]
+async fn recheck_staged_revision_refuses_when_head_unchanged() {
+    let workspace = tempdir().unwrap();
+    let parent_pr_url = "https://github.com/spinyfin/mono/pull/2605";
+    let head = "ffffffffffffffffffffffffffffffffffffffff";
+    let (_dir, db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
+
+    let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+    staged_pr_urls.record_if_unset(&execution_id, parent_pr_url);
+
+    let verifier = StubBranchVerifier::ok("boss/parent");
+    verifier.set_head_oid(Ok(head.to_owned())).await;
+    let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let handler = handler
+        .with_staged_pr_urls(staged_pr_urls)
+        .with_branch_verifier(verifier);
+
+    let outcome = handler.recheck_for_pr(&execution_id).await;
+    assert_eq!(
+        outcome,
+        StopOutcome::AwaitingInput,
+        "pr_recheck_staged with sha_unchanged must refuse review terminalization; got {outcome:?}",
+    );
+    match db.get_work_item(&revision_id).unwrap() {
+        WorkItem::Task(t) | WorkItem::Chore(t) => {
+            assert_eq!(t.status, TaskStatus::Active);
+        }
+        other => panic!("expected task, got {other:?}"),
+    }
+    assert!(cube.release_calls.lock().await.is_empty());
+}
