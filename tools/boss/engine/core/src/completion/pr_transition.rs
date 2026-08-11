@@ -40,6 +40,18 @@ impl WorkerCompletionHandler {
             }
         };
 
+        // incident-004 AI-4: every finalization source funnels through
+        // here, so this is the one place that can observe "is the worker
+        // we are about to reap still mid-turn?" for all of them at once —
+        // read BEFORE `begin_teardown`/`finish_worker_teardown` below can
+        // release the pane and clear the live-state slot out from under
+        // this check.
+        if let Ok(execution) = execution_result.as_ref()
+            && self.observed_mid_turn(execution_id)
+        {
+            self.record_mid_turn_reap(execution, source).await;
+        }
+
         let merged = matches!(target, WorkerPrCompletionTarget::Done);
 
         // For reviewer-triggering executions with a fresh
@@ -591,6 +603,78 @@ impl WorkerCompletionHandler {
                 }
             });
             StopOutcome::PrDetected { pr_url }
+        }
+    }
+
+    /// True when the live-state registry reports [`boss_protocol::WorkerActivity::Working`]
+    /// for `execution_id`'s slot right now — i.e. the worker is mid-turn,
+    /// not between turns. `WaitingForInput` is deliberately treated as
+    /// parked rather than mid-turn: it can represent a pending notification
+    /// after Stop, so treating it as active could retain a genuinely parked
+    /// worker for the full staged-recheck horizon. Returns `false` when no
+    /// registry is wired (unit tests) or the run has no live slot: an
+    /// unobservable execution is never reported as mid-turn, so this
+    /// undercounts rather than fabricating reaps.
+    pub(super) fn observed_mid_turn(&self, execution_id: &str) -> bool {
+        use boss_protocol::WorkerActivity;
+
+        self.live_worker_states
+            .as_ref()
+            .and_then(|registry| registry.activity_for_run(execution_id))
+            .is_some_and(|activity| activity == WorkerActivity::Working)
+    }
+
+    /// Record a mid-turn reap (incident-004 AI-4): bump the aggregate and
+    /// per-source counters and, for revision implementations, file a sticky
+    /// attention item on the execution. The counters remain unconditional so
+    /// every source stays countable and alertable; the sticky item is limited
+    /// to the execution class where a reviewer-requested correction can be
+    /// lost, avoiding an unbounded operator queue for routine finalizations.
+    ///
+    /// Deliberately does not touch [`crate::live_worker_state::LiveWorkerStateRegistry::release_slot`]'s
+    /// own `activity` log line — that remains the forensic record this
+    /// only adds a first-class signal alongside, per the postmortem's
+    /// explicit forbidden-workaround list.
+    async fn record_mid_turn_reap(&self, execution: &crate::work::WorkExecution, source: &'static str) {
+        MID_TURN_REAP_TOTAL.inc(&self.metrics);
+        self.metrics.counter_inc_by_dynamic(
+            &format!("completion.mid_turn_reap.{source}.count"),
+            "PR-completion finalizations on this source that observed the producing execution \
+             mid-turn (activity=working) rather than idle at finalize time.",
+            1,
+        );
+        tracing::warn!(
+            execution_id = %execution.id,
+            work_item_id = %execution.work_item_id,
+            source,
+            "pr completion: finalizing via {source} while producing execution is mid-turn \
+             (activity=working) — worker will be reaped before its remaining turn runs",
+        );
+        if execution.kind != ExecutionKind::RevisionImplementation {
+            return;
+        }
+        let body = format!(
+            "The engine finalized this execution's PR via `{source}` while the worker's live \
+             activity was still `working` — it had not reached its own Stop boundary. The pane \
+             is being torn down immediately after this, so any remaining steps in the worker's \
+             current turn (unpushed commits, PR description/comment updates, etc.) will not run.\n\n\
+             See tools/boss/docs/postmortems/incident-004-live-revision-workers-reaped-mid-turn.md \
+             for the incident this class of reap comes from."
+        );
+        if let Err(err) = self
+            .file_execution_attention(
+                execution,
+                MID_TURN_REAP_ATTENTION_KIND,
+                "Worker reaped mid-turn during PR-completion finalize",
+                body,
+            )
+            .await
+        {
+            tracing::warn!(
+                execution_id = %execution.id,
+                ?err,
+                "mid-turn reap: failed to file attention item",
+            );
         }
     }
 

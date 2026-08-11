@@ -185,6 +185,22 @@ crate::register_counter!(
      sentinel scrape (or the attentions_followups_backstop LLM pass) because no worker_proposals \
      row of kind followup_task existed for the execution (followup_proposals_seam on).",
 );
+// incident-004 AI-4: a first-class, in-system count of "finalize_pr_transition
+// tore down a producing execution whose live activity was still `working`
+// (mid-turn) rather than idle." Aggregate across every finalize source —
+// `pr_recheck_staged`, the `pr_recheck` detector branch, `stop_satisfied_clean`,
+// and any future source — because the postmortem measurement found the
+// missing guard was a property of the shared finalize/teardown funnel, not of
+// any one code block. See `WorkerCompletionHandler::record_mid_turn_reap` in
+// `completion/pr_transition.rs`, the single call site, and
+// tools/boss/docs/postmortems/incident-004-live-revision-workers-reaped-mid-turn.md.
+crate::register_counter!(
+    MID_TURN_REAP_TOTAL,
+    "completion.mid_turn_reap.total",
+    "finalize_pr_transition tore down a producing execution while its live activity was \
+     `working` (mid-turn) rather than idle, summed across every finalization source. \
+     Per-source breakdown: completion.mid_turn_reap.<source>.count.",
+);
 
 /// Register all PR-URL-capture counter handles with `registry`. Called from
 /// [`crate::metrics_init::init_all`] at engine startup so duplicate-name panics
@@ -196,6 +212,7 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&PR_URL_CAPTURE_RECONSTRUCTION_HIT);
     registry.register_counter(&PR_URL_CAPTURE_RECONSTRUCTION_FAILED);
     registry.register_counter(&PR_RECHECK_STAGED_BRANCH_MISMATCH);
+    registry.register_counter(&MID_TURN_REAP_TOTAL);
     registry.register_counter(&WORKER_SIGNAL_FALLBACK_HIT_EFFORT_ESCALATION);
     registry.register_counter(&WORKER_SIGNAL_FALLBACK_HIT_BLOCKED);
     registry.register_counter(&DEFERRED_SCOPE_FALLBACK_HIT);
@@ -1634,6 +1651,20 @@ pub const DRIVER_TERMINAL_ERROR_ATTENTION_KIND: &str = "driver_terminal_error";
 /// asked for something, so a worker declining it is a judgement a human
 /// should see rather than a silent close.
 pub const REVISION_NO_OP_ATTENTION_KIND: &str = "revision_no_changes_needed";
+
+/// Attention-item kind filed when [`WorkerCompletionHandler::finalize_pr_transition`]
+/// observes the producing execution's live-state activity as `working`
+/// (mid-turn) rather than idle at the moment it decides to terminalize and
+/// tear the worker down — i.e. the worker had not reached its own Stop
+/// boundary. Fired from the one shared finalize/teardown funnel every
+/// completion path (`pr_recheck_staged`, the `pr_recheck` detector branch,
+/// `stop_satisfied_clean`, and any future source) routes through, so it is
+/// not scoped to any single reap path. Together with [`MID_TURN_REAP_TOTAL`]
+/// this is incident-004 AI-4: make a mid-turn reap countable and alertable
+/// in-system instead of requiring the offline trace reconstruction that
+/// postmortem needed. See
+/// tools/boss/docs/postmortems/incident-004-live-revision-workers-reaped-mid-turn.md.
+pub const MID_TURN_REAP_ATTENTION_KIND: &str = "mid_turn_reap";
 
 /// Probe text dispatched when a worker stops without producing any PR
 /// for its branch. Phrased so a worker that already finished the work

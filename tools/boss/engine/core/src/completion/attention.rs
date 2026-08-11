@@ -5,10 +5,10 @@
 //! One helper: the execution-scoped attention-item filing shared by every
 //! call site in this module tree that records something about a *run*
 //! (worker escalation/blocker, deferred scope, proposal-channel error,
-//! reviewer give-up, nudge-breaker park) rather than about the work item.
-//! Work-item-scoped filings (`finalize_passes.rs`, `pr_transition.rs`) are
-//! deliberately NOT routed through here: they set `work_item_id` instead of
-//! `execution_id` and publish no frontend event.
+//! reviewer give-up, nudge-breaker park, mid-turn reap) rather than about
+//! the work item. The work-item-scoped filings in `finalize_passes.rs` and
+//! `pr_transition.rs` are deliberately NOT routed through here: they set
+//! `work_item_id` instead of `execution_id` and publish no frontend event.
 
 use super::*;
 
