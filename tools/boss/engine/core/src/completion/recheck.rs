@@ -53,14 +53,14 @@ impl WorkerCompletionHandler {
             .get_entry(execution_id)
             .is_none_or(|entry| entry.finalization_armed);
 
-         // Then: if the PostToolUse dispatcher already
-         // captured this execution's PR URL from the worker's hook
-         // stream, finalize via that URL and skip the detector. Layer-2
-         // defence-in-depth: verify the staged PR's headRefName matches
-         // this execution's expected branch before trusting the URL. A
-         // mismatch means the URL was captured from an unrelated Bash
-         // invocation (e.g. reading a chore description that referenced
-         // an old PR number) and must be discarded.
+        // Then: if the PostToolUse dispatcher already
+        // captured this execution's PR URL from the worker's hook
+        // stream, finalize via that URL and skip the detector. Layer-2
+        // defence-in-depth: verify the staged PR's headRefName matches
+        // this execution's expected branch before trusting the URL. A
+        // mismatch means the URL was captured from an unrelated Bash
+        // invocation (e.g. reading a chore description that referenced
+        // an old PR number) and must be discarded.
         // Then: if the PostToolUse dispatcher already captured this
         // execution's PR URL from the worker's hook stream, verify it before
         // trusting it. For primary implementations the URL is the completed
@@ -79,11 +79,11 @@ impl WorkerCompletionHandler {
         // implicit completion signal.
         if staged_armed
             && let Some(staged_url) = self
-            .verified_staged_pr_url(execution_id, &execution, "pr-recheck")
-            .await
+                .verified_staged_pr_url(execution_id, &execution, "pr-recheck")
+                .await
         {
             if execution.kind == ExecutionKind::RevisionImplementation {
-                tracing::info!(
+                tracing::debug!(
                     execution_id,
                     pr_url = %staged_url,
                     "pr-recheck: staged PR URL present for revision; retaining it for the \

@@ -27,6 +27,7 @@ impl WorkerCompletionHandler {
             pane_releaser,
             probe_queuer,
             staged_pr_urls: Arc::new(crate::pr_url_capture::StagedPrUrlCache::new()),
+            live_worker_states: None,
             staged_revision_pushes: Arc::new(crate::pr_url_capture::StagedRevisionPushCache::new()),
             staged_proposal_channel_errors: Arc::new(crate::proposal_channel_error::ProposalChannelErrorTracker::new()),
             staged_unobserved_commands: Arc::new(crate::codex_unobserved_command::UnobservedCommandTracker::new()),
@@ -221,6 +222,12 @@ impl WorkerCompletionHandler {
     /// behaviour without a signature break.
     pub fn with_staged_pr_urls(mut self, cache: Arc<crate::pr_url_capture::StagedPrUrlCache>) -> Self {
         self.staged_pr_urls = cache;
+        self
+    }
+
+    /// Share the app's live worker registry for mid-turn reap detection.
+    pub fn with_live_worker_states(mut self, states: Arc<crate::live_worker_state::LiveWorkerStateRegistry>) -> Self {
+        self.live_worker_states = Some(states);
         self
     }
 

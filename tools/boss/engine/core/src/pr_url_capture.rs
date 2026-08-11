@@ -53,6 +53,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use boss_engine_gh_invocation::{GhNoun, classify};
 use boss_engine_structured_output::pr_url::find_first_pr_url;
@@ -446,14 +447,14 @@ impl StagedPrUrlCache {
         if guard.contains_key(execution_id) {
             StagePrUrlOutcome::AlreadyStaged
         } else {
-             guard.insert(
-                 execution_id.to_owned(),
-                 StagedPrUrlEntry {
-                     pr_url: pr_url.to_owned(),
-                     staged_at: Instant::now(),
+            guard.insert(
+                execution_id.to_owned(),
+                StagedPrUrlEntry {
+                    pr_url: pr_url.to_owned(),
+                    staged_at: Instant::now(),
                     finalization_armed: true,
-                 },
-             );
+                },
+            );
             StagePrUrlOutcome::Staged
         }
     }

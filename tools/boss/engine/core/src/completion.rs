@@ -1189,6 +1189,9 @@ pub struct WorkerCompletionHandler {
     /// the staging path get the same behaviour they always had —
     /// nothing is staged → fall through to `pr_detector`.
     staged_pr_urls: Arc<crate::pr_url_capture::StagedPrUrlCache>,
+    /// Live worker activity used to distinguish a mid-turn finalization from
+    /// one that occurs after the worker reached its Stop boundary.
+    live_worker_states: Option<Arc<crate::live_worker_state::LiveWorkerStateRegistry>>,
     /// In-memory set recording `revision_implementation` executions that ran a
     /// `jj git push` command since their last Stop boundary. Populated by the
     /// `PostToolUse` hook dispatcher; consumed (and cleared) by
