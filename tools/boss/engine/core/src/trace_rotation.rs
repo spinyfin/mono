@@ -146,7 +146,7 @@ impl Write for RotatingJsonlWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
