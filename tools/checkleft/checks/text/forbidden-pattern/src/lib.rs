@@ -758,8 +758,9 @@ mod tests {
         assert!(findings.is_empty());
     }
 
-    /// Unavailable reason is consulted even when a stale Some body is also
-    /// present is not expected from the host, but prefer fail-loud if reason set.
+    /// The host never sets both a body and an unavailable reason. If it ever
+    /// did, the reason wins: fail loudly rather than scan text we were told is
+    /// unreliable.
     #[test]
     fn changeset_scope_unavailable_reason_takes_precedence_over_body() {
         let findings = forbidden_pattern_check(make_changeset_input_with_unavailable(

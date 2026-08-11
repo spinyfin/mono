@@ -37,7 +37,8 @@ use checkleft::progress::{DEFAULT_DEBOUNCE, LiveProgress, NoopProgressReporter, 
 use checkleft::runner::{DEFAULT_FIX_PASSES, Runner};
 use checkleft::source_tree::LocalSourceTree;
 use checkleft::vcs::{
-    BaseRevision, GithubApiContext, GithubApiTimeout, Vcs, github_pr_number_for_branch, github_pull_request_description,
+    BaseRevision, BranchPrLookup, GithubApiContext, GithubApiTimeout, Vcs, github_pr_number_for_branch,
+    github_pull_request_description,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing::info;
@@ -621,7 +622,7 @@ async fn dispatch_run(
 
     let (results, elapsed) = if skip_run {
         if matches!(format, OutputFormat::Json) {
-            print_json_results(&[])?;
+            print_json_results(&[], pr_description_surface(&changeset))?;
         }
         (Vec::new(), Duration::ZERO)
     } else {
@@ -666,7 +667,7 @@ async fn dispatch_run(
                     print_human_results(&results, elapsed);
                 }
             }
-            OutputFormat::Json => print_json_results(&results)?,
+            OutputFormat::Json => print_json_results(&results, pr_description_surface(&changeset))?,
         }
 
         (results, elapsed)
@@ -1839,6 +1840,16 @@ impl PrDescriptionResolution {
     }
 }
 
+fn pr_description_surface(changeset: &ChangeSet) -> &'static str {
+    if changeset.pr_description_unavailable_reason.is_some() {
+        "unavailable"
+    } else if changeset.pr_description.is_some() {
+        "scanned"
+    } else {
+        "not_applicable"
+    }
+}
+
 fn pr_description_fetch_failed_reason(repository: &str, pr_id: &str) -> String {
     format!(
         "GitHub API did not return a description for PR {pr_id} in {repository} \
@@ -1867,6 +1878,17 @@ async fn resolve_pr_description(
     let github = GithubApiContext::production(&github_base_url);
     let github_token = detect_github_token();
 
+    resolve_pr_description_with_github(repository, change_id, env, vcs, github, github_token.as_deref()).await
+}
+
+async fn resolve_pr_description_with_github(
+    repository: &str,
+    change_id: Option<&str>,
+    env: &CiEnvironment,
+    vcs: &Vcs,
+    github: GithubApiContext<'_>,
+    github_token: Option<&str>,
+) -> Result<PrDescriptionResolution> {
     if github_token.is_none() {
         eprintln!("{}", github_auth_unavailable_warning(repository));
     }
@@ -1879,7 +1901,7 @@ async fn resolve_pr_description(
             change_id = change_id,
             "fetching PR description by change id"
         );
-        return match github_pull_request_description(github, repository, change_id, github_token.as_deref()).await? {
+        return match github_pull_request_description(github, repository, change_id, github_token).await? {
             Some(desc) => Ok(PrDescriptionResolution::Resolved(desc)),
             None => Ok(PrDescriptionResolution::Unavailable {
                 reason: pr_description_fetch_failed_reason(repository, change_id),
@@ -1904,23 +1926,24 @@ async fn resolve_pr_description(
         let mut descriptions = Vec::new();
         let mut failed_ids = Vec::new();
         for pr_number in &merge_queue_pr_numbers {
-            match github_pull_request_description(github, repository, pr_number, github_token.as_deref()).await? {
+            match github_pull_request_description(github, repository, pr_number, github_token).await? {
                 Some(description) => descriptions.push(description),
                 None => failed_ids.push(pr_number.clone()),
             }
         }
-        if !descriptions.is_empty() {
-            return Ok(PrDescriptionResolution::Resolved(descriptions.join("\n\n")));
+        if !failed_ids.is_empty() {
+            return Ok(PrDescriptionResolution::Unavailable {
+                reason: pr_description_fetch_failed_reason(repository, &failed_ids.join(",")),
+            });
         }
-        return Ok(PrDescriptionResolution::Unavailable {
-            reason: pr_description_fetch_failed_reason(repository, &failed_ids.join(",")),
-        });
+        return Ok(PrDescriptionResolution::Resolved(descriptions.join("\n\n")));
     }
 
     // Level 3b: no PR number from env — detect the current branch and look up
-    // the open PR via the GitHub API. No open PR (empty list / branch not
-    // found) is NotApplicable. Once a PR number is known, a failed body fetch
-    // is Unavailable. Timeouts remain fatal (propagated as Err).
+    // the open PR via the GitHub API. Only a successful empty list is
+    // NotApplicable; a lookup failure is Unavailable. Once a PR number is
+    // known, a failed body fetch is likewise Unavailable. Timeouts remain fatal
+    // (propagated as Err).
     let Some(branch) = detect_current_branch(env, vcs) else {
         return Ok(PrDescriptionResolution::NotApplicable);
     };
@@ -1929,13 +1952,12 @@ async fn resolve_pr_description(
         branch = branch,
         "resolving PR description via branch lookup"
     );
-    let Some(pr_number) = github_pr_number_for_branch(github, repository, &branch, github_token.as_deref()).await?
-    else {
-        // Could not establish that an open PR exists. Missing token on a
-        // private repo can also yield this shape; we cannot tell "no PR"
-        // from "auth failed looking for a PR" without a known PR number, and
-        // failing every non-PR local build is not acceptable. Treat as N/A.
-        return Ok(PrDescriptionResolution::NotApplicable);
+    let pr_number = match github_pr_number_for_branch(github, repository, &branch, github_token).await? {
+        BranchPrLookup::Found(pr_number) => pr_number,
+        BranchPrLookup::NoOpenPr => return Ok(PrDescriptionResolution::NotApplicable),
+        BranchPrLookup::LookupFailed { reason } => {
+            return Ok(PrDescriptionResolution::Unavailable { reason });
+        }
     };
     info!(
         repository = repository,
@@ -1943,7 +1965,7 @@ async fn resolve_pr_description(
         pr_number = pr_number,
         "fetching PR description for branch-resolved PR"
     );
-    match github_pull_request_description(github, repository, &pr_number, github_token.as_deref()).await? {
+    match github_pull_request_description(github, repository, &pr_number, github_token).await? {
         Some(desc) => Ok(PrDescriptionResolution::Resolved(desc)),
         None => Ok(PrDescriptionResolution::Unavailable {
             reason: pr_description_fetch_failed_reason(repository, &pr_number),
@@ -2245,9 +2267,19 @@ fn print_human_results(results: &[CheckResult], elapsed: Duration) {
     );
 }
 
-fn print_json_results(results: &[CheckResult]) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(results)?);
+fn print_json_results(results: &[CheckResult], pr_description_surface: &str) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json_run_output(results, pr_description_surface))?
+    );
     Ok(())
+}
+
+fn json_run_output(results: &[CheckResult], pr_description_surface: &str) -> serde_json::Value {
+    serde_json::json!({
+        "pr_description_surface": pr_description_surface,
+        "results": results,
+    })
 }
 
 fn sort_results_for_output(results: &mut [CheckResult]) {
