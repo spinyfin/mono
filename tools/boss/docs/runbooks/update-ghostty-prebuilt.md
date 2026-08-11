@@ -7,7 +7,7 @@ Run this when Ghostty needs a version bump or the xcframework must be rebuilt.
 - macOS machine with Xcode and the Metal Toolchain component installed
 - `xcodebuild -downloadComponent MetalToolchain` if not already present
 - `gh` CLI authenticated as `spinyfin`
-- Zig 0.15.x (the bootstrap script will download it if not found)
+- Zig 0.16.0 (the bootstrap script will download it if not found)
 
 ## Steps
 
@@ -15,10 +15,10 @@ Run this when Ghostty needs a version bump or the xcframework must be rebuilt.
 
 ```sh
 cd tools/boss/app-macos
-bash scripts/bootstrap-ghosttykit.sh
+GHOSTTY_REF=71c2d68eb40d4e51d30d94e46e7b0c305aa4407f bash scripts/bootstrap-ghosttykit.sh
 ```
 
-The script clones/updates ghostty from `https://github.com/ghostty-org/ghostty` (latest `main`), builds the `GhosttyKit.xcframework` (static, arm64, `-Doptimize=ReleaseFast`), and places it at `ThirdParty/GhosttyKit.xcframework`.
+The script fetches and checks out the named immutable Ghostty commit from `https://github.com/ghostty-org/ghostty`, builds the `GhosttyKit.xcframework` (static, arm64, `-Doptimize=ReleaseFast`), and places it at `ThirdParty/GhosttyKit.xcframework`. It defaults to `71c2d68eb40d4e51d30d94e46e7b0c305aa4407f`; set `GHOSTTY_REF` to another full commit ID when deliberately rebuilding a different revision. Do not use a moving branch such as `main`.
 
 Note the ghostty commit SHA:
 

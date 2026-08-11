@@ -55,8 +55,7 @@ final class SpawnDiagnosticsLogTests: XCTestCase {
                 mainDisplayAsleep: true,
                 sessionLocked: true,
                 screenCount: 1,
-                nsScreenMainNonNil: true,
-                vsyncOverrideApplied: true
+                nsScreenMainNonNil: true
             ),
             diagnostic: "[GhosttyTerminalView] ghostty_surface_new returned NULL. Context:\n  workingDirectory: /tmp/ws\n"
         )
@@ -78,7 +77,6 @@ final class SpawnDiagnosticsLogTests: XCTestCase {
         XCTAssertTrue(lines[1].contains("\"host\""), lines[1])
         XCTAssertTrue(lines[1].contains("\"active_display_count\":0"), lines[1])
         XCTAssertTrue(lines[1].contains("\"session_locked\":true"), lines[1])
-        XCTAssertTrue(lines[1].contains("\"vsync_override_applied\":true"), lines[1])
         // Rejected-input block is durable here (fd 2 is /dev/null in prod).
         XCTAssertTrue(lines[1].contains("\"diagnostic\""), lines[1])
         XCTAssertTrue(lines[1].contains("workingDirectory"), lines[1])

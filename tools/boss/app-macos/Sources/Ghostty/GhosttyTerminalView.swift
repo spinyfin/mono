@@ -81,11 +81,10 @@ final class GhosttyTerminalHostView: NSView {
     /// argument; `updateNSView` refreshes it whenever the input changes.
     private var paneMonitorEnabled: Bool
     /// Tokens for the display-retry observers installed only while
-    /// surface creation has failed. With window-vsync forced off for the
-    /// embed, renderer init no longer creates a DisplayLink, so a NULL from
-    /// `ghostty_surface_new` is no longer attributable to zero active
-    /// displays; retries stay armed because other failures remain
-    /// environment-tied. Installed and removed together — see
+    /// surface creation has failed. GhosttyKit tolerates a temporarily
+    /// unavailable display link with vsync enabled, but other environment-
+    /// tied failures can still resolve when displays change. Installed and
+    /// removed together — see
     /// `installScreenObserverIfNeeded()` / `removeScreenObserver()`.
     private var screenObserver: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
@@ -417,7 +416,6 @@ final class GhosttyTerminalHostView: NSView {
           host.session_console:  \(host.sessionOnConsole)
           host.ns_screens:       \(host.screenCount)
           host.ns_main_non_nil:  \(host.nsScreenMainNonNil)
-          host.vsync_override:   \(host.vsyncOverrideApplied)
           host.summary:          \(host.summary)
 
         """

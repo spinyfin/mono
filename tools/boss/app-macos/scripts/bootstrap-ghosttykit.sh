@@ -13,7 +13,15 @@ UPSTREAM_DIR="$CACHE_DIR/ghostty-upstream"
 OUTPUT_DIR="$ROOT_DIR/ThirdParty"
 FRAMEWORK_DIR="$OUTPUT_DIR/GhosttyKit.xcframework"
 TOOLCHAIN_DIR="$CACHE_DIR/toolchains"
-ZIG_VERSION="0.15.2"
+# Build a named upstream commit by default. Override only with another
+# immutable commit ID, never a moving branch such as `main`.
+GHOSTTY_REF="${GHOSTTY_REF:-71c2d68eb40d4e51d30d94e46e7b0c305aa4407f}"
+ZIG_VERSION="0.16.0"
+
+if [[ ! "$GHOSTTY_REF" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "GHOSTTY_REF must be a full immutable commit ID, not a branch or tag: $GHOSTTY_REF" >&2
+  exit 1
+fi
 
 case "$(uname -m)" in
   arm64) TARGET_TRIPLE="aarch64-macos.15.0" ;;
@@ -43,16 +51,20 @@ EOF
 ensure_zig() {
   if command -v brew >/dev/null 2>&1; then
     local brew_prefix
-    brew_prefix="$(brew --prefix zig@0.15 2>/dev/null || true)"
-    if [[ -n "$brew_prefix" && -x "$brew_prefix/bin/zig" ]]; then
+    brew_prefix="$(brew --prefix zig@0.16 2>/dev/null || true)"
+    if [[ -n "$brew_prefix" && -x "$brew_prefix/bin/zig" && "$("$brew_prefix/bin/zig" version)" == "$ZIG_VERSION" ]]; then
       echo "$brew_prefix/bin/zig"
       return 0
     fi
   fi
 
   if command -v zig >/dev/null 2>&1; then
-    command -v zig
-    return 0
+    local system_zig
+    system_zig="$(command -v zig)"
+    if [[ "$("$system_zig" version)" == "$ZIG_VERSION" ]]; then
+      echo "$system_zig"
+      return 0
+    fi
   fi
 
   local arch
@@ -82,10 +94,18 @@ ZIG_BIN="$(ensure_zig)"
 SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
 
 if [[ ! -d "$UPSTREAM_DIR/.git" ]]; then
-  git clone --depth 1 https://github.com/ghostty-org/ghostty "$UPSTREAM_DIR"
-else
-  git -C "$UPSTREAM_DIR" fetch --depth 1 origin main
-  git -C "$UPSTREAM_DIR" reset --hard origin/main
+  git init --quiet "$UPSTREAM_DIR"
+  git -C "$UPSTREAM_DIR" remote add origin https://github.com/ghostty-org/ghostty
+fi
+
+# Fetch and check out exactly the requested object. A detached HEAD makes the
+# source used for the xcframework explicit even when this cache already exists.
+git -C "$UPSTREAM_DIR" fetch --depth 1 origin "$GHOSTTY_REF"
+git -C "$UPSTREAM_DIR" reset --hard FETCH_HEAD
+CHECKED_OUT_REF="$(git -C "$UPSTREAM_DIR" rev-parse HEAD)"
+if [[ "$CHECKED_OUT_REF" != "$GHOSTTY_REF" ]]; then
+  echo "Ghostty checkout mismatch: requested $GHOSTTY_REF, got $CHECKED_OUT_REF" >&2
+  exit 1
 fi
 
 (
