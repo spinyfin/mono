@@ -2219,27 +2219,29 @@ Just do the thing, no explicit entries here.\n\
     }
 
     #[test]
-    fn real_operator_forced_dispatch_doc_parses_as_one_entry() {
-        // Re-run against the real design doc itself, via the
-        // //tools/boss/docs:operator_forced_dispatch_design_doc filegroup
-        // (see BUILD.bazel compile_data) — not a testdata copy, so this test
-        // can never silently drift from the doc it claims to cover.
+    fn real_operator_forced_dispatch_doc_has_no_breakdown_after_ship() {
+        // Pin against the real design doc via
+        // //tools/boss/docs:operator_forced_dispatch_design_doc (see BUILD.bazel
+        // compile_data) — not a testdata copy, so this cannot silently drift
+        // from the doc it claims to cover.
+        //
+        // After mono#2705 shipped, the as-built postmortem replaced the
+        // pre-ship "Proposed implementation task breakdown" with an as-shipped
+        // layer table and "Outstanding work: none". The planner must therefore
+        // see zero breakdown entries (no further design-scoped tasks to emit).
+        // The single-entry shape is still covered by SINGLE_ENTRY_DOC fixtures
+        // above; this pin only guards the live doc's post-ship contract.
         let doc = include_str!(env!("BOSS_OPERATOR_FORCED_DISPATCH_DESIGN_DOC"));
         let entries = extract_breakdown_entries(doc);
-        assert_eq!(
-            entries.len(),
-            1,
-            "real doc must yield exactly one breakdown entry, got {}: {:?}",
+        assert!(
+            entries.is_empty(),
+            "as-built postmortem must not reintroduce a task breakdown; got {}: {:?}",
             entries.len(),
             entries.iter().map(|e| e.title.as_str()).collect::<Vec<_>>()
         );
-        assert_eq!(entries[0].title, "Implement pause-only forced dispatch end to end");
         assert!(
-            entries[0]
-                .body
-                .lines()
-                .any(|l| l.trim().eq_ignore_ascii_case("Dependencies: none")),
-            "real doc entry must declare Dependencies: none"
+            extract_breakdown_section(doc).is_none(),
+            "as-built postmortem must not keep a recognised breakdown heading"
         );
     }
 
