@@ -341,11 +341,13 @@ impl WorkDb {
         if execution.status.is_terminal() {
             return Ok(StallEscalation::Terminal);
         }
-        // `classify_id` accepts only product/project/task ids — the exact set
-        // `file_dispatch_stage_stalled_attention` can target. An automation
-        // (`auto_…`) or other non-work-item id falls through here.
-        if classify_id(&execution.work_item_id).is_err() {
-            return Ok(StallEscalation::NotWorkItem);
+        // `classify_id` also recognizes comments, but the dispatch-stall
+        // attention surface is intentionally limited to product, project,
+        // and task ids. An answer-agent comment (`cmt_…`), automation
+        // (`auto_…`), or other non-work-item id must stay a quiet skip.
+        match classify_id(&execution.work_item_id) {
+            Ok(ItemKind::Product | ItemKind::Project | ItemKind::Task) => {}
+            Ok(ItemKind::Comment) | Err(_) => return Ok(StallEscalation::NotWorkItem),
         }
         Ok(StallEscalation::Escalate {
             work_item_id: execution.work_item_id,
@@ -1011,13 +1013,10 @@ impl WorkDb {
     pub fn is_bound_work_item_closed(&self, id: &str) -> Result<bool> {
         match classify_id(id)? {
             ItemKind::Product | ItemKind::Project => Ok(false),
-            ItemKind::Task => {
-                let conn = self.connect()?;
-                let task = query_task(&conn, id)?
-                    .filter(|task| task.deleted_at.is_none())
-                    .with_context(|| format!("unknown task: {id}"))?;
-                Ok(task.status.is_terminal())
-            }
+            ItemKind::Task => Ok(matches!(
+                self.get_work_item(id)?,
+                WorkItem::Task(task) | WorkItem::Chore(task) if task.status.is_terminal()
+            )),
             ItemKind::Comment => {
                 let comment = self
                     .get_comment(id)?

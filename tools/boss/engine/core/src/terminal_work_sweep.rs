@@ -303,11 +303,14 @@ pub async fn run_one_pass(
 
         // `AutomationTriage`'s `work_item_id` is an automation id — not a
         // product/project/task/comment — so bound-item closedness cannot be
-        // established; skip the lookup (and its per-minute WARN) and fall
-        // back to the execution signal alone. Answer-agent executions bind a
-        // real comment id (`cmt_…`) and go through the normal closed check
-        // via `is_bound_work_item_closed`.
-        let never_bound_work_item = matches!(execution.kind, boss_protocol::ExecutionKind::AutomationTriage);
+        // established. Answer-agent executions bind a real comment id, but
+        // their completion sweep owns comment-terminal recovery so it can
+        // finalize through the answer-agent path and file its lost-signal
+        // attention item. Skip both here and fall back to execution status.
+        let never_bound_work_item = matches!(
+            execution.kind,
+            boss_protocol::ExecutionKind::AutomationTriage | boss_protocol::ExecutionKind::AnswerAgent
+        );
 
         // The O'Brien signal: the bound work item is terminal (done /
         // archived / comment resolved|dismissed|answered) even though the
@@ -583,7 +586,7 @@ mod tests {
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::test_support::*;
-    use crate::work::{FakePrStateChecker, PrOpenState, WorkDb, WorkItemPatch};
+    use crate::work::{CreateCommentInput, FakePrStateChecker, PrOpenState, WorkDb, WorkItemPatch};
 
     // ─── reaper stub ─────────────────────────────────────────────────────────
 
@@ -646,6 +649,38 @@ mod tests {
         db.request_execution(RequestExecutionInput::builder().work_item_id(work_item_id).build())
             .unwrap()
             .id
+    }
+
+    fn create_answer_agent_execution(db: &WorkDb, product_id: &str) -> (String, String) {
+        const DOC_REPO: &str = "git@github.com:spinyfin/mono.git";
+        const DOC_ARTIFACT: &str = "pr_doc:git@github.com:spinyfin/mono.git:main:docs/design.md";
+        let investigation = db
+            .create_investigation(
+                boss_protocol::CreateInvestigationInput::builder()
+                    .product_id(product_id)
+                    .name("Investigate answer-agent terminal sweep")
+                    .build(),
+            )
+            .unwrap();
+        db.set_task_doc_pointer(&investigation.id, Some(DOC_REPO), Some("main"), Some("docs/design.md"))
+            .unwrap();
+        let comment = db
+            .create_comment(CreateCommentInput {
+                artifact_kind: "pr_doc".to_owned(),
+                artifact_id: DOC_ARTIFACT.to_owned(),
+                doc_version: "v1".to_owned(),
+                anchor: boss_protocol::CommentAnchor {
+                    exact: "the quoted text".to_owned(),
+                    prefix: String::new(),
+                    suffix: String::new(),
+                },
+                body: "why?".to_owned(),
+                author: "operator".to_owned(),
+                plain_text_projection_version: 0,
+            })
+            .unwrap();
+        let execution = db.create_answer_agent_execution(&comment.id, DOC_REPO).unwrap();
+        (comment.id, execution.id)
     }
 
     /// Raw UPDATE to drive an execution to a terminal status without a full
@@ -838,6 +873,69 @@ mod tests {
         let events = sink.events().await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].details["reason"], "execution_terminal");
+    }
+
+    /// Answer agents are deliberately excluded from this generic reaper even
+    /// after a comment is answered/resolved or deleted. Their completion sweep
+    /// owns those states so it can use the answer-agent finalizer and surface
+    /// a lost completion signal rather than silently releasing the slot.
+    #[tokio::test]
+    async fn leaves_answer_agents_for_their_completion_sweep() {
+        for state in ["answering", "answered", "resolved", "missing"] {
+            let (_dir, db, product_id) = setup();
+            let (comment_id, execution_id) = create_answer_agent_execution(&db, &product_id);
+            if state == "answering" {
+                db.transition_comment_to_answering(&comment_id).unwrap();
+            } else if state == "answered" {
+                db.transition_comment_to_answering(&comment_id).unwrap();
+                db.transition_comment_to_answered(&comment_id).unwrap();
+            } else if state == "missing" {
+                let conn = db.connect().unwrap();
+                conn.execute("DELETE FROM work_comments WHERE id = ?1", [&comment_id])
+                    .unwrap();
+            } else {
+                db.set_comment_status(&comment_id, state, Some("operator")).unwrap();
+            }
+
+            let live_states = Arc::new(LiveWorkerStateRegistry::new());
+            register_live_worker(&live_states, 7, &execution_id, &comment_id);
+            let reaper = RecordingReaper::new(live_states.clone(), true);
+            let cube = RecordingCubeClient::default();
+            let sink = Arc::new(RecordingDispatchEventSink::new());
+            let teardown = TeardownRegistry::new();
+            let mut seen = HashSet::new();
+
+            let first = run_one_pass(
+                db.as_ref(),
+                &live_states,
+                &reaper,
+                &cube,
+                sink.as_ref(),
+                &teardown,
+                &mut seen,
+            )
+            .await;
+            let second = run_one_pass(
+                db.as_ref(),
+                &live_states,
+                &reaper,
+                &cube,
+                sink.as_ref(),
+                &teardown,
+                &mut seen,
+            )
+            .await;
+            assert_eq!(first.active_skipped, 1, "{state} answer agent must be ignored");
+            assert_eq!(second.active_skipped, 1, "{state} answer agent must stay ignored");
+            assert!(
+                reaper.reaped().is_empty(),
+                "{state} answer agent must use its completion sweep"
+            );
+            assert!(
+                sink.events().await.is_empty(),
+                "{state} answer agent must not emit terminal-work events"
+            );
+        }
     }
 
     /// The "Seven" regression: a live worker whose bound work item ROW WAS
