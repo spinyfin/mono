@@ -448,10 +448,19 @@ private struct CommentRow: View {
     /// `resolved`/`inRevision`/`orphaned`/`dismissed` render nothing here —
     /// that track has its own `RevisionChip` instead.
     ///
-    /// `answerAgentFailed` (`Comment.answerAgentFailed`) takes priority over
-    /// each status's default rendering in `.answering`/`.awaitingFollowup`/
-    /// `.active`: those are exactly the statuses a failed spawn can leave a
-    /// `question`-classified comment sitting in (see
+    /// `.answerFailed` is its own terminal status (the engine's
+    /// `transition_comment_to_answer_failed`) — a run that ended with no
+    /// reply ever posted — and renders the failed indicator alongside a
+    /// `FollowupComposer` so it isn't a dead end: posting a follow-up here
+    /// drives the same `answered → awaiting_followup` engine transition
+    /// (widened to also accept `answer_failed`, see
+    /// `transition_comment_to_awaiting_followup`), which either re-spawns
+    /// the answer agent or bridges into the revision path. This mirrors how
+    /// the `answerAgentFailed` flag renders for the statuses a failed
+    /// *spawn* (never even reaching `running`) can leave a comment sitting
+    /// in: `answerAgentFailed` (`Comment.answerAgentFailed`) takes priority
+    /// over each of those statuses' default rendering in
+    /// `.answering`/`.awaitingFollowup`/`.active` (see
     /// `record_answer_agent_spawn_failure` in the engine), and without this
     /// check they'd render either nothing or a perpetual in-progress
     /// indicator for a run that already gave up.
@@ -469,6 +478,11 @@ private struct CommentRow: View {
                 Label("Answered", systemImage: "checkmark.circle")
                     .font(.caption2)
                     .foregroundStyle(.green)
+                FollowupComposer(comment: comment, layer: layer)
+            }
+        case .answerFailed:
+            VStack(alignment: .leading, spacing: 4) {
+                AnswerFailedIndicatorView()
                 FollowupComposer(comment: comment, layer: layer)
             }
         case .awaitingFollowup:

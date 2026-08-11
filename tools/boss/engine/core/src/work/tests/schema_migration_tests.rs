@@ -478,6 +478,229 @@ fn migration_collapses_directive_and_larger_change_intent_to_revision() {
     let _ = std::fs::remove_file(path);
 }
 
+/// Regression test for the "comment reads answered when its answer-agent run
+/// failed with no reply" incident: `migrate_correct_falsely_answered_comments_with_failed_runs`
+/// must repair a `work_comments` row left `status = 'answered'` by the
+/// (now-fixed) bug where a failed, no-reply-posted answer-agent run still
+/// drove the comment all the way to `answered`. Seeds the exact shape the
+/// pre-fix `recover_unanswered_comment` produced — a `failed` run with a
+/// NULL `reply_body`, and the comment forced to `answered` via a raw UPDATE
+/// bypassing the now-fixed guarded transition — then reopens the DB to
+/// trigger the repair migration.
+#[test]
+fn migration_repairs_a_comment_falsely_answered_by_a_failed_no_reply_run() {
+    let (_dir, path) = disk_db_path("repair-falsely-answered-comments");
+    let db = WorkDb::open(path.clone()).unwrap();
+
+    let comment = db
+        .create_comment(CreateCommentInput {
+            artifact_kind: "work_item".to_owned(),
+            artifact_id: "t1".to_owned(),
+            doc_version: "v0".to_owned(),
+            anchor: CommentAnchor {
+                exact: "alpha".to_owned(),
+                prefix: String::new(),
+                suffix: String::new(),
+            },
+            body: "why does this retry three times?".to_owned(),
+            author: "user:test@example.com".to_owned(),
+            plain_text_projection_version: 0,
+        })
+        .unwrap();
+    db.set_comment_intent(&comment.id, "question", 0.9).unwrap();
+    db.transition_comment_to_answering(&comment.id).unwrap();
+    let run = db
+        .create_answer_agent_run(&comment.id, "work_item", "t1", "v0", 0)
+        .unwrap();
+    db.complete_answer_agent_run(&run.id, "failed", None, Some("stranded_no_stop"))
+        .unwrap();
+
+    // Bypass the now-fixed `transition_comment_to_answer_failed` to
+    // reproduce exactly what the pre-fix `recover_unanswered_comment` wrote:
+    // status forced straight to 'answered' with nothing behind it.
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_comments SET status = 'answered', updated_at = '1700000000' WHERE id = ?1",
+            [&comment.id],
+        )
+        .unwrap();
+    }
+    let corrupted = db.get_comment(&comment.id).unwrap().unwrap();
+    assert_eq!(corrupted.status, "answered");
+    drop(db);
+
+    // Re-opening runs the repair migration.
+    let db = WorkDb::open(path.clone()).unwrap();
+    let repaired = db.get_comment(&comment.id).unwrap().unwrap();
+    assert_ne!(
+        repaired.status, "answered",
+        "a failed, no-reply run must never be left reading as answered"
+    );
+    assert_eq!(repaired.status, "answer_failed");
+    assert_eq!(repaired.status_actor.as_deref(), Some("engine"));
+    assert_ne!(
+        repaired.updated_at, "1700000000",
+        "the repair must restamp updated_at rather than leave the corrupt write's timestamp"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// The revision-intent counterpart: a comment reclassified to `revision`
+/// mid-flight (the follow-up reclassifier writes `intent` without touching
+/// `status`) must repair to `active`, not `answer_failed` — mirroring
+/// `transition_comment_to_answer_failed`'s own fold, so the repaired comment
+/// lands in the `[Revise]` pool instead of a failure state that no longer
+/// describes it.
+#[test]
+fn migration_repairs_a_falsely_answered_revisable_comment_to_active() {
+    let (_dir, path) = disk_db_path("repair-falsely-answered-revisable-comment");
+    let db = WorkDb::open(path.clone()).unwrap();
+
+    let comment = db
+        .create_comment(CreateCommentInput {
+            artifact_kind: "work_item".to_owned(),
+            artifact_id: "t1".to_owned(),
+            doc_version: "v0".to_owned(),
+            anchor: CommentAnchor {
+                exact: "alpha".to_owned(),
+                prefix: String::new(),
+                suffix: String::new(),
+            },
+            body: "please rename this".to_owned(),
+            author: "user:test@example.com".to_owned(),
+            plain_text_projection_version: 0,
+        })
+        .unwrap();
+    db.set_comment_intent(&comment.id, "question", 0.9).unwrap();
+    db.transition_comment_to_answering(&comment.id).unwrap();
+    let run = db
+        .create_answer_agent_run(&comment.id, "work_item", "t1", "v0", 0)
+        .unwrap();
+    db.complete_answer_agent_run(&run.id, "failed", None, Some("no_reply_posted"))
+        .unwrap();
+    db.reclassify_comment_intent(&comment.id, "revision", 0.8).unwrap();
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_comments SET status = 'answered' WHERE id = ?1",
+            [&comment.id],
+        )
+        .unwrap();
+    }
+    drop(db);
+
+    let db = WorkDb::open(path.clone()).unwrap();
+    let repaired = db.get_comment(&comment.id).unwrap().unwrap();
+    assert_eq!(repaired.status, "active");
+    assert_eq!(repaired.intent.as_deref(), Some("revision"));
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// A comment that hit the bug and then received an operator follow-up
+/// before this repair migration ever ran advances past `answered` to
+/// `awaiting_followup` — it must still be repaired, not permanently
+/// excluded just because its status moved on.
+#[test]
+fn migration_repairs_a_falsely_answered_comment_that_already_moved_to_awaiting_followup() {
+    let (_dir, path) = disk_db_path("repair-falsely-answered-awaiting-followup");
+    let db = WorkDb::open(path.clone()).unwrap();
+
+    let comment = db
+        .create_comment(CreateCommentInput {
+            artifact_kind: "work_item".to_owned(),
+            artifact_id: "t1".to_owned(),
+            doc_version: "v0".to_owned(),
+            anchor: CommentAnchor {
+                exact: "alpha".to_owned(),
+                prefix: String::new(),
+                suffix: String::new(),
+            },
+            body: "why does this retry three times?".to_owned(),
+            author: "user:test@example.com".to_owned(),
+            plain_text_projection_version: 0,
+        })
+        .unwrap();
+    db.set_comment_intent(&comment.id, "question", 0.9).unwrap();
+    db.transition_comment_to_answering(&comment.id).unwrap();
+    let run = db
+        .create_answer_agent_run(&comment.id, "work_item", "t1", "v0", 0)
+        .unwrap();
+    db.complete_answer_agent_run(&run.id, "failed", None, Some("stranded_no_stop"))
+        .unwrap();
+
+    // Reproduce the pre-fix bug (status forced to 'answered' with nothing
+    // behind it), then an operator follow-up against the phantom answer
+    // advances it further to 'awaiting_followup'.
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_comments SET status = 'answered', updated_at = '1700000000' WHERE id = ?1",
+            [&comment.id],
+        )
+        .unwrap();
+    }
+    db.transition_comment_to_awaiting_followup(&comment.id).unwrap();
+    let corrupted = db.get_comment(&comment.id).unwrap().unwrap();
+    assert_eq!(corrupted.status, "awaiting_followup");
+    drop(db);
+
+    // Re-opening runs the repair migration.
+    let db = WorkDb::open(path.clone()).unwrap();
+    let repaired = db.get_comment(&comment.id).unwrap().unwrap();
+    assert_eq!(
+        repaired.status, "answer_failed",
+        "a falsely-answered comment must be repaired even after it advanced to awaiting_followup"
+    );
+    assert_eq!(repaired.status_actor.as_deref(), Some("engine"));
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// A comment that legitimately reached `answered` via a real reply must be
+/// left untouched by the repair migration — it is not the bug's shape.
+#[test]
+fn migration_leaves_a_genuinely_answered_comment_alone() {
+    let (_dir, path) = disk_db_path("repair-leaves-genuine-answer-alone");
+    let db = WorkDb::open(path.clone()).unwrap();
+
+    let comment = db
+        .create_comment(CreateCommentInput {
+            artifact_kind: "work_item".to_owned(),
+            artifact_id: "t1".to_owned(),
+            doc_version: "v0".to_owned(),
+            anchor: CommentAnchor {
+                exact: "alpha".to_owned(),
+                prefix: String::new(),
+                suffix: String::new(),
+            },
+            body: "what does this do?".to_owned(),
+            author: "user:test@example.com".to_owned(),
+            plain_text_projection_version: 0,
+        })
+        .unwrap();
+    db.set_comment_intent(&comment.id, "question", 0.9).unwrap();
+    db.transition_comment_to_answering(&comment.id).unwrap();
+    let run = db
+        .create_answer_agent_run(&comment.id, "work_item", "t1", "v0", 0)
+        .unwrap();
+    db.complete_answer_agent_run(&run.id, "replied", Some("It lives in config.rs."), None)
+        .unwrap();
+    db.transition_comment_to_answered(&comment.id).unwrap();
+    drop(db);
+
+    let db = WorkDb::open(path.clone()).unwrap();
+    let untouched = db.get_comment(&comment.id).unwrap().unwrap();
+    assert_eq!(
+        untouched.status, "answered",
+        "a genuine reply must still read as answered"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
 /// Upgrading a database that predates the `reasoning` column re-adds it and
 /// leaves every existing row NULL. No backfill is correct, not an omission:
 /// NULL is the "never classified" state the dispatcher resolves through its

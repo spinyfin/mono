@@ -26,6 +26,7 @@ enum WireCommentStatus {
     static let inRevision = "in_revision"
     static let answering = "answering"
     static let answered = "answered"
+    static let answerFailed = "answer_failed"
     static let awaitingFollowup = "awaiting_followup"
 }
 

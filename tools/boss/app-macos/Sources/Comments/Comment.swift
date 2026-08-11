@@ -42,8 +42,13 @@ enum CommentStatus: String, Equatable {
     /// The answer agent is running for this comment (design § "Bucket 2" —
     /// "Thinking indicator").
     case answering
-    /// The answer agent posted its reply; awaiting an operator follow-up.
+    /// The answer agent posted a real reply; awaiting an operator follow-up.
     case answered
+    /// The answer-agent run assigned to this comment ended without ever
+    /// posting a reply. Terminal and distinct from `.answered` — the apology
+    /// thread entry standing in for the missing answer must not read as a
+    /// real one.
+    case answerFailed = "answer_failed"
     /// An operator follow-up was posted and awaits reclassification —
     /// loops back to `.answering` (another question) or bridges to
     /// `.active` (revision).
@@ -188,7 +193,7 @@ struct Comment: Identifiable, Equatable {
             if wasInRevision, statusActor == "engine" { return .reopened }
             let hasNudge = threadEntries.contains { $0.entryKind == .nudge }
             return hasNudge ? .nudged : nil
-        case .answering, .answered, .awaitingFollowup, .orphaned, .dismissed:
+        case .answering, .answered, .answerFailed, .awaitingFollowup, .orphaned, .dismissed:
             return nil
         }
     }

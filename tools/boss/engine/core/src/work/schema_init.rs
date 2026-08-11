@@ -769,6 +769,14 @@ impl WorkDb {
         // root. Additive and independent of every other table.
         // Design: tools/boss/docs/designs/worker-screenshot-evidence-attachments.md
         migrate_work_attachments_table(conn)?;
+        // Data correction: repair any `work_comments` row still reading
+        // 'answered' off a failed, no-reply answer-agent run (the
+        // "comment reads answered when its answer-agent run failed with no
+        // reply" incident) — see the migration's own doc comment for the
+        // exact repair rule. Must run after `migrate_work_comments_table`
+        // and `migrate_answer_agent_runs_table`, both far earlier in this
+        // list. Idempotent; a no-op on every subsequent startup.
+        migrate_correct_falsely_answered_comments_with_failed_runs(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '31')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

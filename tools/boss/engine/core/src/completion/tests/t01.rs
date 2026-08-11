@@ -364,13 +364,14 @@ async fn on_stop_recovers_task_created_by_this_run_as_produced_task() {
 }
 
 #[tokio::test]
-async fn on_stop_finalizes_answer_agent_with_no_reply_as_failed_and_answered() {
+async fn on_stop_finalizes_answer_agent_with_no_reply_as_failed_and_answer_failed() {
     // Regression test for the "stranded running run" edge case: the
     // agent's session ended (Stop fired) without ever calling
     // `CommentsPostAnswer` to post a reply. `finalize_answer_agent` must
     // mark the still-`running` run 'failed', post an apology thread
-    // entry, and force the comment `answering -> answered` so it doesn't
-    // sit unanswered forever.
+    // entry, and force the comment `answering -> answer_failed` so it
+    // doesn't sit unanswered forever — and, critically, does NOT read as
+    // `answered` when there is no real answer behind it.
     let workspace = tempdir().unwrap();
     let (_dir, db, comment_id, run_id, execution_id) = answer_agent_fixture(workspace.path());
     let detector = StubPrDetector::ok(None);
@@ -396,7 +397,8 @@ async fn on_stop_finalizes_answer_agent_with_no_reply_as_failed_and_answered() {
         .get_comment(&comment_id)
         .unwrap()
         .expect("comment should still exist");
-    assert_eq!(comment.status, "answered");
+    assert_ne!(comment.status, "answered", "a no-reply run must never read as answered");
+    assert_eq!(comment.status, "answer_failed");
 
     let entries = db.list_comment_thread_entries(&comment_id).unwrap();
     assert_eq!(entries.len(), 1, "an apology thread entry should have been posted");

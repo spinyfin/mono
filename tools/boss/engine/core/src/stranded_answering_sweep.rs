@@ -49,13 +49,16 @@
 //! Recovery shares [`WorkDb::recover_unanswered_comment`] with
 //! `finalize_answer_agent`'s no-reply-posted path: mark the run `failed` with a
 //! distinguishing `error_kind`, post the apology thread entry so the thread
-//! isn't silently stuck, then `transition_comment_to_answered`, which is
+//! isn't silently stuck, then `transition_comment_to_answer_failed`, which is
 //! intent-aware and lands a comment already reclassified to
-//! `revision` on `active` instead. This sweep is a
-//! *substitute for a Stop that never came*, not a second, divergent recovery
-//! policy — except when the answer already landed (the run went `replied` or
-//! `superseded` but the comment's transition didn't follow), in which case
-//! only the transition runs; see `recover`.
+//! `revision` on `active` instead. Landing on `answer_failed` — never
+//! `answered` — is the point: no reply ever arrived for these comments, so
+//! the apology entry standing in for it must not read as a real answer. This
+//! sweep is a *substitute for a Stop that never came*, not a second,
+//! divergent recovery policy — except when the answer already landed (the
+//! run went `replied` or `superseded` but the comment's transition didn't
+//! follow), in which case only the (real) `transition_comment_to_answered`
+//! transition runs; see `recover`.
 //!
 //! ## Safety
 //!
@@ -211,9 +214,11 @@ fn is_stranded(work_db: &WorkDb, comment: &WorkComment) -> bool {
 /// answer (or the reclassification that superseded it) already reached the
 /// thread — only the comment's transition didn't follow. Posting the apology
 /// in that case would land it directly under a real answer, so this skips
-/// straight to the transition. Otherwise this is a genuine no-reply-ever-came
-/// stranding, and it shares [`WorkDb::recover_unanswered_comment`] with
-/// `finalize_answer_agent`'s no-reply-posted path.
+/// straight to the (real) `answered` transition. Otherwise this is a genuine
+/// no-reply-ever-came stranding, and it shares
+/// [`WorkDb::recover_unanswered_comment`] with `finalize_answer_agent`'s
+/// no-reply-posted path — landing the comment on `answer_failed`, not
+/// `answered`, since no reply exists to justify the latter.
 fn recover(work_db: &WorkDb, comment: &WorkComment) -> bool {
     let latest_run = work_db.latest_answer_agent_run_for_comment(&comment.id).ok().flatten();
     let answer_already_landed = latest_run.as_ref().is_some_and(|run| {
@@ -328,14 +333,37 @@ mod tests {
         let second = run_one_pass(&db, &mut seen).await;
         assert_eq!(second.recovered, 1);
 
+        // Regression: a run swept to a terminal failure state with no reply
+        // must NOT produce an 'answered' comment — that reads as "there is a
+        // real answer here" to an operator when there is none. It must land
+        // on the distinguishable 'answer_failed' state instead.
         let recovered = db.get_comment(&comment_id).unwrap().unwrap();
-        assert_eq!(recovered.status, "answered");
+        assert_ne!(
+            recovered.status, "answered",
+            "a failed, no-reply run must never read as answered"
+        );
+        assert_eq!(recovered.status, "answer_failed");
         let run = db.latest_answer_agent_run_for_comment(&comment_id).unwrap().unwrap();
         assert_eq!(run.status, ANSWER_AGENT_RUN_STATUS_FAILED);
         assert_eq!(run.error_kind.as_deref(), Some(STRANDED_ERROR_KIND));
+        assert!(
+            run.reply_body.is_none(),
+            "a stranded run must never carry a synthesized reply body"
+        );
         let entries = db.list_comment_thread_entries(&comment_id).unwrap();
         assert_eq!(entries.len(), 1, "the operator must see why the thread stopped");
         assert_eq!(entries[0].entry_kind, THREAD_ENTRY_KIND_ANSWER);
+
+        // The viewer's read path must agree: `answer_agent_failed` is what
+        // drives the sidebar's failure indicator, and it must be true for
+        // exactly this comment.
+        let with_thread = db.list_comments_with_thread("work_item", "t1", false).unwrap();
+        let cwt = with_thread
+            .iter()
+            .find(|c| c.comment.id == comment_id)
+            .expect("recovered comment must still be listed");
+        assert!(cwt.answer_agent_failed);
+        assert_eq!(cwt.comment.status, "answer_failed");
     }
 
     #[tokio::test]
@@ -350,8 +378,9 @@ mod tests {
         run_one_pass(&db, &mut seen).await;
         run_one_pass(&db, &mut seen).await;
 
-        // `transition_comment_to_answered` skips `answered` for a revisable
-        // intent, so recovery folds the comment straight into the revise pool.
+        // `transition_comment_to_answer_failed` skips `answer_failed` for a
+        // revisable intent, so recovery folds the comment straight into the
+        // revise pool.
         assert_eq!(db.get_comment(&comment_id).unwrap().unwrap().status, "active");
     }
 
@@ -383,7 +412,7 @@ mod tests {
         run_one_pass(&db, &mut seen).await;
         let second = run_one_pass(&db, &mut seen).await;
         assert_eq!(second.recovered, 1);
-        assert_eq!(db.get_comment(&comment_id).unwrap().unwrap().status, "answered");
+        assert_eq!(db.get_comment(&comment_id).unwrap().unwrap().status, "answer_failed");
     }
 
     #[tokio::test]

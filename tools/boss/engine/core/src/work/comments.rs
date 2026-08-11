@@ -321,10 +321,11 @@ impl WorkDb {
     }
 
     /// Bucket-2 track (P3b): `answering → answered`, fired when the answer
-    /// agent posts its reply (`CommentsPostAnswer`) or when its run ends
-    /// without one (`finalize_answer_agent`'s no-reply-posted path — an
-    /// apology thread entry stands in for the missing answer so the thread
-    /// isn't left silently stuck). Guarded on `status = 'answering'`,
+    /// agent posts a real reply (`CommentsPostAnswer`). For the sibling
+    /// "the run ended with no reply" case, see
+    /// [`Self::transition_comment_to_answer_failed`] — that path must never
+    /// land here, or an apology thread entry standing in for a missing
+    /// answer would read as a real one. Guarded on `status = 'answering'`,
     /// mirroring the design's idempotency table.
     ///
     /// Reverse-edge case: [`Self::reclassify_comment_intent`] (the follow-up
@@ -363,28 +364,81 @@ impl WorkDb {
             .with_context(|| format!("missing comment after answered transition: {comment_id}"))
     }
 
+    /// Bucket-2 track (P3b): `answering → answer_failed`, fired when the
+    /// answer-agent run assigned to a comment ends without ever posting a
+    /// reply — a Stop hook that arrived with the run still `running`
+    /// (`finalize_answer_agent`'s no-reply-posted path, via
+    /// [`Self::recover_unanswered_comment`]) or a Stop that never arrived at
+    /// all ([`crate::stranded_answering_sweep`], same shared path). Terminal
+    /// and deliberately distinct from [`Self::transition_comment_to_answered`]:
+    /// the apology thread entry standing in for the missing answer must never
+    /// let the comment read as `answered` to an operator glancing at the
+    /// sidebar. Guarded on `status = 'answering'`, mirroring
+    /// `transition_comment_to_answered`'s idempotency table.
+    ///
+    /// Shares that method's revision-intent fold-to-`active` reverse edge for
+    /// the identical reason: a comment reclassified to `revision` mid-flight
+    /// (see [`Self::reclassify_comment_intent`]) must re-enter the
+    /// `[Revise]` candidate pool regardless of whether the abandoned
+    /// question ever got an answer — there's no question left to mark
+    /// failed.
+    pub fn transition_comment_to_answer_failed(&self, comment_id: &str) -> Result<WorkComment> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let n = conn.execute(
+            "UPDATE work_comments
+             SET status = CASE WHEN intent = ?5 THEN ?6 ELSE ?2 END,
+                 status_actor = 'engine', updated_at = ?3
+             WHERE id = ?1 AND status = ?4",
+            params![
+                comment_id,
+                COMMENT_STATUS_ANSWER_FAILED,
+                now,
+                COMMENT_STATUS_ANSWERING,
+                INTENT_REVISION,
+                COMMENT_STATUS_ACTIVE,
+            ],
+        )?;
+        if n == 0 {
+            bail!("comment {comment_id} not found, or not 'answering' (expected answering → answer_failed)");
+        }
+        query_comment(&conn, comment_id)?
+            .with_context(|| format!("missing comment after answer_failed transition: {comment_id}"))
+    }
+
     /// Bucket-2 track (P3c): `answered → awaiting_followup`, fired when an
     /// operator posts a reply in the thread (`CommentsPostFollowup`).
-    /// Guarded on `status = 'answered'` — in particular, a comment still
-    /// `answering` (a run already in flight) rejects a second follow-up
-    /// rather than queuing it (design §"Concurrency/idempotency" describes
-    /// queuing as the eventual UX; not yet implemented).
+    /// Guarded on `status IN ('answered', 'answer_failed')` — in particular,
+    /// a comment still `answering` (a run already in flight) rejects a
+    /// second follow-up rather than queuing it (design
+    /// §"Concurrency/idempotency" describes queuing as the eventual UX; not
+    /// yet implemented). `answer_failed` is accepted alongside `answered` so
+    /// a failed run isn't a terminal dead end: posting a follow-up on it
+    /// re-enters the reclassifier exactly like a follow-up on a real answer
+    /// does, which either re-spawns the answer agent (intent stays
+    /// `question`) or bridges straight into the revision path (intent flips
+    /// to `revision`) via
+    /// [`Self::transition_comment_awaiting_followup_to_answering`] /
+    /// [`Self::reclassify_comment_intent`].
     pub fn transition_comment_to_awaiting_followup(&self, comment_id: &str) -> Result<WorkComment> {
         let conn = self.connect()?;
         let now = now_string();
         let n = conn.execute(
             "UPDATE work_comments
              SET status = ?2, status_actor = 'engine', updated_at = ?3
-             WHERE id = ?1 AND status = ?4",
+             WHERE id = ?1 AND status IN (?4, ?5)",
             params![
                 comment_id,
                 COMMENT_STATUS_AWAITING_FOLLOWUP,
                 now,
-                COMMENT_STATUS_ANSWERED
+                COMMENT_STATUS_ANSWERED,
+                COMMENT_STATUS_ANSWER_FAILED,
             ],
         )?;
         if n == 0 {
-            bail!("comment {comment_id} not found, or not 'answered' (expected answered → awaiting_followup)");
+            bail!(
+                "comment {comment_id} not found, or not 'answered'/'answer_failed' (expected answered|answer_failed → awaiting_followup)"
+            );
         }
         query_comment(&conn, comment_id)?
             .with_context(|| format!("missing comment after awaiting_followup transition: {comment_id}"))
@@ -567,20 +621,22 @@ impl WorkDb {
     /// classification, so no re-classification LLM call is triggered.
     ///
     /// Also has no status guard — it can fire from any comment status,
-    /// including mid-bucket-2 (`answering`/`answered`/`awaiting_followup`).
+    /// including mid-bucket-2
+    /// (`answering`/`answered`/`answer_failed`/`awaiting_followup`).
     /// If the new intent is revisable (`revision`) and the
-    /// comment is sitting in any of those three statuses, this also resets
-    /// `status` back to `active` in the same write: all three only make
-    /// sense for a `question` awaiting (or receiving) an answer, and leaving
-    /// a revisable-intent comment stranded there silently excludes it from
-    /// every consumer of [`revisable_comment_predicate`] — `[Revise]`'s
-    /// candidate query, its claim UPDATE, and the banner's
-    /// `unresolved_count` (comment-triggered-document-revisions.md
-    /// §"Reclassifying an answered question mid-flight"). The answer-agent's
-    /// prior reply is preserved as thread context regardless (it isn't
-    /// touched by this transition) — `compose_doc_comment_directive` pulls
-    /// it in via [`Self::latest_answer_agent_run_for_comment`] once the
-    /// comment is claimed into a revision.
+    /// comment is sitting in any of those four statuses, this also resets
+    /// `status` back to `active` in the same write: all four only make
+    /// sense for a `question` awaiting (or having received, or having failed
+    /// to receive) an answer, and leaving a revisable-intent comment
+    /// stranded there silently excludes it from every consumer of
+    /// [`revisable_comment_predicate`] — `[Revise]`'s candidate query, its
+    /// claim UPDATE, and the banner's `unresolved_count`
+    /// (comment-triggered-document-revisions.md §"Reclassifying an answered
+    /// question mid-flight"). The answer-agent's prior reply (if any) is
+    /// preserved as thread context regardless (it isn't touched by this
+    /// transition) — `compose_doc_comment_directive` pulls it in via
+    /// [`Self::latest_answer_agent_run_for_comment`] once the comment is
+    /// claimed into a revision.
     ///
     /// `answering` is included: a live run is stood down by the caller
     /// (`handle_comments_set_intent`), so the status must move in this same
@@ -611,9 +667,9 @@ impl WorkDb {
             "UPDATE work_comments
              SET intent = ?2, intent_confidence = NULL, intent_classified_at = ?3, intent_overridden_by = 'user',
                  intent_classification_failed_at = NULL, intent_classification_error = NULL,
-                 status = CASE WHEN status IN (?4, ?5, ?8) AND ?2 = ?6 THEN ?7 ELSE status END,
-                 status_actor = CASE WHEN status IN (?4, ?5, ?8) AND ?2 = ?6 THEN 'user' ELSE status_actor END,
-                 updated_at = CASE WHEN status IN (?4, ?5, ?8) AND ?2 = ?6 THEN ?3 ELSE updated_at END
+                 status = CASE WHEN status IN (?4, ?5, ?8, ?9) AND ?2 = ?6 THEN ?7 ELSE status END,
+                 status_actor = CASE WHEN status IN (?4, ?5, ?8, ?9) AND ?2 = ?6 THEN 'user' ELSE status_actor END,
+                 updated_at = CASE WHEN status IN (?4, ?5, ?8, ?9) AND ?2 = ?6 THEN ?3 ELSE updated_at END
              WHERE id = ?1",
             params![
                 comment_id,
@@ -624,6 +680,7 @@ impl WorkDb {
                 INTENT_REVISION,
                 COMMENT_STATUS_ACTIVE,
                 COMMENT_STATUS_ANSWERING,
+                COMMENT_STATUS_ANSWER_FAILED,
             ],
         )?;
         if n == 0 {
@@ -1540,6 +1597,23 @@ mod tests {
     }
 
     #[test]
+    fn override_comment_intent_resets_answer_failed_status_to_active_for_revisable_intent() {
+        let db = mem_db();
+        let comment = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        db.transition_comment_to_answering(&comment.id).unwrap();
+        let failed = db.transition_comment_to_answer_failed(&comment.id).unwrap();
+        assert_eq!(failed.status, "answer_failed");
+
+        // A comment left in the distinguishable failure state must still be
+        // reachable by a manual reclassification into the revise pool —
+        // exactly like an 'answered' or 'awaiting_followup' comment.
+        let overridden = db.override_comment_intent(&comment.id, "revision").unwrap();
+        assert_eq!(overridden.status, "active");
+        assert_eq!(overridden.status_actor.as_deref(), Some("user"));
+        assert_eq!(overridden.intent.as_deref(), Some("revision"));
+    }
+
+    #[test]
     fn override_comment_intent_resets_awaiting_followup_status_to_active_for_revisable_intent() {
         let db = mem_db();
         let comment = seed_answered_comment(&db);
@@ -1735,6 +1809,43 @@ mod tests {
         // No override happened — the ordinary path is unaffected.
         let answered = db.transition_comment_to_answered(&comment.id).unwrap();
         assert_eq!(answered.status, "answered");
+    }
+
+    #[test]
+    fn transition_to_answer_failed_lands_on_answer_failed_not_answered() {
+        let db = mem_db();
+        let comment = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        db.transition_comment_to_answering(&comment.id).unwrap();
+
+        // The distinguishable failure exit: a run that never produced a
+        // reply must never land the comment on 'answered'.
+        let failed = db.transition_comment_to_answer_failed(&comment.id).unwrap();
+        assert_ne!(failed.status, "answered");
+        assert_eq!(failed.status, "answer_failed");
+        assert_eq!(failed.status_actor.as_deref(), Some("engine"));
+    }
+
+    #[test]
+    fn transition_to_answer_failed_lands_on_active_when_intent_is_revisable_mid_flight() {
+        let db = mem_db();
+        let comment = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        db.transition_comment_to_answering(&comment.id).unwrap();
+        db.reclassify_comment_intent(&comment.id, "revision", 0.8).unwrap();
+
+        // Mirrors `transition_to_answered_lands_on_active_when_intent_is_revisable_mid_flight`:
+        // a comment reclassified to 'revision' mid-flight must fold into the
+        // revise pool regardless of whether the abandoned question ever got
+        // an answer.
+        let failed = db.transition_comment_to_answer_failed(&comment.id).unwrap();
+        assert_eq!(failed.status, "active");
+        assert_eq!(failed.intent.as_deref(), Some("revision"));
+    }
+
+    #[test]
+    fn transition_to_answer_failed_rejects_non_answering_source() {
+        let db = mem_db();
+        let comment = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        assert!(db.transition_comment_to_answer_failed(&comment.id).is_err());
     }
 
     #[test]

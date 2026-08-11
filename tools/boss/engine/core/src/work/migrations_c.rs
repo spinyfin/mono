@@ -578,6 +578,91 @@ fn live_column_names(conn: &Connection, table: &str) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// One-time data correction for the "comment reads answered when its
+/// answer-agent run failed with no reply" incident: before
+/// [`super::comments::WorkDb::recover_unanswered_comment`] was fixed to land
+/// on `answer_failed`, both the no-reply-posted path
+/// (`finalize_answer_agent`) and [`crate::stranded_answering_sweep`] shared a
+/// bug where a comment whose answer-agent run ended `failed` with no
+/// `reply_body` was still transitioned all the way to `answered` — an
+/// apology thread entry standing in for the missing answer, but nothing in
+/// `work_comments.status` telling an operator that. Confirmed live: two
+/// `answer_agent_runs` rows recorded `error_kind = 'stranded_no_stop'` with
+/// an empty `reply_body`, both stamped `completed_at` at the identical
+/// second a bulk sweep closed them out, while their comments read
+/// `answered`.
+///
+/// Repairs every `work_comments` row still carrying that shape: `status IN
+/// ('answered', 'awaiting_followup')` whose most recent `answer_agent_runs`
+/// row is `failed` with no `reply_body`. Such a comment can only have
+/// reached `answered` (and, from there, possibly `awaiting_followup` if an
+/// operator posted a follow-up against the falsely-answered comment before
+/// this repair ran) through the now-fixed bug (the real reply path,
+/// `CommentsPostAnswer`, always leaves a `replied` run with a non-null
+/// `reply_body` behind), so this is a safe, general repair rather than one
+/// hand-picked to the two rows from the original incident. `awaiting_followup`
+/// is included alongside `answered` so a comment that already collected an
+/// operator follow-up on top of the phantom answer isn't permanently
+/// excluded from repair — its lineage still traces back to the same
+/// no-reply failed run. A comment whose intent was reclassified to
+/// `revision` mid-flight is repaired to `active` — mirroring
+/// `transition_comment_to_answer_failed`'s fold — so it lands in the
+/// `[Revise]` pool instead of a failure state that no longer applies to it;
+/// every other repaired comment lands on `answer_failed`.
+///
+/// Idempotent: a comment already corrected (or one that never had the bug)
+/// no longer matches `status IN ('answered', 'awaiting_followup')` with a
+/// failed, reply-less latest run, so re-running this on every engine startup
+/// is a cheap no-op past the first pass. Must run after
+/// `migrate_work_comments_table` and `migrate_answer_agent_runs_table`,
+/// which create the two tables this reads.
+pub(crate) fn migrate_correct_falsely_answered_comments_with_failed_runs(conn: &Connection) -> Result<()> {
+    let mut stmt =
+        conn.prepare("SELECT id, intent FROM work_comments WHERE status IN ('answered', 'awaiting_followup')")?;
+    let candidates: Vec<(String, Option<String>)> = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    let now = now_string();
+    for (comment_id, intent) in candidates {
+        let latest_run: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT status, reply_body FROM answer_agent_runs
+                 WHERE comment_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 1",
+                [&comment_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((run_status, reply_body)) = latest_run else {
+            continue;
+        };
+        if run_status != "failed" || reply_body.is_some() {
+            // A `replied`/`superseded` latest run (or no run at all) means
+            // this comment's `answered` status is legitimate.
+            continue;
+        }
+
+        let repaired_status = if intent.as_deref() == Some("revision") {
+            "active"
+        } else {
+            "answer_failed"
+        };
+        tracing::warn!(
+            comment_id,
+            repaired_status,
+            "repairing a comment falsely marked 'answered' by a failed, no-reply answer-agent run",
+        );
+        conn.execute(
+            "UPDATE work_comments SET status = ?2, status_actor = 'engine', updated_at = ?3 WHERE id = ?1",
+            params![comment_id, repaired_status, now],
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod status_check_clause_tests {
     use super::status_check_clause;
