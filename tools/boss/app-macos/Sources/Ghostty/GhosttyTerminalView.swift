@@ -81,20 +81,12 @@ final class GhosttyTerminalHostView: NSView {
     /// argument; `updateNSView` refreshes it whenever the input changes.
     private var paneMonitorEnabled: Bool
     /// Tokens for the display-retry observers installed only while
-    /// surface creation has failed. libghostty's `ghostty_surface_new`
-    /// returns NULL when the machine has no active display (lid closed
-    /// with no external monitor, all monitors disconnected, display
-    /// asleep) — the renderer's `CVDisplayLinkCreateWithCGDisplays`
-    /// rejects a display count of 0. That is a transient/environmental
-    /// condition, so instead of crashing the app we keep the pane in a
-    /// surface-less placeholder state and retry when the display set
-    /// changes (#800) or the system wakes from sleep (`screenObserver`
-    /// listens for `NSApplication.didChangeScreenParametersNotification`;
-    /// `wakeObserver` listens for `GhosttyRuntime`'s `.ghosttyDisplaysDidWake`,
-    /// which fires on `NSWorkspace` sleep/wake notifications and does not
-    /// depend on a screen-parameters change actually occurring). Installed
-    /// and removed together — see `installScreenObserverIfNeeded()` /
-    /// `removeScreenObserver()`.
+    /// surface creation has failed. With window-vsync forced off for the
+    /// embed, renderer init no longer creates a DisplayLink, so a NULL from
+    /// `ghostty_surface_new` is no longer attributable to zero active
+    /// displays; retries stay armed because other failures remain
+    /// environment-tied. Installed and removed together — see
+    /// `installScreenObserverIfNeeded()` / `removeScreenObserver()`.
     private var screenObserver: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
 
@@ -228,8 +220,26 @@ final class GhosttyTerminalHostView: NSView {
             return
         }
 
-        guard let surface = makeSurface() else {
-            session.statusMessage = "Waiting for an active display…"
+        switch makeSurface() {
+        case .created(let surface):
+            self.surface = surface
+            removeScreenObserver()
+            // A surface came up: clear the failure latch so a later teardown +
+            // failed recreation (e.g. a Boss-pane restart) can report again.
+            reportedSurfaceCreationFailure = false
+            session.statusMessage = nil
+            session.attach(hostView: self)
+            // Register with the event-loop diagnostics so the 1 Hz sampler can
+            // probe this pane's pty/EOF/pid liveness (idempotent; safe across
+            // restarts). See [[TerminalLoopMonitor]].
+            TerminalLoopMonitor.shared.register(self)
+            syncGeometry()
+            reconcilePaneMonitor()
+
+        case .failed(let host, let diagnostic):
+            session.statusMessage = host.activeDisplayCount == 0
+                ? "Waiting for an active display…"
+                : "Surface creation failed…"
             installScreenObserverIfNeeded()
             // Tell the session the SPAWN failed — never that the pane died.
             // A surface that was never created hosted no pty and therefore no
@@ -244,65 +254,63 @@ final class GhosttyTerminalHostView: NSView {
             // the first. The pane stays in its surface-less placeholder either
             // way; if the display returns before the engine reaps, the retry
             // still recreates the surface.
+            //
+            // Forward the same host snapshot used for the reason string so
+            // the JSONL `host` object cannot disagree with `reason` if the
+            // display wakes between measurement and logging.
             if !reportedSurfaceCreationFailure {
                 reportedSurfaceCreationFailure = true
                 session.onSurfaceCreationFailed?(
-                    Self.surfaceFailureReason(hasActiveDisplay: NSScreen.main != nil)
+                    Self.surfaceFailureReason(host: host),
+                    host,
+                    diagnostic
                 )
             }
-            return
         }
+    }
 
-        self.surface = surface
-        removeScreenObserver()
-        // A surface came up: clear the failure latch so a later teardown +
-        // failed recreation (e.g. a Boss-pane restart) can report again.
-        reportedSurfaceCreationFailure = false
-        session.statusMessage = nil
-        session.attach(hostView: self)
-        // Register with the event-loop diagnostics so the 1 Hz sampler can
-        // probe this pane's pty/EOF/pid liveness (idempotent; safe across
-        // restarts). See [[TerminalLoopMonitor]].
-        TerminalLoopMonitor.shared.register(self)
-        syncGeometry()
-        reconcilePaneMonitor()
+    /// Outcome of one `ghostty_surface_new` attempt. Failure carries the
+    /// single host snapshot and diagnostic block measured at rejection time.
+    private enum SurfaceCreationOutcome {
+        case created(ghostty_surface_t)
+        case failed(host: HostDisplaySnapshot, diagnostic: String)
     }
 
     /// The reason string reported to the engine when `ghostty_surface_new`
-    /// returns NULL, **diagnosed from the display state actually observed**
-    /// rather than assumed.
+    /// returns NULL, **diagnosed from measured CoreGraphics / session state**
+    /// rather than `NSScreen.main` (which lies when the screen is locked).
     ///
-    /// This string is the operator-facing explanation: it is what the engine
-    /// writes as the execution's orphan reason and what surfaces on the
-    /// dispatch event. A failure with a display present is an entirely
-    /// different, non-transient bug class (env pollution, a rejected working
-    /// directory, a libghostty version mismatch) and must never be recorded
-    /// as the benign post-sleep case. The two branches here are the whole
-    /// point: they are the difference between "wait for the display to come
-    /// back" and "this will fail again on the next attempt and needs a
-    /// human".
+    /// This string is the human-facing explanation: it is what the engine
+    /// writes as the execution's orphan reason, what lands on the dispatch
+    /// event, and what `bossctl logs spawn` shows on `surface_failed`. The
+    /// measured host summary is always embedded; the rejected input block
+    /// (cwd, env, app handle) is mirrored into the durable spawn JSONL
+    /// `diagnostic` field — app fd 2 is `/dev/null` in production, so
+    /// reason strings never point at stderr.
     ///
-    /// No active display is the known-recoverable #800 condition: libghostty's
-    /// renderer calls `CVDisplayLinkCreateWithCGDisplays`, which rejects a
-    /// display count of 0, so a surface genuinely cannot be created headless.
-    /// `installScreenObserverIfNeeded()` retries when a display returns.
-    ///
-    /// Free function (not gated on any instance state) so it is unit-testable
-    /// without a live surface/window.
-    static func surfaceFailureReason(hasActiveDisplay: Bool) -> String {
-        let cause = hasActiveDisplay
-            ? "a display IS active, so display availability is not the cause — check the "
-                + "stderr diagnostic dump for the rejected precondition"
-            : "no active display (lid closed, monitors disconnected, or display asleep); "
-                + "libghostty cannot create a surface headless"
+    /// Free / static so it is unit-testable without a live surface/window.
+    static func surfaceFailureReason(host: HostDisplaySnapshot) -> String {
+        // Prefer the CG active-display count (what DisplayLink uses) over
+        // AppKit's NSScreen.main, which remains non-nil across lock/sleep.
+        let cause: String
+        if host.activeDisplayCount == 0 {
+            cause = "no active CG displays "
+                + "(session_locked=\(host.sessionLocked), main_display_asleep=\(host.mainDisplayAsleep)); "
+                + "libghostty DisplayLink/Metal surface init cannot bind a display link "
+                + "over an empty set — measured \(host.summary)"
+        } else {
+            cause = "active CG displays present (count=\(host.activeDisplayCount)), so "
+                + "display availability is not the cause; measured \(host.summary) "
+                + "— inspect surface_failed host and diagnostic fields via "
+                + "bossctl logs spawn (spawn JSONL under Application Support/Boss/diagnostics)"
+        }
         return "libghostty surface creation failed (ghostty_surface_new returned NULL — \(cause))"
     }
 
     /// Build the surface config from `launchSpec` and call
-    /// `ghostty_surface_new`. Returns `nil` (after dumping a diagnostic
-    /// to stderr) when libghostty rejects the surface, rather than
-    /// trapping — see `attemptSurfaceCreation`.
-    private func makeSurface() -> ghostty_surface_t? {
+    /// `ghostty_surface_new`. On rejection, returns the host snapshot and
+    /// diagnostic measured once so reason + JSONL stay consistent.
+    private func makeSurface() -> SurfaceCreationOutcome {
         // Build env_vars: each `ghostty_env_var_s` holds borrowed C
         // pointers, so we strdup every string and free them after
         // ghostty_surface_new returns (ghostty copies during init).
@@ -344,16 +352,16 @@ final class GhosttyTerminalHostView: NSView {
             // libghostty's C API (as of 1.3.2) exposes no log callback and
             // ghostty_surface_new returns void* with no error code, so the
             // best we can do on failure is dump every input we control.
-            // Without this, the only visible signal is a Sentry minidump,
-            // which doesn't tell us which precondition libghostty rejected.
-            // Print to stderr so it lands in the dev `swift run` log and in
-            // os_log for bundled installs.
+            // Mirror the block into spawn JSONL (`diagnostic` field) because
+            // production fd 2 is /dev/null; also write stderr for local
+            // `swift run` / os_log capture when present.
             let fm = FileManager.default
             var isDir: ObjCBool = false
             let cwdExists = fm.fileExists(atPath: launchSpec.workingDirectory, isDirectory: &isDir)
             let envSummary = launchSpec.env.prefix(8)
                 .map { "\($0.0)=\($0.1.prefix(60))" }
                 .joined(separator: ", ")
+            let host = HostDisplaySnapshot.capture()
             let diagnostic = Self.surfaceFailureDiagnostic(
                 appNonNil: runtime.app != nil,
                 workingDirectory: launchSpec.workingDirectory,
@@ -363,21 +371,22 @@ final class GhosttyTerminalHostView: NSView {
                 scaleFactor: Double(NSScreen.main?.backingScaleFactor ?? 2.0),
                 envVarCount: launchSpec.env.count,
                 envSummary: envSummary,
-                initialInputCount: launchSpec.initialInput.count
+                initialInputCount: launchSpec.initialInput.count,
+                host: host
             )
             // `write(contentsOf:)`, not the exception-raising `write(_:)` — see
             // [[DiagnosticWrite]]. A closed/broken stderr must never abort the app.
             try? FileHandle.standardError.write(contentsOf: Data(diagnostic.utf8))
-            return nil
+            return .failed(host: host, diagnostic: diagnostic)
         }
 
-        return surface
+        return .created(surface)
     }
 
-    /// Multi-line diagnostic block dumped to stderr when
-    /// `ghostty_surface_new` returns NULL. Pure and `static` so the
-    /// failure-context contract is unit-testable without standing up a
-    /// libghostty surface.
+    /// Multi-line diagnostic block recorded on `surface_failed` (and also
+    /// written to stderr when available) when `ghostty_surface_new` returns
+    /// NULL. Pure and `static` so the failure-context contract is
+    /// unit-testable without standing up a libghostty surface.
     static func surfaceFailureDiagnostic(
         appNonNil: Bool,
         workingDirectory: String,
@@ -387,7 +396,8 @@ final class GhosttyTerminalHostView: NSView {
         scaleFactor: Double,
         envVarCount: Int,
         envSummary: String,
-        initialInputCount: Int
+        initialInputCount: Int,
+        host: HostDisplaySnapshot = .make(activeDisplayCount: -1)
     ) -> String {
         """
         [GhosttyTerminalView] ghostty_surface_new returned NULL. Context:
@@ -400,6 +410,15 @@ final class GhosttyTerminalHostView: NSView {
           env_var_count:         \(envVarCount)
           env (first 8):         \(envSummary)
           initialInput (chars):  \(initialInputCount)
+          host.active_displays:  \(host.activeDisplayCount)
+          host.online_displays:  \(host.onlineDisplayCount)
+          host.main_asleep:      \(host.mainDisplayAsleep)
+          host.session_locked:   \(host.sessionLocked)
+          host.session_console:  \(host.sessionOnConsole)
+          host.ns_screens:       \(host.screenCount)
+          host.ns_main_non_nil:  \(host.nsScreenMainNonNil)
+          host.vsync_override:   \(host.vsyncOverrideApplied)
+          host.summary:          \(host.summary)
 
         """
     }

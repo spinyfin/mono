@@ -276,12 +276,21 @@ final class WorkersWorkspaceModel: ObservableObject {
                 else { return }
                 self?.onPaneDied?(capturedRunId, .childProcessExited)
             }
-            // Fail-fast NACK: if the libghostty surface never comes up (the
-            // post-sleep "no active display" condition), tell the engine at once
-            // instead of leaving it to time out after 60s. Also mirror the failure
-            // into the durable spawn diagnostics keyed by execution id.
-            session.onSurfaceCreationFailed = { [weak self] reason in
-                SpawnDiagnosticsLog.shared.surfaceFailed(runId: capturedRunId, reason: reason)
+            // Fail-fast NACK: if the libghostty surface never comes up, tell the
+            // engine at once instead of leaving it to time out after 60s. Also
+            // mirror the failure into the durable spawn diagnostics keyed by
+            // execution id, with a measured host-display snapshot so the rejected
+            // precondition is visible from `bossctl logs spawn`.
+            session.onSurfaceCreationFailed = { [weak self] reason, host, diagnostic in
+                // Use the host + diagnostic measured at rejection — do not
+                // re-capture here, or a mid-transition wake can put a
+                // contradictory host object next to the reason string.
+                SpawnDiagnosticsLog.shared.surfaceFailed(
+                    runId: capturedRunId,
+                    reason: reason,
+                    host: host,
+                    diagnostic: diagnostic
+                )
                 self?.onSpawnFailed?(capturedRunId, reason)
             }
         }

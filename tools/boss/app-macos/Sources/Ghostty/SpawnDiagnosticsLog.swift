@@ -77,11 +77,27 @@ final class SpawnDiagnosticsLog: @unchecked Sendable {
         )
     }
 
-    /// Log that surface creation failed and no shell came up — the
-    /// post-sleep/wake false-live spawn. `reason` mirrors the NACK sent to the
-    /// engine.
-    func surfaceFailed(runId: String, reason: String) {
-        record(event: Self.eventSurfaceFailed, runId: runId, extra: ["reason": reason])
+    /// Log that surface creation failed and no shell came up. `reason` mirrors
+    /// the NACK sent to the engine. When `host` is provided, its measured
+    /// fields are embedded as a nested `host` object so `bossctl logs spawn`
+    /// can show the rejected display precondition. When `diagnostic` is
+    /// provided, the rejected-input block (cwd, env, app handle) is stored
+    /// under `diagnostic` — production fd 2 is `/dev/null`, so this is the
+    /// durable place that block is readable.
+    func surfaceFailed(
+        runId: String,
+        reason: String,
+        host: HostDisplaySnapshot? = nil,
+        diagnostic: String? = nil
+    ) {
+        var extra: [String: Any] = ["reason": reason]
+        if let host {
+            extra["host"] = host.jsonObject
+        }
+        if let diagnostic {
+            extra["diagnostic"] = diagnostic
+        }
+        record(event: Self.eventSurfaceFailed, runId: runId, extra: extra)
     }
 
     private func record(event: String, runId: String, extra: [String: Any]) {

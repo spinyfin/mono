@@ -290,7 +290,15 @@ final class WorkersWorkspaceModelSpawnTests: XCTestCase {
 
         _ = model.spawnWorkerPane(makeRequest(slot: 5, runId: "exec-surface-failed"))
         let session = model.slots.first(where: { $0.slotId == 5 })?.session
-        session?.onSurfaceCreationFailed?("no active display")
+        let host = HostDisplaySnapshot.make(
+            activeDisplayCount: 0,
+            onlineDisplayCount: 1,
+            mainDisplayAsleep: true,
+            sessionLocked: true,
+            screenCount: 1,
+            nsScreenMainNonNil: true
+        )
+        session?.onSurfaceCreationFailed?("no active display", host, "diagnostic")
 
         XCTAssertEqual(spawnFailures.map(\.0), ["exec-surface-failed"])
         XCTAssertEqual(spawnFailures.map(\.1), ["no active display"])
@@ -302,22 +310,48 @@ final class WorkersWorkspaceModelSpawnTests: XCTestCase {
     }
 
     func testSurfaceFailureReasonNamesTheDisplayStateActuallyObserved() {
-        // The reason string is the operator-facing explanation the engine
+        // The reason string is the human-facing explanation the engine
         // stores as the orphan reason. A reason that names display
         // availability whatever the real display state is makes the
         // recoverable #800 condition and a genuine non-transient rejection
         // (env pollution, bad cwd, version mismatch) indistinguishable in
         // the record, so each branch must name what it actually observed.
-        let noDisplay = GhosttyTerminalHostView.surfaceFailureReason(hasActiveDisplay: false)
+        // Measured via HostDisplaySnapshot (CG active count), not NSScreen.main.
+        // Realistic lock-screen shape: active=0, online=1, nsScreenMainNonNil=true.
+        let noDisplay = GhosttyTerminalHostView.surfaceFailureReason(
+            host: .make(
+                activeDisplayCount: 0,
+                onlineDisplayCount: 1,
+                mainDisplayAsleep: true,
+                sessionLocked: true,
+                screenCount: 1,
+                nsScreenMainNonNil: true
+            )
+        )
         XCTAssertTrue(
-            noDisplay.contains("no active display"),
+            noDisplay.contains("no active CG displays"),
             "the no-display case must name it as the cause; got: \(noDisplay)"
         )
 
-        let withDisplay = GhosttyTerminalHostView.surfaceFailureReason(hasActiveDisplay: true)
+        let withDisplay = GhosttyTerminalHostView.surfaceFailureReason(
+            host: .make(
+                activeDisplayCount: 1,
+                onlineDisplayCount: 1,
+                screenCount: 1,
+                nsScreenMainNonNil: true
+            )
+        )
         XCTAssertTrue(
-            withDisplay.contains("a display IS active"),
+            withDisplay.contains("active CG displays present"),
             "a failure with a display present must not blame display availability; got: \(withDisplay)"
+        )
+        XCTAssertTrue(
+            withDisplay.contains("bossctl logs spawn"),
+            "active-display branch must point at retrievable spawn logs; got: \(withDisplay)"
+        )
+        XCTAssertFalse(
+            withDisplay.lowercased().contains("stderr"),
+            "must not point at unreadable stderr; got: \(withDisplay)"
         )
         XCTAssertNotEqual(
             noDisplay,
@@ -422,7 +456,15 @@ final class WorkersWorkspaceModelSpawnTests: XCTestCase {
             "spawn must wire the surface-creation-failure callback so a no-display spawn can NACK"
         )
 
-        session?.onSurfaceCreationFailed?("no active display")
+        let host = HostDisplaySnapshot.make(
+            activeDisplayCount: 0,
+            onlineDisplayCount: 1,
+            mainDisplayAsleep: true,
+            sessionLocked: true,
+            screenCount: 1,
+            nsScreenMainNonNil: true
+        )
+        session?.onSurfaceCreationFailed?("no active display", host, "diagnostic")
 
         XCTAssertEqual(captured?.runId, "exec-nack", "NACK must carry the raw execution id")
         XCTAssertEqual(captured?.reason, "no active display")

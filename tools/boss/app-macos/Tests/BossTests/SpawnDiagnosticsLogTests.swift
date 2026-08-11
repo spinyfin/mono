@@ -46,7 +46,20 @@ final class SpawnDiagnosticsLogTests: XCTestCase {
 
         let log = SpawnDiagnosticsLog(directory: dir.path)
         log.spawnRequested(runId: "exec-99", slotId: 7, workspacePath: "/tmp/ws")
-        log.surfaceFailed(runId: "exec-99", reason: "ghostty_surface_new returned NULL")
+        log.surfaceFailed(
+            runId: "exec-99",
+            reason: "ghostty_surface_new returned NULL",
+            host: .make(
+                activeDisplayCount: 0,
+                onlineDisplayCount: 1,
+                mainDisplayAsleep: true,
+                sessionLocked: true,
+                screenCount: 1,
+                nsScreenMainNonNil: true,
+                vsyncOverrideApplied: true
+            ),
+            diagnostic: "[GhosttyTerminalView] ghostty_surface_new returned NULL. Context:\n  workingDirectory: /tmp/ws\n"
+        )
         log.flushForTesting()
 
         let files = try FileManager.default.contentsOfDirectory(atPath: dir.path)
@@ -60,5 +73,14 @@ final class SpawnDiagnosticsLogTests: XCTestCase {
         XCTAssertTrue(lines[0].contains("\"run_id\":\"exec-99\""))
         XCTAssertTrue(lines[1].contains("\"event\":\"surface_failed\""))
         XCTAssertTrue(lines[1].contains("ghostty_surface_new returned NULL"))
+        // Measured host state must be on the wire so `bossctl logs spawn`
+        // can diagnose without the app's stderr.
+        XCTAssertTrue(lines[1].contains("\"host\""), lines[1])
+        XCTAssertTrue(lines[1].contains("\"active_display_count\":0"), lines[1])
+        XCTAssertTrue(lines[1].contains("\"session_locked\":true"), lines[1])
+        XCTAssertTrue(lines[1].contains("\"vsync_override_applied\":true"), lines[1])
+        // Rejected-input block is durable here (fd 2 is /dev/null in prod).
+        XCTAssertTrue(lines[1].contains("\"diagnostic\""), lines[1])
+        XCTAssertTrue(lines[1].contains("workingDirectory"), lines[1])
     }
 }
