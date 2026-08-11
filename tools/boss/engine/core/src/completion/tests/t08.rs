@@ -390,3 +390,145 @@ async fn queued_for_merge_revision_with_proven_absent_still_finalizes_despite_di
         other => panic!("expected task, got {other:?}"),
     }
 }
+
+// -----------------------------------------------------------
+// Binding vs finalization arming (incident-004 / PR URL split).
+// A `gh pr view|edit` observation binds without arming; the recheck must
+// still reach recovery paths, and Stop must not finalize a do-nothing
+// revision on that bound URL alone.
+// -----------------------------------------------------------
+
+/// A URL observed from `gh pr view` binds the execution, but does not prove
+/// this worker published anything. The recheck must not finalize/reap via
+/// the staged arm — yet must still fall through to the cold-path recovery
+/// path (an unarmed entry must not disable the whole recheck).
+#[tokio::test]
+async fn recheck_for_pr_binding_only_url_does_not_finalize_or_reap() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    let pr_url = "https://github.com/spinyfin/mono/pull/459";
+    let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+    // Drive the same path the dispatcher uses: feed → extract → gates → record.
+    let feed = crate::driver::default_pr_url_capture_feed(
+        "Bash",
+        &serde_json::json!({ "command": "gh pr view 459" }),
+        &serde_json::json!({
+            "stdout": format!("{pr_url}\n"),
+            "stderr": "",
+        }),
+    )
+    .expect("view feed");
+    let captured = crate::pr_url_capture::extract_pr_url_from_text(&feed.output_text).expect("url");
+    assert!(crate::pr_url_capture::is_pr_url_binding_command_str(&feed.command));
+    assert!(!crate::pr_url_capture::is_pr_url_finalization_command_str(
+        &feed.command
+    ));
+    staged_pr_urls.record_command_observation(
+        &execution_id,
+        &captured,
+        crate::pr_url_capture::is_pr_url_finalization_command_str(&feed.command),
+    );
+
+    // Detector is allowed to run (cold-path recovery); it fails here so we
+    // observe DetectorFailed rather than a staged finalize.
+    let detector = StubPrDetector::err("cold path retried; no PR yet");
+    let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), detector.clone());
+    let outcome = handler
+        .with_staged_pr_urls(staged_pr_urls.clone())
+        .recheck_for_pr(&execution_id)
+        .await;
+
+    assert_eq!(
+        outcome,
+        StopOutcome::DetectorFailed,
+        "unarmed binding must fall through to the cold-path detector, not short-circuit the recheck"
+    );
+    assert_eq!(staged_pr_urls.get(&execution_id).as_deref(), Some(pr_url));
+    assert!(
+        !staged_pr_urls
+            .get_entry(&execution_id)
+            .expect("bound URL")
+            .finalization_armed,
+        "a view/edit observation must bind without arming finalization"
+    );
+    assert_eq!(
+        detector.call_count(),
+        1,
+        "binding-only URLs must still reach the cold-path detector for recovery"
+    );
+    assert!(
+        cube.release_calls.lock().await.is_empty(),
+        "binding-only URLs must not reap the worker"
+    );
+    match db.get_work_item(&chore_id).unwrap() {
+        WorkItem::Chore(t) => assert!(t.pr_url.is_none(), "the task waits for publish evidence"),
+        other => panic!("expected chore, got {other:?}"),
+    }
+}
+
+/// Stop must not finalize a revision on a binding-only staged URL (parent PR
+/// inspected via `gh pr view` with no push). Without the finalization_armed
+/// gate on the Stop staged arm, verified_staged_pr_url would return the
+/// parent PR (revision branch matches) and stop_staged would advance the
+/// revision to in_review with no push.
+#[tokio::test]
+async fn on_stop_binding_only_url_does_not_finalize_revision() {
+    use crate::merge_poller::{OpenPrStatus, PrLifecycleState};
+
+    let workspace = tempdir().unwrap();
+    let parent_pr_url = "https://github.com/spinyfin/mono/pull/1342";
+    let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (_dir, db, _product_id, revision_id, execution_id) =
+        revision_fixture(workspace.path(), parent_pr_url, head_before);
+
+    let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+    let feed = crate::driver::default_pr_url_capture_feed(
+        "Bash",
+        &serde_json::json!({ "command": "gh pr view 1342" }),
+        &serde_json::json!({
+            "stdout": format!("{parent_pr_url}\n"),
+            "stderr": "",
+        }),
+    )
+    .expect("view feed");
+    let captured = crate::pr_url_capture::extract_pr_url_from_text(&feed.output_text).expect("url");
+    staged_pr_urls.record_command_observation(
+        &execution_id,
+        &captured,
+        crate::pr_url_capture::is_pr_url_finalization_command_str(&feed.command),
+    );
+    assert!(!staged_pr_urls.get_entry(&execution_id).unwrap().finalization_armed);
+
+    // Branch verification would accept the parent PR for a revision — that is
+    // exactly the failure mode if Stop ignores finalization_armed.
+    let verifier = StubBranchVerifier::ok("boss/exec_parent");
+    verifier.set_head_oid(Ok(head_before.into())).await;
+    let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
+
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), detector);
+    let outcome = handler
+        .with_staged_pr_urls(staged_pr_urls.clone())
+        .with_branch_verifier(verifier)
+        .with_merge_probe(probe)
+        .on_stop(&execution_id)
+        .await;
+
+    assert!(
+        !matches!(
+            outcome,
+            StopOutcome::DeliverableSatisfied { .. }
+                | StopOutcome::PrDetected { .. }
+                | StopOutcome::ReviewerEnqueued { .. }
+        ),
+        "binding-only must not finalize via stop_staged; got {outcome:?}"
+    );
+    assert!(
+        cube.release_calls.lock().await.is_empty(),
+        "binding-only Stop must not reap the revision worker"
+    );
+    match db.get_work_item(&revision_id).unwrap() {
+        WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Active),
+        other => panic!("expected revision task, got {other:?}"),
+    }
+}

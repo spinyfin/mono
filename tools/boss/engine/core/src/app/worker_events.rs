@@ -675,7 +675,7 @@ pub(super) async fn dispatch_live_worker_state(
             server_state.live_status_manager.notify(slot_id, Trigger::PostToolUse);
         }
         // Primary-path PR URL capture. Every worker that opens a
-        // PR does it via a shell `gh pr create` / `gh pr edit` /
+        // PR does it via a shell `gh pr create|view|list|edit` /
         // `cube pr create|update|ensure`; the PR URL is
         // printed on the command's output. The *driver* supplies
         // the free-text slice (and command string) via
@@ -688,7 +688,7 @@ pub(super) async fn dispatch_live_worker_state(
         // shelling out to `jj log` or polling GitHub for the
         // branch's PR.
         //
-        // Layer-1 gate: only capture URLs from deliberate `gh pr`
+        // Layer-1 gate: only bind URLs from deliberate `gh pr`
         // / `cube pr` invocations. Arbitrary shell output (file
         // reads, test runs, chore descriptions) can contain PR
         // URLs from unrelated executions; filtering by command
@@ -699,11 +699,11 @@ pub(super) async fn dispatch_live_worker_state(
             // Check for any PR URL first so we can log a rejection
             // when the command isn't a gh/cube pr invocation.
             if let Some(pr_url) = crate::pr_url_capture::extract_pr_url_from_text(&feed.output_text) {
-                if !crate::pr_url_capture::is_gh_pr_command_str(&feed.command) {
+                if !crate::pr_url_capture::is_pr_url_binding_command_str(&feed.command) {
                     tracing::info!(
                         execution_id = run_id,
                         rejected_url = %pr_url,
-                        reason = "not_a_gh_pr_command",
+                        reason = "not_a_pr_url_binding_command",
                         "pr_url_capture_rejected: URL in Bash stdout rejected — command is not a gh pr invocation",
                     );
                 } else {
@@ -741,29 +741,34 @@ pub(super) async fn dispatch_live_worker_state(
                         }
                     };
                     if valid {
-                        let outcome = server_state.staged_pr_urls.record_if_unset(run_id, &pr_url);
+                        let finalization_armed =
+                            crate::pr_url_capture::is_pr_url_finalization_command_str(&feed.command);
+                        let outcome =
+                            server_state
+                                .staged_pr_urls
+                                .record_command_observation(run_id, &pr_url, finalization_armed);
                         match outcome {
-                            crate::pr_url_capture::StagePrUrlOutcome::Staged => {
+                            crate::pr_url_capture::RecordCommandObservationOutcome::Bound
+                            | crate::pr_url_capture::RecordCommandObservationOutcome::Armed => {
                                 tracing::info!(
                                     execution_id = run_id,
                                     pr_url = %pr_url,
-                                    "pr_url_capture: staged PR URL from worker progress stream",
+                                    finalization_armed,
+                                    ?outcome,
+                                    "pr_url_capture: bound PR URL from worker progress stream",
                                 );
                             }
-                            crate::pr_url_capture::StagePrUrlOutcome::AlreadyStaged => {
-                                // Worker emitted a different URL from a
-                                // second staging command after already
-                                // staging one. First-writer-wins so the
-                                // original URL is kept.
+                            crate::pr_url_capture::RecordCommandObservationOutcome::Unchanged => {
                                 tracing::debug!(
                                     execution_id = run_id,
                                     pr_url = %pr_url,
-                                    "pr_url_capture: ignoring later URL (already staged for this execution)",
+                                    finalization_armed,
+                                    "pr_url_capture: re-observation left staged PR URL unchanged",
                                 );
                             }
                         }
                     }
-                } // else (is_gh_pr_command)
+                } // else (is_pr_url_binding_command)
 
                 // Revision push detection: record when a revision worker
                 // runs `cube pr update` (or, defensively, a direct

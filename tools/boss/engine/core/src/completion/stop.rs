@@ -315,8 +315,17 @@ impl WorkerCompletionHandler {
             );
             return false;
         }
-        match self.staged_pr_urls.record_if_unset(&execution.id, pr_url) {
-            crate::pr_url_capture::StagePrUrlOutcome::Staged => {
+        // Artifact / driver-prose URLs are self-reported publish evidence and
+        // must arm finalization. Use the arming path so a prior binding-only
+        // observation (`gh pr view`) cannot leave the entry permanently
+        // unarmed — `record_if_unset` would return AlreadyStaged and change
+        // nothing in that case.
+        match self
+            .staged_pr_urls
+            .record_command_observation(&execution.id, pr_url, true)
+        {
+            crate::pr_url_capture::RecordCommandObservationOutcome::Bound
+            | crate::pr_url_capture::RecordCommandObservationOutcome::Armed => {
                 tracing::info!(
                     execution_id = %execution.id,
                     pr_url = %pr_url,
@@ -325,7 +334,7 @@ impl WorkerCompletionHandler {
                 );
                 true
             }
-            crate::pr_url_capture::StagePrUrlOutcome::AlreadyStaged => {
+            crate::pr_url_capture::RecordCommandObservationOutcome::Unchanged => {
                 tracing::debug!(
                     execution_id = %execution.id,
                     pr_url = %pr_url,
@@ -537,22 +546,30 @@ impl WorkerCompletionHandler {
         // this only takes effect where the hook stream produced nothing.
         self.stage_pr_url_from_artifact(&execution);
 
-        // Next: a PR URL already captured from a
-        // `PostToolUse` Bash hook event (`gh pr create` /
-        // `gh pr view` / `gh pr edit` stdout) while the worker was
-        // still running. Layer-2 defence-in-depth: verify the staged
-        // PR's headRefName matches this execution's expected branch
-        // before finalizing — a mismatch means the URL was captured
-        // from an unrelated Bash invocation and must be discarded.
+        // Next: a PR URL already captured from a `PostToolUse` Bash hook
+        // event while the worker was still running — but only when that
+        // observation was *finalization-armed* (publish/push evidence:
+        // `gh pr create`, `cube pr create|update|ensure`, `jj git push`).
+        // A bare `gh pr view|list|edit` binds the URL without arming, so
+        // Stop must not finalize a revision that only inspected its parent
+        // PR and pushed nothing. Layer-2 defence-in-depth: verify the staged
+        // PR's headRefName matches this execution's expected branch before
+        // finalizing — a mismatch means the URL was captured from an
+        // unrelated Bash invocation and must be discarded.
         //
         // The cold-path fallback below remains for engine-restart
         // recovery: if the engine was down when the worker ran
         // `gh pr create`, the in-memory staging cache is empty here
         // and we fall through to `detect_pr` to reconstruct the URL
         // via the GitHub API.
-        if let Some(staged_url) = self
-            .verified_staged_pr_url(execution_id, &execution, "stop event")
-            .await
+        let staged_armed = self
+            .staged_pr_urls
+            .get_entry(execution_id)
+            .is_none_or(|entry| entry.finalization_armed);
+        if staged_armed
+            && let Some(staged_url) = self
+                .verified_staged_pr_url(execution_id, &execution, "stop event")
+                .await
         {
             tracing::info!(
                 execution_id,
