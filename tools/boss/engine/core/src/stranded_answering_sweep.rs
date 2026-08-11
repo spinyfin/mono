@@ -650,7 +650,9 @@ mod tests {
         reconcile_on_event(&db, &execution.id).await;
 
         let recovered = db.get_comment(&comment_id).unwrap().unwrap();
-        assert_eq!(recovered.status, "answered");
+        // No reply ever landed — must land on answer_failed, never answered
+        // (same contract as the periodic path; see recovers_a_comment_whose_execution_never_reached_stop).
+        assert_eq!(recovered.status, "answer_failed");
         let run = db.latest_answer_agent_run_for_comment(&comment_id).unwrap().unwrap();
         assert_eq!(run.status, ANSWER_AGENT_RUN_STATUS_FAILED);
         assert_eq!(run.error_kind.as_deref(), Some(STRANDED_ERROR_KIND));
@@ -735,7 +737,8 @@ mod tests {
 
         let recovered = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if db.get_comment(&comment_id).unwrap().unwrap().status == "answered" {
+                // No-reply recovery lands on answer_failed (not answered).
+                if db.get_comment(&comment_id).unwrap().unwrap().status == "answer_failed" {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
