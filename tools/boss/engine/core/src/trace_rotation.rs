@@ -1,9 +1,15 @@
 //! Rotation and retention for `engine-trace.jsonl`.
 //!
-//! On engine startup the existing trace file (if any) is renamed to a
-//! timestamped backup (`engine-trace.jsonl.<unix_s>`).  During the run,
-//! [`RotatingJsonlWriter`] checks the running byte count after every
-//! write and rotates when the threshold is crossed.
+//! Rotation is **purely size-based**: [`RotatingJsonlWriter`] checks the
+//! running byte count after every write and rotates to a timestamped
+//! backup (`engine-trace.jsonl.<unix_s>`) when the threshold is crossed.
+//! [`rotate_on_startup`] applies that same size check once at process
+//! start — it rotates only if the existing file is already at or over
+//! the threshold, so an engine restart never rotates a file that isn't
+//! full. Restarts never rotate by themselves — only size growth does, so
+//! retention is a function of trace volume, not restart count. A restart
+//! simply keeps appending to whatever active file it finds, exactly like
+//! a write from within the same process would.
 //!
 //! Rotated files are pruned to the N most recent; older files are
 //! deleted automatically.
@@ -13,7 +19,11 @@
 //! | Variable | Default | Meaning |
 //! |---|---|---|
 //! | `BOSS_ENGINE_TRACE_MAX_BYTES` | `104857600` (100 MiB) | Rotate when file exceeds this size |
-//! | `BOSS_ENGINE_TRACE_MAX_FILES` | `5` | Keep at most this many rotated backups |
+//! | `BOSS_ENGINE_TRACE_MAX_FILES` | `10` | Keep at most this many rotated backups |
+//!
+//! Retention is `max_files` × `max_bytes` of trace volume (default
+//! 10 × 100 MiB, plus the active file: worst case ~1.1 GiB on disk).
+//! Wall-clock coverage depends on write rate.
 //!
 //! ## Rotation safety
 //!
@@ -37,8 +47,10 @@ pub const TRACE_MAX_FILES_ENV: &str = "BOSS_ENGINE_TRACE_MAX_FILES";
 
 /// Default maximum size before rotation: 100 MiB.
 pub const DEFAULT_TRACE_MAX_BYTES: u64 = 100 * 1024 * 1024;
-/// Default number of rotated backups to keep.
-pub const DEFAULT_TRACE_MAX_FILES: usize = 5;
+/// Default number of rotated backups to keep. Sized for volume-based
+/// retention (see module docs), not for the number of times the engine
+/// has restarted.
+pub const DEFAULT_TRACE_MAX_FILES: usize = 10;
 
 /// Read rotation config from env vars, falling back to safe defaults.
 pub fn trace_rotation_config() -> (u64, usize) {
@@ -49,12 +61,28 @@ pub fn trace_rotation_config() -> (u64, usize) {
 
 /// Called once at engine startup before opening the trace file.
 ///
-/// If `path` already exists, renames it to a timestamped backup and
-/// then prunes old backups so only `max_files` remain.  Any error is
-/// printed to stderr and swallowed — trace rotation must never block
-/// engine startup.
-pub fn rotate_on_startup(path: &Path, max_files: usize) {
-    if !path.exists() {
+/// Applies the same size threshold [`RotatingJsonlWriter`] uses mid-run:
+/// if `path` exists and is already at or over `max_bytes`, it is renamed
+/// to a timestamped backup and old backups are pruned to `max_files`. If
+/// the file exists but is under the threshold, this is a no-op — the
+/// engine keeps appending to it, exactly as a live process would. This
+/// is what stops a restart storm from evicting retained history: a
+/// restart no longer rotates by itself, only genuine size growth does.
+/// Any error is printed to stderr and swallowed — trace rotation must
+/// never block engine startup.
+pub fn rotate_on_startup(path: &Path, max_bytes: u64, max_files: usize) {
+    // Match the mid-run writer's clamp: max_bytes = 0 must not make an
+    // empty file "at or over threshold" on every restart.
+    let max_bytes = max_bytes.max(1);
+    let size = match std::fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+        Err(err) => {
+            eprintln!("boss-engine: could not stat engine-trace.jsonl on startup: {err}");
+            return;
+        }
+    };
+    if size < max_bytes {
         return;
     }
     let rotated = next_rotated_path(path);
@@ -113,7 +141,7 @@ impl Write for RotatingJsonlWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
@@ -139,12 +167,12 @@ mod tests {
     }
 
     #[test]
-    fn rotate_on_startup_renames_existing_file() {
+    fn rotate_on_startup_renames_file_at_or_over_threshold() {
         let dir = TempDir::new().unwrap();
         let path = tmp_trace(&dir);
-        fs::write(&path, b"line1\n").unwrap();
+        fs::write(&path, b"0123456789").unwrap(); // 10 bytes
 
-        rotate_on_startup(&path, 5);
+        rotate_on_startup(&path, 10, 5);
 
         assert!(!path.exists(), "active path should be gone after startup rotation");
         let backups = rotated_segments(&path);
@@ -152,10 +180,127 @@ mod tests {
     }
 
     #[test]
+    fn rotate_on_startup_leaves_file_under_threshold_alone() {
+        // A restart with an active file that hasn't hit the size threshold
+        // must not consume a rotation slot — otherwise a restart storm
+        // burns through retention on its own.
+        let dir = TempDir::new().unwrap();
+        let path = tmp_trace(&dir);
+        fs::write(&path, b"line1\n").unwrap();
+
+        rotate_on_startup(&path, 100, 5);
+
+        assert!(path.exists(), "active path should be left in place below threshold");
+        assert!(rotated_segments(&path).is_empty(), "no rotation should have happened");
+    }
+
+    #[test]
+    fn restart_storm_does_not_evict_size_based_history() {
+        // Pre-populate a full retention window of rotated segments, then
+        // simulate many restarts that only *append* to a still-under-
+        // threshold active file. Under size-only rotation every pre-
+        // existing segment must still exist afterwards — the property
+        // the old unconditional rotate-on-start violated (thirteen
+        // restarts would have pruned the whole window).
+        let dir = TempDir::new().unwrap();
+        let path = tmp_trace(&dir);
+        let max_files = 5;
+        let segment_timestamps: Vec<u64> = (1_000_u64..1_000 + max_files as u64).collect();
+        for &ts in &segment_timestamps {
+            fs::write(
+                boss_log_files::rotated_segment_path(&path, ts),
+                format!("history-{ts}\n"),
+            )
+            .unwrap();
+        }
+        // Seed an under-threshold active file, then grow it by append
+        // across restarts (truncate would not model real restarts).
+        fs::write(&path, b"seed\n").unwrap();
+        let mut expected_active = String::from("seed\n");
+        for i in 0..13 {
+            let line = format!("restart-line-{i}\n");
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(line.as_bytes())
+                .unwrap();
+            expected_active.push_str(&line);
+            rotate_on_startup(&path, 100 * 1024 * 1024, max_files);
+        }
+
+        assert!(path.exists(), "active file must survive the restart storm");
+        let active = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            active, expected_active,
+            "active file must retain every appended line across restarts"
+        );
+        let backups = rotated_segments(&path);
+        assert_eq!(
+            backups.len(),
+            max_files,
+            "all pre-created rotated segments must still exist (zero eviction)"
+        );
+        for &ts in &segment_timestamps {
+            let segment = boss_log_files::rotated_segment_path(&path, ts);
+            assert!(
+                segment.exists(),
+                "pre-created segment {ts} must not be pruned by under-threshold restarts"
+            );
+            assert_eq!(fs::read_to_string(&segment).unwrap(), format!("history-{ts}\n"));
+        }
+    }
+
+    #[test]
+    fn restart_storm_with_always_over_threshold_prunes_preexisting_segments() {
+        // Negative control: if every restart *does* rotate (max_bytes = 1,
+        // so any non-empty file is over threshold), the same 13-restart
+        // burst consumes rotation slots and prunes pre-existing segments —
+        // the behaviour the size gate removed.
+        let dir = TempDir::new().unwrap();
+        let path = tmp_trace(&dir);
+        let max_files = 5;
+        let preexisting: Vec<u64> = (1_000_u64..1_000 + max_files as u64).collect();
+        for &ts in &preexisting {
+            fs::write(
+                boss_log_files::rotated_segment_path(&path, ts),
+                format!("history-{ts}\n"),
+            )
+            .unwrap();
+        }
+        fs::write(&path, b"seed\n").unwrap();
+        for i in 0..13 {
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(format!("restart-line-{i}\n").as_bytes())
+                .unwrap();
+            // max_bytes = 1: any non-empty file is over threshold.
+            rotate_on_startup(&path, 1, max_files);
+        }
+
+        let backups = rotated_segments(&path);
+        assert!(
+            backups.len() <= max_files,
+            "prune must still enforce max_files after always-rotate restarts"
+        );
+        for &ts in &preexisting {
+            let segment = boss_log_files::rotated_segment_path(&path, ts);
+            assert!(
+                !segment.exists(),
+                "pre-existing segment {ts} should be pruned when every restart rotates"
+            );
+        }
+    }
+
+    #[test]
     fn rotate_on_startup_noop_when_file_absent() {
         let dir = TempDir::new().unwrap();
         let path = tmp_trace(&dir);
-        rotate_on_startup(&path, 5);
+        rotate_on_startup(&path, 5, 5);
         assert!(rotated_segments(&path).is_empty());
     }
 
