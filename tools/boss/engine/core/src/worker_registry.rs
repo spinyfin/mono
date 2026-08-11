@@ -52,16 +52,16 @@ struct RegistryInner {
     run_to_slot: HashMap<String, RegisteredWorkerPane>,
 }
 
-/// The app surface attached to a worker run. `tmux_hosted` selects direct
-/// tmux input delivery and the non-owning detach RPC during normal cleanup;
-/// it is retained alongside the slot so legacy app-owned panes continue to
-/// use their app RPCs.
+/// The app surface attached to a worker run. `tmux_hosted` selects the
+/// non-owning detach RPC during normal cleanup. A tmux session identity
+/// independently selects direct tmux input delivery, including for adopted
+/// sessions that retain legacy process-tree reaping.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegisteredWorkerPane {
     pub slot_id: u8,
     pub tmux_hosted: bool,
     /// The tmux-owned worker's durable session identity. `None` is valid
-    /// only for an app-owned pane.
+    /// only for an app-owned pane not backed by a tmux session.
     pub tmux_session_name: Option<String>,
 }
 
@@ -103,6 +103,36 @@ impl WorkerRegistry {
                 slot_id,
                 tmux_hosted: true,
                 tmux_session_name: Some(session_name.into()),
+            },
+        );
+    }
+
+    /// Record an adopted tmux session while preserving legacy teardown and
+    /// process-tree reaping until tmux session teardown owns that responsibility.
+    pub fn register_adopted_tmux_run_slot(
+        &self,
+        run_id: impl Into<String>,
+        slot_id: u8,
+        session_name: impl Into<String>,
+    ) {
+        self.inner.lock().expect("registry poisoned").run_to_slot.insert(
+            run_id.into(),
+            RegisteredWorkerPane {
+                slot_id,
+                tmux_hosted: false,
+                tmux_session_name: Some(session_name.into()),
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub fn register_tmux_run_slot_without_session_for_test(&self, run_id: impl Into<String>, slot_id: u8) {
+        self.inner.lock().expect("registry poisoned").run_to_slot.insert(
+            run_id.into(),
+            RegisteredWorkerPane {
+                slot_id,
+                tmux_hosted: true,
+                tmux_session_name: None,
             },
         );
     }

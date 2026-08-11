@@ -546,6 +546,10 @@ struct ServerState {
     /// uses the resolved path recorded in the ready variant.
     #[builder(default = Arc::new(std::sync::RwLock::new(crate::tmux_preflight::TmuxPreflight::Unavailable { reason: "tmux preflight has not run yet".to_owned() })))]
     tmux_preflight: Arc<std::sync::RwLock<crate::tmux_preflight::TmuxPreflight>>,
+    /// Optional tmux controller override for pane delivery. Production uses
+    /// the preflighted executable; tests inject a command runner.
+    #[builder(default = Arc::new(std::sync::RwLock::new(None)))]
+    pane_delivery_tmux_override: Arc<std::sync::RwLock<Option<boss_tmux::Tmux>>>,
     /// Per-slot trigger fan-in for the live-status summarizer. Started
     /// when `spawn_flow` calls `start_live_status_slot`; torn down
     /// in `release_worker_pane`.

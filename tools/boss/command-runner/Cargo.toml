@@ -6,4 +6,7 @@ workspace = "../../.."
 
 [dependencies]
 async-trait = { workspace = true }
-tokio = { workspace = true, features = ["process"] }
+tokio = { workspace = true, features = ["process", "io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

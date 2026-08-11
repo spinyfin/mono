@@ -15,11 +15,18 @@ pub use types::{
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use tokio::time::sleep;
 
 use crate::types::validate_value;
+
+/// Monotonic id for named paste buffers shared across all [`Tmux`] handles in
+/// this process. Multi-line delivery uses a named buffer on both
+/// `load-buffer` and `paste-buffer` so concurrent deliveries cannot steal each
+/// other's content off tmux's unnamed buffer stack.
+static PASTE_BUFFER_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Handle for one resolved tmux executable and Boss's private server.
 #[derive(Clone)]
@@ -200,12 +207,47 @@ impl Tmux {
         command_failed(&args, &output)
     }
 
-    /// Sends literal input in bounded chunks, then submits it in a separate call.
+    /// Submits text as the app transport does: trailing line endings are
+    /// removed, multi-line text is bracketed-pasted, and exactly one Return
+    /// follows. Single-line text keeps the bounded literal-key chunking.
     pub async fn send_keys(&self, session: &str, text: &str) -> Result<()> {
         validate_value("session name", session)?;
         if text.contains('\0') {
             bail!("tmux key input cannot contain NUL");
         }
+        let text = text.trim_end_matches(['\r', '\n']);
+        if text.contains(['\r', '\n']) {
+            let buffer_name = format!(
+                "boss-deliver-{session}-{}",
+                PASTE_BUFFER_SEQ.fetch_add(1, Ordering::Relaxed)
+            );
+            validate_value("buffer name", &buffer_name)?;
+            let mut args = self.server_args();
+            args.extend([
+                "load-buffer".into(),
+                "-b".into(),
+                buffer_name.clone().into(),
+                "-".into(),
+            ]);
+            self.invoke_with_stdin(args, text.as_bytes()).await?;
+            let mut args = self.server_args();
+            args.extend([
+                "paste-buffer".into(),
+                "-b".into(),
+                buffer_name.into(),
+                "-p".into(),
+                "-d".into(),
+                "-t".into(),
+                session.into(),
+            ]);
+            self.invoke(args).await?;
+        } else {
+            self.send_literal_chunks(session, text).await?;
+        }
+        self.send_key(session, "C-m").await
+    }
+
+    async fn send_literal_chunks(&self, session: &str, text: &str) -> Result<()> {
         for chunk in utf8_chunks(text, DEFAULT_SEND_CHUNK_BYTES) {
             let chunk = if chunk == ";" { "\\;" } else { chunk };
             let mut args = self.server_args();
@@ -220,9 +262,7 @@ impl Tmux {
             self.invoke(args).await?;
             sleep(DEFAULT_SEND_CHUNK_DELAY).await;
         }
-        let mut args = self.server_args();
-        args.extend(["send-keys".into(), "-t".into(), session.into(), "C-m".into()]);
-        self.invoke(args).await.map(|_| ())
+        Ok(())
     }
 
     /// Sends one named tmux key without submitting text. This is for control
@@ -273,6 +313,19 @@ impl Tmux {
 
     async fn invoke(&self, args: Vec<OsString>) -> Result<CommandOutput> {
         let output = self.run(&args).await?;
+        if output.success {
+            Ok(output)
+        } else {
+            command_failed(&args, &output)
+        }
+    }
+
+    async fn invoke_with_stdin(&self, args: Vec<OsString>, stdin: &[u8]) -> Result<CommandOutput> {
+        let output = self
+            .runner
+            .run_with_stdin(&self.program, &args, None, stdin)
+            .await
+            .with_context(|| format!("spawning tmux executable {:?}", self.program))?;
         if output.success {
             Ok(output)
         } else {

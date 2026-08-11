@@ -171,8 +171,9 @@ impl ServerState {
         }
     }
 
-    /// Resolve `run_id → slot_id` and ask the app to write `text`
-    /// into that worker pane as if the user had typed it. Returns the
+    /// Resolve `run_id → slot_id` and write `text` into that worker pane:
+    /// `tmux send-keys` for a tmux-backed session or the app's `SendToPane`
+    /// RPC for a legacy app-owned pane. Returns the
     /// resolved slot on success so `bossctl agents send` can echo back
     /// which pane was targeted (useful when the agent reference was a
     /// crew name). Mirrors [`focus_worker_pane`] in shape, but refuses
@@ -248,8 +249,9 @@ impl ServerState {
         }
     }
 
-    /// Resolve `run_id → slot_id` and ask the app to deliver an Esc
-    /// keystroke to that worker pane's pty — equivalent to the human
+    /// Resolve `run_id → slot_id` and deliver an Esc keystroke through tmux
+    /// for a tmux-backed session or the app RPC for a legacy app-owned pane
+    /// — equivalent to the human
     /// pressing Esc with the pane focused. The worker run stays
     /// alive; only the in-flight turn is cancelled. Returns the
     /// resolved slot on success so callers (`bossctl agents
@@ -276,7 +278,7 @@ impl ServerState {
                 .map(|snapshot| (driver, snapshot))
         });
         let result = match self.worker_registry.pane_for_run(run_id) {
-            Some(pane) if pane.tmux_hosted => match pane.tmux_session_name {
+            Some(pane) if pane.tmux_session_name.is_some() || pane.tmux_hosted => match pane.tmux_session_name {
                 Some(session_name) => match self.tmux_for_pane_delivery() {
                     Ok(tmux) => tmux
                         .send_key(&session_name, "Escape")

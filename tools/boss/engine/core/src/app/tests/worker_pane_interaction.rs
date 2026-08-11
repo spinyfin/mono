@@ -1,4 +1,65 @@
 use super::*;
+use std::ffi::OsString;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use boss_tmux::{CommandOutput, CommandRunner, Tmux};
+
+#[derive(Default)]
+struct PaneDeliveryRunner {
+    calls: Mutex<Vec<Vec<String>>>,
+    stdin: Mutex<Vec<Vec<u8>>>,
+    started: tokio::sync::Notify,
+}
+
+impl PaneDeliveryRunner {
+    fn calls(&self) -> Vec<Vec<String>> {
+        self.calls.lock().unwrap().clone()
+    }
+    fn stdin(&self) -> Vec<Vec<u8>> {
+        self.stdin.lock().unwrap().clone()
+    }
+
+    fn success() -> CommandOutput {
+        CommandOutput {
+            success: true,
+            code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl CommandRunner for PaneDeliveryRunner {
+    async fn run(&self, _program: &Path, args: &[OsString], cwd: Option<&Path>) -> std::io::Result<CommandOutput> {
+        assert!(cwd.is_none());
+        self.calls
+            .lock()
+            .unwrap()
+            .push(args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect());
+        self.started.notify_one();
+        Ok(Self::success())
+    }
+
+    async fn run_with_stdin(
+        &self,
+        _program: &Path,
+        args: &[OsString],
+        cwd: Option<&Path>,
+        stdin: &[u8],
+    ) -> std::io::Result<CommandOutput> {
+        assert!(cwd.is_none());
+        self.calls
+            .lock()
+            .unwrap()
+            .push(args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect());
+        self.stdin.lock().unwrap().push(stdin.to_vec());
+        self.started.notify_one();
+        Ok(Self::success())
+    }
+}
 
 #[tokio::test]
 async fn focus_worker_pane_unknown_run_returns_unknown_run() {
@@ -170,29 +231,34 @@ async fn send_input_to_worker_round_trips_to_app() {
 }
 
 #[tokio::test]
-async fn send_input_to_tmux_worker_does_not_require_an_app_session() {
+async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery() {
     let (server_state, _dir) = test_server_state();
     register_idle_worker(&server_state, "run-tmux-send", 7);
     server_state
         .worker_registry
         .register_tmux_run_slot("run-tmux-send", 7, "boss-tmux-send");
-    *server_state.tmux_preflight.write().unwrap() = crate::tmux_preflight::TmuxPreflight::Ready {
-        program: std::path::PathBuf::from("/usr/bin/true"),
-        version: boss_tmux::MINIMUM_VERSION,
-    };
+    let runner = Arc::new(PaneDeliveryRunner::default());
+    *server_state.pane_delivery_tmux_override.write().unwrap() =
+        Some(Tmux::with_runner("/usr/bin/tmux", runner.clone()).unwrap());
 
-    // No app session is registered. A legacy SendToPane attempt would fail
-    // immediately; success after the hook confirmation proves the direct
-    // tmux transport is the path in use.
+    // No app session is registered. The runner notification proves the
+    // waiter has been registered and the direct tmux path was selected before
+    // we emit the hook that makes this a confirmed (not merely unconfirmed)
+    // delivery.
+    let command_started = runner.started.notified();
     let server_clone = server_state.clone();
-    let send = tokio::spawn(async move { server_clone.send_input_to_worker("run-tmux-send", "/help".into()).await });
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let send = tokio::spawn(async move {
+        server_clone
+            .send_input_to_worker("run-tmux-send", "first line\nsecond line\n".into())
+            .await
+    });
+    command_started.await;
     dispatch_live_worker_state(
         &server_state,
         &crate::events_socket::IncomingHookEvent::for_test(
             crate::protocol::WorkerEvent::UserPromptSubmit {
                 session_id: "tmux-sess-1".into(),
-                prompt: "/help".into(),
+                prompt: "first line\nsecond line".into(),
             },
             Some("run-tmux-send".to_owned()),
             None,
@@ -201,6 +267,72 @@ async fn send_input_to_tmux_worker_does_not_require_an_app_session() {
     .await;
 
     assert_eq!(send.await.expect("send task").expect("tmux send succeeds"), 7);
+    let calls = runner.calls();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0][..3], ["-L", "boss", "load-buffer"]);
+    assert_eq!(calls[0][3], "-b");
+    let buffer_name = calls[0][4].clone();
+    assert!(
+        buffer_name.starts_with("boss-deliver-boss-tmux-send-"),
+        "unexpected buffer name: {buffer_name}"
+    );
+    assert_eq!(calls[0][5], "-");
+    assert_eq!(
+        calls[1],
+        vec![
+            "-L",
+            "boss",
+            "paste-buffer",
+            "-b",
+            buffer_name.as_str(),
+            "-p",
+            "-d",
+            "-t",
+            "boss-tmux-send",
+        ]
+    );
+    assert_eq!(calls[2], vec!["-L", "boss", "send-keys", "-t", "boss-tmux-send", "C-m"]);
+    assert_eq!(runner.stdin(), vec![b"first line\nsecond line".to_vec()]);
+}
+
+#[tokio::test]
+async fn tmux_pane_without_session_name_surfaces_typed_errors() {
+    let (server_state, _dir) = test_server_state();
+    register_idle_worker(&server_state, "run-tmux-missing-session", 8);
+    server_state
+        .worker_registry
+        .register_tmux_run_slot_without_session_for_test("run-tmux-missing-session", 8);
+
+    assert!(matches!(
+        server_state
+            .send_input_to_worker("run-tmux-missing-session", "hello".into())
+            .await,
+        Err(SendInputError::Tmux(_))
+    ));
+    assert!(matches!(
+        server_state.interrupt_worker_pane("run-tmux-missing-session").await,
+        Err(InterruptPaneError::Tmux(_))
+    ));
+}
+
+#[tokio::test]
+async fn unavailable_tmux_preflight_surfaces_typed_errors() {
+    let (server_state, _dir) = test_server_state();
+    register_idle_worker(&server_state, "run-tmux-unavailable", 9);
+    server_state
+        .worker_registry
+        .register_tmux_run_slot("run-tmux-unavailable", 9, "boss-tmux-unavailable");
+
+    assert!(matches!(
+        server_state
+            .send_input_to_worker("run-tmux-unavailable", "hello".into())
+            .await,
+        Err(SendInputError::Tmux(_))
+    ));
+    assert!(matches!(
+        server_state.interrupt_worker_pane("run-tmux-unavailable").await,
+        Err(InterruptPaneError::Tmux(_))
+    ));
 }
 
 #[tokio::test(start_paused = true)]
