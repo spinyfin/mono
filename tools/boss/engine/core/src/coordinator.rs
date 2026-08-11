@@ -1797,11 +1797,8 @@ impl DispatchPauseOrigin {
 ///
 /// Held behind a single lock inside [`ExecutionCoordinator`] and read as a
 /// unit, so "is dispatch paused" and "what does this pause hold" can never be
-/// answered from different instants — and so a resume clears the entire
-/// episode rather than leaving one field behind. Before this was a value,
-/// the pause lived in four independent fields and `resume_dispatch` cleared
-/// three of them: `reviews_exempt` kept its last value forever, so
-/// `GetDispatchState` reported a scope for a pause that no longer existed.
+/// answered from different instants. Resuming clears the episode whole, so no
+/// field can survive a resume and describe a pause that no longer exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchPause {
     /// Who paused, which determines [`Self::reviews_held`].
@@ -1866,10 +1863,9 @@ pub enum DispatchAdmission {
     /// designed in
     /// `tools/boss/docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md`
     /// (`bossctl work start --force`), which deliberately does NOT apply to
-    /// a breaker pause and does not grow the pool. That override wants its
-    /// own variant here — one more arm in
-    /// [`ExecutionCoordinator::dispatch_hold_for`], admitted only when
-    /// `pause.origin == Operator` — not a reuse of this one.
+    /// a breaker pause and does not grow the pool. That override has its own
+    /// variant — see [`Self::PauseBypassOverride`] — rather than reusing this
+    /// one, so the two cannot be conflated on rebase.
     OperatorForced,
     /// The spawn-capability breaker's half-open recovery canary (see
     /// [`crate::spawn_health::maybe_admit_recovery_probe`]). Admitted only

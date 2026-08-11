@@ -976,9 +976,12 @@ impl ExecutionCoordinator {
         // unpaused pass. `schedule_execution`'s own admission gate
         // (`dispatch_hold_for`) has no visibility into that marker — it was
         // already consumed here — so a bypassed row must carry
-        // `DispatchAdmission::OperatorForced` (never held) the rest of the
-        // way to `schedule_execution`, in both Pass 1 and Pass 2, or the
-        // chokepoint would refuse the very row the bypass just admitted.
+        // `DispatchAdmission::PauseBypassOverride` the rest of the way to
+        // `schedule_execution`, in both Pass 1 and Pass 2, or the chokepoint
+        // would refuse the very row the bypass just admitted.
+        // `PauseBypassOverride` is admitted only under an operator-origin
+        // pause; a breaker pause still refuses it at the chokepoint (unlike
+        // `OperatorForced`, which is never held).
         let mut pause_bypass_admitted: HashSet<String> = HashSet::new();
         // At most one automation run may be preempted per drain pass, so a
         // burst of mainline arrivals never cascades into tearing down every

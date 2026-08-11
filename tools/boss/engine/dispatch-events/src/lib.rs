@@ -586,10 +586,10 @@ pub enum Stage {
     ///
     /// The `details` object carries `origin` (`"operator"` / `"breaker"`),
     /// `admission` (which entry point asked — `"queued"`,
-    /// `"operator_forced"`, `"breaker_recovery_probe"`), `reviews_held`,
-    /// `targets_review_pool`, and the pause `reason`. Always
-    /// [`Outcome::Skipped`]: a held dispatch is the pause working, not a
-    /// failure.
+    /// `"operator_forced"`, `"breaker_recovery_probe"`,
+    /// `"pause_bypass_override"`), `reviews_held`, `targets_review_pool`,
+    /// and the pause `reason`. Always [`Outcome::Skipped`]: a held dispatch
+    /// is the pause working, not a failure.
     DispatchHeldByPause,
     /// The spawn-capability breaker's half-open recovery probe admitted one
     /// canary execution through a Breaker-origin pause (see

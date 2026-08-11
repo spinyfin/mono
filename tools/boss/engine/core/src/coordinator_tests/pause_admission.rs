@@ -477,6 +477,99 @@ async fn force_dispatch_without_operator_intent_is_still_held() {
     );
 }
 
+// ── PauseBypassOverride at the chokepoint ─────────────────────────────────
+//
+// `#2705` wires `bossctl work start --force` through
+// `dispatch_with_pause_bypass` and the ready-queue drain's marker set; this
+// PR threads that path through `schedule_execution` as
+// `DispatchAdmission::PauseBypassOverride`. The request-layer tests refuse
+// a breaker pause *before* the drain, so they never exercise the
+// `dispatch_hold_for` arm. These two pin the chokepoint itself.
+
+/// `PauseBypassOverride` is admitted at the chokepoint under an
+/// operator-origin pause — the case `bossctl work start --force` is for.
+#[tokio::test]
+async fn pause_bypass_override_is_admitted_under_an_operator_pause() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "operator forced while paused");
+    db.reconcile_product_executions(&product.id).unwrap();
+    let execution = db.list_executions(Some(&chore.id)).unwrap()[0].clone();
+
+    let (coordinator, cube, _runner, _events) = paused_dispatch_fixture(db.clone());
+    operator_pause(coordinator.as_ref());
+
+    let worker_id = coordinator
+        .pool_for_execution(&execution)
+        .claim_worker(&execution.id, None)
+        .await
+        .expect("main pool slot available");
+
+    let result = coordinator
+        .schedule_execution(&execution, &worker_id, DispatchAdmission::PauseBypassOverride)
+        .await;
+    assert!(
+        result.is_ok(),
+        "PauseBypassOverride must be admitted under an operator pause: {result:?}"
+    );
+    assert_eq!(
+        cube.lease_calls.lock().await.len(),
+        1,
+        "the pause-bypass override must lease a workspace and dispatch"
+    );
+}
+
+/// Under a breaker pause the same admission is held: the pause-only force
+/// does not grow past an operator-origin pause, and the refusal is labelled
+/// so `dispatch tail` shows which path asked.
+#[tokio::test]
+async fn pause_bypass_override_is_held_under_a_breaker_pause() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "not forceable through breaker");
+    db.reconcile_product_executions(&product.id).unwrap();
+    let execution = db.list_executions(Some(&chore.id)).unwrap()[0].clone();
+
+    let (coordinator, cube, runner, events) = paused_dispatch_fixture(db.clone());
+
+    let worker_id = coordinator
+        .pool_for_execution(&execution)
+        .claim_worker(&execution.id, None)
+        .await
+        .expect("main pool slot available");
+
+    breaker_pause(coordinator.as_ref());
+
+    let result = coordinator
+        .schedule_execution(&execution, &worker_id, DispatchAdmission::PauseBypassOverride)
+        .await;
+    assert!(
+        result.is_err(),
+        "PauseBypassOverride must be held under a breaker pause"
+    );
+    assert!(
+        cube.lease_calls.lock().await.is_empty(),
+        "a held pause-bypass override must not lease a cube workspace"
+    );
+    assert_eq!(
+        runner.calls.lock().await.len(),
+        0,
+        "a held pause-bypass override must not reach the runner"
+    );
+
+    let recorded = events.events().await;
+    let held = recorded
+        .iter()
+        .find(|e| e.stage == "dispatch_held_by_pause")
+        .expect("the refusal must be visible in `bossctl dispatch tail`");
+    assert_eq!(held.outcome, "skipped");
+    assert_eq!(held.details["origin"], serde_json::json!("breaker"));
+    assert_eq!(held.details["admission"], serde_json::json!("pause_bypass_override"));
+    assert_eq!(held.details["reviews_held"], serde_json::json!(true));
+}
+
 // ── Pause state is one value ──────────────────────────────────────────────
 
 /// Resuming clears the whole episode. Previously `reviews_exempt` was never

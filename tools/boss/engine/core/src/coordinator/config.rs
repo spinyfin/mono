@@ -553,6 +553,13 @@ impl ExecutionCoordinator {
                     reason = pause.reason,
                 ))
             }
+            // Episode generation (matching `pause.since_epoch_s` to the
+            // episode the operator confirmed against) is owned by
+            // `dispatch_with_pause_bypass` and is not re-verified here: the
+            // drain is kicked synchronously after that confirmation, so the
+            // window for a different operator pause to begin is negligible
+            // and the blast radius is one execution. This arm only re-checks
+            // origin so a breaker pause still refuses a bypassed row.
             DispatchAdmission::PauseBypassOverride => {
                 if pause.origin == DispatchPauseOrigin::Operator {
                     return None;
