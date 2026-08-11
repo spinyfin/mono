@@ -1,7 +1,12 @@
 build --jobs=200
 build --disk_cache=~/.cache/bazelcache
-# Default GC limits — sized conservatively for macOS agents (disk-constrained).
-build --experimental_disk_cache_gc_max_size=30G
+# Off-CI GC limits (coordinator laptop, cube worker workspaces). CI overrides
+# this to 3T/60d via .ci.bazelrc and keeps its cache on a dedicated
+# multi-TiB volume. 250G must match flunge exactly: both repos share
+# ~/.cache/bazelcache, and bazel GC applies the invoking build's own
+# max-size to that shared directory, so a smaller value here would evict
+# flunge's entries (and vice versa).
+build --experimental_disk_cache_gc_max_size=250G
 build --experimental_disk_cache_gc_max_age=7d
 
 # Always stamp builds with the git-derived version so that dev builds show a
