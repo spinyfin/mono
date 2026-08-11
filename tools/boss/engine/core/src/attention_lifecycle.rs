@@ -307,7 +307,7 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     entry(
         crate::completion::MID_TURN_REAP_ATTENTION_KIND,
         ClearedBy::HumanDecision,
-        "Records that this execution's worker was torn down while still mid-turn (activity=working) \
+        "Records that a revision implementation's worker was torn down while still mid-turn (activity=working) \
          instead of at its own Stop boundary — unpushed work or unrun post-push steps may be lost \
          (incident-004). The execution this happened to is already terminal by the time the item is \
          filed, so no later run of it can supply contradicting evidence; whether the lost work needs \

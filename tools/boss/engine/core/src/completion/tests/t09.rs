@@ -458,3 +458,64 @@ async fn finalize_pr_transition_does_not_record_mid_turn_reap_when_worker_is_idl
         "an idle finalize must not file a mid-turn-reap attention item; got {items:?}",
     );
 }
+
+/// Mid-turn reaps from every execution kind are counted, but only revision
+/// implementations create sticky attention: that class can lose a
+/// reviewer-requested correction, whereas routine completion volume must not
+/// accumulate an operator queue.
+#[tokio::test]
+async fn finalize_pr_transition_counts_non_revision_mid_turn_reap_without_attention() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+    live_states.register_spawn(
+        5,
+        &execution_id,
+        "claude-opus-5",
+        std::process::id() as i32,
+        Some(boss_protocol::WorkItemBinding {
+            work_item_id: chore_id,
+            work_item_name: "ordinary completion metric".to_owned(),
+            execution_id: execution_id.clone(),
+        }),
+    );
+    live_states.apply_event(
+        5,
+        &boss_protocol::WorkerEvent::PreToolUse {
+            session_id: "s".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+        },
+    );
+
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let handler = handler.with_live_worker_states(live_states);
+    handler
+        .finalize_pr_transition(
+            &execution_id,
+            "https://github.com/spinyfin/mono/pull/1346".to_owned(),
+            WorkerPrCompletionTarget::Done,
+            "test_non_revision",
+        )
+        .await;
+
+    assert_eq!(
+        handler.metrics.counter_value("completion.mid_turn_reap.total"),
+        Some(1),
+        "non-revision reaps must remain visible in the aggregate metric",
+    );
+    assert_eq!(
+        handler
+            .metrics
+            .counter_value("completion.mid_turn_reap.test_non_revision.count"),
+        Some(1),
+        "non-revision reaps must remain visible in the per-source metric",
+    );
+    assert!(
+        !db.list_attention_items(&execution_id)
+            .unwrap()
+            .iter()
+            .any(|i| i.kind == MID_TURN_REAP_ATTENTION_KIND),
+        "routine completion reaps must not file sticky attention items",
+    );
+}

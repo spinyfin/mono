@@ -329,25 +329,12 @@ impl WorkerCompletionHandler {
     /// finalize-immediately behaviour. Non-revision executions also keep
     /// that behavior; this guard is only applied to revision executions.
     ///
-    /// `WaitingForInput` is deliberately treated as parked rather than
-    /// mid-turn. It can represent a pending notification after Stop, so
-    /// deferring it here could retain a genuinely parked worker for the
-    /// full horizon.
-    ///
     /// Bound: enforced here against
     /// [`crate::pr_url_capture::StagedPrUrlEntry::staged_at`] vs
     /// [`Self::staged_pr_mid_turn_defer_secs`]. After the horizon the
     /// staged path finalizes even while still Working.
     fn should_defer_staged_pr_recheck(&self, execution_id: &str) -> bool {
-        use boss_protocol::WorkerActivity;
-
-        let Some(registry) = self.live_worker_states.as_ref() else {
-            return false;
-        };
-        let Some(activity) = registry.activity_for_run(execution_id) else {
-            return false;
-        };
-        if activity != WorkerActivity::Working {
+        if !self.observed_mid_turn(execution_id) {
             return false;
         }
         let Some(entry) = self.staged_pr_urls.get_entry(execution_id) else {

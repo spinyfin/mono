@@ -608,13 +608,13 @@ impl WorkerCompletionHandler {
 
     /// True when the live-state registry reports [`boss_protocol::WorkerActivity::Working`]
     /// for `execution_id`'s slot right now — i.e. the worker is mid-turn,
-    /// not between turns. Mirrors [`Self::should_defer_staged_pr_recheck`]'s
-    /// reading of the same registry and the same `Working`-only definition
-    /// of mid-turn (a `WaitingForInput` worker is parked on a notification,
-    /// not mid-tool-call). Returns `false` when no registry is wired (unit
-    /// tests) or the run has no live slot — the same fail-closed default
-    /// `should_defer_staged_pr_recheck` uses, so an execution this cannot
-    /// observe is never misreported as mid-turn.
+    /// not between turns. `WaitingForInput` is deliberately treated as
+    /// parked rather than mid-turn: it can represent a pending notification
+    /// after Stop, so treating it as active could retain a genuinely parked
+    /// worker for the full staged-recheck horizon. Returns `false` when no
+    /// registry is wired (unit tests) or the run has no live slot: an
+    /// unobservable execution is never reported as mid-turn, so this
+    /// undercounts rather than fabricating reaps.
     pub(super) fn observed_mid_turn(&self, execution_id: &str) -> bool {
         use boss_protocol::WorkerActivity;
 
@@ -625,9 +625,11 @@ impl WorkerCompletionHandler {
     }
 
     /// Record a mid-turn reap (incident-004 AI-4): bump the aggregate and
-    /// per-source counters and file a sticky attention item on the
-    /// execution, so the prevalence the postmortem measured only by hand
-    /// from raw trace is answerable from the running system instead.
+    /// per-source counters and, for revision implementations, file a sticky
+    /// attention item on the execution. The counters remain unconditional so
+    /// every source stays countable and alertable; the sticky item is limited
+    /// to the execution class where a reviewer-requested correction can be
+    /// lost, avoiding an unbounded operator queue for routine finalizations.
     ///
     /// Deliberately does not touch [`crate::live_worker_state::LiveWorkerStateRegistry::release_slot`]'s
     /// own `activity` log line — that remains the forensic record this
@@ -648,6 +650,9 @@ impl WorkerCompletionHandler {
             "pr completion: finalizing via {source} while producing execution is mid-turn \
              (activity=working) — worker will be reaped before its remaining turn runs",
         );
+        if execution.kind != ExecutionKind::RevisionImplementation {
+            return;
+        }
         let body = format!(
             "The engine finalized this execution's PR via `{source}` while the worker's live \
              activity was still `working` — it had not reached its own Stop boundary. The pane \
