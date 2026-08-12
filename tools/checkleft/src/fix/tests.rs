@@ -610,5 +610,5 @@ fn copy_back_first_error_stop_never_half_writes_a_file() {
 // because `compute_fix_plan` is a private function of `main.rs`. The unit
 // tests there cover: dirty partition, all-dirty check still appears, empty
 // dirty set does not filter, and the empty-dirty (allow_dirty=true) default.
-// This comment documents that T12 acknowledges those tests as the allow_dirty
-// proof; no duplication is needed here.
+// Those binary-crate tests are the allow_dirty coverage; duplicating them here
+// would add no proof.
