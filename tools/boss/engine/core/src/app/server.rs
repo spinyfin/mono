@@ -439,9 +439,22 @@ pub async fn serve_with_merge_probe(
     // to app registration, after that app has prepared the session files.
     let coordinator_supervisor_state = server_state.clone();
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(2));
+        const RESTART_FAILURE_LIMIT: u32 = 5;
+        const RESTART_BACKOFF_CAP: Duration = Duration::from_secs(60);
+        const RESTART_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+        let mut restart_failures = 0_u32;
+        let mut last_restart = None;
+        let mut delay = Duration::from_secs(10);
         loop {
-            tick.tick().await;
+            tokio::time::sleep(delay).await;
+            if restart_failures >= RESTART_FAILURE_LIMIT {
+                tracing::error!(
+                    restart_failures,
+                    "coordinator restart limit reached; leaving the dead pane in place"
+                );
+                delay = RESTART_BACKOFF_CAP;
+                continue;
+            }
             let program = match coordinator_supervisor_state.tmux_preflight.read() {
                 Ok(guard) => match &*guard {
                     crate::tmux_preflight::TmuxPreflight::Ready { program, .. } => program.clone(),
@@ -456,7 +469,7 @@ pub async fn serve_with_merge_probe(
                 tracing::error!("coordinator tmux supervisor stopped: preflight supplied an invalid path");
                 return;
             };
-            let replacement = {
+            let restart = {
                 let _guard = coordinator_supervisor_state.coordinator_tmux_lock.lock().await;
                 crate::coordinator_tmux::restart_if_dead(
                     coordinator_supervisor_state.work_db.as_ref(),
@@ -465,8 +478,23 @@ pub async fn serve_with_merge_probe(
                 )
                 .await
             };
-            match replacement {
+            match restart {
                 Ok(Some(record)) => {
+                    let now = std::time::Instant::now();
+                    if last_restart.is_none_or(|last| now.duration_since(last) > RESTART_FAILURE_WINDOW) {
+                        restart_failures = 0;
+                    }
+                    last_restart = Some(now);
+                    restart_failures += 1;
+                    if restart_failures >= RESTART_FAILURE_LIMIT {
+                        delay = RESTART_BACKOFF_CAP;
+                        continue;
+                    }
+                    delay = Duration::from_secs(
+                        2_u64
+                            .saturating_pow(restart_failures)
+                            .min(RESTART_BACKOFF_CAP.as_secs()),
+                    );
                     crate::app::sessions::request_coordinator_attachment(
                         coordinator_supervisor_state.clone(),
                         &tmux,
@@ -474,9 +502,33 @@ pub async fn serve_with_merge_probe(
                     )
                     .await;
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    delay = Duration::from_secs(10);
+                    let app_registered = coordinator_supervisor_state.app_session.lock().await.is_some();
+                    let record = coordinator_supervisor_state
+                        .work_db
+                        .coordinator_tmux_record()
+                        .ok()
+                        .flatten();
+                    if let (true, Some(record)) = (app_registered, record) {
+                        let attached = coordinator_supervisor_state
+                            .coordinator_attached_spawn_token
+                            .lock()
+                            .expect("coordinator attached token mutex poisoned")
+                            .clone();
+                        if attached.as_deref() != Some(record.spawn_token.as_str()) {
+                            crate::app::sessions::request_coordinator_attachment(
+                                coordinator_supervisor_state.clone(),
+                                &tmux,
+                                record,
+                            )
+                            .await;
+                        }
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(error = %format!("{error:#}"), "coordinator tmux supervisor pass failed");
+                    delay = RESTART_BACKOFF_CAP;
                 }
             }
         }
@@ -2179,8 +2231,8 @@ pub(super) fn current_parent_pid() -> Option<libc::pid_t> {
     // (every `SpawnWorkerPane` request fails because no app session
     // is registered to receive it). With None, the trust gate becomes
     // a no-op (matches the test path), the app registers, and the
-    // Boss session pid takes over as the real trust root once
-    // `RegisterBossSession` lands. Production is unaffected: the app
+    // coordinator tmux pane becomes the real trust root once created.
+    // Production is unaffected: the app
     // always sets BOSS_APP_PID via `EngineProcessController`.
     std::env::var("BOSS_APP_PID")
         .ok()

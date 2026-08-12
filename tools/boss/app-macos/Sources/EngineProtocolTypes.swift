@@ -73,6 +73,7 @@ struct EngineCoordinatorAttachRequest: Sendable {
     let sessionName: String
     let spawnToken: String
     let model: String
+    let tmuxProgram: String
 }
 
 enum EngineCoordinatorAttachResult: Sendable {

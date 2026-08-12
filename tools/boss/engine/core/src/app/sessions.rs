@@ -40,7 +40,7 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
         //       rejects `RegisterAppSession` forever, no
         //       `app_session` is registered, and every
         //       engine→app RPC (`SpawnWorkerPane`, reveal) dies
-        //       silently. This is the mirror of T351 (engine
+        //       silently. This mirrors the engine
         //       restart re-attaching surviving panes): there the
         //       app survives and the engine restarts; here the
         //       engine survives and the app restarts. We require
@@ -149,8 +149,8 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
             },
         );
         // The engine, rather than the app, owns the coordinator's detached
-        // tmux session. Do this after the registration/config pushes so the
-        // app has installed its pane handlers before the attach RPC arrives.
+        // tmux session. Attachment is retried by the supervisor until the
+        // current app session acknowledges its viewer.
         let state = server_state.clone();
         tokio::spawn(async move {
             attach_coordinator_to_registered_app(state).await;
@@ -181,7 +181,7 @@ async fn attach_coordinator_to_registered_app(server_state: Arc<ServerState>) {
     };
     let record = {
         let _guard = server_state.coordinator_tmux_lock.lock().await;
-        let state = match crate::coordinator_tmux::ensure_for_attach(
+        match crate::coordinator_tmux::ensure_for_attach(
             server_state.work_db.as_ref(),
             &tmux,
             &server_state.coordinator_model,
@@ -193,10 +193,6 @@ async fn attach_coordinator_to_registered_app(server_state: Arc<ServerState>) {
                 tracing::error!(error = %format!("{error:#}"), "failed to create or recover coordinator tmux session");
                 return;
             }
-        };
-        match state {
-            crate::coordinator_tmux::CoordinatorState::Running(record)
-            | crate::coordinator_tmux::CoordinatorState::ModelChangeRequiresConfirmation(record) => record,
         }
     };
     request_coordinator_attachment(server_state, &tmux, record).await;
@@ -211,18 +207,24 @@ pub(super) async fn request_coordinator_attachment(
         Ok(pid) => server_state.set_boss_pid(pid),
         Err(error) => tracing::warn!(%error, "could not refresh coordinator trust-root pid"),
     }
+    let tmux_program = tmux.program().display().to_string();
     match server_state
         .send_to_app(
             EngineToAppRequest::AttachCoordinatorPane(boss_protocol::AttachCoordinatorPaneInput {
-                session_name: record.session_name,
-                spawn_token: record.spawn_token,
-                model: record.model,
+                session_name: record.session_name.clone(),
+                spawn_token: record.spawn_token.clone(),
+                model: record.model.clone(),
+                tmux_program,
             }),
             Duration::from_secs(5),
         )
         .await
     {
         Ok(EngineToAppResponse::AttachCoordinatorPane { result: Ok(_) }) => {
+            *server_state
+                .coordinator_attached_spawn_token
+                .lock()
+                .expect("coordinator attached token mutex poisoned") = Some(record.spawn_token.clone());
             tracing::info!("attached app Boss pane to coordinator tmux session");
         }
         Ok(response) => tracing::warn!(
@@ -233,8 +235,8 @@ pub(super) async fn request_coordinator_attachment(
     }
 }
 
-/// Replace the durable coordinator only after the app has shown the operator
-/// the loss-of-conversation confirmation. The app cannot choose a session
+/// Replace the durable coordinator only after the UI has confirmed the loss
+/// of the current conversation. The app cannot choose a session
 /// name or model here; both remain engine-owned configuration.
 pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
@@ -320,46 +322,6 @@ pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequ
                 message: format!("recreate_coordinator: {error:#}"),
             },
         ),
-    }
-}
-
-pub(super) async fn handle_register_boss_session(ctx: Dispatch, req: FrontendRequest) {
-    let Dispatch {
-        server_state,
-        sink,
-        session_id,
-        request_id,
-        ..
-    } = ctx;
-    let FrontendRequest::RegisterBossSession { shell_pid } = req else {
-        unreachable!()
-    };
-    {
-        // Only the registered app session may install the
-        // Boss trust root.
-        let app_session_id = server_state
-            .app_session
-            .lock()
-            .await
-            .as_ref()
-            .map(|h| h.session_id.clone());
-        if app_session_id.as_deref() != Some(session_id.as_str()) {
-            tracing::warn!(
-                session_id = %session_id,
-                "register_boss_session rejected: caller is not the app session",
-            );
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::Error {
-                    message: "register_boss_session: only the app session may install the Boss trust root".to_owned(),
-                },
-            );
-            return;
-        }
-        server_state.set_boss_pid(shell_pid as libc::pid_t);
-        tracing::info!(boss_pid = shell_pid, "boss session registered as second trust root",);
-        send_response(&sink, &request_id, FrontendEvent::BossSessionRegistered);
     }
 }
 

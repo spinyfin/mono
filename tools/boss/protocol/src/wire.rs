@@ -1777,13 +1777,6 @@ pub enum FrontendRequest {
     /// flow to this session only.
     RegisterAppSession,
 
-    /// App tells the engine which pid is the Boss session's shell.
-    /// Used to populate the second trust root for Boss-only RPCs.
-    /// Only the registered app session may call this.
-    RegisterBossSession {
-        shell_pid: i32,
-    },
-
     /// App reports the capability IDs compiled into this build. The
     /// engine updates its in-memory capability registry so the flag
     /// system can detect when a flag is enabled but its backing

@@ -427,12 +427,14 @@ final class EngineClient: @unchecked Sendable {
                     let sessionName = request["session_name"] as? String ?? ""
                     let spawnToken = request["spawn_token"] as? String ?? ""
                     let model = request["model"] as? String ?? ""
+                    let tmuxProgram = request["tmux_program"] as? String ?? ""
                     emit(.engineRequest(
                         requestId: requestId,
                         request: .attachCoordinatorPane(EngineCoordinatorAttachRequest(
                             sessionName: sessionName,
                             spawnToken: spawnToken,
-                            model: model
+                            model: model,
+                            tmuxProgram: tmuxProgram
                         ))
                     ))
                 case "detach_worker_pane":

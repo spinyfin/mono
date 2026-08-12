@@ -438,10 +438,10 @@ final class GhosttyRuntime: @unchecked Sendable {
 
         case .childExited(let exitCode):
             if resolved.host?.session.role == .boss {
-                // This is only the local tmux client. The engine sees the
-                // detached coordinator's pane state and reissues an attach
-                // after it recreates the session.
+                // This is only the local tmux client. BossPaneModel rebuilds
+                // its viewer while the engine-owned coordinator stays alive.
                 resolved.host?.session.statusMessage = "Picard reconnecting…"
+                resolved.host?.session.onChildExited?()
             } else {
                 resolved.host?.session.statusMessage = "Command exited (\(exitCode))"
             }
@@ -527,9 +527,10 @@ final class GhosttyRuntime: @unchecked Sendable {
                     return
                 }
                 if host.session.role == .boss {
-                    // This child is the tmux client, not the coordinator. Its
-                    // durable session is recreated and reattached by engine.
+                    // This child is the tmux client, not the coordinator.
+                    // Rebuild the local viewer for the durable session.
                     host.session.statusMessage = "Picard reconnecting…"
+                    host.session.onChildExited?()
                 } else {
                     // Worker pane: show the closed status and report the
                     // death to the engine (if a handler is installed) so

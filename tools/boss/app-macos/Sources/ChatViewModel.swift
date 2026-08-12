@@ -2162,6 +2162,7 @@ final class ChatViewModel: ObservableObject {
     var requestedCoordinatorModel: String?
     var attachedCoordinatorModel: String?
     var attachedCoordinatorSpawnToken: String?
+    var declinedCoordinatorRecreateToken: String?
     @Published var coordinatorModelRecreateConfirmation: CoordinatorModelRecreateConfirmation?
 
     /// Whether the engine has confirmed this client is the registered app session.

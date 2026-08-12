@@ -24,7 +24,7 @@ use crate::effort::SpawnConfig;
 use crate::work::{WorkExecution, WorkItem};
 use boss_protocol::ExecutionStatus;
 
-mod pane_spawn;
+pub(crate) mod pane_spawn;
 mod prompt;
 pub(crate) mod work_item;
 mod worker_spawn;

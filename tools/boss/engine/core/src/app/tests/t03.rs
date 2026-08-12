@@ -1,7 +1,7 @@
 use super::*;
 
 // Regression tests for `authorize_rpc(BossOnly, …)` with a registered Boss
-// pid. The fix for T1104 wires the macOS app to send `RegisterBossSession`
+// pid. The engine-owned coordinator tmux pane supplies the Boss trust root.
 // once the Boss pane's shell pid is known, installing the second trust root.
 // These tests pin the behaviour of the `BossOnly` tier before and after that
 // root is installed, ensuring that:
@@ -57,12 +57,12 @@ fn authorize_rpc_boss_only_rejects_non_boss_pid_even_when_worker_registered() {
 #[test]
 fn authorize_rpc_boss_only_rejects_when_boss_pid_not_registered() {
     // When no boss_pid has been installed yet (e.g. the macOS app has
-    // not yet sent RegisterBossSession), BossOnly falls back to the
+    // not yet created the coordinator), BossOnly falls back to the
     // app-pid + worker-exclusion check. A peer whose process tree does
     // NOT include app_pid (the startup env value) is rejected.
     //
     // This test verifies the pre-registration state that the fix
-    // addresses: before the macOS app sends RegisterBossSession, the
+    // addresses: before the coordinator is created, the
     // coordinator's bossctl cannot satisfy BossOnly via the app_pid
     // fallback (its tree goes through Boss.app's libghostty pane, not
     // through BOSS_APP_PID).

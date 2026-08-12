@@ -418,7 +418,6 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         FrontendRequest::EngineResponse { .. }
         | FrontendRequest::RecreateCoordinator { .. }
         | FrontendRequest::RegisterAppSession
-        | FrontendRequest::RegisterBossSession { .. }
         | FrontendRequest::RegisterCapabilities { .. }
         | FrontendRequest::ReportSelectedProduct { .. }
         | FrontendRequest::ReportWorkerSpawnFailed { .. }

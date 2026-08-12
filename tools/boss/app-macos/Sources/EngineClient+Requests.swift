@@ -655,13 +655,6 @@ extension EngineClient {
         ])
     }
 
-    func sendRegisterBossSession(shellPid: Int32) {
-        sendLine([
-            "type": "register_boss_session",
-            "shell_pid": Int(shellPid),
-        ])
-    }
-
     /// Request the engine-owned, explicitly confirmed replacement of the
     /// coordinator tmux session. The token guards against a delayed UI action
     /// destroying a newer session after recovery.

@@ -148,7 +148,7 @@ enum EngineEvent {
     /// drives the app's capacity check so they can never drift out of sync.
     /// `coordinatorModel` is the engine's requested model for coordinator
     /// creation. A live coordinator with a different model is preserved until
-    /// the operator confirms its destructive replacement.
+    /// its destructive replacement is explicitly confirmed.
     case enginePoolConfig(workerSlots: Int, automationSlots: Int, reviewSlots: Int, coordinatorModel: String)
     /// Response to `get_settings` — snapshot of every per-installation
     /// setting and its current value. Drives the Settings window.

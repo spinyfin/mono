@@ -201,6 +201,7 @@ mod tests {
                     session_name: "boss-coordinator".into(),
                     spawn_token: "token".into(),
                     model: "opus".into(),
+                    tmux_program: "/usr/bin/tmux".into(),
                 }),
                 "attach_coordinator_pane",
             ),

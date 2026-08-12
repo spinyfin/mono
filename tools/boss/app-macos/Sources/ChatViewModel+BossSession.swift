@@ -25,6 +25,7 @@ extension ChatViewModel {
     }
 
     func cancelCoordinatorModelRecreate() {
+        declinedCoordinatorRecreateToken = coordinatorModelRecreateConfirmation?.expectedSpawnToken
         coordinatorModelRecreateConfirmation = nil
     }
 
@@ -33,7 +34,8 @@ extension ChatViewModel {
               let attached = attachedCoordinatorModel,
               let spawnToken = attachedCoordinatorSpawnToken,
               !attached.isEmpty,
-              attached != requested
+              attached != requested,
+              declinedCoordinatorRecreateToken != spawnToken
         else {
             coordinatorModelRecreateConfirmation = nil
             return

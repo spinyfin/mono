@@ -154,7 +154,6 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::Error { .. }
         | FrontendEvent::AppSessionRegistered
         | FrontendEvent::EnginePoolConfig { .. }
-        | FrontendEvent::BossSessionRegistered
         | FrontendEvent::ProbeQueued { .. }
         | FrontendEvent::ProbeRefused { .. }
         | FrontendEvent::ProbeStatusResult { .. }

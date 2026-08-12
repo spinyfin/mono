@@ -4,13 +4,15 @@ import os
 private let logger = Logger(subsystem: "com.boss.app", category: "BossPaneModel")
 
 /// Attaches the single libghostty pane to the engine-owned coordinator tmux
-/// session. It deliberately has no child-exit or model-restart lifecycle:
-/// those destructive decisions belong to the surviving engine process.
+/// session. The engine owns coordinator creation and restart; this model only
+/// recreates its local tmux viewer when that client exits.
 @MainActor
 final class BossPaneModel: ObservableObject {
     let runtime: GhosttyRuntime
     @Published private(set) var session: TerminalPaneSession?
     private var attachedSpawnToken: String?
+    private var lastRequest: EngineCoordinatorAttachRequest?
+    private var viewerGeneration = 0
 
     init() {
         self.runtime = GhosttyRuntime.shared
@@ -28,25 +30,49 @@ final class BossPaneModel: ObservableObject {
         guard !request.sessionName.isEmpty, !request.spawnToken.isEmpty else {
             return .failure(.internalFailure("engine supplied an incomplete coordinator tmux identity"))
         }
-        guard request.sessionName == "boss-coordinator" else {
-            return .failure(.internalFailure("engine supplied an unexpected coordinator tmux session"))
+        guard !request.tmuxProgram.isEmpty, request.tmuxProgram.hasPrefix("/") else {
+            return .failure(.internalFailure("engine supplied an invalid tmux program"))
         }
+        lastRequest = request
         guard attachedSpawnToken != request.spawnToken || session == nil else {
             return .success
         }
+        installViewer(for: request)
+        return .success
+    }
+
+    private func installViewer(for request: EngineCoordinatorAttachRequest) {
+        viewerGeneration += 1
         let launchSpec = TerminalLaunchSpec(
             fontSize: 11.0,
             workingDirectory: FileManager.default.homeDirectoryForCurrentUser.path,
-            initialInput: "exec tmux -L boss attach-session -t \(request.sessionName)\n",
+            initialInput: "exec \(shellQuote(request.tmuxProgram)) -L boss attach-session -t \(shellQuote(request.sessionName))\n",
             env: []
         )
-        session = TerminalPaneSession(
-            id: "boss-\(request.spawnToken)",
+        let viewer = TerminalPaneSession(
+            id: "boss-\(request.spawnToken)-\(viewerGeneration)",
             role: .boss,
             launchSpec: launchSpec
         )
+        viewer.onChildExited = { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.reattachViewer()
+            }
+        }
+        session = viewer
         attachedSpawnToken = request.spawnToken
-        return .success
+    }
+
+    private func reattachViewer() {
+        guard let request = lastRequest else { return }
+        session?.statusMessage = "Picard reconnecting…"
+        // A detached tmux client does not change the durable coordinator's
+        // token, so deliberately rebuild the local viewer for the same token.
+        installViewer(for: request)
+    }
+
+    private func shellQuote(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\\\"'\\\"'"))'"
     }
 
     private static func ensureBossWorkingDirectory() -> String {

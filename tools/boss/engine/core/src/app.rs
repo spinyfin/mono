@@ -554,6 +554,11 @@ struct ServerState {
     /// and the independent child-exit supervisor.
     #[builder(default = Arc::new(Mutex::new(())))]
     coordinator_tmux_lock: Arc<Mutex<()>>,
+    /// Spawn token for which the current app session has acknowledged a
+    /// coordinator viewer. Cleared with the app session so a reconnect gets a
+    /// fresh attach request.
+    #[builder(default)]
+    coordinator_attached_spawn_token: Arc<StdMutex<Option<String>>>,
     /// Per-slot trigger fan-in for the live-status summarizer. Started
     /// when `spawn_flow` calls `start_live_status_slot`; torn down
     /// in `release_worker_pane`.
@@ -697,9 +702,8 @@ struct ServerState {
     /// (`SpawnWorkerPane`, reveal) die. See `register_app_session`'s
     /// caller and `current_app_pid`/`set_app_pid`.
     app_pid: StdMutex<Option<libc::pid_t>>,
-    /// Pid of the Boss session's shell, set by the app via
-    /// `RegisterBossSession` once the Boss libghostty pane has spawned.
-    /// Used as the second trust root: a peer whose process tree
+    /// Pid of the engine-owned coordinator tmux pane. Used as the second
+    /// trust root: a peer whose process tree
     /// includes this pid as an ancestor is treated as the Boss tier
     /// for RPC authorization.
     boss_pid: StdMutex<Option<libc::pid_t>>,
@@ -2402,7 +2406,6 @@ async fn handle_frontend_connection(
             }
             r @ FrontendRequest::RecreateCoordinator { .. } => sessions::handle_recreate_coordinator(ctx, r).await,
             r @ FrontendRequest::RegisterAppSession => sessions::handle_register_app_session(ctx, r).await,
-            r @ FrontendRequest::RegisterBossSession { .. } => sessions::handle_register_boss_session(ctx, r).await,
             r @ FrontendRequest::RegisterCapabilities { .. } => engine_meta::handle_register_capabilities(ctx, r).await,
             r @ FrontendRequest::ReleaseHoldRun { .. } => executions::handle_release_hold_run(ctx, r).await,
             r @ FrontendRequest::ReleaseProject { .. } => planner_ops::handle_release_project(ctx, r).await,

@@ -257,8 +257,6 @@ pub enum FrontendEvent {
         /// default `"opus"`) — independent of the worker effort→model table.
         coordinator_model: String,
     },
-    /// Engine confirms the Boss session pid was registered.
-    BossSessionRegistered,
     /// Engine **accepted** a probe for the given run, having first checked
     /// that it can actually be delivered. The engine-minted `probe_id` lets
     /// callers correlate the probe with the eventual
