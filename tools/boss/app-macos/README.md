@@ -216,7 +216,7 @@ The script clones `ghostty-org/ghostty`, builds the macOS xcframework via
 zig, and places it at `tools/boss/app-macos/ThirdParty/GhosttyKit.xcframework`.
 
 Requirements: macOS 15+, Xcode Metal Toolchain (`xcodebuild
--downloadComponent MetalToolchain`), and `zig@0.15` (Homebrew preferred,
+-downloadComponent MetalToolchain`), and `zig@0.16` (Homebrew preferred,
 falls back to a cached download).
 
 ### Run

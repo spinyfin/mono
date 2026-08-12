@@ -6,7 +6,7 @@ bazel_dep(name = "platforms", version = "1.0.0")
 bazel_dep(name = "buildifier_prebuilt", version = "7.3.1")
 bazel_dep(name = "rules_rust", version = "0.70.0")
 
-# EXPERIMENT (T2856): backport of rules_rust#3774 — native Bazel test sharding
+# EXPERIMENT: backport of rules_rust#3774 — native Bazel test sharding
 # for rust_test via an opt-in `experimental_enable_sharding` attribute. The
 # patch teaches the test runner to honour TEST_SHARD_INDEX/TEST_TOTAL_SHARDS
 # and touch TEST_SHARD_STATUS_FILE, so `shard_count` on a rust_test runs one
@@ -209,9 +209,12 @@ register_toolchains(
     "//tools/checkleft/wasm:wasm_tools_aarch64_linux_toolchain",
 )
 
+# Full ghostty commit for SwiftPM bootstrap (tools/boss/app-macos/scripts/bootstrap-ghosttykit.sh
+# parses this line). Must match the ghosttykit-<short> prefix in the URL below.
+# ghostty_kit_commit = 71c2d68eb40d4e51d30d94e46e7b0c305aa4407f
 http_archive(
     name = "ghostty_kit",
     build_file = "//tools/boss/app-macos:ghosttykit.BUILD",
-    sha256 = "82b8d947484a21e1a9d186628b8af5e3f2e81dc96925f3cdbc1766ececa814a1",
-    urls = ["https://github.com/spinyfin/ghostty-prebuilts/releases/download/ghosttykit-5659cef/GhosttyKit-5659cef.tar.gz"],
+    sha256 = "cdab2165aa9c4a157401c4c6fa494d3a1fc02633a2b5ea6d923ab9f9c696816e",
+    urls = ["https://github.com/spinyfin/ghostty-prebuilts/releases/download/ghosttykit-71c2d68e/GhosttyKit-71c2d68e.tar.gz"],
 )

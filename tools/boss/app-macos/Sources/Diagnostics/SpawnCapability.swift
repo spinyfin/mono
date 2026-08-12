@@ -4,10 +4,6 @@ import Foundation
 
 /// Measured host display / session state at a point in time.
 ///
-/// Lives in this file (same path as open PR #2587's measurement type) so
-/// both PRs edit one declaration and cannot silently produce an invalid
-/// redeclaration of `HostDisplaySnapshot` in module `Boss`.
-///
 /// ## Why this exists
 ///
 /// `ghostty_surface_new` returns NULL with no error code. `NSScreen.main`
@@ -23,20 +19,8 @@ import Foundation
 /// for libghostty's renderer, so the next failure is diagnosable from
 /// `bossctl logs spawn` without hunting the app's stderr.
 ///
-/// ## What libghostty actually checks (GhosttyKit 5659cef)
-///
-/// When `window-vsync` is true, renderer init does
-/// `try DisplayLink.createWithActiveCGDisplays()`
-/// (`src/renderer/generic.zig` ~L692–697). 
-/// `CVDisplayLinkCreateWithActiveCGDisplays` fails when the active display
-/// set is empty. Boss disables `window-vsync` for the embed so that path is
-/// skipped — see `GhosttyRuntime.applyBossEmbedConfigOverrides`. With
-/// vsync off, `display_link` is null and the render thread still draws on
-/// mailbox wake / event-driven paths (`Thread.zig` drawFrame when
-/// `hasVsync()` is false).
-///
 /// Fields other than `activeDisplayCount` are evidence (lock, asleep,
-/// online, AppKit screen count, embed override status), not a separate gate.
+/// online, and AppKit screen count), not a separate gate.
 struct HostDisplaySnapshot: Codable, Equatable, Sendable {
     /// Displays CoreGraphics considers active — the set
     /// `CVDisplayLinkCreateWithActiveCGDisplays` builds over.
@@ -54,11 +38,6 @@ struct HostDisplaySnapshot: Codable, Equatable, Sendable {
     /// Whether AppKit still has a `NSScreen.main` — recorded as evidence only;
     /// it can be true while activeDisplayCount is 0, so it must not drive attribution.
     var nsScreenMainNonNil: Bool
-    /// Whether Boss successfully wrote and loaded the embed override that
-    /// forces `window-vsync = false`. False means surface creation can still
-    /// hit the fatal DisplayLink path on GhosttyKit 5659cef.
-    var vsyncOverrideApplied: Bool
-
     private enum CodingKeys: String, CodingKey {
         case activeDisplayCount = "active_display_count"
         case onlineDisplayCount = "online_display_count"
@@ -67,7 +46,6 @@ struct HostDisplaySnapshot: Codable, Equatable, Sendable {
         case sessionOnConsole = "session_on_console"
         case screenCount = "screen_count"
         case nsScreenMainNonNil = "ns_screen_main_non_nil"
-        case vsyncOverrideApplied = "vsync_override_applied"
     }
 
     /// One-line human summary for NACK reasons and log lines.
@@ -75,8 +53,7 @@ struct HostDisplaySnapshot: Codable, Equatable, Sendable {
         "active_displays=\(activeDisplayCount) online_displays=\(onlineDisplayCount) "
             + "main_display_asleep=\(mainDisplayAsleep) session_locked=\(sessionLocked) "
             + "session_on_console=\(sessionOnConsole) ns_screens=\(screenCount) "
-            + "ns_screen_main_non_nil=\(nsScreenMainNonNil) "
-            + "vsync_override_applied=\(vsyncOverrideApplied)"
+            + "ns_screen_main_non_nil=\(nsScreenMainNonNil)"
     }
 
     /// Dictionary form for JSONL `surface_failed` extras (snake_case keys).
@@ -89,7 +66,6 @@ struct HostDisplaySnapshot: Codable, Equatable, Sendable {
             "session_on_console": sessionOnConsole,
             "screen_count": screenCount,
             "ns_screen_main_non_nil": nsScreenMainNonNil,
-            "vsync_override_applied": vsyncOverrideApplied,
         ]
     }
 
@@ -104,8 +80,7 @@ struct HostDisplaySnapshot: Codable, Equatable, Sendable {
             sessionLocked: session["CGSSessionScreenIsLocked"] as? Bool ?? false,
             sessionOnConsole: session[kCGSessionOnConsoleKey as String] as? Bool ?? true,
             screenCount: NSScreen.screens.count,
-            nsScreenMainNonNil: NSScreen.main != nil,
-            vsyncOverrideApplied: GhosttyRuntime.embedVsyncOverrideApplied
+            nsScreenMainNonNil: NSScreen.main != nil
         )
     }
 
@@ -117,8 +92,7 @@ struct HostDisplaySnapshot: Codable, Equatable, Sendable {
         sessionLocked: Bool = false,
         sessionOnConsole: Bool = true,
         screenCount: Int = 0,
-        nsScreenMainNonNil: Bool = false,
-        vsyncOverrideApplied: Bool = true
+        nsScreenMainNonNil: Bool = false
     ) -> HostDisplaySnapshot {
         HostDisplaySnapshot(
             activeDisplayCount: activeDisplayCount,
@@ -127,8 +101,7 @@ struct HostDisplaySnapshot: Codable, Equatable, Sendable {
             sessionLocked: sessionLocked,
             sessionOnConsole: sessionOnConsole,
             screenCount: screenCount,
-            nsScreenMainNonNil: nsScreenMainNonNil,
-            vsyncOverrideApplied: vsyncOverrideApplied
+            nsScreenMainNonNil: nsScreenMainNonNil
         )
     }
 

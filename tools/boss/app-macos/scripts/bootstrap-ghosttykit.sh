@@ -8,12 +8,67 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# tools/boss/app-macos -> monorepo root (MODULE.bazel is the GhosttyKit pin).
+MONO_ROOT="$(cd "$ROOT_DIR/../../.." && pwd)"
+MODULE_BAZEL="$MONO_ROOT/MODULE.bazel"
 CACHE_DIR="$ROOT_DIR/.build-cache"
 UPSTREAM_DIR="$CACHE_DIR/ghostty-upstream"
 OUTPUT_DIR="$ROOT_DIR/ThirdParty"
 FRAMEWORK_DIR="$OUTPUT_DIR/GhosttyKit.xcframework"
 TOOLCHAIN_DIR="$CACHE_DIR/toolchains"
-ZIG_VERSION="0.15.2"
+ZIG_VERSION="0.16.0"
+
+# Single source of truth: MODULE.bazel's `# ghostty_kit_commit = <40-hex>` line
+# (same block as the http_archive prebuilt URL). Override with GHOSTTY_REF only
+# when deliberately building a not-yet-pinned revision for a new prebuilt release;
+# never a moving branch such as `main`.
+ghostty_kit_commit_from_module() {
+  local commit
+  if [[ ! -f "$MODULE_BAZEL" ]]; then
+    echo "MODULE.bazel not found at $MODULE_BAZEL" >&2
+    return 1
+  fi
+  commit="$(
+    sed -nE 's/^[[:space:]]*#[[:space:]]*ghostty_kit_commit[[:space:]]*=[[:space:]]*([0-9a-f]{40}).*/\1/p' \
+      "$MODULE_BAZEL" | head -1
+  )"
+  if [[ -z "$commit" ]]; then
+    echo "Could not parse ghostty_kit_commit from $MODULE_BAZEL" >&2
+    echo "Expected a line: # ghostty_kit_commit = <40-hex-sha>" >&2
+    return 1
+  fi
+  printf '%s\n' "$commit"
+}
+
+GHOSTTY_REF_FROM_ENV="${GHOSTTY_REF-}"
+if [[ -n "$GHOSTTY_REF_FROM_ENV" ]]; then
+  GHOSTTY_REF="$GHOSTTY_REF_FROM_ENV"
+else
+  GHOSTTY_REF="$(ghostty_kit_commit_from_module)"
+fi
+
+if [[ ! "$GHOSTTY_REF" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "GHOSTTY_REF must be a full immutable commit ID, not a branch or tag: $GHOSTTY_REF" >&2
+  exit 1
+fi
+
+# When using the MODULE.bazel default, refuse a pin that disagrees with the
+# prebuilt URL prefix in the same file. Explicit GHOSTTY_REF skips this so a
+# new release can be built before MODULE.bazel is updated (runbook steps 1–4).
+if [[ -z "$GHOSTTY_REF_FROM_ENV" ]]; then
+  MODULE_TAG_PREFIX="$(
+    sed -nE 's|.*/ghosttykit-([0-9a-f]+)/.*|\1|p' "$MODULE_BAZEL" | head -1
+  )"
+  if [[ -z "$MODULE_TAG_PREFIX" ]]; then
+    echo "Could not parse ghosttykit-<sha> prebuilt tag from $MODULE_BAZEL" >&2
+    exit 1
+  fi
+  if [[ "$GHOSTTY_REF" != "$MODULE_TAG_PREFIX"* ]]; then
+    echo "MODULE.bazel ghostty_kit_commit $GHOSTTY_REF does not start with prebuilt tag prefix $MODULE_TAG_PREFIX" >&2
+    echo "Update both the ghostty_kit_commit line and the http_archive URL in MODULE.bazel together." >&2
+    exit 1
+  fi
+fi
 
 case "$(uname -m)" in
   arm64) TARGET_TRIPLE="aarch64-macos.15.0" ;;
@@ -43,16 +98,20 @@ EOF
 ensure_zig() {
   if command -v brew >/dev/null 2>&1; then
     local brew_prefix
-    brew_prefix="$(brew --prefix zig@0.15 2>/dev/null || true)"
-    if [[ -n "$brew_prefix" && -x "$brew_prefix/bin/zig" ]]; then
+    brew_prefix="$(brew --prefix zig@0.16 2>/dev/null || true)"
+    if [[ -n "$brew_prefix" && -x "$brew_prefix/bin/zig" && "$("$brew_prefix/bin/zig" version)" == "$ZIG_VERSION" ]]; then
       echo "$brew_prefix/bin/zig"
       return 0
     fi
   fi
 
   if command -v zig >/dev/null 2>&1; then
-    command -v zig
-    return 0
+    local system_zig
+    system_zig="$(command -v zig)"
+    if [[ "$("$system_zig" version)" == "$ZIG_VERSION" ]]; then
+      echo "$system_zig"
+      return 0
+    fi
   fi
 
   local arch
@@ -82,10 +141,18 @@ ZIG_BIN="$(ensure_zig)"
 SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
 
 if [[ ! -d "$UPSTREAM_DIR/.git" ]]; then
-  git clone --depth 1 https://github.com/ghostty-org/ghostty "$UPSTREAM_DIR"
-else
-  git -C "$UPSTREAM_DIR" fetch --depth 1 origin main
-  git -C "$UPSTREAM_DIR" reset --hard origin/main
+  git init --quiet "$UPSTREAM_DIR"
+  git -C "$UPSTREAM_DIR" remote add origin https://github.com/ghostty-org/ghostty
+fi
+
+# Fetch and check out exactly the requested object on a detached HEAD so the
+# source used for the xcframework is explicit even when this cache already exists.
+git -C "$UPSTREAM_DIR" fetch --depth 1 origin "$GHOSTTY_REF"
+git -C "$UPSTREAM_DIR" checkout --detach FETCH_HEAD
+CHECKED_OUT_REF="$(git -C "$UPSTREAM_DIR" rev-parse HEAD)"
+if [[ "$CHECKED_OUT_REF" != "$GHOSTTY_REF" ]]; then
+  echo "Ghostty checkout mismatch: requested $GHOSTTY_REF, got $CHECKED_OUT_REF" >&2
+  exit 1
 fi
 
 (

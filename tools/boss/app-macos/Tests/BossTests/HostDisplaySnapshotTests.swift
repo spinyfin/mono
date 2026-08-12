@@ -1,10 +1,11 @@
+import AppKit
 import CoreVideo
 import XCTest
 @testable import Boss
 
 /// Pins the measured host-display contract used to diagnose
 /// `ghostty_surface_new` NULL returns, and documents the CoreVideo
-/// precondition that made locked-screen spawns fail on GhosttyKit 5659cef.
+/// condition GhosttyKit now tolerates during locked-screen spawns.
 final class HostDisplaySnapshotTests: XCTestCase {
     func testSummaryNamesMeasuredFields() {
         let host = HostDisplaySnapshot.make(
@@ -14,8 +15,7 @@ final class HostDisplaySnapshotTests: XCTestCase {
             sessionLocked: true,
             sessionOnConsole: true,
             screenCount: 1,
-            nsScreenMainNonNil: true,
-            vsyncOverrideApplied: true
+            nsScreenMainNonNil: true
         )
         let summary = host.summary
         XCTAssertTrue(summary.contains("active_displays=0"), summary)
@@ -23,7 +23,6 @@ final class HostDisplaySnapshotTests: XCTestCase {
         XCTAssertTrue(summary.contains("main_display_asleep=true"), summary)
         XCTAssertTrue(summary.contains("session_locked=true"), summary)
         XCTAssertTrue(summary.contains("ns_screen_main_non_nil=true"), summary)
-        XCTAssertTrue(summary.contains("vsync_override_applied=true"), summary)
     }
 
     func testJsonObjectUsesSnakeCaseKeys() {
@@ -33,8 +32,7 @@ final class HostDisplaySnapshotTests: XCTestCase {
             mainDisplayAsleep: false,
             sessionLocked: false,
             screenCount: 2,
-            nsScreenMainNonNil: true,
-            vsyncOverrideApplied: false
+            nsScreenMainNonNil: true
         )
         let obj = host.jsonObject
         XCTAssertEqual(obj["active_display_count"] as? Int, 2)
@@ -42,7 +40,6 @@ final class HostDisplaySnapshotTests: XCTestCase {
         XCTAssertEqual(obj["main_display_asleep"] as? Bool, false)
         XCTAssertEqual(obj["session_locked"] as? Bool, false)
         XCTAssertEqual(obj["ns_screen_main_non_nil"] as? Bool, true)
-        XCTAssertEqual(obj["vsync_override_applied"] as? Bool, false)
     }
 
     func testCodableRoundTrip() throws {
@@ -53,8 +50,7 @@ final class HostDisplaySnapshotTests: XCTestCase {
             sessionLocked: true,
             sessionOnConsole: false,
             screenCount: 1,
-            nsScreenMainNonNil: true,
-            vsyncOverrideApplied: true
+            nsScreenMainNonNil: true
         )
         let data = try JSONEncoder().encode(host)
         let decoded = try JSONDecoder().decode(HostDisplaySnapshot.self, from: data)
@@ -62,7 +58,6 @@ final class HostDisplaySnapshotTests: XCTestCase {
         // Snake_case on the wire so spawn JSONL greps match tooling.
         let json = String(data: data, encoding: .utf8)!
         XCTAssertTrue(json.contains("active_display_count"))
-        XCTAssertTrue(json.contains("vsync_override_applied"))
         XCTAssertFalse(json.contains("activeDisplayCount"))
     }
 
@@ -122,8 +117,7 @@ final class HostDisplaySnapshotTests: XCTestCase {
             mainDisplayAsleep: true,
             sessionLocked: true,
             screenCount: 1,
-            nsScreenMainNonNil: true,
-            vsyncOverrideApplied: false
+            nsScreenMainNonNil: true
         )
         let diagnostic = GhosttyTerminalHostView.surfaceFailureDiagnostic(
             appNonNil: true,
@@ -141,68 +135,11 @@ final class HostDisplaySnapshotTests: XCTestCase {
         XCTAssertTrue(diagnostic.contains("host.session_locked:   true"), diagnostic)
         XCTAssertTrue(diagnostic.contains("host.main_asleep:      true"), diagnostic)
         XCTAssertTrue(diagnostic.contains("host.ns_main_non_nil:  true"), diagnostic)
-        XCTAssertTrue(diagnostic.contains("host.vsync_override:   false"), diagnostic)
     }
 
-    func testEmbedOverrideConfigDisablesWindowVsync() {
-        // The Boss-side fix for locked-display surface creation: skip the
-        // fatal DisplayLink create in GhosttyKit 5659cef by forcing
-        // window-vsync=false on the embed config.
-        let contents = GhosttyRuntime.embedOverrideConfigContents
-        XCTAssertTrue(
-            contents.contains("window-vsync = false"),
-            "embed override must force window-vsync=false; got:\n\(contents)"
-        )
-        // Only the assignment line matters (comments may mention the key).
-        let assignments = contents
-            .split(separator: "\n")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty && !$0.hasPrefix("#") }
-        XCTAssertEqual(assignments, ["window-vsync = false"])
-        // Header must state the file is regenerated, not hand-edited.
-        XCTAssertTrue(
-            contents.contains("Regenerated on every launch"),
-            "override header must warn that edits are discarded; got:\n\(contents)"
-        )
-    }
-
-    func testWriteEmbedOverrideConfigFileProducesFile() throws {
-        let appSupport = URL(
-            fileURLWithPath: ProcessInfo.processInfo.environment["TEST_TMPDIR"]
-                ?? NSTemporaryDirectory(),
-            isDirectory: true
-        )
-        .appendingPathComponent("ghostty-override-test-\(UUID().uuidString)", isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: appSupport) }
-
-        let written = try GhosttyRuntime.writeEmbedOverrideConfigFile(
-            applicationSupportDirectory: appSupport
-        )
-        XCTAssertTrue(
-            FileManager.default.fileExists(atPath: written.path),
-            "helper must create the override file at \(written.path)"
-        )
-        let onDisk = try String(contentsOf: written, encoding: .utf8)
-        XCTAssertTrue(onDisk.contains("window-vsync = false"), onDisk)
-        let assignments = onDisk
-            .split(separator: "\n")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty && !$0.hasPrefix("#") }
-        XCTAssertEqual(assignments, ["window-vsync = false"])
-        XCTAssertEqual(
-            written.lastPathComponent,
-            "ghostty-embed-overrides.config"
-        )
-        XCTAssertTrue(
-            written.path.hasPrefix(appSupport.path),
-            "helper must honor the Application Support override for tests"
-        )
-    }
-
-    /// CoreVideo refuses a display link over an empty display set — the
-    /// precondition GhosttyKit 5659cef treated as a hard surface-init error
-    /// (`try DisplayLink.createWithActiveCGDisplays()`). Boss skips that
-    /// path via `window-vsync = false`; this pins the OS-level rejection.
+    /// Upstream precondition for ghostty#13639: CoreVideo rejects a display
+    /// link over an empty display set. GhosttyKit now treats that failure as
+    /// optional; this test only documents the CoreVideo side of that contract.
     func testCVDisplayLinkCreateWithZeroDisplaysFails() {
         var link: CVDisplayLink?
         // Count 0: CoreVideo must not create a link. A non-null buffer is
@@ -212,9 +149,61 @@ final class HostDisplaySnapshotTests: XCTestCase {
         XCTAssertNotEqual(
             status,
             kCVReturnSuccess,
-            "empty display list must be rejected — this is the libghostty pin's fatal path"
+            "CoreVideo must reject a display link over an empty display set — the upstream condition ghostty#13639 made non-fatal"
         )
         XCTAssertNil(link)
+    }
+
+    /// Exercises the C surface path against the pinned GhosttyKit build.
+    /// Opt-in only: constructing `GhosttyRuntime.shared` runs `ghostty_init`
+    /// (which `fatalError`s on failure), installs process-wide signal
+    /// handlers, and spawns a real shell — a shard-killing blast radius if
+    /// libghostty or Metal is unavailable on the agent. Set
+    /// `BOSS_TEST_EXPECT_NO_ACTIVE_DISPLAY=1` to run (also used to assert
+    /// zero active CG displays for the display-sleep verification path).
+    @MainActor
+    func testGhosttyKitCreatesSurfaceInWindow() throws {
+        guard ProcessInfo.processInfo.environment["BOSS_TEST_EXPECT_NO_ACTIVE_DISPLAY"] == "1" else {
+            throw XCTSkip("real GhosttyKit surface test is opt-in (set BOSS_TEST_EXPECT_NO_ACTIVE_DISPLAY=1)")
+        }
+
+        let host = HostDisplaySnapshot.capture()
+        XCTAssertEqual(
+            host.activeDisplayCount,
+            0,
+            "display-sleep verification must begin with no active CoreGraphics displays"
+        )
+
+        let launchSpec = TerminalLaunchSpec(
+            fontSize: 12,
+            workingDirectory: NSTemporaryDirectory(),
+            initialInput: "exit\n"
+        )
+        let session = TerminalPaneSession(
+            id: "ghosttykit-surface-regression",
+            role: .worker(slot: 0),
+            launchSpec: launchSpec
+        )
+        let view = GhosttyTerminalHostView(
+            runtime: GhosttyRuntime.shared,
+            session: session,
+            launchSpec: launchSpec,
+            paneMonitorEnabled: false
+        )
+        defer { view.tearDown() }
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 480),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = view
+        view.syncGeometry()
+
+        XCTAssertNotNil(view.surface)
+        XCTAssertTrue(session.terminalReady)
+        XCTAssertTrue(view.window === window)
     }
 
     @MainActor
