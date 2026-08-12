@@ -140,7 +140,7 @@ use boss_deterministic_resolvers::{ConflictedFile, RegistryResolution, ResolvedF
 use boss_protocol::{CreateAttentionItemInput, FrontendEvent};
 
 use crate::coordinator::{CubeClient, CubeWorkspaceLease, ExecutionPublisher};
-use crate::merge_poller::parse_pr_number;
+use crate::merge_poller::stored_pr_number;
 use crate::work::{ConflictResolution, PendingMergeCheck, WorkDb};
 
 /// The escalation-ladder rung a resolution was produced at, recorded in
@@ -313,7 +313,7 @@ pub(crate) async fn try_mechanical_rungs(
     candidate: &PendingMergeCheck,
     attempt: &ConflictResolution,
 ) -> LadderOutcome {
-    let Some(pr_number) = parse_pr_number(&candidate.pr_url).filter(|n| *n > 0) else {
+    let Some(pr_number) = stored_pr_number(&candidate.pr_url).filter(|n| *n > 0) else {
         tracing::debug!(
             work_item_id = %candidate.work_item_id,
             pr_url = %candidate.pr_url,
@@ -727,7 +727,7 @@ pub(crate) async fn attempt_rung0(
     lease: &CubeWorkspaceLease,
     residual_paths: &[String],
 ) -> LadderOutcome {
-    let Some(pr_number) = parse_pr_number(&candidate.pr_url).filter(|n| *n > 0) else {
+    let Some(pr_number) = stored_pr_number(&candidate.pr_url).filter(|n| *n > 0) else {
         // Unreachable via the live call site (try_mechanical_rungs already
         // parsed this successfully before leasing), but attempt_rung0 is
         // also called directly by tests, so this stays a clean decline
@@ -891,7 +891,7 @@ async fn retire_attempt_at_rung(
 ) {
     log_routing_verdict(
         &candidate.work_item_id,
-        parse_pr_number(&candidate.pr_url).map(|n| n as u64),
+        stored_pr_number(&candidate.pr_url).map(|n| n as u64),
         conflicted_files,
         "deterministic",
         &format!("mechanical rung {rung} resolved every conflicted file; no worker spawned"),
@@ -1037,7 +1037,7 @@ async fn halt_attempt_for_deletion_signoff(
 ) {
     log_routing_verdict(
         &candidate.work_item_id,
-        parse_pr_number(&candidate.pr_url).map(|n| n as u64),
+        stored_pr_number(&candidate.pr_url).map(|n| n as u64),
         conflicted_files,
         "deterministic",
         &format!(

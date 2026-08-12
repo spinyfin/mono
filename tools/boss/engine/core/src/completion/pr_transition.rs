@@ -434,7 +434,7 @@ impl WorkerCompletionHandler {
         if let WorkItem::Task(ref task) | WorkItem::Chore(ref task) = completion.work_item {
             let produces_project_design =
                 matches!(task.kind, TaskKind::Design | TaskKind::DesignPostmortem) && task.project_id.is_some();
-            let uses_task_doc = design_detector::task_uses_per_task_doc(&task.kind, task.project_id.is_none());
+            let uses_task_doc = crate::work::task_uses_per_task_doc(&task.kind, task.project_id.is_none());
             let decision = if produces_project_design {
                 "project-design-doc"
             } else if uses_task_doc {

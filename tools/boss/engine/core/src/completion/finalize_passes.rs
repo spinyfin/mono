@@ -1379,7 +1379,7 @@ impl WorkerCompletionHandler {
                 }
             };
             let Some(attempt) = attempt else { return none };
-            match Some(crate::ci_watch::merge_queue_rebounce_pr_head(&attempt.head_sha_at_trigger).to_owned())
+            match Some(crate::work::merge_queue_rebounce_pr_head(&attempt.head_sha_at_trigger).to_owned())
                 .filter(|s| !s.is_empty())
             {
                 // `ci_remediations` never stamps a base branch — resolved

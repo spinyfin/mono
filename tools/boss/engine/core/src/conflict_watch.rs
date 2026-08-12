@@ -36,7 +36,7 @@ use crate::blocking_signal::{self, SignalKind};
 use crate::conflict_ladder;
 use crate::conflict_remediation::{ConflictRemediationQueue, EnqueueOutcome};
 use crate::coordinator::{CubeClient, ExecutionPublisher};
-use crate::merge_poller::{PrLifecycleProbe, parse_pr_number, pr_labels_opt_out};
+use crate::merge_poller::{PrLifecycleProbe, pr_labels_opt_out, stored_pr_number};
 #[cfg(test)]
 use crate::work::TaskStatus;
 use crate::work::{ConflictResolutionInsertInput, PendingMergeCheck, PrStateChecker, WorkDb};
@@ -655,7 +655,7 @@ pub async fn on_conflict_detected_with(
         product_id: candidate.product_id.clone(),
         work_item_id: candidate.work_item_id.clone(),
         pr_url: candidate.pr_url.clone(),
-        pr_number: parse_pr_number(&candidate.pr_url).unwrap_or(0),
+        pr_number: stored_pr_number(&candidate.pr_url).unwrap_or(0),
         head_branch: probe.head_ref_name.as_deref().unwrap_or("").to_owned(),
         base_branch: probe.base_ref_name.as_deref().unwrap_or("").to_owned(),
         base_sha_at_trigger: probe.base_ref_oid.clone(),
@@ -870,7 +870,7 @@ pub async fn on_conflict_detected_with(
                 );
                 conflict_ladder::log_routing_verdict(
                     &candidate.work_item_id,
-                    parse_pr_number(&candidate.pr_url).map(|n| n as u64),
+                    stored_pr_number(&candidate.pr_url).map(|n| n as u64),
                     &[],
                     "skip",
                     "conflict_ladder_mechanical_rebase feature flag is off; ladder (rungs 0/1) never attempted",

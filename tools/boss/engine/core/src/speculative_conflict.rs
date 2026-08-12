@@ -35,7 +35,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::coordinator::CubeClient;
-use crate::merge_poller::{parse_pr_number, sanitize_metric_name_component};
+use crate::merge_poller::{sanitize_metric_name_component, stored_pr_number};
 use crate::metrics::Registry;
 use crate::work::{PendingMergeCheck, SpeculativeConflictInsertInput, WorkDb};
 
@@ -154,7 +154,7 @@ pub async fn run_speculative_pass(
 }
 
 async fn check_one(work_db: &WorkDb, cube_client: &dyn CubeClient, metrics: &Registry, candidate: &PendingMergeCheck) {
-    let Some(pr_number) = parse_pr_number(&candidate.pr_url).filter(|n| *n > 0) else {
+    let Some(pr_number) = stored_pr_number(&candidate.pr_url).filter(|n| *n > 0) else {
         tracing::debug!(
             work_item_id = %candidate.work_item_id,
             pr_url = %candidate.pr_url,

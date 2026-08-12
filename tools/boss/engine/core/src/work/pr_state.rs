@@ -1,5 +1,20 @@
 use super::*;
 
+/// The PR number in `pr_url`, as the `i64` the durable rows store.
+///
+/// Thin `i64` adapter over [`boss_github::pr_url::pr_number_from_url`] —
+/// the persistence layer parses PR URLs straight from the shared GitHub
+/// crate rather than borrowing the merge poller's copy, so nothing here
+/// depends on a sweep that itself reads these rows.
+///
+/// Named `stored_pr_number` (not `pr_number_from_url`) because the
+/// lower-crate helper returns `Option<u64>` while durable rows store
+/// `i64`; the distinct name keeps the storage adaptor from shadowing
+/// the canonical parser at call sites that import both.
+pub(crate) fn stored_pr_number(pr_url: &str) -> Option<i64> {
+    boss_github::pr_url::pr_number_from_url(pr_url).map(|n| n as i64)
+}
+
 /// Trait for checking the live state of a GitHub PR URL.
 ///
 /// Injected into `create_revision` so the gate can distinguish "open"
@@ -189,17 +204,15 @@ impl RevisionGateError {
         }
     }
     pub(crate) fn merged(task: &Task, pr_url: &str) -> Self {
-        use crate::merge_poller::parse_pr_number;
         Self::Merged {
             short_id: task.short_id.unwrap_or(0),
-            pr_number: parse_pr_number(pr_url).unwrap_or(0),
+            pr_number: stored_pr_number(pr_url).unwrap_or(0),
         }
     }
     pub(crate) fn closed(task: &Task, pr_url: &str) -> Self {
-        use crate::merge_poller::parse_pr_number;
         Self::ClosedUnmerged {
             short_id: task.short_id.unwrap_or(0),
-            pr_number: parse_pr_number(pr_url).unwrap_or(0),
+            pr_number: stored_pr_number(pr_url).unwrap_or(0),
         }
     }
 }

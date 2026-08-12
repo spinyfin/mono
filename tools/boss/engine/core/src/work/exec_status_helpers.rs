@@ -45,10 +45,41 @@ pub(crate) fn execution_kind_for_work_item(conn: &Connection, work_item_id: &str
     })
 }
 
+/// Whether completing a primary-implementation execution with a fresh PR
+/// should trigger an independent reviewer pass. When this returns true, the
+/// producing task's column transition is held in `PendingReview`/Doing until
+/// the reviewer finalises.
+///
+/// `RevisionImplementation` is handled separately, at the call site in
+/// [`crate::completion::WorkerCompletionHandler::finalize_pr_transition`]:
+/// every revision kind (reviewer-spawned, CI-fix, conflict-resolution, and
+/// human/operator-initiated) that pushes new commits to its parent PR
+/// re-triggers a reviewer pass, gated only by the
+/// `WorkerCompletionHandler::enable_revision_triggered_reviews` kill-switch
+/// (2026-07-01 revision-review experiment — closes the gap where only the
+/// first push on a PR was ever reviewed).
+///
+/// Also reused (via [`task_kind_excluded_from_ai_review`]) to derive the
+/// "review not required" AI-review-badge state for a task's *kind*,
+/// independent of any particular execution — sharing this predicate is what
+/// keeps that derivation from drifting out of sync with the actual enqueue
+/// gate.
+///
+/// Lives here rather than in `completion`: the AI-review-badge derivation
+/// below is the other consumer, and the persistence layer must not depend
+/// on the completion handler that writes through it. `completion` re-exports
+/// this under its original path.
+pub(crate) fn should_enqueue_reviewer_for_primary(kind: &ExecutionKind) -> bool {
+    matches!(
+        kind,
+        ExecutionKind::ChoreImplementation | ExecutionKind::TaskImplementation
+    )
+}
+
 /// Whether a task of this `kind` is excluded from AI review entirely — no
 /// `pr_review` execution is ever enqueued for its own primary-implementation
 /// completion. Re-derives the exclusion from
-/// [`crate::completion::should_enqueue_reviewer_for_primary`] via the same
+/// [`should_enqueue_reviewer_for_primary`] via the same
 /// `execution_kind_for_task_kind` mapping that function's other call site
 /// uses, rather than hand-listing `Design`/`DesignPostmortem`/`Investigation`
 /// here — the engine records nothing about the exclusion at review-skip
@@ -65,7 +96,7 @@ pub(crate) fn task_kind_excluded_from_ai_review(kind: &TaskKind) -> bool {
     if *kind == TaskKind::Revision {
         return false;
     }
-    !crate::completion::should_enqueue_reviewer_for_primary(&execution_kind_for_task_kind(kind))
+    !should_enqueue_reviewer_for_primary(&execution_kind_for_task_kind(kind))
 }
 
 /// Stage an [`Event::ExecutionTerminal`] for publish once the caller's

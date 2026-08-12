@@ -2183,7 +2183,7 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
     }
     out.push_str(&format!(
         "**Head sha at trigger**: `{}`\n",
-        crate::ci_watch::merge_queue_rebounce_pr_head(&attempt.head_sha_at_trigger),
+        crate::work::merge_queue_rebounce_pr_head(&attempt.head_sha_at_trigger),
     ));
     out.push_str(&format!("**Attempt id**: `{}`\n\n", attempt.id));
 
@@ -2586,7 +2586,7 @@ fn compose_ci_remediation_prompt(
     }
     prompt.push_str(&format!(
         "**Head sha at trigger**: `{}`\n",
-        crate::ci_watch::merge_queue_rebounce_pr_head(&attempt.head_sha_at_trigger),
+        crate::work::merge_queue_rebounce_pr_head(&attempt.head_sha_at_trigger),
     ));
     prompt.push_str(&format!("**Workspace**: `{}`\n", workspace_path.display()));
     prompt.push_str(&format!("**Attempt id**: `{}`\n", attempt.id));

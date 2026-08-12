@@ -73,7 +73,7 @@ use boss_engine_utils::iso8601::parse_iso8601_lenient;
 // to tell them apart or it will confirm the wrong culprit.
 use boss_gh_telemetry::{callers, scope as gh_scope};
 use boss_github::gh_runner::pr_merge_queue_entry;
-use boss_github::pr_url::{parse_pr_url_parts, pr_number_from_url, repo_from_pr_url};
+use boss_github::pr_url::{parse_pr_url_parts, repo_from_pr_url};
 #[cfg(test)]
 use boss_protocol::ExecutionKind;
 use boss_protocol::{self, CreateAttentionItemInput, TaskKind};

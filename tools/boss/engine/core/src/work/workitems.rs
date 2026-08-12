@@ -1206,7 +1206,7 @@ impl WorkDb {
             let rows = stmt.query_map([], map_task_with_parent)?;
             collect_rows(rows)?
                 .into_iter()
-                .filter(|task| task.pr_url.as_deref().and_then(crate::merge_poller::parse_pr_number) == Some(pr_number))
+                .filter(|task| task.pr_url.as_deref().and_then(super::pr_state::stored_pr_number) == Some(pr_number))
                 .collect()
         };
 

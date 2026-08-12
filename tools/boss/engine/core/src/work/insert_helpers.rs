@@ -1,5 +1,19 @@
 use super::*;
 
+/// Recover the PR head from a namespaced merge-queue rebounce
+/// discriminator (`mq:<pr-head-sha>`, minted by
+/// `ci_watch::merge_queue_rebounce_discriminator`). Rows written before
+/// namespacing used the raw head directly, so callers must preserve that
+/// representation during the transition.
+///
+/// Lives here, with the `ci_failure_suppressions` / `ci_remediations`
+/// rows it keys, rather than in `ci_watch`: the persistence layer owns
+/// the stored representation, and the watcher that writes through it
+/// must not be a dependency of the layer it writes to.
+pub(crate) fn merge_queue_rebounce_pr_head(discriminator: &str) -> &str {
+    discriminator.strip_prefix("mq:").unwrap_or(discriminator)
+}
+
 /// Insert a `ci_failure_suppressions` row for the work item, keyed by
 /// the head sha of the most recent `ci_remediations` attempt. Called
 /// from `update_task` when a human moves a chore out of `blocked:
@@ -35,7 +49,7 @@ pub(crate) fn record_ci_failure_suppression_in_tx(conn: &Connection, work_item_i
         // A merge-queue rebounce uses `mq:<pr-head>` as its database
         // discriminator. Suppressions are keyed by real heads so both the
         // rebounce detector and ordinary CI paths can honour a human veto.
-        let head_sha = crate::ci_watch::merge_queue_rebounce_pr_head(&head_sha);
+        let head_sha = merge_queue_rebounce_pr_head(&head_sha);
         conn.execute(
             "INSERT OR REPLACE INTO ci_failure_suppressions
                  (work_item_id, head_sha, created_at)
