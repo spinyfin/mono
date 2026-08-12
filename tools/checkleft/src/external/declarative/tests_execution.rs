@@ -160,7 +160,10 @@ api_version = "v1"
 applies_to = ["**/*.rs"]
 
 [limits]
-timeout_ms = 3000
+# This test exercises output collection after a successful child exit, not
+# scheduler latency. Keep a generous deadline so a busy CI host cannot turn a
+# completed child into a false timeout before that behavior is observed.
+timeout_ms = 10000
 
 [needs.tool.default]
 path = "{}"

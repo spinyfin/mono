@@ -73,6 +73,13 @@ runtime: declarative-v1
 api_version: v1
 applies_to: ["**"]
 
+# Fix fixtures spawn short-lived shell processes while the full libtest shard
+# is highly concurrent. Their assertions cover sandbox behavior, so give them
+# enough scheduler headroom to avoid conflating host contention with a fixer
+# failure.
+limits:
+  timeout_ms: 30000
+
 needs:
   fixer:
     default:

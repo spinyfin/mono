@@ -222,6 +222,10 @@ _CHECKLEFT_LIB_TEST_ENV = {
     "CHECKLEFT_E2E_BUILDIFIER": "$(rlocationpath @buildifier_prebuilt//:buildifier)",
     "CHECKLEFT_E2E_RUSTFMT": "$(rlocationpath @rules_rust//tools/upstream_wrapper:rustfmt)",
     "CHECKLEFT_PRECOMPILED_CWASM_DIR": "$(rlocationpath :precompiled_cwasm)",
+    # These shards exercise process deadlines and writable sandboxes. Serial
+    # libtest execution keeps concurrent test cases from competing for the
+    # same short-lived subprocess resources.
+    "RUST_TEST_THREADS": "1",
 }
 
 rust_test(
