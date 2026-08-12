@@ -446,6 +446,30 @@ impl WorkerCompletionHandler {
         }
 
         let hold = intent.hold;
+        // A `Debounced` hold re-driven while the worker is mid-turn (e.g. a
+        // single long tool call such as `bazel test`) must not advance the
+        // ladder. `activity_watermark` only moves on PostToolUse, so it is
+        // frozen for the whole in-flight call — without this guard the
+        // retention path would treat that freeze as quiescence, advance the
+        // breaker on every sweep, and eventually park/terminalize a worker
+        // that is still genuinely working. Same signal the staged-PR reap
+        // path uses; returns false when no registry is wired, so unit tests
+        // that do not model live activity are unaffected.
+        if hold == NudgeHold::Debounced && self.observed_mid_turn(execution_id) {
+            tracing::debug!(
+                execution_id,
+                "auto-nudge: debounced nudge deferred another interval — worker is mid-turn \
+                 (in-flight tool); re-recording the intent rather than advancing the ladder",
+            );
+            self.background_children_tracker.record_intent(
+                execution_id,
+                BackgroundNudgeIntent {
+                    activity_watermark: current_watermark,
+                    ..intent
+                },
+            );
+            return Some(StopOutcome::NudgeDebounced);
+        }
         let replay = intent.clone();
         let outcome = self
             .nudge_or_park(
@@ -477,13 +501,14 @@ impl WorkerCompletionHandler {
         // subsequent pass can advance it, all the way to the breaker's own
         // terminal.
         //
-        // Bounded by the ladder, not by this retention: the breaker trips at
-        // `max_unproductive_nudges` on an unchanged fingerprint (and at
-        // `ABSOLUTE_MAX_NUDGES` regardless), and `NudgeBreakerParked` — which
-        // has already terminalized the execution and released its slot —
-        // ends the retention here. A live worker that genuinely resumes
-        // clears the record through its own Stop instead.
-        if hold == NudgeHold::Debounced && !matches!(outcome, StopOutcome::NudgeBreakerParked { .. }) {
+        // Gated on `nudge_queued_a_probe`, not merely "not parked":
+        // suppression outcomes (BackgroundChildrenPending, BuildWaitPending,
+        // …) may themselves have recorded a different hold tag, and
+        // re-writing `..replay` (which still carries `Debounced`) would
+        // clobber that tag. `NudgeDebounced` is already re-recorded by
+        // `nudge_or_park` itself. Only a probe that actually advanced the
+        // ladder needs the retention re-record.
+        if hold == NudgeHold::Debounced && Self::nudge_queued_a_probe(&outcome) {
             self.background_children_tracker.record_intent(
                 execution_id,
                 BackgroundNudgeIntent {
@@ -510,8 +535,8 @@ impl WorkerCompletionHandler {
                     fingerprint = %intent.fingerprint,
                     "auto-nudge: recurring sweep advanced a DEBOUNCED nudge ladder — the worker \
                      went quiet at a boundary whose decision was withheld for pacing, so no Stop \
-                     was ever going to advance it. The probe has been delivered directly to the \
-                     parked pane; the bounded nudge/park ladder now proceeds to its terminal.",
+                     was ever going to advance it. Out-of-band delivery to the pane has been \
+                     requested; the bounded nudge/park ladder now proceeds to its terminal.",
                 );
             }
         }

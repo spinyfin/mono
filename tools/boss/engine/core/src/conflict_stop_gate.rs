@@ -15,8 +15,8 @@
 //! true of a different copy and neither of both.
 //!
 //! The only guard on that Stop was the generic SHA-delta gate, whose
-//! nudge text (`probe_push_to_existing_pr`) literally offers the escape
-//! hatch the worker took: *"if there is nothing left to do, say so"*. For
+//! nudge text (`probe_push_to_existing_pr`) ends by offering the sanctioned
+//! `NO_CHANGES_NEEDED` terminal for a run with nothing left to push. For
 //! a conflict revision that is the wrong contract — "is there still a
 //! conflict" is objectively checkable and the engine already holds the
 //! bound PR URL, so it must check rather than take the worker's word.
@@ -178,12 +178,11 @@ fn non_empty_or(value: &str, fallback: &str) -> String {
 /// Probe text for a merge-conflict revision that stopped without pushing
 /// while GitHub still reports the PR conflicting.
 ///
-/// Deliberately does NOT offer the "or say there is nothing left to do"
-/// escape hatch that [`crate::completion::probe_push_to_existing_pr`]
-/// carries: for this execution kind the question is settled, and the
-/// answer is that there IS something left to do. It quotes the live
-/// GitHub values and names the one command whose output can contradict
-/// them.
+/// Deliberately does NOT offer the sanctioned `NO_CHANGES_NEEDED` terminal
+/// that [`crate::completion::probe_push_to_existing_pr`] ends with: for this
+/// execution kind the question is settled, and the answer is that there IS
+/// something left to do. It quotes the live GitHub values and names the one
+/// command whose output can contradict them.
 pub fn probe_conflict_still_present(pr_url: &str, raw_mergeable: &str, raw_merge_state_status: &str) -> String {
     format!(
         "GitHub still reports `mergeable: {raw_mergeable}` / `mergeStateStatus: \

@@ -323,6 +323,102 @@ async fn a_silent_worker_still_reaches_the_park_terminal_from_the_sweep_path() {
     );
 }
 
+/// A `Debounced` hold whose worker is mid-turn (one long in-flight tool)
+/// must never advance the ladder — even when the activity watermark is
+/// frozen.
+///
+/// `activity_watermark` only advances on PostToolUse, so a 20-minute
+/// `bazel test` looks quiescent to the watermark check. Without the
+/// mid-turn guard the retention path would re-drive the breaker on every
+/// sweep and park the execution (releasing lease + pane) while the tool is
+/// still running. Pinned against that counterfactual: many sweeps past the
+/// debounce window while `WorkerActivity::Working` must never nudge and
+/// must never reach `NudgeBreakerParked`.
+#[tokio::test]
+async fn debounced_hold_defers_while_worker_is_mid_turn_and_never_parks() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    let detector = StubPrDetector::ok(None);
+    let TestHarness {
+        handler, probes, cube, ..
+    } = TestHarness::new(db.clone(), detector);
+    // Watermark frozen for the whole in-flight tool call (no PostToolUse).
+    let probe = ToggleWatermarkProbe::new(0, Some("wm-frozen-during-tool"));
+    let clock = ManualClock::new();
+    let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+    live_states.register_spawn(7, &execution_id, "claude-opus-5", std::process::id() as i32, None);
+    live_states.apply_event(
+        7,
+        &boss_protocol::WorkerEvent::PreToolUse {
+            session_id: "s".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+        },
+    );
+    assert_eq!(
+        live_states.activity_for_run(&execution_id),
+        Some(boss_protocol::WorkerActivity::Working),
+        "fixture must model a mid-turn worker with a tool in flight",
+    );
+    let handler = handler
+        .with_background_activity_probe(probe)
+        .with_now_fn(clock.now_fn())
+        .with_live_worker_states(live_states);
+
+    assert!(matches!(
+        handler.on_stop(&execution_id).await,
+        StopOutcome::AwaitingInput
+    ));
+    assert!(matches!(
+        handler.on_stop(&execution_id).await,
+        StopOutcome::NudgeDebounced
+    ));
+    let probes_after_debounce = probes.snapshot().len();
+
+    // Sweep many times past the debounce window and past the breaker's
+    // park threshold. Mid-turn must hold every pass — never nudge, never park.
+    for _ in 0..(crate::nudge_breaker::ABSOLUTE_MAX_NUDGES + 2) {
+        clock.advance_past_debounce();
+        let outcome = handler.recheck_background_nudge(&execution_id).await;
+        assert!(
+            matches!(outcome, Some(StopOutcome::NudgeDebounced)),
+            "mid-turn must defer a debounced hold every sweep; got {outcome:?}",
+        );
+        assert!(
+            !matches!(outcome, Some(StopOutcome::NudgeBreakerParked { .. })),
+            "mid-turn must never reach the park terminal while a tool is in flight",
+        );
+    }
+
+    assert_eq!(
+        probes.snapshot().len(),
+        probes_after_debounce,
+        "a mid-turn worker must not be probed over an in-flight tool",
+    );
+    assert!(
+        probes.deliver_snapshot().is_empty(),
+        "no out-of-band delivery while mid-turn",
+    );
+    assert!(
+        handler.pending_background_nudge_execution_ids().contains(&execution_id),
+        "the debounced intent must stay tracked so the ladder can advance once the tool ends",
+    );
+    let execution = db.get_execution(&execution_id).unwrap();
+    assert!(
+        execution.status.is_live(),
+        "mid-turn must leave the execution live; got {}",
+        execution.status,
+    );
+    assert!(
+        execution.cube_lease_id.is_some(),
+        "mid-turn must not release the cube lease under a long tool call",
+    );
+    assert!(
+        cube.release_calls.lock().await.is_empty(),
+        "mid-turn must not tear down the lease/pane",
+    );
+}
+
 /// Counterfactual to the sweep re-drive: an execution that is genuinely
 /// still working must be left alone.
 ///

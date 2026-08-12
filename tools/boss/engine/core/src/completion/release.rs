@@ -304,16 +304,16 @@ impl WorkerCompletionHandler {
     /// GitHub-authoritative refusal gate for a merge-conflict revision that
     /// reached a Stop boundary without moving the bound PR's head.
     ///
-    /// The generic [`probe_push_to_existing_pr`] nudge ends with *"if there
-    /// is nothing left to do, say so"*. For a conflict revision that is the
-    /// wrong contract — whether a conflict remains is objectively checkable
-    /// and the engine already holds the bound PR URL, so it must check
-    /// rather than take the worker's word. (Incident 2026-07-23,
-    /// spinyfin/mono#2070: the worker declared the conflict "already
-    /// resolved and pushed in a prior attempt" off divergent local `jj`
-    /// state, having never queried `mergeable` at all; GitHub said
-    /// `CONFLICTING` / `DIRTY` throughout, and the run only recovered after
-    /// a manual message.)
+    /// The generic [`probe_push_to_existing_pr`] nudge ends by offering the
+    /// sanctioned `NO_CHANGES_NEEDED` terminal for a run with nothing left
+    /// to push. For a conflict revision that is the wrong contract — whether
+    /// a conflict remains is objectively checkable and the engine already
+    /// holds the bound PR URL, so it must check rather than take the
+    /// worker's word. (Incident 2026-07-23, spinyfin/mono#2070: the worker
+    /// declared the conflict "already resolved and pushed in a prior
+    /// attempt" off divergent local `jj` state, having never queried
+    /// `mergeable` at all; GitHub said `CONFLICTING` / `DIRTY` throughout,
+    /// and the run only recovered after a manual message.)
     ///
     /// Returns `Some((probe_text, fingerprint))` when the engine must refuse
     /// the "nothing left to do" reading, or `None` when the claim is
