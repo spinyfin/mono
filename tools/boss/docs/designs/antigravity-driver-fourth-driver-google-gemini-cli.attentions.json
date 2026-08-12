@@ -1,0 +1,34 @@
+[
+  {
+    "question_type": "yes_no",
+    "prompt": "No Antigravity ToS text was found either permitting or prohibiting programmatic driving of `agy`. The design reads that silence as an unaddressed gap rather than a granted permission. Do you want implementation to proceed before you make a ToS determination?",
+    "anchor": "risks--open-questions"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Given the measured token overhead (~10-25k per request, ~9.4k cached floor) against a weekly quota metered across all Antigravity surfaces, what is the intended end state for this driver?",
+    "choices": [
+      "Pinned-only, permanently — agy stays at a 0% traffic share and is reached only by explicit --driver agy",
+      "Pinned-only until the spend model proves a nonzero share is affordable, then raise it",
+      "Build toward a nonzero share regardless of the spend model's finding",
+      "Stop the project now if the spend model confirms the estimate"
+    ],
+    "anchor": "economics-model-this-before-the-crate-exists"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "If the pane viability spike finds that agy's hooks do NOT fire in interactive mode (they are only confirmed headless), what should happen? The pane must stay a TUI either way.",
+    "choices": [
+      "Stop the project — no hook boundary means no viable driver",
+      "Pursue transcript-file tailing as the boundary mechanism and re-cost the design",
+      "Pursue pane scraping as the boundary mechanism",
+      "Escalate back to you with the spike's findings before choosing"
+    ],
+    "anchor": "risks--open-questions"
+  },
+  {
+    "question_type": "prompt",
+    "prompt": "The acceptance gate is a state (agy registered, 0% share, pinned-only) rather than an end-of-phase checkpoint. What is N — how many pinned agy executions must reach merged PRs without engine-side incident before you would consider raising the share?",
+    "anchor": "the-acceptance-gate-a-state-not-a-checkpoint"
+  }
+]
