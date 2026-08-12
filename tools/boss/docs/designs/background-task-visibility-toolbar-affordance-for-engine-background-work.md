@@ -10,7 +10,7 @@ The load-bearing decision is that this badge is not a census of every async engi
 
 ## Verdict
 
-Ship an engine-owned global snapshot with two v1 sources: project-planner runs and conflict-remediation queue entries that are waiting for or executing the headless mechanical rungs. Hide each operation until it has run for 15 seconds, poll that snapshot every five seconds through the existing unified engine-attempt RPC, and render it in a new toolbar button adjacent to—not merged with—the app updater.
+Ship an engine-owned global snapshot with two v1 sources: project-planner runs older than 15 seconds and mechanical conflict rungs whose durable lease/phase marker matches the process-wide live ladder-lease snapshot. Poll every five seconds through the existing unified engine-attempt RPC, and render one toolbar button adjacent to—not merged with—the app updater.
 
 The planner’s stranded-`running` startup reaper must land first. Until that prerequisite is deployed, no background-work count may appear in chrome.
 
@@ -39,16 +39,16 @@ This study chose between candidate source populations and between polling and pu
 
 The audit started from durable source rows, every production `tokio::spawn`/loop in `tools/boss/engine/core`, the `ExecutionKind` set, worker-pool routing, existing protocol verbs, the Activity and kanban views, and toolbar composition. The important findings are below.
 
-| Claim                                    | Verified implementation                                                                                                                                   |
-| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Execution-backed work is already visible | `protocol/src/types/execution.rs`, `engine/core/src/pane_summary.rs`, and coordinator pool routing                                                        |
-| Planner persistence and publication      | `engine/core/src/work/planner_runs.rs`, `engine/core/src/populator.rs`, and `app-macos/Sources/PlannerAffordances.swift`                                  |
-| Conflict activity, phase, and recovery   | `engine/core/src/conflict_remediation.rs`, `engine/core/src/merge_poller/schedule.rs`, `engine/core/src/work/conflict_res.rs`, and startup reconciliation |
-| CI vehicle selection                     | `engine/core/src/ci_watch.rs` and `engine/core/src/completion/remediation.rs`                                                                             |
-| Poller topology and durable proxies      | `engine/core/src/merge_poller/schedule.rs`, `trunk_queue_poller.rs`, `github_api_usage.rs`, and `metrics/src/persistence.rs`                              |
-| Existing engine-attempt read paths       | `protocol/src/wire.rs`, `engine/core/src/work/blocking.rs`, and `app-macos/Sources/ChatViewModel+Attentions.swift`                                        |
-| Merge-queue card visibility              | `protocol/src/types/task.rs` and `app-macos/Sources/WorkCardBadges.swift`                                                                                 |
-| Toolbar ownership and polling precedent  | `app-macos/Sources/ContentView.swift`, `ContentViewChrome.swift`, and `UpdateCore/UpdateModel.swift`                                                      |
+| Claim                                    | Verified implementation                                                                                                      |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| Execution-backed work is already visible | `protocol/src/types/execution.rs`, `engine/core/src/pane_summary.rs`, and coordinator pool routing                           |
+| Planner persistence and publication      | `engine/core/src/work/planner_runs.rs`, `engine/core/src/populator.rs`, and `app-macos/Sources/PlannerAffordances.swift`     |
+| Conflict activity, phase, and recovery   | `engine/core/src/ladder_lease_registry.rs`, `conflict_remediation.rs`, `work/conflict_res.rs`, and startup reconciliation    |
+| CI vehicle selection                     | `engine/core/src/ci_watch.rs` and `engine/core/src/completion/remediation.rs`                                                |
+| Poller topology and durable proxies      | `engine/core/src/merge_poller/schedule.rs`, `trunk_queue_poller.rs`, `github_api_usage.rs`, and `metrics/src/persistence.rs` |
+| Existing engine-attempt read paths       | `protocol/src/wire.rs`, `engine/core/src/work/blocking.rs`, and `app-macos/Sources/ChatViewModel+Attentions.swift`           |
+| Merge-queue card visibility              | `protocol/src/types/task.rs` and `app-macos/Sources/WorkCardBadges.swift`                                                    |
+| Toolbar ownership and polling precedent  | `app-macos/Sources/ContentView.swift`, `ContentViewChrome.swift`, and `UpdateCore/UpdateModel.swift`                         |
 
 ### Existing visibility is the first exclusion
 
@@ -66,13 +66,17 @@ Planner timing gives a defensible anti-flicker boundary but not a measured media
 
 Design-doc fetching can make up to three `gh api` calls with two 500 ms backoffs. Its command runner has no timeout, so “normally under five seconds” is not a hard upper bound; nevertheless, it remains request-scoped cache work with no durable operation identity. A wedged fetch deserves a timeout fix, not a new badge source.
 
-### Conflict remediation has durable phase data but no reachable live source
+### Conflict remediation has a free candidate query and live refinement
 
 `conflict_resolutions.mechanical_rung_in_flight` is `1` for the engine-direct rebase, `0` for deterministic residual resolvers, and `NULL` otherwise. The attempt stamps its cube lease/workspace with the marker and clears all three unconditionally when the rung concludes. That row is durable and queryable, but `status IN ('pending', 'running')` also covers attempts waiting for retry or worker escalation; neither status nor a non-`NULL` marker proves that the current process still owns a queue task.
 
-The positive current-process signal lives in `ConflictRemediationQueue`, which is a local variable inside the merge poller’s spawned task. Its private slot map marks a PR `InFlight` before the task obtains one of two permits and later retains some completed entries for a 180-second retry cooldown. `ServerState`, RPC handlers, and the CLI cannot reach that map. The process-wide ladder lease registry is equally unreachable and begins only after a workspace has been leased, so it misses queued and pre-lease work. Exposing the operator’s conflict example therefore requires a new shared live-state handle in `ServerState` before the read surface can exist; a query over the durable table is not an adequate substitute.
+The existing `ListConflictResolutions` request accepts global `status` filters, so `pending` plus `running` is a zero-cost open-attempt baseline using the same rows Activity already consumes. It is not the badge count: an open attempt may be waiting on the two-permit semaphore, cooling down for retry, or about to dispatch a visible worker. Calling that population “work happening now” would give the badge the wrong meaning.
 
-This source is the strongest measured justification for the affordance. Mechanical runs have been observed at 1.5–8.75 minutes, concurrency is capped at two, and one earlier inline implementation produced 32 minutes with no merge-poller trace across seven consecutive ladder runs, delaying merge detection by 33 minutes. A conflict can now wait roughly one run per two entries ahead of it, so the live operation starts when the queue accepts it, not only when a workspace and rung marker appear.
+Two in-memory sources have different reachability. `ConflictRemediationQueue.slots` is trapped inside the merge-poller task and includes semaphore wait plus cooldown. In contrast, `ladder_lease_registry` is a process-wide static with a ready-made `snapshot()` of live `(lease_id, workspace_id)` pairs, callable from an RPC handler today. V1 therefore refines the open-attempt baseline by requiring a non-`NULL` mechanical rung marker whose durable lease/workspace pair is present in that snapshot. The result means “a headless mechanical rung currently holds a workspace in this process,” not “an attempt is open” and not “a remediation is waiting for capacity.”
+
+This source is the strongest measured justification for the affordance. Mechanical runs have been observed at 1.5–8.75 minutes, concurrency is capped at two, and one earlier inline implementation produced 32 minutes with no merge-poller trace across seven consecutive ladder runs, delaying merge detection by 33 minutes. A conflict can now wait roughly one run per two entries ahead of it; that backlog explains why the open-attempt count can exceed the working count, while the badge appears only after an entry obtains a workspace.
+
+That last queue wait is deliberately not counted in v1. It is invisible, but surfacing it would require plumbing `ConflictRemediationQueue.slots`; the existing lease snapshot is sufficient for the chosen “actually working” semantic. Activity can still show the broader open-attempt baseline, so the two counts are allowed to differ on the explicitly named dimension of current workspace activity.
 
 The deterministic-resolver crate does not start another task or maintain an activity registry: its resolver registry visits conflicted files sequentially and logs each result. Rung 0 is therefore a phase of the enclosing remediation entry, not a separately counted operation. The ladder lease heartbeat likewise belongs to that same entry and must not be rendered separately.
 
@@ -84,7 +88,7 @@ CI remediation is not headless once it becomes long-running. A fix attempt spawn
 
 The parent card also carries CI failure state, and Activity already lists the durable remediation attempt. `ci_remediations` and `ci_inflight_observations` are already RPC-exposed; a new badge projection would duplicate those surfaces before dispatch and the Agents pane after dispatch.
 
-`ci_inflight_observations.alert_level_emitted` is useful phase data for a PR that has remained in flight, but it records observed CI state rather than a finite engine operation. `BuildWaitTracker` likewise describes a visible worker execution. It retains `waited_secs` against a 45-minute horizon in memory and logs both values, but its execution-status publication carries only `reason = "worker_build_wait_pending"`; no percentage is published. Both are precedents for engine-owned phase reporting, not toolbar sources.
+`ci_inflight_observations.alert_level_emitted` is useful phase data for a PR that has remained in flight, but it records observed CI state rather than a finite engine operation. `build_wait` is a Stop-message classifier, not a sweep, and `BuildWaitTracker` is an in-memory timer owned by the completion handler; neither has durable state of its own. The tracker describes a visible worker execution, retains `waited_secs` against a 45-minute horizon, and logs both values, but its execution-status publication carries only `reason = "worker_build_wait_pending"`; no percentage is published. These are precedents for engine-owned phase reporting, not toolbar sources.
 
 ### Poller activity is service health, not finite work
 
@@ -111,6 +115,8 @@ Putting the same position in this popover would duplicate a more contextual surf
 ### Other background code is not eligible
 
 - Resident loops—merge polling, schedulers, heartbeats, backups, PR-review recovery, external-tracker reconciliation, metrics flushes, monitoring, and socket servers—are engine services rather than finite operations. Including them would pin the badge on for the lifetime of the engine. The Trunk observer and `ci_watch` are not additional loops, while PR-review recovery runs every 60 seconds and external-tracker reconciliation every 120 seconds; topology and cadence do not turn any of them into a finite user operation.
+- `envelope_watch` is a 60-second resident sweep over `work_executions` plus live worker state. Its durable output is an attention item for an over-envelope visible worker, which is correctly a human-attention concern; counting the sweep or the worker here would duplicate existing surfaces.
+- `build_wait` and `BuildWaitTracker` do not spawn a sweep loop. They classify a visible worker’s Stop narration and retain only an in-memory first-seen timestamp, reset on engine restart.
 - There is no GitHub PR-comment poller to include. The only `issues/{number}/comments` request is the Trunk bot probe; the PR-review crate parses and renders review material but does not run a comment-polling service.
 - Comment-intent `NULL` means no classification result, not proof that classification code is executing. Absence is never a live marker.
 - Short request handlers, cache fills, attachment serving, GitHub authentication, and design-doc fetches do not satisfy the duration and operation-identity tests.
@@ -130,13 +136,17 @@ The shared rule is reusable: attention items are for decisions about work or eng
 
 Rejected because it fails both stable meaning and existing practice. Resident services would keep the badge permanently nonzero, while fast request tasks would flicker; worker-backed activity would duplicate the Agents tab. The checkable counterexample is the engine’s pollers and schedulers: they are intentionally long-lived and healthy precisely when they never finish.
 
+### Count open conflict attempts or plumb the queue
+
+Neither option matches v1’s “actually working” semantic. The existing global `ListConflictResolutions(status: [pending, running])` request cheaply returns open attempts, but those rows include semaphore wait, retry states, and paths about to become visible workers. Promoting `ConflictRemediationQueue.slots` into shared state could distinguish queued work, but it adds plumbing solely to broaden the badge beyond active mechanical rungs. Intersecting the durable candidates with the already-readable ladder lease snapshot is both cheaper and more exact for v1.
+
 ### Let the app union source tables and apply its own threshold
 
 Rejected because inclusion would become client policy. The app would need to know feature flags, distinguish conflict rungs from revision workers, infer stale planner rows, and keep threshold logic aligned with engine changes. This also creates the third read path the current Activity hand-union and unused `ListEngineAttempts` verb warn against.
 
 ### Publish a new start event and make the badge event-only
 
-Not chosen for v1. A start event improves latency, but events are not a restart snapshot and the planner has no start publication today; the app would still need a query on connection or after dropped events. A five-second local poll over a tiny indexed set is sufficient for a feature intentionally delayed by 15 seconds, and it exposes the smallest correctness surface.
+Not chosen for v1. A start event improves latency, but events are not a restart snapshot and the planner has no start publication today; the app would still need a query on connection or after dropped events. A five-second local poll over a tiny indexed set is sufficient for a planner intentionally delayed by 15 seconds and for mechanical rungs measured in minutes, and it exposes the smallest correctness surface.
 
 ### Store background jobs as attention items
 
@@ -160,26 +170,26 @@ An item appears if and only if the engine can establish all of these properties:
 
 1. It is a finite operation with a stable identity and positive running marker.
 2. It has no live `work_executions` row and no existing global live surface.
-3. It is still accepted by a live operation owner in the current engine process; waiting on that owner’s bounded concurrency counts, completed cooldown does not.
-4. Its actual operation start—planner row creation or conflict queue admission, not an enclosing attempt’s creation—was at least 15 seconds ago.
+3. The current engine process can attest that work is happening now; an open attempt or wait for bounded capacity is insufficient.
+4. It has crossed its source-specific anti-flicker gate: a planner row is at least 15 seconds old, while a mechanical conflict item has both a durable rung marker and a matching live workspace lease.
 5. Its marker has a defined normal-completion clear and restart recovery path.
 
-The 15-second threshold is an engine constant. It sits below the unmeasured 30-second low end of the planner estimate, and far below the observed 1.5-minute low end of a mechanical run, while suppressing short request work; the precise number is a policy choice, not a claim of measured planner latency. Planner `created_at` and the conflict registry’s queue-admission time let a later change be evidence-driven without moving policy into Swift.
+The planner’s 15-second threshold is an engine constant. It sits below the unmeasured 30-second low end of the planner estimate while suppressing common short cases; the precise number is a policy choice, not a claim of measured planner latency. The conflict source needs no new timestamp or duration gate: acquiring a real workspace plus stamping a mechanical rung is its structural admission gate, and the observed rung range is 1.5–8.75 minutes. Polling still suppresses attempts that acquire and release between five-second snapshots.
 
-No separate frequency debounce is needed for the selected population. At most one live planner row exists per project, and conflict remediation deduplicates per PR; entries retained only for the queue’s retry cooldown are explicitly excluded. The threshold removes common fast cases, while the five-second polling cadence bounds both appearance latency and a just-completed item’s remaining display time. The engine does not retain a completed item merely to satisfy a minimum dwell, because “running” must remain truthful.
+No separate frequency debounce is needed for the selected population. At most one live planner row exists per project, conflict remediation deduplicates per PR, and semaphore-wait/cooldown entries lack a live lease and are excluded. The planner threshold removes its common fast cases, while the five-second polling cadence bounds both appearance latency and a just-completed item’s remaining display time. The engine does not retain a completed item merely to satisfy a minimum dwell, because “running” must remain truthful.
 
 ### Source projection and crash behavior
 
-| Source               | Positive live evidence                                                                                       | Phase shown                                                                                                            | Normal clear                                    | Engine death / restart                                                                                                                                   |
-| -------------------- | ------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Project planner      | `planner_runs.outcome = 'running'`                                                                           | `Planning <project>`; elapsed time from `created_at`                                                                   | Every normal result updates the outcome         | Startup transaction marks every inherited `running` row `planner_failed` with an explicit restart summary before clients or the populator can observe it |
-| Conflict remediation | Shared queue activity is `queued` or `running`; durable conflict row supplies attempt/work-item/rung context | `Waiting to remediate`, `Preparing rebase`, `Rebasing`, or `Applying deterministic resolution`; elapsed from admission | Queue guard removes or cools down the live slot | Process-local activity vanishes immediately; startup conflict reconciliation abandons the durable attempt, and lease startup recovery releases workspace |
+| Source                   | Positive live evidence                                                                                                                 | Phase shown                                                                       | Normal clear                                        | Engine death / restart                                                                                                                                   |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- | --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Project planner          | `planner_runs.outcome = 'running'` and `created_at` is at least 15 seconds old                                                         | `Planning <project>`; elapsed time from `created_at`                              | Every normal result updates the outcome             | Startup transaction marks every inherited `running` row `planner_failed` with an explicit restart summary before clients or the populator can observe it |
+| Mechanical conflict rung | Open conflict row with non-`NULL` rung/lease/workspace, and the lease/workspace pair is present in `ladder_lease_registry::snapshot()` | `Rebasing <work item>` for rung 1; `Applying deterministic resolution` for rung 0 | Row clears its marker; live registry unregisters it | Process-local snapshot is empty immediately; startup conflict reconciliation abandons the durable attempt, and ladder lease reap releases the workspace  |
 
 The planner reaper needs no heartbeat or stale-age guess. Planner tasks are process-local and cannot survive an engine restart, so every `running` row inherited at startup is definitively stranded. The sweep must execute before socket serving, pollers, and populator installation; it must leave `staged`, `applied`, and terminal failures untouched and free the project’s unique live-run slot for a retry.
 
-Conflict remediation duration cannot be measured from `conflict_resolutions.created_at`, because an attempt may exist before queue admission and then wait on the semaphore before obtaining a workspace. Promote the queue's existing private slot map into a typed `ConflictRemediationActivityRegistry` owned by `ServerState`, and inject the same registry into the merge poller; do not maintain a second activity map. Queue admission records stable attempt identity, context, wall-clock `started_at`, and state `queued`; permit acquisition changes the same slot to `running`; the guard changes or removes it on every exit. The registry may retain `CompletedAt` for the existing retry cooldown, but its live read method must return only `queued` and `running` entries.
+Conflict remediation duration cannot be measured from `conflict_resolutions.created_at`, because an attempt may wait before obtaining a workspace, and the live lease registry does not record acquisition time. V1 does not fabricate elapsed time or add tracking to fill that gap. It reuses the global `pending`/`running` conflict query as a candidate set, then intersects rows carrying a mechanical marker with `ladder_lease_registry::snapshot()` on both lease id and workspace id. The live snapshot is authoritative only for current-process lease ownership; the row is authoritative only for durable attempt/work-item identity and rung `0`/`1` phase.
 
-The read path joins registry entries to durable conflict rows. The live registry is authoritative only for current-process ownership and elapsed time; the row is authoritative only for durable attempt/work-item identity, lease context, and rung `0`/`1` phase once stamped. During the gap between permit acquisition and a rung stamp, the engine reports `Preparing rebase`. A durable row without registry activity is never shown, and registry removal makes completion disappear even if a marker-clear write fails. On restart the empty registry prevents a stale badge immediately, while existing conflict reconciliation and lease recovery still clean the durable attempt and workspace so the operation can retry safely.
+The stamp currently precedes live registration, and normal cleanup clears the stamp before unregistering the lease. Requiring both signals suppresses those boundary windows: a durable row without a matching snapshot is never shown, and unregistering makes completion disappear even if marker cleanup fails. On restart the empty snapshot prevents a stale badge immediately, while existing conflict reconciliation and ladder lease reap still clean the durable attempt and workspace so the operation can retry safely.
 
 ### Engine-owned read model
 
@@ -190,9 +200,9 @@ Add a typed `BackgroundWorkItem` protocol projection with only fields the minima
 - `source_id` for reconciliation with the source model;
 - `product_id`, plus optional `project_id` or `work_item_id` context;
 - engine-authored `title` and `phase`;
-- `started_at`.
+- optional `started_at`; planners provide it, while mechanical rungs omit it because neither existing source records lease-acquisition time.
 
-The response contains only currently live, threshold-qualified items, ordered oldest first for stable display. Its `visible_count` must equal the number of items; the app uses that value verbatim for the badge and must not filter or re-count by kind. Conflict rows in `pending` or `running` state without a registry entry are excluded, as are registry cooldown slots without a live task.
+The response contains only source-qualified items in a stable engine order: known starts oldest first, then items without a start ordered by source id. Its `visible_count` must equal the number of items; the app uses that value verbatim for the badge and must not filter or re-count by kind. The engine reuses the query behind `ListConflictResolutions(status: [pending, running])` for candidates, then excludes every row without a mechanical marker and matching live lease/workspace snapshot. Open, queued, cooldown, and worker-bound attempts therefore remain outside the badge.
 
 Extend `ListEngineAttempts` rather than adding `ListBackgroundWork`. The request gains an `include_background_work` flag defaulting false, and `EngineAttemptsList` gains a backward-compatible `background_work` snapshot defaulting empty. `limit = 0` is the background-only polling form, so the app does not refetch history every five seconds.
 
@@ -218,7 +228,7 @@ Clicking opens one read-only popover. Each row contains only:
 
 - the engine-authored title;
 - project or work-item context when present;
-- phase and elapsed time.
+- phase, plus elapsed time only when the engine supplies an actual operation start.
 
 There are no buttons, navigation, history, success rows, failure rows, charts, or controls. If the final item completes while the popover is open, dismiss the popover when the next snapshot makes the toolbar button disappear rather than showing an empty state.
 
@@ -227,22 +237,22 @@ There are no buttons, navigation, history, success rows, failure rows, charts, o
 The implementation is complete only when the genuine boundaries are exercised:
 
 - A startup test seeds a real `running` planner row, starts the engine’s actual startup sequence, and proves the row becomes terminal before the list RPC can return it.
-- Engine RPC tests drive planner rows and conflict registry entries on both sides of 15 seconds, confirm execution-backed CI/conflict rows never appear, and prove the count equals the returned list.
-- Queue/registry tests cover waiting behind the two-permit bound, transition to a mechanical rung, cooldown exclusion, every guard exit, and process-local reset. A restart test proves a durable mechanical marker and lease cannot survive into a visible snapshot.
+- Engine RPC tests drive planner rows on both sides of 15 seconds, then cover open conflict rows with no marker, a marker with no live lease, mismatched lease/workspace pairs, matching rung-0/rung-1 pairs, and worker-bound attempts. They prove the count equals the returned list and that execution-backed CI/conflict rows never appear.
+- A real startup test proves the process-local ladder lease snapshot is empty and a durable mechanical marker cannot enter the visible response while conflict reconciliation and lease reap clean up the orphan.
 - Swift model tests decode the unified response, replace snapshots atomically, clear on disconnect, and prove Activity no longer sends the two legacy list requests.
 - UI tests cover zero, one, multiple, and completion-while-open states. The toolbar PR captures the real isolated Boss UI for reviewer evidence rather than relying only on a hand-built SwiftUI preview.
 
 ## Risks / open questions
 
-- **The 15-second threshold is calibrated from bounds and an estimate, not production measurements.** It is intentionally engine-owned and easy to change. If planner duration data shows many valid runs finish below it, lower the constant in the engine and update the contract test in the same change.
+- **The planner’s 15-second threshold is calibrated from bounds and an estimate, not production measurements.** It is intentionally engine-owned and easy to change. If planner duration data shows many valid runs finish below it, lower the constant in the engine and update the contract test in the same change.
 - **Migrating Activity to the unified list adds detail-on-demand behavior.** Selection must remain stable while the detail RPC returns, and a failed detail fetch must leave the common row visible with a local error rather than blanking the Activity list.
-- **Conflict visibility depends on two signals with deliberately limited equivalence.** The promoted queue registry and durable row refer to the same remediation attempt, but they are equivalent only on identity: the registry owns current-process liveness and elapsed time, while the row owns durable context and rung phase. Tests must cover admission/stamp and unregister/clear ordering so neither transient boundary becomes a sticky false positive. A second activity map would create the disagreement this design is intended to eliminate.
+- **Conflict visibility depends on two signals with deliberately limited equivalence.** The durable row and process-wide lease snapshot are equivalent only on lease/workspace identity: the snapshot owns current-process lease liveness, while the row owns attempt context and rung phase. Neither supplies lease age, so the UI must omit conflict elapsed time rather than relabel attempt age. The intersection intentionally undercounts open attempts waiting on the semaphore; that is the chosen “actually working” semantic, not data loss.
 - **Polling is intentionally simple but not free.** The query is local and tiny, and five seconds is slower than the eligibility threshold. If source count grows substantially, the replacement should be snapshot-on-connect plus invalidation events, not faster polling or app-side caches.
 - **A hung design-doc fetch remains possible because `gh_output` has no timeout.** That is a real reliability gap, but it is neither durable nor the finite operation this badge represents. Fix it at the command timeout boundary in separate reliability work rather than broadening this feature.
 
 ## Proposed implementation task breakdown
 
-Breakdown size: 9 entries (8 in-scope, 1 deferred) — the change has a planner-recovery seam, a distinct conflict queue-to-`ServerState` live-state seam, one engine/protocol contract with a thin CLI caller, and four ordered macOS seams needed to retire the old hand-union, poll safely, reconcile the planner indicator, and render the toolbar.
+Breakdown size: 8 entries (7 in-scope, 1 deferred) — the change has one planner-recovery seam, one engine/protocol contract that reuses the existing conflict query and lease snapshot, a thin CLI caller, and four ordered macOS seams needed to retire the old hand-union, poll safely, reconcile the planner indicator, and render the toolbar.
 
 ### Reap stranded planner runs during engine startup
 
@@ -254,11 +264,11 @@ Dependencies: none
 
 Scope: in-scope
 
-Parallelism: First engine prerequisite. The following conflict-state task is ordered after it because both substantially edit engine construction/startup surfaces; it must forward-port this reaper’s ordering preservingly.
+Parallelism: First correctness prerequisite. The unified read-surface task is ordered after it so no count can reach clients before startup recovery is authoritative.
 
-### Publish conflict-remediation activity through ServerState
+### Extend the unified engine-attempt RPC with live background work
 
-Replace `ConflictRemediationQueue`'s private slot map with a typed, process-local activity registry owned by `ServerState`, and pass that same registry into the merge poller queue. Record attempt/work-item identity and queue-admission time; transition the shared slot across queued, running, and cooldown states while exposing only queued/running entries to readers. Preserve existing deduplication and cooldown semantics, and cover the two-permit bound, cancellation/panic cleanup, and process restart/reset. This task creates no RPC, no parallel activity map, and does not treat the durable conflict row as proof of liveness.
+Add the typed `BackgroundWorkItem` projection and extend `ListEngineAttempts`/`EngineAttemptsList` with the opt-in background snapshot. Implement the new global running-planner query and 15-second filter; reuse the global `pending`/`running` conflict query as candidates and intersect mechanical rows with `ladder_lease_registry::snapshot()` on lease plus workspace. Add rung phase mapping, an optional wire start time populated only for planners, stable ordering, the count invariant, `limit = 0` background-only behavior, and engine/socket integration tests. Do not plumb `ConflictRemediationQueue.slots`; open attempts without a matching live lease, merge-queue state, worker-backed attempts, and resident loops must stay hidden.
 
 Effort: large
 
@@ -266,19 +276,7 @@ Dependencies: Reap stranded planner runs during engine startup
 
 Scope: in-scope
 
-Parallelism: Ordered after the planner reaper because both substantially touch `app.rs`/`app/server.rs`; forward-port the reaper and do not disturb its pre-serving position.
-
-### Extend the unified engine-attempt RPC with live background work
-
-Add the typed `BackgroundWorkItem` projection and extend `ListEngineAttempts`/`EngineAttemptsList` with the opt-in background snapshot. Implement the new global running-planner query, the 15-second engine filter, conflict registry-to-durable-row join, queued/preparing/rung phase mapping, stable ordering, count invariant, `limit = 0` background-only behavior, and engine/socket integration tests. Durable conflict rows without live registry entries and cooldown-only slots must stay hidden; this task must not expose CI remediation, merge queue state, worker-backed attempts, or resident loops.
-
-Effort: large
-
-Dependencies: Reap stranded planner runs during engine startup; Publish conflict-remediation activity through ServerState
-
-Scope: in-scope
-
-Parallelism: Begins only after both source-correctness prerequisites land.
+Parallelism: Begins after planner recovery lands. The CLI and macOS adoption tasks may then proceed in parallel against this contract.
 
 ### Expose the unified snapshot through the existing engine-attempt CLI
 
@@ -330,7 +328,7 @@ Parallelism: Ordered after polling because it consumes that snapshot and is like
 
 ### Add the adjacent toolbar badge and minimal reveal popover
 
-Add the conditional primary-action toolbar button beside the updater, capped count badge, accessibility text, and read-only row popover. Cover zero/one/many states, disabled mechanical feature flags, elapsed-time rendering, automatic dismissal after the last completion, and isolated-app screenshot evidence; add no actions, history, empty state, or dashboard elements.
+Add the conditional primary-action toolbar button beside the updater, capped count badge, accessibility text, and read-only row popover. Cover zero/one/many states, disabled mechanical feature flags, planner elapsed-time rendering, omission of fabricated conflict elapsed time, automatic dismissal after the last completion, and isolated-app screenshot evidence; add no actions, history, empty state, or dashboard elements.
 
 Effort: medium
 
