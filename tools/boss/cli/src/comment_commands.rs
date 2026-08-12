@@ -42,6 +42,7 @@ pub(crate) enum CommentCommand {
 pub(crate) struct KindCommentArgs {
     /// Task/chore id. Accepts primary id (`task_…`), friendly short id
     /// (`#42` / bare number), or cross-product form (`boss/42`).
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) id: String,
     /// Resolve a friendly short id against this product (slug or id).
     #[arg(long)]
@@ -76,7 +77,7 @@ pub(crate) struct CommentCreateArgs {
     /// shorthand for `--artifact-kind work_item --artifact <id>`.
     /// Accepts primary / friendly short ids (with `--product` for the
     /// latter).
-    #[arg(long)]
+    #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) task: Option<String>,
     /// Raw artifact id. Pairs with `--artifact-kind`.
     #[arg(long)]
@@ -115,7 +116,7 @@ pub(crate) struct CommentCreateArgs {
 pub(crate) struct CommentListArgs {
     /// Work item (task/chore) id whose comments to list — shorthand
     /// for `--artifact-kind work_item --artifact <id>`.
-    #[arg(long)]
+    #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) task: Option<String>,
     /// Raw artifact id (e.g. a `pr_doc:<owner>/<repo>:<branch>:<path>`
     /// composite key — an SSH or HTTPS remote URL also works for

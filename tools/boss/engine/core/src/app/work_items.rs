@@ -122,12 +122,12 @@ pub(super) async fn handle_get_work_item(ctx: Dispatch, req: FrontendRequest) {
         unreachable!()
     };
     {
-        // Use resolving variant so callers can pass T-form short ids
-        // (e.g. `T688`) without knowing the product; the DB lookup is
-        // global and short ids are unique across all products.
+        // Shared choke point: bare long ids, T/P/#/bare short ids, and
+        // product-scoped slug/n. Short ids are per-product (not globally
+        // unique) — ambiguity is a hard error listing every candidate.
         let result = work_db
-            .get_work_item_resolving_short_id(&id)
-            .and_then(|opt| opt.ok_or_else(|| anyhow::anyhow!("unknown work item: {id}")));
+            .resolve_work_item_ref(&id)
+            .and_then(|primary| work_db.get_work_item(&primary).map_err(|err| anyhow::anyhow!("{err}")));
         match result {
             Ok(item) => {
                 send_response_with_revision(

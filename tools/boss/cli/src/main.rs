@@ -99,6 +99,7 @@ mod comment_commands;
 mod cost_cmds;
 mod data;
 mod decision_commands;
+mod dependency_filter_args;
 mod engine_cmds;
 mod output;
 mod status_args;
@@ -110,6 +111,7 @@ pub(crate) use commands::*;
 pub(crate) use comment_commands::*;
 pub(crate) use data::*;
 pub(crate) use decision_commands::*;
+pub(crate) use dependency_filter_args::*;
 pub(crate) use engine_cmds::*;
 pub(crate) use output::*;
 pub(crate) use status_args::*;
@@ -120,6 +122,8 @@ pub(crate) use work_cmds::*;
 mod set_doc_parse_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod work_item_id_surface_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OutputMode {

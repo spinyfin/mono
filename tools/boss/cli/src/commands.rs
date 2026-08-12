@@ -627,11 +627,13 @@ pub(crate) struct PrStatusArgs {
 #[derive(Debug, Clone, Args)]
 pub(crate) struct TaskExecutionsArgs {
     /// Work item id whose execution history to list (task/chore/project
-    /// id, or a friendly short id like `T42` resolved against `--product`).
+    /// id, or a friendly short id like `T42`). Globally unique short ids
+    /// resolve without `--product`.
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) id: String,
     /// Product slug/id used to resolve a friendly short id (`T42`).
     /// Optional when `id` is already a canonical `task_…` id, or when
-    /// the product can be inferred from the working tree.
+    /// the short id is globally unique.
     #[arg(long)]
     pub(crate) product: Option<String>,
 }
@@ -654,8 +656,10 @@ pub(crate) enum DependCommand {
 #[derive(Debug, Clone, Args)]
 pub(crate) struct DependAddArgs {
     /// Id of the work item that becomes gated.
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) dependent: String,
     /// Id of the work item that gates it.
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) prerequisite: String,
     /// Edge type. Only `blocks` is supported in v1.
     #[arg(long, default_value = "blocks")]
@@ -670,7 +674,9 @@ pub(crate) struct DependAddArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct DependRmArgs {
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) dependent: String,
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) prerequisite: String,
     #[arg(long, default_value = "blocks")]
     pub(crate) relation: String,
@@ -685,6 +691,7 @@ pub(crate) struct DependRmArgs {
 #[derive(Debug, Clone, Args)]
 pub(crate) struct DependListArgs {
     /// Id of the work item to inspect.
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) selector: String,
     /// Which side(s) of the edge to return. Defaults to `both`.
     #[arg(long, value_enum, default_value_t = DependDirectionArg::Both)]
@@ -783,7 +790,7 @@ pub(crate) struct DecisionCreateArgs {
     #[arg(long)]
     pub(crate) keywords: Option<String>,
     /// Optional work-item id (`task_…` / `T<n>`) that motivated the decision.
-    #[arg(long)]
+    #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) related_work_item: Option<String>,
     /// Who is recording the decision. Defaults to `user:$USER` (or
     /// `user:cli` when `$USER` is unset).
@@ -906,10 +913,10 @@ pub(crate) struct AttentionListArgs {
     #[arg(long)]
     pub(crate) product: Option<String>,
     /// Filter to groups associated with this project (`P<n>` or `proj_…`).
-    #[arg(long)]
+    #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) project: Option<String>,
     /// Filter to groups associated with this task (`T<n>` or `task_…`).
-    #[arg(long)]
+    #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) task: Option<String>,
     /// Filter by kind: `question` or `followup`.
     #[arg(long)]
@@ -942,11 +949,11 @@ pub(crate) struct AttentionCreateArgs {
     pub(crate) kind: String,
     /// Associated project (`P<n>` or `proj_…`). Exactly one of
     /// `--project` / `--task` is required.
-    #[arg(long)]
+    #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) project: Option<String>,
     /// Associated task (`T<n>` or `task_…`). Exactly one of
     /// `--project` / `--task` is required.
-    #[arg(long)]
+    #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) task: Option<String>,
     /// Join an existing open group (`A<n>` or `atg_…`) rather than letting
     /// the engine derive the group from the association and source fields.
@@ -1414,8 +1421,8 @@ pub(crate) struct EngineCiListArgs {
     /// superseded.
     #[arg(long, value_delimiter = ',')]
     pub(crate) status: Vec<String>,
-    /// Filter to a single parent work item id.
-    #[arg(long = "work-item")]
+    /// Filter to a single parent work item id (primary or friendly short id).
+    #[arg(long = "work-item", value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) work_item: Option<String>,
     /// Cap the number of returned rows. Engine returns every match
     /// when omitted; the CLI default is 50 to keep human output
@@ -1450,14 +1457,16 @@ pub(crate) struct EngineCiAbandonArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct EngineCiBudgetShowArgs {
-    /// Work item id (`chr_…` / `tsk_…`). Friendly numeric / short ids
-    /// are not resolved at the CLI level — pass the canonical id.
+    /// Work item id. Accepts primary id or friendly short id (shared
+    /// resolver; globally unique short ids need no product scope).
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) work_item_id: String,
 }
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct EngineCiBudgetSetArgs {
-    /// Work item id.
+    /// Work item id. Accepts primary id or friendly short id.
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) work_item_id: String,
     /// New per-PR override. Clamped server-side to `0..=10`.
     /// `--budget 0` means "notify only" (no auto-fix attempts).
@@ -1482,8 +1491,8 @@ pub(crate) struct EngineAttemptsListArgs {
     /// kind against each table's own `status` column.
     #[arg(long, value_delimiter = ',')]
     pub(crate) status: Vec<String>,
-    /// Filter to a single parent work item id.
-    #[arg(long = "work-item")]
+    /// Filter to a single parent work item id (primary or friendly short id).
+    #[arg(long = "work-item", value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) work_item: Option<String>,
     /// Cap the number of returned rows. Defaults to 50; pass
     /// `--limit 0` for no cap.
@@ -1604,8 +1613,8 @@ pub(crate) struct EngineConflictsListArgs {
     #[arg(long, value_delimiter = ',')]
     pub(crate) status: Vec<String>,
 
-    /// Filter to a single parent work item id.
-    #[arg(long = "work-item")]
+    /// Filter to a single parent work item id (primary or friendly short id).
+    #[arg(long = "work-item", value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) work_item: Option<String>,
 
     /// Cap the number of returned rows. Engine returns every match
@@ -1816,6 +1825,7 @@ pub(crate) struct ProjectSelectorArgs {
     #[arg(long)]
     pub(crate) product: Option<String>,
 
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) selector: String,
 }
 
@@ -1824,6 +1834,7 @@ pub(crate) struct ProjectPlanArgs {
     #[arg(long)]
     pub(crate) product: Option<String>,
 
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) selector: String,
 
     /// Bypass the refusal when the project already has implementation
@@ -1850,6 +1861,7 @@ pub(crate) struct ProjectUnpopulateArgs {
     #[arg(long)]
     pub(crate) product: Option<String>,
 
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) selector: String,
 
     /// The `planner_runs.id` (`run_…`) to undo. Find it with
@@ -2030,6 +2042,7 @@ pub(crate) struct ProjectShowArgs {
     pub(crate) with_primary_id: bool,
 
     /// Project id, short id (#42 or 42), or slug.
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) selector: String,
 }
 
@@ -2038,6 +2051,7 @@ pub(crate) struct ProjectUpdateArgs {
     #[arg(long)]
     pub(crate) product: Option<String>,
 
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) selector: String,
 
     #[arg(long)]
@@ -2065,6 +2079,7 @@ pub(crate) struct ProjectSetDesignDocArgs {
     #[arg(long)]
     pub(crate) product: Option<String>,
 
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) selector: String,
 
     /// Repo-relative path to the design doc (e.g.
@@ -2099,6 +2114,7 @@ pub(crate) struct ProjectOpenDesignArgs {
     #[arg(long)]
     pub(crate) product: Option<String>,
 
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) selector: String,
 
     /// Skip the same-product / workspace fast path and always emit
@@ -2149,7 +2165,7 @@ pub(crate) struct TaskCreateArgs {
     #[arg(long)]
     pub(crate) product: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) project: Option<String>,
 
     #[arg(long)]
@@ -2229,7 +2245,11 @@ pub(crate) struct TaskCreateArgs {
     /// until every prerequisite is satisfied. Unlike a follow-up `task
     /// depend add`, this leaves no window where the task could autostart
     /// before its gate exists.
-    #[arg(long = "depends-on", value_delimiter = ',')]
+    #[arg(
+        long = "depends-on",
+        value_delimiter = ',',
+        value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME
+    )]
     pub(crate) depends_on: Vec<String>,
 
     /// File this task as deferred / future scope: created and visible in
@@ -2289,7 +2309,7 @@ pub(crate) struct TaskListArgs {
     #[arg(long)]
     pub(crate) product: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) project: Option<String>,
 
     /// Also display the primary id alongside the friendly id.
@@ -2451,7 +2471,11 @@ pub(crate) struct ChoreCreateArgs {
     /// description — the chore is created `blocked` and never dispatches
     /// until every prerequisite is satisfied, closing the
     /// create→`depend add` race.
-    #[arg(long = "depends-on", value_delimiter = ',')]
+    #[arg(
+        long = "depends-on",
+        value_delimiter = ',',
+        value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME
+    )]
     pub(crate) depends_on: Vec<String>,
 
     /// File this chore as deferred / future scope. See
@@ -2473,7 +2497,7 @@ pub(crate) struct InvestigationCreateArgs {
 
     /// Optional project scope. Investigation appears under the project
     /// on the kanban when set.
-    #[arg(long)]
+    #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) project: Option<String>,
 
     #[arg(long)]
@@ -2532,7 +2556,7 @@ pub(crate) struct RevisionCreateArgs {
     /// `T<n>` short ids (e.g. `T651`) or full `task_<hex>` ids.
     /// May itself be a revision task; the gate is evaluated against
     /// the chain root's PR.
-    #[arg(long)]
+    #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) parent: String,
 
     /// The operator's verbatim ask. Stored as the task description and
@@ -2571,12 +2595,18 @@ pub(crate) struct RevisionCreateArgs {
     /// Gate this revision on one or more prerequisites, in addition to
     /// the automatic chain-tail gate, declared atomically with creation.
     /// See `boss task create --depends-on` for the full description —
-    /// selectors accept `T<n>` short ids or full `task_…` ids and are
-    /// resolved without needing a `--product` flag (short ids are
-    /// globally unique). The revision is created `blocked` and never
+    /// selectors accept `T<n>` short ids or full `task_…` ids. create-revision
+    /// takes no `--product`, so each selector resolves globally; a short
+    /// id that exists in more than one product is rejected with the
+    /// candidate list — pass `slug/n` or the canonical `task_…` id to
+    /// disambiguate. The revision is created `blocked` and never
     /// dispatched until every prerequisite is satisfied, then
     /// auto-dispatches on its own once the gate clears.
-    #[arg(long = "depends-on", value_delimiter = ',')]
+    #[arg(
+        long = "depends-on",
+        value_delimiter = ',',
+        value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME
+    )]
     pub(crate) depends_on: Vec<String>,
 }
 
@@ -2625,7 +2655,7 @@ pub(crate) struct RevisionListArgs {
 
     /// Restrict to revisions whose parent is this task. Accepts `T<n>` short
     /// ids (e.g. `T651`) or full `task_<hex>` ids.
-    #[arg(long)]
+    #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) parent: Option<String>,
 
     #[command(flatten)]
@@ -2661,7 +2691,7 @@ pub(crate) struct TaskCreateManyArgs {
 
     /// Default project for items that don't specify one. Items may
     /// override via per-item `project_id`.
-    #[arg(long)]
+    #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) project: Option<String>,
 }
 
@@ -2726,58 +2756,18 @@ pub(crate) struct ChoreListArgs {
     pub(crate) dep: DependencyFilterArgs,
 }
 
-/// The four dependency-graph filter flags from design Q6. They are
-/// mutually exclusive — clap enforces this so the engine never sees
-/// an over-constrained request. Flattened into each
-/// `*ListArgs` so every list verb gets the same surface.
-#[derive(Debug, Clone, Args)]
-#[group(multiple = false)]
-pub(crate) struct DependencyFilterArgs {
-    /// Items that the named work item depends on (its incoming edges).
-    #[arg(long = "prerequisites-of", value_name = "ID")]
-    pub(crate) prerequisites_of: Option<String>,
-
-    /// Items that depend on the named work item (its outgoing edges).
-    #[arg(long = "dependents-of", value_name = "ID")]
-    pub(crate) dependents_of: Option<String>,
-
-    /// Items in `todo` with no gating prerequisite — i.e. what the
-    /// dispatcher could pick up next.
-    #[arg(long = "unblocked")]
-    pub(crate) unblocked: bool,
-
-    /// Items currently gated by at least one incomplete prereq.
-    #[arg(long = "blocked-by-deps")]
-    pub(crate) blocked_by_deps: bool,
-}
-
-impl DependencyFilterArgs {
-    pub(crate) fn into_filter(self) -> Option<DependencyFilter> {
-        if let Some(id) = self.prerequisites_of {
-            return Some(DependencyFilter::PrerequisitesOf { id });
-        }
-        if let Some(id) = self.dependents_of {
-            return Some(DependencyFilter::DependentsOf { id });
-        }
-        if self.unblocked {
-            return Some(DependencyFilter::Unblocked);
-        }
-        if self.blocked_by_deps {
-            return Some(DependencyFilter::BlockedByDeps);
-        }
-        None
-    }
-}
-
 #[derive(Debug, Clone, Args)]
 pub(crate) struct TaskIdArg {
     /// Task/chore id. Accepts: primary id (`task_…`), friendly short id
     /// (`T441`, `t441`, `42`, or `#42`), or cross-product form
-    /// (`boss/42` or `boss/#42`).
+    /// (`boss/42` or `boss/#42`). Globally unique short ids resolve
+    /// without `--product`; ambiguous ones error listing every candidate.
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) id: String,
     /// Resolve a friendly short id (`42` or `#42`) against this product
-    /// (slug or id). Ignored when the selector already embeds a product
-    /// slug (`boss/42`) or when the selector is a primary id.
+    /// (slug or id). Optional when the short id is globally unique.
+    /// Ignored when the selector already embeds a product slug
+    /// (`boss/42`) or when the selector is a primary id.
     #[arg(long)]
     pub(crate) product: Option<String>,
     /// Also display the primary id alongside the friendly id.
@@ -2791,12 +2781,13 @@ pub(crate) struct TaskIdArg {
 pub(crate) struct TaskCompleteArgs {
     /// Task/chore id. Accepts primary id, friendly short id, or
     /// cross-product form (same as `boss task show`).
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) id: String,
     /// Resolve a friendly short id against this product (slug or id).
     #[arg(long)]
     pub(crate) product: Option<String>,
     /// Resolve a friendly short id against the product that owns this project.
-    #[arg(long)]
+    #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) project: Option<String>,
     /// Required prose outcome. What happened — the human judgement the
     /// agent cannot be trusted to self-report. Stored on the row as
@@ -2807,6 +2798,7 @@ pub(crate) struct TaskCompleteArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct TaskMoveArgs {
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) id: String,
 
     #[arg(long = "to")]
@@ -2816,6 +2808,7 @@ pub(crate) struct TaskMoveArgs {
 #[derive(Debug, Clone, Args)]
 pub(crate) struct BindPrArgs {
     /// Task or chore id to attach the PR to.
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) id: String,
 
     /// GitHub PR URL of the form
@@ -2826,6 +2819,7 @@ pub(crate) struct BindPrArgs {
 #[derive(Debug, Clone, Args)]
 pub(crate) struct LinkExternalArgs {
     /// Task or chore id to link.
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) id: String,
 
     /// Tracker discriminator matching `products.external_tracker_kind`
@@ -2852,6 +2846,7 @@ pub(crate) struct ProjectMoveArgs {
     #[arg(long)]
     pub(crate) product: Option<String>,
 
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) selector: String,
 
     #[arg(long = "to")]
@@ -2860,6 +2855,7 @@ pub(crate) struct ProjectMoveArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct TaskDeleteArgs {
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) id: String,
 }
 
@@ -2870,6 +2866,7 @@ pub(crate) struct TaskRestoreArgs {
     /// `43` and cross-product `boss/43` forms are not accepted here —
     /// a soft-deleted row is hidden from the per-product short-id
     /// resolver, so pass the globally-unique `T43` or canonical id.
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) id: String,
 }
 
@@ -2878,7 +2875,7 @@ pub(crate) struct TaskReorderArgs {
     #[arg(long)]
     pub(crate) product: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) project: Option<String>,
 
     #[arg(long, value_delimiter = ',')]
@@ -2904,12 +2901,15 @@ pub(crate) enum CostCommand {
 pub(crate) struct CostTaskArgs {
     /// Task/chore id. Accepts: primary id (`task_…`), friendly short id
     /// (case-insensitive `t`-prefixed form, `42`, or `#42`), or
-    /// cross-product form (`boss/42` or `boss/#42`).
+    /// cross-product form (`boss/42` or `boss/#42`). Globally unique
+    /// short ids resolve without `--product`.
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) id: String,
 
     /// Resolve a friendly short id (`42` or `#42`) against this product
-    /// (slug or id). Ignored when the selector already embeds a product
-    /// slug or is a primary id.
+    /// (slug or id). Optional when the short id is globally unique.
+    /// Ignored when the selector already embeds a product slug or is a
+    /// primary id.
     #[arg(long)]
     pub(crate) product: Option<String>,
 

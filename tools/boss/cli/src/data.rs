@@ -3,6 +3,12 @@
 use crate::*;
 use boss_protocol::WorkRun;
 
+// Re-export the shared selector grammar from boss_protocol so every
+// CLI surface uses the same choke-point types as bossctl / engine RPC.
+// Must live above any `#[cfg(test)]` modules in this file (clippy
+// `items_after_test_module`).
+pub(crate) use boss_protocol::{WorkItemSelector, is_typed_work_item_id, parse_work_item_selector};
+
 pub(crate) async fn connect_for_work(ctx: &RunContext) -> Result<BossClient, CliError> {
     BossClient::connect(&ctx.discovery)
         .await
@@ -566,18 +572,12 @@ pub(crate) async fn run_list_revisions(
 /// Resolve a work-item selector to a primary id without a product context,
 /// erroring loudly (via `GetWorkItem`) when the selector names no row.
 ///
-/// Unlike the generic [`resolve_selector_to_primary_id`], this variant does
-/// not require a product context: `T<n>` short ids are globally unique, so
-/// they can be passed straight to `GetWorkItem`, which resolves them
-/// DB-globally (via `get_work_item_resolving_short_id` in the engine). A
-/// primary id (`task_…`) or an opaque/unrecognized selector is *also*
-/// round-tripped through `GetWorkItem` rather than passed through
-/// unchecked — the engine's resolver accepts canonical ids directly, so
-/// this doubles as the existence check every caller needs; an id that
-/// names no row surfaces as a `CliError`, never a silent pass-through.
-/// `#42` / `42` bare forms still need a product and are rejected with a
-/// helpful message (they don't start with a friendly-id letter, so the
-/// engine can't resolve them without one).
+/// Routes every form through the engine's shared choke point (`GetWorkItem`
+/// → `WorkDb::resolve_work_item_ref`): short ids (`T<n>`, bare `n`, `#n`),
+/// cross-product `slug/n`, and primary ids. Ambiguous short ids hard-error
+/// with every candidate listed; missing short ids hard-error as not-found.
+/// Primary ids are also round-tripped through `GetWorkItem` so a typo
+/// surfaces as a `CliError`, never a silent pass-through.
 ///
 /// Used by `create-revision`'s `--parent` and `--depends-on` (neither of
 /// which accepts a `--product` flag), `list-revisions`' `--parent`, and
@@ -586,6 +586,9 @@ pub(crate) async fn resolve_create_revision_parent(
     client: &mut BossClient,
     selector: &str,
 ) -> Result<String, CliError> {
+    // Always via GetWorkItem (shared engine choke point) so friendly short
+    // ids, slug/n, and primary ids all resolve the same way — and so a
+    // typo is a hard error rather than a silent pass-through.
     let item = get_work_item(client, selector).await?;
     Ok(item.primary_id().to_owned())
 }
@@ -597,8 +600,10 @@ pub(crate) async fn run_create_revision(
 ) -> Result<(), CliError> {
     // Resolve the --parent selector to a full task id before sending to
     // the engine, since the engine's CreateRevision RPC requires a full id.
-    // We use a product-free resolver here: T<n> short ids are globally unique
-    // so no --product flag is needed (or accepted) for create-revision.
+    // create-revision takes no --product, so the parent selector resolves
+    // globally; a short id that exists in more than one product is rejected
+    // with the candidate list — pass `slug/n` or the canonical `task_…` id
+    // to disambiguate.
     let parent_id = resolve_create_revision_parent(client, &args.parent).await?;
     let description = args.description.trim().to_owned();
     if description.is_empty() {
@@ -963,6 +968,7 @@ pub(crate) fn classify_bind_pr<'a>(prior: Option<&'a str>, new: &str) -> BindPrA
 pub(crate) struct TaskSetDocArgs {
     /// Task id. Accepts primary id (`task_…`), friendly short id
     /// (e.g. `42` / `#42`), or cross-product form (`boss/42`).
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) id: String,
 
     /// Resolve a friendly short id against this product (slug or id).
@@ -1852,43 +1858,6 @@ fn print_run_summaries(runs: &[WorkRun], indent: &str) {
     }
 }
 
-#[cfg(test)]
-mod execution_run_tests {
-    use super::*;
-    use boss_protocol::{WorkerTierDenial, WorkerTierDenialReason};
-
-    #[test]
-    fn worker_scope_elides_a_sibling_execution_without_hiding_own_runs() {
-        let own_execution_id = "exec_own";
-        let sibling_execution_id = "exec_sibling";
-        let own_runs = runs_from_list_event(FrontendEvent::RunsList {
-            execution_id: own_execution_id.to_owned(),
-            runs: vec![
-                WorkRun::builder()
-                    .id("run_own")
-                    .agent_id("agent")
-                    .execution_id(own_execution_id)
-                    .created_at("1000")
-                    .status("completed")
-                    .result_summary("finished")
-                    .build(),
-            ],
-        })
-        .expect("own execution runs should be visible");
-        let sibling_runs = runs_from_list_event(FrontendEvent::WorkerTierDenied {
-            denial: WorkerTierDenial::closed("ListRuns", WorkerTierDenialReason::RuntimeIsolation),
-        })
-        .expect("a sibling execution denial should not fail the detail view");
-
-        assert_eq!(own_runs.len(), 1, "the caller's execution keeps its run history");
-        assert!(
-            sibling_runs.is_empty(),
-            "a second execution on the same work item has its history elided when worker-scoped",
-        );
-        assert_ne!(own_execution_id, sibling_execution_id);
-    }
-}
-
 pub(crate) fn print_dependency_view(view: &WorkItemDependencyView) {
     println!("Dependencies for {}:", view.work_item_id);
     if view.prerequisites.is_empty() && view.dependents.is_empty() {
@@ -2047,84 +2016,6 @@ pub(crate) async fn resolve_optional_product(
     }
 }
 
-/// True when `s` looks like a typed engine work-item id. The engine
-/// stamps `prod_…` on products, `proj_…` on projects, and `task_…` on
-/// both tasks and chores (chores share the task prefix at the row
-/// level, so we don't enumerate `chore_` separately). Slugs are short
-/// names like `boss` / `mono` and never collide with these prefixes
-/// in practice.
-pub(crate) fn is_typed_work_item_id(s: &str) -> bool {
-    let s = s.trim();
-    s.starts_with("prod_") || s.starts_with("proj_") || s.starts_with("task_")
-}
-
-/// Parsed form of a task/chore/project selector.
-///
-/// Priority order per design Q5 (extended with friendly-id prefix forms):
-/// 1. `#42` or `42` or `T441`/`t441`/`P7`/`p7` → short id
-/// 2. `boss/42` or `boss/#42` → cross-product short id
-/// 3. `task_…` / `proj_…` / `prod_…` → primary id (typed)
-/// 4. anything else → slug / existing resolution
-#[derive(Debug, Clone)]
-pub(crate) enum WorkItemSelector {
-    /// `42` or `#42` — short id within the context product.
-    ShortId(i64),
-    /// `boss/42` or `boss/#42` — short id in the named product slug.
-    ProductShortId { product_slug: String, n: i64 },
-    /// `task_…` / `proj_…` / `prod_…` — primary engine id.
-    PrimaryId(String),
-    /// Slug or other selector; fall through to existing resolution.
-    Other(String),
-}
-
-/// Parse `s` into a [`WorkItemSelector`] per design Q5 grammar.
-pub(crate) fn parse_work_item_selector(s: &str) -> WorkItemSelector {
-    let s = s.trim();
-    // Cross-product form: "boss/42" or "boss/#42"
-    if let Some(slash) = s.find('/') {
-        let product_slug = &s[..slash];
-        let rest = s[slash + 1..].trim_start_matches('#');
-        if !product_slug.is_empty()
-            && let Ok(n) = rest.parse::<i64>()
-            && n > 0
-        {
-            return WorkItemSelector::ProductShortId {
-                product_slug: product_slug.to_owned(),
-                n,
-            };
-        }
-    }
-    // `#42` form (explicit friendly-id prefix)
-    if let Some(rest) = s.strip_prefix('#')
-        && let Ok(n) = rest.parse::<i64>()
-        && n > 0
-    {
-        return WorkItemSelector::ShortId(n);
-    }
-    // `T441` / `t441` / `P12` / `p12` — friendly kanban id (T for tasks/chores, P for projects).
-    // Case-insensitive; the leading letter is just visual sugar for the short_id number.
-    if s.len() >= 2 {
-        let first = s.as_bytes()[0];
-        if (first == b'T' || first == b't' || first == b'P' || first == b'p')
-            && let Ok(n) = s[1..].parse::<i64>()
-            && n > 0
-        {
-            return WorkItemSelector::ShortId(n);
-        }
-    }
-    // Plain integer → short id (Q5 step 2: `#` is optional)
-    if let Ok(n) = s.parse::<i64>()
-        && n > 0
-    {
-        return WorkItemSelector::ShortId(n);
-    }
-    // Primary id prefixes
-    if is_typed_work_item_id(s) {
-        return WorkItemSelector::PrimaryId(s.to_owned());
-    }
-    WorkItemSelector::Other(s.to_owned())
-}
-
 /// Call the engine's `GetWorkItemByShortId` RPC and return the result.
 pub(crate) async fn get_work_item_by_short_id_rpc(
     client: &mut BossClient,
@@ -2142,22 +2033,41 @@ pub(crate) async fn get_work_item_by_short_id_rpc(
     )
 }
 
-/// Resolve a short-id selector to its work item. `product` is the product
-/// source: the caller's `--product` flag for a bare `ShortId`, or
-/// `Some(product_slug)` for a cross-product `ProductShortId`. Shared by
-/// [`run_show_leaf`] and [`resolve_selector_to_primary_id`], which differ
-/// only in the per-site post-processing left at their call sites.
+/// Resolve a short-id selector to its work item.
+///
+/// Shared choke point for every CLI surface that accepts a friendly
+/// short id. `product` is the caller's `--product` flag for a bare
+/// `ShortId`, or `Some(product_slug)` for a cross-product
+/// `ProductShortId`.
+///
+/// - **With product scope**: `GetWorkItemByShortId` against that product.
+/// - **Without product scope**: `GetWorkItem` with the canonical `T{n}`
+///   wire form so the engine's shared resolver does a global lookup.
+///   Globally unique short ids resolve without `--product`. Ambiguous
+///   short ids hard-error with every candidate listed. Missing short
+///   ids hard-error as "could not resolve id" / "no matching work
+///   item" — never as "product is required".
 pub(crate) async fn resolve_short_id_item(
     client: &mut BossClient,
     ctx: &RunContext,
     product: Option<String>,
     short_id: i64,
 ) -> Result<WorkItem, CliError> {
-    let product = resolve_product(client, product, ctx).await?;
-    get_work_item_by_short_id_rpc(client, &product.id, short_id).await
+    match product {
+        Some(selector) => {
+            let product = resolve_product(client, Some(selector), ctx).await?;
+            get_work_item_by_short_id_rpc(client, &product.id, short_id).await
+        }
+        None => {
+            // Engine shared choke point: global short-id resolve with
+            // ambiguity as a hard error. Do not require --product up
+            // front — that misreports missing ids as a flag error.
+            get_work_item(client, &boss_protocol::short_id_wire_form(short_id)).await
+        }
+    }
 }
 
-/// Resolve any selector form (friendly `T441`, `#42`, plain `42`,
+/// Resolve any selector form (friendly `T-form`, `#42`, plain `42`,
 /// cross-product `boss/42`, or primary `task_…` id) to a primary engine
 /// id. If the selector is already a primary id or an opaque slug, it is
 /// returned unchanged so the engine can reject it with its own error.
@@ -2746,4 +2656,41 @@ pub(crate) fn unexpected_event(context: &str, event: &FrontendEvent) -> CliError
         "unexpected engine event for {context}: {}",
         serde_json::to_string(event).unwrap_or_else(|_| "<unserializable>".to_owned())
     ))
+}
+
+#[cfg(test)]
+mod execution_run_tests {
+    use super::*;
+    use boss_protocol::{WorkerTierDenial, WorkerTierDenialReason};
+
+    #[test]
+    fn worker_scope_elides_a_sibling_execution_without_hiding_own_runs() {
+        let own_execution_id = "exec_own";
+        let sibling_execution_id = "exec_sibling";
+        let own_runs = runs_from_list_event(FrontendEvent::RunsList {
+            execution_id: own_execution_id.to_owned(),
+            runs: vec![
+                WorkRun::builder()
+                    .id("run_own")
+                    .agent_id("agent")
+                    .execution_id(own_execution_id)
+                    .created_at("1000")
+                    .status("completed")
+                    .result_summary("finished")
+                    .build(),
+            ],
+        })
+        .expect("own execution runs should be visible");
+        let sibling_runs = runs_from_list_event(FrontendEvent::WorkerTierDenied {
+            denial: WorkerTierDenial::closed("ListRuns", WorkerTierDenialReason::RuntimeIsolation),
+        })
+        .expect("a sibling execution denial should not fail the detail view");
+
+        assert_eq!(own_runs.len(), 1, "the caller's execution keeps its run history");
+        assert!(
+            sibling_runs.is_empty(),
+            "a second execution on the same work item has its history elided when worker-scoped",
+        );
+        assert_ne!(own_execution_id, sibling_execution_id);
+    }
 }

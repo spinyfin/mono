@@ -351,3 +351,102 @@ fn work_tree_tasks_carry_short_id() {
 
     let _ = std::fs::remove_file(path);
 }
+
+/// Shared choke point: a globally unique short id resolves without a
+/// product scope.
+#[test]
+fn resolve_work_item_ref_unique_short_id() {
+    let path = temp_db_path("resolve-unique-short-id");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
+    let chore = create_test_chore_manual(&db, product.id.clone(), "only one");
+    let n = chore.short_id.expect("short_id");
+    let primary = db.resolve_work_item_ref(&format!("T{n}")).unwrap();
+    assert_eq!(primary, chore.id);
+    // Bare and hash forms too.
+    assert_eq!(db.resolve_work_item_ref(&n.to_string()).unwrap(), chore.id);
+    assert_eq!(db.resolve_work_item_ref(&format!("#{n}")).unwrap(), chore.id);
+    let _ = std::fs::remove_file(path);
+}
+
+/// Ambiguous short ids hard-error listing every candidate — never pick one.
+#[test]
+fn resolve_work_item_ref_ambiguous_short_id_lists_candidates() {
+    let path = temp_db_path("resolve-ambiguous-short-id");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let boss = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
+    let flunge = create_test_product_with_repo(&db, "Flunge", Some("git@example.com:flunge.git"));
+    let b = create_test_chore_manual(&db, boss.id.clone(), "Boss side");
+    let f = create_test_chore_manual(&db, flunge.id.clone(), "Flunge side");
+    assert_eq!(b.short_id, f.short_id);
+    let n = b.short_id.expect("short_id");
+    let err = db.resolve_work_item_ref(&format!("T{n}")).unwrap_err().to_string();
+    assert!(err.contains("ambiguous"), "err={err}");
+    assert!(
+        err.contains(boss_protocol::WORK_ITEM_ID_AMBIGUOUS_MARKER),
+        "err must carry the stable ambiguity marker: {err}"
+    );
+    assert!(
+        err.contains("slug/n") || err.contains("slug/"),
+        "err should mention slug/n form: {err}"
+    );
+    assert!(err.contains(&b.id) && err.contains(&f.id), "err={err}");
+    assert!(
+        err.contains("Boss") && err.contains("Flunge") || err.contains(&boss.slug) && err.contains(&flunge.slug),
+        "err={err}"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+/// Missing short ids hard-error as could-not-resolve, not a quiet None.
+#[test]
+fn resolve_work_item_ref_missing_short_id_is_error() {
+    let path = temp_db_path("resolve-missing-short-id");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let _ = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
+    let err = db
+        .resolve_work_item_ref(&format!("T{}", 999_999))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("could not resolve"), "err={err}");
+    assert!(
+        err.contains(boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER),
+        "err must carry the stable not-found marker: {err}"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+/// Strict resolve rejects opaque garbage that the permissive form would
+/// pass through unchanged (the empty-result misdiagnosis class).
+#[test]
+fn resolve_work_item_ref_strict_rejects_opaque_typo() {
+    let path = temp_db_path("resolve-strict-opaque");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let _ = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
+    let err = db
+        .resolve_work_item_ref_strict("not_a_real_id_typo")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("could not resolve"), "err={err}");
+    // Permissive form still passes opaque input through.
+    assert_eq!(
+        db.resolve_work_item_ref("not_a_real_id_typo").unwrap(),
+        "not_a_real_id_typo"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+/// Cross-product slug/n form resolves unambiguously.
+#[test]
+fn resolve_work_item_ref_product_scoped_slug_form() {
+    let path = temp_db_path("resolve-slug-form");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let boss = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
+    let flunge = create_test_product_with_repo(&db, "Flunge", Some("git@example.com:flunge.git"));
+    let b = create_test_chore_manual(&db, boss.id.clone(), "Boss side");
+    let _f = create_test_chore_manual(&db, flunge.id.clone(), "Flunge side");
+    let n = b.short_id.expect("short_id");
+    let primary = db.resolve_work_item_ref(&format!("{}/{n}", boss.slug)).unwrap();
+    assert_eq!(primary, b.id);
+    let _ = std::fs::remove_file(path);
+}

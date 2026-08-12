@@ -30,10 +30,63 @@ pub(crate) enum ItemKind {
     Comment,
 }
 
+/// One candidate from a short-id lookup. Listed in full when a short id
+/// is ambiguous across products so the caller can disambiguate.
+/// Keep field count ≤5 (repo giant-struct rule); product identity is one
+/// display string (`slug (name)`).
+#[derive(Debug, Clone)]
+pub(crate) struct ShortIdCandidate {
+    pub id: String,
+    pub product: String,
+    pub name: String,
+    pub status: String,
+}
+
+impl ShortIdCandidate {
+    fn display_line(&self) -> String {
+        format!(
+            "  - {id}  product={product}  name={name:?}  status={status}",
+            id = self.id,
+            product = self.product,
+            name = self.name,
+            status = self.status,
+        )
+    }
+}
+
+/// Format an ambiguity error that lists every candidate (long id, product,
+/// name, status). Never pick one — callers must disambiguate.
+///
+/// Guidance covers both surfaces that take `--product` and those that
+/// do not (`create-revision`, `bossctl dispatch diagnose`, `work
+/// executions`, `review show`): `slug/n` and the primary `task_…` /
+/// `proj_…` id work everywhere.
+pub(crate) fn format_short_id_ambiguous(input: &str, candidates: &[ShortIdCandidate]) -> String {
+    let mut lines = vec![format!(
+        "could not resolve id {input}: {} across {} products; \
+         pass --product <slug>, use the product-scoped `slug/n` form, \
+         or a primary id (`task_…` / `proj_…`). candidates:",
+        boss_protocol::WORK_ITEM_ID_AMBIGUOUS_MARKER,
+        candidates.len()
+    )];
+    for c in candidates {
+        lines.push(c.display_line());
+    }
+    lines.join("\n")
+}
+
 /// If `id` looks like a friendly work-item selector (`T42`, `t42`, `P7`,
-/// `p7`), query the DB by short_id and return the matching primary id.
-/// Returns `Ok(None)` when `id` is not a friendly-id form or when no row
-/// matches; callers should treat the original id as-is in that case.
+/// `p7`, `#42`, bare `42`, or `slug/42`), query the DB by short_id and
+/// return the matching primary id.
+///
+/// Returns:
+/// - `Ok(Some(primary))` when exactly one live row matches
+/// - `Ok(None)` when `id` is not a friendly-id form, or when no row
+///   matches (callers that want a hard not-found should check
+///   [`boss_protocol::is_friendly_work_item_selector`] and error)
+/// - `Err` when the short id matches more than one product — the error
+///   message lists every candidate (long id, product, name, status).
+///   Never silently picks one.
 pub(crate) fn resolve_friendly_work_item_id(conn: &Connection, id: &str) -> Result<Option<String>> {
     resolve_friendly_work_item_id_inner(conn, id, false)
 }
@@ -48,39 +101,111 @@ pub(crate) fn resolve_friendly_work_item_id_inner(
     id: &str,
     include_deleted: bool,
 ) -> Result<Option<String>> {
-    if id.len() < 2 {
-        return Ok(None);
-    }
-    let first = id.as_bytes()[0];
-    if first != b'T' && first != b't' && first != b'P' && first != b'p' {
-        return Ok(None);
-    }
-    let n: i64 = match id[1..].parse() {
-        Ok(n) if n > 0 => n,
-        _ => return Ok(None),
+    let selector = boss_protocol::parse_work_item_selector(id);
+    let (short_id, product_scope) = match selector {
+        boss_protocol::WorkItemSelector::ShortId(n) => (n, None),
+        boss_protocol::WorkItemSelector::ProductShortId { product_slug, n } => {
+            // Resolve slug → product_id first; unknown slug is not a match.
+            let product_id: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM products WHERE slug = ?1 OR id = ?1",
+                    params![product_slug],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match product_id {
+                Some(pid) => (n, Some(pid)),
+                None => return Ok(None),
+            }
+        }
+        boss_protocol::WorkItemSelector::PrimaryId(_) | boss_protocol::WorkItemSelector::Other(_) => {
+            return Ok(None);
+        }
     };
-    let task_sql = if include_deleted {
-        "SELECT id FROM tasks WHERE short_id = ?1 LIMIT 1"
+    let candidates = lookup_short_id_candidates(conn, short_id, product_scope.as_deref(), include_deleted)?;
+    match candidates.len() {
+        0 => Ok(None),
+        1 => Ok(Some(candidates.into_iter().next().unwrap().id)),
+        _ => bail!("{}", format_short_id_ambiguous(id, &candidates)),
+    }
+}
+
+/// Look up every live (or, when `include_deleted`, any) work-item row
+/// with the given short_id, optionally scoped to one product.
+fn lookup_short_id_candidates(
+    conn: &Connection,
+    short_id: i64,
+    product_id: Option<&str>,
+    include_deleted: bool,
+) -> Result<Vec<ShortIdCandidate>> {
+    let mut out = Vec::new();
+
+    let task_sql = match (product_id.is_some(), include_deleted) {
+        (true, true) => {
+            "SELECT t.id, t.product_id, p.slug, p.name, t.name, t.status
+             FROM tasks t JOIN products p ON p.id = t.product_id
+             WHERE t.short_id = ?1 AND t.product_id = ?2"
+        }
+        (true, false) => {
+            "SELECT t.id, t.product_id, p.slug, p.name, t.name, t.status
+             FROM tasks t JOIN products p ON p.id = t.product_id
+             WHERE t.short_id = ?1 AND t.product_id = ?2 AND t.deleted_at IS NULL"
+        }
+        (false, true) => {
+            "SELECT t.id, t.product_id, p.slug, p.name, t.name, t.status
+             FROM tasks t JOIN products p ON p.id = t.product_id
+             WHERE t.short_id = ?1"
+        }
+        (false, false) => {
+            "SELECT t.id, t.product_id, p.slug, p.name, t.name, t.status
+             FROM tasks t JOIN products p ON p.id = t.product_id
+             WHERE t.short_id = ?1 AND t.deleted_at IS NULL"
+        }
+    };
+    {
+        let mut stmt = conn.prepare(task_sql)?;
+        let rows = match product_id {
+            Some(pid) => stmt.query_map(params![short_id, pid], map_short_id_candidate)?,
+            None => stmt.query_map(params![short_id], map_short_id_candidate)?,
+        };
+        for row in rows {
+            out.push(row?);
+        }
+    }
+
+    let project_sql = if product_id.is_some() {
+        "SELECT pr.id, pr.product_id, p.slug, p.name, pr.name, pr.status
+         FROM projects pr JOIN products p ON p.id = pr.product_id
+         WHERE pr.short_id = ?1 AND pr.product_id = ?2"
     } else {
-        "SELECT id FROM tasks WHERE short_id = ?1 AND deleted_at IS NULL LIMIT 1"
+        "SELECT pr.id, pr.product_id, p.slug, p.name, pr.name, pr.status
+         FROM projects pr JOIN products p ON p.id = pr.product_id
+         WHERE pr.short_id = ?1"
     };
-    if let Some(primary_id) = conn
-        .query_row(task_sql, params![n], |row| row.get::<_, String>(0))
-        .optional()?
     {
-        return Ok(Some(primary_id));
+        let mut stmt = conn.prepare(project_sql)?;
+        let rows = match product_id {
+            Some(pid) => stmt.query_map(params![short_id, pid], map_short_id_candidate)?,
+            None => stmt.query_map(params![short_id], map_short_id_candidate)?,
+        };
+        for row in rows {
+            out.push(row?);
+        }
     }
-    if let Some(primary_id) = conn
-        .query_row(
-            "SELECT id FROM projects WHERE short_id = ?1 LIMIT 1",
-            params![n],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
-    {
-        return Ok(Some(primary_id));
-    }
-    Ok(None)
+
+    Ok(out)
+}
+
+fn map_short_id_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShortIdCandidate> {
+    let product_id: String = row.get(1)?;
+    let product_slug: String = row.get(2)?;
+    let product_name: String = row.get(3)?;
+    Ok(ShortIdCandidate {
+        id: row.get(0)?,
+        product: format!("{product_slug} ({product_name}, {product_id})"),
+        name: row.get(4)?,
+        status: row.get(5)?,
+    })
 }
 
 pub(crate) fn classify_id(id: &str) -> Result<ItemKind> {
@@ -97,6 +222,35 @@ pub(crate) fn classify_id(id: &str) -> Result<ItemKind> {
         return Ok(ItemKind::Comment);
     }
     bail!("unknown work item id format: {id}")
+}
+
+/// Cheap existence check for a typed primary id (`task_` / `proj_` /
+/// `prod_`). Used by the shared resolver so verifying a primary id does
+/// not pay for a full row read + doc-link attach (GetWorkItem fetches
+/// once after resolve).
+pub(crate) fn typed_work_item_exists(conn: &Connection, id: &str) -> Result<bool> {
+    match classify_id(id)? {
+        ItemKind::Task => Ok(conn
+            .query_row(
+                "SELECT 1 FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+                params![id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()),
+        ItemKind::Project => Ok(conn
+            .query_row("SELECT 1 FROM projects WHERE id = ?1", params![id], |_| Ok(()))
+            .optional()?
+            .is_some()),
+        ItemKind::Product => Ok(conn
+            .query_row("SELECT 1 FROM products WHERE id = ?1", params![id], |_| Ok(()))
+            .optional()?
+            .is_some()),
+        ItemKind::Comment => Ok(conn
+            .query_row("SELECT 1 FROM work_comments WHERE id = ?1", params![id], |_| Ok(()))
+            .optional()?
+            .is_some()),
+    }
 }
 
 /// Resolve a single edge endpoint into its [`DependencyEdge`] view.

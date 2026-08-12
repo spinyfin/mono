@@ -1085,12 +1085,15 @@ impl WorkDb {
     }
 
     /// Look up a work item by canonical id or short-form (`T42`,
-    /// `t42`). Returns `Ok(None)` when no item matches, `Ok(Some(…))`
-    /// on success. Canonical ids are passed straight to
-    /// [`get_work_item`]; short-form ids are first resolved via
-    /// [`resolve_friendly_work_item_id`] and then fetched by canonical
-    /// id. Unlike `get_work_item`, this never calls `classify_id`, so
-    /// it accepts both forms without the caller choosing.
+    /// `t42`, `#42`, bare `42`, `slug/42`). Returns `Ok(None)` when no
+    /// item matches, `Ok(Some(…))` on success. Canonical ids are passed
+    /// straight to [`get_work_item`]; short-form ids are first resolved
+    /// via [`resolve_friendly_work_item_id`] and then fetched by
+    /// canonical id. Ambiguous short ids return `Err` with every
+    /// candidate listed — never silently pick one.
+    ///
+    /// Unlike `get_work_item`, this never calls `classify_id` on the
+    /// raw input, so it accepts both forms without the caller choosing.
     pub fn get_work_item_resolving_short_id(&self, id: &str) -> Result<Option<WorkItem>> {
         let canonical = {
             let conn = self.connect()?;
@@ -1102,6 +1105,75 @@ impl WorkDb {
                 Err(_) => Ok(None),
             },
             Err(_) => Ok(None),
+        }
+    }
+
+    /// Shared id-resolution choke point for every surface that accepts
+    /// a work-item id: bare long ids, `T<n>` / `P<n>` / `#n` / bare `n`
+    /// short ids, and product-scoped `slug/n` forms.
+    ///
+    /// - Success → primary id string
+    /// - Friendly form with no match → `Err("could not resolve id …")`
+    /// - Friendly form matching multiple products → `Err` listing every
+    ///   candidate (long id, product, name, status)
+    /// - Opaque non-friendly input that is not a known primary id →
+    ///   `Err("could not resolve id …")` when `require_known` is true;
+    ///   otherwise returns the input unchanged so callers that also
+    ///   accept execution ids can fall through
+    ///
+    /// This is the single engine-side entry point both the frontend RPC
+    /// path (`GetWorkItem`) and direct-DB consumers (`bossctl dispatch
+    /// diagnose`, `work executions`, …) must use so short-id support
+    /// cannot drift command-by-command.
+    pub fn resolve_work_item_ref(&self, id: &str) -> Result<String> {
+        let id = id.trim();
+        if id.is_empty() {
+            bail!("could not resolve id: empty selector");
+        }
+        let conn = self.connect()?;
+        match resolve_friendly_work_item_id(&conn, id)? {
+            Some(primary) => Ok(primary),
+            None if boss_protocol::is_friendly_work_item_selector(id) => {
+                bail!(
+                    "could not resolve id {id}: {}",
+                    boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER
+                )
+            }
+            None if boss_protocol::is_typed_work_item_id(id) => {
+                // Typed primary id: existence only (SELECT 1). Avoid a full
+                // `get_work_item` here — callers that need the row (e.g.
+                // GetWorkItem) fetch it once after resolve.
+                if typed_work_item_exists(&conn, id)? {
+                    Ok(id.to_owned())
+                } else {
+                    bail!(
+                        "could not resolve id {id}: {}",
+                        boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER
+                    )
+                }
+            }
+            None => Ok(id.to_owned()),
+        }
+    }
+
+    /// Like [`resolve_work_item_ref`], but opaque non-typed input that is
+    /// not a known primary id is also a hard error. Use when the call
+    /// site only accepts work-item ids (not execution ids) so a typo
+    /// cannot silently yield an empty result set.
+    pub fn resolve_work_item_ref_strict(&self, id: &str) -> Result<String> {
+        let resolved = self.resolve_work_item_ref(id)?;
+        // If the input was opaque and passed through unchanged, confirm
+        // it actually names a row — otherwise "no such id" not a quiet
+        // pass-through that a later step misreports.
+        if boss_protocol::is_friendly_work_item_selector(id) || boss_protocol::is_typed_work_item_id(id) {
+            return Ok(resolved);
+        }
+        match self.get_work_item_resolving_short_id(&resolved)? {
+            Some(item) => Ok(item.primary_id().to_owned()),
+            None => bail!(
+                "could not resolve id {id}: {}",
+                boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER
+            ),
         }
     }
 
