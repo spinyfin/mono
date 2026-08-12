@@ -1,7 +1,8 @@
 //! Verified pane-injection delivery.
 //!
-//! `SendToPane` only proves the engine handed bytes to the app, which
-//! writes them to the worker's pty. It does not prove the foreground
+//! A pane write — `tmux send-keys` for a tmux-backed session or `SendToPane`
+//! through the app for a legacy app-owned pane — only proves the engine
+//! handed bytes to the worker's pty. It does not prove the foreground
 //! process treated them as a pending user prompt. Text injected while
 //! the worker is idle at its prompt (the `Stop`-boundary probe path)
 //! has proven reliable. Text injected while the worker is actively
@@ -71,6 +72,7 @@
 
 use super::*;
 use boss_protocol::WorkerActivity;
+use boss_tmux::Tmux;
 
 /// Whether a pane write is permitted for a given `(activity, driver)` pair,
 /// and if so at which of the two delivery postures.
@@ -162,10 +164,10 @@ pub(crate) struct PaneInjectRequest<'a> {
 /// Outcome of [`ServerState::inject_pane_text_verified`].
 #[derive(Debug)]
 pub(crate) enum PaneInjectOutcome {
-    /// `SendToPane` succeeded and either a matching `UserPromptSubmit`
+    /// The pane write succeeded and either a matching `UserPromptSubmit`
     /// hook or a transcript scan confirmed the text was consumed.
     Confirmed,
-    /// `SendToPane` succeeded into a mid-turn agent whose driver buffers
+    /// The pane write succeeded into a mid-turn agent whose driver buffers
     /// stdin ([`PaneInputPosture::MidTurnBuffered`]), and no
     /// `UserPromptSubmit` arrived inside the verification window. Unlike
     /// [`Self::Unconfirmed`] this is the *expected* shape of a successful
@@ -184,7 +186,7 @@ pub(crate) enum PaneInjectOutcome {
     /// above is the only signal that can confirm it, and `Buffered` is the
     /// honest answer when neither lands inside the window.
     Buffered,
-    /// `SendToPane` succeeded (bytes reached the app/pty) but neither a
+    /// The pane write succeeded (bytes reached the pty) but neither a
     /// `UserPromptSubmit` hook nor a transcript scan confirmed delivery
     /// before the timeout. This is NOT proof the write was lost — the
     /// worker may have consumed it through a channel this engine can't
@@ -200,7 +202,7 @@ pub(crate) enum PaneInjectOutcome {
     /// "accepting"). Callers must surface this rather than silently drop the
     /// text or re-issue the write.
     NotAcceptingInput { activity: Option<WorkerActivity> },
-    /// `SendToPane` itself failed at the transport or app layer.
+    /// The pane write itself failed at the transport or app layer.
     /// Carries enough detail for callers that need a typed error
     /// (e.g. [`ServerState::send_input_to_worker`]'s `SendInputError`)
     /// to reconstruct it without re-issuing the write.
@@ -212,6 +214,7 @@ pub(crate) enum PaneInjectOutcome {
 pub(crate) enum PaneSendFailure {
     App(EngineToAppError),
     Send(SendToAppError),
+    Tmux(anyhow::Error),
     ResponseKindMismatch(String),
 }
 
@@ -258,6 +261,22 @@ async fn transcript_shows_text(transcript_path: &str, offset_bytes: u64, text: &
 }
 
 impl ServerState {
+    pub(super) fn tmux_for_pane_delivery(&self) -> anyhow::Result<Tmux> {
+        if let Some(tmux) = self
+            .pane_delivery_tmux_override
+            .read()
+            .expect("pane delivery tmux override lock poisoned")
+            .clone()
+        {
+            return Ok(tmux);
+        }
+        let preflight = self.tmux_preflight.read().expect("tmux preflight lock poisoned");
+        let crate::tmux_preflight::TmuxPreflight::Ready { program, .. } = &*preflight else {
+            anyhow::bail!("tmux is unavailable for pane delivery")
+        };
+        Tmux::from_path(program.clone()).context("creating tmux pane-delivery controller")
+    }
+
     /// Register a one-shot waiter for the next `UserPromptSubmit` hook
     /// on `run_id` that matches `match_text`. Returns a token that
     /// identifies exactly this waiter among any others concurrently
@@ -437,28 +456,41 @@ impl ServerState {
             return PaneInjectOutcome::NotAcceptingInput { activity };
         }
 
-        let (token, waiter) = self.register_delivery_waiter(run_id, &text);
-        let request = EngineToAppRequest::SendToPane(SendToPaneInput {
-            slot_id,
-            text: text.clone(),
-        });
-        match self.send_to_app(request, Duration::from_secs(5)).await {
-            Ok(EngineToAppResponse::SendToPane { result: Ok(_) }) => {}
-            Ok(EngineToAppResponse::SendToPane { result: Err(err) }) => {
-                self.take_delivery_waiter(run_id, token);
-                tracing::warn!(?err, run_id, slot_id, "pane injection rejected by app");
-                return PaneInjectOutcome::SendFailed(PaneSendFailure::App(err));
+        // Match the app transport's submission plan for confirmation and
+        // tmux delivery, while preserving the legacy RPC payload verbatim so
+        // the app remains its single owner of app-pane normalization.
+        let normalized_text = text.trim_end_matches(['\r', '\n']);
+        let (token, waiter) = self.register_delivery_waiter(run_id, normalized_text);
+        let send_result = match self.worker_registry.pane_for_run(run_id) {
+            Some(pane) if pane.tmux_session_name.is_some() || pane.tmux_hosted => match pane.tmux_session_name {
+                Some(session_name) => match self.tmux_for_pane_delivery() {
+                    Ok(tmux) => tmux
+                        .send_keys(&session_name, normalized_text)
+                        .await
+                        .map_err(PaneSendFailure::Tmux),
+                    Err(err) => Err(PaneSendFailure::Tmux(err)),
+                },
+                None => Err(PaneSendFailure::Tmux(anyhow::anyhow!(
+                    "tmux-hosted pane has no session name"
+                ))),
+            },
+            _ => {
+                let request = EngineToAppRequest::SendToPane(SendToPaneInput {
+                    slot_id,
+                    text: text.clone(),
+                });
+                match self.send_to_app(request, Duration::from_secs(5)).await {
+                    Ok(EngineToAppResponse::SendToPane { result: Ok(_) }) => Ok(()),
+                    Ok(EngineToAppResponse::SendToPane { result: Err(err) }) => Err(PaneSendFailure::App(err)),
+                    Ok(other) => Err(PaneSendFailure::ResponseKindMismatch(format!("{other:?}"))),
+                    Err(err) => Err(PaneSendFailure::Send(err)),
+                }
             }
-            Ok(other) => {
-                self.take_delivery_waiter(run_id, token);
-                tracing::warn!(run_id, slot_id, ?other, "pane injection: unexpected app response shape");
-                return PaneInjectOutcome::SendFailed(PaneSendFailure::ResponseKindMismatch(format!("{other:?}")));
-            }
-            Err(err) => {
-                self.take_delivery_waiter(run_id, token);
-                tracing::warn!(?err, run_id, slot_id, "pane injection transport failed");
-                return PaneInjectOutcome::SendFailed(PaneSendFailure::Send(err));
-            }
+        };
+        if let Err(err) = send_result {
+            self.take_delivery_waiter(run_id, token);
+            tracing::warn!(?err, run_id, slot_id, "pane injection transport failed");
+            return PaneInjectOutcome::SendFailed(err);
         }
         match timeout(verify_timeout, waiter).await {
             Ok(Ok(_prompt)) => PaneInjectOutcome::Confirmed,
@@ -469,7 +501,7 @@ impl ServerState {
             Ok(Err(_)) | Err(_) => {
                 self.take_delivery_waiter(run_id, token);
                 if let Some(path) = transcript_path
-                    && transcript_shows_text(path, offset_bytes, &text).await
+                    && transcript_shows_text(path, offset_bytes, normalized_text).await
                 {
                     tracing::info!(
                         run_id,

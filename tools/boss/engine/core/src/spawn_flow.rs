@@ -636,7 +636,6 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     }
 
     let claimed_slot = input.slot_id;
-    let tmux_hosted = input.tmux_host.is_some();
     let (slot_id, shell_pid, ack_timed_out) = if let Some(tmux_host) = input.tmux_host.as_ref() {
         let shell_pid = match start_tmux_worker(
             tmux_host,
@@ -783,10 +782,10 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     //    spawned shell back to this run, and remember the slot id so
     //    follow-up `SendToPane` requests (e.g., probe injection) can
     //    route by run id.
-    if tmux_hosted {
+    if let Some(tmux_host) = input.tmux_host.as_ref() {
         spawner
             .worker_registry()
-            .register_tmux_run_slot(input.run_id.clone(), slot_id);
+            .register_tmux_run_slot(input.run_id.clone(), slot_id, tmux_host.session_name());
     } else {
         spawner
             .worker_registry()

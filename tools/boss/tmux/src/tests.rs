@@ -11,6 +11,7 @@ use super::*;
 struct StubRunner {
     outcomes: Mutex<VecDeque<std::io::Result<CommandOutput>>>,
     calls: Mutex<Vec<(PathBuf, Vec<String>)>>,
+    stdin: Mutex<Vec<Vec<u8>>>,
 }
 
 impl StubRunner {
@@ -18,6 +19,7 @@ impl StubRunner {
         Arc::new(Self {
             outcomes: Mutex::new(replies.into_iter().map(Ok).collect()),
             calls: Mutex::new(Vec::new()),
+            stdin: Mutex::new(Vec::new()),
         })
     }
 
@@ -29,6 +31,10 @@ impl StubRunner {
             .map(|(_, args)| args.clone())
             .collect()
     }
+
+    fn stdin(&self) -> Vec<Vec<u8>> {
+        self.stdin.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
@@ -39,6 +45,26 @@ impl CommandRunner for StubRunner {
             program.to_path_buf(),
             args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect(),
         ));
+        self.outcomes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("stub runner received an unexpected tmux command")
+    }
+
+    async fn run_with_stdin(
+        &self,
+        program: &Path,
+        args: &[OsString],
+        cwd: Option<&Path>,
+        stdin: &[u8],
+    ) -> std::io::Result<CommandOutput> {
+        assert!(cwd.is_none(), "tmux commands must not change the process directory");
+        self.calls.lock().unwrap().push((
+            program.to_path_buf(),
+            args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect(),
+        ));
+        self.stdin.lock().unwrap().push(stdin.to_vec());
         self.outcomes
             .lock()
             .unwrap()
@@ -269,6 +295,61 @@ async fn send_keys_marks_dash_prefixed_literal_input_as_an_argument() {
             vec!["-L", "boss", "send-keys", "-t", "boss-1", "-l", "--", "-R dashdash"],
             vec!["-L", "boss", "send-keys", "-t", "boss-1", "C-m"],
         ]
+    );
+}
+
+#[tokio::test]
+async fn send_keys_pastes_multiline_text_then_submits_once() {
+    let (tmux, runner) = tmux([success(""), success(""), success("")]);
+    tmux.send_keys("boss-1", "first\nsecond\n").await.unwrap();
+    let calls = runner.calls();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0][..3], ["-L", "boss", "load-buffer"]);
+    assert_eq!(calls[0][3], "-b");
+    let buffer_name = calls[0][4].clone();
+    assert!(
+        buffer_name.starts_with("boss-deliver-boss-1-"),
+        "unexpected buffer name: {buffer_name}"
+    );
+    assert_eq!(calls[0][5], "-");
+    assert_eq!(
+        calls[1],
+        vec![
+            "-L",
+            "boss",
+            "paste-buffer",
+            "-b",
+            buffer_name.as_str(),
+            "-p",
+            "-d",
+            "-t",
+            "boss-1",
+        ]
+    );
+    assert_eq!(calls[2], vec!["-L", "boss", "send-keys", "-t", "boss-1", "C-m"]);
+    assert_eq!(runner.stdin(), vec![b"first\nsecond".to_vec()]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn send_keys_strips_trailing_newlines_on_single_line_path() {
+    let (tmux, runner) = tmux([success(""), success("")]);
+    tmux.send_keys("boss-1", "hello\r\n").await.unwrap();
+    assert_eq!(
+        runner.calls(),
+        vec![
+            vec!["-L", "boss", "send-keys", "-t", "boss-1", "-l", "--", "hello"],
+            vec!["-L", "boss", "send-keys", "-t", "boss-1", "C-m"],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn send_key_uses_a_single_named_keypress_without_return() {
+    let (tmux, runner) = tmux([success("")]);
+    tmux.send_key("boss-1", "Escape").await.unwrap();
+    assert_eq!(
+        runner.calls(),
+        vec![vec!["-L", "boss", "send-keys", "-t", "boss-1", "Escape"]]
     );
 }
 

@@ -53,12 +53,16 @@ struct RegistryInner {
 }
 
 /// The app surface attached to a worker run. `tmux_hosted` selects the
-/// non-owning detach RPC during normal cleanup; it is deliberately retained
-/// alongside the slot so legacy app-owned panes continue to use release.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// non-owning detach RPC during normal cleanup. A tmux session identity
+/// independently selects direct tmux input delivery, including for adopted
+/// sessions that retain legacy process-tree reaping.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegisteredWorkerPane {
     pub slot_id: u8,
     pub tmux_hosted: bool,
+    /// The tmux-owned worker's durable session identity. `None` is valid
+    /// only for an app-owned pane not backed by a tmux session.
+    pub tmux_session_name: Option<String>,
 }
 
 impl WorkerRegistry {
@@ -85,18 +89,50 @@ impl WorkerRegistry {
             RegisteredWorkerPane {
                 slot_id,
                 tmux_hosted: false,
+                tmux_session_name: None,
             },
         );
     }
 
     /// Record a tmux-hosted worker whose app surface must detach without
     /// signalling the independently-owned tmux session.
-    pub fn register_tmux_run_slot(&self, run_id: impl Into<String>, slot_id: u8) {
+    pub fn register_tmux_run_slot(&self, run_id: impl Into<String>, slot_id: u8, session_name: impl Into<String>) {
         self.inner.lock().expect("registry poisoned").run_to_slot.insert(
             run_id.into(),
             RegisteredWorkerPane {
                 slot_id,
                 tmux_hosted: true,
+                tmux_session_name: Some(session_name.into()),
+            },
+        );
+    }
+
+    /// Record an adopted tmux session while preserving legacy teardown and
+    /// process-tree reaping until tmux session teardown owns that responsibility.
+    pub fn register_adopted_tmux_run_slot(
+        &self,
+        run_id: impl Into<String>,
+        slot_id: u8,
+        session_name: impl Into<String>,
+    ) {
+        self.inner.lock().expect("registry poisoned").run_to_slot.insert(
+            run_id.into(),
+            RegisteredWorkerPane {
+                slot_id,
+                tmux_hosted: false,
+                tmux_session_name: Some(session_name.into()),
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub fn register_tmux_run_slot_without_session_for_test(&self, run_id: impl Into<String>, slot_id: u8) {
+        self.inner.lock().expect("registry poisoned").run_to_slot.insert(
+            run_id.into(),
+            RegisteredWorkerPane {
+                slot_id,
+                tmux_hosted: true,
+                tmux_session_name: None,
             },
         );
     }
@@ -110,6 +146,18 @@ impl WorkerRegistry {
             .run_to_slot
             .get(run_id)
             .map(|pane| pane.slot_id)
+    }
+
+    /// Look up the complete pane registration for `run_id`. Input and
+    /// interrupt delivery need the tmux session name, while focus still only
+    /// needs the app-facing slot id.
+    pub fn pane_for_run(&self, run_id: &str) -> Option<RegisteredWorkerPane> {
+        self.inner
+            .lock()
+            .expect("registry poisoned")
+            .run_to_slot
+            .get(run_id)
+            .cloned()
     }
 
     /// Get the slot mapped to `run_id`, allocating a virtual remote slot
@@ -145,6 +193,7 @@ impl WorkerRegistry {
             RegisteredWorkerPane {
                 slot_id: slot,
                 tmux_hosted: false,
+                tmux_session_name: None,
             },
         );
         Some((slot, true))
@@ -296,7 +345,7 @@ mod tests {
     #[test]
     fn tmux_registration_preserves_hosting_mode_until_cleanup() {
         let reg = WorkerRegistry::new();
-        reg.register_tmux_run_slot("run-tmux", 4);
+        reg.register_tmux_run_slot("run-tmux", 4, "boss-4-worker");
 
         assert_eq!(reg.slot_for_run("run-tmux"), Some(4));
         assert_eq!(
@@ -304,6 +353,7 @@ mod tests {
             Some(RegisteredWorkerPane {
                 slot_id: 4,
                 tmux_hosted: true,
+                tmux_session_name: Some("boss-4-worker".to_owned()),
             })
         );
         assert_eq!(reg.slot_for_run("run-tmux"), None);

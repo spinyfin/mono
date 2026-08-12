@@ -1,5 +1,5 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 exports_files(["Cargo.toml"])
 
@@ -15,4 +15,19 @@ rust_library(
         "//tools/boss/tmux:__pkg__",
     ],
     deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "command-runner_test",
+    size = "small",
+    crate = ":command-runner",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
 )
