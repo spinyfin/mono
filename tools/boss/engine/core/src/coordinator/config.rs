@@ -86,10 +86,7 @@ impl ExecutionCoordinator {
             metrics: local_metrics,
             execution_started_hook: Arc::new(NoopExecutionStartedHook),
             automation_preemptor: Arc::new(NoopAutomationPreemptor),
-            dispatch_paused: AtomicBool::new(false),
-            dispatch_paused_since_epoch_s: AtomicU64::new(0),
-            dispatch_pause_exempts_reviews: AtomicBool::new(false),
-            dispatch_paused_reason: std::sync::Mutex::new(None),
+            dispatch_pause: std::sync::Mutex::new(None),
             dispatch_pause_bypass_execution_ids: std::sync::Mutex::new(HashSet::new()),
             dispatch_preflight_block_reason: std::sync::Mutex::new(None),
             automation_paused: AtomicBool::new(false),
@@ -409,65 +406,171 @@ impl ExecutionCoordinator {
         self.worker_pool.clone()
     }
 
-    /// Pause global dispatch. The scheduler drain stops claiming worker
-    /// slots for new executions from the main and automation pools;
-    /// already-running executions are unaffected. `origin` determines
-    /// whether `pr_review` executions are exempt from the pause — see
-    /// [`DispatchPauseOrigin`]. `reason` is a required, validated non-empty
-    /// [`PauseReason`] rather than a bare `String` — there is no overload
-    /// that lets a caller pause dispatch without one, which is the point:
-    /// dispatch must never be found paused with no record of who paused it
-    /// or why. See [`Self::resume_dispatch`] to clear the pause.
+    /// Pause global dispatch. No work item in the pause's scope reaches a
+    /// worker spawn or a cube lease until it is resumed; already-running
+    /// executions are untouched, because the pause is admission-only by
+    /// design. `origin` determines the scope — see
+    /// [`DispatchPause::reviews_held`]. `reason` is a required, validated
+    /// non-empty [`PauseReason`] rather than a bare `String` — there is no
+    /// overload that lets a caller pause dispatch without one, which is the
+    /// point: dispatch must never be found paused with no record of who
+    /// paused it or why. See [`Self::resume_dispatch`] to clear the pause.
     ///
     /// The caller is responsible for persisting the new state (including
     /// `origin`, via [`DispatchPauseOrigin::as_metadata_str`], and `reason`)
     /// to `state.db` so it survives an engine restart — see the
     /// `handle_set_dispatch_paused` handler in `app/engine_meta.rs`.
     pub fn pause_dispatch(&self, paused_since_epoch_s: u64, origin: DispatchPauseOrigin, reason: PauseReason) {
-        self.dispatch_paused.store(true, Ordering::Release);
-        self.dispatch_paused_since_epoch_s
-            .store(paused_since_epoch_s, Ordering::Release);
-        self.dispatch_pause_exempts_reviews
-            .store(origin == DispatchPauseOrigin::Operator, Ordering::Release);
-        *self.dispatch_paused_reason.lock().unwrap() = Some(reason.into());
+        *self.dispatch_pause.lock().unwrap() = Some(DispatchPause {
+            origin,
+            since_epoch_s: paused_since_epoch_s,
+            reason: reason.into(),
+        });
     }
 
-    /// Resume global dispatch. Clears the pause flag, the paused-since
-    /// timestamp, and — critically — the stored reason, so a later pause
-    /// starts from a clean slate rather than silently inheriting whatever
-    /// reason the previous episode carried.
+    /// Resume global dispatch, clearing the entire pause episode — flag,
+    /// origin, timestamp and reason together. A later pause therefore always
+    /// starts from a clean slate rather than silently inheriting a field the
+    /// previous episode left behind.
     ///
     /// The caller is responsible for persisting the new state to
     /// `state.db` — see `handle_set_dispatch_paused` in `app/engine_meta.rs`.
     pub fn resume_dispatch(&self) {
-        self.dispatch_paused.store(false, Ordering::Release);
-        self.dispatch_paused_since_epoch_s.store(0, Ordering::Release);
-        *self.dispatch_paused_reason.lock().unwrap() = None;
+        *self.dispatch_pause.lock().unwrap() = None;
+    }
+
+    /// The current pause as one consistent snapshot, or `None` when dispatch
+    /// is running. Prefer this over the individual accessors below whenever
+    /// more than one fact about the pause is needed at once — it is the only
+    /// way to be sure they describe the same instant.
+    pub fn dispatch_pause(&self) -> Option<DispatchPause> {
+        self.dispatch_pause.lock().unwrap().clone()
     }
 
     /// `true` when dispatch is globally paused.
     pub fn is_dispatch_paused(&self) -> bool {
-        self.dispatch_paused.load(Ordering::Acquire)
+        self.dispatch_pause.lock().unwrap().is_some()
     }
 
-    /// `true` when the current pause (if any) exempts `pr_review` executions
-    /// from `drain_ready_queue`'s pause gate. Meaningless when
-    /// [`Self::is_dispatch_paused`] is `false`.
+    /// `true` when the current pause exempts `pr_review` executions. `false`
+    /// when dispatch is not paused at all — an absent pause exempts nothing
+    /// because it holds nothing.
     pub fn dispatch_pause_exempts_reviews(&self) -> bool {
-        self.dispatch_pause_exempts_reviews.load(Ordering::Acquire)
+        self.dispatch_pause
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|p| !p.reviews_held())
     }
 
-    /// The epoch-seconds timestamp at which dispatch was last paused, or
-    /// `None` when not currently paused.
+    /// The epoch-seconds timestamp at which dispatch was paused, or `None`
+    /// when not currently paused.
     pub fn dispatch_paused_since_epoch_s(&self) -> Option<u64> {
-        let v = self.dispatch_paused_since_epoch_s.load(Ordering::Acquire);
-        if v == 0 { None } else { Some(v) }
+        self.dispatch_pause.lock().unwrap().as_ref().map(|p| p.since_epoch_s)
     }
 
     /// Why dispatch is currently paused, or `None` when not paused. See
     /// [`Self::pause_dispatch`] / [`Self::resume_dispatch`].
     pub fn dispatch_paused_reason(&self) -> Option<String> {
-        self.dispatch_paused_reason.lock().unwrap().clone()
+        self.dispatch_pause.lock().unwrap().as_ref().map(|p| p.reason.clone())
+    }
+
+    /// **The single authority on whether a dispatch may proceed while the
+    /// engine is paused.** Returns `Some(hold)` when it may not.
+    ///
+    /// Every path that can spawn a worker funnels through
+    /// [`Self::schedule_execution`], which calls this — so a new dispatch
+    /// entry point cannot reach a spawn without being decided here. That
+    /// placement is deliberate: the 2026-08-10 incident happened because the
+    /// pause was enforced at *one* entry point (the ready-queue drain) while
+    /// a second, `force_dispatch`, bypassed it wholesale, and nothing about
+    /// adding a third would have surfaced the omission.
+    ///
+    /// The decision, by admission:
+    ///
+    /// - [`DispatchAdmission::Queued`] — held by any pause, except that an
+    ///   operator pause exempts review-pool rows
+    ///   ([`DispatchPause::reviews_held`]).
+    /// - [`DispatchAdmission::OperatorForced`] — never held. A human naming
+    ///   one execution by hand is overriding their own pause deliberately;
+    ///   `bossctl dispatch state` declares this bypass.
+    /// - [`DispatchAdmission::BreakerRecoveryProbe`] — allowed **only** under
+    ///   a Breaker-origin pause (an operator pause is manual-resume-only and
+    ///   must never be auto-probed), and **never** for a review-pool row.
+    ///   The review exclusion is the fix for the incident's actual damage:
+    ///   the canary's death records another terminal execution against its
+    ///   work item, and for a `pr_review` that feeds
+    ///   [`crate::pr_review_recovery`]'s churn guard, which parks the item
+    ///   and leaves an open PR permanently unreviewed. It is also what makes
+    ///   `reviews: held` true — a breaker pause that spent reviews as
+    ///   canaries was not holding them.
+    /// - [`DispatchAdmission::PauseBypassOverride`] — allowed **only** under
+    ///   an Operator-origin pause; a Breaker-origin pause holds it exactly
+    ///   like [`DispatchAdmission::Queued`]. [`Self::dispatch_with_pause_bypass`]
+    ///   has already confirmed the pause was operator-originated and
+    ///   overridable before consuming this execution's
+    ///   `dispatch_pause_bypass_execution_ids` marker, so this arm exists to
+    ///   keep that confirmation honest at the chokepoint rather than to
+    ///   re-derive it.
+    pub fn dispatch_hold_for(&self, execution: &WorkExecution, admission: DispatchAdmission) -> Option<DispatchHold> {
+        let pause = self.dispatch_pause()?;
+        let targets_review_pool = self.execution_targets_review_pool(execution);
+        let hold = |detail: String| {
+            Some(DispatchHold {
+                pause: pause.clone(),
+                admission,
+                targets_review_pool,
+                detail,
+            })
+        };
+        match admission {
+            DispatchAdmission::OperatorForced => None,
+            DispatchAdmission::BreakerRecoveryProbe => {
+                if pause.origin != DispatchPauseOrigin::Breaker {
+                    return hold(format!(
+                        "dispatch is paused by the operator ({reason}) — an operator pause is \
+                         manual-resume-only and is never auto-probed",
+                        reason = pause.reason,
+                    ));
+                }
+                if targets_review_pool {
+                    return hold(format!(
+                        "dispatch is breaker-paused ({reason}) and a `pr_review` execution is never \
+                         eligible as a recovery canary — a failed canary counts against the review \
+                         churn guard and would park the work item with an unreviewed open PR",
+                        reason = pause.reason,
+                    ));
+                }
+                None
+            }
+            DispatchAdmission::Queued => {
+                if targets_review_pool && !pause.reviews_held() {
+                    return None;
+                }
+                hold(format!(
+                    "dispatch is paused ({origin}): {reason}",
+                    origin = pause.origin.as_metadata_str(),
+                    reason = pause.reason,
+                ))
+            }
+            // Episode generation (matching `pause.since_epoch_s` to the
+            // episode the operator confirmed against) is owned by
+            // `dispatch_with_pause_bypass` and is not re-verified here: the
+            // drain is kicked synchronously after that confirmation, so the
+            // window for a different operator pause to begin is negligible
+            // and the blast radius is one execution. This arm only re-checks
+            // origin so a breaker pause still refuses a bypassed row.
+            DispatchAdmission::PauseBypassOverride => {
+                if pause.origin == DispatchPauseOrigin::Operator {
+                    return None;
+                }
+                hold(format!(
+                    "dispatch is breaker-paused ({reason}) — the pause-only forced-dispatch override \
+                     applies only to an operator pause",
+                    reason = pause.reason,
+                ))
+            }
+        }
     }
 
     /// Block all local dispatch until the required startup capability is
@@ -577,7 +680,14 @@ impl ExecutionCoordinator {
 
     /// `true` when `execution` must run on the dedicated review pool —
     /// i.e. it is a `pr_review` reviewer execution.
-    pub(super) fn execution_targets_review_pool(&self, execution: &WorkExecution) -> bool {
+    ///
+    /// `pub` rather than `pub(super)` because [`Self::dispatch_hold_for`] and
+    /// [`crate::spawn_health::maybe_admit_recovery_probe`] must agree exactly
+    /// on what counts as a review: the gate refuses a review canary, and the
+    /// probe skips review rows so it never wastes its turn being refused.
+    /// Two independent notions of "is this a review" is precisely the drift
+    /// that would reopen the hole.
+    pub fn execution_targets_review_pool(&self, execution: &WorkExecution) -> bool {
         execution.kind == ExecutionKind::PrReview
     }
 

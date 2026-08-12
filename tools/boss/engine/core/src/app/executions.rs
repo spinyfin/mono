@@ -7,6 +7,8 @@
 
 use super::*;
 
+use crate::coordinator::DispatchAdmission;
+
 /// Byte cap for an over-SSH remote transcript tail pull. The
 /// `TailRunTranscript` RPC requests a line count, not a byte count, so
 /// we pull a generous suffix and split it to the requested lines; 256 KiB
@@ -86,6 +88,15 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
         // hard cap) when every configured slot is busy, so
         // the launch verb skips the cap-deferral the normal
         // request path would otherwise hit.
+        //
+        // It is admitted as `OperatorForced`, which overrides an
+        // active dispatch pause: a human naming one execution by
+        // hand is deliberately overriding their own pause (and
+        // may be probing a breaker pause on purpose). That bypass
+        // is declared in `bossctl dispatch state` so the pause's
+        // stated scope stays honest. The non-force path below
+        // just queues and kicks — the row waits behind the pause
+        // and drains on resume.
         let force = input.force;
         let live_states = server_state.live_worker_states.clone();
         let result = work_db.request_execution_with_live_check(input, |run_id| live_states.is_run_live(run_id));
@@ -101,7 +112,10 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
                     if execution.status == ExecutionStatus::Ready {
                         let coordinator = server_state.execution_coordinator.clone();
                         let execution_id = execution.id.clone();
-                        match coordinator.force_dispatch(&execution_id).await {
+                        match coordinator
+                            .force_dispatch(&execution_id, DispatchAdmission::OperatorForced)
+                            .await
+                        {
                             Ok(_worker_id) => {}
                             Err(err) => {
                                 send_work_error(&sink, &request_id, &err);

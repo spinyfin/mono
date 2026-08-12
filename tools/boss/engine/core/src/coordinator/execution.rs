@@ -189,7 +189,58 @@ impl ExecutionCoordinator {
         }
     }
 
-    pub(super) async fn schedule_execution(self: &Arc<Self>, execution: &WorkExecution, worker_id: &str) -> Result<()> {
+    /// Take one `ready` execution all the way to a running worker: guards,
+    /// host selection, `cube repo ensure`, the workspace lease, positioning,
+    /// and the pane spawn.
+    ///
+    /// `admission` says which entry point asked, and is the reason this
+    /// function is where the dispatch pause is enforced. It is the single
+    /// chokepoint every worker spawn passes through — `drain_ready_queue`
+    /// and `force_dispatch` are its only production callers — so gating here
+    /// means a pause cannot be bypassed by a dispatch entry point that
+    /// forgot to check one, which is precisely how the 2026-08-10 incident
+    /// happened. Any future caller must name a [`DispatchAdmission`], and
+    /// the compiler will not let it avoid the question.
+    pub(super) async fn schedule_execution(
+        self: &Arc<Self>,
+        execution: &WorkExecution,
+        worker_id: &str,
+        admission: DispatchAdmission,
+    ) -> Result<()> {
+        // Global pause gate. `drain_ready_queue` short-circuits before ever
+        // claiming a slot, so in the ordinary case this is never reached
+        // while paused — but a pause can land in the window between that
+        // check and this call (the drain hands the slow tail to a detached
+        // task), and this is the check that a newly-added entry point
+        // cannot skip. Refusing here returns the claimed worker to its pool
+        // via the caller's error path, before any cube lease is taken.
+        if let Some(hold) = self.dispatch_hold_for(execution, admission) {
+            tracing::warn!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                worker_id = %worker_id,
+                admission = admission.as_str(),
+                origin = hold.pause.origin.as_metadata_str(),
+                "spawn_attempt refused: dispatch is paused",
+            );
+            self.dispatch_events
+                .emit(
+                    DispatchEvent::new(Stage::DispatchHeldByPause, DispatchOutcome::Skipped, &execution.id)
+                        .with_work_item(&execution.work_item_id)
+                        .with_worker(worker_id)
+                        .with_details(serde_json::json!({
+                            "origin": hold.pause.origin.as_metadata_str(),
+                            "admission": hold.admission.as_str(),
+                            "reviews_held": hold.pause.reviews_held(),
+                            "targets_review_pool": hold.targets_review_pool,
+                            "paused_since_epoch_s": hold.pause.since_epoch_s,
+                            "reason": hold.pause.reason,
+                            "detail": hold.detail,
+                        })),
+                )
+                .await;
+            return Err(anyhow!("{hold}"));
+        }
         // Double-spawn guard (Bug A): if another execution for this
         // work_item is already live (running or waiting_human), this
         // execution is a redundant duplicate created by the orphan sweep

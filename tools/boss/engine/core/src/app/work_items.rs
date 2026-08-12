@@ -885,6 +885,40 @@ pub(super) async fn apply_work_item_patch(
                     } else {
                         "active".to_owned()
                     };
+                    // `did_dispatch` has always meant "a ready execution row
+                    // was created", not "a worker spawned" — the row still
+                    // has to clear `drain_ready_queue`. While dispatch is
+                    // paused those are very different outcomes, and reading
+                    // `did_dispatch: true, reason_if_skipped: null` 41
+                    // minutes into a pause is exactly what made the
+                    // 2026-08-10 incident look like the pause was being
+                    // ignored (mono#2303). Nothing spawned: the row was
+                    // queued and held. Say so on the event rather than
+                    // leaving the reader to infer it.
+                    //
+                    // The row is still created deliberately. The pause is
+                    // admission-only, so queued work must accumulate and
+                    // drain on resume; refusing to enqueue would silently
+                    // drop the transition instead of deferring it.
+                    //
+                    // Any active pause holds this row unconditionally: this
+                    // path routes through `execution_kind_for_work_item`,
+                    // which never yields `PrReview` (reviews are enqueued by
+                    // `request_pr_review`), so the operator pause's review
+                    // exemption can never apply here.
+                    let pause_hold = server_state
+                        .execution_coordinator
+                        .dispatch_pause()
+                        .filter(|_| did_dispatch)
+                        .map(|pause| {
+                            serde_json::json!({
+                                "origin": pause.origin.as_metadata_str(),
+                                "reviews_held": pause.reviews_held(),
+                                "paused_since_epoch_s": pause.since_epoch_s,
+                                "reason": pause.reason,
+                                "detail": "execution row queued only — no worker spawns until dispatch resumes",
+                            })
+                        });
                     let details = serde_json::json!({
                         "from_status": from_status,
                         "to_status": to_status,
@@ -892,6 +926,7 @@ pub(super) async fn apply_work_item_patch(
                         "reason_if_skipped": skip_reason,
                         "dispatched_execution_id": dispatched_execution_id,
                         "status_reverted": status_reverted,
+                        "dispatch_pause_hold": pause_hold,
                     });
                     server_state
                         .dispatch_events

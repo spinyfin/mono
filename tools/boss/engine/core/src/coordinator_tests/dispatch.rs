@@ -461,7 +461,9 @@ async fn pin_to_disabled_host_yields_no_eligible_host() {
         .claim_worker(&execution.id, None)
         .await
         .expect("worker available");
-    let result = coordinator.schedule_execution(&execution, &worker_id).await;
+    let result = coordinator
+        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .await;
     assert!(result.is_err(), "no eligible host must fail the dispatch");
 
     // No worker run was ever started, and no cube work happened.
@@ -514,7 +516,9 @@ async fn no_eligible_host_emits_terminal_host_selected_error_event() {
         .claim_worker(&execution.id, None)
         .await
         .expect("worker available");
-    let result = coordinator.schedule_execution(&execution, &worker_id).await;
+    let result = coordinator
+        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .await;
     assert!(result.is_err(), "no eligible host must fail the dispatch");
 
     let events = recording.events_for(&execution.id).await;

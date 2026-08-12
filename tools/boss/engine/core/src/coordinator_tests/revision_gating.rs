@@ -47,7 +47,9 @@ async fn revision_with_pr_url_positions_via_goto_not_create_change() {
         .await
         .expect("worker pool slot available");
 
-    let result = coordinator.schedule_execution(&execution, &worker_id).await;
+    let result = coordinator
+        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .await;
     assert!(result.is_ok(), "schedule_execution must succeed: {result:?}");
 
     // goto_workspace must have been called with pr=99.
@@ -119,7 +121,9 @@ async fn revision_without_pr_url_falls_back_to_chain_root_for_goto() {
         .await
         .expect("worker pool slot available");
 
-    let result = coordinator.schedule_execution(&execution, &worker_id).await;
+    let result = coordinator
+        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .await;
     assert!(result.is_ok(), "schedule_execution must succeed: {result:?}");
 
     // goto_workspace must have been called with pr=88 (from the chain root).
@@ -182,7 +186,9 @@ async fn revision_lease_failure_records_start_failure() {
         .await
         .expect("worker pool slot available");
 
-    let result = coordinator.schedule_execution(&execution, &worker_id).await;
+    let result = coordinator
+        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .await;
     assert!(result.is_err(), "schedule_execution must fail when the lease fails");
 
     // No workspace was ever leased so there is nothing to release.
@@ -249,7 +255,9 @@ async fn revision_soft_prefer_fallback_positions_via_goto() {
         .await
         .expect("worker pool slot available");
 
-    let result = coordinator.schedule_execution(&execution, &worker_id).await;
+    let result = coordinator
+        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .await;
     assert!(
         result.is_ok(),
         "schedule_execution must succeed via soft-prefer fallback: {result:?}"
@@ -328,7 +336,9 @@ async fn schedule_execution_rejects_gated_ready_execution() {
         .await
         .expect("worker pool slot available");
 
-    let result = coordinator.schedule_execution(&execution, &worker_id).await;
+    let result = coordinator
+        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .await;
     assert!(result.is_err(), "gated execution must be refused by schedule_execution");
 
     // The execution must have been downgraded to waiting_dependency, not
@@ -422,7 +432,9 @@ async fn schedule_execution_defers_revision_behind_live_chain_sibling() {
         .await
         .expect("worker pool slot available");
 
-    let result = coordinator.schedule_execution(&revision_exec, &worker_id).await;
+    let result = coordinator
+        .schedule_execution(&revision_exec, &worker_id, DispatchAdmission::Queued)
+        .await;
     assert!(
         result.is_err(),
         "revision must be deferred while a chain sibling is live: {result:?}",
@@ -459,7 +471,9 @@ async fn schedule_execution_defers_revision_behind_live_chain_sibling() {
         .claim_worker(&revision_exec.id, None)
         .await
         .expect("worker pool slot available after release");
-    let result_after = coordinator.schedule_execution(&revision_exec, &worker_id2).await;
+    let result_after = coordinator
+        .schedule_execution(&revision_exec, &worker_id2, DispatchAdmission::Queued)
+        .await;
     assert!(
         result_after.is_ok(),
         "revision must dispatch once the live chain sibling has reaped: {result_after:?}",
@@ -539,7 +553,9 @@ async fn schedule_execution_bypasses_live_review_sibling_for_merge_conflict_revi
         .await
         .expect("worker pool slot available");
 
-    let result = coordinator.schedule_execution(&revision_exec, &worker_id).await;
+    let result = coordinator
+        .schedule_execution(&revision_exec, &worker_id, DispatchAdmission::Queued)
+        .await;
     assert!(
         result.is_ok(),
         "merge-conflict revision must bypass a live read-only pr_review sibling: {result:?}",
@@ -643,7 +659,9 @@ async fn schedule_execution_blocks_conflict_revision_when_review_masks_live_desc
         .await
         .expect("worker pool slot available");
 
-    let result = coordinator.schedule_execution(&revision_exec_b, &worker_id).await;
+    let result = coordinator
+        .schedule_execution(&revision_exec_b, &worker_id, DispatchAdmission::Queued)
+        .await;
     assert!(
         result.is_err(),
         "a second conflict revision must NOT bypass when a live descendant writer is masked \
@@ -729,7 +747,9 @@ async fn schedule_execution_still_defers_non_conflict_revision_behind_live_revie
         .await
         .expect("worker pool slot available");
 
-    let result = coordinator.schedule_execution(&revision_exec, &worker_id).await;
+    let result = coordinator
+        .schedule_execution(&revision_exec, &worker_id, DispatchAdmission::Queued)
+        .await;
     assert!(
         result.is_err(),
         "a non-conflict revision must still defer behind a live pr_review sibling: {result:?}",
@@ -982,7 +1002,9 @@ async fn redundant_spawn_guard_emits_terminal_host_selected_error() {
         .await
         .expect("worker pool slot available");
 
-    let result = coordinator.schedule_execution(&redundant_exec, &worker_id).await;
+    let result = coordinator
+        .schedule_execution(&redundant_exec, &worker_id, DispatchAdmission::Queued)
+        .await;
     assert!(result.is_err(), "redundant spawn must be rejected: {result:?}");
 
     // Dispatch timeline: must carry a terminal host_selected:error with the right reason.
@@ -1096,7 +1118,9 @@ async fn redundant_spawn_guard_reconciles_lost_workspace_zombie_and_proceeds() {
         .await
         .expect("worker pool slot available");
 
-    let _ = coordinator.schedule_execution(&fresh, &worker_id).await;
+    let _ = coordinator
+        .schedule_execution(&fresh, &worker_id, DispatchAdmission::Queued)
+        .await;
 
     // The zombie was reconciled to a terminal status (orphaned) with a
     // lost_workspace_reconcile trace event naming its prior status.
@@ -1203,7 +1227,9 @@ async fn chain_serialized_backstop_emits_terminal_host_selected_error() {
     // Use force_dispatch to hit the schedule_execution backstop (the auto-dispatcher
     // pre-filters this case before claiming a worker, so force_dispatch is the path
     // that actually reaches this guard in production).
-    let result = coordinator.force_dispatch(&revision_exec.id).await;
+    let result = coordinator
+        .force_dispatch(&revision_exec.id, DispatchAdmission::OperatorForced)
+        .await;
     assert!(
         result.is_err(),
         "chain-serialized revision must be deferred: {result:?}",
@@ -1516,7 +1542,9 @@ async fn gating_prereqs_guard_emits_terminal_host_selected_error() {
         .await
         .expect("worker pool slot available");
 
-    let result = coordinator.schedule_execution(&gated_exec, &worker_id).await;
+    let result = coordinator
+        .schedule_execution(&gated_exec, &worker_id, DispatchAdmission::Queued)
+        .await;
     assert!(result.is_err(), "gated execution must be refused: {result:?}");
 
     // Dispatch timeline: must carry a terminal host_selected:error with the right reason.
@@ -1659,7 +1687,9 @@ async fn merge_conflict_already_resolved_guard_short_circuits_dispatch() {
         .await
         .expect("worker pool slot available");
 
-    let result = coordinator.schedule_execution(&exec, &worker_id).await;
+    let result = coordinator
+        .schedule_execution(&exec, &worker_id, DispatchAdmission::Queued)
+        .await;
     assert!(
         result.is_err(),
         "an already-resolved merge-conflict revision must not be dispatched: {result:?}"

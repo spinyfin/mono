@@ -1274,7 +1274,7 @@ async fn force_dispatch_bypasses_configured_pool_cap() {
         )
         .unwrap();
     let worker_id = coordinator
-        .force_dispatch(&queued_exec.id)
+        .force_dispatch(&queued_exec.id, DispatchAdmission::OperatorForced)
         .await
         .expect("force_dispatch should bypass the cap and return a worker id");
     assert_eq!(
@@ -1475,7 +1475,7 @@ async fn force_dispatch_refuses_a_failed_startup_preflight() {
     coordinator.set_dispatch_preflight_block(Some("tmux 3.2 is required".to_owned()));
 
     let error = coordinator
-        .force_dispatch("exec-preflight-blocked")
+        .force_dispatch("exec-preflight-blocked", DispatchAdmission::OperatorForced)
         .await
         .expect_err("force dispatch must not bypass a failed tmux preflight");
     assert!(error.to_string().contains("tmux 3.2 is required"));
@@ -1559,7 +1559,7 @@ async fn force_dispatch_pr_review_claims_review_pool_worker_and_preserves_review
     let coordinator = Arc::new(coord);
 
     let worker_id = coordinator
-        .force_dispatch(&execution.id)
+        .force_dispatch(&execution.id, DispatchAdmission::OperatorForced)
         .await
         .expect("force_dispatch should claim a review-pool slot");
     assert!(
@@ -1638,7 +1638,7 @@ async fn force_dispatch_automation_sourced_task_claims_automation_pool_worker() 
     let coordinator = Arc::new(coord);
 
     let worker_id = coordinator
-        .force_dispatch(&execution.id)
+        .force_dispatch(&execution.id, DispatchAdmission::OperatorForced)
         .await
         .expect("force_dispatch should claim an automation-pool slot");
     assert!(
@@ -1730,7 +1730,7 @@ async fn agents_launch_force_path_routes_automation_sourced_chore_to_automation_
     assert_eq!(launched.status, ExecutionStatus::Ready);
 
     let worker_id = coordinator
-        .force_dispatch(&launched.id)
+        .force_dispatch(&launched.id, DispatchAdmission::OperatorForced)
         .await
         .expect("agents-launch force_dispatch should claim an automation-pool slot");
     assert!(
@@ -2316,7 +2316,10 @@ async fn answer_agent_start_records_queue_wait_metric_and_dispatch_event() {
         .await
         .expect("worker should be available");
 
-    coordinator.schedule_execution(&execution, &worker_id).await.unwrap();
+    coordinator
+        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .await
+        .unwrap();
 
     assert_eq!(
         metrics

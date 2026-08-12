@@ -62,8 +62,14 @@
 //! passive recovery is impossible by construction. Instead
 //! [`maybe_admit_recovery_probe`], driven off the existing 60s
 //! [`crate::spawn_ack_sweep`] tick, periodically force-dispatches exactly
-//! ONE ready execution as a canary (bypassing the pause gate the same way
-//! `bossctl agents launch` does) while the breaker is tripped. A real shell
+//! ONE ready **non-review** execution as a canary while the breaker is
+//! tripped. This is the pause's one automatic exception, and it is declared:
+//! it goes through the coordinator's admission gate as
+//! [`crate::coordinator::DispatchAdmission::BreakerRecoveryProbe`] and emits
+//! a [`Stage::BreakerRecoveryProbeAdmitted`] event, so it is distinguishable
+//! in `bossctl dispatch tail` from a pause that is not being honoured.
+//! `pr_review` rows are never eligible — see
+//! [`maybe_admit_recovery_probe`]. A real shell
 //! pid reported for that canary is proof the spawn path works again and
 //! auto-resumes dispatch ([`resume_dispatch_after_breaker_recovery`]); a
 //! reap of the canary (spawn-ack timeout or app NACK) backs off
@@ -83,7 +89,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use boss_protocol::CreateAttentionItemInput;
+use boss_protocol::{CreateAttentionItemInput, WorkExecution};
 use serde::Serialize;
 
 use crate::app::handler_helpers::{
@@ -91,7 +97,7 @@ use crate::app::handler_helpers::{
     METADATA_KEY_DISPATCH_PAUSED_SINCE,
 };
 use crate::config::DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER;
-use crate::coordinator::{DispatchPauseOrigin, ExecutionCoordinator};
+use crate::coordinator::{DispatchAdmission, DispatchPauseOrigin, ExecutionCoordinator};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::work::WorkDb;
 
@@ -441,6 +447,14 @@ impl SpawnHealthTracker {
         self.probe.lock().unwrap().in_flight.as_deref() == Some(execution_id)
     }
 
+    /// Consecutive failed probe attempts since the last success — the
+    /// backoff generation, reported in the
+    /// [`Stage::BreakerRecoveryProbeAdmitted`] event so an operator reading
+    /// `bossctl dispatch tail` can tell a first attempt from the fifth.
+    pub fn probe_consecutive_failures(&self) -> u32 {
+        self.probe.lock().unwrap().consecutive_failures
+    }
+
     /// The in-flight probe failed (reaped by the spawn-ack-timeout sweep, an
     /// app NACK, or a synchronous force-dispatch error) — clear it and back
     /// off exponentially before the next attempt. No-op when `execution_id`
@@ -483,24 +497,47 @@ impl SpawnHealthTracker {
 /// [`DispatchPauseOrigin::Breaker`] (never an operator pause — see
 /// [`resume_dispatch_after_breaker_recovery`]) and the tracker's backoff
 /// says a probe is due, force-dispatch exactly one ready execution as a
-/// canary — bypassing the pause gate the same way `bossctl agents launch`
-/// does via [`ExecutionCoordinator::force_dispatch`] — and mark it in
-/// flight. This is the breaker's only way out of the latch: normal
-/// dispatch stays fully blocked while paused, so without this no execution
-/// could ever run to prove the app's spawn path recovered.
+/// canary and mark it in flight. This is the breaker's only way out of the
+/// latch: normal dispatch stays fully blocked while paused, so without this
+/// no execution could ever run to prove the app's spawn path recovered.
+///
+/// The canary goes through [`ExecutionCoordinator::force_dispatch`] with
+/// [`DispatchAdmission::BreakerRecoveryProbe`], so the coordinator's pause
+/// gate — not this function — decides whether it may run. That gate refuses
+/// a `pr_review` row outright, and this function skips review rows when
+/// choosing a candidate so a refusal never silently burns the probe's turn.
+///
+/// # Why reviews are never canaries
+///
+/// A canary that dies records another terminal execution against its work
+/// item. For a `pr_review` row those terminal executions are exactly what
+/// [`crate::pr_review_recovery`]'s churn guard counts, so a sustained
+/// outage's probes park the item and leave an open PR permanently
+/// unreviewed — with the churn guard behaving perfectly, having been fed by
+/// this path. That is the 2026-08-10 incident: three canaries in a
+/// 41-minute breaker pause, each spending the `pr_review` row that
+/// `pr_review_dead_recovery` had just re-enqueued (a fresh review sorts last
+/// in the ready queue, and the probe picked the last row), while
+/// `bossctl dispatch state` said `reviews: held`.
 ///
 /// Driven off the existing 60s [`crate::spawn_ack_sweep`] tick, which
-/// already owns the `coordinator` / `spawn_health` handles this needs.
-/// Cheap no-op when dispatch isn't Breaker-paused or no probe is due yet.
+/// already owns the handles this needs. Cheap no-op when dispatch isn't
+/// Breaker-paused or no probe is due yet.
 pub async fn maybe_admit_recovery_probe(
     work_db: &WorkDb,
     coordinator: &Arc<ExecutionCoordinator>,
     spawn_health: &SpawnHealthTracker,
+    dispatch_events: &dyn DispatchEventSink,
     now_epoch_secs: i64,
 ) {
-    if !coordinator.is_dispatch_paused() || coordinator.dispatch_pause_exempts_reviews() {
-        // Not paused, or an operator pause (which stays manual-resume-only)
-        // — never auto-probe those.
+    // Not paused, or an operator pause (which stays manual-resume-only) —
+    // never auto-probe those. The authoritative version of this rule lives
+    // in `ExecutionCoordinator::dispatch_hold_for`; checking it here too
+    // avoids consuming a probe slot on a dispatch that would be refused.
+    if !coordinator
+        .dispatch_pause()
+        .is_some_and(|p| p.origin == DispatchPauseOrigin::Breaker)
+    {
         return;
     }
     if !spawn_health.try_admit_probe(now_epoch_secs) {
@@ -516,24 +553,65 @@ pub async fn maybe_admit_recovery_probe(
             return;
         }
     };
+    let total_ready = ready.len();
+    // Reviews are ineligible (see the module-level rationale above); the
+    // coordinator's gate would refuse them anyway, and filtering here means
+    // a queue whose tail happens to be reviews still gets a canary from the
+    // rows behind them.
+    let eligible: Vec<&WorkExecution> = ready
+        .iter()
+        .filter(|e| !coordinator.execution_targets_review_pool(e))
+        .collect();
+    let skipped_reviews = total_ready - eligible.len();
     // `list_ready_executions` orders by dispatch class then FIFO, so
     // `.first()` would be the fleet's single most urgent row (typically a
     // merge-conflict revision) — sacrificing it repeatedly to a sustained
     // outage's probes would burn the highest-priority work first. `.last()`
     // proves the same thing about the spawn path while spending the least
-    // urgent ready row instead.
-    let Some(candidate) = ready.last() else {
-        // Nothing to probe with yet; try again on the next sweep tick.
+    // urgent eligible row instead.
+    let Some(candidate) = eligible.last().copied() else {
+        // Nothing eligible to probe with yet; try again on the next sweep
+        // tick. Logged rather than silent when reviews were the only ready
+        // work: the operator's question in that state is "why is the
+        // breaker not recovering", and the answer is here.
+        if skipped_reviews > 0 {
+            tracing::warn!(
+                skipped_reviews,
+                "spawn-capability breaker: every ready execution is a PR review, which is never \
+                 eligible as a recovery canary; waiting for non-review work, a fresh app session, \
+                 or `bossctl dispatch resume`",
+            );
+        }
         return;
     };
     tracing::warn!(
         execution_id = %candidate.id,
         work_item_id = %candidate.work_item_id,
+        skipped_reviews,
         "spawn-capability breaker: admitting half-open recovery probe through paused dispatch",
     );
-    match coordinator.force_dispatch(&candidate.id).await {
+    match coordinator
+        .force_dispatch(&candidate.id, DispatchAdmission::BreakerRecoveryProbe)
+        .await
+    {
         Ok(worker_id) => {
             spawn_health.mark_probe_dispatched(&candidate.id, now_epoch_secs);
+            // The canary produces a full `worker_claimed` → `pane_spawned`
+            // sequence minutes into a pause. Without this event that reads,
+            // in `bossctl dispatch tail`, exactly like a pause not being
+            // honoured — which is how the incident was first diagnosed.
+            dispatch_events
+                .emit(
+                    DispatchEvent::new(Stage::BreakerRecoveryProbeAdmitted, Outcome::Ok, &candidate.id)
+                        .with_work_item(&candidate.work_item_id)
+                        .with_worker(&worker_id)
+                        .with_details(serde_json::json!({
+                            "ready_candidates": eligible.len(),
+                            "skipped_reviews": skipped_reviews,
+                            "consecutive_failures": spawn_health.probe_consecutive_failures(),
+                        })),
+                )
+                .await;
             tracing::info!(
                 execution_id = %candidate.id,
                 worker_id,
@@ -575,12 +653,18 @@ pub async fn resume_dispatch_after_breaker_recovery(
     execution_id: Option<&str>,
     reason: &str,
 ) -> bool {
-    if !coordinator.is_dispatch_paused() || coordinator.dispatch_pause_exempts_reviews() {
+    // One snapshot answers both "is this a breaker pause" and "when did it
+    // start", so the audit record below cannot describe a different episode
+    // from the one being resumed.
+    let Some(pause) = coordinator.dispatch_pause() else {
+        return false;
+    };
+    if pause.origin != DispatchPauseOrigin::Breaker {
         return false;
     }
-    // Snapshot the pause start before `resume_dispatch` zeroes it, so the
-    // resume's audit record can carry how long the episode actually lasted.
-    let paused_since_epoch_s = coordinator.dispatch_paused_since_epoch_s();
+    // Taken before `resume_dispatch` clears the pause, so the resume's audit
+    // record can carry how long the episode actually lasted.
+    let paused_since_epoch_s = Some(pause.since_epoch_s);
     let now_epoch_s = boss_engine_utils::epoch_time::now_epoch_secs() as u64;
     let pause_duration_secs = paused_since_epoch_s.map(|since| now_epoch_s.saturating_sub(since));
     coordinator.resume_dispatch();
@@ -685,7 +769,10 @@ pub async fn trip_spawn_capability_circuit(
     let rule = format!("{threshold} distinct work items failed to spawn a worker shell within {window_secs}s");
 
     if breaker_enabled {
-        if coordinator.is_dispatch_paused() && !coordinator.dispatch_pause_exempts_reviews() {
+        if coordinator
+            .dispatch_pause()
+            .is_some_and(|p| p.origin == DispatchPauseOrigin::Breaker)
+        {
             tracing::debug!(
                 tripping_execution_id,
                 "spawn-capability breaker: dispatch already paused (non-exempt); skipping duplicate trip",
@@ -1191,7 +1278,7 @@ mod tests {
         );
 
         let spawn_health = SpawnHealthTracker::new();
-        maybe_admit_recovery_probe(&db, &coordinator, &spawn_health, 1000).await;
+        maybe_admit_recovery_probe(&db, &coordinator, &spawn_health, &NoopDispatchEventSink, 1000).await;
 
         assert!(
             spawn_health.is_probe_execution(&execution.id),
@@ -1217,7 +1304,7 @@ mod tests {
         // Dispatch is running normally — no breaker trip in play.
 
         let spawn_health = SpawnHealthTracker::new();
-        maybe_admit_recovery_probe(&db, &coordinator, &spawn_health, 1000).await;
+        maybe_admit_recovery_probe(&db, &coordinator, &spawn_health, &NoopDispatchEventSink, 1000).await;
 
         assert!(!spawn_health.is_probe_execution(&execution.id));
         let reloaded = db.get_execution(&execution.id).unwrap();
@@ -1246,7 +1333,7 @@ mod tests {
         );
 
         let spawn_health = SpawnHealthTracker::new();
-        maybe_admit_recovery_probe(&db, &coordinator, &spawn_health, 1000).await;
+        maybe_admit_recovery_probe(&db, &coordinator, &spawn_health, &NoopDispatchEventSink, 1000).await;
 
         assert!(!spawn_health.is_probe_execution(&execution.id));
         let reloaded = db.get_execution(&execution.id).unwrap();
@@ -1275,12 +1362,12 @@ mod tests {
         // highest-priority work — `second` (created later, so ordered last
         // by the FIFO tiebreak) is the one admitted, not `first`.
         let spawn_health = SpawnHealthTracker::new();
-        maybe_admit_recovery_probe(&db, &coordinator, &spawn_health, 1000).await;
+        maybe_admit_recovery_probe(&db, &coordinator, &spawn_health, &NoopDispatchEventSink, 1000).await;
         assert!(spawn_health.is_probe_execution(&second.id));
 
         // A second tick while the first probe is unresolved must not admit
         // the other ready execution too.
-        maybe_admit_recovery_probe(&db, &coordinator, &spawn_health, 1001).await;
+        maybe_admit_recovery_probe(&db, &coordinator, &spawn_health, &NoopDispatchEventSink, 1001).await;
         assert!(spawn_health.is_probe_execution(&second.id), "still the original probe");
         let first_reloaded = db.get_execution(&first.id).unwrap();
         assert_eq!(

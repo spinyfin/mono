@@ -475,7 +475,7 @@ pub async fn run_one_pass(
     // the pause. Runs every pass regardless of whether this pass reaped
     // anything — the breaker may have tripped from an app NACK (a different
     // code path) rather than from a timeout seen above.
-    maybe_admit_recovery_probe(work_db, &coordinator, spawn_health, now_epoch_secs).await;
+    maybe_admit_recovery_probe(work_db, &coordinator, spawn_health, dispatch_events, now_epoch_secs).await;
 
     outcome
 }

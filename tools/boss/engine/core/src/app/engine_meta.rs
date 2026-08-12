@@ -573,18 +573,8 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
         let already = coordinator.is_dispatch_paused();
         if already == paused {
             // Idempotent: no-op but still respond with the current state.
-            let paused_since_epoch_s = coordinator.dispatch_paused_since_epoch_s();
             tracing::debug!(paused, "set_dispatch_paused: idempotent no-op");
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::DispatchStateResult {
-                    paused,
-                    paused_since_epoch_s,
-                    reviews_exempt: coordinator.dispatch_pause_exempts_reviews(),
-                    reason: coordinator.dispatch_paused_reason(),
-                },
-            );
+            send_response(&sink, &request_id, dispatch_state_result(coordinator.dispatch_pause()));
             return;
         }
         // A pause with no usable reason is rejected outright — dispatch must
@@ -697,20 +687,27 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
                 )
                 .await;
         }
-        let paused_since_epoch_s = coordinator.dispatch_paused_since_epoch_s();
-        send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::DispatchStateResult {
-                paused,
-                paused_since_epoch_s,
-                reviews_exempt: coordinator.dispatch_pause_exempts_reviews(),
-                reason: coordinator.dispatch_paused_reason(),
-            },
-        );
+        send_response(&sink, &request_id, dispatch_state_result(coordinator.dispatch_pause()));
         // Broadcast the new health report to all connected app clients so
         // the pause banner updates live without requiring an app restart.
         server_state.broadcast_engine_health().await;
+    }
+}
+
+/// Build the wire reply from ONE pause snapshot.
+///
+/// Every field here describes the same pause episode or none at all. Reading
+/// them through four separate accessors instead would let a concurrent
+/// pause/resume land between two of them and produce a reply that describes
+/// no state the engine was ever actually in — e.g. `paused: false` carrying
+/// the previous episode's `reviews_exempt`, which is exactly the stale-scope
+/// report this refactor exists to make impossible.
+fn dispatch_state_result(pause: Option<crate::coordinator::DispatchPause>) -> FrontendEvent {
+    FrontendEvent::DispatchStateResult {
+        paused: pause.is_some(),
+        paused_since_epoch_s: pause.as_ref().map(|p| p.since_epoch_s),
+        reviews_exempt: pause.as_ref().is_some_and(|p| !p.reviews_held()),
+        reason: pause.as_ref().map(|p| p.reason.clone()),
     }
 }
 
@@ -724,21 +721,8 @@ pub(super) async fn handle_get_dispatch_state(ctx: Dispatch, req: FrontendReques
     let FrontendRequest::GetDispatchState = req else {
         unreachable!()
     };
-    {
-        let coordinator = &server_state.execution_coordinator;
-        let paused = coordinator.is_dispatch_paused();
-        let paused_since_epoch_s = coordinator.dispatch_paused_since_epoch_s();
-        send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::DispatchStateResult {
-                paused,
-                paused_since_epoch_s,
-                reviews_exempt: coordinator.dispatch_pause_exempts_reviews(),
-                reason: coordinator.dispatch_paused_reason(),
-            },
-        );
-    }
+    let pause = server_state.execution_coordinator.dispatch_pause();
+    send_response(&sink, &request_id, dispatch_state_result(pause));
 }
 
 pub(super) async fn handle_set_automation_paused(ctx: Dispatch, req: FrontendRequest) {

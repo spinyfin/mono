@@ -573,6 +573,47 @@ pub enum Stage {
     /// `entry_point`, the blocking `reason` string, and — when the refusal
     /// followed a stale confirmation — the pause state actually observed.
     DispatchPauseOverrideRefused,
+    /// A dispatch was refused at the spawn chokepoint because the active
+    /// pause holds it. Emitted by
+    /// `ExecutionCoordinator::schedule_execution`'s admission gate — the
+    /// single check every worker spawn passes through, whichever entry
+    /// point queued the row. The ordinary case is silent (the ready-queue
+    /// drain short-circuits before ever claiming a slot), so this event
+    /// firing means a pause landed *between* a slot claim and the spawn,
+    /// or a caller reached the chokepoint without honouring the pause. In
+    /// either case the claimed worker is handed straight back; nothing is
+    /// leased and nothing spawns.
+    ///
+    /// The `details` object carries `origin` (`"operator"` / `"breaker"`),
+    /// `admission` (which entry point asked — `"queued"`,
+    /// `"operator_forced"`, `"breaker_recovery_probe"`,
+    /// `"pause_bypass_override"`), `reviews_held`, `targets_review_pool`,
+    /// and the pause `reason`. Always [`Outcome::Skipped`]: a held dispatch
+    /// is the pause working, not a failure.
+    DispatchHeldByPause,
+    /// The spawn-capability breaker's half-open recovery probe admitted one
+    /// canary execution through a Breaker-origin pause (see
+    /// `boss_engine::spawn_health::maybe_admit_recovery_probe`). This is the
+    /// breaker's only route out of the latch — normal dispatch stays fully
+    /// held while paused, so without a canary no execution could ever run to
+    /// prove the app's spawn path recovered.
+    ///
+    /// It exists as its own stage because the bypass was previously
+    /// invisible: a canary produced a complete `worker_claimed` →
+    /// `cube_workspace_leased` → `pane_spawned` sequence in
+    /// `bossctl dispatch tail`, minutes into a pause, with nothing
+    /// distinguishing it from a pause that simply was not being honoured.
+    /// Reading the tail during the 2026-08-10 incident, that is exactly how
+    /// it presented.
+    ///
+    /// `pr_review` executions are never eligible as canaries — a dead canary
+    /// records another terminal execution against its work item, and for a
+    /// review that feeds the `pr_review_recovery` churn guard until the item
+    /// parks with an unreviewed open PR. The `details` object carries
+    /// `ready_candidates` (how many rows were eligible), `skipped_reviews`
+    /// (how many ready review rows were passed over), and
+    /// `consecutive_failures` (the probe backoff generation).
+    BreakerRecoveryProbeAdmitted,
     /// A ready mainline item preempted an in-progress spilled automation
     /// run to obtain an interactive slot (see
     /// `boss_engine::dispatch_spillover`). Fires only when every Bridge Crew
@@ -766,6 +807,8 @@ impl Stage {
             Stage::DispatchResumed => "dispatch_resumed",
             Stage::DispatchPauseOverride => "dispatch_pause_override",
             Stage::DispatchPauseOverrideRefused => "dispatch_pause_override_refused",
+            Stage::DispatchHeldByPause => "dispatch_held_by_pause",
+            Stage::BreakerRecoveryProbeAdmitted => "breaker_recovery_probe_admitted",
             Stage::AutomationPreempted => "automation_preempted",
             Stage::WorkspaceRecovery => "workspace_recovery",
             Stage::AbandonedBranchPrRecovery => "abandoned_branch_pr_recovery",

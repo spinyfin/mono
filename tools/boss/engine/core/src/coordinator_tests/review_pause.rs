@@ -228,7 +228,9 @@ async fn pr_review_with_pr_url_positions_via_goto_not_create_change() {
         .await
         .expect("review pool slot available");
 
-    let result = coordinator.schedule_execution(&execution, &worker_id).await;
+    let result = coordinator
+        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .await;
     assert!(result.is_ok(), "schedule_execution must succeed: {result:?}");
 
     // goto_workspace must have been called with pr=42.
@@ -287,7 +289,9 @@ async fn pr_review_lease_failure_records_start_failure() {
         .await
         .expect("review pool slot available");
 
-    let result = coordinator.schedule_execution(&execution, &worker_id).await;
+    let result = coordinator
+        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .await;
     assert!(result.is_err(), "schedule_execution must fail when the lease fails");
 
     // No workspace was ever leased so there is nothing to release.
@@ -341,7 +345,9 @@ async fn pr_review_goto_failure_records_positioning_failed() {
         .await
         .expect("review pool slot available");
 
-    let result = coordinator.schedule_execution(&execution, &worker_id).await;
+    let result = coordinator
+        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .await;
     assert!(result.is_err(), "schedule_execution must fail when goto fails");
 
     // The workspace was leased and must be released after goto failure.
@@ -396,7 +402,9 @@ async fn pr_review_without_pr_url_uses_create_change_path() {
         .await
         .expect("review pool slot available");
 
-    let result = coordinator.schedule_execution(&execution, &worker_id).await;
+    let result = coordinator
+        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .await;
     assert!(
         result.is_ok(),
         "schedule_execution must succeed on the create_change path: {result:?}"
