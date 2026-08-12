@@ -62,6 +62,18 @@ pub const ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD: i64 = 3;
 /// ([`crate::attention_lifecycle::ClearedBy::WorkResumed`]).
 pub const CHURN_GUARD_PARKED_ATTENTION_KIND: &str = "churn_guard_parked";
 
+/// `tasks.dispatch_failed_reason` value stamped by
+/// [`crate::work::WorkDb::bounce_churn_guard_parked_to_backlog`] when
+/// [`crate::orphan_sweep`] trips the churn guard on an `active` work item.
+/// Distinct from [`CHURN_GUARD_PARKED_ATTENTION_KIND`]: that kind remains
+/// in use by [`crate::pr_review_recovery`] (whose target task stays
+/// `in_review`, so it cannot bounce to Backlog), but the `active`-task case
+/// now goes through the same `dispatch_failed_reason` representation a
+/// pre-spawn dispatch failure uses, so the kanban board reflects the park
+/// without ever reading `work_attention_items` — see
+/// `docs/designs/dispatch-halt-state-vs-attention-items.md`.
+pub const CHURN_GUARD_DISPATCH_FAILED_REASON: &str = "churn_guard";
+
 /// `work_attention_items.kind` raised by [`crate::dispatch_stall_escalation`]
 /// when a dispatch timeline sits stuck in one stage past
 /// [`crate::dispatch_stall_escalation::PERSISTENT_STALL_THRESHOLD`]. The

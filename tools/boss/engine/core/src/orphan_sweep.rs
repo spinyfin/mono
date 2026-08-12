@@ -32,8 +32,17 @@
 //!    still in a live status at this point is also skipped unconditionally.
 //! 4. Applies the churn guard: if the work item has already had
 //!    [`ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD`] terminal executions
-//!    in the last [`ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS`], it
-//!    is skipped and a warning is logged.
+//!    in the last [`ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS`], it is
+//!    skipped, a warning is logged, and the item is bounced to Backlog via
+//!    [`crate::work::WorkDb::bounce_churn_guard_parked_to_backlog`] (the
+//!    same `dispatch_failed_reason` surface a pre-spawn dispatch failure
+//!    uses) so the kanban board shows the park instead of the card sitting
+//!    in Doing looking idle — see
+//!    `docs/designs/dispatch-halt-state-vs-attention-items.md`. Auto-clears
+//!    once [`crate::dispatch_failure_recovery_sweep`] retries it after its
+//!    cooldown and the trailing window has drained below its own threshold,
+//!    or immediately on an explicit `bossctl work start` / kanban
+//!    drag-to-Doing, either of which bypasses the guard entirely.
 //! 5. Applies the **durable-process guard**: probes the pid recorded on the
 //!    item's most recent local run ([`crate::durable_liveness`]) and refuses
 //!    to redispatch while that process is alive, then hands the contradiction
@@ -219,7 +228,7 @@ pub async fn run_one_pass(
             let failing_ids = work_db
                 .list_recent_terminal_execution_ids(&work_item_id, churn_cutoff, None)
                 .unwrap_or_default();
-            work_db.file_churn_guard_parked_attention(
+            work_db.bounce_churn_guard_parked_to_backlog(
                 &work_item_id,
                 "orphan_sweep",
                 recent_terminal,
@@ -774,13 +783,18 @@ mod tests {
         assert!(sink.events().await.is_empty(), "no event on churn skip");
     }
 
-    /// The churn guard trip must be operator-visible: a `churn_guard_parked`
-    /// attention item is filed against the work item (not just a trace WARN),
-    /// and it resolves automatically the next time a dispatch attempt is made
-    /// against the item — whether that's a later sweep pass once the window
-    /// drains, or an explicit `bossctl work start` bypassing the guard.
+    /// The churn guard trip must be operator-visible on the board itself,
+    /// not just in a trace WARN or an attention item nobody renders: the
+    /// work item bounces to Backlog (`status = "todo"`, `autostart =
+    /// false`) with `dispatch_failed_reason = "churn_guard"` and an
+    /// explanatory `dispatch_failed_error` — the same surface
+    /// `WorkDispatchFailureBanner` (macOS app) already renders for a
+    /// pre-spawn dispatch failure. It resolves automatically the next time
+    /// a dispatch attempt is made against the item — whether that's a
+    /// later sweep pass once the window drains, or an explicit `bossctl
+    /// work start` bypassing the guard.
     #[tokio::test]
-    async fn churn_guard_trip_files_and_clears_attention_item() {
+    async fn churn_guard_trip_bounces_to_backlog_and_clears_on_retry() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
@@ -804,19 +818,30 @@ mod tests {
         .await;
         assert_eq!(outcome.churn_skipped, 1);
 
+        // No attention item — the park is engine/dispatch state, not a
+        // human-judgment question, so it never touches `work_attention_items`.
         let items = db.list_attention_items_for_work_item(&work_item_id).unwrap();
-        let open: Vec<_> = items
-            .iter()
-            .filter(|i| i.kind == crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND && i.status == "open")
-            .collect();
-        assert_eq!(open.len(), 1, "expected one open churn_guard_parked attention item");
         assert!(
-            open[0].body_markdown.contains("bossctl work start"),
-            "attention body should point at the manual bypass verb"
+            items
+                .iter()
+                .all(|i| i.kind != crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND),
+            "the active-task churn park must not file a churn_guard_parked attention item; got: {items:?}"
         );
 
-        // Bypassing the guard (the `bossctl work start` path) resolves the
-        // attention immediately, without needing another sweep pass.
+        let task = get_task(&db, &work_item_id);
+        assert_eq!(task.status.as_str(), "todo", "bounced item returns to Backlog");
+        assert!(!task.autostart, "autostart must be cleared so the park doesn't loop");
+        assert_eq!(task.dispatch_failed_reason.as_deref(), Some("churn_guard"));
+        assert!(
+            task.dispatch_failed_error
+                .as_deref()
+                .is_some_and(|e| e.contains("bossctl work start")),
+            "dispatch_failed_error should point at the manual bypass verb: {:?}",
+            task.dispatch_failed_error
+        );
+
+        // Bypassing the guard (the `bossctl work start` path) clears the
+        // bounce immediately, without needing another sweep pass.
         db.request_execution_with_live_check(
             RequestExecutionInput::builder()
                 .work_item_id(work_item_id.clone())
@@ -825,14 +850,18 @@ mod tests {
         )
         .unwrap();
 
-        let items_after = db.list_attention_items_for_work_item(&work_item_id).unwrap();
+        let task_after = get_task(&db, &work_item_id);
         assert!(
-            items_after
-                .iter()
-                .filter(|i| i.kind == crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND)
-                .all(|i| i.status == "resolved"),
-            "churn_guard_parked attention should auto-resolve on the next dispatch attempt"
+            task_after.dispatch_failed_reason.is_none(),
+            "dispatch_failed_reason should clear on the next dispatch attempt"
         );
+    }
+
+    fn get_task(db: &WorkDb, work_item_id: &str) -> boss_protocol::Task {
+        match db.get_work_item(work_item_id).unwrap() {
+            boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t,
+            other => panic!("expected a task/chore work item, got {other:?}"),
+        }
     }
 
     /// Recent-transition guard: freshly-activated item is skipped even with

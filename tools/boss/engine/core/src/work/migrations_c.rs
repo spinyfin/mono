@@ -663,6 +663,176 @@ pub(crate) fn migrate_correct_falsely_answered_comments_with_failed_runs(conn: &
     Ok(())
 }
 
+/// One-shot conversion of pre-existing open `churn_guard_parked` attention
+/// items into the new `dispatch_failed_reason` representation — see
+/// `docs/designs/dispatch-halt-state-vs-attention-items.md`. Before this
+/// migration, `orphan_sweep` filed a `churn_guard_parked` attention item
+/// for an `active` work item; after it, that path bounces the item to
+/// Backlog via `WorkDb::bounce_churn_guard_parked_to_backlog` instead
+/// (`tasks.dispatch_failed_reason = 'churn_guard'`), because nothing ever
+/// rendered the attention item on the board it was meant to explain.
+///
+/// This runs once against whatever open items already exist so a churn
+/// park an operator hit before this shipped doesn't stay invisible forever
+/// waiting for a fresh trip to re-file it in the new shape. Preserves the
+/// information rather than discarding it: the attention item's
+/// `body_markdown` becomes the task's `dispatch_failed_error`, and the
+/// item itself is marked `resolved` (not deleted) — the representation
+/// changed, nothing was silently dismissed.
+///
+/// Scoped to `status = 'active'` tasks only: `pr_review_recovery` files
+/// the same attention `kind` for `in_review` tasks (a reviewer dying
+/// repeatedly), where Backlog is not a meaningful destination — those
+/// rows are left exactly as they were, still open attention items, still
+/// handled by that sweep.
+pub(crate) fn migrate_convert_open_churn_guard_parked_to_dispatch_failed(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT wai.id, wai.work_item_id, wai.body_markdown
+           FROM work_attention_items wai
+           JOIN tasks t ON t.id = wai.work_item_id
+          WHERE wai.kind = 'churn_guard_parked'
+            AND wai.status = 'open'
+            AND t.status = 'active'
+            AND t.deleted_at IS NULL",
+    )?;
+    let candidates: Vec<(String, String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    let now = now_string();
+    for (attention_id, work_item_id, body_markdown) in candidates {
+        tracing::warn!(
+            work_item_id,
+            attention_id,
+            "migrating pre-existing open churn_guard_parked attention item to dispatch_failed_reason",
+        );
+        let updated = conn.execute(
+            "UPDATE tasks
+             SET status = 'todo',
+                 autostart = 0,
+                 last_status_actor = 'engine',
+                 dispatch_failed_reason = 'churn_guard',
+                 dispatch_failed_error = ?2,
+                 dispatch_failed_at = ?3,
+                 updated_at = ?3
+             WHERE id = ?1
+               AND status = 'active'
+               AND deleted_at IS NULL",
+            params![work_item_id, body_markdown, now],
+        )?;
+        if updated == 0 {
+            // Raced a status change between the SELECT and here; leave the
+            // attention item as-is rather than resolving a signal whose
+            // information was never actually migrated anywhere.
+            continue;
+        }
+        conn.execute(
+            "UPDATE work_attention_items SET status = 'resolved', resolved_at = ?2 WHERE id = ?1",
+            params![attention_id, now],
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod churn_guard_migration_tests {
+    use super::*;
+    use crate::test_support::*;
+    use boss_protocol::{CreateAttentionItemInput, WorkItem};
+
+    fn get_task(db: &WorkDb, work_item_id: &str) -> boss_protocol::Task {
+        match db.get_work_item(work_item_id).unwrap() {
+            WorkItem::Task(t) | WorkItem::Chore(t) => t,
+            other => panic!("expected a task/chore work item, got {other:?}"),
+        }
+    }
+
+    /// A pre-existing open `churn_guard_parked` attention item on a
+    /// still-`active` task converts to `dispatch_failed_reason` and the
+    /// item itself is marked resolved (its body preserved, not discarded).
+    #[test]
+    fn converts_open_item_on_active_task_and_resolves_it() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+
+        let item = db
+            .create_attention_item(
+                CreateAttentionItemInput::builder()
+                    .kind(crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND)
+                    .title("Parked by churn guard — 3 recent failures")
+                    .body_markdown("some pre-existing failure detail; bossctl work start test_id")
+                    .work_item_id(work_item_id.clone())
+                    .build(),
+            )
+            .unwrap();
+
+        {
+            let conn = db.connect().unwrap();
+            migrate_convert_open_churn_guard_parked_to_dispatch_failed(&conn).unwrap();
+        }
+
+        let task = get_task(&db, &work_item_id);
+        assert_eq!(task.status.as_str(), "todo");
+        assert!(!task.autostart);
+        assert_eq!(task.dispatch_failed_reason.as_deref(), Some("churn_guard"));
+        assert_eq!(
+            task.dispatch_failed_error.as_deref(),
+            Some("some pre-existing failure detail; bossctl work start test_id")
+        );
+
+        let resolved = db.get_attention_item(&item.id).unwrap();
+        assert_eq!(resolved.status, "resolved");
+        assert!(resolved.resolved_at.is_some());
+    }
+
+    /// An open `churn_guard_parked` item on an `in_review` task (the
+    /// `pr_review_recovery` shape) is left untouched: Backlog is not a
+    /// meaningful destination for a task with an open PR under review.
+    #[test]
+    fn leaves_in_review_task_and_its_attention_item_untouched() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+                rusqlite::params![work_item_id],
+            )
+            .unwrap();
+        }
+
+        let item = db
+            .create_attention_item(
+                CreateAttentionItemInput::builder()
+                    .kind(crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND)
+                    .title("Parked by churn guard — 3 recent failures")
+                    .body_markdown("dead pr_review detail")
+                    .work_item_id(work_item_id.clone())
+                    .build(),
+            )
+            .unwrap();
+
+        {
+            let conn = db.connect().unwrap();
+            migrate_convert_open_churn_guard_parked_to_dispatch_failed(&conn).unwrap();
+        }
+
+        let task = get_task(&db, &work_item_id);
+        assert_eq!(task.status.as_str(), "in_review");
+        assert!(task.dispatch_failed_reason.is_none());
+
+        let untouched = db.get_attention_item(&item.id).unwrap();
+        assert_eq!(untouched.status, "open");
+    }
+}
+
 #[cfg(test)]
 mod status_check_clause_tests {
     use super::status_check_clause;
