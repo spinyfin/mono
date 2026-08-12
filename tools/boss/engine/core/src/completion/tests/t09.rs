@@ -107,38 +107,6 @@ async fn background_children_recheck_does_not_probe_after_worker_resumes() {
     assert!(handler.pending_background_nudge_execution_ids().is_empty());
 }
 
-/// `activity_watermark` on demand: `None` simulates "no hook-only
-/// evidence available right now" (e.g. a momentarily terminal or
-/// re-registered live-state entry) independent of whatever
-/// `live_delegated_descendant_count` reports.
-struct ToggleWatermarkProbe {
-    descendant_count: usize,
-    watermark: std::sync::Mutex<Option<String>>,
-}
-
-impl ToggleWatermarkProbe {
-    fn new(descendant_count: usize, watermark: Option<&str>) -> Arc<Self> {
-        Arc::new(Self {
-            descendant_count,
-            watermark: std::sync::Mutex::new(watermark.map(str::to_owned)),
-        })
-    }
-
-    fn set_watermark(&self, watermark: Option<&str>) {
-        *self.watermark.lock().expect("watermark mutex poisoned") = watermark.map(str::to_owned);
-    }
-}
-
-impl crate::background_children::BackgroundActivityProbe for ToggleWatermarkProbe {
-    fn live_delegated_descendant_count(&self, _execution_id: &str) -> std::result::Result<usize, String> {
-        Ok(self.descendant_count)
-    }
-
-    fn activity_watermark(&self, _execution_id: &str) -> Option<String> {
-        self.watermark.lock().expect("watermark mutex poisoned").clone()
-    }
-}
-
 #[tokio::test]
 async fn recheck_does_not_retire_intent_when_current_watermark_is_unavailable() {
     // Regression: `LiveWorkerStateRegistry::activity_watermark_for_run`

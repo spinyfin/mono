@@ -173,6 +173,7 @@ impl WorkerCompletionHandler {
                                 bound_pr_url: bound_pr_url.map(str::to_owned),
                                 proceed_outcome: proceed_outcome.clone(),
                                 activity_watermark: self.background_activity_probe.activity_watermark(&execution.id),
+                                hold: NudgeHold::BackgroundChildren,
                             },
                         );
                         tracing::info!(
@@ -273,6 +274,14 @@ impl WorkerCompletionHandler {
         // means the nudge/park path actually concluded (or an early
         // `BackgroundChildrenPending`/similar suppression above already
         // returned), so any tracked intent is stale and safe to drop.
+        //
+        // Tagged `Debounced`, and that tag is load-bearing: this record is
+        // the ONLY thing that can ever move this execution again. Its
+        // worker's turn just ended, and the sole producer of the "next
+        // Stop" this arm is waiting for is a probe — which is exactly what
+        // the debounce declined to send. Retiring it on hook activity (the
+        // `BackgroundChildren` rule) leaves nothing scheduled to look at the
+        // execution again; see [`NudgeHold::Debounced`].
         if matches!(outcome, StopOutcome::NudgeDebounced) {
             self.background_children_tracker.record_intent(
                 &execution.id,
@@ -282,12 +291,35 @@ impl WorkerCompletionHandler {
                     bound_pr_url: bound_pr_url.map(str::to_owned),
                     proceed_outcome,
                     activity_watermark: self.background_activity_probe.activity_watermark(&execution.id),
+                    hold: NudgeHold::Debounced,
                 },
             );
         } else {
             self.background_children_tracker.forget_intent(&execution.id);
         }
         outcome
+    }
+
+    /// Whether `outcome` means [`Self::nudge_or_park`] actually put a probe
+    /// on the run's FIFO. Every suppression/park/debounce outcome returns
+    /// `false`; anything else is the caller's `proceed_outcome`, which is
+    /// only ever returned from the `NudgeDecision::Proceed` arm — the one
+    /// arm that calls `queue_probe`.
+    ///
+    /// Spelled as an exhaustive match rather than a negated list so a new
+    /// suppression outcome added later fails to compile here instead of
+    /// silently being treated as "a probe was queued" and triggering a
+    /// delivery for a probe that does not exist.
+    fn nudge_queued_a_probe(outcome: &StopOutcome) -> bool {
+        !matches!(
+            outcome,
+            StopOutcome::NudgeDebounced
+                | StopOutcome::NudgeBreakerParked { .. }
+                | StopOutcome::BackgroundChildrenPending { .. }
+                | StopOutcome::BuildWaitPending { .. }
+                | StopOutcome::EscalationPending { .. }
+                | StopOutcome::Held { .. }
+        )
     }
 
     /// Execution ids whose Stop-boundary nudge is currently suppressed by
@@ -303,25 +335,61 @@ impl WorkerCompletionHandler {
     /// no-PR nudges. Returns `None` when the execution has moved on.
     pub(crate) async fn recheck_background_nudge(&self, execution_id: &str) -> Option<StopOutcome> {
         let intent = self.background_children_tracker.intent(execution_id)?;
-        // Only retire on POSITIVE proof of resumption: both the recorded and
-        // the current watermark must be present and differ. A current
-        // watermark of `None` is "no hook-only evidence available right
-        // now" (e.g. the registry entry momentarily turned terminal or was
-        // re-registered) — not proof the worker resumed — so it must never
-        // retire the intent on its own. Retiring on a `None` here is the
-        // fail-closed bug this check exists to avoid: it would strand a
-        // worker that never resumed by discarding the one record that lets
-        // it be rechecked again.
-        if let Some(watermark) = intent.activity_watermark.as_deref()
-            && let Some(current) = self.background_activity_probe.activity_watermark(execution_id)
-            && current != watermark
-        {
-            tracing::debug!(
-                execution_id,
-                "auto-nudge: recurring background-child recheck retired after worker hook activity resumed"
-            );
-            self.background_children_tracker.forget(execution_id);
-            return None;
+        // Did the worker run a tool since this intent was recorded? Only a
+        // POSITIVE answer counts: both the recorded and the current
+        // watermark must be present and differ. A current watermark of
+        // `None` is "no hook-only evidence available right now" (e.g. the
+        // registry entry momentarily turned terminal or was re-registered) —
+        // not proof the worker resumed — so it must never on its own be read
+        // as activity. Treating a `None` as activity is the fail-closed bug
+        // this check exists to avoid: it would strand a worker that never
+        // resumed by discarding the one record that lets it be rechecked
+        // again.
+        let current_watermark = self.background_activity_probe.activity_watermark(execution_id);
+        let worker_ran_a_tool_since_hold = match (intent.activity_watermark.as_deref(), current_watermark.as_deref()) {
+            (Some(recorded), Some(current)) => recorded != current,
+            _ => false,
+        };
+        if worker_ran_a_tool_since_hold {
+            match intent.hold {
+                // The suppression was a bet that the worker would resume on
+                // its own once its delegated children reported back. It did.
+                // The bet paid off, so the held nudge is moot: retire it.
+                NudgeHold::BackgroundChildren => {
+                    tracing::debug!(
+                        execution_id,
+                        "auto-nudge: recurring background-child recheck retired after worker hook activity resumed"
+                    );
+                    self.background_children_tracker.forget(execution_id);
+                    return None;
+                }
+                // A debounce is NOT a bet on resumption — it is a pacing
+                // delay on a decision already taken at a real turn boundary.
+                // Tool activity means the worker is doing something right
+                // now, which is a good reason to hold the nudge one more
+                // interval rather than talk over live work, but it is not a
+                // reason to destroy the record: if the worker goes quiet
+                // again (the exact stall this exists to break) the intent is
+                // the only thing left that can re-drive it. So re-record
+                // against the CURRENT watermark and defer — activity defers,
+                // quiescence advances.
+                NudgeHold::Debounced => {
+                    tracing::debug!(
+                        execution_id,
+                        "auto-nudge: debounced nudge deferred another interval — worker ran a tool \
+                         since the hold; re-recording the intent against the new watermark rather \
+                         than retiring it",
+                    );
+                    self.background_children_tracker.record_intent(
+                        execution_id,
+                        BackgroundNudgeIntent {
+                            activity_watermark: current_watermark,
+                            ..intent
+                        },
+                    );
+                    return Some(StopOutcome::NudgeDebounced);
+                }
+            }
         }
         // Accept any live post-Stop status. Pane-spawned workers park in
         // `Running` (`RunWaitState::WorkerPaneAlive`), not `WaitingHuman`;
@@ -377,6 +445,8 @@ impl WorkerCompletionHandler {
             });
         }
 
+        let hold = intent.hold;
+        let replay = intent.clone();
         let outcome = self
             .nudge_or_park(
                 &execution,
@@ -395,6 +465,55 @@ impl WorkerCompletionHandler {
                 | StopOutcome::NudgeDebounced
         ) {
             self.background_children_tracker.forget_intent(execution_id);
+        }
+        // A `Debounced` hold re-driven from here must survive its own
+        // successful nudge. `nudge_or_park` drops the intent whenever the
+        // nudge actually fires, which is correct on the Stop path — the
+        // worker was handed a probe on a live boundary and its reply
+        // produces the next Stop. It is wrong here: this execution reached
+        // this path precisely because it emits no further Stops, so dropping
+        // the record after one sweep-driven nudge puts the ladder straight
+        // back into the absorbing state, one rung higher. Re-record so each
+        // subsequent pass can advance it, all the way to the breaker's own
+        // terminal.
+        //
+        // Bounded by the ladder, not by this retention: the breaker trips at
+        // `max_unproductive_nudges` on an unchanged fingerprint (and at
+        // `ABSOLUTE_MAX_NUDGES` regardless), and `NudgeBreakerParked` — which
+        // has already terminalized the execution and released its slot —
+        // ends the retention here. A live worker that genuinely resumes
+        // clears the record through its own Stop instead.
+        if hold == NudgeHold::Debounced && !matches!(outcome, StopOutcome::NudgeBreakerParked { .. }) {
+            self.background_children_tracker.record_intent(
+                execution_id,
+                BackgroundNudgeIntent {
+                    activity_watermark: self.background_activity_probe.activity_watermark(execution_id),
+                    ..replay
+                },
+            );
+        }
+        if Self::nudge_queued_a_probe(&outcome) {
+            // A probe queued from here has no Stop fan-out to ride out on:
+            // `dispatch_probe_on_stop` / `dispatch_probe_on_post_tool_use`
+            // only run on a worker hook event, and this whole path exists
+            // precisely because no further hook is coming. Without an
+            // explicit delivery the probe sits in the FIFO forever while the
+            // breaker counts it as an unproductive nudge the worker was
+            // never actually shown.
+            self.probe_queuer.deliver_queued_probes_now(execution_id);
+            if hold == NudgeHold::Debounced {
+                NUDGE_LADDER_SWEEP_ADVANCED.inc(&self.metrics);
+                tracing::warn!(
+                    execution_id,
+                    work_item_id = %execution.work_item_id,
+                    kind = %execution.kind,
+                    fingerprint = %intent.fingerprint,
+                    "auto-nudge: recurring sweep advanced a DEBOUNCED nudge ladder — the worker \
+                     went quiet at a boundary whose decision was withheld for pacing, so no Stop \
+                     was ever going to advance it. The probe has been delivered directly to the \
+                     parked pane; the bounded nudge/park ladder now proceeds to its terminal.",
+                );
+            }
         }
         Some(outcome)
     }
