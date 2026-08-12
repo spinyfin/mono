@@ -727,6 +727,14 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
             };
             let dep_filter = args.dep.into_filter();
             let repo_selector = args.repo.as_deref().map(RepoSelector::parse).transpose()?;
+            // Resolve --parent to a primary id. Unknown selectors error
+            // loudly rather than returning an empty child set (which would
+            // look like "this parent has no children").
+            let parent_task_id = if let Some(selector) = args.parent.as_deref() {
+                Some(resolve_create_revision_parent(&mut client, selector).await?)
+            } else {
+                None
+            };
             let tasks = list_tasks(
                 &mut client,
                 &product.id,
@@ -737,7 +745,7 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
             .await?;
             let resolved_ids = if args.ids.is_empty() {
                 Vec::new()
-            } else if dep_filter.is_none() && project.is_none() && args.include_deleted {
+            } else if dep_filter.is_none() && project.is_none() && parent_task_id.is_none() && args.include_deleted {
                 resolve_ids_for_listing(&mut client, ctx, &args.ids, &product.id, &tasks, |t| {
                     (t.id.as_str(), t.short_id)
                 })
@@ -762,6 +770,7 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
                     .ids(&resolved_ids)
                     .maybe_limit(args.limit)
                     .include_archived(args.include_archived)
+                    .maybe_parent_task_id(parent_task_id.as_deref())
                     .build(),
                 repo_selector.as_ref(),
                 product.repo_remote_url.as_deref(),

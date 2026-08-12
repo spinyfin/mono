@@ -325,13 +325,16 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     })
 }
 
-/// Like [`map_task`] but also reads a trailing `tags` column at index 36
-/// (after `review_cycle`/`last_reviewed_sha` at 33-34). Used by
-/// [`crate::work::WorkDb::list_tasks`] so bulk `boss task list --json`
-/// matches the tags shape already returned by `task show`.
+/// Like [`map_task`] but also reads trailing `parent_task_id` (index 36)
+/// and `tags` (index 37). Used by [`crate::work::WorkDb::list_tasks`] so
+/// bulk `boss task list --json` matches the parentage and tags shape
+/// already returned by `task show`. Without `parent_task_id`, client-side
+/// filters like `select(.parent_task_id == …)` silently return empty
+/// (false negative for "has children?") because serde skips `None`.
 pub(crate) fn map_task_with_tags(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task(row)?;
-    task.tags = decode_task_tags(row.get::<_, Option<String>>(36)?)?;
+    task.parent_task_id = row.get::<_, Option<String>>(36)?.filter(|s| !s.is_empty());
+    task.tags = decode_task_tags(row.get::<_, Option<String>>(37)?)?;
     Ok(task)
 }
 

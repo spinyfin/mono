@@ -76,6 +76,11 @@ pub(crate) struct TaskListCriteria<'a> {
     /// show-everything default other statuses get.
     #[builder(default)]
     pub(crate) include_archived: bool,
+    /// When set, keep only rows whose `parent_task_id` equals this primary
+    /// id. Requires the list surface to project `parent_task_id` (see
+    /// `WorkDb::list_tasks`); without that projection every row would
+    /// fail the filter and return empty — a false "no children" answer.
+    pub(crate) parent_task_id: Option<&'a str>,
 }
 
 pub(crate) fn apply_task_list_filters(
@@ -102,6 +107,11 @@ pub(crate) fn apply_task_list_filters(
                 return false;
             }
             if !id_set.is_empty() && !id_set.contains(task.id.as_str()) {
+                return false;
+            }
+            if let Some(parent_id) = criteria.parent_task_id
+                && task.parent_task_id.as_deref() != Some(parent_id)
+            {
                 return false;
             }
             if let Some(term) = &lc_term {

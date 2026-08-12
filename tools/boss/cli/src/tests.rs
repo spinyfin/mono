@@ -162,6 +162,41 @@ fn unfiltered_task_criteria<'a>() -> TaskListCriteria<'a> {
         .build()
 }
 
+/// `--parent` keeps only rows whose `parent_task_id` matches. Omitting
+/// it leaves every row. A missing projection would make this filter
+/// always empty — the false-negative the list surface used to produce.
+#[test]
+fn task_list_filters_by_parent_task_id() {
+    let mut child = filterable_task("task_child", "child", "", TaskStatus::Todo, "medium");
+    child.parent_task_id = Some("task_parent".to_owned());
+    let other = filterable_task("task_other", "other", "", TaskStatus::Todo, "medium");
+    let orphan = filterable_task("task_orphan", "orphan", "", TaskStatus::Todo, "medium");
+    let rows = vec![child, other, orphan];
+
+    let visible = apply_task_list_filters(
+        rows.clone(),
+        TaskListCriteria::builder().parent_task_id("task_parent").build(),
+        None,
+        None,
+    );
+    assert_eq!(surviving_task_ids(&visible), ["task_child"]);
+
+    // No --parent: nothing is filtered out on that axis.
+    let visible = apply_task_list_filters(rows, unfiltered_task_criteria(), None, None);
+    assert_eq!(visible.len(), 3);
+}
+
+#[test]
+fn task_list_parses_parent_flag() {
+    let cli = Cli::parse_from(["boss", "task", "list", "--parent", "task_18c731dad84bb5f8_30a"]);
+    match cli.command {
+        Commands::Task {
+            command: TaskCommand::List(args),
+        } => assert_eq!(args.parent.as_deref(), Some("task_18c731dad84bb5f8_30a")),
+        _ => panic!("expected task list command"),
+    }
+}
+
 /// `--priority` is an OR over the listed values; omitting it keeps
 /// every priority.
 #[test]

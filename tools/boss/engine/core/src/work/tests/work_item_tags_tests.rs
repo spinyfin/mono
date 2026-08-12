@@ -405,3 +405,50 @@ fn list_tasks_chores_and_revisions_project_tags_like_show() {
 
     let _ = std::fs::remove_file(path);
 }
+
+/// Bulk `list_tasks` must project `parent_task_id` the same way single-item
+/// show does. Without it, `boss task list --json` omits the key on every
+/// row (serde `skip_serializing_if = Option::is_none`), so
+/// `select(.parent_task_id == …)` silently returns empty — a false "no
+/// children" answer for CI-fix / revision discovery.
+#[test]
+fn list_tasks_projects_parent_task_id_like_show() {
+    let path = temp_db_path("parent-list-projection");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let parent = create_test_chore_manual(&db, product.id.clone(), "Parent chore");
+    let orphan = create_test_chore_manual(&db, product.id.clone(), "Orphan chore");
+    let child_id = insert_revision_row(&db, &product.id, &parent.id);
+
+    let show_child = query_task(&db.connect().unwrap(), &child_id)
+        .unwrap()
+        .expect("child revision");
+    assert_eq!(show_child.parent_task_id.as_deref(), Some(parent.id.as_str()));
+
+    let listed = db.list_tasks(&product.id, None, None, false).unwrap();
+    let child = listed.iter().find(|t| t.id == child_id).expect("child on list");
+    assert_eq!(
+        child.parent_task_id.as_deref(),
+        show_child.parent_task_id.as_deref(),
+        "list_tasks must project parent_task_id like show"
+    );
+    let listed_orphan = listed.iter().find(|t| t.id == orphan.id).expect("orphan on list");
+    assert!(
+        listed_orphan.parent_task_id.is_none(),
+        "rows without a parent keep None (JSON key omitted)"
+    );
+
+    // JSON: non-None parent serializes; None is omitted (same as show).
+    let child_json = serde_json::to_value(child).unwrap();
+    assert_eq!(
+        child_json.get("parent_task_id").and_then(|v| v.as_str()),
+        Some(parent.id.as_str())
+    );
+    let orphan_json = serde_json::to_value(listed_orphan).unwrap();
+    assert!(
+        orphan_json.get("parent_task_id").is_none(),
+        "empty parent_task_id must skip_serializing like show, got {orphan_json}"
+    );
+
+    let _ = std::fs::remove_file(path);
+}

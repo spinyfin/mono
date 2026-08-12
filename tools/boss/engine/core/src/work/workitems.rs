@@ -1238,10 +1238,16 @@ impl WorkDb {
         let deleted_clause = if include_deleted { "" } else { " AND deleted_at IS NULL" };
         let kind_clause = list_tasks_kind_filter_sql();
 
+        // parent_task_id is a small scalar and belongs on the list surface:
+        // list_tasks returns revisions (and other leaf kinds that may carry
+        // a parent), and without the column bulk JSON cannot answer "what
+        // are the children of X?" — the key is skip_serializing_if None, so
+        // an unmapped field is indistinguishable from a genuine orphan.
+        // tags follow at index 37 (see map_task_with_tags).
         let mut tasks = if let Some(project_id) = project_id {
             ensure_project_belongs_to_product(&conn, project_id, product_id)?;
             let mut stmt = conn.prepare(&format!(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, tags
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, parent_task_id, tags
                  FROM tasks
                  WHERE product_id = ?1 AND project_id = ?2 AND kind IN ({kind_clause}){deleted_clause}
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1250,7 +1256,7 @@ impl WorkDb {
             collect_rows(rows)?
         } else {
             let mut stmt = conn.prepare(&format!(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, tags
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, parent_task_id, tags
                  FROM tasks
                  WHERE product_id = ?1 AND kind IN ({kind_clause}){deleted_clause}
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1334,10 +1340,11 @@ impl WorkDb {
     }
 
     /// List `kind = 'revision'` rows for a product. Revisions are also
-    /// returned by [`Self::list_tasks`]; this path remains the dedicated
-    /// bulk enumeration that can scope to a single parent via `parent_id`
-    /// and maps `parent_task_id` / provenance columns that the general
-    /// list surface does not need.
+    /// returned by [`Self::list_tasks`] (which projects `parent_task_id`);
+    /// this path remains the dedicated bulk enumeration that can scope to
+    /// a single parent via `parent_id` and maps followup provenance
+    /// columns (`origin_task_short_id` / `origin_pr_number` / `completed_at`)
+    /// that the general list surface does not need.
     ///
     /// When `parent_id` is supplied, it is resolved to the chain root first:
     /// revisions always store `parent_task_id` as the original non-revision

@@ -2346,6 +2346,15 @@ pub(crate) struct TaskListArgs {
     #[arg(long = "repo")]
     pub(crate) repo: Option<String>,
 
+    /// Restrict to rows whose `parent_task_id` matches this task.
+    /// Accepts the same id forms as `boss task show` (`T42`, `42`,
+    /// primary `task_…`). Use this to enumerate children / revisions of
+    /// a known parent in one call (e.g. "did this chore ever spawn a
+    /// CI-fix revision?"). An id that names no row errors rather than
+    /// returning empty. Composes with the other filters as an AND.
+    #[arg(long)]
+    pub(crate) parent: Option<String>,
+
     #[command(flatten)]
     pub(crate) dep: DependencyFilterArgs,
 }
