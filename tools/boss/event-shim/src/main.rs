@@ -37,6 +37,13 @@
 //! 4. **Bounded buffer.** The buffer is capped at the most recent
 //!    [`MAX_BUFFERED_EVENTS`] events. A persistently-down engine can't
 //!    cause the buffer to grow unbounded.
+//! 5. **Total wall-clock budget.** All of the above — drain, connect
+//!    retries, writes, and the mid-send reconnect — share one
+//!    [`SHIM_TOTAL_BUDGET`] deadline stamped at the start of `run()`.
+//!    Whichever stage is running when the budget runs out bails out to
+//!    `buffer_or_lose` immediately rather than continuing, so the shim
+//!    always finishes within its budget instead of relying on an outer
+//!    hook-runner kill.
 //!
 //! The shim is intentionally still small and synchronous: the
 //! resilience layer is local file I/O plus retry, no async runtime.
@@ -52,7 +59,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use fs4::fs_std::FileExt;
@@ -79,21 +86,58 @@ const MAX_BUFFERED_EVENTS: usize = 1000;
 
 /// Default backoff schedule between connect attempts (in addition to
 /// the initial attempt). Sums to ~10.2s of wall time across five
-/// retries, matching the design budget.
-///
-/// Keep the sum under the Grok progress-forwarder hook timeout
-/// (`FORWARDER_HOOK_TIMEOUT_SEC` = 15s in `driver/src/grok/hooks.rs`):
-/// Grok blocks its TUI for the full duration of every command hook, so a
-/// connect schedule that outlives that timeout is killed mid-retry and
-/// still freezes the pane until the kill lands.
+/// retries, matching the design budget below.
 const DEFAULT_RETRY_DELAYS_MS: &[u64] = &[200, 500, 1500, 3000, 5000];
 
-/// Bound on a single connected write / half-close so a peer that
+/// Upper bound on a single connected write / half-close so a peer that
 /// accepts but never reads cannot pin the hook (and, on Grok, the TUI)
-/// until the outer hook runner's timeout. Three seconds is generous for
-/// a small JSON payload on a local Unix socket and still leaves headroom
-/// inside the forwarder hook budget after connect retries.
+/// for the full write. The write timeout actually used is the smaller
+/// of this and whatever remains of [`SHIM_TOTAL_BUDGET`] — see
+/// `write_timeout_for`.
 const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Total wall-clock budget for one shim invocation, covering the
+/// buffer drain, the current event's connect-retry-and-write, and the
+/// mid-send reconnect — everything `run()` does before it either
+/// succeeds or falls back to `buffer_or_lose`. Stamped once at the top
+/// of `run()` as a deadline and checked before every sleep, connect,
+/// and send so the shim can never blow past it, no matter how many
+/// buffered events or retries are pending.
+///
+/// Kept strictly below the Grok progress-forwarder hook timeout
+/// (`FORWARDER_HOOK_TIMEOUT_SEC` = 15s in `driver/src/grok/hooks.rs`):
+/// Grok blocks its TUI for the full duration of every command hook, so
+/// a shim that could still be running when that timeout fires gets
+/// killed before it reaches `buffer_or_lose` — dropping the current
+/// event outright, or (if killed mid-drain) leaving already-delivered
+/// buffered events on disk to be redelivered. 3s of headroom below the
+/// hook timeout covers process teardown and scheduling jitter.
+const SHIM_TOTAL_BUDGET: Duration = Duration::from_secs(12);
+
+/// Minimum wall time reserved for a write once the connect-retry
+/// schedule is exhausted, so a single small JSON payload still gets a
+/// real chance to go out in the worst case rather than a near-zero
+/// timeout.
+const MIN_WRITE_BUDGET_MS: u64 = 250;
+
+const fn sum_ms(delays: &[u64]) -> u64 {
+    let mut total = 0u64;
+    let mut i = 0;
+    while i < delays.len() {
+        total += delays[i];
+        i += 1;
+    }
+    total
+}
+
+// Compiler-enforced version of the invariant the comments above
+// describe in prose: if `DEFAULT_RETRY_DELAYS_MS` is widened without
+// revisiting `SHIM_TOTAL_BUDGET`, the build fails instead of silently
+// reintroducing a worst-case wall time that outlives the shim's budget.
+const _: () = assert!(
+    sum_ms(DEFAULT_RETRY_DELAYS_MS) + MIN_WRITE_BUDGET_MS <= SHIM_TOTAL_BUDGET.as_millis() as u64,
+    "DEFAULT_RETRY_DELAYS_MS plus the minimum write budget must fit within SHIM_TOTAL_BUDGET"
+);
 
 fn main() -> ExitCode {
     match run() {
@@ -106,6 +150,8 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
+    let deadline = Instant::now() + SHIM_TOTAL_BUDGET;
+
     let socket_path =
         env::var(SOCKET_ENV).map_err(|_| anyhow!("{SOCKET_ENV} not set; refusing to deliver hook event"))?;
 
@@ -139,27 +185,40 @@ fn run() -> Result<()> {
     // the current event's connect would otherwise sit in the backlog
     // ahead of the drained connections.
     if let Some(buf) = buffer_path.as_deref()
-        && let Err(err) = drain_buffer(&socket_path, buf)
+        && let Err(err) = drain_buffer(&socket_path, buf, deadline)
     {
         eprintln!("boss-event: drain of {} skipped: {err:#}", buf.display());
     }
 
     // Then send the current event, with bounded connect-retry and a
-    // single mid-send reconnect on broken pipe.
-    match connect_with_retry(&socket_path) {
+    // single mid-send reconnect on broken pipe. Both stages are bounded
+    // by `deadline`, which was stamped before the drain above — so the
+    // total across drain + this send can never exceed SHIM_TOTAL_BUDGET.
+    match connect_with_retry(&socket_path, deadline) {
         Ok(stream) => match send_to_stream(stream, &payload_line) {
             Ok(()) => Ok(()),
             Err(_first_err) => {
                 // Mid-send failure: the engine may have bounced
-                // between connect and write. Reopen once and resend.
-                match connect_once(&socket_path).and_then(|s| send_to_stream(s, &payload_line)) {
-                    Ok(()) => Ok(()),
-                    Err(err) => {
-                        eprintln!(
-                            "boss-event: events socket {socket_path} dropped mid-send and \
-                             reconnect failed: {err:#}; buffering event for later delivery",
-                        );
-                        buffer_or_lose(buffer_path.as_deref(), &payload_line)
+                // between connect and write. Reopen once and resend,
+                // unless the budget is already gone.
+                if budget_exhausted(deadline) {
+                    eprintln!(
+                        "boss-event: events socket {socket_path} dropped mid-send and the shim's \
+                         wall-clock budget is exhausted; buffering event for later delivery",
+                    );
+                    buffer_or_lose(buffer_path.as_deref(), &payload_line)
+                } else {
+                    match connect_once(&socket_path, write_timeout_for(deadline))
+                        .and_then(|s| send_to_stream(s, &payload_line))
+                    {
+                        Ok(()) => Ok(()),
+                        Err(err) => {
+                            eprintln!(
+                                "boss-event: events socket {socket_path} dropped mid-send and \
+                                 reconnect failed: {err:#}; buffering event for later delivery",
+                            );
+                            buffer_or_lose(buffer_path.as_deref(), &payload_line)
+                        }
                     }
                 }
             }
@@ -172,6 +231,23 @@ fn run() -> Result<()> {
             buffer_or_lose(buffer_path.as_deref(), &payload_line)
         }
     }
+}
+
+/// Wall time remaining until `deadline`, saturating at zero.
+fn remaining(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
+/// Whether the shim's total wall-clock budget has already run out.
+fn budget_exhausted(deadline: Instant) -> bool {
+    remaining(deadline).is_zero()
+}
+
+/// The write timeout to use for a connect happening now: the smaller of
+/// [`SOCKET_IO_TIMEOUT`] and whatever budget remains, so a stalled write
+/// can never by itself push the shim past `deadline`.
+fn write_timeout_for(deadline: Instant) -> Duration {
+    remaining(deadline).min(SOCKET_IO_TIMEOUT)
 }
 
 /// Try to append `payload` to the on-disk buffer. If no buffer path
@@ -234,28 +310,41 @@ fn retry_delays() -> Vec<Duration> {
         .collect()
 }
 
-/// One connect attempt, no retry. Applies [`SOCKET_IO_TIMEOUT`] so a
+/// One connect attempt, no retry. Applies `write_timeout` so a
 /// subsequent `write_all` cannot block unbounded if the peer stalls.
-fn connect_once(path: &str) -> Result<UnixStream> {
+/// The shim never reads from this socket (it only writes and
+/// half-closes), so no read timeout is set here.
+fn connect_once(path: &str, write_timeout: Duration) -> Result<UnixStream> {
     let stream = UnixStream::connect(path).with_context(|| format!("connecting to events socket at {path}"))?;
     // Best-effort: a platform that rejects SO_SNDTIMEO still delivers
-    // events; the Grok-side hook timeout remains the outer ceiling.
-    let _ = stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT));
-    let _ = stream.set_read_timeout(Some(SOCKET_IO_TIMEOUT));
+    // events; the shim's own wall-clock budget remains the outer ceiling.
+    let _ = stream.set_write_timeout(Some(write_timeout));
     Ok(stream)
 }
 
 /// Bounded retry loop around `connect_once`. Sleeps between attempts
-/// per [`retry_delays`]. Returns the last error if every attempt fails.
-fn connect_with_retry(path: &str) -> Result<UnixStream> {
-    let delays = retry_delays();
-    if let Ok(stream) = connect_once(path) {
+/// per [`retry_delays`], never past `deadline`. Returns an error as
+/// soon as the budget runs out or every attempt fails, whichever comes
+/// first.
+fn connect_with_retry(path: &str, deadline: Instant) -> Result<UnixStream> {
+    if budget_exhausted(deadline) {
+        return Err(anyhow!("shim wall-clock budget exhausted before first connect attempt"));
+    }
+    if let Ok(stream) = connect_once(path, write_timeout_for(deadline)) {
         return Ok(stream);
     }
+    let delays = retry_delays();
     let mut last_err: Option<anyhow::Error> = None;
     for delay in delays {
-        thread::sleep(delay);
-        match connect_once(path) {
+        let time_left = remaining(deadline);
+        if time_left.is_zero() {
+            return Err(last_err.unwrap_or_else(|| anyhow!("shim wall-clock budget exhausted during connect retries")));
+        }
+        thread::sleep(delay.min(time_left));
+        if budget_exhausted(deadline) {
+            return Err(last_err.unwrap_or_else(|| anyhow!("shim wall-clock budget exhausted during connect retries")));
+        }
+        match connect_once(path, write_timeout_for(deadline)) {
             Ok(stream) => return Ok(stream),
             Err(err) => last_err = Some(err),
         }
@@ -282,9 +371,13 @@ fn send_to_stream(mut stream: UnixStream, payload: &[u8]) -> Result<()> {
 
 /// Send one buffered event in its own connection. Used by drain. No
 /// retry: a failure here means the engine just went down again and the
-/// remaining buffered events should stay on disk for next time.
-fn send_one(socket_path: &str, payload: &[u8]) -> Result<()> {
-    let stream = connect_once(socket_path)?;
+/// remaining buffered events should stay on disk for next time. Also
+/// fails fast once `deadline` has passed, without attempting a connect.
+fn send_one(socket_path: &str, payload: &[u8], deadline: Instant) -> Result<()> {
+    if budget_exhausted(deadline) {
+        return Err(anyhow!("shim wall-clock budget exhausted before send"));
+    }
+    let stream = connect_once(socket_path, write_timeout_for(deadline))?;
     send_to_stream(stream, payload)
 }
 
@@ -322,10 +415,11 @@ fn append_to_buffer(buffer_path: &Path, payload: &[u8]) -> Result<()> {
 }
 
 /// Read the buffer line by line and try to deliver each event. Stops
-/// at the first failure and rewrites the file with the unsent suffix
-/// (FIFO). Removes the file when fully drained. No-op when the buffer
-/// is absent.
-fn drain_buffer(socket_path: &str, buffer_path: &Path) -> Result<()> {
+/// at the first failure — including the shim's wall-clock budget
+/// running out — and rewrites the file with the unsent suffix (FIFO).
+/// Removes the file when fully drained. No-op when the buffer is
+/// absent.
+fn drain_buffer(socket_path: &str, buffer_path: &Path, deadline: Instant) -> Result<()> {
     if !buffer_path.exists() {
         return Ok(());
     }
@@ -341,7 +435,11 @@ fn drain_buffer(socket_path: &str, buffer_path: &Path) -> Result<()> {
     let mut sent = 0usize;
     let mut drain_err: Option<anyhow::Error> = None;
     for line in &lines {
-        match send_one(socket_path, line) {
+        if budget_exhausted(deadline) {
+            drain_err = Some(anyhow!("shim wall-clock budget exhausted during buffer drain"));
+            break;
+        }
+        match send_one(socket_path, line, deadline) {
             Ok(()) => sent += 1,
             Err(err) => {
                 drain_err = Some(err);
@@ -567,11 +665,61 @@ mod tests {
         std::fs::write(&buf, original).unwrap();
 
         let socket = dir.path().join("never-bound.sock");
-        let result = drain_buffer(socket.to_str().unwrap(), &buf);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let result = drain_buffer(socket.to_str().unwrap(), &buf, deadline);
         assert!(result.is_err(), "drain must surface connect failure");
 
         let contents = std::fs::read(&buf).unwrap();
         assert_eq!(contents, original);
+    }
+
+    /// Pins the invariant that `connect_once` applies a write timeout
+    /// to the returned stream — including on the connect path
+    /// `drain_buffer`/`send_one` uses, which is easy to miss since it
+    /// goes through `connect_once` too rather than a separate path.
+    #[test]
+    fn connect_once_applies_write_timeout() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock_path = dir.path().join("test.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+
+        let stream = connect_once(sock_path.to_str().unwrap(), SOCKET_IO_TIMEOUT).unwrap();
+        assert_eq!(stream.write_timeout().unwrap(), Some(SOCKET_IO_TIMEOUT));
+    }
+
+    /// A peer that accepts the connection but never reads must not be
+    /// able to block `send_to_stream` past roughly the write timeout.
+    /// Uses a payload larger than the kernel's socket send buffer
+    /// (~1 MiB) — realistic for a PostToolUse hook payload carrying a
+    /// large `tool_response`, and the only size where the write
+    /// actually blocks instead of returning immediately into the
+    /// kernel buffer.
+    #[test]
+    fn send_to_stream_times_out_on_stalled_peer() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock_path = dir.path().join("test.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+
+        let stream = connect_once(sock_path.to_str().unwrap(), SOCKET_IO_TIMEOUT).unwrap();
+        let (_accepted, _addr) = listener.accept().unwrap();
+
+        let payload = vec![0u8; 8 * 1024 * 1024];
+        let start = Instant::now();
+        let result = send_to_stream(stream, &payload);
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "write to a stalled peer must time out, not succeed");
+        // write_all can issue more than one underlying write() syscall
+        // once the kernel send buffer is full (e.g. one partial write
+        // that succeeds instantly, then a second that blocks and times
+        // out), so allow a couple of SOCKET_IO_TIMEOUT-length blocks
+        // rather than exactly one. What this pins down is that the
+        // write is bounded at all, not left to hang for the ~600s an
+        // unscoped hook runner would otherwise allow.
+        assert!(
+            elapsed < SOCKET_IO_TIMEOUT * 3,
+            "write timeout not honored: took {elapsed:?}, expected roughly {SOCKET_IO_TIMEOUT:?}",
+        );
     }
 
     #[test]
