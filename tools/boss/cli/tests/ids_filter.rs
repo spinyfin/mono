@@ -429,6 +429,107 @@ async fn list_revisions_ids_composes_with_parent_filter_without_erroring() -> Re
     Ok(())
 }
 
+/// `boss task list --parent <id-that-names-no-row>` must error rather
+/// than silently returning an empty list, for both an unresolvable
+/// primary id and an opaque/garbage selector — the false-negative
+/// failure mode the `--parent` flag exists to rule out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_list_parent_unresolvable_id_errors() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let product = create_product(&mut client, "Boss").await?;
+    let project = create_project(&mut client, &product.id, "Project").await?;
+    let _a = create_task(&mut client, &product.id, &project.id, "A").await?;
+
+    let stderr = run_boss_expect_failure(
+        engine.socket_str(),
+        &[
+            "task",
+            "list",
+            "--product",
+            &product.id,
+            "--parent",
+            "task_does_not_exist",
+            "--json",
+        ],
+    )?;
+    assert!(
+        stderr.contains("task_does_not_exist"),
+        "unexpected stderr for unresolvable primary id: {stderr}"
+    );
+
+    let stderr = run_boss_expect_failure(
+        engine.socket_str(),
+        &[
+            "task",
+            "list",
+            "--product",
+            &product.id,
+            "--parent",
+            "garbage",
+            "--json",
+        ],
+    )?;
+    assert!(
+        stderr.contains("garbage"),
+        "unexpected stderr for opaque selector: {stderr}"
+    );
+    Ok(())
+}
+
+/// `boss task list --parent <mid-chain revision id>` must canonicalize
+/// to the revision chain root, exactly like `list-revisions --parent`
+/// does server-side — both surfaces answer "children of a mid-chain
+/// revision id" the same way rather than the former silently returning
+/// empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_list_parent_canonicalizes_to_chain_root() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let product = create_product(&mut client, "Boss").await?;
+    let project = create_project(&mut client, &product.id, "Project").await?;
+    let (parent_id, revisions) =
+        create_task_with_revisions(&engine, &mut client, &product.id, &project.id, "Parent", 2).await?;
+    let mid_chain = &revisions[0];
+
+    let value = run_boss(
+        engine.socket_str(),
+        &[
+            "task",
+            "list",
+            "--product",
+            &product.id,
+            "--parent",
+            &mid_chain.id,
+            "--json",
+        ],
+    )?;
+
+    // `--parent <mid_chain revision id>` returns both revisions (they
+    // both store the root task as their parent), matching what
+    // `--parent <parent_id>` would return directly.
+    let mut ids = task_ids(&value);
+    ids.sort();
+    let mut expected: Vec<String> = revisions.iter().map(|r| r.id.clone()).collect();
+    expected.sort();
+    assert_eq!(ids, expected);
+
+    let value_via_root = run_boss(
+        engine.socket_str(),
+        &[
+            "task",
+            "list",
+            "--product",
+            &product.id,
+            "--parent",
+            &parent_id,
+            "--json",
+        ],
+    )?;
+    assert_eq!(task_ids(&value_via_root), ids);
+    Ok(())
+}
+
 /// `--include-deleted`/`--deleted` narrows the listing exactly like
 /// `--dep`/`--project`/`--parent`: existence must not depend on it, so
 /// a tombstoned task requested via `--ids` (without `--deleted`)
