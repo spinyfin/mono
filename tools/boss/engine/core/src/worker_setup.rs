@@ -821,20 +821,25 @@ fn deny_rules(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> Vec<St
 
     // `bossctl` is the coordinator's CLI surface (probes, agents
     // list, work mutations). Workers don't drive the coordinator,
-    // they answer to it. Block every shape:
+    // they answer to it. These rules are bare shell-prefix matches on
+    // the literal command text, so they only cover the PATH-invocation
+    // shape:
     //   - bare `bossctl` (no args)
     //   - `bossctl <verb> …` via the `:*` shell-prefix glob
-    //   - any absolute path that ends in `/bossctl` (the engine's
-    //     spawn flow injects an absolute symlink dir, so plain
-    //     `bossctl` is the normal shape — but lock the absolute
-    //     form too in case a worker tries to bypass via `$HOME/bin`).
+    // They do NOT match an absolute-path invocation (e.g. a bundled
+    // `.../Contents/Resources/bin/bossctl`) -- that shape is closed by
+    // the `bossctl` basename block in `BOSS_LAUNCH_GUARD_COMMAND`
+    // (see `claude::BOSS_LAUNCH_GUARD_COMMAND`), which is path-agnostic.
     rules.push("Bash(bossctl)".to_owned());
     rules.push("Bash(bossctl:*)".to_owned());
 
     // `boss` lifecycle verbs that bounce the engine out from under
     // the worker. The rest of the `boss` surface (list/show/etc.)
     // talks to the engine over its IPC socket which is fine, but
-    // start/stop reach into engine process state.
+    // start/stop reach into engine process state. As with `bossctl`
+    // above, these rules only match the literal PATH-invocation text;
+    // the absolute-path shape (a bundled `boss` binary) is closed by
+    // the `boss engine start|stop` check in `BOSS_LAUNCH_GUARD_COMMAND`.
     rules.push("Bash(boss engine start)".to_owned());
     rules.push("Bash(boss engine start:*)".to_owned());
     rules.push("Bash(boss engine stop)".to_owned());
