@@ -40,6 +40,62 @@ impl WorkerCompletionHandler {
             }
         };
 
+        let merged = matches!(target, WorkerPrCompletionTarget::Done);
+
+        // incident-004 AI-3: a revision may terminalize to PendingReview /
+        // InReview only with an explicit associated change (head SHA moved
+        // attributably, or observed PR metadata mutation) or an explicit
+        // nothing-to-do outcome. Silence after a mid-turn reap — no push,
+        // no metadata marker, no NO_CHANGES_NEEDED — must not read as
+        // review-ready. Couples the existing `sha_unchanged` observation
+        // (reviewer noop skip) to status success; runs before mid-turn
+        // reap accounting so a refused finalize never looks like a reap.
+        if !merged
+            && matches!(target, WorkerPrCompletionTarget::InReview)
+            && let Ok(producing) = execution_result.as_ref()
+            && producing.kind == ExecutionKind::RevisionImplementation
+        {
+            match self
+                .evaluate_revision_review_contribution(execution_id, producing, &pr_url, source)
+                .await
+            {
+                RevisionReviewGate::Allow(reason) => {
+                    if reason == RevisionContributionReason::Indeterminate {
+                        tracing::warn!(
+                            execution_id,
+                            pr_url = %pr_url,
+                            source,
+                            contribution = reason.as_str(),
+                            "revision contribution gate: allowing InReview terminalization with \
+                             NO usable SHA-delta / metadata / no-op evidence — contribution was \
+                             never established (missing baseline or head fetch failed)",
+                        );
+                    } else {
+                        tracing::info!(
+                            execution_id,
+                            pr_url = %pr_url,
+                            source,
+                            contribution = reason.as_str(),
+                            "revision contribution gate: allowing InReview terminalization",
+                        );
+                    }
+                }
+                RevisionReviewGate::Refuse { reason } => {
+                    tracing::warn!(
+                        execution_id,
+                        pr_url = %pr_url,
+                        source,
+                        refuse_reason = reason,
+                        "revision contribution gate: refusing InReview / PendingReview \
+                         terminalization — no head movement, no metadata-fix confirmation, and \
+                         no explicit NO_CHANGES_NEEDED (couples sha_unchanged to status success; \
+                         incident-004 AI-3)",
+                    );
+                    return StopOutcome::AwaitingInput;
+                }
+            }
+        }
+
         // incident-004 AI-4: every finalization source funnels through
         // here, so this is the one place that can observe "is the worker
         // we are about to reap still mid-turn?" for all of them at once —
@@ -51,8 +107,6 @@ impl WorkerCompletionHandler {
         {
             self.record_mid_turn_reap(execution, source).await;
         }
-
-        let merged = matches!(target, WorkerPrCompletionTarget::Done);
 
         // For reviewer-triggering executions with a fresh
         // (non-merged) PR, try to enqueue an independent reviewer pass

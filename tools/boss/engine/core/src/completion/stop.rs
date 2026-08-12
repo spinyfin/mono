@@ -649,15 +649,38 @@ impl WorkerCompletionHandler {
             if execution.kind == ExecutionKind::RevisionImplementation {
                 self.stamp_revision_stop_contributed_head_from_staged_url(execution_id, &execution, &staged_url)
                     .await;
-            }
-            return self
-                .finalize_pr_transition(
+                // incident-004 AI-3: staged URL + publish arm is not enough.
+                // If the contribution gate refuses (sha_unchanged, no
+                // metadata, no explicit no-op), fall through to the SHA-delta
+                // / no-op / nudge path rather than returning a quiet
+                // AwaitingInput that strands the worker without a probe.
+                let staged_outcome = self
+                    .finalize_pr_transition(
+                        execution_id,
+                        staged_url.clone(),
+                        WorkerPrCompletionTarget::InReview,
+                        "stop_staged",
+                    )
+                    .await;
+                if !matches!(staged_outcome, StopOutcome::AwaitingInput) {
+                    return staged_outcome;
+                }
+                tracing::info!(
                     execution_id,
-                    staged_url,
-                    WorkerPrCompletionTarget::InReview,
-                    "stop_staged",
-                )
-                .await;
+                    pr_url = %staged_url,
+                    "stop event: staged-URL finalize refused by revision contribution gate; \
+                     falling through to SHA-delta / no-op / nudge path (incident-004 AI-3)",
+                );
+            } else {
+                return self
+                    .finalize_pr_transition(
+                        execution_id,
+                        staged_url,
+                        WorkerPrCompletionTarget::InReview,
+                        "stop_staged",
+                    )
+                    .await;
+            }
         }
 
         // Worker escalation/blocker detection: a worker that emitted an

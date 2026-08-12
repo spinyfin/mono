@@ -77,6 +77,7 @@ use boss_github::pr_url::pr_number_from_url;
 // methods to the same type; the handler struct, shared types, traits, and free
 // helpers stay in this parent module and reach the submodules via `use super`.
 mod attention;
+mod contribution_gate;
 mod execution_started;
 mod finalize_passes;
 mod handler_build;
@@ -90,6 +91,11 @@ mod remediation;
 mod stop;
 mod teardown;
 mod worker_signals;
+
+// Re-export contribution-gate types into this parent so sibling completion
+// submodules (which `use super::*`) can name them — same pattern as the
+// free helpers defined directly in this file.
+use contribution_gate::{RevisionContributionReason, RevisionReviewGate};
 
 // Counter handles for the PR URL capture channels, in the order they are
 // consulted: the worker's structured-output artifact (the driver-agnostic file

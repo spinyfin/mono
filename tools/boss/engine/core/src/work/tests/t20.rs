@@ -949,9 +949,9 @@ fn ci_fix_revision_stops_dispatch_after_attempt_succeeds() {
 }
 
 /// Second retired-status case for the `ci-fix` arm: a `failed` attempt is just
-/// as terminal as `succeeded`, so it must also stop re-dispatch and settle the
-/// revision to `in_review`. (A CI fix that exhausts/aborts must not keep minting
-/// executions either.)
+/// as terminal as `succeeded` for re-dispatch (must not keep minting), but
+/// must NOT claim review-ready (incident-004 AI-3). A CI fix that exhausts
+/// settles to `blocked` with a stable reason instead of a false `in_review`.
 #[test]
 fn ci_fix_revision_stops_dispatch_after_attempt_fails() {
     let db = WorkDb::open(temp_db_path("ci-fix-revision-stop-fails")).unwrap();
@@ -974,7 +974,8 @@ fn ci_fix_revision_stops_dispatch_after_attempt_fails() {
     // The CI fix attempt fails (retires terminally).
     db.mark_ci_remediation_failed(&rem_id, "ran out of attempts").unwrap();
 
-    // Second reconcile: no new execution; queued row abandoned; revision settled.
+    // Second reconcile: no new execution; queued row abandoned; revision settled
+    // to blocked — not in_review (false-success side door closed).
     db.reconcile_product_executions(&product_id).unwrap();
     let after_second = executions_for(&db, &revision_id);
     assert_eq!(
@@ -988,9 +989,28 @@ fn ci_fix_revision_stops_dispatch_after_attempt_fails() {
     );
     assert_eq!(
         task_status(&db, &revision_id),
-        "in_review",
-        "the revision must be settled to in_review once its (failed) fix vehicle is spent",
+        "blocked",
+        "a failed spawning attempt must not settle the revision to in_review \
+         (incident-004 AI-3 false-success side door)",
     );
+    let reason: String = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT blocked_reason FROM tasks WHERE id = ?1",
+            rusqlite::params![revision_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        reason, "spawning_attempt_retired_unsuccessfully",
+        "blocked_reason must name the failed-attempt halt",
+    );
+
+    // Third reconcile: idempotent — blocked revision is no longer dispatchable.
+    db.reconcile_product_executions(&product_id).unwrap();
+    assert_eq!(task_status(&db, &revision_id), "blocked");
+    assert_eq!(executions_for(&db, &revision_id).len(), 1);
 }
 
 /// Guard against over-blocking on the `ci-fix` arm (sibling of

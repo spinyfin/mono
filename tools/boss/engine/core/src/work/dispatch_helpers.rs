@@ -726,32 +726,64 @@ pub(crate) fn reconcile_revision_execution(
     // Once the spawning attempt is terminal the fix vehicle is spent: drop
     // any queued execution (a `ready` row would otherwise get picked up and
     // `start_execution_run` would flip the revision straight back to
-    // `active`, since its guard does not protect `in_review`), then settle
-    // the revision to `in_review` — the same resting state the clean-stop
-    // retire path leaves a successful revision in. A live worker is left
-    // alone; it self-retires on Stop.
+    // `active`, since its guard does not protect `in_review` / `blocked`).
+    //
+    // incident-004 AI-3: only a *successful* attempt may settle to
+    // `in_review` (the same resting state a clean-stop leave a successful
+    // revision in). A failed / abandoned / otherwise non-success retirement
+    // must NOT manufacture the same false-success terminal — that was the
+    // 62-occurrence side door (`attempt_status=failed` → `in_review`).
+    // Those land on `blocked` with a stable reason so re-dispatch halts
+    // without claiming review-ready. A live worker is left alone; it
+    // self-retires on Stop.
     if let Some(attempt_status) = retired_spawning_attempt_status(conn, task)? {
         let now = now_string();
         abandon_pending_executions(pending, conn, &task.id, &now)?;
         if query_live_execution_for_work_item(conn, &task.id)?.is_none() {
-            let settled = conn.execute(
-                "UPDATE tasks
-                 SET status = 'in_review',
-                     last_status_actor = 'engine',
-                     updated_at = ?2
-                 WHERE id = ?1
-                   AND status NOT IN ('in_review', 'done', 'archived')
-                   AND deleted_at IS NULL",
-                params![task.id, now],
-            )?;
+            let attempt_succeeded = attempt_status.as_str() == "succeeded";
+            let settled = if attempt_succeeded {
+                conn.execute(
+                    "UPDATE tasks
+                     SET status = 'in_review',
+                         last_status_actor = 'engine',
+                         updated_at = ?2
+                     WHERE id = ?1
+                       AND status NOT IN ('in_review', 'done', 'archived', 'blocked')
+                       AND deleted_at IS NULL",
+                    params![task.id, now],
+                )?
+            } else {
+                conn.execute(
+                    "UPDATE tasks
+                     SET status = 'blocked',
+                         blocked_reason = 'spawning_attempt_retired_unsuccessfully',
+                         last_status_actor = 'engine',
+                         updated_at = ?2
+                     WHERE id = ?1
+                       AND status NOT IN ('in_review', 'done', 'archived', 'blocked')
+                       AND deleted_at IS NULL",
+                    params![task.id, now],
+                )?
+            };
             if settled > 0 {
-                tracing::info!(
-                    task_id = %task.id,
-                    chain_root_id = %chain_root_task.id,
-                    attempt_status = %attempt_status,
-                    "reconcile_revision: spawning conflict/CI attempt retired; \
-                     settled revision to in_review (halting re-dispatch loop)",
-                );
+                if attempt_succeeded {
+                    tracing::info!(
+                        task_id = %task.id,
+                        chain_root_id = %chain_root_task.id,
+                        attempt_status = %attempt_status,
+                        "reconcile_revision: spawning conflict/CI attempt retired successfully; \
+                         settled revision to in_review (halting re-dispatch loop)",
+                    );
+                } else {
+                    tracing::info!(
+                        task_id = %task.id,
+                        chain_root_id = %chain_root_task.id,
+                        attempt_status = %attempt_status,
+                        "reconcile_revision: spawning conflict/CI attempt retired unsuccessfully; \
+                         settled revision to blocked (halting re-dispatch without false in_review; \
+                         incident-004 AI-3)",
+                    );
+                }
             }
         }
         return Ok(());
