@@ -2316,7 +2316,10 @@ async fn answer_agent_start_records_queue_wait_metric_and_dispatch_event() {
         .await
         .expect("worker should be available");
 
-    coordinator.schedule_execution(&execution, &worker_id).await.unwrap();
+    coordinator
+        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .await
+        .unwrap();
 
     assert_eq!(
         metrics
