@@ -5,6 +5,7 @@
 //! Shared fixtures live in [`super::helpers`].
 
 use super::helpers::*;
+use boss_protocol::{CommentAnchor, CreateCommentInput, CreateInvestigationInput};
 
 #[tokio::test]
 async fn worker_pool_clamps_size_to_hard_cap() {
@@ -2137,7 +2138,8 @@ async fn stranded_ready_executions_only_returns_rows_past_the_threshold() {
 
     // Threshold far in the future: the freshly-inserted row is too
     // young to count as stranded.
-    let fresh = coordinator.stranded_ready_executions(60_000);
+    let ready = db.list_ready_executions().unwrap();
+    let fresh = coordinator.stranded_ready_executions(&ready, 60_000);
     assert!(
         fresh.is_empty(),
         "row younger than the threshold must not be flagged as stranded: {fresh:?}",
@@ -2145,11 +2147,205 @@ async fn stranded_ready_executions_only_returns_rows_past_the_threshold() {
 
     // Threshold of zero: any ready row should appear. The
     // execution we just inserted is in the queue with age >= 0.
-    let any = coordinator.stranded_ready_executions(0);
+    let any = coordinator.stranded_ready_executions(&ready, 0);
     assert!(
         any.iter().any(|(id, _)| id == &execution_id),
         "with min_age_ms=0 the helper must surface the freshly-inserted ready row; \
              got {any:?}",
+    );
+}
+
+#[test]
+fn overdue_ready_answer_agent_files_one_question_specific_attention() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let comment = db
+        .create_comment(CreateCommentInput {
+            artifact_kind: "pr_doc".to_owned(),
+            artifact_id: "https://example.test/acme/repo.git:main:docs/answer.md".to_owned(),
+            doc_version: "v1".to_owned(),
+            anchor: CommentAnchor {
+                exact: "Why is the job waiting?".to_owned(),
+                prefix: String::new(),
+                suffix: String::new(),
+            },
+            body: "Why is the job waiting?".to_owned(),
+            author: "operator".to_owned(),
+            plain_text_projection_version: 0,
+        })
+        .unwrap();
+    db.transition_comment_to_answering(&comment.id).unwrap();
+    let run = db
+        .create_answer_agent_run(
+            &comment.id,
+            &comment.artifact_kind,
+            &comment.artifact_id,
+            &comment.doc_version,
+            0,
+        )
+        .unwrap();
+    let execution = db
+        .create_answer_agent_execution(&comment.id, "https://example.test/acme/repo.git")
+        .unwrap();
+    db.bind_answer_agent_run_execution(&run.id, &execution.id).unwrap();
+
+    let coordinator = ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        Arc::new(FakeExecutionRunner::default()),
+    );
+    let ready = db.list_ready_executions().unwrap();
+    coordinator.raise_ready_answer_agent_alarms(&ready, Duration::ZERO);
+    coordinator.raise_ready_answer_agent_alarms(&ready, Duration::ZERO);
+
+    // Read the item back through the same public API a real surface
+    // (e.g. `handle_list_attention_items_for_work_item`) would use — not a
+    // raw `SELECT ... WHERE work_item_id = ?`, which would pass even if
+    // the comment-id row were unreachable through every other read path.
+    let attentions = db.list_attention_items_for_work_item(&comment.id).unwrap();
+    assert_eq!(
+        attentions.len(),
+        1,
+        "repeated scheduler passes must deduplicate the alarm"
+    );
+    assert_eq!(attentions[0].kind, ANSWER_AGENT_READY_AGE_ATTENTION_KIND);
+    assert_eq!(
+        attentions[0].body_markdown,
+        format!(
+            "Question comment `{}` on document `pr_doc:{}` was first seen waiting more than 0s without starting. See the engine log for the current age.\n\nUse `bossctl dispatch diagnose {}` to inspect its dispatch timeline.",
+            comment.id, comment.artifact_id, execution.id,
+        )
+    );
+    let attention_item_id = attentions[0].id.clone();
+
+    db.create_run(
+        CreateRunInput::builder()
+            .agent_id("answer-agent")
+            .execution_id(&execution.id)
+            .started_at(boss_engine_utils::epoch_time::now_epoch_secs().to_string())
+            .build(),
+    )
+    .unwrap();
+    db.reconcile_stale_attention_signals().unwrap();
+    let resolved = db.list_attention_items_for_work_item(&comment.id).unwrap();
+    assert_eq!(
+        resolved
+            .iter()
+            .find(|item| item.id == attention_item_id)
+            .unwrap()
+            .status,
+        "resolved",
+        "the answer-agent run start must clear its queue-age attention"
+    );
+}
+
+#[tokio::test]
+async fn answer_agent_start_records_queue_wait_metric_and_dispatch_event() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = db
+        .create_product(
+            CreateProductInput::builder()
+                .name("Answer-agent metrics")
+                .repo_remote_url("https://example.test/acme/repo.git")
+                .build(),
+        )
+        .unwrap();
+    let investigation = db
+        .create_investigation(
+            CreateInvestigationInput::builder()
+                .product_id(product.id.clone())
+                .name("Question owner")
+                .build(),
+        )
+        .unwrap();
+    db.set_task_doc_pointer(
+        &investigation.id,
+        Some("https://example.test/acme/repo.git"),
+        Some("main"),
+        Some("docs/answer.md"),
+    )
+    .unwrap();
+    let comment = db
+        .create_comment(CreateCommentInput {
+            artifact_kind: "pr_doc".to_owned(),
+            artifact_id: "pr_doc:https://example.test/acme/repo.git:main:docs/answer.md".to_owned(),
+            doc_version: "v1".to_owned(),
+            anchor: CommentAnchor {
+                exact: "Why is this queued?".to_owned(),
+                prefix: String::new(),
+                suffix: String::new(),
+            },
+            body: "Why is this queued?".to_owned(),
+            author: "operator".to_owned(),
+            plain_text_projection_version: 0,
+        })
+        .unwrap();
+    db.set_comment_intent(&comment.id, "question", 0.95).unwrap();
+    db.transition_comment_to_answering(&comment.id).unwrap();
+    let run = db
+        .create_answer_agent_run(
+            &comment.id,
+            &comment.artifact_kind,
+            &comment.artifact_id,
+            &comment.doc_version,
+            0,
+        )
+        .unwrap();
+    let execution = db
+        .create_answer_agent_execution(&comment.id, "https://example.test/acme/repo.git")
+        .unwrap();
+    db.bind_answer_agent_run_execution(&run.id, &execution.id).unwrap();
+
+    let metrics = Arc::new(crate::metrics::Registry::new());
+    crate::metrics_init::init_all(&metrics);
+    let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let mut coordinator = ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        Arc::new(FakeExecutionRunner::default()),
+    )
+    .with_dispatch_events(recording.clone());
+    coordinator.set_metrics(metrics.clone());
+    let coordinator = Arc::new(coordinator);
+    let worker_id = coordinator
+        .worker_pool()
+        .claim_worker(&execution.id, None)
+        .await
+        .expect("worker should be available");
+
+    coordinator.schedule_execution(&execution, &worker_id).await.unwrap();
+
+    assert_eq!(
+        metrics
+            .counter_snapshot_one("answer_agent.started")
+            .map(|snapshot| snapshot.value),
+        Some(1),
+    );
+    assert_eq!(
+        metrics
+            .counter_snapshot_one("answer_agent.queue_wait_ms")
+            .map(|snapshot| snapshot.value),
+        Some(1),
+    );
+    let events = recording.events_for(&execution.id).await;
+    let started = events
+        .iter()
+        .find(|event| event.stage == "run_started" && event.outcome == "ok")
+        .unwrap_or_else(|| panic!("expected run_started event, got {events:#?}"));
+    assert_eq!(
+        started.details.get("execution_kind").and_then(|value| value.as_str()),
+        Some("answer_agent"),
+    );
+    assert!(
+        started
+            .details
+            .get("queue_wait_ms")
+            .and_then(|value| value.as_u64())
+            .is_some(),
+        "run_started must carry queue_wait_ms: {started:#?}",
     );
 }
 

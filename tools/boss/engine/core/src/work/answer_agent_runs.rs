@@ -25,7 +25,7 @@ impl WorkDb {
     /// [`map_answer_agent_run`].
     fn answer_agent_run_columns() -> &'static str {
         "id, comment_id, artifact_kind, artifact_id, doc_version, thread_turn, \
-         status, workspace_lease_id, reply_body, error_kind, created_at, completed_at"
+         status, execution_id, workspace_lease_id, reply_body, error_kind, created_at, completed_at"
     }
 
     /// Insert a `running` answer-agent run row and return it. `thread_turn` is
@@ -80,6 +80,48 @@ impl WorkDb {
         let cols = Self::answer_agent_run_columns();
         let sql = format!("SELECT {cols} FROM answer_agent_runs WHERE id = ?1");
         conn.query_row(&sql, [run_id], map_answer_agent_run).map_err(Into::into)
+    }
+
+    /// Bind a newly-created `answer_agent` execution to its tracking run.
+    /// The association is established before dispatch can pick the execution
+    /// up, so operators can follow a queued question directly into dispatch
+    /// diagnostics.
+    pub fn bind_answer_agent_run_execution(&self, run_id: &str, execution_id: &str) -> Result<AnswerAgentRun> {
+        let conn = self.connect()?;
+        let n = conn.execute(
+            "UPDATE answer_agent_runs SET execution_id = ?2 \
+             WHERE id = ?1 AND status = 'running' \
+               AND (execution_id IS NULL OR execution_id = ?2)",
+            params![run_id, execution_id],
+        )?;
+        if n == 0 {
+            bail!("answer-agent run {run_id} not found, terminal, or bound to another execution");
+        }
+        let cols = Self::answer_agent_run_columns();
+        let sql = format!("SELECT {cols} FROM answer_agent_runs WHERE id = ?1");
+        conn.query_row(&sql, [run_id], map_answer_agent_run).map_err(Into::into)
+    }
+
+    /// Stamp the workspace lease on the run bound to an execution. Returning
+    /// `None` is expected for non-answer-agent executions and lets the
+    /// coordinator share its ordinary lease path without guessing by comment.
+    pub fn set_answer_agent_execution_lease(
+        &self,
+        execution_id: &str,
+        workspace_lease_id: &str,
+    ) -> Result<Option<AnswerAgentRun>> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE answer_agent_runs SET workspace_lease_id = ?2 \
+             WHERE execution_id = ?1 AND status = 'running'",
+            params![execution_id, workspace_lease_id],
+        )?;
+        let cols = Self::answer_agent_run_columns();
+        let sql =
+            format!("SELECT {cols} FROM answer_agent_runs WHERE execution_id = ?1 AND status = 'running' LIMIT 1");
+        conn.query_row(&sql, [execution_id], map_answer_agent_run)
+            .optional()
+            .map_err(Into::into)
     }
 
     /// Transition a run from `running` to a terminal `replied` (with the reply
@@ -400,6 +442,7 @@ mod tests {
         assert_eq!(run.doc_version, "v0");
         assert_eq!(run.thread_turn, 0);
         assert_eq!(run.status, "running");
+        assert!(run.execution_id.is_none());
         assert!(run.workspace_lease_id.is_none());
         assert!(run.reply_body.is_none());
         assert!(run.error_kind.is_none());
@@ -483,6 +526,28 @@ mod tests {
             .unwrap();
         // A completed run never gains a lease.
         assert!(db.set_answer_agent_run_lease(&run.id, "lease-456").is_err());
+    }
+
+    #[test]
+    fn binds_execution_then_stamps_its_workspace_lease() {
+        let db = mem_db();
+        let comment = make_comment(&db, "t1");
+        let run = db
+            .create_answer_agent_run(&comment, "work_item", "t1", "v0", 0)
+            .unwrap();
+        let execution = db
+            .create_answer_agent_execution(&comment, "https://example.test/repo.git")
+            .unwrap();
+
+        let bound = db.bind_answer_agent_run_execution(&run.id, &execution.id).unwrap();
+        assert_eq!(bound.execution_id.as_deref(), Some(execution.id.as_str()));
+
+        let leased = db
+            .set_answer_agent_execution_lease(&execution.id, "lease-123")
+            .unwrap()
+            .expect("bound run should be found through the execution");
+        assert_eq!(leased.workspace_lease_id.as_deref(), Some("lease-123"));
+        assert_eq!(leased.execution_id.as_deref(), Some(execution.id.as_str()));
     }
 
     #[test]

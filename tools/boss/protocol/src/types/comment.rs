@@ -282,7 +282,7 @@ pub struct CreateRevisionInput {
 /// result.
 ///
 /// No `tasks` row backs an answer-agent run (no kanban card); it is tracked
-/// purely as an agent run here. 12 fields → builder pattern per project
+/// purely as an agent run here. 13 fields → builder pattern per project
 /// convention.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
 #[builder(on(String, into))]
@@ -306,6 +306,12 @@ pub struct AnswerAgentRun {
     pub status: String,
 
     pub created_at: String,
+
+    /// The `answer_agent` execution created for this run. This is the
+    /// operator-facing pivot into dispatch diagnostics while the run waits in
+    /// the queue or executes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
 
     /// The cube workspace lease the run holds while it checks out code to read.
     /// `None` when the run answered without leasing. Released on completion.

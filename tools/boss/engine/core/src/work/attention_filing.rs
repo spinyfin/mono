@@ -125,6 +125,13 @@ pub(crate) fn reraise_open_execution_attention(
 }
 
 impl WorkDb {
+    /// Stamp a re-raise onto the open work-item-scoped `kind` item for
+    /// `work_item_id`, returning its id when one existed.
+    pub(crate) fn reraise_open_work_item_attention(&self, work_item_id: &str, kind: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        reraise_open_work_item_attention(&conn, work_item_id, kind)
+    }
+
     /// Stamp a re-raise onto the open execution-scoped `kind` item for
     /// `execution_id`, returning its id when one existed.
     ///

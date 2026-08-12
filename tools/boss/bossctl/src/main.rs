@@ -1590,9 +1590,28 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     artifact,
                     artifact_kind,
                     include_resolved,
+                    intent,
+                    awaiting_answer,
+                    older_than,
                     state_root,
                 },
-        } => comments::comments_list(cli.json, state_root, task, artifact, artifact_kind, include_resolved),
+        } => comments::comments_list(
+            cli.json,
+            comments::CommentsListOptions {
+                state_root,
+                selector: comments::CommentsListSelector {
+                    task,
+                    artifact,
+                    artifact_kind,
+                },
+                filters: comments::CommentsListFilters {
+                    include_resolved,
+                    intent,
+                    awaiting_answer,
+                    older_than,
+                },
+            },
+        ),
         Command::Comments {
             action: comments::CommentsAction::Show { comment_id, state_root },
         } => comments::comments_show(cli.json, state_root, &comment_id),

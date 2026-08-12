@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use boss_engine::dispatch_reader::{self, DispatchWaitReport, PoolQueueSummary};
+use boss_engine::dispatch_reader::{self, DispatchWaitReport, ExecutionKindQueueSummary, PoolQueueSummary};
 use serde::Serialize;
 
 use super::{now_epoch_ms, resolve_state_root};
@@ -25,28 +25,38 @@ struct DispatchStatsOutput {
     #[serde(flatten)]
     report: DispatchWaitReport,
     queue_summary: Vec<PoolQueueSummary>,
+    queue_by_execution_kind: Vec<ExecutionKindQueueSummary>,
     dispatched_last_15m: usize,
     /// Integrity of the stream these numbers were computed over. See
     /// [`crate::stream_integrity`].
     stream_integrity: serde_json::Value,
 }
 
-/// Parse a `--since` value into an absolute epoch-ms cutoff. Accepts a
-/// bare non-negative integer with a `s`/`m`/`h`/`d` suffix (e.g.
-/// `30m`, `6h`, `2d`), measured back from `now_ms`.
-fn parse_since(value: &str, now_ms: u128) -> Result<u128> {
+/// Parse a relative duration (e.g. `30m`, `6h`, `2d`) into a millisecond
+/// count. Accepts a bare non-negative integer with a `s`/`m`/`h`/`d`
+/// suffix. Shared by every flag that measures "how long ago" — today
+/// `dispatch stats --since` (which subtracts the result from `now_ms` to
+/// get an absolute cutoff, see [`parse_since`]) and `comments list
+/// --older-than` (which compares it directly against an age). `flag` is
+/// the caller's flag name (e.g. `"--since"`, `"--older-than"`), used only
+/// to make the error message name the flag the caller actually passed.
+pub(crate) fn parse_duration_ms(flag: &str, value: &str) -> Result<u128> {
     let value = value.trim();
     let (digits, unit_ms) = match value.chars().last() {
         Some('s') => (&value[..value.len() - 1], 1_000u128),
         Some('m') => (&value[..value.len() - 1], 60_000u128),
         Some('h') => (&value[..value.len() - 1], 3_600_000u128),
         Some('d') => (&value[..value.len() - 1], 86_400_000u128),
-        _ => bail!("invalid --since `{value}`: expected a number followed by s/m/h/d, e.g. `30m`"),
+        _ => bail!("invalid {flag} `{value}`: expected a number followed by s/m/h/d, e.g. `30m`"),
     };
     let count: u128 = digits
         .parse()
-        .with_context(|| format!("invalid --since `{value}`: expected a number followed by s/m/h/d"))?;
-    Ok(now_ms.saturating_sub(count.saturating_mul(unit_ms)))
+        .with_context(|| format!("invalid {flag} `{value}`: expected a number followed by s/m/h/d"))?;
+    Ok(count.saturating_mul(unit_ms))
+}
+
+fn parse_since(value: &str, now_ms: u128) -> Result<u128> {
+    Ok(now_ms.saturating_sub(parse_duration_ms("--since", value)?))
 }
 
 pub(crate) fn dispatch_stats(json: bool, state_root: Option<PathBuf>, since: Option<&str>, top: usize) -> Result<()> {
@@ -61,12 +71,14 @@ pub(crate) fn dispatch_stats(json: bool, state_root: Option<PathBuf>, since: Opt
     let events = read.events;
     let report = dispatch_reader::compute_wait_stats(&events, now, since_ms);
     let queue_summary = dispatch_reader::summarize_queue_by_pool(&report.blocked_now);
+    let queue_by_execution_kind = dispatch_reader::summarize_queue_by_execution_kind(&report.blocked_now);
     let dispatched_last_15m = dispatch_reader::dispatches_in_window(&events, now, DISPATCH_RATE_WINDOW_MS);
 
     if json {
         let output = DispatchStatsOutput {
             report,
             queue_summary,
+            queue_by_execution_kind,
             dispatched_last_15m,
             stream_integrity: integrity.to_json(),
         };
@@ -86,6 +98,20 @@ pub(crate) fn dispatch_stats(json: bool, state_root: Option<PathBuf>, since: Opt
                 pool.pool,
                 pool.queued,
                 format_ms(pool.oldest_wait_ms),
+            );
+        }
+    }
+    println!("queue summary (per execution kind):");
+    if queue_by_execution_kind.is_empty() {
+        println!("  nothing queued");
+    } else {
+        println!("  {:<26} {:>7} {:>16}", "execution_kind", "queued", "oldest_waiting");
+        for kind in &queue_by_execution_kind {
+            println!(
+                "  {:<26} {:>7} {:>16}",
+                kind.execution_kind,
+                kind.queued,
+                format_ms(kind.oldest_wait_ms),
             );
         }
     }
@@ -123,10 +149,11 @@ pub(crate) fn dispatch_stats(json: bool, state_root: Option<PathBuf>, since: Opt
         for entry in report.blocked_now.iter().take(top) {
             let work_item = entry.work_item_id.as_deref().unwrap_or("-");
             println!(
-                "  {}  work_item={}  pool={}  reason={}  waiting={}",
+                "  {}  work_item={}  pool={}  kind={}  reason={}  waiting={}",
                 entry.execution_id,
                 work_item,
                 entry.pool,
+                entry.execution_kind,
                 entry.reason,
                 format_ms(entry.wait_so_far_ms),
             );

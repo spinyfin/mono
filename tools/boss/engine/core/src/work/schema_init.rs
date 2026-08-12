@@ -503,6 +503,7 @@ impl WorkDb {
         // EXISTS` so order is irrelevant.
         // Design: tools/boss/docs/designs/comment-triggered-document-revisions.md
         migrate_answer_agent_runs_table(conn)?;
+        migrate_answer_agent_runs_execution_id_column(conn)?;
         // Archival provenance: tasks.archived_reason surfaces why the
         // engine auto-archived a revision (parent PR merged/closed) so
         // `boss task show` doesn't leave the operator guessing.

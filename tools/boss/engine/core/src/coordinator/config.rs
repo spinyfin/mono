@@ -62,6 +62,7 @@ impl ExecutionCoordinator {
         let local_metrics = Arc::new(Registry::new());
         register_metrics(&local_metrics);
         crate::dispatch_metrics::register_metrics(&local_metrics);
+        crate::answer_agent_observability::register_metrics(&local_metrics);
         let host_adapter_provider: Arc<dyn HostAdapterProvider> =
             Arc::new(LocalHostAdapterProvider::new(Arc::clone(&host_adapter)));
         Self {

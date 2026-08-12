@@ -399,7 +399,12 @@ pub struct WorkAttentionItem {
     pub resolved_at: Option<String>,
     /// The work item this item attaches to when there is no execution
     /// row (sticky, pre-dispatch failures). Mutually exclusive with
-    /// `execution_id` — exactly one of the two is `Some`.
+    /// `execution_id` — exactly one of the two is `Some`. Usually a
+    /// `prod_`/`proj_`/`task_` id, but a `work_comments` id is also valid —
+    /// the `answer_agent_ready_age` alarm files against the question
+    /// comment rather than an execution, since the execution the item is
+    /// about is the one whose *next run start* must clear it, which
+    /// execution-scoped rows are excluded from.
     #[serde(default)]
     pub work_item_id: Option<String>,
     /// Set when this item was closed via "create task" (currently only
