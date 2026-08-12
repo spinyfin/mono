@@ -8,7 +8,7 @@
 //! `boss task create` / `boss task depend add` calls.
 //!
 //! See `tools/boss/docs/designs/auto-populate-project-tasks-on-design-pr-merge.md`
-//! (project P783) §2 "The Planner". This module is task 3 of that design.
+//! §2 "The Planner" for the design this module implements.
 //!
 //! ## Pure transform, no writes
 //!
@@ -2219,27 +2219,35 @@ Just do the thing, no explicit entries here.\n\
     }
 
     #[test]
-    fn real_operator_forced_dispatch_doc_parses_as_one_entry() {
-        // Re-run against the real design doc itself, via the
-        // //tools/boss/docs:operator_forced_dispatch_design_doc filegroup
-        // (see BUILD.bazel compile_data) — not a testdata copy, so this test
-        // can never silently drift from the doc it claims to cover.
-        let doc = include_str!(env!("BOSS_OPERATOR_FORCED_DISPATCH_DESIGN_DOC"));
+    fn real_engine_app_rpc_doc_parses_bold_bullet_entries() {
+        // Read the live doc via //tools/boss/docs:engine_app_rpc_design_doc
+        // (see BUILD.bazel compile_data), not a copy that can drift from it.
+        let doc = include_str!(env!("BOSS_ENGINE_APP_RPC_DESIGN_DOC"));
         let entries = extract_breakdown_entries(doc);
         assert_eq!(
-            entries.len(),
-            1,
-            "real doc must yield exactly one breakdown entry, got {}: {:?}",
-            entries.len(),
-            entries.iter().map(|e| e.title.as_str()).collect::<Vec<_>>()
+            entries.iter().map(|entry| entry.title.as_str()).collect::<Vec<_>>(),
+            vec![
+                "6f-4: protocol additions",
+                "6f-5: engine-side dispatch",
+                "6f-6: app-side pane allocator",
+                "6f-7: spawn-flow wiring",
+                "6f-8: PoC chat-code cutover",
+            ],
+            "live implementation plan must yield its bold-bullet entries"
         );
-        assert_eq!(entries[0].title, "Implement pause-only forced dispatch end to end");
+    }
+
+    #[test]
+    fn real_operator_forced_dispatch_doc_does_not_restore_pre_ship_breakdown_heading() {
+        // This live doc is an as-built postmortem. Its retired pre-ship
+        // breakdown heading must not return; follow-up implementation chores
+        // remain a valid heading for future work.
+        let doc = include_str!(env!("BOSS_OPERATOR_FORCED_DISPATCH_DESIGN_DOC"));
         assert!(
-            entries[0]
-                .body
-                .lines()
-                .any(|l| l.trim().eq_ignore_ascii_case("Dependencies: none")),
-            "real doc entry must declare Dependencies: none"
+            !doc.lines().any(|line| line
+                .trim()
+                .eq_ignore_ascii_case("## Proposed implementation task breakdown")),
+            "as-built postmortem must not restore the retired pre-ship breakdown heading"
         );
     }
 

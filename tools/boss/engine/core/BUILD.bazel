@@ -27,11 +27,10 @@ rust_library(
         # src/conformance/claude_goldens.rs.
         "src/conformance/goldens/settings_standard.json.golden",
         "src/conformance/goldens/claude_md_standard.md.golden",
-        # Planner breakdown-authority regression: the real design doc that was
-        # force-split into ten invented tasks, include_str!'d directly from
-        # planner unit tests via this filegroup so the test can never drift
-        # from the source of truth (no testdata copy to fall out of sync).
+        # Planner parser regressions read these live docs directly so their
+        # expectations cannot drift from the source of truth.
         "//tools/boss/docs:operator_forced_dispatch_design_doc",
+        "//tools/boss/docs:engine_app_rpc_design_doc",
     ],
     crate_name = "boss_engine",
     crate_root = "src/lib.rs",
@@ -54,6 +53,9 @@ rust_library(
         # BOSS_CHECKS_YAML above. Keeps the test reading the source of truth
         # instead of a testdata copy that can silently drift.
         "BOSS_OPERATOR_FORCED_DISPATCH_DESIGN_DOC": "$(execpath //tools/boss/docs:operator_forced_dispatch_design_doc)",
+        # Absolute path to a live design doc with bold-bullet breakdown
+        # entries, read by the planner parser regression test.
+        "BOSS_ENGINE_APP_RPC_DESIGN_DOC": "$(execpath //tools/boss/docs:engine_app_rpc_design_doc)",
         # Canonical `bazel run` command for the engine target, so worker-facing
         # guidance (worker_setup.rs, agent_launch_guard.rs) can't drift from
         # the real target label the way the pre-split `//tools/boss/engine:engine`

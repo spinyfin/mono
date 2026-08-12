@@ -10,3 +10,9 @@ filegroup(
     srcs = ["designs/operator-forced-dispatch-while-dispatch-is-paused.md"],
     visibility = ["//tools/boss/engine/core:__pkg__"],
 )
+
+filegroup(
+    name = "engine_app_rpc_design_doc",
+    srcs = ["designs/engine-app-rpc.md"],
+    visibility = ["//tools/boss/engine/core:__pkg__"],
+)
