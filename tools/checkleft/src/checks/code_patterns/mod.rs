@@ -66,10 +66,10 @@ impl ConfiguredCheck for config::CompiledCodePatternsConfig {
 ///
 /// `lang` selects the parser; these globs are the check's definition-level
 /// default path scope (what the framework would answer for "is this file a
-/// target" when the check entry carries no further `include`). They must stay
-/// in lockstep with [`matches_language_path`] — that function is implemented
-/// by matching against this list, so a drift is a compile-time structural
-/// impossibility rather than a silent coverage change.
+/// target" when the check entry carries no further `include`).
+/// [`matches_language_path`] is implemented by matching against this list, so
+/// the declared default scope and the runtime predicate are the same thing by
+/// construction rather than two copies kept in sync.
 fn language_include_globs(language: PatternLanguage) -> &'static [&'static str] {
     match language {
         // Matches `path.extension() == Some("java")` for ordinary repo-relative

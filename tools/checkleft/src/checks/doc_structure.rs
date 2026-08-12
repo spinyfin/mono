@@ -76,16 +76,20 @@ impl ConfiguredCheck for CompiledDocStructureConfig {
 #[serde(deny_unknown_fields)]
 struct DocStructureConfig {
     // Framework-owned legacy scope keys remain in the config blob while the
-    // resolver reads and deprecates them. Consume them here so strict parsing
-    // still rejects check-specific stale keys such as `include_globs`.
+    // resolver reads and deprecates them. Consume only the keys the resolver
+    // actually extracts from `config` so a forgotten check-specific key (e.g.
+    // `include_globs`) or a silent no-op like bare `exclude` becomes a hard
+    // error rather than a silent widen / ignore.
     #[serde(default, rename = "include")]
     _framework_include: Option<toml::Value>,
-    #[serde(default, rename = "exclude")]
-    _framework_exclude: Option<toml::Value>,
     #[serde(default, rename = "exclude_files")]
     _framework_exclude_files: Option<toml::Value>,
     #[serde(default, rename = "exclude_globs")]
     _framework_exclude_globs: Option<toml::Value>,
+    // Accepted only because the config resolver validates `config.applies_to`
+    // generically for all checks (and the declarative executor can override
+    // from it). Built-in effective scope still comes from the check-entry
+    // `include` / `applies_to_patterns`, not from this field.
     #[serde(default, rename = "applies_to")]
     _framework_applies_to: Option<toml::Value>,
     #[serde(default)]
@@ -409,13 +413,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn rejects_config_exclude_key() {
+        // `exclude` inside `config` is not read by the framework legacy
+        // extractors (only `exclude_files` / `exclude_globs` are). Accepting it
+        // would recreate a silent no-op; deny_unknown_fields must reject it.
+        let check = DocStructureCheck;
+        let result = check.configure(&toml::Value::Table(toml::toml! {
+            exclude = ["docs/generated/**"]
+        }));
+        let err = match result {
+            Ok(_) => panic!("config.exclude must not be accepted as a silent no-op"),
+            Err(err) => err,
+        };
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("exclude") || message.contains("unknown field"),
+            "expected deny_unknown_fields diagnostic for exclude, got: {message}"
+        );
+    }
+
     #[test]
     fn accepts_framework_owned_legacy_scope_keys() {
         let check = DocStructureCheck;
         let config: toml::Value = toml::from_str(
             r#"
 include = ["docs/**/*.md"]
-exclude = ["docs/generated/**"]
 exclude_files = ["docs/legacy/**"]
 exclude_globs = ["docs/vendor/**"]
 applies_to = ["docs/**/*.md"]

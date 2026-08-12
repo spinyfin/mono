@@ -227,12 +227,15 @@ fn read_all(mut pipe: impl Read) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::thread;
 
-    /// A completed child may post pipe output after its execution budget is gone.
+    /// Residual execution budget exhausted must not fail the post-exit drain.
     ///
-    /// The post-exit drain uses fixed [`DRAIN_GRACE`], not residual execution
-    /// budget. Back-dating the start instant exercises that boundary without a
-    /// wall-clock sleep or any dependency on host scheduling.
+    /// Production code drains under fixed [`DRAIN_GRACE`], not the leftover
+    /// subprocess budget, so a child that finished near the deadline is not
+    /// reported as a timeout while its pipe readers deliver. This asserts that
+    /// path without wall-clock sleeps or load sensitivity.
     #[test]
     fn receive_output_ok_when_residual_budget_exhausted() {
         let timeout_ms = 100;
@@ -241,16 +244,16 @@ mod tests {
             .expect("Instant can subtract past the execution budget");
         assert!(
             started.elapsed() >= Duration::from_millis(timeout_ms),
-            "test setup must start with residual budget already exhausted"
+            "test setup must start with residual budget already zero"
         );
 
-        let (sender, receiver) = mpsc::sync_channel(1);
-        sender
-            .send(Ok(b"drained\n".to_vec()))
-            .expect("receiver remains connected");
+        let (tx, rx) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let _ = tx.send(Ok(b"drained\n".to_vec()));
+        });
 
         let output = receive_output(
-            receiver,
+            rx,
             "stdout",
             started,
             DRAIN_GRACE,
@@ -258,7 +261,7 @@ mod tests {
             "tool",
             timeout_ms,
         )
-        .expect("exhausted residual budget must not fail the drain");
+        .expect("residual budget exhausted must not fail the drain");
         assert_eq!(output, b"drained\n");
     }
 }
