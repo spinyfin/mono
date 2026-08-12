@@ -68,6 +68,26 @@ const GROK_HOOK_EVENTS: &[&str] = &[
     "SessionEnd",
 ];
 
+/// Per-handler timeout (seconds) for the passive `boss-event` progress
+/// forwarder on every lifecycle event, including `Stop`.
+///
+/// Grok's hook runner **blocks the TUI** for the full duration of every
+/// in-flight command hook (bundled user-guide §Hooks: "long-running hooks
+/// block the UI"). When `timeout` is omitted, non-gate events default to 5s
+/// but **`Stop` / `SubagentStop` default to 600s** — the budget intended for
+/// real stop-*gates* that run builds/tests. Boss's forwarder is passive
+/// observability, never a gate: it must not inherit that 600s ceiling, or a
+/// wedged events socket / slow `boss-event` write freezes the pane after the
+/// final assistant text is already on screen (empty prompt, no keystrokes,
+/// residual `[hooks: 1]` chrome) while the engine may already have flipped
+/// the slot to Ready from a partially-delivered Stop.
+///
+/// 15s covers `boss-event`'s full connect-retry schedule (~10.2s) plus
+/// headroom for a small write. On timeout Grok fails open (turn ends; UI
+/// returns) — correct for a non-gating forwarder. Keep in sync with
+/// `tools/boss/event-shim`'s retry budget.
+pub const FORWARDER_HOOK_TIMEOUT_SEC: u64 = 15;
+
 /// Build the `boss-event` forwarder command line — byte-for-byte the same
 /// env-prefix shape [`crate::claude::ClaudeDriver`]'s
 /// `progress_observation_wiring` uses. The raw Grok payload is forwarded
@@ -93,7 +113,13 @@ fn forwarder_command(config: &ProgressObservationConfig) -> String {
 pub fn forwarder_hooks_map(config: &ProgressObservationConfig) -> serde_json::Map<String, serde_json::Value> {
     let forward_hook = json!({
         "matcher": "*",
-        "hooks": [{"type": "command", "command": forwarder_command(config)}],
+        "hooks": [{
+            "type": "command",
+            "command": forwarder_command(config),
+            // Explicit on every event — critical on Stop, which otherwise
+            // inherits Grok's 600s stop-gate default and can freeze the pane.
+            "timeout": FORWARDER_HOOK_TIMEOUT_SEC,
+        }],
     });
     let mut hooks = serde_json::Map::new();
     for event in GROK_HOOK_EVENTS {
@@ -520,6 +546,13 @@ mod tests {
             let command = entry["hooks"][0]["command"].as_str().unwrap();
             assert!(command.contains("BOSS_RUN_ID='run-1'"), "{command}");
             assert!(command.contains("/tmp/boss-event"), "{command}");
+            // Passive forwarder must never inherit Stop's 600s gate default.
+            let timeout = entry["hooks"][0]["timeout"].as_u64();
+            assert_eq!(
+                timeout,
+                Some(FORWARDER_HOOK_TIMEOUT_SEC),
+                "{event} forwarder missing short timeout (got {timeout:?})"
+            );
         }
     }
 
@@ -562,6 +595,17 @@ mod tests {
         assert_eq!(pre_tool_use.len(), 3, "{pre_tool_use:#?}");
         let forwarder_command = pre_tool_use[0]["hooks"][0]["command"].as_str().unwrap();
         assert!(forwarder_command.contains("/tmp/boss-event"));
+        assert_eq!(
+            pre_tool_use[0]["hooks"][0]["timeout"].as_u64(),
+            Some(FORWARDER_HOOK_TIMEOUT_SEC),
+            "on-disk PreToolUse forwarder must carry the short timeout"
+        );
+        // Stop is the freeze-critical event: its omitted-timeout default is 600s.
+        assert_eq!(
+            hooks_doc["hooks"]["Stop"][0]["hooks"][0]["timeout"].as_u64(),
+            Some(FORWARDER_HOOK_TIMEOUT_SEC),
+            "on-disk Stop forwarder must not inherit Grok's 600s stop-gate default"
+        );
         let guard_1 = pre_tool_use[1]["hooks"][0]["command"].as_str().unwrap();
         assert!(guard_1.starts_with(&shell_quote(&adapter_path.display().to_string())));
         assert!(guard_1.contains("BOSS_DATA_DIR="));

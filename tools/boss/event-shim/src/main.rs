@@ -80,7 +80,20 @@ const MAX_BUFFERED_EVENTS: usize = 1000;
 /// Default backoff schedule between connect attempts (in addition to
 /// the initial attempt). Sums to ~10.2s of wall time across five
 /// retries, matching the design budget.
+///
+/// Keep the sum under the Grok progress-forwarder hook timeout
+/// (`FORWARDER_HOOK_TIMEOUT_SEC` = 15s in `driver/src/grok/hooks.rs`):
+/// Grok blocks its TUI for the full duration of every command hook, so a
+/// connect schedule that outlives that timeout is killed mid-retry and
+/// still freezes the pane until the kill lands.
 const DEFAULT_RETRY_DELAYS_MS: &[u64] = &[200, 500, 1500, 3000, 5000];
+
+/// Bound on a single connected write / half-close so a peer that
+/// accepts but never reads cannot pin the hook (and, on Grok, the TUI)
+/// until the outer hook runner's timeout. Three seconds is generous for
+/// a small JSON payload on a local Unix socket and still leaves headroom
+/// inside the forwarder hook budget after connect retries.
+const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn main() -> ExitCode {
     match run() {
@@ -221,9 +234,15 @@ fn retry_delays() -> Vec<Duration> {
         .collect()
 }
 
-/// One connect attempt, no retry.
+/// One connect attempt, no retry. Applies [`SOCKET_IO_TIMEOUT`] so a
+/// subsequent `write_all` cannot block unbounded if the peer stalls.
 fn connect_once(path: &str) -> Result<UnixStream> {
-    UnixStream::connect(path).with_context(|| format!("connecting to events socket at {path}"))
+    let stream = UnixStream::connect(path).with_context(|| format!("connecting to events socket at {path}"))?;
+    // Best-effort: a platform that rejects SO_SNDTIMEO still delivers
+    // events; the Grok-side hook timeout remains the outer ceiling.
+    let _ = stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(SOCKET_IO_TIMEOUT));
+    Ok(stream)
 }
 
 /// Bounded retry loop around `connect_once`. Sleeps between attempts
@@ -246,6 +265,11 @@ fn connect_with_retry(path: &str) -> Result<UnixStream> {
 
 /// Write payload to a connected stream, half-close, and return. The
 /// engine reads to EOF, so the half-close is the message terminator.
+///
+/// Relies on the write timeout set in [`connect_once`]: without it, a
+/// peer that accepts the connection but never drains the socket can
+/// block `write_all` until the outer hook runner kills the process
+/// (up to 600s for an unscoped Grok `Stop` hook — which freezes the TUI).
 fn send_to_stream(mut stream: UnixStream, payload: &[u8]) -> Result<()> {
     stream
         .write_all(payload)
