@@ -288,7 +288,7 @@ fn record_worker_pr_completion_done_sets_completed_at() {
         "completed_at must be NULL before completion",
     );
 
-    db.record_worker_pr_completion(&exec_id, pr_url, None, WorkerPrCompletionTarget::Done, None)
+    db.record_worker_pr_completion(&exec_id, pr_url, None, None, WorkerPrCompletionTarget::Done, None)
         .unwrap();
 
     assert!(
@@ -311,6 +311,7 @@ fn record_worker_pr_completion_blocked_deletion_signoff_holds_task() {
     db.record_worker_pr_completion(
         &exec_id,
         pr_url,
+        None,
         None,
         WorkerPrCompletionTarget::BlockedDeletionSignoff,
         None,
@@ -345,7 +346,7 @@ fn record_worker_pr_completion_done_coalesce_stability() {
     let (_product_id, chore_id, exec_id) = make_waiting_human_chore(&db, "rwpc-coalesce");
     let pr_url = "https://github.com/spinyfin/mono/pull/9011";
 
-    db.record_worker_pr_completion(&exec_id, pr_url, None, WorkerPrCompletionTarget::Done, None)
+    db.record_worker_pr_completion(&exec_id, pr_url, None, None, WorkerPrCompletionTarget::Done, None)
         .unwrap();
     let first = task_completed_at(&db, &chore_id);
     assert!(first.is_some(), "completed_at must be set after first completion");

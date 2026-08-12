@@ -941,6 +941,27 @@ impl LiveWorkerStateRegistry {
         first
     }
 
+    /// Return `last_event_at` for the non-terminal slot running `run_id`.
+    /// Prefer a `Working` slot when duplicates exist so the mid-turn PR
+    /// completion horizon is measured against the activity that is actually
+    /// blocking terminalization.
+    pub fn last_event_at_for_run(&self, run_id: &str) -> Option<String> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        let mut first = None;
+        for state in guard.values().map(|entry| &entry.state) {
+            if state.activity.is_terminal() || state.run_id != run_id {
+                continue;
+            }
+            if state.activity == WorkerActivity::Working {
+                return state.last_event_at.clone();
+            }
+            if first.is_none() {
+                first = state.last_event_at.clone();
+            }
+        }
+        first
+    }
+
     /// Apply a hook event to the state for `slot_id`. Returns `true`
     /// if the entry actually changed, so callers can suppress no-op
     /// topic pushes. Returns `false` if no entry exists for the slot

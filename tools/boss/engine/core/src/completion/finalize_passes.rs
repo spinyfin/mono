@@ -795,10 +795,18 @@ impl WorkerCompletionHandler {
         // the review verdict above. Same path for both revision and
         // no-revision cases.
         // Marked before the terminalizing write — see `super::teardown`.
+        //
+        // `pr_head_after` is intentionally `None` for reviewer teardowns:
+        // the column's forensic purpose is severity of mid-turn reaps on
+        // *producing* executions that lose work. Reviewers do not hold that
+        // contribution surface; a post-teardown head on the review execution
+        // would not answer the same query and would require a second gh call
+        // on every review finalize.
         let teardown = self.begin_teardown(&execution.id);
         let completion = match self.work_db.record_worker_pr_completion(
             &execution.id,
             &pr_url,
+            None,
             None,
             completion_target,
             Some(review_verdict),

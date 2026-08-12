@@ -1748,7 +1748,7 @@ fn investigation_open_pr_exposes_derived_doc_link_in_work_tree() {
     // The worker opens the doc PR and stops. This is the PR-open signal
     // that stamps `pr_url` on the task — the doc-link source.
     let pr = "https://github.com/spinyfin/mono/pull/1324";
-    db.record_worker_pr_completion(&exec.id, pr, None, WorkerPrCompletionTarget::InReview, None)
+    db.record_worker_pr_completion(&exec.id, pr, None, None, WorkerPrCompletionTarget::InReview, None)
         .expect("PR completion must succeed")
         .expect("execution must not already be terminal");
 
@@ -1852,9 +1852,16 @@ fn redispatched_investigation_open_pr_exposes_derived_doc_link() {
     db.start_execution_run(&redispatched.id, "agent", "repo", "lease", "ws", "/tmp/ws")
         .unwrap();
     let pr = "https://github.com/spinyfin/mono/pull/1324";
-    db.record_worker_pr_completion(&redispatched.id, pr, None, WorkerPrCompletionTarget::InReview, None)
-        .expect("PR completion must succeed")
-        .expect("execution must not already be terminal");
+    db.record_worker_pr_completion(
+        &redispatched.id,
+        pr,
+        None,
+        None,
+        WorkerPrCompletionTarget::InReview,
+        None,
+    )
+    .expect("PR completion must succeed")
+    .expect("execution must not already be terminal");
 
     let tree = db.get_work_tree(&product.id).unwrap();
     let found = tree

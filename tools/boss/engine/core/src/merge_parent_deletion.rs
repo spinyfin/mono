@@ -26,7 +26,7 @@
 //! language-aware parser.
 
 use anyhow::Result;
-use boss_engine_gh_invocation::{gh_compare_jq, run_gh};
+use boss_engine_gh_invocation::gh_compare_jq;
 use boss_gh_telemetry::{callers, scope as gh_scope};
 use std::collections::BTreeSet;
 
@@ -189,8 +189,8 @@ pub fn render_signoff_attention_body(deletions: &[String], pr_url: &str) -> Stri
     )
 }
 
-/// Fetch a PR's current head commit sha via the GitHub API. Used by the
-/// escalation ladder's rung 0/1 result-gate (T9/T2562, see
+/// Fetch a PR's current head commit sha via the shared REST head reader.
+/// Used by the escalation ladder's rung 0/1 result-gate (see
 /// `CubeClient::verify_deletion_tripwire` in `coordinator.rs`) to learn
 /// the sha a mechanical rung just pushed — `push_resolution` /
 /// `rebase_workspace` don't return one (see their doc comments in
@@ -199,12 +199,13 @@ pub fn render_signoff_attention_body(deletions: &[String], pr_url: &str) -> Stri
 /// Fail-open: any `gh` error or unparseable/empty response returns
 /// `None`, matching [`compute_merged_parent_deletions`]'s own fail-open
 /// contract — a transient GitHub failure must not block a legitimate
-/// mechanical resolution.
+/// mechanical resolution. Attributed under
+/// [`callers::MERGE_PARENT_DELETION`] so the call is visible to the same
+/// GitHub-call accounting the merge poller budgets against.
 pub async fn fetch_pr_head_sha(repo_slug: &str, pr_number: u64) -> Option<String> {
-    let endpoint = format!("repos/{repo_slug}/pulls/{pr_number}");
-    let stdout = gh_scope(
+    gh_scope(
         callers::MERGE_PARENT_DELETION,
-        run_gh(&["api", &endpoint, "--jq", ".head.sha"], &format!("gh api {endpoint}")),
+        git_utils::gh_cli::fetch_pr_head_sha_rest(repo_slug, pr_number, /* no_cache */ false),
     )
     .await
     .inspect_err(|err| {
@@ -215,9 +216,7 @@ pub async fn fetch_pr_head_sha(repo_slug: &str, pr_number: u64) -> Option<String
             "merge_parent_deletion: fetch_pr_head_sha failed; tripwire fails open for this rung",
         );
     })
-    .ok()?;
-    let sha = stdout.trim();
-    if sha.is_empty() { None } else { Some(sha.to_owned()) }
+    .ok()
 }
 
 /// Fetch and parse the `.files[]` array of a GitHub compare between two refs.

@@ -262,9 +262,17 @@ fn record_worker_pr_completion_binds_pr_and_advances_to_in_review() {
     let db = WorkDb::open(temp_db_path("rwpc-inreview-bind")).unwrap();
     let (_product_id, chore_id, exec_id) = make_waiting_human_chore(&db, "rwpc-inreview");
     let pr_url = "https://github.com/spinyfin/mono/pull/4030";
+    let pr_head_after = "0123456789abcdef0123456789abcdef01234567";
 
     let completion = db
-        .record_worker_pr_completion(&exec_id, pr_url, None, WorkerPrCompletionTarget::InReview, None)
+        .record_worker_pr_completion(
+            &exec_id,
+            pr_url,
+            Some(pr_head_after),
+            None,
+            WorkerPrCompletionTarget::InReview,
+            None,
+        )
         .unwrap()
         .expect("a live execution must return Some(WorkerPrCompletion)");
 
@@ -283,6 +291,11 @@ fn record_worker_pr_completion_binds_pr_and_advances_to_in_review() {
         completion.execution.pr_url.as_deref(),
         Some(pr_url),
         "the execution row must record the PR url",
+    );
+    assert_eq!(
+        completion.execution.pr_head_after.as_deref(),
+        Some(pr_head_after),
+        "the execution row must record the post-teardown PR head",
     );
     assert!(
         completion.execution.cube_lease_id.is_none(),
@@ -340,7 +353,7 @@ fn pr_completion_and_no_op_completion_differ_in_status_and_pr_binding() {
     let (_pb, noop_chore, noop_exec) = make_waiting_human_chore(&db, "noop-path");
 
     let pr_done = db
-        .record_worker_pr_completion(&pr_exec, pr_url, None, WorkerPrCompletionTarget::InReview, None)
+        .record_worker_pr_completion(&pr_exec, pr_url, None, None, WorkerPrCompletionTarget::InReview, None)
         .unwrap()
         .unwrap();
     let noop_done = db
@@ -373,13 +386,13 @@ fn record_worker_pr_completion_noop_when_execution_terminal() {
     let pr_url = "https://github.com/spinyfin/mono/pull/4050";
 
     // First call finalises the execution.
-    db.record_worker_pr_completion(&exec_id, pr_url, None, WorkerPrCompletionTarget::InReview, None)
+    db.record_worker_pr_completion(&exec_id, pr_url, None, None, WorkerPrCompletionTarget::InReview, None)
         .unwrap()
         .expect("first completion must return Some");
 
     // Second call sees a terminal execution and no-ops.
     let repeat = db
-        .record_worker_pr_completion(&exec_id, pr_url, None, WorkerPrCompletionTarget::InReview, None)
+        .record_worker_pr_completion(&exec_id, pr_url, None, None, WorkerPrCompletionTarget::InReview, None)
         .unwrap();
     assert!(
         repeat.is_none(),

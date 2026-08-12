@@ -27,6 +27,7 @@ impl WorkDb {
         &self,
         execution_id: &str,
         pr_url: &str,
+        pr_head_after: Option<&str>,
         result_summary: Option<&str>,
         target: WorkerPrCompletionTarget,
         review_verdict: Option<ReviewVerdictInput>,
@@ -130,9 +131,10 @@ impl WorkDb {
                  cube_workspace_id = NULL,
                  workspace_path = NULL,
                  finished_at = ?2,
-                 pr_url = ?3
+                 pr_url = ?3,
+                 pr_head_after = ?4
              WHERE id = ?1",
-            params![execution_id, now, pr_url],
+            params![execution_id, now, pr_url, pr_head_after],
         )?;
 
         // Update the most-recent run for this execution: if a summary is

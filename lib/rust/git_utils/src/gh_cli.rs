@@ -59,6 +59,44 @@ pub async fn fetch_pr_head_oid(repo_slug: &str, pr_number: u64) -> Result<String
     parse_head_sha_output(sha, pr_number, repo_slug)
 }
 
+/// Fetch a PR's head commit SHA via GitHub's REST `pulls` endpoint
+/// (`repos/{repo}/pulls/{n}` → `.head.sha`), bypassing the GraphQL path
+/// `gh pr view` uses.
+///
+/// When `no_cache` is true, sends `Cache-Control: no-cache` so an
+/// intermediary revalidates rather than reusing a cached representation —
+/// required at the PR-completion teardown seam so a stale merge-poller
+/// snapshot cannot be recorded as the forensic post-teardown head.
+/// When false, issues a plain GET (callers that only need a best-effort
+/// tripwire snapshot, e.g. merge-parent deletion).
+///
+/// Returns an error when the command fails or the response omits the head
+/// SHA, matching [`fetch_pr_head_oid`]'s fail-closed contract. Callers that
+/// prefer fail-open map the error to `None`.
+pub async fn fetch_pr_head_sha_rest(repo_slug: &str, pr_number: u64, no_cache: bool) -> Result<String> {
+    let endpoint = format!("repos/{repo_slug}/pulls/{pr_number}");
+    let sha = if no_cache {
+        run_gh(
+            &["api", "-H", "Cache-Control: no-cache", &endpoint, "--jq", ".head.sha"],
+            &format!("gh api -H Cache-Control:no-cache {endpoint} --jq .head.sha"),
+        )
+        .await?
+    } else {
+        run_gh(
+            &["api", &endpoint, "--jq", ".head.sha"],
+            &format!("gh api {endpoint} --jq .head.sha"),
+        )
+        .await?
+    };
+    parse_head_sha_output(sha, pr_number, repo_slug)
+}
+
+/// Teardown-time REST head read with `Cache-Control: no-cache`. See
+/// [`fetch_pr_head_sha_rest`].
+pub async fn fetch_pr_head_oid_fresh(repo_slug: &str, pr_number: u64) -> Result<String> {
+    fetch_pr_head_sha_rest(repo_slug, pr_number, true).await
+}
+
 /// Fetch the head branch name (`headRefName`) for a PR by shelling out to
 /// `gh pr view <pr_number> -R <repo_slug> --json headRefName --jq .headRefName`.
 ///
