@@ -1,13 +1,5 @@
 use super::*;
 
-/// Extract the numeric PR number from a GitHub pull-request URL.
-/// Accepts only the canonical form `https://github.com/<owner>/<repo>/pull/<n>`,
-/// delegating to [`boss_github::pr_url::pr_number_from_url`] so every call site
-/// shares the same stricter validation. Returns `None` for any non-canonical URL.
-fn extract_pr_number_from_url(pr_url: &str) -> Option<i64> {
-    boss_github::pr_url::pr_number_from_url(pr_url).map(|n| n as i64)
-}
-
 /// `true` when `created_via` identifies the revision as an engine-managed
 /// kind that is automatically resolved when the parent PR merges: a
 /// merge-conflict-resolution revision or a CI-fix revision.
@@ -350,7 +342,7 @@ pub(crate) fn resolve_revision_on_parent_close(
         let origin_short_id = root.as_ref().and_then(|r| r.short_id);
         let origin_pr_num = root
             .as_ref()
-            .and_then(|r| r.pr_url.as_deref().and_then(extract_pr_number_from_url));
+            .and_then(|r| r.pr_url.as_deref().and_then(stored_pr_number));
         let kind_override = origin_pr_num.is_some().then_some(TaskKind::Followup);
         let desc = rev.description.replace(
             "Address ALL findings before finalising this revision.",
@@ -558,46 +550,6 @@ mod tests {
     use super::*;
     use crate::test_support::create_test_product;
     use std::path::PathBuf;
-
-    // ── extract_pr_number_from_url ──────────────────────────────────────
-    // Pure fn: assert observable input -> output only.
-
-    #[test]
-    fn extract_pr_number_parses_canonical_url() {
-        assert_eq!(
-            extract_pr_number_from_url("https://github.com/o/r/pull/42"),
-            Some(42),
-            "canonical pull URL must yield the trailing PR number"
-        );
-    }
-
-    #[test]
-    fn extract_pr_number_rejects_bare_number() {
-        // Canonical-only parsing: a bare integer is not a full PR URL.
-        assert_eq!(
-            extract_pr_number_from_url("42"),
-            None,
-            "a bare integer is not a canonical PR URL"
-        );
-    }
-
-    #[test]
-    fn extract_pr_number_tolerates_trailing_slash() {
-        // The canonical parser ignores a trailing path/query/fragment after the
-        // number (GitHub decorates real PR URLs with `/files`, `?tab=…`, etc.),
-        // so a trailing slash still yields the leading PR number.
-        assert_eq!(extract_pr_number_from_url("https://github.com/o/r/pull/42/"), Some(42));
-    }
-
-    #[test]
-    fn extract_pr_number_rejects_non_numeric_tail() {
-        assert_eq!(extract_pr_number_from_url("https://github.com/o/r/pull/abc"), None);
-    }
-
-    #[test]
-    fn extract_pr_number_rejects_empty_string() {
-        assert_eq!(extract_pr_number_from_url(""), None);
-    }
 
     // ── is_moot_revision_kind ───────────────────────────────────────────
     // Only the two engine-managed prefixes that self-resolve before a

@@ -511,6 +511,13 @@ pub(crate) fn record_sweep_metrics(metrics: &Registry, outcome: &SweepOutcome) {
     TRUNK_EPISODES_ADOPTED.inc_by(metrics, outcome.trunk_episodes_adopted as u64);
 }
 
+/// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`.
+/// The returned `JoinHandle` is detached by callers — the poller has no
+/// shutdown path.
+///
+/// Startup sweep (`chore-lifecycle-pr-closed-unmerged.md` Q9 /
+/// `merge-conflict-handling-in-review.md` Phase 6 #17): the first
+/// `run_one_pass` fires immediately on spawn so any chore whose PR
 /// merged or developed a conflict while the engine was offline gets
 /// reconciled on boot. The sweep runs inside the spawned task so
 /// engine startup isn't blocked on `gh`; subsequent full sweeps are
