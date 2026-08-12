@@ -247,26 +247,34 @@ macro_rules! python_command_guard {
 /// - A phrase inside a quoted argument (a commit message, a `--body`) is one
 ///   token and never matches.
 ///
-/// Blocked: any program whose basename is `Boss` or `engine` / `boss-engine`,
-/// any program path containing `Boss.app` *except* CLI tools under
-/// `Contents/Resources/bin/`, `open` of a Boss bundle / `-a Boss` / the bundle
-/// id, `bazel run` of an `app-macos` target without an isolating
-/// `BOSS_SOCKET_PATH` + `BOSS_ENGINE_AUTOSTART=0`, `bazel run` of an engine
-/// target without an isolating `--socket-path`, and `swift run`.
+/// Blocked: any program whose basename is `Boss`, `engine`, `boss-engine`,
+/// or `bossctl` (bossctl is coordinator-only, never worker-facing, even by
+/// absolute bundled path), any program path containing `Boss.app` *except*
+/// CLI tools under `Contents/Resources/bin/`, `open` of a Boss bundle /
+/// `-a Boss` / the bundle id, `bazel run` of an `app-macos` target without
+/// an isolating `BOSS_SOCKET_PATH` + `BOSS_ENGINE_AUTOSTART=0`, `bazel run`
+/// of an engine target without an isolating `--socket-path`, a `boss engine
+/// start` / `boss engine stop` invocation of any `boss` binary (PATH or
+/// bundled path — these bounce the engine out from under the worker), and
+/// `swift run`.
 ///
 /// Allowed: `bazel build`, `bazel test`, unpacking or inspecting a bundle,
-/// absolute paths to bundled CLI tools (`…/Boss.app/Contents/Resources/bin/boss`,
-/// `bossctl`, `boss-event`, … — these are command-line tools that start no GUI;
-/// the basename-`engine` rule still blocks the engine binary living in that
-/// same directory), `bazel run //tools/boss/engine/core:engine -- --socket-path
+/// absolute paths to bundled CLI tools that are not Boss-tier
+/// (`…/Boss.app/Contents/Resources/bin/boss`, `boss-event`, `cube`, … —
+/// these are command-line tools that start no GUI; the basename rule above
+/// still blocks `bossctl` and the engine binary living in that same
+/// directory), `bazel run //tools/boss/engine/core:engine -- --socket-path
 /// <non-production>`, and isolated capture launches of the app
 /// (`BOSS_SOCKET_PATH=/tmp/boss-shot-<id>.sock BOSS_ENGINE_AUTOSTART=0 bazel
 /// run //tools/boss/app-macos:Boss -- --capture-to <path>.png`).
 ///
 /// Distinguishing CLI-under-bundle from app launch is load-bearing: workers
-/// must be able to invoke the version-matched `boss` / `bossctl` that ships
-/// inside the running app (including by absolute path). Conflating the two
-/// forbade the only correct binary while still letting a stale `PATH` copy
+/// must be able to invoke the version-matched `boss` that ships inside the
+/// running app (including by absolute path); `bossctl` stays off the worker
+/// surface entirely, per the coordinator-only invariant pinned by
+/// `boss_engine_worker_bin::launcher_names`. Conflating CLI-under-bundle
+/// with app launch would have forbidden the only correct binary while still
+/// letting a stale `PATH` copy
 /// win if the launcher ever slipped.
 pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     "DELIMS={'&&','||',';','|','&'}\n",
@@ -315,9 +323,14 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     "    return None\n",
     // CLI tools ship inside the .app at Contents/Resources/bin/. Executing
     // those is not launching the app (Contents/MacOS/<AppName> / open -a).
-    // Basename Boss/engine/boss-engine is still blocked above this helper.
+    // Basename Boss/engine/boss-engine/bossctl is still blocked above this
+    // helper. Require the *normalized* parent directory to be exactly
+    // Contents/Resources/bin -- a plain substring test on the raw path
+    // would let a traversal like '.../Contents/Resources/bin/../MacOS/x'
+    // through even though it resolves outside bin/.
     "def is_bundle_cli(p):\n",
-    "    return '/Contents/Resources/bin/' in p\n",
+    "    d=os.path.dirname(os.path.normpath(p))\n",
+    "    return d.endswith('/Contents/Resources/bin')\n",
     "matched=None\n",
     "for g in groups:\n",
     "    i=0\n",
@@ -335,11 +348,19 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     "        continue\n",
     "    prog=rest[0]\n",
     "    base=os.path.basename(prog)\n",
-    "    if base in ('Boss','engine','boss-engine'):\n",
+    "    if base in ('Boss','engine','boss-engine','bossctl'):\n",
     "        matched=prog\n",
     "        break\n",
     "    if 'Boss.app' in prog and not is_bundle_cli(prog):\n",
     "        matched=prog\n",
+    "        break\n",
+    // `boss engine start|stop` bounces the engine out from under the
+    // worker regardless of whether `boss` was resolved via PATH or an
+    // absolute bundled path -- the bare-name deny rules in
+    // `worker_setup::deny_rules` only match the literal PATH-invocation
+    // text, so the guard closes the absolute-path gap here.
+    "    if base=='boss' and len(rest)>=3 and rest[1]=='engine' and rest[2] in ('start','stop'):\n",
+    "        matched=prog+' engine '+rest[2]\n",
     "        break\n",
     "    if base=='open':\n",
     "        joined=' '.join(rest)\n",

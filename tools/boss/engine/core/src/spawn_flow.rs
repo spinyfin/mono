@@ -88,8 +88,11 @@ const WORKER_EDITOR_NOOP: &str = "false";
 /// When `boss_bin_dir` is non-empty (installed mode: set by the macOS app
 /// to `…/Boss.app/Contents/Resources/bin`):
 /// - export `BOSS_BIN_DIR` and `BOSS_BIN` (`$BOSS_BIN_DIR/boss`)
-/// - prepend the directory to `PATH` so bare `boss` / `bossctl` hit the
-///   version-matched copies ahead of any sanitized-PATH fallback
+/// - prepend the directory to `PATH` so bare `boss` hits the
+///   version-matched copy ahead of any sanitized-PATH fallback. `bossctl`
+///   also ships in this directory, but stays coordinator-only: it is never
+///   exported as its own env var, and `BOSS_LAUNCH_GUARD_COMMAND` blocks it
+///   by basename regardless of where PATH resolution finds it.
 ///
 /// Empty / missing is a no-op: dev / `bazel run` mode relies on the
 /// per-workspace `boss` launcher instead, and never falls back to a
@@ -603,10 +606,14 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
 
     // Installed mode: propagate BOSS_BIN_DIR (set by the app when
     // launching the engine from Boss.app/Contents/Resources/bin/).
-    // Workers prepend this directory to PATH so bare `boss` / `bossctl`
-    // resolve the bundled copies, and export BOSS_BIN (absolute path to
-    // the bundled `boss`) for the same reason the coordinator session
-    // does — absolute-path invocation must be legal and version-matched.
+    // Workers prepend this directory to PATH so bare `boss` resolves the
+    // bundled copy, and export BOSS_BIN (absolute path to the bundled
+    // `boss`) for the same reason the coordinator session does —
+    // absolute-path invocation must be legal and version-matched.
+    // `bossctl` lives in the same directory but stays coordinator-only:
+    // this prepend does not export a BOSS_BIN-shaped var for it, and
+    // BOSS_LAUNCH_GUARD_COMMAND blocks any `bossctl` invocation by
+    // basename regardless of path.
     // Unset in dev mode (no bundle bin/ directory); the per-workspace
     // `boss` launcher (BOSS_WORKER_BIN_DIR) still pins bare `boss` to the
     // engine's own CLI without searching PATH.
@@ -1746,7 +1753,7 @@ mod tests {
         assert_eq!(
             path,
             format!("{fake}:{WORKER_SANITIZED_PATH}"),
-            "bundle bin dir must lead PATH so bare boss/bossctl win",
+            "bundle bin dir must lead PATH so bare boss wins",
         );
 
         // Empty / missing must not invent empty PATH entries.

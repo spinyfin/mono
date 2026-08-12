@@ -216,22 +216,23 @@ fn launch_guard_still_blocks_direct_boss_app_binary() {
 /// Executing them is *not* launching the production app (that is
 /// `Contents/MacOS/Boss` or `open -a Boss`). The previous matcher treated
 /// any path containing `Boss.app` as a launch, which forbade the only
-/// version-matched `boss` / `bossctl` a worker can use.
+/// version-matched `boss` a worker can use.
 ///
 /// Pin both the production install path and a non-`/Applications` bundle
 /// so a dev build's own CLI is allowed too — hardcoding `/Applications`
-/// is exactly the skew this allowance must not reintroduce.
+/// is exactly the skew this allowance must not reintroduce. `bossctl` is
+/// deliberately absent here: see
+/// `launch_guard_still_blocks_bundled_bossctl` below.
 #[test]
 fn launch_guard_allows_bundled_cli_binaries() {
     for command in [
         "/Applications/Boss.app/Contents/Resources/bin/boss",
         "/Applications/Boss.app/Contents/Resources/bin/boss pr status --json",
-        "/Applications/Boss.app/Contents/Resources/bin/bossctl status",
         "/Applications/Boss.app/Contents/Resources/bin/boss-event",
         "exec /Applications/Boss.app/Contents/Resources/bin/boss pr status",
         // Dev / non-production bundle: same layout, different install root.
         "/Users/dev/Library/Developer/Xcode/DerivedData/Boss-abc/Build/Products/Debug/Boss.app/Contents/Resources/bin/boss",
-        "/tmp/scratch/boss-app-run/Boss.app/Contents/Resources/bin/bossctl --help",
+        "/tmp/scratch/boss-app-run/Boss.app/Contents/Resources/bin/boss-event --help",
         // Variable-held path that expands to a CLI, not an app open.
         concat!(
             "BIN=/Applications/Boss.app/Contents/Resources/bin/boss\n",
@@ -252,6 +253,58 @@ fn launch_guard_still_blocks_bundled_engine_binary() {
         "/Applications/Boss.app/Contents/Resources/bin/engine",
         "exec /tmp/boss-app-run/Boss.app/Contents/Resources/bin/engine --socket-path /tmp/s.sock",
         "/Applications/Boss.app/Contents/Resources/bin/boss-engine",
+    ] {
+        assert_eq!(launch_decision(command), "block", "must block: {command}");
+    }
+}
+
+/// `bossctl` is the coordinator's CLI surface and stays off the worker
+/// surface entirely — coordinator-only per the worker CLAUDE.md text and
+/// `boss_engine_worker_bin::launcher_names::writes_only_boss_and_never_bossctl`.
+/// The bundled-CLI carve-out must not accidentally widen that: `bossctl`
+/// shipping in the same `Contents/Resources/bin/` directory as the
+/// allowed `boss` binary must still be blocked, by basename, regardless
+/// of path.
+#[test]
+fn launch_guard_still_blocks_bundled_bossctl() {
+    for command in [
+        "/Applications/Boss.app/Contents/Resources/bin/bossctl",
+        "/Applications/Boss.app/Contents/Resources/bin/bossctl status",
+        "exec /tmp/boss-app-run/Boss.app/Contents/Resources/bin/bossctl status",
+        "/Users/dev/Library/Developer/Xcode/DerivedData/Boss-abc/Build/Products/Debug/Boss.app/Contents/Resources/bin/bossctl status",
+    ] {
+        assert_eq!(launch_decision(command), "block", "must block: {command}");
+    }
+}
+
+/// `boss engine start` / `boss engine stop` bounce the engine out from
+/// under the worker. The static bare-name deny rules in
+/// `worker_setup::deny_rules` only match the literal PATH-invocation
+/// text (`Bash(boss engine stop:*)`), so once the bundled-CLI carve-out
+/// makes the absolute-path shape reachable, the guard itself must close
+/// that gap for both bundled and PATH invocations.
+#[test]
+fn launch_guard_still_blocks_boss_engine_start_stop() {
+    for command in [
+        "/Applications/Boss.app/Contents/Resources/bin/boss engine stop",
+        "/Applications/Boss.app/Contents/Resources/bin/boss engine start",
+        "exec /tmp/boss-app-run/Boss.app/Contents/Resources/bin/boss engine stop --force",
+        "boss engine stop",
+        "boss engine start",
+    ] {
+        assert_eq!(launch_decision(command), "block", "must block: {command}");
+    }
+}
+
+/// `is_bundle_cli` must require the *normalized* parent directory to be
+/// exactly `Contents/Resources/bin` — a raw substring test would let a
+/// `..`-traversal path escape the carve-out even though it resolves
+/// outside `bin/`.
+#[test]
+fn launch_guard_still_blocks_direct_boss_app_binary_via_traversal() {
+    for command in [
+        "/Applications/Boss.app/Contents/Resources/bin/../MacOS/Boss",
+        "/Applications/Boss.app/Contents/Resources/bin/../MacOS/SomeHelper",
     ] {
         assert_eq!(launch_decision(command), "block", "must block: {command}");
     }
