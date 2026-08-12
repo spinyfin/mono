@@ -380,6 +380,12 @@ runtime = "declarative-v1"
 api_version = "v1"
 applies_to = ["**"]
 
+[limits]
+# These tests exercise per-file error isolation, not deadline enforcement. Give
+# their short-lived helper processes room to run when the full test binary is
+# scheduled concurrently on a loaded CI host.
+timeout_ms = 15_000
+
 [needs.tool.default]
 path = "/bin/sh"
 
