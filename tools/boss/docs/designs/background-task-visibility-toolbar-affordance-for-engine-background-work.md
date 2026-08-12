@@ -45,6 +45,7 @@ The audit started from durable source rows, every production `tokio::spawn`/loop
 | Planner persistence and publication      | `engine/core/src/work/planner_runs.rs`, `engine/core/src/populator.rs`, and `app-macos/Sources/PlannerAffordances.swift`                                  |
 | Conflict activity, phase, and recovery   | `engine/core/src/conflict_remediation.rs`, `engine/core/src/merge_poller/schedule.rs`, `engine/core/src/work/conflict_res.rs`, and startup reconciliation |
 | CI vehicle selection                     | `engine/core/src/ci_watch.rs` and `engine/core/src/completion/remediation.rs`                                                                             |
+| Poller topology and durable proxies      | `engine/core/src/merge_poller/schedule.rs`, `trunk_queue_poller.rs`, `github_api_usage.rs`, and `metrics/src/persistence.rs`                              |
 | Existing engine-attempt read paths       | `protocol/src/wire.rs`, `engine/core/src/work/blocking.rs`, and `app-macos/Sources/ChatViewModel+Attentions.swift`                                        |
 | Merge-queue card visibility              | `protocol/src/types/task.rs` and `app-macos/Sources/WorkCardBadges.swift`                                                                                 |
 | Toolbar ownership and polling precedent  | `app-macos/Sources/ContentView.swift`, `ContentViewChrome.swift`, and `UpdateCore/UpdateModel.swift`                                                      |
@@ -79,19 +80,37 @@ Neither the current CLI conflict table nor the Swift conflict model carries the 
 
 ### The initial CI candidate fails the inclusion test
 
-CI remediation is not headless in the current code. A fix attempt spawns an engine-triggered revision, while an infrastructure retrigger creates an `ExecutionKind::CiRemediation` execution; both are visible in Agents. The parent card also carries CI failure state, and Activity already lists the durable remediation attempt.
+CI remediation is not headless once it becomes long-running. A fix attempt spawns an engine-triggered revision, while an infrastructure retrigger creates an `ExecutionKind::CiRemediation` execution; both are visible in Agents. The only headless interval is before dispatch, but `ci_watch` is handler code invoked from `merge_poller::sweep_one`, not a background loop, and `ci_remediations.status = 'pending'` does not prove that a handler is currently executing. That short transition has neither a positive live marker nor evidence that it survives the 15-second threshold, so it is excluded rather than inferred from a durable pending row.
+
+The parent card also carries CI failure state, and Activity already lists the durable remediation attempt. `ci_remediations` and `ci_inflight_observations` are already RPC-exposed; a new badge projection would duplicate those surfaces before dispatch and the Agents pane after dispatch.
 
 `ci_inflight_observations.alert_level_emitted` is useful phase data for a PR that has remained in flight, but it records observed CI state rather than a finite engine operation. `BuildWaitTracker` likewise describes a visible worker execution. It retains `waited_secs` against a 45-minute horizon in memory and logs both values, but its execution-status publication carries only `reason = "worker_build_wait_pending"`; no percentage is published. Both are precedents for engine-owned phase reporting, not toolbar sources.
 
+### Poller activity is service health, not finite work
+
+The merge poller is one process-lifetime `tokio` task with a 60-second full-sweep cadence. `TrunkQueueProbe` is a state machine driven from that task's `select!`, not a second poller loop, and `ci_watch` has no spawn or interval of its own. Counting pollers would therefore pin the badge at exactly one while the engine is healthy and reveal no finite operation to the user.
+
+No SQLite row marks a merge, Trunk, or CI pass as in flight. `PrPollSchedule`, `TrunkQueueProbe.queues`, `ConflictRemediationQueue.slots`, and the per-pass `ProbeSnapshot` are process memory; after restart there is no pass state to recover or read out of process. Existing durable proxies rank as follows, but none is equivalent to current pass execution:
+
+| Rank | Durable proxy                                         | Fidelity and existing surface                                                                                                                                      |
+| ---- | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1    | `github_api_calls`                                    | Per-call caller/API/verb/start/duration/cost, written within about two seconds and retained for 14 days; best evidence of recent poller activity, not an open pass |
+| 2    | `tasks.pr_state_polled_at`                            | Per-work-item successful-check time already on the task wire and already rendered by the UI as “last checked”                                                      |
+| 3    | `metrics_gauge['merge_poller.adaptive_tracked']`      | Adaptive-set size persisted on the metrics flush cadence, so it can be roughly 30 seconds stale and says nothing about a pass executing now                        |
+| 4    | active `trunk_merge_intents` and task queue detail    | Durable queue membership and position; meaningful lifecycle state already projected onto task cards, but not engine work in progress                               |
+| 5    | `ci_remediations` and `ci_inflight_observations` rows | Durable attempt/observation state with existing RPCs; mostly becomes a visible execution and does not identify a live `ci_watch` handler                           |
+
+If poller diagnostics need a richer read surface later, they should expose these existing proxies in fidelity order rather than inventing an “in-flight pass” marker. That observability problem must not broaden this finite-operation badge.
+
 ### Merge-queue position is meaningful but belongs to the work item
 
-`trunk_merge_intents` has no standalone list RPC, but the value a user cares about is already copied into `tasks.merge_queue_detail`, sent over the work-item wire model, used to order the Merging section, and rendered as a queue-position badge on the task card. Waiting in an external merge queue is PR lifecycle state, not evidence that Boss is currently executing a finite job.
+`trunk_merge_intents` has no standalone list RPC or CLI, but the value a user cares about is already copied into `tasks.merge_queue_detail`, sent over the work-item wire model, used to order the Merging section, and rendered as a queue-position badge on the task card. Waiting in an external merge queue is PR lifecycle state, not evidence that Boss is currently executing a finite job.
 
 Putting the same position in this popover would duplicate a more contextual surface and could keep the toolbar permanently active on a busy repository. A future request for a global merge-queue summary should be designed as such; it is not v1 background-work visibility.
 
 ### Other background code is not eligible
 
-- Resident loops—merge and Trunk pollers, schedulers, heartbeats, backups, PR-review recovery, external-tracker reconciliation, metrics flushes, monitoring, and socket servers—are engine services rather than finite operations. Including them would pin the badge on for the lifetime of the engine. PR-review recovery runs every 60 seconds and external-tracker reconciliation every 120 seconds; cadence does not turn either service into a finite user operation.
+- Resident loops—merge polling, schedulers, heartbeats, backups, PR-review recovery, external-tracker reconciliation, metrics flushes, monitoring, and socket servers—are engine services rather than finite operations. Including them would pin the badge on for the lifetime of the engine. The Trunk observer and `ci_watch` are not additional loops, while PR-review recovery runs every 60 seconds and external-tracker reconciliation every 120 seconds; topology and cadence do not turn any of them into a finite user operation.
 - There is no GitHub PR-comment poller to include. The only `issues/{number}/comments` request is the Trunk bot probe; the PR-review crate parses and renders review material but does not run a comment-polling service.
 - Comment-intent `NULL` means no classification result, not proof that classification code is executing. Absence is never a live marker.
 - Short request handlers, cache fills, attachment serving, GitHub authentication, and design-doc fetches do not satisfy the duration and operation-identity tests.
@@ -158,7 +177,7 @@ No separate frequency debounce is needed for the selected population. At most on
 
 The planner reaper needs no heartbeat or stale-age guess. Planner tasks are process-local and cannot survive an engine restart, so every `running` row inherited at startup is definitively stranded. The sweep must execute before socket serving, pollers, and populator installation; it must leave `staged`, `applied`, and terminal failures untouched and free the project’s unique live-run slot for a retry.
 
-Conflict remediation duration cannot be measured from `conflict_resolutions.created_at`, because an attempt may exist before queue admission and then wait on the semaphore before obtaining a workspace. Introduce a typed `ConflictRemediationActivityRegistry` owned by `ServerState` and inject a clone into the merge poller’s queue. Queue admission records stable attempt identity, context, wall-clock `started_at`, and state `queued`; permit acquisition changes the state to `running`; the guard removes active state on every exit. The queue may retain its private `CompletedAt` entry for deduplication, but completed cooldown state must never enter the shared registry.
+Conflict remediation duration cannot be measured from `conflict_resolutions.created_at`, because an attempt may exist before queue admission and then wait on the semaphore before obtaining a workspace. Promote the queue's existing private slot map into a typed `ConflictRemediationActivityRegistry` owned by `ServerState`, and inject the same registry into the merge poller; do not maintain a second activity map. Queue admission records stable attempt identity, context, wall-clock `started_at`, and state `queued`; permit acquisition changes the same slot to `running`; the guard changes or removes it on every exit. The registry may retain `CompletedAt` for the existing retry cooldown, but its live read method must return only `queued` and `running` entries.
 
 The read path joins registry entries to durable conflict rows. The live registry is authoritative only for current-process ownership and elapsed time; the row is authoritative only for durable attempt/work-item identity, lease context, and rung `0`/`1` phase once stamped. During the gap between permit acquisition and a rung stamp, the engine reports `Preparing rebase`. A durable row without registry activity is never shown, and registry removal makes completion disappear even if a marker-clear write fails. On restart the empty registry prevents a stale badge immediately, while existing conflict reconciliation and lease recovery still clean the durable attempt and workspace so the operation can retry safely.
 
@@ -217,7 +236,7 @@ The implementation is complete only when the genuine boundaries are exercised:
 
 - **The 15-second threshold is calibrated from bounds and an estimate, not production measurements.** It is intentionally engine-owned and easy to change. If planner duration data shows many valid runs finish below it, lower the constant in the engine and update the contract test in the same change.
 - **Migrating Activity to the unified list adds detail-on-demand behavior.** Selection must remain stable while the detail RPC returns, and a failed detail fetch must leave the common row visible with a local error rather than blanking the Activity list.
-- **Conflict visibility depends on two signals with deliberately limited equivalence.** The queue registry and durable row refer to the same remediation attempt, but they are equivalent only on identity: the registry owns current-process liveness and elapsed time, while the row owns durable context and rung phase. Tests must cover admission/stamp and unregister/clear ordering so neither transient boundary becomes a sticky false positive.
+- **Conflict visibility depends on two signals with deliberately limited equivalence.** The promoted queue registry and durable row refer to the same remediation attempt, but they are equivalent only on identity: the registry owns current-process liveness and elapsed time, while the row owns durable context and rung phase. Tests must cover admission/stamp and unregister/clear ordering so neither transient boundary becomes a sticky false positive. A second activity map would create the disagreement this design is intended to eliminate.
 - **Polling is intentionally simple but not free.** The query is local and tiny, and five seconds is slower than the eligibility threshold. If source count grows substantially, the replacement should be snapshot-on-connect plus invalidation events, not faster polling or app-side caches.
 - **A hung design-doc fetch remains possible because `gh_output` has no timeout.** That is a real reliability gap, but it is neither durable nor the finite operation this badge represents. Fix it at the command timeout boundary in separate reliability work rather than broadening this feature.
 
@@ -239,7 +258,7 @@ Parallelism: First engine prerequisite. The following conflict-state task is ord
 
 ### Publish conflict-remediation activity through ServerState
 
-Add a typed, process-local conflict-remediation activity registry owned by `ServerState`, pass it into the merge poller’s `ConflictRemediationQueue`, and publish queue admission, permit acquisition, and removal on every guard exit. Preserve the queue’s existing dedup/cooldown behavior while keeping cooldown entries out of the registry; record attempt/work-item identity and queue-admission time, and cover queued-versus-running state, the two-permit bound, cancellation/panic cleanup, and process restart/reset. This task creates no RPC and does not treat the durable conflict row as proof of liveness.
+Replace `ConflictRemediationQueue`'s private slot map with a typed, process-local activity registry owned by `ServerState`, and pass that same registry into the merge poller queue. Record attempt/work-item identity and queue-admission time; transition the shared slot across queued, running, and cooldown states while exposing only queued/running entries to readers. Preserve existing deduplication and cooldown semantics, and cover the two-permit bound, cancellation/panic cleanup, and process restart/reset. This task creates no RPC, no parallel activity map, and does not treat the durable conflict row as proof of liveness.
 
 Effort: large
 
