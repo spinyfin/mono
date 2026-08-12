@@ -137,8 +137,9 @@ final class HostDisplaySnapshotTests: XCTestCase {
         XCTAssertTrue(diagnostic.contains("host.ns_main_non_nil:  true"), diagnostic)
     }
 
-    /// CoreVideo refuses a display link over an empty display set. GhosttyKit
-    /// now treats that failure as optional and continues surface creation.
+    /// Upstream precondition for ghostty#13639: CoreVideo rejects a display
+    /// link over an empty display set. GhosttyKit now treats that failure as
+    /// optional; this test only documents the CoreVideo side of that contract.
     func testCVDisplayLinkCreateWithZeroDisplaysFails() {
         var link: CVDisplayLink?
         // Count 0: CoreVideo must not create a link. A non-null buffer is
@@ -148,30 +149,35 @@ final class HostDisplaySnapshotTests: XCTestCase {
         XCTAssertNotEqual(
             status,
             kCVReturnSuccess,
-            "empty display list must be rejected so GhosttyKit must use its fallback path"
+            "CoreVideo must reject a display link over an empty display set — the upstream condition ghostty#13639 made non-fatal"
         )
         XCTAssertNil(link)
     }
 
     /// Exercises the C surface path against the pinned GhosttyKit build.
-    /// With the display-link fix, this remains valid when CoreGraphics has
-    /// no active displays: Ghostty falls back to change-driven rendering
-    /// instead of rejecting the surface.
+    /// Opt-in only: constructing `GhosttyRuntime.shared` runs `ghostty_init`
+    /// (which `fatalError`s on failure), installs process-wide signal
+    /// handlers, and spawns a real shell — a shard-killing blast radius if
+    /// libghostty or Metal is unavailable on the agent. Set
+    /// `BOSS_TEST_EXPECT_NO_ACTIVE_DISPLAY=1` to run (also used to assert
+    /// zero active CG displays for the display-sleep verification path).
     @MainActor
-    func testGhosttyKitCreatesSurfaceInWindow() {
-        let host = HostDisplaySnapshot.capture()
-        if ProcessInfo.processInfo.environment["BOSS_TEST_EXPECT_NO_ACTIVE_DISPLAY"] == "1" {
-            XCTAssertEqual(
-                host.activeDisplayCount,
-                0,
-                "display-sleep verification must begin with no active CoreGraphics displays"
-            )
+    func testGhosttyKitCreatesSurfaceInWindow() throws {
+        guard ProcessInfo.processInfo.environment["BOSS_TEST_EXPECT_NO_ACTIVE_DISPLAY"] == "1" else {
+            throw XCTSkip("real GhosttyKit surface test is opt-in (set BOSS_TEST_EXPECT_NO_ACTIVE_DISPLAY=1)")
         }
+
+        let host = HostDisplaySnapshot.capture()
+        XCTAssertEqual(
+            host.activeDisplayCount,
+            0,
+            "display-sleep verification must begin with no active CoreGraphics displays"
+        )
 
         let launchSpec = TerminalLaunchSpec(
             fontSize: 12,
             workingDirectory: NSTemporaryDirectory(),
-            initialInput: "exit\\n"
+            initialInput: "exit\n"
         )
         let session = TerminalPaneSession(
             id: "ghosttykit-surface-regression",

@@ -4,10 +4,6 @@ import Foundation
 
 /// Measured host display / session state at a point in time.
 ///
-/// Lives in this file (same path as open PR #2587's measurement type) so
-/// both PRs edit one declaration and cannot silently produce an invalid
-/// redeclaration of `HostDisplaySnapshot` in module `Boss`.
-///
 /// ## Why this exists
 ///
 /// `ghostty_surface_new` returns NULL with no error code. `NSScreen.main`
