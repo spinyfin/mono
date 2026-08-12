@@ -523,6 +523,7 @@ pub(crate) use migrations_c::*;
 pub(crate) use products_design::{attach_task_doc_link_state, parse_pr_doc_artifact_id, task_uses_per_task_doc};
 // Only the unit-test suite (and the resolver itself) call this directly;
 // production attach sites go through `attach_task_doc_link_state`.
+pub(crate) use pr_state::stored_pr_number;
 #[cfg(test)]
 pub(crate) use products_design::resolve_task_doc_pointer;
 pub(crate) use proposal_apply::*;
@@ -584,7 +585,6 @@ pub use pr_state::PrStateChecker;
 pub use pr_state::RevisionGateError;
 pub use pr_state::StaticPrStateChecker;
 pub use pr_state::classify_pr_merge_state;
-pub use pr_state::pr_number_from_url;
 pub use proposals::SubmitWorkerProposalInput;
 pub use proposals::SubmitWorkerProposalOutcome;
 pub use review_verdicts::{

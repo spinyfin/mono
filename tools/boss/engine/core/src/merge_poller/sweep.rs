@@ -2276,23 +2276,14 @@ pub(crate) async fn mark_closed_unmerged(
     true
 }
 
-/// Spawn a tokio task that runs [`run_one_pass`] forever at
-/// `interval`. The returned `JoinHandle` is detached by callers —
-/// the poller has no shutdown path; aborting the engine process is
-/// the only way out, which matches every other engine background
-/// task.
-///
-/// Startup sweep (`chore-lifecycle-pr-closed-unmerged.md` Q9 /
-/// `merge-conflict-handling-in-review.md` Phase 6 #17): the first
-/// `run_one_pass` fires immediately on spawn so any chore whose PR
 /// Extract the PR number from a GitHub PR URL as an `i64` for DB storage.
 ///
 /// Re-exported from the persistence layer, which owns the stored `i64`
 /// representation; it in turn is a thin adaptor over the canonical
-/// [`pr_number_from_url`] helper in `boss_github` (including tolerance for
-/// the `/pull/<N>/files`, `?query`, and `#fragment` decorations). Returns
-/// `None` for any non-canonical URL.
-pub(crate) use crate::work::pr_number_from_url as parse_pr_number;
+/// [`boss_github::pr_url::pr_number_from_url`] helper (including tolerance
+/// for the `/pull/<N>/files`, `?query`, and `#fragment` decorations).
+/// Returns `None` for any non-canonical URL.
+pub(crate) use crate::work::stored_pr_number;
 
 /// Reviewer-fallback: advance a task from `active` to `in_review` when
 /// its AI reviewer pass has either finished without advancing it (missed Stop

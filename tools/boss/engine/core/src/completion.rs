@@ -2252,25 +2252,8 @@ fn work_item_id(item: &WorkItem) -> String {
     }
 }
 
-/// Whether completing a primary-implementation execution with a fresh PR
-/// should trigger an independent reviewer pass. When this
-/// returns true, the producing task's column transition is held in
-/// `PendingReview`/Doing until the reviewer finalises.
-///
-/// `RevisionImplementation` is handled separately, at the call site in
-/// [`WorkerCompletionHandler::finalize_pr_transition`]: every revision kind
-/// (reviewer-spawned, CI-fix, conflict-resolution, and human/operator-
-/// initiated) that pushes new commits to its parent PR re-triggers a
-/// reviewer pass, gated only by the
-/// [`WorkerCompletionHandler::enable_revision_triggered_reviews`] kill-switch
-/// (2026-07-01 revision-review experiment — closes the gap where only the
-/// first push on a PR was ever reviewed).
-///
-/// Also reused (via [`crate::work::task_kind_excluded_from_ai_review`]) to
-/// derive the "review not required" AI-review-badge state for a task's
-/// *kind*, independent of any particular execution — sharing this predicate
-/// is what keeps that derivation from drifting out of sync with the actual
-/// enqueue gate.
+/// Defined in the persistence layer; re-exported here under its original
+/// path — see [`crate::work::should_enqueue_reviewer_for_primary`].
 pub(crate) use crate::work::should_enqueue_reviewer_for_primary;
 
 /// Whether `execution` is a live worker that owns its own turn loop — i.e.

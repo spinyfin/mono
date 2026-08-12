@@ -2892,12 +2892,12 @@ async fn merge_of_ci_blocked_pr_clears_badge() {
 
 // NOTE: PR-number parsing behavior (standard URL, query/fragment stripping,
 // trailing-path tolerance, and the strict rejections) is covered by the
-// canonical parser's tests in `boss_github::pr_url`. `parse_pr_number` here
-// is now a thin `i64` adaptor over `pr_number_from_url`.
+// canonical parser's tests in `boss_github::pr_url`. `stored_pr_number` here
+// is a thin `i64` adaptor over that helper for durable-row storage.
 #[test]
-fn parse_pr_number_adapts_to_i64() {
-    assert_eq!(parse_pr_number("https://github.com/o/r/pull/123"), Some(123));
-    assert_eq!(parse_pr_number("not a url at all"), None);
+fn stored_pr_number_adapts_to_i64() {
+    assert_eq!(stored_pr_number("https://github.com/o/r/pull/123"), Some(123));
+    assert_eq!(stored_pr_number("not a url at all"), None);
 }
 
 #[test]

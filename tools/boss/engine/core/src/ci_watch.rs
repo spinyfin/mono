@@ -43,7 +43,7 @@ use serde::Serialize;
 use crate::blocking_signal::{self, SignalKind};
 use crate::coordinator::ExecutionPublisher;
 use crate::merge_poller::{
-    OpenPrCiStatus, PrLifecycleProbe, PrLifecycleState, RequiredCheckFailure, parse_pr_number, pr_labels_opt_out,
+    OpenPrCiStatus, PrLifecycleProbe, PrLifecycleState, RequiredCheckFailure, pr_labels_opt_out, stored_pr_number,
 };
 use crate::work::{
     CiRemediation, CiRemediationInsertInput, CreateExecutionInput, PendingMergeCheck, PrStateChecker,
@@ -585,7 +585,7 @@ pub async fn on_ci_failure_detected(
     let consumes_budget: i64 = if attempt_kind == "fix" { 1 } else { 0 };
 
     let failed_checks_json = encode_failed_checks(failures);
-    let pr_number = parse_pr_number(&candidate.pr_url).unwrap_or(0);
+    let pr_number = stored_pr_number(&candidate.pr_url).unwrap_or(0);
 
     // Best-effort attempt insert. The unique key
     // (work_item_id, head_sha, attempt_kind) is the idempotency lock —
@@ -1307,7 +1307,7 @@ async fn on_queue_side_failure_detected(
     // Queue-side failures are always `fix` — the semantic conflict requires
     // a worker to rebase and potentially resolve incompatible changes;
     // `retrigger` would not help.
-    let pr_number = parse_pr_number(&candidate.pr_url).unwrap_or(0);
+    let pr_number = stored_pr_number(&candidate.pr_url).unwrap_or(0);
 
     // `discriminator` serves as `head_sha_at_trigger` so the unique key
     // `(work_item_id, head_sha_at_trigger, attempt_kind)` naturally
