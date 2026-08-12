@@ -334,22 +334,44 @@ pub(crate) fn resolve_revision_on_parent_close(
     let is_wip = rev.status == TaskStatus::Active;
     let is_pr_review = rev.created_via.starts_with(CREATED_VIA_PR_REVIEW_PREFIX);
 
-    // For PR-review revisions, emit a `followup` with provenance.
+    // For PR-review revisions, emit a `followup` with provenance when the
+    // chain root still has a parseable origin PR. Only tag `Followup` when
+    // that number is present — `followup_pr_body_prefix` treats the kind as
+    // a hard origin-PR contract and bails at dispatch otherwise, so minting
+    // a Followup with `origin_pr_number = None` (missing/soft-deleted root
+    // or unparseable `pr_url`) would permanently wedge the task. Fall back
+    // to the historical `chore` in that case, matching the deferred-scope
+    // creation site. Carry the revision's `pr_review:` `created_via`
+    // through onto the followup so `followup_kind_label` can render
+    // "review findings" rather than the degenerate engine-kind string.
     // For all other non-moot revisions, keep the historical `chore`.
-    let (kind_override, origin_task_short_id, origin_pr_number, description) = if is_pr_review {
+    let (kind_override, origin_task_short_id, origin_pr_number, description, created_via) = if is_pr_review {
         let root = query_task(conn, chain_root_id)?;
         let origin_short_id = root.as_ref().and_then(|r| r.short_id);
         let origin_pr_num = root
             .as_ref()
             .and_then(|r| r.pr_url.as_deref().and_then(extract_pr_number_from_url));
+        let kind_override = origin_pr_num.is_some().then_some(TaskKind::Followup);
         let desc = rev.description.replace(
             "Address ALL findings before finalising this revision.",
             "Address ALL findings before closing this follow-up.",
         );
-        (Some(TaskKind::Followup), origin_short_id, origin_pr_num, desc)
+        let created_via = if kind_override.is_some() {
+            rev.created_via.clone()
+        } else {
+            CREATED_VIA_ENGINE_AUTO.to_owned()
+        };
+        (kind_override, origin_short_id, origin_pr_num, desc, created_via)
     } else {
-        (None, None, None, rev.description.clone())
+        (
+            None,
+            None,
+            None,
+            rev.description.clone(),
+            CREATED_VIA_ENGINE_AUTO.to_owned(),
+        )
     };
+    let is_followup = kind_override == Some(TaskKind::Followup);
 
     let new_chore = insert_chore_in_tx(
         conn,
@@ -358,7 +380,7 @@ pub(crate) fn resolve_revision_on_parent_close(
             .autostart(is_wip)
             .force_duplicate(true)
             .name(rev.name.clone())
-            .maybe_created_via(Some(CREATED_VIA_ENGINE_AUTO.to_owned()))
+            .maybe_created_via(Some(created_via))
             .maybe_description(Some(description))
             .maybe_effort_level(rev.effort_level)
             .maybe_model_override(rev.model_override.clone())
@@ -372,7 +394,7 @@ pub(crate) fn resolve_revision_on_parent_close(
 
     let archived_reason = format!(
         "parent PR merged: superseded by {} {}",
-        if is_pr_review { "followup" } else { "chore" },
+        if is_followup { "followup" } else { "chore" },
         new_chore.id,
     );
     archive_revision_task(conn, &rev.id, now, &archived_reason)?;
@@ -383,8 +405,9 @@ pub(crate) fn resolve_revision_on_parent_close(
         chain_root_id,
         is_wip,
         is_pr_review,
+        is_followup,
         "{log_prefix}: revision converted to standalone {} (parent PR merged; will {})",
-        if is_pr_review { "followup" } else { "chore" },
+        if is_followup { "followup" } else { "chore" },
         if is_wip { "auto-dispatch" } else { "stay in backlog" },
     );
     Ok(())
