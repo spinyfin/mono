@@ -83,6 +83,34 @@ const WORKER_EXTRA_ENV_ALLOWLIST: &[&str] = &[
 /// forgotten `-m` into a fast, recoverable error.
 const WORKER_EDITOR_NOOP: &str = "false";
 
+/// Propagate the running app's bundled CLI directory into a worker env.
+///
+/// When `boss_bin_dir` is non-empty (installed mode: set by the macOS app
+/// to `…/Boss.app/Contents/Resources/bin`):
+/// - export `BOSS_BIN_DIR` and `BOSS_BIN` (`$BOSS_BIN_DIR/boss`)
+/// - prepend the directory to `PATH` so bare `boss` / `bossctl` hit the
+///   version-matched copies ahead of any sanitized-PATH fallback
+///
+/// Empty / missing is a no-op: dev / `bazel run` mode relies on the
+/// per-workspace `boss` launcher instead, and never falls back to a
+/// user `PATH` copy for `boss`.
+fn apply_boss_bin_dir_to_worker_env(env: &mut Vec<EnvVar>, boss_bin_dir: Option<&str>) {
+    let Some(boss_bin_dir) = boss_bin_dir.filter(|d| !d.is_empty()) else {
+        return;
+    };
+    env.push(EnvVar {
+        key: "BOSS_BIN_DIR".into(),
+        value: boss_bin_dir.to_owned(),
+    });
+    env.push(EnvVar {
+        key: "BOSS_BIN".into(),
+        value: format!("{boss_bin_dir}/boss"),
+    });
+    if let Some(path_entry) = env.iter_mut().find(|e| e.key == "PATH") {
+        path_entry.value = format!("{boss_bin_dir}:{}", path_entry.value);
+    }
+}
+
 /// Value forced into `XAI_API_KEY` for every worker pane, same belt-and-
 /// suspenders rationale as `WORKER_EDITOR_NOOP` above: a caller-side
 /// precheck (`grok::home::provision_grok_home`) already refuses to spawn
@@ -575,20 +603,14 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
 
     // Installed mode: propagate BOSS_BIN_DIR (set by the app when
     // launching the engine from Boss.app/Contents/Resources/bin/).
-    // Workers prepend this directory to PATH so `boss` / `boss-event`
-    // callbacks resolve the bundled copies. Unset in dev mode (no bundle
-    // bin/ directory) — workers fall back to PATH as today.
-    if let Ok(boss_bin_dir) = std::env::var("BOSS_BIN_DIR")
-        && !boss_bin_dir.is_empty()
-    {
-        env.push(EnvVar {
-            key: "BOSS_BIN_DIR".into(),
-            value: boss_bin_dir.clone(),
-        });
-        if let Some(path_entry) = env.iter_mut().find(|e| e.key == "PATH") {
-            path_entry.value = format!("{boss_bin_dir}:{}", path_entry.value);
-        }
-    }
+    // Workers prepend this directory to PATH so bare `boss` / `bossctl`
+    // resolve the bundled copies, and export BOSS_BIN (absolute path to
+    // the bundled `boss`) for the same reason the coordinator session
+    // does — absolute-path invocation must be legal and version-matched.
+    // Unset in dev mode (no bundle bin/ directory); the per-workspace
+    // `boss` launcher (BOSS_WORKER_BIN_DIR) still pins bare `boss` to the
+    // engine's own CLI without searching PATH.
+    apply_boss_bin_dir_to_worker_env(&mut env, std::env::var("BOSS_BIN_DIR").ok().as_deref());
 
     // The per-workspace launcher dir goes ahead of everything, including
     // BOSS_BIN_DIR: it holds a `boss` pinned to an absolute path, so it
@@ -1698,6 +1720,45 @@ mod tests {
             !env.iter().any(|(k, _)| k == boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
             "no launcher dir supplied means no launcher dir exported",
         );
+    }
+
+    /// Pure unit of the installed-mode env wiring: given a bundle bin
+    /// dir, workers get `BOSS_BIN_DIR`, `BOSS_BIN`, and a PATH prepend —
+    /// never a silent no-op, never a user-bin fallback.
+    #[test]
+    fn apply_boss_bin_dir_exports_boss_bin_and_prepends_path() {
+        let mut env = vec![EnvVar {
+            key: "PATH".into(),
+            value: WORKER_SANITIZED_PATH.into(),
+        }];
+        let fake = "/tmp/fake-boss-app/Contents/Resources/bin";
+        apply_boss_bin_dir_to_worker_env(&mut env, Some(fake));
+
+        assert_eq!(
+            env.iter().find(|e| e.key == "BOSS_BIN_DIR").map(|e| e.value.as_str()),
+            Some(fake),
+        );
+        assert_eq!(
+            env.iter().find(|e| e.key == "BOSS_BIN").map(|e| e.value.as_str()),
+            Some("/tmp/fake-boss-app/Contents/Resources/bin/boss"),
+        );
+        let path = env.iter().find(|e| e.key == "PATH").expect("PATH").value.as_str();
+        assert_eq!(
+            path,
+            format!("{fake}:{WORKER_SANITIZED_PATH}"),
+            "bundle bin dir must lead PATH so bare boss/bossctl win",
+        );
+
+        // Empty / missing must not invent empty PATH entries.
+        let mut untouched = vec![EnvVar {
+            key: "PATH".into(),
+            value: WORKER_SANITIZED_PATH.into(),
+        }];
+        apply_boss_bin_dir_to_worker_env(&mut untouched, None);
+        apply_boss_bin_dir_to_worker_env(&mut untouched, Some(""));
+        assert_eq!(untouched.len(), 1);
+        assert_eq!(untouched[0].value, WORKER_SANITIZED_PATH);
+        assert!(!untouched.iter().any(|e| e.key == "BOSS_BIN" || e.key == "BOSS_BIN_DIR"));
     }
 
     #[tokio::test]
