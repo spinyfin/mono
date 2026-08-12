@@ -6,17 +6,6 @@
   },
   {
     "question_type": "multiple_choice",
-    "prompt": "Given the measured token overhead (~10-25k per request, ~9.4k cached floor) against a weekly quota metered across all Antigravity surfaces, what is the intended end state for this driver?",
-    "choices": [
-      "Pinned-only, permanently — agy stays at a 0% traffic share and is reached only by explicit --driver agy",
-      "Pinned-only until the spend model proves a nonzero share is affordable, then raise it",
-      "Build toward a nonzero share regardless of the spend model's finding",
-      "Stop the project now if the spend model confirms the estimate"
-    ],
-    "anchor": "economics-model-this-before-the-crate-exists"
-  },
-  {
-    "question_type": "multiple_choice",
     "prompt": "If the pane viability spike finds that agy's hooks do NOT fire in interactive mode (they are only confirmed headless), what should happen? The pane must stay a TUI either way.",
     "choices": [
       "Stop the project — no hook boundary means no viable driver",

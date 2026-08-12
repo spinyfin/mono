@@ -17,15 +17,14 @@
 
 Technically the integration looks tractable: `agy` has a Claude-shaped hook system with a real `Stop` hook, an interactive TUI suitable for a pane, and — verified in this pass — a state tree that relocates cleanly under a scoped `HOME`.
 
-Economically it looks marginal at best. `agy`'s measured per-request overhead (~10–25k input tokens, ~9.4k floor even cached) against a weekly quota metered across all Antigravity surfaces means a 16-worker fleet is very unlikely to be affordable. The honest expected end state is a **pinned-only, zero-share driver** — reachable by explicit `--driver agy`, receiving no allocated traffic — and this design is built so that state is the _default_, enforced in code, rather than a phase that ends when someone decides it has.
+The initial operating state is a **pinned-only, zero-share driver** — reachable by explicit `--driver agy`, receiving no allocated traffic — as a behaviour-preserving rollout default, not an economic verdict. The operator has a paid Gemini subscription, but this pass did not establish its entitlement or an apples-to-apples quota comparison with `claude`, `codex`, or `grok`. Spend and quota accounting belongs in a separate, driver-neutral project; it is not an implementation gate for this driver.
 
 ## Goals
 
 1. Add `agy` as Boss's fourth registered driver, running as a first-class **interactive TUI worker in a GhosttyKit pane**, on the same terms as `claude`, `codex`, and `grok`.
 2. Resolve the three coupled risks — ingress behind a TUI, per-run isolation, per-worker-kind permission posture — _before_ the driver crate is built, because an isolation strategy that fails later invalidates everything stacked on it.
 3. Migrate the driver traffic split from three shares to four, across the Rust protocol, the DB, and the Swift app, without a broken intermediate state.
-4. Produce a spend and quota model early enough that "this driver is not economically viable at fleet scale" is a cheap outcome rather than an expensive one.
-5. Define a phase gate that is a **state enforced by code**, not a checkpoint that only blocks what follows it.
+4. Define a phase gate that is a **state enforced by code**, not a checkpoint that only blocks what follows it.
 
 ## Non-goals
 
@@ -35,6 +34,7 @@ Economically it looks marginal at best. `agy`'s measured per-request overhead (~
 - **PR review on `agy`.** Review dispatches on the review pool's fixed driver by deliberate policy (`work/driver_allocation.rs`, `decide_execution_driver` step 1), so it does not participate in the split at all. Changing that is a change to reviewer dispatch policy, not to this driver.
 - **Remote / SSH host support** for `agy` workers. v1 is local-macOS only.
 - **Raising `agy`'s traffic share.** This design ships the fourth share at zero and defines what would justify raising it. It does not raise it.
+- **Driver-specific spend, quota, or cost accounting.** The driver-abstraction design already records token/quota and cost accounting as a known cross-driver absence. Building an `agy`-only model would create the wrong boundary; a later mechanism should compare all drivers under their actual subscription entitlements.
 
 ## Method, and what was actually verified in this pass
 
@@ -78,20 +78,15 @@ Everything in the spike checklist below. In particular: whether hooks fire at al
 | Model menu                                   | `gemini-3.6-flash-{high,medium,low}`, `gemini-3.5-flash-{high,medium,low}`, `gemini-3.1-pro-{high,low}`, `claude-sonnet-4-6`, `claude-opus-4-6-thinking`, `gpt-oss-120b-medium` | From `agy models` (brief)                   |
 | Subagents                                    | `invoke_subagent` / `define_subagent` / `browser_subagent`, no disable flag                                                                                                     | Verified absent from `--help`               |
 
-## Economics: model this before the crate exists
+## Subscription and quota context
 
-Boss already records `input_tokens`, `output_tokens`, `cache_creation_tokens`, and `cache_read_tokens` per work execution, so the shape of the question is answerable — but not by a worker, which must never read the engine's DB. The spend model therefore has to be built from direct measurement of `agy` plus published quota terms.
+The operator reports having a paid Gemini subscription. This pass did not identify the subscription tier or its Antigravity entitlement, so the fact that quota may be metered weekly across Antigravity surfaces does **not** establish that quota is restrictive for this account.
 
-The measured inputs available today: a trivial "reply PONG" run consumed **17,644 input tokens**; per-request overhead is **~10–25k**; the system-prompt and tool-surface floor is **~9.4k even when cached**.
+The earlier draft's token figures — 17,644 input tokens for a "reply PONG" run, an estimated 10–25k per-request overhead, and a 9.4k cached floor — came from the project brief, not from a measurement performed during this design pass. The brief included neither a capture nor the `agy` version that produced them, and this pass did not repeat the experiment on 1.1.12 or a later CLI. Their provenance and version therefore cannot be established, so this revision removes them as inputs to the verdict and makes no fleet-affordability inference from them.
 
-The multiplier that matters is **requests per Boss run, not runs per hour**. Every tool call is a model request, so a Boss chore that makes 40–120 tool calls pays the overhead 40–120 times. At a 15k midpoint that is **0.6M–1.8M input tokens of pure overhead per run**, before any conversation context. Sixteen concurrent workers turning over a few runs an hour puts the fleet in the tens of millions of overhead tokens per hour against a quota that Antigravity meters **weekly** and **across all surfaces** — including the operator's own IDE use of the same account.
+The available sibling-driver evidence is not comparable enough to fill that gap. The Grok spike established that 16 concurrent sessions completed, while explicitly saying that did not prove unlimited quota; the Codex design records provider-specific quota classification as incomplete; and the shared driver-abstraction design treats token/quota and cost accounting as a known cross-driver absence. Boss therefore has no normalized baseline showing that `agy` is better or worse than `claude`, `codex`, or `grok` under the operator's subscriptions.
 
-Two conclusions follow, and the design is built on them:
-
-1. **A meaningful traffic share is not plausible on a personal-account OAuth quota.** The default four-way split must ship `agy` at zero, and the driver's realistic operating mode is explicit per-row pinning.
-2. **The request-count assumption above is the single largest source of error in that estimate, and it is measurable.** That measurement is a task, sequenced in parallel with the spike, and it is allowed to return "stop": if the model says a single pinned chore routinely exhausts a week of quota, the correct outcome is to record that and not build the crate.
-
-This is also a convenient convergence rather than a coincidence: the economics and the acceptance gate independently produce the same posture — registered, zero-share, pinned-only.
+Quota and spend tracking should be designed once across all drivers, not as an `agy` prerequisite. This project still classifies a quota-exhaustion error correctly so dispatch does not retry blindly, but it does not measure spend, set affordability thresholds, or make quota a gate on building the driver.
 
 ## Alternatives considered
 
@@ -107,11 +102,15 @@ Rejected, on three checkable grounds:
 
 The transcript file is still used — for `Capability::TranscriptAccess`, resolved post-hoc from the `transcriptPath` the `Stop` payload already stamps. That is what `transcript_path_for_session` is for.
 
-### B. Reuse `ClaudeDriver` behind a compatibility shim rather than adding a driver
+### B. Reuse the concrete `ClaudeDriver` behind a compatibility shim rather than adding a driver
 
 `agy`'s hook event names are Claude-shaped, it reads `AGENTS.md`, and its hook contract is the same stdin-JSON / stdout-JSON / `type: "command"` shape. A shim over `ClaudeDriver` looks cheap.
 
 Rejected: Grok already ran this experiment and it produced the worst possible failure mode. Grok's `PreToolUse` accepts Claude's payload shape but **silently fails open** on Claude's `block` verdict, reserving `block` for stop-gates — so wiring Claude's five guards unmodified "would run every guard, always approve, and look identical to a healthy configuration" (`grok/hooks.rs` module docs, grounded in `grok-pretooluse-decision-vocabulary-and-tool-name-map.md`). `agy`'s verdict vocabulary is _known to differ already_ — `allow` / `deny` / `ask` / `force_ask` — so this alternative starts from the exact condition that produced the Grok defect. Separately, the registry is keyed by slug and every consuming call site resolves through it (`registry.rs`, `require`); a shim would have to lie about the slug or about the capability set, and `agy` genuinely differs on capabilities (no `Notification`-shaped event, therefore no `AwaitingInputSignal`) and on the model menu.
+
+That rejects reuse of a **concrete driver**, not code sharing. `AgyDriver` plugs into the existing `AgentDriver` trait, `DriverRegistry` / `CapabilityResolver`, `ProgressIngress`, `ProgressSessionNormalizer`, `ProgressIdentityStore`, durable transcript store, structured-output env-file contract, transient-recovery seam, and shared conformance suites. Its hooks use the unchanged `boss-event` transport and the same five guard scripts behind a thin dialect adapter. Driver-local code is limited to facts that genuinely differ: the descriptor and model menu, spawn flags, scoped-`HOME` layout, permission syntax, hook payload and verdict translation, transcript paths and records, control verbs, and provider error vocabulary.
+
+The implementation tasks below must reuse those shared seams first. If characterisation reveals byte-for-byte lifecycle, provisioning, or adapter logic already present in another driver, that logic moves into a narrow lower-level helper or crate rather than being copied into `agy`; the provider-specific driver remains the consumer so shared code never depends on a higher-level driver implementation.
 
 ### C. One shared `HOME`, with runs separated by `--project` / `--new-project` / `--conversation`
 
@@ -215,7 +214,7 @@ So the gate is inverted. Rather than a checkpoint at the end, it is the **defaul
 
 - **What enforces it.** `DriverTrafficSplit`'s shipped default gives `agy` **zero**, and `allocate_among` treats zero as literally empty — "zero means zero", with `driver_for_bucket` handing it no bucket at all. No allocated work reaches `agy` until an operator makes a deliberate, atomic, single-write change to the persisted split. The four-way migration lands with a unit assertion that the shipped default is `agy = 0`, so a later edit that quietly raises it fails a test rather than silently changing fleet behaviour.
 - **The state while unmet: `pinned-only`.** `agy` is registered, resolvable, and reachable _only_ by an explicit `tasks.driver` / product `default_driver` pin that clears the capability gate. This is a steady state, not a waiting state: nothing is blocked, nothing silently proceeds, and the driver is exercised on real work the whole time.
-- **What would move it.** A recorded run of N pinned `agy` executions reaching merged PRs without engine-side incident, plus a spend measurement showing a nonzero share is affordable. Both are written into a separate acceptance-ledger document, not into this doc, so the durable reasoning here is not disturbed every time the status changes.
+- **What would move it.** A recorded run of N pinned `agy` executions reaching merged PRs without engine-side incident, followed by an explicit operator decision to raise the share. The run evidence is written into a separate acceptance-ledger document so the durable reasoning here is not disturbed every time the status changes. Cross-driver spend and quota accounting is not part of this gate.
 - **Who can move it.** Raising the share is an operator action against engine state. No task in the breakdown below has "raise the share" as its deliverable, because no cube worker can or should perform it.
 
 One more structural rule, taken from the same retrospective: **the acceptance evidence must come from real Boss dispatch, not from a harness.** A hand-built reproduction is assembled from the same beliefs that produced the code, so it is structurally incapable of finding the integration bugs — the events-socket routing, the credential strip, the adapter identity mismatch — that are precisely what killed Grok's sweep. Every phase-0 investigation likewise runs in a real GhosttyKit pane, not a simulated one.
@@ -244,9 +243,9 @@ Omitted, each with its reason:
 
 **R5 — `agy` auto-updates.** Grok's design records that it "auto-updates itself on its own schedule", which is why its version pin warns rather than gates. `agy` has `--update` and an `updater/` state directory, so the same drift applies, and a scoped `HOME` may cause each run to re-check for updates. `AGY_CLI_DISABLE_AUTO_UPDATE` exists in the binary and is the obvious lever to probe.
 
-**R6 — Economics may simply refuse this driver.** Addressed above; the spend model is sequenced early precisely so this can end the project cheaply.
+**R6 — Quota exhaustion remains a runtime condition.** The paid subscription's entitlement is unknown, and this project deliberately does not build the missing cross-driver accounting mechanism. The driver must still classify quota exhaustion distinctly so recovery does not redispatch into the same exhausted account.
 
-**R7 — Terms of service are silent on programmatic driving, and silence is not permission.** No ToS text was located either permitting or prohibiting driving `agy` programmatically. The weak reading is "not prohibited, therefore allowed". The stronger and more likely reading is that **no decision was ever made** about this use — an unaddressed gap, not a granted allowance — and a personal-account OAuth quota driven by a 16-worker fleet is exactly the case a provider would address if it addressed any. This needs an operator call before the driver runs on real work, and it is in the questions manifest.
+**R7 — Terms of service are silent on programmatic driving, and silence is not permission.** No ToS text was located either permitting or prohibiting driving `agy` programmatically. The weak reading is "not prohibited, therefore allowed". The stronger and more likely reading is that **no decision was ever made** about this use — an unaddressed gap, not a granted allowance — and automated fleet use on a personal Google account is exactly the case a provider would address if it addressed any. This needs an operator call before the driver runs on real work, and it is in the questions manifest.
 
 **R8 — CI cannot authenticate.** `agy` requires a prior interactive login and caches the credential under `HOME`. Any live-CLI conformance gate (`BOSS_REQUIRE_AGY_CLI`) will therefore only be meaningful on a developer machine with a signed-in account, exactly as `BOSS_REQUIRE_GROK_CLI` is. Fixture-side pins carry the contract in CI.
 
@@ -254,9 +253,11 @@ Omitted, each with its reason:
 
 ## Proposed implementation task breakdown
 
-Breakdown size: 22 entries (20 in-scope, 2 deferred) — a new fourth driver reaching across five investigations (pane viability, spend, isolation, hooks, permissions), a breaking protocol+DB+Swift split migration, a new driver module with ten distinct trait seams (skeleton, home provisioning, retention, spawn, hook wiring, guard adapter, progress normaliser, turn boundary, permission rendering, transcript), a soft-deny detector, and a conformance extension; each is its own reviewable PR, and the count sits below the 30 tasks the comparable Grok integration actually shipped.
+Breakdown size: 21 entries (19 in-scope, 2 deferred) — a new fourth driver reaching across four investigations (pane viability, isolation, hooks, permissions), a breaking protocol+DB+Swift split migration, a new driver module with ten distinct trait seams (skeleton, home provisioning, retention, spawn, hook wiring, guard adapter, progress normaliser, turn boundary, permission rendering, transcript), a soft-deny detector, and a conformance extension; each is its own reviewable PR, and the count sits below the 30 tasks the comparable Grok integration actually shipped.
 
-Parallelism is noted per entry. Depth-0 entries (spike, spend model, traffic split) may all run concurrently.
+Parallelism is noted per entry. The depth-0 pane spike and traffic-split migration may run concurrently.
+
+Every entry starts from the driver-neutral machinery named in Alternative B. New `agy` code implements only the provider dialect or run-state details that the shared traits cannot express; identical logic found in an existing driver is extracted into a lower-level helper or crate instead of copied.
 
 ### Ghostty pane viability spike for `agy`
 
@@ -264,14 +265,6 @@ Run `agy` 1.1.12 as an interactive TUI inside a **real GhosttyKit-hosted pane** 
 
 - **Effort:** large
 - **Dependencies:** none
-- Scope: in-scope
-
-### Antigravity spend and quota model
-
-Instrument `agy` headlessly (explicitly permitted as a research instrument) over a representative Boss-shaped brief — a real task prompt of realistic size, run to completion — and measure what the economics section can only estimate: requests per run, per-request overhead, cache-hit behaviour across a multi-turn session, and total input tokens for one complete chore-sized run. Convert that into a fleet model against Antigravity's published weekly quota terms, at 1, 4, and 16 concurrent workers, and state a maximum affordable traffic share. **This study is choosing, not validating**: it decides whether the driver is worth building at all, and a finding that a single pinned chore routinely exhausts a week of quota is a valid terminal outcome. Must not read Boss's engine DB. Deliverable: `tools/boss/docs/investigations/agy-spend-and-quota-model.md`.
-
-- **Effort:** medium
-- **Dependencies:** none — runs in parallel with the pane viability spike
 - Scope: in-scope
 
 ### Four-way driver traffic split migration
@@ -284,7 +277,7 @@ Widen `DriverTrafficSplit` from three shares to four across every layer that mus
 
 ### Acceptance ledger and pinned-only gate state
 
-Create the acceptance ledger as a separate document from this design so status can be refreshed without touching durable reasoning: the criterion (N pinned `agy` executions reaching merged PRs without engine-side incident, plus an affordability finding from the spend model), an empty evidence table, the explicit statement that the project sits in `pinned-only` state until the criterion is met, and the explicit statement that raising the share is an operator action no task performs. Document how `pinned-only` is enforced — zero share plus "zero means zero" in `allocate_among`, with an explicit pin still routing — and cross-link it from this design.
+Create the acceptance ledger as a separate document from this design so status can be refreshed without touching durable reasoning: the criterion (N pinned `agy` executions reaching merged PRs without engine-side incident), an empty evidence table, the explicit statement that the project sits in `pinned-only` state until the criterion is met, and the explicit statement that raising the share is an operator action no task performs. Document how `pinned-only` is enforced — zero share plus "zero means zero" in `allocate_among`, with an explicit pin still routing — and cross-link it from this design. Spend and quota do not appear in this driver-specific ledger.
 
 - **Effort:** small
 - **Dependencies:** Four-way driver traffic split migration
@@ -319,7 +312,7 @@ Determine how Boss's per-worker-kind posture is actually expressed: the real key
 The seed changeset, modelled on the Grok skeleton PR: `DriverDescriptor` (slug `agy`, binary `agy`, config dir, agent-rules filename, initial-prompt filename), the `ModelMenu`'s seven function pointers over the `agy models` catalogue with the three-rung effort ladder, the `CapabilitySet` with every omission carrying its recorded reason, registration in `DriverRegistry::default()`, and the minimum trait implementations needed to compile and keep the conformance suite green — including a native-dialect transcript fixture in `conformance/native_transcript.rs` and a transcript normaliser sufficient to surface a `[blocked]` marker from it, since that suite fails closed on any registered slug without one. No spawn line, no provisioning, no hooks. Capability declarations must be justified from the phase-0 characterisation, not asserted.
 
 - **Effort:** medium
-- **Dependencies:** Hook surface characterisation; Permission, trust, and soft-deny characterisation; Antigravity spend and quota model
+- **Dependencies:** Hook surface characterisation; Permission, trust, and soft-deny characterisation
 - Scope: in-scope
 
 ### Per-run `HOME` provisioning and credential delegation
@@ -396,7 +389,7 @@ Detect the Risk 3b failure — an ungranted tool soft-denied while the turn boun
 
 ### Control verbs and error classification
 
-Declare `probe` / `interrupt` / `stop` / `reap` / `mid_turn_pane_input` from what the spike measured, not from what seems likely — `MidTurnPaneInput` stays at the `Rejects` default unless mid-turn stdin consumption was proven, per the standard Grok set. Implement `classify_error` for the `agy`/Google error surface, with **quota exhaustion as a first-class class**: given the economics, a quota-exhausted worker misclassified as a generic failure would drive redispatch straight back into the same wall.
+Declare `probe` / `interrupt` / `stop` / `reap` / `mid_turn_pane_input` from what the spike measured, not from what seems likely — `MidTurnPaneInput` stays at the `Rejects` default unless mid-turn stdin consumption was proven, per the standard Grok set. Implement `classify_error` for the `agy`/Google error surface, with **quota exhaustion as a first-class class**: regardless of entitlement, a quota-exhausted worker misclassified as a generic failure would drive redispatch straight back into the same wall.
 
 - **Effort:** medium
 - **Dependencies:** Pane spawn invocation and `PaneMonitorSpec`; Ghostty pane viability spike for `agy`. **Co-edits `agy.rs`'s trait impl — land after the permission-config entry and forward-port.**
