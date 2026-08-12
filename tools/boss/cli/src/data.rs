@@ -563,39 +563,31 @@ pub(crate) async fn run_list_revisions(
     })
 }
 
-/// Resolve a work-item selector to a primary id without a product context.
+/// Resolve a work-item selector to a primary id without a product context,
+/// erroring loudly (via `GetWorkItem`) when the selector names no row.
 ///
 /// Unlike the generic [`resolve_selector_to_primary_id`], this variant does
 /// not require a product context: `T<n>` short ids are globally unique, so
-/// we pass them straight to `GetWorkItem` which resolves them DB-globally
-/// (via `get_work_item_resolving_short_id` in the engine). This is the only
-/// product-free resolution we allow here; `#42` / `42` bare forms still need
-/// a product and are rejected with a helpful message.
+/// they can be passed straight to `GetWorkItem`, which resolves them
+/// DB-globally (via `get_work_item_resolving_short_id` in the engine). A
+/// primary id (`task_…`) or an opaque/unrecognized selector is *also*
+/// round-tripped through `GetWorkItem` rather than passed through
+/// unchecked — the engine's resolver accepts canonical ids directly, so
+/// this doubles as the existence check every caller needs; an id that
+/// names no row surfaces as a `CliError`, never a silent pass-through.
+/// `#42` / `42` bare forms still need a product and are rejected with a
+/// helpful message (they don't start with a friendly-id letter, so the
+/// engine can't resolve them without one).
 ///
 /// Used by `create-revision`'s `--parent` and `--depends-on` (neither of
-/// which accepts a `--product` flag) and `list-revisions`' `--parent`.
+/// which accepts a `--product` flag), `list-revisions`' `--parent`, and
+/// `task list`'s `--parent`.
 pub(crate) async fn resolve_create_revision_parent(
     client: &mut BossClient,
     selector: &str,
 ) -> Result<String, CliError> {
-    match parse_work_item_selector(selector) {
-        // T-form short ids are globally unique — pass the friendly form
-        // straight to GetWorkItem; the engine resolves it without a product.
-        WorkItemSelector::ShortId(_) => {
-            let item = get_work_item(client, selector).await?;
-            Ok(item.primary_id().to_owned())
-        }
-        // Already a primary id or opaque slug — pass through unchanged.
-        WorkItemSelector::PrimaryId(id) | WorkItemSelector::Other(id) => Ok(id),
-        // Cross-product slug form (boss/42) — also unambiguous.
-        WorkItemSelector::ProductShortId { .. } => {
-            // Shouldn't normally appear given the --parent doc, but handle it
-            // via the standard resolution with an empty product context.
-            // This will fail clearly if the product slug can't be resolved.
-            let item = get_work_item(client, selector).await?;
-            Ok(item.primary_id().to_owned())
-        }
-    }
+    let item = get_work_item(client, selector).await?;
+    Ok(item.primary_id().to_owned())
 }
 
 pub(crate) async fn run_create_revision(
@@ -696,7 +688,12 @@ async fn warn_if_chain_has_live_worker(client: &mut BossClient, parent_id: &str,
 /// successfully-resolved id, matching the engine's broken-parent handling —
 /// this never fails, so `warn_if_chain_has_live_worker`'s downstream RPC
 /// failure is the only thing that can skip the advisory.
-async fn resolve_chain_root_id(client: &mut BossClient, task_id: &str) -> String {
+///
+/// Also used by `task list`'s `--parent` filter to canonicalize to the
+/// chain root, matching `list-revisions --parent`'s server-side
+/// `chain_root(...)` canonicalization (`WorkDb::list_revisions`) so both
+/// surfaces answer "children of a mid-chain revision id" the same way.
+pub(crate) async fn resolve_chain_root_id(client: &mut BossClient, task_id: &str) -> String {
     let mut current = task_id.to_owned();
     for _ in 0..64 {
         let Ok(item) = get_work_item(client, &current).await else {

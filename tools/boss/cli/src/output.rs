@@ -80,6 +80,13 @@ pub(crate) struct TaskListCriteria<'a> {
     /// id. Requires the list surface to project `parent_task_id` (see
     /// `WorkDb::list_tasks`); without that projection every row would
     /// fail the filter and return empty — a false "no children" answer.
+    ///
+    /// Callers must canonicalize this to the revision chain root before
+    /// passing it in (see `resolve_chain_root_id` in data.rs) — revisions
+    /// always store `parent_task_id` as the chain root, so an
+    /// uncanonicalized mid-chain revision id would match nothing here even
+    /// though `boss task list-revisions --parent` returns the whole chain
+    /// for the same id.
     pub(crate) parent_task_id: Option<&'a str>,
 }
 

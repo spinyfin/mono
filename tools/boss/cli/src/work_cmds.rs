@@ -727,11 +727,15 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
             };
             let dep_filter = args.dep.into_filter();
             let repo_selector = args.repo.as_deref().map(RepoSelector::parse).transpose()?;
-            // Resolve --parent to a primary id. Unknown selectors error
-            // loudly rather than returning an empty child set (which would
-            // look like "this parent has no children").
+            // Resolve --parent to a primary id, then canonicalize to the
+            // revision chain root so a mid-chain revision id matches the
+            // same rows `boss task list-revisions --parent` would return.
+            // Unknown selectors error loudly rather than returning an empty
+            // child set (which would look like "this parent has no
+            // children").
             let parent_task_id = if let Some(selector) = args.parent.as_deref() {
-                Some(resolve_create_revision_parent(&mut client, selector).await?)
+                let resolved = resolve_create_revision_parent(&mut client, selector).await?;
+                Some(resolve_chain_root_id(&mut client, &resolved).await)
             } else {
                 None
             };
