@@ -347,7 +347,7 @@ impl WorkerCompletionHandler {
     /// the historical finalize-immediately behavior. The same is true after
     /// the horizon expires, so a pushed worker that never reaches Stop cannot
     /// leave the execution active forever.
-    fn should_defer_staged_pr_recheck(&self, execution_id: &str) -> bool {
+    pub(super) fn should_defer_staged_pr_recheck(&self, execution_id: &str) -> bool {
         if !self.observed_mid_turn(execution_id) {
             return false;
         }

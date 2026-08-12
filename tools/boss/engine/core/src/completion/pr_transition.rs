@@ -96,17 +96,43 @@ impl WorkerCompletionHandler {
             }
         }
 
-        // incident-004 AI-4: every finalization source funnels through
-        // here, so this is the one place that can observe "is the worker
-        // we are about to reap still mid-turn?" for all of them at once —
-        // read BEFORE `begin_teardown`/`finish_worker_teardown` below can
-        // release the pane and clear the live-state slot out from under
-        // this check.
+        // Every PR-terminalization source funnels through here, so this is
+        // the one place that can prevent a recheck or Stop race from reaping
+        // a worker that is still mid-turn. Read BEFORE
+        // `begin_teardown`/`finish_worker_teardown` can release the pane and
+        // clear the live-state slot out from under this check.
         if let Ok(execution) = execution_result.as_ref()
             && self.observed_mid_turn(execution_id)
         {
+            if self.should_defer_mid_turn_pr_completion(execution_id, source) {
+                tracing::info!(
+                    execution_id,
+                    source,
+                    kind = %execution.kind,
+                    "pr completion: worker is still mid-turn; deferring terminalization to its activity boundary",
+                );
+                return StopOutcome::AwaitingInput;
+            }
             self.record_mid_turn_reap(execution, source).await;
         }
+
+        // Forensic teardown head — captured before any durable reviewer
+        // enqueue or terminalization write. Fail-open: this snapshot is not
+        // consulted by the mid-turn guard, so a transient `gh` failure or an
+        // unparseable URL must not block PR completion engine-wide.
+        let pr_head_after = match execution_result.as_ref() {
+            Ok(execution) => self.fetch_pr_head_after(execution, &pr_url).await,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    source,
+                    ?err,
+                    "pr completion: cannot capture pr_head_after without an execution record; \
+                     continuing terminalization with None",
+                );
+                None
+            }
+        };
 
         // For reviewer-triggering executions with a fresh
         // (non-merged) PR, try to enqueue an independent reviewer pass
@@ -306,18 +332,21 @@ impl WorkerCompletionHandler {
         let teardown = self.begin_teardown(execution_id);
 
         let record_started = std::time::Instant::now();
-        let completion =
-            match self
-                .work_db
-                .record_worker_pr_completion(execution_id, &pr_url, None, effective_target, None)
-            {
-                Ok(Some(completion)) => completion,
-                Ok(None) => return StopOutcome::AlreadyTerminal,
-                Err(err) => {
-                    tracing::error!(execution_id, source, ?err, "pr completion: failed to record");
-                    return StopOutcome::DbError;
-                }
-            };
+        let completion = match self.work_db.record_worker_pr_completion(
+            execution_id,
+            &pr_url,
+            pr_head_after.as_deref(),
+            None,
+            effective_target,
+            None,
+        ) {
+            Ok(Some(completion)) => completion,
+            Ok(None) => return StopOutcome::AlreadyTerminal,
+            Err(err) => {
+                tracing::error!(execution_id, source, ?err, "pr completion: failed to record");
+                return StopOutcome::DbError;
+            }
+        };
         tracing::info!(
             execution_id,
             source,
@@ -685,12 +714,101 @@ impl WorkerCompletionHandler {
             .is_some_and(|activity| activity == WorkerActivity::Working)
     }
 
-    /// Record a mid-turn reap (incident-004 AI-4): bump the aggregate and
-    /// per-source counters and, for revision implementations, file a sticky
-    /// attention item on the execution. The counters remain unconditional so
-    /// every source stays countable and alertable; the sticky item is limited
-    /// to the execution class where a reviewer-requested correction can be
-    /// lost, avoiding an unbounded operator queue for routine finalizations.
+    /// Whether a mid-turn PR finalization must defer. Every source is
+    /// bounded so a wedged-but-alive worker (`WorkerActivity::Working` never
+    /// decays via `downgrade_stale_activity`, and `stale_worker_sweep` skips
+    /// slots with a tool in flight) cannot leave the execution active forever.
+    ///
+    /// - Staged recheck measures the horizon from
+    ///   [`crate::pr_url_capture::StagedPrUrlEntry::staged_at`].
+    /// - Every other source (detector, `stop_satisfied_clean`, …) measures
+    ///   the same [`Self::staged_pr_mid_turn_defer_secs`] horizon from
+    ///   `LiveWorkerState::last_event_at`, falling back to the execution's
+    ///   `started_at`. Once the horizon expires, finalization proceeds and
+    ///   [`Self::record_mid_turn_reap`] fires.
+    fn should_defer_mid_turn_pr_completion(&self, execution_id: &str, source: &str) -> bool {
+        if source == "pr_recheck_staged" {
+            return self.should_defer_staged_pr_recheck(execution_id);
+        }
+        self.should_defer_mid_turn_within_activity_horizon(execution_id)
+    }
+
+    /// True while the mid-turn activity anchor is still inside the shared
+    /// deferral horizon. Anchor preference: live-state `last_event_at`, then
+    /// execution `started_at`. Missing/unparseable anchors fail open (do not
+    /// defer) so terminalization cannot hang without a clock.
+    fn should_defer_mid_turn_within_activity_horizon(&self, execution_id: &str) -> bool {
+        let horizon_secs = self.staged_pr_mid_turn_defer_secs.max(0);
+        if horizon_secs == 0 {
+            return false;
+        }
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let anchor_epoch = self
+            .live_worker_states
+            .as_ref()
+            .and_then(|registry| registry.last_event_at_for_run(execution_id))
+            .and_then(|ts| boss_engine_utils::iso8601::parse_iso8601_to_epoch(&ts))
+            .or_else(|| {
+                self.work_db.get_execution(execution_id).ok().and_then(|execution| {
+                    execution
+                        .started_at
+                        .as_deref()
+                        .and_then(boss_engine_utils::iso8601::parse_iso8601_to_epoch)
+                })
+            });
+        match anchor_epoch {
+            Some(epoch) => now.saturating_sub(epoch) < horizon_secs,
+            None => false,
+        }
+    }
+
+    /// Fetch the head that is about to be recorded on a PR-completion
+    /// teardown. Forensic only: parse failures and `gh` errors log at WARN
+    /// and return `None` so terminalization still proceeds.
+    async fn fetch_pr_head_after(&self, execution: &crate::work::WorkExecution, pr_url: &str) -> Option<String> {
+        let repo_slug = match parse_repo_slug(&execution.repo_remote_url) {
+            Ok(repo_slug) => repo_slug,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    pr_url,
+                    ?err,
+                    "pr completion: cannot parse repo slug for pr_head_after; recording None",
+                );
+                return None;
+            }
+        };
+        let Some(pr_number) = pr_number_from_url(pr_url) else {
+            tracing::warn!(
+                execution_id = %execution.id,
+                pr_url,
+                "pr completion: cannot parse PR number for pr_head_after; recording None",
+            );
+            return None;
+        };
+        match self
+            .branch_verifier
+            .fetch_pr_head_oid_fresh(&repo_slug, pr_number)
+            .await
+        {
+            Ok(head) => Some(head),
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    pr_url,
+                    ?err,
+                    "pr completion: fresh pr_head_after read failed; recording None",
+                );
+                None
+            }
+        }
+    }
+
+    /// Record when a mid-turn finalization proceeds past its deferral horizon:
+    /// bump the aggregate and per-source counters and, for revision
+    /// implementations, file a sticky attention item on the execution. This
+    /// is the explicit escape hatch for a wedged mid-tool worker that never
+    /// reaches Stop — not a successful clean-boundary teardown.
     ///
     /// Deliberately does not touch [`crate::live_worker_state::LiveWorkerStateRegistry::release_slot`]'s
     /// own `activity` log line — that remains the forensic record this

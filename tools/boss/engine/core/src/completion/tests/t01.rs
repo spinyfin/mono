@@ -1122,13 +1122,21 @@ async fn recheck_defers_revision_then_on_stop_finalizes_staged_url() {
     let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), detector);
     let handler = handler
         .with_staged_pr_urls(staged_pr_urls.clone())
-        .with_live_worker_states(live_states)
+        .with_live_worker_states(live_states.clone())
         .with_branch_verifier(verifier);
 
     let recheck_outcome = handler.recheck_for_pr(&execution_id).await;
     assert_eq!(recheck_outcome, StopOutcome::AwaitingInput);
 
     // The driver's own Stop boundary authorizes finalization.
+    live_states.apply_event(
+        4,
+        &boss_protocol::WorkerEvent::Stop {
+            session_id: "s".into(),
+            stop_hook_active: false,
+            stop_reason: boss_protocol::StopReason::Completed,
+        },
+    );
     let stop_outcome = handler.on_stop(&execution_id).await;
     assert!(
         matches!(stop_outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == parent_pr_url),
@@ -2120,19 +2128,25 @@ async fn cross_execution_attribution_uses_per_execution_branch_name() {
     // Detector returns Fresh URLs unique per branch — the
     // production behaviour of `gh pr list --head <branch>` once
     // each worker has pushed.
-    struct PerBranchDetector;
+    struct PerBranchDetector {
+        observed: std::sync::Mutex<Vec<(String, String)>>,
+    }
     #[async_trait]
     impl PrDetector for PerBranchDetector {
         async fn detect_pr(&self, _repo_remote_url: &str, expected_branch: &str) -> Result<PrStatus> {
-            Ok(PrStatus::Fresh {
-                url: format!("https://github.com/spinyfin/mono/pull/PR-for-{expected_branch}"),
-            })
+            let mut observed = self.observed.lock().expect("detector mutex poisoned");
+            let pr_number = 9_000 + observed.len();
+            let url = format!("https://github.com/spinyfin/mono/pull/{pr_number}");
+            observed.push((expected_branch.to_owned(), url.clone()));
+            Ok(PrStatus::Fresh { url })
         }
     }
-    let detector = Arc::new(PerBranchDetector);
+    let detector = Arc::new(PerBranchDetector {
+        observed: std::sync::Mutex::new(Vec::new()),
+    });
 
     let alice_handler = TestHarness::new(db.clone(), detector.clone()).handler;
-    let bob_handler = TestHarness::new(bob_db.clone(), detector).handler;
+    let bob_handler = TestHarness::new(bob_db.clone(), detector.clone()).handler;
 
     let alice_outcome = alice_handler.on_stop(&alice_exec).await;
     let bob_outcome = bob_handler.on_stop(&bob_exec).await;
@@ -2151,13 +2165,18 @@ async fn cross_execution_attribution_uses_per_execution_branch_name() {
         "two concurrent workers in different workspaces must bind to different PRs — \
          the fan-out bug from incident 001 was exactly the case where they got the same one",
     );
+    let observed = detector.observed.lock().expect("detector mutex poisoned");
     assert!(
-        alice_url.contains(&expected_branch_name(&alice_exec, &BranchNaming::BossExecPrefix, None)),
-        "alice's bound URL must derive from her own execution id, got {alice_url}",
+        observed.iter().any(|(branch, url)| {
+            branch == &expected_branch_name(&alice_exec, &BranchNaming::BossExecPrefix, None) && url == &alice_url
+        }),
+        "alice's PR must be detected using her own execution branch, got {observed:?}",
     );
     assert!(
-        bob_url.contains(&expected_branch_name(&bob_exec, &BranchNaming::BossExecPrefix, None)),
-        "bob's bound URL must derive from his own execution id, got {bob_url}",
+        observed.iter().any(|(branch, url)| {
+            branch == &expected_branch_name(&bob_exec, &BranchNaming::BossExecPrefix, None) && url == &bob_url
+        }),
+        "bob's PR must be detected using his own execution branch, got {observed:?}",
     );
 }
 

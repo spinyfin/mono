@@ -375,6 +375,7 @@ impl WorkDb {
         migrate_work_executions_pre_start_retry(conn)?;
         migrate_work_executions_pr_url(conn)?;
         migrate_work_executions_pr_head_before(conn)?;
+        migrate_work_executions_pr_head_after(conn)?;
         // Positive-evidence columns for the metadata-only CI-fix finalize
         // gate (issue #1252): the PR body snapshotted at run start plus the
         // Stop-boundary "metadata delta observed" marker.

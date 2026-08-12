@@ -297,13 +297,12 @@ async fn ci_remediation_debounced_nudge_does_not_double_fail_or_republish() {
     );
 }
 
-/// incident-004 AI-4: when `finalize_pr_transition` tears down a worker
-/// whose live activity is still `Working` (mid-turn) must bump the aggregate
-/// and per-source mid-turn-reap counters and file an operator-visible
-/// attention item on the execution, so the prevalence the postmortem measured
-/// only by an offline trace sweep is answerable from the running system.
+/// A staged PR URL must not turn a live revision worker into an implicit
+/// completion. This drives the real recheck arm rather than calling the
+/// common funnel directly, so a branch-local regression cannot hide behind
+/// the shared guard.
 #[tokio::test]
-async fn finalize_pr_transition_records_mid_turn_reap_when_worker_is_working() {
+async fn staged_recheck_does_not_terminalize_a_mid_turn_revision_before_the_horizon() {
     let workspace = tempdir().unwrap();
     let parent_pr_url = "https://github.com/spinyfin/mono/pull/1344";
     let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -336,9 +335,190 @@ async fn finalize_pr_transition_records_mid_turn_reap_when_worker_is_working() {
         "fixture must model the mid-turn state observed at teardown",
     );
 
+    let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+    staged_pr_urls.record_if_unset(&execution_id, parent_pr_url);
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), detector);
+    let handler = handler
+        .with_staged_pr_urls(staged_pr_urls)
+        .with_live_worker_states(live_states)
+        .with_branch_verifier(StubBranchVerifier::ok("boss/parent"));
+
+    assert_eq!(handler.recheck_for_pr(&execution_id).await, StopOutcome::AwaitingInput);
+    let execution = db.get_execution(&execution_id).unwrap();
+    assert!(execution.status.is_live(), "the worker must remain live");
+    assert_eq!(
+        execution.pr_head_after, None,
+        "a refused teardown must not be recorded as successful",
+    );
+    assert!(
+        cube.release_calls.lock().await.is_empty(),
+        "the live worker must not be reaped"
+    );
+}
+
+/// The cold branch detector is not covered by staged-URL state. Its
+/// finalization must nevertheless defer when the worker is still mid-turn.
+#[tokio::test]
+async fn detector_recheck_does_not_terminalize_a_mid_turn_worker() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+    let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+    live_states.register_spawn(4, &execution_id, "claude-opus-5", std::process::id() as i32, None);
+    live_states.apply_event(
+        4,
+        &boss_protocol::WorkerEvent::PreToolUse {
+            session_id: "s".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+        },
+    );
+
+    let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/1345"));
+    let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), detector);
+    let handler = handler.with_live_worker_states(live_states);
+
+    assert_eq!(handler.recheck_for_pr(&execution_id).await, StopOutcome::AwaitingInput);
+    let execution = db.get_execution(&execution_id).unwrap();
+    assert!(
+        execution.status.is_live(),
+        "detector recheck must leave the worker live"
+    );
+    assert!(
+        execution.pr_head_after.is_none(),
+        "no successful teardown may be recorded"
+    );
+    assert!(
+        cube.release_calls.lock().await.is_empty(),
+        "detector recheck must not release the lease"
+    );
+}
+
+/// `stop_satisfied_clean` previously treated a stale working signal as a
+/// clean boundary. The shared mid-turn guard at `finalize_pr_transition`
+/// decides purely on `observed_mid_turn` — head movement is never consulted
+/// — so both an unchanged and a moved head must refuse while the worker is
+/// mid-turn.
+#[tokio::test]
+async fn stop_satisfied_clean_does_not_terminalize_a_mid_turn_worker() {
+    use crate::merge_poller::{OpenPrStatus, PrLifecycleState};
+
+    for (label, fresh_head) in [
+        ("unchanged", "cccccccccccccccccccccccccccccccccccccccc"),
+        ("moved", "dddddddddddddddddddddddddddddddddddddddd"),
+    ] {
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/1346";
+        let head = "cccccccccccccccccccccccccccccccccccccccc";
+        let (_dir, db, _product_id, _revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head);
+
+        let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+        live_states.register_spawn(5, &execution_id, "claude-opus-5", std::process::id() as i32, None);
+        live_states.apply_event(
+            5,
+            &boss_protocol::WorkerEvent::PreToolUse {
+                session_id: "s".into(),
+                tool_name: "Bash".into(),
+                tool_input: serde_json::Value::Null,
+            },
+        );
+
+        let verifier = StubBranchVerifier::ok("boss/parent");
+        // Head stubs are intentional: they prove the guard is head-independent.
+        // The mid-turn path returns before any head is read.
+        verifier.set_head_oid(Ok(head.to_owned())).await;
+        verifier.set_fresh_head_oid(Ok(fresh_head.to_owned())).await;
+        let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
+        let TestHarness { handler, cube, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+        let handler = handler
+            .with_branch_verifier(verifier)
+            .with_live_worker_states(live_states)
+            .with_merge_probe(probe);
+
+        let execution_before = db.get_execution(&execution_id).unwrap();
+        assert_eq!(execution_before.pr_head_before.as_deref(), Some(head));
+        assert_eq!(
+            handler
+                .try_finalize_satisfied_deliverable_on_stop(
+                    &execution_id,
+                    &execution_before,
+                    parent_pr_url,
+                    ContributionEvidence::Indeterminate,
+                )
+                .await,
+            Some(StopOutcome::AwaitingInput),
+            "mid-turn satisfied-deliverable must defer regardless of head ({label})",
+        );
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert!(
+            execution.status.is_live(),
+            "satisfied-deliverable must not reap a mid-turn worker ({label})"
+        );
+        assert_eq!(
+            execution.pr_head_after, None,
+            "refused mid-turn finalize is not a success record ({label})"
+        );
+        assert!(
+            cube.release_calls.lock().await.is_empty(),
+            "satisfied-deliverable must not release the lease ({label})"
+        );
+    }
+}
+
+/// Staged mid-turn deferral is bounded: once `staged_pr_mid_turn_defer_secs`
+/// expires the escape hatch must finalize, bump counters, and file revision
+/// attention. Horizon `0` forces immediate expiry.
+#[tokio::test]
+async fn finalize_pr_transition_records_mid_turn_reap_when_staged_horizon_expires() {
+    let workspace = tempdir().unwrap();
+    let parent_pr_url = "https://github.com/spinyfin/mono/pull/1344";
+    let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (_dir, db, _product_id, revision_id, execution_id) =
+        revision_fixture(workspace.path(), parent_pr_url, head_before);
+
+    let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+    live_states.register_spawn(
+        3,
+        &execution_id,
+        "claude-opus-5",
+        std::process::id() as i32,
+        Some(boss_protocol::WorkItemBinding {
+            work_item_id: revision_id.clone(),
+            work_item_name: "revision mid-turn metric".to_owned(),
+            execution_id: execution_id.clone(),
+        }),
+    );
+    live_states.apply_event(
+        3,
+        &boss_protocol::WorkerEvent::PreToolUse {
+            session_id: "s".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+        },
+    );
+    assert_eq!(
+        live_states.activity_for_run(&execution_id),
+        Some(boss_protocol::WorkerActivity::Working),
+        "fixture must model the mid-turn state observed at teardown",
+    );
+
+    let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+    staged_pr_urls.record_if_unset(&execution_id, parent_pr_url);
+
+    let verifier = StubBranchVerifier::ok("boss/parent");
+    let head_after = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    // Contribution gate (AI-3) needs a moved head; forensic column records the fresh REST read.
+    verifier.set_head_oid(Ok(head_after.to_owned())).await;
+    verifier.set_fresh_head_oid(Ok(head_after.to_owned())).await;
     let detector = StubPrDetector::ok(None);
     let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
-    let handler = handler.with_live_worker_states(live_states);
+    let handler = handler
+        .with_live_worker_states(live_states)
+        .with_staged_pr_urls(staged_pr_urls)
+        .with_branch_verifier(verifier)
+        // Zero horizon → staged deferral always expired → record_mid_turn_reap path.
+        .with_staged_pr_mid_turn_defer_secs(0);
 
     assert_eq!(
         handler.metrics.counter_value("completion.mid_turn_reap.total"),
@@ -356,13 +536,13 @@ async fn finalize_pr_transition_records_mid_turn_reap_when_worker_is_working() {
         .await;
     assert!(
         matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == parent_pr_url),
-        "the finalization path must complete; got {outcome:?}",
+        "the finalization path must complete past the expired horizon; got {outcome:?}",
     );
 
     assert_eq!(
         handler.metrics.counter_value("completion.mid_turn_reap.total"),
         Some(1),
-        "a mid-turn finalize must bump the aggregate counter exactly once",
+        "a mid-turn finalize past the horizon must bump the aggregate counter exactly once",
     );
     assert_eq!(
         handler
@@ -375,7 +555,80 @@ async fn finalize_pr_transition_records_mid_turn_reap_when_worker_is_working() {
     let items = db.list_attention_items(&execution_id).unwrap();
     assert!(
         items.iter().any(|i| i.kind == MID_TURN_REAP_ATTENTION_KIND),
-        "a mid-turn reap must file its own attention item; got {items:?}",
+        "a revision mid-turn reap must file its own attention item; got {items:?}",
+    );
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().pr_head_after.as_deref(),
+        Some(head_after),
+    );
+}
+
+/// Mid-turn reaps from every execution kind are counted, but only revision
+/// implementations create sticky attention: that class can lose a
+/// reviewer-requested correction, whereas routine completion volume must not
+/// accumulate an operator queue.
+#[tokio::test]
+async fn finalize_pr_transition_counts_non_revision_mid_turn_reap_without_attention() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+    live_states.register_spawn(
+        5,
+        &execution_id,
+        "claude-opus-5",
+        std::process::id() as i32,
+        Some(boss_protocol::WorkItemBinding {
+            work_item_id: chore_id,
+            work_item_name: "ordinary completion metric".to_owned(),
+            execution_id: execution_id.clone(),
+        }),
+    );
+    live_states.apply_event(
+        5,
+        &boss_protocol::WorkerEvent::PreToolUse {
+            session_id: "s".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+        },
+    );
+
+    let verifier = StubBranchVerifier::ok("boss/parent");
+    verifier
+        .set_fresh_head_oid(Ok("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_owned()))
+        .await;
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    // Zero horizon so the non-staged activity bound does not defer forever.
+    let handler = handler
+        .with_live_worker_states(live_states)
+        .with_branch_verifier(verifier)
+        .with_staged_pr_mid_turn_defer_secs(0);
+    handler
+        .finalize_pr_transition(
+            &execution_id,
+            "https://github.com/spinyfin/mono/pull/1346".to_owned(),
+            WorkerPrCompletionTarget::Done,
+            "test_non_revision",
+        )
+        .await;
+
+    assert_eq!(
+        handler.metrics.counter_value("completion.mid_turn_reap.total"),
+        Some(1),
+        "non-revision reaps must remain visible in the aggregate metric",
+    );
+    assert_eq!(
+        handler
+            .metrics
+            .counter_value("completion.mid_turn_reap.test_non_revision.count"),
+        Some(1),
+        "non-revision reaps must remain visible in the per-source metric",
+    );
+    assert!(
+        !db.list_attention_items(&execution_id)
+            .unwrap()
+            .iter()
+            .any(|i| i.kind == MID_TURN_REAP_ATTENTION_KIND),
+        "routine completion reaps must not file sticky attention items",
     );
 }
 
@@ -423,9 +676,14 @@ async fn finalize_pr_transition_does_not_record_mid_turn_reap_when_worker_is_idl
         "fixture must model the worker having already reached its own Stop boundary",
     );
 
+    let verifier = StubBranchVerifier::ok("boss/parent");
+    let head_after = "dddddddddddddddddddddddddddddddddddddddd";
+    verifier.set_fresh_head_oid(Ok(head_after.to_owned())).await;
     let detector = StubPrDetector::ok(None);
     let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
-    let handler = handler.with_live_worker_states(live_states);
+    let handler = handler
+        .with_live_worker_states(live_states)
+        .with_branch_verifier(verifier);
 
     let outcome = handler
         .finalize_pr_transition(
@@ -441,74 +699,13 @@ async fn finalize_pr_transition_does_not_record_mid_turn_reap_when_worker_is_idl
     );
 
     assert_eq!(
-        handler.metrics.counter_value("completion.mid_turn_reap.total"),
-        Some(0),
-        "an idle finalize must not be counted as a mid-turn reap",
+        db.get_execution(&execution_id).unwrap().pr_head_after.as_deref(),
+        Some(head_after),
+        "a successful teardown must persist the fresh post-teardown head SHA",
     );
     let items = db.list_attention_items(&execution_id).unwrap();
     assert!(
         !items.iter().any(|i| i.kind == MID_TURN_REAP_ATTENTION_KIND),
         "an idle finalize must not file a mid-turn-reap attention item; got {items:?}",
-    );
-}
-
-/// Mid-turn reaps from every execution kind are counted, but only revision
-/// implementations create sticky attention: that class can lose a
-/// reviewer-requested correction, whereas routine completion volume must not
-/// accumulate an operator queue.
-#[tokio::test]
-async fn finalize_pr_transition_counts_non_revision_mid_turn_reap_without_attention() {
-    let workspace = tempdir().unwrap();
-    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
-    let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
-    live_states.register_spawn(
-        5,
-        &execution_id,
-        "claude-opus-5",
-        std::process::id() as i32,
-        Some(boss_protocol::WorkItemBinding {
-            work_item_id: chore_id,
-            work_item_name: "ordinary completion metric".to_owned(),
-            execution_id: execution_id.clone(),
-        }),
-    );
-    live_states.apply_event(
-        5,
-        &boss_protocol::WorkerEvent::PreToolUse {
-            session_id: "s".into(),
-            tool_name: "Bash".into(),
-            tool_input: serde_json::Value::Null,
-        },
-    );
-
-    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
-    let handler = handler.with_live_worker_states(live_states);
-    handler
-        .finalize_pr_transition(
-            &execution_id,
-            "https://github.com/spinyfin/mono/pull/1346".to_owned(),
-            WorkerPrCompletionTarget::Done,
-            "test_non_revision",
-        )
-        .await;
-
-    assert_eq!(
-        handler.metrics.counter_value("completion.mid_turn_reap.total"),
-        Some(1),
-        "non-revision reaps must remain visible in the aggregate metric",
-    );
-    assert_eq!(
-        handler
-            .metrics
-            .counter_value("completion.mid_turn_reap.test_non_revision.count"),
-        Some(1),
-        "non-revision reaps must remain visible in the per-source metric",
-    );
-    assert!(
-        !db.list_attention_items(&execution_id)
-            .unwrap()
-            .iter()
-            .any(|i| i.kind == MID_TURN_REAP_ATTENTION_KIND),
-        "routine completion reaps must not file sticky attention items",
     );
 }

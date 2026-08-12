@@ -876,7 +876,7 @@ mod tests {
             .unwrap();
         db.start_execution_run(&exec.id, "agent", "repo", "lease", "ws", "/tmp/ws")
             .unwrap();
-        db.record_worker_pr_completion(&exec.id, &pr_url, None, WorkerPrCompletionTarget::InReview, None)
+        db.record_worker_pr_completion(&exec.id, &pr_url, None, None, WorkerPrCompletionTarget::InReview, None)
             .unwrap()
             .unwrap();
 
@@ -934,7 +934,7 @@ mod tests {
             .unwrap();
         db.start_execution_run(&exec.id, "agent", "repo", "lease", "ws", "/tmp/ws")
             .unwrap();
-        db.record_worker_pr_completion(&exec.id, &pr_url, None, WorkerPrCompletionTarget::InReview, None)
+        db.record_worker_pr_completion(&exec.id, &pr_url, None, None, WorkerPrCompletionTarget::InReview, None)
             .unwrap()
             .unwrap();
 

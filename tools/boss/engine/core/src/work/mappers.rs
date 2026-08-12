@@ -554,6 +554,7 @@ pub(crate) fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
             .filter(|s| !s.is_empty())
             .map(|raw| parse_text_column(28, &raw))
             .transpose()?,
+        pr_head_after: row.get(29)?,
     })
 }
 

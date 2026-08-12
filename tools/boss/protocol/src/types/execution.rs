@@ -681,6 +681,17 @@ pub struct WorkExecution {
     #[serde(default)]
     pub pr_head_before: Option<String>,
 
+    /// SHA of the PR head observed immediately before this execution's
+    /// successful PR-completion terminalization. Unlike [`Self::pr_head_before`],
+    /// this is a teardown-time forensic snapshot rather than a run-start
+    /// contribution baseline. `None` when the fresh REST read failed or was
+    /// unparseable, on executions that did not complete through a producing
+    /// PR transition (including `pr_review` teardowns, which do not record
+    /// a post-teardown head — reviewers are not the class that loses work
+    /// mid-turn), or on rows that predate this column.
+    #[serde(default)]
+    pub pr_head_after: Option<String>,
+
     /// The PR URL captured at the end of this execution's run, if any.
     /// Set when the worker successfully opens a PR and the engine
     /// records the `completed` transition for this execution.

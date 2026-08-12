@@ -117,6 +117,12 @@ struct StubBranchVerifier {
     /// [`StubBranchVerifier::set_head_oid`] to override.
     #[builder(default = Mutex::new(Ok("oid_unknown".to_owned())))]
     head_oid_result: Mutex<Result<String, String>>,
+    /// `headRefOid` returned by the direct, teardown-time REST read. This is
+    /// deliberately independent from `head_oid_result`: an ordinary
+    /// SHA-delta read can fail without making the later fresh finalization
+    /// read fail as well.
+    #[builder(default = Mutex::new(Ok("oid_unknown".to_owned())))]
+    fresh_head_oid_result: Mutex<Result<String, String>>,
     /// Line count returned by `fetch_diff_line_count`. Defaults to
     /// `999` (non-trivial) so tests that don't exercise the skip gate
     /// never accidentally trigger a skip.
@@ -173,6 +179,11 @@ impl StubBranchVerifier {
         *self.head_oid_result.lock().await = oid;
     }
 
+    /// Override the head returned by the direct, teardown-time REST read.
+    async fn set_fresh_head_oid(&self, oid: Result<String, String>) {
+        *self.fresh_head_oid_result.lock().await = oid;
+    }
+
     /// Override the diff line count returned by `fetch_diff_line_count`.
     /// Tests that exercise the no-op / trivial-diff skip gate use this to
     /// simulate a pure rebase (0 lines) or trivially small change.
@@ -222,6 +233,14 @@ impl BranchVerifier for StubBranchVerifier {
 
     async fn fetch_pr_head_oid(&self, _repo_slug: &str, _pr_number: u64) -> Result<String> {
         let guard = self.head_oid_result.lock().await;
+        match &*guard {
+            Ok(oid) => Ok(oid.clone()),
+            Err(msg) => Err(anyhow::anyhow!(msg.clone())),
+        }
+    }
+
+    async fn fetch_pr_head_oid_fresh(&self, _repo_slug: &str, _pr_number: u64) -> Result<String> {
+        let guard = self.fresh_head_oid_result.lock().await;
         match &*guard {
             Ok(oid) => Ok(oid.clone()),
             Err(msg) => Err(anyhow::anyhow!(msg.clone())),
@@ -401,6 +420,10 @@ impl TestHarness {
             pane.clone(),
             probes.clone(),
         )
+        // PR-completion terminalization records a fresh head. Keep the shared
+        // harness hermetic; tests that exercise branch-specific behaviour
+        // replace this with their own verifier.
+        .with_branch_verifier(StubBranchVerifier::ok("boss/test"))
         // Auto-advancing by default: most tests drive several `on_stop`
         // calls back-to-back to exercise the circuit breaker's *count*,
         // not its timing, and a synchronous test loop would otherwise

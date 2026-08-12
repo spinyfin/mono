@@ -563,6 +563,11 @@ pub trait BranchVerifier: Send + Sync {
     /// `PROBE_NO_PR` nudge.
     async fn fetch_pr_head_oid(&self, repo_slug: &str, pr_number: u64) -> Result<String>;
 
+    /// Returns a fresh PR head OID for a teardown decision. This must bypass
+    /// the merge poller's persisted/batched observation so a stale snapshot
+    /// cannot falsely certify that a live worker made no contribution.
+    async fn fetch_pr_head_oid_fresh(&self, repo_slug: &str, pr_number: u64) -> Result<String>;
+
     /// Returns the total number of changed lines (additions + deletions)
     /// between `base` and `head` in `repo_slug`. Used by the no-op /
     /// trivial-diff skip gate to detect pure rebases and
@@ -622,6 +627,17 @@ impl BranchVerifier for CommandBranchVerifier {
 
     async fn fetch_pr_head_oid(&self, repo_slug: &str, pr_number: u64) -> Result<String> {
         git_utils::gh_cli::fetch_pr_head_oid(repo_slug, pr_number).await
+    }
+
+    async fn fetch_pr_head_oid_fresh(&self, repo_slug: &str, pr_number: u64) -> Result<String> {
+        // Attribute the completion-path REST head read under COMPLETION so it
+        // shares the same GitHub-call accounting as the other completion
+        // helpers (and is not invisible to merge-poller budgets).
+        gh_scope(
+            callers::COMPLETION,
+            git_utils::gh_cli::fetch_pr_head_oid_fresh(repo_slug, pr_number),
+        )
+        .await
     }
 
     async fn fetch_diff_line_count(&self, repo_slug: &str, base: &str, head: &str) -> Result<u64> {

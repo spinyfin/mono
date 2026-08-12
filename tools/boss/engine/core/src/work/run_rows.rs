@@ -744,7 +744,7 @@ impl WorkDb {
                     e.pre_start_failure_count, e.dispatch_not_before, e.pr_url, e.pr_head_before,
                     e.prefer_is_soft, e.worker_branch_prefix, e.transient_failure_count,
                     e.allow_dirty, e.branch_naming, e.dispatch_wait_reason, e.dispatch_wait_since,
-                    e.driver_runtime_state, e.driver, e.model, e.effort_level
+                    e.driver_runtime_state, e.driver, e.model, e.effort_level, e.pr_head_after
              FROM work_executions e
              WHERE e.status IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND EXISTS (
