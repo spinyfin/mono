@@ -37,13 +37,12 @@
 //! 4. **Bounded buffer.** The buffer is capped at the most recent
 //!    [`MAX_BUFFERED_EVENTS`] events. A persistently-down engine can't
 //!    cause the buffer to grow unbounded.
-//! 5. **Total wall-clock budget.** All of the above — drain, connect
-//!    retries, writes, and the mid-send reconnect — share one
-//!    [`SHIM_TOTAL_BUDGET`] deadline stamped at the start of `run()`.
-//!    Whichever stage is running when the budget runs out bails out to
-//!    `buffer_or_lose` immediately rather than continuing, so the shim
-//!    always finishes within its budget instead of relying on an outer
-//!    hook-runner kill.
+//! 5. **Total socket-work budget.** Drain, connect retries, writes, and
+//!    the mid-send reconnect share one [`SHIM_TOTAL_BUDGET`] deadline
+//!    stamped at the start of `run()`. Whichever socket stage is running
+//!    when the budget runs out bails out to `buffer_or_lose` immediately
+//!    rather than continuing. Local buffer appends retain their blocking
+//!    lock so the final event is not lost.
 //!
 //! The shim is intentionally still small and synchronous: the
 //! resilience layer is local file I/O plus retry, no async runtime.
@@ -114,10 +113,10 @@ const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(3);
 /// hook timeout covers process teardown and scheduling jitter.
 const SHIM_TOTAL_BUDGET: Duration = Duration::from_secs(12);
 
-/// Minimum wall time reserved for a write once the connect-retry
-/// schedule is exhausted, so a single small JSON payload still gets a
-/// real chance to go out in the worst case rather than a near-zero
-/// timeout.
+/// Compile-time headroom that the default connect-retry schedule must
+/// leave within [`SHIM_TOTAL_BUDGET`] for a final write attempt. The
+/// actual write timeout remains the time left at runtime because a
+/// preceding buffer drain may have consumed part of the budget.
 const MIN_WRITE_BUDGET_MS: u64 = 250;
 
 const fn sum_ms(delays: &[u64]) -> u64 {
@@ -383,9 +382,11 @@ fn send_one(socket_path: &str, payload: &[u8], deadline: Instant) -> Result<()> 
 
 /// Append `payload` as a new line to the workspace's event buffer.
 /// Creates the parent directory if needed, takes an advisory exclusive
-/// lock for the duration of the write so a concurrent shim invocation
-/// can't interleave bytes mid-line, and rotates the file when it grows
-/// past [`MAX_BUFFERED_EVENTS`] lines.
+/// blocking advisory exclusive lock for the duration of the write so a
+/// concurrent shim invocation can't interleave bytes mid-line. This
+/// final persistence step deliberately waits for the lock rather than
+/// dropping an event, and rotates the file when it grows past
+/// [`MAX_BUFFERED_EVENTS`] lines.
 fn append_to_buffer(buffer_path: &Path, payload: &[u8]) -> Result<()> {
     if let Some(parent) = buffer_path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("creating {} ", parent.display()))?;
@@ -418,7 +419,8 @@ fn append_to_buffer(buffer_path: &Path, payload: &[u8]) -> Result<()> {
 /// at the first failure — including the shim's wall-clock budget
 /// running out — and rewrites the file with the unsent suffix (FIFO).
 /// Removes the file when fully drained. No-op when the buffer is
-/// absent.
+/// absent. If another shim is already draining, returns successfully
+/// without waiting so that process can preserve FIFO order.
 fn drain_buffer(socket_path: &str, buffer_path: &Path, deadline: Instant) -> Result<()> {
     if !buffer_path.exists() {
         return Ok(());
@@ -428,7 +430,11 @@ fn drain_buffer(socket_path: &str, buffer_path: &Path, deadline: Instant) -> Res
         .write(true)
         .open(buffer_path)
         .with_context(|| format!("opening {} for drain", buffer_path.display()))?;
-    FileExt::lock_exclusive(&file).context("locking event buffer for drain")?;
+    match FileExt::try_lock_exclusive(&file) {
+        Ok(true) => {}
+        Ok(false) => return Ok(()),
+        Err(err) => return Err(err).context("locking event buffer for drain"),
+    }
     let _guard = LockGuard(&file);
 
     let lines = read_lines(&file)?;
@@ -625,6 +631,20 @@ mod tests {
     }
 
     #[test]
+    fn connect_with_retry_skips_attempts_after_budget_expires() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("never-bound.sock");
+        let start = Instant::now();
+        let result = connect_with_retry(socket.to_str().unwrap(), Instant::now() - Duration::from_secs(1));
+
+        assert!(result.is_err(), "an expired budget must reject the connect");
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "an expired budget must skip the retry schedule"
+        );
+    }
+
+    #[test]
     fn append_then_read_roundtrips_lines() {
         let dir = tempfile::TempDir::new().unwrap();
         let buf = dir.path().join(".boss/events-pending.jsonl");
@@ -671,6 +691,26 @@ mod tests {
 
         let contents = std::fs::read(&buf).unwrap();
         assert_eq!(contents, original);
+    }
+
+    #[test]
+    fn drain_with_expired_budget_preserves_buffer() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let buf = dir.path().join(".boss/events-pending.jsonl");
+        std::fs::create_dir_all(buf.parent().unwrap()).unwrap();
+        let original = b"{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n";
+        std::fs::write(&buf, original).unwrap();
+
+        let socket = dir.path().join("never-bound.sock");
+        let start = Instant::now();
+        let result = drain_buffer(socket.to_str().unwrap(), &buf, Instant::now() - Duration::from_secs(1));
+
+        assert!(result.is_err(), "an expired budget must stop the drain");
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "an expired budget must not attempt a socket connect"
+        );
+        assert_eq!(std::fs::read(&buf).unwrap(), original);
     }
 
     /// Pins the invariant that `connect_once` applies a write timeout
