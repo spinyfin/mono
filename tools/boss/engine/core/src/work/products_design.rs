@@ -1,5 +1,22 @@
 use super::*;
 
+/// Whether a docs-backed work item routes through the **per-task** doc
+/// pointer (`design_detector`'s `on_task_doc_pr_*` + the `tasks.doc_*`
+/// columns) rather than the per-project design-doc pointer.
+///
+/// `true` for every `kind = investigation` (its deliverable doc is never
+/// a project's design doc) and for project-less `kind = design` tasks
+/// (which have no project pointer to populate). `false` for design tasks
+/// that have a project — those keep using the per-project pointer — and
+/// for every kind that produces no doc.
+///
+/// Lives here, next to the `tasks.doc_*` reads it gates, rather than in
+/// `design_detector`: the persistence layer must not depend on the
+/// detector that writes through it.
+pub(crate) fn task_uses_per_task_doc(kind: &TaskKind, has_project: bool) -> bool {
+    matches!(kind, TaskKind::Investigation) || (matches!(kind, TaskKind::Design) && !has_project)
+}
+
 impl WorkDb {
     /// Fetch a single project by id. Used by the runner when it
     /// composes the worker prompt for a `kind = 'design'` task —
@@ -836,7 +853,7 @@ impl WorkDb {
 /// field `None` (affordance hidden). The workspace lookup is always `|_| None`:
 /// cube is not consulted on these paths.
 pub(crate) fn attach_task_doc_link_state(conn: &Connection, task: &mut Task, caller: &str, queries: &mut u64) -> bool {
-    if !crate::design_detector::task_uses_per_task_doc(&task.kind, task.project_id.is_none()) {
+    if !task_uses_per_task_doc(&task.kind, task.project_id.is_none()) {
         return false;
     }
     match resolve_task_doc_pointer(conn, &task.id, |_| None, queries) {
@@ -1229,5 +1246,23 @@ mod tests {
             .pr_doc_artifact_hint("pr_doc:spinyfin/mono:boss/exec_x:docs/foo.md")
             .unwrap();
         assert_eq!(hint, None);
+    }
+
+    // ---- task_uses_per_task_doc routing ------------------------------
+
+    #[test]
+    fn task_doc_routing_matches_investigations_and_project_less_designs() {
+        // Investigations always route to the per-task pointer.
+        assert!(task_uses_per_task_doc(&TaskKind::Investigation, true));
+        assert!(task_uses_per_task_doc(&TaskKind::Investigation, false));
+        // Design with a project uses the per-project pointer; project-less
+        // design falls back to the per-task pointer.
+        assert!(!task_uses_per_task_doc(&TaskKind::Design, true));
+        assert!(task_uses_per_task_doc(&TaskKind::Design, false));
+        // Kinds that produce no doc never route to the per-task pointer.
+        assert!(!task_uses_per_task_doc(&TaskKind::Task, false));
+        assert!(!task_uses_per_task_doc(&TaskKind::Chore, false));
+        assert!(!task_uses_per_task_doc(&TaskKind::ProjectTask, false));
+        assert!(!task_uses_per_task_doc(&TaskKind::Revision, false));
     }
 }

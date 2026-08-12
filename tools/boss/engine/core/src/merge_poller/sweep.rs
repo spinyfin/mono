@@ -1398,7 +1398,7 @@ async fn reap_superseded_merge_queue_attempt(
         );
         return Some(active);
     }
-    if ci_watch::merge_queue_rebounce_pr_head(&active.head_sha_at_trigger) == current_head_sha {
+    if crate::work::merge_queue_rebounce_pr_head(&active.head_sha_at_trigger) == current_head_sha {
         ci_watch::record_declined_evaluation(
             candidate,
             &active,
@@ -2183,7 +2183,7 @@ pub(crate) async fn mark_merged(
     // `design_doc_*` pointer; project-less docs-backed items
     // (investigations / project-less designs) -> the task's own `doc_*`
     // pointer. Errors are logged inside the detector.
-    if design_detector::task_uses_per_task_doc(&updated.kind, updated.project_id.is_none()) {
+    if crate::work::task_uses_per_task_doc(&updated.kind, updated.project_id.is_none()) {
         design_detector::on_task_doc_pr_merged(
             work_db,
             &updated.id,
@@ -2287,12 +2287,12 @@ pub(crate) async fn mark_closed_unmerged(
 /// `run_one_pass` fires immediately on spawn so any chore whose PR
 /// Extract the PR number from a GitHub PR URL as an `i64` for DB storage.
 ///
-/// Thin `i64` adaptor over the canonical [`pr_number_from_url`] helper, which
-/// owns the parsing (including tolerance for the `/pull/<N>/files`, `?query`,
-/// and `#fragment` decorations). Returns `None` for any non-canonical URL.
-pub(crate) fn parse_pr_number(pr_url: &str) -> Option<i64> {
-    pr_number_from_url(pr_url).map(|n| n as i64)
-}
+/// Re-exported from the persistence layer, which owns the stored `i64`
+/// representation; it in turn is a thin adaptor over the canonical
+/// [`pr_number_from_url`] helper in `boss_github` (including tolerance for
+/// the `/pull/<N>/files`, `?query`, and `#fragment` decorations). Returns
+/// `None` for any non-canonical URL.
+pub(crate) use crate::work::pr_number_from_url as parse_pr_number;
 
 /// Reviewer-fallback: advance a task from `active` to `in_review` when
 /// its AI reviewer pass has either finished without advancing it (missed Stop

@@ -1587,13 +1587,6 @@ pub(crate) fn merge_queue_rebounce_discriminator(pr_head_sha: &str) -> String {
     format!("mq:{pr_head_sha}")
 }
 
-/// Recover the PR head from a namespaced rebounce discriminator. Rows written
-/// before namespacing used the raw head directly, so callers must preserve
-/// that representation during the transition.
-pub(crate) fn merge_queue_rebounce_pr_head(discriminator: &str) -> &str {
-    discriminator.strip_prefix("mq:").unwrap_or(discriminator)
-}
-
 /// The composite per-episode discriminator a Trunk eviction is keyed on —
 /// see [`on_trunk_queue_eviction_detected`]'s doc comment. `trunk:` prefixed
 /// so it can never collide with a real git SHA (which `pr_branch_ci`/rebounce

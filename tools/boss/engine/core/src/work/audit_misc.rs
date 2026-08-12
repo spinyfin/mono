@@ -238,9 +238,9 @@ pub(crate) fn canonicalize_design_doc_repo_remote_url(value: Option<String>) -> 
 /// fail the whole request just because the URL formatter can't pull
 /// `owner/repo` out of the remote.
 pub(crate) fn render_design_doc_web_url(repo_remote_url: &str, branch: &str, path: &str) -> String {
-    match crate::completion::parse_repo_slug(repo_remote_url) {
-        Ok(slug) => format!("https://github.com/{slug}/blob/{branch}/{path}"),
-        Err(_) => format!("{repo_remote_url}/blob/{branch}/{path}"),
+    match git_utils::repo_slug::parse_github_slug(repo_remote_url) {
+        Some(slug) => format!("https://github.com/{slug}/blob/{branch}/{path}"),
+        None => format!("{repo_remote_url}/blob/{branch}/{path}"),
     }
 }
 
@@ -267,8 +267,7 @@ pub(crate) fn render_design_doc_raw_content_url(repo_remote_url: &str, branch: &
     // Git branch names (alphanumeric, `-`, `_`, `.`) are safe in a URL
     // path segment without encoding.
     let encoded_ref = branch.replace('/', "%2F");
-    crate::completion::parse_repo_slug(repo_remote_url)
-        .ok()
+    git_utils::repo_slug::parse_github_slug(repo_remote_url)
         .map(|slug| format!("https://raw.githubusercontent.com/{slug}/{encoded_ref}/{path}"))
 }
 

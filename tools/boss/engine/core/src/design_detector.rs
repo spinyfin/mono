@@ -30,7 +30,7 @@
 use anyhow::Result;
 
 use crate::work::WorkDb;
-use boss_protocol::{SetProjectDesignDocInput, TaskKind};
+use boss_protocol::SetProjectDesignDocInput;
 
 /// Metadata extracted from `gh pr view --json files,headRefName,baseRefName`.
 pub(crate) struct PrScanResult {
@@ -341,19 +341,6 @@ pub async fn on_design_pr_merged(
             );
         }
     }
-}
-
-/// Whether a docs-backed work item routes through the **per-task** doc
-/// pointer (this module's `on_task_doc_pr_*` + `tasks.doc_*` columns)
-/// rather than the per-project design-doc pointer.
-///
-/// `true` for every `kind = investigation` (its deliverable doc is never
-/// a project's design doc) and for project-less `kind = design` tasks
-/// (which have no project pointer to populate). `false` for design tasks
-/// that have a project — those keep using the per-project pointer — and
-/// for every kind that produces no doc.
-pub(crate) fn task_uses_per_task_doc(kind: &TaskKind, has_project: bool) -> bool {
-    matches!(kind, TaskKind::Investigation) || (matches!(kind, TaskKind::Design) && !has_project)
 }
 
 /// Per-task analogue of [`on_design_pr_detected`] for project-less
@@ -1189,23 +1176,5 @@ mod tests {
         });
         let scan = parse_pr_scan(&root);
         assert_eq!(scan.doc_path, None);
-    }
-
-    // ---- task_uses_per_task_doc routing ------------------------------
-
-    #[test]
-    fn task_doc_routing_matches_investigations_and_project_less_designs() {
-        // Investigations always route to the per-task pointer.
-        assert!(task_uses_per_task_doc(&TaskKind::Investigation, true));
-        assert!(task_uses_per_task_doc(&TaskKind::Investigation, false));
-        // Design with a project uses the per-project pointer; project-less
-        // design falls back to the per-task pointer.
-        assert!(!task_uses_per_task_doc(&TaskKind::Design, true));
-        assert!(task_uses_per_task_doc(&TaskKind::Design, false));
-        // Kinds that produce no doc never route to the per-task pointer.
-        assert!(!task_uses_per_task_doc(&TaskKind::Task, false));
-        assert!(!task_uses_per_task_doc(&TaskKind::Chore, false));
-        assert!(!task_uses_per_task_doc(&TaskKind::ProjectTask, false));
-        assert!(!task_uses_per_task_doc(&TaskKind::Revision, false));
     }
 }

@@ -2271,12 +2271,7 @@ fn work_item_id(item: &WorkItem) -> String {
 /// *kind*, independent of any particular execution — sharing this predicate
 /// is what keeps that derivation from drifting out of sync with the actual
 /// enqueue gate.
-pub(crate) fn should_enqueue_reviewer_for_primary(kind: &ExecutionKind) -> bool {
-    matches!(
-        kind,
-        ExecutionKind::ChoreImplementation | ExecutionKind::TaskImplementation
-    )
-}
+pub(crate) use crate::work::should_enqueue_reviewer_for_primary;
 
 /// Whether `execution` is a live worker that owns its own turn loop — i.e.
 /// the engine has dispatched it, its agent is driving, and a `Stop` from it
