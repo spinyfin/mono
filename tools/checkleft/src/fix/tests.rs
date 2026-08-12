@@ -1,4 +1,4 @@
-//! Integration tests for the `checkleft fix` pipeline (T12).
+//! Integration tests for the `checkleft fix` pipeline.
 //!
 //! These tests prove behavioral safety and correctness properties that span the
 //! sandbox, executor, and scheduler:
@@ -72,6 +72,12 @@ mode: declarative
 runtime: declarative-v1
 api_version: v1
 applies_to: ["**"]
+
+# The fixer subprocess plus its `--version` probe share one check-wide
+# deadline; keep it well above the few-millisecond real cost so ordinary
+# host scheduling jitter cannot be reported as a fixer failure.
+limits:
+  timeout_ms: 30000
 
 needs:
   fixer:
@@ -235,9 +241,9 @@ printf 'ESCAPED' > sandbox_escape.txt"#,
 
 // ── framework exclusion on the fix path ────────────────────────────────────
 
-/// Task 3 (fix path): an excluded file is removed from the fixable set before any
-/// invocation runs, so `--write` never stages or rewrites it. The non-excluded
-/// file is still fixed.
+/// An excluded file is removed from the fixable set before any invocation
+/// runs, so `--write` never stages or rewrites it. The non-excluded file is
+/// still fixed.
 #[cfg(unix)]
 #[test]
 fn run_declarative_fix_skips_excluded_files() {
@@ -267,6 +273,10 @@ done"#,
         |_| {},
     );
 
+    assert!(
+        outcomes.iter().all(|o| o.error.is_none()),
+        "no invocation should error: {outcomes:?}"
+    );
     assert_eq!(
         fs::read(dir.path().join("vendor/skip.txt")).unwrap(),
         b"fix me",
@@ -411,10 +421,14 @@ done"#,
     );
     assert_eq!(outcomes2.len(), 1, "one invocation outcome on second pass");
     assert!(
+        outcomes2[0].error.is_none(),
+        "no error on second pass: {:?}",
+        outcomes2[0].error
+    );
+    assert!(
         outcomes2[0].applied.is_empty(),
         "second pass on an already-fixed file must produce zero applied files"
     );
-    assert!(outcomes2[0].error.is_none(), "no error on second pass");
     assert_eq!(
         fs::read(dir.path().join("a.txt")).unwrap(),
         b"LOWER",
@@ -596,5 +610,5 @@ fn copy_back_first_error_stop_never_half_writes_a_file() {
 // because `compute_fix_plan` is a private function of `main.rs`. The unit
 // tests there cover: dirty partition, all-dirty check still appears, empty
 // dirty set does not filter, and the empty-dirty (allow_dirty=true) default.
-// This comment documents that T12 acknowledges those tests as the allow_dirty
-// proof; no duplication is needed here.
+// Those binary-crate tests are the allow_dirty coverage; duplicating them here
+// would add no proof.

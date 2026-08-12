@@ -149,7 +149,7 @@ fn near_deadline_subprocess_succeeds_and_captures_stdout() {
     let script = repo_root.path().join("near-deadline.sh");
     write_executable(
         &script,
-        "#!/bin/sh\nif [ \"$1\" = --version ]; then\n  printf 'test tool 1.0\\n'\n  exit 0\nfi\nsleep 1.5\nprintf 'src/lib.rs\\n'\n",
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then\n  printf 'test tool 1.0\\n'\n  exit 0\nfi\nsleep 8.5\nprintf 'src/lib.rs\\n'\n",
     );
     let manifest = format!(
         r#"
@@ -160,7 +160,14 @@ api_version = "v1"
 applies_to = ["**/*.rs"]
 
 [limits]
-timeout_ms = 3000
+# The child sleeps 8.5s against this 10s deadline, leaving under DRAIN_GRACE
+# (2s, see src/external/timeout.rs) of headroom at exit. This keeps the
+# near-deadline invariant intact: a regression that made the post-exit pipe
+# drain consume budget would push the check past its deadline and fail this
+# test. A busy CI host adds scheduling jitter before the child starts, which
+# the 10s ceiling (vs. the original 3s) absorbs without loosening the
+# post-exit margin the test actually guards.
+timeout_ms = 10000
 
 [needs.tool.default]
 path = "{}"
