@@ -28,7 +28,7 @@ final class SpawnCapabilityDiagnosticsTests: XCTestCase {
         onConsole: Bool = true,
         screens: Int = 1
     ) -> HostDisplaySnapshot {
-        HostDisplaySnapshot(
+        HostDisplaySnapshot.make(
             activeDisplayCount: active,
             onlineDisplayCount: online,
             mainDisplayAsleep: asleep,
@@ -97,6 +97,7 @@ final class SpawnCapabilityDiagnosticsTests: XCTestCase {
 
     /// The live reader must agree with itself: whatever this host is, the
     /// verdict derived from a fresh snapshot equals `current()`.
+    @MainActor
     func testCurrentMatchesVerdictOfSnapshot() {
         XCTAssertEqual(SpawnCapability.current(), SpawnCapability.verdict(for: SpawnCapability.snapshot()))
     }
@@ -135,6 +136,7 @@ final class SpawnCapabilityDiagnosticsTests: XCTestCase {
     /// process-lifetime token opts out of App Nap and explicitly permits
     /// display sleep. This one is the display-sleep suppressor, and it must
     /// carry `.idleDisplaySleepDisabled` or it repeats the same mistake.
+    @MainActor
     func testAssertionOptionsActuallySuppressDisplaySleep() {
         XCTAssertTrue(
             LiveWorkDisplayAssertion.activityOptions.contains(.idleDisplaySleepDisabled),
