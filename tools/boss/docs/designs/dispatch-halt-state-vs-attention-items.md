@@ -1,7 +1,7 @@
 # Boss: dispatch/execution halt state does not belong in attention items
 
-- **Status:** shipped (churn-guard park only) — see PR mono#TBD.
-- **Prompted by:** operator report that a churn-guard park is completely invisible on the kanban board (the card sits in Doing looking normal while nothing runs). The chore that produced this doc originally asked for a generic "render attention items on kanban cards" surface; the operator corrected that framing mid-flight — see git history on the originating chore for the correction text — because it would have cemented a category error rather than fixed it.
+- **Status:** shipped (churn-guard park only) — see PR mono#2742.
+- **Prompted by:** a churn-guard park being invisible on the kanban board — the card sits in Doing looking normal while nothing runs, and the only way to find it was the CLI. Rendering attention items on cards was considered and rejected: it would have made the wrong representation load-bearing rather than fixing it.
 - **Code:** `tools/boss/engine/core/src/attention_lifecycle.rs` (the kind registry this doc classifies), `tools/boss/engine/core/src/orphan_sweep.rs`, `tools/boss/engine/core/src/work/dispatch.rs` (`bounce_dispatch_failed_to_backlog`), `tools/boss/app-macos/Sources/WorkBoardCard.swift` (`WorkDispatchFailureBanner`).
 
 ## The rule
@@ -18,7 +18,7 @@ Attention items remain the right mechanism whenever the honest answer to "what c
 
 `churn_guard_parked` (filed by `orphan_sweep` when an `active` work item accumulates too many terminal executions in the trailing window) moves off `work_attention_items` entirely. It now goes through the same mechanism a pre-spawn dispatch failure already uses: `WorkDb::bounce_dispatch_failed_to_backlog(work_item_id, "churn_guard", body)`. See the code comment on that call site in `orphan_sweep.rs` for the exact tradeoffs (status change, retry cadence).
 
-`pr_review_recovery`'s use of the _same_ `churn_guard_parked` kind is explicitly **not** touched by this PR — see `[deferred-scope]` in the PR this doc ships with. It guards a `pr_review` execution for an `in_review` task, where "Backlog" is not a meaningful destination (the task has an open PR under active review); it needs its own board-surfacing design, not a copy-paste of the active-task fix.
+`pr_review_recovery`'s use of the _same_ `churn_guard_parked` kind is explicitly **not** touched by this PR — the deferral is recorded on the PR that ships this doc. It guards a `pr_review` execution for a task under active review, where "Backlog" is not a meaningful destination (the task has an open PR under active review); it needs its own board-surfacing design, not a copy-paste of the active-task fix.
 
 ## Classification of every kind in `ATTENTION_LIFECYCLES` (as of this audit)
 
@@ -49,4 +49,4 @@ Of particular note, since a sibling chore ("worker_blocked and worker_escalation
 
 ## Migration for pre-existing open `churn_guard_parked` items
 
-A one-shot data migration (`migrate_convert_open_churn_guard_parked_to_dispatch_failed`, `tools/boss/engine/core/src/work/migrations_c.rs`) converts any `work_attention_items` row with `kind = 'churn_guard_parked'`, `status = 'open'`, whose target task is still `status = 'active'`, into the new `dispatch_failed_reason` representation, then marks the attention item resolved. This preserves the information (same title/body land in `dispatch_failed_error`) rather than discarding it — it is a representation change, not a silent dismissal. Rows attached to a task in any other status (e.g. `in_review`, from `pr_review_recovery`) are left untouched, since that path still uses the attention item.
+A one-shot data migration (`migrate_convert_open_churn_guard_parked_to_dispatch_failed`, `tools/boss/engine/core/src/work/migrations_c.rs`) converts any `work_attention_items` row with `kind = 'churn_guard_parked'`, `status = 'open'`, whose target task is still `status = 'active'` and whose body text records `orphan_sweep` as the source, into the new `dispatch_failed_reason` representation, then marks the attention item resolved. This preserves the information (same title/body land in `dispatch_failed_error`) rather than discarding it — it is a representation change, not a silent dismissal. The source check matters because `pr_review_recovery` can also file this kind against an `active` task (`list_dead_pr_review_candidates` allows any status other than `done`/`archived`, not just `in_review`), so task status alone cannot tell the two sources apart; rows recording `pr_review_recovery` as their source are left untouched, since that path still uses the attention item.

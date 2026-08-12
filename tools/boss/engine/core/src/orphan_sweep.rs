@@ -30,25 +30,36 @@
 //!    the execution is genuinely live and the candidate is skipped.
 //!    As a defense-in-depth guard, any candidate whose live execution is
 //!    still in a live status at this point is also skipped unconditionally.
-//! 4. Applies the churn guard: if the work item has already had
-//!    [`ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD`] terminal executions
-//!    in the last [`ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS`], it is
-//!    skipped, a warning is logged, and the item is bounced to Backlog via
-//!    [`crate::work::WorkDb::bounce_churn_guard_parked_to_backlog`] (the
-//!    same `dispatch_failed_reason` surface a pre-spawn dispatch failure
-//!    uses) so the kanban board shows the park instead of the card sitting
-//!    in Doing looking idle — see
-//!    `docs/designs/dispatch-halt-state-vs-attention-items.md`. Auto-clears
-//!    once [`crate::dispatch_failure_recovery_sweep`] retries it after its
-//!    cooldown and the trailing window has drained below its own threshold,
-//!    or immediately on an explicit `bossctl work start` / kanban
-//!    drag-to-Doing, either of which bypasses the guard entirely.
-//! 5. Applies the **durable-process guard**: probes the pid recorded on the
+//! 4. Applies the **durable-process guard**: probes the pid recorded on the
 //!    item's most recent local run ([`crate::durable_liveness`]) and refuses
 //!    to redispatch while that process is alive, then hands the contradiction
 //!    to [`crate::worker_readoption`] to be resolved. Every guard above this
 //!    one reads engine bookkeeping, which is exactly what is wrong in the
 //!    failure this guards — see the comment at the call site.
+//! 5. Only once both liveness guards above have passed does the sweep act on
+//!    the churn guard it evaluated earlier in the pass: if the work item has
+//!    already had [`ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD`] terminal
+//!    executions in the last [`ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS`],
+//!    it is skipped, a warning is logged, and the item is bounced to Backlog
+//!    via [`crate::work::WorkDb::bounce_churn_guard_parked_to_backlog`] (the
+//!    same `dispatch_failed_reason` surface a pre-spawn dispatch failure
+//!    uses) so the kanban board shows the park instead of the card sitting
+//!    in Doing looking idle — see
+//!    `docs/designs/dispatch-halt-state-vs-attention-items.md`. The bounce is
+//!    deliberately sequenced *after* steps 3 and 4: those are the only
+//!    checks that can tell a churn-tripped row apart from a row whose
+//!    previous worker process is still alive (a live-but-untracked worker
+//!    tends to also produce the terminal-execution churn that trips this
+//!    guard), and bouncing first would demote a row to Backlog with a
+//!    failure banner while its previous worker is still editing the
+//!    workspace. Auto-clears once [`crate::dispatch_failure_recovery_sweep`]
+//!    retries it after its cooldown: that sweep recognises a
+//!    `CHURN_GUARD_DISPATCH_FAILED_REASON` row and applies *this* guard's
+//!    own threshold/window to it (not its own looser 5-in-24h one), so the
+//!    3-in-1h contract carries over unchanged rather than being weakened by
+//!    the representation change. Also clears immediately on an explicit
+//!    `bossctl work start` / kanban drag-to-Doing, either of which bypasses
+//!    the guard entirely.
 //! 6. Calls [`WorkDb::request_execution_with_live_check`] (the same
 //!    path `bossctl work start` uses) to mark the stale execution
 //!    `abandoned` and insert a fresh `ready` execution, then kicks
@@ -206,6 +217,21 @@ pub async fn run_one_pass(
 
     for work_item_id in candidates {
         // Churn guard: count terminal executions in the trailing window.
+        // Deliberately read-only here — whether the threshold is tripped is
+        // decided now (recorded in the dispatch-decision event below), but
+        // the *mutating* bounce-to-Backlog is deferred until after the
+        // live-execution guard and the durable-process guard, both further
+        // down, have had a chance to skip first. Those two guards are the
+        // only things in this loop that can tell a churn-tripped row apart
+        // from a row whose previous worker process is still alive — the
+        // 2026-07-28 storm shape that produces >= 3 terminal executions in
+        // an hour is exactly the shape that also confuses engine bookkeeping
+        // about liveness (`docs/investigations/worker-liveness-convergence-design-review.md`
+        // sec 3.3), so the two are correlated, not independent. Bouncing
+        // before those guards run would demote a row to Backlog with a
+        // failure banner while its previous worker is still editing the
+        // workspace, and `autostart = 0` means the engine would never pick
+        // it back up on its own.
         let recent_terminal = match work_db.count_recent_terminal_executions(&work_item_id, churn_cutoff, None) {
             Ok(n) => n,
             Err(err) => {
@@ -217,27 +243,7 @@ pub async fn run_one_pass(
                 continue;
             }
         };
-        if recent_terminal >= ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
-            tracing::warn!(
-                work_item_id = %work_item_id,
-                recent_terminal,
-                threshold = ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD,
-                window_secs = ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS,
-                "orphan sweep: churn guard tripped; skipping redispatch — human attention required",
-            );
-            let failing_ids = work_db
-                .list_recent_terminal_execution_ids(&work_item_id, churn_cutoff, None)
-                .unwrap_or_default();
-            work_db.bounce_churn_guard_parked_to_backlog(
-                &work_item_id,
-                "orphan_sweep",
-                recent_terminal,
-                &failing_ids,
-                "terminal executions",
-            );
-            outcome.churn_skipped += 1;
-            continue;
-        }
+        let churn_tripped = recent_terminal >= ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD;
 
         // Decision-point instrumentation (re-dispatch storm visibility).
         //
@@ -397,6 +403,33 @@ pub async fn run_one_pass(
             convergence
                 .converge_live_worker(&blocking_execution_id, "redispatch_guard")
                 .await;
+            continue;
+        }
+
+        // Now apply the churn guard's mutation. Both liveness guards above
+        // have already run and neither skipped this candidate, so we know
+        // (as well as this sweep ever can) that there is no live execution
+        // and no live previous-worker process for this row — only now is it
+        // safe to bounce it to Backlog with a failure banner.
+        if churn_tripped {
+            tracing::warn!(
+                work_item_id = %work_item_id,
+                recent_terminal,
+                threshold = ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD,
+                window_secs = ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS,
+                "orphan sweep: churn guard tripped; skipping redispatch — human attention required",
+            );
+            let failing_ids = work_db
+                .list_recent_terminal_execution_ids(&work_item_id, churn_cutoff, None)
+                .unwrap_or_default();
+            work_db.bounce_churn_guard_parked_to_backlog(
+                &work_item_id,
+                "orphan_sweep",
+                recent_terminal,
+                &failing_ids,
+                "terminal executions",
+            );
+            outcome.churn_skipped += 1;
             continue;
         }
 
@@ -857,6 +890,63 @@ mod tests {
         );
     }
 
+    /// Regression: the churn guard must not bounce a row to Backlog while
+    /// the row's previous worker process is still alive. Before the fix,
+    /// the churn-guard bounce ran and mutated the row (`status = 'todo'`,
+    /// `autostart = 0`, failure banner) *before* the durable-process guard
+    /// ever got a chance to detect the live process, so a worker still
+    /// editing the workspace would get its work item yanked out from under
+    /// it. The durable-process guard must win: no bounce, status stays
+    /// `active`, and the live-process path (not the churn path) is the one
+    /// that fires.
+    #[tokio::test]
+    async fn churn_trip_does_not_bounce_while_prior_process_is_alive() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+
+        // Enough terminal executions to trip the churn guard...
+        let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
+        for i in 0..ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
+            db.insert_terminal_execution_for_test(&work_item_id, "chore_implementation", "orphaned", now_epoch - i)
+                .unwrap();
+        }
+        // ...but the most recent run's shell_pid is still alive (our own
+        // pid stands in for the still-running worker shell).
+        let execution_id = create_spawned_execution(&db, &work_item_id, i64::from(std::process::id()));
+        db.mark_execution_orphaned(&execution_id, "spawn-ack timeout; worker presumed dead")
+            .unwrap();
+        make_old(&db, &work_item_id);
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let convergence = RecordingConvergence::default();
+
+        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), &convergence).await;
+
+        assert_eq!(
+            outcome.live_process_skipped, 1,
+            "the durable-process guard must fire before the churn guard's bounce"
+        );
+        assert_eq!(
+            outcome.churn_skipped, 0,
+            "the churn bounce must not run while a prior process is alive"
+        );
+        assert_eq!(outcome.redispatched, 0);
+
+        let task = get_task(&db, &work_item_id);
+        assert_eq!(
+            task.status.as_str(),
+            "active",
+            "the row must not be bounced to Backlog while its prior worker is still alive"
+        );
+        assert!(
+            task.dispatch_failed_reason.is_none(),
+            "no churn-guard park while the process is alive"
+        );
+    }
+
     fn get_task(db: &WorkDb, work_item_id: &str) -> boss_protocol::Task {
         match db.get_work_item(work_item_id).unwrap() {
             boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t,
@@ -894,8 +984,8 @@ mod tests {
     /// claimed — but it is still alive and waiting for a response.
     ///
     /// Previously the sweep treated unclaimed + non-terminal as "dead worker"
-    /// and double-dispatched a second worker onto the same row (T1104 /
-    /// exec_18b508391244f798_34 → exec_18b508565e3b6e30_39).
+    /// and double-dispatched a second worker onto the same row
+    /// (exec_18b508391244f798_34 → exec_18b508565e3b6e30_39).
     #[tokio::test]
     async fn skips_item_with_waiting_human_execution() {
         let (_dir, db) = open_db();
@@ -1013,7 +1103,8 @@ mod tests {
         );
     }
 
-    /// Regression for the critical finding in T1647's automated review:
+    /// Regression: the sweep double-dispatched a second worker onto the same
+    /// row when the live worker was a review-pool `pr_review` execution.
     ///
     /// A `running` `pr_review` execution is a live reviewer pane actively
     /// working (`RunWaitState::WorkerPaneAlive`). The reviewer is claimed

@@ -37,6 +37,20 @@
 //! then on it stays parked for the human, and the attention item raised
 //! at the original bounce remains the escalation; this sweep does not
 //! raise a second one on every skip.
+//!
+//! `crate::orphan_sweep`'s own churn guard also parks a work item through
+//! this same `dispatch_failed_reason` representation
+//! ([`crate::work::CHURN_GUARD_DISPATCH_FAILED_REASON`]), which makes such a
+//! row a candidate here too. Applying this sweep's own looser 5-in-24h guard
+//! to it would silently weaken the 3-in-1h contract that parked it in the
+//! first place — this sweep would retry it after its 10-minute cooldown,
+//! long before orphan_sweep's 1-hour trailing window has drained. So this
+//! sweep reads each candidate's `dispatch_failed_reason` and, for a
+//! churn-park row, applies orphan_sweep's own
+//! [`crate::work::ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD`]/
+//! [`crate::work::ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS`] instead of its
+//! own — the 3-in-1h contract carries over unchanged rather than being
+//! diluted by the representation change.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,8 +60,9 @@ use boss_protocol::RequestExecutionInput;
 use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::work::{
-    DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_THRESHOLD, DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_WINDOW_SECS,
-    DISPATCH_FAILURE_RECOVERY_MIN_AGE_SECS, WorkDb,
+    CHURN_GUARD_DISPATCH_FAILED_REASON, DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_THRESHOLD,
+    DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_WINDOW_SECS, DISPATCH_FAILURE_RECOVERY_MIN_AGE_SECS,
+    ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD, ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS, WorkDb,
 };
 
 /// Counts from one pass of the sweep; logged at `info` when non-zero.
@@ -119,13 +134,45 @@ pub async fn run_one_pass(
     };
 
     let now_epoch_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
-    let churn_cutoff = now_epoch_secs - DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_WINDOW_SECS;
 
     // Snapshot of claimed execution ids across every pool, same shape
     // orphan_sweep uses, so a live execution is never mistaken for dead.
     let claimed = coordinator.all_claimed_execution_ids().await;
 
     for work_item_id in candidates {
+        // A row parked by `bounce_churn_guard_parked_to_backlog` carries
+        // `dispatch_failed_reason = CHURN_GUARD_DISPATCH_FAILED_REASON`. Its
+        // guard was orphan_sweep's tighter 3-in-1h contract, not this sweep's
+        // looser 5-in-24h one — applying the looser threshold here would let
+        // this sweep re-dispatch a row twice inside ~20 minutes before the
+        // 3-in-1h guard it inherited ever gets a chance to stick. Use the
+        // orphan sweep's own threshold/window for that reason so the
+        // contract survives the churn park moving off `active` status onto
+        // this representation.
+        let is_churn_park = match work_db.get_dispatch_failed_reason(&work_item_id) {
+            Ok(reason) => reason.as_deref() == Some(CHURN_GUARD_DISPATCH_FAILED_REASON),
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id = %work_item_id,
+                    ?err,
+                    "dispatch-failure recovery sweep: failed to read dispatch_failed_reason; skipping item",
+                );
+                continue;
+            }
+        };
+        let (churn_threshold, churn_window_secs) = if is_churn_park {
+            (
+                ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD,
+                ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS,
+            )
+        } else {
+            (
+                DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_THRESHOLD,
+                DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_WINDOW_SECS,
+            )
+        };
+        let churn_cutoff = now_epoch_secs - churn_window_secs;
+
         let recent_terminal = match work_db.count_recent_terminal_executions(&work_item_id, churn_cutoff, None) {
             Ok(n) => n,
             Err(err) => {
@@ -137,12 +184,13 @@ pub async fn run_one_pass(
                 continue;
             }
         };
-        if recent_terminal >= DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_THRESHOLD {
+        if recent_terminal >= churn_threshold {
             tracing::warn!(
                 work_item_id = %work_item_id,
                 recent_terminal,
-                threshold = DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_THRESHOLD,
-                window_secs = DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_WINDOW_SECS,
+                threshold = churn_threshold,
+                window_secs = churn_window_secs,
+                is_churn_park,
                 "dispatch-failure recovery sweep: churn guard tripped; leaving parked for human attention",
             );
             outcome.churn_skipped += 1;
@@ -360,6 +408,62 @@ mod tests {
         assert!(
             !task.autostart,
             "autostart must stay cleared once the churn guard trips"
+        );
+    }
+
+    /// Regression: a row parked by `orphan_sweep`'s churn guard
+    /// (`dispatch_failed_reason = CHURN_GUARD_DISPATCH_FAILED_REASON`) must
+    /// keep its 3-in-1h contract even after this sweep's own looser
+    /// 5-in-24h churn guard would otherwise let it through. Before the fix,
+    /// `list_dispatch_failed_recovery_candidates` applied
+    /// `DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_THRESHOLD` (5) unconditionally,
+    /// so a churn-parked row with only `ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD`
+    /// (3) terminal executions would be re-dispatched here 10 minutes after
+    /// being parked — defeating the guard that parked it.
+    #[tokio::test]
+    async fn churn_park_keeps_orphan_threshold_not_recovery_threshold() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product_id)
+                    .name("churn-parked chore")
+                    .build(),
+            )
+            .unwrap();
+        let work_item_id = chore.id;
+
+        let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
+        for i in 0..crate::work::ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
+            db.insert_terminal_execution_for_test(&work_item_id, "chore_implementation", "failed", now_epoch - i)
+                .unwrap();
+        }
+        db.bounce_churn_guard_parked_to_backlog(&work_item_id, "orphan_sweep", 3, &[], "terminal executions");
+        assert_eq!(
+            get_task(&db, &work_item_id).dispatch_failed_reason.as_deref(),
+            Some(crate::work::CHURN_GUARD_DISPATCH_FAILED_REASON),
+            "setup must produce a churn-guard-parked row"
+        );
+        make_failure_old(&db, &work_item_id, DISPATCH_FAILURE_RECOVERY_MIN_AGE_SECS + 60);
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+
+        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref()).await;
+
+        assert_eq!(
+            outcome.churn_skipped, 1,
+            "orphan sweep's 3-in-1h threshold must still apply to a churn-parked row"
+        );
+        assert_eq!(outcome.redispatched, 0);
+        assert!(sink.events().await.is_empty());
+
+        let task = get_task(&db, &work_item_id);
+        assert!(
+            !task.autostart,
+            "a churn-parked row must stay parked, not be re-dispatched on the looser recovery threshold"
         );
     }
 

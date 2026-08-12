@@ -680,11 +680,19 @@ pub(crate) fn migrate_correct_falsely_answered_comments_with_failed_runs(conn: &
 /// item itself is marked `resolved` (not deleted) — the representation
 /// changed, nothing was silently dismissed.
 ///
-/// Scoped to `status = 'active'` tasks only: `pr_review_recovery` files
-/// the same attention `kind` for `in_review` tasks (a reviewer dying
-/// repeatedly), where Backlog is not a meaningful destination — those
-/// rows are left exactly as they were, still open attention items, still
-/// handled by that sweep.
+/// Scoped to items filed by `orphan_sweep`, not by task status: both
+/// `orphan_sweep` and `pr_review_recovery` file the same attention `kind`,
+/// and `pr_review_recovery`'s target task can itself be `active` (it fires
+/// off `list_dead_pr_review_candidates`, which allows `status NOT IN
+/// ('done', 'archived')` — not just `in_review`). Inferring the source from
+/// task status would therefore wrongly convert a `pr_review_recovery`-filed
+/// item on an `active` task, misattributing a dying reviewer to a dispatch
+/// failure and bouncing a row whose actual problem is review-side.
+/// `churn_guard_parked_text` stamps the sweep name into `body_markdown`
+/// verbatim (`` The `{source}` sweep stopped auto-redispatching... ``), so
+/// matching on that text recovers the real source without needing a second
+/// attention kind. Rows filed by `pr_review_recovery` are left exactly as
+/// they were, still open attention items, still handled by that sweep.
 pub(crate) fn migrate_convert_open_churn_guard_parked_to_dispatch_failed(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare(
         "SELECT wai.id, wai.work_item_id, wai.body_markdown
@@ -693,7 +701,8 @@ pub(crate) fn migrate_convert_open_churn_guard_parked_to_dispatch_failed(conn: &
           WHERE wai.kind = 'churn_guard_parked'
             AND wai.status = 'open'
             AND t.status = 'active'
-            AND t.deleted_at IS NULL",
+            AND t.deleted_at IS NULL
+            AND wai.body_markdown LIKE '%`orphan_sweep` sweep%'",
     )?;
     let candidates: Vec<(String, String, String)> = stmt
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
@@ -766,7 +775,10 @@ mod churn_guard_migration_tests {
                 CreateAttentionItemInput::builder()
                     .kind(crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND)
                     .title("Parked by churn guard — 3 recent failures")
-                    .body_markdown("some pre-existing failure detail; bossctl work start test_id")
+                    .body_markdown(
+                        "The `orphan_sweep` sweep stopped auto-redispatching this work item: some \
+                         pre-existing failure detail; bossctl work start test_id",
+                    )
                     .work_item_id(work_item_id.clone())
                     .build(),
             )
@@ -783,12 +795,59 @@ mod churn_guard_migration_tests {
         assert_eq!(task.dispatch_failed_reason.as_deref(), Some("churn_guard"));
         assert_eq!(
             task.dispatch_failed_error.as_deref(),
-            Some("some pre-existing failure detail; bossctl work start test_id")
+            Some(
+                "The `orphan_sweep` sweep stopped auto-redispatching this work item: some pre-existing \
+                 failure detail; bossctl work start test_id"
+            )
         );
 
         let resolved = db.get_attention_item(&item.id).unwrap();
         assert_eq!(resolved.status, "resolved");
         assert!(resolved.resolved_at.is_some());
+    }
+
+    /// A `pr_review_recovery`-sourced open `churn_guard_parked` item whose
+    /// target task happens to be `active` (not `in_review`) must NOT be
+    /// converted — `list_dead_pr_review_candidates` allows `active` tasks,
+    /// so inferring the source from task status alone would misattribute a
+    /// repeatedly-dying reviewer to a dispatch failure and bounce a row
+    /// whose actual problem is review-side. The migration must key off the
+    /// body text's recorded source instead.
+    #[test]
+    fn leaves_active_task_with_pr_review_recovery_sourced_item_untouched() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+
+        let item = db
+            .create_attention_item(
+                CreateAttentionItemInput::builder()
+                    .kind(crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND)
+                    .title("Parked by churn guard — 3 recent failures")
+                    .body_markdown("The `pr_review_recovery` sweep stopped auto-redispatching this work item: dead pr_review detail")
+                    .work_item_id(work_item_id.clone())
+                    .build(),
+            )
+            .unwrap();
+
+        {
+            let conn = db.connect().unwrap();
+            migrate_convert_open_churn_guard_parked_to_dispatch_failed(&conn).unwrap();
+        }
+
+        let task = get_task(&db, &work_item_id);
+        assert_eq!(
+            task.status.as_str(),
+            "active",
+            "an active task must not be bounced to Backlog"
+        );
+        assert!(task.dispatch_failed_reason.is_none());
+
+        let untouched = db.get_attention_item(&item.id).unwrap();
+        assert_eq!(
+            untouched.status, "open",
+            "the pr_review_recovery-sourced item must stay open"
+        );
     }
 
     /// An open `churn_guard_parked` item on an `in_review` task (the

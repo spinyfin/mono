@@ -422,6 +422,31 @@ impl WorkDb {
         Ok(out)
     }
 
+    /// Current `tasks.dispatch_failed_reason` for `work_item_id`, if any.
+    ///
+    /// [`crate::dispatch_failure_recovery_sweep`] uses this to tell a row
+    /// parked by [`Self::bounce_churn_guard_parked_to_backlog`]
+    /// (`reason = `[`crate::work::CHURN_GUARD_DISPATCH_FAILED_REASON`]`)
+    /// apart from an ordinary pre-spawn dispatch failure, so it can apply
+    /// the orphan sweep's own tighter
+    /// [`crate::work::ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD`]/
+    /// [`crate::work::ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS`] instead of
+    /// this sweep's looser 5-in-24h guard — otherwise the churn park's
+    /// 3-in-1h contract would not survive the move off `active` status onto
+    /// `dispatch_failed_reason`.
+    pub fn get_dispatch_failed_reason(&self, work_item_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let reason: Option<String> = conn
+            .query_row(
+                "SELECT dispatch_failed_reason FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+                params![work_item_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(reason)
+    }
+
     /// Reverse of [`Self::bounce_dispatch_failed_to_backlog`]: re-enable
     /// `autostart` on a work item the engine previously parked after a
     /// pre-spawn dispatch failure, so the fresh `ready` execution the

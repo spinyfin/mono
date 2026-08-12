@@ -32,11 +32,15 @@ pub(crate) struct DispatchAdmissionFacts {
     /// resolving dependencies for a row that can't dispatch anyway).
     #[builder(default)]
     pub unmet_dependencies: Vec<String>,
-    /// `true` when an open `churn_guard_parked` attention item exists for
-    /// this work item. Informational only: an explicit dispatch request
-    /// (forced or not) has always cleared this rather than being blocked
-    /// by it — see `request_execution_in_tx_with_live_check`'s
-    /// unconditional `resolve_attention_kind_in_tx` call.
+    /// `true` when the item is churn-guard parked under either
+    /// representation: an open `churn_guard_parked` attention item
+    /// (`pr_review_recovery`'s path) or `tasks.dispatch_failed_reason =
+    /// 'churn_guard'` (`orphan_sweep`'s path) — see the query in
+    /// [`dispatch_admission_facts`] for why both are checked. Informational
+    /// only: an explicit dispatch request (forced or not) has always
+    /// cleared this rather than being blocked by it — see
+    /// `request_execution_in_tx_with_live_check`'s unconditional
+    /// `resolve_attention_kind_in_tx` call.
     #[builder(default)]
     pub churn_guard_parked: bool,
     /// `true` when the task has `autostart = false` and is still `todo`.
