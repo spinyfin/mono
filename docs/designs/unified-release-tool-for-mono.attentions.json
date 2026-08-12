@@ -1,0 +1,28 @@
+[
+  {
+    "question_type": "yes_no",
+    "prompt": "Bring Boss's release record (version resolution, tag, notes, draft, upload, verify, publish) into the shared tool in v1? Saying yes gives Boss draft-then-publish and .sha256 sidecars it lacks today, and gives checkleft/appoint Boss's hardened REST + git-ls-remote version resolution they lack today. Saying no keeps v1 to checkleft + appoint only, and drops the Boss migration task from the breakdown.",
+    "anchor": "boss-app-in-or-out"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Keep checkleft's X.Y.Z-alpha.N version scheme? Keeping it means the tool carries two version-scheme enum variants indefinitely. Retiring it means one scheme, but requires re-pinning every external consumer (appoint, checkleft-sandbox) and is visible in every future tag name.",
+    "anchor": "defaults-which-behaviour-wins"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "What should the binary be called? It appears as //tools/release, a repobin entry, and @multitool//tools/<name> in external repos. 'release' is descriptive but very generic for something a human might put on PATH.",
+    "choices": ["release", "relcut", "cutter", "shipwright"],
+    "anchor": "shape"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "How should per-product settings reach the tool? The file option exists so the required-asset list is one source of truth shared by the upload phase and the verify phase; flags would mean two copies in two shell invocations that can drift.",
+    "choices": [
+      "A small flat TOML file per product (8 keys, closed enums, no inheritance/interpolation/conditionals)",
+      "CLI flags only, passed from each shell step",
+      "A compiled-in table in the Rust binary, one struct literal per product"
+    ],
+    "anchor": "configuration"
+  }
+]
