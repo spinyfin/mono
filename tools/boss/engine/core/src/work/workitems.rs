@@ -275,6 +275,35 @@ impl WorkDb {
         failing_execution_ids: &[String],
         counted_scope: &str,
     ) {
+        let (title, body) = Self::churn_guard_parked_text(
+            work_item_id,
+            source,
+            recent_terminal,
+            failing_execution_ids,
+            counted_scope,
+        );
+        if let Err(err) =
+            self.upsert_external_tracker_attention(work_item_id, CHURN_GUARD_PARKED_ATTENTION_KIND, &title, &body)
+        {
+            tracing::warn!(
+                work_item_id = %work_item_id,
+                ?err,
+                "churn guard: failed to file parked attention item",
+            );
+        }
+    }
+
+    /// Title/body text shared by [`Self::file_churn_guard_parked_attention`]
+    /// and [`Self::bounce_churn_guard_parked_to_backlog`], so both callers
+    /// describe the same trip in the same words regardless of which
+    /// representation they file it as.
+    fn churn_guard_parked_text(
+        work_item_id: &str,
+        source: &str,
+        recent_terminal: i64,
+        failing_execution_ids: &[String],
+        counted_scope: &str,
+    ) -> (String, String) {
         let title = format!("Parked by churn guard — {recent_terminal} recent failures");
         let ids = if failing_execution_ids.is_empty() {
             "(could not resolve the failing execution ids)".to_owned()
@@ -292,14 +321,62 @@ impl WorkDb {
              sweep pass redispatches successfully. To bypass the guard and retry immediately, run \
              `bossctl work start {work_item_id}`."
         );
-        if let Err(err) =
-            self.upsert_external_tracker_attention(work_item_id, CHURN_GUARD_PARKED_ATTENTION_KIND, &title, &body)
-        {
-            tracing::warn!(
-                work_item_id = %work_item_id,
-                ?err,
-                "churn guard: failed to file parked attention item",
-            );
+        (title, body)
+    }
+
+    /// Bounce an `active` work item to Backlog when the churn guard trips —
+    /// the replacement for [`Self::file_churn_guard_parked_attention`] on
+    /// [`crate::orphan_sweep`]'s path (an `active` task with no live
+    /// execution). Reuses the same `dispatch_failed_reason` /
+    /// `dispatch_failed_error` / `dispatch_failed_at` representation a
+    /// pre-spawn dispatch failure uses
+    /// ([`Self::bounce_dispatch_failed_to_backlog`], reason
+    /// [`CHURN_GUARD_DISPATCH_FAILED_REASON`]), so the kanban board shows the
+    /// park (`WorkDispatchFailureBanner` in the macOS app) and the row
+    /// returns to Backlog (`status = 'todo'`) without ever reading
+    /// `work_attention_items` — see
+    /// `docs/designs/dispatch-halt-state-vs-attention-items.md` for why.
+    ///
+    /// [`crate::pr_review_recovery`] keeps filing the attention-item form
+    /// via [`Self::file_churn_guard_parked_attention`]: its target task
+    /// stays `in_review`, and `bounce_dispatch_failed_to_backlog` only
+    /// applies to `todo`/`active` rows — Backlog is not a meaningful
+    /// destination for a task with an open PR under review.
+    ///
+    /// Best-effort like its attention-item sibling: the caller has already
+    /// logged the trip via `tracing::warn!`; a failure (or a no-op because
+    /// the row raced a status change) is logged and swallowed rather than
+    /// aborting the sweep pass.
+    pub fn bounce_churn_guard_parked_to_backlog(
+        &self,
+        work_item_id: &str,
+        source: &str,
+        recent_terminal: i64,
+        failing_execution_ids: &[String],
+        counted_scope: &str,
+    ) {
+        let (_, body) = Self::churn_guard_parked_text(
+            work_item_id,
+            source,
+            recent_terminal,
+            failing_execution_ids,
+            counted_scope,
+        );
+        match self.bounce_dispatch_failed_to_backlog(work_item_id, CHURN_GUARD_DISPATCH_FAILED_REASON, &body) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    work_item_id = %work_item_id,
+                    "churn guard: bounce to backlog was a no-op (work item is no longer todo/active)",
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id = %work_item_id,
+                    ?err,
+                    "churn guard: failed to bounce work item to backlog",
+                );
+            }
         }
     }
 

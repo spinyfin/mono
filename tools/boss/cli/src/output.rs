@@ -978,6 +978,12 @@ pub(crate) fn print_task_details(title: &str, task: &Task, parent_product: Optio
     if let Some(reason) = task.archived_reason.as_deref() {
         println!("Archived reason: {reason}");
     }
+    if let Some(reason) = task.dispatch_failed_reason.as_deref() {
+        println!("Dispatch failed: {reason}");
+        if let Some(error) = task.dispatch_failed_error.as_deref() {
+            println!("  {error}");
+        }
+    }
     if let Some(product) = parent_product {
         println!("Repo: {}", format_repo_line(task.repo_remote_url.as_deref(), product),);
     }

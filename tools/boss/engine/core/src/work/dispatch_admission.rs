@@ -32,11 +32,15 @@ pub(crate) struct DispatchAdmissionFacts {
     /// resolving dependencies for a row that can't dispatch anyway).
     #[builder(default)]
     pub unmet_dependencies: Vec<String>,
-    /// `true` when an open `churn_guard_parked` attention item exists for
-    /// this work item. Informational only: an explicit dispatch request
-    /// (forced or not) has always cleared this rather than being blocked
-    /// by it — see `request_execution_in_tx_with_live_check`'s
-    /// unconditional `resolve_attention_kind_in_tx` call.
+    /// `true` when the item is churn-guard parked under either
+    /// representation: an open `churn_guard_parked` attention item
+    /// (`pr_review_recovery`'s path) or `tasks.dispatch_failed_reason =
+    /// 'churn_guard'` (`orphan_sweep`'s path) — see the query in
+    /// [`dispatch_admission_facts`] for why both are checked. Informational
+    /// only: an explicit dispatch request (forced or not) has always
+    /// cleared this rather than being blocked by it — see
+    /// `request_execution_in_tx_with_live_check`'s unconditional
+    /// `resolve_attention_kind_in_tx` call.
     #[builder(default)]
     pub churn_guard_parked: bool,
     /// `true` when the task has `autostart = false` and is still `todo`.
@@ -144,9 +148,26 @@ impl WorkDb {
                         }
                     }
                 };
+                // Two representations, one per caller: `orphan_sweep` bounces
+                // an `active` task straight to `dispatch_failed_reason =
+                // 'churn_guard'` (see `WorkDb::bounce_churn_guard_parked_to_backlog`),
+                // while `pr_review_recovery` still files the
+                // `churn_guard_parked` attention item for an `in_review` task
+                // (Backlog is not a meaningful bounce target for a task with
+                // an open PR under review). Checking both keeps this
+                // informational-only fact accurate for either source — see
+                // `docs/designs/dispatch-halt-state-vs-attention-items.md`.
                 let churn_guard_parked: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM work_attention_items WHERE work_item_id = ?1 AND kind = ?2 AND status = 'open'",
-                    params![resolved_work_item_id, CHURN_GUARD_PARKED_ATTENTION_KIND],
+                    "SELECT
+                        (SELECT COUNT(*) FROM tasks
+                          WHERE id = ?1 AND dispatch_failed_reason = ?3)
+                        + (SELECT COUNT(*) FROM work_attention_items
+                            WHERE work_item_id = ?1 AND kind = ?2 AND status = 'open')",
+                    params![
+                        resolved_work_item_id,
+                        CHURN_GUARD_PARKED_ATTENTION_KIND,
+                        CHURN_GUARD_DISPATCH_FAILED_REASON
+                    ],
                     |row| row.get(0),
                 )?;
                 let autostart_disabled = autostart == 0 && status == TaskStatus::Todo;
@@ -203,5 +224,53 @@ impl WorkDb {
             .targets_main_pool(targets_main_pool)
             .exempt_from_operator_pause(exempt_from_operator_pause)
             .build())
+    }
+}
+
+#[cfg(test)]
+mod churn_guard_parked_fact_tests {
+    use crate::test_support::*;
+
+    /// `orphan_sweep`'s representation: `dispatch_failed_reason =
+    /// 'churn_guard'` on the task row, no attention item.
+    #[test]
+    fn true_via_dispatch_failed_reason() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        db.bounce_churn_guard_parked_to_backlog(&work_item_id, "orphan_sweep", 3, &[], "terminal executions");
+
+        let facts = db.dispatch_admission_facts(&work_item_id).unwrap();
+        assert!(facts.churn_guard_parked);
+    }
+
+    /// `pr_review_recovery`'s representation: an open `churn_guard_parked`
+    /// attention item, task status untouched.
+    #[test]
+    fn true_via_open_attention_item() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        db.file_churn_guard_parked_attention(
+            &work_item_id,
+            "pr_review_recovery",
+            3,
+            &[],
+            "terminal pr_review executions",
+        );
+
+        let facts = db.dispatch_admission_facts(&work_item_id).unwrap();
+        assert!(facts.churn_guard_parked);
+    }
+
+    /// Neither representation present: not reported as parked.
+    #[test]
+    fn false_when_neither_representation_present() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+
+        let facts = db.dispatch_admission_facts(&work_item_id).unwrap();
+        assert!(!facts.churn_guard_parked);
     }
 }

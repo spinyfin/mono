@@ -47,20 +47,35 @@ pub const ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS: i64 = 60 * 60;
 /// go live; the 4th trips the guard.
 pub const ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD: i64 = 3;
 
-/// `work_attention_items.kind` filed when [`crate::orphan_sweep`] or
-/// [`crate::pr_review_recovery`] trips the churn guard above and parks a
-/// work item instead of auto-redispatching it. Before this existed the
-/// trip was only a `tracing::warn!` in the engine trace — the work item
-/// stayed `active` with no live execution and nothing in `boss task show`,
-/// `bossctl agents status`, or the kanban card said why. Resolved
-/// automatically the next time [`WorkDb::request_execution_with_live_check`]
-/// is called for the work item (either the sweep succeeding once the
-/// trailing window drains, or an operator running `bossctl work start`,
-/// which bypasses the guard entirely since it only lives in the sweeps),
-/// and — as a backstop for every other way an item can start moving —
-/// whenever a run starts for it afterwards
+/// `work_attention_items.kind` filed when [`crate::pr_review_recovery`]
+/// trips the churn guard above and parks a work item instead of
+/// auto-redispatching it. [`crate::orphan_sweep`] used to file this same
+/// kind for its own (`active`-task) churn trip; it now bounces through
+/// [`CHURN_GUARD_DISPATCH_FAILED_REASON`] instead — see that constant's docs
+/// — so this kind is `pr_review_recovery`-only going forward. Before this
+/// kind existed at all, a trip was only a `tracing::warn!` in the engine
+/// trace — the work item stayed active with no live execution and nothing
+/// in `boss task show`, `bossctl agents status`, or the kanban card said
+/// why. Resolved automatically the next time
+/// [`WorkDb::request_execution_with_live_check`] is called for the work
+/// item (either the sweep succeeding once the trailing window drains, or an
+/// operator running `bossctl work start`, which bypasses the guard entirely
+/// since it only lives in the sweeps), and — as a backstop for every other
+/// way an item can start moving — whenever a run starts for it afterwards
 /// ([`crate::attention_lifecycle::ClearedBy::WorkResumed`]).
 pub const CHURN_GUARD_PARKED_ATTENTION_KIND: &str = "churn_guard_parked";
+
+/// `tasks.dispatch_failed_reason` value stamped by
+/// [`crate::work::WorkDb::bounce_churn_guard_parked_to_backlog`] when
+/// [`crate::orphan_sweep`] trips the churn guard on an `active` work item.
+/// Distinct from [`CHURN_GUARD_PARKED_ATTENTION_KIND`]: that kind remains
+/// in use by [`crate::pr_review_recovery`] (whose target task stays
+/// `in_review`, so it cannot bounce to Backlog), but the `active`-task case
+/// now goes through the same `dispatch_failed_reason` representation a
+/// pre-spawn dispatch failure uses, so the kanban board reflects the park
+/// without ever reading `work_attention_items` — see
+/// `docs/designs/dispatch-halt-state-vs-attention-items.md`.
+pub const CHURN_GUARD_DISPATCH_FAILED_REASON: &str = "churn_guard";
 
 /// `work_attention_items.kind` raised by [`crate::dispatch_stall_escalation`]
 /// when a dispatch timeline sits stuck in one stage past

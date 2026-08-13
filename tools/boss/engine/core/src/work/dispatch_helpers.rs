@@ -1104,14 +1104,18 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         }
 
         // Every call into this function represents a deliberate fresh
-        // dispatch attempt (a kanban drag-to-Doing or `bossctl work
-        // start`) — automatic re-dispatch sweeps (reconcile/rescan) never
-        // reach a work item bounced by `bounce_dispatch_failed_to_backlog`
-        // because those only scan `status = 'active'` rows, and a bounced
-        // row is `todo` with `autostart = 0`. So it's safe to clear the
-        // stale error here unconditionally: this attempt gets to prove
-        // itself again, and `record_start_failure` will re-stamp the
-        // fields if it fails the same way.
+        // dispatch attempt (a kanban drag-to-Doing, `bossctl work start`, or
+        // a recovery sweep giving a bounced row another shot). The ordinary
+        // reconcile/rescan sweeps still never reach a work item bounced by
+        // `bounce_dispatch_failed_to_backlog` — those only scan `status =
+        // 'active'` rows, and a bounced row is `todo` with `autostart = 0`
+        // — but `crate::dispatch_failure_recovery_sweep` exists precisely to
+        // reach such rows on a cooldown (and, for a `churn_guard`-reason
+        // row, applies `orphan_sweep`'s own tighter threshold rather than
+        // its own looser one — see that sweep's module doc). Either way,
+        // it's safe to clear the stale error here unconditionally: this
+        // attempt gets to prove itself again, and `record_start_failure`
+        // will re-stamp the fields if it fails the same way.
         conn.execute(
             "UPDATE tasks
              SET dispatch_failed_reason = NULL,
@@ -1125,13 +1129,15 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         // Same reasoning as the dispatch_failed_reason clear just above:
         // every call into this function is a deliberate fresh dispatch
         // attempt, so a stale `churn_guard_parked` attention (filed by
-        // `orphan_sweep` / `pr_review_recovery` the last time this item's
-        // terminal-execution count tripped the shared churn guard) is
-        // resolved here unconditionally. This is what makes the park clear
-        // automatically once a sweep's trailing window drains enough to
-        // redispatch again, and immediately when an operator runs `bossctl
-        // work start` to bypass the guard — that path reaches this same
-        // function, and the guard itself only ever lives in the sweeps, so
+        // `pr_review_recovery` the last time this item's terminal-execution
+        // count tripped the shared churn guard — `orphan_sweep` now uses
+        // the `dispatch_failed_reason` representation cleared above instead
+        // of this attention kind) is resolved here unconditionally. This is
+        // what makes the park clear automatically once a sweep's trailing
+        // window drains enough to redispatch again, and immediately when an
+        // operator runs `bossctl work start` to bypass the guard — that
+        // path reaches this same function, and the guard itself only ever
+        // lives in the sweeps, so
         // there is nothing here to bypass. If the fresh attempt fails again,
         // the next sweep pass re-files the attention.
         resolve_attention_kind_in_tx(conn, &work_item_id, CHURN_GUARD_PARKED_ATTENTION_KIND)?;

@@ -779,6 +779,14 @@ impl WorkDb {
         // and `migrate_answer_agent_runs_table`, both far earlier in this
         // list. Idempotent; a no-op on every subsequent startup.
         migrate_correct_falsely_answered_comments_with_failed_runs(conn)?;
+        // Data correction: resolve stale pre-existing `orphan_sweep`
+        // `churn_guard_parked` attention items. The current guarded sweep
+        // will re-park genuinely orphaned work in the
+        // `dispatch_failed_reason` representation — see the migration's own
+        // doc comment and
+        // `docs/designs/dispatch-halt-state-vs-attention-items.md`.
+        // Idempotent; a no-op once no open items of this shape remain.
+        migrate_resolve_open_orphan_sweep_churn_guard_parked(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '31')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

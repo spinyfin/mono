@@ -412,9 +412,18 @@ pub(crate) async fn agents_status(socket_path: &Option<String>, json: bool, agen
 /// to spawn one (e.g. parked by the orphan-sweep / pr_review-recovery churn
 /// guard). Prints the item's own status plus its current execution
 /// (`GetTaskRuntime`) and any open operational attention items
-/// (`ListAttentionItemsForWorkItem`) — the `churn_guard_parked` kind in
-/// particular is exactly the "why is this active with no worker" signal
-/// the coordinator previously had to dig out of the engine trace.
+/// (`ListAttentionItemsForWorkItem`).
+///
+/// Two representations carry the "why is this active/todo with no worker"
+/// signal, and this prints both: a `churn_guard_parked` open attention item
+/// (still how `pr_review_recovery` files it) via `open_attention_items`
+/// below, and `tasks.dispatch_failed_reason` / `dispatch_failed_error` (how
+/// `orphan_sweep`'s churn guard and a pre-spawn dispatch failure park a
+/// `Task`/`Chore` since `docs/designs/dispatch-halt-state-vs-attention-items.md`)
+/// printed alongside `status`, mirroring `print_task_details` in
+/// `cli/src/output.rs`. Without the latter, a churn-parked task/chore would
+/// print `status: todo` followed by "(no open attention items)" with no clue
+/// why — the same read-surface gap `boss task/chore show` already closed.
 async fn print_parked_work_item_status(client: &mut BossClient, json: bool, work_item: &WorkItem) -> Result<()> {
     let primary_id = work_item.primary_id().to_owned();
 
@@ -463,6 +472,14 @@ async fn print_parked_work_item_status(client: &mut BossClient, json: bool, work
     };
     println!("{primary_id} \"{name}\" — no live worker");
     println!("  status: {status}");
+    if let WorkItem::Task(t) | WorkItem::Chore(t) = work_item
+        && let Some(reason) = t.dispatch_failed_reason.as_deref()
+    {
+        println!("  dispatch_failed_reason: {reason}");
+        if let Some(error) = t.dispatch_failed_error.as_deref() {
+            println!("    {error}");
+        }
+    }
     if let Some(runtime) = &runtime {
         println!(
             "  current_execution: {} [{}]",

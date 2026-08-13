@@ -663,6 +663,211 @@ pub(crate) fn migrate_correct_falsely_answered_comments_with_failed_runs(conn: &
     Ok(())
 }
 
+/// One-shot cleanup of pre-existing open `churn_guard_parked` attention
+/// items superseded by the new `dispatch_failed_reason` representation — see
+/// `docs/designs/dispatch-halt-state-vs-attention-items.md`. Before this
+/// migration, `orphan_sweep` filed a `churn_guard_parked` attention item
+/// for an `active` work item; after it, that path bounces the item to
+/// Backlog via `WorkDb::bounce_churn_guard_parked_to_backlog` instead
+/// (`tasks.dispatch_failed_reason = 'churn_guard'`), because nothing ever
+/// rendered the attention item on the board it was meant to explain.
+///
+/// This only resolves stale `orphan_sweep` items; it intentionally does not
+/// convert their task rows. The old sweep filed its item before checking
+/// durable worker liveness, so an `active` task with one of these items can
+/// still have a live worker process after an engine restart. Demoting that
+/// row to Backlog here would recreate the race the current sweep avoids.
+/// The next guarded sweep pass re-parks genuinely orphaned work with fresh
+/// failure counts. The item is marked `resolved` (not deleted), retaining
+/// its recorded history without presenting an obsolete failure banner.
+///
+/// Scoped to items filed by `orphan_sweep`, not by task status: both
+/// `orphan_sweep` and `pr_review_recovery` file the same attention `kind`,
+/// and `pr_review_recovery`'s target task can itself be `active` (it fires
+/// off `list_dead_pr_review_candidates`, which allows `status NOT IN
+/// ('done', 'archived')` — not just `in_review`). Inferring the source from
+/// task status would therefore wrongly convert a `pr_review_recovery`-filed
+/// item on an `active` task, misattributing a dying reviewer to a dispatch
+/// failure and bouncing a row whose actual problem is review-side.
+/// `churn_guard_parked_text` stamps the sweep name into `body_markdown`
+/// verbatim (`` The `{source}` sweep stopped auto-redispatching... ``), so
+/// matching on that text recovers the real source without needing a second
+/// attention kind. Rows filed by `pr_review_recovery` are left exactly as
+/// they were, still open attention items, still handled by that sweep.
+pub(crate) fn migrate_resolve_open_orphan_sweep_churn_guard_parked(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT wai.id, wai.work_item_id
+           FROM work_attention_items wai
+           JOIN tasks t ON t.id = wai.work_item_id
+          WHERE wai.kind = 'churn_guard_parked'
+            AND wai.status = 'open'
+            AND t.status = 'active'
+            AND t.deleted_at IS NULL
+            AND wai.body_markdown LIKE '%`orphan_sweep` sweep%'",
+    )?;
+    let candidates: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    let now = now_string();
+    for (attention_id, work_item_id) in candidates {
+        tracing::warn!(
+            work_item_id,
+            attention_id,
+            "resolving stale pre-existing orphan_sweep churn_guard_parked attention item",
+        );
+        conn.execute(
+            "UPDATE work_attention_items SET status = 'resolved', resolved_at = ?2 WHERE id = ?1",
+            params![attention_id, now],
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod churn_guard_migration_tests {
+    use super::*;
+    use crate::test_support::*;
+    use boss_protocol::{CreateAttentionItemInput, WorkItem};
+
+    fn get_task(db: &WorkDb, work_item_id: &str) -> boss_protocol::Task {
+        match db.get_work_item(work_item_id).unwrap() {
+            WorkItem::Task(t) | WorkItem::Chore(t) => t,
+            other => panic!("expected a task/chore work item, got {other:?}"),
+        }
+    }
+
+    /// A stale `orphan_sweep` item on an active task with a live worker must
+    /// not demote the task during startup cleanup. The next guarded sweep
+    /// decides whether a later, genuinely orphaned task should be re-parked.
+    #[test]
+    fn leaves_active_task_with_live_shell_pid_untouched_and_resolves_item() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let shell_pid = i64::from(std::process::id());
+        create_spawned_execution(&db, &work_item_id, shell_pid);
+
+        let item = db
+            .create_attention_item(
+                CreateAttentionItemInput::builder()
+                    .kind(crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND)
+                    .title("Parked by churn guard — 3 recent failures")
+                    .body_markdown(
+                        "The `orphan_sweep` sweep stopped auto-redispatching this work item: some \
+                         pre-existing failure detail; bossctl work start test_id",
+                    )
+                    .work_item_id(work_item_id.clone())
+                    .build(),
+            )
+            .unwrap();
+
+        {
+            let conn = db.connect().unwrap();
+            migrate_resolve_open_orphan_sweep_churn_guard_parked(&conn).unwrap();
+        }
+
+        let task = get_task(&db, &work_item_id);
+        assert_eq!(task.status.as_str(), "active");
+        assert!(task.dispatch_failed_reason.is_none());
+        assert!(task.dispatch_failed_error.is_none());
+
+        let resolved = db.get_attention_item(&item.id).unwrap();
+        assert_eq!(resolved.status, "resolved");
+        assert!(resolved.resolved_at.is_some());
+    }
+
+    /// A `pr_review_recovery`-sourced open `churn_guard_parked` item whose
+    /// target task happens to be `active` (not `in_review`) must be left
+    /// open — the migration only resolves `orphan_sweep`-sourced items and
+    /// never rewrites task rows. `list_dead_pr_review_candidates` allows
+    /// `active` tasks, so inferring the source from task status alone would
+    /// wrongly resolve a review-side park; the migration keys off the body
+    /// text's recorded source instead.
+    #[test]
+    fn leaves_active_task_with_pr_review_recovery_sourced_item_untouched() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+
+        let item = db
+            .create_attention_item(
+                CreateAttentionItemInput::builder()
+                    .kind(crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND)
+                    .title("Parked by churn guard — 3 recent failures")
+                    .body_markdown("The `pr_review_recovery` sweep stopped auto-redispatching this work item: dead pr_review detail")
+                    .work_item_id(work_item_id.clone())
+                    .build(),
+            )
+            .unwrap();
+
+        {
+            let conn = db.connect().unwrap();
+            migrate_resolve_open_orphan_sweep_churn_guard_parked(&conn).unwrap();
+        }
+
+        let task = get_task(&db, &work_item_id);
+        assert_eq!(
+            task.status.as_str(),
+            "active",
+            "an active task must not be bounced to Backlog"
+        );
+        assert!(task.dispatch_failed_reason.is_none());
+
+        let untouched = db.get_attention_item(&item.id).unwrap();
+        assert_eq!(
+            untouched.status, "open",
+            "the pr_review_recovery-sourced item must stay open"
+        );
+    }
+
+    /// An open `churn_guard_parked` item on an `in_review` task (the
+    /// `pr_review_recovery` shape) is left untouched: Backlog is not a
+    /// meaningful destination for a task with an open PR under review.
+    #[test]
+    fn leaves_in_review_task_and_its_attention_item_untouched() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+                rusqlite::params![work_item_id],
+            )
+            .unwrap();
+        }
+
+        let item = db
+            .create_attention_item(
+                CreateAttentionItemInput::builder()
+                    .kind(crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND)
+                    .title("Parked by churn guard — 3 recent failures")
+                    .body_markdown("dead pr_review detail")
+                    .work_item_id(work_item_id.clone())
+                    .build(),
+            )
+            .unwrap();
+
+        {
+            let conn = db.connect().unwrap();
+            migrate_resolve_open_orphan_sweep_churn_guard_parked(&conn).unwrap();
+        }
+
+        let task = get_task(&db, &work_item_id);
+        assert_eq!(task.status.as_str(), "in_review");
+        assert!(task.dispatch_failed_reason.is_none());
+
+        let untouched = db.get_attention_item(&item.id).unwrap();
+        assert_eq!(untouched.status, "open");
+    }
+}
+
 #[cfg(test)]
 mod status_check_clause_tests {
     use super::status_check_clause;
