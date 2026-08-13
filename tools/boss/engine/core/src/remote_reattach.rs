@@ -8,7 +8,7 @@
 //! keeps running on the remote but its events (and its eventual `Stop` /
 //! PR-URL completion) never reach the new engine: the run strands forever.
 //!
-//! On startup the engine queries [`WorkDb::list_reattachable_remote_runs`]
+//! On startup the engine queries [`WorkDb::list_live_remote_runs`]
 //! (active runs on a non-local host whose execution is still non-terminal)
 //! and, for each, re-opens the host adapter (which re-establishes the
 //! `ControlMaster`) and re-establishes that run's reverse forward. Once the
@@ -60,7 +60,7 @@ pub async fn reattach_remote_runs(
 ) -> ReattachSummary {
     let mut summary = ReattachSummary::default();
 
-    let candidates = match work_db.list_reattachable_remote_runs() {
+    let candidates = match work_db.list_live_remote_runs() {
         Ok(c) => c,
         Err(err) => {
             tracing::warn!(?err, "reattach: failed to list reattachable remote runs");

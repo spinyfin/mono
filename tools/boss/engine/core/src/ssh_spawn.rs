@@ -36,6 +36,7 @@
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 
+use crate::host_adapter::WORKER_LOG_TAIL_BYTES;
 use crate::ssh_transport::{SshOutput, SshTransport};
 
 // ── Failure-reason taxonomy (matches the wrapper sentinels) ───────────────────
@@ -50,6 +51,13 @@ pub const REASON_MISSING_CLAUDE: &str = "host_missing_claude";
 pub const REASON_MISSING_CUBE: &str = "host_missing_cube";
 /// `exit 81`: `gh` not found on the remote PATH.
 pub const REASON_MISSING_GH: &str = "host_missing_gh";
+/// `exit 82`: `boss-event` not found on the remote PATH. Without the shim
+/// the worker runs but every hook is a no-op, so the engine never learns
+/// the run started, never records a transcript path, and never sees the
+/// `Stop` that drives completion — a worker that does its job and reports
+/// nothing. Preflighted by the wrapper so that becomes a named launch
+/// failure rather than a silent one.
+pub const REASON_MISSING_BOSS_EVENT: &str = "host_missing_boss_event";
 /// Any other non-zero wrapper exit, or a failure to even establish the
 /// events forward before launch.
 pub const REASON_WORKER_LAUNCH_FAILED: &str = "worker_launch_failed";
@@ -99,6 +107,7 @@ pub fn classify_wrapper_exit(code: i32) -> WrapperLaunch {
         79 => WrapperLaunch::Failed(REASON_MISSING_CLAUDE),
         80 => WrapperLaunch::Failed(REASON_MISSING_CUBE),
         81 => WrapperLaunch::Failed(REASON_MISSING_GH),
+        82 => WrapperLaunch::Failed(REASON_MISSING_BOSS_EVENT),
         _ => WrapperLaunch::Failed(REASON_WORKER_LAUNCH_FAILED),
     }
 }
@@ -325,6 +334,18 @@ pub async fn perform_remote_launch(
                     // Provably gone: tear down the forward we opened and
                     // report a terminal launch failure.
                     Ok(false) => {
+                        // Read the worker's own output BEFORE tearing anything
+                        // down. Telling the operator to "inspect
+                        // <workspace>/.boss/worker.log on the remote host" was
+                        // advice nobody could act on: the workspace goes back
+                        // to cube on the failure path below and is reset for
+                        // the next lease, so by the time anyone reads the
+                        // error the file is gone. The one line in it is the
+                        // whole diagnosis — `Failed to authenticate. API
+                        // Error: 401 OAuth access token has expired.` in the
+                        // case this was written for — so carry it in the
+                        // failure detail instead of a pointer to it.
+                        let log_tail = pull_worker_log_tail(exec, &plan.workspace_path).await;
                         let _ = exec
                             .cancel_reverse_unix_forward(&plan.events_socket_path, engine_events_socket)
                             .await;
@@ -334,8 +355,14 @@ pub async fn perform_remote_launch(
                             remote_pid: Some(pid),
                             detail: Some(format!(
                                 "worker pid {pid} was not alive {WORKER_LIVENESS_SETTLE_SECS}s after launch \
-                                 (claude exited immediately; inspect {}/.boss/worker.log on the remote host)",
-                                plan.workspace_path,
+                                 (the agent exited immediately). Last output from \
+                                 {ws}/.boss/worker.log: {log}",
+                                ws = plan.workspace_path,
+                                log = match log_tail.as_deref() {
+                                    Some(tail) if !tail.trim().is_empty() => tail.trim().to_owned(),
+                                    Some(_) => "(empty — the agent produced no output at all)".to_owned(),
+                                    None => "(could not be read from the host)".to_owned(),
+                                },
                             )),
                         });
                     }
@@ -374,6 +401,20 @@ pub async fn perform_remote_launch(
             })
         }
     }
+}
+
+/// Best-effort read of the tail of `<workspace>/.boss/worker.log` on the
+/// remote — the file the wrapper tees the agent's stdout+stderr to.
+///
+/// `None` means the tail could not be obtained (transport failure);
+/// `Some("")` means it was read and really is empty. Reuses the same
+/// byte-suffix pull the transcript readback uses rather than adding a second
+/// remote-tail implementation.
+async fn pull_worker_log_tail(exec: &dyn SshExec, workspace_path: &str) -> Option<String> {
+    let path = format!("{}/.boss/worker.log", workspace_path.trim_end_matches('/'));
+    crate::remote_transcript::pull_remote_transcript_tail(exec, &path, WORKER_LOG_TAIL_BYTES)
+        .await
+        .ok()
 }
 
 /// Re-probe a just-launched remote worker's liveness over the master.
@@ -503,6 +544,10 @@ mod tests {
         assert_eq!(classify_wrapper_exit(79), WrapperLaunch::Failed(REASON_MISSING_CLAUDE));
         assert_eq!(classify_wrapper_exit(80), WrapperLaunch::Failed(REASON_MISSING_CUBE));
         assert_eq!(classify_wrapper_exit(81), WrapperLaunch::Failed(REASON_MISSING_GH));
+        assert_eq!(
+            classify_wrapper_exit(82),
+            WrapperLaunch::Failed(REASON_MISSING_BOSS_EVENT)
+        );
         assert_eq!(
             classify_wrapper_exit(1),
             WrapperLaunch::Failed(REASON_WORKER_LAUNCH_FAILED)

@@ -615,6 +615,32 @@ pub fn render_remote_settings_json(input: &WorkerSetupInput, driver: &dyn AgentD
     serde_json::to_string_pretty(&value).expect("settings JSON value is always serializable")
 }
 
+/// Whether `driver` reports its progress through hooks that this module
+/// merges into the worker's `--settings` file.
+///
+/// Exposes the decision [`settings_value`] already makes internally
+/// ([`merges_hooks_into_worker_settings`]) so a caller can find out
+/// *before* shipping a settings file whether that file will carry any
+/// observability at all. A driver whose ingress is a byte stream
+/// ([`ProgressIngress::StdoutJsonl`] / [`ProgressIngress::AgentJsonlFile`])
+/// renders an empty `hooks` map by design — correct locally, where the
+/// engine reads that stream directly, and catastrophic on the REMOTE path,
+/// whose only channel back is the hooks-over-forwarded-socket one.
+///
+/// Deliberately answers the *capability* question rather than "is this
+/// Claude": `DriverRegistry::require` is the single mechanism for turning a
+/// slug into a driver precisely so call sites do not match on slugs.
+pub fn driver_reports_progress_via_worker_settings(driver: &dyn AgentDriver, input: &WorkerSetupInput) -> bool {
+    let ingress = driver.progress_observation_wiring(&ProgressObservationConfig {
+        events_socket_path: input.events_socket_path.clone(),
+        lease_id: input.lease_id.clone(),
+        run_id: input.run_id.clone(),
+        workspace_path: input.workspace_path.clone(),
+        forwarder_binary: input.boss_event_path.clone(),
+    });
+    merges_hooks_into_worker_settings(&ingress)
+}
+
 fn settings_value(
     input: &WorkerSetupInput,
     sandbox: EngineDataDirSandbox,

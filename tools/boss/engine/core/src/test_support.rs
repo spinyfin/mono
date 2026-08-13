@@ -670,9 +670,10 @@ macro_rules! stub_cube_client {
 /// double, spelling out only the methods a given test drives. Every
 /// workspace-lifecycle method and `spawn_worker` left unlisted is filled
 /// in with `unimplemented!()`; `command_repr` defaults to `None`; and the
-/// three trait-defaulted methods (`read_transcript_tail_bytes`,
-/// `reattach_events_forward`, `probe_remote_worker_alive`) fall through to
-/// their trait defaults unless overridden.
+/// four trait-defaulted methods (`read_transcript_tail_bytes`,
+/// `reattach_events_forward`, `probe_remote_worker_alive`,
+/// `read_worker_log_tail`) fall through to their trait defaults unless
+/// overridden.
 ///
 /// `host_id` has no universal default and **must be listed first**;
 /// remaining overrides follow in the trait's declaration order.
@@ -828,9 +829,17 @@ macro_rules! stub_host_adapter {
 
     // ── probe_remote_worker_alive (trait default unless overridden) ──────────
     (@munch $ty:ty [$($acc:tt)*] @probe_remote_worker_alive async fn probe_remote_worker_alive $a:tt -> $r:ty $b:block $($rest:tt)*) => {
-        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn probe_remote_worker_alive $a -> $r $b] @done $($rest)*);
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn probe_remote_worker_alive $a -> $r $b] @read_worker_log_tail $($rest)*);
     };
     (@munch $ty:ty [$($acc:tt)*] @probe_remote_worker_alive $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)*] @read_worker_log_tail $($rest)*);
+    };
+
+    // ── read_worker_log_tail (trait default unless overridden) ───────────────
+    (@munch $ty:ty [$($acc:tt)*] @read_worker_log_tail async fn read_worker_log_tail $a:tt -> $r:ty $b:block $($rest:tt)*) => {
+        $crate::stub_host_adapter!(@munch $ty [$($acc)* async fn read_worker_log_tail $a -> $r $b] @done $($rest)*);
+    };
+    (@munch $ty:ty [$($acc:tt)*] @read_worker_log_tail $($rest:tt)*) => {
         $crate::stub_host_adapter!(@munch $ty [$($acc)*] @done $($rest)*);
     };
 

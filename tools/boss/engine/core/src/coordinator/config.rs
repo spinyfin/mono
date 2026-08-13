@@ -127,6 +127,19 @@ impl ExecutionCoordinator {
         self.host_adapter_provider = provider;
     }
 
+    /// The installed host-adapter provider.
+    ///
+    /// Exposed so lease bookkeeping that runs OUTSIDE the dispatch loop can
+    /// reach the same per-host cube the dispatch loop leased with — notably
+    /// [`crate::cube_lease_heartbeat::HostRoutedCubes`], which must beat a
+    /// remote lease against the remote cube that issued it rather than the
+    /// engine's own. Read only after `app.rs` has installed the SSH-capable
+    /// provider; a caller that reads it earlier gets the local-only default,
+    /// which is correct for a local-only deployment.
+    pub fn host_adapter_provider(&self) -> Arc<dyn HostAdapterProvider> {
+        Arc::clone(&self.host_adapter_provider)
+    }
+
     /// Read the tail of a run's transcript that lives on host `host_id`.
     ///
     /// Returns `Ok(None)` for `host_id = "local"` — the transcript is on
