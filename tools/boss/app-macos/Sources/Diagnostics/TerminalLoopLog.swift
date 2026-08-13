@@ -211,6 +211,75 @@ struct DisplayPowerSample: Codable, Identifiable, Sendable, Equatable {
     }
 }
 
+/// One AppKit menu-tracking transition, mirrored into the same JSONL stream.
+///
+/// Recorded by [[MenuTrackingMonitor]]. A menu-tracking session is a nested
+/// modal event loop, so "is one running right now, which control owns it, and
+/// did it ever end" is a question about app state that `sample` can only
+/// answer after the fact and only for the moment it happened to run. These
+/// records answer it from the app's own log: a `begin` with no matching `end`,
+/// followed by `still_open` records with a growing `open_ms`, is an orphaned
+/// session; a matched `begin`/`end` pair is a menu a human opened and closed.
+struct MenuTrackingSample: Codable, Identifiable, Sendable, Equatable {
+    let kind: String
+    let id: UUID
+    let tsEpochMs: Int64
+    /// "begin", "end", "still_open", or "unbalanced_end".
+    let event: String
+    /// Name of the control that owns the menu — see
+    /// [[MenuTrackingLedger.label(title:itemTitles:)]].
+    let menu: String
+    /// How long the session had been open. Absent on `begin`.
+    let openMs: Int64?
+    /// Sessions open across the whole app after this transition. Submenus
+    /// nest, so a value above 1 is normal while a submenu is showing.
+    let openCount: Int
+    /// The main run loop's mode at the moment of the record, e.g.
+    /// `kCFRunLoopDefaultMode` or `NSEventTrackingRunLoopMode`. This is the
+    /// field that cross-checks a `sample`: a profile showing a nested menu
+    /// loop while this says the default mode (or while nothing is open at
+    /// all) means the tracking loop outlived the menu.
+    let runloopMode: String?
+    /// Only set on `unbalanced_end`. `true` means this was the first
+    /// unbalanced end seen this launch — the benign case where the monitor
+    /// started mid-session. `false` means AppKit ended a session this
+    /// monitor never saw begin, which is worth noticing on its own.
+    let firstUnbalancedEnd: Bool?
+
+    init(
+        id: UUID = UUID(),
+        tsEpochMs: Int64,
+        event: String,
+        menu: String,
+        openMs: Int64?,
+        openCount: Int,
+        runloopMode: String?,
+        firstUnbalancedEnd: Bool? = nil
+    ) {
+        self.kind = "menu_tracking"
+        self.id = id
+        self.tsEpochMs = tsEpochMs
+        self.event = event
+        self.menu = menu
+        self.openMs = openMs
+        self.openCount = openCount
+        self.runloopMode = runloopMode
+        self.firstUnbalancedEnd = firstUnbalancedEnd
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case id
+        case tsEpochMs = "ts_epoch_ms"
+        case event
+        case menu
+        case openMs = "open_ms"
+        case openCount = "open_count"
+        case runloopMode = "runloop_mode"
+        case firstUnbalancedEnd = "first_unbalanced_end"
+    }
+}
+
 /// Pure rate arithmetic, factored out so the counter→rate conversion is
 /// unit-testable without standing up timers. Times are monotonic
 /// nanoseconds (`DispatchTime.uptimeNanoseconds`); counters are
@@ -300,6 +369,7 @@ final class TerminalLoopLog: @unchecked Sendable {
     private let loopRing = OSAllocatedUnfairLock(initialState: [LoopSample]())
     private let tabRing = OSAllocatedUnfairLock(initialState: [TabSwitchSample]())
     private let displayPowerRing = OSAllocatedUnfairLock(initialState: [DisplayPowerSample]())
+    private let menuTrackingRing = OSAllocatedUnfairLock(initialState: [MenuTrackingSample]())
     private let capacity: Int
     private let retainDays: Int
 
@@ -365,6 +435,17 @@ final class TerminalLoopLog: @unchecked Sendable {
         writeLine(of: sample, at: sample.tsEpochMs)
     }
 
+    /// Append a menu-tracking transition to its ring + on-disk mirror.
+    func record(_ sample: MenuTrackingSample) {
+        menuTrackingRing.withLock { buf in
+            buf.append(sample)
+            if buf.count > capacity {
+                buf.removeFirst(buf.count - capacity)
+            }
+        }
+        writeLine(of: sample, at: sample.tsEpochMs)
+    }
+
     private func writeLine(of value: some Encodable, at tsEpochMs: Int64) {
         guard directory != nil,
               let json = try? Self.encoder.encode(value) else { return }
@@ -411,6 +492,11 @@ final class TerminalLoopLog: @unchecked Sendable {
     /// Newest-last snapshot of the display sleep/wake ring.
     func displayPowerSnapshot() -> [DisplayPowerSample] {
         displayPowerRing.withLock { $0 }
+    }
+
+    /// Newest-last snapshot of the menu-tracking ring.
+    func menuTrackingSnapshot() -> [MenuTrackingSample] {
+        menuTrackingRing.withLock { $0 }
     }
 
     /// Block until queued file writes have drained. Test-only helper.

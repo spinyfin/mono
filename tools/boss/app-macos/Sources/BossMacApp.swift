@@ -491,6 +491,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // JSONL mirror (App Nap incident, 2026-07-15) — see
             // [[DisplayPowerMonitor]].
             DisplayPowerMonitor.shared.start()
+            // Record AppKit menu-tracking begin/end into the same mirror, so
+            // "a sample says a nested menu loop is running" can be checked
+            // against whether a menu was actually open, and which control
+            // owns it. Two notification observers while idle; the 1 Hz probe
+            // exists only while a menu is open. See [[MenuTrackingMonitor]].
+            MenuTrackingMonitor.shared.start()
             // 1 Hz flush of board fan-out counters (applyWorkTree, incremental
             // task updates, main-actor engine deliveries, card body evals).
             // Idle ticks are free; non-idle flushes emit `ui-update-rates` on
