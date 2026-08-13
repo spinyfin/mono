@@ -136,6 +136,18 @@ crate::register_counter!(
     "staged URL's PR branch did not match execution's expected branch; URL was dropped.",
 );
 
+// The nudge/park ladder's only mover used to be a worker Stop. Every time the
+// recurring sweep has to advance a debounced ladder instead, it means the
+// worker went quiet at a boundary whose decision was withheld for pacing and
+// no further Stop was ever coming — i.e. the sweep broke a stall that would
+// otherwise have held a slot indefinitely. A nonzero, growing count is the
+// in-system signal for that class of stall; it should be rare.
+crate::register_counter!(
+    NUDGE_LADDER_SWEEP_ADVANCED,
+    "nudge_ladder.sweep_advanced",
+    "recurring sweep advanced a debounced nudge ladder no Stop boundary could have advanced.",
+);
+
 // Worker-proposal seam: fallback-hit counters for
 // `detect_and_file_worker_signals`'s legacy marker parsers, incremented only
 // when `worker_signal_proposals_seam` is on and no `worker_proposals` row
@@ -218,6 +230,7 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&PR_URL_CAPTURE_RECONSTRUCTION_HIT);
     registry.register_counter(&PR_URL_CAPTURE_RECONSTRUCTION_FAILED);
     registry.register_counter(&PR_RECHECK_STAGED_BRANCH_MISMATCH);
+    registry.register_counter(&NUDGE_LADDER_SWEEP_ADVANCED);
     registry.register_counter(&MID_TURN_REAP_TOTAL);
     registry.register_counter(&WORKER_SIGNAL_FALLBACK_HIT_EFFORT_ESCALATION);
     registry.register_counter(&WORKER_SIGNAL_FALLBACK_HIT_BLOCKED);
@@ -1054,7 +1067,33 @@ pub trait ProbeQueuer: Send + Sync {
     /// delivered on the same boundary that produced it. That is a structural
     /// property of this path, not a flag — a completion probe is never queued
     /// mid-turn, so it never reaches a tool-boundary delivery.
+    ///
+    /// That "always delivered on the current boundary" guarantee holds ONLY
+    /// for a probe queued from inside a Stop fan-out. A probe queued from a
+    /// recurring sweep has no boundary to ride and needs
+    /// [`Self::deliver_queued_probes_now`].
     fn queue_probe(&self, run_id: &str, text: &str);
+
+    /// Deliver whatever is queued for `run_id` **now**, without waiting for a
+    /// hook boundary.
+    ///
+    /// Probe delivery is otherwise driven entirely by worker hook events
+    /// (`dispatch_probe_on_stop` / `dispatch_probe_on_post_tool_use`) or by a
+    /// human's `ProbeRun` RPC. An idle worker emits neither, so a probe the
+    /// engine queues for one on a recurring sweep is written to the FIFO and
+    /// never leaves it — the engine "nudges" into a void, scores the silence
+    /// as an unproductive nudge, and the worker is never actually asked
+    /// anything. This is the seam that lets a sweep-driven nudge reach a
+    /// parked pane, so a re-driven ladder is honest: the worker really does
+    /// get the probe, and really does get the chance to answer with the
+    /// sanctioned terminal marker.
+    ///
+    /// Fail-closed and best-effort, exactly like the hook-driven paths it
+    /// shares an implementation with: a pane whose `(activity, driver)`
+    /// posture admits no write leaves the probe queued for a later
+    /// opportunity rather than dropping it. Defaults to a no-op so
+    /// test/stub queuers are unaffected.
+    fn deliver_queued_probes_now(&self, _run_id: &str) {}
 
     /// Drop every not-yet-delivered probe queued for `run_id`.
     ///
@@ -1095,13 +1134,52 @@ impl ProbeQueuer for NoopProbeQueuer {
 /// a worker that never reaches Stop cannot keep an execution live forever.
 pub const DEFAULT_STAGED_PR_MID_TURN_DEFER_SECS: i64 = DEFAULT_BUILD_WAIT_HORIZON_SECS;
 
-#[derive(Clone)]
+/// Why a Stop-boundary nudge decision was recorded for later re-evaluation
+/// instead of being acted on when it was made. The two holds look identical
+/// in the registry but have opposite retirement conditions, and conflating
+/// them is what let a stalled execution lose the only record that could ever
+/// re-drive it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NudgeHold {
+    /// The nudge was suppressed because the worker still has live delegated
+    /// background children. The worker is *expected* to resume on its own —
+    /// so hook activity after the hold is positive proof the suppression did
+    /// its job, and the intent is retired.
+    BackgroundChildren,
+    /// The nudge decision was made and then debounced by
+    /// [`crate::nudge_breaker::MIN_RENUDGE_INTERVAL`]: an identical
+    /// fingerprint had just been nudged, so re-sending the same probe could
+    /// not carry new information *yet*.
+    ///
+    /// This hold must NEVER be retired on hook activity. A debounce is a
+    /// pacing decision about a decision already taken at a real turn
+    /// boundary, not a bet that the worker will resume — and the worker
+    /// cannot resume unaided, because the only thing that produces its next
+    /// Stop is a probe and the debounce is precisely the choice not to send
+    /// one. Retiring on a watermark change (the `BackgroundChildren` rule,
+    /// previously applied to every intent) drops the one record that keeps
+    /// the bounded nudge/park ladder advancing, leaving the execution live,
+    /// idle, and holding its slot with nothing scheduled to look at it again.
+    Debounced,
+}
+
+// Six fields, so the project's builder convention applies. The three
+// construction sites here deliberately keep struct-literal syntax (two of
+// them re-record an existing intent with `..spread`, which a builder cannot
+// express); the derive is what keeps a future additive field from being a
+// breaking change for any site that does not need it.
+#[derive(Clone, bon::Builder)]
+#[builder(on(String, into))]
 struct BackgroundNudgeIntent {
     probe_text: String,
     fingerprint: String,
     bound_pr_url: Option<String>,
     proceed_outcome: StopOutcome,
     activity_watermark: Option<String>,
+    /// Which suppression recorded this intent — see [`NudgeHold`]. Decides
+    /// how [`WorkerCompletionHandler::recheck_background_nudge`] is allowed
+    /// to retire it.
+    hold: NudgeHold,
 }
 
 #[derive(Default)]
@@ -1679,11 +1757,26 @@ pub const MID_TURN_REAP_ATTENTION_KIND: &str = "mid_turn_reap";
 /// for its branch. Phrased so a worker that already finished the work
 /// will simply push and open one, but a worker that's blocked has an
 /// out to explain itself rather than churning.
+///
+/// The final sentence names the [`NO_CHANGES_NEEDED`](crate::no_op_signal::NO_CHANGES_NEEDED_MARKER)
+/// marker verbatim rather than inviting free prose. A probe that asks the
+/// worker to "explain your status" gets exactly that — prose — and prose is
+/// not a terminal signal any engine path can read: `worker_signalled_no_op`
+/// requires an own-line exact match of the marker. Asking in a language the
+/// engine cannot parse is what stranded the 2026-08-12 revision worker on
+/// mono#2622 for 2h40m (see [`probe_push_to_existing_pr`]). Pinned against
+/// the marker const by `probe_texts_name_the_no_op_marker`; the mention here
+/// is inline and backticked, so it can never itself satisfy the own-line
+/// match.
 pub const PROBE_NO_PR: &str = "You stopped without producing a PR for this work. \
 If the work is complete, open the PR with `cube pr create --branch <bookmark>` (pushes the \
 branch and opens the PR in one step, jj-aware, no GIT_DIR needed). If a PR already exists \
 for this branch, push any new commits with `cube pr update --branch <bookmark>` instead — \
-do not open a duplicate. If you're blocked, explain what you need.";
+do not open a duplicate. If you're blocked, explain what you need. If instead you have \
+verified there is genuinely nothing left to change (`jj diff -r @` is empty because the work \
+is already done), do NOT answer in prose alone — prose is not a signal the engine can act on. \
+End your response with a line containing exactly `NO_CHANGES_NEEDED` and stop; that is the \
+sanctioned way to close this run with no PR.";
 
 /// Extract the set of required-check names a `ci_remediations` attempt
 /// was opened to fix, parsed from its `failed_checks` JSON snapshot
@@ -1774,12 +1867,29 @@ fn mergeability_satisfies_deliverable(mergeability: OpenPrMergeability, merge_co
 /// to `gh pr create` here — its job is to push fixes to the existing
 /// PR's branch. Phrased so a worker with nothing left to do can say so
 /// rather than churning; the circuit breaker bounds repeats.
+///
+/// **"Say so" must name the marker.** This probe used to end *"there is
+/// nothing left to do, say so — explain your status instead of
+/// re-running."* A worker that complied answered in prose, and prose is
+/// unreadable to every terminal the engine owns: `worker_signalled_no_op`
+/// matches [`NO_CHANGES_NEEDED`](crate::no_op_signal::NO_CHANGES_NEEDED_MARKER)
+/// on an own line and *deliberately* rejects prose that merely mentions the
+/// protocol. So the engine asked a question in a language it cannot read,
+/// scored the honest answer as "no progress", and re-entered the nudge
+/// ladder — where the debounce then swallowed the boundary and the run sat
+/// idle holding its slot for 2h40m. Naming the marker is what turns a
+/// correct "nothing to do" conclusion into an actual terminal on the
+/// worker's very next turn. Pinned by `probe_texts_name_the_no_op_marker`;
+/// the mention is inline and backticked, so the probe text can never itself
+/// satisfy the own-line match.
 pub fn probe_push_to_existing_pr(pr_url: &str) -> String {
     format!(
         "A PR already exists for this work: {pr_url}. Do NOT open a new PR. If you have local \
 commits, push them to the existing PR's branch with `cube pr update --branch <bookmark>`. If your \
-changes are already pushed or there is nothing left to do, say so — explain your status instead of \
-re-running."
+changes are already pushed, or you have verified this work needs no further code change, do NOT \
+answer in prose alone — prose is not a signal the engine can act on, and it will re-prompt you. \
+End your response with a line containing exactly `NO_CHANGES_NEEDED` and stop; that is the \
+sanctioned way to close this run without another push."
     )
 }
 

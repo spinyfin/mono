@@ -97,6 +97,40 @@ impl ProbeQueuer for ServerStateProbeQueuer {
         };
         server.clear_pending_probes(run_id, reason);
     }
+
+    /// Reuses the same delivery path the human-driven `ProbeRun` RPC calls
+    /// ([`super::worker_events::dispatch_probe_now`]) — including its
+    /// in-flight guard, its `(activity, driver)` posture check, and its
+    /// mid-turn-vs-parked branch. A parked (`Idle`/`WaitingForInput`) pane
+    /// is documented there as "a reliable arrival point just like Stop",
+    /// which is exactly the posture a stalled worker sits in.
+    ///
+    /// Spawned rather than awaited because [`ProbeQueuer`] is a sync trait
+    /// and this is fire-and-forget by contract: the caller has already
+    /// recorded the nudge against the circuit breaker and its decision does
+    /// not depend on the delivery outcome. `dispatch_probe_now` logs and
+    /// names every exit itself, so a failed or refused delivery still leaves
+    /// a trace, and an undeliverable probe stays queued rather than being
+    /// dropped.
+    fn deliver_queued_probes_now(&self, run_id: &str) {
+        let Some(weak) = self.server.get() else {
+            tracing::warn!(run_id, "probe queuer called before server state was bound");
+            return;
+        };
+        let Some(server) = weak.upgrade() else {
+            tracing::debug!(run_id, "probe queuer: server state already dropped");
+            return;
+        };
+        let run_id = run_id.to_owned();
+        tokio::spawn(async move {
+            let outcome = super::worker_events::dispatch_probe_now(&server, &run_id).await;
+            tracing::debug!(
+                run_id,
+                ?outcome,
+                "probe queuer: out-of-band delivery attempted for a sweep-driven nudge",
+            );
+        });
+    }
 }
 
 /// Why one call into a probe-dispatch path ended the way it did.

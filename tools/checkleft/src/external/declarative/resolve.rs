@@ -621,7 +621,10 @@ mod tests {
         let npx = temp.path().join("npx");
         write_fake_executable(&npx, "#!/bin/sh\n");
 
-        check_node_runtime_version("oxfmt", &npx, "test/node", CheckDeadline::new(5_000))
+        // This assertion exercises version acceptance, not timeout enforcement.
+        // Allow for scheduler contention when the full checkleft suite runs in
+        // parallel on CI so a ready shell probe is not rejected before it runs.
+        check_node_runtime_version("oxfmt", &npx, "test/node", CheckDeadline::new(30_000))
             .expect("current node must pass preflight");
     }
 
