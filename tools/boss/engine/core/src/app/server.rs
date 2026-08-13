@@ -417,6 +417,21 @@ pub async fn serve_with_merge_probe(
         None,
         None,
     )?;
+
+    // A Planner run can only be active inside this engine process. Recover
+    // every durable `running` row before the frontend becomes reachable or
+    // the Populator hook can accept new work, so the replacement engine never
+    // reports a stranded run as live or leaves its project permanently gated.
+    let recovered_planner_runs = server_state.work_db.recover_running_planner_runs_on_engine_restart()?;
+    if recovered_planner_runs > 0 {
+        tracing::warn!(
+            count = recovered_planner_runs,
+            "marked planner runs interrupted by the previous engine as failed at startup",
+        );
+    } else {
+        tracing::debug!("no running planner runs to recover at startup");
+    }
+
     let tmux_preflight = crate::tmux_preflight::TmuxPreflight::probe().await;
     if let Some(reason) = tmux_preflight.unavailable_reason() {
         tracing::error!(%reason, "tmux preflight failed; refusing all new local dispatches");
