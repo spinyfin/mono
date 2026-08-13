@@ -32,7 +32,7 @@ pub(crate) enum CommentsAction {
     List {
         /// Work item (task/chore) id whose comments to list — shorthand
         /// for `--artifact-kind work_item --artifact <id>`.
-        #[arg(long)]
+        #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
         task: Option<String>,
         /// Raw artifact id (e.g. a `pr_doc:<owner>/<repo>:<branch>:<path>`
         /// composite key — an SSH or HTTPS remote URL also works for

@@ -7,10 +7,15 @@ use crate::*;
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct TaskUpdateArgs {
+    /// Task/chore id. Accepts primary id, friendly short id, or
+    /// cross-product form. Globally unique short ids resolve without
+    /// `--product`; ambiguous ones error listing every candidate.
+    #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) id: String,
 
     /// Resolve a friendly short id (`T42`, `42`, `#42`) against this product
-    /// (slug or id). Ignored when the selector already embeds a product slug
+    /// (slug or id). Optional when the short id is globally unique.
+    /// Ignored when the selector already embeds a product slug
     /// (`boss/42`) or when the selector is a primary id.
     #[arg(long)]
     pub(crate) product: Option<String>,
@@ -19,12 +24,16 @@ pub(crate) struct TaskUpdateArgs {
     /// Accepts a typed project id (`project_…`) to infer the product
     /// automatically. Combined with `--product` when passing a slug; ignored
     /// for primary ids.
-    #[arg(long)]
+    #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) project: Option<String>,
 
     /// Move into this project (resolved against the item's own product): `chore` becomes `project_task` with a
     /// fresh ordinal. Refused for other kinds. Mutates membership, unlike `--project` above. Conflicts with `--unset-project`.
-    #[arg(long = "set-project", value_name = "PROJECT", conflicts_with = "unset_project")]
+    #[arg(
+        long = "set-project",
+        value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME,
+        conflicts_with = "unset_project"
+    )]
     pub(crate) set_project: Option<String>,
 
     /// Move out to the no-project state: `project_task` becomes `chore`, ordinal cleared. Conflicts with `--set-project`.

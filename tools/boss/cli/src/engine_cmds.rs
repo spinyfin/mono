@@ -2,6 +2,22 @@
 
 use crate::*;
 
+/// Resolve an optional `--work-item` list filter through the shared
+/// choke point so a short id never filters the ledger as a literal
+/// (confident empty result) and a missing/ambiguous id hard-errors.
+async fn resolve_optional_work_item_filter(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    work_item: Option<String>,
+) -> Result<Option<String>, CliError> {
+    match work_item {
+        Some(sel) if !sel.trim().is_empty() => Ok(Some(
+            resolve_selector_to_primary_id(client, ctx, sel.trim(), None).await?,
+        )),
+        _ => Ok(None),
+    }
+}
+
 pub(crate) async fn run_engine_command(command: EngineCommand, ctx: &RunContext) -> Result<(), CliError> {
     match command {
         EngineCommand::Status => {
@@ -344,11 +360,12 @@ pub(crate) async fn run_engine_ci_command(command: EngineCiCommand, ctx: &RunCon
                 Some(n) => Some(n),
                 None => Some(50),
             };
+            let work_item_id = resolve_optional_work_item_filter(&mut client, ctx, args.work_item).await?;
             let response = client
                 .send_request(&FrontendRequest::ListCiRemediations {
                     product_id,
                     status: args.status.clone(),
-                    work_item_id: args.work_item.clone(),
+                    work_item_id,
                     limit,
                 })
                 .await
@@ -515,12 +532,13 @@ pub(crate) async fn run_engine_attempts_command(
                 Some(n) => Some(n),
                 None => Some(50),
             };
+            let work_item_id = resolve_optional_work_item_filter(&mut client, ctx, args.work_item).await?;
             let response = client
                 .send_request(&FrontendRequest::ListEngineAttempts {
                     kinds: args.kind.clone(),
                     product_id,
                     status: args.status.clone(),
-                    work_item_id: args.work_item.clone(),
+                    work_item_id,
                     limit,
                 })
                 .await
@@ -559,11 +577,12 @@ pub(crate) async fn run_engine_conflicts_command(
                 Some(n) => Some(n),
                 None => Some(50),
             };
+            let work_item_id = resolve_optional_work_item_filter(&mut client, ctx, args.work_item).await?;
             let response = client
                 .send_request(&FrontendRequest::ListConflictResolutions {
                     product_id,
                     status: args.status.clone(),
-                    work_item_id: args.work_item.clone(),
+                    work_item_id,
                     limit,
                 })
                 .await

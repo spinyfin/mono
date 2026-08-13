@@ -929,6 +929,14 @@ pub(super) async fn handle_get_ci_budget(ctx: Dispatch, req: FrontendRequest) {
         unreachable!()
     };
     {
+        // Shared id-resolution choke point (short ids / ambiguity).
+        let work_item_id = match work_db.resolve_work_item_ref(&work_item_id) {
+            Ok(id) => id,
+            Err(err) => {
+                send_work_error(&sink, &request_id, &err);
+                return;
+            }
+        };
         match work_db.ci_budget_snapshot(&work_item_id) {
             Ok(Some(budget)) => send_response(&sink, &request_id, FrontendEvent::CiBudget { budget }),
             Ok(None) => send_response(
@@ -954,6 +962,14 @@ pub(super) async fn handle_set_ci_budget(ctx: Dispatch, req: FrontendRequest) {
         unreachable!()
     };
     {
+        // Shared id-resolution choke point (short ids / ambiguity).
+        let work_item_id = match work_db.resolve_work_item_ref(&work_item_id) {
+            Ok(id) => id,
+            Err(err) => {
+                send_work_error(&sink, &request_id, &err);
+                return;
+            }
+        };
         match work_db.set_ci_attempt_budget(&work_item_id, budget) {
             Ok(Some(snapshot)) => {
                 send_response(&sink, &request_id, FrontendEvent::CiBudgetUpdated { budget: snapshot })

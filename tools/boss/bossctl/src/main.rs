@@ -310,6 +310,7 @@ enum Command {
     /// running, the item is deleted, or the id is unknown.
     Reveal {
         /// Work item to reveal: short id (`T607`) or canonical id.
+        #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
         id: String,
     },
     /// Open a markdown file in the Boss UI, the same as using the app's
@@ -433,11 +434,16 @@ enum DispatchAction {
     /// queue-side CI, …) with evidence lines and known recovery.
     ///
     /// Accepts an execution id (`exec_…`) or a work-item id (`task_…`,
-    /// `chore_…`, …). File-scan only over dispatch JSONL + engine-trace —
-    /// works when the engine is wedged. Signature catalog:
+    /// friendly `T<n>` / `#n` / bare `n` / `slug/n`). Short ids resolve
+    /// via the shared WorkDb choke point and hard-error when missing or
+    /// ambiguous — never an empty "no dispatch events" result.
+    /// File-scan over dispatch JSONL + engine-trace works when the
+    /// engine is wedged (state.db still required for short-id resolve).
+    /// Signature catalog:
     /// `tools/boss/docs/investigations/bossctl-doctor-failure-signatures-*.md`.
     Diagnose {
-        /// Execution id (`exec_…`) or work-item id.
+        /// Execution id (`exec_…`) or work-item id (primary or short).
+        #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
         id: String,
         /// Override the Boss state root.
         #[arg(long)]
@@ -728,6 +734,7 @@ enum AgentsAction {
     /// Launch a worker session for a given work item without going
     /// through the coordinator's auto-dispatch path.
     Launch {
+        #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
         work_item_id: String,
         #[arg(long)]
         preferred_workspace_id: Option<String>,
@@ -868,6 +875,7 @@ enum DoctorAction {
 enum WorkAction {
     /// Request the engine schedule a work item for execution.
     Start {
+        #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
         work_item_id: String,
         #[arg(long)]
         priority: Option<i64>,
@@ -897,6 +905,7 @@ enum WorkAction {
     /// `metrics`/`hosts`), so it works even when the engine is wedged.
     /// Exec ids are ready to paste into `bossctl dispatch diagnose`.
     Executions {
+        #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
         work_item_id: String,
         /// Override the Boss state-root directory.
         #[arg(long)]
@@ -922,8 +931,8 @@ enum ProposalsAction {
         #[arg(long)]
         execution_id: Option<String>,
         /// Restrict to proposals filed against this work item (across all
-        /// its executions).
-        #[arg(long)]
+        /// its executions). Accepts primary id or friendly short id.
+        #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
         work_item_id: Option<String>,
         /// Restrict to one proposal kind (e.g. `followup_task`, `blocked`).
         #[arg(long)]
@@ -1141,7 +1150,7 @@ enum ExecutionsAction {
         execution_id: Option<String>,
         /// Cancel every never-started execution for this work item
         /// (canonical id or short id as accepted by the engine).
-        #[arg(long)]
+        #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
         work_item: Option<String>,
         /// Operator reason recorded in `engine-audit.log` and the
         /// terminalization log line.
@@ -1227,7 +1236,7 @@ enum AttachmentsAction {
     /// image and whether retention has reclaimed its bytes.
     List {
         /// Only show attachments for one work item.
-        #[arg(long)]
+        #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
         work_item: Option<String>,
         /// Override the Boss state-root directory.
         #[arg(long)]
@@ -1706,9 +1715,36 @@ fn dispatch_tail(
 fn dispatch_diagnose(json: bool, state_root: Option<PathBuf>, id: &str, signatures_only: bool) -> Result<()> {
     let root = resolve_state_root(state_root.clone())?;
     // Optional state.db: resolve work-item ↔ executions and SIG-2 facts.
-    // Missing/unreadable db is non-fatal — diagnose stays file-scan-first.
+    // Missing/unreadable db is non-fatal for the file-scan path — but a
+    // friendly short-id selector *must* resolve via the shared WorkDb
+    // choke point. Passing a short id through as a literal yields a
+    // confident empty "no dispatch events" answer that misdiagnoses a
+    // live work item as never dispatched.
     let db = open_state_db(state_root).ok();
-    doctor::run_diagnose(&root, id, json, signatures_only, now_epoch_ms(), db.as_ref())
+    let id = resolve_diagnose_id(db.as_ref(), id)?;
+    doctor::run_diagnose(&root, &id, json, signatures_only, now_epoch_ms(), db.as_ref())
+}
+
+/// Shared id-resolution choke point for `dispatch diagnose`.
+///
+/// Friendly short-id forms (`T-form`, `#n`, bare `n`, `slug/n`) go
+/// through [`WorkDb::resolve_work_item_ref`]. Unresolvable / ambiguous
+/// short ids are hard errors (non-zero exit, explicit message) — never
+/// an empty diagnose result. Opaque forms (execution ids, primary ids)
+/// pass through for the existing file-scan / db execution lookup.
+fn resolve_diagnose_id(db: Option<&boss_engine::work::WorkDb>, id: &str) -> Result<String> {
+    if !boss_protocol::is_friendly_work_item_selector(id) {
+        return Ok(id.to_owned());
+    }
+    let Some(work_db) = db else {
+        anyhow::bail!(
+            "could not resolve id {id}: state.db unavailable \
+             (pass --state-root, or use a primary task_… / exec_… id)"
+        );
+    };
+    work_db
+        .resolve_work_item_ref(id)
+        .map_err(|err| anyhow::anyhow!("{err}"))
 }
 
 fn dispatch_ghost_active(
@@ -2135,10 +2171,14 @@ async fn grok_homes_sweep(
 /// gallery) is not running.
 fn attachments_list(json: bool, state_root: Option<PathBuf>, work_item: Option<String>) -> Result<()> {
     let db = open_state_db(state_root)?;
-    let attachments = match work_item.as_deref() {
-        Some(id) => db
-            .list_work_attachments_for_work_item(id)
-            .context("listing attachments for work item")?,
+    let attachments = match work_item {
+        Some(id) => {
+            let id = db
+                .resolve_work_item_ref_strict(&id)
+                .map_err(|err| anyhow::anyhow!("{err}"))?;
+            db.list_work_attachments_for_work_item(&id)
+                .context("listing attachments for work item")?
+        }
         None => db.list_all_work_attachments().context("listing attachments")?,
     };
 
@@ -2247,9 +2287,15 @@ async fn attachments_sweep(
 /// use), so it works even when the engine is wedged.
 fn work_executions(json: bool, state_root: Option<PathBuf>, work_item_id: &str) -> Result<()> {
     let db = open_state_db(state_root)?;
-    let executions = db.list_executions(Some(work_item_id)).context("listing executions")?;
+    // Strict choke point: only work-item ids (not exec_…). A typo that is
+    // not a friendly form and not a known primary id hard-errors instead
+    // of querying with the literal and printing an empty list.
+    let work_item_id = db
+        .resolve_work_item_ref_strict(work_item_id)
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
+    let executions = db.list_executions(Some(&work_item_id)).context("listing executions")?;
     let host_ids = db
-        .execution_host_ids_for_item(work_item_id)
+        .execution_host_ids_for_item(&work_item_id)
         .context("resolving execution hosts")?;
     let hosts: Vec<String> = executions
         .iter()
@@ -2314,6 +2360,12 @@ fn work_proposals_list(
         .context("parsing --state")?;
 
     let db = open_state_db(state_root)?;
+    // Shared choke point: short ids resolve (or hard-error) before the
+    // proposals filter so a bare T-form never silently matches nothing.
+    let work_item_id = work_item_id
+        .map(|id| db.resolve_work_item_ref_strict(&id))
+        .transpose()
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
     let proposals = db
         .list_worker_proposals(execution_id.as_deref(), work_item_id.as_deref(), kind, state)
         .context("listing worker proposals")?;

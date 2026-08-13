@@ -90,57 +90,56 @@ pub(crate) fn looks_like_name_or_slot(reference: &str) -> bool {
     ROSTER.iter().any(|name| name.eq_ignore_ascii_case(reference))
 }
 
-/// Resolve `reference` to a work item when it looks like one: a friendly
-/// short id (`T42`, `t42`, `P7`, `p7`) or a primary `task_…` / `proj_…` /
-/// `prod_…` id. Returns `Ok(None)` for anything else (run ids, slot
-/// numbers, crew names) so callers can fall through to their own
-/// resolution — this never errors on a selector that simply isn't a work
-/// item reference.
+/// Resolve `reference` to a work item via the engine's shared id-resolution
+/// choke point (`GetWorkItem` → `WorkDb::resolve_work_item_ref`).
+///
+/// Accepts friendly short ids (`T42`, `t42`, `P7`, `#42`, bare `42`,
+/// `slug/n`) and primary `task_…` / `proj_…` / `prod_…` ids. Ambiguous
+/// short ids hard-error with every candidate listed — never silently
+/// pick the first product match.
+///
+/// Returns `Ok(None)` for anything that is not a work-item selector form
+/// (run ids, slot numbers, crew names) so callers can fall through to
+/// their own resolution. A friendly form that matches nothing also
+/// returns `Ok(None)` (not an error) so agent verbs can report "no
+/// worker matches" (with live / durable candidate lists) rather than
+/// "no such work item". Ambiguity still hard-errors — it must never
+/// fall through to the first-product-match path.
 pub(crate) async fn resolve_work_item_ref(client: &mut BossClient, reference: &str) -> Result<Option<WorkItem>> {
-    if reference.starts_with("task_") || reference.starts_with("proj_") || reference.starts_with("prod_") {
-        return match client
-            .send_request(&FrontendRequest::GetWorkItem {
-                id: reference.to_owned(),
-            })
-            .await
-            .context("resolving work item")?
-        {
-            FrontendEvent::WorkItemResult { item } => Ok(Some(item)),
-            _ => Ok(None),
-        };
-    }
-    if reference.len() < 2 {
+    let looks_like_work_item =
+        boss_protocol::is_friendly_work_item_selector(reference) || boss_protocol::is_typed_work_item_id(reference);
+    if !looks_like_work_item {
         return Ok(None);
     }
-    let first = reference.as_bytes()[0];
-    if first != b'T' && first != b't' && first != b'P' && first != b'p' {
-        return Ok(None);
-    }
-    let n: i64 = match reference[1..].parse() {
-        Ok(n) if n > 0 => n,
-        _ => return Ok(None),
+    // Normalize bare/hash short ids to the T{n} wire form so GetWorkItem
+    // hits the shared engine choke point uniformly.
+    let wire_id = match boss_protocol::parse_work_item_selector(reference) {
+        boss_protocol::WorkItemSelector::ShortId(n) => boss_protocol::short_id_wire_form(n),
+        _ => reference.to_owned(),
     };
-    let products = match client
-        .send_request(&FrontendRequest::ListProducts)
+    match client
+        .send_request(&FrontendRequest::GetWorkItem { id: wire_id })
         .await
-        .context("listing products for friendly-id resolution")?
+        .context("resolving work item")?
     {
-        FrontendEvent::ProductsList { products } => products,
-        _ => return Ok(None),
-    };
-    for product in &products {
-        if let FrontendEvent::WorkItemResult { item } = client
-            .send_request(&FrontendRequest::GetWorkItemByShortId {
-                product_id: product.id.clone(),
-                short_id: n,
-            })
-            .await
-            .context("resolving friendly id")?
-        {
-            return Ok(Some(item));
+        FrontendEvent::WorkItemResult { item } => Ok(Some(item)),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            // Discriminate via protocol markers (not free-form English) so
+            // a reworded engine message cannot silently flip this back to
+            // "pick the first product". Ambiguity must surface; not-found
+            // falls through to no_worker_matches_error.
+            if message.contains(boss_protocol::WORK_ITEM_ID_AMBIGUOUS_MARKER) {
+                bail!("{message}");
+            }
+            if message.contains(boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER) {
+                return Ok(None);
+            }
+            // Unknown error class from the engine — surface it rather
+            // than swallow.
+            bail!("{message}");
         }
+        _ => Ok(None),
     }
-    Ok(None)
 }
 
 /// If `selector` looks like a friendly work-item id (`T42`, `t42`, `P7`,

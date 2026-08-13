@@ -53,7 +53,9 @@ pub(crate) enum ReviewAction {
     /// direct-DB pattern `bossctl work executions` already uses, so it
     /// still answers even when the engine itself is wedged.
     Show {
-        /// Work item id (task/chore), e.g. `task_abc123`.
+        /// Work item id (task/chore). Accepts primary id or friendly
+        /// short id (`T42`); short ids resolve via the shared choke point.
+        #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
         work_item: String,
         /// Override the Boss state-root directory.
         #[arg(long)]
@@ -70,6 +72,14 @@ pub(crate) enum ReviewAction {
 /// runs, not a worker-facing surface (see `bossctl`'s crate doc comment).
 pub(crate) fn review_show(json: bool, state_root: Option<PathBuf>, work_item: String) -> Result<()> {
     let db = super::open_state_db(state_root)?;
+    // Shared choke point: short ids resolve (or hard-error) before the
+    // PR-status lookup so a bare T-form never reports "unknown work item"
+    // when the row exists under its primary id.
+    // Strict: only work-item ids — a typo must not report "unknown work
+    // item" after a quiet pass-through of the bogus literal.
+    let work_item = db
+        .resolve_work_item_ref_strict(&work_item)
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
     // `get_pr_status_snapshot` returns `Ok(None)` ONLY when the `tasks` row
     // itself is absent or soft-deleted (see its doc comment) — never for a
     // work item that merely has no PR yet. Treat `None` as "unknown work

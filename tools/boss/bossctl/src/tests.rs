@@ -506,3 +506,160 @@ fn work_start_force_composes_with_priority_and_workspace() {
         other => panic!("expected WorkAction::Start, got {other:?}"),
     }
 }
+
+/// Walk clap collecting `(surface_path, arg_id, has_work_item_id_marker)`.
+fn walk_clap_args(command: &clap::Command) -> Vec<(String, String, bool)> {
+    fn walk(command: &clap::Command, path: &mut Vec<String>, out: &mut Vec<(String, String, bool)>) {
+        for arg in command.get_arguments() {
+            let arg_id = arg.get_id().as_str().to_owned();
+            let marked = arg.get_value_names().is_some_and(|names| {
+                names
+                    .iter()
+                    .any(|n| n.as_str() == boss_protocol::WORK_ITEM_ID_VALUE_NAME)
+            });
+            let mut surface = path.clone();
+            surface.push(arg_id.clone());
+            out.push((surface.join(" "), arg_id, marked));
+        }
+        for sub in command.get_subcommands() {
+            path.push(sub.get_name().to_owned());
+            walk(sub, path, out);
+            path.pop();
+        }
+    }
+    let mut out = Vec::new();
+    walk(command, &mut Vec::new(), &mut out);
+    out
+}
+
+fn is_id_shaped_arg(arg_id: &str) -> bool {
+    if arg_id.starts_with("with_") || arg_id == "comment_id" {
+        return false;
+    }
+    matches!(
+        arg_id,
+        "id" | "selector" | "parent" | "dependent" | "prerequisite" | "depends_on" | "task" | "project" | "agent"
+    ) || arg_id.starts_with("work_item")
+        || arg_id.ends_with("_id")
+}
+
+/// Arg ids that look id-shaped but are not work-item selectors.
+const NON_WORK_ITEM_ARG_IDS: &[&str] = &[
+    "execution_id",
+    "probe_id",
+    "preferred_workspace_id",
+    "host_id",
+    "agent", // run id / slot / crew name; work-item form is optional fall-through
+];
+
+/// Surface paths for non-work-item namespaces (hosts, comments cmt_…).
+fn is_non_work_item_surface(surface: &str) -> bool {
+    if surface.starts_with("hosts ") {
+        return true;
+    }
+    if surface.starts_with("comments ") && (surface.ends_with(" comment_id") || surface.contains("comment_id")) {
+        return true;
+    }
+    false
+}
+
+/// Adversarial: every id-shaped bossctl arg is marked WORK_ITEM_ID or
+/// explicitly allowlisted as a non-work-item namespace.
+#[test]
+fn every_id_shaped_arg_is_marked_or_allowlisted() {
+    use clap::CommandFactory;
+    let args = walk_clap_args(&Cli::command());
+    let mut unmarked = Vec::new();
+    let mut marked = Vec::new();
+    for (surface, arg_id, has_marker) in &args {
+        if !is_id_shaped_arg(arg_id) {
+            continue;
+        }
+        if *has_marker {
+            marked.push(surface.clone());
+            continue;
+        }
+        if NON_WORK_ITEM_ARG_IDS.contains(&arg_id.as_str()) || is_non_work_item_surface(surface) {
+            continue;
+        }
+        // Positional `id` under dispatch diagnose is marked; other bare
+        // `id` fields (if any) must be allowlisted here intentionally.
+        unmarked.push(format!("{surface} (arg={arg_id})"));
+    }
+    assert!(
+        unmarked.is_empty(),
+        "id-shaped bossctl clap args missing WORK_ITEM_ID marker: {unmarked:?}\n\
+         marked: {marked:?}"
+    );
+    assert!(
+        marked.iter().any(|s| s.contains("diagnose")),
+        "dispatch diagnose must be a WORK_ITEM_ID surface; marked={marked:?}"
+    );
+    assert!(
+        marked
+            .iter()
+            .any(|s| s.contains("work_item_id") || s.contains("work_item")),
+        "work proposals / executions / cancel work-item filters must be marked; marked={marked:?}"
+    );
+}
+
+/// Each handler module that serves WORK_ITEM_ID surfaces must call the
+/// shared WorkDb choke point (`resolve_work_item_ref` /
+/// `resolve_work_item_ref_strict` / `resolve_diagnose_id`).
+#[test]
+fn every_work_item_id_surface_routes_through_shared_resolver() {
+    use clap::CommandFactory;
+    let marked: Vec<String> = walk_clap_args(&Cli::command())
+        .into_iter()
+        .filter(|(_, _, m)| *m)
+        .map(|(s, _, _)| s)
+        .collect();
+    assert!(!marked.is_empty(), "expected WORK_ITEM_ID surfaces on bossctl");
+
+    const HANDLER_MODULES: &[(&str, &str, &[&str])] = &[
+        (
+            "main.rs",
+            include_str!("main.rs"),
+            &[
+                "resolve_work_item_ref_strict",
+                "resolve_work_item_ref",
+                "resolve_diagnose_id",
+            ],
+        ),
+        (
+            "agents.rs",
+            include_str!("agents.rs"),
+            &["resolve_work_item_ref", "GetWorkItem"],
+        ),
+        (
+            "review.rs",
+            include_str!("review.rs"),
+            &["resolve_work_item_ref_strict", "resolve_work_item_ref"],
+        ),
+    ];
+    for (name, src, symbols) in HANDLER_MODULES {
+        let reachable = symbols.iter().any(|sym| src.contains(sym));
+        assert!(
+            reachable,
+            "bossctl handler {name} must call a shared resolver symbol \
+             {symbols:?}; marked surfaces={marked:?}"
+        );
+    }
+}
+
+#[test]
+fn resolve_diagnose_id_rejects_unresolvable_short_id() {
+    // Without a db, friendly short ids must hard-error — never pass
+    // through as a literal that yields an empty diagnose result.
+    let err = resolve_diagnose_id(None, &format!("T{}", 99)).unwrap_err().to_string();
+    assert!(
+        err.contains("could not resolve") || err.contains("state.db"),
+        "expected hard resolve failure, got: {err}"
+    );
+}
+
+#[test]
+fn resolve_diagnose_id_passes_through_execution_ids() {
+    let resolved = resolve_diagnose_id(None, "exec_18cb2cafec048218_1e").unwrap();
+    assert_eq!(resolved, "exec_18cb2cafec048218_1e");
+}

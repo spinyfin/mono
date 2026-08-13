@@ -15,6 +15,7 @@ mod metrics_wire;
 pub mod planner;
 mod types;
 mod wire;
+mod work_item_id;
 mod worker_event;
 mod worker_names;
 
@@ -32,5 +33,10 @@ pub use planner::{
 };
 pub use types::*;
 pub use wire::*;
+pub use work_item_id::{
+    WORK_ITEM_ID_AMBIGUOUS_MARKER, WORK_ITEM_ID_NOT_FOUND_MARKER, WORK_ITEM_ID_VALUE_NAME, WorkItemSelector,
+    is_friendly_work_item_selector, is_typed_work_item_id, parse_short_id_number, parse_work_item_selector,
+    short_id_wire_form,
+};
 pub use worker_event::*;
 pub use worker_names::*;
