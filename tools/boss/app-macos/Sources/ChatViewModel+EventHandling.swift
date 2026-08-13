@@ -68,8 +68,6 @@ extension ChatViewModel {
             // selected-product` would answer `no_selection` after every
             // reconnect until the operator happened to switch products.
             reportSelectedProductToEngine()
-        case .bossSessionRegistered:
-            break
         case .engineRequest(let requestId, let request):
             handleEngineRequest(requestId: requestId, request: request)
         case .disconnected:

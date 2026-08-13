@@ -351,8 +351,6 @@ final class EngineClient: @unchecked Sendable {
                 let reviewSlots = (payload["review_slots"] as? NSNumber)?.intValue ?? 8
                 let coordinatorModel = payload["coordinator_model"] as? String ?? "opus"
                 emit(.enginePoolConfig(workerSlots: workerSlots, automationSlots: automationSlots, reviewSlots: reviewSlots, coordinatorModel: coordinatorModel))
-            case "boss_session_registered":
-                emit(.bossSessionRegistered)
             case "engine_request":
                 guard
                     let requestId = payload["request_id"] as? String,

@@ -387,6 +387,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_record_model_preserves_a_live_conversation() {
+        let (db, tmux, server) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
+        db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "")
+            .unwrap();
+        db.record_coordinator_tmux_session_created("token").unwrap();
+
+        let record = ensure_for_attach(&db, &tmux, "opus").await.unwrap();
+
+        assert!(record.model.is_empty());
+        assert!(
+            !server
+                .calls()
+                .iter()
+                .any(|call| call.get(2).map(String::as_str) == Some("kill-session"))
+        );
+    }
+
+    #[tokio::test]
     async fn stale_confirmation_does_not_kill_current_session() {
         let (db, tmux, server) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
         db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus")

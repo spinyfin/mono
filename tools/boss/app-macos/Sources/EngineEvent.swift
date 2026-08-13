@@ -11,7 +11,6 @@ enum EngineEvent {
     case resyncRequired
     case workInvalidated(topic: String, productId: String?, itemIds: [String])
     case appSessionRegistered
-    case bossSessionRegistered
     case engineRequest(requestId: String, request: EngineRequestKind)
     case productsList(products: [WorkProduct])
     case projectsList(productId: String, projects: [WorkProject])
