@@ -62,25 +62,24 @@ pub fn should_skip(input: SkipInput<'_>) -> SkipDecision {
         });
     }
 
-    if input.trigger != Trigger::Schedule || input.last_published.is_none() || input.last_published_sha.is_none() {
+    let (Some(last_release), Some(_)) = (input.last_published, input.last_published_sha) else {
+        return SkipDecision::Proceed;
+    };
+    if input.trigger != Trigger::Schedule {
         return SkipDecision::Proceed;
     }
 
     let touched_relevant_path = input.changed_paths.iter().any(|changed| {
-        input
-            .change_paths
-            .iter()
-            .any(|release_path| changed.starts_with(release_path))
+        input.change_paths.iter().any(|release_path| {
+            let release_path = release_path.trim_end_matches('/');
+            changed == release_path || changed.starts_with(&format!("{release_path}/"))
+        })
     });
     if touched_relevant_path {
         SkipDecision::Proceed
     } else {
         SkipDecision::Skip(SkipReason::NoRelevantChanges {
-            tag: input
-                .last_published
-                .expect("last release checked above")
-                .tag_name
-                .clone(),
+            tag: last_release.tag_name.clone(),
         })
     }
 }
@@ -118,6 +117,16 @@ mod tests {
         let error = assert_allowed_trigger("push").expect_err("push trigger must fail");
 
         assert!(error.to_string().contains("expected schedule, ui, or api"), "{error}");
+    }
+
+    #[test]
+    fn accepts_each_release_trigger_source() {
+        assert_eq!(
+            assert_allowed_trigger("schedule").expect("schedule is allowed"),
+            Trigger::Schedule
+        );
+        assert_eq!(assert_allowed_trigger("ui").expect("ui is allowed"), Trigger::Ui);
+        assert_eq!(assert_allowed_trigger("api").expect("api is allowed"), Trigger::Api);
     }
 
     #[test]
@@ -170,6 +179,26 @@ mod tests {
                 &changed,
             )),
             SkipDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn scheduled_run_does_not_match_a_sibling_path() {
+        let release = release("v1.2.3", false);
+        let release_paths = vec!["tools/release".to_owned()];
+        let changed = vec!["tools/release-notes/x.md".to_owned()];
+
+        assert_eq!(
+            should_skip(input(
+                Trigger::Schedule,
+                Some(&release),
+                Some("previous"),
+                &release_paths,
+                &changed,
+            )),
+            SkipDecision::Skip(SkipReason::NoRelevantChanges {
+                tag: "v1.2.3".to_owned()
+            })
         );
     }
 

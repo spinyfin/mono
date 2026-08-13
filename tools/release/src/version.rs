@@ -88,6 +88,16 @@ pub(crate) fn highest_matching_tag(
     Ok(highest_counter(&base, tag_prefix, tags).map(|counter| (counter, tag_for_counter(&base, tag_prefix, counter))))
 }
 
+pub(crate) fn matching_tag_counter(
+    config: &VersionConfig,
+    tag_prefix: &str,
+    manifest_contents: Option<&str>,
+    tag: &str,
+) -> Result<Option<u64>> {
+    let base = version_base(config, manifest_contents)?;
+    Ok(counter_for_tag(&base, tag_prefix, tag))
+}
+
 fn version_base(config: &VersionConfig, manifest_contents: Option<&str>) -> Result<VersionBase> {
     let manifest_version = || -> Result<String> {
         let contents = manifest_contents.ok_or_else(|| {

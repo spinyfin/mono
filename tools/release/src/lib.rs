@@ -7,14 +7,13 @@
 mod config;
 mod decision;
 mod release_state;
+mod runner;
 mod version;
 
 pub use config::{NotesConfig, NotesSource, ReleaseConfig, VersionConfig, VersionScheme};
 pub use decision::{SkipDecision, SkipInput, SkipReason, Trigger, assert_allowed_trigger, should_skip};
-pub use release_state::{
-    Command, CommandOutput, CommandRunner, GitHubRelease, LastReleases, ReleaseState, RunnerError, query_release_state,
-    resolve_last_release,
-};
+pub use release_state::{GitHubRelease, LastReleases, ReleaseState, query_release_state, resolve_last_release};
+pub use runner::{Command, CommandOutput, CommandRunner, RunnerError};
 pub use version::{NextVersion, compute_next_version};
 
 use thiserror::Error;

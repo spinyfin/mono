@@ -1,62 +1,11 @@
+use std::time::Duration;
+
 use serde::Deserialize;
 
-use crate::version::highest_matching_tag;
-use crate::{ReleaseConfig, ReleaseError, Result};
+use crate::version::{highest_matching_tag, matching_tag_counter};
+use crate::{Command, CommandRunner, ReleaseConfig, ReleaseError, Result};
 
 const RELEASE_LIST_ATTEMPTS: usize = 3;
-
-/// One subprocess invocation, represented as data so tests can inject a
-/// captured runner instead of executing programs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Command {
-    pub program: String,
-    pub args: Vec<String>,
-}
-
-impl Command {
-    fn new(program: impl Into<String>, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        Self {
-            program: program.into(),
-            args: args.into_iter().map(Into::into).collect(),
-        }
-    }
-}
-
-/// Output captured from a subprocess invocation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommandOutput {
-    pub success: bool,
-    pub stdout: String,
-    pub stderr: String,
-}
-
-/// Failure to start or communicate with a command runner.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunnerError {
-    message: String,
-}
-
-impl RunnerError {
-    #[must_use]
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-impl std::fmt::Display for RunnerError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for RunnerError {}
-
-/// The subprocess seam for release-state queries.
-pub trait CommandRunner {
-    fn run(&self, command: &Command) -> std::result::Result<CommandOutput, RunnerError>;
-}
 
 /// The release fields needed by resolution and skip decisions. GitHub's API
 /// supplies more fields, which Serde intentionally ignores.
@@ -95,7 +44,7 @@ pub fn query_release_state(
     let releases = list_releases(runner, &config.repo)?;
     let remote_tags = list_remote_tags(runner, &config.tag_prefix)?;
     verify_remote_tags(runner, config, manifest_contents, &releases, &remote_tags)?;
-    let last = resolve_last_release(&releases, &config.tag_prefix);
+    let last = resolve_last_release(&releases, config, manifest_contents)?;
 
     Ok(ReleaseState {
         releases,
@@ -104,16 +53,35 @@ pub fn query_release_state(
     })
 }
 
-/// Splits the API's newest-first release list into independent latest
-/// published and latest draft values.
-#[must_use]
-pub fn resolve_last_release(releases: &[GitHubRelease], tag_prefix: &str) -> LastReleases {
-    let mut matching = releases
-        .iter()
-        .filter(|release| release.tag_name.starts_with(tag_prefix));
-    let published = matching.clone().find(|release| !release.draft).cloned();
-    let draft = matching.find(|release| release.draft).cloned();
-    LastReleases { published, draft }
+/// Splits releases into the highest matching published and draft values.
+/// Tags outside the configured version family are ignored, and API list order
+/// is never used as a proxy for version order.
+pub fn resolve_last_release(
+    releases: &[GitHubRelease],
+    config: &ReleaseConfig,
+    manifest_contents: Option<&str>,
+) -> Result<LastReleases> {
+    let mut published = None;
+    let mut draft = None;
+    for release in releases {
+        let Some(counter) = matching_tag_counter(
+            &config.version,
+            &config.tag_prefix,
+            manifest_contents,
+            &release.tag_name,
+        )?
+        else {
+            continue;
+        };
+        let selected = if release.draft { &mut draft } else { &mut published };
+        if selected.as_ref().is_none_or(|(highest, _)| counter > *highest) {
+            *selected = Some((counter, release.clone()));
+        }
+    }
+    Ok(LastReleases {
+        published: published.map(|(_, release)| release),
+        draft: draft.map(|(_, release)| release),
+    })
 }
 
 fn list_releases(runner: &impl CommandRunner, repo: &str) -> Result<Vec<GitHubRelease>> {
@@ -130,11 +98,19 @@ fn list_releases(runner: &impl CommandRunner, repo: &str) -> Result<Vec<GitHubRe
         ],
     );
     let mut last_error = String::new();
-    for _ in 0..RELEASE_LIST_ATTEMPTS {
+    for attempt in 1..=RELEASE_LIST_ATTEMPTS {
         match runner.run(&command) {
             Ok(output) if output.success => return Ok(serde_json::from_str(&output.stdout)?),
             Ok(output) => last_error = output.stderr,
             Err(error) => last_error = error.to_string(),
+        }
+        if attempt < RELEASE_LIST_ATTEMPTS {
+            let delay = Duration::from_secs((attempt * 5) as u64);
+            eprintln!(
+                "release list attempt {attempt}/{RELEASE_LIST_ATTEMPTS} failed: {last_error}; retrying in {} seconds",
+                delay.as_secs()
+            );
+            runner.sleep(delay);
         }
     }
     Err(ReleaseError::ReleaseListUnavailable {
@@ -222,8 +198,10 @@ fn parse_remote_tags(stdout: &str) -> Vec<String> {
 mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
+    use std::time::Duration;
 
     use super::*;
+    use crate::{CommandOutput, RunnerError};
 
     const CONFIG: &str = include_str!("testdata/alpha-release.toml");
     const MANIFEST: &str = include_str!("testdata/alpha-package.toml");
@@ -233,6 +211,7 @@ mod tests {
     struct FixtureRunner {
         responses: RefCell<VecDeque<std::result::Result<CommandOutput, RunnerError>>>,
         calls: RefCell<Vec<Command>>,
+        sleeps: RefCell<Vec<Duration>>,
     }
 
     impl FixtureRunner {
@@ -240,6 +219,7 @@ mod tests {
             Self {
                 responses: RefCell::new(responses.into_iter().collect()),
                 calls: RefCell::new(Vec::new()),
+                sleeps: RefCell::new(Vec::new()),
             }
         }
     }
@@ -251,6 +231,10 @@ mod tests {
                 .borrow_mut()
                 .pop_front()
                 .expect("fixture response for command")
+        }
+
+        fn sleep(&self, duration: Duration) {
+            self.sleeps.borrow_mut().push(duration);
         }
     }
 
@@ -265,9 +249,42 @@ mod tests {
     #[test]
     fn splits_published_and_draft_releases_from_captured_json() {
         let releases: Vec<GitHubRelease> = serde_json::from_str(RELEASES).expect("parse captured JSON");
-        let last = resolve_last_release(&releases, "demo-v");
+        let config = ReleaseConfig::parse(CONFIG).expect("parse config");
+        let last = resolve_last_release(&releases, &config, Some(MANIFEST)).expect("resolve last releases");
 
         assert_eq!(last.published.expect("published").tag_name, "demo-v0.4.1-alpha.8");
+        assert_eq!(last.draft.expect("draft").tag_name, "demo-v0.4.1-alpha.9");
+    }
+
+    #[test]
+    fn selects_the_highest_release_in_the_configured_version_family() {
+        let config = ReleaseConfig::parse(CONFIG).expect("parse config");
+        let releases = vec![
+            GitHubRelease {
+                tag_name: "demo-v0.3.9-alpha.99".to_owned(),
+                draft: false,
+            },
+            GitHubRelease {
+                tag_name: "demo-v0.4.1-alpha.8".to_owned(),
+                draft: false,
+            },
+            GitHubRelease {
+                tag_name: "demo-v0.4.1-alpha.10".to_owned(),
+                draft: false,
+            },
+            GitHubRelease {
+                tag_name: "demo-v0.4.1-alpha.bad".to_owned(),
+                draft: true,
+            },
+            GitHubRelease {
+                tag_name: "demo-v0.4.1-alpha.9".to_owned(),
+                draft: true,
+            },
+        ];
+
+        let last = resolve_last_release(&releases, &config, Some(MANIFEST)).expect("resolve last releases");
+
+        assert_eq!(last.published.expect("published").tag_name, "demo-v0.4.1-alpha.10");
         assert_eq!(last.draft.expect("draft").tag_name, "demo-v0.4.1-alpha.9");
     }
 
@@ -320,6 +337,53 @@ mod tests {
     }
 
     #[test]
+    fn reports_a_leaked_remote_tag_when_lookup_returns_not_found() {
+        let config = ReleaseConfig::parse(CONFIG).expect("parse config");
+        let remote_tags = "abc\trefs/tags/demo-v0.4.1-alpha.10\n";
+        let runner = FixtureRunner::new([
+            success(RELEASES),
+            success(remote_tags),
+            Ok(CommandOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "not found".to_owned(),
+            }),
+        ]);
+
+        let error = query_release_state(&runner, &config, Some(MANIFEST)).expect_err("leaked tag must fail");
+
+        assert!(matches!(error, ReleaseError::LeakedRemoteTag { .. }), "{error}");
+    }
+
+    #[test]
+    fn reports_an_unavailable_tag_lookup() {
+        let config = ReleaseConfig::parse(CONFIG).expect("parse config");
+        let remote_tags = "abc\trefs/tags/demo-v0.4.1-alpha.10\n";
+        let runner = FixtureRunner::new([
+            success(RELEASES),
+            success(remote_tags),
+            Err(RunnerError::new("network unavailable")),
+        ]);
+
+        let error = query_release_state(&runner, &config, Some(MANIFEST)).expect_err("unknown tag state must fail");
+
+        assert!(
+            matches!(error, ReleaseError::ReleaseTagLookupUnavailable { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn reports_an_unavailable_remote_tag_list() {
+        let config = ReleaseConfig::parse(CONFIG).expect("parse config");
+        let runner = FixtureRunner::new([success(RELEASES), Err(RunnerError::new("network unavailable"))]);
+
+        let error = query_release_state(&runner, &config, Some(MANIFEST)).expect_err("remote tags must be available");
+
+        assert!(matches!(error, ReleaseError::RemoteTagsUnavailable(_)), "{error}");
+    }
+
+    #[test]
     fn retries_a_failed_release_list_before_accepting_a_snapshot() {
         let config = ReleaseConfig::parse(CONFIG).expect("parse config");
         let runner = FixtureRunner::new([
@@ -335,5 +399,27 @@ mod tests {
         query_release_state(&runner, &config, Some(MANIFEST)).expect("retry should succeed");
 
         assert_eq!(runner.calls.borrow().len(), 3);
+        assert_eq!(*runner.sleeps.borrow(), vec![Duration::from_secs(5)]);
+    }
+
+    #[test]
+    fn reports_the_last_error_after_all_release_list_attempts_fail() {
+        let config = ReleaseConfig::parse(CONFIG).expect("parse config");
+        let runner = FixtureRunner::new([
+            Err(RunnerError::new("first")),
+            Err(RunnerError::new("second")),
+            Err(RunnerError::new("third")),
+        ]);
+
+        let error = query_release_state(&runner, &config, Some(MANIFEST)).expect_err("all attempts must fail");
+
+        assert!(
+            matches!(error, ReleaseError::ReleaseListUnavailable { attempts: 3, ref last_error } if last_error == "third"),
+            "{error}"
+        );
+        assert_eq!(
+            *runner.sleeps.borrow(),
+            vec![Duration::from_secs(5), Duration::from_secs(10)]
+        );
     }
 }

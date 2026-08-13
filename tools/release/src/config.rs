@@ -146,6 +146,89 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_configuration_combinations() {
+        let cases = [
+            (
+                "repo must be owner/repository",
+                RELEASE_CONFIG.replace("repo = \"example/project\"", "repo = \"example\""),
+                "repo must be an owner/repository pair",
+            ),
+            (
+                "empty tag prefix",
+                RELEASE_CONFIG.replace("tag_prefix = \"demo-v\"", "tag_prefix = \"\""),
+                "tag_prefix must not be empty",
+            ),
+            (
+                "empty title prefix",
+                RELEASE_CONFIG.replace("title_prefix = \"Demo\"", "title_prefix = \"\""),
+                "title_prefix must not be empty",
+            ),
+            (
+                "empty change path",
+                RELEASE_CONFIG.replace(
+                    "change_paths = [\"tool/\", \".buildkite/pipeline-release.yml\"]",
+                    "change_paths = [\"\"]",
+                ),
+                "change_paths must not contain empty paths",
+            ),
+            (
+                "empty asset name",
+                RELEASE_CONFIG.replace("required_assets = [\"demo-linux\"]", "required_assets = [\"\"]"),
+                "asset names must not be empty",
+            ),
+            (
+                "duplicate asset role",
+                RELEASE_CONFIG.replace(
+                    "optional_assets = [\"demo-darwin\"]",
+                    "optional_assets = [\"demo-linux\"]",
+                ),
+                "an asset cannot be both required and optional",
+            ),
+            (
+                "alpha without manifest",
+                RELEASE_CONFIG.replace("manifest = \"tool/Cargo.toml\"\n", ""),
+                "alpha-counter requires manifest",
+            ),
+            (
+                "alpha with literal major minor",
+                RELEASE_CONFIG.replace(
+                    "manifest = \"tool/Cargo.toml\"",
+                    "manifest = \"tool/Cargo.toml\"\nmajor_minor = \"0.4\"",
+                ),
+                "alpha-counter requires manifest",
+            ),
+            (
+                "patch with neither source",
+                RELEASE_CONFIG.replace(
+                    "scheme = \"alpha-counter\"\nmanifest = \"tool/Cargo.toml\"",
+                    "scheme = \"patch-counter\"",
+                ),
+                "patch-counter requires exactly one",
+            ),
+            (
+                "patch with both sources",
+                RELEASE_CONFIG
+                    .replace("scheme = \"alpha-counter\"", "scheme = \"patch-counter\"")
+                    .replace(
+                        "manifest = \"tool/Cargo.toml\"",
+                        "manifest = \"tool/Cargo.toml\"\nmajor_minor = \"0.4\"",
+                    ),
+                "patch-counter requires exactly one",
+            ),
+            (
+                "changelog without project",
+                RELEASE_CONFIG.replace("project = \"tool/PROJECT.yaml\"\n", ""),
+                "changelog notes require a project path",
+            ),
+        ];
+
+        for (name, contents, expected) in cases {
+            let error = ReleaseConfig::parse(&contents).expect_err(name);
+            assert!(error.to_string().contains(expected), "{name}: {error}");
+        }
+    }
+
+    #[test]
     fn patch_counter_accepts_a_literal_major_minor_pair() {
         let config = ReleaseConfig::parse(
             r#"
