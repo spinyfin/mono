@@ -56,6 +56,11 @@ fn dispatch_paused_issue(report: &boss_protocol::EngineHealthReport) -> Option<&
     report.issues.iter().find(|issue| issue.kind == "dispatch_paused")
 }
 
+/// The `automation_paused` issue from a report, if present.
+fn automation_paused_issue(report: &boss_protocol::EngineHealthReport) -> Option<&boss_protocol::EngineHealthIssue> {
+    report.issues.iter().find(|issue| issue.kind == "automation_paused")
+}
+
 /// Trip the spawn-capability circuit breaker — a pauser that never goes
 /// anywhere near a `FrontendRequest` handler.
 async fn trip_breaker(state: &Arc<ServerState>) {
@@ -171,9 +176,8 @@ async fn broadcaster_start_pushes_a_pause_that_was_already_in_force() {
     );
 }
 
-/// The operator path still works after the broadcast moved off the handler:
-/// `SetDispatchPaused` pushes because it changes the state, not because the
-/// handler pushes.
+/// A `SetDispatchPaused` RPC pause reaches a running app: the handler does
+/// not push health itself — the pause-state transition it causes does.
 #[tokio::test]
 async fn operator_pause_rpc_still_pushes_engine_health() {
     let (state, _dir) = test_server_state();
@@ -208,5 +212,58 @@ async fn operator_pause_rpc_still_pushes_engine_health() {
     assert!(
         dispatch_paused_issue(&report).is_some_and(|issue| issue.body.contains("operator is rebooting the build host")),
         "the operator's own reason must reach the banner: {report:?}",
+    );
+}
+
+/// Automation pause/resume must also push `engine.health` live. Change
+/// detection on this path is hand-rolled (flag / since / reason), not a
+/// single `PartialEq` snapshot comparison, so a silent regression there
+/// would leave the automation banner stale on a running app.
+#[tokio::test]
+async fn automation_pause_and_resume_push_engine_health_to_a_running_app() {
+    let (state, _dir) = test_server_state();
+    let sink = subscribed_health_session(&state).await;
+    let _broadcaster = state.spawn_pause_state_health_broadcaster();
+
+    let initial = next_health_report(&sink).await;
+    assert!(
+        !initial.automation_paused,
+        "fixture precondition: automation starts unpaused, got {initial:?}",
+    );
+
+    state.execution_coordinator.pause_automation(
+        PAUSED_AT_EPOCH_S as u64,
+        boss_protocol::PauseReason::new("operator is holding automation while debugging triage").unwrap(),
+    );
+
+    let paused = next_health_report(&sink).await;
+    assert!(
+        paused.automation_paused,
+        "an automation pause must push a paused health report, got {paused:?}",
+    );
+    assert!(
+        !paused.dispatch_paused,
+        "pausing automation must not flip the independent dispatch_paused flag, got {paused:?}",
+    );
+    let issue = automation_paused_issue(&paused).expect("a paused report must carry an automation_paused issue");
+    assert!(
+        issue
+            .body
+            .contains("operator is holding automation while debugging triage"),
+        "the automation pause reason must reach the banner, not just the paused fact: {}",
+        issue.body,
+    );
+
+    state.execution_coordinator.resume_automation();
+
+    let resumed = next_health_report(&sink).await;
+    assert!(
+        !resumed.automation_paused,
+        "an automation resume must push a cleared health report so the banner \
+         disappears without an app restart, got {resumed:?}",
+    );
+    assert!(
+        automation_paused_issue(&resumed).is_none(),
+        "a cleared report must not still carry an automation_paused issue: {resumed:?}",
     );
 }
