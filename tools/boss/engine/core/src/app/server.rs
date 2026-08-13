@@ -442,9 +442,6 @@ pub async fn serve_with_merge_probe(
         const RESTART_FAILURE_LIMIT: u32 = 5;
         const RESTART_BACKOFF_CAP: Duration = Duration::from_secs(60);
         const RESTART_FAILURE_WINDOW: Duration = Duration::from_secs(60);
-        // After the ceiling latches, wait this long before clearing the
-        // counter so a transient storm does not disable recovery forever.
-        const RESTART_CEILING_COOLDOWN: Duration = Duration::from_secs(5 * 60);
         let mut restart_failures = 0_u32;
         let mut last_restart: Option<std::time::Instant> = None;
         let mut ceiling_notified = false;
@@ -453,29 +450,22 @@ pub async fn serve_with_merge_probe(
         let mut delay = Duration::from_millis(500);
         loop {
             tokio::time::sleep(delay).await;
+            if last_restart.is_some_and(|last| last.elapsed() > RESTART_FAILURE_WINDOW) {
+                restart_failures = 0;
+                last_restart = None;
+                ceiling_notified = false;
+            }
             if restart_failures >= RESTART_FAILURE_LIMIT {
-                let cooldown_elapsed = last_restart.is_none_or(|last| last.elapsed() > RESTART_CEILING_COOLDOWN);
-                if cooldown_elapsed {
-                    tracing::info!(
-                        restart_failures,
-                        "coordinator restart ceiling cooldown elapsed; resuming recovery"
-                    );
-                    restart_failures = 0;
-                    last_restart = None;
-                    ceiling_notified = false;
-                    delay = Duration::from_secs(1);
-                } else {
-                    if !ceiling_notified {
-                        raise_coordinator_restart_ceiling_attention(&coordinator_supervisor_state).await;
-                        ceiling_notified = true;
-                    }
-                    tracing::error!(
-                        restart_failures,
-                        "coordinator restart limit reached; pausing recovery until cooldown elapses"
-                    );
-                    delay = RESTART_BACKOFF_CAP;
-                    continue;
+                if !ceiling_notified {
+                    raise_coordinator_restart_ceiling_attention(&coordinator_supervisor_state).await;
+                    ceiling_notified = true;
                 }
+                tracing::error!(
+                    restart_failures,
+                    "coordinator restart limit reached; pausing recovery until the failure window expires"
+                );
+                delay = RESTART_BACKOFF_CAP;
+                continue;
             }
             let program = match coordinator_supervisor_state.tmux_preflight.read() {
                 Ok(guard) => match &*guard {
@@ -515,12 +505,14 @@ pub async fn serve_with_merge_probe(
             match restart {
                 Ok(Some(record)) => {
                     let now = std::time::Instant::now();
-                    if last_restart.is_none_or(|last| now.duration_since(last) > RESTART_FAILURE_WINDOW) {
-                        restart_failures = 0;
-                        ceiling_notified = false;
-                    }
                     last_restart = Some(now);
                     restart_failures += 1;
+                    crate::app::sessions::request_coordinator_attachment(
+                        coordinator_supervisor_state.clone(),
+                        &tmux,
+                        record,
+                    )
+                    .await;
                     if restart_failures >= RESTART_FAILURE_LIMIT {
                         if !ceiling_notified {
                             raise_coordinator_restart_ceiling_attention(&coordinator_supervisor_state).await;
@@ -534,12 +526,6 @@ pub async fn serve_with_merge_probe(
                             .saturating_pow(restart_failures)
                             .min(RESTART_BACKOFF_CAP.as_secs()),
                     );
-                    crate::app::sessions::request_coordinator_attachment(
-                        coordinator_supervisor_state.clone(),
-                        &tmux,
-                        record,
-                    )
-                    .await;
                 }
                 Ok(None) => {
                     delay = Duration::from_secs(10);
@@ -2105,7 +2091,7 @@ pub async fn serve_with_merge_probe(
 }
 
 /// Surface a latched coordinator restart ceiling in each active project's
-/// attention feed. The supervisor resumes after `RESTART_CEILING_COOLDOWN`;
+/// attention feed. The supervisor resumes after `RESTART_FAILURE_WINDOW`;
 /// this makes the pause visible to the operator rather than only in tracing.
 async fn raise_coordinator_restart_ceiling_attention(server_state: &Arc<ServerState>) {
     let products = match server_state.work_db.list_products() {

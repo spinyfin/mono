@@ -56,7 +56,7 @@ fn authorize_rpc_boss_only_rejects_non_boss_pid_even_when_worker_registered() {
 #[test]
 fn authorize_rpc_boss_only_rejects_when_boss_pid_not_registered() {
     // When no boss_pid has been installed yet (e.g. the engine has not
-    // yet created the coordinator), BossOnly falls back to the app-pid
+    // yet created the coordinator session), BossOnly falls back to the app-pid
     // + worker-exclusion check. This covers the state before any trust
     // root is installed.
     let (server_state, _dir) = test_server_state();
@@ -72,6 +72,7 @@ fn authorize_rpc_boss_only_rejects_when_boss_pid_not_registered() {
             "no roots configured → permissive (test mode)"
         );
     }
-    // (When app_pid is set, the fall-through logic checks app ancestry —
+    // (When app_pid is set before the engine creates the coordinator session,
+    // the fall-through logic checks app ancestry —
     // that path is exercised by existing tests in this file.)
 }

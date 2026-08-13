@@ -40,10 +40,10 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
         //       rejects `RegisterAppSession` forever, no
         //       `app_session` is registered, and every
         //       engine→app RPC (`SpawnWorkerPane`, reveal) dies
-        //       silently. This mirrors the engine
-        //       restart re-attaching surviving panes): there the
-        //       app survives and the engine restarts; here the
-        //       engine survives and the app restarts. We require
+        //       silently. This mirrors engine restart re-attaching
+        //       surviving panes: there the app survives and the
+        //       engine restarts; here the engine survives and the
+        //       app restarts. We require
         //       the old pid to be genuinely dead so a second
         //       live app can't hijack the trust root from the
         //       real one.

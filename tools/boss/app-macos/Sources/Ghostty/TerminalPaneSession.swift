@@ -262,9 +262,10 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
         return true
     }
     private var paneMonitorTracker: PaneMonitorTracker
-    /// Called on the main actor when a worker pane's child process exits.
-    /// The coordinator pane leaves this unset because the engine owns its
-    /// detached tmux lifecycle.
+    /// Called on the main actor when the pane's child process exits. Worker
+    /// panes use it to report pane death to the engine; the coordinator pane
+    /// uses it to rebuild its local tmux client while the engine-owned
+    /// detached coordinator session remains unaffected.
     var onChildExited: (() -> Void)?
     /// Called on the main actor each time a libghostty surface is
     /// successfully attached to this session. Fires on initial creation

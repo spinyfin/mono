@@ -307,6 +307,9 @@ fn coordinator_verbs_stay_closed() {
         FrontendRequest::MergeWhenReady {
             work_item_id: "task_1".into(),
         },
+        FrontendRequest::RecreateCoordinator {
+            expected_spawn_token: "token".into(),
+        },
     ] {
         let denial = assert_denied(request);
         assert_eq!(denial.reason, WorkerTierDenialReason::CoordinatorOnly);
