@@ -84,6 +84,7 @@ members = [
   "tools/checkleft_package",
   "tools/cube",
   "tools/repobin",
+  "tools/release",
   "tools/changelog",
 ]
 resolver = "2"

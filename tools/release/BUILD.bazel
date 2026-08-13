@@ -1,0 +1,47 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:private"])
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "release_lib",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    compile_data = glob(["src/testdata/**"]),
+    crate_name = "release",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//tools/release:__pkg__"],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "release",
+    srcs = ["src/main.rs"],
+    crate_root = "src/main.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = [
+        ":release_lib",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "release_lib_test",
+    size = "small",
+    compile_data = glob(["src/testdata/**"]),
+    crate = ":release_lib",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
