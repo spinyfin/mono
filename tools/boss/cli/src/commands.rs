@@ -2369,13 +2369,15 @@ pub(crate) struct TaskListArgs {
     /// Restrict to rows whose `parent_task_id` matches this task,
     /// canonicalized to its revision chain root (so a mid-chain revision id
     /// and its root return the same rows, matching `list-revisions
-    /// --parent`). Accepts the same id forms as `boss task show`: a
-    /// friendly `T<n>` short id, or a primary `task_…` id — bare numeric
-    /// (`42`, `#42`) forms need a `--product` context this flag doesn't
-    /// take, and are rejected. Use this to enumerate children / revisions
-    /// of a known parent in one call (e.g. "did this chore ever spawn a
-    /// CI-fix revision?"). An id that names no row errors rather than
-    /// returning empty. Composes with the other filters as an AND.
+    /// --parent`). Accepts the same id forms as `boss task show`: friendly
+    /// short ids (`T<n>`, bare `n`, `#n`), product-scoped `slug/n`, or a
+    /// primary `task_…` id. Bare and `#` forms resolve globally; a short
+    /// id that exists in more than one product hard-errors with the
+    /// candidate list — pass `slug/n` or the primary id to disambiguate.
+    /// Use this to enumerate children / revisions of a known parent in one
+    /// call (e.g. "did this chore ever spawn a CI-fix revision?"). An id
+    /// that names no row errors rather than returning empty. Composes with
+    /// the other filters as an AND.
     #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) parent: Option<String>,
 
