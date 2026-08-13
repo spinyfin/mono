@@ -783,12 +783,12 @@ mod churn_guard_migration_tests {
     }
 
     /// A `pr_review_recovery`-sourced open `churn_guard_parked` item whose
-    /// target task happens to be `active` (not `in_review`) must NOT be
-    /// converted — `list_dead_pr_review_candidates` allows `active` tasks,
-    /// so inferring the source from task status alone would misattribute a
-    /// repeatedly-dying reviewer to a dispatch failure and bounce a row
-    /// whose actual problem is review-side. The migration must key off the
-    /// body text's recorded source instead.
+    /// target task happens to be `active` (not `in_review`) must be left
+    /// open — the migration only resolves `orphan_sweep`-sourced items and
+    /// never rewrites task rows. `list_dead_pr_review_candidates` allows
+    /// `active` tasks, so inferring the source from task status alone would
+    /// wrongly resolve a review-side park; the migration keys off the body
+    /// text's recorded source instead.
     #[test]
     fn leaves_active_task_with_pr_review_recovery_sourced_item_untouched() {
         let (_dir, db) = open_db();
