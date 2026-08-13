@@ -250,8 +250,6 @@ fn no_entry_applies_to_uses_definition_glob_unnarrowed() {
 #[test]
 #[cfg(unix)]
 fn definition_applies_to_end_to_end_selects_matching_files() {
-    use std::os::unix::fs::PermissionsExt;
-
     let temp = tempfile::tempdir().expect("temp dir");
 
     let script_path = temp.path().join("emit_one.sh");
@@ -260,9 +258,6 @@ fn definition_applies_to_end_to_end_selects_matching_files() {
         "#!/bin/sh\nprintf '%s' '{\"findings\":[{\"severity\":\"warning\",\"message\":\"selected\",\"location\":null,\"remediations\":[],\"suggested_fix\":null}]}'\n",
     )
     .expect("write script");
-    let mut perms = std::fs::metadata(&script_path).expect("metadata").permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&script_path, perms).expect("chmod");
 
     let package = applies_to_test_package(&script_path.to_string_lossy());
     let changeset = changeset_with_files(&["src/main.rs", "BUILD.bzl"]);
@@ -290,6 +285,9 @@ fn definition_applies_to_end_to_end_selects_matching_files() {
 /// wired to a shell script that immediately succeeds and emits one finding.
 #[cfg(unix)]
 fn applies_to_test_package(script_path: &str) -> ExternalCheckDeclarativePackage {
+    // The freshly written fixture is shell input, not the executable under test.
+    // This keeps file-selection assertions independent of macOS executable-policy
+    // validation for new files.
     let manifest = format!(
         r#"
 id = "test-check"
@@ -299,13 +297,13 @@ api_version = "v1"
 applies_to = ["**/*.bzl"]
 
 [needs.tool.default]
-path = "{script_path}"
+path = "/bin/sh"
 
 [[invocations]]
 id = "run"
 run = "tool"
 mode = "batch"
-args = ["{{{{files}}}}"]
+args = ["{script_path}", "{{{{files}}}}"]
 exit = {{ "0" = "findings", default = "error" }}
 
 [invocations.transform]
@@ -321,12 +319,12 @@ kind = "passthrough"
 
 // ── skip_symlinks flag ─────────────────────────────────────────────────────────
 
-/// Build a minimal per_file declarative manifest wired to a fake script, with
-/// skip_symlinks controlled by the caller. The script always exits 2 (which maps
-/// to `default → error`) when invoked, so the test can tell whether the file was
-/// selected (error propagated) or skipped (empty result returned early).
+/// Build a minimal per-file declarative manifest wired to a caller-provided
+/// script, with `skip_symlinks` controlled by the caller.
 #[cfg(unix)]
 fn skip_symlinks_package(script: &Path, skip_symlinks: bool) -> ExternalCheckDeclarativePackage {
+    // Invoke the fixture through the existing interpreter for the same reason as
+    // `applies_to_test_package`: this test is about selection, not script trust.
     let manifest = format!(
         r#"
 id = "test-skip-symlinks"
@@ -337,13 +335,13 @@ applies_to = ["**/*.md"]
 skip_symlinks = {skip_symlinks}
 
 [needs.tool.default]
-path = "{script}"
+path = "/bin/sh"
 
 [[invocations]]
 id = "run"
 run = "tool"
 mode = "per_file"
-args = ["{{{{file}}}}"]
+args = ["{script}", "{{{{file}}}}"]
 exit = {{ "0" = "ok", default = "error" }}
 
 [invocations.transform]
@@ -362,8 +360,6 @@ message = "hit"
 #[cfg(unix)]
 #[test]
 fn skip_symlinks_true_excludes_symlinked_file() {
-    use std::os::unix::fs::PermissionsExt;
-
     let repo_root = tempfile::tempdir().expect("temp repo root");
 
     // Real file.
@@ -375,9 +371,6 @@ fn skip_symlinks_true_excludes_symlinked_file() {
     // Verifying CLAUDE.md is absent from the log confirms it was filtered out.
     let script_path2 = repo_root.path().join("count.sh");
     std::fs::write(&script_path2, "#!/bin/sh\necho \"$1\" >> \"$0.log\"\nexit 0\n").expect("write count script");
-    let mut perms2 = std::fs::metadata(&script_path2).expect("metadata").permissions();
-    perms2.set_mode(0o755);
-    std::fs::set_permissions(&script_path2, perms2).expect("chmod");
 
     let package = skip_symlinks_package(&script_path2, true);
     let changeset = ChangeSet::new(vec![
@@ -425,17 +418,12 @@ fn skip_symlinks_true_excludes_symlinked_file() {
 #[cfg(unix)]
 #[test]
 fn skip_symlinks_false_includes_symlinked_file() {
-    use std::os::unix::fs::PermissionsExt;
-
     let repo_root = tempfile::tempdir().expect("temp repo root");
     std::fs::write(repo_root.path().join("AGENTS.md"), "# Agents\n").expect("write real file");
     std::os::unix::fs::symlink("AGENTS.md", repo_root.path().join("CLAUDE.md")).expect("create symlink");
 
     let script_path = repo_root.path().join("count.sh");
     std::fs::write(&script_path, "#!/bin/sh\necho \"$1\" >> \"$0.log\"\nexit 0\n").expect("write count script");
-    let mut perms = std::fs::metadata(&script_path).expect("metadata").permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&script_path, perms).expect("chmod");
 
     let package = skip_symlinks_package(&script_path, false);
     let changeset = ChangeSet::new(vec![
@@ -481,16 +469,11 @@ fn skip_symlinks_false_includes_symlinked_file() {
 #[cfg(unix)]
 #[test]
 fn real_non_symlink_file_always_included_regardless_of_flag() {
-    use std::os::unix::fs::PermissionsExt;
-
     let repo_root = tempfile::tempdir().expect("temp repo root");
     std::fs::write(repo_root.path().join("README.md"), "# Hello\n").expect("write file");
 
     let script_path = repo_root.path().join("count.sh");
     std::fs::write(&script_path, "#!/bin/sh\necho \"$1\" >> \"$0.log\"\nexit 0\n").expect("write count script");
-    let mut perms = std::fs::metadata(&script_path).expect("metadata").permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&script_path, perms).expect("chmod");
 
     let package = skip_symlinks_package(&script_path, true);
     let changeset = ChangeSet::new(vec![ChangedFile {

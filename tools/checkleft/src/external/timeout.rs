@@ -223,3 +223,42 @@ fn read_all(mut pipe: impl Read) -> Result<Vec<u8>> {
         .context("failed to read subprocess output")?;
     Ok(output)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A completed child may post pipe output after its execution budget is gone.
+    ///
+    /// The post-exit drain uses fixed [`DRAIN_GRACE`], not residual execution
+    /// budget. Back-dating the start instant exercises that boundary without a
+    /// wall-clock sleep or any dependency on host scheduling.
+    #[test]
+    fn receive_output_ok_when_residual_budget_exhausted() {
+        let timeout_ms = 100;
+        let started = Instant::now()
+            .checked_sub(Duration::from_millis(timeout_ms) + Duration::from_secs(1))
+            .expect("Instant can subtract past the execution budget");
+        assert!(
+            started.elapsed() >= Duration::from_millis(timeout_ms),
+            "test setup must start with residual budget already exhausted"
+        );
+
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender
+            .send(Ok(b"drained\n".to_vec()))
+            .expect("receiver remains connected");
+
+        let output = receive_output(
+            receiver,
+            "stdout",
+            started,
+            DRAIN_GRACE,
+            "test/drain-grace",
+            "tool",
+            timeout_ms,
+        )
+        .expect("exhausted residual budget must not fail the drain");
+        assert_eq!(output, b"drained\n");
+    }
+}
