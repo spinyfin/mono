@@ -26,8 +26,9 @@
 //!
 //! So a dead remote worker strands two ways: its execution row blocks the
 //! redundant-spawn guard (the work item shows "queued" forever — the
-//! symptom the operator saw), and its cube lease strands a remote
-//! workspace (and its multi-GB clone) as unreclaimable waste.
+//! symptom that made the failure look like a stuck queue), and its cube
+//! lease strands a remote workspace (and its multi-GB clone) as
+//! unreclaimable waste.
 //!
 //! ## What it does
 //!
@@ -260,6 +261,17 @@ async fn reap_dead_remote_execution(
     if execution.status.is_terminal() {
         return false;
     }
+    // Only live workers (`running` / `waiting_human`) can be reaped here.
+    // Park states — especially `waiting_review` / `waiting_merge` — keep
+    // their lease by design after the worker finishes and exits: the
+    // workspace is retained for a follow-up revision. A dead or never-
+    // reported pid in those states is expected, not a zombie; force-
+    // releasing the lease would hand the workspace back to cube and
+    // destroy the park. Sibling sweeps (`db_fallback_death_evidence`,
+    // `lost_workspace_sweep`, `dead_pane_sweep`) all gate the same way.
+    if !execution.status.is_live() {
+        return false;
+    }
 
     let prior_status = execution.status.as_str().to_owned();
 
@@ -267,7 +279,8 @@ async fn reap_dead_remote_execution(
     // the evidence with it. A remote worker that dies before its first hook
     // leaves every engine-side surface blank — no activity, no transcript,
     // no `Stop` — and the only record of the cause is the wrapper's
-    // `<workspace>/.boss/worker.log`. Read before the force-release below,
+    // worker log (see [`crate::host_adapter::remote_worker_log_path`]).
+    // Read before the force-release below,
     // because releasing the lease is what makes that file unreachable.
     // Best-effort by construction: the reap proceeds identically whether or
     // not the log can be read, and an unreadable log is reported as
@@ -352,24 +365,29 @@ async fn reap_dead_remote_execution(
     }
 
     // Raise an attention item. A dispatch event alone is a forensic
-    // surface an operator has to already suspect something to go looking
-    // at; the incident that motivated this sweep presented as a card
-    // sitting in Doing, reading `active`, with nothing anywhere saying its
-    // worker had died minutes earlier. A remote worker dying is exactly the
-    // "someone needs to know" class the attention lane exists for —
-    // especially since the most common cause is a host-level problem
-    // (expired agent credentials, a missing toolchain) that will kill every
-    // subsequent dispatch to that host the same way until a human fixes it.
+    // surface that has to be sought out deliberately; a dead remote worker
+    // needs to surface without anyone suspecting it first. The incident
+    // that motivated this sweep presented as a card sitting in Doing,
+    // reading `active`, with nothing anywhere saying its worker had died
+    // minutes earlier. A remote worker dying is exactly the "someone needs
+    // to know" class the attention lane exists for — especially since the
+    // most common cause is a host-level problem (expired agent credentials,
+    // a missing toolchain) that will kill every subsequent dispatch to that
+    // host the same way until it is fixed.
+    let worker_log_path = execution
+        .workspace_path
+        .as_deref()
+        .map(crate::host_adapter::remote_worker_log_path)
+        .unwrap_or_else(|| "<unknown workspace>/.boss/worker.log".to_owned());
     let attention_body = format!(
         "Execution `{exec_id}` was dispatched to host `{host}` and its worker process (pid {remote_pid}) is gone \
          without ever reporting completion.\n\n\
          The execution has been reaped and its cube lease released, so the work item can be re-dispatched.\n\n\
-         **Last worker output** (`{workspace}/.boss/worker.log` on `{host}`):\n\n```\n{log}\n```\n\n\
+         **Last worker output** (`{worker_log_path}` on `{host}`):\n\n```\n{log}\n```\n\n\
          If that output shows a host-level problem — expired agent credentials, a missing binary — every dispatch \
          to `{host}` will fail the same way until it is fixed.",
         exec_id = execution.id,
         host = handle.host_id,
-        workspace = execution.workspace_path.as_deref().unwrap_or("<unknown workspace>"),
         log = match worker_log.as_deref() {
             Some(tail) if !tail.trim().is_empty() => tail.trim().to_owned(),
             Some(_) => "(the worker log exists but is empty — the worker produced no output at all)".to_owned(),
@@ -764,6 +782,49 @@ mod tests {
         // A live worker must never be reaped or have its lease released.
         assert_eq!(db.get_execution(&exec_id).unwrap().status, ExecutionStatus::Running);
         assert!(adapter.force_released.lock().unwrap().is_empty());
+    }
+
+    /// A remote chore that succeeds parks in `waiting_review` with its
+    /// lease retained and its worker already exited by design. The
+    /// recorded `remote_pid` stays set (only spawn writes it), so a
+    /// `kill -0` probe correctly reports dead — and without the
+    /// `is_live()` gate that would look like a zombie and orphan the
+    /// just-opened PR ~60s later. Sibling sweeps all refuse to reap this
+    /// park state; this one must too.
+    #[tokio::test]
+    async fn parked_waiting_review_remote_execution_is_not_reaped() {
+        let (_d, db) = open_db_arc();
+        let chore = create_chore(&db);
+        db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
+        let exec_id = start_remote_run(&db, &chore, "anaplian", "lease-WR", Some(4242));
+        db.force_execution_status_for_test(&chore, ExecutionStatus::WaitingReview)
+            .unwrap();
+        assert_eq!(
+            db.get_execution(&exec_id).unwrap().status,
+            ExecutionStatus::WaitingReview
+        );
+        assert!(
+            db.get_execution(&exec_id).unwrap().cube_lease_id.is_some(),
+            "waiting_review must retain its lease"
+        );
+
+        let (adapter, provider) = provider("anaplian", Probe::Dead);
+        let sink = RecordingDispatchEventSink::new();
+        let outcome = reconcile_remote_leases(&db, &provider, &sink).await;
+
+        assert_eq!(
+            outcome.reaped, 0,
+            "a parked waiting_review execution must never be reaped"
+        );
+        assert_eq!(
+            db.get_execution(&exec_id).unwrap().status,
+            ExecutionStatus::WaitingReview,
+            "status must be unchanged"
+        );
+        assert!(
+            adapter.force_released.lock().unwrap().is_empty(),
+            "the retained park lease must not be force-released"
+        );
     }
 
     #[tokio::test]

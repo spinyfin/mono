@@ -28,22 +28,14 @@
 //!
 //! ## Which cube gets the beat
 //!
-//! A lease is issued by, tracked in, and refreshed against exactly one
-//! cube daemon: the one on the host its workspace lives on. This sweep
-//! therefore routes every call through [`ExecutionCubes`], which resolves
-//! the execution's dispatch host. `local` resolves to the engine's own cube
-//! client, so the local-only path is unchanged; a remote execution resolves
+//! A lease is tracked only by the cube on the host its workspace lives on,
+//! so every call routes through [`ExecutionCubes`], which resolves the
+//! execution's dispatch host. `local` resolves to the engine's own cube
+//! client (the local-only path is unchanged); a remote execution resolves
 //! to the same `ssh <host> cube …` transport the dispatch loop leased with.
-//!
-//! Before that seam existed the sweep held a single local `CubeClient` and
-//! used it for everything, so a remote lease was asked about on the wrong
-//! machine and came back `lease <id> is not tracked` on every pass —
-//! forever, while the lease sat healthy on the remote cube. The failure was
-//! never just log noise: the remote lease was never actually refreshed, and
-//! the auto-reap's confirm-dead probe below adjudicated a REMOTE workspace
-//! id against the LOCAL cube's workspace list, which reports "no such
-//! workspace" and classifies `Dead` for every remote run — inverting the
-//! guard that exists to stop it mass-reaping live workers.
+//! Heartbeat failure events — and, for non-local hosts, success events —
+//! carry `cube_command` / `cube_cwd` the same way the lease and repo-ensure
+//! stages already do, so a misrouted beat is readable on the timeline.
 //!
 //! 1. Snapshot [`crate::live_worker_state::LiveWorkerStateRegistry`].
 //! 2. For each slot with a live `shell_pid` and non-terminal activity
@@ -216,23 +208,12 @@ use crate::work::WorkDb;
 
 /// Resolves the cube endpoint that actually owns an execution's lease.
 ///
-/// A cube lease is issued by, tracked in, and heartbeated against exactly
-/// one cube daemon: the one on the host the workspace lives on. Before this
-/// seam existed the whole sweep called a single, engine-LOCAL
-/// [`CubeClient`], so every remote execution's heartbeat asked the wrong
-/// machine about a lease it had never issued and got back `lease <id> is
-/// not tracked` — forever, on every pass, while the lease sat perfectly
-/// healthy on the remote cube (`state: leased`). Two consequences, not one:
-/// the remote lease was never actually refreshed (so it would TTL-expire
-/// under a live worker), and the auto-reap's second-opinion probe
-/// ([`run_reconcile::confirm_execution_dead`]) listed the LOCAL cube's
-/// workspaces to adjudicate a REMOTE workspace id — which classifies `Dead`
-/// for the trivial reason that the local cube has never heard of it, and
-/// would have reaped a live remote worker and force-released a lease on the
-/// wrong daemon.
-///
-/// Resolution failure is deliberately an `Err`, never a silent skip: a
-/// heartbeat this sweep cannot route is a heartbeat that did not happen,
+/// A lease is tracked only by the cube on the host its workspace lives on,
+/// so every heartbeat (and every auto-reap force-release) must go through
+/// this seam. `local` resolves to the engine's own client; any other host
+/// resolves through the same adapter provider the dispatch loop leased
+/// with. Resolution failure is deliberately an `Err`, never a silent skip:
+/// a heartbeat this sweep cannot route is a heartbeat that did not happen,
 /// and the caller must count it as a failure and emit the error event so it
 /// stays visible. See [`heartbeat_one`].
 #[async_trait]
@@ -674,27 +655,18 @@ async fn run_one_pass_impl(
 
     for state in live_states.snapshot() {
         // Slot hasn't reported a shell pid yet — we can't probe liveness
-        // with `kill(pid, 0)`, so this sweep has nothing to adjudicate.
+        // with `kill(pid, 0)`, so this branch has nothing to adjudicate.
         //
-        // A REMOTE worker's `shell_pid` is 0 *permanently* by design (it
-        // holds no local process; see `register_remote_worker_slot`), so it
-        // lands here on every pass for the whole of its life. Marking it
-        // `registered` here — as this branch used to do unconditionally —
-        // then told the DB-fallback sweep below "already handled", and the
-        // DB-fallback sweep is the ONLY path that resolves the cube the
-        // remote lease actually lives on. Between the two, a remote lease
-        // was never heartbeated at all: it would silently TTL-expire out
-        // from under a live remote worker, which is precisely the incident
-        // this module exists to prevent, reintroduced for remote hosts.
-        //
-        // So: leave a pid-less slot OUT of `registered_run_ids` and let the
-        // DB-fallback sweep own it. That sweep resolves the owning cube per
-        // execution and applies its own durable liveness gate
-        // (`db_fallback_death_evidence`), which is strictly more evidence
-        // than this branch had — it is not a weaker check, just a
-        // differently-sourced one. A local slot whose app has not yet
-        // reported its pid is covered by the same gate, which errs toward
-        // heartbeating on every ambiguous signal.
+        // A pid-less slot must stay out of `registered_run_ids` because the
+        // DB-fallback sweep below is the only path that resolves the owning
+        // cube per execution (and applies `db_fallback_death_evidence`). A
+        // REMOTE worker's `shell_pid` is 0 permanently by design (see
+        // `register_remote_worker_slot`), so it lands here on every pass
+        // for the whole of its life; marking it registered would hide it
+        // from that sweep and leave its remote lease unheartbeated. A local
+        // slot whose app has not yet reported its pid is covered by the
+        // same fall-through, which errs toward heartbeating on every
+        // ambiguous signal.
         if state.shell_pid <= 0 {
             outcome.no_pid_skipped += 1;
             continue;
@@ -949,11 +921,9 @@ async fn heartbeat_one(
         }
     };
     // Surface WHICH cube this beat went to, the same way the lease and
-    // repo-ensure stages already do. That asymmetry is what made the
-    // original incident hard to read: those stages logged an explicit
-    // `ssh <host> cube …` with `cube_cwd: (remote: <host>)`, and the
-    // heartbeat — the one call that was failing — logged neither, so
-    // nothing in the timeline said it had gone to the wrong machine.
+    // repo-ensure stages already do (`cube_command` / `cube_cwd`). Remote
+    // adapters report `cube_cwd: (remote: <host>)`; that is the signal
+    // that distinguishes a correctly-routed remote beat from a local one.
     let cube_invocation = cube.command_repr(&["workspace", "heartbeat", lease_id]);
     let result = tokio::time::timeout(timeout, cube.heartbeat_lease(lease_id, Some(LEASE_TTL_SECS))).await;
     match result {
@@ -965,6 +935,27 @@ async fn heartbeat_one(
                 ttl_secs = LEASE_TTL_SECS,
                 "cube-lease heartbeat: refreshed lease",
             );
+            // Emit Outcome::Ok only for non-local hosts. Local workers would
+            // produce a 300 s-cadence event storm across every live slot;
+            // remote beats are rare and the routing is what live verification
+            // needs to see (`cube_cwd: (remote: <host>)`).
+            if cube_invocation
+                .as_ref()
+                .is_some_and(|(_, cwd)| cwd.starts_with("(remote:"))
+            {
+                ctx.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::CubeLeaseHeartbeat, Outcome::Ok, execution_id)
+                            .with_work_item(work_item_id)
+                            .with_cube_lease(lease_id)
+                            .with_cube_invocation(cube_invocation)
+                            .with_details(serde_json::json!({
+                                "ttl_secs": LEASE_TTL_SECS,
+                                "cube_workspace_id": cube_workspace_id,
+                            })),
+                    )
+                    .await;
+            }
             true
         }
         Ok(Err(err)) => {
@@ -1616,6 +1607,145 @@ mod tests {
             remote: Arc::new(RecordingCube::default()),
             remote_host_id: remote_host_id.to_owned(),
         }
+    }
+
+    /// Production-path routing: constructs the real [`HostRoutedCubes`]
+    /// against a stub [`HostAdapterProvider`], rather than the
+    /// test-local `RoutingCubes` re-implementation above. Pins the three
+    /// decision arms: local (and no-run) → engine client; registered remote
+    /// → adapter-backed [`HostAdapterCubeClient`]; host absent from the
+    /// registry → loud `Err` with the design's context string.
+    struct HostRoutedStubAdapter {
+        host_id: String,
+        heartbeats: Mutex<Vec<(String, Option<u64>)>>,
+    }
+
+    crate::stub_host_adapter! { HostRoutedStubAdapter {
+        fn host_id(&self) -> &str {
+            &self.host_id
+        }
+        async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()> {
+            self.heartbeats
+                .lock()
+                .unwrap()
+                .push((lease_id.to_owned(), ttl_seconds));
+            Ok(())
+        }
+        fn command_repr(&self, args: &[&str]) -> Option<(String, String)> {
+            let mut cmd = format!("ssh {}", self.host_id);
+            cmd.push_str(" cube");
+            for a in args {
+                cmd.push(' ');
+                cmd.push_str(a);
+            }
+            Some((cmd, format!("(remote: {})", self.host_id)))
+        }
+    } }
+
+    struct HostRoutedStubProvider {
+        adapter: Arc<HostRoutedStubAdapter>,
+    }
+
+    #[async_trait]
+    impl crate::host_adapter::HostAdapterProvider for HostRoutedStubProvider {
+        async fn adapter_for(
+            &self,
+            host: &crate::host_registry::Host,
+        ) -> Result<Arc<dyn crate::host_adapter::HostAdapter>> {
+            if host.id != self.adapter.host_id {
+                return Err(anyhow!("stub provider has no adapter for host '{}'", host.id));
+            }
+            Ok(self.adapter.clone() as Arc<dyn crate::host_adapter::HostAdapter>)
+        }
+    }
+
+    /// Direct unit coverage of the production [`HostRoutedCubes`] match:
+    /// (a) local run → engine's own client, (b) registered remote →
+    /// adapter-backed client, (c) host dropped from the registry → `Err`
+    /// carrying the "no longer in the host registry" context.
+    #[tokio::test]
+    async fn host_routed_cubes_resolves_local_remote_and_missing_host() {
+        let (_dir, db) = open_db_arc();
+        let product_id = create_product(&db);
+        db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
+
+        let local_work = create_test_chore(&db, &product_id, "host-routed local").id;
+        let local_exec = running_execution_with_lease(&db, &local_work, "lease-local");
+
+        let remote_work = create_test_chore(&db, &product_id, "host-routed remote").id;
+        let remote_exec = running_execution_on_host_with_lease(&db, &remote_work, "lease-remote", "anaplian");
+
+        // Host is not in the registry — `get_host` returns Ok(None).
+        let gone_work = create_test_chore(&db, &product_id, "host-routed gone").id;
+        let gone_exec = running_execution_on_host_with_lease(&db, &gone_work, "lease-gone", "vanished");
+
+        let adapter = Arc::new(HostRoutedStubAdapter {
+            host_id: "anaplian".to_owned(),
+            heartbeats: Mutex::new(Vec::new()),
+        });
+        let provider = Arc::new(HostRoutedStubProvider {
+            adapter: Arc::clone(&adapter),
+        });
+        let local_cube = Arc::new(RecordingCube::default());
+        let cubes = HostRoutedCubes::new(
+            Arc::clone(&db),
+            provider as Arc<dyn crate::host_adapter::HostAdapterProvider>,
+            Arc::clone(&local_cube) as Arc<dyn CubeClient>,
+        );
+
+        // (a) local run resolves to the engine's own client.
+        let resolved_local = cubes.cube_for_execution(&local_exec).await.expect("local route");
+        resolved_local
+            .heartbeat_lease("lease-local", Some(LEASE_TTL_SECS))
+            .await
+            .unwrap();
+        assert_eq!(
+            local_cube.calls(),
+            vec![("lease-local".to_owned(), Some(LEASE_TTL_SECS))],
+            "local/no-host runs must use the engine's own CubeClient"
+        );
+        assert!(
+            adapter.heartbeats.lock().unwrap().is_empty(),
+            "local route must not touch the remote adapter"
+        );
+
+        // (b) a run on a registered remote resolves to an adapter-backed client.
+        let resolved_remote = cubes.cube_for_execution(&remote_exec).await.expect("remote route");
+        let repr = resolved_remote
+            .command_repr(&["workspace", "heartbeat", "lease-remote"])
+            .expect("HostAdapterCubeClient must surface the adapter's command_repr");
+        assert!(
+            repr.1.starts_with("(remote: anaplian)"),
+            "remote cube_cwd must name the host: {:?}",
+            repr.1
+        );
+        resolved_remote
+            .heartbeat_lease("lease-remote", Some(LEASE_TTL_SECS))
+            .await
+            .unwrap();
+        assert_eq!(
+            adapter.heartbeats.lock().unwrap().clone(),
+            vec![("lease-remote".to_owned(), Some(LEASE_TTL_SECS))],
+            "registered remote runs must beat through HostAdapterCubeClient"
+        );
+        // Local cube still only has the (a) call.
+        assert_eq!(local_cube.calls().len(), 1);
+
+        // (c) a run bound to a host absent from the registry returns Err
+        // with the design's loud-failure context string.
+        let err = match cubes.cube_for_execution(&gone_exec).await {
+            Ok(_) => panic!("missing host must fail closed"),
+            Err(err) => err,
+        };
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("no longer in the host registry"),
+            "missing-host error must name the registry miss, got: {message}"
+        );
+        assert!(
+            message.contains("vanished"),
+            "missing-host error must name the host id, got: {message}"
+        );
     }
 
     /// The 2026-08-12 anaplian incident, in one test.

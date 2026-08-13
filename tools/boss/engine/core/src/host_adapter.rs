@@ -193,12 +193,12 @@ pub trait HostAdapter: Send + Sync {
     /// reap instead of being lost with the workspace.
     ///
     /// `Ok(None)` means "not applicable" — the default and
-    /// [`LocalHostAdapter`], whose workers log to a pane the operator can
-    /// already see. `Ok(Some(""))` means the log exists but is empty (or was
-    /// never created), which is itself informative and distinct from `None`.
-    /// An `Err` is a transport failure; it must never be mistaken for "the
-    /// worker exited cleanly", so callers surface it as an unavailable log
-    /// rather than an empty one.
+    /// [`LocalHostAdapter`], whose workers log to a local pane, which is
+    /// already directly readable. `Ok(Some(""))` means the log exists but is
+    /// empty (or was never created), which is itself informative and distinct
+    /// from `None`. An `Err` is a transport failure; it must never be
+    /// mistaken for "the worker exited cleanly", so callers surface it as an
+    /// unavailable log rather than an empty one.
     async fn read_worker_log_tail(&self, _workspace_path: &str, _max_bytes: u64) -> Result<Option<String>> {
         Ok(None)
     }
@@ -210,6 +210,13 @@ pub trait HostAdapter: Send + Sync {
 /// in the file when the worker dies immediately. 4 KiB comfortably covers
 /// that while staying small enough to embed in an attention item's body.
 pub const WORKER_LOG_TAIL_BYTES: u64 = 4096;
+
+/// Absolute path of the remote worker log the wrapper tees stdout/stderr to
+/// (`<workspace>/.boss/worker.log`). Shared by every consumer that pulls or
+/// cites that file so relocating it is a one-line change.
+pub fn remote_worker_log_path(workspace_path: &str) -> String {
+    format!("{}/.boss/worker.log", workspace_path.trim_end_matches('/'))
+}
 
 // ── LocalHostAdapter ──────────────────────────────────────────────────────────
 
@@ -932,7 +939,7 @@ impl HostAdapter for SshHostAdapter {
         // byte-suffix pull the transcript readback uses (it already maps a
         // missing file to an empty string and surfaces real transport
         // failures) rather than adding a second remote-tail implementation.
-        let path = format!("{}/.boss/worker.log", workspace_path.trim_end_matches('/'));
+        let path = remote_worker_log_path(workspace_path);
         let content = crate::remote_transcript::pull_remote_transcript_tail(&self.transport, &path, max_bytes).await?;
         Ok(Some(content))
     }
@@ -1162,6 +1169,17 @@ impl HostAdapterProvider for SshHostAdapterProvider {
 /// No path dispatches answer agents remotely today (the spawn trigger ships in
 /// P3b); this is a defensive backstop so the security property holds regardless
 /// of how dispatch/scheduling evolves.
+fn reject_remote_answer_agent(kind: &ExecutionKind, host: &str) -> Result<()> {
+    if *kind == ExecutionKind::AnswerAgent {
+        bail!(
+            "answer_agent executions are local-only: the remote worker wrapper runs \
+             with --dangerously-skip-permissions, which would bypass the read-only \
+             dontAsk allowlist. Refusing to spawn an unsandboxed answer agent on host {host}."
+        );
+    }
+    Ok(())
+}
+
 /// Failure-reason taxonomy string for a driver the remote path cannot
 /// observe. Named alongside the wrapper's own sentinels
 /// (`host_missing_claude`, …) so it reads as one family in
@@ -1201,17 +1219,6 @@ fn reject_unobservable_remote_driver(
          engine can see (no live status, no transcript path, no Stop, therefore no PR) — and the remote wrapper \
          launches `claude` regardless of the resolved driver. Refusing to spawn an unobservable remote worker."
     )
-}
-
-fn reject_remote_answer_agent(kind: &ExecutionKind, host: &str) -> Result<()> {
-    if *kind == ExecutionKind::AnswerAgent {
-        bail!(
-            "answer_agent executions are local-only: the remote worker wrapper runs \
-             with --dangerously-skip-permissions, which would bypass the read-only \
-             dontAsk allowlist. Refusing to spawn an unsandboxed answer agent on host {host}."
-        );
-    }
-    Ok(())
 }
 
 #[cfg(test)]

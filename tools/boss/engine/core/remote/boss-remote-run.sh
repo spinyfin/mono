@@ -40,7 +40,7 @@
 # `<workspace>/.boss/worker.log` so the engine can read recent output
 # on demand over the multiplex. The wrapper's own exit status reports
 # only *launch* success (0) or a sentinel config/toolchain failure
-# (78-81) — the worker's real lifecycle is driven by its hook events
+# (78-82) — the worker's real lifecycle is driven by its hook events
 # over the forwarded BOSS_EVENTS_SOCKET, not by this wrapper blocking.
 # The wrapper prints `boss-remote-run: starting … pid=<n>` to stderr so
 # the engine can record `work_runs.remote_pid`.

@@ -36,7 +36,7 @@
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 
-use crate::host_adapter::WORKER_LOG_TAIL_BYTES;
+use crate::host_adapter::{WORKER_LOG_TAIL_BYTES, remote_worker_log_path};
 use crate::ssh_transport::{SshOutput, SshTransport};
 
 // ── Failure-reason taxonomy (matches the wrapper sentinels) ───────────────────
@@ -335,16 +335,13 @@ pub async fn perform_remote_launch(
                     // report a terminal launch failure.
                     Ok(false) => {
                         // Read the worker's own output BEFORE tearing anything
-                        // down. Telling the operator to "inspect
-                        // <workspace>/.boss/worker.log on the remote host" was
-                        // advice nobody could act on: the workspace goes back
-                        // to cube on the failure path below and is reset for
-                        // the next lease, so by the time anyone reads the
-                        // error the file is gone. The one line in it is the
-                        // whole diagnosis — `Failed to authenticate. API
-                        // Error: 401 OAuth access token has expired.` in the
-                        // case this was written for — so carry it in the
-                        // failure detail instead of a pointer to it.
+                        // down. The workspace goes back to cube on the failure
+                        // path below and is reset for the next lease, so a
+                        // pointer to the log is unusable by the time anyone
+                        // reads the error — carry the content itself. The one
+                        // line in it is the whole diagnosis — `Failed to
+                        // authenticate. API Error: 401 OAuth access token has
+                        // expired.` in the case this was written for.
                         let log_tail = pull_worker_log_tail(exec, &plan.workspace_path).await;
                         let _ = exec
                             .cancel_reverse_unix_forward(&plan.events_socket_path, engine_events_socket)
@@ -356,8 +353,8 @@ pub async fn perform_remote_launch(
                             detail: Some(format!(
                                 "worker pid {pid} was not alive {WORKER_LIVENESS_SETTLE_SECS}s after launch \
                                  (the agent exited immediately). Last output from \
-                                 {ws}/.boss/worker.log: {log}",
-                                ws = plan.workspace_path,
+                                 {log_path}: {log}",
+                                log_path = remote_worker_log_path(&plan.workspace_path),
                                 log = match log_tail.as_deref() {
                                     Some(tail) if !tail.trim().is_empty() => tail.trim().to_owned(),
                                     Some(_) => "(empty — the agent produced no output at all)".to_owned(),
@@ -411,7 +408,7 @@ pub async fn perform_remote_launch(
 /// byte-suffix pull the transcript readback uses rather than adding a second
 /// remote-tail implementation.
 async fn pull_worker_log_tail(exec: &dyn SshExec, workspace_path: &str) -> Option<String> {
-    let path = format!("{}/.boss/worker.log", workspace_path.trim_end_matches('/'));
+    let path = remote_worker_log_path(workspace_path);
     crate::remote_transcript::pull_remote_transcript_tail(exec, &path, WORKER_LOG_TAIL_BYTES)
         .await
         .ok()
