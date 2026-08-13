@@ -1,0 +1,14 @@
+repo = "example/project"
+tag_prefix = "demo-v"
+title_prefix = "Demo"
+change_paths = ["tool/", ".buildkite/pipeline-release.yml"]
+required_assets = ["demo-linux"]
+optional_assets = ["demo-darwin"]
+
+[version]
+scheme = "alpha-counter"
+manifest = "tool/Cargo.toml"
+
+[notes]
+source = "changelog"
+project = "tool/PROJECT.yaml"

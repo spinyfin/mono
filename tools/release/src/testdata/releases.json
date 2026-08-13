@@ -1,0 +1,17 @@
+[
+  {
+    "tag_name": "demo-v0.4.1-alpha.9",
+    "draft": true,
+    "name": "Unpublished demo release"
+  },
+  {
+    "tag_name": "demo-v0.4.1-alpha.8",
+    "draft": false,
+    "name": "Published demo release"
+  },
+  {
+    "tag_name": "unrelated-v9.9.9",
+    "draft": false,
+    "name": "Unrelated release"
+  }
+]
