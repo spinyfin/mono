@@ -150,6 +150,41 @@ pub async fn reconcile_remote_leases(
             continue;
         };
 
+        // Only live workers (`running` / `waiting_human`) can be reaped here.
+        // Park states — especially `waiting_review` / `waiting_merge` — keep
+        // their lease by design after the worker finishes and exits: the
+        // workspace is retained for a follow-up revision. A dead or never-
+        // reported pid in those states is expected, not a zombie; force-
+        // releasing the lease would hand the workspace back to cube and
+        // destroy the park. Sibling sweeps (`db_fallback_death_evidence`,
+        // `lost_workspace_sweep`, `dead_pane_sweep`) all gate the same way.
+        //
+        // Checked *before* the SSH probe so a long-parked remote execution
+        // does not pay a `kill -0` round trip every reconcile pass for the
+        // whole of its park (hours, across a revision cycle).
+        // `list_live_remote_runs` still admits park states because the
+        // startup reattach consumer shares that query.
+        match work_db.get_execution(&handle.execution_id) {
+            Ok(execution) if execution.status.is_live() => {}
+            Ok(_) => {
+                tracing::trace!(
+                    execution_id = %handle.execution_id,
+                    host_id = %handle.host_id,
+                    "remote-lease reconcile: execution is not live (parked or settled); not probing",
+                );
+                continue;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %handle.execution_id,
+                    ?err,
+                    "remote-lease reconcile: could not load execution status before probe; skipping",
+                );
+                outcome.skipped += 1;
+                continue;
+            }
+        }
+
         let host = match work_db.get_host(&handle.host_id) {
             Ok(Some(host)) => host,
             Ok(None) => {
@@ -258,17 +293,9 @@ async fn reap_dead_remote_execution(
             return false;
         }
     };
-    if execution.status.is_terminal() {
-        return false;
-    }
-    // Only live workers (`running` / `waiting_human`) can be reaped here.
-    // Park states — especially `waiting_review` / `waiting_merge` — keep
-    // their lease by design after the worker finishes and exits: the
-    // workspace is retained for a follow-up revision. A dead or never-
-    // reported pid in those states is expected, not a zombie; force-
-    // releasing the lease would hand the workspace back to cube and
-    // destroy the park. Sibling sweeps (`db_fallback_death_evidence`,
-    // `lost_workspace_sweep`, `dead_pane_sweep`) all gate the same way.
+    // Re-check after the probe: the row may have parked or settled between
+    // the pre-probe gate and now. Same `is_live()` predicate as the
+    // candidate loop (terminal statuses are a subset of `!is_live()`).
     if !execution.status.is_live() {
         return false;
     }
@@ -489,12 +516,14 @@ mod tests {
         Error,
     }
 
-    /// Records `force_release_lease` calls and returns a canned liveness
-    /// verdict. Every other method is unused by the reconcile path.
+    /// Records `force_release_lease` / probe calls and returns a canned
+    /// liveness verdict. Every other method is unused by the reconcile path.
     struct StubAdapter {
         host_id: String,
         probe: Probe,
         force_released: Mutex<Vec<(String, Option<String>)>>,
+        /// How many times `probe_remote_worker_alive` was called.
+        probe_calls: Mutex<usize>,
         /// Canned `worker.log` tail. `Ok(None)` models an adapter with no
         /// such log; `Err` models a failed round-trip.
         worker_log: Mutex<Option<String>>,
@@ -516,6 +545,7 @@ mod tests {
             Ok(())
         }
         async fn probe_remote_worker_alive(&self, _remote_pid: i64) -> Result<Option<bool>> {
+            *self.probe_calls.lock().unwrap() += 1;
             match self.probe {
                 Probe::Alive => Ok(Some(true)),
                 Probe::Dead => Ok(Some(false)),
@@ -612,6 +642,7 @@ mod tests {
             host_id: host_id.to_owned(),
             probe,
             force_released: Mutex::new(Vec::new()),
+            probe_calls: Mutex::new(0),
             worker_log: Mutex::new(worker_log),
             worker_log_fails,
             worker_log_reads: Mutex::new(Vec::new()),
@@ -815,6 +846,15 @@ mod tests {
         assert_eq!(
             outcome.reaped, 0,
             "a parked waiting_review execution must never be reaped"
+        );
+        assert_eq!(
+            outcome.skipped, 0,
+            "parked executions are filtered before the probe, not counted as probe skips"
+        );
+        assert_eq!(
+            *adapter.probe_calls.lock().unwrap(),
+            0,
+            "must not SSH-probe a parked execution every reconcile pass"
         );
         assert_eq!(
             db.get_execution(&exec_id).unwrap().status,

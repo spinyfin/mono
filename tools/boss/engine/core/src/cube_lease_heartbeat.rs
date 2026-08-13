@@ -206,6 +206,28 @@ use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::run_reconcile::{self, RunReconcileReport, RunReconcileVerdict};
 use crate::work::WorkDb;
 
+/// Cube that owns an execution's lease, plus the host that cube lives on.
+///
+/// Returned by [`ExecutionCubes::cube_for_execution`] so callers that care
+/// about *which* host was resolved (e.g. emitting a remote-only ok event)
+/// do not have to re-derive it by sniffing display labels from
+/// [`CubeClient::command_repr`].
+#[derive(Clone)]
+pub struct ResolvedExecutionCube {
+    pub cube: Arc<dyn CubeClient>,
+    /// Host the execution's latest run was dispatched to. `"local"` when the
+    /// engine's own cube issued (or will issue) the lease — including
+    /// executions with no run row yet.
+    pub host_id: String,
+}
+
+impl ResolvedExecutionCube {
+    /// True when the lease lives on the engine's own cube.
+    pub fn is_local(&self) -> bool {
+        self.host_id == "local"
+    }
+}
+
 /// Resolves the cube endpoint that actually owns an execution's lease.
 ///
 /// A lease is tracked only by the cube on the host its workspace lives on,
@@ -218,8 +240,9 @@ use crate::work::WorkDb;
 /// stays visible. See [`heartbeat_one`].
 #[async_trait]
 pub trait ExecutionCubes: Send + Sync {
-    /// The cube that owns `execution_id`'s lease.
-    async fn cube_for_execution(&self, execution_id: &str) -> Result<Arc<dyn CubeClient>>;
+    /// The cube that owns `execution_id`'s lease, and the host that cube
+    /// lives on.
+    async fn cube_for_execution(&self, execution_id: &str) -> Result<ResolvedExecutionCube>;
 }
 
 /// Production [`ExecutionCubes`]: routes by the host the execution's
@@ -249,7 +272,7 @@ impl HostRoutedCubes {
 
 #[async_trait]
 impl ExecutionCubes for HostRoutedCubes {
-    async fn cube_for_execution(&self, execution_id: &str) -> Result<Arc<dyn CubeClient>> {
+    async fn cube_for_execution(&self, execution_id: &str) -> Result<ResolvedExecutionCube> {
         let host_id = self
             .work_db
             .latest_run_host_for_execution(execution_id)
@@ -257,12 +280,17 @@ impl ExecutionCubes for HostRoutedCubes {
         let host_id = match host_id.as_deref() {
             // No run row yet, or a local run: the engine's own cube issued
             // (or will issue) this lease.
-            None | Some("local") => return Ok(Arc::clone(&self.local)),
-            Some(host_id) => host_id,
+            None | Some("local") => {
+                return Ok(ResolvedExecutionCube {
+                    cube: Arc::clone(&self.local),
+                    host_id: "local".to_owned(),
+                });
+            }
+            Some(host_id) => host_id.to_owned(),
         };
         let host = self
             .work_db
-            .get_host(host_id)
+            .get_host(&host_id)
             .with_context(|| format!("looking up host '{host_id}' to heartbeat execution {execution_id}"))?
             .with_context(|| {
                 format!(
@@ -273,7 +301,10 @@ impl ExecutionCubes for HostRoutedCubes {
         let adapter = self.provider.adapter_for(&host).await.with_context(|| {
             format!("building the host adapter for '{host_id}' to heartbeat execution {execution_id}")
         })?;
-        Ok(Arc::new(HostAdapterCubeClient::new(adapter)))
+        Ok(ResolvedExecutionCube {
+            cube: Arc::new(HostAdapterCubeClient::new(adapter)),
+            host_id,
+        })
     }
 }
 
@@ -893,8 +924,8 @@ async fn heartbeat_one(
     // counted, evented, and fed to the breaker. Never a silent skip: a
     // quietly-unheartbeated lease is exactly how a live worker loses its
     // workspace to the TTL sweep.
-    let cube = match ctx.cubes.cube_for_execution(execution_id).await {
-        Ok(cube) => cube,
+    let resolved = match ctx.cubes.cube_for_execution(execution_id).await {
+        Ok(resolved) => resolved,
         Err(err) => {
             *failed += 1;
             tracing::warn!(
@@ -920,10 +951,11 @@ async fn heartbeat_one(
             return false;
         }
     };
+    let cube = resolved.cube.as_ref();
     // Surface WHICH cube this beat went to, the same way the lease and
-    // repo-ensure stages already do (`cube_command` / `cube_cwd`). Remote
-    // adapters report `cube_cwd: (remote: <host>)`; that is the signal
-    // that distinguishes a correctly-routed remote beat from a local one.
+    // repo-ensure stages already do (`cube_command` / `cube_cwd`). Best-
+    // effort display only — the local-vs-remote decision below uses the
+    // host id from resolution, not this label.
     let cube_invocation = cube.command_repr(&["workspace", "heartbeat", lease_id]);
     let result = tokio::time::timeout(timeout, cube.heartbeat_lease(lease_id, Some(LEASE_TTL_SECS))).await;
     match result {
@@ -933,16 +965,16 @@ async fn heartbeat_one(
                 execution_id,
                 lease_id,
                 ttl_secs = LEASE_TTL_SECS,
+                host_id = %resolved.host_id,
                 "cube-lease heartbeat: refreshed lease",
             );
             // Emit Outcome::Ok only for non-local hosts. Local workers would
             // produce a 300 s-cadence event storm across every live slot;
             // remote beats are rare and the routing is what live verification
-            // needs to see (`cube_cwd: (remote: <host>)`).
-            if cube_invocation
-                .as_ref()
-                .is_some_and(|(_, cwd)| cwd.starts_with("(remote:"))
-            {
+            // needs to see. Gate on the resolved host id from
+            // `cube_for_execution`, not on sniffing `command_repr`'s display
+            // cwd — adapters may return `None` or format cwd differently.
+            if !resolved.is_local() {
                 ctx.dispatch_events
                     .emit(
                         DispatchEvent::new(Stage::CubeLeaseHeartbeat, Outcome::Ok, execution_id)
@@ -952,6 +984,7 @@ async fn heartbeat_one(
                             .with_details(serde_json::json!({
                                 "ttl_secs": LEASE_TTL_SECS,
                                 "cube_workspace_id": cube_workspace_id,
+                                "host_id": resolved.host_id,
                             })),
                     )
                     .await;
@@ -1098,7 +1131,7 @@ async fn auto_reap_dead_lease(
         // routing failure here is treated exactly like a failed probe:
         // `Unknown`, so nothing is reaped on it.
         let cube = match ctx.cubes.cube_for_execution(&execution.id).await {
-            Ok(cube) => cube,
+            Ok(resolved) => resolved.cube,
             Err(err) => {
                 ctx.breaker.forget(&execution.id);
                 tracing::warn!(
@@ -1300,8 +1333,8 @@ async fn reap_and_release_lease(
     // already reclaimed it, or the host is unreachable — is benign and
     // logged rather than propagated.
     match ctx.cubes.cube_for_execution(&execution.id).await {
-        Ok(cube) => {
-            if let Err(err) = cube.force_release_lease(lease_id, Some(reason)).await {
+        Ok(resolved) => {
+            if let Err(err) = resolved.cube.force_release_lease(lease_id, Some(reason)).await {
                 tracing::debug!(
                     execution_id = %execution.id,
                     lease_id,
@@ -1364,7 +1397,7 @@ pub async fn reheartbeat_live_runs(
         // startup like every other beat here, so an unreachable host logs
         // and the periodic sweep retries rather than blocking boot.
         let cube = match cubes.cube_for_execution(&execution.id).await {
-            Ok(cube) => cube,
+            Ok(resolved) => resolved.cube,
             Err(err) => {
                 tracing::warn!(
                     execution_id = %execution.id,
@@ -1495,8 +1528,11 @@ mod tests {
     /// cannot tell a correctly-routed call from a misrouted one.
     #[async_trait]
     impl ExecutionCubes for Arc<RecordingCube> {
-        async fn cube_for_execution(&self, _execution_id: &str) -> Result<Arc<dyn CubeClient>> {
-            Ok(Arc::clone(self) as Arc<dyn CubeClient>)
+        async fn cube_for_execution(&self, _execution_id: &str) -> Result<ResolvedExecutionCube> {
+            Ok(ResolvedExecutionCube {
+                cube: Arc::clone(self) as Arc<dyn CubeClient>,
+                host_id: "local".to_owned(),
+            })
         }
     }
 
@@ -1591,10 +1627,16 @@ mod tests {
 
     #[async_trait]
     impl ExecutionCubes for RoutingCubes {
-        async fn cube_for_execution(&self, execution_id: &str) -> Result<Arc<dyn CubeClient>> {
+        async fn cube_for_execution(&self, execution_id: &str) -> Result<ResolvedExecutionCube> {
             match self.work_db.latest_run_host_for_execution(execution_id)?.as_deref() {
-                None | Some("local") => Ok(Arc::clone(&self.local) as Arc<dyn CubeClient>),
-                Some(host) if host == self.remote_host_id => Ok(Arc::clone(&self.remote) as Arc<dyn CubeClient>),
+                None | Some("local") => Ok(ResolvedExecutionCube {
+                    cube: Arc::clone(&self.local) as Arc<dyn CubeClient>,
+                    host_id: "local".to_owned(),
+                }),
+                Some(host) if host == self.remote_host_id => Ok(ResolvedExecutionCube {
+                    cube: Arc::clone(&self.remote) as Arc<dyn CubeClient>,
+                    host_id: host.to_owned(),
+                }),
                 Some(host) => Err(anyhow!("no adapter for host '{host}'")),
             }
         }
@@ -1695,7 +1737,9 @@ mod tests {
 
         // (a) local run resolves to the engine's own client.
         let resolved_local = cubes.cube_for_execution(&local_exec).await.expect("local route");
+        assert!(resolved_local.is_local(), "local route must report host_id=local");
         resolved_local
+            .cube
             .heartbeat_lease("lease-local", Some(LEASE_TTL_SECS))
             .await
             .unwrap();
@@ -1711,7 +1755,13 @@ mod tests {
 
         // (b) a run on a registered remote resolves to an adapter-backed client.
         let resolved_remote = cubes.cube_for_execution(&remote_exec).await.expect("remote route");
+        assert_eq!(
+            resolved_remote.host_id, "anaplian",
+            "remote route must hand back the concrete host id, not a display label"
+        );
+        assert!(!resolved_remote.is_local());
         let repr = resolved_remote
+            .cube
             .command_repr(&["workspace", "heartbeat", "lease-remote"])
             .expect("HostAdapterCubeClient must surface the adapter's command_repr");
         assert!(
@@ -1720,6 +1770,7 @@ mod tests {
             repr.1
         );
         resolved_remote
+            .cube
             .heartbeat_lease("lease-remote", Some(LEASE_TTL_SECS))
             .await
             .unwrap();
@@ -1783,12 +1834,26 @@ mod tests {
             "the engine's local cube never issued this lease and must not be asked about it",
         );
         assert_eq!(outcome.failed, 0, "a correctly-routed beat must not report failure");
+        let events = sink.events_for(&execution_id).await;
         assert!(
-            sink.events_for(&execution_id)
-                .await
+            events
                 .iter()
-                .all(|event| event.stage != "cube_lease_heartbeat"),
+                .filter(|event| event.stage == "cube_lease_heartbeat")
+                .all(|event| event.outcome != "error"),
             "a successful beat emits no error event — this is the `is not tracked` storm that must not recur",
+        );
+        // Ok event is gated on the resolved host id from ExecutionCubes,
+        // not on sniffing command_repr's display cwd (which RecordingCube
+        // does not provide). Remote successes must still emit so live
+        // verification can watch the timeline.
+        let ok = events
+            .iter()
+            .find(|event| event.stage == "cube_lease_heartbeat" && event.outcome == "ok")
+            .expect("a successful remote beat must emit CubeLeaseHeartbeat outcome=ok");
+        assert_eq!(
+            ok.details.get("host_id").and_then(|v| v.as_str()),
+            Some("anaplian"),
+            "ok event must carry the concrete host id from resolution"
         );
     }
 
@@ -2410,8 +2475,11 @@ mod tests {
 
     #[async_trait]
     impl ExecutionCubes for Arc<SlowCube> {
-        async fn cube_for_execution(&self, _execution_id: &str) -> Result<Arc<dyn CubeClient>> {
-            Ok(Arc::clone(self) as Arc<dyn CubeClient>)
+        async fn cube_for_execution(&self, _execution_id: &str) -> Result<ResolvedExecutionCube> {
+            Ok(ResolvedExecutionCube {
+                cube: Arc::clone(self) as Arc<dyn CubeClient>,
+                host_id: "local".to_owned(),
+            })
         }
     }
 

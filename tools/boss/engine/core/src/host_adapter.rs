@@ -1166,9 +1166,9 @@ impl HostAdapterProvider for SshHostAdapterProvider {
 /// remote dispatch — answer agents are local-only until the remote wrapper
 /// learns to honour a restricted permission mode.
 ///
-/// No path dispatches answer agents remotely today (the spawn trigger ships in
-/// P3b); this is a defensive backstop so the security property holds regardless
-/// of how dispatch/scheduling evolves.
+/// No path dispatches answer agents remotely today (no remote answer-agent
+/// dispatch path exists yet); this is a defensive backstop so the security
+/// property holds regardless of how dispatch/scheduling evolves.
 fn reject_remote_answer_agent(kind: &ExecutionKind, host: &str) -> Result<()> {
     if *kind == ExecutionKind::AnswerAgent {
         bail!(
