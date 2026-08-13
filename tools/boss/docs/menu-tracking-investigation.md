@@ -1,6 +1,6 @@
 # Menu tracking sessions in Boss.app — what was measured, and what is still open
 
-An operator reported that sampling `Boss.app` always looks like a context menu is open:
+Sampling `Boss.app` was reported to always look like a context menu is open:
 
 > A context menu was open for 1661 of 6018 samples (28% of the window) — `NSPopUpButtonCell trackMouse:` → `NSContextMenuTrackingSession` → nested menu event loop.
 
@@ -14,7 +14,7 @@ This document records what a measurement pass established, what it rules out, an
 
 ## What was measured
 
-All samples are of the operator's live `Boss.app` (v1.0.537, pid 2246, ~2h uptime) on macOS 26.5.2, 2026-08-12 19:24–19:46 local. Sampling is read-only; nothing was launched, attached to, or restarted.
+All samples are of a live, in-use `Boss.app` (v1.0.537, pid 2246, ~2h uptime) on macOS 26.5.2, 2026-08-12 19:24–19:46 local. Sampling is read-only; nothing was launched, attached to, or restarted.
 
 | Capture                                        | Main-thread samples | `NSPopUpButtonCell trackMouse:` | Menu tracking session |
 | ---------------------------------------------- | ------------------- | ------------------------------- | --------------------- |
@@ -35,11 +35,11 @@ Short mouse-tracking loops — in the 10-second capture, and in 4 of the 20 watc
 - `-[NSButtonCell trackMouse:...]` — 43 of 2800 (1.5%) and 54 of 2650 (2.0%)
 - `-[NSSegmentedCell trackMouse:...]` — 88 of 3654 (2.4%) and 69 of 3573 (1.9%)
 
-These are ordinary press-and-hold tracking on a toolbar button and on the navigation-mode segmented control, lasting tens of milliseconds each, and they correlate with the operator actually clicking. None of them is a pop-up button and none opens a menu — `NSDragEventTracker` is the mouse-down tracker, not a menu session.
+These are ordinary press-and-hold tracking on a toolbar button and on the navigation-mode segmented control, lasting tens of milliseconds each, and they correlate with an actual click. None of them is a pop-up button and none opens a menu — `NSDragEventTracker` is the mouse-down tracker, not a menu session.
 
 ## What this rules out
 
-**The session is not permanently active.** A leaked nested modal loop cannot be 28% of a sampling window: once the main thread is stuck inside `trackMouse:`, every subsequent sample is inside it, so a permanent leak reads as 100% from the moment it happens, not 28% and not 11%. Both reported figures describe a session that started and ended (or started partway) inside the window. The 30-second idle capture then confirms it directly — at 19:26 the app had no nested loop at all, on the same build the operator is running.
+**The session is not permanently active.** A leaked nested modal loop cannot be 28% of a sampling window: once the main thread is stuck inside `trackMouse:`, every subsequent sample is inside it, so a permanent leak reads as 100% from the moment it happens, not 28% and not 11%. Both reported figures describe a session that started and ended (or started partway) inside the window. The 30-second idle capture then confirms it directly — at 19:26 the app had no nested loop at all, on the same build the report came from.
 
 **It is not construction-time.** A fresh instance of the current `main` build, launched with zero user interaction and sampled for 10 seconds, has no tracking session. Whatever produces the condition needs an interaction first. That eliminates every "something opens a menu at startup" hypothesis and narrows the search to interaction-triggered paths.
 
@@ -47,8 +47,8 @@ These are ordinary press-and-hold tracking on a toolbar button and on the naviga
 
 The reports are real, and 1661 samples is ~2.4 seconds of a nested menu loop. Two readings remain live, and the measurements above cannot separate them:
 
-1. **A genuine menu, open longer than the operator realised** — clicked, then left open while attention moved to the terminal to ask for a sample. Consistent with everything measured; not proven.
-2. **A session that outlives its menu** — the menu window is gone (hence "nothing visible") but AppKit's `trackMouse:` loop is still spinning. Also consistent; also not proven. The operator's note that SwiftUI layout was running inside the nested loop does _not_ discriminate: menu tracking runs the main run loop in `NSEventTrackingRunLoopMode`, and SwiftUI's display-cycle observers are registered in the common modes, so a busy app keeps laying out inside a perfectly healthy open menu.
+1. **A genuine menu, open longer than realised** — clicked, then left open while attention moved to the terminal to ask for a sample. Consistent with everything measured; not proven.
+2. **A session that outlives its menu** — the menu window is gone (hence "nothing visible") but AppKit's `trackMouse:` loop is still spinning. Also consistent; also not proven. The report that SwiftUI layout was running inside the nested loop does _not_ discriminate: menu tracking runs the main run loop in `NSEventTrackingRunLoopMode`, and SwiftUI's display-cycle observers are registered in the common modes, so a busy app keeps laying out inside a perfectly healthy open menu.
 
 Distinguishing them requires knowing whether a menu was open _at the moment the profile was taken_, which a profile cannot tell you. That is what the instrumentation added alongside this document is for.
 
@@ -83,7 +83,7 @@ Reproducing the condition needs a mouse on a real window. Every route an agent h
   This is the `NSApp.windows`-empty regression `BossCapture.swift` already tolerates as intermittent, arriving as total. Confirmed under `lldb` against a long-lived isolated instance: `[[NSApplication sharedApplication] windows]` is an empty array minutes after launch, and stays empty after forcing `.regular` activation policy while hidden. So there is no window to click, and no live AppKit state to inspect.
 
 - Accessibility automation, which can drive a non-frontmost window, is unavailable: `System Events got an error: osascript is not allowed assistive access. (-25211)`.
-- Driving the operator's own running app, or launching a visible instance on their laptop, is forbidden by the worker rules — and the UI-performance doc's measurement protocol says the same thing in more detail: "Every step in this protocol is a human step. An agent implementing any task in this plan must not attempt it."
+- Driving the live running app in front of the person using it, or launching a visible instance on their laptop, is forbidden by the worker rules — and the UI-performance doc's measurement protocol says the same thing in more detail: "Every step in this protocol is a human step. An agent implementing any task in this plan must not attempt it."
 
 ## What the app now records
 

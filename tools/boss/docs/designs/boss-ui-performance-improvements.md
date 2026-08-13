@@ -189,7 +189,7 @@ A popup / context menu was open for roughly **5087 main-thread samples** of the 
 
 Consequence, and it is binding on every task below: **the percentages in this document are directional, not a comparison basis.** No task may claim a win by diffing against these numbers. Each task captures its own controlled before-sample under the protocol below.
 
-This caveat was later reported a second time, from the operator's side, as "a menu looks permanently open". A measurement pass established that it is not permanent and not construction-time, and the app now records menu-tracking begin/end into its own diagnostics stream so a future sample can be checked against whether a menu was actually open — see [`../menu-tracking-investigation.md`](../menu-tracking-investigation.md). The mechanism behind the contaminated windows is still unidentified; keep capturing before-samples with no menu open regardless.
+This caveat was later reported a second time, from the other side, as "a menu looks permanently open". A measurement pass established that it is not permanent and not construction-time, and the app now records menu-tracking begin/end into its own diagnostics stream so a future sample can be checked against whether a menu was actually open — see [`../menu-tracking-investigation.md`](../menu-tracking-investigation.md). The mechanism behind the contaminated windows is still unidentified; keep capturing before-samples with no menu open regardless.
 
 ## Alternatives considered
 

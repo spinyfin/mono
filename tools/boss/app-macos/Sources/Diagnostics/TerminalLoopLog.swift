@@ -240,6 +240,11 @@ struct MenuTrackingSample: Codable, Identifiable, Sendable, Equatable {
     /// loop while this says the default mode (or while nothing is open at
     /// all) means the tracking loop outlived the menu.
     let runloopMode: String?
+    /// Only set on `unbalanced_end`. `true` means this was the first
+    /// unbalanced end seen this launch — the benign case where the monitor
+    /// started mid-session. `false` means AppKit ended a session this
+    /// monitor never saw begin, which is worth noticing on its own.
+    let firstUnbalancedEnd: Bool?
 
     init(
         id: UUID = UUID(),
@@ -248,7 +253,8 @@ struct MenuTrackingSample: Codable, Identifiable, Sendable, Equatable {
         menu: String,
         openMs: Int64?,
         openCount: Int,
-        runloopMode: String?
+        runloopMode: String?,
+        firstUnbalancedEnd: Bool? = nil
     ) {
         self.kind = "menu_tracking"
         self.id = id
@@ -258,6 +264,7 @@ struct MenuTrackingSample: Codable, Identifiable, Sendable, Equatable {
         self.openMs = openMs
         self.openCount = openCount
         self.runloopMode = runloopMode
+        self.firstUnbalancedEnd = firstUnbalancedEnd
     }
 
     enum CodingKeys: String, CodingKey {
@@ -269,6 +276,7 @@ struct MenuTrackingSample: Codable, Identifiable, Sendable, Equatable {
         case openMs = "open_ms"
         case openCount = "open_count"
         case runloopMode = "runloop_mode"
+        case firstUnbalancedEnd = "first_unbalanced_end"
     }
 }
 

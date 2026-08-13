@@ -11,9 +11,9 @@ import os
 /// the app's normal idle loop, and the app's steady state is unmeasurable —
 /// the repo's own UI-performance work had to discard its baseline for exactly
 /// this reason (see `tools/boss/docs/designs/boss-ui-performance-improvements.md`,
-/// "Sampling caveat that constrains every comparison"). An operator then hit
-/// the same thing from the other side: repeated samples that looked like a
-/// menu was permanently open, with no menu visible on screen.
+/// "Sampling caveat that constrains every comparison"). The same stack was
+/// reported a second time from the other side: repeated samples that looked
+/// like a menu was permanently open, with no menu visible on screen.
 ///
 /// A profile cannot tell those two apart. It shows a nested loop running; it
 /// cannot say whether a menu is genuinely open behind it, which control owns
@@ -50,7 +50,7 @@ final class MenuTrackingMonitor {
     /// One notice per session that crosses the suspicion threshold, keyed by
     /// menu identity, so a genuinely stuck session logs once rather than once
     /// per tier.
-    private var noticedOrphans: Set<Int> = []
+    private var noticedOrphans: Set<ObjectIdentifier> = []
 
     init(log: TerminalLoopLog = .shared) {
         self.log = log
@@ -61,7 +61,7 @@ final class MenuTrackingMonitor {
     var isTracking: Bool { ledger.isTracking }
 
     /// Snapshot of open sessions, longest-open first.
-    func openSessions(asOfMs: Int64 = MenuTrackingMonitor.nowMs()) -> [OpenMenuSession] {
+    func openSessions(asOfMs: Int64 = MenuTrackingMonitor.nowMonoMs()) -> [OpenMenuSession] {
         ledger.open.sorted { $0.openMs(asOfMs: asOfMs) > $1.openMs(asOfMs: asOfMs) }
     }
 
@@ -120,25 +120,29 @@ final class MenuTrackingMonitor {
 
     // MARK: - Transitions
 
-    private func handleBegin(key: Int, label: String) {
-        let now = Self.nowMs()
-        guard ledger.begin(key: key, label: label, atMs: now) else { return }
-        record(event: "begin", menu: label, openMs: nil, at: now)
+    private func handleBegin(key: ObjectIdentifier, label: String) {
+        guard ledger.begin(key: key, label: label, atMs: Self.nowMonoMs()) else { return }
+        record(event: "begin", menu: label, openMs: nil, at: Self.nowMs())
         startProbeIfNeeded()
     }
 
-    private func handleEnd(key: Int, label: String) {
-        let now = Self.nowMs()
+    private func handleEnd(key: ObjectIdentifier, label: String) {
         noticedOrphans.remove(key)
-        guard let closed = ledger.end(key: key, atMs: now) else {
+        guard let closed = ledger.end(key: key, atMs: Self.nowMonoMs()) else {
             // No begin on file. Expected at most once per launch if the
             // monitor started while a menu was already up; otherwise it means
             // AppKit ended a session this app never saw open, which is itself
             // worth having in the log rather than dropping.
-            record(event: "unbalanced_end", menu: label, openMs: nil, at: now)
+            record(
+                event: "unbalanced_end",
+                menu: label,
+                openMs: nil,
+                at: Self.nowMs(),
+                firstUnbalancedEnd: ledger.isFirstUnbalancedEnd
+            )
             return
         }
-        record(event: "end", menu: closed.label, openMs: closed.openMs, at: now)
+        record(event: "end", menu: closed.label, openMs: closed.openMs, at: Self.nowMs())
         if !ledger.isTracking { stopProbe() }
     }
 
@@ -161,27 +165,39 @@ final class MenuTrackingMonitor {
     }
 
     private func tick() {
-        let now = Self.nowMs()
-        for due in ledger.dueReports(asOfMs: now) {
-            record(event: "still_open", menu: due.label, openMs: due.openMs, at: now)
+        let nowEpoch = Self.nowMs()
+        let nowMono = Self.nowMonoMs()
+        for due in ledger.dueReports(asOfMs: nowMono) {
+            record(event: "still_open", menu: due.label, openMs: due.openMs, at: nowEpoch)
         }
-        guard let longest = ledger.longestOpen(asOfMs: now),
-              longest.openMs(asOfMs: now) >= MenuTrackingLedger.orphanSuspicionMs,
-              !noticedOrphans.contains(longest.key)
-        else { return }
-        noticedOrphans.insert(longest.key)
-        logger.notice(
-            """
-            menu-tracking: session open \(longest.openMs(asOfMs: now), privacy: .public)ms \
-            with no end — menu=\(longest.label, privacy: .public) \
-            openCount=\(self.ledger.openCount, privacy: .public)
-            """
-        )
+        // Iterate every open session, not just the longest-open one: two
+        // menus (e.g. a parent and its submenu) can cross the suspicion
+        // threshold at the same time, and each deserves its own notice.
+        for session in ledger.open {
+            let openMs = session.openMs(asOfMs: nowMono)
+            guard openMs >= MenuTrackingLedger.orphanSuspicionMs,
+                  !noticedOrphans.contains(session.key)
+            else { continue }
+            noticedOrphans.insert(session.key)
+            logger.notice(
+                """
+                menu-tracking: session open \(openMs, privacy: .public)ms \
+                with no end — menu=\(session.label, privacy: .public) \
+                openCount=\(self.ledger.openCount, privacy: .public)
+                """
+            )
+        }
     }
 
     // MARK: - Helpers
 
-    private func record(event: String, menu: String, openMs: Int64?, at tsEpochMs: Int64) {
+    private func record(
+        event: String,
+        menu: String,
+        openMs: Int64?,
+        at tsEpochMs: Int64,
+        firstUnbalancedEnd: Bool? = nil
+    ) {
         log.record(
             MenuTrackingSample(
                 tsEpochMs: tsEpochMs,
@@ -189,12 +205,22 @@ final class MenuTrackingMonitor {
                 menu: menu,
                 openMs: openMs,
                 openCount: ledger.openCount,
-                runloopMode: Self.currentRunLoopMode()
+                runloopMode: Self.currentRunLoopMode(),
+                firstUnbalancedEnd: firstUnbalancedEnd
             )
         )
     }
 
+    /// Wall-clock timestamp for the record's `ts_epoch_ms` field — this one
+    /// stays comparable to other diagnostics streams and to `sample` output.
     nonisolated static func nowMs() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
+
+    /// Monotonic milliseconds used for all session-duration arithmetic
+    /// (`beganAtMs`, `openMs`, report tiers, the orphan-suspicion check), so a
+    /// wall-clock step — an NTP correction, a manual clock change — can never
+    /// corrupt or fabricate a session's apparent age. Every sibling diagnostic
+    /// in this directory follows the same convention.
+    nonisolated static func nowMonoMs() -> Int64 { Int64(DispatchTime.now().uptimeNanoseconds / 1_000_000) }
 
     /// Run `body` on the main actor, synchronously when already there.
     ///
@@ -216,8 +242,8 @@ final class MenuTrackingMonitor {
     /// orphaned* session could swallow the `begin` of a new menu allocated at
     /// the same address (the duplicate-begin guard drops it), which biases
     /// toward under-reporting rather than inventing sessions.
-    nonisolated private static func key(for menu: NSMenu) -> Int {
-        ObjectIdentifier(menu).hashValue
+    nonisolated private static func key(for menu: NSMenu) -> ObjectIdentifier {
+        ObjectIdentifier(menu)
     }
 
     nonisolated private static func label(for menu: NSMenu) -> String {

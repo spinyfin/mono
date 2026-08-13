@@ -2,11 +2,11 @@ import Foundation
 
 /// One menu-tracking session the app has seen open and not yet seen close.
 ///
-/// `key` is the identity of the `NSMenu` object (`ObjectIdentifier`'s hash),
-/// not a stable identifier across launches — it exists only to pair a
-/// `didBeginTracking` notification with its `didEndTracking` partner.
+/// `key` is the identity of the `NSMenu` object, not a stable identifier
+/// across launches — it exists only to pair a `didBeginTracking`
+/// notification with its `didEndTracking` partner.
 struct OpenMenuSession: Equatable, Sendable {
-    let key: Int
+    let key: ObjectIdentifier
     /// Human-identifiable name for the control that owns this menu — see
     /// [[MenuTrackingLedger.label(title:itemTitles:)]]. A SwiftUI `Menu`
     /// bridges to an `NSMenu` with an empty `title`, so the item titles are
@@ -23,6 +23,14 @@ struct OpenMenuSession: Equatable, Sendable {
 
 /// A session that has closed, with the duration it was open for.
 struct ClosedMenuSession: Equatable, Sendable {
+    let label: String
+    let openMs: Int64
+}
+
+/// A session's label and how long it has been open — the shape `dueReports`
+/// hands to the still-open reporting path. Deliberately not `ClosedMenuSession`:
+/// every session this produces is, by construction, still open.
+struct OpenSessionReport: Equatable, Sendable {
     let label: String
     let openMs: Int64
 }
@@ -52,6 +60,9 @@ struct MenuTrackingLedger: Equatable, Sendable {
     /// `didEndTracking` seen with no matching `didBeginTracking`. Non-zero
     /// means the monitor started mid-session (benign, at most once per
     /// launch) or that AppKit ended a session the monitor never saw begin.
+    /// The first occurrence is the benign case; anything past it is worth
+    /// distinguishing, which is why `end` reports whether a given end was
+    /// the first unbalanced one.
     private(set) var unbalancedEndCount: Int = 0
 
     var openCount: Int { open.count }
@@ -62,7 +73,7 @@ struct MenuTrackingLedger: Equatable, Sendable {
     /// second begin for a menu that is re-shown without an intervening end,
     /// and double-counting it would make every later report wrong.
     @discardableResult
-    mutating func begin(key: Int, label: String, atMs: Int64) -> Bool {
+    mutating func begin(key: ObjectIdentifier, label: String, atMs: Int64) -> Bool {
         guard !open.contains(where: { $0.key == key }) else { return false }
         open.append(OpenMenuSession(key: key, label: label, beganAtMs: atMs, reportedTiers: 0))
         return true
@@ -71,7 +82,7 @@ struct MenuTrackingLedger: Equatable, Sendable {
     /// Record a session closing, returning how long it was open.
     /// `nil` means no matching begin was on file (counted in
     /// `unbalancedEndCount`).
-    mutating func end(key: Int, atMs: Int64) -> ClosedMenuSession? {
+    mutating func end(key: ObjectIdentifier, atMs: Int64) -> ClosedMenuSession? {
         guard let index = open.lastIndex(where: { $0.key == key }) else {
             unbalancedEndCount += 1
             return nil
@@ -80,8 +91,14 @@ struct MenuTrackingLedger: Equatable, Sendable {
         return ClosedMenuSession(label: session.label, openMs: session.openMs(asOfMs: atMs))
     }
 
+    /// Whether the just-recorded unbalanced end (see `end`) was the first one
+    /// this ledger has seen — the benign mid-session-start case — rather than
+    /// a later one, which means AppKit ended a session this monitor never saw
+    /// begin.
+    var isFirstUnbalancedEnd: Bool { unbalancedEndCount == 1 }
+
     /// The session that has been open longest, if any.
-    func longestOpen(asOfMs: Int64) -> OpenMenuSession? {
+    var longestOpen: OpenMenuSession? {
         open.min(by: { $0.beganAtMs < $1.beganAtMs })
     }
 
@@ -89,8 +106,8 @@ struct MenuTrackingLedger: Equatable, Sendable {
     ///
     /// Call once per tick while anything is open; the returned durations are
     /// what the caller writes to the diagnostics log.
-    mutating func dueReports(asOfMs: Int64) -> [ClosedMenuSession] {
-        var due: [ClosedMenuSession] = []
+    mutating func dueReports(asOfMs: Int64) -> [OpenSessionReport] {
+        var due: [OpenSessionReport] = []
         for index in open.indices {
             let openMs = open[index].openMs(asOfMs: asOfMs)
             var tiers = open[index].reportedTiers
@@ -101,7 +118,7 @@ struct MenuTrackingLedger: Equatable, Sendable {
             }
             if reported {
                 open[index].reportedTiers = tiers
-                due.append(ClosedMenuSession(label: open[index].label, openMs: openMs))
+                due.append(OpenSessionReport(label: open[index].label, openMs: openMs))
             }
         }
         return due

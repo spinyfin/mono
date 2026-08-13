@@ -10,14 +10,20 @@ import XCTest
 /// AppKit's nested modal event loop, which a test process has no deterministic
 /// way back out of.
 final class MenuTrackingLedgerTests: XCTestCase {
+    /// Stand-ins for real `NSMenu` identities — the ledger only ever needs
+    /// `ObjectIdentifier` equality, not a real menu object.
+    private let menuA = NSObject()
+    private let menuB = NSObject()
+
     func testMatchedBeginEndReportsDuration() {
         var ledger = MenuTrackingLedger()
+        let key = ObjectIdentifier(menuA)
         XCTAssertFalse(ledger.isTracking)
-        XCTAssertTrue(ledger.begin(key: 1, label: "Group by", atMs: 1_000))
+        XCTAssertTrue(ledger.begin(key: key, label: "Group by", atMs: 1_000))
         XCTAssertTrue(ledger.isTracking)
         XCTAssertEqual(ledger.openCount, 1)
 
-        let closed = ledger.end(key: 1, atMs: 2_500)
+        let closed = ledger.end(key: key, atMs: 2_500)
         XCTAssertEqual(closed, ClosedMenuSession(label: "Group by", openMs: 1_500))
         XCTAssertFalse(ledger.isTracking)
         XCTAssertEqual(ledger.unbalancedEndCount, 0)
@@ -28,15 +34,17 @@ final class MenuTrackingLedgerTests: XCTestCase {
     /// parent must survive the submenu closing.
     func testNestedSubmenuSessionsAreTrackedIndependently() {
         var ledger = MenuTrackingLedger()
-        ledger.begin(key: 1, label: "Board Style", atMs: 0)
-        ledger.begin(key: 2, label: "Density", atMs: 400)
+        let parent = ObjectIdentifier(menuA)
+        let submenu = ObjectIdentifier(menuB)
+        ledger.begin(key: parent, label: "Board Style", atMs: 0)
+        ledger.begin(key: submenu, label: "Density", atMs: 400)
         XCTAssertEqual(ledger.openCount, 2)
 
-        XCTAssertEqual(ledger.end(key: 2, atMs: 900)?.openMs, 500)
+        XCTAssertEqual(ledger.end(key: submenu, atMs: 900)?.openMs, 500)
         XCTAssertEqual(ledger.openCount, 1)
         XCTAssertTrue(ledger.isTracking)
 
-        XCTAssertEqual(ledger.end(key: 1, atMs: 1_200)?.openMs, 1_200)
+        XCTAssertEqual(ledger.end(key: parent, atMs: 1_200)?.openMs, 1_200)
         XCTAssertFalse(ledger.isTracking)
     }
 
@@ -46,33 +54,39 @@ final class MenuTrackingLedgerTests: XCTestCase {
     /// monitor is supposed to rule out.
     func testDuplicateBeginIsIgnored() {
         var ledger = MenuTrackingLedger()
-        XCTAssertTrue(ledger.begin(key: 7, label: "New", atMs: 100))
-        XCTAssertFalse(ledger.begin(key: 7, label: "New", atMs: 250))
+        let key = ObjectIdentifier(menuA)
+        XCTAssertTrue(ledger.begin(key: key, label: "New", atMs: 100))
+        XCTAssertFalse(ledger.begin(key: key, label: "New", atMs: 250))
         XCTAssertEqual(ledger.openCount, 1)
-        XCTAssertEqual(ledger.end(key: 7, atMs: 300)?.openMs, 200)
+        XCTAssertEqual(ledger.end(key: key, atMs: 300)?.openMs, 200)
         XCTAssertEqual(ledger.openCount, 0)
     }
 
     func testEndWithoutBeginIsCountedNotDropped() {
         var ledger = MenuTrackingLedger()
-        XCTAssertNil(ledger.end(key: 42, atMs: 10))
+        XCTAssertNil(ledger.end(key: ObjectIdentifier(menuA), atMs: 10))
         XCTAssertEqual(ledger.unbalancedEndCount, 1)
+        XCTAssertTrue(ledger.isFirstUnbalancedEnd)
         XCTAssertFalse(ledger.isTracking)
+
+        XCTAssertNil(ledger.end(key: ObjectIdentifier(menuB), atMs: 20))
+        XCTAssertEqual(ledger.unbalancedEndCount, 2)
+        XCTAssertFalse(ledger.isFirstUnbalancedEnd)
     }
 
     func testLongestOpenPicksTheEarliestSession() {
         var ledger = MenuTrackingLedger()
-        ledger.begin(key: 1, label: "first", atMs: 1_000)
-        ledger.begin(key: 2, label: "second", atMs: 5_000)
-        XCTAssertEqual(ledger.longestOpen(asOfMs: 6_000)?.label, "first")
-        XCTAssertEqual(ledger.longestOpen(asOfMs: 6_000)?.openMs(asOfMs: 6_000), 5_000)
+        ledger.begin(key: ObjectIdentifier(menuA), label: "first", atMs: 1_000)
+        ledger.begin(key: ObjectIdentifier(menuB), label: "second", atMs: 5_000)
+        XCTAssertEqual(ledger.longestOpen?.label, "first")
+        XCTAssertEqual(ledger.longestOpen?.openMs(asOfMs: 6_000), 5_000)
     }
 
     // MARK: - Report backoff
 
     func testReportsEscalateThenSettleToTheSteadyInterval() {
         var ledger = MenuTrackingLedger()
-        ledger.begin(key: 1, label: "stuck", atMs: 0)
+        ledger.begin(key: ObjectIdentifier(menuA), label: "stuck", atMs: 0)
 
         // Below the first tier: nothing to say yet.
         XCTAssertTrue(ledger.dueReports(asOfMs: 900).isEmpty)
@@ -95,7 +109,7 @@ final class MenuTrackingLedgerTests: XCTestCase {
     /// must emit one record, not one per skipped tier.
     func testASingleLateTickCollapsesSkippedTiers() {
         var ledger = MenuTrackingLedger()
-        ledger.begin(key: 1, label: "stuck", atMs: 0)
+        ledger.begin(key: ObjectIdentifier(menuA), label: "stuck", atMs: 0)
         let due = ledger.dueReports(asOfMs: 12_000)
         XCTAssertEqual(due.count, 1)
         XCTAssertEqual(due.first?.openMs, 12_000)

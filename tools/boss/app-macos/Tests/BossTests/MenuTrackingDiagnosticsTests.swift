@@ -87,8 +87,8 @@ final class MenuTrackingDiagnosticsTests: XCTestCase {
     }
 
     /// The load-bearing case: an end that never arrives leaves the session
-    /// open and named. This is what tells an operator whose profile shows a
-    /// nested menu loop *which* control owns it.
+    /// open and named, so a profile showing a nested menu loop can be
+    /// matched to the control that owns it.
     func testSessionWithNoEndStaysOpenAndNamed() async {
         let log = TerminalLoopLog(directory: nil)
         let monitor = MenuTrackingMonitor(log: log)
@@ -114,6 +114,7 @@ final class MenuTrackingDiagnosticsTests: XCTestCase {
         await waitForSamples(log, count: 1)
 
         XCTAssertEqual(log.menuTrackingSnapshot().map(\.event), ["unbalanced_end"])
+        XCTAssertEqual(log.menuTrackingSnapshot().first?.firstUnbalancedEnd, true)
         XCTAssertFalse(monitor.isTracking)
     }
 
