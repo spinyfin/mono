@@ -2376,7 +2376,7 @@ pub(crate) struct TaskListArgs {
     /// of a known parent in one call (e.g. "did this chore ever spawn a
     /// CI-fix revision?"). An id that names no row errors rather than
     /// returning empty. Composes with the other filters as an AND.
-    #[arg(long)]
+    #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) parent: Option<String>,
 
     #[command(flatten)]
