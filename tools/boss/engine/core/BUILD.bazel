@@ -443,6 +443,27 @@ rust_test(
     ),
 )
 
+rust_test(
+    name = "startup_recovery_test",
+    size = "small",
+    timeout = "moderate",
+    srcs = ["tests/startup_recovery.rs"],
+    edition = "2024",
+    env = {"HOME": "/tmp"},
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":engine_lib",
+        "//tools/boss/client",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
 filegroup(
     name = "engine_srcs",
     srcs = glob(["src/**/*.rs"]),

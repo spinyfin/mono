@@ -572,6 +572,7 @@ pub use output_types::TmuxRunHandle;
 pub use output_types::WorkerPrCompletion;
 pub use output_types::WorkerPrCompletionTarget;
 pub use planner_runs::ClaimPlannerRunInput;
+pub use planner_runs::PLANNER_RUN_ENGINE_RESTART_SUMMARY;
 pub use planner_runs::PlannerRunPatch;
 pub use pr_flow::PrPollStateInput;
 pub use pr_flow::PrStatusSnapshot;

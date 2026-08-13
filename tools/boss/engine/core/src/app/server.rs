@@ -418,20 +418,6 @@ pub async fn serve_with_merge_probe(
         None,
     )?;
 
-    // A Planner run can only be active inside this engine process. Recover
-    // every durable `running` row before the frontend becomes reachable or
-    // the Populator hook can accept new work, so the replacement engine never
-    // reports a stranded run as live or leaves its project permanently gated.
-    let recovered_planner_runs = server_state.work_db.recover_running_planner_runs_on_engine_restart()?;
-    if recovered_planner_runs > 0 {
-        tracing::warn!(
-            count = recovered_planner_runs,
-            "marked planner runs interrupted by the previous engine as failed at startup",
-        );
-    } else {
-        tracing::debug!("no running planner runs to recover at startup");
-    }
-
     let tmux_preflight = crate::tmux_preflight::TmuxPreflight::probe().await;
     if let Some(reason) = tmux_preflight.unavailable_reason() {
         tracing::error!(%reason, "tmux preflight failed; refusing all new local dispatches");
@@ -482,6 +468,23 @@ pub async fn serve_with_merge_probe(
             owner.map(|p| p.to_string()).unwrap_or_else(|| "unknown pid".to_owned()),
             socket_path.display()
         ));
+    }
+
+    // A Planner run can only be active inside this engine process. Recover
+    // every durable `running` row after ruling out a live frontend owner but
+    // before the replacement engine becomes reachable or installs Populator.
+    // This releases the project gate and surfaces an actionable follow-up for
+    // every interrupted run without mutating a live engine's state.
+    match server_state.work_db.recover_running_planner_runs_on_engine_restart() {
+        Ok(recovered) if !recovered.is_empty() => {
+            tracing::warn!(
+                count = recovered.len(),
+                "marked planner runs interrupted by the previous engine as failed at startup",
+            );
+            raise_recovered_planner_run_attentions(&server_state, &recovered).await;
+        }
+        Ok(_) => tracing::debug!("no running planner runs to recover at startup"),
+        Err(err) => tracing::error!(?err, "planner-run restart recovery failed; continuing"),
     }
 
     // Always attempt to unlink any existing file at the path before
@@ -2029,6 +2032,61 @@ async fn raise_tmux_preflight_attention(server_state: &Arc<ServerState>, reason:
                     tracing::warn!(project_id = %project.id, ?err, "tmux preflight: failed to create startup attention")
                 }
             }
+        }
+    }
+}
+
+/// Surface each Planner run interrupted by the previous engine as an
+/// actionable follow-up. Design-triggered runs reuse Populator's stable group
+/// key so the restart outcome appears with the other outcomes for that design.
+async fn raise_recovered_planner_run_attentions(
+    server_state: &Arc<ServerState>,
+    recovered: &[boss_protocol::PlannerRun],
+) {
+    for run in recovered {
+        let title = "Planner run interrupted by engine restart";
+        let body = format!(
+            "Planner run {} for project {} was interrupted by an engine restart. Investigate and re-run the populate.",
+            run.id, run.project_id
+        );
+        let input = match &run.design_task_id {
+            Some(design_task_id) => boss_protocol::CreateAttentionInput::builder()
+                .kind("followup")
+                .group_key(format!(
+                    "{}|{design_task_id}",
+                    crate::populator::ATTENTION_GROUP_KEY_PREFIX
+                ))
+                .association_task_id(design_task_id)
+                .source_kind("manual")
+                .source_task_id(design_task_id)
+                .proposed_name(title)
+                .proposed_description(body)
+                .build(),
+            None => boss_protocol::CreateAttentionInput::builder()
+                .kind("followup")
+                .group_key(format!("followup|planner_restart|{}", run.id))
+                .association_project_id(run.project_id.clone())
+                .source_kind("manual")
+                .proposed_name(title)
+                .proposed_description(body)
+                .build(),
+        };
+        match server_state.work_db.create_attention(input) {
+            Ok((attention, group)) => {
+                server_state
+                    .publisher
+                    .publish_frontend_event_on_product(
+                        &run.product_id,
+                        boss_protocol::FrontendEvent::AttentionCreated { attention, group },
+                    )
+                    .await;
+            }
+            Err(err) => tracing::warn!(
+                project_id = %run.project_id,
+                run_id = %run.id,
+                ?err,
+                "failed to raise attention for planner run recovered at startup",
+            ),
         }
     }
 }

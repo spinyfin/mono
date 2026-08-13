@@ -74,11 +74,15 @@ impl WorkDb {
     /// restarts, the row cannot have a live owner, so the whole sweep is
     /// performed in one transaction before the replacement engine serves any
     /// frontend requests or installs its Populator hook.
-    pub fn recover_running_planner_runs_on_engine_restart(&self) -> Result<usize> {
+    pub fn recover_running_planner_runs_on_engine_restart(&self) -> Result<Vec<PlannerRun>> {
         let now = now_string();
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let recovered = tx.execute(
+        let mut recovered = {
+            let mut stmt = tx.prepare(&format!("{SELECT_PLANNER_RUN} WHERE outcome = ?1"))?;
+            collect_rows(stmt.query_map(params![PLANNER_OUTCOME_RUNNING], map_planner_run)?)?
+        };
+        tx.execute(
             "UPDATE planner_runs
              SET outcome = ?1, result_summary = ?2, updated_at = ?3
              WHERE outcome = ?4",
@@ -90,6 +94,11 @@ impl WorkDb {
             ],
         )?;
         tx.commit()?;
+        for run in &mut recovered {
+            run.outcome = PLANNER_OUTCOME_PLANNER_FAILED.to_owned();
+            run.result_summary = Some(PLANNER_RUN_ENGINE_RESTART_SUMMARY.to_owned());
+            run.updated_at = now.clone();
+        }
         Ok(recovered)
     }
 
@@ -475,7 +484,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(db.recover_running_planner_runs_on_engine_restart().unwrap(), 1);
+        let recovered_runs = db.recover_running_planner_runs_on_engine_restart().unwrap();
+        assert_eq!(recovered_runs.len(), 1);
+        assert_eq!(recovered_runs[0].id, running.id);
         let recovered = db.get_planner_run(&running.id).unwrap().unwrap();
         assert_eq!(recovered.outcome, PLANNER_OUTCOME_PLANNER_FAILED);
         assert_eq!(
@@ -488,7 +499,7 @@ mod tests {
             "restart recovery must preserve non-running outcomes"
         );
         assert_eq!(
-            db.recover_running_planner_runs_on_engine_restart().unwrap(),
+            db.recover_running_planner_runs_on_engine_restart().unwrap().len(),
             0,
             "a second startup sweep must be idempotent"
         );
