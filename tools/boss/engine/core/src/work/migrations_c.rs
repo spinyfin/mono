@@ -663,8 +663,8 @@ pub(crate) fn migrate_correct_falsely_answered_comments_with_failed_runs(conn: &
     Ok(())
 }
 
-/// One-shot conversion of pre-existing open `churn_guard_parked` attention
-/// items into the new `dispatch_failed_reason` representation — see
+/// One-shot cleanup of pre-existing open `churn_guard_parked` attention
+/// items superseded by the new `dispatch_failed_reason` representation — see
 /// `docs/designs/dispatch-halt-state-vs-attention-items.md`. Before this
 /// migration, `orphan_sweep` filed a `churn_guard_parked` attention item
 /// for an `active` work item; after it, that path bounces the item to
@@ -672,13 +672,14 @@ pub(crate) fn migrate_correct_falsely_answered_comments_with_failed_runs(conn: &
 /// (`tasks.dispatch_failed_reason = 'churn_guard'`), because nothing ever
 /// rendered the attention item on the board it was meant to explain.
 ///
-/// This runs once against whatever open items already exist so a churn
-/// park an operator hit before this shipped doesn't stay invisible forever
-/// waiting for a fresh trip to re-file it in the new shape. Preserves the
-/// information rather than discarding it: the attention item's
-/// `body_markdown` becomes the task's `dispatch_failed_error`, and the
-/// item itself is marked `resolved` (not deleted) — the representation
-/// changed, nothing was silently dismissed.
+/// This only resolves stale `orphan_sweep` items; it intentionally does not
+/// convert their task rows. The old sweep filed its item before checking
+/// durable worker liveness, so an `active` task with one of these items can
+/// still have a live worker process after an engine restart. Demoting that
+/// row to Backlog here would recreate the race the current sweep avoids.
+/// The next guarded sweep pass re-parks genuinely orphaned work with fresh
+/// failure counts. The item is marked `resolved` (not deleted), retaining
+/// its recorded history without presenting an obsolete failure banner.
 ///
 /// Scoped to items filed by `orphan_sweep`, not by task status: both
 /// `orphan_sweep` and `pr_review_recovery` file the same attention `kind`,
@@ -693,9 +694,9 @@ pub(crate) fn migrate_correct_falsely_answered_comments_with_failed_runs(conn: &
 /// matching on that text recovers the real source without needing a second
 /// attention kind. Rows filed by `pr_review_recovery` are left exactly as
 /// they were, still open attention items, still handled by that sweep.
-pub(crate) fn migrate_convert_open_churn_guard_parked_to_dispatch_failed(conn: &Connection) -> Result<()> {
+pub(crate) fn migrate_resolve_open_orphan_sweep_churn_guard_parked(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare(
-        "SELECT wai.id, wai.work_item_id, wai.body_markdown
+        "SELECT wai.id, wai.work_item_id
            FROM work_attention_items wai
            JOIN tasks t ON t.id = wai.work_item_id
           WHERE wai.kind = 'churn_guard_parked'
@@ -704,8 +705,8 @@ pub(crate) fn migrate_convert_open_churn_guard_parked_to_dispatch_failed(conn: &
             AND t.deleted_at IS NULL
             AND wai.body_markdown LIKE '%`orphan_sweep` sweep%'",
     )?;
-    let candidates: Vec<(String, String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+    let candidates: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
 
@@ -714,32 +715,12 @@ pub(crate) fn migrate_convert_open_churn_guard_parked_to_dispatch_failed(conn: &
     }
 
     let now = now_string();
-    for (attention_id, work_item_id, body_markdown) in candidates {
+    for (attention_id, work_item_id) in candidates {
         tracing::warn!(
             work_item_id,
             attention_id,
-            "migrating pre-existing open churn_guard_parked attention item to dispatch_failed_reason",
+            "resolving stale pre-existing orphan_sweep churn_guard_parked attention item",
         );
-        let updated = conn.execute(
-            "UPDATE tasks
-             SET status = 'todo',
-                 autostart = 0,
-                 last_status_actor = 'engine',
-                 dispatch_failed_reason = 'churn_guard',
-                 dispatch_failed_error = ?2,
-                 dispatch_failed_at = ?3,
-                 updated_at = ?3
-             WHERE id = ?1
-               AND status = 'active'
-               AND deleted_at IS NULL",
-            params![work_item_id, body_markdown, now],
-        )?;
-        if updated == 0 {
-            // Raced a status change between the SELECT and here; leave the
-            // attention item as-is rather than resolving a signal whose
-            // information was never actually migrated anywhere.
-            continue;
-        }
         conn.execute(
             "UPDATE work_attention_items SET status = 'resolved', resolved_at = ?2 WHERE id = ?1",
             params![attention_id, now],
@@ -761,14 +742,16 @@ mod churn_guard_migration_tests {
         }
     }
 
-    /// A pre-existing open `churn_guard_parked` attention item on a
-    /// still-`active` task converts to `dispatch_failed_reason` and the
-    /// item itself is marked resolved (its body preserved, not discarded).
+    /// A stale `orphan_sweep` item on an active task with a live worker must
+    /// not demote the task during startup cleanup. The next guarded sweep
+    /// decides whether a later, genuinely orphaned task should be re-parked.
     #[test]
-    fn converts_open_item_on_active_task_and_resolves_it() {
+    fn leaves_active_task_with_live_shell_pid_untouched_and_resolves_item() {
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let shell_pid = i64::from(std::process::id());
+        create_spawned_execution(&db, &work_item_id, shell_pid);
 
         let item = db
             .create_attention_item(
@@ -786,20 +769,13 @@ mod churn_guard_migration_tests {
 
         {
             let conn = db.connect().unwrap();
-            migrate_convert_open_churn_guard_parked_to_dispatch_failed(&conn).unwrap();
+            migrate_resolve_open_orphan_sweep_churn_guard_parked(&conn).unwrap();
         }
 
         let task = get_task(&db, &work_item_id);
-        assert_eq!(task.status.as_str(), "todo");
-        assert!(!task.autostart);
-        assert_eq!(task.dispatch_failed_reason.as_deref(), Some("churn_guard"));
-        assert_eq!(
-            task.dispatch_failed_error.as_deref(),
-            Some(
-                "The `orphan_sweep` sweep stopped auto-redispatching this work item: some pre-existing \
-                 failure detail; bossctl work start test_id"
-            )
-        );
+        assert_eq!(task.status.as_str(), "active");
+        assert!(task.dispatch_failed_reason.is_none());
+        assert!(task.dispatch_failed_error.is_none());
 
         let resolved = db.get_attention_item(&item.id).unwrap();
         assert_eq!(resolved.status, "resolved");
@@ -832,7 +808,7 @@ mod churn_guard_migration_tests {
 
         {
             let conn = db.connect().unwrap();
-            migrate_convert_open_churn_guard_parked_to_dispatch_failed(&conn).unwrap();
+            migrate_resolve_open_orphan_sweep_churn_guard_parked(&conn).unwrap();
         }
 
         let task = get_task(&db, &work_item_id);
@@ -880,7 +856,7 @@ mod churn_guard_migration_tests {
 
         {
             let conn = db.connect().unwrap();
-            migrate_convert_open_churn_guard_parked_to_dispatch_failed(&conn).unwrap();
+            migrate_resolve_open_orphan_sweep_churn_guard_parked(&conn).unwrap();
         }
 
         let task = get_task(&db, &work_item_id);

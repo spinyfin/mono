@@ -18,7 +18,7 @@
 //! was merely transient (a flaky host, a momentary cube error) with no
 //! self-healing story: `orphan_active_redispatch` / `cube_lease_auto_reap`
 //! already provide that for failures *after* `run_started`, but nothing
-//! played that role pre-spawn (2026-07-03 T215 incident: a dispatch
+//! played that role pre-spawn (2026-07-03 incident: a dispatch
 //! failed pre-spawn, exhausted its retries, and sat parked for 45+
 //! minutes with free worker slots available, until a human ran
 //! `bossctl work start`).
