@@ -179,12 +179,20 @@ async fn attach_coordinator_to_registered_app(server_state: Arc<ServerState>) {
             return;
         }
     };
+    let working_directory = match crate::coordinator_tmux::coordinator_working_directory() {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::error!(error = %format!("{error:#}"), "failed to resolve coordinator session directory");
+            return;
+        }
+    };
     let record = {
         let _guard = server_state.coordinator_tmux_lock.lock().await;
         match crate::coordinator_tmux::ensure_for_attach(
             server_state.work_db.as_ref(),
             &tmux,
             &server_state.coordinator_model,
+            &working_directory,
         )
         .await
         {
@@ -215,6 +223,7 @@ pub(super) async fn request_coordinator_attachment(
                 spawn_token: record.spawn_token.clone(),
                 model: record.model.clone(),
                 tmux_program,
+                server_label: boss_tmux::SERVER_LABEL.to_owned(),
             }),
             Duration::from_secs(5),
         )
@@ -303,6 +312,19 @@ pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequ
             return;
         }
     };
+    let working_directory = match crate::coordinator_tmux::coordinator_working_directory() {
+        Ok(path) => path,
+        Err(error) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::Error {
+                    message: format!("recreate_coordinator: session directory: {error:#}"),
+                },
+            );
+            return;
+        }
+    };
     let replacement = {
         let _guard = server_state.coordinator_tmux_lock.lock().await;
         crate::coordinator_tmux::recreate_after_confirmation(
@@ -310,6 +332,7 @@ pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequ
             &tmux,
             &server_state.coordinator_model,
             &expected_spawn_token,
+            &working_directory,
         )
         .await
     };

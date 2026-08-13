@@ -12,7 +12,18 @@ final class BossPaneModel: ObservableObject {
     @Published private(set) var session: TerminalPaneSession?
     private var attachedSpawnToken: String?
     private var lastRequest: EngineCoordinatorAttachRequest?
+    /// Bumped on every viewer install so dual `onChildExited` paths
+    /// (childExited + closeSurface) for one exit only schedule one rebuild.
     private var viewerGeneration = 0
+    private var lastHandledExitGeneration: Int?
+    private var consecutiveImmediateExits = 0
+    private var viewerInstalledAt: Date?
+    private var reattachTask: Task<Void, Never>?
+
+    private static let minStableUptime: TimeInterval = 5
+    private static let maxConsecutiveImmediateExits = 8
+    private static let baseBackoffSeconds: TimeInterval = 1
+    private static let maxBackoffSeconds: TimeInterval = 30
 
     init() {
         self.runtime = GhosttyRuntime.shared
@@ -33,46 +44,82 @@ final class BossPaneModel: ObservableObject {
         guard !request.tmuxProgram.isEmpty, request.tmuxProgram.hasPrefix("/") else {
             return .failure(.internalFailure("engine supplied an invalid tmux program"))
         }
+        guard !request.serverLabel.isEmpty else {
+            return .failure(.internalFailure("engine supplied an empty tmux server label"))
+        }
         lastRequest = request
         guard attachedSpawnToken != request.spawnToken || session == nil else {
             return .success
         }
+        consecutiveImmediateExits = 0
+        reattachTask?.cancel()
+        reattachTask = nil
         installViewer(for: request)
         return .success
     }
 
     private func installViewer(for request: EngineCoordinatorAttachRequest) {
         viewerGeneration += 1
+        let generation = viewerGeneration
         let launchSpec = TerminalLaunchSpec(
             fontSize: 11.0,
             workingDirectory: FileManager.default.homeDirectoryForCurrentUser.path,
-            initialInput: "exec \(shellQuote(request.tmuxProgram)) -L boss attach-session -t \(shellQuote(request.sessionName))\n",
+            initialInput: "exec \(bossShellQuote(request.tmuxProgram)) -L \(bossShellQuote(request.serverLabel)) attach-session -t \(bossShellQuote(request.sessionName))\n",
             env: []
         )
         let viewer = TerminalPaneSession(
-            id: "boss-\(request.spawnToken)-\(viewerGeneration)",
+            id: "boss-\(request.spawnToken)-\(generation)",
             role: .boss,
             launchSpec: launchSpec
         )
         viewer.onChildExited = { [weak self] in
             Task { @MainActor [weak self] in
-                self?.reattachViewer()
+                self?.reattachViewer(generation: generation)
             }
         }
         session = viewer
         attachedSpawnToken = request.spawnToken
+        viewerInstalledAt = Date()
     }
 
-    private func reattachViewer() {
-        guard let request = lastRequest else { return }
-        session?.statusMessage = "Picard reconnecting…"
-        // A detached tmux client does not change the durable coordinator's
-        // token, so deliberately rebuild the local viewer for the same token.
-        installViewer(for: request)
-    }
+    /// Rebuild the local tmux client after it exits. Bounded with
+    /// exponential backoff so a missing durable session cannot spin a
+    /// surface-recreate hot loop; dual Ghostty exit callbacks for one
+    /// child are collapsed by `viewerGeneration`.
+    private func reattachViewer(generation: Int) {
+        guard generation == viewerGeneration else { return }
+        guard lastHandledExitGeneration != generation else { return }
+        lastHandledExitGeneration = generation
+        guard lastRequest != nil else { return }
 
-    private func shellQuote(_ value: String) -> String {
-        "'\(value.replacingOccurrences(of: "'", with: "'\\\"'\\\"'"))'"
+        let uptime = viewerInstalledAt.map { Date().timeIntervalSince($0) } ?? 0
+        if uptime >= Self.minStableUptime {
+            consecutiveImmediateExits = 0
+        }
+        consecutiveImmediateExits += 1
+
+        if consecutiveImmediateExits > Self.maxConsecutiveImmediateExits {
+            session?.statusMessage =
+                "Picard could not attach after repeated attempts. Waiting for the coordinator session…"
+            logger.error("Boss pane viewer reattach ceiling reached; leaving failure status")
+            return
+        }
+
+        let exponent = min(consecutiveImmediateExits - 1, 5)
+        let delay = min(
+            Self.baseBackoffSeconds * pow(2.0, Double(exponent)),
+            Self.maxBackoffSeconds
+        )
+        reattachTask?.cancel()
+        reattachTask = Task { @MainActor [weak self] in
+            let nanos = UInt64(delay * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanos)
+            guard !Task.isCancelled else { return }
+            guard let self else { return }
+            guard generation == self.viewerGeneration else { return }
+            guard let request = self.lastRequest else { return }
+            self.installViewer(for: request)
+        }
     }
 
     private static func ensureBossWorkingDirectory() -> String {
@@ -110,6 +157,13 @@ final class BossPaneModel: ObservableObject {
 
         return bossSession.path
     }
+}
+
+/// POSIX single-quote a value for `/bin/sh` (safe for arbitrary engine-supplied paths).
+func bossShellQuote(_ value: String) -> String {
+    // Replacement is the five-character POSIX idiom '"'"' so a value
+    // containing `'` stays inside a well-formed single-quoted string.
+    "'\(value.replacingOccurrences(of: "'", with: "'\"'\"'"))'"
 }
 
 /// Baseline `permissions.allow` rules the Boss coordinator session needs to run its

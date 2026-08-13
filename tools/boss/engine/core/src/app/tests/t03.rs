@@ -1,11 +1,10 @@
 use super::*;
 
 // Regression tests for `authorize_rpc(BossOnly, …)` with a registered Boss
-// pid. The engine-owned coordinator tmux pane supplies the Boss trust root.
-// once the Boss pane's shell pid is known, installing the second trust root.
-// These tests pin the behaviour of the `BossOnly` tier before and after that
-// root is installed, ensuring that:
-//   (a) a peer in the Boss subtree is admitted after registration, and
+// pid. The engine-owned coordinator tmux pane's pid is installed as the
+// second trust root. These tests pin the behaviour of the `BossOnly` tier
+// before and after that root is installed, ensuring that:
+//   (a) a peer in the Boss subtree is admitted after the root is set, and
 //   (b) a peer outside the Boss subtree (including registered worker pids)
 //       is rejected.
 //
@@ -56,16 +55,10 @@ fn authorize_rpc_boss_only_rejects_non_boss_pid_even_when_worker_registered() {
 
 #[test]
 fn authorize_rpc_boss_only_rejects_when_boss_pid_not_registered() {
-    // When no boss_pid has been installed yet (e.g. the macOS app has
-    // not yet created the coordinator), BossOnly falls back to the
-    // app-pid + worker-exclusion check. A peer whose process tree does
-    // NOT include app_pid (the startup env value) is rejected.
-    //
-    // This test verifies the pre-registration state that the fix
-    // addresses: before the coordinator is created, the
-    // coordinator's bossctl cannot satisfy BossOnly via the app_pid
-    // fallback (its tree goes through Boss.app's libghostty pane, not
-    // through BOSS_APP_PID).
+    // When no boss_pid has been installed yet (e.g. the engine has not
+    // yet created the coordinator), BossOnly falls back to the app-pid
+    // + worker-exclusion check. This covers the state before any trust
+    // root is installed.
     let (server_state, _dir) = test_server_state();
     // test_server_state() passes None for app_pid; with both trust roots
     // absent the permissive "no-roots-configured" path applies. Guard

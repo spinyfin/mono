@@ -74,6 +74,8 @@ struct EngineCoordinatorAttachRequest: Sendable {
     let spawnToken: String
     let model: String
     let tmuxProgram: String
+    /// tmux `-L` label for the engine-owned private server.
+    let serverLabel: String
 }
 
 enum EngineCoordinatorAttachResult: Sendable {

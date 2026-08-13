@@ -158,6 +158,8 @@ pub struct AttachCoordinatorPaneInput {
     pub model: String,
     /// Absolute tmux binary selected by the engine preflight.
     pub tmux_program: String,
+    /// Private tmux server label (`-L`) the coordinator session runs on.
+    pub server_label: String,
 }
 
 /// App's reply when its Boss pane is attached to the coordinator session.
@@ -645,6 +647,7 @@ mod tests {
             spawn_token: "opaque-token".into(),
             model: "opus".into(),
             tmux_program: "/opt/homebrew/bin/tmux".into(),
+            server_label: "boss".into(),
         });
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("attach_coordinator_pane"));

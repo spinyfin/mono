@@ -202,6 +202,7 @@ mod tests {
                     spawn_token: "token".into(),
                     model: "opus".into(),
                     tmux_program: "/usr/bin/tmux".into(),
+                    server_label: "boss".into(),
                 }),
                 "attach_coordinator_pane",
             ),
