@@ -47,6 +47,20 @@ pub enum SkipReason {
     NoRelevantChanges { tag: String },
 }
 
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyReleased { tag } => write!(
+                formatter,
+                "HEAD is already {tag} — re-releasing the same commit is a no-op"
+            ),
+            Self::NoRelevantChanges { tag } => {
+                write!(formatter, "no release-affecting changes since {tag}")
+            }
+        }
+    }
+}
+
 /// Decides whether a release run should stop before allocating a new version.
 ///
 /// Idempotency applies to every accepted trigger. Only scheduled runs use
@@ -216,6 +230,24 @@ mod tests {
                 &[],
             )),
             SkipDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn skip_reasons_render_as_operator_facing_sentences() {
+        assert_eq!(
+            SkipReason::AlreadyReleased {
+                tag: "demo-v1.0.0".to_owned()
+            }
+            .to_string(),
+            "HEAD is already demo-v1.0.0 — re-releasing the same commit is a no-op"
+        );
+        assert_eq!(
+            SkipReason::NoRelevantChanges {
+                tag: "demo-v1.0.0".to_owned()
+            }
+            .to_string(),
+            "no release-affecting changes since demo-v1.0.0"
         );
     }
 }

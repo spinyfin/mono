@@ -17,7 +17,9 @@ rust_library(
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = ["//tools/release:__pkg__"],
-    deps = all_crate_deps(normal = True),
+    deps = [
+        "//tools/changelog:git_changelog_lib",
+    ] + all_crate_deps(normal = True),
 )
 
 rust_binary(
