@@ -36,14 +36,18 @@
 #
 # Contract (output): the worker is launched DETACHED (`nohup` +
 # background) so it survives the engine restarting and the launching
-# SSH session closing. Its stdout/stderr are teed to
-# `<workspace>/.boss/worker.log` so the engine can read recent output
-# on demand over the multiplex. The wrapper's own exit status reports
-# only *launch* success (0) or a sentinel config/toolchain failure
-# (78-82) — the worker's real lifecycle is driven by its hook events
-# over the forwarded BOSS_EVENTS_SOCKET, not by this wrapper blocking.
-# The wrapper prints `boss-remote-run: starting … pid=<n>` to stderr so
-# the engine can record the direct worker PID in `work_runs.remote_pid`.
+# SSH session closing. A detached supervisor brackets the direct Claude
+# child: it publishes that child's PID through `<workspace>/.boss/worker.pid`
+# before the `pid=<n>` stderr handshake, and appends
+# `boss-remote-run: worker exited with status=<n>` to
+# `<workspace>/.boss/worker.log` after it exits. The engine reads both
+# surfaces for liveness and immediate-death reporting. The wrapper's own
+# exit status reports only *launch* success (0) or a sentinel
+# config/toolchain/worker-PID-publication failure (78-83) — the worker's
+# real lifecycle is driven by its hook events over the forwarded
+# BOSS_EVENTS_SOCKET, not by this wrapper blocking. The wrapper prints
+# `boss-remote-run: starting … pid=<n>` to stderr so the engine can record
+# the direct worker PID in `work_runs.remote_pid`.
 #
 # NOTE: this wrapper launches `claude` unconditionally. The engine will
 # not dispatch a worker here whose resolved driver reports progress by
@@ -188,6 +192,7 @@ if [ -n "$initial_input" ]; then
         nohup claude --dangerously-skip-permissions "$@" &
         worker_pid=$!
         printf "%s\\n" "$worker_pid" > "$BOSS_WORKER_PID_FILE"
+        trap '\''kill "$worker_pid" 2>/dev/null || true; exit 143'\'' TERM INT HUP
         wait "$worker_pid"
         worker_status=$?
         printf "\\nboss-remote-run: worker exited with status=%s\\n" "$worker_status"
@@ -197,6 +202,7 @@ else
         nohup claude --dangerously-skip-permissions "$@" &
         worker_pid=$!
         printf "%s\\n" "$worker_pid" > "$BOSS_WORKER_PID_FILE"
+        trap '\''kill "$worker_pid" 2>/dev/null || true; exit 143'\'' TERM INT HUP
         wait "$worker_pid"
         worker_status=$?
         printf "\\nboss-remote-run: worker exited with status=%s\\n" "$worker_status"
@@ -215,14 +221,14 @@ done
 if [ ! -s "$worker_pid_file" ]; then
     printf 'boss-remote-run: worker supervisor did not publish a pid\n' 1>&2
     kill "$supervisor_pid" 2>/dev/null || true
-    exit 78
+    exit 83
 fi
 worker_pid="$(cat "$worker_pid_file")"
 case "$worker_pid" in
     *[!0-9]*|'')
         printf 'boss-remote-run: worker supervisor published an invalid pid\n' 1>&2
         kill "$supervisor_pid" 2>/dev/null || true
-        exit 78
+        exit 83
         ;;
 esac
 

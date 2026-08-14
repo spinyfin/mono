@@ -36,6 +36,7 @@
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 
+use crate::host_adapter::{WORKER_LOG_TAIL_BYTES, remote_worker_log_path};
 use crate::ssh_transport::{SshOutput, SshTransport};
 
 // ── Failure-reason taxonomy (matches the wrapper sentinels) ───────────────────
@@ -57,6 +58,9 @@ pub const REASON_MISSING_GH: &str = "host_missing_gh";
 /// nothing. Preflighted by the wrapper so that becomes a named launch
 /// failure rather than a silent one.
 pub const REASON_MISSING_BOSS_EVENT: &str = "host_missing_boss_event";
+/// `exit 83`: the detached supervisor failed to publish the direct worker
+/// PID before the wrapper's bounded handshake deadline.
+pub const REASON_WORKER_PID_UNPUBLISHED: &str = "host_worker_pid_unpublished";
 /// Any other non-zero wrapper exit, or a failure to even establish the
 /// events forward before launch.
 pub const REASON_WORKER_LAUNCH_FAILED: &str = "worker_launch_failed";
@@ -83,11 +87,6 @@ const WORKER_LIVENESS_SETTLE_SECS: u64 = 2;
 const LIVENESS_ALIVE_SENTINEL: &str = "BOSS_WORKER_ALIVE";
 const LIVENESS_DEAD_SENTINEL: &str = "BOSS_WORKER_DEAD";
 
-/// Maximum remote worker-log tail included in an immediate-death error.
-/// The shared SSH transport also applies its fast-command timeout, so this
-/// failure-path capture has both byte and time bounds.
-const WORKER_LOG_CAPTURE_MAX_BYTES: u64 = 2 * 1024;
-
 /// Line appended by the detached wrapper supervisor after the worker exits.
 pub(crate) const WORKER_EXIT_STATUS_PREFIX: &str = "boss-remote-run: worker exited with status=";
 
@@ -105,7 +104,7 @@ pub enum WrapperLaunch {
 }
 
 /// Map a wrapper exit code onto the launch outcome. The sentinel codes
-/// (78–81) are the wrapper's documented contract; anything else is an
+/// (78–83) are the wrapper's documented contract; anything else is an
 /// opaque launch failure.
 pub fn classify_wrapper_exit(code: i32) -> WrapperLaunch {
     match code {
@@ -115,6 +114,7 @@ pub fn classify_wrapper_exit(code: i32) -> WrapperLaunch {
         80 => WrapperLaunch::Failed(REASON_MISSING_CUBE),
         81 => WrapperLaunch::Failed(REASON_MISSING_GH),
         82 => WrapperLaunch::Failed(REASON_MISSING_BOSS_EVENT),
+        83 => WrapperLaunch::Failed(REASON_WORKER_PID_UNPUBLISHED),
         _ => WrapperLaunch::Failed(REASON_WORKER_LAUNCH_FAILED),
     }
 }
@@ -352,9 +352,7 @@ pub async fn perform_remote_launch(
                                 let exit_status = parse_worker_exit_status(&log)
                                     .map(|status| format!("worker-reported exit status {status}"))
                                     .unwrap_or_else(|| "worker exit status was not recorded".to_owned());
-                                format!(
-                                    "{exit_status}; worker log tail (up to {WORKER_LOG_CAPTURE_MAX_BYTES} bytes):\n{log}"
-                                )
+                                format!("{exit_status}; worker log tail (up to {WORKER_LOG_TAIL_BYTES} bytes):\n{log}")
                             }
                             Err(err) => format!("worker log capture failed: {err:#}"),
                         };
@@ -413,8 +411,8 @@ pub async fn perform_remote_launch(
 /// missing log is reported as a capture failure here: an immediate-death error
 /// must say whether the engine successfully observed worker output.
 async fn capture_worker_death_log(exec: &dyn SshExec, workspace_path: &str) -> Result<String> {
-    let path = format!("{workspace_path}/.boss/worker.log");
-    let command = crate::remote_transcript::remote_tail_command(&path, WORKER_LOG_CAPTURE_MAX_BYTES);
+    let path = remote_worker_log_path(workspace_path);
+    let command = crate::remote_transcript::remote_tail_command(&path, WORKER_LOG_TAIL_BYTES);
     let out = exec.run_shell(&command).await?;
     if out.success() {
         return Ok(out.stdout);
@@ -431,12 +429,14 @@ async fn capture_worker_death_log(exec: &dyn SshExec, workspace_path: &str) -> R
 /// worker stopped. Treat malformed/missing markers as absent rather than
 /// inventing a status.
 fn parse_worker_exit_status(log: &str) -> Option<i32> {
-    log.rmatch_indices(WORKER_EXIT_STATUS_PREFIX).find_map(|(index, _)| {
-        log[index + WORKER_EXIT_STATUS_PREFIX.len()..]
-            .lines()
-            .next()
-            .and_then(|status| status.trim().parse().ok())
-    })
+    log.rmatch_indices(WORKER_EXIT_STATUS_PREFIX)
+        .next()
+        .and_then(|(index, _)| {
+            log[index + WORKER_EXIT_STATUS_PREFIX.len()..]
+                .lines()
+                .next()
+                .and_then(|status| status.trim().parse().ok())
+        })
 }
 /// Re-probe a just-launched remote worker's liveness over the master.
 ///
@@ -570,6 +570,10 @@ mod tests {
             WrapperLaunch::Failed(REASON_MISSING_BOSS_EVENT)
         );
         assert_eq!(
+            classify_wrapper_exit(83),
+            WrapperLaunch::Failed(REASON_WORKER_PID_UNPUBLISHED)
+        );
+        assert_eq!(
             classify_wrapper_exit(1),
             WrapperLaunch::Failed(REASON_WORKER_LAUNCH_FAILED)
         );
@@ -649,6 +653,12 @@ mod tests {
                 "worker output without a final newline{WORKER_EXIT_STATUS_PREFIX}17\n"
             )),
             Some(17)
+        );
+        assert_eq!(
+            parse_worker_exit_status(&format!(
+                "{WORKER_EXIT_STATUS_PREFIX}17\n{WORKER_EXIT_STATUS_PREFIX}not-a-number\n"
+            )),
+            None
         );
     }
 
@@ -946,7 +956,7 @@ mod tests {
         assert!(
             exec.calls().iter().any(|call| matches!(
                 call,
-                Call::Run(argv) if argv.first().is_some_and(|script| script == "tail -c 2048 -- '/ws/.boss/worker.log'")
+                Call::Run(argv) if argv.first().is_some_and(|script| *script == format!("tail -c {WORKER_LOG_TAIL_BYTES} -- '/ws/.boss/worker.log'"))
             )),
             "the dead-worker path must issue one byte-bounded log tail",
         );
