@@ -287,7 +287,11 @@ fn check_node_runtime_version(package: &str, npx: &Path, check_id: &str, deadlin
         Err(err) if err.downcast_ref::<SubprocessTimeout>().is_some() => return Err(err),
         Err(_) => return Ok(()),
     };
-    let Some(major) = parse_node_major_version(&raw_version) else {
+    validate_node_runtime_version(package, &node, &raw_version)
+}
+
+fn validate_node_runtime_version(package: &str, node: &Path, raw_version: &str) -> Result<()> {
+    let Some(major) = parse_node_major_version(raw_version) else {
         return Ok(());
     };
     if major < MIN_NODE_MAJOR_VERSION {
@@ -571,8 +575,6 @@ pub(crate) fn resolve_bazel_target_executable(
 #[cfg(test)]
 mod tests {
     use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
 
     use super::*;
 
@@ -589,43 +591,21 @@ mod tests {
         assert_eq!(parse_node_major_version("not-a-version"), None);
     }
 
-    #[cfg(unix)]
-    fn write_fake_executable(path: &Path, contents: &str) {
-        fs::write(path, contents).expect("write fake executable");
-        let mut perms = fs::metadata(path).expect("metadata").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(path, perms).expect("set permissions");
-    }
-
-    #[cfg(unix)]
     #[test]
-    fn check_node_runtime_version_rejects_stale_node() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        write_fake_executable(&temp.path().join("node"), "#!/bin/sh\necho 'v20.7.0'\n");
-        let npx = temp.path().join("npx");
-        write_fake_executable(&npx, "#!/bin/sh\n");
-
-        let err = check_node_runtime_version("oxfmt", &npx, "test/node", CheckDeadline::new(5_000))
-            .expect_err("stale node must fail preflight");
+    fn validate_node_runtime_version_rejects_stale_node() {
+        let node = Path::new("/test/bin/node");
+        let err = validate_node_runtime_version("oxfmt", node, "v20.7.0").expect_err("stale node must fail validation");
         let message = format!("{err:#}");
         assert!(message.contains("Node.js >= 22"), "message: {message}");
         assert!(message.contains("v20.7.0"), "message: {message}");
         assert!(message.contains("oxfmt"), "message: {message}");
+        assert!(message.contains("/test/bin/node"), "message: {message}");
     }
 
-    #[cfg(unix)]
     #[test]
-    fn check_node_runtime_version_accepts_current_node() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        write_fake_executable(&temp.path().join("node"), "#!/bin/sh\necho 'v24.8.0'\n");
-        let npx = temp.path().join("npx");
-        write_fake_executable(&npx, "#!/bin/sh\n");
-
-        // This assertion exercises version acceptance, not timeout enforcement.
-        // Allow for scheduler contention when the full checkleft suite runs in
-        // parallel on CI so a ready shell probe is not rejected before it runs.
-        check_node_runtime_version("oxfmt", &npx, "test/node", CheckDeadline::new(30_000))
-            .expect("current node must pass preflight");
+    fn validate_node_runtime_version_accepts_current_node() {
+        validate_node_runtime_version("oxfmt", Path::new("/test/bin/node"), "v24.8.0")
+            .expect("current node must pass validation");
     }
 
     #[cfg(unix)]
@@ -635,7 +615,6 @@ mod tests {
         let node = temp.path().join("node");
         fs::write(&node, "#!/bin/sh\necho 'v20.7.0'\n").expect("write node");
         let npx = temp.path().join("npx");
-        write_fake_executable(&npx, "#!/bin/sh\n");
 
         check_node_runtime_version("oxfmt", &npx, "test/node", CheckDeadline::new(5_000))
             .expect("an unexecutable best-effort probe must not block resolution");

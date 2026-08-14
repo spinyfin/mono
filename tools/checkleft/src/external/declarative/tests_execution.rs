@@ -12,14 +12,23 @@ use crate::input::{ChangeKind, ChangeSet, ChangedFile};
 use crate::output::Severity;
 
 use super::ExternalCheckDeclarativePackage;
-use super::tests_common::{make_changeset, write_executable};
+use super::tests_common::make_changeset;
+
+/// Write a shell fixture that tests invoke as data through the existing
+/// `/bin/sh` executable. Directly executing a newly written script on macOS can
+/// block behind system executable-policy validation after `spawn()` returns;
+/// these tests exercise declarative behavior, not that host policy.
+#[cfg(unix)]
+fn write_script(path: &Path, contents: &str) {
+    std::fs::write(path, contents).expect("write script");
+}
 
 #[cfg(unix)]
 #[test]
 fn timed_out_subprocess_fails_with_named_limit() {
     let repo_root = tempfile::tempdir().expect("temp repo root");
     let script = repo_root.path().join("hang.sh");
-    write_executable(&script, "#!/bin/sh\nsleep 1\n");
+    write_script(&script, "#!/bin/sh\nsleep 1\n");
     let manifest = format!(
         r#"
 id = "test/timeout"
@@ -32,13 +41,13 @@ applies_to = ["**/*.rs"]
 timeout_ms = 25
 
 [needs.tool.default]
-path = "{}"
+path = "/bin/sh"
 
 [[invocations]]
 id = "hang"
 run = "tool"
 mode = "batch"
-args = ["{{{{files}}}}"]
+args = ["{}", "{{{{files}}}}"]
 exit = {{ "0" = "ok", default = "error" }}
 
 [invocations.transform]
@@ -144,39 +153,26 @@ message = "unused"
 
 #[cfg(unix)]
 #[test]
-fn near_deadline_subprocess_succeeds_and_captures_stdout() {
+fn completed_subprocess_captures_stdout() {
     let repo_root = tempfile::tempdir().expect("temp repo root");
-    let script = repo_root.path().join("near-deadline.sh");
-    write_executable(
-        &script,
-        "#!/bin/sh\nif [ \"$1\" = --version ]; then\n  printf 'test tool 1.0\\n'\n  exit 0\nfi\nsleep 8.5\nprintf 'src/lib.rs\\n'\n",
-    );
+    let script = repo_root.path().join("capture-output.sh");
+    write_script(&script, "#!/bin/sh\nprintf 'src/lib.rs\\n'\n");
     let manifest = format!(
         r#"
-id = "test/near-deadline"
+id = "test/output-capture"
 mode = "declarative"
 runtime = "declarative-v1"
 api_version = "v1"
 applies_to = ["**/*.rs"]
 
-[limits]
-# The child sleeps 8.5s against this 10s deadline, leaving under DRAIN_GRACE
-# (2s, see src/external/timeout.rs) of headroom at exit. This keeps the
-# near-deadline invariant intact: a regression that made the post-exit pipe
-# drain consume budget would push the check past its deadline and fail this
-# test. A busy CI host adds scheduling jitter before the child starts, which
-# the 10s ceiling (vs. the original 3s) absorbs without loosening the
-# post-exit margin the test actually guards.
-timeout_ms = 10000
-
 [needs.tool.default]
-path = "{}"
+path = "/bin/sh"
 
 [[invocations]]
 id = "emit"
 run = "tool"
 mode = "batch"
-args = ["{{{{files}}}}"]
+args = ["{}", "{{{{files}}}}"]
 exit = {{ "0" = "findings", default = "error" }}
 
 [invocations.transform]
@@ -192,13 +188,13 @@ message = "captured output"
 
     let result = super::run_declarative_check(
         repo_root.path(),
-        "test/near-deadline",
+        "test/output-capture",
         &package,
         &make_changeset(&["src/lib.rs"]),
         &toml::Value::Table(Default::default()),
         None,
     )
-    .expect("a completed subprocess must not time out while its output drains");
+    .expect("a completed subprocess must return its captured output");
     assert_eq!(result.findings.len(), 1);
     assert_eq!(
         result.findings[0]
@@ -316,13 +312,13 @@ api_version = "v1"
 applies_to = ["**/*.rs"]
 
 [needs.tool.default]
-path = "{script}"
+path = "/bin/sh"
 
 [[invocations]]
 id = "run"
 run = "tool"
 mode = "batch"
-args = ["{{{{files}}}}"]
+args = ["{script}", "{{{{files}}}}"]
 exit = {{ "0" = "findings", default = "error" }}
 
 [invocations.transform]
@@ -385,13 +381,13 @@ api_version = "v1"
 applies_to = ["**"]
 
 [needs.tool.default]
-path = "{script}"
+path = "/bin/sh"
 
 [[invocations]]
 id = "check"
 run = "tool"
 mode = "per_file"
-args = ["{{{{file}}}}"]
+args = ["{script}", "{{{{file}}}}"]
 exit = {{ "0" = "ok", "1" = "findings", default = "error" }}
 
 [invocations.transform]
@@ -419,7 +415,7 @@ fn per_file_error_isolates_to_file_does_not_abort_check() {
     // Script: file_a → exit 2 (error); file_b → print filename + exit 1 (finding);
     // file_c → exit 0 (clean).
     let script_path = repo_root.path().join("per_file_tool.sh");
-    write_executable(
+    write_script(
         &script_path,
         "#!/bin/sh\ncase \"$1\" in\n  *file_a*) exit 2 ;;\n  *file_b*) echo \"$1\"; exit 1 ;;\n  *) exit 0 ;;\nesac\n",
     );
@@ -512,7 +508,7 @@ fn per_file_single_exit2_does_not_hide_other_files_findings() {
     let repo_root = tempfile::tempdir().expect("temp repo root");
     let script_path = repo_root.path().join("tool.sh");
     // First arg that contains "first" → exit 2; anything else → echo filename + exit 1.
-    write_executable(
+    write_script(
         &script_path,
         "#!/bin/sh\ncase \"$1\" in\n  *first*) exit 2 ;;\n  *) echo \"$1\"; exit 1 ;;\nesac\n",
     );

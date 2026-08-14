@@ -224,12 +224,8 @@ _CHECKLEFT_LIB_TEST_ENV = {
     "CHECKLEFT_PRECOMPILED_CWASM_DIR": "$(rlocationpath :precompiled_cwasm)",
 }
 
-# The declarative and rest shards exercise process deadlines and writable
-# sandboxes (subprocess fixtures under src/external/declarative and
-# src/fix). Serial libtest execution keeps concurrent test cases from
-# competing for the same short-lived subprocess resources. The wasm shard
-# only deserializes AOT `.cwasm` fixtures — no subprocess spawning — so it
-# runs at full libtest concurrency.
+# The rest shard exercises writable sandboxes and subprocess fixtures under
+# src/fix. Keep that shard serial independently of the declarative shard.
 _CHECKLEFT_LIB_TEST_ENV_SERIAL = _CHECKLEFT_LIB_TEST_ENV | {
     "RUST_TEST_THREADS": "1",
 }
@@ -242,7 +238,7 @@ rust_test(
     compile_data = _CHECKLEFT_LIB_TEST_COMPILE_DATA,
     crate = ":checkleft_lib",
     data = _CHECKLEFT_LIB_TEST_DATA,
-    env = _CHECKLEFT_LIB_TEST_ENV_SERIAL,
+    env = _CHECKLEFT_LIB_TEST_ENV,
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
