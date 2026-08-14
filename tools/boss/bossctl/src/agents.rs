@@ -1039,11 +1039,17 @@ pub(crate) async fn agents_interrupt(socket_path: &Option<String>, json: bool, a
 /// configured slot is busy and dispatches the work item immediately,
 /// rather than letting the auto-dispatcher defer until a slot frees
 /// up.
+///
+/// `host` pins the launch to one named host. The engine validates it
+/// against the host registry before creating anything and refuses the
+/// whole request when that host cannot take the work — see
+/// `boss_engine::host_pin`.
 pub(crate) async fn agents_launch(
     socket_path: &Option<String>,
     json: bool,
     work_item_id: String,
     preferred_workspace_id: Option<String>,
+    host: Option<String>,
 ) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let response = client
@@ -1051,6 +1057,7 @@ pub(crate) async fn agents_launch(
             input: RequestExecutionInput::builder()
                 .work_item_id(work_item_id.clone())
                 .maybe_preferred_workspace_id(preferred_workspace_id)
+                .maybe_pinned_host_id(host)
                 .force(true)
                 .build(),
         })
@@ -1070,6 +1077,10 @@ pub(crate) async fn agents_launch(
     }
 }
 
+/// `bossctl work start`. `force` is the pause-only override
+/// (`bypass_dispatch_pause`); `host` is an orthogonal per-dispatch host
+/// pin that never falls back to another host — the two compose, and
+/// neither implies the other.
 pub(crate) async fn work_start(
     socket_path: &Option<String>,
     json: bool,
@@ -1077,12 +1088,14 @@ pub(crate) async fn work_start(
     priority: Option<i64>,
     preferred_workspace_id: Option<String>,
     force: bool,
+    host: Option<String>,
 ) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let input = RequestExecutionInput::builder()
         .work_item_id(work_item_id.clone())
         .maybe_priority(priority)
         .maybe_preferred_workspace_id(preferred_workspace_id)
+        .maybe_pinned_host_id(host.clone())
         .bypass_dispatch_pause(force)
         .maybe_entry_point(force.then_some(DispatchAdmissionEntryPoint::Cli))
         .build();
@@ -1103,6 +1116,8 @@ pub(crate) async fn work_start(
             // forced refusal names the specific non-overridable blocker
             // (interactive cap, unmet dependency, ineligible status, or a
             // non-overridable breaker pause) rather than silently no-op'ing.
+            // A `--host` refusal (unknown / disabled / unhealthy / no free
+            // slot) lands here too, and dispatched nothing anywhere.
             if json {
                 println!(
                     "{}",
@@ -1110,6 +1125,7 @@ pub(crate) async fn work_start(
                         "status": "refused",
                         "work_item_id": work_item_id,
                         "forced": force,
+                        "host": host,
                         "reason": message,
                     })
                 );

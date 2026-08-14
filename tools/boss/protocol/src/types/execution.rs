@@ -281,6 +281,14 @@ pub struct CreateExecutionInput {
     #[serde(default)]
     pub pr_url: Option<String>,
 
+    /// Stamped onto `work_executions.pinned_host_id`, the "pin escape
+    /// hatch" host selection honours: when set, the scheduler routes this
+    /// execution only to that host and never falls back to another one.
+    /// Written by the `--host` dispatch surfaces (see
+    /// [`RequestExecutionInput::pinned_host_id`]).
+    #[serde(default)]
+    pub pinned_host_id: Option<String>,
+
     pub preferred_workspace_id: Option<String>,
     pub priority: Option<i64>,
     pub repo_remote_url: Option<String>,
@@ -539,6 +547,26 @@ pub struct RequestExecutionInput {
     /// pause-generation race handling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_pause_since_epoch_s: Option<u64>,
+
+    /// Pin this one dispatch to the named host (`bossctl work start
+    /// --host` / `bossctl agents launch --host`). Scoped to this request
+    /// exactly like [`Self::force`]: it is stamped on the execution row
+    /// this request creates and is never sticky across a later
+    /// re-dispatch of the same work item.
+    ///
+    /// The engine validates the id against the host registry *before*
+    /// creating any row and refuses the whole request — naming the
+    /// specific reason (unknown / disabled / unhealthy / no free slot) —
+    /// rather than falling back to another host. An operator naming a
+    /// host is testing that host, so a silent fallback would make the
+    /// dispatch prove nothing.
+    ///
+    /// Pins placement only: it does not bypass the interactive
+    /// concurrency cap, dependency gating, an active dispatch pause, or
+    /// any other admission constraint. It composes with
+    /// [`Self::bypass_dispatch_pause`] rather than implying it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_host_id: Option<String>,
 
     pub preferred_workspace_id: Option<String>,
     pub priority: Option<i64>,

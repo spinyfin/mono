@@ -427,6 +427,105 @@ async fn raising_interactive_concurrency_cap_live_unblocks_held_rows() {
     );
 }
 
+/// The operator-facing `--host` path end to end below the socket: a
+/// `RequestExecutionInput` carrying `pinned_host_id` must produce an
+/// execution the dispatch loop routes to that host — not merely a row
+/// with a column set. This is the acceptance criterion "`bossctl work
+/// start <id> --host <remote-host>` places the execution on that host";
+/// the test above pins the row directly and so cannot catch a break in
+/// the request → row plumbing.
+#[tokio::test]
+async fn request_execution_with_pinned_host_routes_to_that_host() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    db.add_host("zakalwe", "user@zakalwe", 2, &[]).unwrap();
+
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Remote smoke test");
+
+    let execution = db
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .pinned_host_id("zakalwe")
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(
+        db.execution_pinned_host(&execution.id).unwrap().as_deref(),
+        Some("zakalwe"),
+        "the request's pin must land on the row host selection reads",
+    );
+
+    let cube = Arc::new(FakeCubeClient::default());
+    let runner = Arc::new(FakeExecutionRunner {
+        pending: true,
+        ..FakeExecutionRunner::default()
+    });
+    let mut coordinator_inner = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone());
+    let provider = Arc::new(RecordingHostAdapterProvider {
+        inner: coordinator_inner.host_adapter(),
+        requested: Mutex::new(Vec::new()),
+    });
+    coordinator_inner.set_host_adapter_provider(provider.clone());
+    let coordinator = Arc::new(coordinator_inner);
+
+    coordinator.kick();
+    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
+
+    let requested = provider.requested.lock().await.clone();
+    assert!(
+        requested.iter().any(|h| h == "zakalwe"),
+        "expected dispatch through the requested host, got {requested:?}",
+    );
+    assert!(
+        !requested.iter().any(|h| h == "local"),
+        "a pinned request must never fall back to local, got {requested:?}",
+    );
+    let run_ids = db.active_run_ids_for_execution(&execution.id).unwrap();
+    assert_eq!(
+        db.run_host(&run_ids[0]).unwrap().as_deref(),
+        Some("zakalwe"),
+        "`bossctl work executions` reads work_runs.host_id — it must report the pinned host",
+    );
+}
+
+/// The pin is per-dispatch, not a property of the work item: a later
+/// re-dispatch that names no host must select freely again. (The engine
+/// creates a *fresh* execution row for the re-dispatch, and only a
+/// request that names a host writes the column.)
+#[tokio::test]
+async fn pin_does_not_stick_to_the_next_dispatch_of_the_same_item() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    db.add_host("zakalwe", "user@zakalwe", 2, &[]).unwrap();
+
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Remote smoke test");
+
+    let pinned = db
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .pinned_host_id("zakalwe")
+                .build(),
+        )
+        .unwrap();
+    // Terminalize it so the next request creates a fresh row rather than
+    // reusing this one.
+    db.force_execution_status_for_test(&chore.id, ExecutionStatus::Completed)
+        .unwrap();
+
+    let replacement = db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    assert_ne!(replacement.id, pinned.id, "expected a fresh execution row");
+    assert!(
+        db.execution_pinned_host(&replacement.id).unwrap().is_none(),
+        "a pin must not survive into the next dispatch of the same work item",
+    );
+}
+
 /// PR3 routing: an execution pinned to a host that is registered but
 /// disabled finds no eligible host. The dispatch records a
 /// `no_eligible_host` pre-start failure (leaving the row recoverable)

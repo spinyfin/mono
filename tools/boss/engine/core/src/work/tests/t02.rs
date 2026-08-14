@@ -257,6 +257,81 @@ fn request_execution_marks_existing_stale_when_no_live_worker() {
     assert!(stale_after.finished_at.is_some());
 }
 
+/// A `--host` pin against a work item whose execution is already live
+/// must refuse, not silently return that execution. Its host was chosen
+/// when it spawned, so accepting would report "started" for a placement
+/// the request never made — the exact confusion the flag exists to
+/// remove.
+#[test]
+fn pinned_request_refuses_when_a_live_worker_already_owns_the_item() {
+    let path = temp_db_path("request-pin-live");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Already running");
+    let live = create_ready_chore_execution(&db, chore.id.clone());
+    // A started run is what makes the row "already dispatched" rather
+    // than a never-claimed `ready` row.
+    db.start_execution_run(&live.id, "worker-1", "mono", "lease-L", "mono-agent-001", "/tmp/ws")
+        .unwrap();
+
+    let err = db
+        .request_execution_with_live_check(
+            RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .pinned_host_id("zakalwe")
+                .build(),
+            |_| true,
+        )
+        .expect_err("pinning an already-live item must refuse");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("zakalwe") && message.contains("already live"),
+        "refusal must name the host and the live execution, got: {message}"
+    );
+
+    let executions = db.list_executions(Some(&chore.id)).unwrap();
+    assert_eq!(executions.len(), 1, "a refused pin must create no extra row");
+    assert!(
+        db.execution_pinned_host(&live.id).unwrap().is_none(),
+        "a refused pin must not be written to the live row either",
+    );
+}
+
+/// The same request against a `ready` row no worker has claimed yet is
+/// the ordinary idempotent reuse path — no placement decision has been
+/// made, so the pin applies to it rather than being refused.
+#[test]
+fn pinned_request_stamps_a_never_dispatched_ready_row() {
+    let path = temp_db_path("request-pin-ready");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Queued chore");
+    let ready = create_ready_chore_execution(&db, chore.id.clone());
+
+    let returned = db
+        .request_execution_with_live_check(
+            RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .pinned_host_id("zakalwe")
+                .build(),
+            |_| false,
+        )
+        .unwrap();
+
+    assert_eq!(returned.id, ready.id, "expected the existing ready row to be reused");
+    assert_eq!(db.execution_pinned_host(&ready.id).unwrap().as_deref(), Some("zakalwe"),);
+
+    // And a later unpinned request must not silently clear a pin the
+    // operator set deliberately — only a request naming a host writes
+    // the column.
+    db.request_execution_with_live_check(
+        RequestExecutionInput::builder().work_item_id(chore.id.clone()).build(),
+        |_| false,
+    )
+    .unwrap();
+    assert_eq!(db.execution_pinned_host(&ready.id).unwrap().as_deref(), Some("zakalwe"),);
+}
+
 /// The `abandon_stale_and_redispatch` decision in
 /// `request_execution_in_tx_with_live_check` must publish
 /// `ExecutionTerminal` for the row it abandons — same coverage as

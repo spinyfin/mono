@@ -84,6 +84,7 @@ pub mod github_api_usage;
 pub mod hold_registry;
 pub mod host_adapter;
 pub mod host_capability_probe;
+pub mod host_pin;
 pub mod host_provisioning;
 pub mod host_reconcile;
 pub mod host_registry;

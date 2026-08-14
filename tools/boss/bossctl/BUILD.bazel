@@ -12,6 +12,7 @@ rust_binary(
         "src/hosts.rs",
         "src/logs.rs",
         "src/main.rs",
+        "src/metrics.rs",
         "src/pause.rs",
         "src/probe.rs",
         "src/review.rs",

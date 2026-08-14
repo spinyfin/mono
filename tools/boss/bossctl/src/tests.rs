@@ -1,4 +1,5 @@
 use super::*;
+use crate::metrics::{GITHUB_HOURLY_BUDGET, points_per_hour};
 use boss_protocol::WorkerActivity;
 
 fn live(slot: u8, run: &str) -> LiveWorkerState {
@@ -496,14 +497,101 @@ fn work_start_force_composes_with_priority_and_workspace() {
                     priority,
                     preferred_workspace_id,
                     force,
+                    host,
                 },
         } => {
             assert_eq!(work_item_id, "task_1");
             assert!(force);
             assert_eq!(priority, Some(5));
             assert_eq!(preferred_workspace_id.as_deref(), Some("mono-agent-002"));
+            assert!(host.is_none(), "--host must default to unset");
         }
         other => panic!("expected WorkAction::Start, got {other:?}"),
+    }
+}
+
+#[test]
+fn work_start_defaults_host_to_unset() {
+    let cli = Cli::try_parse_from(["bossctl", "work", "start", "task_1"]).unwrap();
+    match cli.command {
+        Command::Work {
+            action: WorkAction::Start { host, .. },
+        } => assert!(
+            host.is_none(),
+            "omitting --host must leave selection to the engine, unchanged"
+        ),
+        other => panic!("expected WorkAction::Start, got {other:?}"),
+    }
+}
+
+/// `--host` is a placement pin and `--force` is the pause-only override:
+/// distinct intents that must compose without either implying the other
+/// (see `agents::work_start`, which maps them to `pinned_host_id` and
+/// `bypass_dispatch_pause` respectively).
+#[test]
+fn work_start_host_composes_with_force() {
+    let cli = Cli::try_parse_from(["bossctl", "work", "start", "task_1", "--host", "zakalwe", "--force"]).unwrap();
+    match cli.command {
+        Command::Work {
+            action: WorkAction::Start { force, host, .. },
+        } => {
+            assert!(force);
+            assert_eq!(host.as_deref(), Some("zakalwe"));
+        }
+        other => panic!("expected WorkAction::Start, got {other:?}"),
+    }
+}
+
+#[test]
+fn work_start_host_requires_a_value() {
+    let result = Cli::try_parse_from(["bossctl", "work", "start", "task_1", "--host"]);
+    assert!(
+        result.is_err(),
+        "a bare --host must fail parsing rather than silently pinning nothing"
+    );
+}
+
+#[test]
+fn agents_launch_parses_host() {
+    let cli = Cli::try_parse_from(["bossctl", "agents", "launch", "task_1", "--host", "zakalwe"]).unwrap();
+    match cli.command {
+        Command::Agents {
+            action: AgentsAction::Launch { work_item_id, host, .. },
+        } => {
+            assert_eq!(work_item_id, "task_1");
+            assert_eq!(host.as_deref(), Some("zakalwe"));
+        }
+        other => panic!("expected AgentsAction::Launch, got {other:?}"),
+    }
+}
+
+/// The no-fallback contract is the whole point of the flag, so `--help`
+/// must state it on both dispatch surfaces rather than leaving an operator
+/// to discover it from a refusal.
+#[test]
+fn host_help_documents_that_it_never_falls_back() {
+    fn host_help(path: &[&str]) -> String {
+        let mut command = <Cli as clap::CommandFactory>::command();
+        for name in path {
+            command = command
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("missing subcommand {name}"))
+                .clone();
+        }
+        command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "host")
+            .and_then(|arg| arg.get_long_help().or_else(|| arg.get_help()))
+            .unwrap_or_else(|| panic!("no --host arg on {path:?}"))
+            .to_string()
+    }
+
+    for path in [["work", "start"], ["agents", "launch"]] {
+        let help = host_help(&path);
+        assert!(
+            help.contains("NEVER falls back"),
+            "{path:?} --help must say the pin never falls back; got: {help}"
+        );
     }
 }
 

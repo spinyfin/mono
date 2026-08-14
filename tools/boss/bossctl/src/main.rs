@@ -27,6 +27,7 @@ mod dispatch_stats;
 mod doctor;
 mod hosts;
 mod logs;
+mod metrics;
 mod pause;
 mod probe;
 mod review;
@@ -36,7 +37,7 @@ use boss_engine::dispatch_events::DispatchEvent;
 use boss_engine::dispatch_reader;
 use boss_protocol::{
     DispatchAdmissionEntryPoint, FrontendEvent, FrontendRequest, HostedPaneState, HostedPaneStatus,
-    LiveStatusDebugReport, LiveStatusSlotDebug, LiveWorkerState, MetricLiveEntry, ProposalKind, ProposalState, ROSTER,
+    LiveStatusDebugReport, LiveStatusSlotDebug, LiveWorkerState, ProposalKind, ProposalState, ROSTER,
     RequestExecutionInput, WorkExecution, WorkItem, WorkRun, WorkerProposal, WorkspacePoolEntry,
 };
 use clap::{Parser, Subcommand};
@@ -738,6 +739,19 @@ enum AgentsAction {
         work_item_id: String,
         #[arg(long)]
         preferred_workspace_id: Option<String>,
+        /// Pin this one launch to the named host (`bossctl hosts list`
+        /// shows the ids). Scoped to this request only — it is never
+        /// sticky across a later re-dispatch of the same work item.
+        ///
+        /// NEVER falls back: if the host is unknown, disabled, failing
+        /// its health gate, or has no free slot, this command exits
+        /// non-zero naming that reason and launches nothing, rather than
+        /// quietly placing the work on another host. Placement only — it
+        /// does not skip dependency gates or any other admission
+        /// constraint (though `agents launch` already grows the pool by
+        /// one slot, which is what this verb has always done).
+        #[arg(long, value_name = "HOST_ID")]
+        host: Option<String>,
     },
     /// Stop a worker session and release its lease.
     Stop {
@@ -892,6 +906,23 @@ enum WorkAction {
         /// `docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md`.
         #[arg(long)]
         force: bool,
+        /// Pin this one dispatch to the named host (`bossctl hosts list`
+        /// shows the ids). Scoped to this request only, exactly like
+        /// `--force` — it is never sticky across a later re-dispatch of
+        /// the same work item.
+        ///
+        /// NEVER falls back: if the host is unknown, disabled, failing
+        /// its health gate, or has no free slot, this command exits
+        /// non-zero naming that reason and dispatches nothing, rather
+        /// than quietly placing the work on another host — which would
+        /// defeat the point of naming a host to exercise it.
+        ///
+        /// Pins placement only. It does not bypass the interactive
+        /// concurrency cap, dependency gates, an active dispatch pause,
+        /// or any other admission constraint; combine it with `--force`
+        /// to override an operator pause as well.
+        #[arg(long, value_name = "HOST_ID")]
+        host: Option<String>,
     },
     /// Cancel a queued or running execution (any non-terminal status).
     ///
@@ -1349,8 +1380,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 AgentsAction::Launch {
                     work_item_id,
                     preferred_workspace_id,
+                    host,
                 },
-        } => agents::agents_launch(&cli.socket_path, cli.json, work_item_id, preferred_workspace_id).await,
+        } => agents::agents_launch(&cli.socket_path, cli.json, work_item_id, preferred_workspace_id, host).await,
         Command::Work {
             action:
                 WorkAction::Start {
@@ -1358,6 +1390,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     priority,
                     preferred_workspace_id,
                     force,
+                    host,
                 },
         } => {
             agents::work_start(
@@ -1367,6 +1400,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 priority,
                 preferred_workspace_id,
                 force,
+                host,
             )
             .await
         }
@@ -1485,24 +1519,24 @@ async fn dispatch(cli: Cli) -> Result<()> {
         } => pause::automation_state(&cli.socket_path, cli.json).await,
         Command::Metrics {
             action: MetricsAction::List { prefix, state_root },
-        } => metrics_list(cli.json, state_root, prefix.as_deref()),
+        } => metrics::metrics_list(cli.json, state_root, prefix.as_deref()),
         Command::Metrics {
             action: MetricsAction::Show { name, live, state_root },
         } => {
             if live {
-                metrics_show_live(&cli.socket_path, cli.json, name).await
+                metrics::metrics_show_live(&cli.socket_path, cli.json, name).await
             } else {
-                metrics_show(cli.json, state_root, &name)
+                metrics::metrics_show(cli.json, state_root, &name)
             }
         }
         Command::Metrics {
             action: MetricsAction::Github { hours, state_root },
-        } => metrics_github(cli.json, state_root, hours),
+        } => metrics::metrics_github(cli.json, state_root, hours),
         Command::Metrics {
             action: MetricsAction::Reset { name, all },
         } => {
             let target = if all { None } else { name };
-            metrics_reset(&cli.socket_path, cli.json, target).await
+            metrics::metrics_reset(&cli.socket_path, cli.json, target).await
         }
         Command::Hosts {
             action:
@@ -2444,389 +2478,6 @@ fn format_age_ms(ts_ms: i64, now_ms: u128) -> String {
     }
     let diff_d = diff_h / 24;
     format!("({}d ago)", diff_d)
-}
-
-/// A unified metric row for rendering, covering both counters and
-/// gauges loaded from `state.db`.
-struct MetricRow {
-    name: String,
-    description: String,
-    kind: &'static str,
-    value: i64,
-    timestamp_ms: i64,
-    stale: bool,
-}
-
-fn load_metric_rows(db_path: PathBuf, prefix: Option<&str>) -> Result<Vec<MetricRow>> {
-    let db = WorkDb::open(db_path).context("opening state.db")?;
-    let (counters, gauges) = db.metrics_load_all().context("reading metrics from state.db")?;
-
-    let mut rows: Vec<MetricRow> = counters
-        .into_iter()
-        .map(|c| MetricRow {
-            name: c.name,
-            description: c.description,
-            kind: "counter",
-            value: c.value as i64,
-            timestamp_ms: c.updated_at_ms,
-            stale: false,
-        })
-        .chain(gauges.into_iter().map(|g| MetricRow {
-            name: g.name,
-            description: g.description,
-            kind: "gauge",
-            value: g.value,
-            timestamp_ms: g.observed_at_ms,
-            stale: false,
-        }))
-        .collect();
-
-    if let Some(p) = prefix {
-        rows.retain(|r| r.name.starts_with(p));
-    }
-    rows.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(rows)
-}
-
-fn print_metric_row_short(row: &MetricRow, now_ms: u128, name_width: usize) {
-    let age = format_age_ms(row.timestamp_ms, now_ms);
-    let stale_tag = if row.stale { " [stale]" } else { "" };
-    println!(
-        "{:<width$}  {:>12}  {:>10}  {}{}",
-        row.name,
-        row.value,
-        age,
-        row.kind,
-        stale_tag,
-        width = name_width,
-    );
-}
-
-fn metrics_list(json: bool, state_root: Option<PathBuf>, prefix: Option<&str>) -> Result<()> {
-    let db_path = resolve_db_path(state_root)?;
-    let rows = load_metric_rows(db_path, prefix)?;
-    let now = now_epoch_ms();
-
-    if json {
-        let entries: Vec<serde_json::Value> = rows
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "name": r.name,
-                    "description": r.description,
-                    "kind": r.kind,
-                    "value": r.value,
-                    "timestamp_ms": r.timestamp_ms,
-                    "stale": r.stale,
-                })
-            })
-            .collect();
-        println!("{}", serde_json::json!({ "metrics": entries }));
-    } else if rows.is_empty() {
-        println!("no metrics in state.db (engine may not have flushed yet)");
-    } else {
-        let name_width = rows.iter().map(|r| r.name.len()).max().unwrap_or(0);
-        for row in &rows {
-            print_metric_row_short(row, now, name_width);
-        }
-    }
-    Ok(())
-}
-
-fn metrics_show(json: bool, state_root: Option<PathBuf>, name: &str) -> Result<()> {
-    let db_path = resolve_db_path(state_root)?;
-    let rows = load_metric_rows(db_path, None)?;
-    let now = now_epoch_ms();
-
-    let row = rows.iter().find(|r| r.name == name);
-    match row {
-        None => {
-            if json {
-                println!("{}", serde_json::json!({ "entry": null, "name": name }));
-            } else {
-                println!("metric not found: {name}");
-                println!("  (engine may not have flushed yet; try --live to read in-memory value)");
-            }
-        }
-        Some(r) => {
-            let age = format_age_ms(r.timestamp_ms, now);
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "entry": {
-                            "name": r.name,
-                            "description": r.description,
-                            "kind": r.kind,
-                            "value": r.value,
-                            "timestamp_ms": r.timestamp_ms,
-                            "stale": r.stale,
-                        }
-                    })
-                );
-            } else {
-                let stale_tag = if r.stale {
-                    "  [stale: not registered by current engine]"
-                } else {
-                    ""
-                };
-                println!("{}{}", r.name, stale_tag);
-                println!("  description:   {}", r.description);
-                println!("  kind:          {}", r.kind);
-                println!("  value:         {}", r.value);
-                println!("  last_updated:  {age}");
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn metrics_show_live(socket_path: &Option<String>, json: bool, name: String) -> Result<()> {
-    let mut client = connect(socket_path).await?;
-    let response = client
-        .send_request(&FrontendRequest::MetricsShowLive { name: name.clone() })
-        .await
-        .context("sending MetricsShowLive")?;
-    match response {
-        FrontendEvent::MetricsShowLiveResult { entry } => {
-            print_metric_live_entry(json, &name, entry.as_ref());
-            Ok(())
-        }
-        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
-            bail!("engine rejected metrics show --live: {message}")
-        }
-        other => bail!("engine returned unexpected response: {other:?}"),
-    }
-}
-
-fn print_metric_live_entry(json: bool, name: &str, entry: Option<&MetricLiveEntry>) {
-    let now = now_epoch_ms();
-    match entry {
-        None => {
-            if json {
-                println!("{}", serde_json::json!({ "entry": null, "name": name }));
-            } else {
-                println!("metric not found: {name}");
-                println!("  (not registered in the current engine binary)");
-            }
-        }
-        Some(e) => {
-            let age = format_age_ms(e.timestamp_ms, now);
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "entry": {
-                            "name": e.name,
-                            "description": e.description,
-                            "kind": e.kind,
-                            "value": e.value,
-                            "timestamp_ms": e.timestamp_ms,
-                            "stale": e.stale,
-                            "source": "live",
-                        }
-                    })
-                );
-            } else {
-                let stale_tag = if e.stale {
-                    "  [stale: not registered by current engine]"
-                } else {
-                    ""
-                };
-                println!("{}{}", e.name, stale_tag);
-                println!("  description:   {}", e.description);
-                println!("  kind:          {}  (live — read from in-memory atomic)", e.kind);
-                println!("  value:         {}", e.value);
-                println!("  last_updated:  {age}");
-            }
-        }
-    }
-}
-
-/// GitHub's hourly quota for a personal token, on each of the two
-/// independently-metered buckets. Rates are printed against this so the
-/// table answers "over or under budget" without the reader doing the
-/// division.
-const GITHUB_HOURLY_BUDGET: f64 = 5000.0;
-
-/// Convert a spend and an observed span into a points-per-hour rate.
-///
-/// Divides by the span the data *actually* covers, not by the requested
-/// look-back: an engine that has been running the instrumented build for
-/// 20 minutes, queried with `--hours 24`, would otherwise report a rate
-/// ~70x under the truth. A span shorter than a minute is not a usable
-/// denominator (one burst would extrapolate to an absurd rate), so it
-/// reports `None` rather than a confident wrong number.
-fn points_per_hour(points: i64, span_ms: i64) -> Option<f64> {
-    if span_ms < 60_000 {
-        return None;
-    }
-    Some(points as f64 * 3_600_000.0 / span_ms as f64)
-}
-
-/// Per-subsystem GitHub API attribution over a time window.
-fn metrics_github(json: bool, state_root: Option<PathBuf>, hours: u32) -> Result<()> {
-    let db_path = resolve_db_path(state_root)?;
-    let db = WorkDb::open(db_path).context("opening state.db")?;
-    let since_ms = now_epoch_ms() as i64 - (hours as i64) * 3_600_000;
-
-    let buckets = db
-        .github_api_usage_by_caller(since_ms)
-        .context("reading github_api_calls from state.db")?;
-    let window = db
-        .github_api_usage_window(since_ms)
-        .context("reading github_api_calls window from state.db")?;
-    // A single sample spans zero time; treat the observed span as at
-    // least the gap between first and last row.
-    let span_ms = window.map(|(min, max)| max - min).unwrap_or(0);
-
-    if json {
-        let entries: Vec<serde_json::Value> = buckets
-            .iter()
-            .map(|b| {
-                serde_json::json!({
-                    "caller": b.caller,
-                    "api": b.api,
-                    "calls": b.calls,
-                    "points": b.points,
-                    "calls_without_reading": b.calls_without_reading,
-                    "errors": b.errors,
-                    "rate_limited": b.rate_limited,
-                    "points_per_hour": points_per_hour(b.points, span_ms),
-                })
-            })
-            .collect();
-        println!(
-            "{}",
-            serde_json::json!({
-                "since_epoch_ms": since_ms,
-                "observed_span_ms": span_ms,
-                "hourly_budget": GITHUB_HOURLY_BUDGET,
-                "usage": entries,
-            })
-        );
-        return Ok(());
-    }
-
-    if buckets.is_empty() {
-        println!("no github_api_calls rows in the last {hours}h (engine may not have made a call yet)");
-        return Ok(());
-    }
-
-    let span_hours = span_ms as f64 / 3_600_000.0;
-    println!("GitHub API usage — {span_hours:.2}h observed (requested {hours}h look-back)");
-    println!();
-    let name_width = buckets.iter().map(|b| b.caller.len()).max().unwrap_or(10).max(10);
-    println!(
-        "{:<width$}  {:>8}  {:>8}  {:>9}  {:>11}  {:>7}  {:>7}",
-        "SUBSYSTEM",
-        "API",
-        "CALLS",
-        "UNITS",
-        "UNITS/HR",
-        "ERRORS",
-        "429s",
-        width = name_width,
-    );
-    for b in &buckets {
-        let rate = match points_per_hour(b.points, span_ms) {
-            Some(rate) => format!("{rate:.0}"),
-            None => "—".to_owned(),
-        };
-        println!(
-            "{:<width$}  {:>8}  {:>8}  {:>9}  {:>11}  {:>7}  {:>7}",
-            b.caller,
-            b.api,
-            b.calls,
-            b.points,
-            rate,
-            b.errors,
-            b.rate_limited,
-            width = name_width,
-        );
-    }
-
-    // Per-bucket totals: GraphQL and REST have separate 5000/hour
-    // budgets, so a combined total would compare against a limit that
-    // does not exist.
-    println!();
-    for api in ["graphql", "rest", "cli"] {
-        let points: i64 = buckets.iter().filter(|b| b.api == api).map(|b| b.points).sum();
-        let calls: i64 = buckets.iter().filter(|b| b.api == api).map(|b| b.calls).sum();
-        if calls == 0 {
-            continue;
-        }
-        match points_per_hour(points, span_ms) {
-            Some(rate) => {
-                let pct = rate / GITHUB_HOURLY_BUDGET * 100.0;
-                let verdict = if rate > GITHUB_HOURLY_BUDGET {
-                    "OVER BUDGET"
-                } else {
-                    "within budget"
-                };
-                println!("{api:>8}: {calls} calls, {points} units → {rate:.0}/hr ({pct:.0}% of 5000/hr) — {verdict}");
-            }
-            None => println!("{api:>8}: {calls} calls, {points} units (window too short for a rate)"),
-        }
-    }
-
-    let unmeasured: i64 = buckets.iter().map(|b| b.calls_without_reading).sum();
-    if unmeasured > 0 {
-        println!();
-        println!(
-            "note: {unmeasured} call(s) carried no rateLimit reading — their spend is counted \
-             as calls but contributes 0 units, so the rates above are a lower bound.",
-        );
-    }
-    Ok(())
-}
-
-async fn metrics_reset(socket_path: &Option<String>, json: bool, name: Option<String>) -> Result<()> {
-    let mut client = connect(socket_path).await?;
-    let response = client
-        .send_request(&FrontendRequest::MetricsReset { name: name.clone() })
-        .await
-        .context("sending MetricsReset")?;
-    match response {
-        FrontendEvent::MetricsResetDone {
-            name: returned_name,
-            counters_reset,
-            gauges_reset,
-        } => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "status": "reset",
-                        "name": returned_name,
-                        "counters_reset": counters_reset,
-                        "gauges_reset": gauges_reset,
-                    })
-                );
-            } else {
-                match &name {
-                    Some(n) => {
-                        if counters_reset == 0 && gauges_reset == 0 {
-                            println!("metric not found: {n}");
-                        } else {
-                            println!("reset {n} ({} counter(s), {} gauge(s))", counters_reset, gauges_reset);
-                        }
-                    }
-                    None => {
-                        println!(
-                            "reset all metrics ({} counter(s), {} gauge(s))",
-                            counters_reset, gauges_reset
-                        );
-                    }
-                }
-            }
-            Ok(())
-        }
-        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
-            bail!("engine rejected metrics reset: {message}")
-        }
-        other => bail!("engine returned unexpected response: {other:?}"),
-    }
 }
 
 /// One-shot diagnostic snapshot of the live-status pipeline. Mirrors
