@@ -377,6 +377,44 @@ async fn re_registering_a_host_converges_on_the_latest_discovery() {
 // ── Auto-disable on provisioning failure ─────────────────────────────────────
 
 #[tokio::test]
+async fn add_host_success_stamps_last_seen_and_reports_no_error() {
+    // A successful provision is a real contact with the host. The HostResult
+    // the app (and bossctl's re-read after `hosts add` / `hosts probe`)
+    // renders must show that contact: last_seen stamped, last_error cleared.
+    // Regression for the bug where only last_error was cleared and the
+    // printed summary still carried a pre-contact last_seen / stale error.
+    let (state, _dir) = test_server_state();
+
+    let added = expect_host_result(
+        add_host(
+            &state,
+            &provision_ok_with(&["os=macos", "arch=arm64"]),
+            "anaplian",
+            "user@anaplian",
+            3,
+            &[],
+        )
+        .await,
+    );
+    assert!(added.enabled, "successful provision must leave the host enabled");
+    assert_eq!(
+        added.last_error_text, None,
+        "successful provision must not leave a last_error on the reply"
+    );
+    assert!(
+        added.last_seen_at.is_some(),
+        "successful provision must stamp last_seen_at so the reply reflects the contact just made; got {added:?}"
+    );
+    assert_eq!(
+        caps(&added),
+        vec![
+            ("arch=arm64".to_owned(), "auto".to_owned()),
+            ("os=macos".to_owned(), "auto".to_owned()),
+        ],
+    );
+}
+
+#[tokio::test]
 async fn add_host_disables_a_host_whose_remote_provisioning_fails() {
     // The highest-value behaviour in the module. A host the engine could
     // not provision must never be left enabled: an enabled-but-broken

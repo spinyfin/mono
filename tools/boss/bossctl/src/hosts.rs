@@ -92,7 +92,15 @@ async fn eager_push_wrapper(db: &WorkDb, host_id: &str, ssh_target: &str) -> Eag
 
     match provision_remote_host(host_id, ssh_target).await {
         RemoteProvisionOutcome::Ok { capabilities } => {
-            let _ = db.set_host_last_error(host_id, None);
+            // Stamp last_seen_at, clear last_error_text, and reset the
+            // health counter. set_host_last_error(None) alone only cleared
+            // the error column — a successful probe then printed a summary
+            // whose last_seen still predated the contact (and any stale
+            // consecutive_failures stayed put). Same write the dispatch
+            // path uses after a healthy cube call.
+            if let Err(err) = db.record_host_dispatch_success(host_id) {
+                eprintln!("bossctl: warning: failed to record successful contact for {host_id}: {err:#}");
+            }
             if let Err(err) = db.replace_auto_host_capabilities(host_id, &capabilities) {
                 eprintln!("bossctl: warning: failed to persist discovered capabilities for {host_id}: {err:#}");
             }
