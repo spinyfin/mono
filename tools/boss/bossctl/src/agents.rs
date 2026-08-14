@@ -1044,6 +1044,7 @@ pub(crate) async fn agents_launch(
     json: bool,
     work_item_id: String,
     preferred_workspace_id: Option<String>,
+    host: Option<String>,
 ) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let response = client
@@ -1051,6 +1052,7 @@ pub(crate) async fn agents_launch(
             input: RequestExecutionInput::builder()
                 .work_item_id(work_item_id.clone())
                 .maybe_preferred_workspace_id(preferred_workspace_id)
+                .maybe_requested_host_id(host)
                 .force(true)
                 .build(),
         })
@@ -1076,6 +1078,7 @@ pub(crate) async fn work_start(
     work_item_id: String,
     priority: Option<i64>,
     preferred_workspace_id: Option<String>,
+    host: Option<String>,
     force: bool,
 ) -> Result<()> {
     let mut client = connect(socket_path).await?;
@@ -1083,6 +1086,7 @@ pub(crate) async fn work_start(
         .work_item_id(work_item_id.clone())
         .maybe_priority(priority)
         .maybe_preferred_workspace_id(preferred_workspace_id)
+        .maybe_requested_host_id(host)
         .bypass_dispatch_pause(force)
         .maybe_entry_point(force.then_some(DispatchAdmissionEntryPoint::Cli))
         .build();

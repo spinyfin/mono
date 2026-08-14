@@ -22,6 +22,7 @@ use anyhow::{Context, Result, bail};
 use boss_client::{BossClient, Discovery};
 
 mod agents;
+mod command_types;
 mod comments;
 mod dispatch_stats;
 mod doctor;
@@ -40,6 +41,7 @@ use boss_protocol::{
     RequestExecutionInput, WorkExecution, WorkItem, WorkRun, WorkerProposal, WorkspacePoolEntry,
 };
 use clap::{Parser, Subcommand};
+use command_types::{LogSource, TranscriptFormat};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -638,56 +640,6 @@ impl PauseArg {
     }
 }
 
-/// Output format for `bossctl agents transcript --format`.
-#[derive(clap::ValueEnum, Debug, Clone, PartialEq)]
-enum TranscriptFormat {
-    /// Plain-text summary (default).
-    Text,
-    /// Raw JSONL lines as emitted by Claude Code.
-    Jsonl,
-    /// Converted markdown via the engine's transcript renderer.
-    Markdown,
-}
-
-impl std::fmt::Display for TranscriptFormat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TranscriptFormat::Text => write!(f, "text"),
-            TranscriptFormat::Jsonl => write!(f, "jsonl"),
-            TranscriptFormat::Markdown => write!(f, "markdown"),
-        }
-    }
-}
-
-/// Which engine log / diagnostic stream `bossctl logs` should read.
-#[derive(clap::ValueEnum, Debug, Clone, PartialEq)]
-pub(crate) enum LogSource {
-    /// `engine-trace.jsonl` — structured tracing events (primary log).
-    Engine,
-    /// `engine-audit.log` — lifecycle events (start, socket bind, shutdown).
-    Audit,
-    /// `dispatch-events/current.jsonl` — dispatch pipeline stage events.
-    Dispatch,
-    /// `diagnostics/spawn-YYYY-MM-DD.jsonl` — worker-spawn diagnostics.
-    Spawn,
-    /// App + engine population-timing day files under `diagnostics/`
-    /// (`population-timing-*.jsonl` and `engine-population-timing-*.jsonl`).
-    #[value(name = "population-timing")]
-    PopulationTiming,
-}
-
-impl std::fmt::Display for LogSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LogSource::Engine => write!(f, "engine"),
-            LogSource::Audit => write!(f, "audit"),
-            LogSource::Dispatch => write!(f, "dispatch"),
-            LogSource::Spawn => write!(f, "spawn"),
-            LogSource::PopulationTiming => write!(f, "population-timing"),
-        }
-    }
-}
-
 #[derive(Subcommand, Debug)]
 enum AgentsAction {
     /// List worker sessions and their current state.
@@ -738,6 +690,10 @@ enum AgentsAction {
         work_item_id: String,
         #[arg(long)]
         preferred_workspace_id: Option<String>,
+        /// Pin this dispatch to a registered host. Refuses if that host is
+        /// unavailable; never falls back to another host.
+        #[arg(long)]
+        host: Option<String>,
     },
     /// Stop a worker session and release its lease.
     Stop {
@@ -881,6 +837,10 @@ enum WorkAction {
         priority: Option<i64>,
         #[arg(long)]
         preferred_workspace_id: Option<String>,
+        /// Pin this dispatch to a registered host. Refuses if that host is
+        /// unavailable; never falls back to another host.
+        #[arg(long)]
+        host: Option<String>,
         /// Bypass an active *operator*-originated global dispatch pause for
         /// this one request. Distinct from `bossctl agents launch`'s pool
         /// growth: this never grows a worker pool, never skips the
@@ -1349,14 +1309,16 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 AgentsAction::Launch {
                     work_item_id,
                     preferred_workspace_id,
+                    host,
                 },
-        } => agents::agents_launch(&cli.socket_path, cli.json, work_item_id, preferred_workspace_id).await,
+        } => agents::agents_launch(&cli.socket_path, cli.json, work_item_id, preferred_workspace_id, host).await,
         Command::Work {
             action:
                 WorkAction::Start {
                     work_item_id,
                     priority,
                     preferred_workspace_id,
+                    host,
                     force,
                 },
         } => {
@@ -1366,6 +1328,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 work_item_id,
                 priority,
                 preferred_workspace_id,
+                host,
                 force,
             )
             .await

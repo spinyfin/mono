@@ -542,6 +542,11 @@ pub struct RequestExecutionInput {
 
     pub preferred_workspace_id: Option<String>,
     pub priority: Option<i64>,
+    /// Host selected for this one dispatch request. This is intentionally
+    /// request-scoped: the coordinator applies it only to the execution it
+    /// creates or refreshes, and does not copy it onto the work item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_host_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]

@@ -196,6 +196,81 @@ async fn pinned_execution_routes_to_remote_host_and_persists_host_id() {
     );
 }
 
+/// An explicit host request validates before creating a row, then pins only
+/// that execution until it reaches `running`.
+#[tokio::test]
+async fn requested_host_routes_one_dispatch_and_refuses_without_queueing() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    db.add_host("zakalwe", "user@zakalwe", 2, &[]).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Remote cleanup");
+
+    let cube = Arc::new(FakeCubeClient::default());
+    let runner = Arc::new(FakeExecutionRunner {
+        pending: true,
+        ..FakeExecutionRunner::default()
+    });
+    let mut coordinator_inner = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube, runner);
+    let provider = Arc::new(RecordingHostAdapterProvider {
+        inner: coordinator_inner.host_adapter(),
+        requested: Mutex::new(Vec::new()),
+    });
+    coordinator_inner.set_host_adapter_provider(provider.clone());
+    let coordinator = Arc::new(coordinator_inner);
+
+    let execution = coordinator
+        .request_execution_via_db(
+            RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .requested_host_id("zakalwe")
+                .build(),
+            Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new()),
+        )
+        .unwrap();
+    assert_eq!(
+        db.execution_pinned_host(&execution.id).unwrap().as_deref(),
+        Some("zakalwe")
+    );
+    coordinator.kick();
+    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
+    assert!(provider.requested.lock().await.iter().any(|host| host == "zakalwe"));
+    assert!(db.execution_pinned_host(&execution.id).unwrap().is_none());
+
+    db.add_host("disabled", "user@disabled", 1, &[]).unwrap();
+    db.set_host_enabled("disabled", false).unwrap();
+    let rejected = create_test_chore(&db, product.id.clone(), "Rejected cleanup");
+    let err = coordinator
+        .request_execution_via_db(
+            RequestExecutionInput::builder()
+                .work_item_id(rejected.id.clone())
+                .requested_host_id("disabled")
+                .build(),
+            Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new()),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("disabled"), "got: {err}");
+    assert!(db.list_executions(Some(&rejected.id)).unwrap().is_empty());
+
+    let unknown = create_test_chore(&db, product.id, "Unknown host cleanup");
+    let err = coordinator
+        .request_execution_via_db(
+            RequestExecutionInput::builder()
+                .work_item_id(unknown.id.clone())
+                .requested_host_id("not-registered")
+                .build(),
+            Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new()),
+        )
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("known hosts:"), "got: {message}");
+    assert!(
+        message.contains("local") && message.contains("zakalwe") && message.contains("disabled"),
+        "got: {message}"
+    );
+    assert!(db.list_executions(Some(&unknown.id)).unwrap().is_empty());
+}
+
 /// The interactive-pool concurrency cap
 /// ([`MAX_CONCURRENT_INTERACTIVE_WORKERS`]): when the interactive pool
 /// already carries the capped number of live workers, a drain pass holds

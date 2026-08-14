@@ -369,13 +369,25 @@ impl ExecutionCoordinator {
         Ok(execution)
     }
 
-    fn request_execution_via_db(
+    pub(crate) fn request_execution_via_db(
         &self,
         input: RequestExecutionInput,
         live_states: Arc<crate::live_worker_state::LiveWorkerStateRegistry>,
     ) -> Result<WorkExecution> {
-        self.work_db
-            .request_execution_with_live_check(input, move |run_id| live_states.is_run_live(run_id))
+        if let Some(host_id) = input.requested_host_id.as_deref() {
+            self.validate_requested_host(host_id)?;
+        }
+        let requested_host_id = input.requested_host_id.clone();
+        let execution = self
+            .work_db
+            .request_execution_with_live_check(input, move |run_id| live_states.is_run_live(run_id))?;
+        if let Some(host_id) = requested_host_id {
+            // This is an execution-level, one-dispatch routing hint. A
+            // subsequent explicit dispatch creates a fresh execution and has
+            // no pin unless its own request names --host.
+            self.work_db.set_execution_pinned_host(&execution.id, Some(&host_id))?;
+        }
+        Ok(execution)
     }
 
     async fn emit_pause_override_refused(

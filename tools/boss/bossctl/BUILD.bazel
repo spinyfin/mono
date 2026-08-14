@@ -5,6 +5,7 @@ rust_binary(
     name = "bossctl",
     srcs = [
         "src/agents.rs",
+        "src/command_types.rs",
         "src/comments.rs",
         "src/dispatch_stats.rs",
         "src/doctor.rs",

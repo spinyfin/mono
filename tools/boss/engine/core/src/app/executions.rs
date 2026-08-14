@@ -48,6 +48,12 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
     let FrontendRequest::RequestExecution { input } = req else {
         unreachable!()
     };
+    if let Some(host_id) = input.requested_host_id.as_deref()
+        && let Err(err) = server_state.execution_coordinator.validate_requested_host(host_id)
+    {
+        send_work_error(&sink, &request_id, &err);
+        return;
+    }
     if input.bypass_dispatch_pause {
         // Pause-only forced dispatch (`bossctl work start --force`, or a
         // confirmed app-drag going through `MoveWorkItemOnBoard` instead
@@ -99,7 +105,8 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
         // and drains on resume.
         let force = input.force;
         let live_states = server_state.live_worker_states.clone();
-        let result = work_db.request_execution_with_live_check(input, |run_id| live_states.is_run_live(run_id));
+        let coordinator = server_state.execution_coordinator.clone();
+        let result = coordinator.request_execution_via_db(input, live_states);
         match result {
             Ok(execution) => {
                 if force {

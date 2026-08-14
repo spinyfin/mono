@@ -1,9 +1,41 @@
 //! Per-execution scheduling: work-item resolution, host selection, workspace
 //! leasing/recovery, and pre-start failure handling. Part of the `coordinator`
 //! module split; see [`super`] for the struct and shared types.
+use anyhow::bail;
+
 use super::*;
 
 impl ExecutionCoordinator {
+    /// Reject an explicit host request before the work DB can create or
+    /// refresh an execution. This makes `bossctl ... --host` failures
+    /// transactional from the operator's point of view: an unknown,
+    /// disabled, or saturated host leaves no queued execution behind.
+    pub(crate) fn validate_requested_host(&self, host_id: &str) -> Result<()> {
+        let hosts = self.work_db.list_hosts().context("host validation: list hosts")?;
+        let known_hosts = hosts.iter().map(|host| host.id.as_str()).collect::<Vec<_>>().join(", ");
+        let host = hosts
+            .iter()
+            .find(|host| host.id == host_id)
+            .ok_or_else(|| anyhow!("unknown host '{host_id}'; known hosts: {known_hosts}"))?;
+        if !host.enabled {
+            bail!("requested host '{host_id}' is disabled by its health gate")
+        }
+        // Local concurrency is owned by WorkerPool, as in normal host
+        // selection. Remote hosts additionally enforce their registry slot
+        // count so a pin cannot overcommit that machine.
+        if host.id != "local" {
+            let active = self.work_db.active_runs_per_host().unwrap_or_default();
+            let active_runs = active.get(host_id).copied().unwrap_or_default();
+            if active_runs >= host.pool_size {
+                bail!(
+                    "requested host '{host_id}' has no free slot ({active_runs}/{} active)",
+                    host.pool_size
+                )
+            }
+        }
+        Ok(())
+    }
+
     /// Resolve the [`WorkItem`] an execution operates on.
     ///
     /// For a normal execution this is the persisted task/chore/product/
@@ -97,7 +129,7 @@ impl ExecutionCoordinator {
     }
 
     /// Pick the host this execution should run on. Honours the pin escape
-    /// hatch (`work_executions.pinned_host_id`) and the capability filter,
+    /// hatch (`work_executions.pinned_host_id`) while retaining the capability filter,
     /// then ranks the survivors by branch affinity / free slots — see
     /// [`crate::host_scheduling::select_host`].
     ///
@@ -1267,6 +1299,12 @@ impl ExecutionCoordinator {
             &selected_host.id,
         ) {
             Ok((execution, run)) => {
+                // The pin belongs to this dispatch request only. The durable
+                // run keeps its selected host for reporting, while any later
+                // re-dispatch starts unpinned unless its caller names a host.
+                if let Err(err) = self.work_db.set_execution_pinned_host(&execution.id, None) {
+                    tracing::warn!(execution_id = %execution.id, ?err, "failed to clear one-dispatch host pin after start");
+                }
                 let worker_id_owned = worker_id.to_owned();
                 let queue_wait_ms = execution
                     .started_epoch()

@@ -11,10 +11,9 @@
 //!    2. then the host with the most free slots,
 //!    3. then lexicographic host id (for deterministic tests).
 //!
-//! Pinned hosts bypass step 1 entirely (per the design's "Pin escape
-//! hatch" — `work_executions.pinned_host_id`). The pinned host must
-//! still be enabled and have a free slot, otherwise the execution
-//! sits queued until it does.
+//! A pinned host narrows the candidates to one host. It still has to
+//! satisfy the capability, enabled, and free-slot gates; pinning controls
+//! placement, not admission.
 
 use std::collections::BTreeSet;
 
@@ -48,8 +47,8 @@ impl HostSlot {
 pub struct ChoreRequirements {
     /// Union of product / project / chore required capabilities.
     pub required_capabilities: BTreeSet<String>,
-    /// `work_executions.pinned_host_id`; bypasses the capability
-    /// filter when set.
+    /// `work_executions.pinned_host_id`; narrows placement to this host
+    /// while retaining every eligibility gate.
     pub pinned_host_id: Option<String>,
 }
 
@@ -95,21 +94,19 @@ pub fn select_host(requirements: &ChoreRequirements, slots: &[HostSlot]) -> (Opt
         if slot.free_slots() <= 0 {
             reasons.push(IneligibilityReason::NoFreeSlots);
         }
-        if let Some(pin) = &requirements.pinned_host_id {
-            if &slot.host.id != pin {
-                reasons.push(IneligibilityReason::NotPinned);
-            }
-        } else {
-            // Capability filter only applies when not pinned.
-            let missing: Vec<String> = requirements
-                .required_capabilities
-                .iter()
-                .filter(|cap| !slot.capabilities.contains(*cap))
-                .cloned()
-                .collect();
-            if !missing.is_empty() {
-                reasons.push(IneligibilityReason::MissingCapabilities(missing));
-            }
+        if let Some(pin) = &requirements.pinned_host_id
+            && &slot.host.id != pin
+        {
+            reasons.push(IneligibilityReason::NotPinned);
+        }
+        let missing: Vec<String> = requirements
+            .required_capabilities
+            .iter()
+            .filter(|cap| !slot.capabilities.contains(*cap))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            reasons.push(IneligibilityReason::MissingCapabilities(missing));
         }
         let eligible = reasons.is_empty();
         report.push(Eligibility {
@@ -244,8 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_host_wins_even_without_capability_match() {
-        // Pinned host bypasses capability filter (per design).
+    fn pinned_host_must_meet_capability_requirements() {
         let reqs = ChoreRequirements {
             required_capabilities: ["xcode=15".into()].into_iter().collect(),
             pinned_host_id: Some("local".to_owned()),
@@ -255,7 +251,7 @@ mod tests {
             slot("zakalwe", 4, 0, &["os=macos", "xcode=15"]),
         ];
         let (picked, _) = select_host(&reqs, &slots);
-        assert_eq!(picked.as_deref(), Some("local"));
+        assert!(picked.is_none());
     }
 
     #[test]
