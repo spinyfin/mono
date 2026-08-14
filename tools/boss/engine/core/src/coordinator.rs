@@ -2101,6 +2101,24 @@ pub struct ExecutionCoordinator {
     dispatch_pause_bypass_execution_ids: std::sync::Mutex<std::collections::HashSet<String>>,
     /// One-dispatch `--host` routes. Kept out of `work_executions` so they
     /// cannot overwrite or clear the durable pin escape hatch.
+    ///
+    /// Process-local and best-effort, not a durable pin: it does NOT
+    /// survive an engine restart. An execution still `ready` (dispatch
+    /// paused, no free slot, a restart landing mid-queue, ...) when the
+    /// engine comes back up loses its `--host` constraint and is placed
+    /// by ordinary (unconstrained) host selection on the next drain, with
+    /// no error or notice — this is a known limitation of keeping the
+    /// constraint in memory rather than on the execution row. Entries are
+    /// removed on every terminal outcome for the execution — success
+    /// (`schedule_execution`'s `start_execution_run_on_host` success arm),
+    /// every cancel path that can fire while a request-scoped host is
+    /// still pinned, and any pre-start failure (host adapter build,
+    /// `cube repo ensure`, workspace lease, cube change create) — so an
+    /// entry is never left behind for an execution that will not drain
+    /// again; it is only ever read (never destructively taken) during
+    /// selection itself (`select_host_for_execution`), so a mid-dispatch
+    /// failure cannot silently lose the constraint before the retry
+    /// decision is made.
     #[builder(default)]
     requested_host_ids: std::sync::Mutex<HashMap<String, String>>,
     /// Startup capability gate for the local tmux runtime. Unlike the
@@ -2232,7 +2250,7 @@ fn summarize_ineligibility(report: &[host_scheduling::Eligibility]) -> String {
                 .map(|r| match r {
                     R::Disabled => "disabled".to_owned(),
                     R::NoFreeSlots => "no free slots".to_owned(),
-                    R::NotPinned => "not the pinned host".to_owned(),
+                    R::NotSelectedHost => "not the requested/pinned host".to_owned(),
                     R::MissingCapabilities(missing) => {
                         format!("missing capabilities [{}]", missing.join(", "))
                     }

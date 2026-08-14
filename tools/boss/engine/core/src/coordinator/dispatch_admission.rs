@@ -241,6 +241,17 @@ impl ExecutionCoordinator {
         self.requested_host_ids.lock().unwrap().remove(execution_id)
     }
 
+    /// Non-destructive read of the `--host` routing constraint. Host
+    /// selection must not remove the entry at selection time: everything
+    /// after selection (adapter build, `cube repo ensure`, workspace
+    /// lease) can still fail recoverably, and a retry that re-enters
+    /// selection needs the constraint to still be there. Callers that
+    /// genuinely consume the constraint (a successful dispatch, or a
+    /// terminal cancel) use [`Self::take_requested_host`] instead.
+    pub(super) fn requested_host_for(&self, execution_id: &str) -> Option<String> {
+        self.requested_host_ids.lock().unwrap().get(execution_id).cloned()
+    }
+
     /// Mutating: admit `input.work_item_id` past an active, overridable
     /// (operator-origin) global dispatch pause for this one request, or
     /// refuse and explain why — using the exact same
@@ -361,6 +372,10 @@ impl ExecutionCoordinator {
                     queued_only: true,
                 },
             );
+            // This row can carry a `--host` routing constraint set by
+            // `request_execution_via_db` just above; it will never drain
+            // now, so drop the constraint rather than leaking it.
+            self.take_requested_host(&refreshed.id);
         }
         self.emit_pause_override_refused(&work_item_id, entry_point, &admission.pause, &reason)
             .await;
@@ -382,10 +397,22 @@ impl ExecutionCoordinator {
 
     pub(crate) fn request_execution_via_db(
         &self,
-        input: RequestExecutionInput,
+        mut input: RequestExecutionInput,
         live_states: Arc<crate::live_worker_state::LiveWorkerStateRegistry>,
     ) -> Result<WorkExecution> {
-        if let Some(host_id) = input.requested_host_id.as_deref() {
+        if let Some(host_id) = input.requested_host_id.clone() {
+            // `request_execution_with_live_check` (called below) resolves
+            // friendly ids (`T3`, `#42`, ...) to a primary id itself, but
+            // that resolution happens too late for `--host`: both the
+            // live-execution pre-check and `validate_requested_host` need
+            // the canonical id *before* that call, or a short id makes the
+            // live-execution check silently no-op (an empty `list_executions`
+            // result) and `validate_requested_host` bail with "unknown work
+            // item id format". Resolve once, up front, and reuse the
+            // canonical id everywhere — including the input passed on to
+            // `request_execution_with_live_check`, which then resolves it
+            // to itself as a no-op.
+            input.work_item_id = self.work_db.resolve_work_item_ref(&input.work_item_id)?;
             let live_execution = self
                 .work_db
                 .list_executions(Some(&input.work_item_id))?
@@ -398,7 +425,7 @@ impl ExecutionCoordinator {
                     execution.id
                 );
             }
-            self.validate_requested_host(&input.work_item_id, host_id)?;
+            self.validate_requested_host(&input.work_item_id, &host_id)?;
         }
         let requested_host_id = input.requested_host_id.clone();
         let execution = self
@@ -406,10 +433,26 @@ impl ExecutionCoordinator {
             .request_execution_with_live_check(input, move |run_id| live_states.is_run_live(run_id))?;
         if let Some(host_id) = requested_host_id {
             if execution.status != ExecutionStatus::Ready {
+                // Reached only after the live-execution pre-check above has
+                // already refused every live row (and the in-tx reuse path
+                // maps `WaitingDependency` back to `Ready`), so anything
+                // landing here is non-`Ready` and *not* live — name what
+                // this actually detects rather than repeating the live-
+                // execution message. The transaction above already
+                // committed a created/refreshed row for this status, so
+                // clean it up rather than leaving residue behind an error.
+                let _ = self.work_db.cancel_execution_with(
+                    &execution.id,
+                    CancelExecutionOpts {
+                        reason: Some("--host only applies to a queued execution".to_string()),
+                        queued_only: true,
+                    },
+                );
                 bail!(
-                    "{} already has a live execution {}; --host cannot move a running dispatch",
+                    "{} resolved to execution {} in status `{:?}`; --host only applies to a queued execution",
                     execution.work_item_id,
-                    execution.id
+                    execution.id,
+                    execution.status
                 );
             }
             // This request-only routing constraint never touches the durable

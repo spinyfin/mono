@@ -67,8 +67,12 @@ pub enum IneligibilityReason {
     NoFreeSlots,
     /// Capability filter rejected the host.
     MissingCapabilities(Vec<String>),
-    /// `pinned_host_id` is set on the execution and this host isn't it.
-    NotPinned,
+    /// A durable `pinned_host_id` OR a request-scoped `requested_host_id`
+    /// is set on the execution and this host is not that host. When both
+    /// are set the request-scoped host wins outright (see `selected_pin`
+    /// below) — a `--host` request silently overrides a durable pin for
+    /// that one dispatch.
+    NotSelectedHost,
 }
 
 #[derive(Debug, Clone)]
@@ -105,7 +109,7 @@ pub fn select_host(requirements: &ChoreRequirements, slots: &[HostSlot]) -> (Opt
         if let Some(pin) = selected_pin
             && &slot.host.id != pin
         {
-            reasons.push(IneligibilityReason::NotPinned);
+            reasons.push(IneligibilityReason::NotSelectedHost);
         }
         let missing: Vec<String> = requirements
             .required_capabilities
@@ -298,11 +302,11 @@ mod tests {
         let slots = vec![slot("local", 4, 0, &[])];
         let (picked, report) = select_host(&reqs, &slots);
         assert!(picked.is_none());
-        assert!(
-            report
+        assert!(report.iter().any(|r| {
+            r.reasons
                 .iter()
-                .any(|r| r.reasons.iter().any(|x| matches!(x, IneligibilityReason::NotPinned)))
-        );
+                .any(|x| matches!(x, IneligibilityReason::NotSelectedHost))
+        }));
     }
 
     #[test]

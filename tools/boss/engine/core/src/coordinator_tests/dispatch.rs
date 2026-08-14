@@ -307,6 +307,73 @@ async fn requested_host_routes_one_dispatch_and_refuses_without_queueing() {
     assert!(db.list_executions(Some(&unknown.id)).unwrap().is_empty());
 }
 
+/// A friendly short id (`T<n>`) passed alongside `--host` must resolve to
+/// the canonical `task_…` id before either the live-execution pre-check or
+/// `validate_requested_host` runs — both look the id up directly and, on
+/// the raw short form, used to silently misbehave: `validate_requested_host`
+/// rejected it outright (`classify_id` only accepts typed prefixes) and the
+/// live-execution pre-check's `list_executions` lookup returned an empty
+/// list instead of ever finding the live row. `bossctl work start <short-id>
+/// --host X` must work exactly like the canonical-id form.
+#[tokio::test]
+async fn requested_host_resolves_friendly_short_id() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    db.add_host("zakalwe", "user@zakalwe", 1, &[]).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Short-id remote cleanup");
+    let short_id = chore.short_id.expect("test chore must have a short_id");
+    let friendly_id = boss_protocol::short_id_label(Some(short_id)).unwrap();
+
+    let cube = Arc::new(FakeCubeClient::default());
+    let runner = Arc::new(FakeExecutionRunner {
+        pending: true,
+        ..FakeExecutionRunner::default()
+    });
+    let mut coordinator_inner = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube, runner);
+    let provider = Arc::new(RecordingHostAdapterProvider {
+        inner: coordinator_inner.host_adapter(),
+        requested: Mutex::new(Vec::new()),
+    });
+    coordinator_inner.set_host_adapter_provider(provider.clone());
+    let coordinator = Arc::new(coordinator_inner);
+
+    // The short id resolves and the execution is created and routed to
+    // the requested host, exactly like the canonical-id form above.
+    let execution = coordinator
+        .request_execution_via_db(
+            RequestExecutionInput::builder()
+                .work_item_id(friendly_id.clone())
+                .requested_host_id("zakalwe")
+                .build(),
+            Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new()),
+        )
+        .unwrap();
+    assert_eq!(
+        execution.work_item_id, chore.id,
+        "short id must resolve to the canonical task id"
+    );
+    coordinator.kick();
+    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
+    assert!(provider.requested.lock().await.iter().any(|host| host == "zakalwe"));
+
+    // With that execution now live, a second `--host` request against the
+    // same short id must hit the live-execution pre-check rather than
+    // silently no-op past it.
+    let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+    live_states.register_spawn(1, &execution.id, "test", 1, None);
+    let err = coordinator
+        .request_execution_via_db(
+            RequestExecutionInput::builder()
+                .work_item_id(friendly_id)
+                .requested_host_id("zakalwe")
+                .build(),
+            live_states,
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("already has a live execution"), "got: {err}");
+}
+
 /// The interactive-pool concurrency cap
 /// ([`MAX_CONCURRENT_INTERACTIVE_WORKERS`]): when the interactive pool
 /// already carries the capped number of live workers, a drain pass holds
