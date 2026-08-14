@@ -182,6 +182,14 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          item working again; the dead pane is history, not current state.",
     ),
     entry(
+        crate::remote_lease_reconcile::REMOTE_WORKER_DIED_ATTENTION_KIND,
+        ClearedBy::WorkResumed,
+        "Records that the item's worker died on a remote host and was reaped, and carries the worker's last \
+         output so the cause is readable after the workspace goes back to cube. A later run start is the \
+         redispatch that reap made room for; if the underlying host problem persists the next death files a \
+         fresh item, so nothing is lost by clearing this one.",
+    ),
+    entry(
         crate::tmux_adoption::TMUX_ADOPTION_SCHEMA_SKEW_ATTENTION_KIND,
         ClearedBy::WorkResumed,
         "Records that boot-time adoption refused and reaped a version-skewed tmux session for \
@@ -551,6 +559,7 @@ mod tests {
             crate::work::ATTENTION_KIND_RECOVERY_EXHAUSTED,
             crate::coordinator::CHAIN_SERIALIZED_STALL_ATTENTION_KIND,
             crate::dead_pid_sweep::PANE_DEATH_ATTENTION_KIND,
+            crate::remote_lease_reconcile::REMOTE_WORKER_DIED_ATTENTION_KIND,
             crate::tmux_adoption::TMUX_ADOPTION_SCHEMA_SKEW_ATTENTION_KIND,
             crate::spawn_ack_sweep::DRIVER_START_ATTENTION_KIND,
             crate::app::readoption::PROGRESS_INGRESS_UNRECOVERABLE_ATTENTION_KIND,

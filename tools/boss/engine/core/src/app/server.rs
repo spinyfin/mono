@@ -806,6 +806,23 @@ pub async fn serve_with_merge_probe(
     // tmux already proved them alive more directly than a cube lease
     // snapshot can, so `run_reconcile` covers only what adoption did not
     // claim.
+    // Host-routed cube resolution for every lease operation that runs
+    // OUTSIDE the dispatch loop. A cube lease is tracked only by the cube
+    // daemon on the host its workspace lives on, so heartbeating,
+    // confirming, or force-releasing a REMOTE lease against the engine's
+    // own local cube asks the wrong machine and always fails ("lease … is
+    // not tracked") — while the lease sits healthy on the remote host. This
+    // resolves each execution to the cube that issued its lease, reusing
+    // the coordinator's own `HostAdapterProvider` (and therefore the same
+    // per-host `ControlMaster`), and falls back to the local cube for
+    // `local` runs so single-host deployments are unchanged.
+    let host_routed_cubes: Arc<dyn crate::cube_lease_heartbeat::ExecutionCubes> =
+        Arc::new(crate::cube_lease_heartbeat::HostRoutedCubes::new(
+            server_state.work_db.clone(),
+            server_state.execution_coordinator.host_adapter_provider(),
+            server_state.cube_client.clone(),
+        ));
+
     let in_flight = match server_state.work_db.list_in_flight_executions() {
         Ok(rows) => rows
             .into_iter()
@@ -857,12 +874,9 @@ pub async fn serve_with_merge_probe(
     // and not expired), push the expiry forward now so the worker is safe
     // through that gap. Best-effort; never blocks startup.
     if !in_flight.is_empty() {
-        let readopted = crate::cube_lease_heartbeat::reheartbeat_live_runs(
-            server_state.cube_client.as_ref(),
-            &in_flight,
-            &probe_report,
-        )
-        .await;
+        let readopted =
+            crate::cube_lease_heartbeat::reheartbeat_live_runs(host_routed_cubes.as_ref(), &in_flight, &probe_report)
+                .await;
         if readopted > 0 {
             tracing::info!(
                 readopted,
@@ -1097,7 +1111,7 @@ pub async fn serve_with_merge_probe(
         server_state.work_db.clone(),
         server_state.live_worker_states.clone(),
         server_state.execution_coordinator.clone(),
-        server_state.cube_client.clone(),
+        host_routed_cubes.clone(),
         server_state.dispatch_events.clone(),
         crate::cube_lease_heartbeat::heartbeat_interval(),
     );

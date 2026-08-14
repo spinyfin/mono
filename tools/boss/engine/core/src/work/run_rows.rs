@@ -824,9 +824,9 @@ impl WorkDb {
         .map_err(Into::into)
     }
 
-    /// Active runs on a non-local host whose backing execution is still
-    /// non-terminal — the set of detached remote workers the engine
-    /// should re-attach to after a restart.
+    /// The latest run of every non-terminal execution dispatched to a
+    /// non-local host — the set of detached remote workers the engine is
+    /// still responsible for.
     ///
     /// A remote worker is launched detached (`nohup`) and survives the
     /// engine restarting, but the reverse events-socket forward that
@@ -835,20 +835,49 @@ impl WorkDb {
     /// this set and re-establishes each forward (see
     /// [`crate::remote_reattach`]) so the still-running worker's events
     /// — and its eventual `Stop` / PR-URL completion — reach the engine
-    /// again. Local runs are excluded (`host_id != 'local'`): a local
-    /// worker is a child of the previous engine and is already gone.
-    /// Terminal executions are excluded so a settled run is never
-    /// re-attached.
-    pub fn list_reattachable_remote_runs(&self) -> Result<Vec<RemoteRunHandle>> {
+    /// again. The same set is the candidate list for
+    /// [`crate::remote_lease_reconcile`], which probes each worker pid
+    /// over SSH and reaps the ones that are provably gone.
+    ///
+    /// **Liveness is judged on the EXECUTION, never on `work_runs.status`.**
+    /// This query used to require `r.status = 'active'`, which made it
+    /// return nothing in production and silently disabled both consumers:
+    /// `coordinator::record_run_completion` sets `run_status = 'completed'`
+    /// within milliseconds of a successful spawn for *every* wait state,
+    /// including `WorkerPaneAlive` — the `work_runs` row tracks the
+    /// engine's dispatch/spawn ACTION (a ~5-8s lifetime), not the worker's
+    /// (see the note at that call site). A live remote worker therefore
+    /// spends its entire life on a `completed` run row. The bug was
+    /// invisible to the existing unit tests because their fixtures call
+    /// `start_execution_run_on_host` and never `finish_execution_run`, so
+    /// the run stayed `active` in a way it never does in production.
+    ///
+    /// Local runs are excluded (`host_id != 'local'`): a local worker is a
+    /// child of the previous engine and is already gone, and the local
+    /// sweeps own it. Terminal executions are excluded so a settled run is
+    /// never re-attached or re-probed. Exactly one row per execution is
+    /// returned — the run an in-flight worker actually belongs to, chosen
+    /// with the same "unfinished first, then newest" preference
+    /// [`resolve_run_id_for_execution_hooks`] uses, so a resumed execution
+    /// yields its current run rather than an ancient one.
+    pub fn list_live_remote_runs(&self) -> Result<Vec<RemoteRunHandle>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT r.id, r.execution_id, r.host_id, r.remote_pid
              FROM work_runs r
              JOIN work_executions e ON e.id = r.execution_id
-             WHERE r.status = 'active'
-               AND r.host_id != 'local'
+             WHERE r.host_id != 'local'
                AND e.status NOT IN
                    ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+               AND r.id = (
+                   SELECT r2.id FROM work_runs r2
+                   WHERE r2.execution_id = r.execution_id
+                   ORDER BY
+                     CASE WHEN r2.finished_at IS NULL THEN 0 ELSE 1 END,
+                     r2.created_at DESC,
+                     r2.id DESC
+                   LIMIT 1
+               )
              ORDER BY r.created_at ASC, r.id ASC",
         )?;
         let rows = stmt.query_map([], |row| {

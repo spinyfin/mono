@@ -26,6 +26,17 @@
 //! Every [`heartbeat_interval`] (default 300 s — deliberately ≪ the
 //! 86400 s TTL, see "TTL ownership" below):
 //!
+//! ## Which cube gets the beat
+//!
+//! A lease is tracked only by the cube on the host its workspace lives on,
+//! so every call routes through [`ExecutionCubes`], which resolves the
+//! execution's dispatch host. `local` resolves to the engine's own cube
+//! client (the local-only path is unchanged); a remote execution resolves
+//! to the same `ssh <host> cube …` transport the dispatch loop leased with.
+//! Heartbeat failure events — and, for non-local hosts, success events —
+//! carry `cube_command` / `cube_cwd` the same way the lease and repo-ensure
+//! stages already do, so a misrouted beat is readable on the timeline.
+//!
 //! 1. Snapshot [`crate::live_worker_state::LiveWorkerStateRegistry`].
 //! 2. For each slot with a live `shell_pid` and non-terminal activity
 //!    whose execution is non-terminal and has recorded a
@@ -183,14 +194,119 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use anyhow::{Context, Result};
+use async_trait::async_trait;
 use boss_protocol::{ExecutionKind, WorkExecution};
 
 use crate::coordinator::{CubeClient, ExecutionCoordinator};
 use crate::dead_pid_sweep::{PidStatus, probe_pid};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
+use crate::host_adapter::{HostAdapterCubeClient, HostAdapterProvider};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::run_reconcile::{self, RunReconcileReport, RunReconcileVerdict};
 use crate::work::WorkDb;
+
+/// Cube that owns an execution's lease, plus the host that cube lives on.
+///
+/// Returned by [`ExecutionCubes::cube_for_execution`] so callers that care
+/// about *which* host was resolved (e.g. emitting a remote-only ok event)
+/// do not have to re-derive it by sniffing display labels from
+/// [`CubeClient::command_repr`].
+#[derive(Clone)]
+pub struct ResolvedExecutionCube {
+    pub cube: Arc<dyn CubeClient>,
+    /// Host the execution's latest run was dispatched to. `"local"` when the
+    /// engine's own cube issued (or will issue) the lease — including
+    /// executions with no run row yet.
+    pub host_id: String,
+}
+
+impl ResolvedExecutionCube {
+    /// True when the lease lives on the engine's own cube.
+    pub fn is_local(&self) -> bool {
+        self.host_id == "local"
+    }
+}
+
+/// Resolves the cube endpoint that actually owns an execution's lease.
+///
+/// A lease is tracked only by the cube on the host its workspace lives on,
+/// so every heartbeat (and every auto-reap force-release) must go through
+/// this seam. `local` resolves to the engine's own client; any other host
+/// resolves through the same adapter provider the dispatch loop leased
+/// with. Resolution failure is deliberately an `Err`, never a silent skip:
+/// a heartbeat this sweep cannot route is a heartbeat that did not happen,
+/// and the caller must count it as a failure and emit the error event so it
+/// stays visible. See [`heartbeat_one`].
+#[async_trait]
+pub trait ExecutionCubes: Send + Sync {
+    /// The cube that owns `execution_id`'s lease, and the host that cube
+    /// lives on.
+    async fn cube_for_execution(&self, execution_id: &str) -> Result<ResolvedExecutionCube>;
+}
+
+/// Production [`ExecutionCubes`]: routes by the host the execution's
+/// current run was dispatched to.
+///
+/// `local` (and an execution with no run row yet) resolves to the engine's
+/// own cube client unchanged, so the local-only path is byte-for-byte what
+/// it was. Every other host resolves through the same
+/// [`HostAdapterProvider`] the dispatch loop leases and releases with, so
+/// the heartbeat rides the identical `ssh <host> cube …` `ControlMaster`
+/// that issued the lease in the first place.
+pub struct HostRoutedCubes {
+    work_db: Arc<WorkDb>,
+    provider: Arc<dyn HostAdapterProvider>,
+    local: Arc<dyn CubeClient>,
+}
+
+impl HostRoutedCubes {
+    pub fn new(work_db: Arc<WorkDb>, provider: Arc<dyn HostAdapterProvider>, local: Arc<dyn CubeClient>) -> Self {
+        Self {
+            work_db,
+            provider,
+            local,
+        }
+    }
+}
+
+#[async_trait]
+impl ExecutionCubes for HostRoutedCubes {
+    async fn cube_for_execution(&self, execution_id: &str) -> Result<ResolvedExecutionCube> {
+        let host_id = self
+            .work_db
+            .latest_run_host_for_execution(execution_id)
+            .with_context(|| format!("resolving the dispatch host for execution {execution_id}"))?;
+        let host_id = match host_id.as_deref() {
+            // No run row yet, or a local run: the engine's own cube issued
+            // (or will issue) this lease.
+            None | Some("local") => {
+                return Ok(ResolvedExecutionCube {
+                    cube: Arc::clone(&self.local),
+                    host_id: "local".to_owned(),
+                });
+            }
+            Some(host_id) => host_id.to_owned(),
+        };
+        let host = self
+            .work_db
+            .get_host(&host_id)
+            .with_context(|| format!("looking up host '{host_id}' to heartbeat execution {execution_id}"))?
+            .with_context(|| {
+                format!(
+                    "execution {execution_id} is bound to host '{host_id}', which is no longer in the host registry; \
+                     its lease lives on that host's cube and cannot be reached from here"
+                )
+            })?;
+        let adapter = self.provider.adapter_for(&host).await.with_context(|| {
+            format!("building the host adapter for '{host_id}' to heartbeat execution {execution_id}")
+        })?;
+        Ok(ResolvedExecutionCube {
+            cube: Arc::new(HostAdapterCubeClient::new(adapter)),
+            host_id,
+        })
+    }
+}
 
 /// Consecutive cube-lease-heartbeat failures for one execution before the
 /// engine treats the lease as definitively gone and auto-reaps the
@@ -335,7 +451,7 @@ pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     live_states: Arc<LiveWorkerStateRegistry>,
     coordinator: Arc<ExecutionCoordinator>,
-    cube_client: Arc<dyn CubeClient>,
+    cubes: Arc<dyn ExecutionCubes>,
     dispatch_events: Arc<dyn DispatchEventSink>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
@@ -345,7 +461,7 @@ pub fn spawn_loop(
             let outcome = run_one_pass(
                 work_db.as_ref(),
                 live_states.as_ref(),
-                cube_client.as_ref(),
+                cubes.as_ref(),
                 dispatch_events.as_ref(),
                 &breaker,
             )
@@ -367,7 +483,7 @@ pub fn spawn_loop(
 /// (keeps helper signatures under clippy's `too_many_arguments`).
 struct HeartbeatCtx<'a> {
     work_db: &'a WorkDb,
-    cube_client: &'a dyn CubeClient,
+    cubes: &'a dyn ExecutionCubes,
     dispatch_events: &'a dyn DispatchEventSink,
     breaker: &'a HeartbeatFailureBreaker,
 }
@@ -533,14 +649,14 @@ async fn db_fallback_death_evidence(
 pub async fn run_one_pass(
     work_db: &WorkDb,
     live_states: &LiveWorkerStateRegistry,
-    cube_client: &dyn CubeClient,
+    cubes: &dyn ExecutionCubes,
     dispatch_events: &dyn DispatchEventSink,
     breaker: &HeartbeatFailureBreaker,
 ) -> HeartbeatSweepOutcome {
     run_one_pass_impl(
         work_db,
         live_states,
-        cube_client,
+        cubes,
         dispatch_events,
         breaker,
         HEARTBEAT_CUBE_TIMEOUT,
@@ -553,14 +669,14 @@ pub async fn run_one_pass(
 async fn run_one_pass_impl(
     work_db: &WorkDb,
     live_states: &LiveWorkerStateRegistry,
-    cube_client: &dyn CubeClient,
+    cubes: &dyn ExecutionCubes,
     dispatch_events: &dyn DispatchEventSink,
     breaker: &HeartbeatFailureBreaker,
     heartbeat_timeout: Duration,
 ) -> HeartbeatSweepOutcome {
     let ctx = HeartbeatCtx {
         work_db,
-        cube_client,
+        cubes,
         dispatch_events,
         breaker,
     };
@@ -569,16 +685,21 @@ async fn run_one_pass_impl(
     let mut db_fallback_sweep_succeeded = false;
 
     for state in live_states.snapshot() {
-        // Slot hasn't reported a shell pid yet — we can't probe liveness,
-        // and the lease was just created with a full TTL, so there is no
-        // urgency. The next pass picks it up once the app reports the pid.
+        // Slot hasn't reported a shell pid yet — we can't probe liveness
+        // with `kill(pid, 0)`, so this branch has nothing to adjudicate.
         //
-        // Remote workers (shell_pid = 0 by design, since they have no local
-        // pid and their leases live on a remote cube) also land here
-        // permanently — they are out of scope for this local sweep.
+        // A pid-less slot must stay out of `registered_run_ids` because the
+        // DB-fallback sweep below is the only path that resolves the owning
+        // cube per execution (and applies `db_fallback_death_evidence`). A
+        // REMOTE worker's `shell_pid` is 0 permanently by design (see
+        // `register_remote_worker_slot`), so it lands here on every pass
+        // for the whole of its life; marking it registered would hide it
+        // from that sweep and leave its remote lease unheartbeated. A local
+        // slot whose app has not yet reported its pid is covered by the
+        // same fall-through, which errs toward heartbeating on every
+        // ambiguous signal.
         if state.shell_pid <= 0 {
             outcome.no_pid_skipped += 1;
-            registered_run_ids.insert(state.run_id.clone());
             continue;
         }
 
@@ -797,7 +918,46 @@ async fn heartbeat_one(
         work_item_id,
         cube_workspace_id,
     } = *target;
-    let result = tokio::time::timeout(timeout, ctx.cube_client.heartbeat_lease(lease_id, Some(LEASE_TTL_SECS))).await;
+    // Route to the cube that owns this lease before anything else. An
+    // unroutable execution is a heartbeat that did NOT happen, so it takes
+    // the same loud failure path as a cube that answered with an error —
+    // counted, evented, and fed to the breaker. Never a silent skip: a
+    // quietly-unheartbeated lease is exactly how a live worker loses its
+    // workspace to the TTL sweep.
+    let resolved = match ctx.cubes.cube_for_execution(execution_id).await {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            *failed += 1;
+            tracing::warn!(
+                execution_id,
+                lease_id,
+                error = %format!("{err:#}"),
+                "cube-lease heartbeat: could not resolve the cube that owns this lease; the lease cannot be \
+                 refreshed from here (the worker's workspace is at risk)",
+            );
+            ctx.dispatch_events
+                .emit(
+                    DispatchEvent::new(Stage::CubeLeaseHeartbeat, Outcome::Error, execution_id)
+                        .with_work_item(work_item_id)
+                        .with_cube_lease(lease_id)
+                        .with_error(&err)
+                        .with_details(serde_json::json!({
+                            "ttl_secs": LEASE_TTL_SECS,
+                            "cube_workspace_id": cube_workspace_id,
+                            "cube_unroutable": true,
+                        })),
+                )
+                .await;
+            return false;
+        }
+    };
+    let cube = resolved.cube.as_ref();
+    // Surface WHICH cube this beat went to, the same way the lease and
+    // repo-ensure stages already do (`cube_command` / `cube_cwd`). Best-
+    // effort display only — the local-vs-remote decision below uses the
+    // host id from resolution, not this label.
+    let cube_invocation = cube.command_repr(&["workspace", "heartbeat", lease_id]);
+    let result = tokio::time::timeout(timeout, cube.heartbeat_lease(lease_id, Some(LEASE_TTL_SECS))).await;
     match result {
         Ok(Ok(())) => {
             *succeeded += 1;
@@ -805,8 +965,30 @@ async fn heartbeat_one(
                 execution_id,
                 lease_id,
                 ttl_secs = LEASE_TTL_SECS,
+                host_id = %resolved.host_id,
                 "cube-lease heartbeat: refreshed lease",
             );
+            // Emit Outcome::Ok only for non-local hosts. Local workers would
+            // produce a 300 s-cadence event storm across every live slot;
+            // remote beats are rare and the routing is what live verification
+            // needs to see. Gate on the resolved host id from
+            // `cube_for_execution`, not on sniffing `command_repr`'s display
+            // cwd — adapters may return `None` or format cwd differently.
+            if !resolved.is_local() {
+                ctx.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::CubeLeaseHeartbeat, Outcome::Ok, execution_id)
+                            .with_work_item(work_item_id)
+                            .with_cube_lease(lease_id)
+                            .with_cube_invocation(cube_invocation)
+                            .with_details(serde_json::json!({
+                                "ttl_secs": LEASE_TTL_SECS,
+                                "cube_workspace_id": cube_workspace_id,
+                                "host_id": resolved.host_id,
+                            })),
+                    )
+                    .await;
+            }
             true
         }
         Ok(Err(err)) => {
@@ -822,6 +1004,7 @@ async fn heartbeat_one(
                     DispatchEvent::new(Stage::CubeLeaseHeartbeat, Outcome::Error, execution_id)
                         .with_work_item(work_item_id)
                         .with_cube_lease(lease_id)
+                        .with_cube_invocation(cube_invocation)
                         .with_error(&err)
                         .with_details(serde_json::json!({
                             "ttl_secs": LEASE_TTL_SECS,
@@ -848,6 +1031,7 @@ async fn heartbeat_one(
                     DispatchEvent::new(Stage::CubeLeaseHeartbeat, Outcome::Error, execution_id)
                         .with_work_item(work_item_id)
                         .with_cube_lease(lease_id)
+                        .with_cube_invocation(cube_invocation)
                         .with_error(&err)
                         .with_details(serde_json::json!({
                             "ttl_secs": LEASE_TTL_SECS,
@@ -939,8 +1123,31 @@ async fn auto_reap_dead_lease(
     let host_offline = ctx.work_db.execution_bound_host_offline(&execution.id).unwrap_or(false);
 
     if !host_offline {
+        // The confirmation MUST list the workspaces of the cube that owns
+        // this lease. Asking the engine's local cube about a remote
+        // workspace id returns "no such workspace", which `classify` reads
+        // as `Dead` — turning the guard that exists to stop mass-reaping
+        // live workers into an unconditional yes for every remote run. A
+        // routing failure here is treated exactly like a failed probe:
+        // `Unknown`, so nothing is reaped on it.
+        let cube = match ctx.cubes.cube_for_execution(&execution.id).await {
+            Ok(resolved) => resolved.cube,
+            Err(err) => {
+                ctx.breaker.forget(&execution.id);
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    lease_id,
+                    consecutive_failures,
+                    error = %format!("{err:#}"),
+                    "cube-lease heartbeat: consecutive failures reached auto-reap threshold but the owning cube \
+                     could not be resolved to confirm death; not reaping (an unroutable cube is not proof the \
+                     workspace is gone)",
+                );
+                return false;
+            }
+        };
         let verdict = run_reconcile::confirm_execution_dead(
-            ctx.cube_client,
+            cube.as_ref(),
             execution,
             boss_engine_utils::epoch_time::now_epoch_secs(),
         )
@@ -1117,18 +1324,32 @@ async fn reap_and_release_lease(
     }
 
     // Actively release the lease rather than leaving it to expire on its
-    // own TTL — the fix this module exists for. Best-effort: the lease is
-    // already known to be stale (either it has been failing to heartbeat,
-    // or we independently proved the worker is gone), so force-release is
-    // very likely a no-op if cube already reclaimed it. Failure here is
-    // benign.
-    if let Err(err) = ctx.cube_client.force_release_lease(lease_id, Some(reason)).await {
-        tracing::debug!(
+    // own TTL — the fix this module exists for. Released on the cube that
+    // ISSUED it: releasing a remote lease id against the engine's local
+    // cube is a guaranteed no-op that leaves the remote workspace stranded
+    // for the full 24 h TTL. Best-effort throughout: the lease is already
+    // known to be stale (either it has been failing to heartbeat, or we
+    // independently proved the worker is gone), so a failure here — cube
+    // already reclaimed it, or the host is unreachable — is benign and
+    // logged rather than propagated.
+    match ctx.cubes.cube_for_execution(&execution.id).await {
+        Ok(resolved) => {
+            if let Err(err) = resolved.cube.force_release_lease(lease_id, Some(reason)).await {
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    lease_id,
+                    error = %format!("{err:#}"),
+                    "cube-lease heartbeat: best-effort force-release after reap failed (likely already released)",
+                );
+            }
+        }
+        Err(err) => tracing::warn!(
             execution_id = %execution.id,
             lease_id,
             error = %format!("{err:#}"),
-            "cube-lease heartbeat: best-effort force-release after reap failed (likely already released)",
-        );
+            "cube-lease heartbeat: reaped the execution but could not resolve its owning cube to force-release \
+             the lease; it will be reclaimed by cube's own TTL sweep instead",
+        ),
     }
 
     ctx.dispatch_events
@@ -1156,7 +1377,7 @@ async fn reap_and_release_lease(
 /// else. Best-effort: failures are logged, never fatal. Returns the
 /// number of leases successfully refreshed.
 pub async fn reheartbeat_live_runs(
-    cube_client: &dyn CubeClient,
+    cubes: &dyn ExecutionCubes,
     in_flight: &[WorkExecution],
     report: &RunReconcileReport,
 ) -> usize {
@@ -1171,9 +1392,26 @@ pub async fn reheartbeat_live_runs(
         let Some(lease_id) = execution.cube_lease_id.as_deref() else {
             continue;
         };
+        // Same host routing as the periodic sweep: a remote lease is
+        // re-adopted against the remote cube that issued it. Best-effort at
+        // startup like every other beat here, so an unreachable host logs
+        // and the periodic sweep retries rather than blocking boot.
+        let cube = match cubes.cube_for_execution(&execution.id).await {
+            Ok(resolved) => resolved.cube,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    lease_id,
+                    error = %format!("{err:#}"),
+                    "cube-lease heartbeat: could not resolve the owning cube to re-adopt a live lease at startup \
+                     (best-effort; the periodic sweep retries)",
+                );
+                continue;
+            }
+        };
         let result = tokio::time::timeout(
             HEARTBEAT_CUBE_TIMEOUT,
-            cube_client.heartbeat_lease(lease_id, Some(LEASE_TTL_SECS)),
+            cube.heartbeat_lease(lease_id, Some(LEASE_TTL_SECS)),
         )
         .await;
         match result {
@@ -1283,6 +1521,21 @@ mod tests {
         }
     } }
 
+    /// Route every execution to the one stub cube — the single-cube shape
+    /// these tests model, which is exactly right for a local-only engine.
+    /// Multi-host routing has its own fixtures further down
+    /// (`RoutingCubes`), because a stub that answers for every execution
+    /// cannot tell a correctly-routed call from a misrouted one.
+    #[async_trait]
+    impl ExecutionCubes for Arc<RecordingCube> {
+        async fn cube_for_execution(&self, _execution_id: &str) -> Result<ResolvedExecutionCube> {
+            Ok(ResolvedExecutionCube {
+                cube: Arc::clone(self) as Arc<dyn CubeClient>,
+                host_id: "local".to_owned(),
+            })
+        }
+    }
+
     // ─── helpers ─────────────────────────────────────────────────────────────
 
     /// Build a `cube workspace list` row. Mirrors `run_reconcile`'s test
@@ -1356,6 +1609,315 @@ mod tests {
         );
     }
 
+    // ─── host routing ────────────────────────────────────────────────────────
+
+    /// An [`ExecutionCubes`] that hands out a DIFFERENT cube per host, so a
+    /// test can tell a correctly-routed beat from a misrouted one. Routes
+    /// via the same `latest_run_host_for_execution` lookup
+    /// [`HostRoutedCubes`] uses, so the routing decision under test is the
+    /// production one; only the transport underneath is stubbed.
+    struct RoutingCubes {
+        work_db: Arc<WorkDb>,
+        local: Arc<RecordingCube>,
+        remote: Arc<RecordingCube>,
+        /// Host id `remote` answers for. Any other non-local host is
+        /// unroutable, modelling a host dropped from the registry.
+        remote_host_id: String,
+    }
+
+    #[async_trait]
+    impl ExecutionCubes for RoutingCubes {
+        async fn cube_for_execution(&self, execution_id: &str) -> Result<ResolvedExecutionCube> {
+            match self.work_db.latest_run_host_for_execution(execution_id)?.as_deref() {
+                None | Some("local") => Ok(ResolvedExecutionCube {
+                    cube: Arc::clone(&self.local) as Arc<dyn CubeClient>,
+                    host_id: "local".to_owned(),
+                }),
+                Some(host) if host == self.remote_host_id => Ok(ResolvedExecutionCube {
+                    cube: Arc::clone(&self.remote) as Arc<dyn CubeClient>,
+                    host_id: host.to_owned(),
+                }),
+                Some(host) => Err(anyhow!("no adapter for host '{host}'")),
+            }
+        }
+    }
+
+    fn routing_cubes(db: &Arc<WorkDb>, remote_host_id: &str) -> RoutingCubes {
+        RoutingCubes {
+            work_db: Arc::clone(db),
+            local: Arc::new(RecordingCube::default()),
+            remote: Arc::new(RecordingCube::default()),
+            remote_host_id: remote_host_id.to_owned(),
+        }
+    }
+
+    /// Production-path routing: constructs the real [`HostRoutedCubes`]
+    /// against a stub [`HostAdapterProvider`], rather than the
+    /// test-local `RoutingCubes` re-implementation above. Pins the three
+    /// decision arms: local (and no-run) → engine client; registered remote
+    /// → adapter-backed [`HostAdapterCubeClient`]; host absent from the
+    /// registry → loud `Err` with the design's context string.
+    struct HostRoutedStubAdapter {
+        host_id: String,
+        heartbeats: Mutex<Vec<(String, Option<u64>)>>,
+    }
+
+    crate::stub_host_adapter! { HostRoutedStubAdapter {
+        fn host_id(&self) -> &str {
+            &self.host_id
+        }
+        async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()> {
+            self.heartbeats
+                .lock()
+                .unwrap()
+                .push((lease_id.to_owned(), ttl_seconds));
+            Ok(())
+        }
+        fn command_repr(&self, args: &[&str]) -> Option<(String, String)> {
+            let mut cmd = format!("ssh {}", self.host_id);
+            cmd.push_str(" cube");
+            for a in args {
+                cmd.push(' ');
+                cmd.push_str(a);
+            }
+            Some((cmd, format!("(remote: {})", self.host_id)))
+        }
+    } }
+
+    struct HostRoutedStubProvider {
+        adapter: Arc<HostRoutedStubAdapter>,
+    }
+
+    #[async_trait]
+    impl crate::host_adapter::HostAdapterProvider for HostRoutedStubProvider {
+        async fn adapter_for(
+            &self,
+            host: &crate::host_registry::Host,
+        ) -> Result<Arc<dyn crate::host_adapter::HostAdapter>> {
+            if host.id != self.adapter.host_id {
+                return Err(anyhow!("stub provider has no adapter for host '{}'", host.id));
+            }
+            Ok(self.adapter.clone() as Arc<dyn crate::host_adapter::HostAdapter>)
+        }
+    }
+
+    /// Direct unit coverage of the production [`HostRoutedCubes`] match:
+    /// (a) local run → engine's own client, (b) registered remote →
+    /// adapter-backed client, (c) host dropped from the registry → `Err`
+    /// carrying the "no longer in the host registry" context.
+    #[tokio::test]
+    async fn host_routed_cubes_resolves_local_remote_and_missing_host() {
+        let (_dir, db) = open_db_arc();
+        let product_id = create_product(&db);
+        db.add_host("anaplian", "user@anaplian", 4, &[]).unwrap();
+
+        let local_work = create_test_chore(&db, &product_id, "host-routed local").id;
+        let local_exec = running_execution_with_lease(&db, &local_work, "lease-local");
+
+        let remote_work = create_test_chore(&db, &product_id, "host-routed remote").id;
+        let remote_exec = running_execution_on_host_with_lease(&db, &remote_work, "lease-remote", "anaplian");
+
+        // Host is not in the registry — `get_host` returns Ok(None).
+        let gone_work = create_test_chore(&db, &product_id, "host-routed gone").id;
+        let gone_exec = running_execution_on_host_with_lease(&db, &gone_work, "lease-gone", "vanished");
+
+        let adapter = Arc::new(HostRoutedStubAdapter {
+            host_id: "anaplian".to_owned(),
+            heartbeats: Mutex::new(Vec::new()),
+        });
+        let provider = Arc::new(HostRoutedStubProvider {
+            adapter: Arc::clone(&adapter),
+        });
+        let local_cube = Arc::new(RecordingCube::default());
+        let cubes = HostRoutedCubes::new(
+            Arc::clone(&db),
+            provider as Arc<dyn crate::host_adapter::HostAdapterProvider>,
+            Arc::clone(&local_cube) as Arc<dyn CubeClient>,
+        );
+
+        // (a) local run resolves to the engine's own client.
+        let resolved_local = cubes.cube_for_execution(&local_exec).await.expect("local route");
+        assert!(resolved_local.is_local(), "local route must report host_id=local");
+        resolved_local
+            .cube
+            .heartbeat_lease("lease-local", Some(LEASE_TTL_SECS))
+            .await
+            .unwrap();
+        assert_eq!(
+            local_cube.calls(),
+            vec![("lease-local".to_owned(), Some(LEASE_TTL_SECS))],
+            "local/no-host runs must use the engine's own CubeClient"
+        );
+        assert!(
+            adapter.heartbeats.lock().unwrap().is_empty(),
+            "local route must not touch the remote adapter"
+        );
+
+        // (b) a run on a registered remote resolves to an adapter-backed client.
+        let resolved_remote = cubes.cube_for_execution(&remote_exec).await.expect("remote route");
+        assert_eq!(
+            resolved_remote.host_id, "anaplian",
+            "remote route must hand back the concrete host id, not a display label"
+        );
+        assert!(!resolved_remote.is_local());
+        let repr = resolved_remote
+            .cube
+            .command_repr(&["workspace", "heartbeat", "lease-remote"])
+            .expect("HostAdapterCubeClient must surface the adapter's command_repr");
+        assert!(
+            repr.1.starts_with("(remote: anaplian)"),
+            "remote cube_cwd must name the host: {:?}",
+            repr.1
+        );
+        resolved_remote
+            .cube
+            .heartbeat_lease("lease-remote", Some(LEASE_TTL_SECS))
+            .await
+            .unwrap();
+        assert_eq!(
+            adapter.heartbeats.lock().unwrap().clone(),
+            vec![("lease-remote".to_owned(), Some(LEASE_TTL_SECS))],
+            "registered remote runs must beat through HostAdapterCubeClient"
+        );
+        // Local cube still only has the (a) call.
+        assert_eq!(local_cube.calls().len(), 1);
+
+        // (c) a run bound to a host absent from the registry returns Err
+        // with the design's loud-failure context string.
+        let err = match cubes.cube_for_execution(&gone_exec).await {
+            Ok(_) => panic!("missing host must fail closed"),
+            Err(err) => err,
+        };
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("no longer in the host registry"),
+            "missing-host error must name the registry miss, got: {message}"
+        );
+        assert!(
+            message.contains("vanished"),
+            "missing-host error must name the host id, got: {message}"
+        );
+    }
+
+    /// The 2026-08-12 anaplian incident, in one test.
+    ///
+    /// A remote worker's lease is issued by the cube on its own host. The
+    /// beat must go THERE. It used to go to the engine's local cube, which
+    /// had never issued the lease and answered `lease … is not tracked` on
+    /// every pass — while `ssh anaplian cube workspace list` showed the very
+    /// same lease `state: leased`. Two failures in one: the remote lease was
+    /// never actually refreshed, and the error storm buried the run.
+    #[tokio::test]
+    async fn remote_lease_is_heartbeated_against_its_own_host_cube() {
+        let (_dir, db) = open_db_arc();
+        let product_id = create_product(&db);
+        let work_item_id = create_chore(&db, &product_id);
+        let execution_id = running_execution_on_host_with_lease(&db, &work_item_id, "lease-remote", "anaplian");
+
+        // A remote worker holds no local process, so its slot carries
+        // shell_pid 0 for the whole of its life.
+        let live_states = LiveWorkerStateRegistry::new();
+        register_slot(&live_states, 1, &execution_id, 0);
+
+        let cubes = routing_cubes(&db, "anaplian");
+        let sink = RecordingDispatchEventSink::new();
+        let breaker = HeartbeatFailureBreaker::default();
+        let outcome = run_one_pass(db.as_ref(), &live_states, &cubes, &sink, &breaker).await;
+
+        assert_eq!(
+            cubes.remote.calls(),
+            vec![("lease-remote".to_owned(), Some(LEASE_TTL_SECS))],
+            "the remote lease must be refreshed against the remote host's own cube",
+        );
+        assert!(
+            cubes.local.calls().is_empty(),
+            "the engine's local cube never issued this lease and must not be asked about it",
+        );
+        assert_eq!(outcome.failed, 0, "a correctly-routed beat must not report failure");
+        let events = sink.events_for(&execution_id).await;
+        assert!(
+            events
+                .iter()
+                .filter(|event| event.stage == "cube_lease_heartbeat")
+                .all(|event| event.outcome != "error"),
+            "a successful beat emits no error event — this is the `is not tracked` storm that must not recur",
+        );
+        // Ok event is gated on the resolved host id from ExecutionCubes,
+        // not on sniffing command_repr's display cwd (which RecordingCube
+        // does not provide). Remote successes must still emit so live
+        // verification can watch the timeline.
+        let ok = events
+            .iter()
+            .find(|event| event.stage == "cube_lease_heartbeat" && event.outcome == "ok")
+            .expect("a successful remote beat must emit CubeLeaseHeartbeat outcome=ok");
+        assert_eq!(
+            ok.details.get("host_id").and_then(|v| v.as_str()),
+            Some("anaplian"),
+            "ok event must carry the concrete host id from resolution"
+        );
+    }
+
+    /// A local execution keeps going to the engine's own cube: host routing
+    /// must not disturb the single-host path, which is every deployment
+    /// without a registered remote.
+    #[tokio::test]
+    async fn local_lease_still_routes_to_the_engine_cube() {
+        let (_dir, db) = open_db_arc();
+        let product_id = create_product(&db);
+        let work_item_id = create_chore(&db, &product_id);
+        let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-local");
+
+        let live_states = LiveWorkerStateRegistry::new();
+        register_slot(&live_states, 1, &execution_id, std::process::id() as i32);
+
+        let cubes = routing_cubes(&db, "anaplian");
+        let sink = RecordingDispatchEventSink::new();
+        let breaker = HeartbeatFailureBreaker::default();
+        let outcome = run_one_pass(db.as_ref(), &live_states, &cubes, &sink, &breaker).await;
+
+        assert_eq!(outcome.heartbeated, 1);
+        assert_eq!(
+            cubes.local.calls(),
+            vec![("lease-local".to_owned(), Some(LEASE_TTL_SECS))]
+        );
+        assert!(cubes.remote.calls().is_empty());
+    }
+
+    /// An execution whose cube cannot be resolved at all (host dropped from
+    /// the registry) must FAIL LOUDLY — counted, evented, and fed to the
+    /// breaker — never silently pass. A lease nothing can refresh is exactly
+    /// the state this module exists to make visible; quietly skipping it
+    /// would let the workspace TTL-expire under a live worker with nothing
+    /// in the timeline to say why.
+    #[tokio::test]
+    async fn unroutable_cube_is_a_loud_heartbeat_failure() {
+        let (_dir, db) = open_db_arc();
+        let product_id = create_product(&db);
+        let work_item_id = create_chore(&db, &product_id);
+        let execution_id = running_execution_on_host_with_lease(&db, &work_item_id, "lease-gone", "vanished");
+
+        let live_states = LiveWorkerStateRegistry::new();
+        register_slot(&live_states, 1, &execution_id, std::process::id() as i32);
+
+        let cubes = routing_cubes(&db, "anaplian");
+        let sink = RecordingDispatchEventSink::new();
+        let breaker = HeartbeatFailureBreaker::default();
+        let outcome = run_one_pass(db.as_ref(), &live_states, &cubes, &sink, &breaker).await;
+
+        assert_eq!(outcome.failed, 1, "an unroutable lease is a failed heartbeat");
+        assert_eq!(outcome.heartbeated, 0);
+        let events = sink.events_for(&execution_id).await;
+        let error = events
+            .iter()
+            .find(|event| event.stage == "cube_lease_heartbeat")
+            .expect("an unroutable cube must emit a cube_lease_heartbeat error event");
+        assert_eq!(error.outcome, "error");
+        assert_eq!(
+            error.details.get("cube_unroutable").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
     /// A PID guaranteed not to exist: spawn `true`, wait for it to exit,
     /// reuse its released pid. (Same trick the dead-PID sweep tests use.)
     fn dead_pid() -> i32 {
@@ -1417,7 +1979,7 @@ mod tests {
         let live_states = LiveWorkerStateRegistry::new();
         register_slot(&live_states, 1, &execution_id, std::process::id() as i32);
 
-        let cube = RecordingCube::default();
+        let cube = Arc::new(RecordingCube::default());
         let sink = RecordingDispatchEventSink::new();
         let breaker = HeartbeatFailureBreaker::default();
         let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
@@ -1440,7 +2002,7 @@ mod tests {
         let live_states = LiveWorkerStateRegistry::new();
         register_slot(&live_states, 1, &execution_id, dead_pid());
 
-        let cube = RecordingCube::default();
+        let cube = Arc::new(RecordingCube::default());
         let sink = RecordingDispatchEventSink::new();
         let breaker = HeartbeatFailureBreaker::default();
         let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
@@ -1450,10 +2012,19 @@ mod tests {
         assert!(cube.calls().is_empty(), "dead PID lease must not be heartbeated");
     }
 
-    /// A slot with no reported pid yet is skipped (the lease is freshly
-    /// minted with a full TTL).
+    /// A slot with no reported pid is skipped by the REGISTRY sweep — it has
+    /// no pid to `kill(pid, 0)`, so that sweep has nothing to adjudicate —
+    /// and is then picked up by the DB-fallback sweep, which applies the
+    /// durable liveness gate instead.
+    ///
+    /// The registry sweep used to additionally mark such a slot "already
+    /// handled", which suppressed the DB-fallback beat too. For a local slot
+    /// that was merely a delay; for a REMOTE worker — whose `shell_pid` is 0
+    /// permanently by design — it meant the lease was never heartbeated at
+    /// all, for the whole life of the run. See
+    /// `remote_lease_is_heartbeated_against_its_own_host_cube`.
     #[tokio::test]
-    async fn zero_pid_slot_is_skipped() {
+    async fn zero_pid_slot_falls_through_to_the_db_fallback_sweep() {
         let (_dir, db) = open_db_arc();
         let product_id = create_product(&db);
         let work_item_id = create_chore(&db, &product_id);
@@ -1462,13 +2033,24 @@ mod tests {
         let live_states = LiveWorkerStateRegistry::new();
         register_slot(&live_states, 1, &execution_id, 0);
 
-        let cube = RecordingCube::default();
+        let cube = Arc::new(RecordingCube::default());
         let sink = RecordingDispatchEventSink::new();
         let breaker = HeartbeatFailureBreaker::default();
         let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
 
-        assert_eq!(outcome.no_pid_skipped, 1);
-        assert!(cube.calls().is_empty());
+        assert_eq!(
+            outcome.no_pid_skipped, 1,
+            "the registry sweep still skips a pid-less slot"
+        );
+        assert_eq!(
+            outcome.db_fallback_heartbeated, 1,
+            "but the lease must still be refreshed by the DB-fallback sweep, not dropped entirely",
+        );
+        assert_eq!(
+            cube.calls(),
+            vec![("lease-z".to_owned(), Some(LEASE_TTL_SECS))],
+            "exactly one beat, carrying the engine-owned TTL",
+        );
     }
 
     /// A terminal execution's lease is not re-extended (completion owns it).
@@ -1483,7 +2065,7 @@ mod tests {
         let live_states = LiveWorkerStateRegistry::new();
         register_slot(&live_states, 1, &execution_id, std::process::id() as i32);
 
-        let cube = RecordingCube::default();
+        let cube = Arc::new(RecordingCube::default());
         let sink = RecordingDispatchEventSink::new();
         let breaker = HeartbeatFailureBreaker::default();
         let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
@@ -1503,7 +2085,7 @@ mod tests {
         let live_states = LiveWorkerStateRegistry::new();
         register_slot(&live_states, 1, &execution_id, std::process::id() as i32);
 
-        let cube = RecordingCube::default();
+        let cube = Arc::new(RecordingCube::default());
         let sink = RecordingDispatchEventSink::new();
         let breaker = HeartbeatFailureBreaker::default();
         let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
@@ -1524,7 +2106,7 @@ mod tests {
         let live_states = LiveWorkerStateRegistry::new();
         register_slot(&live_states, 1, &execution_id, std::process::id() as i32);
 
-        let cube = RecordingCube::default();
+        let cube = Arc::new(RecordingCube::default());
         cube.fail.store(true, Ordering::SeqCst);
         let sink = RecordingDispatchEventSink::new();
         let breaker = HeartbeatFailureBreaker::default();
@@ -1557,7 +2139,7 @@ mod tests {
         let live_states = LiveWorkerStateRegistry::new();
         register_slot(&live_states, 1, &execution_id, std::process::id() as i32);
 
-        let cube = RecordingCube::default();
+        let cube = Arc::new(RecordingCube::default());
         cube.fail.store(true, Ordering::SeqCst);
         // Cube's own snapshot confirms the workspace is no longer leased —
         // the positive evidence auto-reap now requires before proceeding.
@@ -1611,7 +2193,7 @@ mod tests {
         let live_states = LiveWorkerStateRegistry::new();
         register_slot(&live_states, 1, &execution_id, std::process::id() as i32);
 
-        let cube = RecordingCube::default();
+        let cube = Arc::new(RecordingCube::default());
         let sink = RecordingDispatchEventSink::new();
         let breaker = HeartbeatFailureBreaker::default();
 
@@ -1652,7 +2234,7 @@ mod tests {
         // first hook event.
         let live_states = LiveWorkerStateRegistry::new();
 
-        let cube = RecordingCube::default();
+        let cube = Arc::new(RecordingCube::default());
         cube.fail.store(true, Ordering::SeqCst);
         cube.set_workspaces(vec![workspace("mono-agent-001", "free", None)]);
         let sink = RecordingDispatchEventSink::new();
@@ -1687,7 +2269,7 @@ mod tests {
         let live_states = LiveWorkerStateRegistry::new();
         register_slot(&live_states, 1, &execution_id, std::process::id() as i32);
 
-        let cube = RecordingCube::default();
+        let cube = Arc::new(RecordingCube::default());
         cube.fail.store(true, Ordering::SeqCst);
         cube.list_workspaces_fail.store(true, Ordering::SeqCst);
         let sink = RecordingDispatchEventSink::new();
@@ -1735,7 +2317,7 @@ mod tests {
         let live_states = LiveWorkerStateRegistry::new();
         register_slot(&live_states, 1, &execution_id, std::process::id() as i32);
 
-        let cube = RecordingCube::default();
+        let cube = Arc::new(RecordingCube::default());
         cube.fail.store(true, Ordering::SeqCst);
         // Deliberately DO NOT set any workspaces: the confirm probe returns
         // an empty snapshot → `Unknown`. On an enabled host this would block
@@ -1811,7 +2393,7 @@ mod tests {
         let live_states = LiveWorkerStateRegistry::new();
         register_slot(&live_states, 1, &exec.id, std::process::id() as i32);
 
-        let cube = RecordingCube::default();
+        let cube = Arc::new(RecordingCube::default());
         cube.fail.store(true, Ordering::SeqCst);
         cube.set_workspaces(vec![workspace("mono-agent-999", "free", None)]);
         let sink = RecordingDispatchEventSink::new();
@@ -1850,7 +2432,7 @@ mod tests {
             .verdicts
             .insert("exec-unknown".to_owned(), RunReconcileVerdict::Unknown);
 
-        let cube = RecordingCube::default();
+        let cube = Arc::new(RecordingCube::default());
         let count = reheartbeat_live_runs(&cube, &in_flight, &report).await;
 
         assert_eq!(count, 1, "only the Live verdict is re-adopted");
@@ -1891,6 +2473,16 @@ mod tests {
         }
     } }
 
+    #[async_trait]
+    impl ExecutionCubes for Arc<SlowCube> {
+        async fn cube_for_execution(&self, _execution_id: &str) -> Result<ResolvedExecutionCube> {
+            Ok(ResolvedExecutionCube {
+                cube: Arc::clone(self) as Arc<dyn CubeClient>,
+                host_id: "local".to_owned(),
+            })
+        }
+    }
+
     /// A hung heartbeat for one slot must NOT block heartbeating of the
     /// remaining slots. The timed-out slot increments `failed`; the other
     /// slot is heartbeated successfully.
@@ -1910,7 +2502,7 @@ mod tests {
         register_slot(&live_states, 1, &exec_slow, std::process::id() as i32);
         register_slot(&live_states, 2, &exec_fast, std::process::id() as i32);
 
-        let cube = SlowCube::default();
+        let cube = Arc::new(SlowCube::default());
         let sink = RecordingDispatchEventSink::new();
 
         // Use a short timeout so the test does not wait 30 s.
@@ -1947,7 +2539,7 @@ mod tests {
         // Registry is empty (simulates post-restart state before worker re-hooks).
         let live_states = LiveWorkerStateRegistry::new();
 
-        let cube = RecordingCube::default();
+        let cube = Arc::new(RecordingCube::default());
         let sink = RecordingDispatchEventSink::new();
         let breaker = HeartbeatFailureBreaker::default();
         let outcome = run_one_pass_impl(&db, &live_states, &cube, &sink, &breaker, HEARTBEAT_CUBE_TIMEOUT).await;
@@ -1991,7 +2583,7 @@ mod tests {
         // (e.g. it crashed before an engine restart and never re-registered).
         let live_states = LiveWorkerStateRegistry::new();
 
-        let cube = RecordingCube::default();
+        let cube = Arc::new(RecordingCube::default());
         let sink = RecordingDispatchEventSink::new();
         let breaker = HeartbeatFailureBreaker::default();
         let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
@@ -2052,7 +2644,7 @@ mod tests {
 
         let live_states = LiveWorkerStateRegistry::new();
 
-        let cube = RecordingCube::default();
+        let cube = Arc::new(RecordingCube::default());
         let sink = RecordingDispatchEventSink::new();
         let breaker = HeartbeatFailureBreaker::default();
         let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
@@ -2090,7 +2682,7 @@ mod tests {
 
         let live_states = LiveWorkerStateRegistry::new();
 
-        let cube = RecordingCube::default();
+        let cube = Arc::new(RecordingCube::default());
         let sink = RecordingDispatchEventSink::new();
         let breaker = HeartbeatFailureBreaker::default();
         let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
@@ -2118,7 +2710,7 @@ mod tests {
 
         let live_states = LiveWorkerStateRegistry::new();
 
-        let cube = RecordingCube::default();
+        let cube = Arc::new(RecordingCube::default());
         let sink = RecordingDispatchEventSink::new();
         let breaker = HeartbeatFailureBreaker::default();
         let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
@@ -2171,7 +2763,7 @@ mod tests {
         assert!(exec.cube_lease_id.is_some(), "waiting_review must retain its lease");
 
         let live_states = LiveWorkerStateRegistry::new();
-        let cube = RecordingCube::default();
+        let cube = Arc::new(RecordingCube::default());
         let sink = RecordingDispatchEventSink::new();
         let breaker = HeartbeatFailureBreaker::default();
         let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
@@ -2223,7 +2815,7 @@ mod tests {
         assert!(exec.cube_lease_id.is_some(), "waiting_merge must retain its lease");
 
         let live_states = LiveWorkerStateRegistry::new();
-        let cube = RecordingCube::default();
+        let cube = Arc::new(RecordingCube::default());
         let sink = RecordingDispatchEventSink::new();
         let breaker = HeartbeatFailureBreaker::default();
         let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
@@ -2271,7 +2863,7 @@ mod tests {
         .unwrap();
 
         let live_states = LiveWorkerStateRegistry::new();
-        let cube = RecordingCube::default();
+        let cube = Arc::new(RecordingCube::default());
         let sink = RecordingDispatchEventSink::new();
         let breaker = HeartbeatFailureBreaker::default();
         let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;

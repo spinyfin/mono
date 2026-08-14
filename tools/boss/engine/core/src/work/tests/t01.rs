@@ -2466,31 +2466,92 @@ fn set_run_remote_pid_updates_latest_run() {
 }
 
 #[test]
-fn list_reattachable_remote_runs_filters_local_and_terminal() {
+fn list_live_remote_runs_filters_local_and_terminal() {
     let db = WorkDb::open(temp_db_path("reattachable")).unwrap();
     let remote_exec = start_run_on_host_for_test(&db, "zakalwe");
     let local_exec = start_run_on_host_for_test(&db, "local");
 
-    let runs = db.list_reattachable_remote_runs().unwrap();
+    let runs = db.list_live_remote_runs().unwrap();
     let exec_ids: Vec<&str> = runs.iter().map(|r| r.execution_id.as_str()).collect();
     assert!(
         exec_ids.contains(&remote_exec.as_str()),
-        "an active remote run must be reattachable, got {exec_ids:?}",
+        "a live remote run must be listed, got {exec_ids:?}",
     );
     assert!(
         !exec_ids.contains(&local_exec.as_str()),
-        "a local run must never be reattachable",
+        "a local run must never be listed",
     );
     let remote_handle = runs.iter().find(|r| r.execution_id == remote_exec).unwrap();
     assert_eq!(remote_handle.host_id, "zakalwe");
 
-    // Settling the execution removes it from the reattachable set.
+    // Settling the execution removes it from the live set.
     db.mark_execution_orphaned(&remote_exec, "test: settled").unwrap();
-    let after = db.list_reattachable_remote_runs().unwrap();
+    let after = db.list_live_remote_runs().unwrap();
     assert!(
         !after.iter().any(|r| r.execution_id == remote_exec),
-        "a run whose execution has settled must not be reattachable",
+        "a run whose execution has settled must not be listed",
     );
+}
+
+/// The production sequence, which the fixture above deliberately did not
+/// reproduce: `coordinator::record_run_completion` finishes the `work_runs`
+/// row (`run_status = 'completed'`) within milliseconds of a successful
+/// remote spawn, while the EXECUTION stays live (`running`). A live remote
+/// worker therefore spends its whole life on a `completed` run row.
+///
+/// The old `r.status = 'active'` filter made this query return nothing for
+/// exactly that shape, which silently disabled both consumers — the startup
+/// reattach pass and the remote-lease reconciler — so a remote worker that
+/// died was never reaped and its lease was never released. Liveness must be
+/// judged on the execution, never on the run row's status.
+#[test]
+fn list_live_remote_runs_includes_a_finished_run_row_whose_execution_is_live() {
+    let db = WorkDb::open(temp_db_path("live-remote-finished-run")).unwrap();
+    let remote_exec = start_run_on_host_for_test(&db, "zakalwe");
+    let run_id = db.list_live_remote_runs().unwrap()[0].run_id.clone();
+    db.set_run_remote_pid_for_execution(&remote_exec, 4242).unwrap();
+
+    // Exactly what the dispatch path does after a successful remote spawn:
+    // the run row completes, the execution parks live.
+    db.finish_execution_run(
+        FinishExecutionRunInput::builder()
+            .execution_id(&remote_exec)
+            .run_id(&run_id)
+            .execution_status(ExecutionStatus::Running)
+            .run_status("completed")
+            .clear_workspace_lease(false)
+            .build(),
+    )
+    .unwrap();
+
+    let runs = db.list_live_remote_runs().unwrap();
+    let handle = runs
+        .iter()
+        .find(|r| r.execution_id == remote_exec)
+        .expect("a live remote execution must still be listed once its dispatch run row completes");
+    assert_eq!(handle.run_id, run_id);
+    assert_eq!(handle.remote_pid, Some(4242), "the probe pid must ride along");
+}
+
+/// A resumed remote execution mints a fresh execution row, so one handle
+/// per execution is the shape every consumer expects. Pin it: the reconciler
+/// must never probe the same execution twice (it would double-reap) and must
+/// never see a stale run whose recorded pid another process may since have
+/// been assigned.
+#[test]
+fn list_live_remote_runs_returns_one_handle_per_execution() {
+    let db = WorkDb::open(temp_db_path("live-remote-one-per-exec")).unwrap();
+    let first = start_run_on_host_for_test(&db, "zakalwe");
+    let second = start_run_on_host_for_test(&db, "zakalwe");
+
+    let runs = db.list_live_remote_runs().unwrap();
+    for execution_id in [&first, &second] {
+        assert_eq!(
+            runs.iter().filter(|r| &r.execution_id == execution_id).count(),
+            1,
+            "expected exactly one handle for {execution_id}, got {runs:?}",
+        );
+    }
 }
 
 #[test]

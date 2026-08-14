@@ -40,10 +40,17 @@
 # `<workspace>/.boss/worker.log` so the engine can read recent output
 # on demand over the multiplex. The wrapper's own exit status reports
 # only *launch* success (0) or a sentinel config/toolchain failure
-# (78-81) — the worker's real lifecycle is driven by its hook events
+# (78-82) — the worker's real lifecycle is driven by its hook events
 # over the forwarded BOSS_EVENTS_SOCKET, not by this wrapper blocking.
 # The wrapper prints `boss-remote-run: starting … pid=<n>` to stderr so
 # the engine can record `work_runs.remote_pid`.
+#
+# NOTE: this wrapper launches `claude` unconditionally. The engine will
+# not dispatch a worker here whose resolved driver reports progress by
+# any other route — see `host_adapter::reject_unobservable_remote_driver`,
+# which fails such a spawn closed rather than shipping a settings file
+# whose hooks this script would never honour. Teaching the wrapper to
+# launch other drivers means relaxing that gate in step with it.
 #
 # --version: print the embedded BOSS_REMOTE_RUN_VERSION and exit 0.
 # Used by the engine for the lazy version-handshake at dispatch time.
@@ -99,6 +106,19 @@ fi
 if ! command -v gh >/dev/null 2>&1; then
     printf 'boss-remote-run: `gh` not found on PATH; install gh on this host\n' 1>&2
     exit 81  # documented sentinel: gh missing
+fi
+
+# boss-event is the ONLY channel by which anything this worker does
+# reaches the engine: the settings file wires every hook to it, and the
+# engine derives activity, transcript path, completion and PR capture
+# from that stream. It was previously unchecked, which made its absence
+# the quietest possible failure — the worker would run to completion and
+# the engine would see a run that never started, with no error anywhere.
+# Preflight it exactly like the others so a host missing the shim fails
+# at launch with a named reason instead of silently going dark.
+if ! command -v boss-event >/dev/null 2>&1; then
+    printf 'boss-remote-run: `boss-event` not found on PATH; the worker would run completely unobserved\n' 1>&2
+    exit 82  # documented sentinel: boss-event missing
 fi
 
 cd "$BOSS_WORKSPACE" || {

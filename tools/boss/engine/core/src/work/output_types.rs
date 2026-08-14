@@ -41,11 +41,12 @@ pub enum SetRunTranscriptPathOutcome {
 }
 
 /// One detached remote run returned by
-/// [`WorkDb::list_reattachable_remote_runs`]: an `active` `work_runs`
-/// row on a non-local host whose execution is still non-terminal. The
-/// engine's startup reattach pass (see [`crate::remote_reattach`])
+/// [`WorkDb::list_live_remote_runs`]: the latest `work_runs` row on a
+/// non-local host whose execution is still non-terminal. The engine's
+/// startup reattach pass (see [`crate::remote_reattach`])
 /// re-establishes the reverse events-socket forward for each of these
-/// so the still-running worker's hook stream reaches the new engine.
+/// so the still-running worker's hook stream reaches the new engine,
+/// and [`crate::remote_lease_reconcile`] probes each one's worker pid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteRunHandle {
     /// `work_runs.id` (`run_*`).

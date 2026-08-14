@@ -177,6 +177,45 @@ pub trait HostAdapter: Send + Sync {
     async fn probe_remote_worker_alive(&self, _remote_pid: i64) -> Result<Option<bool>> {
         Ok(None)
     }
+
+    /// Read the tail of the worker's own stdout/stderr log for the run in
+    /// `workspace_path` — the remote wrapper tees it to
+    /// `<workspace>/.boss/worker.log`.
+    ///
+    /// This is the only place a remote worker's *startup* failure is ever
+    /// written down. A worker that dies before its first hook produces no
+    /// events, no transcript, and no `Stop`, so every engine-side surface is
+    /// blank; meanwhile the actual cause — `Failed to authenticate. API
+    /// Error: 401 OAuth access token has expired.` in the case that motivated
+    /// this method — is sitting in that file, which the engine arranged to be
+    /// written and then never read. Callers that have positive evidence a
+    /// remote worker is gone pull this tail so the reason travels with the
+    /// reap instead of being lost with the workspace.
+    ///
+    /// `Ok(None)` means "not applicable" — the default and
+    /// [`LocalHostAdapter`], whose workers log to a local pane, which is
+    /// already directly readable. `Ok(Some(""))` means the log exists but is
+    /// empty (or was never created), which is itself informative and distinct
+    /// from `None`. An `Err` is a transport failure; it must never be
+    /// mistaken for "the worker exited cleanly", so callers surface it as an
+    /// unavailable log rather than an empty one.
+    async fn read_worker_log_tail(&self, _workspace_path: &str, _max_bytes: u64) -> Result<Option<String>> {
+        Ok(None)
+    }
+}
+
+/// How much of a dead remote worker's `worker.log` to pull. The interesting
+/// content is a startup failure — an auth error, a missing binary, a config
+/// rejection — which lands in the first few lines and is also the last thing
+/// in the file when the worker dies immediately. 4 KiB comfortably covers
+/// that while staying small enough to embed in an attention item's body.
+pub const WORKER_LOG_TAIL_BYTES: u64 = 4096;
+
+/// Absolute path of the remote worker log the wrapper tees stdout/stderr to
+/// (`<workspace>/.boss/worker.log`). Shared by every consumer that pulls or
+/// cites that file so relocating it is a one-line change.
+pub fn remote_worker_log_path(workspace_path: &str) -> String {
+    format!("{}/.boss/worker.log", workspace_path.trim_end_matches('/'))
 }
 
 // ── LocalHostAdapter ──────────────────────────────────────────────────────────
@@ -754,6 +793,18 @@ impl HostAdapter for SshHostAdapter {
         let driver = crate::driver::DriverRegistry::default()
             .require(&spawn_config.driver)
             .map_err(|err| anyhow::anyhow!("remote spawn: {err}"))?;
+        // Fail closed on a driver the remote path cannot observe. The remote
+        // spawn ships exactly one observability channel — this settings
+        // file, whose `boss-event` hooks tunnel back over the reverse
+        // events socket — and the wrapper unconditionally execs `claude`. A
+        // driver that reports progress as a byte stream instead renders an
+        // EMPTY hooks map here, so the worker would launch and then be
+        // completely invisible: no live-status entry, no transcript path,
+        // no `Stop`, therefore no completion and no PR, with nothing in the
+        // dispatch timeline to say why. That is not hypothetical — a
+        // settings file containing exactly `"hooks": {}` was recovered from
+        // a remote host after this shipped. Refuse the spawn instead.
+        reject_unobservable_remote_driver(driver.as_ref(), &spawn_config.driver, &settings_input, &host)?;
         let settings_json = render_remote_settings_json(&settings_input, driver.as_ref());
 
         // 5. Ship the prompt + settings to the remote. The prompt lives
@@ -883,6 +934,16 @@ impl HostAdapter for SshHostAdapter {
         Ok(true)
     }
 
+    async fn read_worker_log_tail(&self, workspace_path: &str, max_bytes: u64) -> Result<Option<String>> {
+        // The wrapper tees the worker's stdout+stderr here; reuse the same
+        // byte-suffix pull the transcript readback uses (it already maps a
+        // missing file to an empty string and surfaces real transport
+        // failures) rather than adding a second remote-tail implementation.
+        let path = remote_worker_log_path(workspace_path);
+        let content = crate::remote_transcript::pull_remote_transcript_tail(&self.transport, &path, max_bytes).await?;
+        Ok(Some(content))
+    }
+
     async fn probe_remote_worker_alive(&self, remote_pid: i64) -> Result<Option<bool>> {
         // Reuse the same `kill -0` probe the spawn-time liveness ack uses,
         // with no settle (the worker has been running a while). Maps the
@@ -892,6 +953,90 @@ impl HostAdapter for SshHostAdapter {
         // look like proof of death).
         let alive = crate::ssh_spawn::probe_worker_liveness(&self.transport, remote_pid, 0).await?;
         Ok(Some(alive))
+    }
+}
+
+// ── HostAdapterCubeClient ─────────────────────────────────────────────────────
+
+/// Presents a [`HostAdapter`]'s cube half as a [`CubeClient`].
+///
+/// [`HostAdapter`] already declares every method [`CubeClient`] requires —
+/// the trait was carved so that "which cube owns this workspace" is a
+/// property of the host, not a global. But the engine's lease bookkeeping
+/// predates host routing and is written against `&dyn CubeClient`
+/// throughout ([`crate::cube_lease_heartbeat`],
+/// [`crate::run_reconcile::confirm_execution_dead`]). This newtype is the
+/// adapter between the two, so a caller that has resolved the *owning*
+/// host can hand its cube to that existing code unchanged instead of
+/// silently falling back to the engine's own local cube.
+///
+/// Every method is a straight delegation — there is no `unimplemented!()`
+/// arm and no behaviour of its own, which is what makes the substitution
+/// safe: code that receives one of these cannot tell it apart from the
+/// local `CommandCubeClient` except by which machine answers.
+pub struct HostAdapterCubeClient {
+    adapter: Arc<dyn HostAdapter>,
+}
+
+impl HostAdapterCubeClient {
+    pub fn new(adapter: Arc<dyn HostAdapter>) -> Self {
+        Self { adapter }
+    }
+}
+
+#[async_trait]
+impl CubeClient for HostAdapterCubeClient {
+    async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle> {
+        self.adapter.ensure_repo(origin).await
+    }
+
+    async fn lease_workspace(
+        &self,
+        repo_id: &str,
+        task: &str,
+        prefer_workspace_id: Option<&str>,
+        allow_dirty: bool,
+        exclude_workspace_ids: &[&str],
+    ) -> Result<CubeWorkspaceLease> {
+        self.adapter
+            .lease_workspace(repo_id, task, prefer_workspace_id, allow_dirty, exclude_workspace_ids)
+            .await
+    }
+
+    async fn create_change(&self, workspace_path: &Path, title: &str) -> Result<CubeChangeHandle> {
+        self.adapter.create_change(workspace_path, title).await
+    }
+
+    async fn goto_workspace(&self, workspace_path: &Path, pr: u64) -> Result<()> {
+        self.adapter.goto_workspace(workspace_path, pr).await
+    }
+
+    async fn release_workspace(&self, lease_id: &str) -> Result<()> {
+        self.adapter.release_workspace(lease_id).await
+    }
+
+    async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus> {
+        self.adapter.workspace_status(workspace_path).await
+    }
+
+    async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()> {
+        self.adapter.heartbeat_lease(lease_id, ttl_seconds).await
+    }
+
+    async fn force_release_lease(&self, lease_id: &str, reason: Option<&str>) -> Result<()> {
+        self.adapter.force_release_lease(lease_id, reason).await
+    }
+
+    async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
+        self.adapter.list_workspaces().await
+    }
+
+    async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
+        self.adapter.list_repos().await
+    }
+
+    fn command_repr(&self, args: &[&str]) -> Option<(String, String)> {
+        self.adapter.command_repr(args)
     }
 }
 
@@ -1021,9 +1166,9 @@ impl HostAdapterProvider for SshHostAdapterProvider {
 /// remote dispatch — answer agents are local-only until the remote wrapper
 /// learns to honour a restricted permission mode.
 ///
-/// No path dispatches answer agents remotely today (the spawn trigger ships in
-/// P3b); this is a defensive backstop so the security property holds regardless
-/// of how dispatch/scheduling evolves.
+/// No path dispatches answer agents remotely today (no remote answer-agent
+/// dispatch path exists yet); this is a defensive backstop so the security
+/// property holds regardless of how dispatch/scheduling evolves.
 fn reject_remote_answer_agent(kind: &ExecutionKind, host: &str) -> Result<()> {
     if *kind == ExecutionKind::AnswerAgent {
         bail!(
@@ -1035,9 +1180,118 @@ fn reject_remote_answer_agent(kind: &ExecutionKind, host: &str) -> Result<()> {
     Ok(())
 }
 
+/// Failure-reason taxonomy string for a driver the remote path cannot
+/// observe. Named alongside the wrapper's own sentinels
+/// (`host_missing_claude`, …) so it reads as one family in
+/// `hosts.last_error_text` and the dispatch stream.
+pub const REASON_HOST_DRIVER_UNSUPPORTED: &str = "host_driver_unsupported";
+
+/// Refuse a remote spawn whose resolved driver would produce no
+/// engine-visible progress.
+///
+/// The remote worker's ENTIRE lifecycle — activity, transcript path,
+/// completion, PR capture — is driven by `boss-event` hook deliveries over
+/// the reverse events socket, wired through the `--settings` file this
+/// adapter ships. A driver whose ingress is a byte stream (`StdoutJsonl` /
+/// `AgentJsonlFile`) declares no such hooks, and the engine has no reader
+/// for its stream on another machine; on top of that the wrapper
+/// (`remote/boss-remote-run.sh`) launches `claude` no matter which driver
+/// was resolved, so the settings shipped and the binary run would not even
+/// describe the same agent.
+///
+/// Failing loudly here converts a worker that would run silently to no
+/// effect into a spawn error the dispatcher can attribute and re-route.
+/// Checked on the driver's declared capability rather than its slug, so a
+/// future driver that DOES wire hooks into the settings file passes without
+/// this gate needing to learn its name.
+fn reject_unobservable_remote_driver(
+    driver: &dyn crate::driver::AgentDriver,
+    driver_slug: &str,
+    settings_input: &WorkerSetupInput,
+    host: &str,
+) -> Result<()> {
+    if crate::worker_setup::driver_reports_progress_via_worker_settings(driver, settings_input) {
+        return Ok(());
+    }
+    bail!(
+        "{REASON_HOST_DRIVER_UNSUPPORTED} on host {host}: driver `{driver_slug}` reports progress as a byte stream \
+         rather than hooks in the worker settings file, so a remote worker running it would emit no events the \
+         engine can see (no live status, no transcript path, no Stop, therefore no PR) — and the remote wrapper \
+         launches `claude` regardless of the resolved driver. Refusing to spawn an unobservable remote worker."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `WorkerSetupInput` shaped like the one the remote spawn builds.
+    /// Only the fields `progress_observation_wiring` reads matter here.
+    fn remote_settings_input() -> WorkerSetupInput {
+        WorkerSetupInput {
+            run_id: "exec_1".to_owned(),
+            lease_id: "lease-1".to_owned(),
+            workspace_path: PathBuf::from("/remote/ws"),
+            events_socket_path: PathBuf::from("/tmp/boss-events-exec_1.sock"),
+            boss_event_path: PathBuf::from(REMOTE_BOSS_EVENT_BIN),
+            draft_pr_mode: false,
+            execution_kind: "chore_implementation".to_owned(),
+            task_kind: None,
+            worker_kind: crate::worker_setup::WorkerKind::Standard,
+        }
+    }
+
+    /// A driver whose hooks land in the worker settings file is exactly what
+    /// the remote path ships and reads back, so it passes the gate.
+    #[test]
+    fn hook_wiring_driver_is_accepted_for_remote_spawn() {
+        assert!(
+            reject_unobservable_remote_driver(
+                &crate::driver::ClaudeDriver,
+                "claude",
+                &remote_settings_input(),
+                "anaplian",
+            )
+            .is_ok(),
+        );
+    }
+
+    /// A byte-stream driver renders `"hooks": {}` into the settings file the
+    /// remote worker is launched with, and the engine has no reader for its
+    /// stream on another machine — so the worker would be completely
+    /// invisible: no live status, no transcript path, no `Stop`, no PR. A
+    /// settings file containing exactly that empty hooks map was recovered
+    /// from a remote host, which is how this gate came to exist. Refuse the
+    /// spawn rather than launch a worker nothing can observe.
+    #[test]
+    fn byte_stream_drivers_are_refused_for_remote_spawn() {
+        let input = remote_settings_input();
+        for (driver, slug) in [
+            (
+                Arc::new(crate::driver::CodexDriver::default()) as Arc<dyn crate::driver::AgentDriver>,
+                "codex",
+            ),
+            (
+                Arc::new(crate::driver::GrokDriver::default()) as Arc<dyn crate::driver::AgentDriver>,
+                "grok",
+            ),
+        ] {
+            // Guard the premise: if a driver ever starts wiring hooks into
+            // the settings file, this test should stop asserting a refusal
+            // rather than silently pin stale behaviour.
+            if crate::worker_setup::driver_reports_progress_via_worker_settings(driver.as_ref(), &input) {
+                continue;
+            }
+            let err = reject_unobservable_remote_driver(driver.as_ref(), slug, &input, "anaplian")
+                .expect_err("a driver with no settings-file hooks must not spawn remotely");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains(REASON_HOST_DRIVER_UNSUPPORTED),
+                "failure must carry the taxonomy reason, got: {message}",
+            );
+            assert!(message.contains(slug), "failure must name the driver, got: {message}");
+        }
+    }
 
     #[test]
     fn reject_remote_answer_agent_blocks_answer_agent_allows_others() {
