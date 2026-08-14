@@ -48,6 +48,34 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
     let FrontendRequest::RequestExecution { input } = req else {
         unreachable!()
     };
+    // Host pin admission, ahead of *both* dispatch paths below and ahead
+    // of every DB write. An operator naming `--host` is testing that host,
+    // so an unusable one must refuse loudly here rather than mint a `ready`
+    // row that quietly waits (or, worse, lands elsewhere). Refusing before
+    // anything is created is what leaves no queued residue behind — see
+    // `crate::host_pin`.
+    if let Some(host_id) = input.pinned_host_id.as_deref() {
+        match crate::host_pin::validate_host_pin(work_db.as_ref(), host_id) {
+            Ok(Ok(())) => {}
+            Ok(Err(refusal)) => {
+                tracing::warn!(
+                    work_item_id = %input.work_item_id,
+                    host_id = %host_id,
+                    "RequestExecution refused: host pin is not dispatchable — {refusal}",
+                );
+                send_work_error(&sink, &request_id, format!("cannot pin to host: {refusal}"));
+                return;
+            }
+            Err(err) => {
+                send_work_error(
+                    &sink,
+                    &request_id,
+                    format!("cannot pin to host '{host_id}': reading the host registry failed: {err:#}"),
+                );
+                return;
+            }
+        }
+    }
     if input.bypass_dispatch_pause {
         // Pause-only forced dispatch (`bossctl work start --force`, or a
         // confirmed app-drag going through `MoveWorkItemOnBoard` instead

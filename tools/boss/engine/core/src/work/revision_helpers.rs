@@ -902,6 +902,7 @@ pub(crate) fn insert_execution(conn: &Connection, input: CreateExecutionInput) -
     let prefer_is_soft: i64 = if input.prefer_is_soft { 1 } else { 0 };
     let allow_dirty: i64 = if input.allow_dirty { 1 } else { 0 };
     let pr_url = normalize_optional_text(input.pr_url);
+    let pinned_host_id = normalize_optional_text(input.pinned_host_id);
     // Freeze the owning product's worker branch prefix onto the execution row,
     // mirroring `repo_remote_url`. Kept for backward compatibility.
     let worker_branch_prefix = resolve_execution_worker_branch_prefix(conn, &input.work_item_id)?;
@@ -916,8 +917,8 @@ pub(crate) fn insert_execution(conn: &Connection, input: CreateExecutionInput) -
             id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
             cube_workspace_id, workspace_path, priority, preferred_workspace_id,
             created_at, started_at, finished_at, prefer_is_soft, pr_url, worker_branch_prefix,
-            allow_dirty, branch_naming
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+            allow_dirty, branch_naming, pinned_host_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         params![
             id,
             input.work_item_id,
@@ -938,6 +939,7 @@ pub(crate) fn insert_execution(conn: &Connection, input: CreateExecutionInput) -
             worker_branch_prefix,
             allow_dirty,
             branch_naming_json,
+            pinned_host_id,
         ],
     )?;
 

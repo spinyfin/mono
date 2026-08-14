@@ -334,6 +334,30 @@ rust_test(
 )
 
 rust_test(
+    name = "host_pin_e2e_test",
+    size = "small",
+    timeout = "moderate",
+    srcs = [
+        "tests/common/mod.rs",
+        "tests/host_pin_e2e.rs",
+    ],
+    crate_root = "tests/host_pin_e2e.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":engine_lib",
+        "//tools/boss/client",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
     name = "pause_bypass_e2e_test",
     size = "small",
     timeout = "moderate",

@@ -39,7 +39,6 @@ checks:
         # these files are now flagged. host_adapter.rs, settings.rs, and worker_registry.rs
         # were dropped from exclude_globs without replacement — they have zero current
         # violations (the structs that earned the exclude have since been migrated/removed).
-        - bossctl/src/main.rs::MetricRow
         - client/src/lib.rs::Discovery
         - engine/core/src/audit.rs::StartContext
         - github_tracker/src/lib.rs::UpstreamItem

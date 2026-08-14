@@ -1003,9 +1003,11 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         entry_point: _,
         observed_pause_since_epoch_s: _,
         allow_dirty,
+        pinned_host_id,
     } = input;
 
     let preferred_workspace_id = normalize_optional_text(preferred_workspace_id);
+    let pinned_host_id = normalize_optional_text(pinned_host_id);
     let kind = execution_kind_for_work_item(conn, &work_item_id)?;
 
     // Refuse explicit dispatch against a status that can't accept one
@@ -1245,6 +1247,24 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
             // live-status row (see `request_execution_marks_existing_stale_when_no_live_worker`).
             let never_dispatched = existing.status.can_reconcile() && query_latest_run(conn, &existing.id)?.is_none();
             if never_dispatched || is_live(&existing.id) {
+                // A host pin is a placement instruction, and placement for
+                // an execution a worker is already attached to was decided
+                // when it spawned. Silently returning that row would tell
+                // the operator "started on <host>" when nothing of the sort
+                // happened — the exact confusion `--host` exists to remove
+                // — so refuse instead. The never-dispatched row below has
+                // made no placement decision yet, so the pin still applies
+                // there.
+                if let (Some(pin), false) = (pinned_host_id.as_deref(), never_dispatched) {
+                    bail!(
+                        "cannot pin {work_item_id} to host '{pin}': execution {} is already live \
+                         (`{}`) — its host was chosen when it spawned and cannot be changed. \
+                         Stop it with `bossctl agents stop {}` first, then re-run with --host.",
+                        existing.id,
+                        existing.status,
+                        existing.id,
+                    );
+                }
                 let (decision, message) = if never_dispatched {
                     (
                         "reuse_never_dispatched",
@@ -1274,13 +1294,24 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
                 };
                 let next_priority = priority.unwrap_or(existing.priority);
                 let next_preferred = preferred_workspace_id.clone().or(existing.preferred_workspace_id);
+                // Only a pin supplied by *this* request rewrites the
+                // column; an unpinned request leaves whatever the row
+                // already carries alone, so re-dispatching without --host
+                // never silently clears a pin someone set deliberately.
                 conn.execute(
                     "UPDATE work_executions
                      SET status = ?2,
                          priority = ?3,
-                         preferred_workspace_id = ?4
+                         preferred_workspace_id = ?4,
+                         pinned_host_id = COALESCE(?5, pinned_host_id)
                      WHERE id = ?1",
-                    params![existing.id, next_status.as_str(), next_priority, next_preferred],
+                    params![
+                        existing.id,
+                        next_status.as_str(),
+                        next_priority,
+                        next_preferred,
+                        pinned_host_id
+                    ],
                 )?;
                 return query_execution(conn, &existing.id).require("execution", &existing.id);
             } else if existing.kind == ExecutionKind::CiRemediation {
@@ -1355,9 +1386,10 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
                          cube_workspace_id      = NULL,
                          workspace_path         = NULL,
                          preferred_workspace_id = ?2,
+                         pinned_host_id         = COALESCE(?3, pinned_host_id),
                          finished_at            = NULL
                      WHERE id = ?1",
-                    params![existing.id, preferred],
+                    params![existing.id, preferred, pinned_host_id],
                 )?;
                 tracing::info!(
                     work_item_id = %work_item_id,
@@ -1434,6 +1466,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
             .maybe_priority(priority)
             .maybe_preferred_workspace_id(preferred_workspace_id)
             .maybe_pr_url(revision_pr_url)
+            .maybe_pinned_host_id(pinned_host_id)
             .allow_dirty(allow_dirty)
             .build(),
     )
