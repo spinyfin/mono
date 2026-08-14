@@ -374,15 +374,10 @@ async fn re_registering_a_host_converges_on_the_latest_discovery() {
     );
 }
 
-// ── Auto-disable on provisioning failure ─────────────────────────────────────
-
 #[tokio::test]
 async fn add_host_success_stamps_last_seen_and_reports_no_error() {
-    // A successful provision is a real contact with the host. The HostResult
-    // the app (and bossctl's re-read after `hosts add` / `hosts probe`)
-    // renders must show that contact: last_seen stamped, last_error cleared.
-    // Regression for the bug where only last_error was cleared and the
-    // printed summary still carried a pre-contact last_seen / stale error.
+    // The returned snapshot represents the successful contact that just
+    // completed: last_seen is stamped and last_error is clear.
     let (state, _dir) = test_server_state();
 
     let added = expect_host_result(
@@ -413,6 +408,8 @@ async fn add_host_success_stamps_last_seen_and_reports_no_error() {
         ],
     );
 }
+
+// ── Auto-disable on provisioning failure ─────────────────────────────────────
 
 #[tokio::test]
 async fn add_host_disables_a_host_whose_remote_provisioning_fails() {

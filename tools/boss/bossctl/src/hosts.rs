@@ -3,7 +3,9 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use boss_engine::host_provisioning::{RemoteProvisionOutcome, provision_remote_host};
 use boss_engine::host_registry::{Host, HostCapability};
+use boss_engine::remote_wrapper::expected_version;
 use boss_engine::work::WorkDb;
 
 use crate::open_state_db;
@@ -23,7 +25,7 @@ pub(crate) async fn hosts_add(
     let push_outcome = if skip_wrapper_push {
         None
     } else {
-        Some(eager_push_wrapper(&db, &host.id, &ssh_target).await)
+        Some(eager_push_wrapper(&db, &host.id, &ssh_target, &SshHostProvisioner).await)
     };
 
     let host = db.get_host(&host.id)?.context("host disappeared after registration")?;
@@ -86,19 +88,32 @@ enum EagerPushOutcome {
 /// engine's `AddHost` RPC, so registering a host through the CLI and
 /// through the app cannot diverge. This function only maps the outcome to
 /// the CLI's reporting shape and performs the DB writes it implies.
-async fn eager_push_wrapper(db: &WorkDb, host_id: &str, ssh_target: &str) -> EagerPushOutcome {
-    use boss_engine::host_provisioning::{RemoteProvisionOutcome, provision_remote_host};
-    use boss_engine::remote_wrapper::expected_version;
+#[async_trait::async_trait]
+trait HostProvisioner: Send + Sync {
+    async fn provision(&self, host_id: &str, ssh_target: &str) -> RemoteProvisionOutcome;
+}
 
-    match provision_remote_host(host_id, ssh_target).await {
+struct SshHostProvisioner;
+
+#[async_trait::async_trait]
+impl HostProvisioner for SshHostProvisioner {
+    async fn provision(&self, host_id: &str, ssh_target: &str) -> RemoteProvisionOutcome {
+        provision_remote_host(host_id, ssh_target).await
+    }
+}
+
+async fn eager_push_wrapper(
+    db: &WorkDb,
+    host_id: &str,
+    ssh_target: &str,
+    provisioner: &dyn HostProvisioner,
+) -> EagerPushOutcome {
+    match provisioner.provision(host_id, ssh_target).await {
         RemoteProvisionOutcome::Ok { capabilities } => {
-            // Stamp last_seen_at, clear last_error_text, and reset the
-            // health counter. set_host_last_error(None) alone only cleared
-            // the error column — a successful probe then printed a summary
-            // whose last_seen still predated the contact (and any stale
-            // consecutive_failures stayed put). Same write the dispatch
-            // path uses after a healthy cube call.
-            if let Err(err) = db.record_host_dispatch_success(host_id) {
+            // A successful provision is a real contact with the host, so
+            // record the complete healthy state before callers re-read the
+            // row to render their summary.
+            if let Err(err) = db.record_host_contact_success(host_id) {
                 eprintln!("bossctl: warning: failed to record successful contact for {host_id}: {err:#}");
             }
             if let Err(err) = db.replace_auto_host_capabilities(host_id, &capabilities) {
@@ -123,21 +138,30 @@ async fn eager_push_wrapper(db: &WorkDb, host_id: &str, ssh_target: &str) -> Eag
     }
 }
 
-/// Re-run provisioning and discovery for an existing remote host.
-pub(crate) async fn hosts_probe(json: bool, state_root: Option<PathBuf>, id: String) -> Result<()> {
-    let db = open_state_db(state_root)?;
-    let host = db.get_host(&id)?.context("host not found")?;
+async fn probe_host_with(
+    db: &WorkDb,
+    id: &str,
+    provisioner: &dyn HostProvisioner,
+) -> Result<(EagerPushOutcome, Host, Vec<HostCapability>)> {
+    let host = db.get_host(id)?.context("host not found")?;
     let ssh_target = host
         .ssh_target
         .as_deref()
         .context("the built-in local host does not need remote probing")?;
 
-    let outcome = eager_push_wrapper(&db, &id, ssh_target).await;
+    let outcome = eager_push_wrapper(db, id, ssh_target, provisioner).await;
     if matches!(outcome, EagerPushOutcome::Ok { .. }) {
-        db.set_host_enabled(&id, true)?;
+        db.set_host_enabled(id, true)?;
     }
-    let host = db.get_host(&id)?.context("host disappeared after probe")?;
-    let caps = db.list_host_capabilities(&id)?;
+    let host = db.get_host(id)?.context("host disappeared after probe")?;
+    let caps = db.list_host_capabilities(id)?;
+    Ok((outcome, host, caps))
+}
+
+/// Re-run provisioning and discovery for an existing remote host.
+pub(crate) async fn hosts_probe(json: bool, state_root: Option<PathBuf>, id: String) -> Result<()> {
+    let db = open_state_db(state_root)?;
+    let (outcome, host, caps) = probe_host_with(&db, &id, &SshHostProvisioner).await?;
     if json {
         let mut obj = host_to_json(&host, &caps);
         obj["wrapper_push"] = serde_json::to_value(&outcome).unwrap_or(serde_json::Value::Null);
@@ -342,6 +366,17 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    struct SuccessProvisioner;
+
+    #[async_trait::async_trait]
+    impl HostProvisioner for SuccessProvisioner {
+        async fn provision(&self, _host_id: &str, _ssh_target: &str) -> RemoteProvisionOutcome {
+            RemoteProvisionOutcome::Ok {
+                capabilities: vec!["os=macos".to_owned(), "arch=arm64".to_owned()],
+            }
+        }
+    }
+
     /// Build a `Host` fixture. Callers override the fields that matter to
     /// each test (ssh_target, last_seen_at, last_error_text,
     /// consecutive_failures, enabled) so the formatting/serialization
@@ -365,6 +400,31 @@ mod tests {
             capability: capability.to_owned(),
             source: source.to_owned(),
         }
+    }
+
+    #[tokio::test]
+    async fn probe_re_reads_healthy_host_after_successful_provision() {
+        let db = WorkDb::open(":memory:".into()).unwrap();
+        db.add_host("anaplian", "user@anaplian", 3, &[]).unwrap();
+        db.record_host_dispatch_failure("anaplian", "prior connection failure")
+            .unwrap();
+
+        let (outcome, host, caps) = probe_host_with(&db, "anaplian", &SuccessProvisioner).await.unwrap();
+
+        assert!(matches!(outcome, EagerPushOutcome::Ok { .. }));
+        assert!(host.enabled);
+        assert!(host.last_seen_at.is_some());
+        assert_eq!(host.last_error_text, None);
+        assert_eq!(host.consecutive_failures, 0);
+        assert_eq!(
+            caps.into_iter()
+                .map(|cap| (cap.capability, cap.source))
+                .collect::<Vec<_>>(),
+            vec![
+                ("arch=arm64".to_owned(), "auto".to_owned()),
+                ("os=macos".to_owned(), "auto".to_owned()),
+            ],
+        );
     }
 
     // ---- host_to_json ------------------------------------------------------

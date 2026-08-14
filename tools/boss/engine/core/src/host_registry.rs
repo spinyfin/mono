@@ -446,7 +446,7 @@ impl WorkDb {
     /// Does not touch `enabled` — re-enabling a host the operator (or a
     /// prior auto-disable) turned off is an explicit `set_host_enabled`
     /// action, not an implicit side-effect of one successful call.
-    pub fn record_host_dispatch_success(&self, id: &str) -> Result<()> {
+    pub fn record_host_contact_success(&self, id: &str) -> Result<()> {
         let conn = self.connect()?;
         let now = now_epoch_string();
         conn.execute(
@@ -1001,13 +1001,13 @@ mod tests {
     }
 
     #[test]
-    fn record_host_dispatch_success_resets_counter_and_clears_error() {
+    fn record_host_contact_success_resets_counter_and_clears_error() {
         let db = open_db();
         db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
         db.record_host_dispatch_failure("zakalwe", "transient blip").unwrap();
         assert_eq!(db.get_host("zakalwe").unwrap().unwrap().consecutive_failures, 1);
 
-        db.record_host_dispatch_success("zakalwe").unwrap();
+        db.record_host_contact_success("zakalwe").unwrap();
 
         let host = db.get_host("zakalwe").unwrap().unwrap();
         assert_eq!(host.consecutive_failures, 0);
@@ -1015,14 +1015,11 @@ mod tests {
         assert!(host.last_seen_at.is_some());
     }
 
-    /// Registration / `hosts probe` success must leave the row the
-    /// operator reads next fully healthy — clear `last_error_text` *and*
-    /// stamp `last_seen_at`. The old Ok arm called
-    /// `set_host_last_error(None)`, which left `last_seen_at` at the
-    /// pre-contact value, so `bossctl hosts probe` printed a healthy first
-    /// line over a summary still carrying the failed probe.
+    /// Registration / `hosts probe` success leaves the row the operator
+    /// reads next fully healthy: it clears `last_error_text`, stamps
+    /// `last_seen_at`, and resets the failure counter.
     #[test]
-    fn record_host_dispatch_success_heals_row_after_stale_failure() {
+    fn record_host_contact_success_heals_row_after_stale_failure() {
         let db = open_db();
         db.add_host("anaplian", "user@a", 3, &[]).unwrap();
         db.record_host_dispatch_failure("anaplian", "opening ssh control master: could not resolve hostname")
@@ -1035,7 +1032,7 @@ mod tests {
         assert!(before.last_seen_at.is_some());
         assert_eq!(before.consecutive_failures, 1);
 
-        db.record_host_dispatch_success("anaplian").unwrap();
+        db.record_host_contact_success("anaplian").unwrap();
 
         let after = db.get_host("anaplian").unwrap().unwrap();
         assert_eq!(after.last_error_text, None, "success must clear last_error_text");
@@ -1047,9 +1044,8 @@ mod tests {
     }
 
     /// Clearing only the error column is not a successful-contact write:
-    /// last_seen stays put. Documents why provision Ok uses
-    /// [`WorkDb::record_host_dispatch_success`] rather than
-    /// [`WorkDb::set_host_last_error`]`(None)`.
+    /// `last_seen_at` stays put, unlike
+    /// [`WorkDb::record_host_contact_success`].
     #[test]
     fn set_host_last_error_none_does_not_stamp_last_seen() {
         let db = open_db();
@@ -1068,12 +1064,12 @@ mod tests {
     }
 
     #[test]
-    fn record_host_dispatch_success_does_not_re_enable_a_disabled_host() {
+    fn record_host_contact_success_does_not_re_enable_a_disabled_host() {
         let db = open_db();
         db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
         db.set_host_enabled("zakalwe", false).unwrap();
 
-        db.record_host_dispatch_success("zakalwe").unwrap();
+        db.record_host_contact_success("zakalwe").unwrap();
 
         assert!(
             !db.get_host("zakalwe").unwrap().unwrap().enabled,

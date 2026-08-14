@@ -416,7 +416,7 @@ impl SshHostAdapter {
     /// cube invocation. Best-effort, same rationale as
     /// `record_host_health_failure`.
     fn record_host_health_success(&self) {
-        if let Err(err) = self.work_db.record_host_dispatch_success(&self.transport.host_id) {
+        if let Err(err) = self.work_db.record_host_contact_success(&self.transport.host_id) {
             tracing::warn!(
                 host_id = %self.transport.host_id,
                 ?err,

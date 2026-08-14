@@ -301,13 +301,11 @@ fn apply_provision_outcome(work_db: &crate::work::WorkDb, host_id: &str, outcome
     match outcome {
         ProvisionOutcome::Skipped => {}
         ProvisionOutcome::Ok { capabilities } => {
-            // Stamp last_seen_at, clear last_error_text, reset consecutive
-            // failures. Clearing only last_error (the previous write) left
-            // last_seen stale, so the HostResult / bossctl summary printed
-            // after a successful contact still looked unhealthy. Reuse the
-            // same health write the dispatch path uses after a good cube call
-            // — shared with `bossctl hosts add` / `hosts probe`.
-            if let Err(err) = work_db.record_host_dispatch_success(host_id) {
+            // A successful provision is a real contact: record it exactly as
+            // the dispatch path records a healthy cube call. The caller
+            // re-reads the row to build its reply, so this makes the AddHost
+            // reply and CLI provisioning output report the contact just made.
+            if let Err(err) = work_db.record_host_contact_success(host_id) {
                 tracing::warn!(host_id, ?err, "add_host: failed to record successful contact");
             }
             if let Err(err) = work_db.replace_auto_host_capabilities(host_id, &capabilities) {
