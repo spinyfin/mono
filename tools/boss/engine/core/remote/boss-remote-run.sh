@@ -43,7 +43,7 @@
 # (78-82) — the worker's real lifecycle is driven by its hook events
 # over the forwarded BOSS_EVENTS_SOCKET, not by this wrapper blocking.
 # The wrapper prints `boss-remote-run: starting … pid=<n>` to stderr so
-# the engine can record `work_runs.remote_pid`.
+# the engine can record the direct worker PID in `work_runs.remote_pid`.
 #
 # NOTE: this wrapper launches `claude` unconditionally. The engine will
 # not dispatch a worker here whose resolved driver reports progress by
@@ -138,12 +138,17 @@ export BOSS_WORKSPACE
 export BOSS_REPO_REMOTE_URL="${BOSS_REPO_REMOTE_URL:-}"
 
 # Per-run scratch + log dir under the cube workspace. The engine pulls
-# tails of worker.log over the SSH multiplex on demand (a later phase)
-# so remote runs get the same recent-output surface as local panes —
-# without a second reverse channel.
+# tails of worker.log over the SSH multiplex on demand so remote runs
+# get the same recent-output surface as local panes — without a second
+# reverse channel. The detached supervisor appends the worker's exit
+# status after `claude` stops, letting the engine report an observed
+# status instead of guessing why the worker disappeared.
 boss_run_dir="$BOSS_WORKSPACE/.boss"
 mkdir -p "$boss_run_dir" 2>/dev/null || true
 worker_log="$boss_run_dir/worker.log"
+worker_pid_file="$boss_run_dir/worker.pid"
+rm -f "$worker_pid_file"
+export BOSS_WORKER_PID_FILE="$worker_pid_file"
 
 # Resolve the initial prompt. A file (BOSS_INITIAL_INPUT_FILE) is the
 # engine's preferred channel; an inline value is the fallback. Claude
@@ -170,19 +175,56 @@ if [ -n "${BOSS_SETTINGS_FILE:-}" ] && [ -f "$BOSS_SETTINGS_FILE" ]; then
 fi
 
 # Launch DETACHED so the worker survives the engine restarting and the
-# launching SSH session closing: `nohup` makes it ignore the SIGHUP the
-# remote sshd sends on session teardown, and backgrounding reparents it
-# off this wrapper. stdin is taken from /dev/null (the prompt rides the
-# positional arg) and stdout+stderr are teed to the per-run log. The
-# wrapper returns immediately; the worker keeps running.
+# launching SSH session closing: `nohup` makes the supervisor and worker
+# ignore the SIGHUP the remote sshd sends on session teardown, and
+# backgrounding reparents the supervisor off this wrapper. The supervisor
+# writes its direct Claude child PID before waiting for that child and
+# appending its observed exit status to the same log. stdin is taken from
+# /dev/null (the prompt rides the positional arg) and stdout+stderr are
+# teed to the per-run log. The wrapper returns once it has the worker PID;
+# the supervisor keeps running while the worker does.
 if [ -n "$initial_input" ]; then
-    nohup claude --dangerously-skip-permissions "$@" "$initial_input" \
-        >"$worker_log" 2>&1 </dev/null &
+    nohup sh -c '
+        nohup claude --dangerously-skip-permissions "$@" &
+        worker_pid=$!
+        printf "%s\\n" "$worker_pid" > "$BOSS_WORKER_PID_FILE"
+        wait "$worker_pid"
+        worker_status=$?
+        printf "\\nboss-remote-run: worker exited with status=%s\\n" "$worker_status"
+    ' boss-remote-worker "$@" "$initial_input" >"$worker_log" 2>&1 </dev/null &
 else
-    nohup claude --dangerously-skip-permissions "$@" \
-        >"$worker_log" 2>&1 </dev/null &
+    nohup sh -c '
+        nohup claude --dangerously-skip-permissions "$@" &
+        worker_pid=$!
+        printf "%s\\n" "$worker_pid" > "$BOSS_WORKER_PID_FILE"
+        wait "$worker_pid"
+        worker_status=$?
+        printf "\\nboss-remote-run: worker exited with status=%s\\n" "$worker_status"
+    ' boss-remote-worker "$@" >"$worker_log" 2>&1 </dev/null &
 fi
-worker_pid=$!
+supervisor_pid=$!
+
+# The supervisor starts asynchronously, so wait a short bounded interval for
+# it to publish the direct worker PID. Do not report the supervisor PID:
+# remote_pid drives both liveness reconciliation and control-channel signals.
+attempt=0
+while [ ! -s "$worker_pid_file" ] && [ "$attempt" -lt 50 ]; do
+    sleep 0.1
+    attempt=$((attempt + 1))
+done
+if [ ! -s "$worker_pid_file" ]; then
+    printf 'boss-remote-run: worker supervisor did not publish a pid\n' 1>&2
+    kill "$supervisor_pid" 2>/dev/null || true
+    exit 78
+fi
+worker_pid="$(cat "$worker_pid_file")"
+case "$worker_pid" in
+    *[!0-9]*|'')
+        printf 'boss-remote-run: worker supervisor published an invalid pid\n' 1>&2
+        kill "$supervisor_pid" 2>/dev/null || true
+        exit 78
+        ;;
+esac
 
 # Echo the embedded version + worker pid so the engine sees the wrapper
 # that actually ran (separate from --version, a probe-only path) and can

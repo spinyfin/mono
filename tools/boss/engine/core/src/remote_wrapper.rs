@@ -80,6 +80,7 @@ pub fn remote_wrapper_path() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ssh_spawn::WORKER_EXIT_STATUS_PREFIX;
 
     #[test]
     fn placeholder_present_in_source() {
@@ -128,6 +129,14 @@ mod tests {
         assert!(
             WRAPPER_SOURCE.contains("--settings"),
             "wrapper must pass `--settings` to claude when BOSS_SETTINGS_FILE is set"
+        );
+    }
+
+    #[test]
+    fn wrapper_records_the_workers_observed_exit_status() {
+        assert!(
+            WRAPPER_SOURCE.contains(&format!("{WORKER_EXIT_STATUS_PREFIX}%s")),
+            "the detached worker supervisor must append its observed exit status to worker.log"
         );
     }
 
