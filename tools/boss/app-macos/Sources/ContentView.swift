@@ -28,7 +28,7 @@ struct ContentView: View {
     @State private var workColumnVisibility: NavigationSplitViewVisibility = .all
     @Environment(\.openWindow) private var openWindow
     @AppStorage("boss.ui.standardSearch", store: BossDefaults.store) private var useStandardSearch: Bool = false
-    @AppStorage("boss.kanban.boardStyle", store: BossDefaults.store) private var kanbanBoardStyle: KanbanBoardStyle = .classic
+    @AppStorage(KanbanBoardStyle.storageKey, store: BossDefaults.store) private var kanbanBoardStyle: KanbanBoardStyle = .productDefault
 
     var body: some View {
         // Work and Agents are kept alive via opacity + hit-testing so SwiftUI

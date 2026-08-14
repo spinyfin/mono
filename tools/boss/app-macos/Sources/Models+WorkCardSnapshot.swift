@@ -85,7 +85,7 @@ struct WorkCardSnapshotContext: Equatable {
     /// `boss.kanban.boardStyle` (an `@Environment` read alone is
     /// invisible to `WorkBoardCardView.==` and would leave mounted
     /// cards on stale fill/border/shadow).
-    var boardStyle: KanbanBoardStyle = .classic
+    var boardStyle: KanbanBoardStyle = .productDefault
 }
 
 /// Equatable value type holding exactly the fields `WorkBoardCardView`

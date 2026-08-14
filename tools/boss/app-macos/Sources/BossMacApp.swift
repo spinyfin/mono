@@ -580,7 +580,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 /// View > Board Style: single-choice menu items that persist the selection
 /// in UserDefaults and sync with the kanban board's @AppStorage binding.
 private struct BoardStyleMenuItems: View {
-    @AppStorage("boss.kanban.boardStyle", store: BossDefaults.store) private var style: KanbanBoardStyle = .classic
+    @AppStorage(KanbanBoardStyle.storageKey, store: BossDefaults.store) private var style: KanbanBoardStyle = .productDefault
 
     var body: some View {
         ForEach(KanbanBoardStyle.allCases) { boardStyle in
