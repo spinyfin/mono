@@ -48,12 +48,6 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
     let FrontendRequest::RequestExecution { input } = req else {
         unreachable!()
     };
-    if let Some(host_id) = input.requested_host_id.as_deref()
-        && let Err(err) = server_state.execution_coordinator.validate_requested_host(host_id)
-    {
-        send_work_error(&sink, &request_id, &err);
-        return;
-    }
     if input.bypass_dispatch_pause {
         // Pause-only forced dispatch (`bossctl work start --force`, or a
         // confirmed app-drag going through `MoveWorkItemOnBoard` instead

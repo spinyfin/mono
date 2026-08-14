@@ -196,13 +196,13 @@ async fn pinned_execution_routes_to_remote_host_and_persists_host_id() {
     );
 }
 
-/// An explicit host request validates before creating a row, then pins only
-/// that execution until it reaches `running`.
+/// An explicit host request validates before creating a row and routes only
+/// that dispatch without modifying the durable execution pin.
 #[tokio::test]
 async fn requested_host_routes_one_dispatch_and_refuses_without_queueing() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-    db.add_host("zakalwe", "user@zakalwe", 2, &[]).unwrap();
+    db.add_host("zakalwe", "user@zakalwe", 1, &[]).unwrap();
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, product.id.clone(), "Remote cleanup");
 
@@ -228,13 +228,49 @@ async fn requested_host_routes_one_dispatch_and_refuses_without_queueing() {
             Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new()),
         )
         .unwrap();
-    assert_eq!(
-        db.execution_pinned_host(&execution.id).unwrap().as_deref(),
-        Some("zakalwe")
-    );
+    assert!(db.execution_pinned_host(&execution.id).unwrap().is_none());
     coordinator.kick();
     wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
     assert!(provider.requested.lock().await.iter().any(|host| host == "zakalwe"));
+    assert!(db.execution_pinned_host(&execution.id).unwrap().is_none());
+
+    let saturated = create_test_chore(&db, product.id.clone(), "Saturated remote");
+    let err = coordinator
+        .request_execution_via_db(
+            RequestExecutionInput::builder()
+                .work_item_id(saturated.id.clone())
+                .requested_host_id("zakalwe")
+                .build(),
+            Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new()),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("no free slot"), "got: {err}");
+    assert!(db.list_executions(Some(&saturated.id)).unwrap().is_empty());
+
+    let local = create_test_chore(&db, product.id.clone(), "Local remains pool-managed");
+    let local_execution = coordinator
+        .request_execution_via_db(
+            RequestExecutionInput::builder()
+                .work_item_id(local.id.clone())
+                .requested_host_id("local")
+                .build(),
+            Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new()),
+        )
+        .unwrap();
+    assert_eq!(local_execution.status, ExecutionStatus::Ready);
+
+    let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+    live_states.register_spawn(1, &execution.id, "test", 1, None);
+    let err = coordinator
+        .request_execution_via_db(
+            RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .requested_host_id("local")
+                .build(),
+            live_states,
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("already has a live execution"), "got: {err}");
     assert!(db.execution_pinned_host(&execution.id).unwrap().is_none());
 
     db.add_host("disabled", "user@disabled", 1, &[]).unwrap();

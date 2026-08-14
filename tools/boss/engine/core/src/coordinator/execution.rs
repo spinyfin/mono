@@ -1,6 +1,7 @@
 //! Per-execution scheduling: work-item resolution, host selection, workspace
 //! leasing/recovery, and pre-start failure handling. Part of the `coordinator`
 //! module split; see [`super`] for the struct and shared types.
+use crate::work::CancelExecutionOpts;
 use anyhow::bail;
 
 use super::*;
@@ -10,7 +11,7 @@ impl ExecutionCoordinator {
     /// refresh an execution. This makes `bossctl ... --host` failures
     /// transactional from the operator's point of view: an unknown,
     /// disabled, or saturated host leaves no queued execution behind.
-    pub(crate) fn validate_requested_host(&self, host_id: &str) -> Result<()> {
+    pub(crate) fn validate_requested_host(&self, work_item_id: &str, host_id: &str) -> Result<()> {
         let hosts = self.work_db.list_hosts().context("host validation: list hosts")?;
         let known_hosts = hosts.iter().map(|host| host.id.as_str()).collect::<Vec<_>>().join(", ");
         let host = hosts
@@ -18,22 +19,18 @@ impl ExecutionCoordinator {
             .find(|host| host.id == host_id)
             .ok_or_else(|| anyhow!("unknown host '{host_id}'; known hosts: {known_hosts}"))?;
         if !host.enabled {
-            bail!("requested host '{host_id}' is disabled by its health gate")
+            bail!(
+                "requested host '{host_id}' is disabled{}",
+                host.last_error_text
+                    .as_deref()
+                    .map(|text| format!(" — {text}"))
+                    .unwrap_or_default()
+            )
         }
-        // Local concurrency is owned by WorkerPool, as in normal host
-        // selection. Remote hosts additionally enforce their registry slot
-        // count so a pin cannot overcommit that machine.
-        if host.id != "local" {
-            let active = self.work_db.active_runs_per_host().unwrap_or_default();
-            let active_runs = active.get(host_id).copied().unwrap_or_default();
-            if active_runs >= host.pool_size {
-                bail!(
-                    "requested host '{host_id}' has no free slot ({active_runs}/{} active)",
-                    host.pool_size
-                )
-            }
-        }
-        Ok(())
+        let work_item = self.work_db.get_work_item(work_item_id)?;
+        self.pick_host(&work_item, None, Some(host_id.to_string()))
+            .map(|_| ())
+            .map_err(|err| anyhow!("requested host '{host_id}' is ineligible: {err}"))
     }
 
     /// Resolve the [`WorkItem`] an execution operates on.
@@ -128,8 +125,8 @@ impl ExecutionCoordinator {
         Some(WorkItem::Chore(task))
     }
 
-    /// Pick the host this execution should run on. Honours the pin escape
-    /// hatch (`work_executions.pinned_host_id`) while retaining the capability filter,
+    /// Pick the host this execution should run on. Durable pins bypass
+    /// capability matching; a one-dispatch requested host remains subject to it,
     /// then ranks the survivors by branch affinity / free slots — see
     /// [`crate::host_scheduling::select_host`].
     ///
@@ -143,39 +140,31 @@ impl ExecutionCoordinator {
     /// Returns the selected [`Host`] or an error describing why nothing was
     /// eligible (consumed by the caller as a recoverable pre-start
     /// failure).
-    fn select_host_for_execution(&self, execution: &WorkExecution, work_item: &WorkItem) -> Result<Host> {
-        let pinned = self.work_db.execution_pinned_host(&execution.id).unwrap_or_else(|err| {
-            tracing::warn!(
-                execution_id = %execution.id,
-                error = %format!("{err:#}"),
-                "host-selection: failed to read pinned host; treating as unpinned",
-            );
-            None
-        });
-
+    fn pick_host(
+        &self,
+        work_item: &WorkItem,
+        pinned_host_id: Option<String>,
+        requested_host_id: Option<String>,
+    ) -> Result<Host> {
         // Capability requirements union over the chore + its product +
         // its project. Empty today (no writer yet), which leaves every
         // enabled host capability-eligible — preserving local behaviour.
         let product_id = work_item.product_id().to_string();
         let project_id = work_item_project_id(work_item);
-        let mut subject_ids: Vec<&str> = vec![execution.work_item_id.as_str(), product_id.as_str()];
+        let mut subject_ids: Vec<&str> = vec![work_item.primary_id(), product_id.as_str()];
         if let Some(pid) = project_id.as_deref() {
             subject_ids.push(pid);
         }
         let required_capabilities = self
             .work_db
             .required_capabilities_for_subject_ids(&subject_ids)
-            .unwrap_or_else(|err| {
-                tracing::warn!(
-                    execution_id = %execution.id,
-                    error = %format!("{err:#}"),
-                    "host-selection: failed to read capability requirements; treating as none",
-                );
-                BTreeSet::new()
-            });
+            .context("host-selection: capability requirements")?;
 
         let hosts = self.work_db.list_hosts().context("host-selection: list hosts")?;
-        let active = self.work_db.active_runs_per_host().unwrap_or_default();
+        let active = self
+            .work_db
+            .active_runs_per_host()
+            .context("host-selection: active runs per host")?;
 
         let slots: Vec<HostSlot> = hosts
             .iter()
@@ -184,13 +173,13 @@ impl ExecutionCoordinator {
                     .work_db
                     .list_host_capabilities(&host.id)
                     .map(|caps| caps.into_iter().map(|c| c.capability).collect::<BTreeSet<_>>())
-                    .unwrap_or_default();
+                    .context("host-selection: host capabilities")?;
                 let active_runs = if host.id == "local" {
                     0
                 } else {
                     *active.get(&host.id).unwrap_or(&0)
                 };
-                HostSlot {
+                Ok(HostSlot {
                     host: host.clone(),
                     capabilities,
                     active_runs,
@@ -199,13 +188,14 @@ impl ExecutionCoordinator {
                     // the first run pushes. Free-slots-first is the
                     // design's documented v1 fallback for the first run.
                     had_prior_run_on_branch: false,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<_>>()?;
 
         let requirements = ChoreRequirements {
             required_capabilities,
-            pinned_host_id: pinned,
+            pinned_host_id,
+            requested_host_id,
         };
         let (picked, report) = host_scheduling::select_host(&requirements, &slots);
         match picked {
@@ -214,11 +204,20 @@ impl ExecutionCoordinator {
                 .find(|h| h.id == host_id)
                 .ok_or_else(|| anyhow!("selected host '{host_id}' is missing from the registry")),
             None => Err(anyhow!(
-                "no eligible host for execution {}: {}",
-                execution.id,
+                "no eligible host for work item {}: {}",
+                work_item.primary_id(),
                 summarize_ineligibility(&report),
             )),
         }
+    }
+
+    fn select_host_for_execution(&self, execution: &WorkExecution, work_item: &WorkItem) -> Result<Host> {
+        let pinned = self
+            .work_db
+            .execution_pinned_host(&execution.id)
+            .context("host-selection: execution pinned host")?;
+        let requested = self.take_requested_host(&execution.id);
+        self.pick_host(work_item, pinned, requested)
     }
 
     /// Take one `ready` execution all the way to a running worker: guards,
@@ -707,9 +706,19 @@ impl ExecutionCoordinator {
         // no-eligible-host result is a recoverable pre-start failure — it
         // backs off and raises an attention item rather than hot-looping,
         // and a later kick retries once a host comes online / tags change.
+        let had_requested_host = self.requested_host_ids.lock().unwrap().contains_key(&execution.id);
         let selected_host = match self.select_host_for_execution(execution, &work_item) {
             Ok(host) => host,
             Err(err) => {
+                if had_requested_host {
+                    let _ = self.work_db.cancel_execution_with(
+                        &execution.id,
+                        CancelExecutionOpts {
+                            reason: Some(format!("requested host became ineligible: {err}")),
+                            queued_only: true,
+                        },
+                    );
+                }
                 // No event was emitted here before, so a `no_eligible_host`
                 // failure was invisible in the per-execution timeline — the
                 // watchdog reaped it as a `worker_claimed` stall. Emit a
@@ -724,6 +733,9 @@ impl ExecutionCoordinator {
                             .with_details(serde_json::json!({ "reason": "no_eligible_host" })),
                     )
                     .await;
+                if had_requested_host {
+                    return Err(err);
+                }
                 self.record_start_failure(
                     Arc::clone(self),
                     execution,
@@ -1299,12 +1311,6 @@ impl ExecutionCoordinator {
             &selected_host.id,
         ) {
             Ok((execution, run)) => {
-                // The pin belongs to this dispatch request only. The durable
-                // run keeps its selected host for reporting, while any later
-                // re-dispatch starts unpinned unless its caller names a host.
-                if let Err(err) = self.work_db.set_execution_pinned_host(&execution.id, None) {
-                    tracing::warn!(execution_id = %execution.id, ?err, "failed to clear one-dispatch host pin after start");
-                }
                 let worker_id_owned = worker_id.to_owned();
                 let queue_wait_ms = execution
                     .started_epoch()

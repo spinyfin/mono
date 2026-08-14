@@ -230,6 +230,17 @@ impl ExecutionCoordinator {
             .remove(execution_id)
     }
 
+    pub(super) fn mark_requested_host(&self, execution_id: &str, host_id: String) {
+        self.requested_host_ids
+            .lock()
+            .unwrap()
+            .insert(execution_id.to_string(), host_id);
+    }
+
+    pub(super) fn take_requested_host(&self, execution_id: &str) -> Option<String> {
+        self.requested_host_ids.lock().unwrap().remove(execution_id)
+    }
+
     /// Mutating: admit `input.work_item_id` past an active, overridable
     /// (operator-origin) global dispatch pause for this one request, or
     /// refuse and explain why — using the exact same
@@ -375,17 +386,35 @@ impl ExecutionCoordinator {
         live_states: Arc<crate::live_worker_state::LiveWorkerStateRegistry>,
     ) -> Result<WorkExecution> {
         if let Some(host_id) = input.requested_host_id.as_deref() {
-            self.validate_requested_host(host_id)?;
+            let live_execution = self
+                .work_db
+                .list_executions(Some(&input.work_item_id))?
+                .into_iter()
+                .find(|execution| !execution.status.is_terminal() && live_states.is_run_live(&execution.id));
+            if let Some(execution) = live_execution {
+                bail!(
+                    "{} already has a live execution {}; --host cannot move a running dispatch",
+                    input.work_item_id,
+                    execution.id
+                );
+            }
+            self.validate_requested_host(&input.work_item_id, host_id)?;
         }
         let requested_host_id = input.requested_host_id.clone();
         let execution = self
             .work_db
             .request_execution_with_live_check(input, move |run_id| live_states.is_run_live(run_id))?;
         if let Some(host_id) = requested_host_id {
-            // This is an execution-level, one-dispatch routing hint. A
-            // subsequent explicit dispatch creates a fresh execution and has
-            // no pin unless its own request names --host.
-            self.work_db.set_execution_pinned_host(&execution.id, Some(&host_id))?;
+            if execution.status != ExecutionStatus::Ready {
+                bail!(
+                    "{} already has a live execution {}; --host cannot move a running dispatch",
+                    execution.work_item_id,
+                    execution.id
+                );
+            }
+            // This request-only routing constraint never touches the durable
+            // pin escape hatch persisted on the execution.
+            self.mark_requested_host(&execution.id, host_id);
         }
         Ok(execution)
     }

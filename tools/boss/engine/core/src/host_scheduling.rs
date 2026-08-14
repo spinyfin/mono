@@ -11,9 +11,10 @@
 //!    2. then the host with the most free slots,
 //!    3. then lexicographic host id (for deterministic tests).
 //!
-//! A pinned host narrows the candidates to one host. It still has to
-//! satisfy the capability, enabled, and free-slot gates; pinning controls
-//! placement, not admission.
+//! A durable pinned host narrows the candidates to one host and bypasses
+//! capability matching, the documented escape hatch for operator knowledge
+//! that is not represented by capability tags. A request-scoped host narrows
+//! placement too, but still satisfies every admission gate.
 
 use std::collections::BTreeSet;
 
@@ -47,9 +48,12 @@ impl HostSlot {
 pub struct ChoreRequirements {
     /// Union of product / project / chore required capabilities.
     pub required_capabilities: BTreeSet<String>,
-    /// `work_executions.pinned_host_id`; narrows placement to this host
-    /// while retaining every eligibility gate.
+    /// `work_executions.pinned_host_id`; narrows placement to this host and
+    /// intentionally bypasses capability matching.
     pub pinned_host_id: Option<String>,
+    /// A one-dispatch `--host` request. Unlike [`Self::pinned_host_id`], this
+    /// is an admission constraint and therefore does not bypass capabilities.
+    pub requested_host_id: Option<String>,
 }
 
 /// Reasons a host can be ineligible. Surfaced as part of the
@@ -94,7 +98,11 @@ pub fn select_host(requirements: &ChoreRequirements, slots: &[HostSlot]) -> (Opt
         if slot.free_slots() <= 0 {
             reasons.push(IneligibilityReason::NoFreeSlots);
         }
-        if let Some(pin) = &requirements.pinned_host_id
+        let selected_pin = requirements
+            .requested_host_id
+            .as_ref()
+            .or(requirements.pinned_host_id.as_ref());
+        if let Some(pin) = selected_pin
             && &slot.host.id != pin
         {
             reasons.push(IneligibilityReason::NotPinned);
@@ -105,7 +113,9 @@ pub fn select_host(requirements: &ChoreRequirements, slots: &[HostSlot]) -> (Opt
             .filter(|cap| !slot.capabilities.contains(*cap))
             .cloned()
             .collect();
-        if !missing.is_empty() {
+        // The durable pin escape hatch intentionally bypasses capabilities;
+        // a request-scoped pin is stricter and must meet them.
+        if !missing.is_empty() && (requirements.requested_host_id.is_some() || requirements.pinned_host_id.is_none()) {
             reasons.push(IneligibilityReason::MissingCapabilities(missing));
         }
         let eligible = reasons.is_empty();
@@ -176,6 +186,7 @@ mod tests {
         let reqs = ChoreRequirements {
             required_capabilities: ["os=macos".into()].into_iter().collect(),
             pinned_host_id: None,
+            requested_host_id: None,
         };
         let slots = vec![slot("local", 4, 0, &["os=macos", "bazel"])];
         let (picked, report) = select_host(&reqs, &slots);
@@ -189,6 +200,7 @@ mod tests {
         let reqs = ChoreRequirements {
             required_capabilities: ["xcode=15".into()].into_iter().collect(),
             pinned_host_id: None,
+            requested_host_id: None,
         };
         let slots = vec![
             slot("local", 4, 0, &["os=macos"]),
@@ -241,17 +253,36 @@ mod tests {
     }
 
     #[test]
-    fn pinned_host_must_meet_capability_requirements() {
+    fn pinned_host_wins_even_without_capability_match() {
         let reqs = ChoreRequirements {
             required_capabilities: ["xcode=15".into()].into_iter().collect(),
             pinned_host_id: Some("local".to_owned()),
+            requested_host_id: None,
         };
         let slots = vec![
             slot("local", 4, 0, &["os=macos"]), // pinned, doesn't have xcode
             slot("zakalwe", 4, 0, &["os=macos", "xcode=15"]),
         ];
         let (picked, _) = select_host(&reqs, &slots);
+        assert_eq!(picked.as_deref(), Some("local"));
+    }
+
+    #[test]
+    fn requested_host_must_meet_capability_requirements() {
+        let reqs = ChoreRequirements {
+            required_capabilities: ["xcode=15".into()].into_iter().collect(),
+            pinned_host_id: None,
+            requested_host_id: Some("local".to_owned()),
+        };
+        let slots = vec![slot("local", 4, 0, &["os=macos"]), slot("zakalwe", 4, 0, &["xcode=15"])];
+        let (picked, report) = select_host(&reqs, &slots);
         assert!(picked.is_none());
+        assert!(
+            report[0]
+                .reasons
+                .iter()
+                .any(|reason| matches!(reason, IneligibilityReason::MissingCapabilities(_)))
+        );
     }
 
     #[test]
@@ -262,6 +293,7 @@ mod tests {
         let reqs = ChoreRequirements {
             required_capabilities: BTreeSet::new(),
             pinned_host_id: Some("not-registered".to_owned()),
+            requested_host_id: None,
         };
         let slots = vec![slot("local", 4, 0, &[])];
         let (picked, report) = select_host(&reqs, &slots);
@@ -278,6 +310,7 @@ mod tests {
         let reqs = ChoreRequirements {
             required_capabilities: ["os=macos".into(), "xcode=15".into()].into_iter().collect(),
             pinned_host_id: None,
+            requested_host_id: None,
         };
         let slots = vec![slot("linux-host", 4, 0, &["os=linux"])];
         let (picked, report) = select_host(&reqs, &slots);
@@ -318,6 +351,7 @@ mod tests {
         let one_requirement = ChoreRequirements {
             required_capabilities: ["os=macos".into()].into_iter().collect(),
             pinned_host_id: None,
+            requested_host_id: None,
         };
         let (picked, report) = select_host(&one_requirement, &slots);
         assert!(picked.is_none());

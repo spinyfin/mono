@@ -2099,6 +2099,10 @@ pub struct ExecutionCoordinator {
     /// durable badge on the row.
     #[builder(default)]
     dispatch_pause_bypass_execution_ids: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// One-dispatch `--host` routes. Kept out of `work_executions` so they
+    /// cannot overwrite or clear the durable pin escape hatch.
+    #[builder(default)]
+    requested_host_ids: std::sync::Mutex<HashMap<String, String>>,
     /// Startup capability gate for the local tmux runtime. Unlike the
     /// operator/breaker pause state this is not user-resumable: a worker
     /// cannot be dispatched until the engine has recorded a passing probe.
