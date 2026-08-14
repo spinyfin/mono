@@ -119,19 +119,39 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_passes_settings_file_through_to_claude() {
+    fn wrapper_passes_settings_file_through_to_driver() {
         // The engine ships the worker's `--settings` JSON outside the
-        // workspace tree and points claude at it via BOSS_SETTINGS_FILE;
-        // the wrapper must consume that env var and forward `--settings`.
-        // A refactor that dropped either side would silently strip the
-        // boss-event hooks from remote workers, pinning their lifecycle.
+        // workspace tree and points the resolved driver at it via
+        // BOSS_SETTINGS_FILE; the wrapper must consume that env var and
+        // forward `--settings`. A refactor that dropped either side would
+        // silently strip the boss-event hooks from remote workers, pinning
+        // their lifecycle.
         assert!(
             WRAPPER_SOURCE.contains("BOSS_SETTINGS_FILE"),
             "wrapper must read BOSS_SETTINGS_FILE so the engine can wire boss-event hooks remotely"
         );
         assert!(
             WRAPPER_SOURCE.contains("--settings"),
-            "wrapper must pass `--settings` to claude when BOSS_SETTINGS_FILE is set"
+            "wrapper must pass `--settings` to the driver when BOSS_SETTINGS_FILE is set"
+        );
+    }
+
+    #[test]
+    fn wrapper_launches_resolved_driver_not_hardcoded_claude() {
+        // A row allocated to codex must not silently exec `claude` on a
+        // remote host. The wrapper reads BOSS_DRIVER and execs that binary.
+        assert!(
+            WRAPPER_SOURCE.contains("BOSS_DRIVER"),
+            "wrapper must read BOSS_DRIVER so the engine can launch the resolved driver"
+        );
+        assert!(
+            WRAPPER_SOURCE.contains("\"$BOSS_DRIVER\""),
+            "wrapper must exec \"$BOSS_DRIVER\", not a hardcoded claude binary"
+        );
+        // The old hardcoded form must not reappear as the launch target.
+        assert!(
+            !WRAPPER_SOURCE.contains("nohup claude "),
+            "wrapper must not hardcode `nohup claude`; launch the resolved driver"
         );
     }
 

@@ -14,25 +14,31 @@
 #                            through to the worker process env so the
 #                            shim can stamp it on every event).
 #   BOSS_WORKSPACE         — absolute workspace path on this host.
+#   BOSS_DRIVER            — agent-driver binary to exec (e.g. `claude`,
+#                            `codex`, `grok`). Required. Comes from the
+#                            execution's resolved driver — never hardcoded
+#                            so a row allocated to one driver cannot
+#                            silently run as another.
 #   BOSS_REPO_REMOTE_URL   — repo origin URL (used by the worker for
 #                            informational logging only; cube already
 #                            cloned the repo before lease was issued).
 #   BOSS_INITIAL_INPUT_FILE — path to a file holding the initial prompt.
 #                            Preferred over BOSS_INITIAL_INPUT so a
 #                            multi-KB prompt never has to survive ssh
-#                            argv re-quoting. Read as claude's first
+#                            argv re-quoting. Read as the driver's first
 #                            positional arg (its initial user message).
 #   BOSS_INITIAL_INPUT     — inline fallback for the initial prompt.
-#   BOSS_SETTINGS_FILE     — optional path to a claude `--settings` JSON
+#   BOSS_SETTINGS_FILE     — optional path to a driver `--settings` JSON
 #                            file (the boss-event hooks + sandbox guards
 #                            the engine renders). Shipped OUTSIDE the
 #                            workspace tree, mirroring the local runner so
 #                            the file never lands in a worker's PR. When
 #                            set and the file exists it is passed as
-#                            `claude --settings <file>`, so every hook
-#                            event tunnels back over BOSS_EVENTS_SOCKET.
-#                            Unset/missing → claude's own settings
-#                            discovery (no boss-event hooks).
+#                            `$BOSS_DRIVER --settings <file>`, so every
+#                            hook event tunnels back over
+#                            BOSS_EVENTS_SOCKET. Unset/missing → the
+#                            driver's own settings discovery (no
+#                            boss-event hooks).
 #
 # Contract (output): the worker is launched DETACHED (`nohup` +
 # background) so it survives the engine restarting and the launching
@@ -75,7 +81,7 @@ fi
 # variables are an engine bug, not a user-visible failure mode, so we
 # print a short diagnostic that the SSH transport will surface back to
 # the engine as the wrapper exit-status reason.
-required_vars="BOSS_RUN_ID BOSS_EVENTS_SOCKET BOSS_LEASE_ID BOSS_WORKSPACE"
+required_vars="BOSS_RUN_ID BOSS_EVENTS_SOCKET BOSS_LEASE_ID BOSS_WORKSPACE BOSS_DRIVER"
 for var in $required_vars; do
     eval "val=\${$var:-}"
     if [ -z "$val" ]; then
@@ -89,12 +95,14 @@ if [ ! -d "$BOSS_WORKSPACE" ]; then
     exit 78
 fi
 
-# Health check: claude must be reachable. The engine sets a documented
-# sentinel exit code so the failure surface in `last_error_text` is
-# clean (`host_missing_claude` per the Q6 design table).
-if ! command -v claude >/dev/null 2>&1; then
-    printf 'boss-remote-run: `claude` not found on PATH; install or set up the worker toolchain\n' 1>&2
-    exit 79  # documented sentinel: claude missing
+# Health check: the resolved driver must be reachable. The engine sets a
+# documented sentinel exit code so the failure surface in
+# `last_error_text` is clean (`host_missing_driver`). Name the actual
+# binary so an operator never chases a misattributed `claude` install.
+if ! command -v "$BOSS_DRIVER" >/dev/null 2>&1; then
+    printf 'boss-remote-run: `%s` not found on PATH; install or set up the worker toolchain\n' \
+        "$BOSS_DRIVER" 1>&2
+    exit 79  # documented sentinel: resolved driver missing
 fi
 
 # cube must be reachable for the same reason. The engine leases the
@@ -139,6 +147,7 @@ export BOSS_RUN_ID
 export BOSS_EVENTS_SOCKET
 export BOSS_LEASE_ID
 export BOSS_WORKSPACE
+export BOSS_DRIVER
 export BOSS_REPO_REMOTE_URL="${BOSS_REPO_REMOTE_URL:-}"
 
 # Per-run scratch + log dir under the cube workspace. The engine pulls
@@ -155,9 +164,10 @@ rm -f "$worker_pid_file"
 export BOSS_WORKER_PID_FILE="$worker_pid_file"
 
 # Resolve the initial prompt. A file (BOSS_INITIAL_INPUT_FILE) is the
-# engine's preferred channel; an inline value is the fallback. Claude
-# Code treats its first positional arg as the initial user message —
-# mirroring the local pane, which launches with `claude "$(cat …)"`.
+# engine's preferred channel; an inline value is the fallback. Drivers
+# that accept a first positional arg as the initial user message get
+# it here — mirroring the local pane, which launches with
+# `<driver> "$(cat …)"`.
 initial_input=""
 if [ -n "${BOSS_INITIAL_INPUT_FILE:-}" ] && [ -f "$BOSS_INITIAL_INPUT_FILE" ]; then
     initial_input="$(cat "$BOSS_INITIAL_INPUT_FILE")"
@@ -165,14 +175,15 @@ elif [ -n "${BOSS_INITIAL_INPUT:-}" ]; then
     initial_input="$BOSS_INITIAL_INPUT"
 fi
 
-# Resolve the claude session settings. The engine renders a settings
+# Resolve the driver session settings. The engine renders a settings
 # file (boss-event hooks wiring every event to BOSS_EVENTS_SOCKET, plus
 # the sandbox guards) and ships it OUTSIDE the workspace tree, then
-# points claude at it here — mirroring the local runner's `--settings`
-# so the file never gets snapshotted into a worker's PR. We accumulate
-# the flag into the positional params so a settings path with spaces is
-# passed as a single argument. Unset/missing → no flag, and claude falls
-# back to its own project/user settings discovery (no boss-event hooks).
+# points the driver at it here — mirroring the local runner's
+# `--settings` so the file never gets snapshotted into a worker's PR.
+# We accumulate the flag into the positional params so a settings path
+# with spaces is passed as a single argument. Unset/missing → no flag,
+# and the driver falls back to its own project/user settings discovery
+# (no boss-event hooks).
 set --
 if [ -n "${BOSS_SETTINGS_FILE:-}" ] && [ -f "$BOSS_SETTINGS_FILE" ]; then
     set -- --settings "$BOSS_SETTINGS_FILE"
@@ -182,14 +193,20 @@ fi
 # launching SSH session closing: `nohup` makes the supervisor and worker
 # ignore the SIGHUP the remote sshd sends on session teardown, and
 # backgrounding reparents the supervisor off this wrapper. The supervisor
-# writes its direct Claude child PID before waiting for that child and
+# writes its direct child PID before waiting for that child and
 # appending its observed exit status to the same log. stdin is taken from
 # /dev/null (the prompt rides the positional arg) and stdout+stderr are
 # teed to the per-run log. The wrapper returns once it has the worker PID;
 # the supervisor keeps running while the worker does.
+#
+# `--dangerously-skip-permissions` is the Claude-family flag; non-Claude
+# drivers that do not recognise it will fail loud at launch (the
+# post-launch liveness ack reports it) rather than silently substituting
+# a different binary. Driver-specific argv shaping for remote is a
+# follow-on; this change only ensures the *right* binary is exec'd.
 if [ -n "$initial_input" ]; then
     nohup sh -c '
-        nohup claude --dangerously-skip-permissions "$@" &
+        nohup "$BOSS_DRIVER" --dangerously-skip-permissions "$@" &
         worker_pid=$!
         printf "%s\\n" "$worker_pid" > "$BOSS_WORKER_PID_FILE"
         trap '\''kill "$worker_pid" 2>/dev/null || true; exit 143'\'' TERM INT HUP
@@ -199,7 +216,7 @@ if [ -n "$initial_input" ]; then
     ' boss-remote-worker "$@" "$initial_input" >"$worker_log" 2>&1 </dev/null &
 else
     nohup sh -c '
-        nohup claude --dangerously-skip-permissions "$@" &
+        nohup "$BOSS_DRIVER" --dangerously-skip-permissions "$@" &
         worker_pid=$!
         printf "%s\\n" "$worker_pid" > "$BOSS_WORKER_PID_FILE"
         trap '\''kill "$worker_pid" 2>/dev/null || true; exit 143'\'' TERM INT HUP
@@ -239,7 +256,7 @@ esac
 # record `work_runs.remote_pid`. Prefixed `boss-remote-run:` so the
 # engine can recognize it amongst stderr noise without a structured
 # handshake.
-printf 'boss-remote-run: starting run_id=%s version=%s pid=%s\n' \
-    "$BOSS_RUN_ID" "$BOSS_REMOTE_RUN_VERSION" "$worker_pid" 1>&2
+printf 'boss-remote-run: starting run_id=%s version=%s pid=%s driver=%s\n' \
+    "$BOSS_RUN_ID" "$BOSS_REMOTE_RUN_VERSION" "$worker_pid" "$BOSS_DRIVER" 1>&2
 
 exit 0

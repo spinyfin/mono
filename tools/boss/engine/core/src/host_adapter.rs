@@ -823,6 +823,12 @@ impl HostAdapter for SshHostAdapter {
         // 6. Open the reverse events tunnel and launch the detached
         //    remote worker (PR1 orchestration over the one master
         //    multiplex).
+        // Launch the resolved driver binary, never a hardcoded `claude`.
+        // Placement already required `driver=<slug>` on this host; the
+        // wrapper still re-checks PATH so a race between probe and
+        // launch surfaces as `host_missing_driver` rather than a silent
+        // substitute.
+        let driver_binary = driver.descriptor().binary.to_owned();
         let plan = RemoteSpawnPlan::builder()
             .run_id(run_id.clone())
             .lease_id(lease_id)
@@ -832,6 +838,7 @@ impl HostAdapter for SshHostAdapter {
             .initial_input_file(remote_prompt_path)
             .settings_file(remote_settings_path)
             .wrapper_path(remote_wrapper_path())
+            .driver_binary(driver_binary.clone())
             .build();
 
         let engine_socket = self.events_socket_path.display().to_string();
@@ -873,6 +880,8 @@ impl HostAdapter for SshHostAdapter {
             host_id = %host,
             run_id = %run_id,
             remote_pid = ?outcome.remote_pid,
+            driver = %spawn_config.driver,
+            driver_binary = %driver_binary,
             model = %spawn_config.model,
             reasoning = spawn_config.reasoning.map(|mode| mode.as_str()).unwrap_or("unclassified"),
             "remote worker launched; awaiting Stop over the forwarded events socket",
