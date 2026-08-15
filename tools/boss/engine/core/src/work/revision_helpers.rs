@@ -615,10 +615,11 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
     // The redirect to the last completed revision's verdict is a
     // preference, not a hard cutover: when that target has no
     // informative verdict of its own, fall back to the row's own
-    // verdict rather than rendering nothing. This is the gap that let
-    // Done chain roots with a perfectly good verdict on record blank
-    // out once their terminal revision (which has none) became the
-    // redirect target.
+    // verdict rather than rendering nothing. Without this fallback, a
+    // chain root whose terminal revision was never reviewed would
+    // render no badge despite holding its own verdict — a shape that
+    // occurs disproportionately once a card reaches Done and its last
+    // revision flips to `done`.
     let resolve = |row: &Task| -> (Option<&'static str>, Option<String>) {
         if task_kind_excluded_from_ai_review(&row.kind) {
             return (Some(AI_REVIEW_STATE_REVIEW_NOT_REQUIRED), None);

@@ -117,6 +117,7 @@ fn ai_review_state_falls_back_to_root_verdict_when_terminal_revision_has_none() 
                 .build(),
         )
         .unwrap();
+    let followup_id = "task_followup_fallback_test";
     {
         let conn = db.connect().unwrap();
         WorkDb::insert_review_verdict_in_tx(
@@ -132,17 +133,22 @@ fn ai_review_state_falls_back_to_root_verdict_when_terminal_revision_has_none() 
         )
         .unwrap();
     }
+    db.set_review_verdict_revision_task_id(&execution.id, followup_id)
+        .unwrap();
 
-    // A later revision completed (in_review) but never itself got an
-    // informative verdict — it becomes the rollup target with nothing to
-    // report, so the root must fall back to the verdict it already has.
+    // A later revision completed but never itself got an informative
+    // verdict — it becomes the rollup target with nothing to report, so
+    // the root must fall back to the verdict it already has. Both rows
+    // are driven to `done` (rather than `in_review`) because the reported
+    // defect is specifically Done-biased: it surfaces once a card reaches
+    // Done and its terminal revision flips to `done` alongside it.
     let checker = FakePrStateChecker::always(PrOpenState::Open);
     let revision = db.create_revision(revision_input(&root_id), &checker).unwrap();
     {
         let conn = db.connect().unwrap();
         conn.execute(
-            "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
-            rusqlite::params![revision.id],
+            "UPDATE tasks SET status = 'done' WHERE id IN (?1, ?2)",
+            rusqlite::params![root_id, revision.id],
         )
         .unwrap();
     }
@@ -157,6 +163,11 @@ fn ai_review_state_falls_back_to_root_verdict_when_terminal_revision_has_none() 
         root_card.ai_review_state.as_deref(),
         Some("reviewed_with_findings"),
         "the root must fall back to its own verdict when the terminal revision has none"
+    );
+    assert_eq!(
+        root_card.ai_review_findings_revision_id.as_deref(),
+        Some(followup_id),
+        "the reveal target must be the root's own verdict's revision_task_id"
     );
 }
 
