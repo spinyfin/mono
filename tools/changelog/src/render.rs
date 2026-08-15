@@ -28,6 +28,21 @@ impl ChangelogRenderer for GithubMarkdownRenderer {
     }
 }
 
+/// Renders a bare-bones plain-text changelog for consumers that do not render markdown
+/// (e.g. TestFlight's "What to Test" field): one title per line, no heading, no author
+/// handle, no PR URL, no compare link.
+pub struct PlainTextRenderer;
+
+impl ChangelogRenderer for PlainTextRenderer {
+    fn render(&self, range: &ChangelogRange) -> String {
+        if range.entries.is_empty() {
+            return "No changes.".to_string();
+        }
+        let lines: Vec<&str> = range.entries.iter().map(|entry| entry.title.as_str()).collect();
+        lines.join("\n")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,5 +104,48 @@ Nothing significant!
 **Full Changelog**: https://github.com/example/repo/compare/v1.0.0...v1.1.0";
 
         assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn plain_text_renders_bare_title_lines() {
+        let range = ChangelogRange {
+            from_tag: "v1.0.0".to_string(),
+            to_tag: "v1.1.0".to_string(),
+            compare_url: "https://github.com/example/repo/compare/v1.0.0...v1.1.0".to_string(),
+            entries: vec![
+                ChangelogEntry {
+                    pr_number: 42,
+                    title: "Add cool feature".to_string(),
+                    author_login: "alice".to_string(),
+                    pr_url: "https://github.com/example/repo/pull/42".to_string(),
+                },
+                ChangelogEntry {
+                    pr_number: 41,
+                    title: "Fix nasty bug".to_string(),
+                    author_login: "bob".to_string(),
+                    pr_url: "https://github.com/example/repo/pull/41".to_string(),
+                },
+            ],
+        };
+
+        let renderer = PlainTextRenderer;
+        let output = renderer.render(&range);
+
+        assert_eq!(output, "Add cool feature\nFix nasty bug");
+    }
+
+    #[test]
+    fn plain_text_renders_placeholder_when_empty() {
+        let range = ChangelogRange {
+            from_tag: "v1.0.0".to_string(),
+            to_tag: "v1.1.0".to_string(),
+            compare_url: "https://github.com/example/repo/compare/v1.0.0...v1.1.0".to_string(),
+            entries: vec![],
+        };
+
+        let renderer = PlainTextRenderer;
+        let output = renderer.render(&range);
+
+        assert_eq!(output, "No changes.");
     }
 }
