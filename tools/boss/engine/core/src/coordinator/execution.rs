@@ -716,22 +716,32 @@ impl ExecutionCoordinator {
             Ok(host) => host,
             Err(err) => {
                 if had_requested_host {
-                    if let Err(cancel_err) = self.work_db.cancel_execution_with(
+                    match self.work_db.cancel_execution_with(
                         &execution.id,
                         CancelExecutionOpts {
                             reason: Some(format!("requested host became ineligible: {err}")),
                             queued_only: true,
                         },
                     ) {
-                        tracing::warn!(
-                            execution_id = %execution.id,
-                            error = %format!("{cancel_err:#}"),
-                            "failed to cancel execution whose requested host became ineligible",
-                        );
+                        Ok(_) => {
+                            // Terminal for this execution: drop the constraint so it
+                            // cannot leak (selection no longer takes it itself).
+                            self.take_requested_host(&execution.id);
+                        }
+                        Err(cancel_err) => {
+                            // The cancel is what makes this row terminal. If it
+                            // failed, the row is still `ready` and will be
+                            // drained again — keep the constraint in place so
+                            // the retry is refused for the same requested host
+                            // instead of landing unpinned on an arbitrary one.
+                            tracing::warn!(
+                                execution_id = %execution.id,
+                                error = %format!("{cancel_err:#}"),
+                                "failed to cancel execution whose requested host became ineligible; \
+                                 leaving the --host constraint in place so a retry cannot land unpinned",
+                            );
+                        }
                     }
-                    // Terminal for this execution: drop the constraint so it
-                    // cannot leak (selection no longer takes it itself).
-                    self.take_requested_host(&execution.id);
                 }
                 // No event was emitted here before, so a `no_eligible_host`
                 // failure was invisible in the per-execution timeline — the
@@ -2268,20 +2278,6 @@ impl ExecutionCoordinator {
         }
     }
 
-    /// Record a pre-start failure and either schedule an automatic retry
-    /// or surface a permanent failure to the operator.
-    ///
-    /// Safe-to-retry stages (no worker side effects yet):
-    /// `cube_repo_ensure`, `workspace_lease`, `change_create`,
-    /// `run_start` (DB-only failure, transaction rolled back).
-    ///
-    /// Do NOT call this for post-`run_started` failures — those require
-    /// `finish_execution_run`.
-    /// Shared shape for the two `cube repo ensure` failure arms (error and
-    /// timeout): emit a `CubeRepoEnsureFailed` dispatch event carrying the
-    /// reproducible cube invocation, then record the pre-start failure. Only
-    /// the error, the details payload, and the (attention_kind, attention_title)
-    /// tuple differ between the arms.
     /// Emits the `CubeRepoEnsureFailed` dispatch event only. Callers decide
     /// what happens next: [`Self::record_start_failure`]'s ordinary retry
     /// for an unconstrained execution, or
@@ -2308,6 +2304,15 @@ impl ExecutionCoordinator {
             .await;
     }
 
+    /// Record a pre-start failure and either schedule an automatic retry
+    /// or surface a permanent failure to the operator.
+    ///
+    /// Safe-to-retry stages (no worker side effects yet):
+    /// `cube_repo_ensure`, `workspace_lease`, `change_create`,
+    /// `run_start` (DB-only failure, transaction rolled back).
+    ///
+    /// Do NOT call this for post-`run_started` failures — those require
+    /// `finish_execution_run`.
     fn record_start_failure(
         &self,
         coordinator: Arc<ExecutionCoordinator>,
@@ -2486,20 +2491,59 @@ impl ExecutionCoordinator {
     /// retry) and drop the constraint, matching how the ineligible-host
     /// case in [`Self::schedule_execution`] already behaves.
     fn cancel_requested_host_pre_start_failure(&self, execution: &WorkExecution, stage: &str, err: &anyhow::Error) {
-        if let Err(cancel_err) = self.work_db.cancel_execution_with(
+        // Not retried, but must still be reported: a `--host` pre-start
+        // failure never reaches `record_start_failure`'s permanent-failure
+        // path, so without this the operator's requested-host dispatch can
+        // silently disappear as a `cancelled` row with no attention item —
+        // exactly the case an SSH-unreachable remote host hits.
+        let attention_body = format!(
+            "Execution `{execution_id}` (requested host) failed during `{stage}` and was \
+             cancelled rather than retried, so the `--host` constraint is not silently \
+             dropped.\n\n\
+             **Error:** {err:#}\n\n\
+             Inspect `dispatch-events/executions/{execution_id}/dispatch.jsonl` \
+             for the full stage timeline.",
+            execution_id = execution.id,
+        );
+        if let Err(attention_err) = self.work_db.create_attention_item(CreateAttentionItemInput {
+            execution_id: Some(execution.id.clone()),
+            work_item_id: None,
+            kind: "requested_host_dispatch_failed".to_owned(),
+            status: None,
+            title: "Requested-host dispatch failed".to_owned(),
+            body_markdown: attention_body,
+            resolved_at: None,
+        }) {
+            tracing::error!(
+                ?attention_err,
+                execution_id = %execution.id,
+                "failed to record attention item for requested-host pre-start failure",
+            );
+        }
+
+        match self.work_db.cancel_execution_with(
             &execution.id,
             CancelExecutionOpts {
                 reason: Some(format!("requested host dispatch failed during {stage}: {err:#}")),
                 queued_only: true,
             },
         ) {
-            tracing::warn!(
-                execution_id = %execution.id,
-                stage,
-                error = %format!("{cancel_err:#}"),
-                "failed to cancel requested-host execution after a pre-start failure",
-            );
+            Ok(_) => {
+                self.take_requested_host(&execution.id);
+            }
+            Err(cancel_err) => {
+                // The cancel is what makes this row terminal. If it failed,
+                // the row is still `ready` and will be drained again — keep
+                // the constraint in place so the retry is refused for the
+                // same requested host instead of landing unpinned.
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    stage,
+                    error = %format!("{cancel_err:#}"),
+                    "failed to cancel requested-host execution after a pre-start failure; \
+                     leaving the --host constraint in place so a retry cannot land unpinned",
+                );
+            }
         }
-        self.take_requested_host(&execution.id);
     }
 }

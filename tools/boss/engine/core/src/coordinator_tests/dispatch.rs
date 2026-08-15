@@ -374,6 +374,91 @@ async fn requested_host_resolves_friendly_short_id() {
     assert!(err.to_string().contains("already has a live execution"), "got: {err}");
 }
 
+/// Host-adapter provider that fails the first `adapter_for` call for a
+/// chosen host id, then behaves like [`RecordingHostAdapterProvider`] for
+/// every call after — including the very next retry for the *same* host,
+/// so the test can tell "cancelled, never retried" apart from "retried and
+/// happened to succeed the second time."
+struct FlakyHostAdapterProvider {
+    inner: Arc<dyn HostAdapter>,
+    fail_host: String,
+    requested: Mutex<Vec<String>>,
+    failed_once: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl HostAdapterProvider for FlakyHostAdapterProvider {
+    async fn adapter_for(&self, host: &Host) -> Result<Arc<dyn HostAdapter>> {
+        self.requested.lock().await.push(host.id.clone());
+        if host.id == self.fail_host && !self.failed_once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err(anyhow::anyhow!("simulated SSH-unreachable failure for {}", host.id));
+        }
+        Ok(Arc::clone(&self.inner))
+    }
+}
+
+/// The central invariant the `--host` rework is built on: a recoverable
+/// pre-start failure (here, `host_adapter_provider.adapter_for` failing —
+/// the SSH-unreachable case) on an execution with a request-scoped `--host`
+/// constraint must cancel the execution rather than fall through to the
+/// ordinary unpinned retry. Two enabled hosts are registered with free
+/// slots so an unpinned retry has somewhere else to go; if the rework
+/// regressed to falling through to `record_start_failure`, this test would
+/// see the execution land on `spare` instead of ending up `Cancelled`.
+#[tokio::test]
+async fn requested_host_pre_start_failure_cancels_instead_of_retrying_elsewhere() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    db.add_host("zakalwe", "user@zakalwe", 1, &[]).unwrap();
+    db.add_host("spare", "user@spare", 1, &[]).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Flaky remote cleanup");
+
+    let cube = Arc::new(FakeCubeClient::default());
+    let runner = Arc::new(FakeExecutionRunner {
+        pending: true,
+        ..FakeExecutionRunner::default()
+    });
+    let mut coordinator_inner =
+        ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube, runner).with_pre_start_retry_delays(Vec::new());
+    let provider = Arc::new(FlakyHostAdapterProvider {
+        inner: coordinator_inner.host_adapter(),
+        fail_host: "zakalwe".to_string(),
+        requested: Mutex::new(Vec::new()),
+        failed_once: std::sync::atomic::AtomicBool::new(false),
+    });
+    coordinator_inner.set_host_adapter_provider(provider.clone());
+    let coordinator = Arc::new(coordinator_inner);
+
+    let execution = coordinator
+        .request_execution_via_db(
+            RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .requested_host_id("zakalwe")
+                .build(),
+            Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new()),
+        )
+        .unwrap();
+
+    coordinator.kick();
+    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Cancelled).await;
+
+    let requested = provider.requested.lock().await.clone();
+    assert!(
+        requested.iter().any(|h| h == "zakalwe"),
+        "expected the provider to be asked for the requested host, got {requested:?}",
+    );
+    assert!(
+        !requested.iter().any(|h| h == "spare"),
+        "a --host pre-start failure must not fall through to an unpinned retry \
+         onto another eligible host, got {requested:?}",
+    );
+    assert!(
+        db.execution_pinned_host(&execution.id).unwrap().is_none(),
+        "cancel must not leave a durable pin behind",
+    );
+}
+
 /// The interactive-pool concurrency cap
 /// ([`MAX_CONCURRENT_INTERACTIVE_WORKERS`]): when the interactive pool
 /// already carries the capped number of live workers, a drain pass holds

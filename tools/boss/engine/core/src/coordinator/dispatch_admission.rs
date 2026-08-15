@@ -402,7 +402,8 @@ impl ExecutionCoordinator {
     ) -> Result<WorkExecution> {
         if let Some(host_id) = input.requested_host_id.clone() {
             // `request_execution_with_live_check` (called below) resolves
-            // friendly ids (`T3`, `#42`, ...) to a primary id itself, but
+            // friendly short ids (a `T`-prefixed short id, `#42`, ...) to a
+            // primary id itself, but
             // that resolution happens too late for `--host`: both the
             // live-execution pre-check and `validate_requested_host` need
             // the canonical id *before* that call, or a short id makes the
@@ -449,7 +450,7 @@ impl ExecutionCoordinator {
                     },
                 );
                 bail!(
-                    "{} resolved to execution {} in status `{:?}`; --host only applies to a queued execution",
+                    "{} resolved to execution {} in status `{}`; --host only applies to a queued execution",
                     execution.work_item_id,
                     execution.id,
                     execution.status
