@@ -93,6 +93,73 @@ fn ai_review_state_rolls_up_from_last_completed_revision_on_chain_root() {
     assert_eq!(revision_card.ai_review_state.as_deref(), Some("reviewed_with_findings"));
 }
 
+/// The rollup to the last completed revision's verdict is a preference, not
+/// a hard redirect: when that revision has no informative verdict of its
+/// own, the root must fall back to its OWN verdict rather than rendering no
+/// badge. This is the exact defect that left Done chain roots with a
+/// perfectly good verdict on record blanking out once their terminal
+/// revision (itself unreviewed) became the rollup target.
+#[test]
+fn ai_review_state_falls_back_to_root_verdict_when_terminal_revision_has_none() {
+    let db = WorkDb::open(temp_db_path("ai-review-state-fallback")).unwrap();
+    let product_id = make_revision_product(&db, "fallback");
+    let pr_url = "https://github.com/spinyfin/mono/pull/5101";
+    let root_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    // The root's own push was reviewed and got a verdict recorded against
+    // the root's own id.
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(root_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    {
+        let conn = db.connect().unwrap();
+        WorkDb::insert_review_verdict_in_tx(
+            &conn,
+            &execution.id,
+            &root_id,
+            &crate::work::ReviewVerdictInput {
+                head_sha: Some("sha-root-findings".to_owned()),
+                findings_count: 1,
+                revision_warranted: true,
+                gate_outcome: crate::work::REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS,
+            },
+        )
+        .unwrap();
+    }
+
+    // A later revision completed (in_review) but never itself got an
+    // informative verdict — it becomes the rollup target with nothing to
+    // report, so the root must fall back to the verdict it already has.
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db.create_revision(revision_input(&root_id), &checker).unwrap();
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+            rusqlite::params![revision.id],
+        )
+        .unwrap();
+    }
+
+    let tree = db.get_work_tree(&product_id).unwrap();
+    let root_card = tree
+        .chores
+        .iter()
+        .find(|c| c.id == root_id)
+        .expect("root chore present");
+    assert_eq!(
+        root_card.ai_review_state.as_deref(),
+        Some("reviewed_with_findings"),
+        "the root must fall back to its own verdict when the terminal revision has none"
+    );
+}
+
 /// `design`/`design_postmortem`/`investigation` kinds never get an initial
 /// AI review (`should_enqueue_reviewer_for_primary` excludes them) — the
 /// badge must read `review_not_required` regardless of status or any PR
