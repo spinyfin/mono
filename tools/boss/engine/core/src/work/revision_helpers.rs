@@ -539,14 +539,17 @@ pub(crate) const AI_REVIEW_STATE_REVIEW_NOT_REQUIRED: &str = "review_not_require
 ///    (never `gave_up`/`dropped_duplicate_head` — see
 ///    [`query_latest_informative_review_verdicts`]; a give-up or dropped
 ///    duplicate is treated exactly like "no verdict at all," per the
-///    deliberate absence of a "review failed" state) for: the last
+///    deliberate absence of a "review failed" state), preferring the last
 ///    completed (`in_review`/`done`) direct-child revision's own id when one
-///    exists, else the row's own id. `completed_clean` →
-///    `reviewed_all_clear`. `completed_with_findings` /
+///    exists, and falling back to the row's own id when that preferred
+///    target has no informative verdict of its own (e.g. the terminal
+///    revision was never reviewed, but the chain root itself was).
+///    `completed_clean` → `reviewed_all_clear`. `completed_with_findings` /
 ///    `revision_creation_failed` → `reviewed_with_findings`, plus the
 ///    verdict's `revision_task_id` (the follow-up revision carrying those
 ///    review comments — `None` when revision creation itself failed, so
-///    there is nothing to reveal). No informative verdict → no badge.
+///    there is nothing to reveal). No informative verdict at either the
+///    preferred target or the fallback → no badge.
 /// 4. Anything else (backlog/blocked/cancelled/archived) → no badge.
 pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chores: &mut [Task]) -> Result<()> {
     // The last completed (in_review/done) direct-child revision per parent
@@ -603,12 +606,20 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
             !task_kind_excluded_from_ai_review(&row.kind)
                 && matches!(row.status, TaskStatus::InReview | TaskStatus::Done)
         })
-        .map(target_id)
+        .flat_map(|row| [target_id(row), row.id.clone()])
         .collect();
     lookup_ids.sort_unstable();
     lookup_ids.dedup();
     let verdicts = query_latest_informative_review_verdicts(conn, &lookup_ids)?;
 
+    // The redirect to the last completed revision's verdict is a
+    // preference, not a hard cutover: when that target has no
+    // informative verdict of its own, fall back to the row's own
+    // verdict rather than rendering nothing. Without this fallback, a
+    // chain root whose terminal revision was never reviewed would
+    // render no badge despite holding its own verdict — a shape that
+    // occurs disproportionately once a card reaches Done and its last
+    // revision flips to `done`.
     let resolve = |row: &Task| -> (Option<&'static str>, Option<String>) {
         if task_kind_excluded_from_ai_review(&row.kind) {
             return (Some(AI_REVIEW_STATE_REVIEW_NOT_REQUIRED), None);
@@ -621,18 +632,24 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
                     (None, None)
                 }
             }
-            TaskStatus::InReview | TaskStatus::Done => match verdicts.get(&target_id(row)) {
-                None => (None, None),
-                Some(v) => match v.gate_outcome.as_str() {
-                    REVIEW_GATE_OUTCOME_COMPLETED_CLEAN => (Some(AI_REVIEW_STATE_REVIEWED_ALL_CLEAR), None),
-                    REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS | REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED => {
-                        (Some(AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS), v.revision_task_id.clone())
-                    }
-                    // Not reachable: `query_latest_informative_review_verdicts`
-                    // already restricts to these three outcomes.
-                    _ => (None, None),
-                },
-            },
+            TaskStatus::InReview | TaskStatus::Done => {
+                let target = target_id(row);
+                let verdict = verdicts
+                    .get(&target)
+                    .or_else(|| if target != row.id { verdicts.get(&row.id) } else { None });
+                match verdict {
+                    None => (None, None),
+                    Some(v) => match v.gate_outcome.as_str() {
+                        REVIEW_GATE_OUTCOME_COMPLETED_CLEAN => (Some(AI_REVIEW_STATE_REVIEWED_ALL_CLEAR), None),
+                        REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS | REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED => {
+                            (Some(AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS), v.revision_task_id.clone())
+                        }
+                        // Not reachable: `query_latest_informative_review_verdicts`
+                        // already restricts to these three outcomes.
+                        _ => (None, None),
+                    },
+                }
+            }
             _ => (None, None),
         }
     };
