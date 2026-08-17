@@ -133,7 +133,10 @@ async fn bare_short_ids_resolve_in_the_selected_product() {
 #[tokio::test]
 async fn missing_bare_short_id_names_the_selected_product() {
     let (server_state, _dir) = test_server_state();
-    let product = crate::test_support::create_test_product_named(&server_state.work_db, "selected");
+    // Named distinctively so the assertion below can't pass by
+    // coincidence of the fixture happening to share a word with the
+    // product-selection vocabulary itself.
+    let product = crate::test_support::create_test_product_named(&server_state.work_db, "flunge");
     server_state
         .register_app_session("session-app".into(), make_session_sink())
         .await;
@@ -149,7 +152,155 @@ async fn missing_bare_short_id_names_the_selected_product() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(err.contains("product selected"), "unexpected error: {err}");
+    assert!(err.contains("in product flunge"), "unexpected error: {err}");
+    assert!(
+        err.contains(boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER),
+        "error must carry the not-found protocol marker so bossctl's marker-discriminating \
+         callers (e.g. agent verbs) fall through correctly, got: {err}",
+    );
+}
+
+/// When the app is not connected at all, a bare short id that is unique
+/// across every product must still resolve — the old global-resolution
+/// contract (`resolve_short_id_item`, tools/boss/cli/src/data.rs) that
+/// `boss task show T<n>` with the app closed depends on.
+#[tokio::test]
+async fn bare_short_id_resolves_globally_when_app_is_not_connected() {
+    let (server_state, _dir) = test_server_state();
+    let product = crate::test_support::create_test_product_named(&server_state.work_db, "flunge");
+    let task = crate::test_support::create_test_chore(&server_state.work_db, &product.id, "row");
+
+    assert_eq!(
+        server_state.selected_product_state().await,
+        SelectedProductState::AppNotConnected,
+    );
+    let selector = boss_protocol::short_id_wire_form(task.short_id.unwrap());
+    assert_eq!(server_state.resolve_work_item_id(&selector).await.unwrap(), task.id);
+}
+
+/// Same as above, but for an app that is connected and simply has not
+/// (yet) reported a selection — a distinct state from `AppNotConnected`
+/// that must fall back the same way.
+#[tokio::test]
+async fn bare_short_id_resolves_globally_with_no_selection_reported() {
+    let (server_state, _dir) = test_server_state();
+    let product = crate::test_support::create_test_product_named(&server_state.work_db, "flunge");
+    let task = crate::test_support::create_test_chore(&server_state.work_db, &product.id, "row");
+    server_state
+        .register_app_session("session-app".into(), make_session_sink())
+        .await;
+
+    assert_eq!(
+        server_state.selected_product_state().await,
+        SelectedProductState::NoSelection,
+    );
+    let selector = boss_protocol::short_id_wire_form(task.short_id.unwrap());
+    assert_eq!(server_state.resolve_work_item_id(&selector).await.unwrap(), task.id);
+}
+
+/// A canonical `task_…` id bypasses short-id scoping entirely, with or
+/// without a selection — the PR that introduced this resolver claims this
+/// is unchanged behaviour, so it needs a regression test.
+#[tokio::test]
+async fn canonical_id_resolves_unchanged_regardless_of_selection() {
+    let (server_state, _dir) = test_server_state();
+    let product = crate::test_support::create_test_product_named(&server_state.work_db, "flunge");
+    let task = crate::test_support::create_test_chore(&server_state.work_db, &product.id, "row");
+
+    assert_eq!(server_state.resolve_work_item_id(&task.id).await.unwrap(), task.id);
+
+    server_state
+        .register_app_session("session-app".into(), make_session_sink())
+        .await;
+    assert!(
+        server_state
+            .record_selected_product("session-app", Some(product.id))
+            .await
+    );
+    assert_eq!(server_state.resolve_work_item_id(&task.id).await.unwrap(), task.id);
+}
+
+/// `resolve_work_item_id_for_restore` for a short id that has no row (live
+/// or tombstoned) in the selected product must report a clean not-found
+/// error, not an unresolved `prod_…/N` selector handed to the DB (which
+/// previously misclassified as a product and bailed with "products are
+/// archived, not soft-deleted").
+#[tokio::test]
+async fn restore_missing_short_id_in_selected_product_is_not_found() {
+    let (server_state, _dir) = test_server_state();
+    let product = crate::test_support::create_test_product_named(&server_state.work_db, "flunge");
+    server_state
+        .register_app_session("session-app".into(), make_session_sink())
+        .await;
+    assert!(
+        server_state
+            .record_selected_product("session-app", Some(product.id))
+            .await
+    );
+
+    let selector = boss_protocol::short_id_wire_form(999_999);
+    let err = server_state
+        .resolve_work_item_id_for_restore(&selector)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("in product flunge"), "unexpected error: {err}");
+    assert!(
+        err.contains(boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER),
+        "unexpected error: {err}",
+    );
+    assert!(
+        !err.contains("archived"),
+        "must not fall through to the product-classification error: {err}",
+    );
+}
+
+/// With no selected product at all, restore falls back to global
+/// resolution just like `resolve_work_item_id` does — this is the exact
+/// path `delete_then_restore_round_trip_through_engine`
+/// (tools/boss/engine/core/tests/work_crud.rs) exercises with no app
+/// session registered.
+#[tokio::test]
+async fn restore_resolves_globally_when_no_product_is_selected() {
+    let (server_state, _dir) = test_server_state();
+    let product = crate::test_support::create_test_product_named(&server_state.work_db, "flunge");
+    let task = crate::test_support::create_test_chore(&server_state.work_db, &product.id, "row");
+    server_state.work_db.delete_work_item(&task.id).unwrap();
+
+    assert_eq!(
+        server_state.selected_product_state().await,
+        SelectedProductState::AppNotConnected,
+    );
+    let selector = boss_protocol::short_id_wire_form(task.short_id.unwrap());
+    assert_eq!(
+        server_state.resolve_work_item_id_for_restore(&selector).await.unwrap(),
+        task.id
+    );
+}
+
+/// A deleted task's short id still resolves for restore — the whole
+/// point of the restore-scoped resolver is to see tombstoned rows the
+/// live-only resolvers filter out.
+#[tokio::test]
+async fn restore_resolves_a_tombstoned_short_id_in_the_selected_product() {
+    let (server_state, _dir) = test_server_state();
+    let product = crate::test_support::create_test_product_named(&server_state.work_db, "flunge");
+    let task = crate::test_support::create_test_chore(&server_state.work_db, &product.id, "row");
+    server_state.work_db.delete_work_item(&task.id).unwrap();
+    server_state
+        .register_app_session("session-app".into(), make_session_sink())
+        .await;
+    assert!(
+        server_state
+            .record_selected_product("session-app", Some(product.id))
+            .await
+    );
+
+    let selector = boss_protocol::short_id_wire_form(task.short_id.unwrap());
+    assert_eq!(
+        server_state.resolve_work_item_id_for_restore(&selector).await.unwrap(),
+        task.id
+    );
 }
 
 /// An app that reports "nothing selected" is not the same as an app that
@@ -433,6 +584,65 @@ async fn report_from_a_non_app_session_is_acked_as_not_accepted() {
         Some(product.id.as_str()),
         "a rejected report must leave the recorded selection untouched",
     );
+}
+
+/// End-to-end regression test for the bug this resolver exists to fix:
+/// `bossctl reveal T<n>` with the chooser on a product that is not the
+/// hardcoded "Boss" product must reveal the right row rather than
+/// guessing across products (or failing outright).
+#[tokio::test]
+async fn reveal_work_item_resolves_short_id_via_the_selected_non_boss_product() {
+    let (server_state, _dir) = test_server_state();
+    let boss_product = crate::test_support::create_test_product_named(&server_state.work_db, "Boss");
+    let other_product = crate::test_support::create_test_product_named(&server_state.work_db, "flunge");
+    let boss_task = crate::test_support::create_test_chore(&server_state.work_db, &boss_product.id, "boss row");
+    let other_task = crate::test_support::create_test_chore(&server_state.work_db, &other_product.id, "flunge row");
+    assert_eq!(boss_task.short_id, other_task.short_id);
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+    assert!(
+        server_state
+            .record_selected_product("session-app", Some(other_product.id.clone()))
+            .await
+    );
+
+    let selector = boss_protocol::short_id_wire_form(other_task.short_id.unwrap());
+    let server_clone = server_state.clone();
+    let selector_clone = selector.clone();
+    let reveal = tokio::spawn(async move { server_clone.reveal_work_item(&selector_clone).await });
+
+    let envelope = sink.next().await.expect("an EngineRequest event should be enqueued");
+    let request_id = match &envelope.payload {
+        FrontendEvent::EngineRequest { request_id, request } => {
+            let boss_protocol::EngineToAppRequest::RevealWorkItem(input) = request else {
+                panic!("expected a RevealWorkItem request, got {request:?}");
+            };
+            assert_eq!(
+                input.work_item_id, other_task.id,
+                "must reveal the row from the selected product, not the same-numbered row in another product",
+            );
+            request_id.clone()
+        }
+        other => panic!("expected EngineRequest, got {other:?}"),
+    };
+    server_state
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            boss_protocol::EngineToAppResponse::RevealWorkItem {
+                result: Ok(boss_protocol::RevealWorkItemResult::default()),
+            },
+        )
+        .await;
+
+    let revealed_id = reveal
+        .await
+        .expect("reveal_work_item task panicked")
+        .expect("reveal should succeed");
+    assert_eq!(revealed_id, other_task.id);
 }
 
 #[tokio::test]

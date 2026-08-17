@@ -37,6 +37,7 @@ pub(super) async fn handle_audit_product_effort(ctx: Dispatch, req: FrontendRequ
 
 pub(super) async fn handle_record_effort_escalation(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -51,6 +52,16 @@ pub(super) async fn handle_record_effort_escalation(ctx: Dispatch, req: Frontend
     } = req
     else {
         unreachable!()
+    };
+    // A bare short id must resolve to a canonical id before it is
+    // recorded, or the escalation event is filed against a raw `T<n>`
+    // string that no later reader's exact-match lookup will ever find.
+    let work_item_id = match server_state.resolve_work_item_id(&work_item_id).await {
+        Ok(id) => id,
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+            return;
+        }
     };
     {
         // Coordinator-only RPC in practice (the sibling

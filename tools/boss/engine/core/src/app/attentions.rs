@@ -270,6 +270,7 @@ pub(super) async fn handle_list_attention_merges(ctx: Dispatch, req: FrontendReq
 
 pub(super) async fn handle_list_attention_groups(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -284,6 +285,32 @@ pub(super) async fn handle_list_attention_groups(ctx: Dispatch, req: FrontendReq
     } = req
     else {
         unreachable!()
+    };
+    // `product_id` is always the canonical id the app's chooser reports
+    // (see `FrontendRequest::ListAttentionGroups`), never a short id, so
+    // it is left as-is. `project_id`/`task_id` are caller-supplied
+    // association filters that a `T<n>`/`P<n>` short id can reach — the
+    // DB filter below is an exact-match `association_task_id = ?`, so an
+    // unresolved short id would silently match nothing rather than error.
+    let project_id = match project_id {
+        Some(id) => match server_state.resolve_work_item_id(&id).await {
+            Ok(id) => Some(id),
+            Err(err) => {
+                send_work_error(&sink, &request_id, &err);
+                return;
+            }
+        },
+        None => None,
+    };
+    let task_id = match task_id {
+        Some(id) => match server_state.resolve_work_item_id(&id).await {
+            Ok(id) => Some(id),
+            Err(err) => {
+                send_work_error(&sink, &request_id, &err);
+                return;
+            }
+        },
+        None => None,
     };
     {
         let listed = work_db

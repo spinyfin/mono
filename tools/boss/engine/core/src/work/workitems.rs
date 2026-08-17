@@ -1233,6 +1233,23 @@ impl WorkDb {
         }
     }
 
+    /// Resolve a friendly work-item selector to a primary id, including
+    /// tombstoned rows. Used by restore — the one engine path that
+    /// intentionally operates on deleted work items — so a missing short
+    /// id reports "no such row" instead of being handed through
+    /// unresolved and misclassified downstream by `classify_id`.
+    ///
+    /// `id` may be a bare short id (`T5`) for the no-selected-product
+    /// fallback (ambiguity across products is a hard error, matching
+    /// [`Self::resolve_work_item_ref`]'s contract) or an already
+    /// product-scoped selector (`{product_id}/{n}`) when a product is
+    /// selected. Returns `Ok(None)` when nothing matches (live or
+    /// deleted); never guesses.
+    pub fn resolve_work_item_ref_for_restore(&self, id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        resolve_friendly_work_item_id_inner(&conn, id, true)
+    }
+
     /// Like [`resolve_work_item_ref`], but opaque non-typed input that is
     /// not a known primary id is also a hard error. Use when the call
     /// site only accepts work-item ids (not execution ids) so a typo
