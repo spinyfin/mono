@@ -1,9 +1,38 @@
 //! Per-execution scheduling: work-item resolution, host selection, workspace
 //! leasing/recovery, and pre-start failure handling. Part of the `coordinator`
 //! module split; see [`super`] for the struct and shared types.
+use crate::work::CancelExecutionOpts;
+use anyhow::bail;
+
 use super::*;
 
 impl ExecutionCoordinator {
+    /// Reject an explicit host request before the work DB can create or
+    /// refresh an execution. This makes `bossctl ... --host` failures
+    /// transactional from the operator's point of view: an unknown,
+    /// disabled, or saturated host leaves no queued execution behind.
+    pub(crate) fn validate_requested_host(&self, work_item_id: &str, host_id: &str) -> Result<()> {
+        let hosts = self.work_db.list_hosts().context("host validation: list hosts")?;
+        let known_hosts = hosts.iter().map(|host| host.id.as_str()).collect::<Vec<_>>().join(", ");
+        let host = hosts
+            .iter()
+            .find(|host| host.id == host_id)
+            .ok_or_else(|| anyhow!("unknown host '{host_id}'; known hosts: {known_hosts}"))?;
+        if !host.enabled {
+            bail!(
+                "requested host '{host_id}' is disabled{}",
+                host.last_error_text
+                    .as_deref()
+                    .map(|text| format!(" — {text}"))
+                    .unwrap_or_default()
+            )
+        }
+        let work_item = self.work_db.get_work_item(work_item_id)?;
+        self.pick_host(&work_item, None, Some(host_id.to_string()))
+            .map(|_| ())
+            .map_err(|err| anyhow!("requested host '{host_id}' is ineligible: {err}"))
+    }
+
     /// Resolve the [`WorkItem`] an execution operates on.
     ///
     /// For a normal execution this is the persisted task/chore/product/
@@ -96,8 +125,8 @@ impl ExecutionCoordinator {
         Some(WorkItem::Chore(task))
     }
 
-    /// Pick the host this execution should run on. Honours the pin escape
-    /// hatch (`work_executions.pinned_host_id`) and the capability filter,
+    /// Pick the host this execution should run on. Durable pins bypass
+    /// capability matching; a one-dispatch requested host remains subject to it,
     /// then ranks the survivors by branch affinity / free slots — see
     /// [`crate::host_scheduling::select_host`].
     ///
@@ -111,39 +140,31 @@ impl ExecutionCoordinator {
     /// Returns the selected [`Host`] or an error describing why nothing was
     /// eligible (consumed by the caller as a recoverable pre-start
     /// failure).
-    fn select_host_for_execution(&self, execution: &WorkExecution, work_item: &WorkItem) -> Result<Host> {
-        let pinned = self.work_db.execution_pinned_host(&execution.id).unwrap_or_else(|err| {
-            tracing::warn!(
-                execution_id = %execution.id,
-                error = %format!("{err:#}"),
-                "host-selection: failed to read pinned host; treating as unpinned",
-            );
-            None
-        });
-
+    fn pick_host(
+        &self,
+        work_item: &WorkItem,
+        pinned_host_id: Option<String>,
+        requested_host_id: Option<String>,
+    ) -> Result<Host> {
         // Capability requirements union over the chore + its product +
         // its project. Empty today (no writer yet), which leaves every
         // enabled host capability-eligible — preserving local behaviour.
         let product_id = work_item.product_id().to_string();
         let project_id = work_item_project_id(work_item);
-        let mut subject_ids: Vec<&str> = vec![execution.work_item_id.as_str(), product_id.as_str()];
+        let mut subject_ids: Vec<&str> = vec![work_item.primary_id(), product_id.as_str()];
         if let Some(pid) = project_id.as_deref() {
             subject_ids.push(pid);
         }
         let required_capabilities = self
             .work_db
             .required_capabilities_for_subject_ids(&subject_ids)
-            .unwrap_or_else(|err| {
-                tracing::warn!(
-                    execution_id = %execution.id,
-                    error = %format!("{err:#}"),
-                    "host-selection: failed to read capability requirements; treating as none",
-                );
-                BTreeSet::new()
-            });
+            .context("host-selection: capability requirements")?;
 
         let hosts = self.work_db.list_hosts().context("host-selection: list hosts")?;
-        let active = self.work_db.active_runs_per_host().unwrap_or_default();
+        let active = self
+            .work_db
+            .active_runs_per_host()
+            .context("host-selection: active runs per host")?;
 
         let slots: Vec<HostSlot> = hosts
             .iter()
@@ -152,13 +173,13 @@ impl ExecutionCoordinator {
                     .work_db
                     .list_host_capabilities(&host.id)
                     .map(|caps| caps.into_iter().map(|c| c.capability).collect::<BTreeSet<_>>())
-                    .unwrap_or_default();
+                    .context("host-selection: host capabilities")?;
                 let active_runs = if host.id == "local" {
                     0
                 } else {
                     *active.get(&host.id).unwrap_or(&0)
                 };
-                HostSlot {
+                Ok(HostSlot {
                     host: host.clone(),
                     capabilities,
                     active_runs,
@@ -167,13 +188,14 @@ impl ExecutionCoordinator {
                     // the first run pushes. Free-slots-first is the
                     // design's documented v1 fallback for the first run.
                     had_prior_run_on_branch: false,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<_>>()?;
 
         let requirements = ChoreRequirements {
             required_capabilities,
-            pinned_host_id: pinned,
+            pinned_host_id,
+            requested_host_id,
         };
         let (picked, report) = host_scheduling::select_host(&requirements, &slots);
         match picked {
@@ -182,11 +204,25 @@ impl ExecutionCoordinator {
                 .find(|h| h.id == host_id)
                 .ok_or_else(|| anyhow!("selected host '{host_id}' is missing from the registry")),
             None => Err(anyhow!(
-                "no eligible host for execution {}: {}",
-                execution.id,
+                "no eligible host for work item {}: {}",
+                work_item.primary_id(),
                 summarize_ineligibility(&report),
             )),
         }
+    }
+
+    fn select_host_for_execution(&self, execution: &WorkExecution, work_item: &WorkItem) -> Result<Host> {
+        let pinned = self
+            .work_db
+            .execution_pinned_host(&execution.id)
+            .context("host-selection: execution pinned host")?;
+        // Non-destructive: everything after selection (adapter build,
+        // `cube repo ensure`, workspace lease) can still fail recoverably
+        // and re-enter selection on retry, so the constraint must still be
+        // there. `schedule_execution` clears it explicitly on success or
+        // on a terminal cancel — never here.
+        let requested = self.requested_host_for(&execution.id);
+        self.pick_host(work_item, pinned, requested)
     }
 
     /// Take one `ready` execution all the way to a running worker: guards,
@@ -675,9 +711,38 @@ impl ExecutionCoordinator {
         // no-eligible-host result is a recoverable pre-start failure — it
         // backs off and raises an attention item rather than hot-looping,
         // and a later kick retries once a host comes online / tags change.
+        let had_requested_host = self.requested_host_ids.lock().unwrap().contains_key(&execution.id);
         let selected_host = match self.select_host_for_execution(execution, &work_item) {
             Ok(host) => host,
             Err(err) => {
+                if had_requested_host {
+                    match self.work_db.cancel_execution_with(
+                        &execution.id,
+                        CancelExecutionOpts {
+                            reason: Some(format!("requested host became ineligible: {err}")),
+                            queued_only: true,
+                        },
+                    ) {
+                        Ok(_) => {
+                            // Terminal for this execution: drop the constraint so it
+                            // cannot leak (selection no longer takes it itself).
+                            self.take_requested_host(&execution.id);
+                        }
+                        Err(cancel_err) => {
+                            // The cancel is what makes this row terminal. If it
+                            // failed, the row is still `ready` and will be
+                            // drained again — keep the constraint in place so
+                            // the retry is refused for the same requested host
+                            // instead of landing unpinned on an arbitrary one.
+                            tracing::warn!(
+                                execution_id = %execution.id,
+                                error = %format!("{cancel_err:#}"),
+                                "failed to cancel execution whose requested host became ineligible; \
+                                 leaving the --host constraint in place so a retry cannot land unpinned",
+                            );
+                        }
+                    }
+                }
                 // No event was emitted here before, so a `no_eligible_host`
                 // failure was invisible in the per-execution timeline — the
                 // watchdog reaped it as a `worker_claimed` stall. Emit a
@@ -692,6 +757,9 @@ impl ExecutionCoordinator {
                             .with_details(serde_json::json!({ "reason": "no_eligible_host" })),
                     )
                     .await;
+                if had_requested_host {
+                    return Err(err);
+                }
                 self.record_start_failure(
                     Arc::clone(self),
                     execution,
@@ -721,6 +789,10 @@ impl ExecutionCoordinator {
                             })),
                     )
                     .await;
+                if had_requested_host {
+                    self.cancel_requested_host_pre_start_failure(execution, "host adapter build", &err);
+                    return Err(err);
+                }
                 self.record_start_failure(
                     Arc::clone(self),
                     execution,
@@ -779,15 +851,26 @@ impl ExecutionCoordinator {
         {
             Ok(Ok(repo)) => repo,
             Ok(Err(err)) => {
-                self.emit_ensure_failed_and_record(
+                self.emit_ensure_failed(
                     execution,
                     worker_id,
                     adapter.command_repr(&ensure_args),
                     &err,
                     serde_json::json!({ "host_id": selected_host.id.clone() }),
-                    ("cube_repo_ensure_failed", "Cube `repo ensure` failed"),
                 )
-                .await?;
+                .await;
+                if had_requested_host {
+                    self.cancel_requested_host_pre_start_failure(execution, "cube repo ensure", &err);
+                    return Err(err);
+                }
+                self.record_start_failure(
+                    Arc::clone(self),
+                    execution,
+                    worker_id,
+                    None,
+                    ("cube_repo_ensure_failed", "Cube `repo ensure` failed"),
+                    &err,
+                )?;
                 return Err(err);
             }
             Err(_elapsed) => {
@@ -795,7 +878,7 @@ impl ExecutionCoordinator {
                     "cube `repo ensure` timed out after {}s",
                     CUBE_REPO_ENSURE_TIMEOUT.as_secs()
                 );
-                self.emit_ensure_failed_and_record(
+                self.emit_ensure_failed(
                     execution,
                     worker_id,
                     adapter.command_repr(&ensure_args),
@@ -805,9 +888,20 @@ impl ExecutionCoordinator {
                         "timeout_ms": CUBE_REPO_ENSURE_TIMEOUT.as_millis() as u64,
                         "host_id": selected_host.id.clone(),
                     }),
-                    ("cube_repo_ensure_failed", "Cube `repo ensure` timed out"),
                 )
-                .await?;
+                .await;
+                if had_requested_host {
+                    self.cancel_requested_host_pre_start_failure(execution, "cube repo ensure", &err);
+                    return Err(err);
+                }
+                self.record_start_failure(
+                    Arc::clone(self),
+                    execution,
+                    worker_id,
+                    None,
+                    ("cube_repo_ensure_failed", "Cube `repo ensure` timed out"),
+                    &err,
+                )?;
                 return Err(err);
             }
         };
@@ -856,6 +950,10 @@ impl ExecutionCoordinator {
         {
             Ok(lease) => lease,
             Err(err) => {
+                if had_requested_host {
+                    self.cancel_requested_host_pre_start_failure(execution, "cube workspace lease", &err);
+                    return Err(err);
+                }
                 // The lease helper has already emitted attempt /
                 // failure events for every try; convert the final
                 // failure into the start-failure record so the
@@ -1244,6 +1342,10 @@ impl ExecutionCoordinator {
                                 .with_cube_invocation(change_repr.clone()),
                         )
                         .await;
+                    if had_requested_host {
+                        self.cancel_requested_host_pre_start_failure(execution, "cube change create", &err);
+                        return Err(err);
+                    }
                     self.record_start_failure(
                         Arc::clone(self),
                         execution,
@@ -1267,6 +1369,11 @@ impl ExecutionCoordinator {
             &selected_host.id,
         ) {
             Ok((execution, run)) => {
+                // Dispatch succeeded: the request-scoped `--host` constraint
+                // (if any) has done its job. Clear it here — the same point
+                // the durable pin used to be cleared before request-scoped
+                // routing got its own lifetime — so it can never leak.
+                self.take_requested_host(&execution.id);
                 let worker_id_owned = worker_id.to_owned();
                 let queue_wait_ms = execution
                     .started_epoch()
@@ -1383,6 +1490,10 @@ impl ExecutionCoordinator {
                             .with_error(&err),
                     )
                     .await;
+                if had_requested_host {
+                    self.cancel_requested_host_pre_start_failure(execution, "start_execution_run", &err);
+                    return Err(err);
+                }
                 self.record_start_failure(
                     Arc::clone(self),
                     execution,
@@ -2167,29 +2278,20 @@ impl ExecutionCoordinator {
         }
     }
 
-    /// Record a pre-start failure and either schedule an automatic retry
-    /// or surface a permanent failure to the operator.
-    ///
-    /// Safe-to-retry stages (no worker side effects yet):
-    /// `cube_repo_ensure`, `workspace_lease`, `change_create`,
-    /// `run_start` (DB-only failure, transaction rolled back).
-    ///
-    /// Do NOT call this for post-`run_started` failures — those require
-    /// `finish_execution_run`.
-    /// Shared shape for the two `cube repo ensure` failure arms (error and
-    /// timeout): emit a `CubeRepoEnsureFailed` dispatch event carrying the
-    /// reproducible cube invocation, then record the pre-start failure. Only
-    /// the error, the details payload, and the (attention_kind, attention_title)
-    /// tuple differ between the arms.
-    async fn emit_ensure_failed_and_record(
+    /// Emits the `CubeRepoEnsureFailed` dispatch event only. Callers decide
+    /// what happens next: [`Self::record_start_failure`]'s ordinary retry
+    /// for an unconstrained execution, or
+    /// [`Self::cancel_requested_host_pre_start_failure`] for one with a
+    /// `--host` constraint still in effect (retrying would silently drop
+    /// the constraint — see that method's doc comment).
+    async fn emit_ensure_failed(
         self: &Arc<Self>,
         execution: &WorkExecution,
         worker_id: &str,
         ensure_repr: Option<(String, String)>,
         error: &anyhow::Error,
         details: serde_json::Value,
-        attention: (&str, &str),
-    ) -> Result<()> {
+    ) {
         self.dispatch_events
             .emit(
                 DispatchEvent::new(Stage::CubeRepoEnsureFailed, DispatchOutcome::Error, &execution.id)
@@ -2200,9 +2302,17 @@ impl ExecutionCoordinator {
                     .with_details(details),
             )
             .await;
-        self.record_start_failure(Arc::clone(self), execution, worker_id, None, attention, error)
     }
 
+    /// Record a pre-start failure and either schedule an automatic retry
+    /// or surface a permanent failure to the operator.
+    ///
+    /// Safe-to-retry stages (no worker side effects yet):
+    /// `cube_repo_ensure`, `workspace_lease`, `change_create`,
+    /// `run_start` (DB-only failure, transaction rolled back).
+    ///
+    /// Do NOT call this for post-`run_started` failures — those require
+    /// `finish_execution_run`.
     fn record_start_failure(
         &self,
         coordinator: Arc<ExecutionCoordinator>,
@@ -2367,5 +2477,73 @@ impl ExecutionCoordinator {
             }
         }
         Ok(())
+    }
+
+    /// A recoverable pre-start failure (host adapter build, `cube repo
+    /// ensure`, workspace lease, cube change create, ...) on an execution
+    /// with a request-scoped `--host` constraint must not fall through to
+    /// [`Self::record_start_failure`]'s ordinary retry: a retry re-enters
+    /// host selection, and by then this constraint may already be the
+    /// last thing standing between "runs on the host the operator asked
+    /// for" and "runs on any eligible host with no notice" — exactly the
+    /// silent-misplacement class `--host` exists to eliminate. Cancel the
+    /// execution instead (leaving no residue queued behind an unpinned
+    /// retry) and drop the constraint, matching how the ineligible-host
+    /// case in [`Self::schedule_execution`] already behaves.
+    fn cancel_requested_host_pre_start_failure(&self, execution: &WorkExecution, stage: &str, err: &anyhow::Error) {
+        // Not retried, but must still be reported: a `--host` pre-start
+        // failure never reaches `record_start_failure`'s permanent-failure
+        // path, so without this the operator's requested-host dispatch can
+        // silently disappear as a `cancelled` row with no attention item —
+        // exactly the case an SSH-unreachable remote host hits.
+        let attention_body = format!(
+            "Execution `{execution_id}` (requested host) failed during `{stage}` and was \
+             cancelled rather than retried, so the `--host` constraint is not silently \
+             dropped.\n\n\
+             **Error:** {err:#}\n\n\
+             Inspect `dispatch-events/executions/{execution_id}/dispatch.jsonl` \
+             for the full stage timeline.",
+            execution_id = execution.id,
+        );
+        if let Err(attention_err) = self.work_db.create_attention_item(CreateAttentionItemInput {
+            execution_id: Some(execution.id.clone()),
+            work_item_id: None,
+            kind: "requested_host_dispatch_failed".to_owned(),
+            status: None,
+            title: "Requested-host dispatch failed".to_owned(),
+            body_markdown: attention_body,
+            resolved_at: None,
+        }) {
+            tracing::error!(
+                ?attention_err,
+                execution_id = %execution.id,
+                "failed to record attention item for requested-host pre-start failure",
+            );
+        }
+
+        match self.work_db.cancel_execution_with(
+            &execution.id,
+            CancelExecutionOpts {
+                reason: Some(format!("requested host dispatch failed during {stage}: {err:#}")),
+                queued_only: true,
+            },
+        ) {
+            Ok(_) => {
+                self.take_requested_host(&execution.id);
+            }
+            Err(cancel_err) => {
+                // The cancel is what makes this row terminal. If it failed,
+                // the row is still `ready` and will be drained again — keep
+                // the constraint in place so the retry is refused for the
+                // same requested host instead of landing unpinned.
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    stage,
+                    error = %format!("{cancel_err:#}"),
+                    "failed to cancel requested-host execution after a pre-start failure; \
+                     leaving the --host constraint in place so a retry cannot land unpinned",
+                );
+            }
+        }
     }
 }

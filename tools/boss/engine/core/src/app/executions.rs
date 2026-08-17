@@ -99,7 +99,8 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
         // and drains on resume.
         let force = input.force;
         let live_states = server_state.live_worker_states.clone();
-        let result = work_db.request_execution_with_live_check(input, |run_id| live_states.is_run_live(run_id));
+        let coordinator = server_state.execution_coordinator.clone();
+        let result = coordinator.request_execution_via_db(input, live_states);
         match result {
             Ok(execution) => {
                 if force {

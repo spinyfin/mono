@@ -495,6 +495,7 @@ fn work_start_force_composes_with_priority_and_workspace() {
                     work_item_id,
                     priority,
                     preferred_workspace_id,
+                    host,
                     force,
                 },
         } => {
@@ -502,8 +503,28 @@ fn work_start_force_composes_with_priority_and_workspace() {
             assert!(force);
             assert_eq!(priority, Some(5));
             assert_eq!(preferred_workspace_id.as_deref(), Some("mono-agent-002"));
+            assert!(host.is_none());
         }
         other => panic!("expected WorkAction::Start, got {other:?}"),
+    }
+}
+
+#[test]
+fn host_flag_is_available_on_both_manual_dispatch_verbs() {
+    let work = Cli::try_parse_from(["bossctl", "work", "start", "task_1", "--host", "remote-a"]).unwrap();
+    match work.command {
+        Command::Work {
+            action: WorkAction::Start { host, .. },
+        } => assert_eq!(host.as_deref(), Some("remote-a")),
+        other => panic!("expected WorkAction::Start, got {other:?}"),
+    }
+
+    let agents = Cli::try_parse_from(["bossctl", "agents", "launch", "task_1", "--host", "remote-a"]).unwrap();
+    match agents.command {
+        Command::Agents {
+            action: AgentsAction::Launch { host, .. },
+        } => assert_eq!(host.as_deref(), Some("remote-a")),
+        other => panic!("expected AgentsAction::Launch, got {other:?}"),
     }
 }
 

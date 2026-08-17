@@ -2099,6 +2099,36 @@ pub struct ExecutionCoordinator {
     /// durable badge on the row.
     #[builder(default)]
     dispatch_pause_bypass_execution_ids: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// One-dispatch `--host` routes. Kept out of `work_executions` so they
+    /// cannot overwrite or clear the durable pin escape hatch.
+    ///
+    /// Process-local and best-effort, not a durable pin: it does NOT
+    /// survive an engine restart. An execution still `ready` (dispatch
+    /// paused, no free slot, a restart landing mid-queue, ...) when the
+    /// engine comes back up loses its `--host` constraint and is placed
+    /// by ordinary (unconstrained) host selection on the next drain, with
+    /// no error or notice — this is a known limitation of keeping the
+    /// constraint in memory rather than on the execution row. Entries are
+    /// removed on the paths internal to dispatch that can fire while a
+    /// request-scoped host is still pinned: successful dispatch
+    /// (`schedule_execution`'s `start_execution_run_on_host` success arm),
+    /// the ineligible-requested-host cancel, any pre-start-failure cancel
+    /// (host adapter build, `cube repo ensure`, workspace lease, cube
+    /// change create, `start_execution_run`), and the pause-override
+    /// no-residue refusal — and only when the clearing cancel itself
+    /// succeeds; a failed cancel deliberately leaves the entry in place so
+    /// a retry cannot land unpinned. It is only ever read (never
+    /// destructively taken) during selection itself
+    /// (`select_host_for_execution`), so a mid-dispatch failure cannot
+    /// silently lose the constraint before the retry decision is made.
+    /// An execution cancelled through an external path instead (e.g.
+    /// `bossctl executions cancel` / `work cancel`) is NOT cleared here:
+    /// the entry is left behind for the process lifetime. That leak is
+    /// harmless — execution ids are unique, so a stale entry can never
+    /// bind to another execution — but it does mean this map is not
+    /// guaranteed empty for every terminal execution.
+    #[builder(default)]
+    requested_host_ids: std::sync::Mutex<HashMap<String, String>>,
     /// Startup capability gate for the local tmux runtime. Unlike the
     /// operator/breaker pause state this is not user-resumable: a worker
     /// cannot be dispatched until the engine has recorded a passing probe.
@@ -2228,7 +2258,7 @@ fn summarize_ineligibility(report: &[host_scheduling::Eligibility]) -> String {
                 .map(|r| match r {
                     R::Disabled => "disabled".to_owned(),
                     R::NoFreeSlots => "no free slots".to_owned(),
-                    R::NotPinned => "not the pinned host".to_owned(),
+                    R::NotSelectedHost => "not the requested/pinned host".to_owned(),
                     R::MissingCapabilities(missing) => {
                         format!("missing capabilities [{}]", missing.join(", "))
                     }

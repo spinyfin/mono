@@ -1003,6 +1003,10 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         entry_point: _,
         observed_pause_since_epoch_s: _,
         allow_dirty,
+        // Placement is a coordinator concern. The coordinator validates and
+        // installs this onto the one execution after this transaction has
+        // created or refreshed it; it must never become a work-item field.
+        requested_host_id: _,
     } = input;
 
     let preferred_workspace_id = normalize_optional_text(preferred_workspace_id);
