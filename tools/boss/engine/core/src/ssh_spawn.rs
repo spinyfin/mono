@@ -58,6 +58,9 @@ pub const REASON_MISSING_GH: &str = "host_missing_gh";
 /// nothing. Preflighted by the wrapper so that becomes a named launch
 /// failure rather than a silent one.
 pub const REASON_MISSING_BOSS_EVENT: &str = "host_missing_boss_event";
+/// `exit 83`: the detached supervisor failed to publish the direct worker
+/// PID before the wrapper's bounded handshake deadline.
+pub const REASON_WORKER_PID_UNPUBLISHED: &str = "host_worker_pid_unpublished";
 /// Any other non-zero wrapper exit, or a failure to even establish the
 /// events forward before launch.
 pub const REASON_WORKER_LAUNCH_FAILED: &str = "worker_launch_failed";
@@ -84,6 +87,9 @@ const WORKER_LIVENESS_SETTLE_SECS: u64 = 2;
 const LIVENESS_ALIVE_SENTINEL: &str = "BOSS_WORKER_ALIVE";
 const LIVENESS_DEAD_SENTINEL: &str = "BOSS_WORKER_DEAD";
 
+/// Line appended by the detached wrapper supervisor after the worker exits.
+pub(crate) const WORKER_EXIT_STATUS_PREFIX: &str = "boss-remote-run: worker exited with status=";
+
 /// Outcome of classifying the wrapper's exit status. `Launched` means
 /// the wrapper validated its contract and backgrounded the worker; it
 /// does **not** mean the worker finished (the worker runs detached and
@@ -98,7 +104,7 @@ pub enum WrapperLaunch {
 }
 
 /// Map a wrapper exit code onto the launch outcome. The sentinel codes
-/// (78–81) are the wrapper's documented contract; anything else is an
+/// (78–83) are the wrapper's documented contract; anything else is an
 /// opaque launch failure.
 pub fn classify_wrapper_exit(code: i32) -> WrapperLaunch {
     match code {
@@ -108,6 +114,7 @@ pub fn classify_wrapper_exit(code: i32) -> WrapperLaunch {
         80 => WrapperLaunch::Failed(REASON_MISSING_CUBE),
         81 => WrapperLaunch::Failed(REASON_MISSING_GH),
         82 => WrapperLaunch::Failed(REASON_MISSING_BOSS_EVENT),
+        83 => WrapperLaunch::Failed(REASON_WORKER_PID_UNPUBLISHED),
         _ => WrapperLaunch::Failed(REASON_WORKER_LAUNCH_FAILED),
     }
 }
@@ -334,15 +341,21 @@ pub async fn perform_remote_launch(
                     // Provably gone: tear down the forward we opened and
                     // report a terminal launch failure.
                     Ok(false) => {
-                        // Read the worker's own output BEFORE tearing anything
-                        // down. The workspace goes back to cube on the failure
-                        // path below and is reset for the next lease, so a
-                        // pointer to the log is unusable by the time anyone
-                        // reads the error — carry the content itself. The one
-                        // line in it is the whole diagnosis — `Failed to
-                        // authenticate. API Error: 401 OAuth access token has
-                        // expired.` in the case this was written for.
-                        let log_tail = pull_worker_log_tail(exec, &plan.workspace_path).await;
+                        // The forward and SSH master are still live here, so
+                        // recover the worker's own final output before the
+                        // terminal failure tears them down. Failure to capture
+                        // is diagnostic only: the liveness result remains the
+                        // finding and is never masked by this extra command.
+                        let worker_detail = match capture_worker_death_log(exec, &plan.workspace_path).await {
+                            Ok(log) if log.trim().is_empty() => "worker log capture was empty".to_owned(),
+                            Ok(log) => {
+                                let exit_status = parse_worker_exit_status(&log)
+                                    .map(|status| format!("worker-reported exit status {status}"))
+                                    .unwrap_or_else(|| "worker exit status was not recorded".to_owned());
+                                format!("{exit_status}; worker log tail (up to {WORKER_LOG_TAIL_BYTES} bytes):\n{log}")
+                            }
+                            Err(err) => format!("worker log capture failed: {err:#}"),
+                        };
                         let _ = exec
                             .cancel_reverse_unix_forward(&plan.events_socket_path, engine_events_socket)
                             .await;
@@ -352,14 +365,7 @@ pub async fn perform_remote_launch(
                             remote_pid: Some(pid),
                             detail: Some(format!(
                                 "worker pid {pid} was not alive {WORKER_LIVENESS_SETTLE_SECS}s after launch \
-                                 (the agent exited immediately). Last output from \
-                                 {log_path}: {log}",
-                                log_path = remote_worker_log_path(&plan.workspace_path),
-                                log = match log_tail.as_deref() {
-                                    Some(tail) if !tail.trim().is_empty() => tail.trim().to_owned(),
-                                    Some(_) => "(empty — the agent produced no output at all)".to_owned(),
-                                    None => "(could not be read from the host)".to_owned(),
-                                },
+                                 (measured by liveness probe); {worker_detail}",
                             )),
                         });
                     }
@@ -400,20 +406,38 @@ pub async fn perform_remote_launch(
     }
 }
 
-/// Best-effort read of the tail of `<workspace>/.boss/worker.log` on the
-/// remote — the file the wrapper tees the agent's stdout+stderr to.
-///
-/// `None` means the tail could not be obtained (transport failure);
-/// `Some("")` means it was read and really is empty. Reuses the same
-/// byte-suffix pull the transcript readback uses rather than adding a second
-/// remote-tail implementation.
-async fn pull_worker_log_tail(exec: &dyn SshExec, workspace_path: &str) -> Option<String> {
+/// Read a bounded tail of the remote worker log after a liveness probe proves
+/// the worker is gone. Unlike the transcript helper's normal UX path, a
+/// missing log is reported as a capture failure here: an immediate-death error
+/// must say whether the engine successfully observed worker output.
+async fn capture_worker_death_log(exec: &dyn SshExec, workspace_path: &str) -> Result<String> {
     let path = remote_worker_log_path(workspace_path);
-    crate::remote_transcript::pull_remote_transcript_tail(exec, &path, WORKER_LOG_TAIL_BYTES)
-        .await
-        .ok()
+    let command = crate::remote_transcript::remote_tail_command(&path, WORKER_LOG_TAIL_BYTES);
+    let out = exec.run_shell(&command).await?;
+    if out.success() {
+        return Ok(out.stdout);
+    }
+    let detail = if out.stderr.trim().is_empty() {
+        format!("exit {}", out.status)
+    } else {
+        format!("exit {}: {}", out.status, out.stderr.trim())
+    };
+    Err(anyhow!("tailing {path} on host {} failed: {detail}", exec.host_id()))
 }
 
+/// Extract the status the remote wrapper's detached supervisor wrote after the
+/// worker stopped. Treat malformed/missing markers as absent rather than
+/// inventing a status.
+fn parse_worker_exit_status(log: &str) -> Option<i32> {
+    log.rmatch_indices(WORKER_EXIT_STATUS_PREFIX)
+        .next()
+        .and_then(|(index, _)| {
+            log[index + WORKER_EXIT_STATUS_PREFIX.len()..]
+                .lines()
+                .next()
+                .and_then(|status| status.trim().parse().ok())
+        })
+}
 /// Re-probe a just-launched remote worker's liveness over the master.
 ///
 /// Runs one remote shell that settles for `settle_secs`, then `kill -0`s
@@ -546,6 +570,10 @@ mod tests {
             WrapperLaunch::Failed(REASON_MISSING_BOSS_EVENT)
         );
         assert_eq!(
+            classify_wrapper_exit(83),
+            WrapperLaunch::Failed(REASON_WORKER_PID_UNPUBLISHED)
+        );
+        assert_eq!(
             classify_wrapper_exit(1),
             WrapperLaunch::Failed(REASON_WORKER_LAUNCH_FAILED)
         );
@@ -607,6 +635,33 @@ mod tests {
         assert_eq!(parse_remote_pid("x pid=12 done"), Some(12));
     }
 
+    #[test]
+    fn parse_worker_exit_status_reads_the_final_supervisor_marker() {
+        assert_eq!(
+            parse_worker_exit_status(&format!(
+                "starting worker\n{WORKER_EXIT_STATUS_PREFIX}17\n{WORKER_EXIT_STATUS_PREFIX}2\n"
+            )),
+            Some(2)
+        );
+        assert_eq!(parse_worker_exit_status("worker output without a marker\n"), None);
+        assert_eq!(
+            parse_worker_exit_status(&format!("{WORKER_EXIT_STATUS_PREFIX}not-a-number\n")),
+            None
+        );
+        assert_eq!(
+            parse_worker_exit_status(&format!(
+                "worker output without a final newline{WORKER_EXIT_STATUS_PREFIX}17\n"
+            )),
+            Some(17)
+        );
+        assert_eq!(
+            parse_worker_exit_status(&format!(
+                "{WORKER_EXIT_STATUS_PREFIX}17\n{WORKER_EXIT_STATUS_PREFIX}not-a-number\n"
+            )),
+            None
+        );
+    }
+
     // ── Orchestration against a stubbed transport ────────────────────────────
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -632,6 +687,16 @@ mod tests {
         TransportError,
     }
 
+    /// What the bounded `worker.log` tail command reports once liveness
+    /// has proven that the supervisor is gone.
+    #[derive(Clone, Copy)]
+    enum WorkerLogStub {
+        Content(&'static str),
+        Empty,
+        CommandFailure,
+        TransportError,
+    }
+
     /// Stubbed transport: records every call and returns a canned exit
     /// status for the wrapper-launch `run` (the one whose argv[0] ==
     /// "env"). Forward add succeeds unless `fail_forward` is set. The
@@ -642,6 +707,7 @@ mod tests {
         wrapper_stderr: String,
         fail_forward: bool,
         liveness: LivenessStub,
+        worker_log: WorkerLogStub,
     }
 
     impl FakeExec {
@@ -654,10 +720,15 @@ mod tests {
                 // Default: a spawned worker is alive, so the happy path
                 // exercises the real "alive" branch of the liveness ack.
                 liveness: LivenessStub::Alive,
+                worker_log: WorkerLogStub::Empty,
             }
         }
         fn with_liveness(mut self, liveness: LivenessStub) -> Self {
             self.liveness = liveness;
+            self
+        }
+        fn with_worker_log(mut self, worker_log: WorkerLogStub) -> Self {
+            self.worker_log = worker_log;
             self
         }
         fn calls(&self) -> Vec<Call> {
@@ -691,8 +762,7 @@ mod tests {
         }
         async fn run_shell(&self, script: &str) -> Result<SshOutput> {
             self.calls.lock().unwrap().push(Call::Run(vec![script.to_owned()]));
-            // The only `run_shell` on the launch path is the liveness
-            // probe (`kill -0`). Report the canned verdict.
+            // The liveness probe (`kill -0`) reports its canned verdict.
             if script.contains("kill -0") {
                 return match self.liveness {
                     LivenessStub::Alive => Ok(SshOutput {
@@ -711,6 +781,28 @@ mod tests {
                         stderr: String::new(),
                     }),
                     LivenessStub::TransportError => Err(anyhow!("ssh probe transport failure")),
+                };
+            }
+            // A confirmed-dead worker gets exactly one bounded tail read
+            // before its events forward is cancelled.
+            if script.contains("tail -c") {
+                return match self.worker_log {
+                    WorkerLogStub::Content(stdout) => Ok(SshOutput {
+                        status: 0,
+                        stdout: stdout.to_owned(),
+                        stderr: String::new(),
+                    }),
+                    WorkerLogStub::Empty => Ok(SshOutput {
+                        status: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    }),
+                    WorkerLogStub::CommandFailure => Ok(SshOutput {
+                        status: 255,
+                        stdout: String::new(),
+                        stderr: "ssh: connection to host fake: Broken pipe".to_owned(),
+                    }),
+                    WorkerLogStub::TransportError => Err(anyhow!("ssh log capture transport failure")),
                 };
             }
             Ok(SshOutput {
@@ -829,13 +921,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_dead_after_launch_reports_died_immediately_and_cancels_forward() {
+    async fn worker_dead_after_launch_reports_its_log_and_exit_status_then_cancels_forward() {
         // Wrapper exit 0 with a pid, but the worker is already gone at the
         // liveness re-probe (failure-mode B: launched then died instantly).
         // This MUST become a terminal launch failure — not a phantom
         // success — and tear down the forward so it doesn't leak.
         let exec = FakeExec::new(0, "boss-remote-run: starting run_id=run-1 version=eng-x pid=4242\n")
-            .with_liveness(LivenessStub::Dead);
+            .with_liveness(LivenessStub::Dead)
+            .with_worker_log(WorkerLogStub::Content(
+                "Failed to authenticate: OAuth session expired and could not be refreshed\n\
+                 boss-remote-run: worker exited with status=17\n",
+            ));
         let outcome = perform_remote_launch(&exec, &sample_plan(), "/engine.sock")
             .await
             .unwrap();
@@ -850,9 +946,73 @@ mod tests {
             Some(4242),
             "the dead pid is surfaced for diagnostics"
         );
-        assert!(outcome.detail.unwrap().contains("4242"));
+        let detail = outcome.detail.unwrap();
+        assert!(detail.contains("4242"));
+        assert!(detail.contains("measured by liveness probe"));
+        assert!(detail.contains("Failed to authenticate: OAuth session expired and could not be refreshed"));
+        assert!(detail.contains("worker-reported exit status 17"));
+        assert!(detail.contains("bytes):\nFailed to authenticate"));
+        assert!(!detail.contains("claude exited immediately"));
+        assert!(
+            exec.calls().iter().any(|call| matches!(
+                call,
+                Call::Run(argv) if argv.first().is_some_and(|script| *script == format!("tail -c {WORKER_LOG_TAIL_BYTES} -- '/ws/.boss/worker.log'"))
+            )),
+            "the dead-worker path must issue one byte-bounded log tail",
+        );
         // The forward opened before the (failed) launch is torn down.
         assert!(exec.calls().iter().any(|c| matches!(c, Call::CancelForward { .. })));
+    }
+
+    #[tokio::test]
+    async fn worker_dead_after_launch_keeps_death_report_when_log_capture_fails() {
+        let exec = FakeExec::new(0, "boss-remote-run: starting run_id=run-1 version=eng-x pid=4242\n")
+            .with_liveness(LivenessStub::Dead)
+            .with_worker_log(WorkerLogStub::CommandFailure);
+        let outcome = perform_remote_launch(&exec, &sample_plan(), "/engine.sock")
+            .await
+            .unwrap();
+
+        assert!(!outcome.launched);
+        assert_eq!(outcome.failure_reason, Some(REASON_WORKER_DIED_IMMEDIATELY));
+        let detail = outcome.detail.unwrap();
+        assert!(detail.contains("worker pid 4242 was not alive 2s after launch"));
+        assert!(detail.contains("worker log capture failed"));
+        assert!(detail.contains("Broken pipe"));
+    }
+
+    #[tokio::test]
+    async fn worker_dead_after_launch_reports_an_empty_log_exactly() {
+        let exec = FakeExec::new(0, "boss-remote-run: starting run_id=run-1 version=eng-x pid=4242\n")
+            .with_liveness(LivenessStub::Dead)
+            .with_worker_log(WorkerLogStub::Empty);
+        let outcome = perform_remote_launch(&exec, &sample_plan(), "/engine.sock")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.detail.unwrap(),
+            "worker pid 4242 was not alive 2s after launch (measured by liveness probe); worker log capture was empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_dead_after_launch_keeps_death_report_when_log_transport_errors() {
+        let exec = FakeExec::new(0, "boss-remote-run: starting run_id=run-1 version=eng-x pid=4242\n")
+            .with_liveness(LivenessStub::Dead)
+            .with_worker_log(WorkerLogStub::TransportError);
+        let outcome = perform_remote_launch(&exec, &sample_plan(), "/engine.sock")
+            .await
+            .unwrap();
+
+        assert!(!outcome.launched);
+        assert_eq!(outcome.failure_reason, Some(REASON_WORKER_DIED_IMMEDIATELY));
+        assert!(
+            outcome
+                .detail
+                .unwrap()
+                .contains("worker log capture failed: ssh log capture transport failure")
+        );
     }
 
     #[tokio::test]
