@@ -79,6 +79,7 @@ pub(super) async fn handle_get_attention_item(ctx: Dispatch, req: FrontendReques
 
 pub(super) async fn handle_list_attention_items_for_work_item(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -86,6 +87,13 @@ pub(super) async fn handle_list_attention_items_for_work_item(ctx: Dispatch, req
     } = ctx;
     let FrontendRequest::ListAttentionItemsForWorkItem { work_item_id } = req else {
         unreachable!()
+    };
+    let work_item_id = match server_state.resolve_work_item_id(&work_item_id).await {
+        Ok(id) => id,
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+            return;
+        }
     };
     {
         match work_db.list_attention_items_for_work_item(&work_item_id) {

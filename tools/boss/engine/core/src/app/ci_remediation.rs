@@ -752,6 +752,7 @@ pub(super) async fn handle_mark_ci_remediation_noop(ctx: Dispatch, req: Frontend
 
 pub(super) async fn handle_list_ci_remediations(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -765,6 +766,16 @@ pub(super) async fn handle_list_ci_remediations(ctx: Dispatch, req: FrontendRequ
     } = req
     else {
         unreachable!()
+    };
+    let work_item_id = match work_item_id {
+        Some(id) => match server_state.resolve_work_item_id(&id).await {
+            Ok(id) => Some(id),
+            Err(err) => {
+                send_work_error(&sink, &request_id, &err);
+                return;
+            }
+        },
+        None => None,
     };
     {
         // Read-only listing surface for `boss engine ci list`
@@ -920,6 +931,7 @@ pub(super) async fn handle_abandon_ci_remediation(ctx: Dispatch, req: FrontendRe
 
 pub(super) async fn handle_get_ci_budget(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -930,7 +942,7 @@ pub(super) async fn handle_get_ci_budget(ctx: Dispatch, req: FrontendRequest) {
     };
     {
         // Shared id-resolution choke point (short ids / ambiguity).
-        let work_item_id = match work_db.resolve_work_item_ref(&work_item_id) {
+        let work_item_id = match server_state.resolve_work_item_id(&work_item_id).await {
             Ok(id) => id,
             Err(err) => {
                 send_work_error(&sink, &request_id, &err);
@@ -953,6 +965,7 @@ pub(super) async fn handle_get_ci_budget(ctx: Dispatch, req: FrontendRequest) {
 
 pub(super) async fn handle_set_ci_budget(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -963,7 +976,7 @@ pub(super) async fn handle_set_ci_budget(ctx: Dispatch, req: FrontendRequest) {
     };
     {
         // Shared id-resolution choke point (short ids / ambiguity).
-        let work_item_id = match work_db.resolve_work_item_ref(&work_item_id) {
+        let work_item_id = match server_state.resolve_work_item_id(&work_item_id).await {
             Ok(id) => id,
             Err(err) => {
                 send_work_error(&sink, &request_id, &err);

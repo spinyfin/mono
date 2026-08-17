@@ -134,8 +134,15 @@ pub(super) async fn handle_link_work_item_external_ref(ctx: Dispatch, req: Front
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::LinkWorkItemExternalRef { input } = req else {
+    let FrontendRequest::LinkWorkItemExternalRef { mut input } = req else {
         unreachable!()
+    };
+    input.work_item_id = match server_state.resolve_work_item_id(&input.work_item_id).await {
+        Ok(id) => id,
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+            return;
+        }
     };
     {
         let result = work_db
@@ -180,6 +187,13 @@ pub(super) async fn handle_unlink_work_item_external_ref(ctx: Dispatch, req: Fro
     } = req
     else {
         unreachable!()
+    };
+    let target_id = match server_state.resolve_work_item_id(&target_id).await {
+        Ok(id) => id,
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+            return;
+        }
     };
     {
         let result = work_db

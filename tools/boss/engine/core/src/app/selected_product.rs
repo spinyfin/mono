@@ -48,6 +48,39 @@ pub(super) struct SelectedProductReport {
 }
 
 impl ServerState {
+    /// Resolve a caller-supplied work-item selector at the engine boundary.
+    /// Canonical ids and explicitly product-scoped short ids retain their
+    /// existing semantics. A bare short id is scoped to the product currently
+    /// selected in the connected app, because short ids are only unique within
+    /// a product.
+    pub(super) async fn resolve_work_item_id(&self, id: &str) -> anyhow::Result<String> {
+        let selector = boss_protocol::parse_work_item_selector(id);
+        let boss_protocol::WorkItemSelector::ShortId(short_id) = selector else {
+            return self.work_db.resolve_work_item_ref(id);
+        };
+
+        match self.selected_product_state().await {
+            SelectedProductState::Selected { product_id, name, .. } => self
+                .work_db
+                .resolve_work_item_ref(&format!("{product_id}/{short_id}"))
+                .map_err(|_| anyhow::anyhow!("no work item found for {id} in product {name}")),
+            state => anyhow::bail!("cannot resolve short id {id}: selected product is unavailable ({state:?})"),
+        }
+    }
+
+    /// Resolve a restore selector without excluding a tombstoned row. The
+    /// restore database operation owns the final lookup because it is the one
+    /// engine path that intentionally includes deleted work items.
+    pub(super) async fn resolve_work_item_id_for_restore(&self, id: &str) -> anyhow::Result<String> {
+        let boss_protocol::WorkItemSelector::ShortId(short_id) = boss_protocol::parse_work_item_selector(id) else {
+            return Ok(id.to_owned());
+        };
+        match self.selected_product_state().await {
+            SelectedProductState::Selected { product_id, .. } => Ok(format!("{product_id}/{short_id}")),
+            state => anyhow::bail!("cannot resolve short id {id}: selected product is unavailable ({state:?})"),
+        }
+    }
+
     /// Record the app's current chooser selection. Returns `false` — and
     /// changes nothing — when `session_id` is not the registered app
     /// session, which is what keeps this a *report* of UI state rather

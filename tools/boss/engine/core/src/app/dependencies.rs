@@ -16,8 +16,22 @@ pub(super) async fn handle_add_dependency(ctx: Dispatch, req: FrontendRequest) {
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::AddDependency { input } = req else {
+    let FrontendRequest::AddDependency { mut input } = req else {
         unreachable!()
+    };
+    input.dependent = match server_state.resolve_work_item_id(&input.dependent).await {
+        Ok(id) => id,
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+            return;
+        }
+    };
+    input.prerequisite = match server_state.resolve_work_item_id(&input.prerequisite).await {
+        Ok(id) => id,
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+            return;
+        }
     };
     {
         match work_db.add_dependency_with_worker_reconcile(input) {
@@ -89,8 +103,22 @@ pub(super) async fn handle_remove_dependency(ctx: Dispatch, req: FrontendRequest
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::RemoveDependency { input } = req else {
+    let FrontendRequest::RemoveDependency { mut input } = req else {
         unreachable!()
+    };
+    input.dependent = match server_state.resolve_work_item_id(&input.dependent).await {
+        Ok(id) => id,
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+            return;
+        }
+    };
+    input.prerequisite = match server_state.resolve_work_item_id(&input.prerequisite).await {
+        Ok(id) => id,
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+            return;
+        }
     };
     {
         let dependent_id = input.dependent.clone();

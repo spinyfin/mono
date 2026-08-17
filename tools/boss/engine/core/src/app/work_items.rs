@@ -125,8 +125,9 @@ pub(super) async fn handle_get_work_item(ctx: Dispatch, req: FrontendRequest) {
         // Shared choke point: bare long ids, T/P/#/bare short ids, and
         // product-scoped slug/n. Short ids are per-product (not globally
         // unique) — ambiguity is a hard error listing every candidate.
-        let result = work_db
-            .resolve_work_item_ref(&id)
+        let result = server_state
+            .resolve_work_item_id(&id)
+            .await
             .and_then(|primary| work_db.get_work_item(&primary).map_err(|err| anyhow::anyhow!("{err}")));
         match result {
             Ok(item) => {
@@ -437,6 +438,13 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
     else {
         unreachable!()
     };
+    let id = match ctx.server_state.resolve_work_item_id(&id).await {
+        Ok(id) => id,
+        Err(err) => {
+            send_work_error(&ctx.sink, &ctx.request_id, &err);
+            return;
+        }
+    };
     let row = match board_row_for_id(&ctx.work_db, &id) {
         Ok(row) => row,
         Err(err) => {
@@ -562,6 +570,13 @@ pub(super) async fn apply_work_item_patch(
         peer_pid,
         ..
     } = ctx;
+    let id = match server_state.resolve_work_item_id(&id).await {
+        Ok(id) => id,
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+            return;
+        }
+    };
     {
         // Capture the task/chore status before the update so we
         // can detect a transition into `active` after the patch
@@ -1046,6 +1061,13 @@ pub(super) async fn handle_delete_work_item(ctx: Dispatch, req: FrontendRequest)
     let FrontendRequest::DeleteWorkItem { id } = req else {
         unreachable!()
     };
+    let id = match server_state.resolve_work_item_id(&id).await {
+        Ok(id) => id,
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+            return;
+        }
+    };
     match work_db.get_work_item(&id) {
         Ok(item) => match work_db.delete_work_item(&id) {
             Ok(tombstoned_ids) => {
@@ -1128,6 +1150,13 @@ pub(super) async fn handle_restore_work_item(ctx: Dispatch, req: FrontendRequest
     } = ctx;
     let FrontendRequest::RestoreWorkItem { id } = req else {
         unreachable!()
+    };
+    let id = match server_state.resolve_work_item_id_for_restore(&id).await {
+        Ok(id) => id,
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+            return;
+        }
     };
     match work_db.restore_work_item(&id) {
         Ok(item) => {

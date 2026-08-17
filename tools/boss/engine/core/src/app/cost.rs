@@ -10,6 +10,7 @@ use super::*;
 
 pub(super) async fn handle_get_work_item_cost_report(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -21,6 +22,13 @@ pub(super) async fn handle_get_work_item_cost_report(ctx: Dispatch, req: Fronten
     } = req
     else {
         unreachable!()
+    };
+    let work_item_id = match server_state.resolve_work_item_id(&work_item_id).await {
+        Ok(id) => id,
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+            return;
+        }
     };
     {
         let task = match work_db.get_work_item(&work_item_id) {

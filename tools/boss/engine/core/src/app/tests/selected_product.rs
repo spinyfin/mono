@@ -106,6 +106,52 @@ async fn reported_product_is_resolved_to_id_name_and_slug() {
     );
 }
 
+#[tokio::test]
+async fn bare_short_ids_resolve_in_the_selected_product() {
+    let (server_state, _dir) = test_server_state();
+    let first = crate::test_support::create_test_product_named(&server_state.work_db, "first");
+    let selected = crate::test_support::create_test_product_named(&server_state.work_db, "selected");
+    let first_task = crate::test_support::create_test_chore(&server_state.work_db, &first.id, "first row");
+    let selected_task = crate::test_support::create_test_chore(&server_state.work_db, &selected.id, "selected row");
+    assert_eq!(first_task.short_id, selected_task.short_id);
+    server_state
+        .register_app_session("session-app".into(), make_session_sink())
+        .await;
+    assert!(
+        server_state
+            .record_selected_product("session-app", Some(selected.id))
+            .await
+    );
+
+    let selector = boss_protocol::short_id_wire_form(selected_task.short_id.unwrap());
+    assert_eq!(
+        server_state.resolve_work_item_id(&selector).await.unwrap(),
+        selected_task.id
+    );
+}
+
+#[tokio::test]
+async fn missing_bare_short_id_names_the_selected_product() {
+    let (server_state, _dir) = test_server_state();
+    let product = crate::test_support::create_test_product_named(&server_state.work_db, "selected");
+    server_state
+        .register_app_session("session-app".into(), make_session_sink())
+        .await;
+    assert!(
+        server_state
+            .record_selected_product("session-app", Some(product.id))
+            .await
+    );
+
+    let selector = boss_protocol::short_id_wire_form(999_999);
+    let err = server_state
+        .resolve_work_item_id(&selector)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("product selected"), "unexpected error: {err}");
+}
+
 /// An app that reports "nothing selected" is not the same as an app that
 /// has not reported — but neither is an answer, so both land on
 /// `NoSelection` rather than on a product.
