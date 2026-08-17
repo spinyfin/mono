@@ -147,8 +147,8 @@ mod tests {
             "wrapper must read BOSS_DRIVER so the engine can launch the resolved driver"
         );
         assert!(
-            WRAPPER_SOURCE.contains("nohup sh -c \"$BOSS_DRIVER_COMMAND\""),
-            "wrapper must execute the resolved driver's rendered command"
+            WRAPPER_SOURCE.contains("nohup sh -c \"exec $BOSS_DRIVER_COMMAND\""),
+            "wrapper must exec the resolved driver's rendered command so its PID is published"
         );
         // The old hardcoded form must not reappear as the launch target.
         assert!(
@@ -166,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_handshake_reports_the_direct_claude_pid() {
+    fn wrapper_handshake_reports_the_direct_driver_pid() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         let bin_dir = temp.path().join("bin");

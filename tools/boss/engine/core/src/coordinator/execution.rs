@@ -28,9 +28,29 @@ impl ExecutionCoordinator {
             )
         }
         let work_item = self.work_db.get_work_item(work_item_id)?;
-        self.pick_host(&work_item, None, Some(host_id.to_string()), None)
+        let required_driver = self.requested_host_driver(&work_item)?;
+        self.pick_host(&work_item, None, Some(host_id.to_string()), required_driver)
             .map(|_| ())
             .map_err(|err| anyhow!("requested host '{host_id}' is ineligible: {err}"))
+    }
+
+    /// Resolve the driver that a newly requested task execution will use,
+    /// before creating that execution. Requested-host admission must apply
+    /// the same driver capability constraint as later scheduling, otherwise
+    /// an operator gets a misleading successful dispatch followed by a hold.
+    fn requested_host_driver(&self, work_item: &WorkItem) -> Result<Option<String>> {
+        let (task_driver, product_id) = match work_item {
+            WorkItem::Task(task) | WorkItem::Chore(task) => (task.driver.as_deref(), task.product_id.as_str()),
+            WorkItem::Product(_) | WorkItem::Project(_) => return Ok(None),
+        };
+        let product_driver = self
+            .work_db
+            .get_product(product_id)?
+            .and_then(|product| product.default_driver);
+        Ok(Some(boss_engine_effort::resolve_driver(
+            task_driver,
+            product_driver.as_deref(),
+        )))
     }
 
     /// Resolve the [`WorkItem`] an execution operates on.

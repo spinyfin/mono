@@ -27,7 +27,7 @@
 #
 # Contract (output): the worker is launched DETACHED (`nohup` +
 # background) so it survives the engine restarting and the launching
-# SSH session closing. A detached supervisor brackets the direct Claude
+# SSH session closing. A detached supervisor brackets the direct driver
 # child: it publishes that child's PID through `<workspace>/.boss/worker.pid`
 # before the `pid=<n>` stderr handshake, and appends
 # `boss-remote-run: worker exited with status=<n>` to
@@ -39,13 +39,6 @@
 # BOSS_EVENTS_SOCKET, not by this wrapper blocking. The wrapper prints
 # `boss-remote-run: starting … pid=<n>` to stderr so the engine can record
 # the direct worker PID in `work_runs.remote_pid`.
-#
-# NOTE: this wrapper launches `claude` unconditionally. The engine will
-# not dispatch a worker here whose resolved driver reports progress by
-# any other route — see `host_adapter::reject_unobservable_remote_driver`,
-# which fails such a spawn closed rather than shipping a settings file
-# whose hooks this script would never honour. Teaching the wrapper to
-# launch other drivers means relaxing that gate in step with it.
 #
 # --version: print the embedded BOSS_REMOTE_RUN_VERSION and exit 0.
 # Used by the engine for the lazy version-handshake at dispatch time.
@@ -139,7 +132,7 @@ export BOSS_REPO_REMOTE_URL="${BOSS_REPO_REMOTE_URL:-}"
 # tails of worker.log over the SSH multiplex on demand so remote runs
 # get the same recent-output surface as local panes — without a second
 # reverse channel. The detached supervisor appends the worker's exit
-# status after `claude` stops, letting the engine report an observed
+# status after the driver exits, letting the engine report an observed
 # status instead of guessing why the worker disappeared.
 boss_run_dir="$BOSS_WORKSPACE/.boss"
 mkdir -p "$boss_run_dir" 2>/dev/null || true
@@ -163,7 +156,7 @@ export BOSS_WORKER_PID_FILE="$worker_pid_file"
 # file, and environment while this wrapper owns only remote detachment.
 eval "$BOSS_DRIVER_ENV"
 nohup sh -c '
-    nohup sh -c "$BOSS_DRIVER_COMMAND" &
+    nohup sh -c "exec $BOSS_DRIVER_COMMAND" &
     worker_pid=$!
     printf "%s\\n" "$worker_pid" > "$BOSS_WORKER_PID_FILE"
     trap '\''kill "$worker_pid" 2>/dev/null || true; exit 143'\'' TERM INT HUP

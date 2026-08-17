@@ -309,6 +309,38 @@ async fn requested_host_routes_one_dispatch_and_refuses_without_queueing() {
     assert!(db.list_executions(Some(&unknown.id)).unwrap().is_empty());
 }
 
+/// Requested-host admission must enforce the row/product driver's capability
+/// before it creates an execution, rather than accepting the pin and leaving
+/// scheduling to fail later with a host hold.
+#[tokio::test]
+async fn requested_host_rejects_missing_resolved_driver_capability() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    db.add_host("zakalwe", "user@zakalwe", 1, &[]).unwrap();
+    crate::test_support::insert_host_capability(&db, "zakalwe", "driver=claude", "auto");
+    let product = create_test_product(&db);
+    db.set_product_default_driver(&product.id, Some("codex")).unwrap();
+    let chore = create_test_chore(&db, product.id, "Codex-only requested host");
+    let coordinator = ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        Arc::new(FakeExecutionRunner::default()),
+    );
+
+    let err = coordinator
+        .request_execution_via_db(
+            RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .requested_host_id("zakalwe")
+                .build(),
+            Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new()),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("driver codex"), "got: {err}");
+    assert!(db.list_executions(Some(&chore.id)).unwrap().is_empty());
+}
+
 /// A friendly short id (`T<n>`) passed alongside `--host` must resolve to
 /// the canonical `task_…` id before either the live-execution pre-check or
 /// `validate_requested_host` runs — both look the id up directly and, on

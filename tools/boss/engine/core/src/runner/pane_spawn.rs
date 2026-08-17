@@ -26,7 +26,7 @@ use super::{ExecutionRunner, RunOutcome, RunWaitState, bound_events_socket_path}
 /// every driver: the engine knows how to turn a `Set`/`Unset` directive into
 /// shell syntax, but never which vars a given driver names (that knowledge
 /// stays in the driver's [`crate::driver::SpawnPlan`]).
-fn render_env_directive(directive: &crate::driver::EnvDirective) -> String {
+pub(crate) fn render_env_directive(directive: &crate::driver::EnvDirective) -> String {
     match directive {
         crate::driver::EnvDirective::Set(key, value) => {
             format!("export {key}={}; ", crate::ssh_transport::shell_quote(value))

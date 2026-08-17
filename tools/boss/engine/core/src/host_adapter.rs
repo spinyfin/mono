@@ -46,18 +46,6 @@ use crate::work::{WorkDb, WorkExecution, WorkItem};
 use crate::worker_setup::{WorkerSetupInput, render_remote_settings_json};
 use crate::wrapper_distribution::{WrapperPushLocks, WrapperPushOutcome, ensure_wrapper_current};
 
-fn render_remote_driver_env(directives: &[crate::driver::EnvDirective]) -> String {
-    directives
-        .iter()
-        .map(|directive| match directive {
-            crate::driver::EnvDirective::Set(key, value) => {
-                format!("export {key}={}; ", crate::ssh_transport::shell_quote(value))
-            }
-            crate::driver::EnvDirective::Unset(key) => format!("unset {key}; "),
-        })
-        .collect()
-}
-
 /// Remote dir (under `$HOME`) that holds rendered worker `--settings`
 /// files. Outside any workspace tree so the worker's `jj`/`git` never
 /// sees them — the same invariant the local runner keeps by writing
@@ -68,6 +56,19 @@ const REMOTE_SETTINGS_DIR: &str = ".boss-remote/settings";
 /// the worker's PATH (see the wrapper's note), so the hook command
 /// resolves it by name rather than an engine-local absolute path.
 const REMOTE_BOSS_EVENT_BIN: &str = "boss-event";
+
+/// Paths for engine-owned files in a remote driver's workspace config
+/// directory. Keeping the prompt and ignore file together prevents the
+/// prompt from appearing in the worker's change.
+fn remote_driver_config_paths(
+    workspace: &str,
+    descriptor: &crate::driver::DriverDescriptor,
+) -> (String, String, String) {
+    let directory = format!("{workspace}/{}", descriptor.config_dir);
+    let prompt = format!("{directory}/{}", descriptor.initial_prompt_filename);
+    let gitignore = format!("{directory}/.gitignore");
+    (directory, prompt, gitignore)
+}
 
 /// Abstracts all host-specific operations: workspace lifecycle and
 /// worker spawn. Later phases extend this with control-channel
@@ -812,7 +813,7 @@ impl HostAdapter for SshHostAdapter {
         // Fail closed on a driver the remote path cannot observe. The remote
         // spawn ships exactly one observability channel — this settings
         // file, whose `boss-event` hooks tunnel back over the reverse
-        // events socket — and the wrapper unconditionally execs `claude`. A
+        // events socket — and the wrapper execs the resolved driver's rendered command. A
         // driver that reports progress as a byte stream instead renders an
         // EMPTY hooks map here, so the worker would launch and then be
         // completely invisible: no live-status entry, no transcript path,
@@ -827,13 +828,20 @@ impl HostAdapter for SshHostAdapter {
         //    settings outside the workspace tree under `~/.boss-remote/`.
         //    This keeps the remote command identical to the local driver's
         //    command rather than teaching the wrapper a second argv dialect.
-        let remote_prompt_dir = format!("{workspace}/{}", driver.descriptor().config_dir);
-        let remote_prompt_path = format!("{remote_prompt_dir}/{}", driver.descriptor().initial_prompt_filename);
+        let (remote_prompt_dir, remote_prompt_path, remote_prompt_gitignore_path) =
+            remote_driver_config_paths(&workspace, driver.descriptor());
         let remote_home = remote_home_dir(&self.transport).await?;
         let remote_settings_dir = format!("{remote_home}/{REMOTE_SETTINGS_DIR}");
         let remote_settings_path = format!("{remote_settings_dir}/{run_id}.json");
         self.ship_file(&remote_prompt_dir, &remote_prompt_path, &prompt_text, "prompt")
             .await?;
+        self.ship_file(
+            &remote_prompt_dir,
+            &remote_prompt_gitignore_path,
+            driver.config_dir_gitignore(),
+            "driver config gitignore",
+        )
+        .await?;
         self.ship_file(&remote_settings_dir, &remote_settings_path, &settings_json, "settings")
             .await?;
 
@@ -865,7 +873,13 @@ impl HostAdapter for SshHostAdapter {
             .wrapper_path(remote_wrapper_path())
             .driver_binary(driver_binary.clone())
             .driver_command(driver_spawn_plan.command)
-            .driver_env(render_remote_driver_env(&driver_spawn_plan.env))
+            .driver_env(
+                driver_spawn_plan
+                    .env
+                    .iter()
+                    .map(crate::runner::pane_spawn::render_env_directive)
+                    .collect::<String>(),
+            )
             .build();
 
         let engine_socket = self.events_socket_path.display().to_string();
@@ -1243,10 +1257,9 @@ async fn remote_home_dir(transport: &SshTransport) -> Result<String> {
 /// the reverse events socket, wired through the `--settings` file this
 /// adapter ships. A driver whose ingress is a byte stream (`StdoutJsonl` /
 /// `AgentJsonlFile`) declares no such hooks, and the engine has no reader
-/// for its stream on another machine; on top of that the wrapper
-/// (`remote/boss-remote-run.sh`) launches `claude` no matter which driver
-/// was resolved, so the settings shipped and the binary run would not even
-/// describe the same agent.
+/// for its stream on another machine. The wrapper executes the resolved
+/// driver's rendered command, so this gate is specifically about whether
+/// that driver's settings wire an engine-visible progress channel.
 ///
 /// Failing loudly here converts a worker that would run silently to no
 /// effect into a spawn error the dispatcher can attribute and re-route.
@@ -1265,8 +1278,8 @@ fn reject_unobservable_remote_driver(
     bail!(
         "{REASON_HOST_DRIVER_UNSUPPORTED} on host {host}: driver `{driver_slug}` reports progress as a byte stream \
          rather than hooks in the worker settings file, so a remote worker running it would emit no events the \
-         engine can see (no live status, no transcript path, no Stop, therefore no PR) — and the remote wrapper \
-         launches `claude` regardless of the resolved driver. Refusing to spawn an unobservable remote worker."
+         engine can see (no live status, no transcript path, no Stop, therefore no PR). Refusing to spawn an \
+         unobservable remote worker."
     )
 }
 
@@ -1375,6 +1388,16 @@ mod tests {
         assert!(plan.command.contains("--permission-mode dontAsk"));
         assert!(!plan.command.contains("--dangerously-skip-permissions"));
         assert!(!plan.command.contains("~/"));
+    }
+
+    #[test]
+    fn remote_spawn_ignores_engine_owned_driver_config_files() {
+        let driver = crate::driver::ClaudeDriver;
+        let (directory, prompt, gitignore) = remote_driver_config_paths("/remote/workspace", driver.descriptor());
+        assert_eq!(directory, "/remote/workspace/.claude");
+        assert_eq!(prompt, "/remote/workspace/.claude/initial-prompt.txt");
+        assert_eq!(gitignore, "/remote/workspace/.claude/.gitignore");
+        assert_eq!(driver.config_dir_gitignore(), "*\n");
     }
 
     // ── Pure helpers ─────────────────────────────────────────────────────────

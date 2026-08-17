@@ -165,7 +165,9 @@ pub struct RemoteSpawnPlan {
     /// allocated to one driver cannot silently run as another.
     pub driver_binary: String,
     /// Shell command rendered by the resolved driver's `spawn_invocation`.
-    /// The wrapper executes this verbatim after applying `driver_env`, so
+    /// It must be a single command suitable for `exec`: the wrapper uses
+    /// that form so its published worker PID is the driver's PID, not an
+    /// intermediate shell. The wrapper executes it after applying `driver_env`, so
     /// local and remote launches share one source of truth for argv shaping.
     pub driver_command: String,
     /// Shell statements rendering the resolved driver's environment
