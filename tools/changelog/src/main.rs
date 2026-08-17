@@ -4,11 +4,20 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use git_changelog::{
-    ChangelogRenderer, ExtractionConfig, GithubMarkdownRenderer, derive_paths_from_project, extract_changelog,
-    repo_slug_from_remote,
+    ChangelogRenderer, ExtractionConfig, GithubMarkdownRenderer, PlainTextRenderer, derive_paths_from_project,
+    extract_changelog, repo_slug_from_remote,
 };
+
+/// Output format for the rendered changelog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OutputFormat {
+    /// GitHub-flavoured markdown (default).
+    Markdown,
+    /// Bare title lines with no markdown, for non-markdown consumers (e.g. TestFlight).
+    Plain,
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "changelog", about = "Path-scoped GitHub-matching changelog generator")]
@@ -45,6 +54,10 @@ struct Cli {
     /// Path to the git repository (defaults to the current directory).
     #[arg(long, default_value = ".")]
     git_dir: PathBuf,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    format: OutputFormat,
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -86,7 +99,10 @@ fn run(cli: Cli) -> Result<()> {
     };
 
     let range = extract_changelog(&config)?;
-    let output = GithubMarkdownRenderer.render(&range);
+    let output = match cli.format {
+        OutputFormat::Markdown => GithubMarkdownRenderer.render(&range),
+        OutputFormat::Plain => PlainTextRenderer.render(&range),
+    };
 
     io::stdout()
         .write_all(output.as_bytes())

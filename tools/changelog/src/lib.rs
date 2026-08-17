@@ -6,4 +6,4 @@ pub mod render;
 pub use extract::{ExtractionConfig, extract_changelog, repo_slug_from_remote};
 pub use model::{ChangelogEntry, ChangelogRange};
 pub use project::derive_paths_from_project;
-pub use render::{ChangelogRenderer, GithubMarkdownRenderer};
+pub use render::{ChangelogRenderer, GithubMarkdownRenderer, PlainTextRenderer};
