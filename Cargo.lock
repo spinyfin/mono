@@ -1005,6 +1005,7 @@ name = "bossctl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bon",
  "boss-build-info",
  "boss-client",

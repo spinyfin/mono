@@ -301,7 +301,13 @@ fn apply_provision_outcome(work_db: &crate::work::WorkDb, host_id: &str, outcome
     match outcome {
         ProvisionOutcome::Skipped => {}
         ProvisionOutcome::Ok { capabilities } => {
-            let _ = work_db.set_host_last_error(host_id, None);
+            // A successful provision is a real contact: record it exactly as
+            // the dispatch path records a healthy cube call. The caller
+            // re-reads the row to build its reply, so this makes the AddHost
+            // reply and CLI provisioning output report the contact just made.
+            if let Err(err) = work_db.record_host_contact_success(host_id) {
+                tracing::warn!(host_id, ?err, "add_host: failed to record successful contact");
+            }
             if let Err(err) = work_db.replace_auto_host_capabilities(host_id, &capabilities) {
                 // Non-fatal: the host is genuinely provisioned, and losing
                 // the capability rows degrades to the pre-fix behaviour

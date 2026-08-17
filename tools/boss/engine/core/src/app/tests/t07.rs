@@ -374,6 +374,41 @@ async fn re_registering_a_host_converges_on_the_latest_discovery() {
     );
 }
 
+#[tokio::test]
+async fn add_host_success_stamps_last_seen_and_reports_no_error() {
+    // The returned snapshot represents the successful contact that just
+    // completed: last_seen is stamped and last_error is clear.
+    let (state, _dir) = test_server_state();
+
+    let added = expect_host_result(
+        add_host(
+            &state,
+            &provision_ok_with(&["os=macos", "arch=arm64"]),
+            "anaplian",
+            "user@anaplian",
+            3,
+            &[],
+        )
+        .await,
+    );
+    assert!(added.enabled, "successful provision must leave the host enabled");
+    assert_eq!(
+        added.last_error_text, None,
+        "successful provision must not leave a last_error on the reply"
+    );
+    assert!(
+        added.last_seen_at.is_some(),
+        "successful provision must stamp last_seen_at so the reply reflects the contact just made; got {added:?}"
+    );
+    assert_eq!(
+        caps(&added),
+        vec![
+            ("arch=arm64".to_owned(), "auto".to_owned()),
+            ("os=macos".to_owned(), "auto".to_owned()),
+        ],
+    );
+}
+
 // ── Auto-disable on provisioning failure ─────────────────────────────────────
 
 #[tokio::test]
