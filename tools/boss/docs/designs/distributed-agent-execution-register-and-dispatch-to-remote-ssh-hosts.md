@@ -141,6 +141,8 @@ The `HostAdapter` trait abstracts spawn / probe / interrupt across local and rem
 
 The wrapper script is deployed and kept current by Boss itself — see "Wrapper Distribution" below for install and update mechanics. From Q1's perspective the wrapper is a known-good executable at `~/.boss-remote/bin/boss-remote-run` whose contract (env vars in, exec shape out, sentinel JSON on the channel) the engine controls and the engine refreshes on drift.
 
+**Current driver boundary.** Remote dispatch is explicitly limited to drivers whose descriptor declares a host-independent spawn plan. Today that is Claude Code only: Codex's per-run `CODEX_HOME` and Grok's home/session/seatbelt artifacts are provisioned on the coordinator and cannot be rendered safely for another machine. The SSH adapter rejects those drivers before launch rather than shipping coordinator-local paths; enabling either requires remote provisioning plus remote-path spawn rendering.
+
 ### Q2 — Hook-Event Transport
 
 **Decision:** SSH remote port-forwarded Unix socket; the existing `event-shim` binary on the remote sees what looks like a local socket.

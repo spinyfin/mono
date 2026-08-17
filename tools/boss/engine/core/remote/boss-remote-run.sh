@@ -24,23 +24,6 @@
 #   BOSS_REPO_REMOTE_URL   — repo origin URL (used by the worker for
 #                            informational logging only; cube already
 #                            cloned the repo before lease was issued).
-#   BOSS_INITIAL_INPUT_FILE — path to a file holding the initial prompt.
-#                            Preferred over BOSS_INITIAL_INPUT so a
-#                            multi-KB prompt never has to survive ssh
-#                            argv re-quoting. Read as the driver's first
-#                            positional arg (its initial user message).
-#   BOSS_INITIAL_INPUT     — inline fallback for the initial prompt.
-#   BOSS_SETTINGS_FILE     — optional path to a driver `--settings` JSON
-#                            file (the boss-event hooks + sandbox guards
-#                            the engine renders). Shipped OUTSIDE the
-#                            workspace tree, mirroring the local runner so
-#                            the file never lands in a worker's PR. When
-#                            set and the file exists it is passed as
-#                            `$BOSS_DRIVER --settings <file>`, so every
-#                            hook event tunnels back over
-#                            BOSS_EVENTS_SOCKET. Unset/missing → the
-#                            driver's own settings discovery (no
-#                            boss-event hooks).
 #
 # Contract (output): the worker is launched DETACHED (`nohup` +
 # background) so it survives the engine restarting and the launching

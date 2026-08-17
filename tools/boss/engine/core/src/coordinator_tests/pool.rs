@@ -2247,6 +2247,7 @@ fn overdue_ready_answer_agent_files_one_question_specific_attention() {
 async fn answer_agent_start_records_queue_wait_metric_and_dispatch_event() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
     let product = db
         .create_product(
             CreateProductInput::builder()

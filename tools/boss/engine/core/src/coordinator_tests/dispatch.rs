@@ -204,6 +204,7 @@ async fn requested_host_routes_one_dispatch_and_refuses_without_queueing() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     db.add_host("zakalwe", "user@zakalwe", 1, &[]).unwrap();
+    crate::test_support::insert_host_capability(&db, "zakalwe", "driver=claude", "auto");
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, product.id.clone(), "Remote cleanup");
 
@@ -321,6 +322,7 @@ async fn requested_host_resolves_friendly_short_id() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     db.add_host("zakalwe", "user@zakalwe", 1, &[]).unwrap();
+    crate::test_support::insert_host_capability(&db, "zakalwe", "driver=claude", "auto");
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, product.id.clone(), "Short-id remote cleanup");
     let short_id = chore.short_id.expect("test chore must have a short_id");
@@ -412,6 +414,8 @@ async fn requested_host_pre_start_failure_cancels_instead_of_retrying_elsewhere(
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     db.add_host("zakalwe", "user@zakalwe", 1, &[]).unwrap();
     db.add_host("spare", "user@spare", 1, &[]).unwrap();
+    crate::test_support::insert_host_capability(&db, "zakalwe", "driver=claude", "auto");
+    crate::test_support::insert_host_capability(&db, "spare", "driver=claude", "auto");
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, product.id.clone(), "Flaky remote cleanup");
 
@@ -743,17 +747,19 @@ async fn pin_to_disabled_host_yields_no_eligible_host() {
 }
 
 #[tokio::test]
-async fn host_selection_injects_resolved_driver_capability() {
+async fn host_selection_fails_closed_when_enabled_local_has_no_driver_capability() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-    // Remove the ambient local host from this placement decision, leaving one
-    // enabled host with no driver=codex capability.
-    db.set_host_enabled("local", false).unwrap();
-    db.add_host("zakalwe", "user@zakalwe", 2, &[]).unwrap();
+    // `drivers-probed=true` says discovery completed: with no `driver=` row,
+    // the enabled local host must fail closed instead of getting test-only
+    // capability fabrication from the scheduling path.
+    crate::test_support::insert_host_capability(&db, "local", "drivers-probed=true", "auto");
 
     let product = create_test_product(&db);
-    db.set_product_default_driver(&product.id, Some("codex")).unwrap();
-    let chore = create_test_chore(&db, product.id.clone(), "Requires Codex");
+    db.set_product_default_driver(&product.id, Some("claude")).unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Requires Claude");
+    db.replace_auto_host_capabilities("local", &["drivers-probed=true".to_owned()])
+        .unwrap();
     db.reconcile_product_executions(&product.id).unwrap();
     let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
 
@@ -773,13 +779,10 @@ async fn host_selection_injects_resolved_driver_capability() {
         .await
         .unwrap_err();
     assert!(
-        err.to_string().contains("no enabled host has driver codex"),
+        err.to_string().contains("no enabled host has driver claude"),
         "got: {err:#}"
     );
-    assert!(
-        err.to_string().contains("zakalwe: missing driver codex"),
-        "got: {err:#}"
-    );
+    assert!(err.to_string().contains("local: missing driver claude"), "got: {err:#}");
 }
 
 /// The `no_eligible_host` pre-start failure used to emit NO dispatch

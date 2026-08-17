@@ -157,19 +157,6 @@ pub struct RemoteSpawnPlan {
     /// Forwarded events-socket path on the remote (from
     /// [`remote_events_socket_path`]).
     pub events_socket_path: String,
-    /// Remote path of a file holding the initial prompt, if the engine
-    /// shipped one. Preferred over an inline env var so a multi-KB
-    /// prompt never has to survive ssh-argv re-quoting.
-    pub initial_input_file: Option<String>,
-    /// Remote path of the worker's `--settings` JSON file — rendered by
-    /// [`crate::worker_setup::render_remote_settings_json`] and shipped
-    /// outside the workspace tree (mirroring the local runner, which
-    /// keeps the settings file out of the repo so it never lands in a
-    /// worker's PR). When present the wrapper passes `--settings <file>`
-    /// to the resolved driver so the `boss-event` hooks fire and the
-    /// Stop event tunnels back over the forwarded socket. `None` falls
-    /// back to the driver's own project/user settings discovery.
-    pub settings_file: Option<String>,
     /// Absolute remote path of the wrapper (`~/.boss-remote/bin/boss-remote-run`).
     pub wrapper_path: String,
     /// Agent-driver binary the remote wrapper must exec (e.g. `claude`,
@@ -203,12 +190,6 @@ pub fn build_remote_command(plan: &RemoteSpawnPlan) -> Vec<String> {
     ];
     if let Some(url) = &plan.repo_remote_url {
         argv.push(format!("BOSS_REPO_REMOTE_URL={url}"));
-    }
-    if let Some(file) = &plan.initial_input_file {
-        argv.push(format!("BOSS_INITIAL_INPUT_FILE={file}"));
-    }
-    if let Some(file) = &plan.settings_file {
-        argv.push(format!("BOSS_SETTINGS_FILE={file}"));
     }
     argv.push(plan.wrapper_path.clone());
     argv
@@ -606,8 +587,6 @@ mod tests {
             workspace_path: "/ws/mono-agent-007".into(),
             repo_remote_url: Some("git@example.com:me/mono.git".into()),
             events_socket_path: "/tmp/boss-events-run-1.sock".into(),
-            initial_input_file: Some("/ws/mono-agent-007/.boss/initial-input.txt".into()),
-            settings_file: Some("/ws/mono-agent-007/.boss/settings.json".into()),
             wrapper_path: "~/.boss-remote/bin/boss-remote-run".into(),
             driver_binary: "codex".into(),
             driver_command: "codex -m gpt-5.6-sol \"$(cat .codex/initial-prompt.txt)\"".into(),
@@ -626,8 +605,6 @@ mod tests {
                 .any(|arg| arg.starts_with("BOSS_DRIVER_ENV=export CODEX_HOME"))
         );
         assert!(argv.contains(&"BOSS_REPO_REMOTE_URL=git@example.com:me/mono.git".to_owned()));
-        assert!(argv.contains(&"BOSS_INITIAL_INPUT_FILE=/ws/mono-agent-007/.boss/initial-input.txt".to_owned()));
-        assert!(argv.contains(&"BOSS_SETTINGS_FILE=/ws/mono-agent-007/.boss/settings.json".to_owned()));
         // The wrapper path is always the final token.
         assert_eq!(argv.last().unwrap(), "~/.boss-remote/bin/boss-remote-run");
     }
@@ -640,8 +617,6 @@ mod tests {
             workspace_path: "/ws".into(),
             repo_remote_url: None,
             events_socket_path: "/tmp/s.sock".into(),
-            initial_input_file: None,
-            settings_file: None,
             wrapper_path: "wrapper".into(),
             driver_binary: "claude".into(),
             driver_command: "claude --model opus \"$(cat .claude/initial-prompt.txt)\"".into(),
@@ -649,8 +624,6 @@ mod tests {
         };
         let argv = build_remote_command(&plan);
         assert!(!argv.iter().any(|a| a.starts_with("BOSS_REPO_REMOTE_URL=")));
-        assert!(!argv.iter().any(|a| a.starts_with("BOSS_INITIAL_INPUT_FILE=")));
-        assert!(!argv.iter().any(|a| a.starts_with("BOSS_SETTINGS_FILE=")));
         // Driver is required — always present even when optionals are not.
         assert!(argv.contains(&"BOSS_DRIVER=claude".to_owned()));
     }
@@ -875,8 +848,6 @@ mod tests {
             workspace_path: "/ws".into(),
             repo_remote_url: None,
             events_socket_path: remote_events_socket_path("run-1"),
-            initial_input_file: None,
-            settings_file: None,
             wrapper_path: "~/.boss-remote/bin/boss-remote-run".into(),
             driver_binary: "claude".into(),
             driver_command: "claude --model opus \"$(cat .claude/initial-prompt.txt)\"".into(),

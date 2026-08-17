@@ -181,7 +181,7 @@ mod tests {
         for (name, body) in [
             (
                 "claude",
-                "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$CLAUDE_PID_FILE\"\nsleep 0.1\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$CLAUDE_PID_FILE.tmp\"\nmv \"$CLAUDE_PID_FILE.tmp\" \"$CLAUDE_PID_FILE\"\nsleep 0.1\n",
             ),
             ("cube", "#!/bin/sh\nexit 0\n"),
             ("gh", "#!/bin/sh\nexit 0\n"),
@@ -208,6 +208,9 @@ mod tests {
             .env("BOSS_EVENTS_SOCKET", "/tmp/boss-events-test.sock")
             .env("BOSS_LEASE_ID", "lease-test")
             .env("BOSS_WORKSPACE", &workspace)
+            .env("BOSS_DRIVER", "claude")
+            .env("BOSS_DRIVER_COMMAND", "claude")
+            .env("BOSS_DRIVER_ENV", ":")
             .output()
             .unwrap();
 
