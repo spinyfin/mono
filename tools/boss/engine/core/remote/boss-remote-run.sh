@@ -210,11 +210,13 @@ else
 fi
 supervisor_pid=$!
 
-# The supervisor starts asynchronously, so wait a short bounded interval for
-# it to publish the direct worker PID. Do not report the supervisor PID:
-# remote_pid drives both liveness reconciliation and control-channel signals.
+# The supervisor starts asynchronously, so wait a bounded interval for it to
+# publish the direct worker PID. Remote hosts can be busy just after an SSH
+# launch, so five seconds is too short to distinguish scheduling delay from a
+# broken supervisor. Do not report the supervisor PID: remote_pid drives both
+# liveness reconciliation and control-channel signals.
 attempt=0
-while [ ! -s "$worker_pid_file" ] && [ "$attempt" -lt 50 ]; do
+while [ ! -s "$worker_pid_file" ] && [ "$attempt" -lt 300 ]; do
     sleep 0.1
     attempt=$((attempt + 1))
 done

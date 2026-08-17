@@ -196,7 +196,11 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let handshake_pid = crate::ssh_spawn::parse_remote_pid(&String::from_utf8_lossy(&output.stderr)).unwrap();
-        for _ in 0..50 {
+        // The wrapper has successfully received the direct child PID at this
+        // point, but a loaded CI shard can still delay the child before it
+        // writes its test marker. Wait long enough to observe that asynchronous
+        // handoff instead of treating scheduler latency as a bad PID.
+        for _ in 0..1_000 {
             if claude_pid.exists() {
                 break;
             }
