@@ -10,7 +10,7 @@ export REPOBIN_BAZEL_FLAGS="--config=ci-${OS_TYPE}"
 # invocation instead of lingering for bazel's multi-hour default. The hot `mono`
 # PR pipeline keeps a long TTL so back-to-back PR builds stay warm.
 case "${BUILDKITE_PIPELINE_SLUG:-}" in
-  mono-checkleft-release | mono-integrity)
+  mono-checkleft-release | mono-changelog-release | mono-integrity)
     BAZEL_MAX_IDLE_SECS=900
     ;;
   *)
