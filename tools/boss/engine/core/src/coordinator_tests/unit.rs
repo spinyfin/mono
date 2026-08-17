@@ -4,7 +4,47 @@
 //!
 //! Shared fixtures live in [`super::helpers`].
 
+use super::super::summarize_ineligibility;
 use super::helpers::*;
+use crate::host_scheduling::{Eligibility, IneligibilityReason};
+
+fn ineligible_host(id: &str, reasons: Vec<IneligibilityReason>) -> Eligibility {
+    Eligibility {
+        host_id: id.to_owned(),
+        eligible: false,
+        reasons,
+        free_slots: 0,
+        had_prior_run_on_branch: false,
+    }
+}
+
+#[test]
+fn summarize_ineligibility_names_driver_only_when_every_host_lacks_it() {
+    let all_missing = vec![
+        ineligible_host(
+            "local",
+            vec![IneligibilityReason::MissingCapabilities(vec!["driver=codex".into()])],
+        ),
+        ineligible_host(
+            "remote",
+            vec![IneligibilityReason::MissingCapabilities(vec!["driver=codex".into()])],
+        ),
+    ];
+    let summary = summarize_ineligibility(&all_missing, Some("codex"));
+    assert!(summary.starts_with("no enabled host has driver codex;"));
+    assert!(summary.contains("local: missing driver codex"));
+
+    let mixed = vec![
+        ineligible_host(
+            "local",
+            vec![IneligibilityReason::MissingCapabilities(vec!["driver=codex".into()])],
+        ),
+        ineligible_host("remote", vec![IneligibilityReason::NoFreeSlots]),
+    ];
+    let summary = summarize_ineligibility(&mixed, Some("codex"));
+    assert!(!summary.contains("no enabled host has driver"));
+    assert_eq!(summary, "local: missing driver codex; remote: no free slots");
+}
 
 /// Reproduces the live incident (flunge, PR brianduff/flunge#906,
 /// 2026-07-16): rung 1's `conflicted_files` come straight from `jj

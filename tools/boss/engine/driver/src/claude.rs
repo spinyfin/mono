@@ -547,6 +547,10 @@ impl AgentDriver for ClaudeDriver {
         ])
     }
 
+    fn remote_spawn_host_independent(&self) -> bool {
+        true
+    }
+
     fn pane_monitor_spec(&self) -> Option<PaneMonitorSpec> {
         // Exact reproduction of the pre-spec literals in
         // `GhosttyTerminalView.makeClaudeSnapshot` / the tracker's

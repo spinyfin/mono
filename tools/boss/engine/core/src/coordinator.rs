@@ -2244,11 +2244,17 @@ fn work_item_project_id(item: &WorkItem) -> Option<String> {
 
 /// Render a one-line, human-readable summary of why no host was eligible,
 /// for the no-eligible-host pre-start failure / attention item.
-fn summarize_ineligibility(report: &[host_scheduling::Eligibility]) -> String {
+///
+/// When every considered host is missing the same required driver, lead
+/// with an explicit "no enabled host has driver X" so an operator reading
+/// the queue never has to decode per-host capability lists to see the
+/// hold reason.
+fn summarize_ineligibility(report: &[host_scheduling::Eligibility], required_driver: Option<&str>) -> String {
     use host_scheduling::IneligibilityReason as R;
     if report.is_empty() {
         return "no hosts are registered".to_owned();
     }
+    let driver_cap = required_driver.map(crate::host_capability_probe::driver_capability);
     let per_host: Vec<String> = report
         .iter()
         .map(|h| {
@@ -2260,6 +2266,15 @@ fn summarize_ineligibility(report: &[host_scheduling::Eligibility]) -> String {
                     R::NoFreeSlots => "no free slots".to_owned(),
                     R::NotSelectedHost => "not the requested/pinned host".to_owned(),
                     R::MissingCapabilities(missing) => {
+                        // Prefer a driver-specific phrase when the only
+                        // missing cap is the required driver so the hold
+                        // names the binary an operator must install.
+                        if let (Some(cap), Some(driver)) = (driver_cap.as_deref(), required_driver)
+                            && missing.len() == 1
+                            && missing.iter().any(|m| m == cap)
+                        {
+                            return format!("missing driver {driver}");
+                        }
                         format!("missing capabilities [{}]", missing.join(", "))
                     }
                 })
@@ -2267,7 +2282,27 @@ fn summarize_ineligibility(report: &[host_scheduling::Eligibility]) -> String {
             format!("{}: {}", h.host_id, reasons.join(", "))
         })
         .collect();
-    per_host.join("; ")
+    let detail = per_host.join("; ");
+    // When the driver is the distinguishing constraint and no host is
+    // eligible, put the operator-facing hold reason first.
+    if let Some(driver) = required_driver {
+        let all_miss_driver = report.iter().all(|h| {
+            !h.eligible
+                && h.reasons.iter().any(|r| match r {
+                    R::MissingCapabilities(missing) => missing
+                        .iter()
+                        .any(|m| m == &crate::host_capability_probe::driver_capability(driver)),
+                    _ => false,
+                })
+        });
+        let any_enabled = report
+            .iter()
+            .any(|h| !h.reasons.iter().any(|r| matches!(r, R::Disabled | R::NotSelectedHost)));
+        if all_miss_driver && any_enabled {
+            return format!("no enabled host has driver {driver}; {detail}");
+        }
+    }
+    detail
 }
 
 /// One failing-check record after parsing `ci_remediations.failed_checks`

@@ -119,19 +119,41 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_passes_settings_file_through_to_claude() {
-        // The engine ships the worker's `--settings` JSON outside the
-        // workspace tree and points claude at it via BOSS_SETTINGS_FILE;
-        // the wrapper must consume that env var and forward `--settings`.
-        // A refactor that dropped either side would silently strip the
-        // boss-event hooks from remote workers, pinning their lifecycle.
+    fn wrapper_uses_driver_owned_spawn_plan() {
+        // The engine ships settings and command details to the resolved
+        // driver's SpawnPlan. The wrapper must not impose Claude-only args
+        // such as `--settings` or `--dangerously-skip-permissions`.
         assert!(
-            WRAPPER_SOURCE.contains("BOSS_SETTINGS_FILE"),
-            "wrapper must read BOSS_SETTINGS_FILE so the engine can wire boss-event hooks remotely"
+            WRAPPER_SOURCE.contains("BOSS_DRIVER_COMMAND"),
+            "wrapper must receive the command rendered by the resolved driver's SpawnPlan"
         );
         assert!(
-            WRAPPER_SOURCE.contains("--settings"),
-            "wrapper must pass `--settings` to claude when BOSS_SETTINGS_FILE is set"
+            WRAPPER_SOURCE.contains("BOSS_DRIVER_ENV"),
+            "wrapper must apply environment directives from the resolved driver's SpawnPlan"
+        );
+        assert!(
+            !WRAPPER_SOURCE.contains("--dangerously-skip-permissions"),
+            "wrapper must not impose Claude-only permission flags"
+        );
+    }
+
+    #[test]
+    fn wrapper_launches_resolved_driver_not_hardcoded_claude() {
+        // A row allocated to codex must not silently exec `claude` on a
+        // remote host. The wrapper validates BOSS_DRIVER and runs the
+        // driver-owned command rather than a hardcoded binary.
+        assert!(
+            WRAPPER_SOURCE.contains("BOSS_DRIVER"),
+            "wrapper must read BOSS_DRIVER so the engine can launch the resolved driver"
+        );
+        assert!(
+            WRAPPER_SOURCE.contains("nohup sh -c \"exec $BOSS_DRIVER_COMMAND\""),
+            "wrapper must exec the resolved driver's rendered command so its PID is published"
+        );
+        // The old hardcoded form must not reappear as the launch target.
+        assert!(
+            !WRAPPER_SOURCE.contains("nohup claude "),
+            "wrapper must not hardcode `nohup claude`; launch the resolved driver"
         );
     }
 
@@ -144,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_handshake_reports_the_direct_claude_pid() {
+    fn wrapper_handshake_reports_the_direct_driver_pid() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         let bin_dir = temp.path().join("bin");
@@ -159,7 +181,7 @@ mod tests {
         for (name, body) in [
             (
                 "claude",
-                "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$CLAUDE_PID_FILE\"\nsleep 0.1\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$CLAUDE_PID_FILE.tmp\"\nmv \"$CLAUDE_PID_FILE.tmp\" \"$CLAUDE_PID_FILE\"\nsleep 0.1\n",
             ),
             ("cube", "#!/bin/sh\nexit 0\n"),
             ("gh", "#!/bin/sh\nexit 0\n"),
@@ -186,6 +208,9 @@ mod tests {
             .env("BOSS_EVENTS_SOCKET", "/tmp/boss-events-test.sock")
             .env("BOSS_LEASE_ID", "lease-test")
             .env("BOSS_WORKSPACE", &workspace)
+            .env("BOSS_DRIVER", "claude")
+            .env("BOSS_DRIVER_COMMAND", "claude")
+            .env("BOSS_DRIVER_ENV", ":")
             .output()
             .unwrap();
 

@@ -29,6 +29,13 @@ pub(super) use crate::work::{
     WorkItemPatch,
 };
 
+/// Coordinator fixtures that exercise a launch seed the local driver's
+/// discovered capability explicitly. The production probe never fabricates
+/// this row, but hermetic Bazel tests intentionally have no CLI on PATH.
+pub(super) fn seed_local_claude_driver(db: &WorkDb) {
+    crate::test_support::insert_host_capability(db, "local", "driver=claude", "auto");
+}
+
 /// Recorded args for each `lease_workspace` call:
 /// `(repo_id, task, prefer_workspace_id, allow_dirty, exclude_workspace_ids)`.
 pub(super) type LeaseCall = (String, String, Option<String>, bool, Vec<String>);

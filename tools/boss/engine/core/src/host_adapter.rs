@@ -42,7 +42,7 @@ use crate::ssh_spawn::{
     REASON_WORKER_LAUNCH_FAILED, RemoteSpawnPlan, perform_remote_launch, remote_events_socket_path,
 };
 use crate::ssh_transport::SshTransport;
-use crate::work::{ExecutionKind, WorkDb, WorkExecution, WorkItem};
+use crate::work::{WorkDb, WorkExecution, WorkItem};
 use crate::worker_setup::{WorkerSetupInput, render_remote_settings_json};
 use crate::wrapper_distribution::{WrapperPushLocks, WrapperPushOutcome, ensure_wrapper_current};
 
@@ -56,6 +56,19 @@ const REMOTE_SETTINGS_DIR: &str = ".boss-remote/settings";
 /// the worker's PATH (see the wrapper's note), so the hook command
 /// resolves it by name rather than an engine-local absolute path.
 const REMOTE_BOSS_EVENT_BIN: &str = "boss-event";
+
+/// Paths for engine-owned files in a remote driver's workspace config
+/// directory. Keeping the prompt and ignore file together prevents the
+/// prompt from appearing in the worker's change.
+fn remote_driver_config_paths(
+    workspace: &str,
+    descriptor: &crate::driver::DriverDescriptor,
+) -> (String, String, String) {
+    let directory = format!("{workspace}/{}", descriptor.config_dir);
+    let prompt = format!("{directory}/{}", descriptor.initial_prompt_filename);
+    let gitignore = format!("{directory}/.gitignore");
+    (directory, prompt, gitignore)
+}
 
 /// Abstracts all host-specific operations: workspace lifecycle and
 /// worker spawn. Later phases extend this with control-channel
@@ -323,6 +336,8 @@ impl HostAdapter for LocalHostAdapter {
 /// opens the reverse events-socket forward, and launches the detached
 /// remote worker — returning `WorkerPaneAlive` so `completion::on_stop`
 /// drives the in_review / PR-URL transition over the forwarded socket.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct SshHostAdapter {
     transport: SshTransport,
     push_locks: WrapperPushLocks,
@@ -337,6 +352,9 @@ pub struct SshHostAdapter {
     /// model routing (PR3) and the live-status surface (PR4) consume it.
     #[allow(dead_code)]
     cfg: Arc<RuntimeConfig>,
+    /// Mirrors the local pane spawner's `workers.non_opus_permission_mode`
+    /// setting so remote Claude argv has identical permission semantics.
+    non_opus_auto_mode: bool,
     /// Absolute path of the engine's LOCAL events socket — the target of
     /// the reverse `ssh -R <remote sock>:<this>` forward, so the remote
     /// worker's hook events tunnel back to the same socket local workers
@@ -349,6 +367,7 @@ impl SshHostAdapter {
         transport: SshTransport,
         work_db: Arc<WorkDb>,
         cfg: Arc<RuntimeConfig>,
+        non_opus_auto_mode: bool,
         events_socket_path: PathBuf,
     ) -> Self {
         Self {
@@ -356,6 +375,7 @@ impl SshHostAdapter {
             push_locks: WrapperPushLocks::new(),
             work_db,
             cfg,
+            non_opus_auto_mode,
             events_socket_path,
         }
     }
@@ -700,10 +720,6 @@ impl HostAdapter for SshHostAdapter {
     ) -> Result<RunOutcome> {
         let host = self.transport.host_id.clone();
 
-        // 0. Fail closed for the capability-restricted answer agent (see
-        //    `reject_remote_answer_agent`).
-        reject_remote_answer_agent(&execution.kind, &host)?;
-
         // 1. Verify the wrapper before any other work — drifted versions
         //    turn into `host_wrapper_push_failed` early so we don't try
         //    to invoke a stale wrapper contract.
@@ -793,10 +809,11 @@ impl HostAdapter for SshHostAdapter {
         let driver = crate::driver::DriverRegistry::default()
             .require(&spawn_config.driver)
             .map_err(|err| anyhow::anyhow!("remote spawn: {err}"))?;
+        reject_host_local_remote_spawn_plan(driver.as_ref(), &spawn_config.driver, &host)?;
         // Fail closed on a driver the remote path cannot observe. The remote
         // spawn ships exactly one observability channel — this settings
         // file, whose `boss-event` hooks tunnel back over the reverse
-        // events socket — and the wrapper unconditionally execs `claude`. A
+        // events socket — and the wrapper execs the resolved driver's rendered command. A
         // driver that reports progress as a byte stream instead renders an
         // EMPTY hooks map here, so the worker would launch and then be
         // completely invisible: no live-status entry, no transcript path,
@@ -807,31 +824,62 @@ impl HostAdapter for SshHostAdapter {
         reject_unobservable_remote_driver(driver.as_ref(), &spawn_config.driver, &settings_input, &host)?;
         let settings_json = render_remote_settings_json(&settings_input, driver.as_ref());
 
-        // 5. Ship the prompt + settings to the remote. The prompt lives
-        //    under `<workspace>/.boss/` (read by the wrapper via
-        //    BOSS_INITIAL_INPUT_FILE); the settings live outside the tree
-        //    under `~/.boss-remote/settings/`.
-        let remote_prompt_dir = format!("{workspace}/.boss");
-        let remote_prompt_path = format!("{remote_prompt_dir}/initial-input.txt");
-        let remote_settings_dir = format!("~/{REMOTE_SETTINGS_DIR}");
+        // 5. Ship the prompt to the path the driver's SpawnPlan reads and
+        //    settings outside the workspace tree under `~/.boss-remote/`.
+        //    This keeps the remote command identical to the local driver's
+        //    command rather than teaching the wrapper a second argv dialect.
+        let (remote_prompt_dir, remote_prompt_path, remote_prompt_gitignore_path) =
+            remote_driver_config_paths(&workspace, driver.descriptor());
+        let remote_home = remote_home_dir(&self.transport).await?;
+        let remote_settings_dir = format!("{remote_home}/{REMOTE_SETTINGS_DIR}");
         let remote_settings_path = format!("{remote_settings_dir}/{run_id}.json");
         self.ship_file(&remote_prompt_dir, &remote_prompt_path, &prompt_text, "prompt")
             .await?;
+        self.ship_file(
+            &remote_prompt_dir,
+            &remote_prompt_gitignore_path,
+            driver.config_dir_gitignore(),
+            "driver config gitignore",
+        )
+        .await?;
         self.ship_file(&remote_settings_dir, &remote_settings_path, &settings_json, "settings")
             .await?;
 
         // 6. Open the reverse events tunnel and launch the detached
         //    remote worker (PR1 orchestration over the one master
         //    multiplex).
+        // Launch the resolved driver's SpawnPlan, never a hardcoded Claude
+        // command. The driver owns argv shaping and environment directives.
+        // Placement already required `driver=<slug>` on this host; the
+        // wrapper still re-checks PATH so a race between probe and
+        // launch surfaces as `host_missing_driver` rather than a silent
+        // substitute.
+        let worker_kind = settings_input.worker_kind;
+        let driver_binary = driver.descriptor().binary.to_owned();
+        let driver_spawn_plan = driver.spawn_invocation(crate::driver::SpawnRequest {
+            model: &spawn_config.model,
+            effort: spawn_config.effort_value,
+            settings_path: Some(std::path::Path::new(&remote_settings_path)),
+            non_opus_auto_mode: self.non_opus_auto_mode,
+            permission_mode_override: worker_kind.forced_permission_mode(),
+            run_id: Some(&run_id),
+        });
         let plan = RemoteSpawnPlan::builder()
             .run_id(run_id.clone())
             .lease_id(lease_id)
             .workspace_path(workspace)
             .maybe_repo_remote_url((!execution.repo_remote_url.is_empty()).then(|| execution.repo_remote_url.clone()))
             .events_socket_path(remote_socket)
-            .initial_input_file(remote_prompt_path)
-            .settings_file(remote_settings_path)
             .wrapper_path(remote_wrapper_path())
+            .driver_binary(driver_binary.clone())
+            .driver_command(driver_spawn_plan.command)
+            .driver_env(
+                driver_spawn_plan
+                    .env
+                    .iter()
+                    .map(crate::runner::pane_spawn::render_env_directive)
+                    .collect::<String>(),
+            )
             .build();
 
         let engine_socket = self.events_socket_path.display().to_string();
@@ -873,6 +921,8 @@ impl HostAdapter for SshHostAdapter {
             host_id = %host,
             run_id = %run_id,
             remote_pid = ?outcome.remote_pid,
+            driver = %spawn_config.driver,
+            driver_binary = %driver_binary,
             model = %spawn_config.model,
             reasoning = spawn_config.reasoning.map(|mode| mode.as_str()).unwrap_or("unclassified"),
             "remote worker launched; awaiting Stop over the forwarded events socket",
@@ -1096,6 +1146,7 @@ pub struct SshHostAdapterProvider {
     /// Engine runtime config, threaded into each built `SshHostAdapter`
     /// for parity with the local `PaneSpawnRunner`.
     cfg: Arc<RuntimeConfig>,
+    non_opus_auto_mode: bool,
     /// Absolute path of the engine's local events socket — the target of
     /// the per-run reverse `ssh -R` forward.
     events_socket_path: PathBuf,
@@ -1111,6 +1162,7 @@ impl SshHostAdapterProvider {
         local: Arc<dyn HostAdapter>,
         work_db: Arc<WorkDb>,
         cfg: Arc<RuntimeConfig>,
+        non_opus_auto_mode: bool,
         events_socket_path: PathBuf,
         control_socket_dir: PathBuf,
     ) -> Self {
@@ -1118,6 +1170,7 @@ impl SshHostAdapterProvider {
             local,
             work_db,
             cfg,
+            non_opus_auto_mode,
             events_socket_path,
             control_socket_dir,
             cache: Mutex::new(HashMap::new()),
@@ -1150,6 +1203,7 @@ impl HostAdapterProvider for SshHostAdapterProvider {
             transport,
             Arc::clone(&self.work_db),
             Arc::clone(&self.cfg),
+            self.non_opus_auto_mode,
             self.events_socket_path.clone(),
         ));
         cache.insert(host.id.clone(), Arc::clone(&adapter));
@@ -1157,34 +1211,43 @@ impl HostAdapterProvider for SshHostAdapterProvider {
     }
 }
 
-/// Fail closed for the capability-restricted answer agent on the REMOTE spawn
-/// path. Its read-only sandbox is enforced by the local spawn path forcing
-/// `--permission-mode dontAsk` (see `runner.rs`), but the remote worker wrapper
-/// (`remote/boss-remote-run.sh`) launches every worker with
-/// `--dangerously-skip-permissions`, which bypasses the settings allow/deny
-/// rules entirely. Rather than silently run an answer agent unsandboxed, refuse
-/// remote dispatch — answer agents are local-only until the remote wrapper
-/// learns to honour a restricted permission mode.
-///
-/// No path dispatches answer agents remotely today (no remote answer-agent
-/// dispatch path exists yet); this is a defensive backstop so the security
-/// property holds regardless of how dispatch/scheduling evolves.
-fn reject_remote_answer_agent(kind: &ExecutionKind, host: &str) -> Result<()> {
-    if *kind == ExecutionKind::AnswerAgent {
-        bail!(
-            "answer_agent executions are local-only: the remote worker wrapper runs \
-             with --dangerously-skip-permissions, which would bypass the read-only \
-             dontAsk allowlist. Refusing to spawn an unsandboxed answer agent on host {host}."
-        );
-    }
-    Ok(())
-}
-
 /// Failure-reason taxonomy string for a driver the remote path cannot
 /// observe. Named alongside the wrapper's own sentinels
 /// (`host_missing_claude`, …) so it reads as one family in
 /// `hosts.last_error_text` and the dispatch stream.
 pub const REASON_HOST_DRIVER_UNSUPPORTED: &str = "host_driver_unsupported";
+
+/// Refuse plans that refer to per-run homes or OS sandbox artifacts created on
+/// the coordinator. Remote provisioning for those drivers is not implemented;
+/// descriptor opt-in keeps an added driver from silently inheriting unsafe
+/// remote eligibility.
+fn reject_host_local_remote_spawn_plan(
+    driver: &dyn crate::driver::AgentDriver,
+    driver_slug: &str,
+    host: &str,
+) -> Result<()> {
+    if driver.remote_spawn_host_independent() {
+        return Ok(());
+    }
+    bail!(
+        "{REASON_HOST_DRIVER_UNSUPPORTED} on host {host}: driver `{driver_slug}` has a host-local spawn plan and is not remote-eligible"
+    )
+}
+
+/// Ask the target shell for its home before driver argv rendering. Driver
+/// commands quote settings paths, so a home-relative `~/…` cannot expand.
+async fn remote_home_dir(transport: &SshTransport) -> Result<String> {
+    let home = transport
+        .run_shell("printf '%s' \"$HOME\"")
+        .await?
+        .stdout
+        .trim()
+        .to_owned();
+    if !home.starts_with('/') {
+        bail!("remote home directory is not an absolute path: {home:?}");
+    }
+    Ok(home)
+}
 
 /// Refuse a remote spawn whose resolved driver would produce no
 /// engine-visible progress.
@@ -1194,10 +1257,9 @@ pub const REASON_HOST_DRIVER_UNSUPPORTED: &str = "host_driver_unsupported";
 /// the reverse events socket, wired through the `--settings` file this
 /// adapter ships. A driver whose ingress is a byte stream (`StdoutJsonl` /
 /// `AgentJsonlFile`) declares no such hooks, and the engine has no reader
-/// for its stream on another machine; on top of that the wrapper
-/// (`remote/boss-remote-run.sh`) launches `claude` no matter which driver
-/// was resolved, so the settings shipped and the binary run would not even
-/// describe the same agent.
+/// for its stream on another machine. The wrapper executes the resolved
+/// driver's rendered command, so this gate is specifically about whether
+/// that driver's settings wire an engine-visible progress channel.
 ///
 /// Failing loudly here converts a worker that would run silently to no
 /// effect into a spawn error the dispatcher can attribute and re-route.
@@ -1216,14 +1278,15 @@ fn reject_unobservable_remote_driver(
     bail!(
         "{REASON_HOST_DRIVER_UNSUPPORTED} on host {host}: driver `{driver_slug}` reports progress as a byte stream \
          rather than hooks in the worker settings file, so a remote worker running it would emit no events the \
-         engine can see (no live status, no transcript path, no Stop, therefore no PR) — and the remote wrapper \
-         launches `claude` regardless of the resolved driver. Refusing to spawn an unobservable remote worker."
+         engine can see (no live status, no transcript path, no Stop, therefore no PR). Refusing to spawn an \
+         unobservable remote worker."
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::AgentDriver;
 
     /// A `WorkerSetupInput` shaped like the one the remote spawn builds.
     /// Only the fields `progress_observation_wiring` reads matter here.
@@ -1294,20 +1357,47 @@ mod tests {
     }
 
     #[test]
-    fn reject_remote_answer_agent_blocks_answer_agent_allows_others() {
-        // The security-critical decision: an answer agent must never spawn on
-        // the remote (unsandboxed) path.
-        assert!(reject_remote_answer_agent(&ExecutionKind::AnswerAgent, "host-1").is_err());
-        // Every other kind is unaffected — remote dispatch proceeds.
-        for kind in [
-            ExecutionKind::TaskImplementation,
-            ExecutionKind::ChoreImplementation,
-            ExecutionKind::RevisionImplementation,
-            ExecutionKind::PrReview,
-            ExecutionKind::CiRemediation,
+    fn host_local_driver_spawn_plans_are_refused() {
+        for (driver, slug) in [
+            (
+                Arc::new(crate::driver::CodexDriver::default()) as Arc<dyn crate::driver::AgentDriver>,
+                "codex",
+            ),
+            (
+                Arc::new(crate::driver::GrokDriver::default()) as Arc<dyn crate::driver::AgentDriver>,
+                "grok",
+            ),
         ] {
-            assert!(reject_remote_answer_agent(&kind, "host-1").is_ok(), "kind {kind:?}");
+            let err = reject_host_local_remote_spawn_plan(driver.as_ref(), slug, "host-1")
+                .expect_err("host-local plans must not be rendered on the engine for remote use");
+            assert!(format!("{err:#}").contains(REASON_HOST_DRIVER_UNSUPPORTED));
         }
+        assert!(reject_host_local_remote_spawn_plan(&crate::driver::ClaudeDriver, "claude", "host-1").is_ok());
+    }
+
+    #[test]
+    fn remote_answer_agent_plan_forces_dont_ask_without_tilde_settings_path() {
+        let plan = crate::driver::ClaudeDriver.spawn_invocation(crate::driver::SpawnRequest {
+            model: "sonnet",
+            effort: None,
+            settings_path: Some(Path::new("/Users/remote/.boss-remote/settings/exec_1.json")),
+            non_opus_auto_mode: false,
+            permission_mode_override: crate::worker_setup::WorkerKind::AnswerAgent.forced_permission_mode(),
+            run_id: Some("exec_1"),
+        });
+        assert!(plan.command.contains("--permission-mode dontAsk"));
+        assert!(!plan.command.contains("--dangerously-skip-permissions"));
+        assert!(!plan.command.contains("~/"));
+    }
+
+    #[test]
+    fn remote_spawn_ignores_engine_owned_driver_config_files() {
+        let driver = crate::driver::ClaudeDriver;
+        let (directory, prompt, gitignore) = remote_driver_config_paths("/remote/workspace", driver.descriptor());
+        assert_eq!(directory, "/remote/workspace/.claude");
+        assert_eq!(prompt, "/remote/workspace/.claude/initial-prompt.txt");
+        assert_eq!(gitignore, "/remote/workspace/.claude/.gitignore");
+        assert_eq!(driver.config_dir_gitignore(), "*\n");
     }
 
     // ── Pure helpers ─────────────────────────────────────────────────────────
@@ -1379,7 +1469,7 @@ mod tests {
             .build();
         let cfg = Arc::new(RuntimeConfig::from_parts(work, None));
         let transport = SshTransport::new(host_id, ssh_target, &base);
-        SshHostAdapter::new(transport, Arc::new(db), cfg, base.join("events.sock"))
+        SshHostAdapter::new(transport, Arc::new(db), cfg, false, base.join("events.sock"))
     }
 
     #[test]

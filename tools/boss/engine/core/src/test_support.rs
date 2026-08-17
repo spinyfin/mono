@@ -69,6 +69,10 @@ pub fn create_test_product_named(db: &WorkDb, name: &str) -> Product {
 /// remote (`None` for a repo-less product). All other fields default to
 /// `None`.
 pub fn create_test_product_with_repo(db: &WorkDb, name: &str, repo_remote_url: Option<&str>) -> Product {
+    // Hermetic coordinator fixtures exercise dispatch without installed agent
+    // CLIs. Seed discovery explicitly in their common fixture, never in the
+    // production scheduling path.
+    insert_host_capability(db, "local", "driver=claude", "auto");
     db.create_product(
         CreateProductInput::builder()
             .name(name)
@@ -118,6 +122,7 @@ pub fn create_active_chore(db: &WorkDb, product_id: &str, name: &str) -> String 
 /// `impl Into<String>` so existing call sites lift their expressions
 /// (`product.id.clone()`, `"Cleanup"`, `format!(...)`) verbatim.
 pub fn create_test_chore(db: &WorkDb, product_id: impl Into<String>, name: impl Into<String>) -> Task {
+    insert_host_capability(db, "local", "driver=claude", "auto");
     db.create_chore(CreateChoreInput::builder().product_id(product_id).name(name).build())
         .unwrap()
 }
@@ -134,6 +139,7 @@ pub fn create_test_chore(db: &WorkDb, product_id: impl Into<String>, name: impl 
 /// `impl Into<String>` so existing call sites lift their expressions
 /// (`product.id.clone()`, `"Parent chore"`, `format!(...)`) verbatim.
 pub fn create_test_chore_manual(db: &WorkDb, product_id: impl Into<String>, name: impl Into<String>) -> Task {
+    insert_host_capability(db, "local", "driver=claude", "auto");
     db.create_chore(
         CreateChoreInput::builder()
             .product_id(product_id)

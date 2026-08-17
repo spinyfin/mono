@@ -178,8 +178,15 @@ pub(crate) fn ensure_local_host(conn: &Connection) -> Result<()> {
 pub(crate) fn refresh_local_host_auto_capabilities(conn: &Connection) -> Result<()> {
     let caps = discover_local_capabilities();
     replace_auto_capabilities(conn, "local", &caps)?;
+    let driver_count = caps.iter().filter(|cap| cap.starts_with("driver=")).count();
+    if driver_count == 0 {
+        tracing::warn!(
+            "host_registry: local host refresh found no installed drivers; driver-constrained dispatch will hold",
+        );
+    }
     tracing::debug!(
         count = caps.len(),
+        driver_count,
         "host_registry: refreshed local host auto capabilities",
     );
     Ok(())
@@ -231,7 +238,9 @@ fn discover_local_capabilities() -> Vec<String> {
 /// a local and a remote macOS host must describe themselves identically or
 /// a requirement written against one silently excludes the other.
 fn discover_local_capabilities_uncached() -> Vec<String> {
-    use crate::host_capability_probe::{arch_capability, gh_authed_capability, os_capability};
+    use crate::host_capability_probe::{
+        arch_capability, discover_local_driver_capabilities, gh_authed_capability, os_capability,
+    };
 
     let mut caps: Vec<String> = Vec::new();
 
@@ -258,6 +267,11 @@ fn discover_local_capabilities_uncached() -> Vec<String> {
     .map(|out| out.status.success())
     .unwrap_or(false);
     caps.push(gh_authed_capability(gh_authed));
+
+    // Installed agent drivers (same vocabulary as the remote probe). A
+    // host that has none still gets `drivers-probed=true` so selection
+    // can tell "checked, missing" from "never checked".
+    caps.extend(discover_local_driver_capabilities());
 
     caps
 }

@@ -1634,6 +1634,12 @@ pub trait AgentDriver: Send + Sync {
     fn descriptor(&self) -> &DriverDescriptor;
     fn capabilities(&self) -> CapabilitySet;
 
+    /// Explicit remote-spawn declaration. Drivers default to host-local until
+    /// they prove their per-run state can be provisioned remotely.
+    fn remote_spawn_host_independent(&self) -> bool {
+        false
+    }
+
     // ── Spawn capability ────────────────────────────────────────────────────
 
     /// Build the [`SpawnPlan`] — environment adjustments plus the command

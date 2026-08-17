@@ -982,7 +982,7 @@ enum HostsAction {
     /// Register a new remote host. The host row is persisted to
     /// `state.db`, then provisioned: push the `boss-remote-run` wrapper,
     /// verify `cube` is invocable over non-interactive SSH, and discover
-    /// the host's capabilities (`os=`, `arch=`, `gh-authed=`) by probing
+    /// the host's capabilities (`os=`, `arch=`, `gh-authed=`, `driver=…`) by probing
     /// it. The host is left enabled only if all of that succeeds;
     /// otherwise it is disabled with the reason on `last_error`.
     ///

@@ -10,12 +10,13 @@ use super::helpers::*;
 async fn read_remote_transcript_tail_local_returns_none_and_unknown_host_errors() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-    let coordinator = ExecutionCoordinator::new(
+    seed_local_claude_driver(&db);
+    let coordinator = Arc::new(ExecutionCoordinator::new(
         db.clone(),
         WorkerPool::new(1),
         Arc::new(FakeCubeClient::default()),
         Arc::new(FakeExecutionRunner::default()),
-    );
+    ));
 
     // "local" short-circuits to None so the RPC reads the local fs.
     assert_eq!(
@@ -203,6 +204,7 @@ async fn requested_host_routes_one_dispatch_and_refuses_without_queueing() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     db.add_host("zakalwe", "user@zakalwe", 1, &[]).unwrap();
+    crate::test_support::insert_host_capability(&db, "zakalwe", "driver=claude", "auto");
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, product.id.clone(), "Remote cleanup");
 
@@ -307,6 +309,38 @@ async fn requested_host_routes_one_dispatch_and_refuses_without_queueing() {
     assert!(db.list_executions(Some(&unknown.id)).unwrap().is_empty());
 }
 
+/// Requested-host admission must enforce the row/product driver's capability
+/// before it creates an execution, rather than accepting the pin and leaving
+/// scheduling to fail later with a host hold.
+#[tokio::test]
+async fn requested_host_rejects_missing_resolved_driver_capability() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    db.add_host("zakalwe", "user@zakalwe", 1, &[]).unwrap();
+    crate::test_support::insert_host_capability(&db, "zakalwe", "driver=claude", "auto");
+    let product = create_test_product(&db);
+    db.set_product_default_driver(&product.id, Some("codex")).unwrap();
+    let chore = create_test_chore(&db, product.id, "Codex-only requested host");
+    let coordinator = ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        Arc::new(FakeExecutionRunner::default()),
+    );
+
+    let err = coordinator
+        .request_execution_via_db(
+            RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .requested_host_id("zakalwe")
+                .build(),
+            Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new()),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("driver codex"), "got: {err}");
+    assert!(db.list_executions(Some(&chore.id)).unwrap().is_empty());
+}
+
 /// A friendly short id (`T<n>`) passed alongside `--host` must resolve to
 /// the canonical `task_…` id before either the live-execution pre-check or
 /// `validate_requested_host` runs — both look the id up directly and, on
@@ -320,6 +354,7 @@ async fn requested_host_resolves_friendly_short_id() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     db.add_host("zakalwe", "user@zakalwe", 1, &[]).unwrap();
+    crate::test_support::insert_host_capability(&db, "zakalwe", "driver=claude", "auto");
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, product.id.clone(), "Short-id remote cleanup");
     let short_id = chore.short_id.expect("test chore must have a short_id");
@@ -411,6 +446,8 @@ async fn requested_host_pre_start_failure_cancels_instead_of_retrying_elsewhere(
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     db.add_host("zakalwe", "user@zakalwe", 1, &[]).unwrap();
     db.add_host("spare", "user@spare", 1, &[]).unwrap();
+    crate::test_support::insert_host_capability(&db, "zakalwe", "driver=claude", "auto");
+    crate::test_support::insert_host_capability(&db, "spare", "driver=claude", "auto");
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, product.id.clone(), "Flaky remote cleanup");
 
@@ -739,6 +776,45 @@ async fn pin_to_disabled_host_yields_no_eligible_host() {
         "expected a no_eligible_host attention item, got {:?}",
         items.iter().map(|i| &i.kind).collect::<Vec<_>>(),
     );
+}
+
+#[tokio::test]
+async fn host_selection_fails_closed_when_enabled_local_has_no_driver_capability() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    // `drivers-probed=true` says discovery completed: with no `driver=` row,
+    // the enabled local host must fail closed instead of getting test-only
+    // capability fabrication from the scheduling path.
+    crate::test_support::insert_host_capability(&db, "local", "drivers-probed=true", "auto");
+
+    let product = create_test_product(&db);
+    db.set_product_default_driver(&product.id, Some("claude")).unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Requires Claude");
+    db.replace_auto_host_capabilities("local", &["drivers-probed=true".to_owned()])
+        .unwrap();
+    db.reconcile_product_executions(&product.id).unwrap();
+    let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        Arc::new(FakeExecutionRunner::default()),
+    ));
+    let worker_id = coordinator
+        .worker_pool()
+        .claim_worker(&execution.id, None)
+        .await
+        .expect("worker available");
+    let err = coordinator
+        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("no enabled host has driver claude"),
+        "got: {err:#}"
+    );
+    assert!(err.to_string().contains("local: missing driver claude"), "got: {err:#}");
 }
 
 /// The `no_eligible_host` pre-start failure used to emit NO dispatch
@@ -1161,6 +1237,7 @@ async fn successful_run_leaves_execution_running_and_releases_worker() {
 async fn start_failure_marks_execution_failed_and_releases_worker() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
     db.reconcile_product_executions(&product.id).unwrap();

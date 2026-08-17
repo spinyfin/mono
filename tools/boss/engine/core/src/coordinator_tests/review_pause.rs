@@ -14,6 +14,7 @@ use boss_protocol::PauseReason;
 async fn pr_review_execution_routes_to_review_pool() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
     let cube = Arc::new(FakeCubeClient::default());
     let mut coord = ExecutionCoordinator::new(
         db.clone(),
@@ -112,6 +113,7 @@ async fn review_prefix_worker_id_releases_to_review_pool() {
 async fn review_pool_exhaustion_does_not_block_main_pool() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
     let product = create_test_product(&db);
 
     // One regular chore — must still dispatch even when review is full.
@@ -476,6 +478,7 @@ async fn operator_pause_exempts_ready_pr_review_execution() {
 async fn operator_pause_holds_main_pool_row_until_resume() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
     db.reconcile_product_executions(&product.id).unwrap();
@@ -635,6 +638,7 @@ async fn automation_pause_holds_automation_pool_row_until_resume() {
 
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
     let product = create_test_product(&db);
 
     let automation = db

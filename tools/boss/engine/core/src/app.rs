@@ -1264,6 +1264,7 @@ impl ServerState {
         // dir, and a config handle. Resolved out here so the move-closure
         // below can consume them.
         let cfg_for_provider = cfg.clone();
+        let remote_non_opus_auto_mode = settings.is_enabled("workers.non_opus_permission_mode");
         // The socket this engine actually bound (stamped on the config by
         // `serve`), not a fresh read of `$BOSS_EVENTS_SOCKET` — an isolated
         // fixture that re-resolved here would point every remote worker's
@@ -1326,6 +1327,7 @@ impl ServerState {
                         local_adapter,
                         work_db.clone(),
                         cfg_for_provider,
+                        remote_non_opus_auto_mode,
                         provider_events_socket,
                         control_dir,
                     ),

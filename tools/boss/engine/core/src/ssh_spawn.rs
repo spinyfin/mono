@@ -45,8 +45,8 @@ use crate::ssh_transport::{SshOutput, SshTransport};
 /// (missing var, workspace path absent). An engine bug, surfaced so it
 /// is not silently swallowed.
 pub const REASON_WRAPPER_MISCONFIGURED: &str = "host_wrapper_misconfigured";
-/// `exit 79`: `claude` not found on the remote PATH.
-pub const REASON_MISSING_CLAUDE: &str = "host_missing_claude";
+/// `exit 79`: the resolved driver binary was not found on the remote PATH.
+pub const REASON_MISSING_DRIVER: &str = "host_missing_driver";
 /// `exit 80`: `cube` not found on the remote PATH.
 pub const REASON_MISSING_CUBE: &str = "host_missing_cube";
 /// `exit 81`: `gh` not found on the remote PATH.
@@ -110,7 +110,7 @@ pub fn classify_wrapper_exit(code: i32) -> WrapperLaunch {
     match code {
         0 => WrapperLaunch::Launched,
         78 => WrapperLaunch::Failed(REASON_WRAPPER_MISCONFIGURED),
-        79 => WrapperLaunch::Failed(REASON_MISSING_CLAUDE),
+        79 => WrapperLaunch::Failed(REASON_MISSING_DRIVER),
         80 => WrapperLaunch::Failed(REASON_MISSING_CUBE),
         81 => WrapperLaunch::Failed(REASON_MISSING_GH),
         82 => WrapperLaunch::Failed(REASON_MISSING_BOSS_EVENT),
@@ -157,21 +157,22 @@ pub struct RemoteSpawnPlan {
     /// Forwarded events-socket path on the remote (from
     /// [`remote_events_socket_path`]).
     pub events_socket_path: String,
-    /// Remote path of a file holding the initial prompt, if the engine
-    /// shipped one. Preferred over an inline env var so a multi-KB
-    /// prompt never has to survive ssh-argv re-quoting.
-    pub initial_input_file: Option<String>,
-    /// Remote path of the worker's `--settings` JSON file — rendered by
-    /// [`crate::worker_setup::render_remote_settings_json`] and shipped
-    /// outside the workspace tree (mirroring the local runner, which
-    /// keeps the settings file out of the repo so it never lands in a
-    /// worker's PR). When present the wrapper passes `--settings <file>`
-    /// to claude so the `boss-event` hooks fire and the Stop event
-    /// tunnels back over the forwarded socket. `None` falls back to
-    /// claude's own project/user settings discovery.
-    pub settings_file: Option<String>,
     /// Absolute remote path of the wrapper (`~/.boss-remote/bin/boss-remote-run`).
     pub wrapper_path: String,
+    /// Agent-driver binary the remote wrapper must exec (e.g. `claude`,
+    /// `codex`, `grok`). Comes from the execution's resolved driver
+    /// descriptor — never a hardcoded default. Required so a row
+    /// allocated to one driver cannot silently run as another.
+    pub driver_binary: String,
+    /// Shell command rendered by the resolved driver's `spawn_invocation`.
+    /// It must be a single command suitable for `exec`: the wrapper uses
+    /// that form so its published worker PID is the driver's PID, not an
+    /// intermediate shell. The wrapper executes it after applying `driver_env`, so
+    /// local and remote launches share one source of truth for argv shaping.
+    pub driver_command: String,
+    /// Shell statements rendering the resolved driver's environment
+    /// directives, in order, before [`Self::driver_command`] runs.
+    pub driver_env: String,
 }
 
 /// Compose the remote command as an argv vector: an `env VAR=val …`
@@ -185,15 +186,12 @@ pub fn build_remote_command(plan: &RemoteSpawnPlan) -> Vec<String> {
         format!("BOSS_EVENTS_SOCKET={}", plan.events_socket_path),
         format!("BOSS_LEASE_ID={}", plan.lease_id),
         format!("BOSS_WORKSPACE={}", plan.workspace_path),
+        format!("BOSS_DRIVER={}", plan.driver_binary),
+        format!("BOSS_DRIVER_COMMAND={}", plan.driver_command),
+        format!("BOSS_DRIVER_ENV={}", plan.driver_env),
     ];
     if let Some(url) = &plan.repo_remote_url {
         argv.push(format!("BOSS_REPO_REMOTE_URL={url}"));
-    }
-    if let Some(file) = &plan.initial_input_file {
-        argv.push(format!("BOSS_INITIAL_INPUT_FILE={file}"));
-    }
-    if let Some(file) = &plan.settings_file {
-        argv.push(format!("BOSS_SETTINGS_FILE={file}"));
     }
     argv.push(plan.wrapper_path.clone());
     argv
@@ -562,7 +560,7 @@ mod tests {
             classify_wrapper_exit(78),
             WrapperLaunch::Failed(REASON_WRAPPER_MISCONFIGURED)
         );
-        assert_eq!(classify_wrapper_exit(79), WrapperLaunch::Failed(REASON_MISSING_CLAUDE));
+        assert_eq!(classify_wrapper_exit(79), WrapperLaunch::Failed(REASON_MISSING_DRIVER));
         assert_eq!(classify_wrapper_exit(80), WrapperLaunch::Failed(REASON_MISSING_CUBE));
         assert_eq!(classify_wrapper_exit(81), WrapperLaunch::Failed(REASON_MISSING_GH));
         assert_eq!(
@@ -591,9 +589,10 @@ mod tests {
             workspace_path: "/ws/mono-agent-007".into(),
             repo_remote_url: Some("git@example.com:me/mono.git".into()),
             events_socket_path: "/tmp/boss-events-run-1.sock".into(),
-            initial_input_file: Some("/ws/mono-agent-007/.boss/initial-input.txt".into()),
-            settings_file: Some("/ws/mono-agent-007/.boss/settings.json".into()),
             wrapper_path: "~/.boss-remote/bin/boss-remote-run".into(),
+            driver_binary: "codex".into(),
+            driver_command: "codex -m gpt-5.6-sol \"$(cat .codex/initial-prompt.txt)\"".into(),
+            driver_env: "export CODEX_HOME='/tmp/codex'; ".into(),
         };
         let argv = build_remote_command(&plan);
         assert_eq!(argv[0], "env");
@@ -601,9 +600,13 @@ mod tests {
         assert!(argv.contains(&"BOSS_EVENTS_SOCKET=/tmp/boss-events-run-1.sock".to_owned()));
         assert!(argv.contains(&"BOSS_LEASE_ID=lease-1".to_owned()));
         assert!(argv.contains(&"BOSS_WORKSPACE=/ws/mono-agent-007".to_owned()));
+        assert!(argv.contains(&"BOSS_DRIVER=codex".to_owned()));
+        assert!(argv.iter().any(|arg| arg.starts_with("BOSS_DRIVER_COMMAND=codex -m")));
+        assert!(
+            argv.iter()
+                .any(|arg| arg.starts_with("BOSS_DRIVER_ENV=export CODEX_HOME"))
+        );
         assert!(argv.contains(&"BOSS_REPO_REMOTE_URL=git@example.com:me/mono.git".to_owned()));
-        assert!(argv.contains(&"BOSS_INITIAL_INPUT_FILE=/ws/mono-agent-007/.boss/initial-input.txt".to_owned()));
-        assert!(argv.contains(&"BOSS_SETTINGS_FILE=/ws/mono-agent-007/.boss/settings.json".to_owned()));
         // The wrapper path is always the final token.
         assert_eq!(argv.last().unwrap(), "~/.boss-remote/bin/boss-remote-run");
     }
@@ -616,14 +619,15 @@ mod tests {
             workspace_path: "/ws".into(),
             repo_remote_url: None,
             events_socket_path: "/tmp/s.sock".into(),
-            initial_input_file: None,
-            settings_file: None,
             wrapper_path: "wrapper".into(),
+            driver_binary: "claude".into(),
+            driver_command: "claude --model opus \"$(cat .claude/initial-prompt.txt)\"".into(),
+            driver_env: "unset ANTHROPIC_API_KEY; ".into(),
         };
         let argv = build_remote_command(&plan);
         assert!(!argv.iter().any(|a| a.starts_with("BOSS_REPO_REMOTE_URL=")));
-        assert!(!argv.iter().any(|a| a.starts_with("BOSS_INITIAL_INPUT_FILE=")));
-        assert!(!argv.iter().any(|a| a.starts_with("BOSS_SETTINGS_FILE=")));
+        // Driver is required — always present even when optionals are not.
+        assert!(argv.contains(&"BOSS_DRIVER=claude".to_owned()));
     }
 
     #[test]
@@ -846,9 +850,10 @@ mod tests {
             workspace_path: "/ws".into(),
             repo_remote_url: None,
             events_socket_path: remote_events_socket_path("run-1"),
-            initial_input_file: None,
-            settings_file: None,
             wrapper_path: "~/.boss-remote/bin/boss-remote-run".into(),
+            driver_binary: "claude".into(),
+            driver_command: "claude --model opus \"$(cat .claude/initial-prompt.txt)\"".into(),
+            driver_env: "unset ANTHROPIC_API_KEY; ".into(),
         }
     }
 
@@ -880,6 +885,10 @@ mod tests {
                 assert_eq!(argv[0], "env");
                 assert!(argv.contains(&"BOSS_RUN_ID=run-1".to_owned()));
                 assert!(argv.contains(&"BOSS_EVENTS_SOCKET=/tmp/boss-events-run-1.sock".to_owned()));
+                assert!(
+                    argv.contains(&"BOSS_DRIVER=claude".to_owned()),
+                    "remote launch must pass the resolved driver binary, got {argv:?}"
+                );
             }
             other => panic!("expected wrapper launch run, got {other:?}"),
         }
@@ -889,15 +898,15 @@ mod tests {
 
     #[tokio::test]
     async fn wrapper_sentinel_failure_maps_reason_and_cancels_forward() {
-        // 79 == claude missing.
-        let exec = FakeExec::new(79, "boss-remote-run: `claude` not found on PATH\n");
-        let outcome = perform_remote_launch(&exec, &sample_plan(), "/engine.sock")
-            .await
-            .unwrap();
+        // 79 == resolved driver binary missing.
+        let exec = FakeExec::new(79, "boss-remote-run: `codex` not found on PATH\n");
+        let mut plan = sample_plan();
+        plan.driver_binary = "codex".into();
+        let outcome = perform_remote_launch(&exec, &plan, "/engine.sock").await.unwrap();
 
         assert!(!outcome.launched);
-        assert_eq!(outcome.failure_reason, Some(REASON_MISSING_CLAUDE));
-        assert!(outcome.detail.unwrap().contains("claude"));
+        assert_eq!(outcome.failure_reason, Some(REASON_MISSING_DRIVER));
+        assert!(outcome.detail.unwrap().contains("codex"));
 
         // The forward we opened before the failed launch is torn down.
         assert!(exec.calls().iter().any(|c| matches!(c, Call::CancelForward { .. })));

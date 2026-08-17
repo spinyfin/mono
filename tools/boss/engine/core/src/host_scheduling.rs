@@ -385,4 +385,73 @@ mod tests {
         assert!(picked.is_none());
         assert!(report.is_empty());
     }
+
+    /// A row allocated to a driver a host lacks must never land there —
+    /// same hard exclusion as disabled/unhealthy. The required cap is
+    /// `driver=<slug>` (injected by the coordinator from the resolved
+    /// driver); hosts that only have other tags are not candidates.
+    #[test]
+    fn driver_capability_is_a_hard_placement_constraint() {
+        let reqs = ChoreRequirements {
+            required_capabilities: ["driver=codex".into()].into_iter().collect(),
+            pinned_host_id: None,
+            requested_host_id: None,
+        };
+        let slots = vec![
+            slot("local", 4, 0, &["os=macos", "driver=claude", "drivers-probed=true"]),
+            slot(
+                "zakalwe",
+                2,
+                0,
+                &["os=macos", "driver=claude", "driver=codex", "drivers-probed=true"],
+            ),
+        ];
+        let (picked, report) = select_host(&reqs, &slots);
+        assert_eq!(picked.as_deref(), Some("zakalwe"));
+        assert!(!report.iter().find(|r| r.host_id == "local").unwrap().eligible);
+        assert!(report.iter().find(|r| r.host_id == "zakalwe").unwrap().eligible);
+    }
+
+    /// A host that has never been probed for drivers has no `driver=`
+    /// tags and is not a candidate — fail closed, never "assume every
+    /// driver" and never silently fall back to local.
+    #[test]
+    fn host_without_driver_tags_is_ineligible_for_driver_constrained_row() {
+        let reqs = ChoreRequirements {
+            required_capabilities: ["driver=claude".into()].into_iter().collect(),
+            pinned_host_id: None,
+            requested_host_id: None,
+        };
+        // Pre-change remote host: os/arch/gh only, never re-probed.
+        let slots = vec![slot("anaplian", 3, 0, &["os=macos", "arch=arm64", "gh-authed=true"])];
+        let (picked, report) = select_host(&reqs, &slots);
+        assert!(picked.is_none());
+        let missing = report[0]
+            .reasons
+            .iter()
+            .find_map(|r| match r {
+                IneligibilityReason::MissingCapabilities(m) => Some(m.as_slice()),
+                _ => None,
+            })
+            .expect("expected MissingCapabilities");
+        assert!(missing.iter().any(|m| m == "driver=claude"));
+    }
+
+    /// No silent substitution to a different driver: if every enabled
+    /// host lacks the required driver, nothing is picked — the
+    /// coordinator holds the row with a reason naming the driver.
+    #[test]
+    fn no_host_with_required_driver_yields_no_pick() {
+        let reqs = ChoreRequirements {
+            required_capabilities: ["driver=codex".into()].into_iter().collect(),
+            pinned_host_id: None,
+            requested_host_id: None,
+        };
+        let slots = vec![
+            slot("local", 4, 0, &["driver=claude", "drivers-probed=true"]),
+            slot("zakalwe", 2, 0, &["driver=claude", "drivers-probed=true"]),
+        ];
+        let (picked, _) = select_host(&reqs, &slots);
+        assert!(picked.is_none());
+    }
 }

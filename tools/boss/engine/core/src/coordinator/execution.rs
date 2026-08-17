@@ -28,9 +28,29 @@ impl ExecutionCoordinator {
             )
         }
         let work_item = self.work_db.get_work_item(work_item_id)?;
-        self.pick_host(&work_item, None, Some(host_id.to_string()))
+        let required_driver = self.requested_host_driver(&work_item)?;
+        self.pick_host(&work_item, None, Some(host_id.to_string()), required_driver)
             .map(|_| ())
             .map_err(|err| anyhow!("requested host '{host_id}' is ineligible: {err}"))
+    }
+
+    /// Resolve the driver that a newly requested task execution will use,
+    /// before creating that execution. Requested-host admission must apply
+    /// the same driver capability constraint as later scheduling, otherwise
+    /// an operator gets a misleading successful dispatch followed by a hold.
+    fn requested_host_driver(&self, work_item: &WorkItem) -> Result<Option<String>> {
+        let (task_driver, product_id) = match work_item {
+            WorkItem::Task(task) | WorkItem::Chore(task) => (task.driver.as_deref(), task.product_id.as_str()),
+            WorkItem::Product(_) | WorkItem::Project(_) => return Ok(None),
+        };
+        let product_driver = self
+            .work_db
+            .get_product(product_id)?
+            .and_then(|product| product.default_driver);
+        Ok(Some(boss_engine_effort::resolve_driver(
+            task_driver,
+            product_driver.as_deref(),
+        )))
     }
 
     /// Resolve the [`WorkItem`] an execution operates on.
@@ -137,6 +157,11 @@ impl ExecutionCoordinator {
     /// report the local slot as always-free (`active_runs = 0`) and let
     /// only remote hosts be gated by their `work_runs` active count.
     ///
+    /// The execution's resolved agent driver is a hard placement
+    /// constraint: only hosts whose auto-discovered capabilities include
+    /// `driver=<slug>` are candidates. There is no silent fall-back to a
+    /// different driver or to `local`.
+    ///
     /// Returns the selected [`Host`] or an error describing why nothing was
     /// eligible (consumed by the caller as a recoverable pre-start
     /// failure).
@@ -145,20 +170,28 @@ impl ExecutionCoordinator {
         work_item: &WorkItem,
         pinned_host_id: Option<String>,
         requested_host_id: Option<String>,
+        required_driver: Option<String>,
     ) -> Result<Host> {
         // Capability requirements union over the chore + its product +
         // its project. Empty today (no writer yet), which leaves every
-        // enabled host capability-eligible — preserving local behaviour.
+        // enabled host capability-eligible for non-driver tags.
         let product_id = work_item.product_id().to_string();
         let project_id = work_item_project_id(work_item);
         let mut subject_ids: Vec<&str> = vec![work_item.primary_id(), product_id.as_str()];
         if let Some(pid) = project_id.as_deref() {
             subject_ids.push(pid);
         }
-        let required_capabilities = self
+        let mut required_capabilities = self
             .work_db
             .required_capabilities_for_subject_ids(&subject_ids)
             .context("host-selection: capability requirements")?;
+
+        // Resolved driver is a hard requirement, when the caller has one to
+        // enforce — see [`Self::select_host_for_execution`] for how it is
+        // resolved.
+        if let Some(ref driver) = required_driver {
+            required_capabilities.insert(crate::host_capability_probe::driver_capability(driver));
+        }
 
         let hosts = self.work_db.list_hosts().context("host-selection: list hosts")?;
         let active = self
@@ -206,12 +239,17 @@ impl ExecutionCoordinator {
             None => Err(anyhow!(
                 "no eligible host for work item {}: {}",
                 work_item.primary_id(),
-                summarize_ineligibility(&report),
+                summarize_ineligibility(&report, required_driver.as_deref()),
             )),
         }
     }
 
-    fn select_host_for_execution(&self, execution: &WorkExecution, work_item: &WorkItem) -> Result<Host> {
+    fn select_host_for_execution(
+        &self,
+        execution: &WorkExecution,
+        work_item: &WorkItem,
+        worker_id: &str,
+    ) -> Result<Host> {
         let pinned = self
             .work_db
             .execution_pinned_host(&execution.id)
@@ -222,7 +260,26 @@ impl ExecutionCoordinator {
         // there. `schedule_execution` clears it explicitly on success or
         // on a terminal cancel — never here.
         let requested = self.requested_host_for(&execution.id);
-        self.pick_host(work_item, pinned, requested)
+        // Resolved driver is a hard requirement. Prefer the claimed
+        // worker's pool policy (review/automation) so placement matches
+        // the driver spawn will actually launch; otherwise use the same
+        // row/product/allocation resolution the events socket and spawn
+        // path use.
+        let required_driver = crate::coordinator::pool_dispatch_policy_for_worker_id(worker_id)
+            .map(|policy| policy.driver.to_owned())
+            .or_else(|| {
+                self.work_db
+                    .get_execution_driver_slug(&execution.id)
+                    .unwrap_or_else(|err| {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            error = %format!("{err:#}"),
+                            "host-selection: failed to resolve driver slug; treating as none",
+                        );
+                        None
+                    })
+            });
+        self.pick_host(work_item, pinned, requested, required_driver)
     }
 
     /// Take one `ready` execution all the way to a running worker: guards,
@@ -712,7 +769,7 @@ impl ExecutionCoordinator {
         // backs off and raises an attention item rather than hot-looping,
         // and a later kick retries once a host comes online / tags change.
         let had_requested_host = self.requested_host_ids.lock().unwrap().contains_key(&execution.id);
-        let selected_host = match self.select_host_for_execution(execution, &work_item) {
+        let selected_host = match self.select_host_for_execution(execution, &work_item, worker_id) {
             Ok(host) => host,
             Err(err) => {
                 if had_requested_host {

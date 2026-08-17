@@ -13,6 +13,7 @@ use super::helpers::*;
 async fn revision_with_pr_url_positions_via_goto_not_create_change() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
 
     let pr_url = "https://github.com/spinyfin/mono/pull/99";
     let (_, chore_id) = make_pr_review_fixture(&db, None);
@@ -154,6 +155,7 @@ async fn revision_without_pr_url_falls_back_to_chain_root_for_goto() {
 async fn revision_lease_failure_records_start_failure() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
 
     let pr_url = "https://github.com/spinyfin/mono/pull/100";
     let (_, chore_id) = make_pr_review_fixture(&db, None);
