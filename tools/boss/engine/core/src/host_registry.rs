@@ -178,8 +178,15 @@ pub(crate) fn ensure_local_host(conn: &Connection) -> Result<()> {
 pub(crate) fn refresh_local_host_auto_capabilities(conn: &Connection) -> Result<()> {
     let caps = discover_local_capabilities();
     replace_auto_capabilities(conn, "local", &caps)?;
+    let driver_count = caps.iter().filter(|cap| cap.starts_with("driver=")).count();
+    if driver_count == 0 {
+        tracing::warn!(
+            "host_registry: local host refresh found no installed drivers; driver-constrained dispatch will hold",
+        );
+    }
     tracing::debug!(
         count = caps.len(),
+        driver_count,
         "host_registry: refreshed local host auto capabilities",
     );
     Ok(())

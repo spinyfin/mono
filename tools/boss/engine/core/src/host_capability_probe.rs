@@ -98,17 +98,6 @@ pub fn driver_capability(slug: &str) -> String {
 /// can name the distinction.
 pub const DRIVERS_PROBED_CAPABILITY: &str = "drivers-probed=true";
 
-/// True when `capability` is a `driver=<slug>` tag.
-pub fn is_driver_capability(capability: &str) -> bool {
-    capability.starts_with("driver=")
-}
-
-/// Extract the driver slug from a `driver=<slug>` capability, or `None`
-/// when the string is not one.
-pub fn driver_slug_from_capability(capability: &str) -> Option<&str> {
-    capability.strip_prefix("driver=").filter(|s| !s.is_empty())
-}
-
 /// `(slug, binary)` pairs the driver probe checks. Source of truth is the
 /// engine's registered drivers — the candidate set is whatever this binary
 /// can launch, not a hand-maintained list that drifts when a driver is
@@ -209,23 +198,15 @@ pub async fn discover_remote_driver_capabilities(transport: &impl RemoteRunner) 
 /// Probe registered driver binaries on the local host (same vocabulary as
 /// the remote probe). Used by local auto-capability refresh.
 pub fn discover_local_driver_capabilities() -> Vec<String> {
+    discover_local_driver_capabilities_with(local_command_on_path)
+}
+
+fn discover_local_driver_capabilities_with(path_lookup: impl Fn(&str) -> bool) -> Vec<String> {
     let mut caps = Vec::new();
     for (slug, binary) in registered_driver_binaries() {
-        if local_command_on_path(binary) {
+        if path_lookup(binary) {
             caps.push(driver_capability(slug));
         } else {
-            // Hermetic tests strip PATH of host tools (`claude` / `codex` /
-            // `grok`). Without a seed the local host would carry
-            // `drivers-probed=true` and no `driver=` tags, making every
-            // driver-constrained dispatch fail closed for the wrong reason.
-            // Production builds never take this branch — they only record
-            // what is actually on PATH.
-            #[cfg(test)]
-            {
-                caps.push(driver_capability(slug));
-                continue;
-            }
-            #[cfg(not(test))]
             tracing::debug!(
                 driver = slug,
                 binary,
@@ -263,8 +244,9 @@ async fn probe_command_on_path(transport: &impl RemoteRunner, binary: &str) -> R
     Ok(out.success() && !out.stdout.trim().is_empty())
 }
 
-/// Local equivalent of [`probe_command_on_path`]: `command -v` via `sh -c`
-/// so the probe matches non-interactive PATH lookup the launch path uses.
+/// Local equivalent of [`probe_command_on_path`]. The probe uses the pane
+/// launcher's sanitized PATH rather than the process opening state.db, so a
+/// CLI invocation cannot rewrite capabilities using its ambient environment.
 fn local_command_on_path(binary: &str) -> bool {
     // Reject anything that would break out of the `command -v` form. Driver
     // binaries are registry-owned static strings today; defend anyway.
@@ -272,6 +254,7 @@ fn local_command_on_path(binary: &str) -> bool {
         return false;
     }
     let status = std::process::Command::new("sh")
+        .env("PATH", crate::spawn_flow::WORKER_SANITIZED_PATH)
         .args(["-c", &format!("command -v {binary} >/dev/null 2>&1")])
         .status();
     matches!(status, Ok(s) if s.success())
@@ -377,9 +360,6 @@ mod tests {
     #[test]
     fn driver_capability_uses_key_value_shape() {
         assert_eq!(driver_capability("codex"), "driver=codex");
-        assert_eq!(driver_slug_from_capability("driver=codex"), Some("codex"));
-        assert!(is_driver_capability("driver=claude"));
-        assert!(!is_driver_capability("os=macos"));
     }
 
     #[test]
@@ -466,7 +446,7 @@ mod tests {
         ));
         let caps = discover_remote_capabilities(&runner).await.unwrap();
         assert!(
-            !caps.iter().any(|c| is_driver_capability(c)),
+            !caps.iter().any(|c| c.starts_with("driver=")),
             "no driver= tags when nothing is installed, got {caps:?}"
         );
         assert!(
@@ -474,6 +454,12 @@ mod tests {
             "probed-with-none must still carry the marker so it is not \
              confused with never-probed, got {caps:?}"
         );
+    }
+
+    #[test]
+    fn local_driver_probe_does_not_fabricate_missing_drivers() {
+        let caps = discover_local_driver_capabilities_with(|_| false);
+        assert_eq!(caps, vec![DRIVERS_PROBED_CAPABILITY.to_owned()]);
     }
 
     #[tokio::test]

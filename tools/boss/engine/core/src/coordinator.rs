@@ -2297,7 +2297,7 @@ fn summarize_ineligibility(report: &[host_scheduling::Eligibility], required_dri
         });
         let any_enabled = report
             .iter()
-            .any(|h| !h.reasons.iter().any(|r| matches!(r, R::Disabled | R::NotPinned)));
+            .any(|h| !h.reasons.iter().any(|r| matches!(r, R::Disabled | R::NotSelectedHost)));
         if all_miss_driver && any_enabled {
             return format!("no enabled host has driver {driver}; {detail}");
         }

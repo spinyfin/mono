@@ -14,6 +14,7 @@ async fn automation_produced_task_routes_to_automation_pool() {
 
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
     let product = create_test_product(&db);
 
     let automation = db
@@ -117,6 +118,7 @@ async fn automation_dispatch_worker_id_maps_to_automation_pool_slot() {
 
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
     let product = create_test_product(&db);
 
     let automation = db
@@ -855,6 +857,7 @@ async fn preempted_automation_work_redispatches_once_capacity_frees() {
 
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
     let product = create_test_product(&db);
     create_automation_chores(&db, &product.id, 2);
     for n in 0..WORKER_PAGE_SIZE {

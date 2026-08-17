@@ -370,6 +370,7 @@ async fn worker_pool_strict_spillover_fills_bridge_crew_before_lower_decks() {
 async fn higher_priority_executions_run_first() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
     let product = create_test_product(&db);
     let early = create_test_chore(&db, product.id.clone(), "Old");
     let late = create_test_chore(&db, product.id.clone(), "New");
@@ -429,6 +430,7 @@ async fn higher_priority_executions_run_first() {
 async fn merge_conflict_revision_outranks_older_ready_chore_for_a_single_free_slot() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
     let product = db
         .create_product(
             CreateProductInput::builder()
@@ -597,6 +599,7 @@ async fn running_worker_is_never_preempted_by_a_higher_dispatch_class_arrival() 
 async fn scheduler_passes_preferred_workspace_to_lease_and_records_affinity() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
     db.reconcile_product_executions(&product.id).unwrap();

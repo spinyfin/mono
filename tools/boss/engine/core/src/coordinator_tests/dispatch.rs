@@ -10,12 +10,13 @@ use super::helpers::*;
 async fn read_remote_transcript_tail_local_returns_none_and_unknown_host_errors() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-    let coordinator = ExecutionCoordinator::new(
+    seed_local_claude_driver(&db);
+    let coordinator = Arc::new(ExecutionCoordinator::new(
         db.clone(),
         WorkerPool::new(1),
         Arc::new(FakeCubeClient::default()),
         Arc::new(FakeExecutionRunner::default()),
-    );
+    ));
 
     // "local" short-circuits to None so the RPC reads the local fs.
     assert_eq!(
@@ -741,6 +742,46 @@ async fn pin_to_disabled_host_yields_no_eligible_host() {
     );
 }
 
+#[tokio::test]
+async fn host_selection_injects_resolved_driver_capability() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    // Remove the ambient local host from this placement decision, leaving one
+    // enabled host with no driver=codex capability.
+    db.set_host_enabled("local", false).unwrap();
+    db.add_host("zakalwe", "user@zakalwe", 2, &[]).unwrap();
+
+    let product = create_test_product(&db);
+    db.set_product_default_driver(&product.id, Some("codex")).unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Requires Codex");
+    db.reconcile_product_executions(&product.id).unwrap();
+    let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        Arc::new(FakeExecutionRunner::default()),
+    ));
+    let worker_id = coordinator
+        .worker_pool()
+        .claim_worker(&execution.id, None)
+        .await
+        .expect("worker available");
+    let err = coordinator
+        .schedule_execution(&execution, &worker_id, DispatchAdmission::Queued)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("no enabled host has driver codex"),
+        "got: {err:#}"
+    );
+    assert!(
+        err.to_string().contains("zakalwe: missing driver codex"),
+        "got: {err:#}"
+    );
+}
+
 /// The `no_eligible_host` pre-start failure used to emit NO dispatch
 /// event, so the per-execution timeline went silent after
 /// `worker_claimed` and the stall watchdog mislabelled it a
@@ -1161,6 +1202,7 @@ async fn successful_run_leaves_execution_running_and_releases_worker() {
 async fn start_failure_marks_execution_failed_and_releases_worker() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
     db.reconcile_product_executions(&product.id).unwrap();

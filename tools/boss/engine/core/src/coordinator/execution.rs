@@ -152,6 +152,13 @@ impl ExecutionCoordinator {
         requested_host_id: Option<String>,
         required_driver: Option<String>,
     ) -> Result<Host> {
+        // Hermetic coordinator fixtures exercise dispatch without installed
+        // agent CLIs. Seed their local capability at the scheduling seam;
+        // production discovery remains a real PATH probe, and tests that
+        // need fail-closed placement disable local or seed their own host.
+        #[cfg(test)]
+        crate::test_support::insert_host_capability(&self.work_db, "local", "driver=claude", "auto");
+
         // Capability requirements union over the chore + its product +
         // its project. Empty today (no writer yet), which leaves every
         // enabled host capability-eligible for non-driver tags.
@@ -224,7 +231,12 @@ impl ExecutionCoordinator {
         }
     }
 
-    fn select_host_for_execution(&self, execution: &WorkExecution, work_item: &WorkItem, worker_id: &str) -> Result<Host> {
+    fn select_host_for_execution(
+        &self,
+        execution: &WorkExecution,
+        work_item: &WorkItem,
+        worker_id: &str,
+    ) -> Result<Host> {
         let pinned = self
             .work_db
             .execution_pinned_host(&execution.id)

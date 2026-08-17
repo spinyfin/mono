@@ -119,34 +119,36 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_passes_settings_file_through_to_driver() {
-        // The engine ships the worker's `--settings` JSON outside the
-        // workspace tree and points the resolved driver at it via
-        // BOSS_SETTINGS_FILE; the wrapper must consume that env var and
-        // forward `--settings`. A refactor that dropped either side would
-        // silently strip the boss-event hooks from remote workers, pinning
-        // their lifecycle.
+    fn wrapper_uses_driver_owned_spawn_plan() {
+        // The engine ships settings and command details to the resolved
+        // driver's SpawnPlan. The wrapper must not impose Claude-only args
+        // such as `--settings` or `--dangerously-skip-permissions`.
         assert!(
-            WRAPPER_SOURCE.contains("BOSS_SETTINGS_FILE"),
-            "wrapper must read BOSS_SETTINGS_FILE so the engine can wire boss-event hooks remotely"
+            WRAPPER_SOURCE.contains("BOSS_DRIVER_COMMAND"),
+            "wrapper must receive the command rendered by the resolved driver's SpawnPlan"
         );
         assert!(
-            WRAPPER_SOURCE.contains("--settings"),
-            "wrapper must pass `--settings` to the driver when BOSS_SETTINGS_FILE is set"
+            WRAPPER_SOURCE.contains("BOSS_DRIVER_ENV"),
+            "wrapper must apply environment directives from the resolved driver's SpawnPlan"
+        );
+        assert!(
+            !WRAPPER_SOURCE.contains("--dangerously-skip-permissions"),
+            "wrapper must not impose Claude-only permission flags"
         );
     }
 
     #[test]
     fn wrapper_launches_resolved_driver_not_hardcoded_claude() {
         // A row allocated to codex must not silently exec `claude` on a
-        // remote host. The wrapper reads BOSS_DRIVER and execs that binary.
+        // remote host. The wrapper validates BOSS_DRIVER and runs the
+        // driver-owned command rather than a hardcoded binary.
         assert!(
             WRAPPER_SOURCE.contains("BOSS_DRIVER"),
             "wrapper must read BOSS_DRIVER so the engine can launch the resolved driver"
         );
         assert!(
-            WRAPPER_SOURCE.contains("\"$BOSS_DRIVER\""),
-            "wrapper must exec \"$BOSS_DRIVER\", not a hardcoded claude binary"
+            WRAPPER_SOURCE.contains("nohup sh -c \"$BOSS_DRIVER_COMMAND\""),
+            "wrapper must execute the resolved driver's rendered command"
         );
         // The old hardcoded form must not reappear as the launch target.
         assert!(

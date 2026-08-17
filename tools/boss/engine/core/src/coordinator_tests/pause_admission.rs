@@ -105,6 +105,7 @@ fn ready_pr_review_execution(db: &WorkDb, work_item_id: &str) -> WorkExecution {
 async fn breaker_pause_holds_every_enqueue_entry_point_then_drains_on_resume() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
     let product = create_test_product(&db);
     let (coordinator, cube, runner, _events) = paused_dispatch_fixture(db.clone());
     breaker_pause(coordinator.as_ref());
@@ -321,6 +322,7 @@ async fn recovery_probe_never_spends_a_pr_review_row() {
     let product_id = create_product(&db);
     let work_item_id = create_active_chore(&db, &product_id, "ordinary work");
     let db = Arc::new(db);
+    seed_local_claude_driver(&db);
     let chore_execution = create_ready_chore_execution(&db, &work_item_id);
 
     // A `pr_review` row queued *after* the chore, so it sorts last and would

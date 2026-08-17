@@ -395,6 +395,7 @@ mod tests {
         let reqs = ChoreRequirements {
             required_capabilities: ["driver=codex".into()].into_iter().collect(),
             pinned_host_id: None,
+            requested_host_id: None,
         };
         let slots = vec![
             slot("local", 4, 0, &["os=macos", "driver=claude", "drivers-probed=true"]),
@@ -419,6 +420,7 @@ mod tests {
         let reqs = ChoreRequirements {
             required_capabilities: ["driver=claude".into()].into_iter().collect(),
             pinned_host_id: None,
+            requested_host_id: None,
         };
         // Pre-change remote host: os/arch/gh only, never re-probed.
         let slots = vec![slot("anaplian", 3, 0, &["os=macos", "arch=arm64", "gh-authed=true"])];
@@ -443,6 +445,7 @@ mod tests {
         let reqs = ChoreRequirements {
             required_capabilities: ["driver=codex".into()].into_iter().collect(),
             pinned_host_id: None,
+            requested_host_id: None,
         };
         let slots = vec![
             slot("local", 4, 0, &["driver=claude", "drivers-probed=true"]),

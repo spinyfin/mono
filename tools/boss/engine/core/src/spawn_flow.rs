@@ -48,7 +48,7 @@ use crate::worker_setup::{WorkerKind, WorkerSetupInput, WrittenFiles, write_work
 /// Order: Homebrew first (modern Apple-silicon paths), then the
 /// system bins. `/usr/local/bin` is included for legacy x86 brew
 /// installs but Apple-silicon machines ignore it.
-const WORKER_SANITIZED_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
+pub(crate) const WORKER_SANITIZED_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
 
 /// Env keys allowed to flow from the runner's `extra_env` into the
 /// worker pane. Anything outside this set is dropped with a warning;

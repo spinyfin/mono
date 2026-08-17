@@ -46,6 +46,18 @@ use crate::work::{ExecutionKind, WorkDb, WorkExecution, WorkItem};
 use crate::worker_setup::{WorkerSetupInput, render_remote_settings_json};
 use crate::wrapper_distribution::{WrapperPushLocks, WrapperPushOutcome, ensure_wrapper_current};
 
+fn render_remote_driver_env(directives: &[crate::driver::EnvDirective]) -> String {
+    directives
+        .iter()
+        .map(|directive| match directive {
+            crate::driver::EnvDirective::Set(key, value) => {
+                format!("export {key}={}; ", crate::ssh_transport::shell_quote(value))
+            }
+            crate::driver::EnvDirective::Unset(key) => format!("unset {key}; "),
+        })
+        .collect()
+}
+
 /// Remote dir (under `$HOME`) that holds rendered worker `--settings`
 /// files. Outside any workspace tree so the worker's `jj`/`git` never
 /// sees them — the same invariant the local runner keeps by writing
@@ -807,12 +819,12 @@ impl HostAdapter for SshHostAdapter {
         reject_unobservable_remote_driver(driver.as_ref(), &spawn_config.driver, &settings_input, &host)?;
         let settings_json = render_remote_settings_json(&settings_input, driver.as_ref());
 
-        // 5. Ship the prompt + settings to the remote. The prompt lives
-        //    under `<workspace>/.boss/` (read by the wrapper via
-        //    BOSS_INITIAL_INPUT_FILE); the settings live outside the tree
-        //    under `~/.boss-remote/settings/`.
-        let remote_prompt_dir = format!("{workspace}/.boss");
-        let remote_prompt_path = format!("{remote_prompt_dir}/initial-input.txt");
+        // 5. Ship the prompt to the path the driver's SpawnPlan reads and
+        //    settings outside the workspace tree under `~/.boss-remote/`.
+        //    This keeps the remote command identical to the local driver's
+        //    command rather than teaching the wrapper a second argv dialect.
+        let remote_prompt_dir = format!("{workspace}/{}", driver.descriptor().config_dir);
+        let remote_prompt_path = format!("{remote_prompt_dir}/{}", driver.descriptor().initial_prompt_filename);
         let remote_settings_dir = format!("~/{REMOTE_SETTINGS_DIR}");
         let remote_settings_path = format!("{remote_settings_dir}/{run_id}.json");
         self.ship_file(&remote_prompt_dir, &remote_prompt_path, &prompt_text, "prompt")
@@ -823,12 +835,21 @@ impl HostAdapter for SshHostAdapter {
         // 6. Open the reverse events tunnel and launch the detached
         //    remote worker (PR1 orchestration over the one master
         //    multiplex).
-        // Launch the resolved driver binary, never a hardcoded `claude`.
+        // Launch the resolved driver's SpawnPlan, never a hardcoded Claude
+        // command. The driver owns argv shaping and environment directives.
         // Placement already required `driver=<slug>` on this host; the
         // wrapper still re-checks PATH so a race between probe and
         // launch surfaces as `host_missing_driver` rather than a silent
         // substitute.
         let driver_binary = driver.descriptor().binary.to_owned();
+        let driver_spawn_plan = driver.spawn_invocation(crate::driver::SpawnRequest {
+            model: &spawn_config.model,
+            effort: spawn_config.effort_value,
+            settings_path: Some(std::path::Path::new(&remote_settings_path)),
+            non_opus_auto_mode: false,
+            permission_mode_override: None,
+            run_id: Some(&run_id),
+        });
         let plan = RemoteSpawnPlan::builder()
             .run_id(run_id.clone())
             .lease_id(lease_id)
@@ -839,6 +860,8 @@ impl HostAdapter for SshHostAdapter {
             .settings_file(remote_settings_path)
             .wrapper_path(remote_wrapper_path())
             .driver_binary(driver_binary.clone())
+            .driver_command(driver_spawn_plan.command)
+            .driver_env(render_remote_driver_env(&driver_spawn_plan.env))
             .build();
 
         let engine_socket = self.events_socket_path.display().to_string();

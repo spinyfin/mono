@@ -21,6 +21,7 @@ async fn lease_failure_logs_cube_stderr_at_error_before_recording_failure() {
 
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
     db.reconcile_product_executions(&product.id).unwrap();
@@ -110,6 +111,7 @@ async fn lease_failure_logs_cube_stderr_at_error_before_recording_failure() {
 async fn pane_spawn_failure_raises_attention_item_and_dispatch_event() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
     db.reconcile_product_executions(&product.id).unwrap();
@@ -1474,6 +1476,7 @@ async fn cube_repo_ensure_failure_emits_dedicated_failed_stage() {
 async fn cube_lease_failure_bounces_work_item_to_backlog_with_error() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
     db.reconcile_product_executions(&product.id).unwrap();
@@ -1557,6 +1560,7 @@ async fn cube_lease_failure_bounces_work_item_to_backlog_with_error() {
 async fn pre_start_failure_retries_then_permanently_fails() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, product.id.clone(), "Retry Chore");
     db.reconcile_product_executions(&product.id).unwrap();

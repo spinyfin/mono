@@ -46,12 +46,7 @@ use crate::ssh_transport::{SshOutput, SshTransport};
 /// is not silently swallowed.
 pub const REASON_WRAPPER_MISCONFIGURED: &str = "host_wrapper_misconfigured";
 /// `exit 79`: the resolved driver binary was not found on the remote PATH.
-/// Historical name kept as a secondary alias so log greps for the old
-/// `host_missing_claude` string still surface these failures; new code
-/// should prefer [`REASON_MISSING_DRIVER`].
 pub const REASON_MISSING_DRIVER: &str = "host_missing_driver";
-/// Deprecated alias of [`REASON_MISSING_DRIVER`] (pre multi-driver remote).
-pub const REASON_MISSING_CLAUDE: &str = REASON_MISSING_DRIVER;
 /// `exit 80`: `cube` not found on the remote PATH.
 pub const REASON_MISSING_CUBE: &str = "host_missing_cube";
 /// `exit 81`: `gh` not found on the remote PATH.
@@ -182,6 +177,13 @@ pub struct RemoteSpawnPlan {
     /// descriptor — never a hardcoded default. Required so a row
     /// allocated to one driver cannot silently run as another.
     pub driver_binary: String,
+    /// Shell command rendered by the resolved driver's `spawn_invocation`.
+    /// The wrapper executes this verbatim after applying `driver_env`, so
+    /// local and remote launches share one source of truth for argv shaping.
+    pub driver_command: String,
+    /// Shell statements rendering the resolved driver's environment
+    /// directives, in order, before [`Self::driver_command`] runs.
+    pub driver_env: String,
 }
 
 /// Compose the remote command as an argv vector: an `env VAR=val …`
@@ -196,6 +198,8 @@ pub fn build_remote_command(plan: &RemoteSpawnPlan) -> Vec<String> {
         format!("BOSS_LEASE_ID={}", plan.lease_id),
         format!("BOSS_WORKSPACE={}", plan.workspace_path),
         format!("BOSS_DRIVER={}", plan.driver_binary),
+        format!("BOSS_DRIVER_COMMAND={}", plan.driver_command),
+        format!("BOSS_DRIVER_ENV={}", plan.driver_env),
     ];
     if let Some(url) = &plan.repo_remote_url {
         argv.push(format!("BOSS_REPO_REMOTE_URL={url}"));
@@ -606,6 +610,8 @@ mod tests {
             settings_file: Some("/ws/mono-agent-007/.boss/settings.json".into()),
             wrapper_path: "~/.boss-remote/bin/boss-remote-run".into(),
             driver_binary: "codex".into(),
+            driver_command: "codex -m gpt-5.6-sol \"$(cat .codex/initial-prompt.txt)\"".into(),
+            driver_env: "export CODEX_HOME='/tmp/codex'; ".into(),
         };
         let argv = build_remote_command(&plan);
         assert_eq!(argv[0], "env");
@@ -614,6 +620,11 @@ mod tests {
         assert!(argv.contains(&"BOSS_LEASE_ID=lease-1".to_owned()));
         assert!(argv.contains(&"BOSS_WORKSPACE=/ws/mono-agent-007".to_owned()));
         assert!(argv.contains(&"BOSS_DRIVER=codex".to_owned()));
+        assert!(argv.iter().any(|arg| arg.starts_with("BOSS_DRIVER_COMMAND=codex -m")));
+        assert!(
+            argv.iter()
+                .any(|arg| arg.starts_with("BOSS_DRIVER_ENV=export CODEX_HOME"))
+        );
         assert!(argv.contains(&"BOSS_REPO_REMOTE_URL=git@example.com:me/mono.git".to_owned()));
         assert!(argv.contains(&"BOSS_INITIAL_INPUT_FILE=/ws/mono-agent-007/.boss/initial-input.txt".to_owned()));
         assert!(argv.contains(&"BOSS_SETTINGS_FILE=/ws/mono-agent-007/.boss/settings.json".to_owned()));
@@ -633,6 +644,8 @@ mod tests {
             settings_file: None,
             wrapper_path: "wrapper".into(),
             driver_binary: "claude".into(),
+            driver_command: "claude --model opus \"$(cat .claude/initial-prompt.txt)\"".into(),
+            driver_env: "unset ANTHROPIC_API_KEY; ".into(),
         };
         let argv = build_remote_command(&plan);
         assert!(!argv.iter().any(|a| a.starts_with("BOSS_REPO_REMOTE_URL=")));
@@ -866,6 +879,8 @@ mod tests {
             settings_file: None,
             wrapper_path: "~/.boss-remote/bin/boss-remote-run".into(),
             driver_binary: "claude".into(),
+            driver_command: "claude --model opus \"$(cat .claude/initial-prompt.txt)\"".into(),
+            driver_env: "unset ANTHROPIC_API_KEY; ".into(),
         }
     }
 
