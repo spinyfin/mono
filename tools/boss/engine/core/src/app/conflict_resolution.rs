@@ -9,6 +9,7 @@ use super::*;
 
 pub(super) async fn handle_list_conflict_resolutions(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -22,6 +23,19 @@ pub(super) async fn handle_list_conflict_resolutions(ctx: Dispatch, req: Fronten
     } = req
     else {
         unreachable!()
+    };
+    // Mirror of `ListCiRemediations`: a bare short id must resolve to a
+    // canonical id before it reaches the DB filter, or it silently
+    // matches nothing (or, worse, a coincidentally-numbered wrong row).
+    let work_item_id = match work_item_id {
+        Some(id) => match server_state.resolve_work_item_id(&id).await {
+            Ok(id) => Some(id),
+            Err(err) => {
+                send_work_error(&sink, &request_id, &err);
+                return;
+            }
+        },
+        None => None,
     };
     {
         // Read-only listing surface for `boss engine conflicts

@@ -47,7 +47,77 @@ pub(super) struct SelectedProductReport {
     reported_at: String,
 }
 
+/// Rewrite a product-scoped resolution failure into one that names the
+/// product, but only for the not-found case — every other error (an
+/// ambiguity error naming candidates, a DB failure) is propagated
+/// unchanged so it is never misread as "the row does not exist".
+fn rewrite_not_found(err: anyhow::Error, id: &str, product_name: &str) -> anyhow::Error {
+    if err.to_string().contains(boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER) {
+        anyhow::anyhow!(
+            "could not resolve id {id}: {} in product {product_name}",
+            boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER
+        )
+    } else {
+        err
+    }
+}
+
 impl ServerState {
+    /// Resolve a caller-supplied work-item selector at the engine boundary.
+    /// Canonical ids and explicitly product-scoped short ids retain their
+    /// existing semantics. A bare short id is scoped to the product currently
+    /// selected in the connected app, because short ids are only unique within
+    /// a product — but only when a selection is actually available. When the
+    /// app is disconnected or has not reported a selection, this falls back
+    /// to the pre-existing global resolution (`work_db.resolve_work_item_ref`),
+    /// which still never guesses: an id unique across products resolves, and
+    /// an ambiguous one is a hard error naming every candidate. This keeps
+    /// `boss task show T<n>` working with the app closed, matching the
+    /// documented contract on `resolve_short_id_item`
+    /// (tools/boss/cli/src/data.rs) that globally-unique short ids resolve
+    /// without `--product`.
+    pub(super) async fn resolve_work_item_id(&self, id: &str) -> anyhow::Result<String> {
+        let selector = boss_protocol::parse_work_item_selector(id);
+        let boss_protocol::WorkItemSelector::ShortId(short_id) = selector else {
+            return self.work_db.resolve_work_item_ref(id);
+        };
+
+        let SelectedProductState::Selected { product_id, name, .. } = self.selected_product_state().await else {
+            return self.work_db.resolve_work_item_ref(id);
+        };
+        self.work_db
+            .resolve_work_item_ref(&format!("{product_id}/{short_id}"))
+            .map_err(|err| rewrite_not_found(err, id, &name))
+    }
+
+    /// Resolve a restore selector without excluding a tombstoned row. The
+    /// restore database operation owns the final lookup because it is the one
+    /// engine path that intentionally includes deleted work items. Mirrors
+    /// [`Self::resolve_work_item_id`]'s fallback: with no selected product,
+    /// resolution runs globally across products (ambiguity still a hard
+    /// error) rather than refusing outright.
+    pub(super) async fn resolve_work_item_id_for_restore(&self, id: &str) -> anyhow::Result<String> {
+        let boss_protocol::WorkItemSelector::ShortId(short_id) = boss_protocol::parse_work_item_selector(id) else {
+            return Ok(id.to_owned());
+        };
+        let (selector, product_name) = match self.selected_product_state().await {
+            SelectedProductState::Selected { product_id, name, .. } => (format!("{product_id}/{short_id}"), Some(name)),
+            _ => (id.to_owned(), None),
+        };
+        self.work_db
+            .resolve_work_item_ref_for_restore(&selector)?
+            .ok_or_else(|| match &product_name {
+                Some(name) => anyhow::anyhow!(
+                    "could not resolve id {id}: {} in product {name}",
+                    boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER
+                ),
+                None => anyhow::anyhow!(
+                    "could not resolve id {id}: {}",
+                    boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER
+                ),
+            })
+    }
+
     /// Record the app's current chooser selection. Returns `false` — and
     /// changes nothing — when `session_id` is not the registered app
     /// session, which is what keeps this a *report* of UI state rather

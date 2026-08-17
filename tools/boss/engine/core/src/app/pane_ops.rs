@@ -76,8 +76,8 @@ pub enum InterruptPaneError {
 pub enum RevealItemError {
     #[error("no work item found for id: {0}")]
     NotFound(String),
-    #[error("work item {0} is deleted")]
-    Deleted(String),
+    #[error("{0}")]
+    Resolution(String),
     #[error("app reported error: {0:?}")]
     App(EngineToAppError),
     #[error(transparent)]
@@ -324,18 +324,20 @@ impl ServerState {
     /// short transient highlight. Returns the canonical id on success
     /// so `bossctl reveal` can confirm what was highlighted.
     pub async fn reveal_work_item(&self, id: &str) -> Result<String, RevealItemError> {
+        let canonical_id = self
+            .resolve_work_item_id(id)
+            .await
+            .map_err(|err| RevealItemError::Resolution(err.to_string()))?;
         let item = self
             .work_db
-            .get_work_item_resolving_short_id(id)
-            .map_err(|_| RevealItemError::NotFound(id.to_owned()))?
-            .ok_or_else(|| RevealItemError::NotFound(id.to_owned()))?;
+            .get_work_item(&canonical_id)
+            .map_err(|_| RevealItemError::NotFound(id.to_owned()))?;
+        // `get_work_item` already filters `deleted_at IS NULL` for tasks
+        // (and the resolvers above are live-only too), so a tombstoned row
+        // never reaches here — it fails resolution/fetch as not-found
+        // instead of a deleted-specific message.
         let canonical_id = match &item {
-            crate::work::WorkItem::Task(t) | crate::work::WorkItem::Chore(t) => {
-                if t.deleted_at.is_some() {
-                    return Err(RevealItemError::Deleted(id.to_owned()));
-                }
-                t.id.clone()
-            }
+            crate::work::WorkItem::Task(t) | crate::work::WorkItem::Chore(t) => t.id.clone(),
             crate::work::WorkItem::Project(p) => p.id.clone(),
             crate::work::WorkItem::Product(p) => p.id.clone(),
         };

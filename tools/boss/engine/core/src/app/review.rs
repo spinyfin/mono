@@ -18,6 +18,13 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
     let FrontendRequest::MergeWhenReady { work_item_id } = req else {
         unreachable!()
     };
+    let work_item_id = match server_state.resolve_work_item_id(&work_item_id).await {
+        Ok(id) => id,
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+            return;
+        }
+    };
     {
         // Pre-flight: task must exist and be a Task/Chore.
         let item = match work_db.get_work_item(&work_item_id) {
@@ -396,6 +403,13 @@ pub(super) async fn handle_open_review_terminal(ctx: Dispatch, req: FrontendRequ
     let FrontendRequest::OpenReviewTerminal { work_item_id } = req else {
         unreachable!()
     };
+    let work_item_id = match server_state.resolve_work_item_id(&work_item_id).await {
+        Ok(id) => id,
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+            return;
+        }
+    };
     {
         let item = match work_db.get_work_item(&work_item_id) {
             Ok(item) => item,
@@ -509,6 +523,7 @@ pub(super) async fn handle_open_review_terminal(ctx: Dispatch, req: FrontendRequ
 /// not to this terminal window.
 pub(super) async fn handle_open_live_workspace_terminal(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -516,6 +531,13 @@ pub(super) async fn handle_open_live_workspace_terminal(ctx: Dispatch, req: Fron
     } = ctx;
     let FrontendRequest::OpenLiveWorkspaceTerminal { work_item_id } = req else {
         unreachable!()
+    };
+    let work_item_id = match server_state.resolve_work_item_id(&work_item_id).await {
+        Ok(id) => id,
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+            return;
+        }
     };
     let execution = match work_db.get_live_execution_for_work_item(&work_item_id, "") {
         Ok(Some(execution)) => execution,

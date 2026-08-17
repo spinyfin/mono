@@ -45,8 +45,15 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::RequestExecution { input } = req else {
+    let FrontendRequest::RequestExecution { mut input } = req else {
         unreachable!()
+    };
+    input.work_item_id = match server_state.resolve_work_item_id(&input.work_item_id).await {
+        Ok(id) => id,
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+            return;
+        }
     };
     if input.bypass_dispatch_pause {
         // Pause-only forced dispatch (`bossctl work start --force`, or a
@@ -176,6 +183,13 @@ pub(super) async fn handle_evaluate_dispatch_admission(ctx: Dispatch, req: Front
     let FrontendRequest::EvaluateDispatchAdmission { work_item_id } = req else {
         unreachable!()
     };
+    let work_item_id = match server_state.resolve_work_item_id(&work_item_id).await {
+        Ok(id) => id,
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+            return;
+        }
+    };
     match server_state
         .execution_coordinator
         .evaluate_dispatch_admission(&work_item_id)
@@ -196,6 +210,7 @@ pub(super) async fn handle_evaluate_dispatch_admission(ctx: Dispatch, req: Front
 
 pub(super) async fn handle_list_executions(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -207,6 +222,16 @@ pub(super) async fn handle_list_executions(ctx: Dispatch, req: FrontendRequest) 
     } = req
     else {
         unreachable!()
+    };
+    let work_item_id = match work_item_id {
+        Some(id) => match server_state.resolve_work_item_id(&id).await {
+            Ok(id) => Some(id),
+            Err(err) => {
+                send_work_error(&sink, &request_id, &err);
+                return;
+            }
+        },
+        None => None,
     };
     {
         let result = if include_revision_chain {
@@ -237,6 +262,7 @@ pub(super) async fn handle_list_executions(ctx: Dispatch, req: FrontendRequest) 
 
 pub(super) async fn handle_get_task_runtime(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -244,6 +270,13 @@ pub(super) async fn handle_get_task_runtime(ctx: Dispatch, req: FrontendRequest)
     } = ctx;
     let FrontendRequest::GetTaskRuntime { work_item_id } = req else {
         unreachable!()
+    };
+    let work_item_id = match server_state.resolve_work_item_id(&work_item_id).await {
+        Ok(id) => id,
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+            return;
+        }
     };
     {
         match work_db.get_task_runtime(&work_item_id) {
@@ -1234,6 +1267,7 @@ pub(super) async fn handle_execution_transcript(ctx: Dispatch, req: FrontendRequ
 
 pub(super) async fn handle_list_engine_attempts(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -1248,6 +1282,16 @@ pub(super) async fn handle_list_engine_attempts(ctx: Dispatch, req: FrontendRequ
     } = req
     else {
         unreachable!()
+    };
+    let work_item_id = match work_item_id {
+        Some(id) => match server_state.resolve_work_item_id(&id).await {
+            Ok(id) => Some(id),
+            Err(err) => {
+                send_work_error(&sink, &request_id, &err);
+                return;
+            }
+        },
+        None => None,
     };
     {
         match work_db.list_engine_attempts(&kinds, product_id.as_deref(), &status, work_item_id.as_deref(), limit) {
