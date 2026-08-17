@@ -1,0 +1,46 @@
+# changelog-release build fragment — uploaded dynamically by the prepare step
+# when a release is actually being cut. Never used as a standalone pipeline.
+#
+# Uploaded via `buildkite-agent pipeline upload` inside phase_prepare() in
+# .buildkite/steps/changelog-release.sh after the tag and (draft) GitHub
+# Release are created. On a no-release run (scheduled build, nothing changed)
+# prepare exits without uploading this fragment, so these steps never appear
+# in the build.
+#
+# The release created by prepare is a DRAFT. linux/darwin need no
+# `depends_on` here beyond being injected by prepare itself (they only run
+# after prepare exits successfully) and run in parallel. `publish` DOES need
+# `depends_on` on both: it verifies every uploaded asset and flips the
+# release to published, and must not run until every build phase has had its
+# chance to upload (or fail).
+
+steps:
+  - label: ":rust: changelog-release (linux)"
+    key: "changelog-release-linux"
+    command: ".buildkite/steps/changelog-release.sh linux"
+    agents:
+      queue: bazel-any
+      os: linux
+    retry:
+      automatic: false
+
+  - label: ":apple: changelog-release (darwin)"
+    key: "changelog-release-darwin"
+    command: ".buildkite/steps/changelog-release.sh darwin"
+    agents:
+      queue: bazel-any
+      os: darwin
+    retry:
+      automatic: false
+
+  - label: ":white_check_mark: changelog-release (publish)"
+    key: "changelog-release-publish"
+    command: ".buildkite/steps/changelog-release.sh publish"
+    depends_on:
+      - "changelog-release-linux"
+      - "changelog-release-darwin"
+    agents:
+      queue: bazel-any
+      os: linux
+    retry:
+      automatic: false
