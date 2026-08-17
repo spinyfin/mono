@@ -172,7 +172,7 @@ Purpose:
 
 Config keys:
 
-- `lang` (required, currently only `java`)
+- `lang` (required, currently only `java`) — selects the parser. Each `lang` value also defines an explicit default path scope (the check's definition scope): `java` → `**/*.java`. Further narrow with the framework check-entry `include` key; it intersects this default rather than replacing it.
 - `rules` (required array)
 - `message` (optional default for rules)
 - `severity` (optional default for rules, default `error`)
@@ -501,17 +501,20 @@ Purpose:
 - Rule 1: a line matching `metadata_prefixes` (e.g. `Date:`, `Task:`, `Verdict:`) is flagged when it is part of a multi-line paragraph block instead of standing alone (blank-line-separated) or as a list item.
 - Rule 2: the first paragraph immediately after the document's H1 is flagged when it exceeds `max_first_paragraph_chars`.
 
+Scoping (framework keys on the check entry, not inside `config:`):
+
+- `include` (optional array of glob strings) — this check ships with no default repo scope beyond its intrinsic `.md` gate; each consuming repo enables it for the doc trees it wants gated (e.g. `docs/investigations/**/*.md`, `docs/designs/**/*.md`).
+- `exclude` (optional array of glob strings)
+
 Config keys:
 
-- `include_globs` (required array of glob strings) — this check ships with no default scope; each consuming repo enables it for the doc trees it wants gated (e.g. `docs/investigations/**`, `docs/design-docs/**`).
-- `exclude_globs` (optional array of glob strings)
 - `metadata_prefixes` (optional array of strings, default `["Date", "Task", "Verdict"]`)
 - `max_first_paragraph_chars` (optional integer, default `600`)
 - `severity` (optional `error|warning|info`, default `error`)
 
 Notes:
 
-- Only applies to files with a `.md` extension.
+- Only applies to files with a `.md` extension (intrinsic subject matter; further narrowed by the framework `include` / `exclude` on the check entry).
 - The opening-paragraph check is skipped when the block right after the H1 is not prose (a heading, list, table, blockquote, or code fence) — it only measures an actual lead-in paragraph.
 - Forward-looking by design: it only evaluates changed files in the current diff, so it never flags pre-existing docs that aren't being touched.
 
@@ -581,8 +584,8 @@ Per-rule keys:
 
 - `pattern` (required regex string)
 - `message` (required string)
-- `include_globs` (optional array of globs)
-- `exclude_globs` (optional array of globs)
+- `include` (optional array of repo-root-relative globs; `include_globs` is a supported alias) — finer-axis rule selection when rules in one instance genuinely need different path scopes. Prefer the check-entry framework `include` key when every rule shares one scope.
+- `exclude_files` (optional array of globs; `exclude_globs` is a supported alias) — per-rule negative selection. Matches config-dir-relative paths (via `strip_prefix` of the CHECKS file directory); this coordinate is intentional-or-legacy and is not the framework `exclude` key.
 - `severity` (optional `error|warning|info`)
 - `remediation` (optional string)
 

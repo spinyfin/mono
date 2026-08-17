@@ -575,6 +575,8 @@ pub(crate) fn resolve_bazel_target_executable(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     use super::*;
 
@@ -591,6 +593,14 @@ mod tests {
         assert_eq!(parse_node_major_version("not-a-version"), None);
     }
 
+    #[cfg(unix)]
+    fn write_fake_executable(path: &Path, contents: &str) {
+        fs::write(path, contents).expect("write fake executable");
+        let mut permissions = fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("set permissions");
+    }
+
     #[test]
     fn validate_node_runtime_version_rejects_stale_node() {
         let node = Path::new("/test/bin/node");
@@ -600,6 +610,22 @@ mod tests {
         assert!(message.contains("v20.7.0"), "message: {message}");
         assert!(message.contains("oxfmt"), "message: {message}");
         assert!(message.contains("/test/bin/node"), "message: {message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_node_runtime_version_rejects_stale_node() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_fake_executable(&temp.path().join("node"), "#!/bin/sh\necho 'v20.7.0'\n");
+        let npx = temp.path().join("npx");
+        write_fake_executable(&npx, "#!/bin/sh\n");
+
+        let err = check_node_runtime_version("oxfmt", &npx, "test/node", CheckDeadline::new(15_000))
+            .expect_err("stale node must fail preflight");
+        let message = format!("{err:#}");
+        assert!(message.contains("Node.js >= 22"), "message: {message}");
+        assert!(message.contains("v20.7.0"), "message: {message}");
+        assert!(message.contains("oxfmt"), "message: {message}");
     }
 
     #[test]

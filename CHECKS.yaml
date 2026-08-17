@@ -82,10 +82,11 @@ checks:
 
   - id: md/doc-structure
     check: md/doc-structure
-    config:
-      include_globs:
-        - "**/docs/investigations/**/*.md"
-        - "**/docs/designs/**/*.md"
+    # Which doc trees this check gates. The check's intrinsic .md extension
+    # gate applies on top.
+    include:
+      - "**/docs/investigations/**/*.md"
+      - "**/docs/designs/**/*.md"
     policy:
       severity: error
 
