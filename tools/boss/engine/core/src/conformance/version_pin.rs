@@ -398,10 +398,11 @@ fn error_item_as_operational_warning_is_not_silently_a_turn_failure() {
 // `grok models` menu are asserted here rather than folded into a `--help`
 // text diff: a `--help` diff would never notice `--trust`'s removal (it was
 // never listed there), and losing it silently hangs every worker on the
-// folder-trust dialog (spike Q3). A `grok models` menu that grows a second
-// SKU must fail this pin loudly, not get silently absorbed as a stale
-// default (`GROK_DESCRIPTOR`'s model menu, `model_menu.rs`, still hard-codes
-// the single `grok-4.5` SKU).
+// folder-trust dialog (spike Q3). The `grok models` pin asserts the live
+// default still matches `GROK_DESCRIPTOR`'s `engine_default` (currently
+// `grok-4.6`, with `grok-4.5` retained as a prior generation) — any change
+// to the default, or to the retained-generation set, must fail this pin
+// loudly rather than be silently absorbed as a stale pin.
 
 /// Probe grok availability with a flag guaranteed to be present (`--help`).
 /// Soft-skip (return `false`, meaning "test body should return early") when
@@ -543,12 +544,13 @@ fn grok_models_menu_matches_pinned_descriptor() {
         "`grok models` default must match the pinned descriptor's engine_default; \
          got stdout={stdout:?}",
     );
+    let expected_available = vec!["grok-4.6", "grok-4.5"];
     assert_eq!(
-        available,
-        vec![expected_default],
-        "`grok models` must still advertise exactly the pinned single-SKU menu \
-         ({expected_default:?}); a second model appearing here means GROK_DESCRIPTOR's model \
-         menu (model_menu.rs) is stale — update it deliberately (design A-11 / T-20) rather than \
-         letting a new SKU silently become the wrong default. got stdout={stdout:?}",
+        available, expected_available,
+        "`grok models` menu changed shape ({available:?}); this pin asserts the live default \
+         still matches GROK_DESCRIPTOR's engine_default and that the retained-generation set is \
+         exactly what's expected — a genuinely new generation or a dropped retained SKU must \
+         update GROK_DESCRIPTOR's model menu (model_menu.rs) deliberately (design A-11 / T-20) \
+         rather than being silently absorbed as a stale pin. got stdout={stdout:?}",
     );
 }

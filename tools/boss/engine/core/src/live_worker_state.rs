@@ -2443,7 +2443,7 @@ mod tests {
         reg.register_spawn_with_capabilities(
             slot,
             run,
-            "grok-4.5",
+            "grok-4.6",
             92697,
             None,
             awaiting_input_capable,
@@ -2520,7 +2520,7 @@ mod tests {
         reg.register_readoption(
             slot,
             run,
-            "grok-4.5",
+            "grok-4.6",
             92697,
             None,
             false,
@@ -2646,7 +2646,7 @@ mod tests {
     fn unverified_driver_starts_respects_the_grace_window() {
         let reg = LiveWorkerStateRegistry::new();
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
-        reg.register_spawn(1, "run-a", "grok-4.5", 92697, None);
+        reg.register_spawn(1, "run-a", "grok-4.6", 92697, None);
         reg.set_spawn_time_for_test(1, now - 5);
 
         assert!(

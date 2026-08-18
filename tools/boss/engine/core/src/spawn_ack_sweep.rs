@@ -942,7 +942,7 @@ mod tests {
         live_states.register_spawn_with_capabilities(
             slot_id,
             execution_id,
-            "grok-4.5",
+            "grok-4.6",
             shell_pid,
             Some(WorkItemBinding {
                 work_item_id: work_item_id.to_owned(),
@@ -1802,7 +1802,7 @@ mod tests {
         live_states.register_readoption(
             1,
             execution_id.as_str(),
-            "grok-4.5",
+            "grok-4.6",
             92697,
             Some(WorkItemBinding {
                 work_item_id: work_item_id.clone(),

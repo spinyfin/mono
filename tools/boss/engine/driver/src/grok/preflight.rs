@@ -480,7 +480,7 @@ mod tests {
 
     #[test]
     fn grok_models_silent_success_is_rejected() {
-        let output = success("You are not authenticated.\nDefault model: grok-4.5\n");
+        let output = success("You are not authenticated.\nDefault model: grok-4.6\n");
         let error = assert_grok_oauth(&output).unwrap_err().to_string();
         assert!(error.contains("Grok OAuth is unavailable"), "{error}");
     }
