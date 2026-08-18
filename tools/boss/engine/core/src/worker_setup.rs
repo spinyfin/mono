@@ -534,7 +534,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          \n\
          `bazel build` and `bazel test` are unaffected.\n\
          \n\
-         ## Showing a screenshot to your reviewer\n\
+         ## Capturing a screenshot for your own verification\n\
          \n\
          **Do not commit capture PNGs** — and do not delete them either.\n\
          Attach them:\n\
@@ -544,22 +544,26 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          ```\n\
          \n\
          The engine stores the image outside this workspace (which is\n\
-         recycled after your run) and prints a gallery URL. Put that URL in\n\
-         your PR body under an `## Evidence` heading — the reviewer clicks it\n\
-         from the GitHub PR and sees the image. Prose describing a screenshot\n\
-         nobody can look at is not evidence.\n\
+         recycled after your run), for your own verification and for an\n\
+         operator looking at this run locally. `boss attach --list` shows\n\
+         what this work item already has, across runs.\n\
          \n\
          Validation is immediate and typed: a path outside this workspace or\n\
          a temp dir, a file that is not really a PNG/JPEG, an oversize render,\n\
          or a per-run cap all come back as an error you can fix and retry now,\n\
          rather than a silent failure discovered after you are gone. Nothing\n\
          is ever downscaled or truncated behind your back — an image is either\n\
-         stored exactly as you rendered it or refused. `boss attach --list`\n\
-         shows what this work item already has, across runs.\n\
+         stored exactly as you rendered it or refused.\n\
          \n\
-         If `boss attach` reports that the evidence server is not listening,\n\
-         the image is still stored but there is no link to paste; say so in\n\
-         the PR body rather than inventing a URL.\n\
+         **Do not put an attachment URL — or any other localhost link — in a\n\
+         PR body.** The link it prints is only reachable on this machine;\n\
+         nobody reading the PR on GitHub can open it. This applies whether or\n\
+         not the evidence server is listening: if it isn't, the image is\n\
+         still stored, but that is still not a reason to paste a URL, describe\n\
+         the screenshot in prose, or inline it as base64 as a substitute. Where\n\
+         a PR body needs evidence a GitHub reader can actually open, use\n\
+         something that is — a CI artifact, a deploy preview, a code\n\
+         reference.\n\
          \n\
          ## Coordinator\n\
          \n\

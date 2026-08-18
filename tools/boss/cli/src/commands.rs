@@ -144,14 +144,16 @@ pub(crate) enum Commands {
     ///
     /// See `tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md`.
     Propose(propose::ProposeArgs),
-    /// Attach a screenshot as review evidence a human can look at.
+    /// Attach a screenshot for your own verification, or for an operator
+    /// looking at this run locally.
     ///
     /// Committing capture PNGs to the branch is forbidden — and rots, since
     /// merging deletes the branch the images lived on. This is the
     /// alternative: the engine stores the image outside your (ephemeral)
-    /// cube workspace and serves it from a loopback gallery. The command
-    /// prints the gallery URL; put it in the PR body under an `## Evidence`
-    /// heading and the reviewer can click it straight from GitHub.
+    /// cube workspace and serves it from a loopback gallery. The gallery is
+    /// only reachable on this machine — never put its URL, or any other
+    /// localhost link, in a PR body; nobody reading the PR on GitHub can
+    /// open it.
     ///
     /// Validation is synchronous and typed — a path outside your workspace,
     /// a file that is not really a PNG/JPEG, an oversize render, or a

@@ -1,11 +1,13 @@
 //! `boss attach <path>` / `boss attach --list` — hand a screenshot to the
-//! engine as evidence a human reviewer can actually look at.
+//! engine for the worker's own verification and for an operator looking at
+//! the run locally.
 //!
 //! Committing capture PNGs to the branch is forbidden by repo policy (and
 //! rots — links against a merged, deleted branch 404). This verb is the
 //! alternative: the engine stores the image outside the ephemeral cube
-//! workspace and serves it from a loopback gallery, and this command prints
-//! the URL to paste into the PR body.
+//! workspace and serves it from a loopback gallery. That gallery is only
+//! reachable on this machine, so its URL must never be cited as PR-body
+//! evidence — see the caller-facing note in [`run_attach_submit`].
 //!
 //! Pure CLI + wire glue. Everything that could reject a submission — path
 //! confinement, format sniffing, size and dimension caps, per-run and
@@ -122,15 +124,15 @@ async fn run_attach_submit(ctx: &RunContext, path: PathBuf, caption: Option<Stri
                             println!("  image:   {image}");
                             println!("  gallery: {gallery}");
                             println!(
-                                "Put the gallery link in your PR body under an `## Evidence` heading so the \
-                                 reviewer can see it."
+                                "This link is only reachable on this machine — do not put it (or any other \
+                                 localhost link) in your PR body. It's for your own verification and for an \
+                                 operator looking at this run locally."
                             );
                         }
                         // Stored, but nothing is serving it — say so instead
-                        // of printing a URL that would be a dead link in a
-                        // PR body forever.
+                        // of printing a URL that would be a dead link.
                         _ => println!(
-                            "The evidence server is not listening, so there is no link to paste. The image is \
+                            "The evidence server is not listening, so there is no link. The image is \
                              stored; an operator can list it with `bossctl attachments list`."
                         ),
                     }

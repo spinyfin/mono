@@ -263,7 +263,7 @@ what you verified.
 
 `bazel build` and `bazel test` are unaffected.
 
-## Showing a screenshot to your reviewer
+## Capturing a screenshot for your own verification
 
 **Do not commit capture PNGs** — and do not delete them either.
 Attach them:
@@ -273,22 +273,26 @@ boss attach /tmp/shot.png --caption "wide table, after the fix"
 ```
 
 The engine stores the image outside this workspace (which is
-recycled after your run) and prints a gallery URL. Put that URL in
-your PR body under an `## Evidence` heading — the reviewer clicks it
-from the GitHub PR and sees the image. Prose describing a screenshot
-nobody can look at is not evidence.
+recycled after your run), for your own verification and for an
+operator looking at this run locally. `boss attach --list` shows
+what this work item already has, across runs.
 
 Validation is immediate and typed: a path outside this workspace or
 a temp dir, a file that is not really a PNG/JPEG, an oversize render,
 or a per-run cap all come back as an error you can fix and retry now,
 rather than a silent failure discovered after you are gone. Nothing
 is ever downscaled or truncated behind your back — an image is either
-stored exactly as you rendered it or refused. `boss attach --list`
-shows what this work item already has, across runs.
+stored exactly as you rendered it or refused.
 
-If `boss attach` reports that the evidence server is not listening,
-the image is still stored but there is no link to paste; say so in
-the PR body rather than inventing a URL.
+**Do not put an attachment URL — or any other localhost link — in a
+PR body.** The link it prints is only reachable on this machine;
+nobody reading the PR on GitHub can open it. This applies whether or
+not the evidence server is listening: if it isn't, the image is
+still stored, but that is still not a reason to paste a URL, describe
+the screenshot in prose, or inline it as base64 as a substitute. Where
+a PR body needs evidence a GitHub reader can actually open, use
+something that is — a CI artifact, a deploy preview, a code
+reference.
 
 ## Coordinator
 
