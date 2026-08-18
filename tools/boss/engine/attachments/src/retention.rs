@@ -13,8 +13,8 @@
 //! [`AttachmentRetentionPolicy::max_age`] (default 90 days). Inside that
 //! window, [`AttachmentRetentionPolicy::max_total_bytes`] (default 1 GiB)
 //! reclaims oldest-first until the store fits. The window is generous on
-//! purpose — screenshots are small and a PR body link that dies in a fortnight
-//! is barely better than no link — but it is bounded and enforced, not a
+//! purpose — screenshots are small and a local gallery link that dies in a
+//! fortnight is barely better than no link — but it is bounded and enforced, not a
 //! promise to add GC later.
 //!
 //! ## Two rules the home sweeps do not need
@@ -24,7 +24,7 @@
 //!    digest is being reclaimed. Reclaiming one row of a deduplicated pair
 //!    must not blank the other.
 //! 2. **Rows outlive blobs.** Reclaiming deletes bytes and stamps
-//!    `reclaimed_at`; it does not delete the row. A link in a merged PR body
+//!    `reclaimed_at`; it does not delete the row. A stale local gallery link
 //!    then answers "reclaimed on <date>" instead of a bare 404 that reads like
 //!    a bug. Tombstones are removed by execution retention, when the execution
 //!    they hang off is pruned.
@@ -35,8 +35,8 @@ use std::time::Duration;
 use boss_protocol::AttachmentMediaType;
 
 /// Default retention window. Longer than the 14-day home-retention window
-/// because the artefacts are ~1000x smaller and their audience (a human
-/// reading a PR) shows up on a human schedule.
+/// because the artefacts are ~1000x smaller and local inspection may happen
+/// well after a run completes.
 pub const DEFAULT_MAX_AGE_DAYS: u64 = 90;
 
 /// Default total-bytes backstop across retained blobs.

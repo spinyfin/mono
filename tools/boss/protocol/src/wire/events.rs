@@ -966,8 +966,7 @@ pub enum FrontendEvent {
     /// on (`http://127.0.0.1:<port>`). `None` means the surface is disabled
     /// or failed to bind, which is exactly when a caller must **not** invent
     /// a URL — the image is stored and inspectable via `bossctl attachments`,
-    /// but there is no link to paste into a PR body and saying otherwise
-    /// would hand the reviewer a dead link.
+    /// but there is no local gallery link to follow until the surface binds.
     AttachmentStored {
         attachment: WorkAttachment,
         already_stored: bool,
@@ -976,9 +975,9 @@ pub enum FrontendEvent {
     },
     /// Response to [`FrontendRequest::ListAttachments`]: every attachment
     /// filed against `work_item_id` across all its executions, newest first,
-    /// including reclaimed tombstones (so a stale PR link has an explanation
-    /// rather than a mystery). `evidence_base_url` carries the same meaning
-    /// as on [`Self::AttachmentStored`].
+    /// including reclaimed tombstones (so a stale local gallery link has an
+    /// explanation rather than a mystery). `evidence_base_url` carries the
+    /// same meaning as on [`Self::AttachmentStored`].
     AttachmentsList {
         work_item_id: String,
         attachments: Vec<WorkAttachment>,
