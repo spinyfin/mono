@@ -166,6 +166,7 @@ async fn durable_state_scan_reclaims_a_live_pane_after_its_work_closes() {
             scan_server.execution_coordinator.clone(),
             scan_server.dispatch_events.as_ref(),
             scan_server.as_ref(),
+            scan_server.cube_client.as_ref(),
         )
         .await
     });

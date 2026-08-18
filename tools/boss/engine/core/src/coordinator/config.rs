@@ -340,6 +340,16 @@ impl ExecutionCoordinator {
         self.live_worker_states = Some(live);
     }
 
+    /// The live per-slot worker registry, when [`Self::set_live_worker_states`]
+    /// has wired one up. `None` in tests that don't install it — callers must
+    /// treat that as "no corroborating signal available", never as "worker is
+    /// dead": [`crate::durable_liveness::corroborate_against_live_registry`]
+    /// and its callers ([`crate::dead_pane_sweep`], [`crate::orphan_sweep`]'s
+    /// redispatch guard) already fail open (trust the raw pid probe) on `None`.
+    pub(crate) fn live_worker_states(&self) -> Option<&crate::live_worker_state::LiveWorkerStateRegistry> {
+        self.live_worker_states.as_deref()
+    }
+
     /// Override the pre-start retry delay schedule. Pass an empty vec
     /// to disable retries entirely (immediate permanent failure); pass
     /// short durations in tests to avoid real sleeps.

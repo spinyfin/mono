@@ -962,6 +962,28 @@ impl LiveWorkerStateRegistry {
         first
     }
 
+    /// Return `current_tool` (a tool in flight — an unbalanced `PreToolUse`)
+    /// for the non-terminal slot running `run_id`. Mirrors
+    /// [`Self::last_event_at_for_run`]'s duplicate-slot preference so the two
+    /// stay consistent when read together for liveness corroboration — see
+    /// [`crate::durable_liveness::corroborating_liveness`].
+    pub fn current_tool_for_run(&self, run_id: &str) -> Option<String> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        let mut first = None;
+        for state in guard.values().map(|entry| &entry.state) {
+            if state.activity.is_terminal() || state.run_id != run_id {
+                continue;
+            }
+            if state.activity == WorkerActivity::Working {
+                return state.current_tool.clone();
+            }
+            if first.is_none() {
+                first = state.current_tool.clone();
+            }
+        }
+        first
+    }
+
     /// Apply a hook event to the state for `slot_id`. Returns `true`
     /// if the entry actually changed, so callers can suppress no-op
     /// topic pushes. Returns `false` if no entry exists for the slot

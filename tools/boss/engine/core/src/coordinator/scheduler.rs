@@ -581,6 +581,7 @@ impl ExecutionCoordinator {
                         self.dispatch_events.as_ref(),
                         sibling,
                         boss_engine_utils::epoch_time::now_epoch_secs(),
+                        self.live_worker_states.as_deref(),
                     )
                     .await;
                 if reconciled_lost_workspace || reconciled_dead_pane {

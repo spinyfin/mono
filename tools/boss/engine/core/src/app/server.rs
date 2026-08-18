@@ -1248,6 +1248,7 @@ pub async fn serve_with_merge_probe(
         server_state.live_worker_states.clone(),
         server_state.execution_coordinator.clone(),
         server_state.dispatch_events.clone(),
+        server_state.cube_client.clone(),
         Duration::from_secs(60),
     );
 
@@ -1388,6 +1389,7 @@ pub async fn serve_with_merge_probe(
         server_state.execution_coordinator.clone(),
         server_state.dispatch_events.clone(),
         server_state.clone(),
+        server_state.cube_client.clone(),
         crate::dead_pane_sweep::DEFAULT_INTERVAL,
     );
 

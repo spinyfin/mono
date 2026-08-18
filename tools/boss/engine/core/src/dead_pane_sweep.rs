@@ -97,9 +97,10 @@ use std::time::Duration;
 
 use boss_protocol::WorkExecution;
 
-use crate::coordinator::ExecutionCoordinator;
+use crate::coordinator::{CubeClient, ExecutionCoordinator};
 use crate::dispatch_events::{DispatchEventSink, Stage};
 use crate::durable_liveness::WorkerProcess;
+use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::work::WorkDb;
 use crate::worker_readoption::LiveWorkerConvergence;
 
@@ -145,6 +146,7 @@ pub fn spawn_loop(
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: Arc<dyn DispatchEventSink>,
     convergence: Arc<dyn LiveWorkerConvergence>,
+    cube_client: Arc<dyn CubeClient>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     crate::sweep_loop::spawn_sweep_loop(interval, move || {
@@ -152,12 +154,14 @@ pub fn spawn_loop(
         let coordinator = Arc::clone(&coordinator);
         let dispatch_events = Arc::clone(&dispatch_events);
         let convergence = Arc::clone(&convergence);
+        let cube_client = Arc::clone(&cube_client);
         async move {
             run_one_pass(
                 work_db.as_ref(),
                 coordinator,
                 dispatch_events.as_ref(),
                 convergence.as_ref(),
+                cube_client.as_ref(),
             )
             .await
         }
@@ -171,9 +175,11 @@ pub async fn run_one_pass(
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: &dyn DispatchEventSink,
     convergence: &dyn LiveWorkerConvergence,
+    cube_client: &dyn CubeClient,
 ) -> PaneDeathSweepOutcome {
     let mut outcome = PaneDeathSweepOutcome::default();
     let now_epoch_secs = boss_engine_utils::epoch_time::now_epoch_secs();
+    let live_states = coordinator.live_worker_states();
 
     let candidates = match work_db.list_non_terminal_executions_with_workspace() {
         Ok(rows) => rows,
@@ -187,8 +193,32 @@ pub async fn run_one_pass(
     };
 
     for execution in candidates {
-        if reconcile_if_pane_dead(work_db, dispatch_events, &execution, now_epoch_secs).await {
+        if reconcile_if_pane_dead(work_db, dispatch_events, &execution, now_epoch_secs, live_states).await {
             outcome.reaped += 1;
+            // `mark_execution_orphaned` deliberately leaves the cube lease
+            // columns intact on the row (a resume redispatch may reclaim the
+            // same workspace with its in-flight commits). But this sweep's
+            // redispatch path is the plain orphan-active sweep, which
+            // creates an entirely fresh execution with no memory of the old
+            // lease, so a row reaped here that is never resumed in place
+            // leaves its lease held forever — the "leases leak durably" half
+            // of the false-reap incident, where a workspace stayed leased to
+            // a terminal execution for 10+ hours. Best-effort force-release
+            // it now, mirroring `lost_workspace_sweep::run_one_pass`'s
+            // identical release for its own dead-worker reap. Failure is
+            // benign: the lease may already be gone.
+            if let Some(lease_id) = execution.cube_lease_id.as_deref()
+                && let Err(err) = cube_client
+                    .force_release_lease(lease_id, Some("pane-death reconcile: worker pane gone"))
+                    .await
+            {
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    lease_id,
+                    error = %format!("{err:#}"),
+                    "pane-death sweep: best-effort lease force-release failed (likely already released)",
+                );
+            }
         }
     }
 
@@ -260,6 +290,7 @@ pub(crate) async fn shell_pid_death_evidence(
     work_db: &WorkDb,
     execution: &WorkExecution,
     now_epoch_secs: i64,
+    live_states: Option<&LiveWorkerStateRegistry>,
 ) -> Option<i64> {
     // Only reconcile states where the design expects a LIVE pane to still be
     // holding the workspace: `running` (a pr_review reviewer pane) and
@@ -276,10 +307,10 @@ pub(crate) async fn shell_pid_death_evidence(
     // Grace guard: skip executions dispatched too recently (or with no
     // `started_at`) so a worker whose pid is still settling is never raced.
     let started_epoch = execution.started_epoch();
-    match started_epoch {
-        Some(t) if now_epoch_secs - t >= PANE_DEATH_GRACE_SECS => {}
+    let started_epoch = match started_epoch {
+        Some(t) if now_epoch_secs - t >= PANE_DEATH_GRACE_SECS => t,
         _ => return None,
-    }
+    };
 
     // The durable, restart-robust liveness signal: the shell pid the app
     // reported, persisted to `work_runs.shell_pid`, probed through the shared
@@ -298,7 +329,45 @@ pub(crate) async fn shell_pid_death_evidence(
     // ever cause a missed reap, never a false one. The unbounded probe is the
     // right one here: this path's verb is "reconcile a row", not "signal a
     // process", and its failure direction is to decline.
-    let shell_pid = match crate::durable_liveness::probe_execution_worker(work_db, &execution.id) {
+    let process = crate::durable_liveness::probe_execution_worker(work_db, &execution.id);
+
+    // Corroborate a `Gone` verdict against the (in-memory) live-worker
+    // registry before trusting it. Unlike `dead_pid_sweep`, this probe reads
+    // `work_runs.shell_pid` — a *different*, restart-robust identity from the
+    // registry's tracked pty foreground pid — but it is the same class of
+    // fragile signal: a wrapper shell that exited/exec'd, or a reused pid,
+    // makes `ESRCH` NOT proof the worker is dead. This is the root cause of
+    // the "live workers false-reaped as orphaned" incident: this probe had no
+    // corroboration at all, so it terminalized a demonstrably-live worker
+    // 45ms after `dead_pid_sweep`'s corroborated probe on the very same
+    // execution correctly declined to. `live_states` is `None` only when no
+    // registry was wired up (a test, or a call site with no live-state
+    // access); in that case the sweep falls back to trusting the bare probe,
+    // exactly its pre-fix behavior.
+    let process = match live_states {
+        Some(live) => {
+            let (process, reason) = crate::durable_liveness::corroborate_against_live_registry(
+                process,
+                live,
+                &execution.id,
+                started_epoch,
+                now_epoch_secs,
+            );
+            if let Some(reason) = reason {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    corroborating_activity = %reason,
+                    "pane-death reconcile: durable shell pid probed dead but worker is demonstrably \
+                     alive for this execution; the tracked pid was a transient/reused identity — \
+                     NOT reaping (live-event false-reap guard)",
+                );
+            }
+            process
+        }
+        None => process,
+    };
+
+    let shell_pid = match process {
         WorkerProcess::Gone { shell_pid } => i64::from(shell_pid),
         _ => return None,
     };
@@ -321,8 +390,9 @@ pub async fn reconcile_if_pane_dead(
     dispatch_events: &dyn DispatchEventSink,
     execution: &WorkExecution,
     now_epoch_secs: i64,
+    live_states: Option<&LiveWorkerStateRegistry>,
 ) -> bool {
-    let Some(shell_pid) = shell_pid_death_evidence(work_db, execution, now_epoch_secs).await else {
+    let Some(shell_pid) = shell_pid_death_evidence(work_db, execution, now_epoch_secs, live_states).await else {
         return false;
     };
 
@@ -479,7 +549,7 @@ mod tests {
         assert_eq!(exec.status, ExecutionStatus::WaitingHuman);
 
         let sink = NoopDispatchEventSink;
-        let reconciled = reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs()).await;
+        let reconciled = reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs(), None).await;
         assert!(
             reconciled,
             "a waiting_human zombie with a dead pane pid must be reconciled"
@@ -538,7 +608,7 @@ mod tests {
         // already-terminal row out before the (still-dead) shell pid is even
         // probed, so the misleading pane-died reconcile never fires.
         let sink = NoopDispatchEventSink;
-        let reconciled = reconcile_if_pane_dead(&db, &sink, &after_finalize, now_epoch_secs()).await;
+        let reconciled = reconcile_if_pane_dead(&db, &sink, &after_finalize, now_epoch_secs(), None).await;
         assert!(
             !reconciled,
             "a finalized triage execution must be invisible to the pane-death sweep"
@@ -561,7 +631,7 @@ mod tests {
         let exec = parked_triage_execution(&db, &automation, "/tmp/ws-b", "local", Some(dead_pid()));
 
         let sink = NoopDispatchEventSink;
-        assert!(reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs()).await);
+        assert!(reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs(), None).await);
 
         let after = db.get_execution(&exec.id).unwrap();
         assert_eq!(
@@ -587,7 +657,7 @@ mod tests {
             .unwrap();
 
         let sink = NoopDispatchEventSink;
-        assert!(reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs()).await);
+        assert!(reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs(), None).await);
 
         let runs = db.list_automation_runs(&automation).unwrap();
         assert_eq!(runs[0].outcome, AUTOMATION_OUTCOME_PRODUCED_TASK);
@@ -604,7 +674,7 @@ mod tests {
 
         let sink = NoopDispatchEventSink;
         assert!(
-            !reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs()).await,
+            !reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs(), None).await,
             "an execution whose pane pid is alive must NOT be reconciled"
         );
         assert_eq!(
@@ -624,7 +694,7 @@ mod tests {
 
         let sink = NoopDispatchEventSink;
         assert!(
-            !reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs()).await,
+            !reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs(), None).await,
             "an execution with no recorded shell pid must NOT be reaped"
         );
         assert_eq!(
@@ -645,7 +715,7 @@ mod tests {
 
         let sink = NoopDispatchEventSink;
         assert!(
-            !reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs()).await,
+            !reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs(), None).await,
             "a remote worker must never be reaped by a local pid probe"
         );
         assert_eq!(
@@ -669,7 +739,7 @@ mod tests {
 
         let sink = NoopDispatchEventSink;
         assert!(
-            !reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs()).await,
+            !reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs(), None).await,
             "an execution within the grace window must not be reaped"
         );
     }
@@ -714,7 +784,7 @@ mod tests {
 
         let sink = NoopDispatchEventSink;
         assert!(
-            !reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs()).await,
+            !reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs(), None).await,
             "a waiting_review execution (worker exited by design) must not be reaped"
         );
         assert_eq!(
@@ -734,7 +804,7 @@ mod tests {
         let exec = db.get_execution(&exec.id).unwrap();
 
         let sink = NoopDispatchEventSink;
-        assert!(!reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs()).await);
+        assert!(!reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs(), None).await);
     }
 
     /// Create a `waiting_human` chore execution on the `codex` driver whose
@@ -786,7 +856,7 @@ mod tests {
 
         let sink = NoopDispatchEventSink;
         assert!(
-            reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs()).await,
+            reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs(), None).await,
             "a persistent-driver worker's dead pid is a genuine dead pane, boundary or not",
         );
         assert_eq!(db.get_execution(&exec.id).unwrap().status, ExecutionStatus::Orphaned);
@@ -802,9 +872,171 @@ mod tests {
 
         let sink = NoopDispatchEventSink;
         assert!(
-            reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs()).await,
+            reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs(), None).await,
             "a worker with no delivered turn boundary is a genuine dead pane",
         );
         assert_eq!(db.get_execution(&exec.id).unwrap().status, ExecutionStatus::Orphaned);
+    }
+
+    // ─── corroboration (the "live workers false-reaped" incident) ─────────────
+    //
+    // Before this fix `reconcile_if_pane_dead` had NO corroboration at all —
+    // unlike `dead_pid_sweep`, which already checked recent hook activity
+    // before trusting a `Dead` verdict. That asymmetry is exactly the
+    // incident: two sweeps consumed the same underlying "the tracked pid is
+    // gone" signal 45ms apart in one tick, `dead_pid_sweep`'s corroborated
+    // probe correctly declined to reap, and this sweep's uncorroborated one
+    // terminalized the same, demonstrably-live execution anyway — which then
+    // got a second, duplicate worker dispatched onto it. These tests are the
+    // representative fixture for that class of same-tick occurrence.
+
+    /// A worker whose durable shell pid probes dead, but which has emitted a
+    /// hook well within the corroboration window, must NOT be terminalized —
+    /// the tracked pid was a transient/reused identity, not proof of death.
+    #[tokio::test]
+    async fn recent_hook_activity_spares_a_falsely_probed_dead_pane() {
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_automation(&db, &product);
+        let exec = parked_triage_execution(&db, &automation, "/tmp/ws-corrob", "local", Some(dead_pid()));
+        seed_dispatch_run(&db, &automation, &exec.id, 1_700_000_000);
+
+        let live_states = LiveWorkerStateRegistry::new();
+        live_states.register_spawn(1, &exec.id, "claude-opus-4-7", 424242, None);
+        use boss_protocol::WorkerEvent;
+        live_states.apply_event(
+            1,
+            &WorkerEvent::PreToolUse {
+                session_id: "s".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+            },
+        );
+        live_states.apply_event(
+            1,
+            &WorkerEvent::PostToolUse {
+                session_id: "s".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+                tool_response: serde_json::json!({}),
+            },
+        );
+
+        let sink = NoopDispatchEventSink;
+        let reconciled = reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs(), Some(&live_states)).await;
+        assert!(
+            !reconciled,
+            "a worker with recent hook activity must not be reaped even when its tracked pid probes dead",
+        );
+        assert_eq!(
+            db.get_execution(&exec.id).unwrap().status,
+            ExecutionStatus::WaitingHuman,
+            "the execution must stay untouched, not terminalized",
+        );
+    }
+
+    /// A tool in flight (a long foreground build with no hook for minutes)
+    /// also corroborates — mirrors the incident's "tool `Bash` in flight"
+    /// same-tick occurrences.
+    #[tokio::test]
+    async fn tool_in_flight_spares_a_falsely_probed_dead_pane() {
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_automation(&db, &product);
+        let exec = parked_triage_execution(&db, &automation, "/tmp/ws-corrob-tool", "local", Some(dead_pid()));
+
+        let live_states = LiveWorkerStateRegistry::new();
+        live_states.register_spawn(1, &exec.id, "claude-opus-4-7", 424242, None);
+        use boss_protocol::WorkerEvent;
+        live_states.apply_event(
+            1,
+            &WorkerEvent::PreToolUse {
+                session_id: "s".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+            },
+        );
+
+        let sink = NoopDispatchEventSink;
+        assert!(
+            !reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs(), Some(&live_states)).await,
+            "a tool in flight must spare the worker from the pane-death reap",
+        );
+    }
+
+    /// A genuinely dead worker — no live-state entry at all for its
+    /// execution id — is still reaped: corroboration narrows the false-reap
+    /// window, it does not disable reaping.
+    #[tokio::test]
+    async fn no_live_state_entry_still_reaps_a_genuinely_dead_pane() {
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_automation(&db, &product);
+        let exec = parked_triage_execution(&db, &automation, "/tmp/ws-corrob-dead", "local", Some(dead_pid()));
+
+        let live_states = LiveWorkerStateRegistry::new();
+        let sink = NoopDispatchEventSink;
+        assert!(
+            reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs(), Some(&live_states)).await,
+            "with no corroborating activity the worker must still be reaped",
+        );
+        assert_eq!(db.get_execution(&exec.id).unwrap().status, ExecutionStatus::Orphaned);
+    }
+
+    // ─── cube lease release on reap ────────────────────────────────────────────
+
+    /// Records every `force_release_lease` call; every other [`CubeClient`]
+    /// method is unreachable from this sweep.
+    #[derive(Default)]
+    struct RecordingCube {
+        force_releases: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingCube {
+        fn force_release_calls(&self) -> Vec<String> {
+            self.force_releases.lock().unwrap().clone()
+        }
+    }
+
+    crate::stub_cube_client! { RecordingCube {
+        async fn force_release_lease(&self, lease_id: &str, _: Option<&str>) -> anyhow::Result<()> {
+            self.force_releases.lock().unwrap().push(lease_id.to_owned());
+            Ok(())
+        }
+    } }
+
+    /// `run_one_pass` reaping a dead-pane zombie must force-release its cube
+    /// lease. `mark_execution_orphaned` deliberately leaves the lease columns
+    /// on the row (a resume redispatch may reclaim the workspace), but this
+    /// sweep's actual redispatch path (the plain orphan-active sweep) never
+    /// resumes in place — it dispatches an entirely fresh execution — so a
+    /// row reaped without this release leaks its lease forever. This is the
+    /// "leases leak durably" half of the false-reap incident.
+    #[tokio::test]
+    async fn run_one_pass_force_releases_the_reaped_executions_lease() {
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_automation(&db, &product);
+        let exec = parked_triage_execution(&db, &automation, "/tmp/ws-lease", "local", Some(dead_pid()));
+        assert_eq!(
+            exec.cube_lease_id.as_deref(),
+            Some("lease-1"),
+            "precondition: the parked execution carries a lease to release",
+        );
+        let db = Arc::new(db);
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        let cube = RecordingCube::default();
+        let sink = NoopDispatchEventSink;
+        let convergence = crate::worker_readoption::NoopLiveWorkerConvergence;
+
+        let outcome = run_one_pass(db.as_ref(), coordinator, &sink, &convergence, &cube).await;
+
+        assert_eq!(outcome.reaped, 1);
+        assert_eq!(
+            cube.force_release_calls(),
+            vec!["lease-1".to_owned()],
+            "the reaped execution's cube lease must be force-released",
+        );
     }
 }

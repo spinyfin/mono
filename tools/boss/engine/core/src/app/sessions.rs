@@ -96,12 +96,14 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
             let live_worker_states = server_state.live_worker_states.clone();
             let execution_coordinator = server_state.execution_coordinator.clone();
             let dispatch_events = server_state.dispatch_events.clone();
+            let cube_client = server_state.cube_client.clone();
             tokio::spawn(async move {
                 crate::dead_pid_sweep::reconcile_orphans_on_reattach(
                     work_db,
                     live_worker_states,
                     execution_coordinator,
                     dispatch_events,
+                    cube_client,
                     prior,
                     observed,
                 )
@@ -557,6 +559,7 @@ async fn resolve_reported_pane_death(
             server_state.live_worker_states.as_ref(),
             server_state.execution_coordinator.clone(),
             server_state.dispatch_events.as_ref(),
+            server_state.cube_client.as_ref(),
             run_id,
             reason,
         )

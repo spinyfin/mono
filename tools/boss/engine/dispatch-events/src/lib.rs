@@ -682,6 +682,31 @@ pub enum Stage {
     /// `blocking_execution_id`, its `blocking_execution_status` (normally a
     /// TERMINAL one — that is the whole point), and the probed `shell_pid`.
     RedispatchBlockedLiveProcess,
+    /// The re-dispatch guard in `boss_engine::orphan_sweep` probed a work
+    /// item's previous worker process and DECLINED to block the redispatch —
+    /// the converse of `redispatch_blocked_live_process`, which fires only
+    /// when the guard blocks. Before this event existed the guard was
+    /// silent on its decline path, so diagnosing a false redispatch (the
+    /// probe said `Gone` when the worker was actually still alive) required
+    /// manually cross-referencing this sweep's trace lines against a
+    /// different sweep's (`dead_pid_reconcile`) 45ms apart — this event
+    /// makes that self-diagnosing from `bossctl dispatch diagnose` alone.
+    ///
+    /// Fires only when the guard actually had a recorded pid to evaluate
+    /// (`crate::durable_liveness::probe_work_item_worker` returned `Some`);
+    /// a work item with no prior recorded worker process at all has nothing
+    /// to decline, so it emits nothing here. `details` carries
+    /// `blocking_execution_id`, `blocking_execution_status`, `probe_result`
+    /// (`process_alive` / `process_gone` / `process_unknown` — always a
+    /// non-alive verdict here, since an alive one blocks instead),
+    /// `shell_pid` (the probed pid, when one exists), `last_event_at` and
+    /// `last_event_age_secs` (the live-worker registry's corroboration
+    /// signal for this execution, when available), and
+    /// `corroborated_alive` (whether corroboration flipped an initially-Gone
+    /// probe to Alive, in which case the guard actually blocked instead —
+    /// see `redispatch_blocked_live_process`; this event never fires in
+    /// that case).
+    RedispatchGuardDeclined,
     /// The boot-time tmux adoption pass matched a live tmux session's
     /// authoritative `BOSS_SPAWN_TOKEN` against a non-terminal `work_runs`
     /// row and rebuilt the derived bookkeeping an engine restart always
@@ -803,6 +828,7 @@ impl Stage {
             Stage::AbandonedBranchPrRecovery => "abandoned_branch_pr_recovery",
             Stage::LiveWorkerReadopted => "live_worker_readopted",
             Stage::RedispatchBlockedLiveProcess => "redispatch_blocked_live_process",
+            Stage::RedispatchGuardDeclined => "redispatch_guard_declined",
             Stage::TmuxWorkerAdopted => "tmux_worker_adopted",
             Stage::TmuxAdoptionRefused => "tmux_adoption_refused",
             Stage::TmuxAdoptionOwnerConflict => "tmux_adoption_owner_conflict",
@@ -1574,6 +1600,7 @@ mod tests {
             Stage::RedispatchBlockedLiveProcess.as_str(),
             "redispatch_blocked_live_process"
         );
+        assert_eq!(Stage::RedispatchGuardDeclined.as_str(), "redispatch_guard_declined");
         assert_eq!(Stage::TmuxWorkerAdopted.as_str(), "tmux_worker_adopted");
         assert_eq!(Stage::TmuxAdoptionRefused.as_str(), "tmux_adoption_refused");
         assert_eq!(

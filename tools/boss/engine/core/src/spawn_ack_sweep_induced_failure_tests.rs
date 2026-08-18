@@ -157,6 +157,7 @@ async fn a_pane_hosting_only_a_live_login_shell_is_detected_and_fully_released()
         &live_states,
         coordinator.clone(),
         sink.as_ref(),
+        &NoopCube,
         crate::dead_pid_sweep::DeadPidSweepMode::PeriodicSpeculative,
     )
     .await;
