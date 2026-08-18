@@ -1,9 +1,10 @@
-//! `work_attachments` accessors — the metadata ledger for reviewer-visible
-//! screenshot evidence.
+//! `work_attachments` accessors — the metadata ledger for screenshot evidence
+//! kept for a worker's own verification and for an operator inspecting a run
+//! locally.
 //!
 //! Bytes live outside this table, content-addressed under the engine state
 //! root (`boss_engine_attachments::store`). What is stored here is everything
-//! a reviewer or a retention pass needs *about* an image: who produced it,
+//! an operator or a retention pass needs *about* an image: who produced it,
 //! for which work item, when, how big, and whether retention has since taken
 //! the bytes back.
 //!

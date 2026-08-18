@@ -530,7 +530,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          The instance renders itself in-process via `cacheDisplay` and exits;\n\
          it never shows a window, never takes focus, and needs no\n\
          screen-recording permission. Read the PNG back and state in the PR\n\
-         what you verified.\n\
+         what you verified and what you could not.\n\
          \n\
          `bazel build` and `bazel test` are unaffected.\n\
          \n\

@@ -259,7 +259,7 @@ bazel run //tools/boss/app-macos:Boss -- --capture-to /tmp/shot.png
 The instance renders itself in-process via `cacheDisplay` and exits;
 it never shows a window, never takes focus, and needs no
 screen-recording permission. Read the PNG back and state in the PR
-what you verified.
+what you verified and what you could not.
 
 `bazel build` and `bazel test` are unaffected.
 

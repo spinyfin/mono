@@ -836,7 +836,8 @@ struct ServerState {
     /// counter state isolated per `ServerState` instance and
     /// makes unit tests cheap.
     metrics: Arc<crate::metrics::Registry>,
-    /// Content-addressed store for reviewer-visible screenshot evidence,
+    /// Content-addressed store for screenshot evidence kept for a worker's
+    /// own verification and for an operator inspecting a run locally,
     /// rooted at `<state_root>/attachments`. Under the state root rather
     /// than a workspace because a cube workspace is released and recycled
     /// while the evidence has to outlive the run that produced it.
@@ -907,8 +908,8 @@ impl ServerState {
     /// `None` until the evidence surface has actually bound, and forever if
     /// it never does. Callers must propagate the `None` rather than
     /// substituting a default port: handing a worker a URL that nothing is
-    /// listening on would put a dead link in a PR body, which is worse than
-    /// telling it plainly that there is no link to paste.
+    /// listening on would mint a dead local gallery link, which is worse than
+    /// telling it plainly that there is no gallery URL.
     fn evidence_base_url(&self) -> Option<String> {
         self.evidence_port
             .get()
