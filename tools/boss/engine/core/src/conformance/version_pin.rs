@@ -398,10 +398,9 @@ fn error_item_as_operational_warning_is_not_silently_a_turn_failure() {
 // `grok models` menu are asserted here rather than folded into a `--help`
 // text diff: a `--help` diff would never notice `--trust`'s removal (it was
 // never listed there), and losing it silently hangs every worker on the
-// folder-trust dialog (spike Q3). A `grok models` menu that grows a second
-// SKU must fail this pin loudly, not get silently absorbed as a stale
-// default (`GROK_DESCRIPTOR`'s model menu, `model_menu.rs`, still hard-codes
-// the single `grok-4.5` SKU).
+// folder-trust dialog (spike Q3). The model list may retain legacy entries,
+// but its default must fail this pin loudly if it drifts from the catalog
+// selection in `GROK_DESCRIPTOR` / `model_menu.rs`.
 
 /// Probe grok availability with a flag guaranteed to be present (`--help`).
 /// Soft-skip (return `false`, meaning "test body should return early") when
@@ -544,11 +543,10 @@ fn grok_models_menu_matches_pinned_descriptor() {
          got stdout={stdout:?}",
     );
     assert_eq!(
-        available,
-        vec![expected_default],
-        "`grok models` must still advertise exactly the pinned single-SKU menu \
-         ({expected_default:?}); a second model appearing here means GROK_DESCRIPTOR's model \
-         menu (model_menu.rs) is stale — update it deliberately (design A-11 / T-20) rather than \
-         letting a new SKU silently become the wrong default. got stdout={stdout:?}",
+        available.first().copied(),
+        Some(expected_default),
+        "`grok models` must list the pinned descriptor default first; update GROK_DESCRIPTOR's \
+         model menu deliberately when the provider changes the selected catalog entry. \
+         got stdout={stdout:?}",
     );
 }

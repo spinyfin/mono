@@ -179,7 +179,7 @@ fn grok_initial_input_stays_under_the_limit_with_long_workspace_path_and_full_de
     .unwrap();
 
     let mut plan = GrokDriver::default().spawn_invocation(SpawnRequest {
-        model: "grok-4.5",
+        model: "grok-4.6",
         effort: Some("high"),
         settings_path: None,
         non_opus_auto_mode: false,
