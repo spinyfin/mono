@@ -842,6 +842,81 @@ mod tests {
         );
     }
 
+    /// The acceptance criterion for the decline event: when a registry entry
+    /// exists, the payload must carry `last_event_age_secs` so an operator
+    /// reading `bossctl dispatch diagnose` can tell a correct decline (hook
+    /// aged out of the corroboration window) from a wrong one (recent hook
+    /// that should have blocked). The no-registry
+    /// [`declined_guard_emits_instrumentation_event`] case leaves these null.
+    #[tokio::test]
+    async fn declined_guard_event_carries_last_hook_age() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = create_spawned_execution(&db, &work_item_id, dead_pid());
+        db.mark_execution_orphaned(&execution_id, "worker died").unwrap();
+        make_old(&db, &work_item_id);
+
+        let db = Arc::new(db);
+        let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+        live_states.register_spawn(1, &execution_id, "claude-opus-4-7", 424242, None);
+        live_states.apply_event(
+            1,
+            &boss_protocol::WorkerEvent::PreToolUse {
+                session_id: "s".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+            },
+        );
+        live_states.apply_event(
+            1,
+            &boss_protocol::WorkerEvent::PostToolUse {
+                session_id: "s".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+                tool_response: serde_json::json!({}),
+            },
+        );
+        // Older than the corroboration window so the guard still declines
+        // (a recent hook would block redispatch via corroboration instead).
+        let seeded_age_secs = crate::durable_liveness::CORROBORATION_WINDOW_SECS + 90;
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        live_states.set_last_event_at_for_test(1, crate::live_worker_state::iso8601_utc(now - seeded_age_secs));
+
+        let mut coordinator =
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), Arc::new(NoopCube), Arc::new(NoopRunner));
+        coordinator.set_live_worker_states(live_states);
+        let coordinator = Arc::new(coordinator);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let convergence = RecordingConvergence::default();
+
+        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), &convergence).await;
+
+        assert_eq!(
+            outcome.redispatched, 1,
+            "a hook aged past the corroboration window must not block recovery"
+        );
+
+        let events = sink.events().await;
+        let declined: Vec<_> = events
+            .iter()
+            .filter(|e| e.stage == "redispatch_guard_declined")
+            .collect();
+        assert_eq!(declined.len(), 1, "the guard's decline must be observable");
+        let age = declined[0].details["last_event_age_secs"]
+            .as_i64()
+            .expect("last_event_age_secs must be a number when a registry hook exists");
+        assert!(
+            (age - seeded_age_secs).abs() <= 5,
+            "last_event_age_secs ({age}) must roughly match the seeded age ({seeded_age_secs})",
+        );
+        assert!(
+            declined[0].details["last_event_at"].is_string(),
+            "last_event_at must also be present: {:?}",
+            declined[0].details,
+        );
+    }
+
     /// A work item with no recorded worker process at all has nothing for the
     /// guard to decline — no instrumentation event may fire for it, or every
     /// ordinary redispatch of a never-dispatched item would emit noise.

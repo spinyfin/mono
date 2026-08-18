@@ -86,7 +86,9 @@ pub const REDISPATCH_PID_TRUST_SECS: i64 = 3600;
 
 /// A `Gone` (`kill(pid, 0) == ESRCH`) verdict from a durable-pid probe is
 /// only trusted if the execution has ALSO gone quiet for at least this long.
-/// A hook event newer than this window (or a tool in flight) proves the
+/// A hook event newer than this window (or a tool in flight whose last
+/// in-execution hook is still within
+/// [`crate::stale_worker_sweep::DEFAULT_STALE_THRESHOLD_SECS`]) proves the
 /// worker's process tree is alive regardless of what the *tracked* pid — a
 /// possibly-transient or reused snapshot — reports, so the verdict is
 /// downgraded to `Alive` rather than trusted (the shell-pid false-reap fix,
@@ -137,9 +139,21 @@ pub fn corroborating_liveness(
 
     // A tool in flight (an unbalanced PreToolUse) means the worker is
     // legitimately busy — most importantly a long foreground `bazel build`
-    // that emits no hook for many minutes.
+    // that emits no hook for many minutes. Bound the spare by the same
+    // ceiling [`crate::stale_worker_sweep`] uses for "no progress": an
+    // unbalanced PreToolUse whose last in-execution hook is older than that
+    // is no longer treated as corroboration. Without the bound, a worker
+    // killed mid-tool (activity still `Working`, `current_tool` still set)
+    // would be spared forever by every durable-pid consumer — including
+    // [`crate::dead_pane_sweep`], whose whole reason to exist is the deaths
+    // the app never reports via `reap_reported_pane_death`. Past the ceiling
+    // the `Gone` verdict stands and a later pass reaps the row;
+    // `stale_worker_sweep` itself skips while a tool is in flight, so this
+    // bound is what clears that shape.
+    let tool_in_flight_cutoff = iso8601_utc(now_epoch_secs - crate::stale_worker_sweep::DEFAULT_STALE_THRESHOLD_SECS);
     if let Some(tool) = live_states.current_tool_for_run(execution_id)
         && let Some(event) = in_execution_event
+        && event >= tool_in_flight_cutoff.as_str()
     {
         return Some(format!("tool `{tool}` in flight (last hook {event})"));
     }
@@ -450,7 +464,9 @@ mod tests {
     /// A long foreground tool call (e.g. a `bazel build`) with no hook for
     /// minutes must still corroborate — this is the "tool in flight" branch,
     /// covering the same-tick incidents where the false-reap guard's log
-    /// explicitly noted "tool `Bash` in flight".
+    /// explicitly noted "tool `Bash` in flight". Past
+    /// [`crate::stale_worker_sweep::DEFAULT_STALE_THRESHOLD_SECS`] the spare
+    /// ages out (see [`stale_tool_in_flight_does_not_corroborate`]).
     #[test]
     fn tool_in_flight_corroborates_a_gone_verdict() {
         let live_states = LiveWorkerStateRegistry::new();
@@ -474,6 +490,38 @@ mod tests {
             now,
         );
         assert_eq!(process, WorkerProcess::Alive { shell_pid: 1 });
+    }
+
+    /// An unbalanced PreToolUse whose last in-execution hook is older than
+    /// the stale-worker ceiling must NOT corroborate forever — otherwise a
+    /// mid-tool death the app never reported wedges `dead_pane_sweep` for
+    /// the life of the engine.
+    #[test]
+    fn stale_tool_in_flight_does_not_corroborate() {
+        let live_states = LiveWorkerStateRegistry::new();
+        live_states.register_spawn(1, "exec-stale-tool", "claude-opus-4-7", 12345, None);
+        live_states.apply_event(
+            1,
+            &WorkerEvent::PreToolUse {
+                session_id: "s".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+            },
+        );
+
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let started_epoch = now - crate::stale_worker_sweep::DEFAULT_STALE_THRESHOLD_SECS - 600;
+        // Last hook is attributed to this execution but well past the
+        // tool-in-flight ceiling.
+        live_states.set_last_event_at_for_test(
+            1,
+            iso8601_utc(now - crate::stale_worker_sweep::DEFAULT_STALE_THRESHOLD_SECS - 60),
+        );
+
+        assert!(
+            corroborating_liveness(&live_states, "exec-stale-tool", started_epoch, now).is_none(),
+            "a stuck tool older than the stale-worker ceiling must not corroborate forever",
+        );
     }
 
     /// A genuinely dead worker — no live-state entry at all — must NOT be

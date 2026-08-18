@@ -57,19 +57,20 @@
 //! `started_at` is too recent. A worker with no `started_at` yet
 //! (pane hasn't begun) is also skipped.
 //!
-//! ### Liveness corroboration (the T2450 false-reap fix)
+//! ### Liveness corroboration (the shell-pid false-reap fix)
 //!
 //! The registered `shell_pid` is the pty *foreground* pid captured once
 //! at surface-init (`ghostty_surface_foreground_pid`). That identity is
 //! not stable for the worker's lifetime: a wrapper/login shell can exit
 //! or `exec` while the real `claude` process lives on under a different
-//! pid, and macOS aggressively reuses pids (the T2450 pid, 98601, appears
-//! in the dispatch log of several *older*, long-dead executions). So a
-//! bare `kill(pid, 0) == ESRCH` is *not* proof the worker is dead — it
-//! can equally mean "the transient process we happened to snapshot has
-//! exited while the worker keeps running". Trusting it alone reaped a
-//! live worker mid-tool-call in T2450: the run kept emitting transcript
-//! events for a full minute after the engine logged its pid "not found".
+//! pid, and macOS aggressively reuses pids (the observed reused pid,
+//! 98601, appears in the dispatch log of several *older*, long-dead
+//! executions). So a bare `kill(pid, 0) == ESRCH` is *not* proof the
+//! worker is dead — it can equally mean "the transient process we
+//! happened to snapshot has exited while the worker keeps running".
+//! Trusting it alone reaped a live worker mid-tool-call: the run kept
+//! emitting transcript events for a full minute after the engine logged
+//! its pid "not found".
 //!
 //! The engine holds a fresher, identity-independent liveness signal:
 //! [`boss_protocol::LiveWorkerState::last_event_at`], stamped on every
@@ -161,10 +162,10 @@ pub enum DeadPidSweepMode {
     /// is a *speculative* liveness signal that can vanish (wrapper shell
     /// exit/`exec`, macOS pid reuse) while the worker's process tree
     /// lives on, so a `Dead` verdict is corroborated against recent
-    /// in-execution hook activity before reaping (T2450). Reaps here are
-    /// routine crash/OOM/kill-9 recoveries, one at a time, already
-    /// surfaced via the `dead_pid_reconcile` dispatch event — no
-    /// attention item.
+    /// in-execution hook activity before reaping (shell-pid false-reap
+    /// fix). Reaps here are routine crash/OOM/kill-9 recoveries, one at
+    /// a time, already surfaced via the `dead_pid_reconcile` dispatch
+    /// event — no attention item.
     PeriodicSpeculative,
     /// The app-reattach reconcile ([`reconcile_orphans_on_reattach`]).
     /// The prior app is known-dead, so the pid probe is authoritative and
@@ -749,28 +750,17 @@ async fn reap_dead_execution(
         );
     }
 
-    // `mark_execution_orphaned` deliberately leaves the cube lease columns
-    // intact on the row (a resume redispatch — `request_resume_execution` —
-    // may reclaim the same workspace with its in-flight commits). But THIS
-    // reap's redispatch path is the plain orphan-active sweep, which creates
-    // an entirely fresh execution with no memory of the old lease, so a row
-    // reaped here that is never resumed in place leaves its lease held
-    // forever — the "leases leak durably" half of the false-reap incident,
-    // where a workspace stayed leased to a terminal execution for 10+ hours.
-    // Best-effort force-release it now, mirroring
-    // `lost_workspace_sweep::run_one_pass`'s identical release for its own
-    // dead-worker reap. Failure is benign: the lease may already be gone.
-    if let Some(lease_id) = execution.cube_lease_id.as_deref()
-        && let Err(err) = cube_client
-            .force_release_lease(lease_id, Some("dead-pid reconcile: worker process gone"))
-            .await
-    {
-        tracing::debug!(
+    // `mark_execution_orphaned` keeps lease columns on the row for provenance,
+    // but THIS reap's redispatch path is the plain orphan-active sweep, which
+    // creates an entirely fresh execution with no memory of the old lease — so
+    // release here or the workspace stays leased to a terminal row forever.
+    if let Some(lease_id) = execution.cube_lease_id.as_deref() {
+        crate::execution_liveness::force_release_lease_best_effort(
             execution_id,
             lease_id,
-            error = %format!("{err:#}"),
-            "dead-pid reconcile: best-effort lease force-release failed (likely already released)",
-        );
+            cube_client.force_release_lease(lease_id, Some("dead-pid reconcile: worker process gone")),
+        )
+        .await;
     }
 
     // Drop the live-state entry BEFORE releasing the pool slot. The pool
@@ -1583,11 +1573,11 @@ mod tests {
         assert!(sink.events().await.is_empty());
     }
 
-    // ─── liveness corroboration (the T2450 false-reap fix) ────────────────────
+    // ─── liveness corroboration (the shell-pid false-reap fix) ────────────────
 
-    /// The T2450 reproduction: the registered shell pid is *dead* (a
-    /// wrapper/login shell that exited or exec'd), but the worker's real
-    /// `claude` process is alive and actively emitting hook events. The
+    /// The shell-pid false-reap reproduction: the registered shell pid is
+    /// *dead* (a wrapper/login shell that exited or exec'd), but the worker's
+    /// real `claude` process is alive and actively emitting hook events. The
     /// periodic speculative sweep must NOT reap it — the recent
     /// in-execution activity corroborates that the worker lives despite the
     /// dead pid. This is exactly the run that kept producing transcript
@@ -1648,9 +1638,10 @@ mod tests {
 
     /// A dead tracked pid with a *tool in flight* (a long foreground
     /// `bazel build` that emits no hook for minutes) is spared even when
-    /// the last hook predates the corroboration window — a tool in flight
-    /// is itself proof the worker is busy, and a genuine death mid-tool is
-    /// caught by the app's authoritative pane-death report, not this probe.
+    /// the last hook predates the short corroboration window — a recent
+    /// enough tool in flight is itself proof the worker is busy. (A stuck
+    /// tool older than the stale-worker ceiling ages out; see
+    /// `corroboration_does_not_spare_stale_tool_in_flight`.)
     #[tokio::test]
     async fn dead_pid_with_tool_in_flight_is_not_reaped() {
         let (_dir, db) = open_db();
@@ -1882,20 +1873,43 @@ mod tests {
     }
 
     /// A tool in flight with an in-execution event spares the worker even
-    /// when that event is old — models a long foreground `bazel build` that
-    /// emits no hook for many minutes. The reason names the tool.
+    /// when that event is older than the short corroboration window — models
+    /// a long foreground `bazel build` that emits no hook for many minutes —
+    /// as long as the hook is still within the stale-worker ceiling. The
+    /// reason names the tool.
     #[test]
     fn corroboration_spares_busy_worker_with_tool_in_flight() {
         let started = 1_000_000;
-        // An hour into the run: the last hook is ancient, but a tool is still
-        // in flight, so the worker is legitimately busy, not dead.
-        let now = started + 3_600;
+        // Well past CORROBORATION_WINDOW_SECS, but inside the stale-worker
+        // tool-in-flight ceiling: the worker is legitimately busy, not dead.
+        let now = started + 600;
         let live_states = registry_with_event("run", Some(iso8601_utc(started + 5)), true);
         let reason = corroborating_liveness(&live_states, "run", started, now)
             .expect("busy worker with a tool in flight must be spared");
         assert!(
             reason.contains("Bash"),
             "reason should name the in-flight tool: {reason}"
+        );
+    }
+
+    /// Past the stale-worker ceiling, an unbalanced PreToolUse must not
+    /// corroborate forever — otherwise a mid-tool death the app never
+    /// reported wedges every durable-pid consumer.
+    #[test]
+    fn corroboration_does_not_spare_stale_tool_in_flight() {
+        let started = 1_000_000;
+        let now = started + crate::stale_worker_sweep::DEFAULT_STALE_THRESHOLD_SECS + 600;
+        let live_states = registry_with_event(
+            "run",
+            Some(iso8601_utc(
+                now - crate::stale_worker_sweep::DEFAULT_STALE_THRESHOLD_SECS - 60,
+            )),
+            true,
+        );
+        assert_eq!(
+            corroborating_liveness(&live_states, "run", started, now),
+            None,
+            "a stuck tool older than the stale-worker ceiling must age out",
         );
     }
 
