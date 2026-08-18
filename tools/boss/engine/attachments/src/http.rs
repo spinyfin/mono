@@ -1,15 +1,13 @@
 //! The evidence surface: a loopback HTTP server that renders stored
-//! attachments for a human reviewer.
+//! attachments for a worker's own verification and local inspection.
 //!
 //! ## Why HTTP at all
 //!
-//! Storing evidence a reviewer cannot look at solves nothing, and review
-//! happens on a GitHub PR page. GitHub's markdown sanitiser linkifies `http`
-//! and `https` and nothing else — not `file:`, not a custom scheme — so the
-//! only link shape that survives into a PR body *and* can reach bytes on the
-//! reviewer's own machine is `http://127.0.0.1:<port>/…`. The worker pastes
-//! that link, the reviewer clicks it in the PR, the browser fetches it from
-//! the engine that is already running on that machine.
+//! Storing evidence that nobody can inspect locally solves nothing. A loopback
+//! HTTP URL lets a browser on the capturing machine render stored bytes after
+//! the engine restarts, without exposing the store off-host. This is more
+//! useful than a `file:` URL because it is stable under the engine state root
+//! rather than the ephemeral workspace that produced the image.
 //!
 //! Inline `![](…)` embedding deliberately is not attempted: GitHub proxies
 //! image sources through camo, which fetches from GitHub's servers and cannot
@@ -45,9 +43,9 @@ use crate::store::AttachmentStore;
 
 /// Port the evidence surface listens on by default.
 ///
-/// Fixed rather than ephemeral, and that is load-bearing: a URL pasted into a
-/// PR body has to still resolve after the engine restarts, so the port cannot
-/// be rolled per boot.
+/// Fixed rather than ephemeral, and that is load-bearing: a stored local URL
+/// an operator follows after the engine restarts must still resolve, so the
+/// port cannot be rolled per boot.
 pub const DEFAULT_PORT: u16 = 8419;
 
 /// Env var overriding [`DEFAULT_PORT`]. `0` disables the surface entirely.
@@ -395,9 +393,9 @@ fn index_page() -> String {
     page(
         "Boss evidence",
         "<h1>Boss evidence</h1>\
-         <p class=\"sub\">Screenshots workers attached as review evidence, served to loopback only.</p>\
+         <p class=\"sub\">Screenshots workers attached for their own verification and local inspection, served to loopback only.</p>\
          <p>There is no global index by design. Open a work item's gallery directly \
-         (<code>/w/&lt;work-item-id&gt;</code>) — the link a worker puts in its PR body — or list \
+         (<code>/w/&lt;work-item-id&gt;</code>), or list \
          what is stored with <code>bossctl attachments list</code>.</p>"
             .to_owned(),
     )
@@ -408,7 +406,7 @@ fn gallery_page(work_item_id: &str, label: &WorkItemLabel, attachments: &[WorkAt
     body.push_str(&format!(
         "<h1>{}</h1><p class=\"sub\">Evidence for <code>{}</code>",
         escape(if label.name.is_empty() {
-            "Review evidence"
+            "Stored evidence"
         } else {
             &label.name
         }),
@@ -419,8 +417,8 @@ fn gallery_page(work_item_id: &str, label: &WorkItemLabel, attachments: &[WorkAt
     }
     body.push_str("</p>");
 
-    // Grouped by execution, newest run first — a reviewer of a revision chain
-    // needs to know which run produced which image, and wants the latest at
+    // Grouped by execution, newest run first — someone inspecting a revision
+    // chain locally needs to know which run produced which image, and wants the latest at
     // the top. `attachments` arrives newest-first, so first-seen order is
     // already the order to render.
     let mut execution_order: Vec<&str> = Vec::new();
@@ -437,7 +435,7 @@ fn gallery_page(work_item_id: &str, label: &WorkItemLabel, attachments: &[WorkAt
             body.push_str(&figure(attachment));
         }
     }
-    page("Review evidence", body)
+    page("Stored evidence", body)
 }
 
 fn figure(attachment: &WorkAttachment) -> String {
@@ -473,7 +471,7 @@ fn figure(attachment: &WorkAttachment) -> String {
     )
 }
 
-/// The gallery path a worker is told to paste into its PR body.
+/// The loopback gallery URL for one work item.
 pub fn gallery_url_for(port: u16, work_item_id: &str) -> String {
     format!("{}{}", base_url(port), attachment_gallery_path(work_item_id))
 }

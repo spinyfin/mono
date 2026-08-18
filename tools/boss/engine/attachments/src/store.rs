@@ -4,7 +4,8 @@
 //!
 //! A cube workspace is ephemeral scratch: it is released at the end of a run
 //! and re-leased by an unrelated task, which may reset it to `main`. Evidence
-//! that lived there would be gone by the time a reviewer looked. The store is
+//! that lived there would be gone by the time someone inspected the run
+//! locally. The store is
 //! therefore under the **engine state root**, whose lifetime is the install's,
 //! and the path a worker submitted is kept only as a basename for provenance.
 //!
@@ -91,7 +92,7 @@ impl fmt::Display for IngestRejection {
             IngestRejection::TooLarge { size_bytes } => write!(
                 f,
                 "{size_bytes} bytes exceeds the {ATTACHMENT_MAX_BYTES}-byte cap. Attach a smaller \
-                 render — the image is rejected rather than downscaled, so what a reviewer sees is \
+                 render — the image is rejected rather than downscaled, so what local inspection shows is \
                  always exactly what you produced"
             ),
             IngestRejection::UnrecognisedFormat { path } => write!(

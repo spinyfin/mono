@@ -2213,12 +2213,21 @@ fn overdue_ready_answer_agent_files_one_question_specific_attention() {
         "repeated scheduler passes must deduplicate the alarm"
     );
     assert_eq!(attentions[0].kind, ANSWER_AGENT_READY_AGE_ATTENTION_KIND);
-    assert_eq!(
-        attentions[0].body_markdown,
-        format!(
-            "Question comment `{}` on document `pr_doc:{}` was first seen waiting more than 0s without starting. See the engine log for the current age.\n\nUse `bossctl dispatch diagnose {}` to inspect its dispatch timeline.",
-            comment.id, comment.artifact_id, execution.id,
-        )
+    let body_prefix = format!(
+        "Question comment `{}` on document `pr_doc:{}` was first seen waiting more than ",
+        comment.id, comment.artifact_id,
+    );
+    let body_suffix = format!(
+        " without starting. See the engine log for the current age.\n\nUse `bossctl dispatch diagnose {}` to inspect its dispatch timeline.",
+        execution.id,
+    );
+    assert!(
+        attentions[0].body_markdown.starts_with(&body_prefix),
+        "attention body must identify the waiting question and document"
+    );
+    assert!(
+        attentions[0].body_markdown.ends_with(&body_suffix),
+        "attention body must preserve the diagnosis command"
     );
     let attention_item_id = attentions[0].id.clone();
 

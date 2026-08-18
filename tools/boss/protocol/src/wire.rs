@@ -1062,8 +1062,9 @@ pub enum FrontendRequest {
     ///
     /// Scope is the work item, not the execution, for the same reason
     /// [`Self::ListProposals`] is: a revision chain produces several runs
-    /// against one PR, and the reviewer-facing question is "what evidence
-    /// exists for this PR", not "what did this one run render". The caller
+    /// against one work item, and the local-inspection question is "what
+    /// evidence exists for this work item", not "what did this one run
+    /// render". The caller
     /// cannot widen the scope — the work item is derived from the socket
     /// peer's attributed execution, never from a field on this request.
     ///
@@ -2296,7 +2297,8 @@ pub enum FrontendRequest {
         run_id: String,
     },
 
-    /// Worker → engine: hand over one image as reviewer-visible evidence,
+    /// Worker → engine: store one image for the worker's own verification and
+    /// local inspection,
     /// synchronously validated and copied into the engine's blob store
     /// before the reply.
     ///
@@ -2334,7 +2336,7 @@ pub enum FrontendRequest {
         path: String,
         /// One line on what the image shows. Optional but strongly
         /// encouraged: it is the caption the gallery renders, and "what am I
-        /// looking at" is the reviewer's first question.
+        /// looking at" is the local inspector's first question.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caption: Option<String>,
     },

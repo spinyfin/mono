@@ -1,5 +1,5 @@
-//! Work attachments: the durable, engine-owned image evidence a worker hands
-//! to a human reviewer.
+//! Work attachments: durable, engine-owned images for a worker's own
+//! verification and local inspection.
 //!
 //! A worker making a UI change can render a screenshot but has nowhere to put
 //! it. Committing capture PNGs to the branch is forbidden (and rots — the one
@@ -7,7 +7,7 @@
 //! 404s today, because the branch was deleted on merge), and GitHub's
 //! attachment upload endpoint is not part of the public REST API, so `gh`
 //! cannot reach it. The gap this type closes is the one between "the worker
-//! saw the image" and "the reviewer can look at it".
+//! saw the image" and "someone can inspect it locally after the run".
 //!
 //! `WorkAttachment` mirrors the `work_attachments` table verbatim. Bytes live
 //! outside the row, content-addressed under the engine state root, so an
@@ -116,10 +116,10 @@ impl std::str::FromStr for AttachmentMediaType {
 /// One stored image, as persisted in `work_attachments`.
 ///
 /// Bound to **both** halves of the association question the design poses:
-/// `execution_id` says which run rendered it (a reviewer comparing a revision
-/// against its predecessor needs that), and `work_item_id` is the
-/// reviewer-facing scope — one gallery per work item, so a revision chain's
-/// several runs against one PR collect in one place instead of scattering.
+/// `execution_id` says which run rendered it (someone inspecting a revision
+/// chain locally may need that), and `work_item_id` scopes one gallery per
+/// work item, so a revision chain's several runs collect in one place instead
+/// of scattering.
 ///
 /// `content_digest` is the sha256 of the bytes and is the blob's identity:
 /// two runs that render an identical image share one file on disk, and a
@@ -152,7 +152,7 @@ pub struct WorkAttachment {
     /// a workspace that no longer exists by the time anyone reads this.
     pub source_name: String,
     /// Set when retention reclaimed the bytes. The row outlives the blob on
-    /// purpose — a link in a merged PR body then answers "this evidence was
+    /// purpose — a stale local gallery link then answers "this evidence was
     /// reclaimed on <date>" instead of a bare 404 that reads like a bug.
     pub reclaimed_at: Option<String>,
 }
@@ -166,15 +166,15 @@ impl WorkAttachment {
 }
 
 /// URL path of one image on the evidence HTTP surface. Shared by the engine
-/// (which mints the URL a worker pastes into a PR body) and the CLI (which
-/// renders listings), so the two can never disagree about the path shape.
+/// (which mints local image URLs) and the CLI (which renders listings), so
+/// the two can never disagree about the path shape.
 pub fn attachment_image_path(attachment_id: &str) -> String {
     format!("/a/{attachment_id}")
 }
 
-/// URL path of one work item's evidence gallery — the link that goes in a PR
-/// body. Scoped to the work item rather than the execution so the reviewer
-/// gets every run's evidence for the PR, newest run first.
+/// URL path of one work item's evidence gallery. Scoped to the work item
+/// rather than the execution so local inspection gets every run's evidence,
+/// newest run first.
 pub fn attachment_gallery_path(work_item_id: &str) -> String {
     format!("/w/{work_item_id}")
 }
