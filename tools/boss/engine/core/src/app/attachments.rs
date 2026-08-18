@@ -1,4 +1,5 @@
-//! `FrontendRequest` handlers for reviewer-visible screenshot evidence:
+//! `FrontendRequest` handlers for screenshot evidence kept for a worker's
+//! own verification and for an operator inspecting a run locally:
 //! `SubmitAttachment` (write) and `ListAttachments` (read).
 //!
 //! Both are attributed exactly the way the proposal verbs are — from the

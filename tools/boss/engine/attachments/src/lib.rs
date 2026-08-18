@@ -1,15 +1,15 @@
-//! Screenshot evidence for human reviewers: ingest, storage, retention, and
-//! the loopback surface a reviewer actually looks at.
+//! Screenshot evidence for a worker's own verification and for an operator
+//! inspecting a run locally: ingest, storage, retention, and a loopback
+//! gallery served on the capturing machine.
 //!
 //! ## The problem this crate exists for
 //!
-//! A worker that changes UI can render a screenshot but has nowhere to put it.
-//! Committing capture PNGs to the branch is forbidden by repo policy — and
-//! that policy is right: the one PR in this repo that ever linked
+//! A worker that changes UI can render a screenshot but has nowhere durable
+//! to keep it. Committing capture PNGs to the branch is forbidden by repo
+//! policy — and that policy is right: the one PR in this repo that ever linked
 //! `raw.githubusercontent.com` images 404s today, because merging deleted the
-//! branch the images lived on. But nothing replaced it, so reviewers of UI
-//! changes get a worker's prose description of what it claims it saw. Evidence
-//! a human cannot look at is not evidence.
+//! branch the images lived on. Without a store outside the recycled cube
+//! workspace, a capture vanishes with the run that produced it.
 //!
 //! ## The shape
 //!
@@ -23,11 +23,10 @@
 //! - **Retention** ([`retention`]) — age plus a total-bytes backstop, swept on
 //!   a schedule and on demand, following the Codex/Grok home-retention
 //!   precedent. Bounded and enforced, not deferred.
-//! - **Surfacing** ([`http`]) — a loopback HTTP gallery. The worker pastes the
-//!   gallery URL into its PR body; the reviewer clicks it from the GitHub PR
-//!   and sees the images. That last step is the whole point: a mechanism that
-//!   stores images but leaves the reviewer unable to see them has not solved
-//!   anything.
+//! - **Surfacing** ([`http`]) — a loopback HTTP gallery on the capturing
+//!   machine, for the worker verifying its own capture and for an operator
+//!   inspecting the run locally. The gallery URL is not GitHub-reachable and
+//!   must not be pasted into a PR body.
 //!
 //! Ingest is mediated exactly like a worker proposal — the engine attributes
 //! the call from the socket peer's pid and answers synchronously, so a bad

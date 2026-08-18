@@ -12,9 +12,9 @@
 //! stays down and the engine boots normally. Everything else about
 //! attachments keeps working: ingest still validates and stores, listings
 //! still work, retention still sweeps. What a worker gets in that case is
-//! `evidence_base_url: None` and an explicit "no link to paste", which is the
+//! `evidence_base_url: None` and an explicit "no gallery link", which is the
 //! honest answer. The alternative — minting a URL against a port this engine
-//! does not own — would hand a reviewer someone else's gallery.
+//! does not own — would hand a local browser someone else's gallery.
 
 use std::sync::{Arc, OnceLock};
 
@@ -92,7 +92,7 @@ pub async fn spawn(
     let Some(port) = http::configured_port() else {
         tracing::info!(
             "attachment evidence server: disabled ({}=0); attachments will still be stored, but \
-             workers get no link to paste into a PR body",
+             no local gallery URL will be minted",
             http::PORT_ENV
         );
         return None;
@@ -246,7 +246,7 @@ mod tests {
             )
         }
 
-        // 1. The gallery URL a worker pastes into its PR body.
+        // 1. The loopback gallery URL for a work item (local verification).
         let (head, body) = fetch(port, &boss_protocol::attachment_gallery_path(&chore.id)).await;
         assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
         let html = String::from_utf8(body).unwrap();

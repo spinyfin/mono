@@ -9,7 +9,8 @@
 //!   [`boss_engine_attachments::plan_reclaim`] deletes it only once every row
 //!   pointing at it is being reclaimed.
 //! - Reclaiming stamps `reclaimed_at` rather than deleting the row, so a
-//!   gallery link in a merged PR body can explain itself instead of 404ing.
+//!   stale gallery link an operator follows can explain itself instead of
+//!   404ing.
 //!
 //! ## The orphan pass
 //!

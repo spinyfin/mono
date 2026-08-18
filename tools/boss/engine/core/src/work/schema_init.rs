@@ -766,9 +766,10 @@ impl WorkDb {
         // `editorial_rules.instructions` (GitHub-visible surfaces only) — see
         // `migrate_products_design_guidance`'s doc comment.
         migrate_products_design_guidance(conn)?;
-        // `work_attachments`: metadata for reviewer-visible screenshot
-        // evidence, whose bytes live content-addressed under the engine state
-        // root. Additive and independent of every other table.
+        // `work_attachments`: metadata for screenshot evidence kept for a
+        // worker's own verification and for an operator inspecting a run
+        // locally; bytes live content-addressed under the engine state root.
+        // Additive and independent of every other table.
         // Design: tools/boss/docs/designs/worker-screenshot-evidence-attachments.md
         migrate_work_attachments_table(conn)?;
         // Data correction: repair any `work_comments` row still reading

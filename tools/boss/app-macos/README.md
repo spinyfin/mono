@@ -125,11 +125,9 @@ and bare binary launches remain blocked. The hard gate in
 Do not commit capture PNGs to the branch. Read the image back and state in
 the PR body what you verified and what you could not.
 
-### Showing the capture to a reviewer
+### Capturing a screenshot for your own verification
 
-Not committing a capture used to mean deleting it, which left reviewers of UI
-changes with a prose description of an image nobody could look at. Attach it
-instead:
+Do not commit capture PNGs — and do not delete them either. Attach them:
 
 ```sh
 boss attach /tmp/shot.png --caption "toolbar badge, after the fix"
@@ -137,11 +135,10 @@ boss attach /tmp/shot.png --caption "toolbar badge, after the fix"
 
 The engine copies the bytes into a content-addressed store under its state
 root — outside the cube workspace, which is released and recycled — and prints
-a loopback gallery URL (`http://127.0.0.1:8419/w/<work-item-id>`). Put that URL
-in the PR body under an `## Evidence` heading; GitHub linkifies `http` URLs, so
-the reviewer clicks straight through from the PR and the engine on their
-machine serves the image. Inline `![](…)` embedding does not work — GitHub
-proxies image sources through camo, which cannot reach anyone's loopback.
+a loopback gallery URL (`http://127.0.0.1:8419/w/<work-item-id>`). That gallery
+is only reachable on the machine that captured the screenshot, so its URL (or
+any other localhost link) must not go in a PR body. Use `boss attach --list`
+to inspect what a work item already has locally.
 
 Retention is bounded (90 days, with a 1 GiB backstop; see
 `BOSS_ATTACHMENT_RETENTION_DAYS`) and a reclaimed link explains itself rather

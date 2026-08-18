@@ -2838,8 +2838,9 @@ pub(crate) fn migrate_products_design_guidance(conn: &Connection) -> Result<()> 
     Ok(())
 }
 
-/// Create `work_attachments`: the metadata ledger for reviewer-visible image
-/// evidence. Bytes live outside the row, content-addressed under the engine
+/// Create `work_attachments`: the metadata ledger for screenshot evidence kept
+/// for a worker's own verification and for an operator inspecting a run
+/// locally. Bytes live outside the row, content-addressed under the engine
 /// state root (`boss_engine_attachments::store`) — a screenshot is not
 /// something to put in SQLite, and keeping it out means retention can reclaim
 /// bytes while leaving the row as a tombstone.
@@ -2849,11 +2850,11 @@ pub(crate) fn migrate_products_design_guidance(conn: &Connection) -> Result<()> 
 /// duplicating it, so no caller-supplied idempotency key is needed — the
 /// bytes already are one. The constraint is deliberately scoped to the
 /// execution, not global: two runs that render an identical view each get
-/// their own row (the reviewer wants to know *which run* produced what),
-/// while content addressing still stores the blob once.
+/// their own row (an operator looking locally wants to know *which run*
+/// produced what), while content addressing still stores the blob once.
 ///
-/// `reclaimed_at` is why the row outlives its blob. A gallery link in a
-/// merged PR body then answers "reclaimed by retention on <date>" rather
+/// `reclaimed_at` is why the row outlives its blob. A stale gallery link an
+/// operator follows then answers "reclaimed by retention on <date>" rather
 /// than a bare 404 that reads like a bug. Tombstones are removed with their
 /// execution by the `ON DELETE CASCADE`, the same way `worker_proposals` and
 /// `work_runs` rows are.
