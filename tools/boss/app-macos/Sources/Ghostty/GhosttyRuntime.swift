@@ -437,12 +437,12 @@ final class GhosttyRuntime: @unchecked Sendable {
             }
 
         case .childExited(let exitCode):
-            // Suppress for the Boss pane, which handles its own restart
-            // and shows "Picard restarting…" instead. Gated on role
-            // rather than `onChildExited == nil` — worker panes now set
-            // that closure too (to report pane death to the engine), so
-            // a nil-check would wrongly suppress this message for them.
-            if resolved.host?.session.role != .boss {
+            if resolved.host?.session.role == .boss {
+                // This is only the local tmux client. BossPaneModel rebuilds
+                // its viewer while the engine-owned coordinator stays alive.
+                resolved.host?.session.statusMessage = "Picard reconnecting…"
+                resolved.host?.session.onChildExited?()
+            } else {
                 resolved.host?.session.statusMessage = "Command exited (\(exitCode))"
             }
 
@@ -526,10 +526,11 @@ final class GhosttyRuntime: @unchecked Sendable {
                     host.session.statusMessage = "Surface requested close"
                     return
                 }
-                if host.session.role == .boss, let onExit = host.session.onChildExited {
-                    // Boss pane: delegate to the restart callback instead of
-                    // showing a bare "Surface closed" message.
-                    onExit()
+                if host.session.role == .boss {
+                    // This child is the tmux client, not the coordinator.
+                    // Rebuild the local viewer for the durable session.
+                    host.session.statusMessage = "Picard reconnecting…"
+                    host.session.onChildExited?()
                 } else {
                     // Worker pane: show the closed status and report the
                     // death to the engine (if a handler is installed) so

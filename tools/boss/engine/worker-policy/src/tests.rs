@@ -298,7 +298,6 @@ fn runtime_half_stays_closed() {
 #[test]
 fn coordinator_verbs_stay_closed() {
     for request in [
-        FrontendRequest::RegisterBossSession { shell_pid: 1 },
         FrontendRequest::PlanProject {
             project_id: "proj_1".into(),
             dry_run: false,
@@ -307,6 +306,9 @@ fn coordinator_verbs_stay_closed() {
         },
         FrontendRequest::MergeWhenReady {
             work_item_id: "task_1".into(),
+        },
+        FrontendRequest::RecreateCoordinator {
+            expected_spawn_token: "token".into(),
         },
     ] {
         let denial = assert_denied(request);

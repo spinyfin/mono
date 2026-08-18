@@ -432,6 +432,133 @@ pub async fn serve_with_merge_probe(
         .write()
         .expect("tmux preflight lock poisoned") = tmux_preflight;
 
+    // A coordinator has no worker run to pull it through the ordinary tmux
+    // adoption pass. Watch its singleton independently so an exited Claude
+    // child is recreated by the engine even while the app is closed. The
+    // helper never creates an absent singleton; first creation remains tied
+    // to app registration, after that app has prepared the session files.
+    let coordinator_supervisor_state = server_state.clone();
+    tokio::spawn(async move {
+        const RESTART_FAILURE_LIMIT: u32 = 5;
+        const RESTART_BACKOFF_CAP: Duration = Duration::from_secs(60);
+        const RESTART_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+        let mut restart_failures = 0_u32;
+        let mut last_restart: Option<std::time::Instant> = None;
+        let mut ceiling_notified = false;
+        // Short first delay so a registration-time attach miss is retried
+        // promptly; later passes use the adaptive backoff below.
+        let mut delay = Duration::from_millis(500);
+        loop {
+            tokio::time::sleep(delay).await;
+            if last_restart.is_some_and(|last| last.elapsed() > RESTART_FAILURE_WINDOW) {
+                restart_failures = 0;
+                last_restart = None;
+                ceiling_notified = false;
+            }
+            if restart_failures >= RESTART_FAILURE_LIMIT {
+                if !ceiling_notified {
+                    raise_coordinator_restart_ceiling_attention(&coordinator_supervisor_state).await;
+                    ceiling_notified = true;
+                }
+                tracing::error!(
+                    restart_failures,
+                    "coordinator restart limit reached; pausing recovery until the failure window expires"
+                );
+                delay = RESTART_BACKOFF_CAP;
+                continue;
+            }
+            let program = match coordinator_supervisor_state.tmux_preflight.read() {
+                Ok(guard) => match &*guard {
+                    crate::tmux_preflight::TmuxPreflight::Ready { program, .. } => program.clone(),
+                    crate::tmux_preflight::TmuxPreflight::Unavailable { .. } => continue,
+                },
+                Err(_) => {
+                    tracing::error!("coordinator tmux supervisor stopped: preflight lock poisoned");
+                    return;
+                }
+            };
+            let Ok(tmux) = boss_tmux::Tmux::from_path(program) else {
+                tracing::error!("coordinator tmux supervisor stopped: preflight supplied an invalid path");
+                return;
+            };
+            let restart = {
+                let _guard = coordinator_supervisor_state.coordinator_tmux_lock.lock().await;
+                let working_directory = match crate::coordinator_tmux::coordinator_working_directory() {
+                    Ok(path) => path,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %format!("{error:#}"),
+                            "coordinator tmux supervisor: session directory not ready"
+                        );
+                        delay = RESTART_BACKOFF_CAP;
+                        continue;
+                    }
+                };
+                crate::coordinator_tmux::restart_if_dead(
+                    coordinator_supervisor_state.work_db.as_ref(),
+                    &tmux,
+                    &coordinator_supervisor_state.coordinator_model,
+                    &working_directory,
+                )
+                .await
+            };
+            match restart {
+                Ok(Some(record)) => {
+                    let now = std::time::Instant::now();
+                    last_restart = Some(now);
+                    restart_failures += 1;
+                    crate::app::sessions::request_coordinator_attachment(
+                        coordinator_supervisor_state.clone(),
+                        &tmux,
+                        record,
+                    )
+                    .await;
+                    if restart_failures >= RESTART_FAILURE_LIMIT {
+                        if !ceiling_notified {
+                            raise_coordinator_restart_ceiling_attention(&coordinator_supervisor_state).await;
+                            ceiling_notified = true;
+                        }
+                        delay = RESTART_BACKOFF_CAP;
+                        continue;
+                    }
+                    delay = Duration::from_secs(
+                        2_u64
+                            .saturating_pow(restart_failures)
+                            .min(RESTART_BACKOFF_CAP.as_secs()),
+                    );
+                }
+                Ok(None) => {
+                    delay = Duration::from_secs(10);
+                    let app_registered = coordinator_supervisor_state.app_session.lock().await.is_some();
+                    let record = coordinator_supervisor_state
+                        .work_db
+                        .coordinator_tmux_record()
+                        .ok()
+                        .flatten();
+                    if let (true, Some(record)) = (app_registered, record) {
+                        let attached = coordinator_supervisor_state
+                            .coordinator_attached_spawn_token
+                            .lock()
+                            .expect("coordinator attached token mutex poisoned")
+                            .clone();
+                        if attached.as_deref() != Some(record.spawn_token.as_str()) {
+                            crate::app::sessions::request_coordinator_attachment(
+                                coordinator_supervisor_state.clone(),
+                                &tmux,
+                                record,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "coordinator tmux supervisor pass failed");
+                    delay = RESTART_BACKOFF_CAP;
+                }
+            }
+        }
+    });
+
     // GitHub API usage telemetry: install the process-wide sink and start
     // its batching writer.
     //
@@ -1977,6 +2104,75 @@ pub async fn serve_with_merge_probe(
     }
 }
 
+/// Surface a latched coordinator restart ceiling in each active project's
+/// attention feed. The supervisor resumes after `RESTART_FAILURE_WINDOW`;
+/// this makes the pause visible to the operator rather than only in tracing.
+async fn raise_coordinator_restart_ceiling_attention(server_state: &Arc<ServerState>) {
+    let products = match server_state.work_db.list_products() {
+        Ok(products) => products,
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "coordinator restart ceiling: failed to list products for attention"
+            );
+            return;
+        }
+    };
+    for product in products.into_iter().filter(|product| product.status == "active") {
+        let projects = match server_state.work_db.list_projects(&product.id, None) {
+            Ok(projects) => projects,
+            Err(err) => {
+                tracing::warn!(
+                    product_id = %product.id,
+                    ?err,
+                    "coordinator restart ceiling: failed to list projects for attention"
+                );
+                continue;
+            }
+        };
+        for project in projects {
+            let input = boss_protocol::CreateAttentionInput::builder()
+                .kind("question")
+                .group_key(format!("engine_health_coordinator_restart|{}", project.id))
+                .association_project_id(project.id.clone())
+                .source_kind("manual")
+                .source_doc_path("engine-health/coordinator-restart")
+                .question_type("prompt")
+                .prompt_text(
+                    "Coordinator tmux recovery paused after repeated restart failures. \
+                     The engine will retry after a cooldown; check the coordinator model \
+                     and auth if the session keeps dying."
+                        .to_owned(),
+                )
+                .build();
+            match server_state.work_db.reconcile_attentions(vec![input]) {
+                Ok(Some((group, attentions))) => {
+                    for attention in attentions {
+                        server_state
+                            .publisher
+                            .publish_frontend_event_on_product(
+                                &group.product_id,
+                                boss_protocol::FrontendEvent::AttentionCreated {
+                                    attention,
+                                    group: group.clone(),
+                                },
+                            )
+                            .await;
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        project_id = %project.id,
+                        ?err,
+                        "coordinator restart ceiling: failed to create attention"
+                    )
+                }
+            }
+        }
+    }
+}
+
 /// Surface a failed required-runtime check in each active project's attention
 /// feed. Attentions require a work-item association, so project-scoped items
 /// are the durable global-notification representation available to the app.
@@ -2143,9 +2339,9 @@ pub(super) fn current_parent_pid() -> Option<libc::pid_t> {
     // (every `SpawnWorkerPane` request fails because no app session
     // is registered to receive it). With None, the trust gate becomes
     // a no-op (matches the test path), the app registers, and the
-    // Boss session pid takes over as the real trust root once
-    // `RegisterBossSession` lands. Production is unaffected: the app
-    // always sets BOSS_APP_PID via `EngineProcessController`.
+    // coordinator tmux pane becomes the real trust root once created.
+    // Production is unaffected: the app always sets BOSS_APP_PID via
+    // `EngineProcessController`.
     std::env::var("BOSS_APP_PID")
         .ok()
         .and_then(|raw| raw.parse::<libc::pid_t>().ok())

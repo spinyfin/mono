@@ -351,8 +351,6 @@ final class EngineClient: @unchecked Sendable {
                 let reviewSlots = (payload["review_slots"] as? NSNumber)?.intValue ?? 8
                 let coordinatorModel = payload["coordinator_model"] as? String ?? "opus"
                 emit(.enginePoolConfig(workerSlots: workerSlots, automationSlots: automationSlots, reviewSlots: reviewSlots, coordinatorModel: coordinatorModel))
-            case "boss_session_registered":
-                emit(.bossSessionRegistered)
             case "engine_request":
                 guard
                     let requestId = payload["request_id"] as? String,
@@ -421,6 +419,22 @@ final class EngineClient: @unchecked Sendable {
                             sessionName: sessionName,
                             summary: summary,
                             taskTitle: taskTitle
+                        ))
+                    ))
+                case "attach_coordinator_pane":
+                    let sessionName = request["session_name"] as? String ?? ""
+                    let spawnToken = request["spawn_token"] as? String ?? ""
+                    let model = request["model"] as? String ?? ""
+                    let tmuxProgram = request["tmux_program"] as? String ?? ""
+                    let serverLabel = request["server_label"] as? String ?? ""
+                    emit(.engineRequest(
+                        requestId: requestId,
+                        request: .attachCoordinatorPane(EngineCoordinatorAttachRequest(
+                            sessionName: sessionName,
+                            spawnToken: spawnToken,
+                            model: model,
+                            tmuxProgram: tmuxProgram,
+                            serverLabel: serverLabel
                         ))
                     ))
                 case "detach_worker_pane":

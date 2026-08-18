@@ -374,7 +374,7 @@ pub(crate) fn resolve_boss_event_binary(
 /// The `[ -n … ]` guard makes an unset var a no-op, so the clause is
 /// safe to emit unconditionally. Clauses compose left to right: the
 /// *last* one emitted ends up first on `PATH`.
-fn path_prepend_clause(var: &str) -> String {
+pub(crate) fn path_prepend_clause(var: &str) -> String {
     format!("[ -n \"${var}\" ] && export PATH=\"${var}:$PATH\"; ")
 }
 

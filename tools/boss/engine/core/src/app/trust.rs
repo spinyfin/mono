@@ -174,17 +174,17 @@ impl ServerState {
     /// by the fallback's worker-pid exclusion.
     ///
     /// `BossOnly` semantics: the design names the registered Boss
-    /// session's shell pid as the canonical trust root. When that pid
-    /// is missing (the macOS app hasn't yet sent
-    /// `RegisterBossSession`, or runs that don't set up a Boss pane
-    /// at all), we fall back to "descendant of the app, not a
-    /// descendant of any registered worker shell". Workers each run
-    /// in their own libghostty pane whose shell pid is recorded in
-    /// `WorkerRegistry`; a `bossctl` invoked from inside a worker
-    /// pane therefore descends from a registered worker pid, while
-    /// the same call from the Boss pane (or directly under the app
-    /// shell) does not. That distinction is enough to keep workers
-    /// out of `BossOnly` even with an unregistered Boss pid.
+    /// session's tmux pane pid as the canonical trust root. When that
+    /// pid is missing (the engine has not yet created the coordinator,
+    /// or runs that don't set up a Boss pane at all), we fall back to
+    /// "descendant of the app, not a descendant of any registered
+    /// worker shell". Workers each run in their own libghostty pane
+    /// whose shell pid is recorded in `WorkerRegistry`; a `bossctl`
+    /// invoked from inside a worker pane therefore descends from a
+    /// registered worker pid, while the same call from the Boss pane
+    /// (or directly under the app shell) does not. That distinction
+    /// is enough to keep workers out of `BossOnly` even with an
+    /// unregistered Boss pid.
     pub fn authorize_rpc(&self, tier: RpcTier, peer_pid: Option<libc::pid_t>) -> bool {
         if matches!(tier, RpcTier::User) {
             return true;

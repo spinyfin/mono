@@ -753,11 +753,6 @@ fn tag_cases() -> Vec<TagCase> {
             },
             expected_tag: "engine_pool_config",
         },
-        TagCase {
-            label: "BossSessionRegistered",
-            event: FrontendEvent::BossSessionRegistered,
-            expected_tag: "boss_session_registered",
-        },
         // --- Probes ---
         TagCase {
             label: "ProbeQueued",
@@ -1952,7 +1947,6 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::Error { .. }
         | FrontendEvent::AppSessionRegistered
         | FrontendEvent::EnginePoolConfig { .. }
-        | FrontendEvent::BossSessionRegistered
         | FrontendEvent::ProbeQueued { .. }
         | FrontendEvent::ProbeReplied { .. }
         | FrontendEvent::ProbeDeliveryEscalated { .. }

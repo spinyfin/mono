@@ -106,6 +106,27 @@ struct ContentView: View {
         .windowTitlebarAccessory(isPresented: hasChromeBanners) {
             chromeBanners
         }
+        .confirmationDialog(
+            "Restart Picard with a new model?",
+            isPresented: Binding(
+                get: { model.coordinatorModelRecreateConfirmation != nil },
+                set: { if !$0 { model.cancelCoordinatorModelRecreate() } }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let confirmation = model.coordinatorModelRecreateConfirmation {
+                Button("Restart with \(confirmation.requestedModel)", role: .destructive) {
+                    model.confirmCoordinatorModelRecreate()
+                }
+            }
+            Button("Keep current session", role: .cancel) {
+                model.cancelCoordinatorModelRecreate()
+            }
+        } message: {
+            if let confirmation = model.coordinatorModelRecreateConfirmation {
+                Text("Picard is running \(confirmation.currentModel). Restarting replaces its tmux session and permanently discards the current conversation.")
+            }
+        }
         #if canImport(GhosttyKit)
         .task {
             // Wire the SwiftPM-only pane allocator into ChatViewModel
@@ -121,6 +142,9 @@ struct ContentView: View {
             }
             model.paneAttachHandler = { [workspace = workersWorkspace] request in
                 workspace.attachWorkerPane(request)
+            }
+            model.coordinatorPaneAttachHandler = { [boss = bossPane] request in
+                boss.attach(request)
             }
             model.paneDetachHandler = { [workspace = workersWorkspace] slotId in
                 workspace.detachWorkerPane(slotId: slotId)
@@ -140,28 +164,8 @@ struct ContentView: View {
             // Forward pool-config pushes from the engine so WorkersWorkspaceModel
             // always uses the engine's live pool sizes rather than independently-
             // maintained constants that drift when pool sizes change.
-            // Also forward coordinatorModel to BossPaneModel so the Boss pane
-            // tracks whatever effort=max resolves to in the engine.
-            model.panePoolConfigHandler = { [workspace = workersWorkspace, boss = bossPane] workerSlots, automationSlots, reviewSlots, coordinatorModel in
+            model.panePoolConfigHandler = { [workspace = workersWorkspace] workerSlots, automationSlots, reviewSlots, _ in
                 workspace.configureSlots(workerCount: workerSlots, automationCount: automationSlots, reviewCount: reviewSlots)
-                boss.updateCoordinatorModel(coordinatorModel)
-            }
-            // Install the Boss-pane shell-pid provider so the engine can
-            // authenticate Boss-tier RPCs (e.g. `bossctl agents reap`).
-            // The closure is re-evaluated on every call, so it picks up
-            // the current surface pid after a Boss-pane restart.
-            model.bossPaneShellPidProvider = { [boss = bossPane] in
-                boss.session.shellPid
-            }
-            // Fire whenever the surface is (re-)attached — covers initial
-            // creation and restarts after the coordinator session exits.
-            bossPane.session.onSurfaceAttached = { [model] in
-                model.bossPaneShellPidAvailable()
-            }
-            // Handle the race where the surface was attached before this
-            // task ran (most common at startup).
-            if bossPane.session.terminalReady {
-                model.bossPaneShellPidAvailable()
             }
             // Forward worker-pane shell pids to the engine once surfaces
             // attach. WorkersWorkspaceModel fires onShellPidAvailable after
@@ -824,16 +828,15 @@ struct ContentView: View {
 
             ZStack(alignment: .leading) {
                 // The boss terminal is always mounted, even while the
-                // panel is collapsed. Two things would otherwise reset
-                // the boss claude session:
+                // panel is collapsed. This preserves the tmux client and
+                // prevents a visual reset when the panel expands again.
                 //
                 //   1. A structural `if`/`else` that excludes
                 //      BossPaneTerminalView in the collapsed branch
                 //      deinits GhosttyTerminalHostView; its deinit
-                //      calls ghostty_surface_free, killing the PTY
-                //      child and so the boss claude process. Same
-                //      failure mode the Agents↔Work toggle avoids in
-                //      `body` above.
+                //      calls ghostty_surface_free, ending its attached tmux
+                //      client. The engine-owned coordinator remains alive,
+                //      but the user would lose this viewer's scrollback.
                 //   2. Shrinking the surface to the 88pt collapsed
                 //      strip width would SIGWINCH claude to ~10
                 //      columns and reflow its TUI; the session

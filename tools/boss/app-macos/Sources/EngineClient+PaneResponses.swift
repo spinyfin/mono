@@ -66,6 +66,24 @@ extension EngineClient {
         ])
     }
 
+    func sendAttachCoordinatorPaneResponse(requestId: String, result: EngineCoordinatorAttachResult) {
+        let resultPayload: [String: Any]
+        switch result {
+        case .success:
+            resultPayload = ["Ok": [String: Any]()]
+        case .failure(let error):
+            resultPayload = ["Err": engineToAppErrorPayload(error)]
+        }
+        sendLine([
+            "type": "engine_response",
+            "request_id": requestId,
+            "response": [
+                "kind": "attach_coordinator_pane",
+                "result": resultPayload,
+            ],
+        ])
+    }
+
     func sendDetachWorkerPaneResponse(requestId: String, result: EngineReleaseResult) {
         let resultPayload: [String: Any]
         switch result {

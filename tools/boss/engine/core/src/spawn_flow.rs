@@ -735,6 +735,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
             Ok(
                 EngineToAppResponse::ReleaseWorkerPane { .. }
                 | EngineToAppResponse::AttachWorkerPane { .. }
+                | EngineToAppResponse::AttachCoordinatorPane { .. }
                 | EngineToAppResponse::DetachWorkerPane { .. }
                 | EngineToAppResponse::SendToPane { .. }
                 | EngineToAppResponse::FocusWorkerPane { .. }

@@ -148,6 +148,24 @@ pub struct AttachWorkerPaneInput {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AttachWorkerPaneResult {}
 
+/// Engine asks the app to attach its single Boss-pane surface to the durable
+/// coordinator tmux session. The engine owns session creation and restart;
+/// the app receives only the verified session identity needed to render it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachCoordinatorPaneInput {
+    pub session_name: String,
+    pub spawn_token: String,
+    pub model: String,
+    /// Absolute tmux binary selected by the engine preflight.
+    pub tmux_program: String,
+    /// Private tmux server label (`-L`) the coordinator session runs on.
+    pub server_label: String,
+}
+
+/// App's reply when its Boss pane is attached to the coordinator session.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachCoordinatorPaneResult {}
+
 /// Engine asks the app to remove its Ghostty surface from a tmux-hosted
 /// worker. This must not signal or otherwise stop the tmux session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -267,6 +285,7 @@ pub enum EngineToAppRequest {
     SpawnWorkerPane(SpawnWorkerPaneInput),
     ReleaseWorkerPane(ReleaseWorkerPaneInput),
     AttachWorkerPane(AttachWorkerPaneInput),
+    AttachCoordinatorPane(AttachCoordinatorPaneInput),
     DetachWorkerPane(DetachWorkerPaneInput),
     SendToPane(SendToPaneInput),
     FocusWorkerPane(FocusWorkerPaneInput),
@@ -294,6 +313,9 @@ pub enum EngineToAppResponse {
     },
     AttachWorkerPane {
         result: Result<AttachWorkerPaneResult, EngineToAppError>,
+    },
+    AttachCoordinatorPane {
+        result: Result<AttachCoordinatorPaneResult, EngineToAppError>,
     },
     DetachWorkerPane {
         result: Result<DetachWorkerPaneResult, EngineToAppError>,
@@ -615,6 +637,28 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<EngineToAppResponse>(&detach_json).unwrap(),
             detach
+        );
+    }
+
+    #[test]
+    fn coordinator_attach_round_trips_with_its_verified_identity() {
+        let request = EngineToAppRequest::AttachCoordinatorPane(AttachCoordinatorPaneInput {
+            session_name: "boss-coordinator".into(),
+            spawn_token: "opaque-token".into(),
+            model: "opus".into(),
+            tmux_program: "/opt/homebrew/bin/tmux".into(),
+            server_label: "boss".into(),
+        });
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("attach_coordinator_pane"));
+        assert_eq!(serde_json::from_str::<EngineToAppRequest>(&json).unwrap(), request);
+
+        let response = EngineToAppResponse::AttachCoordinatorPane {
+            result: Ok(AttachCoordinatorPaneResult {}),
+        };
+        assert_eq!(
+            serde_json::from_str::<EngineToAppResponse>(&serde_json::to_string(&response).unwrap()).unwrap(),
+            response
         );
     }
 

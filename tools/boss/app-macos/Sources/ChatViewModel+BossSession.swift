@@ -1,24 +1,50 @@
 import Foundation
 
-/// Session-registration handshake with the engine: the app session, the Boss
-/// pane's shell pid, and the per-worker-pane pid/liveness reports ContentView
-/// pushes down as libghostty surfaces come and go. The backing state
-/// (`isAppSessionRegistered`, `bossPaneShellPidProvider`) lives in
-/// `ChatViewModel.swift`; the `.appSessionRegistered` event that flips it
-/// arrives via `ChatViewModel+EventHandling.swift`.
+/// Session-registration handshake with the engine and worker-pane lifecycle
+/// reports ContentView pushes down as libghostty surfaces come and go. The
+/// engine reads the detached coordinator pane pid itself; the visible tmux
+/// client is only a viewer and cannot be its trust root.
 extension ChatViewModel {
-    /// Called by ContentView when the Boss pane's libghostty surface attaches
-    /// (initial creation or after a restart). Sends RegisterBossSession if the
-    /// app session is already confirmed; otherwise the registration fires when
-    /// appSessionRegistered arrives.
-    func bossPaneShellPidAvailable() {
-        maybeRegisterBossSession()
+    func coordinatorModelConfigured(_ model: String) {
+        let model = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !model.isEmpty else { return }
+        requestedCoordinatorModel = model
+        refreshCoordinatorModelRecreateConfirmation()
     }
 
-    func maybeRegisterBossSession() {
-        guard isAppSessionRegistered else { return }
-        guard let pid = bossPaneShellPidProvider?(), pid > 0 else { return }
-        engine.sendRegisterBossSession(shellPid: pid)
+    func coordinatorPaneAttached(_ request: EngineCoordinatorAttachRequest) {
+        attachedCoordinatorModel = request.model
+        attachedCoordinatorSpawnToken = request.spawnToken
+        refreshCoordinatorModelRecreateConfirmation()
+    }
+
+    func confirmCoordinatorModelRecreate() {
+        guard let confirmation = coordinatorModelRecreateConfirmation else { return }
+        coordinatorModelRecreateConfirmation = nil
+        engine.sendRecreateCoordinator(expectedSpawnToken: confirmation.expectedSpawnToken)
+    }
+
+    func cancelCoordinatorModelRecreate() {
+        declinedCoordinatorRecreateToken = coordinatorModelRecreateConfirmation?.expectedSpawnToken
+        coordinatorModelRecreateConfirmation = nil
+    }
+
+    private func refreshCoordinatorModelRecreateConfirmation() {
+        guard let requested = requestedCoordinatorModel,
+              let attached = attachedCoordinatorModel,
+              let spawnToken = attachedCoordinatorSpawnToken,
+              !attached.isEmpty,
+              attached != requested,
+              declinedCoordinatorRecreateToken != spawnToken
+        else {
+            coordinatorModelRecreateConfirmation = nil
+            return
+        }
+        coordinatorModelRecreateConfirmation = CoordinatorModelRecreateConfirmation(
+            currentModel: attached,
+            requestedModel: requested,
+            expectedSpawnToken: spawnToken
+        )
     }
 
     /// Called by ContentView when a worker pane's libghostty surface attaches

@@ -1764,18 +1764,18 @@ pub enum FrontendRequest {
         conflicted_files: Vec<String>,
     },
 
+    /// App-only acknowledgement of the destructive coordinator-model prompt.
+    /// The expected token prevents a delayed confirmation from destroying a
+    /// coordinator that recovery has already replaced.
+    RecreateCoordinator {
+        expected_spawn_token: String,
+    },
+
     /// App self-identifies as the singleton app session. The engine
     /// rejects this unless `LOCAL_PEERPID` matches the app's pid (the
     /// engine's parent). After registration, `EngineRequest` events
     /// flow to this session only.
     RegisterAppSession,
-
-    /// App tells the engine which pid is the Boss session's shell.
-    /// Used to populate the second trust root for Boss-only RPCs.
-    /// Only the registered app session may call this.
-    RegisterBossSession {
-        shell_pid: i32,
-    },
 
     /// App reports the capability IDs compiled into this build. The
     /// engine updates its in-memory capability registry so the flag

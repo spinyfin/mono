@@ -416,8 +416,8 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         // on. A worker calling one would be repointing the engine's notion
         // of who the app or the Boss session is.
         FrontendRequest::EngineResponse { .. }
+        | FrontendRequest::RecreateCoordinator { .. }
         | FrontendRequest::RegisterAppSession
-        | FrontendRequest::RegisterBossSession { .. }
         | FrontendRequest::RegisterCapabilities { .. }
         | FrontendRequest::ReportSelectedProduct { .. }
         | FrontendRequest::ReportWorkerSpawnFailed { .. }

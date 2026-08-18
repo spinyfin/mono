@@ -69,6 +69,26 @@ enum EngineAttachResult: Sendable {
     case failure(EngineSpawnError)
 }
 
+struct EngineCoordinatorAttachRequest: Sendable {
+    let sessionName: String
+    let spawnToken: String
+    let model: String
+    let tmuxProgram: String
+    /// tmux `-L` label for the engine-owned private server.
+    let serverLabel: String
+}
+
+enum EngineCoordinatorAttachResult: Sendable {
+    case success
+    case failure(EngineSpawnError)
+}
+
+struct CoordinatorModelRecreateConfirmation: Equatable {
+    let currentModel: String
+    let requestedModel: String
+    let expectedSpawnToken: String
+}
+
 enum EngineSendError: Sendable {
     case unknownSlot
     case internalFailure(String)
@@ -131,6 +151,7 @@ enum EngineRequestKind: Sendable {
     case spawnWorkerPane(EngineSpawnRequest)
     case releaseWorkerPane(slotId: Int, killGraceSeconds: UInt32)
     case attachWorkerPane(EngineAttachRequest)
+    case attachCoordinatorPane(EngineCoordinatorAttachRequest)
     case detachWorkerPane(slotId: Int)
     case sendToPane(slotId: Int, text: String)
     case focusWorkerPane(slotId: Int)

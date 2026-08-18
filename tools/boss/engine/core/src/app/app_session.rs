@@ -233,6 +233,10 @@ impl ServerState {
         // A fresh registration means whatever channel-health streak the old
         // session accumulated no longer applies.
         self.app_channel_health.record_success();
+        *self
+            .coordinator_attached_spawn_token
+            .lock()
+            .expect("coordinator attached token mutex poisoned") = None;
         // Nor does the prior session's product-chooser selection: the newly
         // registered app reports its own on connect. Clearing here means the
         // window between registration and that report reads as "no
@@ -270,6 +274,10 @@ impl ServerState {
             // outlived its app would answer `get_selected_product` with a
             // product nobody is looking at.
             self.clear_selected_product();
+            *self
+                .coordinator_attached_spawn_token
+                .lock()
+                .expect("coordinator attached token mutex poisoned") = None;
             tracing::warn!(
                 session_id = %session_id,
                 dropped_pending = prior.pending.len(),

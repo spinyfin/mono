@@ -3,170 +3,123 @@ import os
 
 private let logger = Logger(subsystem: "com.boss.app", category: "BossPaneModel")
 
-/// Build the claude invocation for the Boss coordinator session given a model slug.
-/// Always passes `--permission-mode auto` — the coordinator runs unattended.
-private func coordinatorInvocation(model: String) -> String {
-    "claude --model \(model) --permission-mode auto"
-}
-
-/// Owns the single libghostty pane that hosts the Boss session — a
-/// Claude Code session with a coordinator-flavoured system prompt
-/// that uses `bossctl` to drive the engine.
-///
-/// The Boss session runs in a dedicated working directory under
-/// Application Support so its `CLAUDE.md` system prompt and any
-/// session state stay isolated from worker workspaces.
+/// Attaches the single libghostty pane to the engine-owned coordinator tmux
+/// session. The engine owns coordinator creation and restart; this model only
+/// recreates its local tmux viewer when that client exits.
 @MainActor
 final class BossPaneModel: ObservableObject {
     let runtime: GhosttyRuntime
-    @Published var session: TerminalPaneSession
-    /// The model slug the coordinator session was launched with (or will
-    /// use on the next restart). Updated when the engine pushes
-    /// `engine_pool_config`, which carries the engine's `coordinator_model`
-    /// setting (`BOSS_COORDINATOR_MODEL`, default `"opus"`) rather than the
-    /// worker effort→model table, so it stays a separately-configurable
-    /// knob.
-    private(set) var coordinatorModel: String
-    /// The model slug the *currently live* surface was actually launched
-    /// with. Diverges from `coordinatorModel` only in the window between an
-    /// `engine_pool_config` push and the next surface restart —
-    /// `updateCoordinatorModel(_:)` uses this to decide whether a live
-    /// restart is needed to apply the new value immediately, rather than
-    /// waiting for Claude to exit on its own.
-    private var launchedModel: String
-    /// The resolved claude command line sent to the Boss-session shell.
-    /// Exposed so the UI and debug surfaces can display it without
-    /// inspecting pane scrollback.
-    var claudeInvocation: String { coordinatorInvocation(model: coordinatorModel) }
+    @Published private(set) var session: TerminalPaneSession?
+    private var attachedSpawnToken: String?
+    private var lastRequest: EngineCoordinatorAttachRequest?
+    /// Bumped on every viewer install so dual `onChildExited` paths
+    /// (childExited + closeSurface) for one exit only schedule one rebuild.
+    private var viewerGeneration = 0
+    private var lastHandledExitGeneration: Int?
+    private var consecutiveImmediateExits = 0
+    private var viewerInstalledAt: Date?
+    private var reattachTask: Task<Void, Never>?
+
+    private static let minStableUptime: TimeInterval = 5
+    private static let maxConsecutiveImmediateExits = 8
+    private static let baseBackoffSeconds: TimeInterval = 1
+    private static let maxBackoffSeconds: TimeInterval = 30
 
     init() {
-        // Seed with the engine's default coordinator model (opus). The
-        // engine pushes the authoritative value via engine_pool_config
-        // shortly after connect; if that value differs from this seed,
-        // updateCoordinatorModel(_:) restarts the live surface immediately
-        // rather than waiting for Claude to exit on its own (see
-        // launchedModel above). Fable is no longer a default anywhere — an
-        // installation opts back into it explicitly via
-        // BOSS_COORDINATOR_MODEL, at which point the pushed value overrides
-        // this seed.
-        self.coordinatorModel = "opus"
-        self.launchedModel = "opus"
         self.runtime = GhosttyRuntime.shared
-        let workingDirectory = Self.ensureBossWorkingDirectory()
-        let invocation = coordinatorInvocation(model: coordinatorModel)
-        // Unset ANTHROPIC_API_KEY before invoking claude so the Boss
-        // session authenticates via OAuth (~/.claude/.credentials.json)
-        // rather than the engine's API key. The macOS app process still
-        // holds ANTHROPIC_API_KEY for engine-side LLM calls (pane
-        // summaries, etc.); the shell child must not inherit it or
-        // Claude Code shows "Auth conflict: Using ANTHROPIC_API_KEY
-        // instead of Anthropic Console key."
-        // --permission-mode auto is required so the coordinator session
-        // runs unattended, matching the policy used for worker spawns.
-        logger.info("Boss-session claude invocation: \(invocation, privacy: .public)")
-        let env = Self.bossSessionEnv()
+        // The engine creates only after the app has registered. Preparing the
+        // isolated prompt directory here keeps that creation race-free while
+        // leaving this model a viewer rather than a lifecycle owner.
+        _ = Self.ensureBossWorkingDirectory()
+    }
+
+    /// Attach to the exact engine-verified singleton. Reusing the same token
+    /// preserves an existing Ghostty client across socket reconnects; a new
+    /// token means the engine deliberately recreated the coordinator and the
+    /// viewer must start a fresh tmux client.
+    func attach(_ request: EngineCoordinatorAttachRequest) -> EngineCoordinatorAttachResult {
+        guard !request.sessionName.isEmpty, !request.spawnToken.isEmpty else {
+            return .failure(.internalFailure("engine supplied an incomplete coordinator tmux identity"))
+        }
+        guard !request.tmuxProgram.isEmpty, request.tmuxProgram.hasPrefix("/") else {
+            return .failure(.internalFailure("engine supplied an invalid tmux program"))
+        }
+        guard !request.serverLabel.isEmpty else {
+            return .failure(.internalFailure("engine supplied an empty tmux server label"))
+        }
+        lastRequest = request
+        guard attachedSpawnToken != request.spawnToken || session == nil else {
+            return .success
+        }
+        consecutiveImmediateExits = 0
+        reattachTask?.cancel()
+        reattachTask = nil
+        installViewer(for: request)
+        return .success
+    }
+
+    private func installViewer(for request: EngineCoordinatorAttachRequest) {
+        viewerGeneration += 1
+        let generation = viewerGeneration
         let launchSpec = TerminalLaunchSpec(
             fontSize: 11.0,
-            workingDirectory: workingDirectory,
-            // Re-prepend BOSS_BIN_DIR to PATH here rather than relying solely on
-            // bossSessionEnv()'s PATH entry. The shell's init scripts (.zprofile,
-            // .zshrc) rebuild PATH from /etc/paths and user dotfiles after the
-            // surface env is applied, so the BOSS_BIN_DIR prepend we set there gets
-            // overwritten. BOSS_BIN_DIR itself survives (init scripts don't unset
-            // custom vars), so we can re-prepend it via initialInput which runs
-            // after init completes. The guard is a no-op in dev / bazel-run mode
-            // where bossSessionEnv() returns [] and BOSS_BIN_DIR is unset.
-            // `exec` replaces the shell with claude so there is no shell
-            // process to fall back into when claude exits. A single Ctrl-C
-            // is handled by Claude Code itself (interrupt-current-turn) rather
-            // than by the shell (which would leave the user at a bare prompt).
-            initialInput: Self.buildInitialInput(invocation: invocation),
-            env: env
+            workingDirectory: FileManager.default.homeDirectoryForCurrentUser.path,
+            initialInput: "exec \(bossShellQuote(request.tmuxProgram)) -L \(bossShellQuote(request.serverLabel)) attach-session -t \(bossShellQuote(request.sessionName))\n",
+            env: []
         )
-        self.session = TerminalPaneSession(
-            id: "boss",
+        let viewer = TerminalPaneSession(
+            id: "boss-\(request.spawnToken)-\(generation)",
             role: .boss,
             launchSpec: launchSpec
         )
-        // Restart the surface when claude exits so the coordinator is always
-        // running. The 1.5 s delay lets the "Picard restarting…" message be
-        // readable before the new surface blanks the screen.
-        // Before restarting, update hostView.launchSpec so the new surface
-        // picks up any coordinator model change pushed by the engine since
-        // the last start.
-        self.session.onChildExited = { [weak self] in
-            guard let self else { return }
-            self.session.statusMessage = "Picard restarting…"
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-                guard let self else { return }
-                self.restartLiveSurface()
+        viewer.onChildExited = { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.reattachViewer(generation: generation)
             }
         }
+        session = viewer
+        attachedSpawnToken = request.spawnToken
+        viewerInstalledAt = Date()
     }
 
-    /// Rebuild `launchSpec` for the current `coordinatorModel` and restart
-    /// the live surface, recording that model as `launchedModel`. Shared by
-    /// the `onChildExited` restart path and by `updateCoordinatorModel(_:)`
-    /// when it needs to apply a model change immediately.
-    private func restartLiveSurface() {
-        let latest = coordinatorInvocation(model: coordinatorModel)
-        session.hostView?.launchSpec = TerminalLaunchSpec(
-            fontSize: 11.0,
-            workingDirectory: Self.ensureBossWorkingDirectory(),
-            initialInput: Self.buildInitialInput(invocation: latest),
-            env: Self.bossSessionEnv()
+    /// Rebuild the local tmux client after it exits. Bounded with
+    /// exponential backoff so a missing durable session cannot spin a
+    /// surface-recreate hot loop; dual Ghostty exit callbacks for one
+    /// child are collapsed by `viewerGeneration`.
+    private func reattachViewer(generation: Int) {
+        guard generation == viewerGeneration else { return }
+        guard lastHandledExitGeneration != generation else { return }
+        lastHandledExitGeneration = generation
+        guard lastRequest != nil else { return }
+
+        let uptime = viewerInstalledAt.map { Date().timeIntervalSince($0) } ?? 0
+        if uptime >= Self.minStableUptime {
+            consecutiveImmediateExits = 0
+        }
+        consecutiveImmediateExits += 1
+
+        if consecutiveImmediateExits > Self.maxConsecutiveImmediateExits {
+            session?.statusMessage =
+                "Picard could not attach after repeated attempts. Waiting for the coordinator session…"
+            logger.error("Boss pane viewer reattach ceiling reached; leaving failure status")
+            return
+        }
+
+        let exponent = min(consecutiveImmediateExits - 1, 5)
+        let delay = min(
+            Self.baseBackoffSeconds * pow(2.0, Double(exponent)),
+            Self.maxBackoffSeconds
         )
-        session.hostView?.restartSurface()
-        launchedModel = coordinatorModel
-    }
-
-    /// Called by `ContentView` when the engine pushes `engine_pool_config`
-    /// with an updated coordinator model. Stores the new model; if it
-    /// differs from the model the live surface actually launched with, the
-    /// surface is restarted immediately so the change takes effect without
-    /// waiting for Claude to exit on its own — otherwise an installation
-    /// that sets `BOSS_COORDINATOR_MODEL` would still run its first
-    /// coordinator session on the stale seed value for the entire session.
-    func updateCoordinatorModel(_ model: String) {
-        guard !model.isEmpty, model != coordinatorModel else { return }
-        coordinatorModel = model
-        logger.info("Coordinator model updated to: \(model, privacy: .public)")
-        guard model != launchedModel else { return }
-        restartLiveSurface()
-    }
-
-    private static func buildInitialInput(invocation: String) -> String {
-        "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; unset ANTHROPIC_API_KEY; exec \(invocation)\n"
-    }
-
-    /// Env layered onto the Boss-session shell so `boss` / `bossctl`
-    /// resolve to the binaries bundled inside this `.app`, not whatever
-    /// the user's login `PATH` happens to surface (e.g. a `repobin`
-    /// shim pointing at a cached `spinyfin/mono` revision — see #692).
-    ///
-    /// Sets:
-    ///   - `BOSS_BIN_DIR` — absolute path to the bundled `bin/` dir.
-    ///   - `BOSS_BIN` — absolute path to the bundled `boss` binary.
-    ///   - `PATH` — prepend `BOSS_BIN_DIR` so bare `boss` / `bossctl`
-    ///     calls hit the bundled copies first.
-    ///
-    /// Returns an empty array in dev / `bazel run` mode where the
-    /// bundle has no `Resources/bin/` (the session falls back to the
-    /// developer's `PATH`).
-    private static func bossSessionEnv() -> [(String, String)] {
-        guard let resourcePath = Bundle.main.resourcePath else { return [] }
-        let binDir = "\(resourcePath)/bin"
-        let bossPath = "\(binDir)/boss"
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: bossPath) else { return [] }
-
-        let currentPath = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
-        let newPath = "\(binDir):\(currentPath)"
-        return [
-            ("BOSS_BIN_DIR", binDir),
-            ("BOSS_BIN", bossPath),
-            ("PATH", newPath),
-        ]
+        reattachTask?.cancel()
+        reattachTask = Task { @MainActor [weak self] in
+            let nanos = UInt64(delay * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanos)
+            guard !Task.isCancelled else { return }
+            guard let self else { return }
+            guard generation == self.viewerGeneration else { return }
+            guard let request = self.lastRequest else { return }
+            self.installViewer(for: request)
+        }
     }
 
     private static func ensureBossWorkingDirectory() -> String {
@@ -204,6 +157,13 @@ final class BossPaneModel: ObservableObject {
 
         return bossSession.path
     }
+}
+
+/// POSIX single-quote a value for `/bin/sh` (safe for arbitrary engine-supplied paths).
+func bossShellQuote(_ value: String) -> String {
+    // Replacement is the five-character POSIX idiom '"'"' so a value
+    // containing `'` stays inside a well-formed single-quoted string.
+    "'\(value.replacingOccurrences(of: "'", with: "'\"'\"'"))'"
 }
 
 /// Baseline `permissions.allow` rules the Boss coordinator session needs to run its
