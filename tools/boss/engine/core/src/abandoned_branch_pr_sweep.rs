@@ -418,8 +418,8 @@ impl BindAction {
 /// per-execution failure-count map must survive across passes so
 /// consecutive-failure escalation works; it lives in an `Arc<Mutex<_>>` the
 /// pass closure borrows each iteration, mirroring how
-/// [`crate::terminal_work_sweep::spawn_loop`] threads its own cross-pass
-/// `seen_terminal` set through the same helper — a single task ever holds
+/// [`crate::husk_pane_sweep::spawn_loop`] threads its own cross-pass
+/// `seen_husks` set through the same helper — a single task ever holds
 /// the lock, so there is no real contention.
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,

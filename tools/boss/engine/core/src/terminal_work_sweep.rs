@@ -10,8 +10,8 @@
 //! mid-turn. The worker then sits alive — typically in `waiting_for_input`
 //! — holding its slot indefinitely, long after its task went `done` and
 //! its PR merged. The real incident: run `exec_…8d` on slot 8 stayed alive
-//! for ~2.5 DAYS after work item T1679 had gone to `done` and PR #1496 had
-//! MERGED, and had to be reaped by hand.
+//! for ~2.5 DAYS after its bound work item had gone to `done` and its PR
+//! had merged, and had to be reaped by hand.
 //!
 //! Every other reconciler deliberately skips this case:
 //!
@@ -46,7 +46,7 @@
 //! this exact sweep every ~60s the whole time, and had to be stopped by
 //! hand. [`WorkDb::work_item_row_missing`] tells the two cases apart: a
 //! confirmed-missing row is treated as an orphan and reaped through the
-//! same two-pass path as the O'Brien case (`reason = "work_item_missing"`
+//! same elapsed-time path as the O'Brien case (`reason = "work_item_missing"`
 //! in the emitted [`DispatchEvent`]), while a lookup failure that can't be
 //! confirmed as "row gone" still falls back to the old conservative skip.
 //! Deletion is expected to tear its own live executions down synchronously
@@ -55,10 +55,10 @@
 //!
 //! ## Why this is the safest possible reap signal
 //!
-//! The operator's primary constraint is: never reap a worker that is
-//! actively doing things. This sweep reaps ONLY on strong, positive
-//! evidence of terminality — the bound work item is `done` / `archived`, or
-//! the execution itself is `completed` / `failed` /
+//! The overriding constraint is: never reap a worker that is actively
+//! doing things. This sweep reaps ONLY on strong, positive evidence of
+//! terminality — the bound work item is `done` / `archived` / `cancelled`,
+//! or the execution itself is `completed` / `failed` /
 //! `cancelled` / `orphaned`. A `done` task means the PR already merged: the
 //! work provably landed, so there is nothing active to destroy. An
 //! `in_review` task (PR open, awaiting review) is NOT terminal and is left
@@ -80,14 +80,22 @@
 //!    [`crate::teardown_registry::MAX_TEARDOWN_PROTECTION`] stops
 //!    protecting (logged loudly), because a wedged teardown is exactly the
 //!    strand this sweep exists to reclaim.
-//! 2. **Two-pass confirmation.** A candidate is reaped only if it was ALSO
-//!    a terminal-and-live candidate on the immediately preceding pass — so
-//!    it must have been terminal+live, *and unmarked*, for at least one
-//!    full [`DEFAULT_INTERVAL`]. If the status flips back to non-terminal
-//!    between passes (a reopened task), the candidate drops out and is not
-//!    reaped. A candidate skipped for an in-flight teardown is likewise
-//!    dropped from the carried-forward set, so its confirmation clock
-//!    restarts from scratch once the teardown finishes.
+//! 2. **Elapsed-time confirmation.** A candidate is reaped only once it has
+//!    been continuously observed as terminal-and-live, *and unmarked*, for
+//!    at least [`DEFAULT_INTERVAL`] of WALL-CLOCK time, tracked via
+//!    [`crate::sweep_loop::confirm_after_delay`] (first-seen timestamp, not a
+//!    pass count). Normal completion teardown fires within seconds of
+//!    terminality, so a candidate that survives a full interval is a genuine
+//!    strand, never a teardown still in flight. Because the guard is a
+//!    timestamp rather than "seen on two consecutive passes", an
+//!    event-triggered out-of-cycle pass (see [`spawn_loop`]) can run the
+//!    check more often WITHOUT shortening the confirmation delay itself — it
+//!    can only notice a confirmed strand sooner once the delay has actually
+//!    elapsed. If the status flips back to non-terminal between passes (a
+//!    reopened task), the candidate drops out and is not reaped. A candidate
+//!    skipped for an in-flight teardown is likewise dropped from the
+//!    carried-forward set, so its confirmation clock restarts from scratch
+//!    once the teardown finishes.
 //! 3. **Run-id-keyed idempotent reap.** Reaping goes through the same
 //!    `release_worker_pane(run_id)` the completion path uses, which resolves
 //!    the slot from the run id via an atomic `take_slot_for_run`. If the
@@ -126,11 +134,11 @@
 //! ## Cadence
 //!
 //! Runs every [`DEFAULT_INTERVAL`] and fires once shortly after boot. The
-//! first pass after boot only *records* candidates (two-pass guard), so the
-//! earliest a post-restart zombie is reaped is one interval in — giving any
-//! legitimate teardown a full interval to act first.
+//! first pass after boot only *records* candidates (elapsed-time guard), so
+//! the earliest a post-restart zombie is reaped is one interval in — giving
+//! any legitimate teardown a full interval to act first.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -141,10 +149,18 @@ use crate::teardown_registry::{TeardownRegistry, TeardownState};
 use crate::work::WorkDb;
 
 /// How often the terminal-work reconciler runs. 60s mirrors the dead-pid,
-/// stale-worker, and pool-claim sweeps. Because reaping requires a
-/// candidate to persist across two consecutive passes, this interval also
-/// sets the minimum confirmation delay before a strand is reaped.
+/// stale-worker, and pool-claim sweeps. Because a candidate must be
+/// observed as terminal-and-live for at least this long (see
+/// `sweep_loop::confirm_after_delay`), this interval also sets the minimum
+/// confirmation delay before a strand is reaped.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Once an `ExecutionTerminal` event triggers an out-of-cycle pass, further
+/// events are absorbed for this long before another out-of-cycle pass runs —
+/// mirrors the merge poller's kick-quiesce window so a burst of terminations
+/// can't turn into a hot loop of full passes. The periodic `interval` tick
+/// remains the backstop regardless.
+const EVENT_QUIESCE: Duration = Duration::from_secs(5);
 
 /// Tears down a live worker pane bound to a run id. Implemented by
 /// [`crate::app::ServerState`] (delegating to `release_worker_pane`);
@@ -175,11 +191,11 @@ impl WorkerReaper for NoopWorkerReaper {
 /// Counts from one sweep pass; logged at `info` when any worker was reaped.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct TerminalWorkSweepOutcome {
-    /// Stranded workers (terminal work item / execution, confirmed across
-    /// two passes) that were reaped this pass.
+    /// Stranded workers (terminal work item / execution, confirmed after
+    /// the elapsed-time delay) that were reaped this pass.
     pub reaped: usize,
-    /// Candidates seen terminal+live for the first time; held for one more
-    /// pass before any reap (two-pass confirmation).
+    /// Candidates seen terminal+live for the first time; held until the
+    /// confirmation delay has elapsed.
     pub pending_confirmation: usize,
     /// Live workers left alone because their work item and execution are
     /// both still non-terminal — the normal, healthy case.
@@ -211,8 +227,27 @@ impl crate::sweep_loop::SweepOutcome for TerminalWorkSweepOutcome {
 }
 
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`,
-/// threading the cross-pass candidate set so the two-pass confirmation
-/// guard survives between passes.
+/// threading the cross-pass candidate set (each candidate's first-seen
+/// timestamp) so the elapsed-time confirmation guard survives between
+/// passes.
+///
+/// Also subscribes to `ExecutionTerminal` events via
+/// [`crate::sweep_loop::spawn_sweep_loop_with_events`]: receiving one runs an
+/// out-of-cycle pass right away (subject to [`EVENT_QUIESCE`]) instead of
+/// waiting out the rest of `interval`. This still goes through the same
+/// [`run_one_pass`] and shared `seen_terminal` map as the periodic tick, and
+/// `run_one_pass` always requires a full [`DEFAULT_INTERVAL`] of WALL-CLOCK
+/// time (via [`crate::sweep_loop::confirm_after_delay`]) before treating a
+/// candidate as confirmed — so an out-of-cycle pass can only notice a
+/// confirmed strand sooner once that time has genuinely elapsed, never
+/// shorten the delay itself. The periodic tick remains the backstop: a
+/// dropped or coalesced event never leaves a strand unreconciled for longer
+/// than `interval`.
+// Every parameter is a distinct collaborator `run_one_pass` needs threaded
+// through unchanged (mirrors the precedent in `live_worker_state.rs` /
+// `spawn_ack_sweep.rs`); bundling them into a struct would only move the
+// field count, not reduce it.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     live_states: Arc<LiveWorkerStateRegistry>,
@@ -221,43 +256,55 @@ pub fn spawn_loop(
     dispatch_events: Arc<dyn DispatchEventSink>,
     teardown_registry: Arc<TeardownRegistry>,
     interval: Duration,
+    execution_terminal_events: boss_event_bus::Subscription,
 ) -> tokio::task::JoinHandle<()> {
-    // Candidates observed terminal+live on the previous pass. A candidate is
-    // reaped only once it appears in two consecutive passes, so this set is
-    // the confirmation memory that must survive across passes. The shared
-    // loop helper builds a fresh future per pass, so the set lives in an
-    // `Arc<Mutex>` it can borrow each iteration — a single task ever holds
-    // the lock, so there is no real contention.
-    let seen_terminal: Arc<tokio::sync::Mutex<HashSet<String>>> = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
-    crate::sweep_loop::spawn_sweep_loop(interval, move || {
-        let work_db = Arc::clone(&work_db);
-        let live_states = Arc::clone(&live_states);
-        let reaper = Arc::clone(&reaper);
-        let cube_client = Arc::clone(&cube_client);
-        let dispatch_events = Arc::clone(&dispatch_events);
-        let teardown_registry = Arc::clone(&teardown_registry);
-        let seen_terminal = Arc::clone(&seen_terminal);
-        async move {
-            let mut seen_terminal = seen_terminal.lock().await;
-            run_one_pass(
-                work_db.as_ref(),
-                live_states.as_ref(),
-                reaper.as_ref(),
-                cube_client.as_ref(),
-                dispatch_events.as_ref(),
-                teardown_registry.as_ref(),
-                &mut seen_terminal,
-            )
-            .await
-        }
-    })
+    let seen_terminal: Arc<tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    crate::sweep_loop::spawn_sweep_loop_with_events(
+        interval,
+        EVENT_QUIESCE,
+        execution_terminal_events,
+        "terminal-work sweep",
+        move || {
+            let work_db = Arc::clone(&work_db);
+            let live_states = Arc::clone(&live_states);
+            let reaper = Arc::clone(&reaper);
+            let cube_client = Arc::clone(&cube_client);
+            let dispatch_events = Arc::clone(&dispatch_events);
+            let teardown_registry = Arc::clone(&teardown_registry);
+            let seen_terminal = Arc::clone(&seen_terminal);
+            async move {
+                let mut seen_terminal = seen_terminal.lock().await;
+                run_one_pass(
+                    work_db.as_ref(),
+                    live_states.as_ref(),
+                    reaper.as_ref(),
+                    cube_client.as_ref(),
+                    dispatch_events.as_ref(),
+                    teardown_registry.as_ref(),
+                    &mut seen_terminal,
+                    interval,
+                )
+                .await
+            }
+        },
+    )
 }
 
 /// Run a single terminal-work reconciliation pass over every live worker
-/// slot. `seen_terminal` carries the set of run ids observed
-/// terminal-and-live on the *previous* pass; on return it holds this pass's
-/// candidates so the next pass can confirm them. Returns a summary; callers
-/// may log it.
+/// slot. `seen_terminal` carries, for each run id observed terminal-and-live,
+/// the timestamp it was FIRST observed; on return it holds this pass's
+/// candidates (first-seen timestamps preserved) so the next pass can confirm
+/// them. A candidate is only confirmed once `min_confirm_delay` of
+/// wall-clock time has elapsed since it was first observed — NOT merely
+/// because two passes ran, so an out-of-cycle (event-triggered) pass can
+/// never shorten the effective confirmation delay. Callers pass
+/// [`DEFAULT_INTERVAL`] as `min_confirm_delay` in production; tests may pass
+/// a different value together with a paused [`tokio::time`] clock. Returns a
+/// summary; callers may log it.
+// See the `#[allow]` on `spawn_loop` above: each parameter is a distinct
+// collaborator, not incidental plumbing.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_one_pass(
     work_db: &WorkDb,
     live_states: &LiveWorkerStateRegistry,
@@ -265,7 +312,8 @@ pub async fn run_one_pass(
     cube_client: &dyn CubeClient,
     dispatch_events: &dyn DispatchEventSink,
     teardown_registry: &TeardownRegistry,
-    seen_terminal: &mut HashSet<String>,
+    seen_terminal: &mut HashMap<String, tokio::time::Instant>,
+    min_confirm_delay: Duration,
 ) -> TerminalWorkSweepOutcome {
     let mut outcome = TerminalWorkSweepOutcome::default();
     // One clock read per pass: every candidate's teardown mark is judged
@@ -273,8 +321,8 @@ pub async fn run_one_pass(
     // inconsistently.
     let pass_started = std::time::Instant::now();
     // Reap candidates gathered this pass (terminal work item and/or terminal
-    // execution, live pane). The shared two-pass confirmation helper turns
-    // these into the confirmed/pending partitions below.
+    // execution, live pane). The shared elapsed-time confirmation helper
+    // turns these into the confirmed/pending partitions below.
     let mut candidates: Vec<(String, ReapCandidate)> = Vec::new();
 
     for state in live_states.snapshot() {
@@ -330,7 +378,7 @@ pub async fn run_one_pass(
                     // row is confirmed gone (never existed, or soft-deleted
                     // by `delete_work_item`), not merely unreachable. This is
                     // an orphan, not a degraded-lookup skip — fall through to
-                    // the same two-pass reap path as a terminal work item.
+                    // the same elapsed-time reap path as a terminal work item.
                     Ok(true) => {
                         tracing::warn!(
                             run_id = %run_id,
@@ -412,7 +460,7 @@ pub async fn run_one_pass(
         }
 
         // This slot is a reap candidate this pass. Keyed on `run_id` for the
-        // shared two-pass confirmation helper.
+        // shared elapsed-time confirmation helper.
         candidates.push((
             run_id.clone(),
             ReapCandidate::builder()
@@ -430,12 +478,18 @@ pub async fn run_one_pass(
         ));
     }
 
-    // Two-pass confirmation (shared with `husk_pane_sweep`): only reap a run
-    // that was ALSO a terminal+live candidate on the previous pass. A
-    // teardown still in flight would have completed within the interval, so
-    // survival across a full interval marks a genuine strand.
-    let crate::sweep_loop::Confirmation { confirmed, pending } =
-        crate::sweep_loop::confirm_two_pass(seen_terminal, candidates);
+    // Elapsed-time confirmation: only reap a run that has been continuously
+    // observed terminal+live for at least `min_confirm_delay` of wall-clock
+    // time. A teardown still in flight would have completed within the
+    // interval, so survival across a full interval marks a genuine strand.
+    // Unlike a plain pass count, this cannot be shortened by an
+    // event-triggered out-of-cycle pass running sooner than `interval`.
+    let crate::sweep_loop::TimedConfirmation { confirmed, pending } = crate::sweep_loop::confirm_after_delay(
+        seen_terminal,
+        tokio::time::Instant::now(),
+        min_confirm_delay,
+        candidates,
+    );
 
     outcome.pending_confirmation = pending.len();
     for candidate in pending {
@@ -545,7 +599,7 @@ pub async fn run_one_pass(
 /// A live worker slot that is a reap candidate this pass — its bound work
 /// item and/or its execution is terminal. Carries the fields the deferred
 /// per-candidate logging and reap side effects need, since the shared
-/// two-pass confirmation helper splits candidates into confirmed/pending
+/// elapsed-time confirmation helper splits candidates into confirmed/pending
 /// after the per-slot lookups have already been done.
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
@@ -754,8 +808,9 @@ mod tests {
 
     /// The O'Brien regression: a live worker whose WORK ITEM is `done` (its
     /// execution still non-terminal — hung) is reaped, but only after the
-    /// two-pass confirmation. The first pass records it; the second reaps.
-    #[tokio::test]
+    /// elapsed-time confirmation delay. The first pass records it; a pass
+    /// after `DEFAULT_INTERVAL` has genuinely elapsed reaps it.
+    #[tokio::test(start_paused = true)]
     async fn reaps_worker_whose_work_item_is_done() {
         let (_dir, db, product_id) = setup();
         let work_item_id = create_active_chore(&db, &product_id, "obrien");
@@ -772,7 +827,7 @@ mod tests {
         let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let teardown = TeardownRegistry::new();
-        let mut seen = HashSet::new();
+        let mut seen = HashMap::new();
 
         // Pass 1: candidate observed, not yet reaped.
         let first = run_one_pass(
@@ -783,6 +838,7 @@ mod tests {
             sink.as_ref(),
             &teardown,
             &mut seen,
+            DEFAULT_INTERVAL,
         )
         .await;
         assert_eq!(first.reaped, 0, "first pass must only record the candidate");
@@ -790,7 +846,27 @@ mod tests {
         assert!(reaper.reaped().is_empty());
         assert!(sink.events().await.is_empty());
 
-        // Pass 2: candidate confirmed across two passes — reap.
+        // A pass run again immediately (no time elapsed) must NOT reap —
+        // the confirmation delay is wall-clock time, not merely a second
+        // call. This is the regression an event-triggered out-of-cycle pass
+        // could otherwise race.
+        let immediate = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            &reaper,
+            &cube,
+            sink.as_ref(),
+            &teardown,
+            &mut seen,
+            DEFAULT_INTERVAL,
+        )
+        .await;
+        assert_eq!(immediate.reaped, 0, "no reap before the confirmation delay has elapsed");
+        assert!(reaper.reaped().is_empty());
+
+        // Once a full DEFAULT_INTERVAL has genuinely elapsed, the candidate
+        // is confirmed and reaped.
+        tokio::time::advance(DEFAULT_INTERVAL).await;
         let second = run_one_pass(
             db.as_ref(),
             &live_states,
@@ -799,9 +875,13 @@ mod tests {
             sink.as_ref(),
             &teardown,
             &mut seen,
+            DEFAULT_INTERVAL,
         )
         .await;
-        assert_eq!(second.reaped, 1, "second pass must reap the confirmed strand");
+        assert_eq!(
+            second.reaped, 1,
+            "pass after the confirmation delay must reap the confirmed strand"
+        );
         assert_eq!(reaper.reaped(), vec![execution_id.clone()]);
 
         let events = sink.events().await;
@@ -821,6 +901,7 @@ mod tests {
             sink.as_ref(),
             &teardown,
             &mut seen,
+            DEFAULT_INTERVAL,
         )
         .await;
         assert_eq!(third.reaped, 0);
@@ -831,7 +912,7 @@ mod tests {
     /// A live worker whose EXECUTION is terminal (completion ran but the
     /// pane teardown never landed) is reaped after confirmation, even though
     /// its work item is not itself terminal.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reaps_worker_whose_execution_is_terminal() {
         let (_dir, db, product_id) = setup();
         let work_item_id = create_active_chore(&db, &product_id, "exec-terminal");
@@ -845,7 +926,7 @@ mod tests {
         let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let teardown = TeardownRegistry::new();
-        let mut seen = HashSet::new();
+        let mut seen = HashMap::new();
 
         run_one_pass(
             db.as_ref(),
@@ -855,8 +936,10 @@ mod tests {
             sink.as_ref(),
             &teardown,
             &mut seen,
+            DEFAULT_INTERVAL,
         )
         .await;
+        tokio::time::advance(DEFAULT_INTERVAL).await;
         let second = run_one_pass(
             db.as_ref(),
             &live_states,
@@ -865,6 +948,7 @@ mod tests {
             sink.as_ref(),
             &teardown,
             &mut seen,
+            DEFAULT_INTERVAL,
         )
         .await;
 
@@ -940,7 +1024,7 @@ mod tests {
 
     /// The "Seven" regression: a live worker whose bound work item ROW WAS
     /// DELETED (soft-deleted out from under it, e.g. by `boss task delete`)
-    /// is reaped after two-pass confirmation, its execution is marked
+    /// is reaped after the confirmation delay, its execution is marked
     /// `orphaned` (not just torn down at the pane level), and the emitted
     /// event carries `reason = "work_item_missing"` — distinct from the
     /// O'Brien `work_item_terminal` case, since the row isn't merely
@@ -953,7 +1037,7 @@ mod tests {
     /// `delete_parent_cascades_to_revisions_and_restore_brings_them_back`
     /// (`work/tests/t01.rs`): the live worker is bound to the revision's id,
     /// not the parent's, and the parent's delete is what tombstones it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reaps_worker_whose_bound_work_item_row_was_deleted() {
         let (_dir, db, product_id) = setup();
         let pr_url = "https://github.com/spinyfin/mono/pull/9001";
@@ -999,10 +1083,10 @@ mod tests {
         force_cube_lease_id(&db, &execution_id, lease_id);
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let teardown = TeardownRegistry::new();
-        let mut seen = HashSet::new();
+        let mut seen = HashMap::new();
 
         // Pass 1: candidate observed, not yet reaped — mirrors the O'Brien
-        // two-pass guard so a delete-then-immediately-torn-down-by-the-
+        // elapsed-time guard so a delete-then-immediately-torn-down-by-the-
         // deletion-path race isn't double-reaped.
         let first = run_one_pass(
             db.as_ref(),
@@ -1012,15 +1096,18 @@ mod tests {
             sink.as_ref(),
             &teardown,
             &mut seen,
+            DEFAULT_INTERVAL,
         )
         .await;
         assert_eq!(first.reaped, 0, "first pass must only record the candidate");
         assert_eq!(first.pending_confirmation, 1);
         assert!(reaper.reaped().is_empty());
 
-        // Pass 2: confirmed — reap the pane/slot AND mark the execution
-        // orphaned (there is no other path that would have done so, since
-        // the row is gone and no normal completion ever fired).
+        // Pass 2: confirmed once the confirmation delay has elapsed — reap
+        // the pane/slot AND mark the execution orphaned (there is no other
+        // path that would have done so, since the row is gone and no normal
+        // completion ever fired).
+        tokio::time::advance(DEFAULT_INTERVAL).await;
         let second = run_one_pass(
             db.as_ref(),
             &live_states,
@@ -1029,6 +1116,7 @@ mod tests {
             sink.as_ref(),
             &teardown,
             &mut seen,
+            DEFAULT_INTERVAL,
         )
         .await;
         assert_eq!(second.reaped, 1, "second pass must reap the confirmed orphan");
@@ -1088,7 +1176,7 @@ mod tests {
         let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let teardown = TeardownRegistry::new();
-        let mut seen = HashSet::new();
+        let mut seen = HashMap::new();
 
         for _ in 0..3 {
             let outcome = run_one_pass(
@@ -1099,6 +1187,7 @@ mod tests {
                 sink.as_ref(),
                 &teardown,
                 &mut seen,
+                DEFAULT_INTERVAL,
             )
             .await;
             assert_eq!(outcome.reaped, 0);
@@ -1128,7 +1217,7 @@ mod tests {
         let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let teardown = TeardownRegistry::new();
-        let mut seen = HashSet::new();
+        let mut seen = HashMap::new();
 
         for _ in 0..5 {
             let outcome = run_one_pass(
@@ -1139,6 +1228,7 @@ mod tests {
                 sink.as_ref(),
                 &teardown,
                 &mut seen,
+                DEFAULT_INTERVAL,
             )
             .await;
             assert_eq!(outcome.reaped, 0, "active worker must never be reaped");
@@ -1149,9 +1239,9 @@ mod tests {
     }
 
     /// A worker that is terminal on pass 1 but whose status flips back to
-    /// active before pass 2 (a reopened task) is NOT reaped — the two-pass
-    /// guard re-checks current terminality each pass rather than trusting
-    /// stale memory.
+    /// active before pass 2 (a reopened task) is NOT reaped — the
+    /// confirmation guard re-checks current terminality each pass rather
+    /// than trusting stale memory.
     #[tokio::test]
     async fn does_not_reap_when_status_reverts_before_confirmation() {
         let (_dir, db, product_id) = setup();
@@ -1166,7 +1256,7 @@ mod tests {
         let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let teardown = TeardownRegistry::new();
-        let mut seen = HashSet::new();
+        let mut seen = HashMap::new();
 
         // Pass 1: candidate recorded.
         let first = run_one_pass(
@@ -1177,6 +1267,7 @@ mod tests {
             sink.as_ref(),
             &teardown,
             &mut seen,
+            DEFAULT_INTERVAL,
         )
         .await;
         assert_eq!(first.pending_confirmation, 1);
@@ -1192,6 +1283,7 @@ mod tests {
             sink.as_ref(),
             &teardown,
             &mut seen,
+            DEFAULT_INTERVAL,
         )
         .await;
         assert_eq!(second.reaped, 0, "reverted candidate must not be reaped");
@@ -1213,7 +1305,7 @@ mod tests {
         let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let teardown = TeardownRegistry::new();
-        let mut seen = HashSet::new();
+        let mut seen = HashMap::new();
 
         for _ in 0..3 {
             let outcome = run_one_pass(
@@ -1224,6 +1316,7 @@ mod tests {
                 sink.as_ref(),
                 &teardown,
                 &mut seen,
+                DEFAULT_INTERVAL,
             )
             .await;
             assert_eq!(outcome.reaped, 0);
@@ -1235,7 +1328,7 @@ mod tests {
     /// If a reap does not land (app unreachable — the live state stays), the
     /// strand remains a confirmed candidate and is reaped again on the next
     /// pass. Persistent retry is the desired behaviour for the O'Brien hang.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn retries_reap_when_teardown_does_not_land() {
         let (_dir, db, product_id) = setup();
         let work_item_id = create_active_chore(&db, &product_id, "wedged");
@@ -1251,7 +1344,7 @@ mod tests {
         let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let teardown = TeardownRegistry::new();
-        let mut seen = HashSet::new();
+        let mut seen = HashMap::new();
 
         run_one_pass(
             db.as_ref(),
@@ -1261,8 +1354,10 @@ mod tests {
             sink.as_ref(),
             &teardown,
             &mut seen,
+            DEFAULT_INTERVAL,
         )
         .await; // record
+        tokio::time::advance(DEFAULT_INTERVAL).await;
         let p2 = run_one_pass(
             db.as_ref(),
             &live_states,
@@ -1271,6 +1366,7 @@ mod tests {
             sink.as_ref(),
             &teardown,
             &mut seen,
+            DEFAULT_INTERVAL,
         )
         .await; // reap
         let p3 = run_one_pass(
@@ -1281,6 +1377,7 @@ mod tests {
             sink.as_ref(),
             &teardown,
             &mut seen,
+            DEFAULT_INTERVAL,
         )
         .await; // retry
 
@@ -1294,7 +1391,7 @@ mod tests {
     /// teardown takes*. The point of the mark rather than a longer grace is
     /// exactly that no number of passes changes the answer, so this runs
     /// far more passes than the two-pass guard would need.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn never_reaps_while_a_teardown_mark_is_held() {
         let (_dir, db, product_id) = setup();
         let work_item_id = create_active_chore(&db, &product_id, "mid-completion");
@@ -1313,7 +1410,7 @@ mod tests {
         let reaper = RecordingReaper::new(live_states.clone(), true);
         let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let mut seen = HashSet::new();
+        let mut seen = HashMap::new();
 
         for pass in 1..=10 {
             let outcome = run_one_pass(
@@ -1324,6 +1421,7 @@ mod tests {
                 sink.as_ref(),
                 teardown.as_ref(),
                 &mut seen,
+                DEFAULT_INTERVAL,
             )
             .await;
             assert_eq!(
@@ -1342,7 +1440,7 @@ mod tests {
         // Once teardown finishes without releasing the pane (the genuine
         // strand shape), the sweep resumes ownership — and, because the
         // marked passes were dropped from the carried-forward set, it still
-        // takes a full two passes.
+        // takes a full confirmation delay.
         drop(guard);
         let first = run_one_pass(
             db.as_ref(),
@@ -1352,10 +1450,12 @@ mod tests {
             sink.as_ref(),
             teardown.as_ref(),
             &mut seen,
+            DEFAULT_INTERVAL,
         )
         .await;
         assert_eq!(first.reaped, 0, "the confirmation clock restarts after the mark clears");
         assert_eq!(first.pending_confirmation, 1);
+        tokio::time::advance(DEFAULT_INTERVAL).await;
         let second = run_one_pass(
             db.as_ref(),
             &live_states,
@@ -1364,6 +1464,7 @@ mod tests {
             sink.as_ref(),
             teardown.as_ref(),
             &mut seen,
+            DEFAULT_INTERVAL,
         )
         .await;
         assert_eq!(
@@ -1376,7 +1477,7 @@ mod tests {
     /// The mark must not become a way to leak a slot forever: a teardown
     /// that outlives its protection bound is a wedged teardown, which is
     /// exactly the strand this sweep exists to reclaim.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reaps_when_a_teardown_mark_outlives_its_protection_bound() {
         let (_dir, db, product_id) = setup();
         let work_item_id = create_active_chore(&db, &product_id, "wedged-teardown");
@@ -1394,7 +1495,7 @@ mod tests {
         let reaper = RecordingReaper::new(live_states.clone(), true);
         let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let mut seen = HashSet::new();
+        let mut seen = HashMap::new();
 
         let first = run_one_pass(
             db.as_ref(),
@@ -1404,10 +1505,12 @@ mod tests {
             sink.as_ref(),
             teardown.as_ref(),
             &mut seen,
+            DEFAULT_INTERVAL,
         )
         .await;
         assert_eq!(first.teardown_in_flight_skipped, 0, "an overrun mark stops protecting");
         assert_eq!(first.pending_confirmation, 1);
+        tokio::time::advance(DEFAULT_INTERVAL).await;
         let second = run_one_pass(
             db.as_ref(),
             &live_states,
@@ -1416,6 +1519,7 @@ mod tests {
             sink.as_ref(),
             teardown.as_ref(),
             &mut seen,
+            DEFAULT_INTERVAL,
         )
         .await;
         assert_eq!(second.reaped, 1, "a wedged teardown must still be reclaimable");
@@ -1429,7 +1533,7 @@ mod tests {
     ///
     /// Single-threaded runtime: `driver_teardown`'s test hook counts calls
     /// in a thread-local.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reaping_a_strand_also_tears_down_driver_state() {
         let (_dir, db, product_id) = setup();
         let work_item_id = create_active_chore(&db, &product_id, "driver-state");
@@ -1443,7 +1547,7 @@ mod tests {
         let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let teardown = TeardownRegistry::new();
-        let mut seen = HashSet::new();
+        let mut seen = HashMap::new();
 
         crate::driver_teardown::test_hooks::reset();
         run_one_pass(
@@ -1454,6 +1558,7 @@ mod tests {
             sink.as_ref(),
             &teardown,
             &mut seen,
+            DEFAULT_INTERVAL,
         )
         .await;
         assert_eq!(
@@ -1461,6 +1566,7 @@ mod tests {
             0,
             "a pass that reaps nothing must not tear driver state down",
         );
+        tokio::time::advance(DEFAULT_INTERVAL).await;
         let second = run_one_pass(
             db.as_ref(),
             &live_states,
@@ -1469,6 +1575,7 @@ mod tests {
             sink.as_ref(),
             &teardown,
             &mut seen,
+            DEFAULT_INTERVAL,
         )
         .await;
         assert_eq!(second.reaped, 1);
