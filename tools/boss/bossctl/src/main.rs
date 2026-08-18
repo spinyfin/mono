@@ -69,6 +69,11 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Inspect and steer worker sessions.
+    ///
+    /// Worker references resolve against the live-worker registry and then
+    /// the durable pane roster, each in run-id, slot-id, crew-name order.
+    /// A bare decimal integer or crew name that misses both remains a worker
+    /// resolution error; it is never reinterpreted as a work-item short id.
     Agents {
         #[command(subcommand)]
         action: AgentsAction,
@@ -669,18 +674,21 @@ enum AgentsAction {
     },
     /// Bring a worker pane to the front.
     Focus {
-        /// Worker reference: run id, slot id, or crew name.
+        /// Worker reference: run id, slot id, or crew name; see `agents
+        /// --help` for resolution order.
         agent: String,
     },
     /// Send text to a worker as if user-typed.
     Send {
-        /// Worker reference: run id, slot id, or crew name.
+        /// Worker reference: run id, slot id, or crew name; see `agents
+        /// --help` for resolution order.
         agent: String,
         text: String,
     },
     /// Interrupt a worker (Esc-equivalent).
     Interrupt {
-        /// Worker reference: run id, slot id, or crew name.
+        /// Worker reference: run id, slot id, or crew name; see `agents
+        /// --help` for resolution order.
         agent: String,
     },
     /// Launch a worker session for a given work item without going
@@ -700,7 +708,7 @@ enum AgentsAction {
         /// Worker reference: run id, slot id, or crew name. Resolved in
         /// that order — run id, then numeric slot id, then crew name —
         /// first against the live-worker registry, then against the
-        /// engine's durable pane state. A bare small integer is always
+        /// engine's durable pane state. A bare decimal integer is always
         /// tried as a slot id and never reinterpreted as a work-item
         /// short id (e.g. `T1`), even if resolution misses; an
         /// unresolvable reference errors in terms of workers (live/
@@ -715,7 +723,8 @@ enum AgentsAction {
     /// legitimately waiting on something the automated checks haven't
     /// been taught to recognize (e.g. debugging it by hand).
     Hold {
-        /// Worker reference: run id, slot id, or crew name.
+        /// Worker reference: run id, slot id, or crew name; see `agents
+        /// --help` for resolution order.
         agent: String,
         /// Free-text note explaining why the worker is held. Surfaced on
         /// `agents list`/`agents status`.
@@ -726,7 +735,8 @@ enum AgentsAction {
     /// idle-park/auto-reap sweep behavior. Idempotent — releasing a
     /// worker with no hold in place succeeds as a no-op.
     ReleaseHold {
-        /// Worker reference: run id, slot id, or crew name.
+        /// Worker reference: run id, slot id, or crew name; see `agents
+        /// --help` for resolution order.
         agent: String,
     },
     /// Print the transcript of a worker's conversation.
@@ -781,7 +791,7 @@ enum AgentsAction {
         /// Worker reference: run/execution id (e.g.
         /// `exec_18ad6336fedcb190_12`), slot id, or crew name. Look up
         /// a bare id with `bossctl workspace summary` or `boss chore
-        /// show`.
+        /// show`; see `agents --help` for resolution order.
         agent: String,
     },
     /// Show each worker pool's (main, automation, review) capacity,

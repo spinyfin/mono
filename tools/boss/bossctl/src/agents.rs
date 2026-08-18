@@ -79,15 +79,21 @@ pub(crate) fn live_candidates_summary(states: &[LiveWorkerState]) -> String {
     format!("Live: {}", labels.join(", "))
 }
 
-/// True if `reference` looks like a name or numeric slot id (so a
+/// True if `reference` looks like a name or numeric slot-shaped reference (so a
 /// resolver miss should be terminal rather than falling back to a
 /// historical run-id lookup). A run id like `exec_18ad...` falls
 /// through both checks.
 pub(crate) fn looks_like_name_or_slot(reference: &str) -> bool {
-    if reference.parse::<u8>().is_ok() {
+    if !reference.is_empty() && reference.bytes().all(|byte| byte.is_ascii_digit()) {
         return true;
     }
     ROSTER.iter().any(|name| name.eq_ignore_ascii_case(reference))
+}
+
+/// Whether a worker-resolution miss may fall back to a friendly work-item
+/// selector. Slot-shaped references and crew names must remain worker errors.
+fn work_item_fallback_eligible(reference: &str) -> bool {
+    !looks_like_name_or_slot(reference)
 }
 
 /// Resolve `reference` to a work item via the engine's shared id-resolution
@@ -171,7 +177,7 @@ async fn resolve_tnnn_to_live_worker<'a>(
 ///    path, spawn-ack timeout — but the app and durable state still
 ///    account for).
 /// 3. Friendly work-item id (`T42`, `P7`) — but only when `reference`
-///    does not itself look like a slot id or a crew name. A bare small
+///    does not itself look like a slot id or a crew name. A bare decimal
 ///    integer or a roster name is far more likely to be a worker
 ///    reference than a work-item short id here, since every verb sharing
 ///    this resolver operates on workers and an operator reading a slot
@@ -197,7 +203,7 @@ async fn resolve_agent_ref_or_work_item(
     if let Some(pane) = resolve_hosted_pane_ref(reference, &hosted)? {
         return Ok(pane.run_id.clone());
     }
-    if looks_like_name_or_slot(reference) {
+    if !work_item_fallback_eligible(reference) {
         return Err(no_worker_matches_error(reference, states, &hosted));
     }
     if let Some(state) = resolve_tnnn_to_live_worker(client, reference, states).await? {
@@ -1397,20 +1403,21 @@ pub(crate) async fn agents_transcript(
     // terminal executions absent from both, fall through and let the engine
     // query the DB directly. The engine's resolve_transcript_for_tail
     // handles both the exec_* and run_* namespaces, so passing the raw ref
-    // works for either id form. Friendly ids (T42) are tried as live-worker
-    // references first.
+    // works for either id form. Friendly ids are tried as live-worker
+    // references after the live registry and hosted-pane roster, while
+    // slot-shaped references and crew names remain worker-resolution errors.
     let run_id = match resolve_agent_ref(&agent, &states) {
         Ok(state) => state.run_id.clone(),
         Err(err) => {
-            if let Some(state) = resolve_tnnn_to_live_worker(&mut client, &agent, &states).await? {
+            let hosted = fetch_hosted_pane_statuses(&mut client).await?;
+            if let Some(pane) = resolve_hosted_pane_ref(&agent, &hosted)? {
+                pane.run_id.clone()
+            } else if !work_item_fallback_eligible(&agent) {
+                return Err(err);
+            } else if let Some(state) = resolve_tnnn_to_live_worker(&mut client, &agent, &states).await? {
                 state.run_id.clone()
             } else {
-                let hosted = fetch_hosted_pane_statuses(&mut client).await?;
-                match resolve_hosted_pane_ref(&agent, &hosted)? {
-                    Some(pane) => pane.run_id.clone(),
-                    None if looks_like_name_or_slot(&agent) => return Err(err),
-                    None => agent.clone(),
-                }
+                agent.clone()
             }
         }
     };
@@ -2121,6 +2128,7 @@ mod tests {
     fn numeric_slot_looks_like_name_or_slot() {
         assert!(looks_like_name_or_slot("5"));
         assert!(looks_like_name_or_slot("0"));
+        assert!(looks_like_name_or_slot("300"));
     }
 
     #[test]
@@ -2131,11 +2139,25 @@ mod tests {
     }
 
     #[test]
-    fn run_id_does_not_look_like_name_or_slot() {
+    fn non_slot_references_do_not_look_like_name_or_slot() {
         assert!(!looks_like_name_or_slot("exec_18ad9f"));
-        // Not a roster name, and out of `u8` range so it isn't a slot either.
-        assert!(!looks_like_name_or_slot("300"));
         assert!(!looks_like_name_or_slot("Picard"));
+    }
+
+    // ---- work_item_fallback_eligible --------------------------------------
+
+    #[test]
+    fn work_item_fallback_excludes_slot_shaped_references_and_crew_names() {
+        assert!(!work_item_fallback_eligible("1"));
+        assert!(!work_item_fallback_eligible("300"));
+        assert!(!work_item_fallback_eligible("riker"));
+    }
+
+    #[test]
+    fn work_item_fallback_allows_work_item_and_execution_references() {
+        assert!(work_item_fallback_eligible("exec_18ad9f"));
+        assert!(work_item_fallback_eligible("T1"));
+        assert!(work_item_fallback_eligible("task_123"));
     }
 
     // ---- WorkItem::primary_id ---------------------------------------------
