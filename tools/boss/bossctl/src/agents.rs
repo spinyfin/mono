@@ -159,13 +159,28 @@ async fn resolve_tnnn_to_live_worker<'a>(
     Ok(states.iter().find(|s| s.work_item_id.as_deref() == Some(primary_id)))
 }
 
-/// Resolve `reference` to a live worker's run id, accepting run ids,
-/// slot ids, crew names, and friendly work-item ids (T42, P7). Falls back,
-/// in order, to the engine's durable/hosted-pane roster (a worker the live
-/// registry has dropped — crash, terminal-fail path, spawn-ack timeout —
-/// but the app and durable state still account for) and then to a
-/// friendly work-item id. Errors with a combined candidate list (live AND
-/// durable-tracked-but-not-live) when nothing matches at all.
+/// Resolve `reference` to a live worker's run id.
+///
+/// Disambiguation order (first tier with any match wins; an ambiguous tier
+/// still errors rather than falling through):
+///
+/// 1. Live registry: run id, then numeric slot id, then crew name (see
+///    [`resolve_agent_ref`]).
+/// 2. Engine's durable/hosted-pane roster, same run-id/slot-id/crew-name
+///    order (a worker the live registry has dropped — crash, terminal-fail
+///    path, spawn-ack timeout — but the app and durable state still
+///    account for).
+/// 3. Friendly work-item id (`T42`, `P7`) — but only when `reference`
+///    does not itself look like a slot id or a crew name. A bare small
+///    integer or a roster name is far more likely to be a worker
+///    reference than a work-item short id here, since every verb sharing
+///    this resolver operates on workers and an operator reading a slot
+///    number off `agents list` expects it to resolve as a slot, not get
+///    reinterpreted as `T<n>` against an unrelated product. See
+///    [`looks_like_name_or_slot`].
+///
+/// Errors with a combined candidate list (live AND durable-tracked-but-not-
+/// live) when nothing matches at all.
 ///
 /// Shared by every `agents` verb whose engine RPC takes a bare run id and
 /// has no raw-passthrough escape hatch of its own (`stop`/`reap` layer
@@ -181,6 +196,9 @@ async fn resolve_agent_ref_or_work_item(
     let hosted = fetch_hosted_pane_statuses(client).await?;
     if let Some(pane) = resolve_hosted_pane_ref(reference, &hosted)? {
         return Ok(pane.run_id.clone());
+    }
+    if looks_like_name_or_slot(reference) {
+        return Err(no_worker_matches_error(reference, states, &hosted));
     }
     if let Some(state) = resolve_tnnn_to_live_worker(client, reference, states).await? {
         return Ok(state.run_id.clone());

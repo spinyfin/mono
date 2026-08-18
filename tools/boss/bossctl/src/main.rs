@@ -697,7 +697,14 @@ enum AgentsAction {
     },
     /// Stop a worker session and release its lease.
     Stop {
-        /// Worker reference: run id, slot id, or crew name.
+        /// Worker reference: run id, slot id, or crew name. Resolved in
+        /// that order — run id, then numeric slot id, then crew name —
+        /// first against the live-worker registry, then against the
+        /// engine's durable pane state. A bare small integer is always
+        /// tried as a slot id and never reinterpreted as a work-item
+        /// short id (e.g. `T1`), even if resolution misses; an
+        /// unresolvable reference errors in terms of workers (live/
+        /// tracked slots), not work items.
         agent: String,
     },
     /// Place an explicit hold on a live worker, exempting it from the
