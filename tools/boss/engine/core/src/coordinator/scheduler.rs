@@ -595,29 +595,7 @@ impl ExecutionCoordinator {
                         "chain-serialization guard: 'live' chain sibling's worker pane is gone; \
                          reconciled it and re-checking for still-live siblings",
                     );
-                    // Same lease-release contract as the spawn-time redundant
-                    // guard: terminalizing through this reconcile must free
-                    // the cube lease, not only the periodic sweep.
-                    if let Some(lease_id) = sibling.cube_lease_id.as_deref() {
-                        let registry_still_live = reconciled_dead_pane
-                            && self
-                                .live_worker_states
-                                .as_ref()
-                                .is_some_and(|reg| reg.is_run_live(&sibling.id));
-                        if !registry_still_live {
-                            let reason = if reconciled_dead_pane {
-                                "pane-death reconcile: worker pane gone"
-                            } else {
-                                "execution-liveness reconcile: worker pane gone"
-                            };
-                            crate::execution_liveness::force_release_lease_best_effort(
-                                &sibling.id,
-                                lease_id,
-                                self.host_adapter().force_release_lease(lease_id, Some(reason)),
-                            )
-                            .await;
-                        }
-                    }
+                    self.release_lease_after_reconcile(sibling, reconciled_dead_pane).await;
                 }
             }
             if !any_reconciled {

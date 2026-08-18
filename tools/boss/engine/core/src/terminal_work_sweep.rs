@@ -10,7 +10,7 @@
 //! mid-turn. The worker then sits alive — typically in `waiting_for_input`
 //! — holding its slot indefinitely, long after its task went `done` and
 //! its PR merged. The real incident: run `exec_…8d` on slot 8 stayed alive
-//! for ~2.5 DAYS after work item T1679 had gone to `done` and PR #1496 had
+//! for ~2.5 DAYS after the bound work item had gone to `done` and PR #1496 had
 //! MERGED, and had to be reaped by hand.
 //!
 //! Every other reconciler deliberately skips this case:

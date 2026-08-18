@@ -214,7 +214,7 @@ pub async fn run_one_pass(
 /// orphan work correctly parked awaiting a human.
 ///
 /// Signal 2 closes the exact gap that let the 2026-07-03 zombies survive the
-/// heartbeat-failure auto-reap for a dead-but-leased workspace: their
+/// heartbeat-failure auto-reap (`cube_lease_auto_reap`): their
 /// workspace dirs were still on disk (so signal 1 never fired), their cube
 /// leases were kept alive by the engine's own DB-fallback heartbeat (so
 /// `cube_lease_auto_reap` never fired), and no pid was ever reported (so

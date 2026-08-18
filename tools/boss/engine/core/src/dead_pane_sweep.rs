@@ -15,8 +15,8 @@
 //! - The app never tells the engine a pane died — there is no pane-died RPC.
 //! - The cube lease stays green: the engine's own [`crate::cube_lease_heartbeat`]
 //!   DB-fallback sweep renews the lease of every in-flight row, so the
-//!   heartbeat-failure auto-reap for a dead-but-leased workspace never fires
-//!   for a dead-but-leased pane.
+//!   heartbeat-failure auto-reap (`cube_lease_auto_reap`) never fires for a
+//!   dead-but-leased pane.
 //! - The workspace directory survives, so [`crate::lost_workspace_sweep`]
 //!   (which keys on the cwd being gone) never fires.
 //! - [`crate::dead_pid_sweep`] *could* catch it — it probes the shell pid with
@@ -1065,6 +1065,37 @@ mod tests {
             cube.force_release_calls(),
             vec!["lease-1".to_owned()],
             "the reaped execution's cube lease must be force-released",
+        );
+    }
+
+    /// A stale hook permits the durable dead-pid reap, but the registry still
+    /// owning the execution prevents returning a potentially live workspace
+    /// to the lease pool.
+    #[tokio::test]
+    async fn reconcile_skips_lease_release_when_live_registry_still_tracks_execution() {
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_automation(&db, &product);
+        let exec = parked_triage_execution(&db, &automation, "/tmp/ws-live-lease", "local", Some(dead_pid()));
+        let live_states = LiveWorkerStateRegistry::new();
+        live_states.register_spawn(1, &exec.id, "claude-opus-4-7", 424242, None);
+
+        let now = now_epoch_secs();
+        live_states.set_last_event_at_for_test(
+            1,
+            crate::live_worker_state::iso8601_utc(now - crate::durable_liveness::CORROBORATION_WINDOW_SECS - 1),
+        );
+
+        let sink = NoopDispatchEventSink;
+        let cube = RecordingCube::default();
+        assert!(
+            reconcile_if_pane_dead(&db, &sink, &exec, now, Some(&live_states), Some(&cube)).await,
+            "the stale registry hook must not prevent the durable dead-pid reap",
+        );
+        assert_eq!(db.get_execution(&exec.id).unwrap().status, ExecutionStatus::Orphaned);
+        assert!(
+            cube.force_release_calls().is_empty(),
+            "a live registry entry must keep the potentially active workspace leased",
         );
     }
 }

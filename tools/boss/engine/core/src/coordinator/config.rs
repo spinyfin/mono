@@ -120,6 +120,36 @@ impl ExecutionCoordinator {
         Arc::clone(&self.host_adapter)
     }
 
+    /// Best-effort release after an inline liveness reconcile terminalized an
+    /// execution. A dead-pane reconcile is DB-only, so a live registry entry
+    /// means the worker may still be writing its leased workspace; retain the
+    /// lease in that case rather than handing the checkout to another worker.
+    pub(crate) async fn release_lease_after_reconcile(&self, execution: &WorkExecution, reconciled_dead_pane: bool) {
+        let Some(lease_id) = execution.cube_lease_id.as_deref() else {
+            return;
+        };
+
+        let registry_still_live = reconciled_dead_pane
+            && self
+                .live_worker_states()
+                .is_some_and(|registry| registry.is_run_live(&execution.id));
+        if registry_still_live {
+            return;
+        }
+
+        let reason = if reconciled_dead_pane {
+            "pane-death reconcile: worker pane gone"
+        } else {
+            "execution-liveness reconcile: worker pane gone"
+        };
+        crate::execution_liveness::force_release_lease_best_effort(
+            &execution.id,
+            lease_id,
+            self.host_adapter().force_release_lease(lease_id, Some(reason)),
+        )
+        .await;
+    }
+
     /// Install the host-adapter provider used to build per-host adapters
     /// in the dispatch loop. `app.rs` wires the SSH-capable provider so
     /// the coordinator can route to registered remote hosts; tests inject

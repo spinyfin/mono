@@ -386,32 +386,7 @@ impl ExecutionCoordinator {
                         "spawn_attempt: prior 'live' execution's worker pane was gone; \
                          reconciled it and proceeding with this spawn",
                     );
-                    // Terminalizing an execution must release its cube lease
-                    // (acceptance: not only the periodic sweep). The reconcile
-                    // calls above are DB-only when no CubeClient is threaded;
-                    // release via the host adapter here. For the pane-pid
-                    // path, skip when the live registry still tracks the
-                    // execution — that reconcile does not tear the worker down.
-                    if let Some(lease_id) = live.cube_lease_id.as_deref() {
-                        let registry_still_live = reconciled_dead_pane
-                            && self
-                                .live_worker_states
-                                .as_ref()
-                                .is_some_and(|reg| reg.is_run_live(&live.id));
-                        if !registry_still_live {
-                            let reason = if reconciled_dead_pane {
-                                "pane-death reconcile: worker pane gone"
-                            } else {
-                                "execution-liveness reconcile: worker pane gone"
-                            };
-                            crate::execution_liveness::force_release_lease_best_effort(
-                                &live.id,
-                                lease_id,
-                                self.host_adapter().force_release_lease(lease_id, Some(reason)),
-                            )
-                            .await;
-                        }
-                    }
+                    self.release_lease_after_reconcile(&live, reconciled_dead_pane).await;
                     // Not redundant after all — fall through to the rest of dispatch.
                 } else {
                     // The blocker survived every death check the reconciler
