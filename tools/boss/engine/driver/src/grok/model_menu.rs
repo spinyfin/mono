@@ -13,13 +13,14 @@
 //! # Refresh path
 //!
 //! `ModelMenu` is static function pointers today, so this is a baked
-//! snapshot rather than a live `grok models` parse. **A one-model table
-//! will be wrong the moment xAI ships a second SKU.** Refresh source is
-//! the machine-readable `grok models` listing; when a second model
-//! appears, update [`super::GROK_DESCRIPTOR`]'s `engine_default` /
-//! `model_for_reasoning` / `default_model_for_level` together and add a
-//! conformance assertion that the pinned menu still matches the live
-//! catalog (design A-11 / T-20).
+//! snapshot rather than a live `grok models` parse. This table pins the
+//! provider's current default (plus whatever prior generation xAI still
+//! retains on the menu). Refresh source is the machine-readable `grok
+//! models` listing; when `grok models` reports a new default, update
+//! [`super::GROK_DESCRIPTOR`]'s `engine_default` / `model_for_reasoning` /
+//! `default_model_for_level` together and update the live pin in
+//! `conformance/version_pin.rs` (design A-11 / T-20). Never dispatch a
+//! retained prior generation as a fallback.
 //!
 //! Do **not** reference `grok-build-0.1` (not on the account menu) or
 //! `grok-code-fast-1` (retired 15 May 2026; silently redirects rather
@@ -67,9 +68,10 @@ pub(super) fn effort_value_for_level(level: EffortLevel) -> Option<&'static str>
     })
 }
 
-/// Capability-lever model choice. With a single SKU there is no
-/// sonnet/opus-style split: both `Standard` and `Investigation` resolve
-/// to `grok-4.6`. That is honest rather than degenerate — and it is the
+/// Capability-lever model choice. xAI exposes one current generation plus
+/// retained prior ones; Boss dispatches only the current default, so both
+/// `Standard` and `Investigation` resolve to `grok-4.6`. The retained prior
+/// generation is never selected as a lower tier or fallback — it is the
 /// field most likely to be wrong within a quarter (see module refresh
 /// path).
 pub(super) fn model_for_reasoning(_reasoning: ReasoningMode) -> &'static str {

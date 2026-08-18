@@ -305,8 +305,10 @@ impl AgentDriver for GrokDriver {
         // owns its surface strings.
         Some(PaneMonitorSpec {
             // OR-semantics. "always-approve" assumes Boss spawn keeps
-            // --always-approve. "Grok 4" matches footer "Grok 4.5 …"
-            // without pinning the patch model id.
+            // --always-approve. "Grok 4" matches footer "Grok 4.6 …"
+            // without pinning the patch model id — the prefix is
+            // deliberately generation-agnostic, so it keeps matching
+            // across future SKU bumps too.
             agent_markers: vec!["Shift+Tab:mode".into(), "always-approve".into(), "Grok 4".into()],
             // Footer affordance present on every busy poll, absent idle.
             busy_markers: vec!["Esc:cancel".into(), "[stop]".into()],
