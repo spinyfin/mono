@@ -1103,7 +1103,7 @@ mod tests {
 
     #[test]
     fn claude_model_belongs_to_driver_rejects_other_drivers_models() {
-        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "grok-4.5", "codex-auto-review"] {
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "grok-4.6", "codex-auto-review"] {
             assert!(
                 !claude_model_belongs_to_driver(model),
                 "{model:?} should not be recognised as a Claude model"
