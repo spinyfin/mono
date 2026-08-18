@@ -59,6 +59,7 @@
 //! `live_process_evidence` does.
 
 use crate::dead_pid_sweep::PidStatus;
+use crate::live_worker_state::{LiveWorkerStateRegistry, iso8601_utc};
 use crate::work::WorkDb;
 
 /// How far back a recorded `work_runs.shell_pid` is trusted by the callers
@@ -82,6 +83,120 @@ use crate::work::WorkDb;
 /// [`crate::stale_worker_sweep`] and [`crate::husk_pane_sweep`], not to a
 /// guard whose only job is "don't double-dispatch onto a live process".
 pub const REDISPATCH_PID_TRUST_SECS: i64 = 3600;
+
+/// A `Gone` (`kill(pid, 0) == ESRCH`) verdict from a durable-pid probe is
+/// only trusted if the execution has ALSO gone quiet for at least this long.
+/// A hook event newer than this window (or a tool in flight whose last
+/// in-execution hook is still within
+/// [`crate::stale_worker_sweep::DEFAULT_STALE_THRESHOLD_SECS`]) proves the
+/// worker's process tree is alive regardless of what the *tracked* pid — a
+/// possibly-transient or reused snapshot — reports, so the verdict is
+/// downgraded to `Alive` rather than trusted (the shell-pid false-reap fix,
+/// generalized: see [`corroborating_liveness`]). 120 s is comfortably above
+/// the ~10-30 s hook cadence a working worker shows, so a live worker is
+/// never in danger, yet an order of magnitude below
+/// [`crate::stale_worker_sweep`]'s 30-min threshold, so a genuinely dead
+/// worker still ages out of the window and gets reaped on a later pass. This
+/// is a *corroboration* window, not a longer reap timer: it only ever
+/// *prevents* acting on a demonstrably-live execution — lengthening the
+/// underlying reap/redispatch interval instead would still act on live
+/// workers, which is the opposite of what this guards.
+pub const CORROBORATION_WINDOW_SECS: i64 = 120;
+
+/// Corroborate a `Gone` pid verdict against `execution_id`'s recent
+/// in-execution activity, as recorded by the (in-memory, NOT
+/// restart-robust) [`LiveWorkerStateRegistry`]. Returns `Some(reason)` when
+/// the execution is demonstrably alive — meaning a caller about to reap or
+/// block a redispatch on a bare `Gone` verdict must not — naming the
+/// contradicting signal for the log, and `None` when nothing contradicts the
+/// dead verdict.
+///
+/// This is the **single** implementation of the corroboration check —
+/// originally private to [`crate::dead_pid_sweep`] (the shell-pid
+/// false-reap fix), lifted here so every durable-pid probe caller
+/// ([`crate::dead_pid_sweep`], [`crate::dead_pane_sweep`], and the
+/// re-dispatch guard in [`crate::orphan_sweep`]) applies the identical rule
+/// instead of each carrying its own (and, historically, only one of them
+/// actually doing so).
+///
+/// Only activity attributable to *this* execution counts: a recycled slot
+/// can carry a *prior* run's `last_event_at`, and a timestamp predating this
+/// execution's own `started_at` cannot be one of its events. Gating on `>=
+/// started_at` means a genuinely dead worker with a stale prior-run
+/// timestamp is still reaped, while a live worker with flowing events is
+/// spared.
+pub fn corroborating_liveness(
+    live_states: &LiveWorkerStateRegistry,
+    execution_id: &str,
+    started_epoch: i64,
+    now_epoch_secs: i64,
+) -> Option<String> {
+    let started_iso = iso8601_utc(started_epoch);
+    // A hook whose timestamp predates this execution's start belongs to a
+    // prior run on a recycled slot — not evidence of *this* worker's life.
+    let last_event_at = live_states.last_event_at_for_run(execution_id);
+    let in_execution_event = last_event_at.as_deref().filter(|e| *e >= started_iso.as_str());
+
+    // A tool in flight (an unbalanced PreToolUse) means the worker is
+    // legitimately busy — most importantly a long foreground `bazel build`
+    // that emits no hook for many minutes. Bound the spare by the same
+    // ceiling [`crate::stale_worker_sweep`] uses for "no progress": an
+    // unbalanced PreToolUse whose last in-execution hook is older than that
+    // is no longer treated as corroboration. Without the bound, a worker
+    // killed mid-tool (activity still `Working`, `current_tool` still set)
+    // would be spared forever by every durable-pid consumer — including
+    // [`crate::dead_pane_sweep`], whose whole reason to exist is the deaths
+    // the app never reports via `reap_reported_pane_death`. Past the ceiling
+    // the `Gone` verdict stands and a later pass reaps the row;
+    // `stale_worker_sweep` itself skips while a tool is in flight, so this
+    // bound is what clears that shape.
+    let tool_in_flight_cutoff = iso8601_utc(now_epoch_secs - crate::stale_worker_sweep::DEFAULT_STALE_THRESHOLD_SECS);
+    if let Some(tool) = live_states.current_tool_for_run(execution_id)
+        && let Some(event) = in_execution_event
+        && event >= tool_in_flight_cutoff.as_str()
+    {
+        return Some(format!("tool `{tool}` in flight (last hook {event})"));
+    }
+
+    // A hook within the corroboration window proves the process tree is
+    // alive whatever the pid probe says.
+    let recent_cutoff = iso8601_utc(now_epoch_secs - CORROBORATION_WINDOW_SECS);
+    if let Some(event) = in_execution_event
+        && event >= recent_cutoff.as_str()
+    {
+        return Some(format!("hook event at {event} within {CORROBORATION_WINDOW_SECS}s"));
+    }
+
+    None
+}
+
+/// Wrap a raw [`WorkerProcess`] verdict with corroboration against the live
+/// registry: a `Gone` verdict is downgraded to `Alive` when
+/// [`corroborating_liveness`] finds contradicting recent activity, so a
+/// caller that only ever acts on `Gone` (a reaper) or only ever declines to
+/// act on `Alive` (the redispatch guard) gets the safe answer without
+/// duplicating the check. `Alive` and `Unknown` verdicts pass through
+/// unchanged — corroboration only ever pulls a verdict *toward* "alive",
+/// never away from it.
+///
+/// Returns the (possibly-adjusted) verdict plus the corroboration reason,
+/// when one applied, for callers that want to log why a `Gone` probe was
+/// not trusted.
+pub fn corroborate_against_live_registry(
+    process: WorkerProcess,
+    live_states: &LiveWorkerStateRegistry,
+    execution_id: &str,
+    started_epoch: i64,
+    now_epoch_secs: i64,
+) -> (WorkerProcess, Option<String>) {
+    let WorkerProcess::Gone { shell_pid } = process else {
+        return (process, None);
+    };
+    match corroborating_liveness(live_states, execution_id, started_epoch, now_epoch_secs) {
+        Some(reason) => (WorkerProcess::Alive { shell_pid }, Some(reason)),
+        None => (WorkerProcess::Gone { shell_pid }, None),
+    }
+}
 
 /// Verdict on the worker process behind an execution, derived from durable
 /// state only.
@@ -284,12 +399,233 @@ fn probe_recorded_pid(shell_pid: Option<i64>) -> WorkerProcess {
 mod tests {
     use super::*;
     use crate::test_support::*;
+    use boss_protocol::WorkerEvent;
 
     /// A pid that is guaranteed not to exist: `kill(pid, 0)` returns `ESRCH`.
     /// Mirrors the same helper in `dead_pid_sweep`'s tests.
     fn dead_pid() -> i64 {
         // Well above any plausible live pid on macOS/Linux test hosts.
         4_194_303
+    }
+
+    // ─── corroborating_liveness / corroborate_against_live_registry ────────
+
+    /// The 20-same-tick incident replay, condensed to a fixture: a worker
+    /// whose tracked shell pid probes dead (`Gone`) while it has emitted a
+    /// hook well within the corroboration window must not be treated as
+    /// dead — this is the exact race from the "live workers false-reaped as
+    /// orphaned" incident, where `dead_pane_sweep`'s uncorroborated probe and
+    /// `dead_pid_sweep`'s corroborated one disagreed 45ms apart on the same
+    /// execution.
+    #[test]
+    fn recent_hook_corroborates_a_gone_verdict_as_alive() {
+        let live_states = LiveWorkerStateRegistry::new();
+        live_states.register_spawn(1, "exec-1", "claude-opus-4-7", 12345, None);
+        live_states.apply_event(
+            1,
+            &WorkerEvent::PreToolUse {
+                session_id: "s".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+            },
+        );
+        live_states.apply_event(
+            1,
+            &WorkerEvent::PostToolUse {
+                session_id: "s".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+                tool_response: serde_json::json!({}),
+            },
+        );
+
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let started_epoch = now - 300;
+        assert!(
+            corroborating_liveness(&live_states, "exec-1", started_epoch, now).is_some(),
+            "a hook emitted moments ago must corroborate liveness",
+        );
+
+        let (process, reason) = corroborate_against_live_registry(
+            WorkerProcess::Gone { shell_pid: 999 },
+            &live_states,
+            "exec-1",
+            started_epoch,
+            now,
+        );
+        assert_eq!(
+            process,
+            WorkerProcess::Alive { shell_pid: 999 },
+            "a corroborated Gone verdict must be treated as Alive so callers never reap/redispatch over it",
+        );
+        assert!(reason.is_some());
+    }
+
+    /// A long foreground tool call (e.g. a `bazel build`) with no hook for
+    /// minutes must still corroborate — this is the "tool in flight" branch,
+    /// covering the same-tick incidents where the false-reap guard's log
+    /// explicitly noted "tool `Bash` in flight". Past
+    /// [`crate::stale_worker_sweep::DEFAULT_STALE_THRESHOLD_SECS`] the spare
+    /// ages out (see [`stale_tool_in_flight_does_not_corroborate`]).
+    #[test]
+    fn tool_in_flight_corroborates_a_gone_verdict() {
+        let live_states = LiveWorkerStateRegistry::new();
+        live_states.register_spawn(1, "exec-2", "claude-opus-4-7", 12345, None);
+        live_states.apply_event(
+            1,
+            &WorkerEvent::PreToolUse {
+                session_id: "s".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+            },
+        );
+
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let started_epoch = now - 300;
+        let (process, _) = corroborate_against_live_registry(
+            WorkerProcess::Gone { shell_pid: 1 },
+            &live_states,
+            "exec-2",
+            started_epoch,
+            now,
+        );
+        assert_eq!(process, WorkerProcess::Alive { shell_pid: 1 });
+    }
+
+    /// An unbalanced PreToolUse whose last in-execution hook is older than
+    /// the stale-worker ceiling must NOT corroborate forever — otherwise a
+    /// mid-tool death the app never reported wedges `dead_pane_sweep` for
+    /// the life of the engine.
+    #[test]
+    fn stale_tool_in_flight_does_not_corroborate() {
+        let live_states = LiveWorkerStateRegistry::new();
+        live_states.register_spawn(1, "exec-stale-tool", "claude-opus-4-7", 12345, None);
+        live_states.apply_event(
+            1,
+            &WorkerEvent::PreToolUse {
+                session_id: "s".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+            },
+        );
+
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let started_epoch = now - crate::stale_worker_sweep::DEFAULT_STALE_THRESHOLD_SECS - 600;
+        // Last hook is attributed to this execution but well past the
+        // tool-in-flight ceiling.
+        live_states.set_last_event_at_for_test(
+            1,
+            iso8601_utc(now - crate::stale_worker_sweep::DEFAULT_STALE_THRESHOLD_SECS - 60),
+        );
+
+        assert!(
+            corroborating_liveness(&live_states, "exec-stale-tool", started_epoch, now).is_none(),
+            "a stuck tool older than the stale-worker ceiling must not corroborate forever",
+        );
+    }
+
+    /// A genuinely dead worker — no live-state entry at all — must NOT be
+    /// corroborated: the `Gone` verdict passes through unchanged so the
+    /// reaper still reaps it. Without this, corroboration would turn into a
+    /// blanket "never reap" guard instead of a targeted false-positive fix.
+    #[test]
+    fn no_live_state_does_not_corroborate() {
+        let live_states = LiveWorkerStateRegistry::new();
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        assert!(corroborating_liveness(&live_states, "exec-missing", now - 300, now).is_none());
+
+        let (process, reason) = corroborate_against_live_registry(
+            WorkerProcess::Gone { shell_pid: 7 },
+            &live_states,
+            "exec-missing",
+            now - 300,
+            now,
+        );
+        assert_eq!(process, WorkerProcess::Gone { shell_pid: 7 });
+        assert!(reason.is_none());
+    }
+
+    /// A hook event older than the corroboration window is stale, not
+    /// corroborating — a genuinely dead worker's last-known activity must
+    /// still age out and be reaped on a later pass.
+    #[test]
+    fn stale_hook_does_not_corroborate() {
+        let live_states = LiveWorkerStateRegistry::new();
+        live_states.register_spawn(1, "exec-3", "claude-opus-4-7", 12345, None);
+        live_states.apply_event(
+            1,
+            &WorkerEvent::PreToolUse {
+                session_id: "s".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+            },
+        );
+        live_states.apply_event(
+            1,
+            &WorkerEvent::PostToolUse {
+                session_id: "s".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+                tool_response: serde_json::json!({}),
+            },
+        );
+
+        // Ask as if "now" were far past the corroboration window.
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let far_future = now + CORROBORATION_WINDOW_SECS + 300;
+        assert!(corroborating_liveness(&live_states, "exec-3", now - 600, far_future).is_none());
+    }
+
+    /// A hook that predates this execution's own `started_at` belongs to a
+    /// prior run on a recycled slot — it must not corroborate a DIFFERENT
+    /// (later) execution's liveness.
+    #[test]
+    fn hook_predating_started_at_does_not_corroborate() {
+        let live_states = LiveWorkerStateRegistry::new();
+        live_states.register_spawn(1, "exec-4", "claude-opus-4-7", 12345, None);
+        live_states.apply_event(
+            1,
+            &WorkerEvent::PreToolUse {
+                session_id: "s".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+            },
+        );
+        live_states.apply_event(
+            1,
+            &WorkerEvent::PostToolUse {
+                session_id: "s".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+                tool_response: serde_json::json!({}),
+            },
+        );
+
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        // started_at in the future relative to the hook we just stamped.
+        assert!(corroborating_liveness(&live_states, "exec-4", now + 60, now).is_none());
+    }
+
+    /// Corroboration only ever pulls a verdict toward "alive" — it must
+    /// never touch an already-`Alive` or `Unknown` verdict.
+    #[test]
+    fn corroboration_never_touches_non_gone_verdicts() {
+        let live_states = LiveWorkerStateRegistry::new();
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let (alive, reason) = corroborate_against_live_registry(
+            WorkerProcess::Alive { shell_pid: 5 },
+            &live_states,
+            "exec-5",
+            now - 300,
+            now,
+        );
+        assert_eq!(alive, WorkerProcess::Alive { shell_pid: 5 });
+        assert!(reason.is_none());
+
+        let (unknown, reason) =
+            corroborate_against_live_registry(WorkerProcess::Unknown, &live_states, "exec-5", now - 300, now);
+        assert_eq!(unknown, WorkerProcess::Unknown);
+        assert!(reason.is_none());
     }
 
     #[test]

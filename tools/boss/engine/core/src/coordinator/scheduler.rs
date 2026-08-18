@@ -573,6 +573,7 @@ impl ExecutionCoordinator {
                     self.work_db.as_ref(),
                     self.dispatch_events.as_ref(),
                     sibling,
+                    None, // lease release follows via host_adapter below
                 )
                 .await;
                 let reconciled_dead_pane = !reconciled_lost_workspace
@@ -581,6 +582,8 @@ impl ExecutionCoordinator {
                         self.dispatch_events.as_ref(),
                         sibling,
                         boss_engine_utils::epoch_time::now_epoch_secs(),
+                        self.live_worker_states.as_deref(),
+                        None, // lease release follows via host_adapter below
                     )
                     .await;
                 if reconciled_lost_workspace || reconciled_dead_pane {
@@ -592,6 +595,7 @@ impl ExecutionCoordinator {
                         "chain-serialization guard: 'live' chain sibling's worker pane is gone; \
                          reconciled it and re-checking for still-live siblings",
                     );
+                    self.release_lease_after_reconcile(sibling, reconciled_dead_pane).await;
                 }
             }
             if !any_reconciled {

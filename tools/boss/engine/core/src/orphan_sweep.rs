@@ -356,54 +356,113 @@ pub async fn run_one_pass(
         // branch is one of the two triggers that starts it. What this guard
         // guarantees on its own is narrower and is the point: no duplicate
         // worker is created while the previous one is alive.
-        if let Some((blocking_execution_id, process)) =
+        if let Some((blocking_execution_id, raw_process)) =
             crate::durable_liveness::probe_work_item_worker(work_db, &work_item_id, now_epoch_secs)
-            && process.is_alive()
         {
-            let blocking_status = work_db
-                .get_execution(&blocking_execution_id)
+            let blocking_execution = work_db.get_execution(&blocking_execution_id).ok();
+            let blocking_status = blocking_execution
+                .as_ref()
                 .map(|exec| exec.status.to_string())
-                .unwrap_or_else(|_| "unknown".to_owned());
-            tracing::warn!(
-                work_item_id = %work_item_id,
-                blocking_execution_id = %blocking_execution_id,
-                blocking_status = %blocking_status,
-                shell_pid = process.shell_pid().unwrap_or(0),
-                "orphan sweep: refusing to redispatch — the row's previous worker process is still \
-                 running. The engine's bookkeeping disagrees with the OS; the OS wins.",
-            );
+                .unwrap_or_else(|| "unknown".to_owned());
+
+            // Corroborate a `Gone` verdict against the live-worker registry
+            // before trusting it — the redispatch-guard half of the "live
+            // workers false-reaped as orphaned" incident. `probe_work_item_worker`
+            // reads the same fragile tracked-pid identity `dead_pane_sweep` and
+            // `dead_pid_sweep` do; without this, the guard reads the same
+            // wrong `Gone` verdict a false-reaping sweep just acted on and
+            // fails open — letting a second worker dispatch onto a row whose
+            // first worker is still running. `live_states` is `None` only
+            // when no registry was wired up (a test, or a call site with no
+            // live-state access), in which case the guard falls back to its
+            // pre-fix behavior of trusting the bare probe.
+            let live_states = coordinator.live_worker_states();
+            let started_epoch = blocking_execution.as_ref().and_then(|exec| exec.started_epoch());
+            let (process, corroboration) = match (live_states, started_epoch) {
+                (Some(live), Some(started)) => crate::durable_liveness::corroborate_against_live_registry(
+                    raw_process,
+                    live,
+                    &blocking_execution_id,
+                    started,
+                    now_epoch_secs,
+                ),
+                _ => (raw_process, None),
+            };
+
+            if process.is_alive() {
+                tracing::warn!(
+                    work_item_id = %work_item_id,
+                    blocking_execution_id = %blocking_execution_id,
+                    blocking_status = %blocking_status,
+                    shell_pid = process.shell_pid().unwrap_or(0),
+                    corroborated = corroboration.is_some(),
+                    "orphan sweep: refusing to redispatch — the row's previous worker process is still \
+                     running. The engine's bookkeeping disagrees with the OS; the OS wins.",
+                );
+                dispatch_events
+                    .emit(
+                        DispatchEvent::new(
+                            Stage::RedispatchBlockedLiveProcess,
+                            Outcome::Skipped,
+                            &blocking_execution_id,
+                        )
+                        .with_work_item(&work_item_id)
+                        .with_details(serde_json::json!({
+                            "loop": "orphan_active_sweep",
+                            "blocking_execution_id": blocking_execution_id,
+                            "blocking_execution_status": blocking_status,
+                            "shell_pid": process.shell_pid(),
+                            "recent_terminal_executions": recent_terminal,
+                            "corroborated_alive": corroboration.is_some(),
+                        })),
+                    )
+                    .await;
+                outcome.live_process_skipped += 1;
+                // Skipping alone would leave the row parked forever: never
+                // redispatched (a live process blocks it) and never progressed
+                // (the engine still believes its worker is dead). Hand the
+                // contradiction to the convergence path, which re-adopts the run
+                // if the terminal status was only an inference or reaps the
+                // process if it was a decision. This is the trigger that covers
+                // the case the hook fan-out cannot: a worker that is alive but
+                // currently quiet — parked inside a long foreground build, say —
+                // emits no hook to converge on, so without this the guard would
+                // hold the row indefinitely.
+                convergence
+                    .converge_live_worker(&blocking_execution_id, "redispatch_guard")
+                    .await;
+                continue;
+            }
+
+            // The guard declined to block: instrumentation gap this closes.
+            // Before this event, the guard was silent whenever it let a
+            // redispatch through — diagnosing a wrongly-declined case (the
+            // probe said `Gone`/`Unknown` when the worker was, or should have
+            // been corroborated, alive) required cross-referencing this
+            // sweep's trace lines against a different sweep's 45ms apart.
+            // This makes the decision self-diagnosing from a single dispatch
+            // tail: pid probed, probe result, and last-hook age.
+            let last_event_at = live_states.and_then(|live| live.last_event_at_for_run(&blocking_execution_id));
+            let last_event_age_secs = last_event_at
+                .as_deref()
+                .and_then(boss_engine_utils::iso8601::parse_iso8601_to_epoch)
+                .map(|t| now_epoch_secs - t);
             dispatch_events
                 .emit(
-                    DispatchEvent::new(
-                        Stage::RedispatchBlockedLiveProcess,
-                        Outcome::Skipped,
-                        &blocking_execution_id,
-                    )
-                    .with_work_item(&work_item_id)
-                    .with_details(serde_json::json!({
-                        "loop": "orphan_active_sweep",
-                        "blocking_execution_id": blocking_execution_id,
-                        "blocking_execution_status": blocking_status,
-                        "shell_pid": process.shell_pid(),
-                        "recent_terminal_executions": recent_terminal,
-                    })),
+                    DispatchEvent::new(Stage::RedispatchGuardDeclined, Outcome::Ok, &blocking_execution_id)
+                        .with_work_item(&work_item_id)
+                        .with_details(serde_json::json!({
+                            "loop": "orphan_active_sweep",
+                            "blocking_execution_id": blocking_execution_id,
+                            "blocking_execution_status": blocking_status,
+                            "probe_result": process.reason(),
+                            "shell_pid": process.shell_pid(),
+                            "last_event_at": last_event_at,
+                            "last_event_age_secs": last_event_age_secs,
+                            "recent_terminal_executions": recent_terminal,
+                        })),
                 )
                 .await;
-            outcome.live_process_skipped += 1;
-            // Skipping alone would leave the row parked forever: never
-            // redispatched (a live process blocks it) and never progressed
-            // (the engine still believes its worker is dead). Hand the
-            // contradiction to the convergence path, which re-adopts the run
-            // if the terminal status was only an inference or reaps the
-            // process if it was a decision. This is the trigger that covers
-            // the case the hook fan-out cannot: a worker that is alive but
-            // currently quiet — parked inside a long foreground build, say —
-            // emits no hook to converge on, so without this the guard would
-            // hold the row indefinitely.
-            convergence
-                .converge_live_worker(&blocking_execution_id, "redispatch_guard")
-                .await;
-            continue;
         }
 
         // Now apply the churn guard's mutation. Both liveness guards above
@@ -657,6 +716,237 @@ mod tests {
         assert!(
             convergence.converged().is_empty(),
             "there is no contradiction to converge when the process is really gone",
+        );
+    }
+
+    /// **The redispatch-guard half of the "live workers false-reaped as
+    /// orphaned" incident.** The row's tracked pid probes dead — same as
+    /// `redispatches_normally_once_the_prior_process_is_gone` — but the
+    /// execution has emitted a hook well within the corroboration window.
+    /// Without corroboration this guard reads the same wrong `Gone` verdict
+    /// a false-reaping sweep just acted on and fails open, letting a second
+    /// worker dispatch onto a row whose first worker is still running. With
+    /// it, the guard must block exactly as if the probe had said `Alive`.
+    #[tokio::test]
+    async fn corroborated_activity_blocks_redispatch_despite_a_dead_probe() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = create_spawned_execution(&db, &work_item_id, dead_pid());
+        db.mark_execution_orphaned(&execution_id, "worker presumed dead")
+            .unwrap();
+        make_old(&db, &work_item_id);
+
+        let db = Arc::new(db);
+        let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+        live_states.register_spawn(1, &execution_id, "claude-opus-4-7", 424242, None);
+        live_states.apply_event(
+            1,
+            &boss_protocol::WorkerEvent::PreToolUse {
+                session_id: "s".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+            },
+        );
+        live_states.apply_event(
+            1,
+            &boss_protocol::WorkerEvent::PostToolUse {
+                session_id: "s".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+                tool_response: serde_json::json!({}),
+            },
+        );
+
+        let mut coordinator =
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), Arc::new(NoopCube), Arc::new(NoopRunner));
+        coordinator.set_live_worker_states(live_states);
+        let coordinator = Arc::new(coordinator);
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let convergence = RecordingConvergence::default();
+
+        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), &convergence).await;
+
+        assert_eq!(
+            outcome.redispatched, 0,
+            "corroborated activity must block the redispatch even though the tracked pid probed dead",
+        );
+        assert_eq!(outcome.live_process_skipped, 1);
+
+        let events = sink.events().await;
+        let blocked: Vec<_> = events
+            .iter()
+            .filter(|e| e.stage == "redispatch_blocked_live_process")
+            .collect();
+        assert_eq!(blocked.len(), 1, "the corroborated block must be observable");
+        assert_eq!(
+            blocked[0].details["corroborated_alive"],
+            serde_json::json!(true),
+            "the event must record that corroboration (not a raw Alive probe) is what blocked this",
+        );
+        assert!(
+            events.iter().all(|e| e.stage != "redispatch_guard_declined"),
+            "a corroborated block is not a decline",
+        );
+        assert_eq!(
+            convergence.converged(),
+            vec![(execution_id, "redispatch_guard".to_owned())],
+            "a corroborated block must still hand the contradiction on for resolution",
+        );
+    }
+
+    /// The instrumentation gap this closes: before this event existed, the
+    /// guard was silent whenever it declined to block — diagnosing a wrongly
+    /// -declined redispatch required cross-referencing this sweep's trace
+    /// lines against a different sweep's, 45ms apart. Every decline (with an
+    /// actual probed pid to report on) must now be self-diagnosing from a
+    /// single dispatch tail.
+    #[tokio::test]
+    async fn declined_guard_emits_instrumentation_event() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = create_spawned_execution(&db, &work_item_id, dead_pid());
+        db.mark_execution_orphaned(&execution_id, "worker died").unwrap();
+        make_old(&db, &work_item_id);
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let convergence = RecordingConvergence::default();
+
+        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), &convergence).await;
+
+        assert_eq!(
+            outcome.redispatched, 1,
+            "a genuinely gone process must not block recovery"
+        );
+
+        let events = sink.events().await;
+        let declined: Vec<_> = events
+            .iter()
+            .filter(|e| e.stage == "redispatch_guard_declined")
+            .collect();
+        assert_eq!(declined.len(), 1, "the guard's decline must be observable, not silent");
+        assert_eq!(declined[0].outcome, "ok");
+        assert_eq!(
+            declined[0].details["blocking_execution_id"],
+            serde_json::json!(execution_id)
+        );
+        assert_eq!(declined[0].details["probe_result"], serde_json::json!("process_gone"),);
+        assert!(
+            declined[0].details["shell_pid"].is_number(),
+            "the probed pid must be carried for diagnosis: {:?}",
+            declined[0].details,
+        );
+    }
+
+    /// The acceptance criterion for the decline event: when a registry entry
+    /// exists, the payload must carry `last_event_age_secs` so an operator
+    /// reading `bossctl dispatch diagnose` can tell a correct decline (hook
+    /// aged out of the corroboration window) from a wrong one (recent hook
+    /// that should have blocked). The no-registry
+    /// [`declined_guard_emits_instrumentation_event`] case leaves these null.
+    #[tokio::test]
+    async fn declined_guard_event_carries_last_hook_age() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = create_spawned_execution(&db, &work_item_id, dead_pid());
+        db.mark_execution_orphaned(&execution_id, "worker died").unwrap();
+        make_old(&db, &work_item_id);
+
+        let db = Arc::new(db);
+        let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
+        live_states.register_spawn(1, &execution_id, "claude-opus-4-7", 424242, None);
+        live_states.apply_event(
+            1,
+            &boss_protocol::WorkerEvent::PreToolUse {
+                session_id: "s".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+            },
+        );
+        live_states.apply_event(
+            1,
+            &boss_protocol::WorkerEvent::PostToolUse {
+                session_id: "s".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+                tool_response: serde_json::json!({}),
+            },
+        );
+        // Older than the corroboration window so the guard still declines
+        // (a recent hook would block redispatch via corroboration instead).
+        let seeded_age_secs = crate::durable_liveness::CORROBORATION_WINDOW_SECS + 90;
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        live_states.set_last_event_at_for_test(1, crate::live_worker_state::iso8601_utc(now - seeded_age_secs));
+
+        let mut coordinator =
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), Arc::new(NoopCube), Arc::new(NoopRunner));
+        coordinator.set_live_worker_states(live_states);
+        let coordinator = Arc::new(coordinator);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let convergence = RecordingConvergence::default();
+
+        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), &convergence).await;
+
+        assert_eq!(
+            outcome.redispatched, 1,
+            "a hook aged past the corroboration window must not block recovery"
+        );
+
+        let events = sink.events().await;
+        let declined: Vec<_> = events
+            .iter()
+            .filter(|e| e.stage == "redispatch_guard_declined")
+            .collect();
+        assert_eq!(declined.len(), 1, "the guard's decline must be observable");
+        let age = declined[0].details["last_event_age_secs"]
+            .as_i64()
+            .expect("last_event_age_secs must be a number when a registry hook exists");
+        assert!(
+            (age - seeded_age_secs).abs() <= 5,
+            "last_event_age_secs ({age}) must roughly match the seeded age ({seeded_age_secs})",
+        );
+        assert!(
+            declined[0].details["last_event_at"].is_string(),
+            "last_event_at must also be present: {:?}",
+            declined[0].details,
+        );
+    }
+
+    /// A work item with no recorded worker process at all has nothing for the
+    /// guard to decline — no instrumentation event may fire for it, or every
+    /// ordinary redispatch of a never-dispatched item would emit noise.
+    #[tokio::test]
+    async fn no_recorded_pid_emits_no_decline_event() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = create_old_execution(&db, &work_item_id);
+        db.mark_execution_orphaned(&execution_id, "spawn produced no shell")
+            .unwrap();
+        make_old(&db, &work_item_id);
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+        )
+        .await;
+
+        assert_eq!(outcome.redispatched, 1);
+        let events = sink.events().await;
+        assert!(
+            events.iter().all(|e| e.stage != "redispatch_guard_declined"),
+            "a work item with no recorded pid has nothing to decline",
         );
     }
 

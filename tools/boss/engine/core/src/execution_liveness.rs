@@ -27,6 +27,7 @@
 //! meaningless for a remote worker whose `workspace_path` lives on another
 //! machine. See [`crate::lost_workspace_sweep`].
 
+use std::future::Future;
 use std::path::Path;
 
 use boss_protocol::{AUTOMATION_OUTCOME_FAILED_GAVE_UP, AUTOMATION_OUTCOME_PRODUCED_TASK, WorkExecution};
@@ -228,8 +229,10 @@ pub fn finalize_dead_automation_triage_run(work_db: &WorkDb, execution: &WorkExe
 /// supplies only what distinguishes its signal.
 ///
 /// - `reason` is recorded on the orphan (`mark_execution_orphaned`, which
-///   deliberately preserves the cube lease + workspace so a resume redispatch
-///   can reclaim the work in place).
+///   deliberately keeps the cube lease + workspace *columns* on the row for
+///   provenance). Callers whose recovery path creates a fresh execution —
+///   never reclaiming that lease in place — must follow up with
+///   [`force_release_lease_best_effort`] so the workspace returns to the pool.
 /// - `triage_death_clause` is folded into the automation-run bookkeeping for
 ///   `automation_triage` executions (produced_task if a task was created before
 ///   the worker died, else failed_gave_up).
@@ -292,6 +295,32 @@ pub async fn finalize_gone_execution(
         .await;
 
     true
+}
+
+/// Best-effort force-release of a cube lease left behind by
+/// [`WorkDb::mark_execution_orphaned`], which deliberately keeps lease +
+/// workspace columns on the row for provenance. Callers whose recovery path
+/// creates a fresh execution (never reclaiming that lease in place) must
+/// release here so the workspace returns to the pool. Failure is benign: the
+/// lease may already be gone.
+///
+/// `do_release` is typically
+/// `cube_client.force_release_lease(lease_id, Some(reason))` or the same call
+/// on a [`crate::host_adapter::HostAdapter`] — both share this one logging
+/// path so the four historical copy-pasted blocks stay in lockstep.
+pub async fn force_release_lease_best_effort(
+    execution_id: &str,
+    lease_id: &str,
+    do_release: impl Future<Output = anyhow::Result<()>>,
+) {
+    if let Err(err) = do_release.await {
+        tracing::debug!(
+            execution_id = %execution_id,
+            lease_id = %lease_id,
+            error = %format!("{err:#}"),
+            "best-effort lease force-release failed (likely already released)",
+        );
+    }
 }
 
 #[cfg(test)]

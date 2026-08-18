@@ -364,6 +364,7 @@ impl ExecutionCoordinator {
                     self.work_db.as_ref(),
                     self.dispatch_events.as_ref(),
                     &live,
+                    None, // lease release follows via host_adapter below
                 )
                 .await;
                 let reconciled_dead_pane = !reconciled_lost_workspace
@@ -372,6 +373,8 @@ impl ExecutionCoordinator {
                         self.dispatch_events.as_ref(),
                         &live,
                         boss_engine_utils::epoch_time::now_epoch_secs(),
+                        self.live_worker_states.as_deref(),
+                        None, // lease release follows via host_adapter below
                     )
                     .await;
                 if reconciled_lost_workspace || reconciled_dead_pane {
@@ -383,6 +386,7 @@ impl ExecutionCoordinator {
                         "spawn_attempt: prior 'live' execution's worker pane was gone; \
                          reconciled it and proceeding with this spawn",
                     );
+                    self.release_lease_after_reconcile(&live, reconciled_dead_pane).await;
                     // Not redundant after all — fall through to the rest of dispatch.
                 } else {
                     // The blocker survived every death check the reconciler

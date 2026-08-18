@@ -594,7 +594,14 @@ async fn db_fallback_death_evidence(
     // one reaper per death signal"); reusing it here means the grace window,
     // the `is_live()` gate, and the one-shot-driver exemption can never drift
     // between the two call sites.
-    if let Some(shell_pid) = crate::dead_pane_sweep::shell_pid_death_evidence(work_db, execution, now_epoch_s).await {
+    // No `live_states` to corroborate against: by construction, a DB-fallback
+    // row has nothing in the in-memory registry (see this function's doc
+    // comment) — `dead_pane_sweep::shell_pid_death_evidence` falls back to
+    // trusting the bare durable probe exactly as it did before corroboration
+    // existed.
+    if let Some(shell_pid) =
+        crate::dead_pane_sweep::shell_pid_death_evidence(work_db, execution, now_epoch_s, None).await
+    {
         return Some(DbFallbackDeathEvidence::ShellPidDead { shell_pid });
     }
 

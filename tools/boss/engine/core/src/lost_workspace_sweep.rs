@@ -168,32 +168,8 @@ pub async fn run_one_pass(
     };
 
     for execution in candidates {
-        if reconcile_if_execution_dead(work_db, dispatch_events, &execution).await {
+        if reconcile_if_execution_dead(work_db, dispatch_events, &execution, Some(cube_client)).await {
             outcome.reaped += 1;
-            // `mark_execution_orphaned` deliberately leaves the cube lease
-            // columns intact (a live workspace may hold in-flight commits a
-            // resume should reclaim). Here we KNOW the worker pane is gone, so
-            // best-effort force-release the dead lease. This matters MOST for
-            // the pane-death signals: unlike a lost workspace (whose lease cube
-            // already reclaimed), a dead pane's workspace dir still exists and
-            // its lease is still `leased` — kept alive by the engine's own
-            // DB-fallback heartbeat. Releasing it here is what actually frees
-            // the slot; without it the reconciled row would stop blocking the
-            // guard but the workspace would stay occupied until TTL. Failure is
-            // benign: for the lost-workspace case the lease is very likely
-            // already gone.
-            if let Some(lease_id) = execution.cube_lease_id.as_deref()
-                && let Err(err) = cube_client
-                    .force_release_lease(lease_id, Some("execution-liveness reconcile: worker pane gone"))
-                    .await
-            {
-                tracing::debug!(
-                    execution_id = %execution.id,
-                    lease_id,
-                    error = %format!("{err:#}"),
-                    "execution-liveness sweep: best-effort lease force-release failed (likely already released)",
-                );
-            }
         }
     }
 
@@ -238,26 +214,32 @@ pub async fn run_one_pass(
 /// orphan work correctly parked awaiting a human.
 ///
 /// Signal 2 closes the exact gap that let the 2026-07-03 zombies survive the
-/// T2168 fix: their workspace dirs were still on disk (so signal 1 never
-/// fired), their cube leases were kept alive by the engine's own DB-fallback
-/// heartbeat (so `cube_lease_auto_reap` never fired), and no pid was ever
-/// reported (so neither `dead_pid_sweep` nor `dead_pane_sweep`, which only
-/// ever probe a pid that was actually reported, ever saw them). See
+/// heartbeat-failure auto-reap (`cube_lease_auto_reap`): their
+/// workspace dirs were still on disk (so signal 1 never fired), their cube
+/// leases were kept alive by the engine's own DB-fallback heartbeat (so
+/// `cube_lease_auto_reap` never fired), and no pid was ever reported (so
+/// neither `dead_pid_sweep` nor `dead_pane_sweep`, which only ever probe a
+/// pid that was actually reported, ever saw them). See
 /// [`classify_pane_liveness`].
 ///
-/// DB + filesystem, plus a trace event — no cube/coordinator dependency — so
-/// it can be called both from the periodic [`run_one_pass`] and inline from
-/// the coordinator's redundant-spawn guard.
+/// DB + filesystem plus an optional cube client for the post-reconcile lease
+/// force-release — so it can be called both from the periodic [`run_one_pass`]
+/// and inline from the coordinator's redundant-spawn guard. When `cube_client`
+/// is provided, a successful reconcile best-effort force-releases the cube
+/// lease (the row keeps lease columns for provenance; this path's recovery
+/// creates a fresh execution that never reclaims in place).
 pub async fn reconcile_if_execution_dead(
     work_db: &WorkDb,
     dispatch_events: &dyn DispatchEventSink,
     execution: &WorkExecution,
+    cube_client: Option<&dyn CubeClient>,
 ) -> bool {
     reconcile_if_execution_dead_at(
         work_db,
         dispatch_events,
         execution,
         boss_engine_utils::epoch_time::now_epoch_secs(),
+        cube_client,
     )
     .await
 }
@@ -270,6 +252,7 @@ async fn reconcile_if_execution_dead_at(
     dispatch_events: &dyn DispatchEventSink,
     execution: &WorkExecution,
     now_epoch: i64,
+    cube_client: Option<&dyn CubeClient>,
 ) -> bool {
     // Already settled — nothing to reconcile.
     if execution.status.is_terminal() {
@@ -350,6 +333,7 @@ async fn reconcile_if_execution_dead_at(
                 workspace_path = %workspace_path,
                 "lost-workspace reconcile: finalized execution whose workspace directory is gone",
             );
+            maybe_force_release_reconciled_lease(execution, cube_client).await;
         }
 
         return reconciled;
@@ -419,9 +403,29 @@ async fn reconcile_if_execution_dead_at(
             age_in_status_secs = ?age_in_status_secs,
             "execution-liveness reconcile: finalized execution whose worker pane never attached",
         );
+        maybe_force_release_reconciled_lease(execution, cube_client).await;
     }
 
     reconciled
+}
+
+/// Best-effort cube lease release after a successful lost-workspace /
+/// never-attached reconcile. The workspace is gone or the pane never came
+/// up, so there is no live writer to protect — unlike the pane-pid path,
+/// which gates on the live registry.
+async fn maybe_force_release_reconciled_lease(execution: &WorkExecution, cube_client: Option<&dyn CubeClient>) {
+    let Some(cube) = cube_client else {
+        return;
+    };
+    let Some(lease_id) = execution.cube_lease_id.as_deref() else {
+        return;
+    };
+    crate::execution_liveness::force_release_lease_best_effort(
+        &execution.id,
+        lease_id,
+        cube.force_release_lease(lease_id, Some("execution-liveness reconcile: worker pane gone")),
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -513,7 +517,7 @@ mod tests {
         assert_eq!(exec.status, ExecutionStatus::WaitingHuman);
 
         let sink = NoopDispatchEventSink;
-        let reconciled = reconcile_if_execution_dead(&db, &sink, &exec).await;
+        let reconciled = reconcile_if_execution_dead(&db, &sink, &exec, None).await;
         assert!(
             reconciled,
             "a waiting_human zombie with a missing workspace must be reconciled"
@@ -554,7 +558,7 @@ mod tests {
             .unwrap();
 
         let sink = NoopDispatchEventSink;
-        assert!(reconcile_if_execution_dead(&db, &sink, &exec).await);
+        assert!(reconcile_if_execution_dead(&db, &sink, &exec, None).await);
 
         let runs = db.list_automation_runs(&automation).unwrap();
         assert_eq!(runs.len(), 1);
@@ -579,7 +583,7 @@ mod tests {
         let exec = parked_triage_execution(&db, &automation, real_dir.path().to_str().unwrap(), "local");
 
         let sink = NoopDispatchEventSink;
-        let reconciled = reconcile_if_execution_dead(&db, &sink, &exec).await;
+        let reconciled = reconcile_if_execution_dead(&db, &sink, &exec, None).await;
         assert!(
             !reconciled,
             "a live execution whose workspace exists must NOT be reconciled"
@@ -604,7 +608,7 @@ mod tests {
         let now = started_epoch(&exec) + PANE_ATTACH_DEADLINE_SECS + 1;
 
         let sink = RecordingDispatchEventSink::new();
-        let reconciled = reconcile_if_execution_dead_at(&db, &sink, &exec, now).await;
+        let reconciled = reconcile_if_execution_dead_at(&db, &sink, &exec, now, None).await;
         assert!(reconciled, "a zombie whose pane never attached must be reconciled");
 
         assert_eq!(db.get_execution(&exec.id).unwrap().status, ExecutionStatus::Orphaned);
@@ -637,7 +641,7 @@ mod tests {
         let now = started_epoch(&exec) + PANE_ATTACH_DEADLINE_SECS + 10_000;
 
         let sink = NoopDispatchEventSink;
-        let reconciled = reconcile_if_execution_dead_at(&db, &sink, &exec, now).await;
+        let reconciled = reconcile_if_execution_dead_at(&db, &sink, &exec, now, None).await;
         assert!(
             !reconciled,
             "an execution with a reported pid must never be reaped as 'never attached'"
@@ -689,7 +693,7 @@ mod tests {
         let now = started_epoch(&exec) + PANE_ATTACH_DEADLINE_SECS + 10_000;
 
         let sink = NoopDispatchEventSink;
-        let reconciled = reconcile_if_execution_dead_at(&db, &sink, &exec, now).await;
+        let reconciled = reconcile_if_execution_dead_at(&db, &sink, &exec, now, None).await;
         assert!(
             !reconciled,
             "a waiting_review execution (worker exited by design) must not be reaped"
@@ -735,7 +739,7 @@ mod tests {
         assert_eq!(exec.status, ExecutionStatus::WaitingMerge);
 
         let sink = NoopDispatchEventSink;
-        let reconciled = reconcile_if_execution_dead(&db, &sink, &exec).await;
+        let reconciled = reconcile_if_execution_dead(&db, &sink, &exec, None).await;
         assert!(
             !reconciled,
             "a waiting_merge execution must not be reaped even with a missing workspace dir"
@@ -758,7 +762,7 @@ mod tests {
         let now = started_epoch(&exec) + PANE_ATTACH_DEADLINE_SECS - 1;
 
         let sink = NoopDispatchEventSink;
-        let reconciled = reconcile_if_execution_dead_at(&db, &sink, &exec, now).await;
+        let reconciled = reconcile_if_execution_dead_at(&db, &sink, &exec, now, None).await;
         assert!(
             !reconciled,
             "a fresh worker within the attach deadline must not be reaped"
@@ -778,7 +782,7 @@ mod tests {
         let exec = parked_triage_execution(&db, &automation, "/remote/only/path/mono-agent-036", "remote-1");
 
         let sink = NoopDispatchEventSink;
-        let reconciled = reconcile_if_execution_dead(&db, &sink, &exec).await;
+        let reconciled = reconcile_if_execution_dead(&db, &sink, &exec, None).await;
         assert!(
             !reconciled,
             "a remote worker must never be reaped by a local filesystem probe"

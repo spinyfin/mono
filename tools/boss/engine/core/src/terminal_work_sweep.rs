@@ -10,7 +10,7 @@
 //! mid-turn. The worker then sits alive — typically in `waiting_for_input`
 //! — holding its slot indefinitely, long after its task went `done` and
 //! its PR merged. The real incident: run `exec_…8d` on slot 8 stayed alive
-//! for ~2.5 DAYS after work item T1679 had gone to `done` and PR #1496 had
+//! for ~2.5 DAYS after the bound work item had gone to `done` and PR #1496 had
 //! MERGED, and had to be reaped by hand.
 //!
 //! Every other reconciler deliberately skips this case:
@@ -476,26 +476,20 @@ pub async fn run_one_pass(
                 );
             }
 
-            // `mark_execution_orphaned` deliberately leaves the cube lease
-            // columns intact (see `lost_workspace_sweep`), and this sweep is
-            // the terminalizer for this candidate — nothing else will ever
-            // free the lease once the row drops out of every lease-reclaim
-            // path's non-terminal filter. Best-effort force-release it here,
-            // mirroring `lost_workspace_sweep::run_one_pass`.
-            if let Some(lease_id) = candidate.cube_lease_id.as_deref()
-                && let Err(err) = cube_client
-                    .force_release_lease(
+            // `mark_execution_orphaned` keeps lease columns for provenance, and
+            // this sweep is the terminalizer for this candidate — nothing else
+            // will free the lease once the row drops out of every
+            // lease-reclaim path's non-terminal filter.
+            if let Some(lease_id) = candidate.cube_lease_id.as_deref() {
+                crate::execution_liveness::force_release_lease_best_effort(
+                    &candidate.run_id,
+                    lease_id,
+                    cube_client.force_release_lease(
                         lease_id,
                         Some("terminal-work sweep: bound work item row no longer exists"),
-                    )
-                    .await
-            {
-                tracing::debug!(
-                    run_id = %candidate.run_id,
-                    lease_id,
-                    ?err,
-                    "terminal-work sweep: best-effort lease force-release failed (likely already released)",
-                );
+                    ),
+                )
+                .await;
             }
         }
 
