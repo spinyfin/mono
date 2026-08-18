@@ -113,12 +113,33 @@ static GROK_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
 /// Preamble for the agent-rules file (`AGENTS.md`). Names Grok observability
 /// rather than Claude hooks so the shared body below it is not lying about
 /// the mechanism this session uses.
+///
+/// Also carries a Grok-specific paragraph raising the bar at which this
+/// worker stops to ask a question rather than proceeding on a stated
+/// assumption; Grok defaults to asking far more readily than the other
+/// drivers on equivalent ambiguity. It lives in this driver-scoped preamble
+/// (see [`crate::AgentDriver::agent_rules_preamble`]) rather than in
+/// `model_menu::prompt_addendum_for_level`, which is gated by `EffortLevel`
+/// and returns `None` for Trivial/Small rows, so it reaches every Grok
+/// worker. The shared body is unchanged, so Claude and Codex workers see no
+/// difference.
 const GROK_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed worker session. The engine\n\
      spawned you in a leased cube workspace and observes this session\n\
      via Grok hooks under a Boss-owned GROK_HOME.\n\
      For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
      `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
-     strong stated justification.";
+     strong stated justification.\n\
+     \n\
+     Default to proceeding on a reasonable assumption instead of stopping to\n\
+     ask the human: pick the interpretation a competent engineer would\n\
+     default to, implement it, and record the assumption explicitly (in your\n\
+     PR body or final summary) so it is visible to whoever reviews the work.\n\
+     Reserve asking for cases where proceeding either way would be unsafe,\n\
+     destructive, or irreversible (e.g. data loss, an unrecoverable\n\
+     production action, a missing credential), or where a wrong guess would\n\
+     waste substantial work (e.g. a fork the rest of the task's shape\n\
+     depends on). Ordinary ambiguity that a reasonable default resolves is\n\
+     not, by itself, a reason to stop.";
 
 // ---------------------------------------------------------------------------
 // GrokDriver
@@ -974,6 +995,25 @@ mod tests {
             r#"{"token":"test-only-not-a-real-credential","provider":"grok.com"}"#,
         )
         .unwrap();
+    }
+
+    /// The ask-threshold guidance lands in Grok's agent-rules preamble
+    /// (rendered once per session, ahead of the shared body every driver
+    /// gets) rather than the effort-level-gated `prompt_addendum`, so it
+    /// reaches every Grok worker regardless of the row's classified effort.
+    #[test]
+    fn agent_rules_preamble_raises_the_ask_threshold() {
+        let preamble = GrokDriver::default().agent_rules_preamble();
+        assert!(
+            preamble.contains("Default to proceeding on a reasonable assumption"),
+            "preamble must guide Grok workers to proceed on a stated assumption: {preamble}",
+        );
+        assert!(
+            preamble.contains("Reserve asking for cases"),
+            "preamble must still reserve asking for genuinely blocking cases: {preamble}",
+        );
+        // The pre-existing observability paragraph must survive untouched.
+        assert!(preamble.contains("via Grok hooks under a Boss-owned GROK_HOME"));
     }
 
     #[test]
