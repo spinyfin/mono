@@ -746,6 +746,19 @@ pub(super) async fn apply_work_item_patch(
                 // execution id the client is already tracking).
                 // The reconcile / rescan paths handle
                 // re-dispatch of stale (worker-died) cases.
+                //
+                // Exception: an explicit operator pause-bypass
+                // (confirmed drag-to-Doing while dispatch is
+                // paused) must still reach
+                // `dispatch_with_pause_bypass` when the latest
+                // execution is `ready` and held by that pause.
+                // `work_item_needs_dispatch` is false for any
+                // non-terminal row, so gating the bypass arm
+                // on it made the force gesture a no-op in
+                // exactly the state the pause creates. The
+                // coordinator reuses the held `ready` row and
+                // early-returns if the execution is already
+                // live.
                 if task_transitioned_to_active(&previous_task_status, &item) {
                     let work_item_id_for_event = work_item_id(&item);
                     let from_status = previous_task_status.clone();
@@ -757,6 +770,10 @@ pub(super) async fn apply_work_item_patch(
                     );
                     let needs_dispatch =
                         !item_is_human_driven && work_item_needs_dispatch(&work_db, &work_item_id_for_event);
+                    // Captured before the match consumes `pause_bypass`, so
+                    // residual skip / event arms can still see that the
+                    // operator consented to a force-start.
+                    let consented_override = pause_bypass.is_some();
                     let (dispatched_execution_id, did_dispatch, skip_reason) = if item_is_human_driven {
                         (
                             None,
@@ -767,11 +784,15 @@ pub(super) async fn apply_work_item_patch(
                                     .to_owned(),
                             ),
                         )
-                    } else if needs_dispatch && let Some(bypass) = pause_bypass {
-                        // Pre-checked in `handle_move_work_item_on_board`
-                        // before this patch ever applied — this is the
-                        // authoritative re-check per the design's
-                        // pause-generation race handling, using the same
+                    } else if let Some(bypass) = pause_bypass {
+                        // Do not gate this arm on `needs_dispatch`. A held
+                        // `ready` row is non-terminal, so that helper is
+                        // false — and `dispatch_with_pause_bypass` already
+                        // reuses it. Pre-checked in
+                        // `handle_move_work_item_on_board` before this
+                        // patch ever applied — this is the authoritative
+                        // re-check per the design's pause-generation race
+                        // handling, using the same
                         // `RequestExecutionInput::bypass_dispatch_pause`
                         // seam `bossctl work start --force` drives.
                         let coordinator = server_state.execution_coordinator.clone();
@@ -864,17 +885,35 @@ pub(super) async fn apply_work_item_patch(
                                 (None, false, Some(format!("{err:#}")))
                             }
                         }
+                    } else if consented_override {
+                        // Unreachable after the bypass arm above: a
+                        // consented override always enters
+                        // `dispatch_with_pause_bypass`. If a future
+                        // refactor reopens a skip here, fail loudly —
+                        // a check that cannot do its job must not
+                        // return success and leave the card in Doing
+                        // with no worker.
+                        let reason = "consented pause override did not dispatch \
+                            (held ready execution was not force-started)"
+                            .to_owned();
+                        tracing::error!(
+                            work_item_id = %work_item_id_for_event,
+                            "UpdateWorkItem → active: consented pause-bypass skipped dispatch"
+                        );
+                        dispatch_failure_response = Some(reason.clone());
+                        (None, false, Some(reason))
                     } else {
-                        // The auto-dispatch gate decided this transition
-                        // already has an in-flight execution. Before this
-                        // event existed the skip was silent — exactly the
-                        // "I dragged it and nothing happened" shape.
+                        // Ordinary (no-bypass) drag: an existing
+                        // non-terminal execution already owns the
+                        // slot. Before this event existed the skip
+                        // was silent.
                         (
                             None,
                             false,
                             Some(
                                 "work_item_needs_dispatch=false (existing \
-                                             non-terminal execution owns dispatch slot)"
+                                 non-terminal execution owns dispatch slot; \
+                                 no pause-bypass requested)"
                                     .to_owned(),
                             ),
                         )
@@ -924,7 +963,7 @@ pub(super) async fn apply_work_item_patch(
                     let pause_hold = server_state
                         .execution_coordinator
                         .dispatch_pause()
-                        .filter(|_| did_dispatch)
+                        .filter(|_| did_dispatch && !consented_override)
                         .map(|pause| {
                             serde_json::json!({
                                 "origin": pause.origin.as_metadata_str(),
