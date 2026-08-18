@@ -123,6 +123,15 @@ static GROK_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
 /// and returns `None` for Trivial/Small rows, so it reaches every Grok
 /// worker. The shared body is unchanged, so Claude and Codex workers see no
 /// difference.
+///
+/// A second Grok-specific paragraph forbids entering an interactive
+/// approval gate (plan-approval mode being the observed case: a worker on
+/// an ordinary chore opened a `plan.md` review UI and sat idle waiting for
+/// a keypress that never came). That is a distinct failure from asking a
+/// question the ask-threshold paragraph above already covers — the worker
+/// isn't asking anything answerable by a default, it's entered a UI whose
+/// only exit is a human pressing a key. Planning and recording a plan are
+/// still fine; blocking on approval of one is not.
 const GROK_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed worker session. The engine\n\
      spawned you in a leased cube workspace and observes this session\n\
      via Grok hooks under a Boss-owned GROK_HOME.\n\
@@ -139,7 +148,20 @@ const GROK_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed w
      production action, a missing credential), or where a wrong guess would\n\
      waste substantial work (e.g. a fork the rest of the task's shape\n\
      depends on). Ordinary ambiguity that a reasonable default resolves is\n\
-     not, by itself, a reason to stop.";
+     not, by itself, a reason to stop.\n\
+     \n\
+     Never enter an interactive approval gate that halts the run waiting on\n\
+     a human keypress: plan-approval mode, a \"waiting for approval\" state,\n\
+     a confirmation prompt you yourself initiate, or any other interactive\n\
+     affordance whose exit condition is a human acting on it. You run\n\
+     autonomously with nobody watching the pane to press a key. You may\n\
+     still reason about approach and write a plan; what you must not do is\n\
+     block on approval of it. If you want a human to see your plan, put it\n\
+     in the PR body once the work is done — that PR is your output\n\
+     surface, not an interactive prompt mid-run. This does not change the\n\
+     genuinely blocking cases above (unsafe, destructive, or irreversible\n\
+     actions, or a missing credential) — those remain reasons to stop\n\
+     and emit a blocked marker, not reasons to open an approval UI.";
 
 // ---------------------------------------------------------------------------
 // GrokDriver
@@ -1014,6 +1036,30 @@ mod tests {
         );
         // The pre-existing observability paragraph must survive untouched.
         assert!(preamble.contains("via Grok hooks under a Boss-owned GROK_HOME"));
+    }
+
+    /// Extends the ask-threshold guidance to cover interactive approval
+    /// gates (plan-approval mode being the observed case): a Grok worker
+    /// that never asks a question can still halt a run by opening a UI
+    /// that only exits on a human keypress. Both paragraphs must survive
+    /// together in the same driver-scoped preamble.
+    #[test]
+    fn agent_rules_preamble_forbids_interactive_approval_gates() {
+        let preamble = GrokDriver::default().agent_rules_preamble();
+        assert!(
+            preamble.contains("Never enter an interactive approval gate"),
+            "preamble must forbid blocking on plan-approval / confirmation UIs: {preamble}",
+        );
+        assert!(
+            preamble.contains("plan-approval mode"),
+            "preamble must name plan-approval mode as a covered case: {preamble}",
+        );
+        assert!(
+            preamble.contains("put it\nin the PR body once the work is done"),
+            "preamble must redirect plans to the PR body instead of an approval prompt: {preamble}",
+        );
+        // The ask-threshold paragraph must still be present alongside it.
+        assert!(preamble.contains("Default to proceeding on a reasonable assumption"));
     }
 
     #[test]
