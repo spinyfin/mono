@@ -116,18 +116,14 @@ static GROK_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
 /// the mechanism this session uses.
 ///
 /// Also carries a Grok-specific paragraph raising the bar at which this
-/// worker stops to ask the operator a question, rather than proceeding on
-/// a stated assumption. Operators observed Grok workers asking the
-/// operator far more often than Claude or Codex workers on the same kind
-/// of ambiguity — the read is a behavioural change in a recent Grok CLI
-/// update, not anything Boss changed on its side, and Claude/Codex are not
-/// exhibiting it. This preamble is Grok's own, driver-scoped hook (see
-/// [`crate::AgentDriver::agent_rules_preamble`]), rendered once per session
-/// ahead of the shared "Boss worker rules" body every driver receives —
-/// unlike `model_menu::prompt_addendum_for_level`, it is not gated by
-/// `EffortLevel`, so it reaches every Grok worker rather than only rows
-/// classified at Medium effort or above. The shared body itself is left
-/// untouched, so Claude and Codex workers see no change.
+/// worker stops to ask a question rather than proceeding on a stated
+/// assumption; Grok defaults to asking far more readily than the other
+/// drivers on equivalent ambiguity. It lives in this driver-scoped preamble
+/// (see [`crate::AgentDriver::agent_rules_preamble`]) rather than in
+/// `model_menu::prompt_addendum_for_level`, which is gated by `EffortLevel`
+/// and returns `None` for Trivial/Small rows, so it reaches every Grok
+/// worker. The shared body is unchanged, so Claude and Codex workers see no
+/// difference.
 const GROK_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed worker session. The engine\n\
      spawned you in a leased cube workspace and observes this session\n\
      via Grok hooks under a Boss-owned GROK_HOME.\n\
@@ -136,7 +132,7 @@ const GROK_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed w
      strong stated justification.\n\
      \n\
      Default to proceeding on a reasonable assumption instead of stopping to\n\
-     ask the operator: pick the interpretation a competent engineer would\n\
+     ask the human: pick the interpretation a competent engineer would\n\
      default to, implement it, and record the assumption explicitly (in your\n\
      PR body or final summary) so it is visible to whoever reviews the work.\n\
      Reserve asking for cases where proceeding either way would be unsafe,\n\
