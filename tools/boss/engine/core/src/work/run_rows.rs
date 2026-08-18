@@ -937,6 +937,45 @@ impl WorkDb {
         collect_rows(rows)
     }
 
+    /// Find the durable tmux handle for one exact spawn token, regardless of
+    /// whether the run is currently eligible for the normal adoption query.
+    ///
+    /// A session is direct evidence that its local process exists, so the
+    /// periodic tmux sweep uses this after a token misses
+    /// [`Self::list_adoptable_tmux_runs`]: a non-terminal row must be sent
+    /// back through adoption rather than being mistaken for a leaked session.
+    /// Terminal rows are deliberately returned too; their live-process
+    /// contradiction is owned by `worker_readoption`.
+    pub fn tmux_run_handle_for_spawn_token(&self, spawn_token: &str) -> Result<Option<TmuxRunHandle>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT r.id, r.execution_id, r.agent_id, r.transcript_path,
+                    r.tmux_server_label, r.tmux_session_name, r.tmux_spawn_token,
+                    r.tmux_spawn_state, r.tmux_pane_pid
+             FROM work_runs r
+             WHERE r.tmux_spawn_token = ?1
+               AND r.tmux_server_label IS NOT NULL
+               AND r.tmux_session_name IS NOT NULL
+               AND r.tmux_spawn_state IS NOT NULL",
+            params![spawn_token],
+            |row| {
+                Ok(TmuxRunHandle {
+                    run_id: row.get(0)?,
+                    execution_id: row.get(1)?,
+                    agent_id: row.get(2)?,
+                    transcript_path: row.get(3)?,
+                    tmux_server_label: row.get(4)?,
+                    tmux_session_name: row.get(5)?,
+                    tmux_spawn_token: row.get(6)?,
+                    tmux_spawn_state: row.get(7)?,
+                    tmux_pane_pid: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// Resolve the execution id behind a tmux spawn token, independent of the
     /// execution's terminal status — unlike [`Self::list_adoptable_tmux_runs`],
     /// which only ever returns non-terminal candidates.
