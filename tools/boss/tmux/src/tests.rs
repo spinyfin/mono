@@ -208,11 +208,10 @@ async fn environment_and_option_reads_distinguish_absence() {
 }
 
 #[tokio::test]
-async fn set_option_capture_kill_and_display_use_the_private_server() {
-    let (tmux, runner) = tmux([success(""), success("pane text\n"), success(""), success("1234\n")]);
+async fn set_option_capture_and_display_use_the_private_server() {
+    let (tmux, runner) = tmux([success(""), success("pane text\n"), success("1234\n")]);
     tmux.set_option("boss-1", "@boss_spawn_token", "token").await.unwrap();
     assert_eq!(tmux.capture_pane("boss-1").await.unwrap(), "pane text\n");
-    tmux.kill_session("boss-1").await.unwrap();
     assert_eq!(
         tmux.display_message("boss-1", DisplayField::PanePid).await.unwrap(),
         "1234"
@@ -222,9 +221,131 @@ async fn set_option_capture_kill_and_display_use_the_private_server() {
         vec![
             vec!["-L", "boss", "set-option", "-t", "boss-1", "@boss_spawn_token", "token"],
             vec!["-L", "boss", "capture-pane", "-p", "-t", "boss-1"],
-            vec!["-L", "boss", "kill-session", "-t", "boss-1"],
             vec!["-L", "boss", "display-message", "-p", "-t", "boss-1", "#{pane_pid}"],
         ]
+    );
+}
+
+#[tokio::test]
+async fn kill_session_verified_kills_only_on_an_exact_token_match() {
+    let (tmux, runner) = tmux([success("BOSS_SPAWN_TOKEN=secret\n"), success("")]);
+    let outcome = tmux.kill_session_verified("boss-1", "secret").await.unwrap();
+    assert_eq!(outcome, KillSessionOutcome::Killed);
+    assert_eq!(
+        runner.calls(),
+        vec![
+            vec!["-L", "boss", "show-environment", "-t", "boss-1", "BOSS_SPAWN_TOKEN"],
+            vec!["-L", "boss", "kill-session", "-t", "boss-1"],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn kill_session_verified_treats_a_session_destroyed_just_before_the_kill_as_absent() {
+    // The token read matches, but the session dies on its own (the
+    // ordinary worker-completion race) before the kill-session call
+    // lands — tmux reports it the same way it would report a session
+    // that was already gone at the token read. That must still resolve
+    // to Absent, not surface as a hard Tmux error.
+    let (tmux, runner) = tmux([
+        success("BOSS_SPAWN_TOKEN=secret\n"),
+        failure("can't find session: boss-1"),
+    ]);
+    let outcome = tmux.kill_session_verified("boss-1", "secret").await.unwrap();
+    assert_eq!(outcome, KillSessionOutcome::Absent);
+    assert_eq!(
+        runner.calls(),
+        vec![
+            vec!["-L", "boss", "show-environment", "-t", "boss-1", "BOSS_SPAWN_TOKEN"],
+            vec!["-L", "boss", "kill-session", "-t", "boss-1"],
+        ],
+    );
+}
+
+#[tokio::test]
+async fn kill_session_verified_refuses_a_token_mismatch_and_never_kills() {
+    let (tmux, runner) = tmux([success("BOSS_SPAWN_TOKEN=someone-elses-token\n")]);
+    let error = tmux.kill_session_verified("boss-1", "secret").await.unwrap_err();
+    match error {
+        KillSessionError::TokenMismatch {
+            session,
+            expected,
+            actual,
+        } => {
+            assert_eq!(session, "boss-1");
+            assert_eq!(expected, "secret");
+            assert_eq!(actual, "someone-elses-token");
+        }
+        other => panic!("expected TokenMismatch, got {other:?}"),
+    }
+    assert_eq!(
+        runner.calls(),
+        vec![vec![
+            "-L",
+            "boss",
+            "show-environment",
+            "-t",
+            "boss-1",
+            "BOSS_SPAWN_TOKEN"
+        ]],
+        "a mismatch must never issue kill-session",
+    );
+}
+
+#[tokio::test]
+async fn kill_session_verified_treats_an_absent_session_as_already_torn_down() {
+    let (tmux, runner) = tmux([failure("unknown variable: BOSS_SPAWN_TOKEN")]);
+    let outcome = tmux.kill_session_verified("boss-1", "secret").await.unwrap();
+    assert_eq!(outcome, KillSessionOutcome::Absent);
+    assert_eq!(
+        runner.calls(),
+        vec![vec![
+            "-L",
+            "boss",
+            "show-environment",
+            "-t",
+            "boss-1",
+            "BOSS_SPAWN_TOKEN"
+        ]],
+        "an absent session must never issue kill-session",
+    );
+}
+
+#[tokio::test]
+async fn kill_session_verified_treats_a_missing_session_as_already_torn_down() {
+    let (tmux, runner) = tmux([failure("can't find session: boss-1")]);
+    let outcome = tmux.kill_session_verified("boss-1", "secret").await.unwrap();
+    assert_eq!(outcome, KillSessionOutcome::Absent);
+    assert_eq!(
+        runner.calls(),
+        vec![vec![
+            "-L",
+            "boss",
+            "show-environment",
+            "-t",
+            "boss-1",
+            "BOSS_SPAWN_TOKEN"
+        ]],
+        "a missing session must never issue kill-session",
+    );
+}
+
+#[tokio::test]
+async fn kill_session_verified_treats_a_dead_server_as_already_torn_down() {
+    let (tmux, runner) = tmux([failure("no server running on /tmp/tmux-501/boss")]);
+    let outcome = tmux.kill_session_verified("boss-1", "secret").await.unwrap();
+    assert_eq!(outcome, KillSessionOutcome::Absent);
+    assert_eq!(
+        runner.calls(),
+        vec![vec![
+            "-L",
+            "boss",
+            "show-environment",
+            "-t",
+            "boss-1",
+            "BOSS_SPAWN_TOKEN"
+        ]],
+        "a dead server must never issue kill-session",
     );
 }
 
@@ -432,9 +553,27 @@ async fn new_session_validation_rejections_do_not_run_tmux() {
 #[tokio::test]
 async fn command_failures_include_the_argv_and_stderr() {
     let (tmux, _) = tmux([failure("session not found: boss-1")]);
-    let error = tmux.kill_session("boss-1").await.unwrap_err().to_string();
-    assert!(error.contains("kill-session"), "error was: {error}");
+    let error = tmux.capture_pane("boss-1").await.unwrap_err().to_string();
+    assert!(error.contains("capture-pane"), "error was: {error}");
     assert!(error.contains("session not found: boss-1"), "error was: {error}");
+}
+
+#[tokio::test]
+async fn kill_session_verified_surfaces_a_kill_session_failure_after_a_matched_token() {
+    // A genuine kill-session failure — not one of the absent-session stderr
+    // shapes `is_absent_session_stderr` recognizes — must still surface as
+    // a hard error rather than being swallowed as Absent.
+    let (tmux, _) = tmux([
+        success("BOSS_SPAWN_TOKEN=secret\n"),
+        failure("server exited unexpectedly"),
+    ]);
+    let error = tmux.kill_session_verified("boss-1", "secret").await.unwrap_err();
+    let KillSessionError::Tmux(err) = error else {
+        panic!("expected KillSessionError::Tmux, got {error:?}");
+    };
+    let text = err.to_string();
+    assert!(text.contains("kill-session"), "error was: {text}");
+    assert!(text.contains("server exited unexpectedly"), "error was: {text}");
 }
 
 #[tokio::test]

@@ -108,6 +108,7 @@ mod sessions;
 mod subscriptions;
 #[cfg(test)]
 mod tests;
+mod tmux_teardown;
 mod trunk_auth;
 mod trust;
 mod work_items;
@@ -563,6 +564,16 @@ struct ServerState {
     /// when `spawn_flow` calls `start_live_status_slot`; torn down
     /// in `release_worker_pane`.
     live_status_manager: Arc<LiveStatusManager>,
+    /// Test-only override for the [`boss_tmux::Tmux`] handle
+    /// [`Self::reap_tmux_worker`] resolves. Production leaves this `None`
+    /// and always resolves a real handle via `Tmux::resolve()`. Exists so
+    /// `release_worker_pane` / `reap_untracked_worker_process`'s wiring
+    /// into the tmux reap can be exercised end-to-end against a stubbed
+    /// `Tmux` (mirroring `reap_tmux_worker_with`'s injected-runner tests)
+    /// without a real tmux binary on the test host.
+    #[cfg(test)]
+    #[builder(default)]
+    tmux_override: std::sync::Mutex<Option<boss_tmux::Tmux>>,
     /// One prepared/active run-correlated JSONL file source per execution.
     /// Prepared before Ghostty launch, activated after live-slot
     /// registration, and cancelled through `release_worker_pane`.
@@ -1705,9 +1716,17 @@ impl ServerState {
         // process tree goes down even when the app path can't reach it.
         // Idempotent with the app's reap: a process already gone just
         // yields `ESRCH`. The grace mirrors the app's `kill_grace_seconds`.
+        // tmux-hosted panes outlive the app viewer (#2647): detach rather
+        // than kill from the app path, and skip the shell-pid process-group
+        // reap here. The token-verified tmux teardown below owns killing
+        // that tree (and the session) when identity columns are present.
         if !pane.tmux_hosted {
             reap_worker_process_tree(shell_pid, Duration::from_secs(5));
         }
+        // tmux-hosted counterpart of the two steps above: a cheap no-op
+        // past one DB read for every run that isn't tmux-hosted (every run
+        // today). See `tmux_teardown` for the token-verified sequence.
+        self.reap_tmux_worker(run_id).await;
         // The engine's WorkerPool slot was held for the lifetime of
         // the libghostty pane (the coordinator deferred its release
         // when `run_execution` returned with `slot_id = Some(N)`).
@@ -1805,6 +1824,14 @@ impl ServerState {
                 "release_worker_pane: no slot mapped and no live durable pid within the trust \
                  window; treating as mid-spawn, already released, or too old to vouch for",
             );
+            // The tmux reap does not depend on pid trust at all — it
+            // re-verifies BOSS_SPAWN_TOKEN against the durably recorded
+            // token before touching anything, so it is safe (and necessary)
+            // to run even when the OS-pid probe above found nothing to
+            // vouch for. Without this, a tmux-hosted session whose pane
+            // process already died, or whose run aged past the trust
+            // window, would never be torn down.
+            self.reap_tmux_worker(run_id).await;
             return PaneReleaseOutcome::NoLiveWorker;
         };
         tracing::warn!(
@@ -1860,6 +1887,10 @@ impl ServerState {
             }
         }
         reap_worker_process_tree(shell_pid, Duration::from_secs(5));
+        // tmux-hosted counterpart, same as `release_worker_pane`'s slot-mapped
+        // path — reaches a tmux-hosted worker the engine lost track of just
+        // as the process-tree signal above does.
+        self.reap_tmux_worker(run_id).await;
         self.transcript_path_cache.forget(run_id);
         self.run_cost_capture.forget(run_id);
         // A live process was signalled, so this IS a reap: the caller may free

@@ -244,24 +244,24 @@ impl crate::husk_pane_sweep::HuskPaneSweepSource for ServerState {
         match boss_tmux::Tmux::resolve() {
             Ok(tmux) => {
                 match tmux
-                    .show_environment(&session.session_name, crate::tmux_adoption::TMUX_SPAWN_TOKEN_ENV)
+                    .kill_session_verified(&session.session_name, &session.spawn_token)
                     .await
                 {
-                    Ok(Some(token)) if token == session.spawn_token => {
-                        if let Err(err) = tmux.kill_session(&session.session_name).await {
-                            tracing::warn!(?err, session = %session.session_name, "husk-pane sweep: kill-session failed");
-                        }
-                    }
-                    Ok(current) => tracing::warn!(
-                        session = %session.session_name,
-                        expected_token = %session.spawn_token,
-                        current_token = ?current,
+                    Ok(boss_tmux::KillSessionOutcome::Killed | boss_tmux::KillSessionOutcome::Absent) => {}
+                    Err(boss_tmux::KillSessionError::TokenMismatch {
+                        session: name,
+                        expected,
+                        actual,
+                    }) => tracing::warn!(
+                        session = %name,
+                        expected_token = %expected,
+                        current_token = %actual,
                         "husk-pane sweep: session identity changed before reap; refusing kill-session",
                     ),
                     Err(err) => tracing::warn!(
                         ?err,
                         session = %session.session_name,
-                        "husk-pane sweep: could not verify session token before reap",
+                        "husk-pane sweep: kill-session failed",
                     ),
                 }
             }

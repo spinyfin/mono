@@ -89,6 +89,23 @@ pub struct TmuxRunHandle {
     pub tmux_pane_pid: Option<i64>,
 }
 
+/// A tmux-hosted run's durable identity as needed for token-verified
+/// teardown ([`WorkDb::tmux_identity_for_execution`]). Unlike
+/// [`TmuxRunHandle`], reading this applies no status filtering — teardown
+/// must find a run's tmux identity even after its execution has already
+/// gone terminal, which is precisely when most teardown calls happen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxIdentity {
+    /// Human-readable tmux session name. Not an adoption/teardown key on
+    /// its own — see [`TmuxRunHandle::tmux_session_name`].
+    pub session_name: String,
+    /// Opaque, unique token a session's live `BOSS_SPAWN_TOKEN` must match
+    /// exactly before teardown may touch it.
+    pub spawn_token: String,
+    /// `#{pane_pid}` recorded when tmux created the session's initial pane.
+    pub pane_pid: Option<i64>,
+}
+
 /// One non-terminal execution whose latest run landed on a host that is
 /// no longer eligible to run it — the host was disabled (operator
 /// `bossctl hosts disable` or the dispatch-health circuit breaker) or

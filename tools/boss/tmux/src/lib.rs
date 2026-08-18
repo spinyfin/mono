@@ -22,12 +22,78 @@ use tokio::time::sleep;
 
 use crate::types::validate_value;
 
+/// Environment variable carrying the durable spawn token that identifies
+/// which execution a session belongs to. The sole thing
+/// [`Tmux::kill_session_verified`] trusts to decide whether a session is
+/// the caller's to destroy.
+const BOSS_SPAWN_TOKEN_ENV: &str = "BOSS_SPAWN_TOKEN";
+
+/// Outcome of a successful [`Tmux::kill_session_verified`] call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KillSessionOutcome {
+    /// The session existed, its live token matched, and it has been
+    /// destroyed.
+    Killed,
+    /// No session by that name exists on the private server (or it carries
+    /// no `BOSS_SPAWN_TOKEN` at all) — treated as an already-completed
+    /// teardown, not an error, so repeated calls stay idempotent.
+    Absent,
+}
+
+/// Failure returned by [`Tmux::kill_session_verified`].
+#[derive(Debug)]
+pub enum KillSessionError {
+    /// A session by that name exists, but its live token does not match
+    /// `expected_token`. Refused: the session currently answering to that
+    /// name is not the one the caller recorded, most likely because the
+    /// original session was already destroyed and the name recycled onto a
+    /// different execution. Nothing was signalled or killed.
+    TokenMismatch {
+        session: String,
+        expected: String,
+        actual: String,
+    },
+    /// The underlying `tmux` invocation failed.
+    Tmux(anyhow::Error),
+}
+
+impl std::fmt::Display for KillSessionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TokenMismatch {
+                session,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "refusing to kill tmux session {session:?}: live token {actual:?} does not match the \
+                 expected {expected:?}",
+            ),
+            Self::Tmux(err) => write!(formatter, "{err:#}"),
+        }
+    }
+}
+
+impl std::error::Error for KillSessionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TokenMismatch { .. } => None,
+            Self::Tmux(err) => err.source(),
+        }
+    }
+}
+
+impl From<anyhow::Error> for KillSessionError {
+    fn from(err: anyhow::Error) -> Self {
+        Self::Tmux(err)
+    }
+}
+
 /// Monotonic id for named paste buffers shared across all [`Tmux`] handles in
 /// this process. Multi-line delivery uses a named buffer on both
 /// `load-buffer` and `paste-buffer` so concurrent deliveries cannot steal each
 /// other's content off tmux's unnamed buffer stack.
 static PASTE_BUFFER_SEQ: AtomicU64 = AtomicU64::new(0);
-
 /// Handle for one resolved tmux executable and Boss's private server.
 #[derive(Clone)]
 pub struct Tmux {
@@ -110,7 +176,7 @@ impl Tmux {
         ]);
         let output = self.run(&args).await?;
         if !output.success {
-            if output.stderr.contains("no server running") {
+            if is_absent_session_stderr(&output.stderr) {
                 return Ok(Vec::new());
             }
             return command_failed(&args, &output);
@@ -138,7 +204,10 @@ impl Tmux {
                 .map(|value| Some(value.to_owned()))
                 .ok_or_else(|| anyhow::anyhow!("unexpected tmux environment output for {name:?}: {value:?}"));
         }
-        if output.stderr.contains("unknown variable") || output.stderr.contains("environment variable not found") {
+        if output.stderr.contains("unknown variable")
+            || output.stderr.contains("environment variable not found")
+            || is_absent_session_stderr(&output.stderr)
+        {
             return Ok(None);
         }
         command_failed(&args, &output)
@@ -285,12 +354,67 @@ impl Tmux {
         Ok(self.invoke(args).await?.stdout)
     }
 
-    /// Destroys exactly one named session on Boss's private server.
-    pub async fn kill_session(&self, session: &str) -> Result<()> {
+    /// Destroys `session` only after confirming its live `BOSS_SPAWN_TOKEN`
+    /// matches `expected_token` exactly — the sole sanctioned way to kill a
+    /// Boss-owned tmux session. This crate deliberately exposes no "kill by
+    /// name alone" entry point: a caller that has not durably recorded the
+    /// token it expects cannot destroy anything through this API.
+    ///
+    /// `Ok(Absent)` means the session was already gone (or never carried a
+    /// Boss token), which is treated as an idempotent success rather than
+    /// an error so repeated teardown calls stay safe.
+    /// `Err(KillSessionError::TokenMismatch)` means a session answers to
+    /// `session`, but with a *different* token: refuses to touch it, since
+    /// destroying it would tear down a worker this caller does not own —
+    /// this is the guard against a session name recycled onto a different
+    /// execution after the original session was destroyed.
+    pub async fn kill_session_verified(
+        &self,
+        session: &str,
+        expected_token: &str,
+    ) -> std::result::Result<KillSessionOutcome, KillSessionError> {
+        validate_value("session name", session)?;
+        validate_value("expected token", expected_token)?;
+        match self.show_environment(session, BOSS_SPAWN_TOKEN_ENV).await? {
+            None => Ok(KillSessionOutcome::Absent),
+            Some(actual) if actual == expected_token => {
+                // The session can still die on its own between the token
+                // read above and this call — the ordinary worker-completion
+                // race. Treat a kill that fails because the session is
+                // already gone as Absent, not a hard error, so this window
+                // doesn't leak the identity columns the way an unclassified
+                // Refused would.
+                if self.kill_session_unchecked(session).await? {
+                    Ok(KillSessionOutcome::Killed)
+                } else {
+                    Ok(KillSessionOutcome::Absent)
+                }
+            }
+            Some(actual) => Err(KillSessionError::TokenMismatch {
+                session: session.to_owned(),
+                expected: expected_token.to_owned(),
+                actual,
+            }),
+        }
+    }
+
+    /// Low-level `kill-session -t <name>`, with no identity verification.
+    /// Private: [`Self::kill_session_verified`] is this crate's only public
+    /// teardown entry point, by design — see its doc comment. Returns
+    /// `Ok(true)` when the session was actually killed, `Ok(false)` when it
+    /// had already vanished (a real command failure still becomes `Err`).
+    async fn kill_session_unchecked(&self, session: &str) -> Result<bool> {
         validate_value("session name", session)?;
         let mut args = self.server_args();
         args.extend(["kill-session".into(), "-t".into(), session.into()]);
-        self.invoke(args).await.map(|_| ())
+        let output = self.run(&args).await?;
+        if output.success {
+            return Ok(true);
+        }
+        if is_absent_session_stderr(&output.stderr) {
+            return Ok(false);
+        }
+        command_failed(&args, &output)
     }
 
     /// Reads one known pane/window field without parsing a pane capture.
@@ -350,6 +474,18 @@ fn parse_session(line: &str) -> Result<Session> {
         name: name.to_owned(),
         spawn_token: (!token.is_empty()).then(|| token.to_owned()),
     })
+}
+
+/// True when tmux's stderr indicates the target session (or the whole
+/// private server) simply does not exist, as opposed to a real command
+/// failure. tmux reports this a few different ways depending on whether the
+/// session is missing or the server itself was never started:
+/// `"can't find session: <name>"`, `"session not found: <name>"`, and
+/// `"no server running on <socket>"`.
+fn is_absent_session_stderr(stderr: &str) -> bool {
+    stderr.contains("can't find session")
+        || stderr.contains("session not found")
+        || stderr.contains("no server running")
 }
 
 fn command_failed<T>(args: &[OsString], output: &CommandOutput) -> Result<T> {

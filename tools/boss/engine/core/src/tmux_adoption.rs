@@ -396,7 +396,7 @@ where
                 tmux,
                 dispatch_events,
                 &handle.execution_id,
-                &session.session_name,
+                (session.session_name.as_str(), handle.tmux_spawn_token.as_str()),
                 &failure,
                 RefusedRowKind::NonTerminal,
             )
@@ -670,7 +670,7 @@ async fn classify_untracked_session<S>(
                 tmux,
                 dispatch_events,
                 &execution_id,
-                &session.session_name,
+                (session.session_name.as_str(), session.spawn_token.as_str()),
                 &failure,
                 RefusedRowKind::Terminal,
             )
@@ -952,6 +952,10 @@ enum RefusedRowKind {
 /// engine logs. The execution row itself is always left untouched — what
 /// happens to it next depends on `row_kind` (see [`RefusedRowKind`]).
 ///
+/// Teardown goes through [`Tmux::kill_session_verified`] with the durably
+/// recorded (and live-matched) spawn token — never a bare name kill — so a
+/// recycled session name cannot destroy a different execution's worker.
+///
 /// The refuse-then-reap safety argument only holds when the kill actually
 /// happened — a session left alive risks a second worker landing in the
 /// same cube workspace once the work is redispatched. So a failed
@@ -959,18 +963,22 @@ enum RefusedRowKind {
 /// and reaped" success shape: the dispatch event carries [`Outcome::Error`]
 /// and a `"reaped": false` detail, and the attention body tells the
 /// operator the session may still be running and names the manual command
-/// to clear it.
+/// to clear it. An already-absent session is treated as reaped (the
+/// session is not live either way).
 async fn refuse_and_reap(
     work_db: &WorkDb,
     tmux: &Tmux,
     dispatch_events: &dyn DispatchEventSink,
     execution_id: &str,
-    session_name: &str,
+    // Live session name + the spawn token that matched it — the only
+    // identity pair `Tmux::kill_session_verified` will accept.
+    session: (&str, &str),
     failure: &SchemaGuardFailure,
     row_kind: RefusedRowKind,
 ) {
-    let reaped = match tmux.kill_session(session_name).await {
-        Ok(()) => true,
+    let (session_name, spawn_token) = session;
+    let reaped = match tmux.kill_session_verified(session_name, spawn_token).await {
+        Ok(boss_tmux::KillSessionOutcome::Killed | boss_tmux::KillSessionOutcome::Absent) => true,
         Err(err) => {
             tracing::error!(
                 execution_id,
@@ -1226,11 +1234,16 @@ mod tests {
                     let session = args[4].clone();
                     self.killed_sessions.lock().unwrap().push(session.clone());
                     if self.kill_session_failures.contains(&session) {
+                        // Must NOT look like an absent-session error: those
+                        // are treated as idempotent success by
+                        // `kill_session_verified`. A real post-match kill
+                        // failure has to surface as Err so refuse_and_reap
+                        // reports reaped=false.
                         Ok(CommandOutput {
                             success: false,
                             code: Some(1),
                             stdout: String::new(),
-                            stderr: format!("can't find session: {session}"),
+                            stderr: format!("error connecting to /tmp/tmux-0/default ({session})"),
                         })
                     } else {
                         Ok(ok_output(String::new()))
