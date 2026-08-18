@@ -651,13 +651,13 @@ mod tests {
     #[test]
     fn macos_wrapper_activates_only_when_profile_exists() {
         let temp = tempfile::TempDir::new().unwrap();
-        let command = "grok --model grok-4.5\n";
+        let command = "grok --model grok-4.6\n";
         assert_eq!(wrap_with_macos_seatbelt(command, temp.path()).unwrap(), command);
 
         std::fs::write(macos_seatbelt_profile_path(temp.path()), "(version 1)\n").unwrap();
         let wrapped = wrap_with_macos_seatbelt(command, temp.path()).unwrap();
         assert!(wrapped.starts_with("/usr/bin/sandbox-exec -f "), "{wrapped}");
-        assert!(wrapped.ends_with(" grok --model grok-4.5\n"), "{wrapped}");
+        assert!(wrapped.ends_with(" grok --model grok-4.6\n"), "{wrapped}");
     }
 
     #[test]
@@ -665,7 +665,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         std::fs::write(macos_seatbelt_profile_path(temp.path()), "(version 1)\n").unwrap();
 
-        let error = wrap_with_macos_seatbelt("env grok --model grok-4.5", temp.path())
+        let error = wrap_with_macos_seatbelt("env grok --model grok-4.6", temp.path())
             .unwrap_err()
             .to_string();
         assert!(error.contains("outside the Boss Seatbelt"), "{error}");

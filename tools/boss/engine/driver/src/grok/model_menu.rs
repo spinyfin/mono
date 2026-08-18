@@ -1,12 +1,13 @@
 //! Grok model / effort menu tables.
 //!
-//! Sourced from `grok models` on grok 0.2.112 (2026-07-27); re-verified
-//! unchanged on 1.0.0 (2026-08-09). Catalog snapshot is a single SKU:
+//! Sourced from authenticated `grok models` on 2026-08-18. Catalog snapshot
+//! has a current default plus a prior generation:
 //!
 //! ```text
-//! Default model: grok-4.5
+//! Default model: grok-4.6
 //! Available models:
-//!   * grok-4.5 (default)
+//!   * grok-4.6 (default)
+//!   - grok-4.5
 //! ```
 //!
 //! # Refresh path
@@ -28,7 +29,7 @@ use boss_protocol::{EffortLevel, ReasoningMode};
 
 /// Map a Boss effort level onto Grok's `--reasoning-effort` vocabulary.
 ///
-/// **Live ladder (grok CLI 1.0.0 / model `grok-4.5`, probed 2026-08-09):**
+/// **Live ladder (model `grok-4.6`, probed 2026-08-18):**
 /// only `low`, `medium`, and `high` are accepted. Anything else is rejected
 /// at request time (not at flag parse) with:
 ///
@@ -68,17 +69,17 @@ pub(super) fn effort_value_for_level(level: EffortLevel) -> Option<&'static str>
 
 /// Capability-lever model choice. With a single SKU there is no
 /// sonnet/opus-style split: both `Standard` and `Investigation` resolve
-/// to `grok-4.5`. That is honest rather than degenerate — and it is the
+/// to `grok-4.6`. That is honest rather than degenerate — and it is the
 /// field most likely to be wrong within a quarter (see module refresh
 /// path).
 pub(super) fn model_for_reasoning(_reasoning: ReasoningMode) -> &'static str {
-    "grok-4.5"
+    "grok-4.6"
 }
 
 /// Legacy size-derived table. Consulted only for rows with no
-/// [`ReasoningMode`]. Single SKU → every level maps to `grok-4.5`.
+/// [`ReasoningMode`]. The current default → every level maps to `grok-4.6`.
 pub(super) fn default_model_for_level(_level: EffortLevel) -> &'static str {
-    "grok-4.5"
+    "grok-4.6"
 }
 
 /// Optional per-level worker-prompt addendum. Same shape as Claude/Codex

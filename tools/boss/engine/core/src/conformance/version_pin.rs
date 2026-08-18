@@ -401,7 +401,7 @@ fn error_item_as_operational_warning_is_not_silently_a_turn_failure() {
 // folder-trust dialog (spike Q3). A `grok models` menu that grows a second
 // SKU must fail this pin loudly, not get silently absorbed as a stale
 // default (`GROK_DESCRIPTOR`'s model menu, `model_menu.rs`, still hard-codes
-// the single `grok-4.5` SKU).
+// the prior single `grok-4.5` SKU).
 
 /// Probe grok availability with a flag guaranteed to be present (`--help`).
 /// Soft-skip (return `false`, meaning "test body should return early") when

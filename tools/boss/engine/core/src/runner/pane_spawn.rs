@@ -173,7 +173,7 @@ mod apply_permission_extra_args_tests {
         std::fs::write(grok_home.join("boss-workspace-path"), "/tmp/ws-extra-args\n").unwrap();
 
         let plan = GrokDriver::default().spawn_invocation(SpawnRequest {
-            model: "grok-4.5",
+            model: "grok-4.6",
             effort: Some("high"),
             settings_path: None,
             non_opus_auto_mode: false,

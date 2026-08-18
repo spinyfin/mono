@@ -236,7 +236,7 @@ mod tests {
         assert_eq!(driver.descriptor().config_dir, ".grok");
         assert_eq!(driver.descriptor().agent_rules_filename, "AGENTS.md");
         assert_eq!(driver.descriptor().binary, "grok");
-        assert_eq!(driver.descriptor().model_menu.engine_default, "grok-4.5");
+        assert_eq!(driver.descriptor().model_menu.engine_default, "grok-4.6");
     }
 
     /// Acceptance: `--driver codex` resolves in the registry and the
