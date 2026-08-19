@@ -1071,6 +1071,30 @@ impl WorkDb {
         Ok(())
     }
 
+    /// Names of the given task ids, keyed by id. Missing rows are
+    /// omitted so the caller can fall back to the id itself. Used by
+    /// the background-work snapshot to render `Rebasing <name>`
+    /// without reconstructing source state in the app.
+    pub fn task_names(&self, ids: &[String]) -> Result<HashMap<String, String>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare("SELECT id, name FROM tasks WHERE id = ?1")?;
+        let mut names = HashMap::new();
+        for id in ids {
+            let row = stmt
+                .query_row(params![id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .optional()?;
+            if let Some((task_id, name)) = row {
+                names.insert(task_id, name);
+            }
+        }
+        Ok(names)
+    }
+
     pub fn get_work_item(&self, id: &str) -> Result<WorkItem> {
         let conn = self.connect()?;
         match classify_id(id)? {

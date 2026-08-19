@@ -1245,8 +1245,21 @@ pub enum FrontendEvent {
     /// Response to [`FrontendRequest::ListEngineAttempts`]: the
     /// projected and merged row set, ordered freshest-first across the
     /// three attempt subsystems.
+    ///
+    /// `background_work` is empty unless the request set
+    /// `include_background_work` — additive and backward-compatible,
+    /// so existing callers keep reading identically. When populated it
+    /// is ordered independently of `attempts`: known starts oldest
+    /// first, then items without a start ordered by `source_id`. There
+    /// is no separate `visible_count` field: `background_work.len()` is
+    /// the badge count by construction, so the app reads the array
+    /// length verbatim rather than a second field that could desync.
+    /// See
+    /// `background-task-visibility-toolbar-affordance-for-engine-background-work.md`.
     EngineAttemptsList {
         attempts: Vec<EngineAttemptListEntry>,
+        #[serde(default)]
+        background_work: Vec<BackgroundWorkItem>,
     },
     /// Engine acknowledges a reveal request — the macOS app has
     /// switched to the kanban, scrolled the target card into view, and

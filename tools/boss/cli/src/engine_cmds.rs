@@ -540,11 +540,12 @@ pub(crate) async fn run_engine_attempts_command(
                     status: args.status.clone(),
                     work_item_id,
                     limit,
+                    include_background_work: false,
                 })
                 .await
                 .map_err(CliError::internal)?;
             match response {
-                FrontendEvent::EngineAttemptsList { attempts } => {
+                FrontendEvent::EngineAttemptsList { attempts, .. } => {
                     print_entity(ctx, &serde_json::json!({ "attempts": attempts }), || {
                         print_engine_attempts_table(&attempts)
                     })

@@ -10,8 +10,8 @@ use crate::live_worker_state::LiveWorkerState;
 use crate::metrics_wire::MetricLiveEntry;
 use crate::types::{
     AddDependencyInput, AnswerAgentRun, Attention, AttentionGroup, AttentionMerge, Automation,
-    AutomationDedupSuppression, AutomationPatch, AutomationRun, BoardDropTarget, CiBudgetSnapshot, CiRemediation,
-    CommentAnchor, CommentThreadEntry, CommentWithThread, CommentsBannerState, ConflictHotspotReport,
+    AutomationDedupSuppression, AutomationPatch, AutomationRun, BackgroundWorkItem, BoardDropTarget, CiBudgetSnapshot,
+    CiRemediation, CommentAnchor, CommentThreadEntry, CommentWithThread, CommentsBannerState, ConflictHotspotReport,
     ConflictResolution, CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput,
     CreateCommentInput, CreateDecisionInput, CreateExecutionInput, CreateInvestigationInput, CreateManyChoresInput,
     CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput,
@@ -1252,6 +1252,18 @@ pub enum FrontendRequest {
     /// matches all three. `status` is AND-ed across all included
     /// kinds (each row is filtered by its own table's `status`
     /// column). Ordering: `created_at DESC` across the merged set.
+    ///
+    /// `include_background_work` (default `false`) additionally
+    /// populates [`FrontendEvent::EngineAttemptsList`]'s
+    /// `background_work` snapshot — the "Background task visibility"
+    /// toolbar badge (design
+    /// `background-task-visibility-toolbar-affordance-for-engine-background-work.md`).
+    /// It is independent of `kinds`/`status`/`work_item_id`, which
+    /// filter only the `attempts` list. `limit: Some(0)` is the
+    /// background-only polling form: `attempts` comes back empty
+    /// while `background_work` is still populated when requested, so
+    /// a five-second poller does not re-fetch attempt history it
+    /// already has.
     ListEngineAttempts {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         kinds: Vec<String>,
@@ -1263,6 +1275,8 @@ pub enum FrontendRequest {
         work_item_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<u32>,
+        #[serde(default)]
+        include_background_work: bool,
     },
 
     ListExecutions {

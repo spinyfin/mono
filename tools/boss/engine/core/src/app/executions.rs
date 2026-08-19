@@ -1285,6 +1285,7 @@ pub(super) async fn handle_list_engine_attempts(ctx: Dispatch, req: FrontendRequ
         status,
         work_item_id,
         limit,
+        include_background_work,
     } = req
     else {
         unreachable!()
@@ -1299,10 +1300,36 @@ pub(super) async fn handle_list_engine_attempts(ctx: Dispatch, req: FrontendRequ
         },
         None => None,
     };
-    {
+    let attempts =
         match work_db.list_engine_attempts(&kinds, product_id.as_deref(), &status, work_item_id.as_deref(), limit) {
-            Ok(attempts) => send_response(&sink, &request_id, FrontendEvent::EngineAttemptsList { attempts }),
-            Err(err) => send_work_error(&sink, &request_id, &err),
+            Ok(attempts) => attempts,
+            Err(err) => {
+                send_work_error(&sink, &request_id, &err);
+                return;
+            }
+        };
+    let background_work = if include_background_work {
+        match crate::background_work::snapshot(&work_db) {
+            Ok(items) => items,
+            Err(err) => {
+                // Auxiliary view: a transient snapshot failure must not
+                // blank the primary attempts list. The next poll retries.
+                tracing::warn!(
+                    error = %err,
+                    "background_work snapshot failed; returning empty auxiliary list"
+                );
+                Vec::new()
+            }
         }
-    }
+    } else {
+        Vec::new()
+    };
+    send_response(
+        &sink,
+        &request_id,
+        FrontendEvent::EngineAttemptsList {
+            attempts,
+            background_work,
+        },
+    );
 }

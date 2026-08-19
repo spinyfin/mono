@@ -20,12 +20,16 @@
 //! Deliberately a *separate* periodic sweep rather than an inline
 //! `heartbeat_lease` call inside `try_mechanical_rungs` itself: rung-1's
 //! `CubeClient` test doubles (`ScriptCube`, `Rung0Cube` in
-//! `conflict_ladder_tests.rs`) don't implement `heartbeat_lease`, and a
-//! rung-1 attempt is normally seconds long anyway (a mechanical rebase, no
-//! agent) — there is no real risk of it outliving even a single sweep
-//! interval in practice. Keeping the heartbeat out-of-band means this
-//! sweep can be added, tuned, or disabled without touching the ladder's
-//! hot path or its tests at all.
+//! `conflict_ladder_tests.rs`) don't implement `heartbeat_lease`, and this
+//! out-of-band shape lets the sweep be added, tuned, or disabled without
+//! touching the ladder's hot path or its tests at all. A rung-1 attempt
+//! commonly *does* outlive a single [`DEFAULT_INTERVAL`] pass — observed
+//! full mechanical runs range 1.5–8.75 minutes
+//! (`crate::conflict_remediation`), well past the 120 s cadence — which is
+//! exactly why this is a repeating sweep rather than a one-shot refresh:
+//! [`RUNG1_LEASE_TTL_SECS`] still comfortably exceeds that measured
+//! maximum, so a genuinely long attempt gets several renewals before the
+//! tightened TTL could lapse.
 //!
 //! Reuses [`crate::ladder_lease_registry::snapshot`] as its candidate set —
 //! the same in-memory tracking `try_mechanical_rungs` already registers
@@ -39,10 +43,11 @@ use crate::coordinator::CubeClient;
 use crate::sweep_loop::{SweepOutcome, spawn_sweep_loop};
 
 /// TTL (seconds) this sweep refreshes every tracked rung-1 lease to.
-/// Deliberately far below cube's 86400 s / 24 h default: a rung-1 attempt
-/// normally completes in well under a minute (an engine-direct rebase, no
-/// agent), so 600 s / 10 min is generous headroom while still shrinking
-/// the 2026-07-18 incident's exposure window by orders of magnitude.
+/// Deliberately far below cube's 86400 s / 24 h default: observed full
+/// mechanical runs range 1.5–8.75 minutes (`crate::conflict_remediation`),
+/// so 600 s / 10 min still exceeds the measured maximum with headroom
+/// while shrinking the 2026-07-18 incident's exposure window by orders of
+/// magnitude.
 pub const RUNG1_LEASE_TTL_SECS: u64 = 600;
 
 /// Cadence between passes. Well below [`RUNG1_LEASE_TTL_SECS`] so a lease
@@ -82,9 +87,12 @@ impl SweepOutcome for LadderHeartbeatOutcome {
 
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`.
 /// Fires immediately on spawn (via `spawn_sweep_loop`'s contract), which is
-/// a harmless no-op whenever the registry is empty — the overwhelmingly
-/// common case, since rung-1 attempts are normally over well before the
-/// first pass would even fire.
+/// a harmless no-op whenever the registry happens to be empty at that
+/// instant. It is not, however, a rare case that finds one occupied: a
+/// live rung-1 attempt commonly runs 1.5–8.75 minutes, so an immediate
+/// pass landing mid-attempt — and getting its first refresh in well
+/// before a full [`DEFAULT_INTERVAL`] would otherwise elapse — is
+/// unremarkable.
 pub fn spawn_loop(cube_client: Arc<dyn CubeClient>, interval: Duration) -> tokio::task::JoinHandle<()> {
     spawn_sweep_loop(interval, move || {
         let cube_client = Arc::clone(&cube_client);

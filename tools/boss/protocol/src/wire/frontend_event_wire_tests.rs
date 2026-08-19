@@ -1602,7 +1602,10 @@ fn tag_cases() -> Vec<TagCase> {
         },
         TagCase {
             label: "EngineAttemptsList",
-            event: FrontendEvent::EngineAttemptsList { attempts: vec![] },
+            event: FrontendEvent::EngineAttemptsList {
+                attempts: vec![],
+                background_work: vec![],
+            },
             expected_tag: "engine_attempts_list",
         },
         // --- Reveal / shutdown / auth ---

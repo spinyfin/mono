@@ -383,6 +383,74 @@ pub struct EngineAttemptListEntry {
     pub work_item_id: Option<String>,
 }
 
+/// Typed discriminator for [`BackgroundWorkItem::kind`] — the two v1
+/// sources of the "Background task visibility" toolbar badge (design
+/// `background-task-visibility-toolbar-affordance-for-engine-background-work.md`).
+/// Unlike [`EngineAttemptListEntry::kind`] this is a proper enum: the
+/// badge's whole point is a closed, engine-decided membership, so a new
+/// source must be a compile-time decision here rather than a new string
+/// literal a consumer has to recognise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundWorkKind {
+    /// A `planner_runs` row still `outcome = 'running'` and at least the
+    /// engine's anti-flicker threshold old.
+    ProjectPlanner,
+    /// A `conflict_resolutions` row whose mechanical rung
+    /// (`mechanical_rung_in_flight`) is executing right now in this
+    /// process.
+    ConflictRemediation,
+}
+
+/// One item in the global background-work snapshot returned by
+/// [`crate::wire::FrontendRequest::ListEngineAttempts`] when
+/// `include_background_work` is set — design "Background task
+/// visibility: only long-lived, headless engine work enters the
+/// toolbar badge". Deliberately minimal: only the fields the read-only
+/// popover needs, with every value already fully engine-authored so the
+/// app renders the snapshot without reconstructing source state.
+///
+/// Eligibility (what makes a row appear here at all) lives entirely in
+/// the engine — see `crate::background_work` in `boss-engine-core` and
+/// the design's "Eligibility invariant" section. This type carries no
+/// filtering logic of its own.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct BackgroundWorkItem {
+    /// Stable id namespaced by source: `"<kind>:<source_id>"`, so ids
+    /// from the two sources can never collide even though their raw
+    /// primary keys are drawn from different tables.
+    pub id: String,
+    pub kind: BackgroundWorkKind,
+    /// Engine-authored phase text for the current state, e.g. `"Planning
+    /// <project>"` or `"Rebasing <work item>"`. Changes over the item's
+    /// lifetime (a conflict remediation can move between mechanical
+    /// rungs); `title` does not.
+    pub phase: String,
+    pub product_id: String,
+    /// The owning row's own primary key (`planner_runs.id` or
+    /// `conflict_resolutions.id`) — how a consumer reconciles this item
+    /// with the source-specific model it already has (e.g. the
+    /// project-card planner affordance).
+    pub source_id: String,
+    /// Engine-authored, kind-derived heading — stable for the item's
+    /// whole lifetime, unlike `phase`.
+    pub title: String,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+
+    /// Operation start time, populated only for `project_planner` items
+    /// (`planner_runs.created_at`, the claim time). Mechanical conflict
+    /// rungs omit it: neither source records lease-acquisition time, and
+    /// fabricating one would misrepresent how long the rung has run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExecutionReconcileResult {
     pub created: Vec<WorkExecution>,
