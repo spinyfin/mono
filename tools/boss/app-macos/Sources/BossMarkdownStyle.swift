@@ -152,7 +152,13 @@ struct BossHeadingStyle: StructuredText.HeadingStyle {
     // Maps the Boss type scale (26 / 22 / 18 / 16 / 14 / 14 pt) onto
     // SwiftUI's body font (17 pt on macOS) via fontScale so the rendering
     // continues to respond to dynamic-type changes.
-    private static let fontScales: [CGFloat] = [
+    //
+    // Not `private`: `CollapsibleMarkdownSection` (MarkdownDocumentChrome.swift)
+    // renders a heading label as a plain SwiftUI `Text`, not through Textual's
+    // `configuration.label`, so it can't use `.textual.fontScale`. It instead
+    // reads these same arrays directly so its folded H2 heading can never
+    // drift out of sync with this editorial H2 treatment again.
+    static let fontScales: [CGFloat] = [
         26.0 / 17.0,
         22.0 / 17.0,
         18.0 / 17.0,
@@ -160,9 +166,17 @@ struct BossHeadingStyle: StructuredText.HeadingStyle {
         14.0 / 17.0,
         14.0 / 17.0,
     ]
-    private static let weights: [Font.Weight] = [
+    static let weights: [Font.Weight] = [
         .bold, .semibold, .semibold, .semibold, .semibold, .semibold,
     ]
+    /// The macOS system body point size `fontScales` is expressed relative
+    /// to — shared with `CollapsibleMarkdownSection` for the same reason.
+    static let bodyPointSize: CGFloat = 17.0
+    /// Shared with `CollapsibleMarkdownSection`, which folds a heading-
+    /// delimited section behind a disclosure control and must match this
+    /// same top/bottom rhythm around its own heading row.
+    static let headingBlockSpacingTop: CGFloat = 16
+    static let headingBlockSpacingBottom: CGFloat = 8
 
     @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
@@ -174,11 +188,11 @@ struct BossHeadingStyle: StructuredText.HeadingStyle {
                     .fill(BossMarkdownPalette.hairline)
                     .frame(height: 1)
             }
-            .textual.blockSpacing(.init(top: 16, bottom: 8))
+            .textual.blockSpacing(.init(top: Self.headingBlockSpacingTop, bottom: Self.headingBlockSpacingBottom))
             .proseMeasureClamped()
         } else {
             headingLabel(configuration: configuration, level: level)
-                .textual.blockSpacing(.init(top: 16, bottom: 8))
+                .textual.blockSpacing(.init(top: Self.headingBlockSpacingTop, bottom: Self.headingBlockSpacingBottom))
                 .proseMeasureClamped()
         }
     }

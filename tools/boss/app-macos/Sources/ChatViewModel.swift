@@ -2115,6 +2115,17 @@ final class ChatViewModel: ObservableObject {
         asyncMarkdownViewerVM.renderStartTime = nil
         asyncMarkdownViewerVM.clickStartTime = nil
         asyncMarkdownViewerVM.renderContentID = UUID()
+        // Engine-minted revision briefs (`kind == "revision"`) always carry
+        // the standing "HARD RULE: no punting" boilerplate ahead of their
+        // findings (`render_revision_instructions` in
+        // `tools/boss/engine/pr-review/src/render.rs`) — collapse it by
+        // default so the findings are immediately visible. This is purely
+        // presentational: the heading text matched here never changes what
+        // `task.description` itself contains, which is what the worker
+        // actually reads (see that Rust function's doc comment for the
+        // cross-language contract this string must stay in sync with).
+        asyncMarkdownViewerVM.collapsedByDefaultHeadings =
+            task.kind == "revision" ? [RevisionBriefCollapsibleHeadings.hardRule] : []
         asyncMarkdownViewerVM.state = .loaded(
             title: task.name,
             markdown: task.description,
@@ -2147,6 +2158,11 @@ final class ChatViewModel: ObservableObject {
             asyncMarkdownViewerVM.pendingRenderProjectShortID = projectShortID
             asyncMarkdownViewerVM.renderStartTime = Date()
             asyncMarkdownViewerVM.renderContentID = UUID()
+            // This is the design-doc/investigation-doc fetch path, never a
+            // revision brief — reset explicitly so a collapsed-by-default
+            // heading set left over from a previously-viewed revision brief
+            // (the VM/window are a shared singleton) can't leak in here.
+            asyncMarkdownViewerVM.collapsedByDefaultHeadings = []
             asyncMarkdownViewerVM.state = .loaded(title: title, markdown: markdown, artifact: artifact)
         } catch {
             asyncMarkdownViewerVM.state = .failed(

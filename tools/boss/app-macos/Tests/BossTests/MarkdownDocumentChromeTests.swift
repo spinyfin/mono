@@ -232,4 +232,238 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         hosting.layoutSubtreeIfNeeded()
         XCTAssertGreaterThan(hosting.fittingSize.height, 0)
     }
+
+    // MARK: - Collapsible sections
+
+    /// A revision brief's exact shape: a summary paragraph, the
+    /// `## HARD RULE ...` boilerplate heading, then findings rendered as
+    /// `### [severity] ...` headings with no intervening heading. The
+    /// literal text this test builds mirrors `render_revision_instructions`
+    /// in `tools/boss/engine/pr-review/src/render.rs`.
+    private static let revisionBrief = """
+    Automated PR review of PR #5 found 1 finding(s) requiring attention.
+    Address ALL findings before finalising this revision.
+
+    ## HARD RULE: no punting — do the actual work
+
+    Each finding below requires a real code change that resolves it.
+    The following are FORBIDDEN — they do NOT count as addressing a finding:
+
+    - Filing a follow-up task, chore, or issue in lieu of fixing the finding.
+
+    ### [high] Null pointer dereference
+
+    **File:** `src/main.rs`
+
+    The handle function dereferences without a null check; add a guard.
+
+    **Review summary:** One bug found.
+    """
+
+    /// Must stay byte-for-byte identical to the heading text
+    /// `render_revision_instructions` emits (after stripping `## `) — see
+    /// that function's doc comment in `render.rs` for the matching half of
+    /// this cross-language contract.
+    func testRevisionBriefHardRuleHeadingTextIsPinned() {
+        XCTAssertEqual(
+            RevisionBriefCollapsibleHeadings.hardRule,
+            "HARD RULE: no punting — do the actual work"
+        )
+    }
+
+    /// The default (empty) heading set must leave every document — every
+    /// caller except a revision task's description — split as a single
+    /// unmodified `.plain` chunk, so today's single-`StructuredText`
+    /// rendering path is unaffected.
+    func testHeadingSectionsWithNoCollapsibleHeadingsIsSinglePlainChunk() {
+        let chunks = MarkdownHeadingSections.chunks(in: Self.revisionBrief, collapsibleHeadings: [])
+        XCTAssertEqual(chunks.count, 1)
+        guard case .plain(let text) = chunks[0] else {
+            return XCTFail("expected a single .plain chunk")
+        }
+        XCTAssertEqual(text, Self.revisionBrief)
+    }
+
+    /// A heading set that names no heading actually present in the source
+    /// must also fall back to a single `.plain` chunk (e.g. a design doc
+    /// that happens to be checked against a heading text it doesn't have).
+    func testHeadingSectionsWithNonMatchingHeadingIsSinglePlainChunk() {
+        let chunks = MarkdownHeadingSections.chunks(in: Self.revisionBrief, collapsibleHeadings: ["Not present anywhere"])
+        XCTAssertEqual(chunks.count, 1)
+        guard case .plain = chunks[0] else {
+            return XCTFail("expected a single .plain chunk")
+        }
+    }
+
+    /// The core invariant: the `## HARD RULE ...` section folds, but the
+    /// findings after it (rendered as a *deeper* `###` heading, with no H2
+    /// in between) never end up inside the collapsible chunk. A same-level
+    /// boundary rule would get this wrong — this pins "next heading of any
+    /// level" as the actual behavior.
+    func testHeadingSectionsFoldsHardRuleButNeverFindings() {
+        let chunks = MarkdownHeadingSections.chunks(
+            in: Self.revisionBrief,
+            collapsibleHeadings: [RevisionBriefCollapsibleHeadings.hardRule]
+        )
+        XCTAssertEqual(chunks.count, 3, "expected prefix, collapsible section, suffix: \(chunks)")
+
+        guard case .plain(let prefix) = chunks[0] else { return XCTFail("expected a leading .plain chunk") }
+        XCTAssertTrue(prefix.contains("Automated PR review of PR #5"))
+        XCTAssertFalse(prefix.contains("HARD RULE"))
+
+        guard case .collapsible(let heading, let body) = chunks[1] else {
+            return XCTFail("expected a .collapsible chunk")
+        }
+        XCTAssertEqual(heading, RevisionBriefCollapsibleHeadings.hardRule)
+        XCTAssertTrue(body.contains("FORBIDDEN"))
+        XCTAssertFalse(body.contains("### [high]"), "a finding heading must never be folded into the collapsed body")
+        XCTAssertFalse(body.contains("Review summary"))
+
+        guard case .plain(let suffix) = chunks[2] else { return XCTFail("expected a trailing .plain chunk") }
+        XCTAssertTrue(suffix.contains("### [high] Null pointer dereference"))
+        XCTAssertTrue(suffix.contains("Review summary"))
+        XCTAssertFalse(suffix.contains("FORBIDDEN"))
+    }
+
+    /// Concatenating the three chunks (re-adding back the `## ` marker and
+    /// heading-line newline the collapsible chunk strips) must reconstruct
+    /// the original source exactly — chunking must never drop or duplicate
+    /// text, since this same text is what the app shows the reader.
+    func testHeadingSectionsChunksReassembleToOriginalSource() {
+        let chunks = MarkdownHeadingSections.chunks(
+            in: Self.revisionBrief,
+            collapsibleHeadings: [RevisionBriefCollapsibleHeadings.hardRule]
+        )
+        var reassembled = ""
+        for chunk in chunks {
+            switch chunk {
+            case .plain(let text):
+                reassembled += text
+            case .collapsible(let heading, let body):
+                reassembled += "## \(heading)\n\(body)"
+            }
+        }
+        XCTAssertEqual(reassembled, Self.revisionBrief)
+    }
+
+    func testChromeWithCollapsedByDefaultHeadingRenders() {
+        let view = MarkdownDocumentChrome(
+            title: "Revision brief",
+            source: Self.revisionBrief,
+            collapsedByDefaultHeadings: [RevisionBriefCollapsibleHeadings.hardRule]
+        )
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame = NSRect(x: 0, y: 0, width: 760, height: 640)
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
+        XCTAssertGreaterThan(hosting.fittingSize.width, 0)
+    }
+
+    /// A '#' line inside a fenced code block must not be mistaken for a
+    /// heading/section boundary, matching the fence-aware convention
+    /// `MarkdownDocumentMeasure.containsTable` already establishes in this
+    /// same file.
+    func testHeadingLinesIgnoreHeadingsInsideFencedCodeBlocks() {
+        let doc = """
+        # Title
+
+        ```
+        # not a heading
+        ```
+
+        ## Real heading
+
+        body
+        """
+        let chunks = MarkdownHeadingSections.chunks(in: doc, collapsibleHeadings: ["not a heading"])
+        XCTAssertEqual(chunks.count, 1, "a '#' line inside a fence must not be treated as a heading/section boundary")
+        guard case .plain(let text) = chunks[0] else { return XCTFail("expected a single .plain chunk") }
+        XCTAssertEqual(text, doc)
+    }
+
+    /// CommonMark permits up to three leading spaces before an ATX heading's
+    /// `#` markers.
+    func testHeadingTextRecognizesUpToThreeLeadingSpaces() {
+        let doc = """
+        Intro
+
+           ## Indented heading
+
+        body
+
+        ### Next
+        """
+        let chunks = MarkdownHeadingSections.chunks(in: doc, collapsibleHeadings: ["Indented heading"])
+        XCTAssertEqual(chunks.count, 3, "expected prefix, collapsible section, suffix: \(chunks)")
+        guard case .collapsible(let heading, _) = chunks[1] else { return XCTFail("expected a .collapsible chunk") }
+        XCTAssertEqual(heading, "Indented heading")
+    }
+
+    // MARK: - Find-in-document over a chunked document
+
+    /// The invariant the index-shift bug violated: the sum of per-chunk
+    /// match counts must equal `MarkdownFindState`'s global `matches.count`
+    /// for the same source, and every global index must map to exactly one
+    /// in-range local index across the chunks. Before chunk-aware search,
+    /// `matches` was computed once over the whole source — including the
+    /// collapsible heading's own text, which no chunk's parser ever renders —
+    /// so the global index space and the sum of per-chunk match counts could
+    /// disagree.
+    @MainActor
+    func testFindStateEveryGlobalMatchIndexMapsToExactlyOneChunkLocalIndex() {
+        let state = MarkdownFindState()
+        let heading = RevisionBriefCollapsibleHeadings.hardRule
+        state.updateSource(Self.revisionBrief, baseURL: nil, collapsibleHeadings: [heading])
+        state.query = "the"
+
+        let chunkCount = MarkdownHeadingSections.chunks(in: Self.revisionBrief, collapsibleHeadings: [heading]).count
+        XCTAssertGreaterThan(
+            state.matches.count, 1,
+            "fixture must have more than one match, spanning more than one chunk, to exercise the mapping")
+
+        for global in 0..<state.matches.count {
+            if global > 0 { state.selectNext() }
+            XCTAssertEqual(state.currentIndex, global)
+
+            var chunksReportingCurrent: [Int] = []
+            for index in 0..<chunkCount {
+                let (matches, currentLocal) = state.chunkMatches(index)
+                if let currentLocal {
+                    XCTAssertTrue(matches.indices.contains(currentLocal), "chunk \(index) reported an out-of-range local index")
+                    chunksReportingCurrent.append(index)
+                }
+            }
+            XCTAssertEqual(
+                chunksReportingCurrent.count, 1,
+                "global match \(global) must map to exactly one chunk's local index, got \(chunksReportingCurrent)")
+        }
+
+        let summedLocalMatches = (0..<chunkCount).reduce(0) { $0 + state.chunkMatches($1).matches.count }
+        XCTAssertEqual(summedLocalMatches, state.matches.count)
+    }
+
+    /// A match inside a still-collapsed section must be identified so the
+    /// viewer can auto-expand it — otherwise the find bar counts a hit whose
+    /// highlight is never in the view hierarchy to paint.
+    @MainActor
+    func testFindStateIdentifiesCollapsedChunkForAutoExpand() {
+        let state = MarkdownFindState()
+        let heading = RevisionBriefCollapsibleHeadings.hardRule
+        state.updateSource(Self.revisionBrief, baseURL: nil, collapsibleHeadings: [heading])
+        state.query = "FORBIDDEN"
+        XCTAssertEqual(state.matches.count, 1)
+        XCTAssertEqual(state.currentCollapsibleHeadingToExpand, heading)
+    }
+
+    /// A match outside any collapsible chunk must not report a heading to
+    /// expand.
+    @MainActor
+    func testFindStateReportsNoHeadingToExpandForAPlainChunkMatch() {
+        let state = MarkdownFindState()
+        let heading = RevisionBriefCollapsibleHeadings.hardRule
+        state.updateSource(Self.revisionBrief, baseURL: nil, collapsibleHeadings: [heading])
+        state.query = "Null pointer"
+        XCTAssertEqual(state.matches.count, 1)
+        XCTAssertNil(state.currentCollapsibleHeadingToExpand)
+    }
 }
