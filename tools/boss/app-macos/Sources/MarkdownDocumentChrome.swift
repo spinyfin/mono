@@ -16,7 +16,9 @@ private let designDocTimingLog = Logger(subsystem: "com.boss.app", category: "De
 enum MarkdownDocumentMeasure {
     /// The prose reading measure, matched by `BossMarkdownStyle`'s per-block
     /// clamp so paragraphs stay this width even inside `wide` documents.
-    static let readable: CGFloat = 720
+    /// At the 1.12× editorial body size, the 0.5em average-character-width
+    /// heuristic yields about 65 characters per line (620 / 9.52 = 65.1).
+    static let readable: CGFloat = 620
     /// The document column width once a table is present.
     static let wide: CGFloat = 1440
 
@@ -701,6 +703,8 @@ private struct CollapsibleMarkdownSection: View {
     let sectionBody: String
     let parser: any MarkupParser
     @Binding var isExpanded: Bool
+    @Environment(\.markdownEditorialStyle) private var isEditorial
+    @ScaledMetric(relativeTo: .body) private var bodySize: CGFloat = BossHeadingStyle.bodyPointSize
 
     private var hiddenLineCount: Int {
         max(sectionBody.split(separator: "\n", omittingEmptySubsequences: true).count, 1)
@@ -718,8 +722,8 @@ private struct CollapsibleMarkdownSection: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .padding(.top, BossHeadingStyle.headingBlockSpacingTop)
-        .padding(.bottom, BossHeadingStyle.headingBlockSpacingBottom)
+        .padding(.top, headingSpacing.top)
+        .padding(.bottom, headingSpacing.bottom)
     }
 
     private var toggleButton: some View {
@@ -730,10 +734,7 @@ private struct CollapsibleMarkdownSection: View {
                 Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                     .font(.callout.weight(.semibold))
                     .foregroundStyle(BossMarkdownPalette.muted)
-                Text(heading)
-                    .font(.system(size: BossHeadingStyle.bodyPointSize * BossHeadingStyle.fontScales[1], weight: BossHeadingStyle.weights[1]))
-                    .foregroundStyle(BossMarkdownPalette.ink)
-                    .tracking(-0.3)
+                headingLabel
                 Spacer(minLength: 8)
                 Text(isExpanded ? "Collapse" : "Collapsed — \(hiddenLineCount) lines hidden. Click to expand.")
                     .font(.caption)
@@ -747,6 +748,42 @@ private struct CollapsibleMarkdownSection: View {
             isExpanded
                 ? "Collapse \(heading)"
                 : "Expand \(heading) — \(hiddenLineCount) lines hidden"
+        )
+    }
+
+    @ViewBuilder
+    private var headingLabel: some View {
+        let label = Text(heading)
+            .font(.system(size: headingPointSize, weight: headingWeight))
+            .foregroundStyle(BossMarkdownPalette.ink)
+        if isEditorial {
+            label.modifier(EditorialHeadingTracking(headingScale: MarkdownEditorialMetrics.headingScales[1]))
+        } else {
+            label.tracking(-0.3)
+        }
+    }
+
+    private var headingPointSize: CGFloat {
+        let scale = isEditorial
+            ? MarkdownEditorialMetrics.headingScales[1]
+            : BossHeadingStyle.compactFontScales[1]
+        return BossHeadingStyle.bodyPointSize * scale
+    }
+
+    private var headingWeight: Font.Weight {
+        isEditorial ? BossHeadingStyle.editorialWeights[1] : BossHeadingStyle.compactWeights[1]
+    }
+
+    private var headingSpacing: (top: CGFloat, bottom: CGFloat) {
+        guard isEditorial else {
+            return (
+                top: BossHeadingStyle.headingBlockSpacingTop,
+                bottom: BossHeadingStyle.headingBlockSpacingBottom
+            )
+        }
+        return (
+            top: bodySize * MarkdownEditorialMetrics.editorialH2Spacing.top,
+            bottom: bodySize * MarkdownEditorialMetrics.editorialH2Spacing.bottom
         )
     }
 }
