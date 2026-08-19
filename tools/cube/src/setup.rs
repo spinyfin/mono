@@ -28,6 +28,11 @@ pub struct SetupStep {
     pub run_when: RunPolicy,
     #[serde(default)]
     pub fingerprint: Vec<FingerprintInput>,
+    /// When true, a non-zero exit is recorded as [`StepStatus::Failed`] and
+    /// printed as a warning, but does not abort the lease or stop later steps.
+    /// Setup state is not persisted, so the step retries on the next lease.
+    #[serde(default)]
+    pub allow_failure: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -81,10 +86,19 @@ impl SetupReport {
             .count()
     }
 
+    /// Hard (non-tolerated) failures only. A step that declared
+    /// `allow_failure: true` stays in the report as [`StepStatus::Failed`]
+    /// but is not a lease-aborting failure.
     pub fn first_failure(&self) -> Option<&StepOutcome> {
-        self.steps
-            .iter()
-            .find(|step| matches!(step.status, StepStatus::Failed { .. }))
+        self.steps.iter().find(|step| step.status.is_hard_failure())
+    }
+
+    pub fn warning_count(&self) -> usize {
+        self.tolerated_failures().count()
+    }
+
+    pub fn tolerated_failures(&self) -> impl Iterator<Item = &StepOutcome> {
+        self.steps.iter().filter(|step| step.status.is_tolerated_failure())
     }
 }
 
@@ -101,8 +115,69 @@ pub struct StepOutcome {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum StepStatus {
     Ran,
-    Skipped { reason: SkipReason },
-    Failed { error: String },
+    Skipped {
+        reason: SkipReason,
+    },
+    Failed {
+        error: String,
+        /// Copied from the step's `allow_failure` declaration. Stays `Failed`
+        /// even when tolerated — never rewritten to success or skipped.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        allow_failure: bool,
+        /// Underlying command stderr when the runner captured a non-empty
+        /// one. Printed verbatim on the tolerated-failure warning path.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stderr: Option<String>,
+    },
+}
+
+impl StepStatus {
+    fn failed(error: CubeError, allow_failure: bool) -> Self {
+        let stderr = match &error {
+            CubeError::CommandFailed { stderr, .. } if !stderr.is_empty() => Some(stderr.clone()),
+            _ => None,
+        };
+        Self::Failed {
+            error: error.to_string(),
+            allow_failure,
+            stderr,
+        }
+    }
+
+    fn is_hard_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Failed {
+                allow_failure: false,
+                ..
+            }
+        )
+    }
+
+    fn is_tolerated_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Failed {
+                allow_failure: true,
+                ..
+            }
+        )
+    }
+}
+
+impl StepOutcome {
+    /// Human-facing warning body for a tolerated failure: the command's
+    /// captured stderr when present, otherwise the full error string.
+    pub fn warning_detail(&self) -> Option<&str> {
+        match &self.status {
+            StepStatus::Failed {
+                allow_failure: true,
+                stderr,
+                error,
+            } => Some(stderr.as_deref().filter(|s| !s.is_empty()).unwrap_or(error.as_str())),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -246,16 +321,21 @@ pub fn run_setup_engine(
                 }
                 Err(error) => {
                     let duration_ms = started.elapsed().as_millis() as u64;
+                    let allow_failure = step.allow_failure;
                     report.steps.push(StepOutcome {
                         id: step.id.clone(),
-                        status: StepStatus::Failed {
-                            error: error.to_string(),
-                        },
+                        status: StepStatus::failed(error, allow_failure),
                         fingerprint,
                         duration_ms,
                     });
-                    // Stop on first failure: subsequent steps may depend on
-                    // this one having run.
+                    if allow_failure {
+                        // Tolerated: leave remaining steps to run, and do
+                        // not persist workspace_setup state so this step
+                        // retries on the next lease.
+                        continue;
+                    }
+                    // Stop on first hard failure: subsequent steps may
+                    // depend on this one having run.
                     return Ok(report);
                 }
             },
@@ -346,8 +426,10 @@ steps:
         assert_eq!(config.steps.len(), 2);
         assert_eq!(config.steps[0].id, "secrets");
         assert_eq!(config.steps[0].run_when, RunPolicy::OnCreate);
+        assert!(!config.steps[0].allow_failure, "allow_failure defaults to false");
         assert_eq!(config.steps[1].id, "deps");
         assert_eq!(config.steps[1].run_when, RunPolicy::OnFingerprintChange);
+        assert!(!config.steps[1].allow_failure);
         assert_eq!(
             config.steps[1].fingerprint,
             vec![
@@ -391,6 +473,7 @@ steps:
             fingerprint: vec![FingerprintInput::File {
                 file: "lock".to_string(),
             }],
+            allow_failure: false,
         };
         let first = compute_fingerprint(temp.path(), &step).unwrap();
 
@@ -407,6 +490,7 @@ steps:
             command: "a".to_string(),
             run_when: RunPolicy::OnFingerprintChange,
             fingerprint: vec![],
+            allow_failure: false,
         };
         let first = compute_fingerprint(temp.path(), &step).unwrap();
         step.command = "b".to_string();
@@ -424,6 +508,7 @@ steps:
             fingerprint: vec![FingerprintInput::File {
                 file: "lock".to_string(),
             }],
+            allow_failure: false,
         };
         let missing = compute_fingerprint(temp.path(), &step).unwrap();
 
@@ -496,6 +581,22 @@ steps:
 "#;
         let parsed: SetupConfig = serde_yaml::from_str(raw).unwrap();
         assert_eq!(parsed.steps[0].run_when, RunPolicy::OnFingerprintChange);
+        assert!(
+            !parsed.steps[0].allow_failure,
+            "allow_failure defaults to false when omitted"
+        );
+    }
+
+    #[test]
+    fn allow_failure_parses_true() {
+        let raw = r#"version: 1
+steps:
+  - id: copy-config
+    command: cp missing dest
+    allow_failure: true
+"#;
+        let parsed: SetupConfig = serde_yaml::from_str(raw).unwrap();
+        assert!(parsed.steps[0].allow_failure);
     }
 
     // ── env-var injection tests ──────────────────────────────────────────────
@@ -667,5 +768,229 @@ steps:
             "config.toml should have been copied from $CUBE_BASE_REPO"
         );
         assert_eq!(std::fs::read(&dest).unwrap(), b"secret");
+    }
+
+    struct ScriptedRunner {
+        results: RefCell<std::collections::VecDeque<Result<String, CubeError>>>,
+        invocations: RefCell<Vec<CommandInvocation>>,
+    }
+
+    impl ScriptedRunner {
+        fn new(results: Vec<Result<String, CubeError>>) -> Self {
+            Self {
+                results: RefCell::new(results.into()),
+                invocations: RefCell::new(vec![]),
+            }
+        }
+    }
+
+    impl CommandRunner for ScriptedRunner {
+        fn run(&self, invocation: &CommandInvocation) -> Result<String, CubeError> {
+            self.invocations.borrow_mut().push(invocation.clone());
+            self.results
+                .borrow_mut()
+                .pop_front()
+                .expect("unexpected extra setup invocation")
+        }
+    }
+
+    fn command_failed(stderr: &str) -> CubeError {
+        CubeError::CommandFailed {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "cmd".to_string()],
+            status: Some(1),
+            stderr: stderr.to_string(),
+        }
+    }
+
+    fn two_step_config(first_allow_failure: bool) -> SetupConfig {
+        let allow = if first_allow_failure { "true" } else { "false" };
+        serde_yaml::from_str(&format!(
+            r#"version: 1
+steps:
+  - id: copy-config
+    command: cp missing dest
+    run_when: on-create
+    allow_failure: {allow}
+  - id: after
+    command: echo ok
+    run_when: always
+"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn first_failure_skips_tolerated_failures() {
+        use super::{SetupReport, StepOutcome, StepStatus};
+        let report = SetupReport {
+            steps: vec![
+                StepOutcome {
+                    id: "copy-config".to_string(),
+                    status: StepStatus::Failed {
+                        error: "boom".to_string(),
+                        allow_failure: true,
+                        stderr: Some("missing".to_string()),
+                    },
+                    fingerprint: "abc".to_string(),
+                    duration_ms: 1,
+                },
+                StepOutcome {
+                    id: "after".to_string(),
+                    status: StepStatus::Ran,
+                    fingerprint: "def".to_string(),
+                    duration_ms: 1,
+                },
+            ],
+        };
+        assert!(report.first_failure().is_none());
+        assert_eq!(report.warning_count(), 1);
+        assert_eq!(report.steps[0].warning_detail(), Some("missing"));
+    }
+
+    #[test]
+    fn first_failure_still_reports_hard_failures() {
+        use super::{SetupReport, StepOutcome, StepStatus};
+        let report = SetupReport {
+            steps: vec![StepOutcome {
+                id: "deps".to_string(),
+                status: StepStatus::Failed {
+                    error: "boom".to_string(),
+                    allow_failure: false,
+                    stderr: Some("pnpm exploded".to_string()),
+                },
+                fingerprint: "abc".to_string(),
+                duration_ms: 1,
+            }],
+        };
+        let failure = report.first_failure().expect("hard failure");
+        assert_eq!(failure.id, "deps");
+        assert_eq!(report.warning_count(), 0);
+    }
+
+    #[test]
+    fn tolerated_failure_continues_and_does_not_persist() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store_with_repo(&tmp, None);
+        let ws = workspace_record(&tmp);
+        let runner = ScriptedRunner::new(vec![
+            Err(command_failed("cp: missing: No such file or directory")),
+            Ok(String::new()),
+        ]);
+
+        let report = run_setup_engine(&store, &runner, &ws, &two_step_config(true), 0).unwrap();
+
+        assert!(report.first_failure().is_none());
+        assert_eq!(report.steps.len(), 2);
+        assert!(
+            report.steps[0].status.is_tolerated_failure(),
+            "tolerated failure stays Failed, not rewritten"
+        );
+        assert!(matches!(report.steps[1].status, super::StepStatus::Ran));
+        assert_eq!(runner.invocations.borrow().len(), 2, "later step still ran");
+        assert!(
+            store
+                .get_workspace_setup_state("mono", "mono-agent-001", "copy-config")
+                .unwrap()
+                .is_none(),
+            "tolerated failure must not persist setup state"
+        );
+        assert!(
+            store
+                .get_workspace_setup_state("mono", "mono-agent-001", "after")
+                .unwrap()
+                .is_some(),
+            "successful later step still persists"
+        );
+    }
+
+    #[test]
+    fn hard_failure_still_stops_later_steps() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store_with_repo(&tmp, None);
+        let ws = workspace_record(&tmp);
+        let runner = ScriptedRunner::new(vec![Err(command_failed("boom"))]);
+
+        let report = run_setup_engine(&store, &runner, &ws, &two_step_config(false), 0).unwrap();
+
+        let failure = report.first_failure().expect("hard failure");
+        assert_eq!(failure.id, "copy-config");
+        assert_eq!(report.steps.len(), 1, "later steps must not run");
+        assert_eq!(runner.invocations.borrow().len(), 1);
+        assert!(
+            store
+                .get_workspace_setup_state("mono", "mono-agent-001", "copy-config")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn tolerated_failure_retries_on_next_run() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store_with_repo(&tmp, None);
+        let ws = workspace_record(&tmp);
+        let config = two_step_config(true);
+
+        let first = ScriptedRunner::new(vec![
+            Err(command_failed("cp: missing: No such file or directory")),
+            Ok(String::new()),
+        ]);
+        run_setup_engine(&store, &first, &ws, &config, 0).unwrap();
+        assert_eq!(first.invocations.borrow().len(), 2);
+
+        // No state for the tolerated step, so on-create runs again. The
+        // later `always` step also runs.
+        let second = ScriptedRunner::new(vec![Ok(String::new()), Ok(String::new())]);
+        let report = run_setup_engine(&store, &second, &ws, &config, 1).unwrap();
+        assert_eq!(second.invocations.borrow().len(), 2);
+        assert!(matches!(report.steps[0].status, super::StepStatus::Ran));
+        assert!(
+            store
+                .get_workspace_setup_state("mono", "mono-agent-001", "copy-config")
+                .unwrap()
+                .is_some(),
+            "a later success must persist so on-create can skip afterwards"
+        );
+    }
+
+    #[test]
+    fn tolerated_missing_file_copy_surfaces_real_stderr() {
+        let tmp = TempDir::new().unwrap();
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let store = make_store_with_repo(&tmp, Some(&source_dir));
+        let ws = workspace_record(&tmp);
+        let config: SetupConfig = serde_yaml::from_str(
+            r#"version: 1
+steps:
+  - id: copy-config
+    command: 'cp "$CUBE_BASE_REPO/config.toml" config.toml'
+    run_when: on-create
+    allow_failure: true
+  - id: after
+    command: 'touch ran-after'
+    run_when: always
+"#,
+        )
+        .unwrap();
+
+        let report = run_setup_engine(&store, &RealCommandRunner, &ws, &config, 0).unwrap();
+        assert!(report.first_failure().is_none());
+        assert_eq!(report.steps.len(), 2);
+        assert!(report.steps[0].status.is_tolerated_failure());
+        assert!(matches!(report.steps[1].status, super::StepStatus::Ran));
+        let detail = report.steps[0].warning_detail().expect("warning detail");
+        assert!(
+            detail.contains("No such file") || detail.contains("config.toml"),
+            "real cp stderr should name the missing path, got: {detail}"
+        );
+        assert!(ws.workspace_path.join("ran-after").exists());
+        assert!(
+            store
+                .get_workspace_setup_state("mono", "mono-agent-001", "copy-config")
+                .unwrap()
+                .is_none()
+        );
     }
 }

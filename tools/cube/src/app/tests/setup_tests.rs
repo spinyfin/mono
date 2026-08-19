@@ -424,3 +424,181 @@ steps:
         "the lease id must be cleared after a released setup failure",
     );
 }
+
+#[test]
+fn workspace_setup_tolerated_failure_does_not_abort_lease() {
+    let (tempdir, database_path) = with_database_path();
+    let workspace_root = tempdir.path().join("workspaces");
+    let workspace_path = workspace_root.join("mono-agent-001");
+    std::fs::create_dir_all(workspace_path.join(".jj")).unwrap();
+    write_setup_yaml(
+        &workspace_path,
+        r#"version: 1
+steps:
+  - id: copy-config
+    command: cp missing dest
+    run_when: on-create
+    allow_failure: true
+  - id: after
+    command: echo ok
+    run_when: always
+"#,
+    );
+
+    seed_mono_repo(&workspace_root, &database_path);
+
+    let lease_runner = lease_runner_with_setup(
+        &workspace_path,
+        "abc1234",
+        vec![
+            ExpectedCommand {
+                cwd: workspace_path.clone(),
+                program: "sh".to_string(),
+                args: vec!["-c".to_string(), "cp missing dest".to_string()],
+                result: Err(CubeError::CommandFailed {
+                    program: "sh".to_string(),
+                    args: vec!["-c".to_string(), "cp missing dest".to_string()],
+                    status: Some(1),
+                    stderr: "cp: missing: No such file or directory".to_string(),
+                }),
+                creates_dir: None,
+                duration: std::time::Duration::ZERO,
+            },
+            ExpectedCommand::ok(workspace_path.clone(), "sh", &["-c", "echo ok"], ""),
+        ],
+    );
+
+    let result = run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo"]),
+        Some(&database_path),
+        &lease_runner,
+    )
+    .expect("tolerated setup failure must not abort the lease");
+    lease_runner.assert_exhausted();
+
+    let steps = result.payload["setup"]["steps"].as_array().expect("steps");
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0]["id"], "copy-config");
+    assert_eq!(steps[0]["status"], "failed");
+    assert_eq!(steps[0]["allow_failure"], json!(true));
+    assert_eq!(steps[1]["status"], "ran");
+    assert!(
+        result
+            .message
+            .contains("Setup: 1 ran, 0 skipped, 1 warning (copy-config)."),
+        "human output must name the tolerated step, got: {}",
+        result.message
+    );
+    assert!(
+        result.message.contains("cp: missing: No such file or directory"),
+        "human output must include the command stderr, got: {}",
+        result.message
+    );
+
+    use crate::store::Store;
+    let store = Store::open_at(&database_path).unwrap();
+    let record = store.get_workspace_by_path(&workspace_path).unwrap().unwrap();
+    assert_eq!(record.state, crate::metadata::WorkspaceState::Leased);
+    assert!(record.lease_id.is_some());
+    assert!(
+        store
+            .get_workspace_setup_state("mono", "mono-agent-001", "copy-config")
+            .unwrap()
+            .is_none(),
+        "tolerated failure must not persist setup state"
+    );
+}
+
+#[test]
+fn workspace_setup_tolerated_failure_retries_on_next_lease() {
+    let (tempdir, database_path) = with_database_path();
+    let workspace_root = tempdir.path().join("workspaces");
+    let workspace_path = workspace_root.join("mono-agent-001");
+    std::fs::create_dir_all(workspace_path.join(".jj")).unwrap();
+    write_setup_yaml(
+        &workspace_path,
+        r#"version: 1
+steps:
+  - id: copy-config
+    command: cp missing dest
+    run_when: on-create
+    allow_failure: true
+"#,
+    );
+
+    seed_mono_repo(&workspace_root, &database_path);
+
+    let first_runner = lease_runner_with_setup(
+        &workspace_path,
+        "abc1234",
+        vec![ExpectedCommand {
+            cwd: workspace_path.clone(),
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "cp missing dest".to_string()],
+            result: Err(CubeError::CommandFailed {
+                program: "sh".to_string(),
+                args: vec!["-c".to_string(), "cp missing dest".to_string()],
+                status: Some(1),
+                stderr: "cp: missing: No such file or directory".to_string(),
+            }),
+            creates_dir: None,
+            duration: std::time::Duration::ZERO,
+        }],
+    );
+    let first = run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo"]),
+        Some(&database_path),
+        &first_runner,
+    )
+    .expect("first lease");
+    first_runner.assert_exhausted();
+    let lease_id = first.payload["workspace"]["lease_id"].as_str().unwrap().to_string();
+
+    let release_runner = FakeRunner::new(vec![
+        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+        release_guard_reusable_command(&workspace_path),
+        ExpectedCommand::ok(
+            workspace_path.clone(),
+            "jj",
+            &["git", "remote", "list"],
+            "origin\tgit@github.com:spinyfin/mono.git\n",
+        ),
+        ExpectedCommand::ok(
+            workspace_path.clone(),
+            "jj",
+            &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
+        gc_noop_command(&workspace_path),
+        gc_pr_noop_command(&workspace_path),
+    ]);
+    run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
+        Some(&database_path),
+        &release_runner,
+    )
+    .expect("release");
+    release_runner.assert_exhausted();
+
+    // No persisted state, so on-create must run again rather than skip.
+    let second_runner = lease_runner_with_setup(
+        &workspace_path,
+        "def5678",
+        vec![ExpectedCommand::ok(
+            workspace_path.clone(),
+            "sh",
+            &["-c", "cp missing dest"],
+            "",
+        )],
+    );
+    let second = run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo2"]),
+        Some(&database_path),
+        &second_runner,
+    )
+    .expect("second lease");
+    second_runner.assert_exhausted();
+    let steps = second.payload["setup"]["steps"].as_array().unwrap();
+    assert_eq!(steps[0]["status"], "ran");
+}

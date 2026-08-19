@@ -235,29 +235,63 @@ pub(super) fn run_setup_for_workspace(
         return Ok(SetupReport::empty());
     };
     let now = current_epoch_s()?;
-    run_setup_engine(store, runner, workspace, &config, now)
+    let report = run_setup_engine(store, runner, workspace, &config, now)?;
+    emit_tolerated_failure_warnings(&report);
+    Ok(report)
+}
+
+/// Write tolerated-failure warnings to stderr so they surface in `--json`
+/// mode as well as the human-readable `RunResult::message` path.
+fn emit_tolerated_failure_warnings(report: &SetupReport) {
+    for step in report.tolerated_failures() {
+        eprintln!(
+            "warning: setup step `{}` failed but was tolerated (allow_failure): {}",
+            step.id,
+            step.warning_detail().unwrap_or(""),
+        );
+    }
 }
 
 pub(super) fn format_lease_message(lease_message: &str, report: &SetupReport) -> String {
     if report.steps.is_empty() {
         return lease_message.to_string();
     }
-    format!(
-        "{lease_message} Setup: {} ran, {} skipped.",
-        report.ran_count(),
-        report.skipped_count()
-    )
+    format!("{lease_message} Setup: {}", format_setup_counts(report))
 }
 
 pub(super) fn format_setup_message(workspace_id: &str, report: &SetupReport) -> String {
     if report.steps.is_empty() {
         return format!("No setup steps are configured for {workspace_id}.");
     }
-    format!(
-        "Setup complete for {workspace_id}: {} ran, {} skipped.",
-        report.ran_count(),
-        report.skipped_count()
-    )
+    format!("Setup complete for {workspace_id}: {}", format_setup_counts(report))
+}
+
+/// `N ran, M skipped.` plus, when any step was a tolerated failure,
+/// `, K warning(s) (id, …).` and a line of that step's captured stderr.
+fn format_setup_counts(report: &SetupReport) -> String {
+    let mut out = format!("{} ran, {} skipped", report.ran_count(), report.skipped_count());
+    let warnings: Vec<_> = report.tolerated_failures().collect();
+    if !warnings.is_empty() {
+        let ids = warnings
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let noun = if report.warning_count() == 1 {
+            "warning"
+        } else {
+            "warnings"
+        };
+        out.push_str(&format!(", {} {noun} ({ids})", report.warning_count()));
+    }
+    out.push('.');
+    for step in warnings {
+        if let Some(detail) = step.warning_detail() {
+            out.push('\n');
+            out.push_str(detail);
+        }
+    }
+    out
 }
 
 pub(super) fn discover_workspaces(repo: &RepoRecord) -> Result<Vec<crate::metadata::WorkspaceCandidate>> {
@@ -323,4 +357,62 @@ pub(super) fn find_workspace_record(
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_lease_message, format_setup_message};
+    use crate::setup::{SetupReport, StepOutcome, StepStatus};
+
+    fn failed_warning(id: &str, stderr: &str) -> StepOutcome {
+        StepOutcome {
+            id: id.to_string(),
+            status: StepStatus::Failed {
+                error: format!("command `sh -c cp` failed with exit code 1: {stderr}"),
+                allow_failure: true,
+                stderr: Some(stderr.to_string()),
+            },
+            fingerprint: "abc".to_string(),
+            duration_ms: 1,
+        }
+    }
+
+    fn ran(id: &str) -> StepOutcome {
+        StepOutcome {
+            id: id.to_string(),
+            status: StepStatus::Ran,
+            fingerprint: "def".to_string(),
+            duration_ms: 1,
+        }
+    }
+
+    #[test]
+    fn format_lease_message_includes_warning_count_id_and_stderr() {
+        let report = SetupReport {
+            steps: vec![
+                failed_warning("copy-config", "cp: /tmp/base/config.toml: No such file or directory"),
+                ran("after"),
+            ],
+        };
+        let message = format_lease_message("Leased mono-agent-001 at /tmp/ws.", &report);
+        assert!(
+            message.contains("Setup: 1 ran, 0 skipped, 1 warning (copy-config)."),
+            "summary should name the tolerated step, got: {message}"
+        );
+        assert!(
+            message.contains("cp: /tmp/base/config.toml: No such file or directory"),
+            "warning must surface the command stderr verbatim, got: {message}"
+        );
+    }
+
+    #[test]
+    fn format_setup_message_keeps_legacy_counts_when_no_warnings() {
+        let report = SetupReport {
+            steps: vec![ran("deps")],
+        };
+        assert_eq!(
+            format_setup_message("mono-agent-001", &report),
+            "Setup complete for mono-agent-001: 1 ran, 0 skipped."
+        );
+    }
 }
