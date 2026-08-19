@@ -1644,6 +1644,10 @@ impl ServerState {
     /// `WaitingForInput`, making the UI think the worker was still
     /// running.
     pub async fn release_worker_pane(&self, run_id: &str) -> PaneReleaseOutcome {
+        // A slot leaving the live-state registry can never be visited by
+        // the stale-worker sweep again, so resolve any open stale_worker
+        // attention here — complete, stop, or reap all share this path.
+        crate::stale_worker_sweep::resolve_stale_worker_attention(&self.work_db, run_id);
         // A file ingress is prepared before pane spawn, so stop it even when
         // no slot was ever mapped. Cancellation closes the source stream and
         // lets the generic reader flush/drain without blocking teardown.

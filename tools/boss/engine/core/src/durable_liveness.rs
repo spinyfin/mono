@@ -31,8 +31,9 @@
 //! implementation instead of the engine's own opinion — or its own private
 //! copy of the pid semantics. Every caller goes through here:
 //! [`crate::dead_pane_sweep`], the re-dispatch guard in
-//! [`crate::orphan_sweep`], the re-adoption path, the husk classifier, and
-//! `release_worker_pane`'s reap.
+//! [`crate::orphan_sweep`], the re-adoption path, the husk classifier,
+//! `release_worker_pane`'s reap, and [`crate::stale_worker_sweep`] when a
+//! tmux session is absent or its spawn token no longer matches.
 //!
 //! ## Two entry points, and which one to reach for
 //!

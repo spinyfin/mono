@@ -138,6 +138,49 @@ async fn release_worker_pane_drops_live_worker_state() {
 }
 
 #[tokio::test]
+async fn release_worker_pane_resolves_open_stale_worker_attention() {
+    let (server_state, _dir) = test_server_state();
+    let product_id = create_product(&server_state.work_db);
+    let work_item_id = create_active_chore(&server_state.work_db, &product_id, "test chore");
+    let execution_id = create_old_execution(&server_state.work_db, &work_item_id);
+    server_state
+        .work_db
+        .upsert_external_tracker_attention(
+            &work_item_id,
+            crate::stale_worker_sweep::STALE_WORKER_ATTENTION_KIND,
+            "Worker appears stuck; inspection required",
+            "prior body",
+        )
+        .unwrap();
+    server_state.worker_registry.register_run_slot(&execution_id, 1);
+    server_state.live_worker_states.register_spawn(
+        1,
+        &execution_id,
+        "claude-opus-4-7",
+        0,
+        Some(boss_protocol::WorkItemBinding {
+            work_item_id: work_item_id.clone(),
+            work_item_name: "test chore".to_owned(),
+            execution_id: execution_id.clone(),
+        }),
+    );
+
+    server_state.release_worker_pane(&execution_id).await;
+
+    let open_items: Vec<_> = server_state
+        .work_db
+        .list_attention_items_for_work_item(&work_item_id)
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.kind == crate::stale_worker_sweep::STALE_WORKER_ATTENTION_KIND && item.status == "open")
+        .collect();
+    assert!(
+        open_items.is_empty(),
+        "release_worker_pane must resolve stale_worker attention so a manual stop cannot strand it: {open_items:?}"
+    );
+}
+
+#[tokio::test]
 async fn release_worker_pane_reaps_the_tmux_session_for_a_slot_mapped_run() {
     // Regression coverage for the slot-mapped call site
     // (`release_worker_pane`'s primary body, as opposed to the

@@ -525,6 +525,59 @@ pub async fn reap_reported_pane_death(
     run_id: &str,
     report_reason: WorkerPaneDeathReason,
 ) -> bool {
+    let detail = report_reason.describe();
+    let reason = format!("worker-pane-died: app reported {detail}");
+    reap_live_nonterminal_worker(
+        work_db,
+        live_states,
+        coordinator,
+        dispatch_events,
+        cube_client,
+        run_id,
+        &reason,
+        Some(report_reason),
+    )
+    .await
+}
+
+/// Reap a worker the engine itself observed as dead (tmux `#{pane_dead}`,
+/// an absent session after pid corroboration, a spawn-token mismatch).
+/// Unlike [`reap_reported_pane_death`], `reason` is recorded as-is — this
+/// is not an app pane-death callback, so the durable narrative must not
+/// claim the app reported a child-process exit.
+pub async fn reap_observed_worker_death(
+    work_db: &WorkDb,
+    live_states: &LiveWorkerStateRegistry,
+    coordinator: Arc<ExecutionCoordinator>,
+    dispatch_events: &dyn DispatchEventSink,
+    cube_client: &dyn CubeClient,
+    run_id: &str,
+    reason: &str,
+) -> bool {
+    reap_live_nonterminal_worker(
+        work_db,
+        live_states,
+        coordinator,
+        dispatch_events,
+        cube_client,
+        run_id,
+        reason,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reap_live_nonterminal_worker(
+    work_db: &WorkDb,
+    live_states: &LiveWorkerStateRegistry,
+    coordinator: Arc<ExecutionCoordinator>,
+    dispatch_events: &dyn DispatchEventSink,
+    cube_client: &dyn CubeClient,
+    run_id: &str,
+    reason: &str,
+    app_report_reason: Option<WorkerPaneDeathReason>,
+) -> bool {
     let Some(state) = live_states.snapshot().into_iter().find(|s| s.run_id == run_id) else {
         tracing::warn!(
             run_id,
@@ -552,9 +605,6 @@ pub async fn reap_reported_pane_death(
     }
 
     let now_epoch_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
-
-    let detail = report_reason.describe();
-    let reason = format!("worker-pane-died: app reported {detail}");
     reap_dead_execution(
         work_db,
         live_states,
@@ -563,11 +613,11 @@ pub async fn reap_reported_pane_death(
         &state,
         &execution,
         ReapOptions::builder()
-            .reason(&reason)
+            .reason(reason)
             .now_epoch_secs(now_epoch_secs)
             .file_pane_death_attention(false)
             .cube_client(cube_client)
-            .app_report_reason(report_reason)
+            .maybe_app_report_reason(app_report_reason)
             .build(),
     )
     .await
