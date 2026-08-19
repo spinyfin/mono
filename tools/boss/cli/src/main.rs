@@ -9,18 +9,19 @@ pub(crate) use boss_client::{
 };
 pub(crate) use boss_protocol::{
     AddDependencyInput, AnswerAgentRun, Attention, AttentionGroup, Automation, AutomationDedupSuppression,
-    AutomationPatch, AutomationRun, AutomationTrigger, CREATED_VIA_CLI, CiBudgetSnapshot, CiRemediation, CommentAnchor,
-    ConflictHotspotReport, ConflictResolution, CostBucket, CostMeasurement, CreateAttentionInput,
-    CreateAutomationInput, CreateChoreInput, CreateCommentInput, CreateDecisionInput, CreateInvestigationInput,
-    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
-    CreateTaskInput, Decision, DependencyDirection, DependencyEdge, DependencyFilter, EditorialAction, EditorialRules,
-    EffortAuditReport, EffortLevel, EngineAttemptListEntry, ExecutionKind, FollowupMemberOverride, FrontendEvent,
-    FrontendRequest, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, OrgAuthState, PlannerOutput,
-    PlannerRun, PrWorkItemMatch, Product, Project, ProjectDesignDocState, ReasoningMode, RemoveDependencyInput,
-    ResolveProjectDesignDocOutput, ResolvedDesignDocKind, SetProductEditorialRulesInput,
-    SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskDocPointerInput, Task, TaskCostReport,
-    TaskRuntime, TopCostReport, UnpopulatePreservedTask, WindowCostReport, WorkAttentionItem, WorkComment,
-    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
+    AutomationPatch, AutomationRun, AutomationTrigger, BackgroundWorkItem, BackgroundWorkKind, CREATED_VIA_CLI,
+    CiBudgetSnapshot, CiRemediation, CommentAnchor, ConflictHotspotReport, ConflictResolution, CostBucket,
+    CostMeasurement, CreateAttentionInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput,
+    CreateDecisionInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput,
+    CreateProjectInput, CreateRevisionInput, CreateTaskInput, Decision, DependencyDirection, DependencyEdge,
+    DependencyFilter, EditorialAction, EditorialRules, EffortAuditReport, EffortLevel, EngineAttemptListEntry,
+    ExecutionKind, FollowupMemberOverride, FrontendEvent, FrontendRequest, GitHubAuthStateDto, LinkExternalRefInput,
+    ListDependenciesInput, OrgAuthState, PlannerOutput, PlannerRun, PrWorkItemMatch, Product, Project,
+    ProjectDesignDocState, ReasoningMode, RemoveDependencyInput, ResolveProjectDesignDocOutput, ResolvedDesignDocKind,
+    SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskDocPointerInput,
+    Task, TaskCostReport, TaskRuntime, TopCostReport, UnpopulatePreservedTask, WindowCostReport, WorkAttentionItem,
+    WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
+    WorkItemPatch,
 };
 pub(crate) use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 pub(crate) use comfy_table::{Cell, ContentArrangement, Table};

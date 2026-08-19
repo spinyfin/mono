@@ -533,6 +533,7 @@ pub(crate) async fn run_engine_attempts_command(
                 None => Some(50),
             };
             let work_item_id = resolve_optional_work_item_filter(&mut client, ctx, args.work_item).await?;
+            let include_background_work = args.background;
             let response = client
                 .send_request(&FrontendRequest::ListEngineAttempts {
                     kinds: args.kind.clone(),
@@ -540,15 +541,33 @@ pub(crate) async fn run_engine_attempts_command(
                     status: args.status.clone(),
                     work_item_id,
                     limit,
-                    include_background_work: false,
+                    include_background_work,
                 })
                 .await
                 .map_err(CliError::internal)?;
             match response {
-                FrontendEvent::EngineAttemptsList { attempts, .. } => {
-                    print_entity(ctx, &serde_json::json!({ "attempts": attempts }), || {
-                        print_engine_attempts_table(&attempts)
-                    })
+                FrontendEvent::EngineAttemptsList {
+                    attempts,
+                    background_work,
+                } => {
+                    // Always forward the additive `background_work` field so
+                    // `--json` matches the engine response. Human history
+                    // output stays the attempts table only unless `--background`
+                    // opted in to rendering the snapshot.
+                    print_entity(
+                        ctx,
+                        &serde_json::json!({
+                            "attempts": attempts,
+                            "background_work": background_work,
+                        }),
+                        || {
+                            if include_background_work {
+                                print_background_work(&background_work);
+                                println!();
+                            }
+                            print_engine_attempts_table(&attempts)
+                        },
+                    )
                 }
                 FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
                     Err(CliError::application(message))
@@ -806,9 +825,21 @@ pub(crate) fn attempt_trailing_cells<'a>(
 }
 
 pub(crate) fn print_conflict_resolutions_table(attempts: &[ConflictResolution]) {
-    let mut table = new_dynamic_table(vec!["ID", "STATUS", "PR", "WORK ITEM", "REASON", "CREATED"]);
+    let mut table = new_dynamic_table(vec![
+        "ID",
+        "STATUS",
+        "MECH RUNG",
+        "PR",
+        "WORK ITEM",
+        "REASON",
+        "CREATED",
+    ]);
     for attempt in attempts {
-        let mut cells = vec![attempt.id.as_str(), attempt.status.as_str()];
+        let rung = attempt
+            .mechanical_rung_in_flight
+            .map(|rung| rung.to_string())
+            .unwrap_or_default();
+        let mut cells = vec![attempt.id.as_str(), attempt.status.as_str(), rung.as_str()];
         cells.extend(attempt_trailing_cells(
             attempt.pr_url.as_str(),
             Some(attempt.work_item_id.as_str()),
@@ -824,6 +855,10 @@ pub(crate) fn print_conflict_resolution_detail(attempt: &ConflictResolution) {
     DetailTable::new()
         .row("id", &attempt.id)
         .row("status", &attempt.status)
+        .opt_row(
+            "mechanical_rung_in_flight",
+            attempt.mechanical_rung_in_flight.map(|rung| rung.to_string()),
+        )
         .row("product_id", &attempt.product_id)
         .row("work_item_id", &attempt.work_item_id)
         .row("pr_url", &attempt.pr_url)
@@ -942,6 +977,36 @@ pub(crate) fn print_ci_budget_after_retry(work_item_id: &str, budget: &CiBudgetS
         );
         println!("Parent was not exhausted; no status change.");
     }
+}
+
+pub(crate) fn print_background_work(items: &[BackgroundWorkItem]) {
+    println!("Background work ({})", items.len());
+    if items.is_empty() {
+        println!("No live background work.");
+        return;
+    }
+    let mut table = new_dynamic_table(vec!["KIND", "ID", "TITLE", "PHASE", "STARTED", "CONTEXT"]);
+    for item in items {
+        let kind = match item.kind {
+            BackgroundWorkKind::ProjectPlanner => "project_planner",
+            BackgroundWorkKind::ConflictRemediation => "conflict_remediation",
+        };
+        let started = item.started_at.as_deref().unwrap_or("");
+        let context = item
+            .work_item_id
+            .as_deref()
+            .or(item.project_id.as_deref())
+            .unwrap_or("");
+        table.add_row(vec![
+            kind,
+            item.id.as_str(),
+            item.title.as_str(),
+            item.phase.as_str(),
+            started,
+            context,
+        ]);
+    }
+    print_table(table);
 }
 
 pub(crate) fn print_engine_attempts_table(attempts: &[EngineAttemptListEntry]) {
