@@ -291,6 +291,15 @@ async fn full_cycle_detect_then_retire() {
         closed_revision.deleted_at.is_some(),
         "the resolved CI-fix revision must be tombstoned so it disappears from the board"
     );
+    assert_eq!(closed_revision.archived_by.as_deref(), Some("ci_watch_supersession"));
+    assert!(closed_revision.archived_at.as_deref().is_some_and(|at| !at.is_empty()));
+    assert!(
+        closed_revision
+            .archived_reason
+            .as_deref()
+            .is_some_and(|reason| !reason.is_empty())
+    );
+    assert_eq!(closed_revision.last_status_actor, "engine");
 
     // Attempt row terminal.
     let attempts: Vec<_> = {

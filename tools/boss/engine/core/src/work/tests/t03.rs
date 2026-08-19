@@ -471,7 +471,13 @@ fn archiving_revision_prerequisite_cascades_to_waiting_dependent() {
         .unwrap();
 
     let archived = db
-        .close_moot_revision_task(&prereq_id, "the revision is no longer needed")
+        .close_moot_revision_task(
+            &prereq_id,
+            ArchiveProvenance::new(
+                ARCHIVE_MECHANISM_CONFLICT_WATCH_SUPERSESSION,
+                "the revision is no longer needed",
+            ),
+        )
         .unwrap()
         .expect("the live revision must be archived");
     assert_eq!(archived.status, TaskStatus::Archived);

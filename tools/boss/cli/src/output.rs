@@ -361,6 +361,12 @@ pub(crate) fn print_product_details(title: &str, product: &Product) {
     println!("Name: {}", product.name);
     println!("Slug: {}", product.slug);
     println!("Status: {}", product.status);
+    if let Some(actor) = product.last_status_actor.as_deref() {
+        println!("Status actor: {actor}");
+    }
+    if let Some(basis) = product.status_basis.as_deref() {
+        println!("Status basis: {basis}");
+    }
     println!("Repo: {}", product.repo_remote_url.as_deref().unwrap_or(""));
     if let Some(design_repo) = product.design_repo.as_deref() {
         println!("Design repo: {design_repo}");
@@ -975,8 +981,25 @@ pub(crate) fn print_task_details(title: &str, task: &Task, parent_product: Optio
     if let Some(summary) = task.completion_summary.as_deref() {
         println!("Completion summary: {summary}");
     }
-    if let Some(reason) = task.archived_reason.as_deref() {
-        println!("Archived reason: {reason}");
+    if let Some(deleted_at) = task.deleted_at.as_deref() {
+        println!("Deleted: {}", format_stored_epoch(deleted_at));
+    }
+    if task.status == boss_protocol::TaskStatus::Archived
+        || task.archived_by.is_some()
+        || task.archived_at.is_some()
+        || task.archived_reason.is_some()
+    {
+        println!(
+            "Archived by: {}",
+            task.archived_by.as_deref().unwrap_or("unknown mechanism")
+        );
+        println!("Archived actor: {}", task.last_status_actor);
+        if let Some(archived_at) = task.archived_at.as_deref() {
+            println!("Archived at: {}", format_stored_epoch(archived_at));
+        }
+        if let Some(reason) = task.archived_reason.as_deref() {
+            println!("Archived reason: {reason}");
+        }
     }
     if let Some(reason) = task.dispatch_failed_reason.as_deref() {
         println!("Dispatch failed: {reason}");

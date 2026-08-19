@@ -847,15 +847,35 @@ fn migrate_cancelled_task_statuses_to_archived_with_provenance() {
     let db2 = WorkDb::open(path.clone()).unwrap();
     let conn2 = db2.connect().unwrap();
 
-    let (stuck_status, stuck_deleted_at, stuck_reason): (String, Option<String>, Option<String>) = conn2
+    let (stuck_status, stuck_deleted_at, stuck_by, stuck_at, stuck_reason, stuck_actor): (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+    ) = conn2
         .query_row(
-            "SELECT status, deleted_at, archived_reason FROM tasks WHERE id = ?1",
+            "SELECT status, deleted_at, archived_by, archived_at, archived_reason, last_status_actor
+             FROM tasks WHERE id = ?1",
             [&stuck_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
         )
         .unwrap();
     assert_eq!(stuck_status, "archived");
+    assert_eq!(stuck_by.as_deref(), Some("legacy_cancelled_status_migration"));
+    assert!(stuck_at.as_deref().is_some_and(|at| !at.is_empty()));
     assert_eq!(stuck_reason.as_deref(), Some("migrated from legacy cancelled status"));
+    assert_eq!(stuck_actor, "engine");
     assert!(
         stuck_deleted_at.is_none(),
         "migration changes status without deleting the legacy row"

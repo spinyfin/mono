@@ -91,7 +91,10 @@ async fn resolution_closes_the_revision_task_it_spawned() {
         TaskStatus::Archived,
         "a never-dispatched (no live execution) revision must be closed, not left todo/active forever",
     );
-    assert!(t.archived_reason.is_some());
+    assert_eq!(t.archived_by.as_deref(), Some("conflict_watch_supersession"));
+    assert!(t.archived_at.as_deref().is_some_and(|at| !at.is_empty()));
+    assert!(t.archived_reason.as_deref().is_some_and(|reason| !reason.is_empty()));
+    assert_eq!(t.last_status_actor, "engine");
 }
 
 /// A revision task still being actively driven by a worker (a `running`

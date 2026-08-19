@@ -202,6 +202,8 @@ const TASKS_STATUS_CHECK_COLUMNS: &[(&str, &str)] = &[
     ("origin_pr_number", "origin_pr_number INTEGER"),
     ("completed_at", "completed_at TEXT"),
     ("planner_run_id", "planner_run_id TEXT"),
+    ("archived_by", "archived_by TEXT"),
+    ("archived_at", "archived_at TEXT"),
     ("archived_reason", "archived_reason TEXT"),
     ("dispatch_failed_reason", "dispatch_failed_reason TEXT"),
     ("dispatch_failed_error", "dispatch_failed_error TEXT"),
@@ -328,19 +330,22 @@ pub(crate) fn migrate_projects_tasks_status_check(conn: &Connection) -> Result<(
 }
 
 /// Collapse retired task status data before rebuilding the status constraint.
-/// The existing `archived_reason` is intentionally retained as the one
-/// provenance surface for both automatic archival and this historical
-/// migration; no second terminal state or extra column is needed.
+/// This is an archival write in its own right, so it records the migration as
+/// its stable mechanism plus a specific reason and transition timestamp.
 pub(crate) fn migrate_tasks_cancelled_status_to_archived(conn: &Connection) -> Result<()> {
+    let now = now_string();
     conn.execute(
         "UPDATE tasks
          SET status = 'archived',
+             archived_by = 'legacy_cancelled_status_migration',
+             archived_at = ?1,
              archived_reason = COALESCE(NULLIF(archived_reason, ''), 'migrated from legacy cancelled status'),
+             last_status_actor = 'engine',
              completed_at = COALESCE(completed_at, created_at),
              merge_queue_state = NULL,
              merge_queue_detail = NULL
          WHERE status = 'cancelled'",
-        [],
+        [&now],
     )?;
     Ok(())
 }

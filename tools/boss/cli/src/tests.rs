@@ -9,13 +9,14 @@ use super::{
     TaskListCriteria, TaskPriority, TaskStatusArg, apply_project_list_filters, apply_task_list_filters,
     classify_bind_pr, classify_lint_finding, compile_schedule, decide_open_design_action, default_comment_author,
     dependency_status_is_satisfied, ensure_explicit_product_matches, expect_leaf_work_item,
-    format_project_design_doc_line, format_repo_line, is_typed_work_item_id, lint_summary_line,
-    parse_attention_group_selector, parse_automation_selector, pick_by_index, resolve_comments_artifact,
-    split_shake_report, status_vocab, task_json_with_runtime, validate_github_pr_url, with_display_status,
+    format_dependency_edge_line, format_project_design_doc_line, format_repo_line, format_stored_epoch,
+    is_typed_work_item_id, lint_summary_line, parse_attention_group_selector, parse_automation_selector, pick_by_index,
+    resolve_comments_artifact, split_shake_report, status_vocab, task_json_with_runtime, validate_github_pr_url,
+    with_display_status,
 };
 use boss_protocol::{
-    Product, Project, ProjectDesignDocState, ProjectStatus, ResolvedDesignDoc, ResolvedDesignDocKind, Task, TaskKind,
-    TaskRuntime, TaskStatus, WorkItem,
+    DependencyEdge, Product, Project, ProjectDesignDocState, ProjectStatus, ResolvedDesignDoc, ResolvedDesignDocKind,
+    Task, TaskKind, TaskRuntime, TaskStatus, WorkItem,
 };
 
 #[test]
@@ -38,6 +39,34 @@ fn task_status_arg_maps_board_names_to_stored() {
     assert_eq!(TaskStatusArg::Done.as_str(), "done");
     assert_eq!(TaskStatusArg::Blocked.as_str(), "blocked");
     assert_eq!(TaskStatusArg::Archived.as_str(), "archived");
+}
+
+#[test]
+fn archived_dependency_edge_renders_its_provenance() {
+    let line = format_dependency_edge_line(
+        &DependencyEdge {
+            id: "task_archived".to_owned(),
+            kind: "task".to_owned(),
+            name: "Fix CI".to_owned(),
+            relation: "blocks".to_owned(),
+            status: "archived".to_owned(),
+            archived_by: Some("ci_watch_supersession".to_owned()),
+            archived_at: Some("1787115212".to_owned()),
+            archived_reason: Some("superseded by task_new after a fresh commit".to_owned()),
+        },
+        true,
+    );
+
+    let expected_at = format_stored_epoch("1787115212");
+    assert!(line.contains("ci_watch_supersession"), "line: {line}");
+    assert!(line.contains(&expected_at), "line: {line}");
+    assert!(!line.contains("1787115212"), "raw epoch leaked into line: {line}");
+    assert!(line.contains("superseded by task_new"), "line: {line}");
+}
+
+#[test]
+fn format_stored_epoch_falls_back_for_non_integer_legacy_values() {
+    assert_eq!(format_stored_epoch("not-an-epoch"), "not-an-epoch");
 }
 
 #[test]
@@ -782,6 +811,30 @@ fn parses_task_move_command() {
         } => {
             assert_eq!(args.id, "task_1");
             assert!(matches!(args.target, MoveTarget::Review));
+            assert!(args.archived_reason.is_none());
+        }
+        _ => panic!("expected task move command"),
+    }
+}
+
+#[test]
+fn parses_task_move_archived_reason() {
+    let cli = Cli::parse_from([
+        "boss",
+        "task",
+        "move",
+        "task_1",
+        "--to",
+        "archived",
+        "--archived-reason",
+        "duplicate of the shipped chore",
+    ]);
+    match cli.command {
+        Commands::Task {
+            command: TaskCommand::Move(args),
+        } => {
+            assert!(matches!(args.target, MoveTarget::Archived));
+            assert_eq!(args.archived_reason.as_deref(), Some("duplicate of the shipped chore"));
         }
         _ => panic!("expected task move command"),
     }

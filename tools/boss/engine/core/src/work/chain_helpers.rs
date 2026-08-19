@@ -1,5 +1,32 @@
 use super::*;
 
+pub(crate) const ARCHIVE_MECHANISM_CI_WATCH_SUPERSESSION: &str = "ci_watch_supersession";
+pub(crate) const ARCHIVE_MECHANISM_CONFLICT_WATCH_SUPERSESSION: &str = "conflict_watch_supersession";
+pub(crate) const ARCHIVE_MECHANISM_PARENT_CLOSE_DISPATCH_RECONCILIATION: &str =
+    "revision_parent_close_dispatch_reconciliation";
+pub(crate) const ARCHIVE_MECHANISM_PARENT_CLOSE_SWEEP: &str = "revision_parent_close_sweep";
+/// Human `task update --status archived`. Reason is optional.
+pub(crate) const ARCHIVE_MECHANISM_MANUAL_STATUS_CHANGE: &str = "manual_status_change";
+/// Agent / Boss-worker `task update --status archived`. Reason required.
+pub(crate) const ARCHIVE_MECHANISM_BOSS_STATUS_CHANGE: &str = "boss_status_change";
+/// Engine-attributed `update_task` archive that is not one of the dedicated
+/// sweep helpers. Reason required.
+pub(crate) const ARCHIVE_MECHANISM_ENGINE_STATUS_CHANGE: &str = "engine_status_change";
+
+/// Required provenance for an automated archival write. Its private fields
+/// and required constructor make it impossible for an archive helper caller
+/// to omit either the stable mechanism or the actionable reason.
+pub(crate) struct ArchiveProvenance<'a> {
+    mechanism: &'static str,
+    reason: &'a str,
+}
+
+impl<'a> ArchiveProvenance<'a> {
+    pub(crate) fn new(mechanism: &'static str, reason: &'a str) -> Self {
+        Self { mechanism, reason }
+    }
+}
+
 /// `true` when `created_via` identifies the revision as an engine-managed
 /// kind that is automatically resolved when the parent PR merges: a
 /// merge-conflict-resolution revision or a CI-fix revision.
@@ -226,7 +253,7 @@ pub(crate) fn abandon_pending_executions(
     Ok(abandoned)
 }
 
-/// Archive-and-tombstone the revision `rev_id` with `archived_reason`.
+/// Archive-and-tombstone the revision `rev_id` with required provenance.
 ///
 /// Archiving a revision always tombstones it (`deleted_at`): the kanban /
 /// `get_work_tree` contract is that `archived` rows are hidden by the
@@ -247,12 +274,14 @@ pub(crate) fn archive_revision_task(
     conn: &Connection,
     rev_id: &str,
     now: &str,
-    archived_reason: &str,
+    provenance: ArchiveProvenance<'_>,
 ) -> Result<usize> {
     let rows_changed = conn.execute(
         "UPDATE tasks
          SET status            = 'archived',
-             archived_reason   = ?3,
+             archived_by       = ?3,
+             archived_at       = ?2,
+             archived_reason   = ?4,
              last_status_actor = 'engine',
              updated_at        = ?2,
              completed_at      = COALESCE(completed_at, ?2),
@@ -262,7 +291,7 @@ pub(crate) fn archive_revision_task(
          WHERE id = ?1
            AND kind = 'revision'
            AND deleted_at IS NULL",
-        params![rev_id, now, archived_reason],
+        params![rev_id, now, provenance.mechanism, provenance.reason],
     )?;
     Ok(rows_changed)
 }
@@ -296,10 +325,19 @@ pub(crate) fn resolve_revision_on_parent_close(
     chain_root_id: &str,
     now: &str,
     log_prefix: &str,
+    archive_mechanism: &'static str,
 ) -> Result<()> {
     if is_moot_revision_kind(&rev.created_via) {
-        let archived_reason = format!("parent PR merged: revision moot (created_via={})", rev.created_via);
-        let rows_changed = archive_revision_task(conn, &rev.id, now, &archived_reason)?;
+        let archived_reason = format!(
+            "parent PR merged or closed for chain root {chain_root_id}: revision moot (created_via={})",
+            rev.created_via
+        );
+        let rows_changed = archive_revision_task(
+            conn,
+            &rev.id,
+            now,
+            ArchiveProvenance::new(archive_mechanism, &archived_reason),
+        )?;
         if rows_changed > 0 {
             cascade_dependents_after_prereq_status_change(pending, conn, &rev.id, "archived", now)?;
             tracing::info!(
@@ -391,7 +429,13 @@ pub(crate) fn resolve_revision_on_parent_close(
         if is_followup { "followup" } else { "chore" },
         new_chore.id,
     );
-    if archive_revision_task(conn, &rev.id, now, &archived_reason)? > 0 {
+    if archive_revision_task(
+        conn,
+        &rev.id,
+        now,
+        ArchiveProvenance::new(archive_mechanism, &archived_reason),
+    )? > 0
+    {
         cascade_dependents_after_prereq_status_change(pending, conn, &rev.id, "archived", now)?;
     }
     tracing::info!(
@@ -469,7 +513,15 @@ pub(crate) fn block_pending_revisions_on_parent_close(
         // Drop any not-yet-live execution row before archiving the task.
         abandon_pending_executions(pending, conn, rev_id, now)?;
 
-        resolve_revision_on_parent_close(pending, conn, &rev, chain_root_id, now, "block_pending_revisions")?;
+        resolve_revision_on_parent_close(
+            pending,
+            conn,
+            &rev,
+            chain_root_id,
+            now,
+            "block_pending_revisions",
+            ARCHIVE_MECHANISM_PARENT_CLOSE_SWEEP,
+        )?;
     }
     Ok(())
 }

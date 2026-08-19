@@ -22,6 +22,21 @@ fn mark_chore_pr_merged_surfaces_moot_revision_archival() {
 
     let rem_id = "rem_fake_for_surfaced_test";
     let rev_id = insert_ci_fix_revision_row(&db, &product_id, &parent_id, rem_id);
+    let dependent = create_test_chore_manual(&db, product_id.clone(), "Blocked dependent");
+    db.add_dependency(AddDependencyInput {
+        dependent: dependent.id.clone(),
+        prerequisite: rev_id.clone(),
+        relation: None,
+    })
+    .unwrap();
+    db.update_work_item(
+        &dependent.id,
+        WorkItemPatch {
+            status: Some("blocked".to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
 
     db.mark_chore_pr_merged(&parent_id, pr_url).unwrap();
 
@@ -36,7 +51,39 @@ fn mark_chore_pr_merged_surfaces_moot_revision_archival() {
         reason.contains("parent PR merged"),
         "archived_reason must explain the parent-PR-merged trigger: {reason}"
     );
+    assert_eq!(task.archived_by.as_deref(), Some(ARCHIVE_MECHANISM_PARENT_CLOSE_SWEEP));
+    assert!(task.archived_at.as_deref().is_some_and(|at| !at.is_empty()));
+    assert_eq!(task.last_status_actor, "engine");
     drop(conn);
+
+    let shown = match db.get_work_item(&rev_id).unwrap() {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task,
+        other => panic!("expected archived revision task, got {other:?}"),
+    };
+    assert_eq!(shown.archived_reason.as_deref(), Some(reason));
+    assert_eq!(shown.archived_by.as_deref(), Some(ARCHIVE_MECHANISM_PARENT_CLOSE_SWEEP));
+    assert!(shown.archived_at.is_some());
+
+    db.list_dependencies_detailed(ListDependenciesInput {
+        work_item: rev_id.clone(),
+        direction: Some(DependencyDirection::Both),
+    })
+    .expect("archived task diagnostics must resolve its dependency section");
+
+    let dependencies = db
+        .list_dependencies_detailed(ListDependenciesInput {
+            work_item: dependent.id,
+            direction: Some(DependencyDirection::Prereqs),
+        })
+        .unwrap();
+    let prerequisite = dependencies.prerequisites.first().expect("archived prerequisite");
+    assert_eq!(prerequisite.status, "archived");
+    assert_eq!(prerequisite.archived_reason.as_deref(), Some(reason));
+    assert_eq!(
+        prerequisite.archived_by.as_deref(),
+        Some(ARCHIVE_MECHANISM_PARENT_CLOSE_SWEEP)
+    );
+    assert!(prerequisite.archived_at.is_some());
 
     let attentions = db.list_attention_items_for_work_item(&rev_id).unwrap();
     assert_eq!(
@@ -67,6 +114,15 @@ fn request_execution_refuses_archived_work_item() {
         },
     )
     .unwrap();
+
+    let archived = match db.get_work_item(&chore.id).unwrap() {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task,
+        other => panic!("expected archived chore, got {other:?}"),
+    };
+    assert_eq!(archived.archived_by.as_deref(), Some("manual_status_change"));
+    assert!(archived.archived_at.is_some());
+    assert!(archived.archived_reason.is_none());
+    assert_eq!(archived.last_status_actor, LAST_STATUS_ACTOR_HUMAN);
 
     let err = db
         .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
@@ -266,4 +322,177 @@ fn abandon_stranded_executions_on_closed_work_items_sweep() {
     // Idempotent: a second pass finds nothing left to do.
     let second_pass = db.abandon_stranded_executions_on_closed_work_items().unwrap();
     assert!(second_pass.is_empty(), "sweep must be idempotent: {second_pass:?}");
+}
+
+/// A human archive may omit free-text justification, but a caller-supplied
+/// reason must survive — `update_task` must not blanket-null it.
+#[test]
+fn human_archive_keeps_a_supplied_reason() {
+    let db = WorkDb::open(temp_db_path("human-archive-keeps-reason")).unwrap();
+    let product_id = make_revision_product(&db, "human-keep-reason");
+    let chore = create_test_chore_manual(&db, product_id, "archive me");
+
+    let archived = match db
+        .update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("archived".into()),
+                archived_reason: Some("operator closed as out of scope".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap()
+    {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task,
+        other => panic!("expected archived chore, got {other:?}"),
+    };
+    assert_eq!(
+        archived.archived_by.as_deref(),
+        Some(ARCHIVE_MECHANISM_MANUAL_STATUS_CHANGE)
+    );
+    assert_eq!(
+        archived.archived_reason.as_deref(),
+        Some("operator closed as out of scope")
+    );
+    assert_eq!(archived.last_status_actor, LAST_STATUS_ACTOR_HUMAN);
+}
+
+/// Agent / boss archives go through `update_task` and must not stamp the
+/// manual mechanism or drop the reason.
+#[test]
+fn boss_archive_requires_a_reason_and_stamps_its_own_mechanism() {
+    let db = WorkDb::open(temp_db_path("boss-archive-reason")).unwrap();
+    let product_id = make_revision_product(&db, "boss-archive-reason");
+    let chore = create_test_chore_manual(&db, product_id.clone(), "archive me");
+
+    let err = db
+        .update_work_item_as_actor(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("archived".into()),
+                ..WorkItemPatch::default()
+            },
+            boss_protocol::LAST_STATUS_ACTOR_BOSS,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("archived_reason") && err.contains("--archived-reason"),
+        "boss archive without a reason must name the flag: {err}"
+    );
+    assert_eq!(task_status(&db, &chore.id), "todo");
+
+    let archived = match db
+        .update_work_item_as_actor(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("archived".into()),
+                archived_reason: Some("duplicate of the already-shipped chore".into()),
+                ..WorkItemPatch::default()
+            },
+            boss_protocol::LAST_STATUS_ACTOR_BOSS,
+        )
+        .unwrap()
+    {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task,
+        other => panic!("expected archived chore, got {other:?}"),
+    };
+    assert_eq!(
+        archived.archived_by.as_deref(),
+        Some(ARCHIVE_MECHANISM_BOSS_STATUS_CHANGE)
+    );
+    assert_eq!(
+        archived.archived_reason.as_deref(),
+        Some("duplicate of the already-shipped chore")
+    );
+    assert_eq!(archived.last_status_actor, boss_protocol::LAST_STATUS_ACTOR_BOSS);
+}
+
+/// Boothby archives derive `archived_by` from the armed verb and fill
+/// `archived_reason` from the armed rationale when the patch omitted one.
+#[test]
+fn boothby_archive_uses_armed_verb_and_rationale() {
+    let db = WorkDb::open(temp_db_path("boothby-archive-provenance")).unwrap();
+    let product_id = make_revision_product(&db, "boothby-archive-prov");
+    let chore = create_test_chore_manual(&db, product_id, "stale chore");
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO boothby_passes (id, trigger, started_at) VALUES ('bp_1', 'schedule', ?1)",
+            rusqlite::params![now_string()],
+        )
+        .unwrap();
+
+    let _guard = db
+        .arm_boothby_action(
+            BoothbyActionContext::builder()
+                .verb("close_stale_task")
+                .rationale("no activity in 90 days and no PR")
+                .reversibility(boss_protocol::BOOTHBY_REVERSIBILITY_REVERSIBLE)
+                .build(),
+        )
+        .unwrap();
+    let archived = match db
+        .update_work_item_as_actor(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("archived".into()),
+                ..WorkItemPatch::default()
+            },
+            LAST_STATUS_ACTOR_BOOTHBY,
+        )
+        .unwrap()
+    {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task,
+        other => panic!("expected archived chore, got {other:?}"),
+    };
+    assert_eq!(archived.archived_by.as_deref(), Some("close_stale_task"));
+    assert_eq!(
+        archived.archived_reason.as_deref(),
+        Some("no activity in 90 days and no PR")
+    );
+    assert_eq!(archived.last_status_actor, LAST_STATUS_ACTOR_BOOTHBY);
+}
+
+/// A non-empty `archived_reason` on a row that is not (and is not
+/// becoming) archived must fail rather than being silently discarded
+/// by the archival-provenance invariant.
+#[test]
+fn archived_reason_on_a_non_archived_row_is_refused() {
+    let db = WorkDb::open(temp_db_path("archived-reason-not-archived")).unwrap();
+    let product_id = make_revision_product(&db, "reason-not-archived");
+    let chore = create_test_chore_manual(&db, product_id, "still open");
+
+    let err = db
+        .update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                archived_reason: Some("this would have been dropped".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("cannot set archived_reason") && err.contains("not moving to archived"),
+        "non-archived archived_reason must be refused: {err}"
+    );
+    assert_eq!(task_status(&db, &chore.id), "todo");
+
+    let err = db
+        .update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("active".into()),
+                archived_reason: Some("un-archive plus a reason".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("cannot set archived_reason"),
+        "un-archive with archived_reason must be refused: {err}"
+    );
+    assert_eq!(task_status(&db, &chore.id), "todo");
 }

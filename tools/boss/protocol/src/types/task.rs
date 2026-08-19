@@ -657,16 +657,32 @@ pub struct Task {
     pub status: TaskStatus,
     pub updated_at: String,
 
-    /// Human-readable reason the *engine* (never a human) transitioned this
-    /// row to `status = 'archived'`, e.g. `"parent PR merged: revision moot
-    /// (created_via=merge-conflict:crz_123)"` or `"parent PR merged:
-    /// superseded by chore task_456"`. Set only by the revision-chain
-    /// reconciliation paths (`block_pending_revisions_on_parent_close`,
-    /// `reconcile_revision_execution`'s dispatch-time catch-up gate) so an
-    /// operator running `boss task show` can see *why* a row disappeared
-    /// from the board instead of reconstructing it from engine logs.
-    /// `None` for manually archived rows and for every non-archived status;
-    /// cleared whenever the row leaves `archived` via any path.
+    /// Stable machine-readable mechanism that archived this row, e.g.
+    /// `"revision_parent_close_sweep"` or `"ci_watch_supersession"`.
+    /// Human `task update` archives carry `"manual_status_change"`; a
+    /// Boss-worker archive carries `"boss_status_change"`; a Boothby
+    /// archive carries the armed verb (e.g. `"close_stale_task"`). The
+    /// actor is retained in [`Self::last_status_actor`]. `None` for
+    /// non-archived rows and legacy rows whose archival predates
+    /// provenance capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_by: Option<String>,
+
+    /// Timestamp of the transition into `status = 'archived'`, distinct from
+    /// the row's general-purpose [`Self::updated_at`] timestamp. `None` for
+    /// non-archived rows and legacy rows whose archival predates provenance
+    /// capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<String>,
+
+    /// Human-readable, actionable condition that caused archival, e.g.
+    /// `"parent PR merged: revision moot (created_via=merge-conflict:crz_123)"`
+    /// or `"superseded: merge-conflict resolution pre-empts CI-fix for the
+    /// same PR"`. Automated archival always records a non-empty reason.
+    /// Manual archival has no required free-text reason, but still records
+    /// [`Self::archived_by`], [`Self::archived_at`], and
+    /// [`Self::last_status_actor`]. All three archival fields are cleared
+    /// whenever the row leaves `archived`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_reason: Option<String>,
 

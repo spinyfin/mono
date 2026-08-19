@@ -1963,7 +1963,18 @@ pub(crate) fn format_dependency_edge_line(edge: &DependencyEdge, mark_incomplete
     } else {
         status_vocab::to_ui(&edge.status)
     };
-    format!("    {id:<32}  {status:<10}{name}{suffix}", id = edge.id,)
+    let mut line = format!("    {id:<32}  {status:<10}{name}{suffix}", id = edge.id,);
+    if edge.status == "archived" {
+        let mechanism = edge.archived_by.as_deref().unwrap_or("unknown");
+        let timestamp = edge
+            .archived_at
+            .as_deref()
+            .map(format_stored_epoch)
+            .unwrap_or_else(|| "unknown time".to_owned());
+        let reason = edge.archived_reason.as_deref().unwrap_or("no reason recorded");
+        line.push_str(&format!("\n      archived: {mechanism} at {timestamp} — {reason}"));
+    }
+    line
 }
 
 /// Whether `status` counts as "this prereq is no longer gating its
@@ -2613,6 +2624,7 @@ pub(crate) fn ensure_patch_present(patch: &WorkItemPatch, message: &str) -> Resu
         || patch.completion_summary.is_some()
         || patch.blocked_reason.is_some()
         || patch.blocked_detail.is_some()
+        || patch.archived_reason.is_some()
         || patch.tags.is_some()
         || patch.add_tags.is_some()
         || patch.remove_tags.is_some()

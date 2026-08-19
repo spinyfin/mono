@@ -104,6 +104,15 @@ pub struct Product {
     pub slug: String,
     pub status: String,
     pub updated_at: String,
+    /// Actor that made the current product status transition. In particular,
+    /// a manual archive is never anonymous.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_status_actor: Option<String>,
+    /// First-class explanation of the current product status transition.
+    /// Product deletion is implemented as an operator-requested archive, so
+    /// this records that fact without overloading the product description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_basis: Option<String>,
     /// Per-product default model slug used when a task/chore on this
     /// product has no `model_override` set. `None` → fall through to
     /// the effort-level default / engine default (per the design's Q3

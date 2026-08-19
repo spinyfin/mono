@@ -1163,7 +1163,7 @@ mod compose_worker_spawn_tests {
             .default_driver("codex")
             .dispatch_preamble("house style: terse commit messages")
             .build();
-        db.update_product(&product.id, patch).unwrap();
+        db.update_product(&product.id, patch, "human").unwrap();
         let product = db.get_product(&product.id).unwrap().expect("product exists");
         assert_eq!(product.default_model.as_deref(), Some("sonnet"));
 
@@ -1277,6 +1277,7 @@ mod compose_worker_spawn_tests {
         db.update_product(
             &product.id,
             crate::work::WorkItemPatch::builder().default_driver("codex").build(),
+            "human",
         )
         .unwrap();
 

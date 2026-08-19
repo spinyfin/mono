@@ -269,7 +269,11 @@ fn local_command_on_path_with(pane_launch: &crate::spawn_flow::WorkerPaneLaunch,
             return false;
         }
     };
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // The probe runs a login shell, whose profile can legitimately do small
+    // amounts of setup. Two seconds is also too tight while the sharded engine
+    // test binary is under normal CI load. Keep the probe bounded, but allow
+    // enough time for the same pane-login setup that worker launch uses.
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return status.success(),

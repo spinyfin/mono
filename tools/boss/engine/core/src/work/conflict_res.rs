@@ -441,7 +441,11 @@ impl WorkDb {
     ///   live worker is not this function's job; that execution's own
     ///   on-Stop completion advances the task normally when the worker's
     ///   turn ends.
-    pub fn close_moot_revision_task(&self, revision_task_id: &str, archived_reason: &str) -> Result<Option<Task>> {
+    pub(crate) fn close_moot_revision_task(
+        &self,
+        revision_task_id: &str,
+        provenance: ArchiveProvenance<'_>,
+    ) -> Result<Option<Task>> {
         if self.get_live_execution_for_work_item(revision_task_id, "")?.is_some() {
             return Ok(None);
         }
@@ -460,7 +464,7 @@ impl WorkDb {
         }
         let now = now_string();
         let mut pending = PendingEvents::new();
-        let rows_changed = archive_revision_task(&tx, &rev.id, &now, archived_reason)?;
+        let rows_changed = archive_revision_task(&tx, &rev.id, &now, provenance)?;
         if rows_changed == 0 {
             return Ok(None);
         }

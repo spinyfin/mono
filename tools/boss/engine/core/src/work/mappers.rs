@@ -67,6 +67,8 @@ pub(crate) fn map_product(row: &Row<'_>) -> rusqlite::Result<Product> {
         default_driver: row.get::<_, Option<String>>(16)?.filter(|s| !s.is_empty()),
         merge_mechanism: row.get::<_, Option<String>>(17)?.filter(|s| !s.is_empty()),
         design_guidance: row.get::<_, Option<String>>(18)?.filter(|s| !s.is_empty()),
+        last_status_actor: row.get::<_, Option<String>>(19)?.filter(|s| !s.is_empty()),
+        status_basis: row.get::<_, Option<String>>(20)?.filter(|s| !s.is_empty()),
     })
 }
 
@@ -219,7 +221,9 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         blocked_detail: None,
         // Not part of the base 33-column SELECT; populated only by
         // map_task_with_parent_provenance_and_archived_reason when the
-        // caller's query appends the trailing `archived_reason` column.
+        // caller's query appends the trailing archival provenance columns.
+        archived_by: None,
+        archived_at: None,
         archived_reason: None,
         repo_remote_url: row.get(18)?,
         effort_level,
@@ -407,28 +411,30 @@ pub(crate) fn map_task_with_parent_provenance_and_tags(row: &Row<'_>) -> rusqlit
 }
 
 /// Like [`map_task_with_parent_and_provenance`] but also reads a trailing
-/// `archived_reason` column (index 40), `dispatch_failed_*` (41-43),
-/// `blocked_detail` (44), `deferred` (45), `tags` (46), `human_driven`
-/// (47), `completion_summary` (48), `effort_matched_rule` (49), and
-/// `effort_reasons` (50). Used by `query_task` and
+/// `archived_by` / `archived_at` / `archived_reason` columns (40-42),
+/// `dispatch_failed_*` (43-45), `blocked_detail` (46), `deferred` (47),
+/// `tags` (48), `human_driven` (49), `completion_summary` (50),
+/// `effort_matched_rule` (51), and `effort_reasons` (52). Used by `query_task` and
 /// `get_work_item_by_short_id` so single-item lookups (`boss task show`,
-/// `get_work_item`) surface why the engine auto-archived a row, the
-/// verbatim blocked-status detail, future-scope / human-driven
-/// classification, free-form kanban tags, any human close summary, and
-/// effort-classification provenance.
+/// `get_work_item`) surface complete archival provenance, the verbatim
+/// blocked-status detail, future-scope / human-driven classification,
+/// free-form kanban tags, any human close summary, and effort-classification
+/// provenance.
 pub(crate) fn map_task_with_parent_provenance_and_archived_reason(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_parent_and_provenance(row)?;
-    task.archived_reason = row.get::<_, Option<String>>(40)?.filter(|s| !s.is_empty());
-    task.dispatch_failed_reason = row.get::<_, Option<String>>(41)?.filter(|s| !s.is_empty());
-    task.dispatch_failed_error = row.get::<_, Option<String>>(42)?.filter(|s| !s.is_empty());
-    task.dispatch_failed_at = row.get::<_, Option<String>>(43)?.filter(|s| !s.is_empty());
-    task.blocked_detail = row.get::<_, Option<String>>(44)?.filter(|s| !s.is_empty());
-    task.deferred = row.get::<_, i64>(45)? != 0;
-    task.tags = decode_task_tags(row.get::<_, Option<String>>(46)?)?;
-    task.human_driven = row.get::<_, i64>(47)? != 0;
-    task.completion_summary = row.get::<_, Option<String>>(48)?.filter(|s| !s.is_empty());
-    task.effort_matched_rule = row.get::<_, Option<String>>(49)?.filter(|s| !s.is_empty());
-    task.effort_reasons = row.get::<_, Option<String>>(50)?.filter(|s| !s.is_empty());
+    task.archived_by = row.get::<_, Option<String>>(40)?.filter(|s| !s.is_empty());
+    task.archived_at = row.get::<_, Option<String>>(41)?.filter(|s| !s.is_empty());
+    task.archived_reason = row.get::<_, Option<String>>(42)?.filter(|s| !s.is_empty());
+    task.dispatch_failed_reason = row.get::<_, Option<String>>(43)?.filter(|s| !s.is_empty());
+    task.dispatch_failed_error = row.get::<_, Option<String>>(44)?.filter(|s| !s.is_empty());
+    task.dispatch_failed_at = row.get::<_, Option<String>>(45)?.filter(|s| !s.is_empty());
+    task.blocked_detail = row.get::<_, Option<String>>(46)?.filter(|s| !s.is_empty());
+    task.deferred = row.get::<_, i64>(47)? != 0;
+    task.tags = decode_task_tags(row.get::<_, Option<String>>(48)?)?;
+    task.human_driven = row.get::<_, i64>(49)? != 0;
+    task.completion_summary = row.get::<_, Option<String>>(50)?.filter(|s| !s.is_empty());
+    task.effort_matched_rule = row.get::<_, Option<String>>(51)?.filter(|s| !s.is_empty());
+    task.effort_reasons = row.get::<_, Option<String>>(52)?.filter(|s| !s.is_empty());
     Ok(task)
 }
 

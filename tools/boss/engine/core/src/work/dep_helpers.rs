@@ -130,8 +130,12 @@ pub(crate) fn resolve_friendly_work_item_id_inner(
     }
 }
 
-/// Look up every live (or, when `include_deleted`, any) work-item row
-/// with the given short_id, optionally scoped to one product.
+/// Look up work-item rows with the given short_id, optionally scoped to
+/// one product. Live rows always match. When `include_deleted` is false,
+/// archived-and-tombstoned rows also match so the friendly short-id
+/// form agrees with primary-id retrieval; other soft-deleted rows stay
+/// hidden. When
+/// `include_deleted` is true (restore), every tombstone matches.
 fn lookup_short_id_candidates(
     conn: &Connection,
     short_id: i64,
@@ -149,7 +153,8 @@ fn lookup_short_id_candidates(
         (true, false) => {
             "SELECT t.id, t.product_id, p.slug, p.name, t.name, t.status
              FROM tasks t JOIN products p ON p.id = t.product_id
-             WHERE t.short_id = ?1 AND t.product_id = ?2 AND t.deleted_at IS NULL"
+             WHERE t.short_id = ?1 AND t.product_id = ?2
+              AND (t.deleted_at IS NULL OR t.status = 'archived')"
         }
         (false, true) => {
             "SELECT t.id, t.product_id, p.slug, p.name, t.name, t.status
@@ -159,7 +164,8 @@ fn lookup_short_id_candidates(
         (false, false) => {
             "SELECT t.id, t.product_id, p.slug, p.name, t.name, t.status
              FROM tasks t JOIN products p ON p.id = t.product_id
-             WHERE t.short_id = ?1 AND t.deleted_at IS NULL"
+             WHERE t.short_id = ?1
+               AND (t.deleted_at IS NULL OR t.status = 'archived')"
         }
     };
     {
@@ -232,7 +238,10 @@ pub(crate) fn typed_work_item_exists(conn: &Connection, id: &str) -> Result<bool
     match classify_id(id)? {
         ItemKind::Task => Ok(conn
             .query_row(
-                "SELECT 1 FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+                // Same inspectable-archive predicate as `get_work_item`:
+                // live rows, plus archived rows even when tombstoned.
+                "SELECT 1 FROM tasks
+                 WHERE id = ?1 AND (deleted_at IS NULL OR status = 'archived')",
                 params![id],
                 |_| Ok(()),
             )
@@ -296,6 +305,9 @@ pub(crate) fn resolve_dependency_edge(conn: &Connection, peer_id: &str, relation
                 kind: "project".to_owned(),
                 name: project.name,
                 status: project.status.to_string(),
+                archived_by: None,
+                archived_at: None,
+                archived_reason: None,
             });
         }
     } else if peer_id.starts_with("task_")
@@ -311,6 +323,9 @@ pub(crate) fn resolve_dependency_edge(conn: &Connection, peer_id: &str, relation
             kind: kind.to_owned(),
             name: task.name,
             status: task.status.to_string(),
+            archived_by: task.archived_by,
+            archived_at: task.archived_at,
+            archived_reason: task.archived_reason,
         });
     }
     Ok(DependencyEdge {
@@ -319,6 +334,9 @@ pub(crate) fn resolve_dependency_edge(conn: &Connection, peer_id: &str, relation
         kind: "unknown".to_owned(),
         name: String::new(),
         status: "missing".to_owned(),
+        archived_by: None,
+        archived_at: None,
+        archived_reason: None,
     })
 }
 

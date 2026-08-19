@@ -99,6 +99,60 @@ fn is_movable_project_membership_kind(kind: &TaskKind) -> bool {
     matches!(kind, TaskKind::Chore | TaskKind::ProjectTask)
 }
 
+/// Stamp mechanism / time / reason when `update_task` first moves a row
+/// to `archived`. Human archives stay `manual_status_change` with an
+/// optional reason. Automated actors (`boss`, `engine`, `boothby`) must
+/// record a non-empty reason — never a constant placeholder and never a
+/// blanket `None` that would wipe a caller-supplied value.
+fn apply_archive_transition_provenance(db: &WorkDb, task: &mut Task, actor: &str) -> Result<()> {
+    task.archived_at = Some(task.updated_at.clone());
+    if actor == LAST_STATUS_ACTOR_HUMAN {
+        task.archived_by = Some(ARCHIVE_MECHANISM_MANUAL_STATUS_CHANGE.to_owned());
+        return Ok(());
+    }
+    if actor == LAST_STATUS_ACTOR_BOOTHBY {
+        let context = db.armed_boothby_action()?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot archive {} as boothby without an armed action context (verb + rationale)",
+                task.id
+            )
+        })?;
+        let verb = context.verb.trim();
+        if verb.is_empty() {
+            bail!("cannot archive {} as boothby: armed verb is empty", task.id);
+        }
+        task.archived_by = Some(verb.to_owned());
+        if task.archived_reason.as_deref().is_none_or(|s| s.trim().is_empty()) {
+            let rationale = context.rationale.trim();
+            if rationale.is_empty() {
+                bail!(
+                    "cannot archive {} as boothby without a rationale or archived_reason",
+                    task.id
+                );
+            }
+            task.archived_reason = Some(rationale.to_owned());
+        }
+        return Ok(());
+    }
+
+    if task.archived_reason.as_deref().is_none_or(|s| s.trim().is_empty()) {
+        bail!(
+            "cannot archive {} as actor `{actor}` without an archived_reason; \
+             automated archives must record the condition that was met \
+             (pass --archived-reason)",
+            task.id
+        );
+    }
+    task.archived_by = Some(if actor == boss_protocol::LAST_STATUS_ACTOR_BOSS {
+        ARCHIVE_MECHANISM_BOSS_STATUS_CHANGE.to_owned()
+    } else if actor == boss_protocol::LAST_STATUS_ACTOR_ENGINE {
+        ARCHIVE_MECHANISM_ENGINE_STATUS_CHANGE.to_owned()
+    } else {
+        format!("{actor}_status_change")
+    });
+    Ok(())
+}
+
 /// Normalize and validate a free-form tag list for a leaf work item.
 /// Trims whitespace, drops empty strings, de-duplicates (first wins),
 /// and enforces [`boss_protocol::WORK_ITEM_TAG_MAX_LEN`] /
@@ -166,10 +220,12 @@ pub(crate) fn apply_tag_patch(
 }
 
 impl WorkDb {
-    pub(crate) fn update_product(&self, id: &str, patch: WorkItemPatch) -> Result<WorkItem> {
+    pub(crate) fn update_product(&self, id: &str, patch: WorkItemPatch, actor: &str) -> Result<WorkItem> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let mut product = query_product(&tx, id).require("product", id)?;
+        let previous_status = product.status.clone();
+        let status_changed = patch.status.is_some();
 
         apply_text_patch(&mut product.name, patch.name);
         apply_text_patch(&mut product.description, patch.description);
@@ -188,10 +244,17 @@ impl WorkDb {
         product.worker_branch_prefix = canonicalize_worker_branch_prefix(product.worker_branch_prefix.take());
         product.slug = unique_product_slug_for_update(&tx, id, &slugify(&product.name))?;
         product.updated_at = now_string();
+        if status_changed && product.status != previous_status {
+            product.last_status_actor = Some(actor.to_owned());
+            product.status_basis = Some(format!(
+                "status transition requested by {actor}: {previous_status} to {}",
+                product.status
+            ));
+        }
 
         tx.execute(
             "UPDATE products
-             SET name = ?2, slug = ?3, description = ?4, repo_remote_url = ?5, status = ?6, updated_at = ?7, default_model = ?8, dispatch_preamble = ?9, design_repo = ?10, worker_branch_prefix = ?11, docs_repo = ?12, default_driver = ?13, design_guidance = ?14
+             SET name = ?2, slug = ?3, description = ?4, repo_remote_url = ?5, status = ?6, updated_at = ?7, default_model = ?8, dispatch_preamble = ?9, design_repo = ?10, worker_branch_prefix = ?11, docs_repo = ?12, default_driver = ?13, design_guidance = ?14, last_status_actor = ?15, status_basis = ?16
              WHERE id = ?1",
             params![
                 product.id,
@@ -208,6 +271,8 @@ impl WorkDb {
                 product.docs_repo,
                 product.default_driver,
                 product.design_guidance,
+                product.last_status_actor,
+                product.status_basis,
             ],
         )?;
 
@@ -320,6 +385,7 @@ impl WorkDb {
             validate_blocked_reason_length(reason)?;
         }
         let blocked_detail_patch_requests_set = patch.blocked_detail.as_deref().is_some_and(|s| !s.is_empty());
+        let archived_reason_patch_requests_set = patch.archived_reason.as_deref().is_some_and(|s| !s.is_empty());
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let mut pending = PendingEvents::new();
@@ -425,6 +491,7 @@ impl WorkDb {
         apply_optional_string_patch(&mut task.driver, patch.driver);
         apply_optional_string_patch(&mut task.blocked_reason, patch.blocked_reason);
         apply_optional_string_patch(&mut task.blocked_detail, patch.blocked_detail);
+        apply_optional_string_patch(&mut task.archived_reason, patch.archived_reason);
         if let Some(autostart) = patch.autostart {
             task.autostart = autostart;
         }
@@ -504,10 +571,21 @@ impl WorkDb {
             task.blocked_reason = None;
             task.blocked_attempt_id = None;
         }
-        // Mirror invariant for archived_reason: it only ever documents why
-        // the row is *currently* archived, so it must not linger once the
-        // row leaves that status.
+        // Archival provenance only documents the row's current archived
+        // status, so it must not linger after any reopening transition.
         if task.status != TaskStatus::Archived {
+            // Reject rather than silently drop: a non-empty archived_reason
+            // on a row that is not (and is not becoming) archived is the
+            // same shape as a blocked_detail with no blocked_reason — very
+            // likely the caller forgetting --status archived / --to archived.
+            if archived_reason_patch_requests_set {
+                bail!(
+                    "cannot set archived_reason on {id}: the row is not moving to archived; \
+                     pass --archived-reason only with --status archived or --to archived"
+                );
+            }
+            task.archived_by = None;
+            task.archived_at = None;
             task.archived_reason = None;
         }
         // Invariant: blocked_detail cannot outlive blocked_reason — a
@@ -558,6 +636,9 @@ impl WorkDb {
         } else {
             ""
         };
+        if status_changed && previous_status != task.status && task.status == TaskStatus::Archived {
+            apply_archive_transition_provenance(self, &mut task, actor)?;
+        }
 
         let effort_level_value = task.effort_level.map(|level| level.as_str().to_owned());
         let reasoning_value = task.reasoning.map(|mode| mode.as_str().to_owned());
@@ -572,6 +653,7 @@ impl WorkDb {
                  archived_reason = ?17, blocked_detail = ?18, deferred = ?19,
                  reasoning = ?20, tags = ?21, human_driven = ?22, completion_summary = ?23,
                  effort_matched_rule = ?24, effort_reasons = ?25, project_id = ?26, kind = ?27,
+                 archived_by = ?28, archived_at = ?29,
                  last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END,
                  completed_at = CASE
                      WHEN ?4 IN ('done', 'archived') THEN COALESCE(completed_at, ?7)
@@ -606,6 +688,8 @@ impl WorkDb {
                 task.effort_reasons,
                 task.project_id,
                 task.kind.as_str(),
+                task.archived_by,
+                task.archived_at,
             ],
         )?;
 

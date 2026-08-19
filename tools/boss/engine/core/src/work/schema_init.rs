@@ -118,6 +118,8 @@ impl WorkDb {
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
+                last_status_actor TEXT,
+                status_basis TEXT,
                 default_model TEXT,
                 default_driver TEXT,
                 ci_attempt_budget INTEGER NOT NULL DEFAULT 3,
@@ -179,7 +181,10 @@ impl WorkDb {
                 external_ref_canonical_id TEXT,
                 external_ref_raw TEXT,
                 external_ref_synced_at TEXT,
-                external_ref_unbound_at TEXT
+                external_ref_unbound_at TEXT,
+                archived_by TEXT,
+                archived_at TEXT,
+                archived_reason TEXT
             );
 
             CREATE INDEX IF NOT EXISTS tasks_product_idx
@@ -508,6 +513,8 @@ impl WorkDb {
         // engine auto-archived a revision (parent PR merged/closed) so
         // `boss task show` doesn't leave the operator guessing.
         migrate_tasks_archived_reason(conn)?;
+        migrate_tasks_archival_provenance(conn)?;
+        migrate_products_status_provenance(conn)?;
         // Buckets 1&3 unification (P2a): `work_comments.revise_task_id`, the
         // soft FK a `CommentsReviseDoc` batch stamps on every comment it
         // addresses. Purely additive, `NULL` for every existing row.
