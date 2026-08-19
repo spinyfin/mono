@@ -18,6 +18,7 @@
 
 use std::collections::BTreeSet;
 
+use crate::host_capability_probe::DRIVERS_PROBED_CAPABILITY;
 use crate::host_registry::Host;
 
 /// Per-host context provided to [`select_host`]. The caller builds
@@ -67,6 +68,10 @@ pub enum IneligibilityReason {
     NoFreeSlots,
     /// Capability filter rejected the host.
     MissingCapabilities(Vec<String>),
+    /// A driver-constrained row cannot establish whether this host has the
+    /// requested driver because discovery has not run yet. This is distinct
+    /// from a completed probe that found no matching binary.
+    DriverProbeNotRun,
     /// A durable `pinned_host_id` OR a request-scoped `requested_host_id`
     /// is set on the execution and this host is not that host. When both
     /// are set the request-scoped host wins outright (see `selected_pin`
@@ -120,7 +125,18 @@ pub fn select_host(requirements: &ChoreRequirements, slots: &[HostSlot]) -> (Opt
         // The durable pin escape hatch intentionally bypasses capabilities;
         // a request-scoped pin is stricter and must meet them.
         if !missing.is_empty() && (requirements.requested_host_id.is_some() || requirements.pinned_host_id.is_none()) {
-            reasons.push(IneligibilityReason::MissingCapabilities(missing));
+            let driver_probe_missing = missing.iter().any(|cap| cap.starts_with("driver="))
+                && !slot.capabilities.contains(DRIVERS_PROBED_CAPABILITY);
+            if driver_probe_missing {
+                reasons.push(IneligibilityReason::DriverProbeNotRun);
+                let non_driver_missing: Vec<String> =
+                    missing.into_iter().filter(|cap| !cap.starts_with("driver=")).collect();
+                if !non_driver_missing.is_empty() {
+                    reasons.push(IneligibilityReason::MissingCapabilities(non_driver_missing));
+                }
+            } else {
+                reasons.push(IneligibilityReason::MissingCapabilities(missing));
+            }
         }
         let eligible = reasons.is_empty();
         report.push(Eligibility {
@@ -426,15 +442,29 @@ mod tests {
         let slots = vec![slot("anaplian", 3, 0, &["os=macos", "arch=arm64", "gh-authed=true"])];
         let (picked, report) = select_host(&reqs, &slots);
         assert!(picked.is_none());
-        let missing = report[0]
-            .reasons
-            .iter()
-            .find_map(|r| match r {
-                IneligibilityReason::MissingCapabilities(m) => Some(m.as_slice()),
-                _ => None,
-            })
-            .expect("expected MissingCapabilities");
-        assert!(missing.iter().any(|m| m == "driver=claude"));
+        assert!(
+            report[0].reasons.contains(&IneligibilityReason::DriverProbeNotRun),
+            "a legacy remote host must be surfaced as unprobed, got {:?}",
+            report[0].reasons,
+        );
+    }
+
+    #[test]
+    fn unprobed_host_keeps_non_driver_capability_failures_visible() {
+        let reqs = ChoreRequirements {
+            required_capabilities: ["driver=claude".into(), "os=linux".into()].into_iter().collect(),
+            pinned_host_id: None,
+            requested_host_id: None,
+        };
+        let slots = vec![slot("anaplian", 3, 0, &[])];
+        let (picked, report) = select_host(&reqs, &slots);
+        assert!(picked.is_none());
+        assert!(report[0].reasons.contains(&IneligibilityReason::DriverProbeNotRun));
+        assert!(
+            report[0]
+                .reasons
+                .contains(&IneligibilityReason::MissingCapabilities(vec!["os=linux".into()]))
+        );
     }
 
     /// No silent substitution to a different driver: if every enabled
