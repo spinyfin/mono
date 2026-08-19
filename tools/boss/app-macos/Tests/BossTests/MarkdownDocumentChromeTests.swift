@@ -66,8 +66,10 @@ final class MarkdownDocumentChromeTests: XCTestCase {
     }
 
     func testEditorialTypographyRatiosAndCompactHeadingSpacing() {
-        XCTAssertEqual(MarkdownEditorialMetrics.headingScales[0] / MarkdownEditorialMetrics.bodyScale, 2.75)
-        XCTAssertEqual(MarkdownEditorialMetrics.codeBlockScale / MarkdownEditorialMetrics.bodyScale, 0.82)
+        XCTAssertEqual(
+            MarkdownEditorialMetrics.headingScales[0] / MarkdownEditorialMetrics.bodyScale, 2.75, accuracy: 0.0001)
+        XCTAssertEqual(
+            MarkdownEditorialMetrics.codeBlockScale / MarkdownEditorialMetrics.bodyScale, 0.82, accuracy: 0.0001)
         XCTAssertEqual(MarkdownEditorialMetrics.compactHeadingSpacing.top, 16)
         XCTAssertEqual(MarkdownEditorialMetrics.compactHeadingSpacing.bottom, 8)
     }

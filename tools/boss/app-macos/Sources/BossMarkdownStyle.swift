@@ -226,25 +226,25 @@ struct BossHeadingStyle: StructuredText.HeadingStyle {
     @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
         let level = min(max(configuration.headingLevel, 1), 6)
-        if editorial, level == 2 {
-            VStack(alignment: .leading, spacing: 6) {
-                headingLabel(configuration: configuration, level: level)
-                Rectangle()
-                    .fill(BossMarkdownPalette.hairline)
-                    .frame(height: 1)
-            }
-            .textual.blockSpacing(editorialHeadingSpacing(for: level))
-            .proseMeasureClamped()
-        } else {
-            if editorial {
+        if editorial {
+            if level == 2 {
+                VStack(alignment: .leading, spacing: 6) {
+                    headingLabel(configuration: configuration, level: level)
+                    Rectangle()
+                        .fill(BossMarkdownPalette.hairline)
+                        .frame(height: 1)
+                }
+                .textual.blockSpacing(editorialHeadingSpacing(for: level))
+                .proseMeasureClamped()
+            } else {
                 headingLabel(configuration: configuration, level: level)
                     .textual.blockSpacing(editorialHeadingSpacing(for: level))
                     .proseMeasureClamped()
-            } else {
-                headingLabel(configuration: configuration, level: level)
-                    .textual.blockSpacing(MarkdownEditorialMetrics.compactHeadingSpacing)
-                    .proseMeasureClamped()
             }
+        } else {
+            headingLabel(configuration: configuration, level: level)
+                .textual.blockSpacing(MarkdownEditorialMetrics.compactHeadingSpacing)
+                .proseMeasureClamped()
         }
     }
 
@@ -252,22 +252,31 @@ struct BossHeadingStyle: StructuredText.HeadingStyle {
     @ViewBuilder
     private func headingLabel(configuration: Configuration, level: Int) -> some View {
         if editorial {
-            configuration.label
-                .textual.fontScale(MarkdownEditorialMetrics.headingScales[level - 1])
-                .textual.lineSpacing(.fontScaled(level == 1 ? 0.05 : 0.125))
-                .font(.system(.body, design: .default))
-                .fontWeight(Self.editorialWeights[level - 1])
-                .foregroundStyle(BossMarkdownPalette.ink)
-                .modifier(
-                    level <= 2
-                        ? EditorialHeadingTracking(headingScale: MarkdownEditorialMetrics.headingScales[level - 1])
-                        : EditorialHeadingTracking(headingScale: 0)
-                )
+            editorialHeadingLabel(configuration: configuration, level: level)
         } else {
             configuration.label
                 .textual.fontScale(Self.compactFontScales[level - 1])
                 .textual.lineSpacing(.fontScaled(0.125))
                 .fontWeight(Self.compactWeights[level - 1])
+        }
+    }
+
+    @MainActor
+    @ViewBuilder
+    private func editorialHeadingLabel(configuration: Configuration, level: Int) -> some View {
+        let styled =
+            configuration.label
+            .textual.fontScale(MarkdownEditorialMetrics.headingScales[level - 1])
+            .textual.lineSpacing(.fontScaled(level == 1 ? 0.05 : 0.125))
+            .font(.system(.body, design: .default))
+            .fontWeight(Self.editorialWeights[level - 1])
+            .foregroundStyle(BossMarkdownPalette.ink)
+        // Tracking tightening only applies to H1/H2; H3-H6 are left plain
+        // rather than routed through the modifier with a scale of 0.
+        if level <= 2 {
+            styled.modifier(EditorialHeadingTracking(headingScale: MarkdownEditorialMetrics.headingScales[level - 1]))
+        } else {
+            styled
         }
     }
 
@@ -304,6 +313,12 @@ struct BossParagraphStyle: StructuredText.ParagraphStyle {
     func makeBody(configuration: Configuration) -> some View {
         if editorial {
             configuration.label
+                // Keep fontScale innermost (applied first) so it reads the
+                // serif font set by the `.font` call below it in the chain
+                // and scales *that*, mirroring BossHeadingStyle.headingLabel.
+                // Reversing this order lets the later `.font` win instead,
+                // silently discarding the scale.
+                .textual.fontScale(MarkdownEditorialMetrics.bodyScale)
                 .font(.system(.body, design: .serif))
                 .foregroundStyle(BossMarkdownPalette.ink)
                 // SwiftUI `lineSpacing` is extra leading on top of the natural
@@ -311,9 +326,6 @@ struct BossParagraphStyle: StructuredText.ParagraphStyle {
                 // additional leading produces the 1.65 reference line-height.
                 .textual.lineSpacing(.fontScaled(0.45))
                 .textual.blockSpacing(.fontScaled(top: 0, bottom: 1))
-                // Keep this outermost so font-relative leading and block
-                // spacing resolve from the enlarged editorial body.
-                .textual.fontScale(MarkdownEditorialMetrics.bodyScale)
                 .proseMeasureClamped()
         } else {
             configuration.label
@@ -348,8 +360,10 @@ struct BossListItemStyle: StructuredText.ListItemStyle {
         if editorial {
             StructuredText.DefaultListItemStyle.default
                 .makeBody(configuration: configuration)
-                .font(.system(.body, design: .serif))
+                // fontScale innermost, `.font` outside it — see the matching
+                // comment in BossParagraphStyle.makeBody.
                 .textual.fontScale(MarkdownEditorialMetrics.bodyScale)
+                .font(.system(.body, design: .serif))
                 .foregroundStyle(BossMarkdownPalette.ink)
                 .proseMeasureClamped()
         } else {
