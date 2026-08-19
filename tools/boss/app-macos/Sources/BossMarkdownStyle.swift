@@ -171,13 +171,17 @@ enum MarkdownEditorialMetrics {
     /// Compact surfaces deliberately retain their fixed, pre-editorial
     /// heading rhythm even when their caller applies a smaller font scale.
     static let compactHeadingSpacing = StructuredText.BlockSpacing(top: 16, bottom: 8)
+
+    /// Editorial H2 headings use this font-scaled rhythm, including the
+    /// disclosure heading in a document reader.
+    static let editorialH2Spacing = (top: CGFloat(3), bottom: CGFloat(0.75))
 }
 
 // MARK: - Heading
 
 /// Applies the requested tracking ratio from the user's Dynamic Type-scaled
 /// system body size, then derives the rendered heading size from that body.
-private struct EditorialHeadingTracking: ViewModifier {
+struct EditorialHeadingTracking: ViewModifier {
     let headingScale: CGFloat
     @ScaledMetric(relativeTo: .body) private var bodySize: CGFloat = 17
 
@@ -189,15 +193,15 @@ private struct EditorialHeadingTracking: ViewModifier {
 struct BossHeadingStyle: StructuredText.HeadingStyle {
     let editorial: Bool
 
-    // Maps the Boss type scale (26 / 22 / 18 / 16 / 14 / 14 pt) onto
+    // Maps the compact Boss type scale (26 / 22 / 18 / 16 / 14 / 14 pt) onto
     // SwiftUI's body font (17 pt on macOS) via fontScale so the rendering
     // continues to respond to dynamic-type changes.
     //
     // Not `private`: `CollapsibleMarkdownSection` (MarkdownDocumentChrome.swift)
     // renders a heading label as a plain SwiftUI `Text`, not through Textual's
     // `configuration.label`, so it can't use `.textual.fontScale`. It instead
-    // reads these same arrays directly so its folded H2 heading can never
-    // drift out of sync with this editorial H2 treatment again.
+    // reads these compact arrays directly when it is outside an editorial
+    // document.
     static let compactFontScales: [CGFloat] = [
         26.0 / 17.0,
         22.0 / 17.0,
@@ -206,7 +210,9 @@ struct BossHeadingStyle: StructuredText.HeadingStyle {
         14.0 / 17.0,
         14.0 / 17.0,
     ]
-    private static let editorialWeights: [Font.Weight] = [
+    // Not `private`: `CollapsibleMarkdownSection` uses the editorial H2
+    // weight when the surrounding document opts into editorial typography.
+    static let editorialWeights: [Font.Weight] = [
         .heavy, .semibold, .semibold, .semibold, .semibold, .semibold,
     ]
     // Not `private`: shared with `CollapsibleMarkdownSection` for the same
@@ -217,11 +223,10 @@ struct BossHeadingStyle: StructuredText.HeadingStyle {
     /// The macOS system body point size `compactFontScales` is expressed relative
     /// to — shared with `CollapsibleMarkdownSection` for the same reason.
     static let bodyPointSize: CGFloat = 17.0
-    /// Shared with `CollapsibleMarkdownSection`, which folds a heading-
-    /// delimited section behind a disclosure control and must match this
-    /// same top/bottom rhythm around its own heading row.
-    static let headingBlockSpacingTop: CGFloat = 16
-    static let headingBlockSpacingBottom: CGFloat = 8
+    /// Compact heading rhythm also read by `CollapsibleMarkdownSection` when
+    /// it renders outside an editorial document.
+    static let headingBlockSpacingTop = MarkdownEditorialMetrics.compactHeadingSpacing.top ?? 0
+    static let headingBlockSpacingBottom = MarkdownEditorialMetrics.compactHeadingSpacing.bottom ?? 0
 
     @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
@@ -285,7 +290,10 @@ struct BossHeadingStyle: StructuredText.HeadingStyle {
         case 1:
             FontScaled<StructuredText.BlockSpacing>.fontScaled(top: 1.5, bottom: 1)
         case 2:
-            FontScaled<StructuredText.BlockSpacing>.fontScaled(top: 3, bottom: 0.75)
+            FontScaled<StructuredText.BlockSpacing>.fontScaled(
+                top: MarkdownEditorialMetrics.editorialH2Spacing.top,
+                bottom: MarkdownEditorialMetrics.editorialH2Spacing.bottom
+            )
         case 3:
             FontScaled<StructuredText.BlockSpacing>.fontScaled(top: 2, bottom: 0.6)
         default:
