@@ -218,8 +218,8 @@ final class EngineHealthBannerTests: XCTestCase {
     }
 
     /// The two toolbar treatments must differ by caption, glyph, and
-    /// engaged vs quiet fill — a tooltip-only distinction is a
-    /// regression against the demotion brief.
+    /// engaged vs quiet fill — paused must be distinguishable from
+    /// running without hovering.
     func testPausedToolbarTreatmentIsVisuallyDistinctFromRunning() {
         XCTAssertNotEqual(
             AutomationPauseControl.caption(isPaused: true),

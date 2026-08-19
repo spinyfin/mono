@@ -513,7 +513,7 @@ struct ContentView: View {
         // AppKit-backed split view subtree, not just the bar.
         .animation(.easeInOut(duration: 0.15), value: model.showConnectionLostBanner)
         .animation(.easeInOut(duration: 0.15), value: model.engineSupervisionState)
-        .animation(.easeInOut(duration: 0.15), value: model.engineHealthIssues)
+        .animation(.easeInOut(duration: 0.15), value: model.bannerHealthIssues)
     }
 
     private var sidebar: some View {
