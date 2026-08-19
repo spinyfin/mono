@@ -220,7 +220,7 @@ async fn canonical_id_resolves_unchanged_regardless_of_selection() {
     assert_eq!(server_state.resolve_work_item_id(&task.id).await.unwrap(), task.id);
 }
 
-/// `resolve_work_item_id_for_restore` for a short id that has no row (live
+/// `resolve_work_item_id_including_deleted` for a short id that has no row (live
 /// or tombstoned) in the selected product must report a clean not-found
 /// error, not an unresolved `prod_…/N` selector handed to the DB (which
 /// previously misclassified as a product and bailed with "products are
@@ -240,7 +240,7 @@ async fn restore_missing_short_id_in_selected_product_is_not_found() {
 
     let selector = boss_protocol::short_id_wire_form(999_999);
     let err = server_state
-        .resolve_work_item_id_for_restore(&selector)
+        .resolve_work_item_id_including_deleted(&selector)
         .await
         .unwrap_err()
         .to_string();
@@ -273,7 +273,10 @@ async fn restore_resolves_globally_when_no_product_is_selected() {
     );
     let selector = boss_protocol::short_id_wire_form(task.short_id.unwrap());
     assert_eq!(
-        server_state.resolve_work_item_id_for_restore(&selector).await.unwrap(),
+        server_state
+            .resolve_work_item_id_including_deleted(&selector)
+            .await
+            .unwrap(),
         task.id
     );
 }
@@ -298,7 +301,70 @@ async fn restore_resolves_a_tombstoned_short_id_in_the_selected_product() {
 
     let selector = boss_protocol::short_id_wire_form(task.short_id.unwrap());
     assert_eq!(
-        server_state.resolve_work_item_id_for_restore(&selector).await.unwrap(),
+        server_state
+            .resolve_work_item_id_including_deleted(&selector)
+            .await
+            .unwrap(),
+        task.id
+    );
+}
+
+/// A typed primary id (`task_…`) naming a tombstoned row still resolves
+/// through the widened dependency-verb resolver, with no app session or
+/// selected product involved at all — this is the shape `depend rm`
+/// sends once it has already resolved a friendly selector to a primary
+/// id. A plain live-only existence check (as used by the ordinary
+/// `resolve_work_item_id`) would reject this as not-found.
+#[tokio::test]
+async fn typed_id_resolves_including_deleted_with_no_selection() {
+    let (server_state, _dir) = test_server_state();
+    let product = crate::test_support::create_test_product_named(&server_state.work_db, "flunge");
+    let task = crate::test_support::create_test_chore(&server_state.work_db, &product.id, "row");
+    server_state.work_db.delete_work_item(&task.id).unwrap();
+
+    assert_eq!(
+        server_state
+            .resolve_work_item_id_including_deleted(&task.id)
+            .await
+            .unwrap(),
+        task.id
+    );
+}
+
+/// A typo'd typed id must still be reported as not-found rather than
+/// passed through as a silent no-op — the widened resolver only relaxes
+/// the *tombstone* filter, not existence itself.
+#[tokio::test]
+async fn typed_id_typo_is_still_not_found_including_deleted() {
+    let (server_state, _dir) = test_server_state();
+    let err = server_state
+        .resolve_work_item_id_including_deleted("task_does_not_exist")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER),
+        "unexpected error: {err}",
+    );
+}
+
+/// A cross-product `slug/n` selector must still resolve through the
+/// widened dependency-verb resolver — it is not a bare `ShortId`, so it
+/// must not be silently forwarded unresolved the way a plain restore
+/// selector would be for any non-short-id shape.
+#[tokio::test]
+async fn product_scoped_selector_resolves_including_deleted() {
+    let (server_state, _dir) = test_server_state();
+    let product = crate::test_support::create_test_product_named(&server_state.work_db, "flunge");
+    let task = crate::test_support::create_test_chore(&server_state.work_db, &product.id, "row");
+    server_state.work_db.delete_work_item(&task.id).unwrap();
+
+    let selector = format!("{}/{}", product.slug, task.short_id.unwrap());
+    assert_eq!(
+        server_state
+            .resolve_work_item_id_including_deleted(&selector)
+            .await
+            .unwrap(),
         task.id
     );
 }

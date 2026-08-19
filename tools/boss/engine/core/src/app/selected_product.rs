@@ -90,32 +90,28 @@ impl ServerState {
             .map_err(|err| rewrite_not_found(err, id, &name))
     }
 
-    /// Resolve a restore selector without excluding a tombstoned row. The
-    /// restore database operation owns the final lookup because it is the one
-    /// engine path that intentionally includes deleted work items. Mirrors
-    /// [`Self::resolve_work_item_id`]'s fallback: with no selected product,
-    /// resolution runs globally across products (ambiguity still a hard
-    /// error) rather than refusing outright.
-    pub(super) async fn resolve_work_item_id_for_restore(&self, id: &str) -> anyhow::Result<String> {
-        let boss_protocol::WorkItemSelector::ShortId(short_id) = boss_protocol::parse_work_item_selector(id) else {
-            return Ok(id.to_owned());
+    /// Resolve a selector without excluding a tombstoned row. Used by
+    /// restore and the dependency verbs (`depend add`/`depend rm`) — the
+    /// engine paths that must be able to name a deleted work item
+    /// explicitly. Mirrors [`Self::resolve_work_item_id`]'s structure
+    /// exactly, including its product-scope short-id handling and its
+    /// generic pass-through for product-scoped selectors, typed ids, and
+    /// opaque forms — the only difference is the tombstone-tolerant
+    /// resolver each step calls into. With no selected product, resolution
+    /// runs globally across products (ambiguity still a hard error) rather
+    /// than refusing outright.
+    pub(super) async fn resolve_work_item_id_including_deleted(&self, id: &str) -> anyhow::Result<String> {
+        let selector = boss_protocol::parse_work_item_selector(id);
+        let boss_protocol::WorkItemSelector::ShortId(short_id) = selector else {
+            return self.work_db.resolve_work_item_ref_including_deleted(id);
         };
-        let (selector, product_name) = match self.selected_product_state().await {
-            SelectedProductState::Selected { product_id, name, .. } => (format!("{product_id}/{short_id}"), Some(name)),
-            _ => (id.to_owned(), None),
+
+        let SelectedProductState::Selected { product_id, name, .. } = self.selected_product_state().await else {
+            return self.work_db.resolve_work_item_ref_including_deleted(id);
         };
         self.work_db
-            .resolve_work_item_ref_for_restore(&selector)?
-            .ok_or_else(|| match &product_name {
-                Some(name) => anyhow::anyhow!(
-                    "could not resolve id {id}: {} in product {name}",
-                    boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER
-                ),
-                None => anyhow::anyhow!(
-                    "could not resolve id {id}: {}",
-                    boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER
-                ),
-            })
+            .resolve_work_item_ref_including_deleted(&format!("{product_id}/{short_id}"))
+            .map_err(|err| rewrite_not_found(err, id, &name))
     }
 
     /// Record the app's current chooser selection. Returns `false` — and

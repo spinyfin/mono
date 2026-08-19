@@ -17,7 +17,7 @@ use boss_protocol::{
 
 mod common;
 mod watcher_support;
-use common::TestEngine;
+use common::{TestEngine, TestEngineOptions};
 use watcher_support::subscribe_watcher;
 
 #[tokio::test]
@@ -1032,6 +1032,273 @@ async fn dependency_rpcs_round_trip_through_engine() -> Result<()> {
     )
     .await?;
     assert!(!removed_again);
+
+    Ok(())
+}
+
+/// Dependency verbs deliberately resolve tombstoned rows even though normal
+/// work-item commands keep their live-row resolver. That lets `depend add`
+/// explain why an archived prerequisite is illegal, and lets `depend rm`
+/// remove a historical edge pointing at it.
+#[tokio::test]
+async fn dependency_rpcs_reject_archived_prereqs_and_remove_archived_edges() -> Result<()> {
+    let engine = TestEngine::spawn_with(TestEngineOptions {
+        on_disk_db: true,
+        ..Default::default()
+    })
+    .await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = create_product(
+        &mut client,
+        CreateProductInput::builder()
+            .name("Archived dependency")
+            .repo_remote_url("git@example.com:boss.git")
+            .build(),
+    )
+    .await?;
+    let dependent = create_chore(
+        &mut client,
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("Dependent")
+            .build(),
+    )
+    .await?;
+    let archived_prereq = create_chore(
+        &mut client,
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("Prerequisite")
+            .build(),
+    )
+    .await?;
+    let another_dependent = create_chore(
+        &mut client,
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("Another dependent")
+            .build(),
+    )
+    .await?;
+
+    add_dependency(
+        &mut client,
+        AddDependencyInput {
+            dependent: dependent.id.clone(),
+            prerequisite: archived_prereq.id.clone(),
+            relation: None,
+        },
+    )
+    .await?;
+
+    // The production archival path sets status and tombstone atomically. Seed
+    // that durable state directly so the wire test can exercise the narrow
+    // dependency resolver without requiring a CI/remediation fixture.
+    {
+        let conn = rusqlite::Connection::open(&engine.db_path)?;
+        conn.execute(
+            "UPDATE tasks SET status = 'archived', deleted_at = '1' WHERE id = ?1",
+            rusqlite::params![archived_prereq.id],
+        )?;
+    }
+
+    match client
+        .send_request(&FrontendRequest::AddDependency {
+            input: AddDependencyInput {
+                dependent: another_dependent.id,
+                prerequisite: archived_prereq.id.clone(),
+                relation: None,
+            },
+        })
+        .await?
+    {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains(&archived_prereq.id),
+                "error must name the archived row: {message}"
+            );
+            assert!(
+                message.contains("archived"),
+                "error must explain the rejection: {message}"
+            );
+        }
+        other => return Err(unexpected_event("archived dependency add", other)),
+    }
+
+    assert!(
+        remove_dependency(
+            &mut client,
+            RemoveDependencyInput {
+                dependent: dependent.id.clone(),
+                // Short-id wire form, not the already-canonical primary id:
+                // this is the shape `boss <kind> depend rm T<n>` actually
+                // sends once the CLI stops pre-resolving the prerequisite
+                // through its live-only lookup, so the test must exercise
+                // the engine resolver's `ShortId` branch, not just its
+                // typed-id pass-through.
+                prerequisite: boss_protocol::short_id_wire_form(
+                    archived_prereq.short_id.expect("chore has a short_id")
+                ),
+                relation: None,
+            },
+        )
+        .await?,
+        "depend rm must resolve an archived prerequisite and remove its edge"
+    );
+    assert!(
+        list_dependencies(
+            &mut client,
+            ListDependenciesInput {
+                work_item: dependent.id,
+                direction: Some(DependencyDirection::Prereqs),
+            },
+        )
+        .await?
+        .prerequisites
+        .is_empty(),
+        "the archived prerequisite edge must be gone after removal"
+    );
+
+    Ok(())
+}
+
+/// Re-adding an already-existing edge must stay a clean idempotent no-op
+/// even when the prerequisite has since been archived — the archived
+/// rejection in `add_dependency_edge_in_tx` must only fire for a
+/// genuinely new edge. This is the shape the materializer relies on when
+/// it re-applies a design proposal's full edge set, including edges a
+/// deduped handle already established.
+#[tokio::test]
+async fn re_adding_existing_edge_to_archived_prereq_is_idempotent() -> Result<()> {
+    let engine = TestEngine::spawn_with(TestEngineOptions {
+        on_disk_db: true,
+        ..Default::default()
+    })
+    .await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = create_product(
+        &mut client,
+        CreateProductInput::builder()
+            .name("Idempotent archived re-add")
+            .repo_remote_url("git@example.com:boss.git")
+            .build(),
+    )
+    .await?;
+    let dependent = create_chore(
+        &mut client,
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("Dependent")
+            .build(),
+    )
+    .await?;
+    let prereq = create_chore(
+        &mut client,
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("Prerequisite")
+            .build(),
+    )
+    .await?;
+
+    let edge = add_dependency(
+        &mut client,
+        AddDependencyInput {
+            dependent: dependent.id.clone(),
+            prerequisite: prereq.id.clone(),
+            relation: None,
+        },
+    )
+    .await?;
+
+    {
+        let conn = rusqlite::Connection::open(&engine.db_path)?;
+        conn.execute(
+            "UPDATE tasks SET status = 'archived', deleted_at = '1' WHERE id = ?1",
+            rusqlite::params![prereq.id],
+        )?;
+    }
+
+    let edge2 = add_dependency(
+        &mut client,
+        AddDependencyInput {
+            dependent: dependent.id.clone(),
+            prerequisite: prereq.id.clone(),
+            relation: None,
+        },
+    )
+    .await?;
+    assert_eq!(
+        edge2, edge,
+        "re-adding a pre-existing edge must stay idempotent even once its prerequisite is archived"
+    );
+
+    Ok(())
+}
+
+/// The create-time `--depends-on` path shares `add_dependency_edge_in_tx`
+/// with the standalone `depend add` verb, so an archived prerequisite
+/// named at create time must be rejected the same way — this is newly a
+/// hard failure and needs its own coverage rather than relying on the
+/// standalone-verb test to imply it.
+#[tokio::test]
+async fn create_time_depends_on_rejects_archived_prereq() -> Result<()> {
+    let engine = TestEngine::spawn_with(TestEngineOptions {
+        on_disk_db: true,
+        ..Default::default()
+    })
+    .await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = create_product(
+        &mut client,
+        CreateProductInput::builder()
+            .name("Create-time archived depends-on")
+            .repo_remote_url("git@example.com:boss.git")
+            .build(),
+    )
+    .await?;
+    let prereq = create_chore(
+        &mut client,
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("Prerequisite")
+            .build(),
+    )
+    .await?;
+
+    {
+        let conn = rusqlite::Connection::open(&engine.db_path)?;
+        conn.execute(
+            "UPDATE tasks SET status = 'archived', deleted_at = '1' WHERE id = ?1",
+            rusqlite::params![prereq.id],
+        )?;
+    }
+
+    match client
+        .send_request(&FrontendRequest::CreateChore {
+            input: CreateChoreInput::builder()
+                .product_id(product.id)
+                .name("Dependent")
+                .depends_on(vec![prereq.id.clone()])
+                .build(),
+        })
+        .await?
+    {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains(&prereq.id),
+                "error must name the archived row: {message}"
+            );
+            assert!(
+                message.contains("archived"),
+                "error must explain the rejection: {message}"
+            );
+        }
+        other => return Err(unexpected_event("create-time depends-on archived prereq", other)),
+    }
 
     Ok(())
 }

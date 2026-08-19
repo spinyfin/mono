@@ -26,7 +26,13 @@ pub(super) async fn handle_add_dependency(ctx: Dispatch, req: FrontendRequest) {
             return;
         }
     };
-    input.prerequisite = match server_state.resolve_work_item_id(&input.prerequisite).await {
+    // Dependency operations must see a tombstoned prerequisite: `add` can
+    // then reject an archived target explicitly instead of misreporting it as
+    // missing, while `rm` can clean up an existing historical edge.
+    input.prerequisite = match server_state
+        .resolve_work_item_id_including_deleted(&input.prerequisite)
+        .await
+    {
         Ok(id) => id,
         Err(err) => {
             send_work_error(&sink, &request_id, &err);
@@ -113,7 +119,13 @@ pub(super) async fn handle_remove_dependency(ctx: Dispatch, req: FrontendRequest
             return;
         }
     };
-    input.prerequisite = match server_state.resolve_work_item_id(&input.prerequisite).await {
+    // Dependency operations must see a tombstoned prerequisite: `add` can
+    // reject an archived target explicitly and `rm` can clean up an existing
+    // historical edge, without widening the shared live-work-item resolver.
+    input.prerequisite = match server_state
+        .resolve_work_item_id_including_deleted(&input.prerequisite)
+        .await
+    {
         Ok(id) => id,
         Err(err) => {
             send_work_error(&sink, &request_id, &err);

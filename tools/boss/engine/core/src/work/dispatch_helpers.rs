@@ -716,7 +716,7 @@ pub(crate) fn reconcile_revision_execution(
         let now = now_string();
         // Drop any not-yet-live execution row before archiving the task.
         abandon_pending_executions(pending, conn, &task.id, &now)?;
-        resolve_revision_on_parent_close(conn, task, &chain_root_task.id, &now, "reconcile_revision")?;
+        resolve_revision_on_parent_close(pending, conn, task, &chain_root_task.id, &now, "reconcile_revision")?;
         return Ok(());
     }
 

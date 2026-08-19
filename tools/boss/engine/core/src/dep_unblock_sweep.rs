@@ -196,7 +196,9 @@ mod tests {
 
     use super::*;
     use crate::test_support::*;
-    use crate::work::{AddDependencyInput, ExecutionStatus, WorkDb, WorkItemPatch};
+    use crate::work::{
+        AddDependencyInput, CreateExecutionInput, ExecutionKind, ExecutionStatus, WorkDb, WorkItemPatch,
+    };
 
     fn create_chore_no_autostart(db: &WorkDb, product_id: &str, name: &str) -> String {
         create_test_chore_manual(db, product_id, name).id
@@ -252,6 +254,61 @@ mod tests {
         };
         assert_eq!(after.status, TaskStatus::Todo);
         assert!(after.blocked_reason.is_none(), "blocked_reason must be cleared");
+    }
+
+    /// Regression: an archived revision is tombstoned in the same transition.
+    /// A row blocked before the archive-cascade fix must still recover through
+    /// the safety-net sweep, and its parked execution must become dispatchable.
+    #[tokio::test]
+    async fn sweep_unblocks_waiting_dependent_of_tombstoned_archived_prereq() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let prereq_id = create_test_chore(&db, &product_id, "prereq").id;
+        let dep_id = create_test_chore(&db, &product_id, "dependent").id;
+
+        db.add_dependency(AddDependencyInput {
+            dependent: dep_id.clone(),
+            prerequisite: prereq_id.clone(),
+            relation: None,
+        })
+        .unwrap();
+        let waiting = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(dep_id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::WaitingDependency)
+                    .build(),
+            )
+            .unwrap();
+
+        // Simulate a row stranded before the event-driven archive cascade
+        // existed: its archived status and tombstone were committed, but the
+        // dependent still waits on the edge.
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'archived', deleted_at = '1' WHERE id = ?1",
+                rusqlite::params![prereq_id],
+            )
+            .unwrap();
+
+        let db = Arc::new(db);
+        let outcome = run_one_pass(db.as_ref()).await;
+        assert_eq!(outcome.rows_evaluated, 1);
+        assert_eq!(outcome.rows_unblocked, 1, "the archived prerequisite must not gate");
+
+        let dep_after = db.get_work_item(&dep_id).unwrap();
+        let boss_protocol::WorkItem::Chore(after) = dep_after else {
+            panic!()
+        };
+        assert_eq!(after.status, TaskStatus::Todo);
+        assert!(after.blocked_reason.is_none());
+        assert_eq!(
+            db.get_execution(&waiting.id).unwrap().status,
+            ExecutionStatus::Ready,
+            "the sweep must promote a stranded waiting_dependency execution"
+        );
     }
 
     /// Actor-mismatch path: the engine auto-blocked the dependent, a

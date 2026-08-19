@@ -440,6 +440,59 @@ fn dependency_add_list_and_remove_round_trip() {
     let _ = std::fs::remove_file(path);
 }
 
+/// Archiving a revision tombstones its row, but its dependency edges remain
+/// valid history. The archive transition must nevertheless make each
+/// dependent runnable and promote its parked execution without waiting for
+/// the periodic safety-net sweep.
+#[test]
+fn archiving_revision_prerequisite_cascades_to_waiting_dependent() {
+    let db = WorkDb::open(temp_db_path("archived-prereq-cascade")).unwrap();
+    let product_id = make_revision_product(&db, "archived-prereq-cascade");
+    let root_id = make_chore_root(&db, &product_id, "archived-prereq-cascade");
+    let prereq_id = insert_revision_row(&db, &product_id, &root_id);
+    let dependent = create_test_chore(&db, product_id, "waiting dependent");
+
+    db.add_dependency(AddDependencyInput {
+        dependent: dependent.id.clone(),
+        prerequisite: prereq_id.clone(),
+        relation: None,
+    })
+    .unwrap();
+    assert_eq!(task_status(&db, &dependent.id), "blocked");
+
+    let waiting = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(dependent.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::WaitingDependency)
+                .build(),
+        )
+        .unwrap();
+
+    let archived = db
+        .close_moot_revision_task(&prereq_id, "the revision is no longer needed")
+        .unwrap()
+        .expect("the live revision must be archived");
+    assert_eq!(archived.status, TaskStatus::Archived);
+    assert!(archived.deleted_at.is_some(), "archival must tombstone the revision");
+
+    assert_eq!(task_status(&db, &dependent.id), "todo");
+    assert_eq!(
+        db.get_execution(&waiting.id).unwrap().status,
+        ExecutionStatus::Ready,
+        "the cascade must promote the parked execution immediately"
+    );
+    let edges = db
+        .list_dependencies(ListDependenciesInput {
+            work_item: dependent.id,
+            direction: None,
+        })
+        .unwrap();
+    assert_eq!(edges.prerequisites.len(), 1, "archiving preserves dependency history");
+    assert_eq!(edges.prerequisites[0].prerequisite_id, prereq_id);
+}
+
 /// Cross-product edges are refused at the engine boundary
 /// (Q3-iii — same-product, cross-project, cross-kind is the v1
 /// scope).

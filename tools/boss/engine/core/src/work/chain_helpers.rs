@@ -290,6 +290,7 @@ pub(crate) fn archive_revision_task(
 /// already `parent_pr_closed`) and for abandoning pending executions via
 /// [`abandon_pending_executions`] beforehand.
 pub(crate) fn resolve_revision_on_parent_close(
+    pending: &mut PendingEvents,
     conn: &Connection,
     rev: &Task,
     chain_root_id: &str,
@@ -300,6 +301,7 @@ pub(crate) fn resolve_revision_on_parent_close(
         let archived_reason = format!("parent PR merged: revision moot (created_via={})", rev.created_via);
         let rows_changed = archive_revision_task(conn, &rev.id, now, &archived_reason)?;
         if rows_changed > 0 {
+            cascade_dependents_after_prereq_status_change(pending, conn, &rev.id, "archived", now)?;
             tracing::info!(
                 revision_id = %rev.id,
                 chain_root_id,
@@ -389,7 +391,9 @@ pub(crate) fn resolve_revision_on_parent_close(
         if is_followup { "followup" } else { "chore" },
         new_chore.id,
     );
-    archive_revision_task(conn, &rev.id, now, &archived_reason)?;
+    if archive_revision_task(conn, &rev.id, now, &archived_reason)? > 0 {
+        cascade_dependents_after_prereq_status_change(pending, conn, &rev.id, "archived", now)?;
+    }
     tracing::info!(
         revision_id = %rev.id,
         new_chore_id = %new_chore.id,
@@ -465,7 +469,7 @@ pub(crate) fn block_pending_revisions_on_parent_close(
         // Drop any not-yet-live execution row before archiving the task.
         abandon_pending_executions(pending, conn, rev_id, now)?;
 
-        resolve_revision_on_parent_close(conn, &rev, chain_root_id, now, "block_pending_revisions")?;
+        resolve_revision_on_parent_close(pending, conn, &rev, chain_root_id, now, "block_pending_revisions")?;
     }
     Ok(())
 }

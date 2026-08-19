@@ -229,8 +229,15 @@ pub(crate) fn apply_create_time_dependencies(
         if prerequisite_id.is_empty() {
             continue;
         }
+        // `with_context` would bury the underlying reason (e.g. "archived
+        // work items cannot be prerequisites") in the anyhow cause chain,
+        // which `send_work_error` never surfaces — it renders an error's
+        // `Display` (the top context only), not its `{:?}` chain. Fold the
+        // inner message into a single flat string so a rejection reason
+        // set deeper in `add_dependency_edge_in_tx` actually reaches the
+        // caller.
         add_dependency_edge_in_tx(&mut pending, conn, dependent_id, prerequisite_id, RELATION_BLOCKS, now)
-            .with_context(|| format!("declaring create-time dependency on `{prerequisite_id}`"))?;
+            .map_err(|err| anyhow::anyhow!("declaring create-time dependency on `{prerequisite_id}`: {err}"))?;
     }
     debug_assert!(
         pending.is_empty(),

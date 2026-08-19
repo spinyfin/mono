@@ -310,6 +310,36 @@ pub fn lookup_work_item_status(conn: &Connection, work_item_id: &str) -> Result<
     Ok(None)
 }
 
+/// Look up a work item's status for dependency evaluation, including a
+/// tombstoned task row. An archived revision is tombstoned in the same write
+/// that gives it `status = 'archived'`; hiding it here would turn that known,
+/// satisfying status into an indistinguishable missing prerequisite.
+///
+/// This is deliberately narrower than [`lookup_work_item_status`]: ordinary
+/// work-item reads retain their live-row contract, while dependency code can
+/// still distinguish an archived prerequisite from a genuinely unknown id.
+pub fn lookup_work_item_status_for_gating(conn: &Connection, work_item_id: &str) -> Result<Option<String>> {
+    if work_item_id.starts_with("proj_") {
+        return conn
+            .query_row(
+                "SELECT status FROM projects WHERE id = ?1",
+                params![work_item_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into);
+    }
+    if work_item_id.starts_with("task_") {
+        return conn
+            .query_row("SELECT status FROM tasks WHERE id = ?1", params![work_item_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()
+            .map_err(Into::into);
+    }
+    Ok(None)
+}
+
 /// Return the prerequisite ids that currently *gate* `work_item_id`
 /// — `blocks` edges whose prereq has not reached a satisfied
 /// status. Used by both the dispatcher (to demote a gated dependent
@@ -324,7 +354,7 @@ pub fn gating_prereqs_for(conn: &Connection, work_item_id: &str) -> Result<Vec<S
     let edges = prerequisites_of(conn, work_item_id, Some(RELATION_BLOCKS))?;
     let mut gating = Vec::new();
     for edge in edges {
-        let status = lookup_work_item_status(conn, &edge.prerequisite_id)?;
+        let status = lookup_work_item_status_for_gating(conn, &edge.prerequisite_id)?;
         match status {
             Some(s) if status_satisfies_for_dependent(&s, dependent_kind.as_deref()) => {}
             _ => gating.push(edge.prerequisite_id),
@@ -397,6 +427,22 @@ mod tests {
                 created_at       TEXT NOT NULL,
                 PRIMARY KEY (dependent_id, prerequisite_id, relation),
                 CHECK (dependent_id <> prerequisite_id)
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Like [`fresh_db`], plus a minimal `tasks` table so
+    /// [`gating_prereqs_for`] can look up prerequisite kind/status.
+    fn fresh_db_with_tasks() -> Connection {
+        let conn = fresh_db();
+        conn.execute_batch(
+            "CREATE TABLE tasks (
+                id          TEXT PRIMARY KEY,
+                kind        TEXT NOT NULL DEFAULT 'chore',
+                status      TEXT NOT NULL,
+                deleted_at  TEXT
             );",
         )
         .unwrap();
@@ -585,5 +631,51 @@ mod tests {
         assert!(status_satisfies_for_dependent("done", Some("revision")));
         assert!(status_satisfies_for_dependent("archived", Some("revision")));
         assert!(!status_satisfies_for_dependent("active", Some("revision")));
+    }
+
+    /// A tombstoned archived prerequisite must not gate its dependent —
+    /// pins the deliberate `None`-still-gates / `archived`-never-gates
+    /// split in [`lookup_work_item_status_for_gating`] at the level
+    /// [`gating_prereqs_for`] actually consumes it, rather than only
+    /// transitively through the sweep/cascade integration tests.
+    #[test]
+    fn gating_prereqs_for_excludes_a_tombstoned_archived_prereq() {
+        let conn = fresh_db_with_tasks();
+        conn.execute(
+            "INSERT INTO tasks (id, kind, status, deleted_at) VALUES ('task_dependent', 'chore', 'todo', NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, kind, status, deleted_at) VALUES ('task_prereq', 'chore', 'archived', '1')",
+            [],
+        )
+        .unwrap();
+        insert_edge(&conn, "task_dependent", "task_prereq", RELATION_BLOCKS, "1").unwrap();
+
+        assert!(
+            gating_prereqs_for(&conn, "task_dependent").unwrap().is_empty(),
+            "a tombstoned archived prerequisite must not gate its dependent"
+        );
+    }
+
+    /// An edge naming a prerequisite row that does not exist at all must
+    /// still gate — only a row that genuinely exists with
+    /// `status = 'archived'` is exempt.
+    #[test]
+    fn gating_prereqs_for_still_gates_on_a_missing_prerequisite_row() {
+        let conn = fresh_db_with_tasks();
+        conn.execute(
+            "INSERT INTO tasks (id, kind, status, deleted_at) VALUES ('task_dependent', 'chore', 'todo', NULL)",
+            [],
+        )
+        .unwrap();
+        insert_edge(&conn, "task_dependent", "task_missing", RELATION_BLOCKS, "1").unwrap();
+
+        assert_eq!(
+            gating_prereqs_for(&conn, "task_dependent").unwrap(),
+            vec!["task_missing".to_owned()],
+            "an edge naming a row that doesn't exist at all must still gate"
+        );
     }
 }
