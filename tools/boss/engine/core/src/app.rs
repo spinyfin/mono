@@ -544,6 +544,16 @@ struct ServerState {
     /// attention item. Shared with the sweep loop (wired in
     /// `app::server::serve`). See [`crate::spawn_health`].
     spawn_health: Arc<crate::spawn_health::SpawnHealthTracker>,
+    /// Per-driver provider quota readings and the policy governing when to
+    /// re-probe. Lazy by construction: no probe runs until a client asks for
+    /// a snapshot, so this costs engine startup nothing. A probe is a
+    /// short-lived child process (or one HTTPS request) owned by the cache —
+    /// it allocates no worker slot, creates no execution row, and opens no
+    /// pane, so it can never be mistaken for, or occupy, a dispatch slot.
+    #[builder(default = Arc::new(boss_engine_driver_quota::QuotaCache::new(
+        boss_engine_driver_quota::default_probes(boss_engine_driver::grok::resolve_grok_auth_source()),
+    )))]
+    driver_quota: Arc<boss_engine_driver_quota::QuotaCache>,
     /// Startup result for the required tmux runtime. The process only ever
     /// uses the resolved path recorded in the ready variant.
     #[builder(default = Arc::new(std::sync::RwLock::new(crate::tmux_preflight::TmuxPreflight::Unavailable { reason: "tmux preflight has not run yet".to_owned() })))]
@@ -2373,6 +2383,7 @@ async fn handle_frontend_connection(
             }
             r @ FrontendRequest::GetAutomationState => engine_meta::handle_get_automation_state(ctx, r).await,
             r @ FrontendRequest::GetCiBudget { .. } => ci_remediation::handle_get_ci_budget(ctx, r).await,
+            r @ FrontendRequest::GetDriverQuotaUsage { .. } => engine_meta::handle_get_driver_quota_usage(ctx, r).await,
             r @ FrontendRequest::GetDriverTrafficSplit => engine_meta::handle_get_driver_traffic_split(ctx, r).await,
             r @ FrontendRequest::GetCiRemediation { .. } => ci_remediation::handle_get_ci_remediation(ctx, r).await,
             r @ FrontendRequest::GetConflictHotspots { .. } => {

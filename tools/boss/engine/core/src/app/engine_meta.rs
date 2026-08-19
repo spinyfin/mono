@@ -497,6 +497,30 @@ pub(super) async fn handle_set_dispatch_concurrency(ctx: Dispatch, req: Frontend
     );
 }
 
+/// Serve the per-driver provider quota snapshot.
+///
+/// Read-only and cheap in the common case: the cache answers from memory
+/// unless its TTL has expired or the operator asked for a refresh, so
+/// opening Preferences does not fan out three provider calls every time.
+/// The figures here are each driver's *provider's* own view — never Boss's
+/// internal token accounting, which measures a different thing.
+///
+/// A driver that cannot be read comes back as an explicit failure entry, not
+/// as an omission: the snapshot always describes every implemented driver.
+pub(super) async fn handle_get_driver_quota_usage(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::GetDriverQuotaUsage { refresh } = req else {
+        unreachable!()
+    };
+    let snapshot = server_state.driver_quota.snapshot(refresh).await;
+    send_response(&sink, &request_id, FrontendEvent::DriverQuotaUsageResult { snapshot });
+}
+
 pub(super) async fn handle_get_driver_traffic_split(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         work_db,

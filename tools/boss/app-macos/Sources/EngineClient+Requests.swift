@@ -88,6 +88,20 @@ extension EngineClient {
         ])
     }
 
+    /// Ask the engine for the per-driver provider quota snapshot — what
+    /// each driver's own provider reports the maintainer has consumed of the
+    /// current subscription window.
+    ///
+    /// Cheap by default: the engine serves its cache unless the cache has
+    /// aged past its TTL, so opening Settings does not fan out three
+    /// provider calls every time. Pass `refresh: true` only for an explicit
+    /// operator request; the engine still enforces a floor between cycles
+    /// and reports a declined refresh as `refresh_throttled` rather than as
+    /// an error. Replies with `driver_quota_usage_result`.
+    func sendGetDriverQuotaUsage(refresh: Bool = false) {
+        sendLine(["type": "get_driver_quota_usage", "refresh": refresh])
+    }
+
     /// Ask the engine for its user-visible configuration health.
     /// Called once at session-start (after `connected`) so the
     /// top-of-window banner surfaces a missing `ANTHROPIC_API_KEY`

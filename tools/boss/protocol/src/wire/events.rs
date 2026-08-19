@@ -1155,6 +1155,12 @@ pub enum FrontendEvent {
     DriverTrafficSplitResult {
         split: DriverTrafficSplit,
     },
+    /// Response to [`FrontendRequest::GetDriverQuotaUsage`]. Carries one
+    /// entry per implemented driver — each either a provider-reported
+    /// figure or a typed failure, never a blank that reads as headroom.
+    DriverQuotaUsageResult {
+        snapshot: DriverQuotaSnapshot,
+    },
     /// Response to [`FrontendRequest::SetDispatchPaused`] and
     /// [`FrontendRequest::GetDispatchState`]. Carries the current pause state
     /// and, when paused, the epoch-seconds timestamp at which it was set.

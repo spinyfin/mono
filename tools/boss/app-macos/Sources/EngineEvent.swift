@@ -132,6 +132,10 @@ enum EngineEvent {
     /// `standard`-reasoning implementation work between the `grok`,
     /// `claude`, and `codex` drivers. Its shares always sum to 100.
     case driverTrafficSplitResult(split: DriverTrafficSplit)
+    /// Response to `get_driver_quota_usage` — one entry per implemented
+    /// driver, each either the provider's own reported figure or an explicit
+    /// typed failure. Never a blank that could read as headroom.
+    case driverQuotaUsageResult(snapshot: DriverQuotaSnapshot)
     /// Reply to `trunk_set_token` / `trunk_status` — whether a Trunk org
     /// API token is configured (env override or Keychain), and where it
     /// came from. Drives the Settings pane's Trunk token control and the

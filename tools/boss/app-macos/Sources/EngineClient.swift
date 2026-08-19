@@ -646,6 +646,9 @@ final class EngineClient: @unchecked Sendable {
                     codex: (raw["codex"] as? NSNumber)?.intValue ?? 0
                 )
                 emit(.driverTrafficSplitResult(split: decoded.isValid ? decoded : .engineDefault))
+            case "driver_quota_usage_result":
+                let raw = payload["snapshot"] as? [String: Any] ?? [:]
+                emit(.driverQuotaUsageResult(snapshot: DriverQuotaSnapshot.decode(raw)))
             case "trunk_status":
                 let configured = (payload["configured"] as? NSNumber)?.boolValue ?? false
                 let source = payload["source"] as? String

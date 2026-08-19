@@ -16,14 +16,15 @@ use crate::types::{
     CreateCommentInput, CreateDecisionInput, CreateExecutionInput, CreateInvestigationInput, CreateManyChoresInput,
     CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput,
     Decision, DeferredScopeAttention, DependencyFilter, DesignDocContent, DesignDocTreeState, DispatchAdmission,
-    DriverTrafficSplit, EditorialAction, EngineAttemptListEntry, FollowupMemberOverride, GitHubAuthStateDto,
-    LinkExternalRefInput, ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch, ProbeDeliveryExpectation,
-    ProbeDeliveryState, Product, Project, ProposalKind, ProposalState, ProposalSubmissionError, RemoveDependencyInput,
-    RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput, ReviseDocOutcome,
-    SelectedProductState, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput,
-    SetTaskDocPointerInput, Task, TaskRuntime, TranscriptSegment, WorkAttachment, WorkAttentionItem, WorkComment,
-    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
-    WorkRun, WorkerContextBundle, WorkerProposal, WorkerTierDenial,
+    DriverQuotaSnapshot, DriverTrafficSplit, EditorialAction, EngineAttemptListEntry, FollowupMemberOverride,
+    GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch,
+    ProbeDeliveryExpectation, ProbeDeliveryState, Product, Project, ProposalKind, ProposalState,
+    ProposalSubmissionError, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
+    ResolvedComment, ReviseDocInput, ReviseDocOutcome, SelectedProductState, SetProductEditorialRulesInput,
+    SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskDocPointerInput, Task, TaskRuntime,
+    TranscriptSegment, WorkAttachment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
+    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun, WorkerContextBundle, WorkerProposal,
+    WorkerTierDenial,
 };
 
 /// Outcome of the live `getQueue` smoke check `boss engine trunk status`
@@ -782,6 +783,23 @@ pub enum FrontendRequest {
     /// Query the current dispatch-pause state without changing it.
     /// Replies with [`FrontendEvent::DispatchStateResult`].
     GetDispatchState,
+
+    /// Read the per-driver provider quota snapshot — what each driver's own
+    /// provider reports the maintainer has consumed of the current
+    /// subscription window. Served from the engine's cache; a probe cycle
+    /// runs only when the cache is older than the service's TTL, or when
+    /// `refresh` is set and the anti-hammer floor has elapsed. Never
+    /// triggered by engine startup. Replies with
+    /// [`FrontendEvent::DriverQuotaUsageResult`].
+    ///
+    /// `refresh` marks an explicit operator request ("Refresh" in
+    /// Preferences); it bypasses the TTL but not the floor, and a refusal
+    /// comes back as `refresh_throttled` on the snapshot rather than as an
+    /// error or a silently unchanged timestamp.
+    GetDriverQuotaUsage {
+        #[serde(default)]
+        refresh: bool,
+    },
 
     /// Query the current driver traffic split (the three-way `grok` /
     /// `claude` / `codex` allocation of eligible `standard`-reasoning
