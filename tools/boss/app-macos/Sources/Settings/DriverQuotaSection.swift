@@ -217,21 +217,47 @@ extension DriverQuotaReading {
     }
 
     /// "resets …" clause, or `nil` when the provider gave no reset info.
-    /// Prefers the machine-readable instant, falling back to the provider's
-    /// own wording rather than inventing one.
+    /// Prefers the normalised instant every driver's parser now produces,
+    /// falling back to the provider's own wording only for the rare clause
+    /// the engine's parser could not turn into an instant.
     func resetsText(now: Date, calendar: Calendar = .current) -> String? {
         if let epoch = resetsAtEpochS {
             let date = Date(timeIntervalSince1970: TimeInterval(epoch))
-            let formatter = DateFormatter()
-            formatter.calendar = calendar
-            formatter.dateStyle = .medium
-            formatter.timeStyle = .short
-            return "resets \(formatter.string(from: date))"
+            return "resets \(Self.formattedResetInstant(date, now: now, calendar: calendar))"
         }
         if let text = resetsAtText, !text.isEmpty {
             return "resets \(text)"
         }
         return nil
+    }
+
+    /// The one shared formatter for all three drivers' reset instants, so a
+    /// provider-specific string never reaches this view — the engine
+    /// normalises every driver's reading to `resets_at_epoch_s` at parse
+    /// time, and this is the single place that turns it into text.
+    ///
+    /// Within the coming week: weekday name and local time, e.g. "Friday at
+    /// 4:04 PM". Beyond that: a plain local date, in one consistent style.
+    /// Always the machine's local time zone — the zone name itself is never
+    /// printed, and sub-second precision never survives to here.
+    static func formattedResetInstant(_ date: Date, now: Date, calendar: Calendar = .current) -> String {
+        let startOfToday = calendar.startOfDay(for: now)
+        let startOfTarget = calendar.startOfDay(for: date)
+        let daysAhead = calendar.dateComponents([.day], from: startOfToday, to: startOfTarget).day ?? 0
+
+        if daysAhead >= 0, daysAhead < 7 {
+            let formatter = DateFormatter()
+            formatter.calendar = calendar
+            formatter.timeZone = calendar.timeZone
+            formatter.dateFormat = "EEEE 'at' h:mm a"
+            return formatter.string(from: date)
+        }
+        let formatter = DateFormatter()
+        formatter.calendar = calendar
+        formatter.timeZone = calendar.timeZone
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .none
+        return formatter.string(from: date)
     }
 }
 
@@ -291,12 +317,15 @@ struct DriverQuotaSection: View {
     private let tick = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
 
     var body: some View {
+        let roster = DriverQuotaSection.roster(from: chatModel.driverQuota)
+        let freshestObservedAtEpochS = DriverQuotaSection.freshestObservedAtEpochS(in: roster)
         Section {
-            ForEach(DriverQuotaSection.roster(from: chatModel.driverQuota), id: \.driver) { entry in
+            ForEach(roster, id: \.driver) { entry in
                 DriverQuotaRow(
                     entry: entry,
                     now: now,
-                    checking: chatModel.isRefreshingDriverQuota
+                    checking: chatModel.isRefreshingDriverQuota,
+                    freshestObservedAtEpochS: freshestObservedAtEpochS
                 )
             }
             HStack(spacing: 8) {
@@ -318,12 +347,29 @@ struct DriverQuotaSection: View {
         } header: {
             Text("Driver Quota")
         } footer: {
-            Text("Each figure comes from that driver's own provider, read out of band — Claude Code's /usage in print mode, Codex's app-server rate-limit method, and the endpoint Grok's own /usage calls. These are provider numbers, not Boss's internal token accounting, which measures only work Boss dispatched and would understate the total. Read-only: nothing here throttles dispatch or changes the traffic split. Refreshed at most every 15 minutes on its own, or on demand with Refresh (declined if a check ran in the last minute). A driver Boss cannot read says so explicitly rather than showing nothing.")
+            Text("These are the providers' own figures, not Boss's internal token accounting. Nothing here affects dispatch.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .onReceive(tick) { now = $0 }
+    }
+
+    /// How much older a row's own reading has to be than the freshest
+    /// reading in the roster before it is flagged as stale — hours, not
+    /// minutes, so ordinary skew between three independent probes never
+    /// trips it. Only a row that is genuinely the outlier gets the
+    /// indicator.
+    static let staleThreshold: TimeInterval = 2 * 60 * 60
+
+    /// The most recent `observedAtEpochS` among readings in the roster, or
+    /// `0` when there are none to compare — a single reading (or none) has
+    /// no "rest" for it to be stale relative to.
+    static func freshestObservedAtEpochS(in roster: [DriverQuotaEntry]) -> Int {
+        roster.compactMap { entry -> Int? in
+            guard case .reading = entry.outcome else { return nil }
+            return entry.observedAtEpochS
+        }.max() ?? 0
     }
 
     /// Every driver Boss implements, in a stable order, with the engine's
@@ -368,6 +414,10 @@ private struct DriverQuotaRow: View {
     let entry: DriverQuotaEntry
     let now: Date
     let checking: Bool
+    /// The freshest `observedAtEpochS` among all readings in the roster, so
+    /// this row can tell whether it is the stale outlier. `0` means there is
+    /// nothing to compare against.
+    let freshestObservedAtEpochS: Int
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -401,10 +451,12 @@ private struct DriverQuotaRow: View {
             switch entry.outcome {
             case .reading(let reading):
                 DriverQuotaBar(usedPercent: reading.usedPercent)
-                Text(detailLine(for: reading))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                if let line = detailLine(for: reading) {
+                    Text(line)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             case .unavailable(_, let reason):
                 Text("\(reason) · tried \(observedText)")
                     .font(.caption)
@@ -422,15 +474,26 @@ private struct DriverQuotaRow: View {
         .accessibilityValue(accessibilityValue)
     }
 
-    /// Reset clause (when the provider gave one), the "as of", and the
-    /// mechanism that produced the figure — joined into one caption so a
-    /// number never stands alone.
-    private func detailLine(for reading: DriverQuotaReading) -> String {
+    /// Reset clause, when the provider gave one, plus a freshness note only
+    /// when this row is genuinely stale relative to the rest of the roster
+    /// (see `DriverQuotaSection.staleThreshold`). How the figure was
+    /// obtained is implementation detail and is not shown here; the panel's
+    /// single "Checked …" line at the bottom already covers the common case.
+    /// `nil` when there is nothing to say beyond the reset clause itself.
+    private func detailLine(for reading: DriverQuotaReading) -> String? {
         var parts: [String] = []
         if let resets = reading.resetsText(now: now) { parts.append(resets) }
-        parts.append("read \(observedText)")
-        parts.append("via \(reading.source)")
-        return parts.joined(separator: " · ")
+        if isStale { parts.append("read \(observedText)") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    /// This row's reading is older than the roster's freshest by more than
+    /// `DriverQuotaSection.staleThreshold` — the one case where a per-row
+    /// freshness note earns its place, because it names the exception.
+    private var isStale: Bool {
+        guard entry.observedAtEpochS > 0, freshestObservedAtEpochS > 0 else { return false }
+        let lag = TimeInterval(freshestObservedAtEpochS - entry.observedAtEpochS)
+        return lag > DriverQuotaSection.staleThreshold
     }
 
     private var observedText: String {

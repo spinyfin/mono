@@ -633,6 +633,7 @@ dependencies = [
  "boss-http-retry",
  "boss-protocol",
  "chrono",
+ "chrono-tz",
  "serde_json",
  "tokio",
  "tracing",

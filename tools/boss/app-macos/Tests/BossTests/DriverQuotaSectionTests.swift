@@ -137,17 +137,49 @@ final class DriverQuotaSectionTests: XCTestCase {
         XCTAssertEqual(reading(percent: 12.5).usedPercentText, "12.5%")
     }
 
-    func testProviderResetWordingIsUsedVerbatimWhenThereIsNoTimestamp() {
+    func testProviderResetWordingIsUsedVerbatimOnlyAsAFallbackWithNoInstant() {
         var r = reading(percent: 3)
-        r.resetsAtText = "Aug 25 at 7pm (America/Chicago)"
+        r.resetsAtText = "some shape the parser did not recognise"
         XCTAssertEqual(
             r.resetsText(now: Date(timeIntervalSince1970: 1_787_000_000)),
-            "resets Aug 25 at 7pm (America/Chicago)"
+            "resets some shape the parser did not recognise"
         )
     }
 
     func testNoResetInformationYieldsNoResetClauseRatherThanAnInventedOne() {
         XCTAssertNil(reading(percent: 3).resetsText(now: Date()))
+    }
+
+    /// All three drivers normalise to `resetsAtEpochS` at the engine's parse
+    /// boundary; this view formats every one of them identically. Within the
+    /// coming week: weekday name and local time, never the zone name.
+    func testResetInstantWithinTheComingWeekUsesWeekdayAndTime() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "America/Chicago")!
+        // "now" is a Monday; the reset instant is that Friday at 4:04 PM.
+        let now = dateFrom("2026-08-17T09:00:00-05:00")
+        let resets = dateFrom("2026-08-21T16:04:00-05:00")
+        var r = reading(percent: 3)
+        r.resetsAtEpochS = Int(resets.timeIntervalSince1970)
+        XCTAssertEqual(r.resetsText(now: now, calendar: calendar), "resets Friday at 4:04 PM")
+    }
+
+    /// Beyond the coming week: a plain date, in one consistent style —
+    /// never a raw ISO string and never sub-second precision.
+    func testResetInstantBeyondTheComingWeekUsesAPlainDate() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "America/Chicago")!
+        let now = dateFrom("2026-08-01T09:00:00-05:00")
+        let resets = dateFrom("2026-08-25T18:59:00-05:00")
+        var r = reading(percent: 3)
+        r.resetsAtEpochS = Int(resets.timeIntervalSince1970)
+        XCTAssertEqual(r.resetsText(now: now, calendar: calendar), "resets Aug 25, 2026")
+    }
+
+    private func dateFrom(_ iso: String) -> Date {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: iso)!
     }
 
     func testNonWeeklyWindowIsNeverLabelledThisWeek() {
