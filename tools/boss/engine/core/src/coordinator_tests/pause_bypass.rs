@@ -52,7 +52,9 @@ async fn force_start_dispatches_past_operator_pause_and_records_override_event()
     let result = coordinator
         .dispatch_with_pause_bypass(force_input(&chore.id, None), live_states())
         .await;
-    let _dispatched = result.expect("force-start must succeed past an operator pause");
+    let _dispatched = result
+        .expect("force-start must succeed past an operator pause")
+        .execution;
     // The row is claimed synchronously; the spawn tail (and the status
     // flip to `running`) happens in a handed-off task — see
     // `dispatch_with_pause_bypass`'s doc on why this doesn't wait for it.
@@ -295,7 +297,9 @@ async fn force_start_proceeds_ordinarily_when_pause_already_lifted() {
     let result = coordinator
         .dispatch_with_pause_bypass(force_input(&chore.id, Some(1_700_000_000)), live_states())
         .await;
-    let dispatched = result.expect("must proceed as an ordinary start once the pause is gone");
+    let dispatched = result
+        .expect("must proceed as an ordinary start once the pause is gone")
+        .execution;
     // The ordinary path is fire-and-forget (`kick()`, not awaited) — the
     // returned row may still read `ready` the instant this call returns;
     // it must still reach `running` shortly via the normal scheduler.
@@ -366,7 +370,9 @@ async fn force_start_preserves_automation_pool_routing() {
     let result = coordinator
         .dispatch_with_pause_bypass(force_input(&auto_chore.id, None), live_states())
         .await;
-    let dispatched = result.expect("force-start must dispatch the automation-sourced item");
+    let dispatched = result
+        .expect("force-start must dispatch the automation-sourced item")
+        .execution;
     wait_for_execution_status(db.as_ref(), &dispatched.id, ExecutionStatus::Running).await;
 
     let calls = runner.calls.lock().await;
@@ -425,7 +431,9 @@ async fn force_start_bypasses_autostart_and_churn_guard_informationally() {
     let result = coordinator
         .dispatch_with_pause_bypass(force_input(&chore.id, None), live_states())
         .await;
-    let dispatched = result.expect("autostart:false must never refuse an explicit forced start");
+    let dispatched = result
+        .expect("autostart:false must never refuse an explicit forced start")
+        .execution;
     wait_for_execution_status(db.as_ref(), &dispatched.id, ExecutionStatus::Running).await;
 }
 
@@ -479,7 +487,9 @@ async fn evaluate_dispatch_admission_exempts_pr_review_from_operator_pause() {
     let result = coordinator
         .dispatch_with_pause_bypass(force_input(&chore_id, None), live_states())
         .await;
-    let dispatched = result.expect("a pr_review row must dispatch under force exactly as it would ordinarily");
+    let dispatched = result
+        .expect("a pr_review row must dispatch under force exactly as it would ordinarily")
+        .execution;
     wait_for_execution_status(db.as_ref(), &dispatched.id, ExecutionStatus::Running).await;
     assert_eq!(dispatched.id, execution.id);
 

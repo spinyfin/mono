@@ -2196,7 +2196,7 @@ mod execution;
 mod run;
 mod scheduler;
 
-pub use dispatch_admission::pause_bypass_decision;
+pub use dispatch_admission::{PauseBypassOutcome, pause_bypass_decision};
 pub use run::PANE_SPAWN_FAILED_ATTENTION_KIND;
 pub use scheduler::ANSWER_AGENT_READY_AGE_ATTENTION_KIND;
 

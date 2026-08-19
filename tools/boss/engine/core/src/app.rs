@@ -46,6 +46,7 @@ use crate::protocol::{
     TopicEventPayload, comment_topic, editorial_actions_topic, execution_topic, probe_topic, work_product_topic,
 };
 use crate::repo_slug;
+use crate::runner::ExecutionRunner;
 use crate::work::{
     ANSWER_AGENT_RUN_STATUS_FAILED, ANSWER_AGENT_RUN_STATUS_REPLIED, ActionedAttentionGroup, DuplicateTaskError,
     ExecutionKind, ExecutionStatus, GhPrStateChecker, INTENT_QUESTION, ProducerConflictInsertInput, ReviseDocOutcome,
@@ -958,6 +959,48 @@ impl ServerState {
         trunk_client_override: Option<boss_trunk_client::TrunkClient>,
         direct_merge_executor_override: Option<Arc<dyn merge_when_ready::DirectMergeExecutor>>,
     ) -> Result<Arc<Self>> {
+        Self::new_arc_with_app_pid_and_merge_probe_and_dispatch_fakes(
+            cfg,
+            app_pid,
+            control_token,
+            merge_probe_override,
+            trunk_token_store_override,
+            trunk_client_override,
+            direct_merge_executor_override,
+            None,
+            None,
+        )
+    }
+
+    /// Same as [`Self::new_arc_with_app_pid_and_merge_probe`], with two
+    /// additional overrides for the cube client and execution runner that
+    /// `ExecutionCoordinator` dispatches through. Production (via that
+    /// function) always passes `None` for both and gets the real
+    /// `CommandCubeClient` (shells out to the `cube` binary) and
+    /// `PaneSpawnRunner` (spawns a real pane). Tests that need to drive a
+    /// dispatch past `drain_ready_queue` to a successful claim — without
+    /// leasing a real cube workspace or spawning a real pane — inject
+    /// [`crate::test_support::AlwaysSucceedsCube`] /
+    /// [`crate::test_support::AlwaysSucceedsRunner`] (or a purpose-built
+    /// fake) here instead of going through the production collaborators.
+    // This constructor exists solely to append two test-only dispatch-fake
+    // overrides onto the existing 7-parameter override list `[Self::
+    // new_arc_with_app_pid_and_merge_probe]` already carries (merge probe,
+    // trunk token store, trunk client, direct-merge executor) — the same
+    // "production passes None, tests inject a fake" shape repeated once
+    // more, not unrelated concerns that should be grouped into a struct.
+    #[allow(clippy::too_many_arguments)]
+    fn new_arc_with_app_pid_and_merge_probe_and_dispatch_fakes(
+        cfg: Arc<RuntimeConfig>,
+        app_pid: Option<libc::pid_t>,
+        control_token: Option<Arc<String>>,
+        merge_probe_override: Option<Arc<dyn MergeProbe>>,
+        trunk_token_store_override: Option<Arc<dyn trunk_auth::TrunkTokenSource>>,
+        trunk_client_override: Option<boss_trunk_client::TrunkClient>,
+        direct_merge_executor_override: Option<Arc<dyn merge_when_ready::DirectMergeExecutor>>,
+        cube_client_override: Option<Arc<dyn CubeClient>>,
+        execution_runner_override: Option<Arc<dyn ExecutionRunner>>,
+    ) -> Result<Arc<Self>> {
         let work_db = Arc::new(WorkDb::open(cfg.work.db_path.clone())?);
         let anthropic_api_key = cfg.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
         // Resolve the engine's own inference provider once, here, and install
@@ -1053,7 +1096,8 @@ impl ServerState {
             kick: std::sync::OnceLock::new(),
         });
         let publisher: Arc<dyn ExecutionPublisher> = publisher_impl.clone();
-        let cube_client: Arc<dyn CubeClient> = Arc::new(CommandCubeClient::new(cfg.clone()));
+        let cube_client: Arc<dyn CubeClient> =
+            cube_client_override.unwrap_or_else(|| Arc::new(CommandCubeClient::new(cfg.clone())));
         let pr_detector: Arc<dyn PrDetector> = Arc::new(CommandPrDetector::new());
         // The pane releaser and probe queuer both need a Weak<ServerState>
         // to call back into ServerState methods, so they're late-bound
@@ -1256,12 +1300,23 @@ impl ServerState {
         // runner needs to call into ServerState (send_to_app +
         // worker_registry) while ServerState owns the runner —
         // Arc::new_cyclic breaks the cycle.
-        let pane_runner = Arc::new(crate::runner::PaneSpawnRunner::new(
-            cfg.clone(),
-            work_db.clone(),
-            feature_flags.clone(),
-        ));
-        let runner_for_coordinator = pane_runner.clone();
+        // When a fake is injected (tests only), there is no concrete
+        // `PaneSpawnRunner` to late-bind `set_server_state` onto below —
+        // the fake owns its own collaborators, if any.
+        let (runner_for_coordinator, pane_runner_for_late_bind): (
+            Arc<dyn ExecutionRunner>,
+            Option<Arc<crate::runner::PaneSpawnRunner>>,
+        ) = match execution_runner_override {
+            Some(runner) => (runner, None),
+            None => {
+                let pane_runner = Arc::new(crate::runner::PaneSpawnRunner::new(
+                    cfg.clone(),
+                    work_db.clone(),
+                    feature_flags.clone(),
+                ));
+                (pane_runner.clone(), Some(pane_runner))
+            }
+        };
         let cube_client_for_state = cube_client.clone();
         let publisher_for_state = publisher.clone();
 
@@ -1447,7 +1502,9 @@ impl ServerState {
         // ServerState's private fields.
         let weak_spawner: Weak<dyn crate::spawn_flow::WorkerSpawner> =
             Arc::downgrade(&server_state) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
-        pane_runner.set_server_state(weak_spawner);
+        if let Some(pane_runner) = pane_runner_for_late_bind {
+            pane_runner.set_server_state(weak_spawner);
+        }
         pane_releaser.set_server_state(Arc::downgrade(&server_state));
         probe_queuer.set_server_state(Arc::downgrade(&server_state));
 
