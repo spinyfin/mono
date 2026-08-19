@@ -11,149 +11,21 @@
 //! this module must not reproduce).
 //!
 //! Two independent enforcement layers, both written from here:
-//! - **Sandbox**: Grok's custom profile on non-macOS/remote workers; a
-//!   Boss-owned Seatbelt profile on local macOS, where Grok's built-in
-//!   template blocks the login-keychain IPC required by `gh`.
+//! - **Sandbox**: Grok's custom profile on non-macOS/remote workers. Local
+//!   macOS workers run with Grok's sandbox disabled so repository test actions
+//!   can apply their own hermetic Seatbelt profile.
 //! - **Rule grammar** (`--deny 'Bash(...)'` / `'Read(...)'` / `'Edit(...)'`):
 //!   the structural deny set (Boss data dir belt, `rm -rf`, `sudo`,
 //!   `bossctl`) — command-pattern denies the sandbox's path-based `deny`
 //!   cannot express.
 //!
-//! Both are defence in depth behind the `PreToolUse` guards
-//! ([`super::hooks`]); the sandbox additionally protects `$GROK_HOME/hooks/`
-//! itself from being overwritten by the worker (design §Global-hook write
-//! protection), which nothing in the hook layer can do for itself.
+//! These policies complement the `PreToolUse` guards ([`super::hooks`]).
+//! Local macOS workers intentionally rely on the repository's test sandbox
+//! rather than a Boss-owned OS-level profile.
 
 use std::path::Path;
 
-use boss_ssh_transport::shell_quote;
-
 use crate::WorkerKind;
-
-pub const MACOS_SEATBELT_PROFILE_FILENAME: &str = "boss-seatbelt.sb";
-const MACOS_SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
-
-/// Grok's built-in macOS profiles omit the Security.framework mach services
-/// used by `gh` to read its login-keychain credential. Boss therefore owns
-/// the local macOS Seatbelt profile and runs Grok's internal sandbox in
-/// `off` mode inside it. Remote workers and non-macOS hosts retain Grok's
-/// native sandbox.
-pub fn uses_external_macos_sandbox(is_remote: bool) -> bool {
-    cfg!(target_os = "macos") && !is_remote
-}
-
-pub fn macos_seatbelt_profile_path(grok_home: &Path) -> std::path::PathBuf {
-    grok_home.join(MACOS_SEATBELT_PROFILE_FILENAME)
-}
-
-/// Prefix a local macOS Grok command with the Boss-owned Seatbelt executor.
-/// Presence of the profile is the local/remote discriminator: remote
-/// permission provisioning deliberately never materialises this file.
-pub fn wrap_with_macos_seatbelt(command: &str, grok_home: &Path) -> anyhow::Result<String> {
-    let profile = macos_seatbelt_profile_path(grok_home);
-    if !profile.exists() {
-        return Ok(command.to_owned());
-    }
-    let Some(rest) = command.strip_prefix("grok") else {
-        anyhow::bail!("refusing to launch Grok outside the Boss Seatbelt: command does not start with grok");
-    };
-    Ok(format!(
-        "{MACOS_SANDBOX_EXEC} -f {} grok{rest}",
-        shell_quote(&profile.display().to_string())
-    ))
-}
-
-/// Render the macOS policy that replaces Grok's built-in Seatbelt profile.
-///
-/// The built-in `workspace`/`devbox`/`read-only` profiles all prevent `gh`
-/// from reaching the login keychain. Starting from `allow default` preserves
-/// that mach-service access, then the file rules reconstruct the relevant
-/// workspace/read-only posture. More-specific path allows override the
-/// global write deny; the final workspace/Boss/hook denies remain the most
-/// specific rules for those paths.
-///
-/// `durable_sessions_dir` is this run's own transcript destination — the
-/// resolved target of the `$GROK_HOME/sessions` symlink
-/// ([`crate::transcript_store::provision_durable_sessions`]). It **must** be
-/// granted explicitly even though `grok_home` is already a writable root:
-/// Seatbelt matches the path the kernel resolves, so a write to
-/// `$GROK_HOME/sessions/...` is evaluated against the symlink's target, not
-/// against `$GROK_HOME`. That target lives under Boss's state root — i.e.
-/// inside `boss_data_dir` — so the fence below denies it unless this
-/// narrower, later rule re-grants it. Without the grant Grok's *own* session
-/// write fails with `EPERM`, which the CLI reports as
-/// `FS_PERMISSION_DENIED` / `Operation not permitted (os error 1)` and which
-/// leaves the pane parked on its start menu having never opened a session.
-///
-/// The grant is deliberately one directory wide — this run's sessions
-/// directory and nothing else. The rest of Boss's state root (`state.db`, the
-/// events socket, the control token, other runs' artifacts) stays denied, as
-/// do the CLI-level `Read`/`Edit` belts in [`structural_deny_rules`]: those
-/// govern what the *agent* may touch through its tools, which is a separate
-/// question from what the Grok process needs to persist its own transcript.
-pub fn render_macos_seatbelt_profile(
-    worker_kind: WorkerKind,
-    workspace: &Path,
-    grok_home: &Path,
-    writable_roots: &[std::path::PathBuf],
-    boss_data_dir: Option<&Path>,
-    durable_sessions_dir: Option<&Path>,
-) -> String {
-    let mut profile = String::from(
-        "; Boss-owned Grok sandbox. Keeps filesystem isolation while leaving\n\
-         ; macOS login-keychain services available to gh.\n\
-         (version 1)\n\
-         (allow default)\n\
-         (deny file-write*)\n\
-         (allow file-write*\n\
-           (literal \"/dev/null\")\n\
-           (literal \"/dev/tty\")\n",
-    );
-    for root in writable_roots {
-        profile.push_str(&format!("  (subpath {})\n", seatbelt_string(root)));
-    }
-    profile.push_str(")\n");
-
-    if worker_kind == WorkerKind::Reviewer {
-        profile.push_str(&format!(
-            "(deny file-write* (literal {path}) (subpath {path}))\n",
-            path = seatbelt_string(workspace)
-        ));
-    }
-    if let Some(dir) = boss_data_dir {
-        profile.push_str(&format!(
-            "(deny file-read* file-write* (literal {path}) (subpath {path}))\n",
-            path = seatbelt_string(dir)
-        ));
-    }
-    // Narrower than — and therefore emitted after — the Boss-data-dir fence.
-    if let Some(dir) = durable_sessions_dir {
-        profile.push_str(&format!(
-            "(allow file-read* file-write* (literal {path}) (subpath {path}))\n",
-            path = seatbelt_string(dir)
-        ));
-    }
-
-    let hooks = grok_home.join("hooks");
-    let hooks_paths = grok_home.join("hooks-paths");
-    profile.push_str(&format!(
-        "(deny file-write* (literal {hooks}) (subpath {hooks}) (literal {hooks_paths}))\n",
-        hooks = seatbelt_string(&hooks),
-        hooks_paths = seatbelt_string(&hooks_paths),
-    ));
-    profile
-}
-
-fn seatbelt_string(path: &Path) -> String {
-    let escaped = path
-        .display()
-        .to_string()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r");
-    format!("\"{escaped}\"")
-}
 
 /// Built-in sandbox profile `[profiles.NAME].extends` must name (never
 /// `off`/`none` — investigation §`sandbox.toml` schema). Reviewer is the only
@@ -191,9 +63,9 @@ pub fn sandbox_profile_arg(worker_kind: WorkerKind, is_remote: bool) -> &'static
     }
 }
 
-/// Refuse a local macOS launch before a pane is spawned if the external
-/// Seatbelt selection did not disable Grok's built-in profile. That profile
-/// denies the IOKit power-management capability Bazel requires at startup.
+/// Refuse a local macOS launch before a pane is spawned if Grok's built-in
+/// profile was not disabled. That profile denies the IOKit power-management
+/// capability Bazel requires at startup.
 pub fn ensure_build_tool_capability(is_remote: bool, sandbox_profile: &str) -> anyhow::Result<()> {
     ensure_build_tool_capability_for_platform(is_remote, sandbox_profile, cfg!(target_os = "macos"))
 }
@@ -221,15 +93,13 @@ fn ensure_build_tool_capability_for_platform(
 /// investigation found refuses the worker to start entirely (fail-closed on
 /// the whole profile, not just the bad entry).
 ///
-/// This path carries no counterpart to the durable-sessions grant
-/// [`render_macos_seatbelt_profile`] emits, because Grok's `deny` glob
-/// grammar has no narrower-allow-wins rule to express one. It is reachable
-/// only for a **local non-macOS** worker (see [`uses_external_macos_sandbox`]),
-/// a shape no shipped engine has — Boss's engine is macOS-only, and remote
-/// workers pass `boss_data_dir: None` so no fence is rendered at all. Should a
-/// Linux-hosted local worker ever exist, `$GROK_HOME/sessions` would need to
-/// stop pointing inside the fenced state root rather than the fence learning
-/// an exception.
+/// This path is reachable only for a **local non-macOS** worker: local macOS
+/// Grok workers deliberately use `--sandbox off` so repository test actions
+/// can install their own hermetic Seatbelt profile. Boss's engine is macOS-only,
+/// and remote workers pass `boss_data_dir: None` so no fence is rendered at
+/// all. Should a Linux-hosted local worker ever exist, `$GROK_HOME/sessions`
+/// would need to stop pointing inside the fenced state root rather than the
+/// fence learning an exception.
 pub fn render_sandbox_toml(worker_kind: WorkerKind, boss_data_dir: Option<&Path>) -> String {
     let base = sandbox_base_profile(worker_kind);
     let name = boss_sandbox_profile_name(worker_kind);
@@ -315,7 +185,7 @@ pub fn permission_mode_for_worker_kind(worker_kind: WorkerKind) -> Option<&'stat
 pub fn extra_args(worker_kind: WorkerKind, boss_data_dir: Option<&Path>, is_remote: bool) -> Vec<String> {
     let mut args = vec![
         "--sandbox".to_owned(),
-        if uses_external_macos_sandbox(is_remote) {
+        if cfg!(target_os = "macos") && !is_remote {
             "off".to_owned()
         } else {
             sandbox_profile_arg(worker_kind, is_remote).to_owned()
@@ -467,207 +337,5 @@ mod tests {
             }
         );
         assert!(!args.contains(&"--permission-mode".to_owned()));
-    }
-
-    #[test]
-    fn macos_seatbelt_profile_allows_required_roots_and_denies_reviewer_workspace() {
-        let workspace = PathBuf::from("/cube/workspaces/worker");
-        let grok_home = PathBuf::from("/tmp/grok-home");
-        let roots = vec![workspace.clone(), PathBuf::from("/cube")];
-        let profile = render_macos_seatbelt_profile(
-            WorkerKind::Reviewer,
-            &workspace,
-            &grok_home,
-            &roots,
-            Some(Path::new("/boss-data")),
-            Some(Path::new("/boss-data/executions/run-1/transcripts/grok/sessions")),
-        );
-
-        assert!(profile.contains("(allow default)"), "{profile}");
-        assert!(profile.contains("(deny file-write*)"), "{profile}");
-        assert!(profile.contains("(subpath \"/cube\")"), "{profile}");
-        assert!(
-            profile.contains("(deny file-write* (literal \"/cube/workspaces/worker\")"),
-            "{profile}"
-        );
-        assert!(profile.contains("file-read* file-write*"), "{profile}");
-        assert!(profile.contains("/tmp/grok-home/hooks"), "{profile}");
-        assert!(profile.contains("/tmp/grok-home/hooks-paths"), "{profile}");
-    }
-
-    /// The Boss-data-dir fence and this run's sessions grant overlap: the
-    /// sessions directory lives *inside* the fenced state root. Seatbelt takes
-    /// the last matching rule, so the grant is only effective if it is emitted
-    /// after the deny. Assert the order, not just the presence of both.
-    #[test]
-    fn durable_sessions_grant_is_emitted_after_the_boss_data_dir_fence() {
-        let boss_data = PathBuf::from("/boss-data");
-        let sessions = boss_data.join("executions/run-1/transcripts/grok/sessions");
-        let profile = render_macos_seatbelt_profile(
-            WorkerKind::Standard,
-            Path::new("/cube/workspaces/worker"),
-            Path::new("/tmp/grok-home"),
-            &[PathBuf::from("/tmp/grok-home")],
-            Some(&boss_data),
-            Some(&sessions),
-        );
-
-        let deny = profile
-            .find("(deny file-read* file-write* (literal \"/boss-data\")")
-            .expect("the Boss data dir fence must still be rendered");
-        let allow = profile
-            .find(&format!(
-                "(allow file-read* file-write* (literal \"{}\")",
-                sessions.display()
-            ))
-            .unwrap_or_else(|| panic!("this run's sessions dir must be granted; got:\n{profile}"));
-        assert!(
-            allow > deny,
-            "the sessions grant must follow the fence it narrows; got:\n{profile}"
-        );
-    }
-
-    /// Omitting the grant must not silently widen anything — the fence alone
-    /// is what the pre-#2662 profile looked like, and it is what denied Grok
-    /// its own session write.
-    #[test]
-    fn no_durable_sessions_dir_renders_the_bare_fence() {
-        let profile = render_macos_seatbelt_profile(
-            WorkerKind::Standard,
-            Path::new("/cube/workspaces/worker"),
-            Path::new("/tmp/grok-home"),
-            &[PathBuf::from("/tmp/grok-home")],
-            Some(Path::new("/boss-data")),
-            None,
-        );
-        assert!(
-            profile.contains("(deny file-read* file-write* (literal \"/boss-data\")"),
-            "{profile}"
-        );
-        assert!(!profile.contains("(allow file-read* file-write*"), "{profile}");
-    }
-
-    /// The kernel is the only authority on whether these rules do what the
-    /// text implies, so drive the *rendered* profile through `sandbox-exec`
-    /// against the real symlink layout Boss provisions.
-    ///
-    /// This reproduces the original failure directly: with no grant, a write
-    /// through `$GROK_HOME/sessions` fails `Operation not permitted` — the
-    /// `os error 1` Grok surfaces as `FS_PERMISSION_DENIED` — because Seatbelt
-    /// matches the symlink's target inside the fenced state root, not the
-    /// `$GROK_HOME` subpath allow.
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn seatbelt_grants_the_sessions_link_target_without_unfencing_the_state_root() {
-        let Some(temp) = seatbelt_capable_tempdir() else {
-            return;
-        };
-        let root = std::fs::canonicalize(temp.path()).unwrap();
-        let boss_data = root.join("boss-data");
-        let sessions = boss_data.join("executions/run-1/transcripts/grok/sessions");
-        let grok_home = root.join("grok-home");
-        std::fs::create_dir_all(&sessions).unwrap();
-        std::fs::create_dir_all(&grok_home).unwrap();
-        std::os::unix::fs::symlink(&sessions, grok_home.join("sessions")).unwrap();
-
-        let render = |grant: Option<&Path>| {
-            render_macos_seatbelt_profile(
-                WorkerKind::Standard,
-                &root.join("workspace"),
-                &grok_home,
-                std::slice::from_ref(&grok_home),
-                Some(&boss_data),
-                grant,
-            )
-        };
-
-        // Without the grant: the symlinked write is denied, exactly as observed.
-        let denied = run_under_profile(&root, &render(None), &grok_home.join("sessions/session.json")).unwrap();
-        assert!(
-            !denied.status.success(),
-            "the fence must deny the sessions link target when it is not granted"
-        );
-        assert!(
-            String::from_utf8_lossy(&denied.stderr).contains("Operation not permitted"),
-            "expected the EPERM Grok reports as FS_PERMISSION_DENIED; got {denied:?}"
-        );
-
-        // With the grant: Grok can write its own session state.
-        let allowed = run_under_profile(
-            &root,
-            &render(Some(&sessions)),
-            &grok_home.join("sessions/session.json"),
-        )
-        .unwrap();
-        assert!(
-            allowed.status.success(),
-            "Grok must be able to create its session file: {}",
-            String::from_utf8_lossy(&allowed.stderr)
-        );
-
-        // ...and the rest of Boss's state root stays fenced.
-        let fenced = run_under_profile(&root, &render(Some(&sessions)), &boss_data.join("state.db")).unwrap();
-        assert!(
-            !fenced.status.success(),
-            "granting this run's sessions dir must not unfence the Boss state root"
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    fn run_under_profile(root: &Path, profile: &str, target: &Path) -> std::io::Result<std::process::Output> {
-        let profile_path = root.join("boss-seatbelt.sb");
-        std::fs::write(&profile_path, profile).unwrap();
-        std::process::Command::new(MACOS_SANDBOX_EXEC)
-            .arg("-f")
-            .arg(&profile_path)
-            .arg("/usr/bin/touch")
-            .arg(target)
-            .output()
-    }
-
-    /// `sandbox-exec` cannot nest inside some build sandboxes. Probe with a
-    /// fully permissive profile so a host that cannot run Seatbelt at all is
-    /// reported as such rather than mimicking a policy failure.
-    #[cfg(target_os = "macos")]
-    fn seatbelt_capable_tempdir() -> Option<tempfile::TempDir> {
-        let temp = tempfile::TempDir::new().unwrap();
-        let probe = temp.path().join("probe");
-        match run_under_profile(temp.path(), "(version 1)\n(allow default)\n", &probe) {
-            Ok(output) if output.status.success() => Some(temp),
-            Ok(output) => {
-                eprintln!(
-                    "skipping: this host cannot nest sandbox-exec ({})",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-                None
-            }
-            Err(err) => {
-                eprintln!("skipping: sandbox-exec is not invocable here ({err})");
-                None
-            }
-        }
-    }
-
-    #[test]
-    fn macos_wrapper_activates_only_when_profile_exists() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let command = "grok --model grok-4.6\n";
-        assert_eq!(wrap_with_macos_seatbelt(command, temp.path()).unwrap(), command);
-
-        std::fs::write(macos_seatbelt_profile_path(temp.path()), "(version 1)\n").unwrap();
-        let wrapped = wrap_with_macos_seatbelt(command, temp.path()).unwrap();
-        assert!(wrapped.starts_with("/usr/bin/sandbox-exec -f "), "{wrapped}");
-        assert!(wrapped.ends_with(" grok --model grok-4.6\n"), "{wrapped}");
-    }
-
-    #[test]
-    fn macos_wrapper_refuses_unrecognised_command_when_profile_exists() {
-        let temp = tempfile::TempDir::new().unwrap();
-        std::fs::write(macos_seatbelt_profile_path(temp.path()), "(version 1)\n").unwrap();
-
-        let error = wrap_with_macos_seatbelt("env grok --model grok-4.6", temp.path())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("outside the Boss Seatbelt"), "{error}");
     }
 }

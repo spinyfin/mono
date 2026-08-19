@@ -28,9 +28,7 @@ use boss_protocol::{NormalizeError, PaneMonitorSpec, WorkerEvent};
 use boss_ssh_transport::shell_quote;
 use serde_json::Value;
 
-use crate::transcript_store::{
-    durable_sessions_dir, resolve_durable_sessions_dir, transcript_store_root, verified_durable_sessions_dir,
-};
+use crate::transcript_store::{durable_sessions_dir, transcript_store_root, verified_durable_sessions_dir};
 
 /// Namespace this driver's durable transcripts are filed under in Boss's
 /// worker transcript store. Every caller that resolves, provisions, or grants
@@ -59,7 +57,6 @@ pub use home::{
 use classify_error::classify_grok_error;
 use environment::GrokProcessEnvironment;
 use home::{provision_grok_home, read_session_id, read_workspace_path_stamp};
-use preflight::run_worker_preflight_under_macos_seatbelt;
 use progress::GrokProgressSession;
 use transcript::GrokTranscriptSession;
 use turn_end_recovery::{is_cancelled_turn_end, prepare_snapshot};
@@ -393,22 +390,7 @@ impl AgentDriver for GrokDriver {
         });
         let workspace_for_cwd = read_workspace_path_stamp(&grok_home).unwrap_or_else(|_| PathBuf::from("."));
 
-        let command = match permissions::wrap_with_macos_seatbelt(
-            &build_grok_pane_command(&request, &workspace_for_cwd, &session_id),
-            &grok_home,
-        ) {
-            Ok(command) => command,
-            Err(error) => {
-                tracing::error!(run_id, error = %error, "refusing to spawn Grok worker outside the Boss Seatbelt");
-                return SpawnPlan {
-                    env: Vec::new(),
-                    command: format!(
-                        "echo {} >&2; exit 1\n",
-                        shell_quote(&format!("Grok worker Seatbelt setup failed: {error:#}"))
-                    ),
-                };
-            }
-        };
+        let command = build_grok_pane_command(&request, &workspace_for_cwd, &session_id);
 
         // Defence-in-depth: never emit worktree flags (cube owns workspaces).
         debug_assert!(!command.contains("--worktree") && !command.contains(" -w ") && !command.contains("\t-w "));
@@ -459,10 +441,9 @@ impl AgentDriver for GrokDriver {
     /// wrote.
     ///
     /// Also writes the full permission-policy artifacts. Local macOS workers
-    /// use a Boss-owned Seatbelt profile because every Grok built-in profile
-    /// blocks the login-keychain service `gh` needs; other platforms retain
-    /// Grok's custom `sandbox.toml`. Both paths layer the Boss-data-dir fence
-    /// on the worker kind's workspace/read-only posture. CLI `--deny` rules
+    /// use `--sandbox off`: their terminal commands are not OS-confined, so
+    /// repository test actions can install their own hermetic Seatbelt profile.
+    /// Other platforms retain Grok's custom `sandbox.toml`. CLI `--deny` rules
     /// remain an independent belt for `rm -rf`, `sudo`, and `bossctl`.
     async fn write_permission_config(
         &self,
@@ -520,54 +501,15 @@ impl AgentDriver for GrokDriver {
             .with_context(|| format!("writing Grok hook wiring under {}", grok_home.display()))?;
         config_files.push(grok_home.join("config.toml"));
 
-        // Boss data dir for the sandbox's kernel-level deny and the CLI
-        // Read/Edit belt — `None` on remote (see `interception.data_dir` above).
+        // Boss data dir for the CLI Read/Edit belt — `None` on remote (see
+        // `interception.data_dir` above).
         let boss_data_dir = if input.is_remote {
             None
         } else {
             input.events_socket_path.parent().map(|p| p.to_path_buf())
         };
 
-        let uses_external_macos_sandbox = permissions::uses_external_macos_sandbox(input.is_remote);
-        if uses_external_macos_sandbox {
-            let process_home = process_home_for_run(&input.run_id)?;
-            let auth_source = resolve_grok_auth_source();
-            let environment = GrokProcessEnvironment::resolve(&grok_home, &process_home, &auth_source)
-                .context("resolving Grok environment for macOS Seatbelt policy")?;
-            let profile_path = permissions::macos_seatbelt_profile_path(&grok_home);
-            // Grok writes its session state through `$GROK_HOME/sessions`, a
-            // symlink into Boss's state root. Seatbelt matches the resolved
-            // target, so the profile has to name it or the Boss-data-dir
-            // fence denies Grok its own transcript. Resolve (never guess) it.
-            let durable_sessions_dir = resolve_durable_sessions_dir(&grok_home, TRANSCRIPT_DRIVER_SLUG, &input.run_id)
-                .with_context(|| {
-                    format!(
-                        "resolving the durable Grok sessions directory linked from {}/sessions so the \
-                         macOS Seatbelt profile can grant it",
-                        grok_home.display()
-                    )
-                })?;
-            fs::write(
-                &profile_path,
-                permissions::render_macos_seatbelt_profile(
-                    input.worker_kind,
-                    &input.workspace_path,
-                    &grok_home,
-                    &environment.macos_writable_roots(&input.workspace_path),
-                    boss_data_dir.as_deref(),
-                    Some(durable_sessions_dir.as_path()),
-                ),
-            )
-            .with_context(|| format!("writing {}", profile_path.display()))?;
-            fs::read_to_string(&profile_path)
-                .with_context(|| format!("verifying {} is readable", profile_path.display()))?;
-            config_files.push(profile_path.clone());
-
-            if !home::skip_posture_assert() {
-                run_worker_preflight_under_macos_seatbelt(&input.workspace_path, &environment, &profile_path)
-                    .context("running fail-fast Grok capability preflight under macOS Seatbelt")?;
-            }
-        } else if !input.is_remote {
+        if !cfg!(target_os = "macos") && !input.is_remote {
             let sandbox_toml_path = grok_home.join("sandbox.toml");
             fs::write(
                 &sandbox_toml_path,
@@ -1997,34 +1939,18 @@ mod tests {
         let artifacts = driver.write_permission_config(&input, tmp.path()).await.unwrap();
 
         let grok_home = grok_home_for_run(run_id).unwrap();
-        if permissions::uses_external_macos_sandbox(false) {
-            let profile_path = permissions::macos_seatbelt_profile_path(&grok_home);
+        if cfg!(target_os = "macos") {
             assert!(
-                artifacts.config_files.contains(&profile_path),
-                "{:?}",
-                artifacts.config_files
-            );
-            let profile = fs::read_to_string(profile_path).unwrap();
-            assert!(profile.contains("(allow default)"), "{profile}");
-            assert!(profile.contains("(deny file-write*)"), "{profile}");
-            assert!(profile.contains(&boss_data_dir.display().to_string()), "{profile}");
-            // The end-to-end proof that the sessions link target — not just
-            // `$GROK_HOME` — is named in the profile the pane actually runs
-            // under. Resolve it the same way the kernel will.
-            let sessions = fs::canonicalize(grok_home.join("sessions")).unwrap();
-            assert!(
-                profile.contains(&format!(
-                    "(allow file-read* file-write* (literal \"{}\")",
-                    sessions.display()
-                )),
-                "Grok's own session store must be granted; got:\n{profile}"
+                !grok_home.join("boss-seatbelt.sb").exists(),
+                "local Grok workers must not materialize a Boss Seatbelt profile"
             );
             let spawn = driver.spawn_invocation(spawn_request("grok-4.6", run_id));
             assert!(
-                spawn.command.starts_with("/usr/bin/sandbox-exec -f "),
-                "local macOS pane must run inside the rendered profile: {}",
+                !spawn.command.contains("sandbox-exec"),
+                "local macOS pane must launch without an outer Seatbelt: {}",
                 spawn.command
             );
+            assert!(spawn.command.starts_with("grok "), "{}", spawn.command);
         } else {
             let sandbox_toml_path = grok_home.join("sandbox.toml");
             assert!(
@@ -2130,11 +2056,10 @@ mod tests {
         );
 
         let grok_home = grok_home_for_run(run_id).unwrap();
-        if permissions::uses_external_macos_sandbox(false) {
-            let profile = fs::read_to_string(permissions::macos_seatbelt_profile_path(&grok_home)).unwrap();
+        if cfg!(target_os = "macos") {
             assert!(
-                profile.contains(&format!("(deny file-write* (literal \"{}\")", workspace.display())),
-                "{profile}"
+                !grok_home.join("boss-seatbelt.sb").exists(),
+                "local macOS reviewer workers must not materialize a Boss Seatbelt profile"
             );
         } else {
             let sandbox_toml = fs::read_to_string(grok_home.join("sandbox.toml")).unwrap();
@@ -2652,14 +2577,7 @@ mod tests {
         extra_args: &[String],
     ) -> std::process::Output {
         let session_id = home::new_session_uuid().unwrap();
-        let seatbelt_profile = permissions::macos_seatbelt_profile_path(grok_home);
-        let mut cmd = if seatbelt_profile.exists() {
-            let mut command = std::process::Command::new("/usr/bin/sandbox-exec");
-            command.arg("-f").arg(&seatbelt_profile).arg("grok");
-            command
-        } else {
-            std::process::Command::new("grok")
-        };
+        let mut cmd = std::process::Command::new("grok");
         let environment = GrokProcessEnvironment::resolve(grok_home, process_home, &home::resolve_grok_auth_source())
             .expect("live probe environment must resolve");
         environment.apply_to_command(&mut cmd);
