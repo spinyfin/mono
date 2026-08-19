@@ -346,6 +346,10 @@ async fn start_tmux_worker(
         .await
         .context("creating detached tmux session")
         .map_err(StartWorkerError::Tmux)?;
+    crate::tmux_session_options::apply(&host.tmux, &host.session_name)
+        .await
+        .context("applying Boss worker tmux session options")
+        .map_err(StartWorkerError::Tmux)?;
     host.tmux
         .set_option(&host.session_name, TMUX_SPAWN_TOKEN_OPTION, &spawn_token)
         .await
@@ -1063,7 +1067,11 @@ mod tests {
                 .collect::<Vec<_>>();
             let (step, stdout) = match args.get(2).map(String::as_str) {
                 Some("new-session") => ("new-session", ""),
-                Some("set-option") => ("label", ""),
+                Some("set-option") => match args.get(5).map(|option| option.as_str()) {
+                    Some("status") => ("presentation", ""),
+                    Some("@boss_spawn_token") => ("label", ""),
+                    other => panic!("unexpected tmux set-option: {other:?}, args={args:?}"),
+                },
                 Some("display-message") => ("pane-pid", "4242\n"),
                 other => panic!("unexpected tmux command: {other:?}, args={args:?}"),
             };
@@ -1114,7 +1122,7 @@ mod tests {
         }
         assert_eq!(
             store.steps(),
-            vec!["intent", "new-session", "label", "pane-pid", "created"]
+            vec!["intent", "new-session", "presentation", "label", "pane-pid", "created"]
         );
 
         let calls = runner.calls();
@@ -1138,10 +1146,15 @@ mod tests {
         );
         assert_eq!(
             &calls[1][..6],
+            ["-L", "boss", "set-option", "-t", "boss-3-run-test", "status"]
+        );
+        assert_eq!(calls[1][6], "off");
+        assert_eq!(
+            &calls[2][..6],
             ["-L", "boss", "set-option", "-t", "boss-3-run-test", "@boss_spawn_token"]
         );
         assert_eq!(
-            calls[2],
+            calls[3],
             vec![
                 "-L",
                 "boss",
