@@ -225,11 +225,25 @@ fn execution_id_with_driver(server_state: &ServerState, driver: Option<&str>) ->
             )
             .unwrap();
     }
-    server_state
+    let execution = server_state
         .work_db
         .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
-        .unwrap()
-        .id
+        .unwrap();
+    // The pane-input boundary reads the *launched* driver
+    // (`work_executions.driver`), which production freezes via
+    // `record_execution_launch_config` right after the worker's pane
+    // spawns — before any pane write can reach it. Mirror that here so
+    // fixtures built before a pane exists behave like a real run.
+    server_state
+        .work_db
+        .record_execution_launch_config(
+            &execution.id,
+            driver.unwrap_or(boss_engine_effort::ENGINE_DEFAULT_DRIVER),
+            "test-model",
+            None,
+        )
+        .unwrap();
+    execution.id
 }
 
 mod answer_agent_lifecycle;
