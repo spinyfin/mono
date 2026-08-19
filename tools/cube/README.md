@@ -90,13 +90,20 @@ automatically: `CUBE_WORKSPACE` (absolute path to the leased workspace
 directory the command runs in) and `CUBE_BASE_REPO` (absolute path to the
 repo pool's source checkout, i.e. the `source` path from `cube repo info`
 — present only when the repo has a source path configured). These let
-checked-in setup commands reference machine-independent paths:
+checked-in setup commands reference machine-independent paths. A step may
+set `allow_failure: true` when a non-zero exit is tolerable (for example
+copying a gitignored local file that a clean clone will not have). Cube
+still records the step as failed, prints a warning naming the step and
+the command's stderr, and continues the lease; it does **not** persist
+setup state for that step, so the next lease retries it. Omitting the
+field (or setting it `false`) keeps the existing fatal behaviour.
 
 ```yaml
 steps:
   - id: copy-config-secrets
     command: cp "$CUBE_BASE_REPO/backend/config-secrets.toml" backend/config-secrets.toml
     run_when: on-create
+    allow_failure: true
 ```
 
 Every command supports a `--json` mode, making `cube` scriptable: Boss

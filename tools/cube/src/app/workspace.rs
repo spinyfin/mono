@@ -435,7 +435,7 @@ pub(super) fn run_workspace(
                 );
 
                 if let Some(failure) = setup_report.first_failure() {
-                    let StepStatus::Failed { error } = &failure.status else {
+                    let StepStatus::Failed { error, .. } = &failure.status else {
                         unreachable!("first_failure returned non-failure step");
                     };
                     return Err(CubeError::SetupStepFailed {
@@ -1221,7 +1221,7 @@ pub(super) fn run_workspace(
             );
 
             if let Some(failure) = setup_report.first_failure() {
-                let StepStatus::Failed { error } = &failure.status else {
+                let StepStatus::Failed { error, .. } = &failure.status else {
                     unreachable!("first_failure returned non-failure step");
                 };
                 if release_on_setup_failure {
@@ -1670,7 +1670,7 @@ pub(super) fn run_workspace(
                 "setup": report,
             });
             if let Some(failure) = report.first_failure() {
-                let StepStatus::Failed { error } = &failure.status else {
+                let StepStatus::Failed { error, .. } = &failure.status else {
                     unreachable!("first_failure returned non-failure step");
                 };
                 return Err(CubeError::SetupStepFailed {
