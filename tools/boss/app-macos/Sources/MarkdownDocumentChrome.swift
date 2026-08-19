@@ -731,7 +731,7 @@ private struct CollapsibleMarkdownSection: View {
                     .font(.callout.weight(.semibold))
                     .foregroundStyle(BossMarkdownPalette.muted)
                 Text(heading)
-                    .font(.system(size: BossHeadingStyle.bodyPointSize * BossHeadingStyle.fontScales[1], weight: BossHeadingStyle.weights[1]))
+                    .font(.system(size: BossHeadingStyle.bodyPointSize * BossHeadingStyle.compactFontScales[1], weight: BossHeadingStyle.compactWeights[1]))
                     .foregroundStyle(BossMarkdownPalette.ink)
                     .tracking(-0.3)
                 Spacer(minLength: 8)

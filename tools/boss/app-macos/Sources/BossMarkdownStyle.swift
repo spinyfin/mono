@@ -144,6 +144,31 @@ extension View {
     }
 }
 
+/// Editorial measurements stay relative to SwiftUI's system body font. That
+/// keeps the document reader's proportions intact as Dynamic Type changes.
+private enum MarkdownEditorialMetrics {
+    /// Slightly enlarge long-form prose while retaining the user's system
+    /// type-size preference as the source of truth.
+    static let bodyScale: CGFloat = 1.12
+
+    /// H1–H6 descend from the editorial body size, not a fixed point scale.
+    /// The first three levels follow the reference hierarchy directly; the
+    /// remaining levels provide a smooth continuation for deeply structured
+    /// documents.
+    static let headingScales: [CGFloat] = [
+        2.75,
+        1.30,
+        1.10,
+        1.00,
+        0.94,
+        0.88,
+    ].map { $0 * bodyScale }
+
+    /// A fenced block is smaller than prose, but still follows the enlarged
+    /// editorial body size instead of falling back to the compact scale.
+    static let codeBlockScale: CGFloat = 0.82 * bodyScale
+}
+
 // MARK: - Heading
 
 struct BossHeadingStyle: StructuredText.HeadingStyle {
@@ -158,7 +183,7 @@ struct BossHeadingStyle: StructuredText.HeadingStyle {
     // `configuration.label`, so it can't use `.textual.fontScale`. It instead
     // reads these same arrays directly so its folded H2 heading can never
     // drift out of sync with this editorial H2 treatment again.
-    static let fontScales: [CGFloat] = [
+    static let compactFontScales: [CGFloat] = [
         26.0 / 17.0,
         22.0 / 17.0,
         18.0 / 17.0,
@@ -166,10 +191,15 @@ struct BossHeadingStyle: StructuredText.HeadingStyle {
         14.0 / 17.0,
         14.0 / 17.0,
     ]
-    static let weights: [Font.Weight] = [
+    private static let editorialWeights: [Font.Weight] = [
+        .heavy, .semibold, .semibold, .semibold, .semibold, .semibold,
+    ]
+    // Not `private`: shared with `CollapsibleMarkdownSection` for the same
+    // reason as `compactFontScales` above.
+    static let compactWeights: [Font.Weight] = [
         .bold, .semibold, .semibold, .semibold, .semibold, .semibold,
     ]
-    /// The macOS system body point size `fontScales` is expressed relative
+    /// The macOS system body point size `compactFontScales` is expressed relative
     /// to — shared with `CollapsibleMarkdownSection` for the same reason.
     static let bodyPointSize: CGFloat = 17.0
     /// Shared with `CollapsibleMarkdownSection`, which folds a heading-
@@ -188,11 +218,11 @@ struct BossHeadingStyle: StructuredText.HeadingStyle {
                     .fill(BossMarkdownPalette.hairline)
                     .frame(height: 1)
             }
-            .textual.blockSpacing(.init(top: Self.headingBlockSpacingTop, bottom: Self.headingBlockSpacingBottom))
+            .textual.blockSpacing(editorialHeadingSpacing(for: level))
             .proseMeasureClamped()
         } else {
             headingLabel(configuration: configuration, level: level)
-                .textual.blockSpacing(.init(top: Self.headingBlockSpacingTop, bottom: Self.headingBlockSpacingBottom))
+                .textual.blockSpacing(editorialHeadingSpacing(for: level))
                 .proseMeasureClamped()
         }
     }
@@ -202,17 +232,33 @@ struct BossHeadingStyle: StructuredText.HeadingStyle {
     private func headingLabel(configuration: Configuration, level: Int) -> some View {
         if editorial {
             configuration.label
-                .textual.fontScale(Self.fontScales[level - 1])
-                .textual.lineSpacing(.fontScaled(0.125))
+                .textual.fontScale(MarkdownEditorialMetrics.headingScales[level - 1])
+                .textual.lineSpacing(.fontScaled(level == 1 ? 0.05 : 0.125))
                 .font(.system(.body, design: .default))
-                .fontWeight(Self.weights[level - 1])
+                .fontWeight(Self.editorialWeights[level - 1])
                 .foregroundStyle(BossMarkdownPalette.ink)
-                .tracking(level <= 2 ? -0.3 : 0)
+                .tracking(level <= 2 ? -0.025 * 17 : 0)
         } else {
             configuration.label
-                .textual.fontScale(Self.fontScales[level - 1])
+                .textual.fontScale(Self.compactFontScales[level - 1])
                 .textual.lineSpacing(.fontScaled(0.125))
-                .fontWeight(Self.weights[level - 1])
+                .fontWeight(Self.compactWeights[level - 1])
+        }
+    }
+
+    private func editorialHeadingSpacing(for level: Int) -> FontScaled<StructuredText.BlockSpacing> {
+        guard editorial else {
+            return .fontScaled(top: 16.0 / 17.0, bottom: 8.0 / 17.0)
+        }
+        return switch level {
+        case 1:
+            FontScaled<StructuredText.BlockSpacing>.fontScaled(top: 1.5, bottom: 1)
+        case 2:
+            FontScaled<StructuredText.BlockSpacing>.fontScaled(top: 3, bottom: 0.75)
+        case 3:
+            FontScaled<StructuredText.BlockSpacing>.fontScaled(top: 2, bottom: 0.6)
+        default:
+            FontScaled<StructuredText.BlockSpacing>.fontScaled(top: 1.5, bottom: 0.6)
         }
     }
 }
@@ -237,12 +283,13 @@ struct BossParagraphStyle: StructuredText.ParagraphStyle {
         if editorial {
             configuration.label
                 .font(.system(.body, design: .serif))
+                .textual.fontScale(MarkdownEditorialMetrics.bodyScale)
                 .foregroundStyle(BossMarkdownPalette.ink)
                 // SwiftUI `lineSpacing` is extra leading on top of the natural
-                // ~1.2em line box, so 0.45em additional lands near the 1.65
-                // reference line-height (0.65em additional was ~1.85).
-                .textual.lineSpacing(.fontScaled(0.45))
-                .textual.blockSpacing(.init(top: 0, bottom: 18))
+                // ~1.2em line box. With the enlarged editorial body, 0.5em
+                // additional leading lands near the 1.65 reference line-height.
+                .textual.lineSpacing(.fontScaled(0.5))
+                .textual.blockSpacing(.fontScaled(top: 0, bottom: 1))
                 .proseMeasureClamped()
         } else {
             configuration.label
@@ -278,6 +325,7 @@ struct BossListItemStyle: StructuredText.ListItemStyle {
             StructuredText.DefaultListItemStyle.default
                 .makeBody(configuration: configuration)
                 .font(.system(.body, design: .serif))
+                .textual.fontScale(MarkdownEditorialMetrics.bodyScale)
                 .foregroundStyle(BossMarkdownPalette.ink)
                 .proseMeasureClamped()
         } else {
@@ -341,8 +389,8 @@ struct BossCodeBlockStyle: StructuredText.CodeBlockStyle {
         if editorial {
             Overflow {
                 configuration.label
-                    .textual.lineSpacing(.fontScaled(0.225))
-                    .textual.fontScale(0.85)
+                    .textual.lineSpacing(.fontScaled(0.35))
+                    .textual.fontScale(MarkdownEditorialMetrics.codeBlockScale)
                     .fixedSize(horizontal: false, vertical: true)
                     .monospaced()
                     .padding(12)
@@ -633,6 +681,59 @@ extension StructuredText.TableLayout {
 
 // MARK: - Inline
 
+/// Marks code runs that need the editorial inline-code box. Textual's inline
+/// style API exposes attributed-text properties, while its public text-layout
+/// preference supplies the final run geometry needed to draw a rounded border.
+private struct EditorialInlineCodeBoxAttribute: AttributedStringKey, TextAttribute {
+    typealias Value = Bool
+    static let name = "dev.spinyfin.boss.editorial-inline-code-box"
+}
+
+private struct EditorialInlineCodeBoxProperty: TextProperty {
+    func apply(in attributes: inout AttributeContainer, environment _: TextEnvironmentValues) {
+        attributes[EditorialInlineCodeBoxAttribute.self] = true
+    }
+}
+
+/// Paints an editorial code box behind each marked inline-code run. The
+/// decoration is deliberately a background: it never participates in hit
+/// testing or text selection, and a fenced block remains the only code form
+/// with a leading rail.
+private struct EditorialInlineCodeBoxDecoration: ViewModifier {
+    @Environment(\.markdownEditorialStyle) private var editorial
+
+    func body(content: Content) -> some View {
+        content.backgroundPreferenceValue(Text.LayoutKey.self) { layouts in
+            GeometryReader { geometry in
+                Canvas { context, _ in
+                    guard editorial else { return }
+                    for anchoredLayout in layouts {
+                        let origin = geometry[anchoredLayout.origin]
+                        context.drawLayer { layer in
+                            layer.translateBy(x: origin.x, y: origin.y)
+                            for line in anchoredLayout.layout {
+                                for run in line {
+                                    guard run[EditorialInlineCodeBoxAttribute.self] != nil else { continue }
+                                    let bounds = run.typographicBounds.rect
+                                    let padding = bounds.height * 0.1
+                                    let box = bounds.insetBy(dx: -padding, dy: -padding)
+                                    let path = Path(roundedRect: box, cornerRadius: 2)
+                                    layer.fill(path, with: .style(BossMarkdownPalette.surface))
+                                    layer.stroke(
+                                        path,
+                                        with: .style(BossMarkdownPalette.hairline),
+                                        lineWidth: 1
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 extension InlineStyle {
     static func boss(editorial: Bool) -> InlineStyle {
         if editorial {
@@ -640,7 +741,7 @@ extension InlineStyle {
                 .code(
                     .font(.system(.callout, design: .monospaced)),
                     .foregroundColor(BossMarkdownPalette.ink),
-                    .backgroundColor(BossMarkdownPalette.surface)
+                    EditorialInlineCodeBoxProperty()
                 )
                 .strong(.fontWeight(.semibold))
                 .link(
@@ -699,6 +800,7 @@ private struct BossMarkdownTheme<Content: View>: View {
         content
             .textual.structuredTextStyle(BossStructuredTextStyle(editorial: isEditorial))
             .textual.highlighterTheme(isEditorial ? BossMarkdownHighlighterTheme.editorial : .default)
+            .modifier(EditorialInlineCodeBoxDecoration())
     }
 }
 
