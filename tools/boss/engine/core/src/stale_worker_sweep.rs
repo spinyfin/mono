@@ -300,9 +300,8 @@ impl WorkerTerminalInspector for TmuxWorkerTerminalInspector {
 }
 
 /// Resolve any open `stale_worker` attention for the work item backing
-/// `execution_id`. Called from the sweep itself and from
-/// [`crate::app::ServerState::release_worker_pane`] so a slot leaving the
-/// live-state registry — complete, stop, or reap — cannot strand the item.
+/// `execution_id`. Used by teardown paths that have an execution id but not
+/// its work item id.
 pub fn resolve_stale_worker_attention(work_db: &WorkDb, execution_id: &str) {
     let Some(execution) = crate::sweep_loop::lookup_execution_or_warn(
         work_db,
@@ -311,9 +310,17 @@ pub fn resolve_stale_worker_attention(work_db: &WorkDb, execution_id: &str) {
     ) else {
         return;
     };
-    if let Err(err) = work_db.resolve_external_tracker_attention(&execution.work_item_id, STALE_WORKER_ATTENTION_KIND) {
+    resolve_stale_worker_attention_for_work_item(work_db, &execution.work_item_id);
+}
+
+/// Resolve any open `stale_worker` attention for `work_item_id`.
+///
+/// The stale-worker sweep already has the execution row, so using this
+/// variant avoids an extra execution lookup for every checked slot.
+pub fn resolve_stale_worker_attention_for_work_item(work_db: &WorkDb, work_item_id: &str) {
+    if let Err(err) = work_db.resolve_external_tracker_attention(work_item_id, STALE_WORKER_ATTENTION_KIND) {
         tracing::warn!(
-            execution_id,
+            work_item_id,
             ?err,
             "stale-worker sweep: failed to resolve stale-worker attention"
         );
@@ -580,7 +587,7 @@ pub async fn run_one_pass_with_terminal(
             continue;
         };
         if execution.status.is_terminal() {
-            resolve_stale_worker_attention(work_db, &state.run_id);
+            resolve_stale_worker_attention_for_work_item(work_db, &execution.work_item_id);
             continue;
         }
 
@@ -628,7 +635,7 @@ pub async fn run_one_pass_with_terminal(
             ) {
                 WorkerLiveness::AliveAndWorking => {
                     outcome.alive_and_working += 1;
-                    resolve_stale_worker_attention(work_db, &state.run_id);
+                    resolve_stale_worker_attention_for_work_item(work_db, &execution.work_item_id);
                 }
                 WorkerLiveness::AliveAndGenuinelyStuck {
                     session_name,
@@ -683,12 +690,6 @@ pub async fn run_one_pass_with_terminal(
                         reason,
                         "stale-worker sweep: tmux reports a dead worker; reconciling it",
                     );
-                    // The reap below releases the pool slot and drops this
-                    // slot's live-state entry, so no later pass can
-                    // reconcile a still-open stale_worker attention for this
-                    // work item — resolve it now while we still hold
-                    // `execution.work_item_id`.
-                    resolve_stale_worker_attention(work_db, &state.run_id);
                     if crate::dead_pid_sweep::reap_observed_worker_death(
                         work_db,
                         live_states,
@@ -820,7 +821,7 @@ pub async fn run_one_pass_with_terminal(
         // entry, so no later pass can reconcile a still-open stale_worker
         // attention for this work item — resolve it now while we still hold
         // `execution.work_item_id`.
-        resolve_stale_worker_attention(work_db, execution_id);
+        resolve_stale_worker_attention_for_work_item(work_db, &execution.work_item_id);
 
         // Reap termination path (stale-worker sweep): tear down any
         // driver-owned state outside the workspace. `mark_execution_orphaned`
@@ -1978,8 +1979,9 @@ mod tests {
     }
 
     /// `#{pane_current_command}` the stuck-classifier compares to the driver
-    /// binary. Observed 2026-08-19 on this machine's only live Boss pane
-    /// (`boss-coordinator`): `2.1.235` — not a binary name. Worker panes are
+    /// binary. A live Boss coordinator pane reported `#{pane_current_command}`
+    /// as `2.1.235` (observed 2026-08-19) — a version string, not a binary
+    /// name. Worker panes are
     /// spawned as `<login-shell> -l -i -c '. .boss/<script>'`, so this field
     /// is the sourced script's current child (`claude` when the descriptor
     /// is on PATH as itself; otherwise `node`, the shell, or a version

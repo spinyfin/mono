@@ -714,9 +714,11 @@ struct ReapOptions<'a> {
 /// `dead_pid_reconcile` dispatch event, and (when
 /// `file_pane_death_attention` is set) file a durable
 /// [`PANE_DEATH_ATTENTION_KIND`] attention item. Shared between
-/// [`run_one_pass`] and [`reap_reported_pane_death`] so all paths — the
-/// periodic sweep, an app-reattach reconcile, and an authoritative app
-/// report — leave the DB, pool, and audit trail in the same shape.
+/// [`run_one_pass`], [`reap_reported_pane_death`], and
+/// [`reap_observed_worker_death`] so all paths — the periodic sweep, an
+/// app-reattach reconcile, an authoritative app report, and a death the
+/// engine itself observed in tmux — leave the DB, pool, and audit trail in
+/// the same shape.
 /// Returns `false` (with no other effect) if the DB write to mark the
 /// execution orphaned fails.
 async fn reap_dead_execution(
@@ -762,6 +764,12 @@ async fn reap_dead_execution(
         );
         return false;
     }
+
+    // Every dead-worker reap removes this slot from the live-state registry.
+    // Resolve the work item's stale-worker attention before that happens so
+    // the periodic sweep, app-driven paths, and tmux-observed death path
+    // cannot strand an attention item after the slot is gone.
+    crate::stale_worker_sweep::resolve_stale_worker_attention_for_work_item(work_db, &execution.work_item_id);
 
     // Reap termination path (dead-pid reconcile): tear down any
     // driver-owned state outside the workspace. `mark_execution_orphaned`
@@ -1745,6 +1753,13 @@ mod tests {
 
         let execution_id = create_old_execution(&db, &work_item_id);
         let started = started_epoch_of(&db, &execution_id);
+        db.upsert_external_tracker_attention(
+            &work_item_id,
+            crate::stale_worker_sweep::STALE_WORKER_ATTENTION_KIND,
+            "Worker appears stuck; inspection required",
+            "prior body",
+        )
+        .unwrap();
         let live_states = Arc::new(LiveWorkerStateRegistry::new());
         register_slot_with_binding(&live_states, 1, &execution_id, dead_pid(), &work_item_id);
         drive_working_idle(&live_states, 1); // Working, no tool in flight
@@ -1771,6 +1786,15 @@ mod tests {
         assert_eq!(
             db.get_execution(&execution_id).unwrap().status,
             ExecutionStatus::Orphaned
+        );
+        assert!(
+            db.list_attention_items_for_work_item(&work_item_id)
+                .unwrap()
+                .into_iter()
+                .all(|item| {
+                    item.kind != crate::stale_worker_sweep::STALE_WORKER_ATTENTION_KIND || item.status != "open"
+                }),
+            "the periodic dead-pid reap must resolve stale-worker attention before dropping the slot",
         );
 
         // The reap event carries what the liveness probe observed (probe
