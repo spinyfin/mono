@@ -268,7 +268,9 @@ impl WorkerTerminalInspector for TmuxWorkerTerminalInspector {
         )
         .await;
         match observation.adoption_state {
-            boss_protocol::TmuxAdoptionState::NotTmuxHosted => Ok(None),
+            // `tmux_run_for_execution` above found the durable identity;
+            // only the panes collector emits `NotTmuxHosted` when it is absent.
+            boss_protocol::TmuxAdoptionState::NotTmuxHosted => unreachable!(),
             boss_protocol::TmuxAdoptionState::ProbeUnavailable => {
                 anyhow::bail!("tmux identity probe unavailable for session {}", run.tmux_session_name)
             }

@@ -1757,8 +1757,9 @@ fn print_live_state_short(state: &LiveWorkerState, tmux: TmuxListEvidence<'_>) {
     println!("{}", format_live_state_short(state, tmux));
 }
 
-/// Why a live-list row has no `TmuxWorkerStatus`. The two `None` causes
-/// used to render identically as `probe_unavailable`.
+/// Why a live-list row has no `TmuxWorkerStatus`. The cause is rendered in
+/// the `adoption_state` column: `probe_unavailable` when the fetch failed,
+/// and `no_status` when the engine answered without a row for this worker.
 #[derive(Debug, Clone, Copy)]
 enum TmuxListEvidence<'a> {
     /// `ListTmuxWorkerStatuses` failed (older engine, RPC error).
@@ -1936,14 +1937,14 @@ mod tests {
     #[test]
     fn format_live_state_short_renders_tmux_observability_fields() {
         let state = worker(5, "exec_tmux", "Data");
-        let status = TmuxWorkerStatus {
-            execution_id: "exec_tmux".to_owned(),
-            session_name: Some("boss-worker-5".to_owned()),
-            adoption_state: TmuxAdoptionState::Adopted,
-            pane_dead: Some(false),
-            last_output_at: Some("2026-08-19T12:00:00Z".to_owned()),
-            attach_command: Some("/opt/homebrew/bin/tmux -L boss attach-session -t boss-worker-5".to_owned()),
-        };
+        let status = TmuxWorkerStatus::builder()
+            .execution_id("exec_tmux")
+            .session_name("boss-worker-5")
+            .adoption_state(TmuxAdoptionState::Adopted)
+            .pane_dead(false)
+            .last_output_at("2026-08-19T12:00:00Z")
+            .attach_command("/opt/homebrew/bin/tmux -L boss attach-session -t boss-worker-5")
+            .build();
         let line = format_live_state_short(&state, TmuxListEvidence::Present(&status));
         assert!(line.contains("tmux_session=boss-worker-5"), "missing session: {line}");
         assert!(
@@ -1973,25 +1974,24 @@ mod tests {
     }
 
     fn adopted_status(session_name: Option<&str>, attach_command: Option<&str>) -> TmuxWorkerStatus {
-        TmuxWorkerStatus {
-            execution_id: "exec_attach".to_owned(),
-            session_name: session_name.map(str::to_owned),
-            adoption_state: TmuxAdoptionState::Adopted,
-            pane_dead: Some(false),
-            last_output_at: None,
-            attach_command: attach_command.map(str::to_owned),
-        }
+        TmuxWorkerStatus::builder()
+            .execution_id("exec_attach")
+            .maybe_session_name(session_name)
+            .adoption_state(TmuxAdoptionState::Adopted)
+            .pane_dead(false)
+            .maybe_attach_command(attach_command)
+            .build()
     }
 
     #[test]
     fn attach_command_from_status_refuses_non_adopted() {
-        let status = TmuxWorkerStatus {
-            adoption_state: TmuxAdoptionState::TokenMismatch,
-            ..adopted_status(
-                Some("boss-worker-1"),
-                Some("tmux -L boss attach-session -t boss-worker-1"),
-            )
-        };
+        let status = TmuxWorkerStatus::builder()
+            .execution_id("exec_attach")
+            .session_name("boss-worker-1")
+            .adoption_state(TmuxAdoptionState::TokenMismatch)
+            .pane_dead(false)
+            .attach_command("tmux -L boss attach-session -t boss-worker-1")
+            .build();
         let err = attach_command_from_status("exec_attach", &status).unwrap_err();
         assert!(
             err.to_string().contains("adoption_state=token_mismatch"),

@@ -298,14 +298,14 @@ fn tmux_status(
     last_output_at: Option<String>,
     attach_command: Option<String>,
 ) -> boss_protocol::TmuxWorkerStatus {
-    boss_protocol::TmuxWorkerStatus {
-        execution_id,
-        session_name,
-        adoption_state,
-        pane_dead,
-        last_output_at,
-        attach_command,
-    }
+    boss_protocol::TmuxWorkerStatus::builder()
+        .execution_id(execution_id)
+        .maybe_session_name(session_name)
+        .adoption_state(adoption_state)
+        .maybe_pane_dead(pane_dead)
+        .maybe_last_output_at(last_output_at)
+        .maybe_attach_command(attach_command)
+        .build()
 }
 
 fn not_tmux_hosted_status(execution_id: String) -> boss_protocol::TmuxWorkerStatus {
