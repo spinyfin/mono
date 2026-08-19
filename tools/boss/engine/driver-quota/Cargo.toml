@@ -6,10 +6,12 @@ workspace = "../../../.."
 
 [dependencies]
 async-trait = { workspace = true }
+boss-engine-codex-hook-trust = { path = "../codex-hook-trust" }
 boss-http-retry = { path = "../../http_retry" }
 boss-protocol = { path = "../../protocol" }
+chrono = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "macros", "process", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 tracing = { workspace = true }
 
 [dev-dependencies]

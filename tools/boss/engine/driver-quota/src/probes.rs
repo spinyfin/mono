@@ -41,27 +41,24 @@ pub mod claude {
         }
     }
 
+    /// Environment variables every `claude` child Boss starts must not
+    /// inherit. Kept in lockstep with `ClaudeDriver::spawn_invocation`
+    /// (`EnvDirective::Unset`): the engine process holds `ANTHROPIC_API_KEY`
+    /// for pane-summary LLM calls, but a stray key makes Claude Code meter
+    /// API usage instead of the subscription `/usage` reports.
+    pub const CLAUDE_UNSET_ENV_VARS: &[&str] = &["ANTHROPIC_API_KEY"];
+
     impl ClaudeQuotaProbe {
         /// Override the executable — tests point this at a stub script.
+        #[cfg(test)]
         pub fn with_program(program: impl Into<PathBuf>) -> Self {
             Self {
                 program: program.into(),
                 ..Self::default()
             }
         }
-    }
 
-    #[async_trait]
-    impl DriverQuotaProbe for ClaudeQuotaProbe {
-        fn driver(&self) -> &'static str {
-            DRIVER_SLUG_CLAUDE
-        }
-
-        async fn probe(&self) -> DriverQuotaOutcome {
-            // Environment is inherited deliberately: the CLI must resolve the
-            // maintainer's own credentials from wherever it normally does
-            // (macOS keychain, or `~/.claude`). Boss neither reads nor relocates
-            // them.
+        fn usage_command(&self) -> tokio::process::Command {
             let mut command = tokio::process::Command::new(&self.program);
             command
                 .arg("-p")
@@ -72,8 +69,25 @@ pub mod claude {
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            for key in CLAUDE_UNSET_ENV_VARS {
+                command.env_remove(*key);
+            }
+            command
+        }
+    }
 
-            let output = match command.output().await {
+    #[async_trait]
+    impl DriverQuotaProbe for ClaudeQuotaProbe {
+        fn driver(&self) -> &'static str {
+            DRIVER_SLUG_CLAUDE
+        }
+
+        async fn probe(&self) -> DriverQuotaOutcome {
+            // Remaining environment is inherited so the CLI can resolve
+            // OAuth credentials from the macOS keychain / `~/.claude`.
+            // `ANTHROPIC_API_KEY` is the exception — see
+            // [`CLAUDE_UNSET_ENV_VARS`].
+            let output = match self.usage_command().output().await {
                 Ok(output) => output,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                     return unavailable(
@@ -131,41 +145,76 @@ pub mod claude {
         async fn driver_slug_is_claude() {
             assert_eq!(ClaudeQuotaProbe::default().driver(), "claude");
         }
+
+        #[tokio::test]
+        async fn probe_unsets_anthropic_api_key_on_the_child() {
+            let dir = std::env::temp_dir().join(format!("boss-driver-quota-claude-env-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let script = dir.join("claude-stub");
+            std::fs::write(
+                &script,
+                "#!/bin/sh\n\
+                 if [ -n \"${ANTHROPIC_API_KEY+x}\" ]; then\n\
+                   echo 'ANTHROPIC_API_KEY was inherited' >&2\n\
+                   exit 1\n\
+                 fi\n\
+                 printf '%s\\n' '{\"is_error\":false,\"result\":\"Current week (all models): 0% used\"}'\n",
+            )
+            .expect("write stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&script).expect("stat").permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&script, perms).expect("chmod");
+            }
+
+            // SAFETY: process-global, but this test is the only one that
+            // writes the var, and the assertion is on the child, not on
+            // later tests reading it back.
+            unsafe {
+                std::env::set_var("ANTHROPIC_API_KEY", "probe-must-not-see-this");
+            }
+
+            let probe = ClaudeQuotaProbe::with_program(&script);
+            match probe.probe().await {
+                DriverQuotaOutcome::Reading(reading) => {
+                    assert_eq!(reading.used_percent, 0.0);
+                }
+                other => panic!("child inherited ANTHROPIC_API_KEY (or stub failed): {other:?}"),
+            }
+            let _ = std::fs::remove_file(&script);
+        }
+
+        #[test]
+        fn unset_list_matches_the_driver_contract() {
+            assert_eq!(CLAUDE_UNSET_ENV_VARS, &["ANTHROPIC_API_KEY"]);
+        }
     }
 }
 
-/// Codex quota probe: two JSON-RPC lines to `codex app-server`.
+/// Codex quota probe: `codex app-server` JSON-RPC `account/rateLimits/read`.
 ///
 /// Codex has no `usage` or `status` subcommand, and its `/status` slash
 /// command is TUI-only. Its app-server protocol, however, exposes
 /// `account/rateLimits/read` — a first-class, machine-readable method that
-/// returns exactly the plan-level figure `/status` renders. The probe speaks
-/// it directly: `initialize`, then the read, then exit. No thread is started,
+/// returns exactly the plan-level figure `/status` renders. The handshake
+/// (spawn with `--listen stdio://`, `initialize`, `notifications/initialized`,
+/// then the method) lives in `boss_engine_codex_hook_trust::app_server`,
+/// the same client the hook-trust gate uses, so the two cannot drift. No thread is started,
 /// no turn is taken, and no credential passes through Boss — the child
-/// resolves `$CODEX_HOME/auth.json` itself, from the engine's inherited
-/// environment, which is the same location
-/// `boss_codex_auth::resolve_operator_auth_path` names.
-///
-/// Note on the protocol: the app-server answers `initialize` synchronously
-/// but resolves `account/rateLimits/read` from the network, so stdin must
-/// stay open until that reply arrives. Closing stdin after writing both
-/// lines makes the child exit *before* answering — this was observed, and is
-/// why the probe drives the exchange itself rather than piping both lines in
-/// with a plain "write everything, then read everything" runner.
+/// resolves `$CODEX_HOME/auth.json` itself.
 pub mod codex {
     use std::path::PathBuf;
-    use std::process::Stdio;
+    use std::time::Duration;
 
     use async_trait::async_trait;
+    use boss_engine_codex_hook_trust::{AppServer, AppServerError, ClientInfo};
     use boss_protocol::{DRIVER_SLUG_CODEX, DriverQuotaFailureKind, DriverQuotaOutcome};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+    use crate::DEFAULT_PROBE_TIMEOUT;
     use crate::DriverQuotaProbe;
     use crate::parse::{parse_codex_rate_limits, unavailable};
-
-    /// JSON-RPC ids used by the exchange. Only two requests are ever sent.
-    const ID_INITIALIZE: i64 = 1;
-    const ID_RATE_LIMITS: i64 = 2;
 
     /// The app-server method carrying the plan-level rate limit.
     const METHOD_RATE_LIMITS: &str = "account/rateLimits/read";
@@ -173,87 +222,27 @@ pub mod codex {
     /// Probe for the `codex` driver.
     pub struct CodexQuotaProbe {
         program: PathBuf,
+        timeout: Duration,
     }
 
     impl Default for CodexQuotaProbe {
         fn default() -> Self {
             Self {
                 program: PathBuf::from("codex"),
+                timeout: DEFAULT_PROBE_TIMEOUT,
             }
         }
     }
 
     impl CodexQuotaProbe {
         /// Override the executable — tests point this at a stub.
+        #[cfg(test)]
         pub fn with_program(program: impl Into<PathBuf>) -> Self {
             Self {
                 program: program.into(),
+                timeout: DEFAULT_PROBE_TIMEOUT,
             }
         }
-    }
-
-    /// One line of the exchange, classified. Kept separate from the IO so the
-    /// line-scanning rules are unit-testable without a child process.
-    #[derive(Debug, PartialEq, Eq)]
-    pub(crate) enum ServerLine {
-        /// The reply we are waiting for, carrying its `result` payload.
-        Result(String),
-        /// The reply we are waiting for, carrying a JSON-RPC error message.
-        Error(String),
-        /// Anything else: the `initialize` reply, an unsolicited notification.
-        Other,
-    }
-
-    /// Classify one stdout line against the id we are waiting for.
-    ///
-    /// The app-server interleaves unsolicited notifications (`remoteControl/…`)
-    /// with replies, so the probe cannot simply take the next line — it matches
-    /// on `id` and ignores everything else.
-    pub(crate) fn classify_line(line: &str, awaiting_id: i64) -> ServerLine {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            return ServerLine::Other;
-        };
-        if value.get("id").and_then(serde_json::Value::as_i64) != Some(awaiting_id) {
-            return ServerLine::Other;
-        }
-        if let Some(err) = value.get("error") {
-            let message = err
-                .get("message")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("app-server returned an error");
-            // Truncated: an unknown-method error echoes the entire method list.
-            let message: String = message.chars().take(200).collect();
-            return ServerLine::Error(message);
-        }
-        match value.get("result") {
-            Some(result) => ServerLine::Result(result.to_string()),
-            None => ServerLine::Error("reply carried neither `result` nor `error`".to_owned()),
-        }
-    }
-
-    fn request_line(id: i64, method: &str, params: serde_json::Value) -> String {
-        let line = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        });
-        format!("{line}\n")
-    }
-
-    /// The `initialize` params the app-server requires before any other method.
-    fn initialize_line() -> String {
-        request_line(
-            ID_INITIALIZE,
-            "initialize",
-            serde_json::json!({
-                "clientInfo": {
-                    "name": "boss-quota-probe",
-                    "title": "Boss quota probe",
-                    "version": "1.0.0",
-                }
-            }),
-        )
     }
 
     #[async_trait]
@@ -263,107 +252,43 @@ pub mod codex {
         }
 
         async fn probe(&self) -> DriverQuotaOutcome {
-            let mut child = match tokio::process::Command::new(&self.program)
-                .arg("app-server")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .kill_on_drop(true)
-                .spawn()
-            {
-                Ok(child) => child,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    return unavailable(
-                        DriverQuotaFailureKind::NotInstalled,
-                        format!("`{}` is not installed or not on PATH", self.program.display()),
-                    );
+            let program = self.program.clone();
+            let timeout = self.timeout;
+            let result = tokio::task::spawn_blocking(move || {
+                AppServer {
+                    program,
+                    extra_env: Vec::new(),
+                    cwd: None,
+                    client_info: ClientInfo {
+                        name: "boss-quota-probe".into(),
+                        title: Some("Boss quota probe".into()),
+                        version: "1.0.0".into(),
+                    },
+                    timeout,
                 }
-                Err(err) => {
-                    return unavailable(
-                        DriverQuotaFailureKind::ProbeFailed,
-                        format!("could not start `codex app-server`: {err}"),
-                    );
-                }
-            };
+                .request(METHOD_RATE_LIMITS, serde_json::json!({}))
+            })
+            .await;
 
-            let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-                let _ = child.start_kill();
-                return unavailable(
+            match result {
+                Ok(Ok(value)) => parse_codex_rate_limits(&value),
+                Ok(Err(AppServerError::NotFound { program })) => unavailable(
+                    DriverQuotaFailureKind::NotInstalled,
+                    format!("`{}` is not installed or not on PATH", program.display()),
+                ),
+                Ok(Err(AppServerError::Rpc { message, .. })) => {
+                    let kind = if message.contains("auth") || message.contains("login") {
+                        DriverQuotaFailureKind::NotAuthenticated
+                    } else {
+                        DriverQuotaFailureKind::ProbeFailed
+                    };
+                    unavailable(kind, format!("codex {METHOD_RATE_LIMITS} failed: {message}"))
+                }
+                Ok(Err(err)) => unavailable(DriverQuotaFailureKind::ProbeFailed, err.to_string()),
+                Err(err) => unavailable(
                     DriverQuotaFailureKind::ProbeFailed,
-                    "codex app-server did not expose stdio pipes".to_owned(),
-                );
-            };
-
-            let outcome = drive_exchange(&mut stdin, stdout).await;
-            // Dropping stdin closes it, which is the app-server's shutdown
-            // signal; `kill_on_drop` is the backstop for a child that ignores it.
-            drop(stdin);
-            let _ = child.start_kill();
-            outcome
-        }
-    }
-
-    /// Write the two requests and read until the rate-limit reply lands.
-    /// Factored out of [`CodexQuotaProbe::probe`] so the process plumbing above
-    /// stays readable; the deadline is applied by the cache around the whole
-    /// probe, so this loop simply ends when stdout does.
-    async fn drive_exchange(
-        stdin: &mut tokio::process::ChildStdin,
-        stdout: tokio::process::ChildStdout,
-    ) -> DriverQuotaOutcome {
-        for line in [
-            initialize_line(),
-            request_line(ID_RATE_LIMITS, METHOD_RATE_LIMITS, serde_json::json!({})),
-        ] {
-            if let Err(err) = stdin.write_all(line.as_bytes()).await {
-                return unavailable(
-                    DriverQuotaFailureKind::ProbeFailed,
-                    format!("could not write to codex app-server: {err}"),
-                );
-            }
-        }
-        if let Err(err) = stdin.flush().await {
-            return unavailable(
-                DriverQuotaFailureKind::ProbeFailed,
-                format!("could not flush to codex app-server: {err}"),
-            );
-        }
-
-        let mut lines = BufReader::new(stdout).lines();
-        loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => match classify_line(&line, ID_RATE_LIMITS) {
-                    ServerLine::Other => continue,
-                    ServerLine::Error(message) => {
-                        let kind = if message.contains("auth") || message.contains("login") {
-                            DriverQuotaFailureKind::NotAuthenticated
-                        } else {
-                            DriverQuotaFailureKind::ProbeFailed
-                        };
-                        return unavailable(kind, format!("codex {METHOD_RATE_LIMITS} failed: {message}"));
-                    }
-                    ServerLine::Result(result) => {
-                        let Ok(value) = serde_json::from_str::<serde_json::Value>(&result) else {
-                            return unavailable(
-                                DriverQuotaFailureKind::Unparseable,
-                                "codex app-server reply was not valid JSON".to_owned(),
-                            );
-                        };
-                        return parse_codex_rate_limits(&value);
-                    }
-                },
-                Ok(None) => {
-                    return unavailable(
-                        DriverQuotaFailureKind::ProbeFailed,
-                        format!("codex app-server closed without answering {METHOD_RATE_LIMITS}"),
-                    );
-                }
-                Err(err) => {
-                    return unavailable(
-                        DriverQuotaFailureKind::ProbeFailed,
-                        format!("could not read from codex app-server: {err}"),
-                    );
-                }
+                    format!("codex app-server task failed: {err}"),
+                ),
             }
         }
     }
@@ -371,61 +296,6 @@ pub mod codex {
     #[cfg(test)]
     mod tests {
         use super::*;
-
-        #[test]
-        fn unsolicited_notification_is_ignored_not_mistaken_for_the_reply() {
-            let line = r#"{"method":"remoteControl/status/changed","params":{"status":"disabled"}}"#;
-            assert_eq!(classify_line(line, ID_RATE_LIMITS), ServerLine::Other);
-        }
-
-        #[test]
-        fn initialize_reply_is_ignored_while_awaiting_the_rate_limit_reply() {
-            let line = r#"{"id":1,"result":{"codexHome":"/home/x/.codex"}}"#;
-            assert_eq!(classify_line(line, ID_RATE_LIMITS), ServerLine::Other);
-        }
-
-        #[test]
-        fn matching_result_is_captured() {
-            let line = r#"{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":5}}}}"#;
-            match classify_line(line, ID_RATE_LIMITS) {
-                ServerLine::Result(result) => {
-                    let value: serde_json::Value = serde_json::from_str(&result).expect("json");
-                    assert_eq!(
-                        value
-                            .pointer("/rateLimits/primary/usedPercent")
-                            .and_then(|v| v.as_f64()),
-                        Some(5.0)
-                    );
-                }
-                other => panic!("expected a result, got {other:?}"),
-            }
-        }
-
-        #[test]
-        fn jsonrpc_error_is_surfaced_and_truncated() {
-            let long = "x".repeat(500);
-            let line = serde_json::json!({ "id": 2, "error": { "code": -32600, "message": long } }).to_string();
-            match classify_line(&line, ID_RATE_LIMITS) {
-                ServerLine::Error(message) => assert_eq!(message.chars().count(), 200),
-                other => panic!("expected an error, got {other:?}"),
-            }
-        }
-
-        #[test]
-        fn non_json_noise_on_stdout_is_ignored() {
-            assert_eq!(classify_line("warning: something", ID_RATE_LIMITS), ServerLine::Other);
-        }
-
-        #[test]
-        fn initialize_request_is_well_formed_jsonrpc() {
-            let line = initialize_line();
-            let value: serde_json::Value = serde_json::from_str(line.trim()).expect("json");
-            assert_eq!(value["jsonrpc"], "2.0");
-            assert_eq!(value["method"], "initialize");
-            assert_eq!(value["id"], ID_INITIALIZE);
-            assert!(value.pointer("/params/clientInfo/name").is_some());
-            assert!(line.ends_with('\n'), "app-server reads line-delimited JSON");
-        }
 
         #[tokio::test]
         async fn missing_executable_reports_not_installed_rather_than_a_blank() {
@@ -493,8 +363,9 @@ pub mod grok {
 
     /// Probe for the `grok` driver.
     pub struct GrokQuotaProbe {
-        /// Path to the operator's `auth.json`, resolved by the caller through the
-        /// driver's own resolution so both read the identical file.
+        /// Path to the Grok `auth.json` the driver reads, resolved by the
+        /// caller through the driver's own resolution so both read the
+        /// identical file.
         auth_path: PathBuf,
         base_url: String,
     }
@@ -515,6 +386,7 @@ pub mod grok {
         }
 
         /// Explicit base URL — tests point this at a local server.
+        #[cfg(test)]
         pub fn with_base_url(auth_path: impl Into<PathBuf>, base_url: impl Into<String>) -> Self {
             Self {
                 auth_path: auth_path.into(),
@@ -567,11 +439,29 @@ pub mod grok {
             }
         }
         match best {
+            Some((expires, _)) if token_expired(expires) => Err(TokenError {
+                kind: DriverQuotaFailureKind::NotAuthenticated,
+                reason: "stored Grok token has expired — run any grok command or `grok login` to refresh".to_owned(),
+            }),
             Some((_, key)) => Ok(key.to_owned()),
             None => Err(TokenError {
                 kind: DriverQuotaFailureKind::NotAuthenticated,
                 reason: "Grok auth.json has no signed-in account — sign in with `grok login`".to_owned(),
             }),
+        }
+    }
+
+    /// `true` when `expires_at` parses as RFC-3339 and is strictly in the
+    /// past. Missing or unparseable timestamps are treated as live so a
+    /// document without an expiry still produces a request rather than a
+    /// false "expired" label.
+    fn token_expired(expires_at: &str) -> bool {
+        if expires_at.is_empty() {
+            return false;
+        }
+        match chrono::DateTime::parse_from_rfc3339(expires_at) {
+            Ok(dt) => dt.timestamp() < crate::now_epoch_s(),
+            Err(_) => false,
         }
     }
 
@@ -657,7 +547,7 @@ pub mod grok {
         #[test]
         fn bearer_taken_from_the_only_account() {
             let doc = serde_json::json!({
-                "https://auth.example::acct": { "key": "token-a", "expires_at": "2026-09-01T00:00:00Z" }
+                "https://auth.example::acct": { "key": "token-a", "expires_at": "2099-09-01T00:00:00Z" }
             });
             assert_eq!(extract_bearer(&doc).ok(), Some("token-a".to_owned()));
         }
@@ -665,8 +555,8 @@ pub mod grok {
         #[test]
         fn furthest_future_account_wins_when_several_are_present() {
             let doc = serde_json::json!({
-                "issuer-a::1": { "key": "old", "expires_at": "2026-01-01T00:00:00Z" },
-                "issuer-b::2": { "key": "new", "expires_at": "2026-09-01T00:00:00Z" },
+                "issuer-a::1": { "key": "old", "expires_at": "2099-01-01T00:00:00Z" },
+                "issuer-b::2": { "key": "new", "expires_at": "2099-09-01T00:00:00Z" },
             });
             assert_eq!(extract_bearer(&doc).ok(), Some("new".to_owned()));
         }
@@ -678,8 +568,22 @@ pub mod grok {
         }
 
         #[test]
+        fn expired_token_is_named_as_expired_not_unsigned() {
+            let doc = serde_json::json!({
+                "issuer-a::1": { "key": "old", "expires_at": "2020-01-01T00:00:00Z" }
+            });
+            let err = extract_bearer(&doc).unwrap_err();
+            assert_eq!(err.kind, DriverQuotaFailureKind::NotAuthenticated);
+            assert!(
+                err.reason.contains("expired"),
+                "reason must name expiry, got {}",
+                err.reason
+            );
+        }
+
+        #[test]
         fn record_without_a_key_is_skipped_rather_than_treated_as_a_token() {
-            let doc = serde_json::json!({ "issuer::1": { "expires_at": "2026-09-01T00:00:00Z" } });
+            let doc = serde_json::json!({ "issuer::1": { "expires_at": "2099-09-01T00:00:00Z" } });
             assert!(extract_bearer(&doc).is_err());
         }
 

@@ -120,10 +120,12 @@ final class DriverQuotaSectionTests: XCTestCase {
         let roster = DriverQuotaSection.roster(from: .empty)
         XCTAssertEqual(roster.count, 3)
         for entry in roster {
-            guard case .unavailable(_, let reason) = entry.outcome else {
-                return XCTFail("nothing should render as a reading before the first check")
+            guard case .pending = entry.outcome else {
+                return XCTFail("nothing should render as a reading or a failure before the first check")
             }
-            XCTAssertEqual(reason, "not checked yet")
+            XCTAssertEqual(entry.outcome.headline(checking: false), "Not checked yet")
+            XCTAssertEqual(entry.outcome.headline(checking: true), "Checking…")
+            XCTAssertFalse(entry.outcome.showsWarning, "not-yet-known must not share the failure glyph")
         }
     }
 

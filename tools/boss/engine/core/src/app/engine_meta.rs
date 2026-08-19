@@ -499,11 +499,14 @@ pub(super) async fn handle_set_dispatch_concurrency(ctx: Dispatch, req: Frontend
 
 /// Serve the per-driver provider quota snapshot.
 ///
-/// Read-only and cheap in the common case: the cache answers from memory
-/// unless its TTL has expired or the operator asked for a refresh, so
-/// opening Preferences does not fan out three provider calls every time.
-/// The figures here are each driver's *provider's* own view — never Boss's
-/// internal token accounting, which measures a different thing.
+/// The request loop is sequential, so this handler must not await a probe
+/// cycle: it replies immediately with whatever is cached, and if the TTL has
+/// expired or a refresh was explicitly requested, a background task runs the
+/// cycle and `send_push`es a second `DriverQuotaUsageResult` when it lands.
+/// Opening Preferences therefore does not stall every other app RPC behind
+/// three child-process probes. The figures here are each driver's
+/// *provider's* own view — never Boss's internal token accounting, which
+/// measures a different thing.
 ///
 /// A driver that cannot be read comes back as an explicit failure entry, not
 /// as an omission: the snapshot always describes every implemented driver.
@@ -517,8 +520,22 @@ pub(super) async fn handle_get_driver_quota_usage(ctx: Dispatch, req: FrontendRe
     let FrontendRequest::GetDriverQuotaUsage { refresh } = req else {
         unreachable!()
     };
-    let snapshot = server_state.driver_quota.snapshot(refresh).await;
-    send_response(&sink, &request_id, FrontendEvent::DriverQuotaUsageResult { snapshot });
+    let lookup = server_state.driver_quota.lookup(refresh).await;
+    send_response(
+        &sink,
+        &request_id,
+        FrontendEvent::DriverQuotaUsageResult {
+            snapshot: lookup.snapshot,
+        },
+    );
+    if lookup.should_probe {
+        let quota = Arc::clone(&server_state.driver_quota);
+        let sink = Arc::clone(&sink);
+        tokio::spawn(async move {
+            let snapshot = quota.snapshot(refresh).await;
+            send_push(&sink, FrontendEvent::DriverQuotaUsageResult { snapshot });
+        });
+    }
 }
 
 pub(super) async fn handle_get_driver_traffic_split(ctx: Dispatch, req: FrontendRequest) {

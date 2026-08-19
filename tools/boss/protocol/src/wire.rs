@@ -792,10 +792,12 @@ pub enum FrontendRequest {
     /// triggered by engine startup. Replies with
     /// [`FrontendEvent::DriverQuotaUsageResult`].
     ///
-    /// `refresh` marks an explicit operator request ("Refresh" in
-    /// Preferences); it bypasses the TTL but not the floor, and a refusal
-    /// comes back as `refresh_throttled` on the snapshot rather than as an
-    /// error or a silently unchanged timestamp.
+    /// `refresh` marks an explicit refresh from the Preferences pane; it
+    /// bypasses the TTL but not the floor, and a refusal comes back as
+    /// `refresh_throttled` on the snapshot rather than as an error or a
+    /// silently unchanged timestamp. The handler replies from cache and
+    /// pushes a second result if a cycle is due, so the request loop is
+    /// never blocked on a probe.
     GetDriverQuotaUsage {
         #[serde(default)]
         refresh: bool,

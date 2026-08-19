@@ -14,6 +14,7 @@ rust_library(
         "//tools/boss/engine/core:__pkg__",
     ],
     deps = all_crate_deps(normal = True) + [
+        "//tools/boss/engine/codex-hook-trust",
         "//tools/boss/http_retry",
         "//tools/boss/protocol",
     ],
@@ -31,5 +32,9 @@ rust_test(
     deps = all_crate_deps(
         normal = True,
         normal_dev = True,
-    ),
+    ) + [
+        "//tools/boss/engine/codex-hook-trust",
+        "//tools/boss/http_retry",
+        "//tools/boss/protocol",
+    ],
 )

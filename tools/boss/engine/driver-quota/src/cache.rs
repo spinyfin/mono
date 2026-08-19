@@ -8,14 +8,20 @@
 //! - **TTL [`DEFAULT_TTL`] (15 minutes).** An ordinary read older than this
 //!   runs one cycle; anything fresher is served straight from memory. Three
 //!   provider calls per quarter-hour of active looking is not hammering.
-//! - **Explicit refresh bypasses the TTL but not the floor.** The operator's
-//!   "Refresh" is honoured unless a cycle ran within
+//! - **Explicit refresh bypasses the TTL but not the floor.** An explicit
+//!   refresh is honoured unless a cycle ran within
 //!   [`DEFAULT_MIN_REFRESH_INTERVAL`] (60 seconds); a refusal is reported as
 //!   `refresh_throttled` on the snapshot, so a held-down button cannot turn
 //!   into a request loop and the UI can still say why the timestamp did not
 //!   move.
-//! - **Concurrent readers coalesce.** One mutex guards the cycle, so two
-//!   windows opening at once produce one set of probes, not two.
+//! - **Reads never wait on a cycle.** [`QuotaCache::lookup`] returns the
+//!   cached snapshot immediately and says whether a cycle is due; the RPC
+//!   handler replies with that and, if needed, runs [`QuotaCache::snapshot`]
+//!   on a background task. Opening Preferences does not stall other app
+//!   RPCs behind three child-process probes.
+//! - **Concurrent cycles coalesce.** A dedicated mutex serializes
+//!   [`QuotaCache::snapshot`] so two windows opening at once produce one set
+//!   of probes, not two. The snapshot mutex is not held while probes run.
 //!
 //! # Not a dispatch slot
 //!
@@ -37,11 +43,19 @@ use crate::{DEFAULT_PROBE_TIMEOUT, DriverQuotaProbe, now_epoch_s};
 /// How long a cycle's results are served without re-probing.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(15 * 60);
 
-/// Floor between two probe cycles, even when the operator asks explicitly.
+/// Floor between two probe cycles, even for an explicit refresh.
 pub const DEFAULT_MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The probes a cache drives, one per implemented driver.
 pub type QuotaProbeSet = Vec<Arc<dyn DriverQuotaProbe>>;
+
+/// Result of [`QuotaCache::lookup`]: whatever is already cached, plus
+/// whether the caller should start a background cycle.
+#[derive(Debug, Clone)]
+pub struct QuotaLookup {
+    pub snapshot: DriverQuotaSnapshot,
+    pub should_probe: bool,
+}
 
 /// Cached provider quota readings plus the policy governing when to re-probe.
 pub struct QuotaCache {
@@ -49,7 +63,15 @@ pub struct QuotaCache {
     ttl: Duration,
     min_refresh_interval: Duration,
     probe_timeout: Duration,
+    locks: QuotaLocks,
+}
+
+/// Snapshot and cycle mutexes, grouped so [`QuotaCache`] stays at five
+/// named fields (the giant-structs check) without collapsing the two
+/// locks into one — cached reads must not wait on a running cycle.
+struct QuotaLocks {
     state: tokio::sync::Mutex<CacheState>,
+    cycle: tokio::sync::Mutex<()>,
 }
 
 #[derive(Default)]
@@ -65,12 +87,15 @@ impl QuotaCache {
             ttl: DEFAULT_TTL,
             min_refresh_interval: DEFAULT_MIN_REFRESH_INTERVAL,
             probe_timeout: DEFAULT_PROBE_TIMEOUT,
-            state: tokio::sync::Mutex::new(CacheState::default()),
+            locks: QuotaLocks {
+                state: tokio::sync::Mutex::new(CacheState::default()),
+                cycle: tokio::sync::Mutex::new(()),
+            },
         }
     }
 
-    /// Override the timing policy. Tests use this to avoid sleeping; nothing
-    /// in production calls it.
+    /// Override the timing policy. Tests use this to avoid sleeping.
+    #[cfg(test)]
     pub fn with_policy(mut self, ttl: Duration, min_refresh_interval: Duration, probe_timeout: Duration) -> Self {
         self.ttl = ttl;
         self.min_refresh_interval = min_refresh_interval;
@@ -78,19 +103,9 @@ impl QuotaCache {
         self
     }
 
-    /// Return the current snapshot, probing first if policy says to.
-    ///
-    /// `refresh` marks an explicit operator request. See the module doc for
-    /// exactly what each flag combination does.
-    pub async fn snapshot(&self, refresh: bool) -> DriverQuotaSnapshot {
-        let mut state = self.state.lock().await;
-        let now = now_epoch_s();
-        let age_s = state
-            .snapshot
-            .generated_at_epoch_s
-            .map(|generated| now.saturating_sub(generated));
-
-        let (should_probe, throttled) = match age_s {
+    fn decide(&self, generated_at_epoch_s: Option<i64>, refresh: bool, now: i64) -> (bool, bool) {
+        let age_s = generated_at_epoch_s.map(|generated| now.saturating_sub(generated));
+        match age_s {
             // Never probed: always run, whatever the flag says.
             None => (true, false),
             Some(age) if refresh => {
@@ -98,29 +113,69 @@ impl QuotaCache {
                 if age >= floor { (true, false) } else { (false, true) }
             }
             Some(age) => (age >= self.ttl.as_secs() as i64, false),
-        };
+        }
+    }
 
-        if should_probe {
-            state.snapshot = self.run_cycle().await;
-        } else {
+    /// Cached snapshot plus whether a probe cycle is due.
+    ///
+    /// Never runs a probe. The RPC handler replies with `snapshot` on the
+    /// request loop and, when `should_probe` is set, runs [`Self::snapshot`]
+    /// on a background task so other app RPCs are not stalled.
+    pub async fn lookup(&self, refresh: bool) -> QuotaLookup {
+        let mut state = self.locks.state.lock().await;
+        let (should_probe, throttled) = self.decide(state.snapshot.generated_at_epoch_s, refresh, now_epoch_s());
+        if !should_probe {
             state.snapshot.refresh_throttled = throttled;
         }
+        QuotaLookup {
+            snapshot: state.snapshot.clone(),
+            should_probe,
+        }
+    }
+
+    /// Return the current snapshot, probing first if policy says to.
+    ///
+    /// `refresh` marks an explicit refresh request from the UI. See the
+    /// module doc for exactly what each flag combination does. The snapshot
+    /// mutex is not held while probes run; concurrent callers share one
+    /// cycle via the cycle lock.
+    pub async fn snapshot(&self, refresh: bool) -> DriverQuotaSnapshot {
+        {
+            let mut state = self.locks.state.lock().await;
+            let (should_probe, throttled) = self.decide(state.snapshot.generated_at_epoch_s, refresh, now_epoch_s());
+            if !should_probe {
+                state.snapshot.refresh_throttled = throttled;
+                return state.snapshot.clone();
+            }
+        }
+        let _cycle = self.locks.cycle.lock().await;
+        {
+            let state = self.locks.state.lock().await;
+            let (should_probe, _) = self.decide(state.snapshot.generated_at_epoch_s, refresh, now_epoch_s());
+            if !should_probe {
+                return state.snapshot.clone();
+            }
+        }
+        let new_snapshot = self.run_cycle().await;
+        let mut state = self.locks.state.lock().await;
+        state.snapshot = new_snapshot;
         state.snapshot.clone()
     }
 
-    /// Return whatever is cached without ever probing. Used by callers that
-    /// must not block — nothing currently needs it, but it makes the
-    /// "Preferences never waits on a fetch" property expressible.
+    /// Return whatever is cached without ever probing. Used by the RPC
+    /// handler to reply before a cycle starts, so Preferences never waits
+    /// on a fetch.
     pub async fn cached(&self) -> DriverQuotaSnapshot {
-        self.state.lock().await.snapshot.clone()
+        self.locks.state.lock().await.snapshot.clone()
     }
 
     /// Run every probe concurrently under its own deadline.
     async fn run_cycle(&self) -> DriverQuotaSnapshot {
-        let futures = self.probes.iter().map(|probe| {
+        let mut join_set = tokio::task::JoinSet::new();
+        for probe in &self.probes {
             let probe = Arc::clone(probe);
             let timeout = self.probe_timeout;
-            async move {
+            join_set.spawn(async move {
                 let driver = probe.driver().to_owned();
                 let outcome = match tokio::time::timeout(timeout, probe.probe()).await {
                     Ok(outcome) => outcome,
@@ -134,9 +189,19 @@ impl QuotaCache {
                     observed_at_epoch_s: now_epoch_s(),
                     outcome,
                 }
+            });
+        }
+        let mut entries: Vec<DriverQuotaEntry> = Vec::new();
+        while let Some(joined) = join_set.join_next().await {
+            match joined {
+                Ok(entry) => entries.push(entry),
+                // A panicking probe must not take the whole cycle down; it
+                // simply contributes nothing, and the driver is then absent
+                // from the snapshot — which the UI renders as "no result",
+                // not as zero.
+                Err(err) => tracing::error!(?err, "driver_quota: probe task failed"),
             }
-        });
-        let mut entries: Vec<DriverQuotaEntry> = futures_join_all(futures).await;
+        }
         // Stable presentation order regardless of which probe answered first.
         entries.sort_by_key(|entry| {
             DRIVER_QUOTA_ORDER
@@ -168,32 +233,6 @@ impl QuotaCache {
             refresh_throttled: false,
         }
     }
-}
-
-/// Await every future in `futures` concurrently, collecting the results in
-/// input order.
-///
-/// Hand-rolled rather than pulling `futures` in for one combinator: this
-/// crate otherwise depends only on `tokio`, and a new third-party crate in
-/// the engine's dependency graph is a bigger cost than eight lines. Order is
-/// preserved by construction — each result is written to its own slot.
-async fn futures_join_all<F, T>(futures: impl IntoIterator<Item = F>) -> Vec<T>
-where
-    F: std::future::Future<Output = T> + Send + 'static,
-    T: Send + 'static,
-{
-    let handles: Vec<_> = futures.into_iter().map(tokio::spawn).collect();
-    let mut out = Vec::with_capacity(handles.len());
-    for handle in handles {
-        match handle.await {
-            Ok(value) => out.push(value),
-            // A panicking probe must not take the whole cycle down; it simply
-            // contributes nothing, and the driver is then absent from the
-            // snapshot — which the UI renders as "no result", not as zero.
-            Err(err) => tracing::error!(?err, "driver_quota: probe task failed"),
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -358,6 +397,22 @@ mod tests {
         let snapshot = cache.snapshot(false).await;
         let order: Vec<&str> = snapshot.entries.iter().map(|e| e.driver.as_str()).collect();
         assert_eq!(order, DRIVER_QUOTA_ORDER.to_vec());
+    }
+
+    #[tokio::test]
+    async fn lookup_does_not_probe_and_reports_when_a_cycle_is_due() {
+        let probe = CountingProbe::new("claude", 7.0);
+        let cache = QuotaCache::new(vec![probe.clone()]);
+        let first = cache.lookup(false).await;
+        assert!(first.should_probe);
+        assert!(first.snapshot.entries.is_empty());
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+
+        cache.snapshot(false).await;
+        let warm = cache.lookup(false).await;
+        assert!(!warm.should_probe);
+        assert_eq!(warm.snapshot.entries.len(), 1);
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

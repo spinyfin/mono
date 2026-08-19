@@ -268,7 +268,12 @@ extension ChatViewModel {
             driverTrafficSplit = split
         case .driverQuotaUsageResult(let snapshot):
             driverQuota = snapshot
-            isRefreshingDriverQuota = false
+            // A cold-cache reply is empty and arrives immediately; keep the
+            // checking flag until a completed cycle lands so the pane can
+            // show "Checking…" rather than a false "not checked yet".
+            if !snapshot.neverChecked {
+                isRefreshingDriverQuota = false
+            }
         case .trunkStatus(let configured, let source, let queueCheck, let note):
             trunkTokenConfigured = configured
             trunkTokenSource = source

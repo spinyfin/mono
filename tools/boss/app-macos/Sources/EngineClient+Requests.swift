@@ -95,7 +95,7 @@ extension EngineClient {
     /// Cheap by default: the engine serves its cache unless the cache has
     /// aged past its TTL, so opening Settings does not fan out three
     /// provider calls every time. Pass `refresh: true` only for an explicit
-    /// operator request; the engine still enforces a floor between cycles
+    /// refresh; the engine still enforces a floor between cycles
     /// and reports a declined refresh as `refresh_throttled` rather than as
     /// an error. Replies with `driver_quota_usage_result`.
     func sendGetDriverQuotaUsage(refresh: Bool = false) {
