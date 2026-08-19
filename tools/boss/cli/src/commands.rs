@@ -2815,6 +2815,12 @@ pub(crate) struct TaskMoveArgs {
 
     #[arg(long = "to")]
     pub(crate) target: MoveTarget,
+
+    /// Required when an agent (or other automated actor) moves the row
+    /// to `archived`; optional for a human archive. The engine rejects
+    /// a non-empty reason unless `--to archived`.
+    #[arg(long = "archived-reason", value_name = "REASON", allow_hyphen_values = true)]
+    pub(crate) archived_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]

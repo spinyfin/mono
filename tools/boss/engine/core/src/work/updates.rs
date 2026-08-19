@@ -138,7 +138,8 @@ fn apply_archive_transition_provenance(db: &WorkDb, task: &mut Task, actor: &str
     if task.archived_reason.as_deref().is_none_or(|s| s.trim().is_empty()) {
         bail!(
             "cannot archive {} as actor `{actor}` without an archived_reason; \
-             automated archives must record the condition that was met",
+             automated archives must record the condition that was met \
+             (pass --archived-reason)",
             task.id
         );
     }
@@ -384,6 +385,7 @@ impl WorkDb {
             validate_blocked_reason_length(reason)?;
         }
         let blocked_detail_patch_requests_set = patch.blocked_detail.as_deref().is_some_and(|s| !s.is_empty());
+        let archived_reason_patch_requests_set = patch.archived_reason.as_deref().is_some_and(|s| !s.is_empty());
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let mut pending = PendingEvents::new();
@@ -572,6 +574,16 @@ impl WorkDb {
         // Archival provenance only documents the row's current archived
         // status, so it must not linger after any reopening transition.
         if task.status != TaskStatus::Archived {
+            // Reject rather than silently drop: a non-empty archived_reason
+            // on a row that is not (and is not becoming) archived is the
+            // same shape as a blocked_detail with no blocked_reason — very
+            // likely the caller forgetting --status archived / --to archived.
+            if archived_reason_patch_requests_set {
+                bail!(
+                    "cannot set archived_reason on {id}: the row is not moving to archived; \
+                     pass --archived-reason only with --status archived or --to archived"
+                );
+            }
             task.archived_by = None;
             task.archived_at = None;
             task.archived_reason = None;

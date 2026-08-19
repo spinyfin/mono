@@ -1042,50 +1042,6 @@ pub(crate) fn print_task_details(title: &str, task: &Task, parent_product: Optio
     }
 }
 
-/// Format a stored epoch-seconds string for human output. Falls back to the
-/// raw value when it does not parse as an `i64` (legacy non-epoch rows).
-///
-/// Uses this host's current UTC offset the same way `boss cost` does
-/// (`cost_cmds::format_epoch`). A timestamp on the other side of a DST
-/// transition from "now" can be off by an hour.
-pub(crate) fn format_stored_epoch(raw: &str) -> String {
-    let Ok(epoch_s) = raw.parse::<i64>() else {
-        return raw.to_owned();
-    };
-    let offset_s = detect_local_utc_offset_seconds().unwrap_or(0);
-    let shifted = epoch_s.saturating_add(i64::from(offset_s));
-    let utc_form = boss_engine_utils::iso8601::format_epoch_iso8601(shifted);
-    let sign = if offset_s < 0 { '-' } else { '+' };
-    let abs = offset_s.unsigned_abs();
-    format!(
-        "{}{sign}{:02}:{:02}",
-        utc_form.trim_end_matches('Z'),
-        abs / 3_600,
-        (abs % 3_600) / 60
-    )
-}
-
-fn detect_local_utc_offset_seconds() -> Option<i32> {
-    let output = Command::new("date").arg("+%z").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(output.stdout).ok()?;
-    let text = text.trim();
-    if text.len() != 5 {
-        return None;
-    }
-    let bytes = text.as_bytes();
-    let sign: i32 = match bytes[0] {
-        b'+' => 1,
-        b'-' => -1,
-        _ => return None,
-    };
-    let hh: i32 = std::str::from_utf8(&bytes[1..3]).ok()?.parse().ok()?;
-    let mm: i32 = std::str::from_utf8(&bytes[3..5]).ok()?.parse().ok()?;
-    Some(sign * (hh * 3_600 + mm * 60))
-}
-
 pub(crate) fn resolve_install_root() -> Result<PathBuf, CliError> {
     if let Ok(root) = std::env::var("BOSS_INSTALL_ROOT") {
         return Ok(PathBuf::from(root));

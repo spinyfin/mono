@@ -811,6 +811,30 @@ fn parses_task_move_command() {
         } => {
             assert_eq!(args.id, "task_1");
             assert!(matches!(args.target, MoveTarget::Review));
+            assert!(args.archived_reason.is_none());
+        }
+        _ => panic!("expected task move command"),
+    }
+}
+
+#[test]
+fn parses_task_move_archived_reason() {
+    let cli = Cli::parse_from([
+        "boss",
+        "task",
+        "move",
+        "task_1",
+        "--to",
+        "archived",
+        "--archived-reason",
+        "duplicate of the shipped chore",
+    ]);
+    match cli.command {
+        Commands::Task {
+            command: TaskCommand::Move(args),
+        } => {
+            assert!(matches!(args.target, MoveTarget::Archived));
+            assert_eq!(args.archived_reason.as_deref(), Some("duplicate of the shipped chore"));
         }
         _ => panic!("expected task move command"),
     }

@@ -1677,6 +1677,7 @@ pub(crate) async fn run_move_leaf(
     let resolved_id = resolve_selector_to_primary_id(client, ctx, &args.id, None).await?;
     let patch = WorkItemPatch {
         status: Some(args.target.as_status().to_owned()),
+        archived_reason: args.archived_reason,
         ..WorkItemPatch::default()
     };
     let (item, label) = expect_leaf_work_item(update_work_item(client, &resolved_id, patch).await?)?;

@@ -126,79 +126,6 @@ fn resolve_window(since: &str, until: Option<&str>) -> Result<(i64, i64), CliErr
     Ok((since_epoch_s, until_epoch_s))
 }
 
-// ── Local-time display ───────────────────────────────────────────────
-//
-// The workspace `chrono` dependency ships without the `clock` feature, so
-// there is no portable in-process "what's my local timezone" lookup
-// without a new external dependency. Shelling out to `date +%z` (POSIX,
-// identical on BSD and GNU `date`) gets this host's *current* UTC offset
-// with zero new dependencies. Applying that one fixed offset to every
-// timestamp in a report is an approximation — a timestamp on the other
-// side of a DST transition from "now" can be off by an hour — so the
-// report header always states the offset in use and callers who need
-// exactness can pass `--utc`.
-
-struct DisplayTz {
-    offset_s: i32,
-    label: String,
-}
-
-fn detect_local_utc_offset_seconds() -> Option<i32> {
-    let output = Command::new("date").arg("+%z").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(output.stdout).ok()?;
-    let text = text.trim();
-    if text.len() != 5 {
-        return None;
-    }
-    let bytes = text.as_bytes();
-    let sign: i32 = match bytes[0] {
-        b'+' => 1,
-        b'-' => -1,
-        _ => return None,
-    };
-    let hh: i32 = std::str::from_utf8(&bytes[1..3]).ok()?.parse().ok()?;
-    let mm: i32 = std::str::from_utf8(&bytes[3..5]).ok()?.parse().ok()?;
-    Some(sign * (hh * 3_600 + mm * 60))
-}
-
-fn offset_suffix(offset_s: i32) -> String {
-    let sign = if offset_s < 0 { '-' } else { '+' };
-    let abs = offset_s.unsigned_abs();
-    format!("{sign}{:02}:{:02}", abs / 3_600, (abs % 3_600) / 60)
-}
-
-fn resolve_display_tz(force_utc: bool) -> DisplayTz {
-    if force_utc {
-        return DisplayTz {
-            offset_s: 0,
-            label: "UTC".to_owned(),
-        };
-    }
-    match detect_local_utc_offset_seconds() {
-        Some(offset_s) => DisplayTz {
-            offset_s,
-            label: format!(
-                "this host's local time, UTC{} — its current offset, applied uniformly; a timestamp \
-                 near a DST change may be off by up to 1 hour. Pass --utc for exact UTC.",
-                offset_suffix(offset_s)
-            ),
-        },
-        None => DisplayTz {
-            offset_s: 0,
-            label: "UTC (could not detect this host's local offset)".to_owned(),
-        },
-    }
-}
-
-fn format_epoch(epoch_s: i64, tz: &DisplayTz) -> String {
-    let shifted = epoch_s.saturating_add(i64::from(tz.offset_s));
-    let utc_form = boss_engine_utils::iso8601::format_epoch_iso8601(shifted);
-    format!("{}{}", utc_form.trim_end_matches('Z'), offset_suffix(tz.offset_s))
-}
-
 // ── Rendering ─────────────────────────────────────────────────────────
 
 fn format_tokens(n: i64) -> String {
@@ -468,14 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn display_helpers_format_offsets_epochs_and_tokens() {
-        assert_eq!(offset_suffix(-19_800), "-05:30");
-        assert_eq!(offset_suffix(0), "+00:00");
-        let tz = DisplayTz {
-            offset_s: -3_600,
-            label: "test".to_owned(),
-        };
-        assert_eq!(format_epoch(0, &tz), "1969-12-31T23:00:00-01:00");
+    fn display_helpers_format_tokens() {
         assert_eq!(format_tokens(0), "0");
         assert_eq!(format_tokens(1_000_000), "1,000,000");
         assert_eq!(format_tokens(-1234), "-1,234");

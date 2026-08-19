@@ -377,8 +377,8 @@ fn boss_archive_requires_a_reason_and_stamps_its_own_mechanism() {
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("archived_reason"),
-        "boss archive without a reason must be refused: {err}"
+        err.contains("archived_reason") && err.contains("--archived-reason"),
+        "boss archive without a reason must name the flag: {err}"
     );
     assert_eq!(task_status(&db, &chore.id), "todo");
 
@@ -452,4 +452,47 @@ fn boothby_archive_uses_armed_verb_and_rationale() {
         Some("no activity in 90 days and no PR")
     );
     assert_eq!(archived.last_status_actor, LAST_STATUS_ACTOR_BOOTHBY);
+}
+
+/// A non-empty `archived_reason` on a row that is not (and is not
+/// becoming) archived must fail rather than being silently discarded
+/// by the archival-provenance invariant.
+#[test]
+fn archived_reason_on_a_non_archived_row_is_refused() {
+    let db = WorkDb::open(temp_db_path("archived-reason-not-archived")).unwrap();
+    let product_id = make_revision_product(&db, "reason-not-archived");
+    let chore = create_test_chore_manual(&db, product_id, "still open");
+
+    let err = db
+        .update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                archived_reason: Some("this would have been dropped".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("cannot set archived_reason") && err.contains("not moving to archived"),
+        "non-archived archived_reason must be refused: {err}"
+    );
+    assert_eq!(task_status(&db, &chore.id), "todo");
+
+    let err = db
+        .update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("active".into()),
+                archived_reason: Some("un-archive plus a reason".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("cannot set archived_reason"),
+        "un-archive with archived_reason must be refused: {err}"
+    );
+    assert_eq!(task_status(&db, &chore.id), "todo");
 }

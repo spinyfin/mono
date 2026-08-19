@@ -104,6 +104,7 @@ mod engine_cmds;
 mod output;
 mod status_args;
 mod task_update_args;
+mod time_fmt;
 mod work_cmds;
 
 pub(crate) use automation_cmds::*;
@@ -116,6 +117,7 @@ pub(crate) use engine_cmds::*;
 pub(crate) use output::*;
 pub(crate) use status_args::*;
 pub(crate) use task_update_args::*;
+pub(crate) use time_fmt::*;
 pub(crate) use work_cmds::*;
 
 #[cfg(test)]
@@ -364,7 +366,7 @@ pub(crate) fn build_cli_reference() -> Result<CliReferenceDocument, CliError> {
             "Task and chore status uses the board (kanban) names: backlog, doing, review, done, blocked, archived. These are the canonical values shown in --status help and emitted in --json.",
             "The legacy stored names are accepted as aliases on input: todo->backlog, active->doing, in_review (or in-review)->review. They remain how rows are stored, so --json/human output always shows the board name regardless of how a row was set.",
             "boss task|chore update --status and --status list filters accept either vocabulary; boss task|chore move --to backlog|doing|review|done|blocked|archived (legacy names also accepted).",
-            "archived is a terminal status for leaf work items (tasks/chores), distinct from delete: `boss task|chore update --status archived` (or `move --to archived`) marks a row as no longer relevant while keeping it queryable — it is NOT soft-deleted (deleted_at stays NULL) and leaves the kanban board the same way an archived project does. It can be reached from any non-terminal status, and moving it back to backlog (`--status backlog` / `--to backlog`) un-archives it. Archived rows are hidden from `boss task|chore list` by default; pass `--include-archived` or filter `--status archived` explicitly to see them.",
+            "archived is a terminal status for leaf work items (tasks/chores), distinct from delete: `boss task|chore update --status archived` (or `move --to archived`) marks a row as no longer relevant while keeping it queryable — it is NOT soft-deleted (deleted_at stays NULL) and leaves the kanban board the same way an archived project does. It can be reached from any non-terminal status, and moving it back to backlog (`--status backlog` / `--to backlog`) un-archives it. An automated archive (any non-human actor) must supply `--archived-reason`; a human archive may omit it. Archived rows are hidden from `boss task|chore list` by default; pass `--include-archived` or filter `--status archived` explicitly to see them.",
             "Product move/delete: --to active|paused|archived. delete is a soft archive (sets status=archived).",
             "Project move/delete: --to planned|active|blocked|done|archived. delete is a soft archive (sets status=archived).",
             "Task/chore delete is a soft delete (sets deleted_at). Recover an accidentally deleted leaf work item with `boss task restore <id>` (alias `undelete`); it clears deleted_at and is idempotent. Find tombstoned rows to restore with `boss task list --deleted` / `boss chore list --deleted`.",
