@@ -235,34 +235,14 @@ impl ServerState {
             Ok(tmux) => tmux,
             Err(err) => {
                 tracing::debug!(error = %format!("{err:#}"), "agents list: tmux evidence unavailable");
-                return identities
-                    .into_iter()
-                    .map(|(execution_id, identity)| match identity {
-                        Ok(Some(identity)) => probe_unavailable_status(execution_id, Some(identity.session_name)),
-                        Ok(None) => not_tmux_hosted_status(execution_id),
-                        Err(err) => {
-                            tracing::warn!(execution_id, error = %format!("{err:#}"), "agents list: failed reading tmux identity");
-                            probe_unavailable_status(execution_id, None)
-                        }
-                    })
-                    .collect();
+                return identity_only_statuses(identities);
             }
         };
         let session_names = match tmux.list_sessions().await {
             Ok(sessions) => sessions.into_iter().map(|session| session.name).collect::<HashSet<_>>(),
             Err(err) => {
                 tracing::debug!(error = %format!("{err:#}"), "agents list: tmux session inventory unavailable");
-                return identities
-                    .into_iter()
-                    .map(|(execution_id, identity)| match identity {
-                        Ok(Some(identity)) => probe_unavailable_status(execution_id, Some(identity.session_name)),
-                        Ok(None) => not_tmux_hosted_status(execution_id),
-                        Err(err) => {
-                            tracing::warn!(execution_id, error = %format!("{err:#}"), "agents list: failed reading tmux identity");
-                            probe_unavailable_status(execution_id, None)
-                        }
-                    })
-                    .collect();
+                return identity_only_statuses(identities);
             }
         };
 
@@ -307,6 +287,22 @@ impl ServerState {
     }
 }
 
+fn identity_only_statuses(
+    identities: Vec<(String, anyhow::Result<Option<crate::work::TmuxIdentity>>)>,
+) -> Vec<boss_protocol::TmuxWorkerStatus> {
+    identities
+        .into_iter()
+        .map(|(execution_id, identity)| match identity {
+            Ok(Some(identity)) => probe_unavailable_status(execution_id, Some(identity.session_name)),
+            Ok(None) => not_tmux_hosted_status(execution_id),
+            Err(err) => {
+                tracing::warn!(execution_id, error = %format!("{err:#}"), "agents list: failed reading tmux identity");
+                probe_unavailable_status(execution_id, None)
+            }
+        })
+        .collect()
+}
+
 fn tmux_status(
     execution_id: String,
     session_name: Option<String>,
@@ -315,14 +311,14 @@ fn tmux_status(
     last_output_at: Option<String>,
     attach_command: Option<String>,
 ) -> boss_protocol::TmuxWorkerStatus {
-    boss_protocol::TmuxWorkerStatus {
-        execution_id,
-        session_name,
-        adoption_state,
-        pane_dead,
-        last_output_at,
-        attach_command,
-    }
+    boss_protocol::TmuxWorkerStatus::builder()
+        .execution_id(execution_id)
+        .maybe_session_name(session_name)
+        .adoption_state(adoption_state)
+        .maybe_pane_dead(pane_dead)
+        .maybe_last_output_at(last_output_at)
+        .maybe_attach_command(attach_command)
+        .build()
 }
 
 fn not_tmux_hosted_status(execution_id: String) -> boss_protocol::TmuxWorkerStatus {

@@ -44,6 +44,10 @@ use boss_engine_jsonl_append::JsonlAppender;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+/// Synthetic execution id for dispatch events that describe engine boot rather
+/// than a single durable execution.
+pub const ENGINE_BOOT_EXECUTION_ID: &str = "engine-boot";
+
 /// One step of the dispatch pipeline. Stage values are stable strings
 /// so external tooling (`jq`, future bossctl verbs) can pin against
 /// them. Spelled provisionally for now — the schema in

@@ -101,7 +101,7 @@ use boss_tmux::{DisplayField, TMUX_SPAWN_TOKEN_ENV, Tmux};
 
 use crate::coordinator::{ExecutionCoordinator, slot_id_from_worker_id};
 use crate::dead_pid_sweep::{PidStatus, probe_pid};
-use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
+use crate::dispatch_events::{DispatchEvent, DispatchEventSink, ENGINE_BOOT_EXECUTION_ID, Outcome, Stage};
 use crate::live_worker_state::{LiveSpawnRouting, ReadoptionEvidence, attributed_pool_label};
 use crate::spawn_flow::{TMUX_SESSION_SCHEMA, WorkerSpawner};
 use crate::work::{TmuxRunHandle, WorkDb};
@@ -393,7 +393,7 @@ where
                     DispatchEvent::new(
                         Stage::TmuxAdoptionOwnerConflict,
                         Outcome::Error,
-                        "engine-boot".to_string(),
+                        ENGINE_BOOT_EXECUTION_ID.to_string(),
                     )
                     .with_details(serde_json::json!({
                         "other_pid": other_pid,
@@ -793,13 +793,16 @@ async fn classify_untracked_session<S>(
                     // mirrors into one stable `executions/engine-boot/`
                     // directory instead of minting a phantom timeline per
                     // leaked token. The token itself is in `details`.
-                    DispatchEvent::new(Stage::TmuxLeakDetected, Outcome::Ok, "engine-boot".to_string()).with_details(
-                        serde_json::json!({
-                            "tmux_session_name": session.session_name,
-                            "spawn_token": session.spawn_token,
-                            "reason": "spawn_token_not_found",
-                        }),
-                    ),
+                    DispatchEvent::new(
+                        Stage::TmuxLeakDetected,
+                        Outcome::Ok,
+                        ENGINE_BOOT_EXECUTION_ID.to_string(),
+                    )
+                    .with_details(serde_json::json!({
+                        "tmux_session_name": session.session_name,
+                        "spawn_token": session.spawn_token,
+                        "reason": "spawn_token_not_found",
+                    })),
                 )
                 .await;
             outcome.untracked_sessions.push(session);
@@ -1864,10 +1867,10 @@ mod tests {
                 spawn_token: "tok-unknown".to_owned(),
             }]
         );
-        let events = sink.events_for("engine-boot").await;
+        let events = sink.events_for(ENGINE_BOOT_EXECUTION_ID).await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].stage, Stage::TmuxLeakDetected.as_str());
-        assert_eq!(events[0].execution_id, "engine-boot");
+        assert_eq!(events[0].execution_id, ENGINE_BOOT_EXECUTION_ID);
         assert_eq!(events[0].details["tmux_session_name"], "boss-worker-9");
         assert_eq!(events[0].details["spawn_token"], "tok-unknown");
         assert!(convergence.calls.lock().unwrap().is_empty());
@@ -2185,7 +2188,7 @@ mod tests {
         );
         assert_eq!(events[0].stage, Stage::TmuxAdoptionOwnerConflict.as_str());
         assert_eq!(events[0].outcome, Outcome::Error.as_str());
-        assert_eq!(events[0].execution_id, "engine-boot");
+        assert_eq!(events[0].execution_id, ENGINE_BOOT_EXECUTION_ID);
         assert_eq!(events[0].details["other_pid"], serde_json::json!(1));
         assert_eq!(events[0].details["this_pid"], serde_json::json!(std::process::id()));
     }
