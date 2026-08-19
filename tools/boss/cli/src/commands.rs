@@ -2583,6 +2583,14 @@ pub(crate) struct RevisionCreateArgs {
     #[arg(long, value_enum)]
     pub(crate) effort: Option<EffortLevelArg>,
 
+    /// See `boss task create --effort-matched-rule`.
+    #[arg(long = "effort-matched-rule", value_name = "RULE", allow_hyphen_values = true)]
+    pub(crate) effort_matched_rule: Option<String>,
+
+    /// See `boss task create --effort-reasons`.
+    #[arg(long = "effort-reasons", value_name = "REASONS", allow_hyphen_values = true)]
+    pub(crate) effort_reasons: Option<String>,
+
     #[arg(long, value_name = "SLUG")]
     pub(crate) model: Option<String>,
 

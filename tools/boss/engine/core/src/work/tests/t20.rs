@@ -2152,6 +2152,46 @@ fn create_revision_explicit_effort_overrides_design_family_default() {
 }
 
 #[test]
+fn create_revision_persists_explicit_effort_provenance_and_leaves_it_unset_when_omitted() {
+    let db = WorkDb::open(temp_db_path("revision-effort-provenance")).unwrap();
+    let product_id = make_revision_product(&db, "revision-effort-provenance");
+    let parent_id = make_in_review_chore(&db, &product_id, "https://github.com/spinyfin/mono/pull/925");
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+
+    let without_provenance = db.create_revision(revision_input(&parent_id), &checker).unwrap();
+    assert!(without_provenance.effort_matched_rule.is_none());
+    assert!(without_provenance.effort_reasons.is_none());
+
+    let with_provenance = db
+        .create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(parent_id.clone())
+                .description("persist explicit effort provenance")
+                .effort_level(boss_protocol::EffortLevel::Medium)
+                .effort_matched_rule("rule 8 (fallback)")
+                .effort_reasons("touches CLI and engine")
+                .build(),
+            &checker,
+        )
+        .unwrap();
+    assert_eq!(
+        with_provenance.effort_matched_rule.as_deref(),
+        Some("rule 8 (fallback)")
+    );
+    assert_eq!(
+        with_provenance.effort_reasons.as_deref(),
+        Some("touches CLI and engine")
+    );
+
+    let read_back = match db.get_work_item(&with_provenance.id).unwrap() {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task,
+        item => panic!("expected revision task, got {item:?}"),
+    };
+    assert_eq!(read_back.effort_matched_rule, with_provenance.effort_matched_rule);
+    assert_eq!(read_back.effort_reasons, with_provenance.effort_reasons);
+}
+
+#[test]
 fn create_revision_still_defaults_to_small_for_non_design_family_parent() {
     // Regression guard: the design-family carve-out must not change the
     // existing default for ordinary chore/task parents (revision-tasks.md
