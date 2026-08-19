@@ -29,9 +29,7 @@ trait PreflightRunner {
     ) -> anyhow::Result<PreflightOutput>;
 }
 
-struct RealPreflightRunner {
-    macos_seatbelt_profile: Option<PathBuf>,
-}
+struct RealPreflightRunner;
 
 impl PreflightRunner for RealPreflightRunner {
     fn run(
@@ -46,14 +44,7 @@ impl PreflightRunner for RealPreflightRunner {
                 .wait_for_auth_ready_for_oauth_probe()
                 .context("waiting for a Grok OAuth refresh before preflight")?;
         }
-        let mut command = match &self.macos_seatbelt_profile {
-            Some(profile) => {
-                let mut command = Command::new("/usr/bin/sandbox-exec");
-                command.arg("-f").arg(profile).arg(program);
-                command
-            }
-            None => Command::new(program),
-        };
+        let mut command = Command::new(program);
         command.args(args).current_dir(workspace);
         if program == "grok" {
             environment.apply_to_command(&mut command);
@@ -146,32 +137,7 @@ fn run_grok_models_with_timeout(command: &mut Command, timeout: Duration) -> any
 /// this matters because `grok models` returns zero while printing "not
 /// authenticated" when no credential is usable.
 pub fn run_worker_preflight(workspace: &Path, environment: &GrokProcessEnvironment) -> anyhow::Result<()> {
-    run_worker_preflight_with(
-        &RealPreflightRunner {
-            macos_seatbelt_profile: None,
-        },
-        workspace,
-        environment,
-    )
-}
-
-/// Run the same affirmative checks under the exact Boss-owned Seatbelt
-/// profile that will contain the Grok pane and all of its terminal tools.
-/// A direct parent-process check is insufficient: Grok's built-in macOS
-/// profile can make `gh auth status` degrade from keyring to a stale file
-/// credential even though the same scoped HOME succeeds outside Seatbelt.
-pub fn run_worker_preflight_under_macos_seatbelt(
-    workspace: &Path,
-    environment: &GrokProcessEnvironment,
-    profile: &Path,
-) -> anyhow::Result<()> {
-    run_worker_preflight_with(
-        &RealPreflightRunner {
-            macos_seatbelt_profile: Some(profile.to_path_buf()),
-        },
-        workspace,
-        environment,
-    )
+    run_worker_preflight_with(&RealPreflightRunner, workspace, environment)
 }
 
 fn run_worker_preflight_with(
@@ -214,15 +180,13 @@ fn run_worker_preflight_with(
 /// the write is evaluated exactly where Grok will create its session.
 const SESSION_STORE_PROBE_LEAF: &str = "sessions/.boss-preflight-write-probe";
 
-/// Prove Grok can create a file in its own session store *through the exact
-/// sandbox the pane will run under* — the one capability whose absence parks
-/// the CLI on its start menu instead of failing it outward.
+/// Prove Grok can create a file in its own session store before the pane is
+/// spawned — the one capability whose absence parks the CLI on its start menu
+/// instead of failing it outward.
 ///
 /// Grok's session store is a symlink out of `$GROK_HOME` into Boss's state
-/// root ([`crate::transcript_store::provision_durable_sessions`]). Seatbelt
-/// evaluates the resolved target, so granting `$GROK_HOME` says nothing about
-/// whether this write lands: the sandbox can deny it while every path-shaped
-/// check in the profile looks right. When it is denied, `grok` starts, reports
+/// root ([`crate::transcript_store::provision_durable_sessions`]). When it is
+/// unavailable, `grok` starts, reports
 /// `Session creation failed: Permission denied.: {"code": "FS_PERMISSION_DENIED",
 /// "detail": "Operation not permitted (os error 1)"}`, and then sits at its
 /// start menu holding a slot and a cube lease — it never execs a session, so
@@ -232,8 +196,7 @@ const SESSION_STORE_PROBE_LEAF: &str = "sessions/.boss-preflight-write-probe";
 /// Running the probe here converts that into a pre-spawn error carrying the
 /// kernel's own `Operation not permitted` text, before any pane, slot, or
 /// lease is committed. It is a real write rather than a permission
-/// calculation, so it stays honest about any future fence — not just the
-/// Boss-data-dir one that first caused this.
+/// calculation, so it stays honest about the actual process environment.
 fn assert_session_store_writable(
     runner: &dyn PreflightRunner,
     workspace: &Path,
@@ -242,12 +205,12 @@ fn assert_session_store_writable(
     let probe = environment.grok_home().join(SESSION_STORE_PROBE_LEAF);
     let probe_arg = probe.display().to_string();
     let output = runner.run("/usr/bin/touch", &[&probe_arg], workspace, environment)?;
-    // The engine itself is unsandboxed, so it can always clear the probe —
-    // and must, so a successful preflight leaves the transcript store clean.
+    // The engine clears the probe so a successful preflight leaves the
+    // transcript store clean.
     let _ = std::fs::remove_file(&probe);
     if !output.success {
         bail!(
-            "Grok worker preflight failed: Grok session storage at {} is not writable under the worker sandbox; \
+            "Grok worker preflight failed: Grok session storage at {} is not writable by the worker; \
              Grok would start and then fail session creation with FS_PERMISSION_DENIED. \
              {}",
             probe.display(),
@@ -438,7 +401,7 @@ mod tests {
         let error = run_worker_preflight_with(&runner, Path::new("/workspace"), &environment())
             .unwrap_err()
             .to_string();
-        assert!(error.contains("not writable under the worker sandbox"), "{error}");
+        assert!(error.contains("not writable by the worker"), "{error}");
         assert!(error.contains("FS_PERMISSION_DENIED"), "{error}");
         assert!(error.contains("Operation not permitted"), "{error}");
     }

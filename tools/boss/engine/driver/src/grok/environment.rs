@@ -268,43 +268,6 @@ impl GrokProcessEnvironment {
         Ok(())
     }
 
-    /// Host paths that Grok and its terminal tools must be able to mutate
-    /// while running under Boss's macOS Seatbelt profile.
-    ///
-    /// The process and Grok homes hold per-run state. Cube owns the jj/git
-    /// object store for secondary workspaces, and the cache roots are needed
-    /// by repobin/Bazel. OAuth refresh is atomic and locks beside
-    /// `GROK_AUTH_PATH`, so its parent must be writable by every concurrent
-    /// worker that shares that credential.
-    pub fn macos_writable_roots(&self, workspace: &Path) -> Vec<PathBuf> {
-        let mut roots = vec![
-            self.grok_home.clone(),
-            self.process_home.clone(),
-            workspace.to_path_buf(),
-            self.host_tools.cube_data_dir.clone(),
-            self.host_tools.cube_config_dir.clone(),
-            self.host_tools.caches.xdg_cache_home.clone(),
-            self.host_tools.caches.repobin_cache_dir.clone(),
-            self.host_tools.caches.bazelisk_home.clone(),
-            self.host_tools.caches.bazel_output_root.clone(),
-            std::env::temp_dir(),
-            PathBuf::from("/tmp"),
-            PathBuf::from("/private/tmp"),
-        ];
-        if let Some(parent) = self.auth_path.parent() {
-            roots.push(parent.to_path_buf());
-        }
-
-        let mut unique = Vec::new();
-        for root in roots {
-            let root = fs::canonicalize(&root).unwrap_or(root);
-            if !unique.contains(&root) {
-                unique.push(root);
-            }
-        }
-        unique
-    }
-
     /// Reproduce the environment visible to Grok terminal tools: HOME stays
     /// scoped, while the parent-only delegation variables are absent. The
     /// startup preflight uses this for Cube/gh/jj so it cannot go green on a
