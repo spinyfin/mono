@@ -284,3 +284,192 @@ fn path_guard_still_approves_tools_it_has_nothing_to_say_about() {
         assert_eq!(decision, "approve", "{tool} must be approved");
     }
 }
+
+// ── Broad-traversal boundary ──────────────────────────────────────────
+//
+// The second boundary the gate enforces: a tool call may not *start* a
+// recursive walk rooted at the whole machine. This is what let a worker's
+// claude process walk `/` and read into ~/Desktop, ~/Documents, ~/Pictures
+// and three other users' home directories in one run — raising a macOS
+// privacy prompt attributed to Boss for each protected category. Evidence:
+// tools/boss/docs/investigations/worker-filesystem-traversal-tcc-prompts-2026-08-19.md
+//
+// `cwd` is passed explicitly so relative roots resolve against a known
+// directory rather than whatever cwd the test binary inherited.
+
+/// Run the gate with an explicit `cwd` in the payload.
+fn run_guard_in(data_dir: &std::path::Path, cwd: &std::path::Path, mut payload: serde_json::Value) -> (String, String) {
+    payload["cwd"] = serde_json::json!(cwd.display().to_string());
+    run_path_guard(data_dir, payload)
+}
+
+fn bash(command: &str) -> serde_json::Value {
+    serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}})
+}
+
+#[test]
+fn path_guard_blocks_a_machine_wide_recursive_walk() {
+    let data = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    for command in [
+        // The exact shape observed in the incident.
+        "find / -name foo",
+        "du -sh /",
+        "rg needle /Users",
+        "grep -rn needle /Volumes",
+        "ls -R /System",
+        "find /Library -name x",
+        // autofs maps: descending these mounts a network volume on demand,
+        // which is what raised the "access files on a network volume" prompt.
+        "find /net -name x",
+        "find /home -name x",
+        // A sibling user's home is as far out of scope as the operator's.
+        "find /Users/someone-else -name x",
+        // The root can arrive via a `cd` earlier in the same command line.
+        "cd / && find . -name x",
+        "cd /;find . -name x",
+        "(cd / && find . -name x)",
+        "{ cd / ; find . -name x ; }",
+        // POSIX -H/-L/-P precede path operands and must not hide the root.
+        "find -L / -name x",
+        "find -H /Users -name x",
+        // A shell glob still denotes every user's protected Desktop.
+        "find /Users/*/Desktop -name x",
+        // Clustered short flags request recursion just as `-r` does.
+        "grep -rn needle /Users",
+        // Pattern-supplying flags leave no positional pattern; the next
+        // non-flag is a real traversal root, not a regex to skip.
+        "rg -e needle /",
+        "grep -r -e needle /",
+        "rg --regexp=needle /",
+        "rg -f patterns.txt /",
+        // Metadata searches are global unless mdfind receives a narrow root.
+        "mdfind 'kMDItemDisplayName == foo'",
+        "locate foo",
+        // Whole-tree archivers must judge their input tree, not their output.
+        "tar -cf out.tar /",
+        "zip -r out.zip /",
+        "ditto / /tmp/copy",
+    ] {
+        let (decision, reason) = run_guard_in(data.path(), cwd.path(), bash(command));
+        assert_eq!(decision, "block", "must block a machine-wide walk: {command}");
+        assert!(
+            reason.contains("recursive directory walk"),
+            "block reason must name the hazard for {command}: {reason}",
+        );
+    }
+}
+
+#[test]
+fn path_guard_blocks_broad_roots_in_their_resolved_spelling_too() {
+    // A root must be recognised in either spelling, or the boundary is one
+    // symlink away from being bypassed:
+    //
+    //  - `/home` is an autofs map; realpath() turns it into
+    //    `/System/Volumes/Data/home`, which is not literally in the broad-root
+    //    set. Descending it is what mounts a network volume on demand, so this
+    //    is precisely the case behind the "network volume" prompt.
+    //  - macOS resolves user paths through the data-volume firmlink, so
+    //    `/Users/x` also arrives as `/System/Volumes/Data/Users/x`.
+    let data = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    for command in [
+        "find /home -name x",
+        "find /System/Volumes/Data/home -name x",
+        "rg needle /System/Volumes/Data/Users/someone-else",
+        "du -sh /System/Volumes/Data",
+    ] {
+        let (decision, reason) = run_guard_in(data.path(), cwd.path(), bash(command));
+        assert_eq!(decision, "block", "must block either spelling: {command} → {reason}");
+    }
+}
+
+#[test]
+fn path_guard_blocks_broad_roots_from_glob_and_grep_tools() {
+    // Claude Code's Glob runs in-process — no Bash command to tokenise — so
+    // the root arrives as `path`, or as the literal prefix of an absolute
+    // `pattern`. Both must be judged, or the boundary only covers shell-outs.
+    let data = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    for payload in [
+        serde_json::json!({"tool_name": "Glob", "tool_input": {"path": "/", "pattern": "**/*.rs"}}),
+        serde_json::json!({"tool_name": "Glob", "tool_input": {"pattern": "/**/*.rs"}}),
+        serde_json::json!({"tool_name": "Grep", "tool_input": {"pattern": "x", "path": "/Users/someone-else"}}),
+        serde_json::json!({"tool_name": "Grep", "tool_input": {"pattern": "x", "path": "/Volumes"}}),
+    ] {
+        let (decision, reason) = run_guard_in(data.path(), cwd.path(), payload.clone());
+        assert_eq!(decision, "block", "must block a broad root for {payload}");
+        assert!(reason.contains("recursive directory walk"), "{reason}");
+    }
+}
+
+#[test]
+fn path_guard_approves_scoped_searches_and_specific_external_files() {
+    // The defect is the breadth of the traversal, not the fact that a path is
+    // outside the workspace. A scoped search, and a read of one named file
+    // outside the workspace, must both stay untouched — narrowing the scan is
+    // the fix; fencing every external read would break ordinary worker work.
+    let data = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let scoped = cwd.path().join("src");
+    std::fs::create_dir_all(&scoped).unwrap();
+    for payload in [
+        bash("find . -name '*.rs'"),
+        bash("rg needle src/"),
+        // The first non-flag grep-family operand is a regex pattern, not a
+        // traversal root, and `find` expressions carry values not paths.
+        bash("rg '/Users' tools/boss"),
+        bash("rg -e '/Users' tools/boss"),
+        bash("rg -A 3 '/Users' tools/boss"),
+        bash("rg --glob '*.rs' '/System' tools"),
+        bash("find tools -name '*.rs' -newer /Users"),
+        bash(&format!("rg needle {}", scoped.display())),
+        // A cargo/bazel cache under the home directory: a real root, but a
+        // named one, not the home directory itself.
+        bash("find ~/.cargo/registry -name x"),
+        // Not recursive: listing a directory is not walking its tree.
+        bash("ls /"),
+        // Changing directories alone is not a traversal.
+        bash("cd /; echo scoped-work"),
+        bash("echo /"),
+        bash("cat /etc/hosts"),
+        bash("bazel test //tools/boss/engine/..."),
+        // `git -C <home>` is not a traversal program at all.
+        bash("git -C /Users/someone-else status"),
+        bash("mdfind -onlyin tools/boss 'kMDItemDisplayName == foo'"),
+        serde_json::json!({"tool_name": "Read", "tool_input": {"file_path": "/etc/hosts"}}),
+        serde_json::json!({"tool_name": "Glob", "tool_input": {"pattern": "**/*.rs"}}),
+        // Grep/Search patterns are regexes; only their `path` is a root.
+        serde_json::json!({"tool_name": "Grep", "tool_input": {"pattern": "/Users/brianduff", "path": "tools/boss"}}),
+    ] {
+        let (decision, reason) = run_guard_in(data.path(), cwd.path(), payload.clone());
+        assert_eq!(
+            decision, "approve",
+            "must not disturb scoped work: {payload} → {reason}"
+        );
+    }
+}
+
+#[test]
+fn path_guard_script_has_the_traversal_boundary_logic() {
+    // Guard against an accidental edit that guts the second boundary, in the
+    // same shape as the data-dir assertions above.
+    let s = PATH_GUARD_SCRIPT;
+    assert!(s.contains("STATIC_BROAD_ROOTS"), "must define the broad-root set");
+    assert!(
+        s.contains("ALWAYS_RECURSIVE") && s.contains("RECURSIVE_WITH_FLAG"),
+        "must know which programs recurse",
+    );
+    assert!(
+        s.contains("\"/net\"") && s.contains("\"/home\""),
+        "autofs maps must be broad roots — descending them mounts a network volume",
+    );
+    assert!(
+        s.contains("is_broad_root") && s.contains("traversal_roots"),
+        "must judge the root of a recursive walk",
+    );
+    assert!(
+        s.contains("TRAVERSAL_RECOVERY"),
+        "must explain how to re-root the search",
+    );
+}
