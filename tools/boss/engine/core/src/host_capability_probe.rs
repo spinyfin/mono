@@ -507,9 +507,12 @@ mod tests {
 
         // This test shell models the worker pane's login-shell phase: it
         // receives only the launcher seed, then a profile prepends the driver
-        // directory before evaluating the requested command. It is a script
-        // rather than zsh-specific setup so the regression is portable to the
-        // Linux Bazel test environment too.
+        // directory before evaluating the requested command. Consume both
+        // `-l` and `-i` here — forwarding `-i` to the inner `/bin/sh` makes
+        // that shell interactive, so it can source the builder's rc files
+        // (or wait on a TTY) and blow the probe's two-second timeout.
+        // A script rather than zsh-specific setup keeps the regression
+        // portable to the Linux Bazel test environment too.
         let login_shell = temp.path().join("profile-login-shell");
         fs::write(
             &login_shell,
@@ -520,7 +523,7 @@ mod tests {
                  test \"$PATH\" = \"{}\" || exit 43\n\
                  PATH=\"{}:$PATH\"\n\
                  export PATH\n\
-                 shift\n\
+                 shift 2\n\
                  exec /bin/sh \"$@\"\n",
                 crate::spawn_flow::WORKER_SANITIZED_PATH,
                 profile_bin.display(),
