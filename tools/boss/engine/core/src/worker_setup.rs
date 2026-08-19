@@ -1355,7 +1355,7 @@ def literal_prefix(pattern):
     return pattern[:cut]
 
 
-SHELL_OPERATORS = frozenset((";", "&&", "||", "|", "&"))
+SHELL_OPERATORS = frozenset((";", "&&", "||", "|", "&", "{", "}"))
 
 
 def command_segments(tokens):
@@ -1363,6 +1363,7 @@ def command_segments(tokens):
     segment = []
     for token in tokens:
         token = token.rstrip(";&|").lstrip("(").rstrip(")")
+        token = token.lstrip("{").rstrip("}")
         if not token or token in SHELL_OPERATORS:
             if segment:
                 yield segment
@@ -1373,17 +1374,23 @@ def command_segments(tokens):
         yield segment
 
 
+# Grep-family flags that *are* the pattern (`-e needle`, `-f patterns.txt`).
+# After one of these, remaining positionals are traversal roots — there is
+# no positional pattern left to skip.
+GREP_PATTERN_FLAGS = frozenset((
+    "-e", "--regexp",
+    "-f", "--file",
+))
+
 # Grep-family flags whose next argument is a value, not a path or the pattern.
 # Consumed so `rg -A 3 '/Users' tools` does not treat `3` as the pattern.
 GREP_VALUE_FLAGS = frozenset((
-    "-e", "--regexp",
-    "-f", "--file",
     "-g", "--glob",
+    "--iglob",
     "-t", "--type",
     "-A", "-B", "-C",
     "-m",
     "--max-depth",
-    "--iglob",
 ))
 
 
@@ -1391,17 +1398,35 @@ def grep_roots(operands):
     """Traversal roots for grep-family commands after their regex pattern."""
     non_flags = []
     skip_next = False
+    pattern_supplied = False
     for token in operands:
         if skip_next:
             skip_next = False
             continue
+        if token in GREP_PATTERN_FLAGS:
+            skip_next = True
+            pattern_supplied = True
+            continue
         if token in GREP_VALUE_FLAGS:
             skip_next = True
+            continue
+        if token.startswith("--regexp=") or token.startswith("--file="):
+            pattern_supplied = True
+            continue
+        # Attached short forms: `-eneedle`, `-fpatterns.txt`.
+        if (
+            (token.startswith("-e") or token.startswith("-f"))
+            and len(token) > 2
+            and not token.startswith("--")
+        ):
+            pattern_supplied = True
             continue
         if token.startswith("-"):
             # `--flag=value` is one token and needs no skip.
             continue
         non_flags.append(token)
+    if pattern_supplied:
+        return non_flags
     return non_flags[1:]
 
 
