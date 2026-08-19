@@ -1500,6 +1500,11 @@ pub(crate) struct EngineAttemptsListArgs {
     /// `--limit 0` for no cap.
     #[arg(long)]
     pub(crate) limit: Option<u32>,
+    /// Request and render the engine's live background-work snapshot.
+    /// Read-only: prints the engine-provided count and items; does not
+    /// query source tables from the CLI. JSON emits `background_work` only with this flag.
+    #[arg(long)]
+    pub(crate) background: bool,
 }
 
 #[derive(Debug, Clone, Args)]
