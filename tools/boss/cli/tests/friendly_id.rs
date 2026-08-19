@@ -167,14 +167,37 @@ async fn task_show_primary_id_surfaces_archived_revision_provenance() -> Result<
             .is_some_and(|reason| reason.contains("superseded by chore task_")),
         "archived_reason must identify the superseding chore: {value}"
     );
+    let short_id = revision.short_id.ok_or_else(|| anyhow!("revision has no short_id"))?;
+    let by_short = run_boss(
+        engine.socket_str(),
+        &["task", "show", "--product", &product.id, &format!("T{short_id}")],
+    )?;
+    assert_eq!(
+        by_short["id"].as_str(),
+        Some(revision.id.as_str()),
+        "friendly short id must resolve the same archived revision: {by_short}"
+    );
+    assert_eq!(by_short["archived_by"].as_str(), Some("revision_parent_close_sweep"));
     let human = run_boss_human(engine.socket_str(), &["task", "show", &revision.id])?;
     assert!(
         human.contains("Archived by: revision_parent_close_sweep"),
         "output: {human}"
     );
     assert!(human.contains("Archived actor: engine"), "output: {human}");
-    assert!(human.contains("Archived at:"), "output: {human}");
+    let archived_at_line = human
+        .lines()
+        .find(|line| line.starts_with("Archived at:"))
+        .unwrap_or("");
+    let rendered_at = archived_at_line.trim_start_matches("Archived at:").trim();
+    assert!(
+        !rendered_at.is_empty() && rendered_at.parse::<i64>().is_err(),
+        "Archived at must be a formatted timestamp, not a raw epoch: {human}"
+    );
     assert!(human.contains("Archived reason:"), "output: {human}");
+    assert!(
+        human.contains("Deleted:"),
+        "tombstoned archived revision must print Deleted: {human}"
+    );
 
     let blocked = run_boss(engine.socket_str(), &["task", "show", &dependent.id])?;
     assert_eq!(blocked["status"].as_str(), Some("blocked"));

@@ -156,6 +156,15 @@ pub struct WorkItemPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_detail: Option<String>,
 
+    /// Set or clear `archived_reason` on a task. `None` → leave unchanged.
+    /// `Some("")` → clear (write NULL). A non-empty string is stored
+    /// verbatim. Required when an automated actor (`boss`, `engine`,
+    /// `boothby`) moves the row to `archived`; optional for a human
+    /// archive. When the actor is `boothby` and this field is omitted,
+    /// the engine fills it from the armed Boothby action's rationale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_reason: Option<String>,
+
     /// Product-level default model. Only honoured on
     /// product-targeted updates; ignored when patching a task/chore/
     /// project. `None` → leave unchanged. `Some("")` → clear.

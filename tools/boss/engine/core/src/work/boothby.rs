@@ -107,7 +107,7 @@ impl WorkDb {
         Ok(BoothbyActionGuard { db: self, previous })
     }
 
-    fn armed_boothby_action(&self) -> Result<Option<BoothbyActionContext>> {
+    pub(crate) fn armed_boothby_action(&self) -> Result<Option<BoothbyActionContext>> {
         Ok(self
             .boothby_action
             .lock()
@@ -137,6 +137,8 @@ pub(crate) fn is_boothby_actor(actor: &str) -> bool {
 /// it as a deliberate Boothby decision that no longer exists.
 pub(crate) fn task_image(task: &Task) -> ColumnImage {
     ColumnImage::from([
+        ("archived_at", task.archived_at.clone()),
+        ("archived_by", task.archived_by.clone()),
         ("archived_reason", task.archived_reason.clone()),
         ("autostart", Some(task.autostart.to_string())),
         ("blocked_attempt_id", task.blocked_attempt_id.clone()),
@@ -535,5 +537,27 @@ mod tests {
         let (pre, post) = changed_columns(&task_image(&task), &task_image(&taken)).expect("last_status_actor moved");
         assert_eq!(pre, r#"{"last_status_actor":"human"}"#);
         assert_eq!(post, r#"{"last_status_actor":"boothby"}"#);
+    }
+
+    #[test]
+    fn task_image_tracks_archival_provenance_columns() {
+        let task = sample_task();
+        let mut archived = task.clone();
+        archived.status = TaskStatus::Archived;
+        archived.archived_by = Some("close_stale_task".to_owned());
+        archived.archived_at = Some("1700000001".to_owned());
+        archived.archived_reason = Some("no activity in 90 days".to_owned());
+
+        let (pre, post) = changed_columns(&task_image(&task), &task_image(&archived)).expect("archival columns moved");
+        let pre: serde_json::Value = serde_json::from_str(&pre).unwrap();
+        let post: serde_json::Value = serde_json::from_str(&post).unwrap();
+        assert_eq!(pre["archived_by"], serde_json::Value::Null);
+        assert_eq!(post["archived_by"], "close_stale_task");
+        assert_eq!(pre["archived_at"], serde_json::Value::Null);
+        assert_eq!(post["archived_at"], "1700000001");
+        assert_eq!(pre["archived_reason"], serde_json::Value::Null);
+        assert_eq!(post["archived_reason"], "no activity in 90 days");
+        assert_eq!(pre["status"], "todo");
+        assert_eq!(post["status"], "archived");
     }
 }

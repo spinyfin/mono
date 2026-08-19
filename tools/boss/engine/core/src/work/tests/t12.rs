@@ -323,3 +323,133 @@ fn abandon_stranded_executions_on_closed_work_items_sweep() {
     let second_pass = db.abandon_stranded_executions_on_closed_work_items().unwrap();
     assert!(second_pass.is_empty(), "sweep must be idempotent: {second_pass:?}");
 }
+
+/// A human archive may omit free-text justification, but a caller-supplied
+/// reason must survive — `update_task` must not blanket-null it.
+#[test]
+fn human_archive_keeps_a_supplied_reason() {
+    let db = WorkDb::open(temp_db_path("human-archive-keeps-reason")).unwrap();
+    let product_id = make_revision_product(&db, "human-keep-reason");
+    let chore = create_test_chore_manual(&db, product_id, "archive me");
+
+    let archived = match db
+        .update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("archived".into()),
+                archived_reason: Some("operator closed as out of scope".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap()
+    {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task,
+        other => panic!("expected archived chore, got {other:?}"),
+    };
+    assert_eq!(
+        archived.archived_by.as_deref(),
+        Some(ARCHIVE_MECHANISM_MANUAL_STATUS_CHANGE)
+    );
+    assert_eq!(
+        archived.archived_reason.as_deref(),
+        Some("operator closed as out of scope")
+    );
+    assert_eq!(archived.last_status_actor, LAST_STATUS_ACTOR_HUMAN);
+}
+
+/// Agent / boss archives go through `update_task` and must not stamp the
+/// manual mechanism or drop the reason.
+#[test]
+fn boss_archive_requires_a_reason_and_stamps_its_own_mechanism() {
+    let db = WorkDb::open(temp_db_path("boss-archive-reason")).unwrap();
+    let product_id = make_revision_product(&db, "boss-archive-reason");
+    let chore = create_test_chore_manual(&db, product_id.clone(), "archive me");
+
+    let err = db
+        .update_work_item_as_actor(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("archived".into()),
+                ..WorkItemPatch::default()
+            },
+            boss_protocol::LAST_STATUS_ACTOR_BOSS,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("archived_reason"),
+        "boss archive without a reason must be refused: {err}"
+    );
+    assert_eq!(task_status(&db, &chore.id), "todo");
+
+    let archived = match db
+        .update_work_item_as_actor(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("archived".into()),
+                archived_reason: Some("duplicate of the already-shipped chore".into()),
+                ..WorkItemPatch::default()
+            },
+            boss_protocol::LAST_STATUS_ACTOR_BOSS,
+        )
+        .unwrap()
+    {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task,
+        other => panic!("expected archived chore, got {other:?}"),
+    };
+    assert_eq!(
+        archived.archived_by.as_deref(),
+        Some(ARCHIVE_MECHANISM_BOSS_STATUS_CHANGE)
+    );
+    assert_eq!(
+        archived.archived_reason.as_deref(),
+        Some("duplicate of the already-shipped chore")
+    );
+    assert_eq!(archived.last_status_actor, boss_protocol::LAST_STATUS_ACTOR_BOSS);
+}
+
+/// Boothby archives derive `archived_by` from the armed verb and fill
+/// `archived_reason` from the armed rationale when the patch omitted one.
+#[test]
+fn boothby_archive_uses_armed_verb_and_rationale() {
+    let db = WorkDb::open(temp_db_path("boothby-archive-provenance")).unwrap();
+    let product_id = make_revision_product(&db, "boothby-archive-prov");
+    let chore = create_test_chore_manual(&db, product_id, "stale chore");
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO boothby_passes (id, trigger, started_at) VALUES ('bp_1', 'schedule', ?1)",
+            rusqlite::params![now_string()],
+        )
+        .unwrap();
+
+    let _guard = db
+        .arm_boothby_action(
+            BoothbyActionContext::builder()
+                .verb("close_stale_task")
+                .rationale("no activity in 90 days and no PR")
+                .reversibility(boss_protocol::BOOTHBY_REVERSIBILITY_REVERSIBLE)
+                .build(),
+        )
+        .unwrap();
+    let archived = match db
+        .update_work_item_as_actor(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("archived".into()),
+                ..WorkItemPatch::default()
+            },
+            LAST_STATUS_ACTOR_BOOTHBY,
+        )
+        .unwrap()
+    {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task,
+        other => panic!("expected archived chore, got {other:?}"),
+    };
+    assert_eq!(archived.archived_by.as_deref(), Some("close_stale_task"));
+    assert_eq!(
+        archived.archived_reason.as_deref(),
+        Some("no activity in 90 days and no PR")
+    );
+    assert_eq!(archived.last_status_actor, LAST_STATUS_ACTOR_BOOTHBY);
+}

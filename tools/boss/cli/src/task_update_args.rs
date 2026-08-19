@@ -166,6 +166,12 @@ pub(crate) struct TaskUpdateArgs {
     #[arg(long = "blocked-detail", value_name = "DETAIL", allow_hyphen_values = true)]
     pub(crate) blocked_detail: Option<String>,
 
+    /// Set or clear the archival reason. Required when an agent (or other
+    /// automated actor) moves the row to `archived`; optional for a human
+    /// archive. Pass `--archived-reason ""` to clear.
+    #[arg(long = "archived-reason", value_name = "REASON", allow_hyphen_values = true)]
+    pub(crate) archived_reason: Option<String>,
+
     /// Replace the full free-form tag set on this work item. Comma-separated
     /// list (e.g. `--tags needs-human,ci-flake`). Empty string clears all
     /// tags (same as `--clear-tags`). Mutually exclusive with `--clear-tags`.

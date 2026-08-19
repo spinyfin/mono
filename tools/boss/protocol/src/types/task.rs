@@ -659,9 +659,12 @@ pub struct Task {
 
     /// Stable machine-readable mechanism that archived this row, e.g.
     /// `"revision_parent_close_sweep"` or `"ci_watch_supersession"`.
-    /// Manual moves carry `"manual_status_change"`; the actor is retained
-    /// in [`Self::last_status_actor`]. `None` for non-archived rows and
-    /// legacy rows whose archival predates provenance capture.
+    /// Human `task update` archives carry `"manual_status_change"`; a
+    /// Boss-worker archive carries `"boss_status_change"`; a Boothby
+    /// archive carries the armed verb (e.g. `"close_stale_task"`). The
+    /// actor is retained in [`Self::last_status_actor`]. `None` for
+    /// non-archived rows and legacy rows whose archival predates
+    /// provenance capture.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_by: Option<String>,
 

@@ -1580,6 +1580,7 @@ pub(crate) async fn run_update_leaf(
         // maps to NULL in the engine (clears the field). The engine rejects
         // a non-empty detail with no accompanying blocked_reason.
         blocked_detail: args.blocked_detail,
+        archived_reason: args.archived_reason,
         // Preserve empty-string "clear" for effort provenance, same contract.
         effort_matched_rule: args.effort_matched_rule,
         effort_reasons: args.effort_reasons,
@@ -1610,7 +1611,7 @@ pub(crate) async fn run_update_leaf(
     };
     ensure_patch_present(
         &patch,
-        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --effort-matched-rule, --effort-reasons, --reasoning, --model, --driver, --autostart, --deferred, --human-driven, --blocked-reason, --blocked-detail, --tags, --add-tag, --remove-tag, --clear-tags, --set-project, or --unset-project",
+        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --effort-matched-rule, --effort-reasons, --reasoning, --model, --driver, --autostart, --deferred, --human-driven, --blocked-reason, --blocked-detail, --archived-reason, --tags, --add-tag, --remove-tag, --clear-tags, --set-project, or --unset-project",
     )?;
     let (item, label) = expect_leaf_work_item(update_work_item(client, &resolved_id, patch).await?)?;
     let item = with_display_status(item);

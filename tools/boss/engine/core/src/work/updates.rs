@@ -99,6 +99,59 @@ fn is_movable_project_membership_kind(kind: &TaskKind) -> bool {
     matches!(kind, TaskKind::Chore | TaskKind::ProjectTask)
 }
 
+/// Stamp mechanism / time / reason when `update_task` first moves a row
+/// to `archived`. Human archives stay `manual_status_change` with an
+/// optional reason. Automated actors (`boss`, `engine`, `boothby`) must
+/// record a non-empty reason — never a constant placeholder and never a
+/// blanket `None` that would wipe a caller-supplied value.
+fn apply_archive_transition_provenance(db: &WorkDb, task: &mut Task, actor: &str) -> Result<()> {
+    task.archived_at = Some(task.updated_at.clone());
+    if actor == LAST_STATUS_ACTOR_HUMAN {
+        task.archived_by = Some(ARCHIVE_MECHANISM_MANUAL_STATUS_CHANGE.to_owned());
+        return Ok(());
+    }
+    if actor == LAST_STATUS_ACTOR_BOOTHBY {
+        let context = db.armed_boothby_action()?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot archive {} as boothby without an armed action context (verb + rationale)",
+                task.id
+            )
+        })?;
+        let verb = context.verb.trim();
+        if verb.is_empty() {
+            bail!("cannot archive {} as boothby: armed verb is empty", task.id);
+        }
+        task.archived_by = Some(verb.to_owned());
+        if task.archived_reason.as_deref().is_none_or(|s| s.trim().is_empty()) {
+            let rationale = context.rationale.trim();
+            if rationale.is_empty() {
+                bail!(
+                    "cannot archive {} as boothby without a rationale or archived_reason",
+                    task.id
+                );
+            }
+            task.archived_reason = Some(rationale.to_owned());
+        }
+        return Ok(());
+    }
+
+    if task.archived_reason.as_deref().is_none_or(|s| s.trim().is_empty()) {
+        bail!(
+            "cannot archive {} as actor `{actor}` without an archived_reason; \
+             automated archives must record the condition that was met",
+            task.id
+        );
+    }
+    task.archived_by = Some(if actor == boss_protocol::LAST_STATUS_ACTOR_BOSS {
+        ARCHIVE_MECHANISM_BOSS_STATUS_CHANGE.to_owned()
+    } else if actor == boss_protocol::LAST_STATUS_ACTOR_ENGINE {
+        ARCHIVE_MECHANISM_ENGINE_STATUS_CHANGE.to_owned()
+    } else {
+        format!("{actor}_status_change")
+    });
+    Ok(())
+}
+
 /// Normalize and validate a free-form tag list for a leaf work item.
 /// Trims whitespace, drops empty strings, de-duplicates (first wins),
 /// and enforces [`boss_protocol::WORK_ITEM_TAG_MAX_LEN`] /
@@ -436,6 +489,7 @@ impl WorkDb {
         apply_optional_string_patch(&mut task.driver, patch.driver);
         apply_optional_string_patch(&mut task.blocked_reason, patch.blocked_reason);
         apply_optional_string_patch(&mut task.blocked_detail, patch.blocked_detail);
+        apply_optional_string_patch(&mut task.archived_reason, patch.archived_reason);
         if let Some(autostart) = patch.autostart {
             task.autostart = autostart;
         }
@@ -571,12 +625,7 @@ impl WorkDb {
             ""
         };
         if status_changed && previous_status != task.status && task.status == TaskStatus::Archived {
-            // Manual archive flows intentionally do not require free-text
-            // justification, but leave an explicit, queryable record of the
-            // operator-triggered mechanism, actor, and transition time.
-            task.archived_by = Some("manual_status_change".to_owned());
-            task.archived_at = Some(task.updated_at.clone());
-            task.archived_reason = None;
+            apply_archive_transition_provenance(self, &mut task, actor)?;
         }
 
         let effort_level_value = task.effort_level.map(|level| level.as_str().to_owned());

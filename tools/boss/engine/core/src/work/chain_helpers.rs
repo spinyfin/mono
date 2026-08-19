@@ -5,6 +5,13 @@ pub(crate) const ARCHIVE_MECHANISM_CONFLICT_WATCH_SUPERSESSION: &str = "conflict
 pub(crate) const ARCHIVE_MECHANISM_PARENT_CLOSE_DISPATCH_RECONCILIATION: &str =
     "revision_parent_close_dispatch_reconciliation";
 pub(crate) const ARCHIVE_MECHANISM_PARENT_CLOSE_SWEEP: &str = "revision_parent_close_sweep";
+/// Human `task update --status archived`. Reason is optional.
+pub(crate) const ARCHIVE_MECHANISM_MANUAL_STATUS_CHANGE: &str = "manual_status_change";
+/// Agent / Boss-worker `task update --status archived`. Reason required.
+pub(crate) const ARCHIVE_MECHANISM_BOSS_STATUS_CHANGE: &str = "boss_status_change";
+/// Engine-attributed `update_task` archive that is not one of the dedicated
+/// sweep helpers. Reason required.
+pub(crate) const ARCHIVE_MECHANISM_ENGINE_STATUS_CHANGE: &str = "engine_status_change";
 
 /// Required provenance for an automated archival write. Its private fields
 /// and required constructor make it impossible for an archive helper caller

@@ -281,8 +281,16 @@ fn engine_and_boss_task_updates_journal_nothing() {
         (boss_protocol::LAST_STATUS_ACTOR_BOSS, "archived"),
     ] {
         let chore = create_test_chore_manual(&db, &product.id, format!("chore for {actor}"));
-        db.update_work_item_as_actor(&chore.id, status_patch(status), actor)
-            .unwrap();
+        let patch = if status == "archived" {
+            WorkItemPatch {
+                status: Some(status.to_owned()),
+                archived_reason: Some(format!("{actor} closed this as obsolete")),
+                ..WorkItemPatch::default()
+            }
+        } else {
+            status_patch(status)
+        };
+        db.update_work_item_as_actor(&chore.id, patch, actor).unwrap();
     }
 
     assert!(actions(&db).is_empty(), "only Boothby writes boothby_actions");
@@ -347,6 +355,13 @@ fn boothby_task_update_journals_only_the_touched_columns() {
     // The actor moved too, and undo needs it to hand the row back.
     assert_eq!(pre["last_status_actor"], "human");
     assert_eq!(post["last_status_actor"], "boothby");
+    // Archival provenance is part of the same mutation and must restore.
+    assert_eq!(pre["archived_by"], serde_json::Value::Null);
+    assert_eq!(post["archived_by"], "close_stale_task");
+    assert_eq!(pre["archived_reason"], serde_json::Value::Null);
+    assert_eq!(post["archived_reason"], "no activity in 90 days and no PR");
+    assert_eq!(pre["archived_at"], serde_json::Value::Null);
+    assert!(post["archived_at"].is_string());
     // `name` never moved, so it must appear in neither image — an undo
     // that rewrote it would clobber a column Boothby never touched.
     assert!(pre.get("name").is_none(), "untouched column leaked into pre_image");

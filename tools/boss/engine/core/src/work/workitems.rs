@@ -1082,10 +1082,13 @@ impl WorkDb {
                 .with_context(|| format!("unknown project: {id}")),
             ItemKind::Task => {
                 let mut task = query_task(&conn, id)?
-                    // Engine-retired revisions are both archived and
-                    // tombstoned. Permit that one inspectable terminal state
-                    // through `task show <primary-id>` while preserving the
-                    // normal soft-delete boundary for every other row.
+                    // Soft-deleted rows stay hidden unless they are archived.
+                    // Archived is the inspectable terminal state: engine-
+                    // retired revisions are both archived and tombstoned, and
+                    // an operator-deleted archived row remains retrievable so
+                    // `task show` can surface provenance plus the Deleted
+                    // timestamp that distinguishes it from a live archived
+                    // row. Non-archived tombstones stay hidden.
                     .filter(|task| task.deleted_at.is_none() || task.status == TaskStatus::Archived)
                     .with_context(|| format!("unknown task: {id}"))?;
                 // Surface the per-task doc pointer on the single-item read
@@ -1331,7 +1334,8 @@ impl WorkDb {
             .query_row(
                 "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, parent_task_id, origin_task_short_id, origin_pr_number, completed_at, archived_by, archived_at, archived_reason, dispatch_failed_reason, dispatch_failed_error, dispatch_failed_at, blocked_detail, deferred, tags, human_driven, completion_summary, effort_matched_rule, effort_reasons
                  FROM tasks
-                 WHERE product_id = ?1 AND short_id = ?2 AND deleted_at IS NULL",
+                 WHERE product_id = ?1 AND short_id = ?2
+                   AND (deleted_at IS NULL OR status = 'archived')",
                 params![product_id, short_id],
                 map_task_with_parent_provenance_and_archived_reason,
             )
