@@ -742,6 +742,11 @@ pub(crate) fn insert_revision_in_tx(
             .map(|l| l.as_str().to_owned())
             .unwrap_or_else(|| default_revision_effort_level(&root.kind).to_owned()),
     );
+    let (description, effort_matched_rule, effort_reasons) = crate::effort::resolve_effort_provenance_for_create(
+        description,
+        input.effort_matched_rule,
+        input.effort_reasons,
+    );
     let model_override = normalize_model_override(input.model_override);
     // Inherit the chain root's capability signal when the caller did not name
     // one: a revision to an investigation is investigation-shaped, a revision
@@ -786,9 +791,9 @@ pub(crate) fn insert_revision_in_tx(
     conn.execute(
         "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, \
          pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, \
-         effort_level, model_override, reasoning, driver, short_id, parent_task_id, repo_remote_url) \
+         effort_level, model_override, reasoning, driver, short_id, parent_task_id, repo_remote_url, effort_matched_rule, effort_reasons) \
          VALUES (?1, ?2, ?3, 'revision', ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, ?7, ?8, ?9, \
-         ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+         ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
             id,
             product_id,
@@ -806,6 +811,8 @@ pub(crate) fn insert_revision_in_tx(
             short_id,
             parent_id,
             repo_remote_url,
+            effort_matched_rule,
+            effort_reasons,
         ],
     )?;
     // `query_task` reads the trailing `parent_task_id` column (via

@@ -627,6 +627,8 @@ pub(crate) async fn run_create_revision(
             .maybe_name(name)
             .maybe_priority(args.priority.map(|p| p.as_str().to_owned()))
             .maybe_effort_level(args.effort.map(boss_protocol::EffortLevel::from))
+            .maybe_effort_matched_rule(args.effort_matched_rule)
+            .maybe_effort_reasons(args.effort_reasons)
             .maybe_model_override(model_override)
             .maybe_reasoning(args.reasoning.map(boss_protocol::ReasoningMode::from))
             .maybe_driver(driver)

@@ -883,6 +883,35 @@ fn parses_task_create_revision_depends_on() {
     }
 }
 
+#[test]
+fn parses_task_create_revision_effort_provenance() {
+    let cli = Cli::parse_from([
+        "boss",
+        "task",
+        "create-revision",
+        "--parent",
+        "task_abc",
+        "--description",
+        "fix the thing",
+        "--effort",
+        "medium",
+        "--effort-matched-rule",
+        "rule 8 (fallback)",
+        "--effort-reasons",
+        "touches CLI and engine",
+    ]);
+    match cli.command {
+        Commands::Task {
+            command: TaskCommand::CreateRevision(args),
+        } => {
+            assert!(matches!(args.effort, Some(EffortLevelArg::Medium)));
+            assert_eq!(args.effort_matched_rule.as_deref(), Some("rule 8 (fallback)"));
+            assert_eq!(args.effort_reasons.as_deref(), Some("touches CLI and engine"));
+        }
+        _ => panic!("expected task create-revision command"),
+    }
+}
+
 /// `boss chore move` is now a thin alias for the same handler. The
 /// legacy `active` value still parses (as an alias of the board name
 /// `doing`), exercising backward compatibility.

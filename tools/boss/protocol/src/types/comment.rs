@@ -229,6 +229,14 @@ pub struct CreateRevisionInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_level: Option<EffortLevel>,
 
+    /// See [`CreateTaskInput::effort_matched_rule`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_matched_rule: Option<String>,
+
+    /// See [`CreateTaskInput::effort_reasons`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_reasons: Option<String>,
+
     /// Explicit model slug override. `None` → resolve per design §Q3
     /// precedence (same as other task kinds).
     #[serde(default, skip_serializing_if = "Option::is_none")]
