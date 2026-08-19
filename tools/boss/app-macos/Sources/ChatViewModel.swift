@@ -276,12 +276,27 @@ final class ChatViewModel: ObservableObject {
     @Published var registeredHosts: [EngineHost] = []
 
     /// Engine-side configuration health issues sourced from
-    /// `get_engine_health` at session start. Empty means the engine
-    /// is healthy. Non-empty drives the top-of-window
-    /// `EngineHealthBanner` and the Settings-pane warning so a
-    /// missing `ANTHROPIC_API_KEY` (or any later "missing config"
-    /// surface) is impossible to miss (#699).
+    /// `get_engine_health` at session start and re-broadcast when
+    /// pause/resume changes land. Empty means the engine is healthy.
+    /// Banner kinds drive `EngineHealthBanner`; `automation_paused`
+    /// is handled by the toolbar toggle instead. Settings still lists
+    /// the full snapshot so a missing `ANTHROPIC_API_KEY` (or any later
+    /// "missing config" surface) is impossible to miss (#699).
     @Published var engineHealthIssues: [EngineHealthIssue] = []
+
+    /// Whether the engine currently reports automations paused.
+    /// Derived from `engineHealthIssues` — the engine is the source of
+    /// truth; the toolbar does not keep a parallel local flag.
+    var isAutomationPaused: Bool {
+        engineHealthIssues.contains { $0.kind == EngineHealthIssue.automationPausedKind }
+    }
+
+    /// Health issues that still render as the chrome banner.
+    /// `automation_paused` stays in `engineHealthIssues` (and Settings)
+    /// but is not a banner kind.
+    var bannerHealthIssues: [EngineHealthIssue] {
+        engineHealthIssues.filter { $0.kind != EngineHealthIssue.automationPausedKind }
+    }
     /// Top-level mirror of the same `get_engine_health` reply. Surfaced
     /// in the Settings pane next to the (future) API-key field so
     /// "key set" / "key missing" is legible without parsing the
@@ -717,6 +732,26 @@ final class ChatViewModel: ObservableObject {
     /// without waiting for the next reconnect.
     func resumeDispatch() {
         engine.sendSetDispatchPaused(paused: false)
+        engine.sendGetEngineHealth()
+    }
+
+    /// Toggle the global automation pause. Drives the same
+    /// `SetAutomationPaused` RPC `bossctl automation pause` /
+    /// `bossctl automation resume` use; the engine owns the state and
+    /// broadcasts a fresh health report. Local `engineHealthIssues`
+    /// is not flipped here — the next `engine_health_result` is the
+    /// source of truth. Pausing supplies a fixed operator reason
+    /// because the engine rejects an anonymous pause; no confirmation
+    /// dialog, this is a cheap reversible action.
+    func toggleAutomationPaused() {
+        if isAutomationPaused {
+            engine.sendSetAutomationPaused(paused: false)
+        } else {
+            engine.sendSetAutomationPaused(
+                paused: true,
+                reason: AutomationPauseControl.toolbarReason
+            )
+        }
         engine.sendGetEngineHealth()
     }
 

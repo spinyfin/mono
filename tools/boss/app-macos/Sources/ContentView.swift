@@ -293,6 +293,10 @@ struct ContentView: View {
             }
 
             ToolbarItem(placement: .primaryAction) {
+                AutomationPauseToolbarButton(model: model)
+            }
+
+            ToolbarItem(placement: .primaryAction) {
                 NotificationsToolbarButton(model: model)
             }
 
@@ -452,7 +456,7 @@ struct ContentView: View {
     private var hasChromeBanners: Bool {
         model.showConnectionLostBanner
             || model.engineSupervisionState != .running
-            || (model.isConnected && !model.engineHealthIssues.isEmpty)
+            || (model.isConnected && !model.bannerHealthIssues.isEmpty)
     }
 
     /// Insertion-only: a banner slides down into the gap AppKit has just
@@ -496,9 +500,9 @@ struct ContentView: View {
             // condition (missing ANTHROPIC_API_KEY, dispatch paused,
             // syspolicyd wedged, etc.). Surface as a first-class
             // affordance so operators can't miss it (#699).
-            if model.isConnected, !model.engineHealthIssues.isEmpty {
+            if model.isConnected, !model.bannerHealthIssues.isEmpty {
                 EngineHealthBanner(
-                    issues: model.engineHealthIssues,
+                    issues: model.bannerHealthIssues,
                     onUnpauseDispatch: { model.resumeDispatch() }
                 )
                 .transition(bannerTransition)

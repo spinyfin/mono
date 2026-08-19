@@ -258,11 +258,11 @@ private struct AutomationDetailView: View {
         model.automationRunsByID[automation.id] ?? []
     }
 
-    /// Whether `bossctl automation pause` is in effect. The engine reports it
-    /// as an `automation_paused` health issue, re-broadcast on every
-    /// pause/resume, so this tracks the banner without a second RPC.
+    /// Whether `bossctl automation pause` is in effect. Derived from the
+    /// engine's `automation_paused` health issue (same snapshot the
+    /// toolbar toggle reads) — no second RPC, no local flag.
     private var isAutomationPaused: Bool {
-        model.engineHealthIssues.contains { $0.kind == "automation_paused" }
+        model.isAutomationPaused
     }
 
     @State private var isEditing = false

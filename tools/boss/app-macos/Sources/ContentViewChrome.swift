@@ -329,6 +329,97 @@ struct EngineHealthBanner: View {
     }
 }
 
+// MARK: - Automation pause toggle
+
+/// Operator-facing reason attached to a pause initiated from the toolbar.
+/// The engine rejects an anonymous `SetAutomationPaused { paused: true }`;
+/// this is the programmatic equivalent of `bossctl automation pause
+/// --reason …` for the in-app control. Resume omits it.
+enum AutomationPauseControl {
+    static let toolbarReason = "Paused from Boss toolbar"
+
+    /// Caption painted on the control. Distinct words so the two states
+    /// cannot be told apart only by color or a tooltip.
+    static func caption(isPaused: Bool) -> String {
+        isPaused ? "Paused" : "Auto"
+    }
+
+    /// SF Symbol for the caption. Filled pause vs filled play — paired
+    /// with `usesEngagedTreatment` so paused is not a quiet outline of
+    /// the same glyph as running.
+    static func symbolName(isPaused: Bool) -> String {
+        isPaused ? "pause.fill" : "play.fill"
+    }
+
+    /// Paused is the engaged treatment (filled orange capsule). Running
+    /// is a quiet outline. A glance must distinguish them without hover.
+    static func usesEngagedTreatment(isPaused: Bool) -> Bool {
+        isPaused
+    }
+}
+
+/// Primary-toolbar control for the global automation pause. The engine
+/// remains authoritative: appearance is derived from the
+/// `automation_paused` health issue (the same snapshot
+/// `bossctl automation state` reads), and a click sends
+/// `SetAutomationPaused` — no local flag, no confirmation.
+///
+/// Paused vs running must be glanceable without a tooltip. The paused
+/// state is an orange filled capsule (custom Text+Capsule, not a glass
+/// bezel, so it survives cacheDisplay under FB20272917). The running
+/// state is a quiet outline of the same size so the two cannot be
+/// confused at a glance.
+struct AutomationPauseToolbarButton: View {
+    @ObservedObject var model: ChatViewModel
+
+    private var isPaused: Bool { model.isAutomationPaused }
+
+    var body: some View {
+        Button {
+            model.toggleAutomationPaused()
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: AutomationPauseControl.symbolName(isPaused: isPaused))
+                    .font(.caption.weight(.bold))
+                Text(AutomationPauseControl.caption(isPaused: isPaused))
+                    .font(.caption.weight(.semibold))
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(labelBackground)
+            .foregroundStyle(isPaused ? Color.white : Color.secondary)
+            .overlay(labelOverlay)
+        }
+        .buttonStyle(.plain)
+        .disabled(!model.isConnected)
+        .help(isPaused
+              ? "Automations are paused. Click to resume (same as `bossctl automation resume`)."
+              : "Automations are running. Click to pause (same as `bossctl automation pause`).")
+        .accessibilityLabel(isPaused ? "Automations paused" : "Automations running")
+        .accessibilityHint(isPaused ? "Resumes automations." : "Pauses automations.")
+        .accessibilityIdentifier("boss.automationPauseToggle")
+        .accessibilityAddTraits(isPaused ? [.isSelected] : [])
+    }
+
+    @ViewBuilder
+    private var labelBackground: some View {
+        if AutomationPauseControl.usesEngagedTreatment(isPaused: isPaused) {
+            Capsule().fill(Color.orange.opacity(0.95))
+        } else {
+            Capsule().fill(Color.clear)
+        }
+    }
+
+    @ViewBuilder
+    private var labelOverlay: some View {
+        if AutomationPauseControl.usesEngagedTreatment(isPaused: isPaused) {
+            EmptyView()
+        } else {
+            Capsule().strokeBorder(Color.secondary.opacity(0.55), lineWidth: 1)
+        }
+    }
+}
+
 // MARK: - Update badge
 
 /// Trailing toolbar button that appears when an update is available in Notify or Automatic mode.
