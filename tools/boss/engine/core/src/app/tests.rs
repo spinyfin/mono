@@ -134,6 +134,32 @@ pub(super) fn register_idle_worker_with_driver(
     execution_id
 }
 
+/// Give an execution the durable tmux identity (`work_runs.tmux_spawn_token`)
+/// that [`crate::app::pane_delivery::ServerState::send_pane_text_checked`]'s
+/// tmux boundary now requires to validate a session before writing to it —
+/// mirroring what `spawn_flow` records in production before any pane input
+/// is possible. `session_name` must match what the test's mocked
+/// `PaneDeliveryRunner`/tmux stub reports for `list-sessions`/
+/// `show-environment` so the spawn-token comparison passes.
+pub(super) fn register_tmux_identity_for_test(
+    server_state: &ServerState,
+    execution_id: &str,
+    session_name: &str,
+    spawn_token: &str,
+) {
+    let db = server_state.work_db.as_ref();
+    db.start_execution_run(execution_id, "worker-1", "repo-1", "lease-1", "ws-1", "/tmp/ws")
+        .expect("start_execution_run for tmux identity fixture");
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(execution_id, boss_tmux::SERVER_LABEL, session_name, spawn_token)
+            .expect("record_tmux_spawn_intent_for_execution"),
+    );
+    assert!(
+        db.record_tmux_session_created_for_execution(execution_id, spawn_token, 4242)
+            .expect("record_tmux_session_created_for_execution"),
+    );
+}
+
 /// Like [`register_idle_worker`], but leaves activity at
 /// [`boss_protocol::WorkerActivity::Working`] (a PreToolUse with no
 /// balancing Stop). Used to assert the typed-input guard refuses
