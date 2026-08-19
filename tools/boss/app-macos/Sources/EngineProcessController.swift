@@ -504,6 +504,13 @@ final class EngineProcessController: @unchecked Sendable {
         // server, then the coordinator's `claude` pane inside it) inherit
         // that nice(5) by plain fork inheritance. `NO_BG_NICE` keeps the
         // backgrounded engine at the same priority as this app.
+        //
+        // This only reaches a tmux server started by a post-fix engine: the
+        // private `tmux -L boss` server, once running, is never killed by
+        // this codebase, so on an existing install it keeps the nice(5) it
+        // was born with even after this fix ships. Run `tmux -L boss
+        // kill-server` (or reboot) once after upgrading so the next engine
+        // launch creates a fresh server under this corrected priority.
         proc.arguments = ["-c", "setopt NO_BG_NICE; nohup \(command) >/dev/null 2>&1 &"]
         proc.currentDirectoryURL = URL(fileURLWithPath: launchDirectory, isDirectory: true)
         // Tell the engine the app's pid explicitly. `bazel run`

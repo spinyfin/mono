@@ -394,7 +394,26 @@ pub(crate) fn path_prepend_clause(var: &str) -> String {
 /// same reach) and without requiring root. Absolute path, matching this
 /// clause's care elsewhere about not depending on a PATH a login shell's
 /// own init scripts might still be rebuilding.
-const WORKER_BACKGROUND_PRIORITY_CLAUSE: &str = "/usr/bin/taskpolicy -b -p $$ >/dev/null 2>&1; ";
+///
+/// This is best-effort by design: `taskpolicy` failing (missing binary,
+/// unexpected sandbox) is swallowed by the trailing `>/dev/null 2>&1;` so a
+/// broken environment can never block a worker from starting, but that also
+/// means a pane that failed to enter background class looks identical to
+/// one that succeeded — there is no engine-side signal or scrollback trace.
+/// To check a live pane, run `ps -o nice -p <pane pid>` (background class
+/// shows up as nice 5) or `taskpolicy -p <pid>`.
+///
+/// The policy also outlives the pane it was applied to: every long-lived
+/// daemon a tool call forks from this shell (most notably a workspace's
+/// `bazel` server, which idles for hours after the pane exits) keeps
+/// `PRIO_DARWIN_BG` for the rest of its life, including for later
+/// invocations against that same daemon from outside a worker pane (a
+/// human, or the coordinator, re-leasing the workspace). If a bazel server
+/// (or other daemon) started by a worker seems to be running slower than
+/// expected, that is why — clear it with `bazel shutdown` (from within the
+/// tainted workspace) or `taskpolicy -B -p <server pid>` (unprivileged for
+/// one's own processes).
+pub(crate) const WORKER_BACKGROUND_PRIORITY_CLAUSE: &str = "/usr/bin/taskpolicy -b -p $$ >/dev/null 2>&1; ";
 
 /// macOS tty canonical-mode line cap (`MAX_CANON`,
 /// `/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/syslimits.h:89`).
