@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import GhosttyKit
 
@@ -435,7 +436,7 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// for why a trailing `\n` inside the payload is not enough to
     /// land the prompt: libghostty's paste path delivers control
     /// characters as input-field content, not as a keystroke.
-    func sendToPane(slotId: Int, text: String) -> EngineSendResult {
+    func sendToPane(slotId: Int, text: String, expectedDriverBinary: String) -> EngineSendResult {
         let targetSlots = reviewSlotRange.contains(slotId) ? reviewSlots : (Self.automationSlotRange.contains(slotId) ? automationSlots : slots)
         guard let index = targetSlots.firstIndex(where: { $0.slotId == slotId }) else {
             return .failure(.unknownSlot)
@@ -446,8 +447,45 @@ final class WorkersWorkspaceModel: ObservableObject {
         guard let host = session.hostView else {
             return .failure(.internalFailure("pane has no live surface"))
         }
+        if let error = Self.driverInputError(
+            expectedDriverBinary: expectedDriverBinary,
+            foregroundProcess: foregroundProcessName(for: session)
+        ) {
+            return .failure(error)
+        }
         host.submitText(text)
         return .success
+    }
+
+    /// Freshly resolve the foreground process immediately before injecting
+    /// text. A surface can remain alive after its agent returns to zsh, so a
+    /// live surface or a live PTY alone is never permission to type into it.
+    private func foregroundProcessName(for session: TerminalPaneSession) -> String? {
+        guard let pid = foregroundPid(for: session), pidIsAlive(Int32(pid)) else {
+            return nil
+        }
+        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        guard proc_name(pid, &buffer, UInt32(buffer.count)) > 0 else {
+            return nil
+        }
+        let end = buffer.firstIndex(of: 0) ?? buffer.endIndex
+        return String(decoding: buffer[..<end].map { UInt8(bitPattern: $0) }, as: UTF8.self)
+    }
+
+    /// Pure decision helper so the no-shell-input contract is testable without
+    /// a real Ghostty surface. An empty expected binary is also refused: an
+    /// older or malformed engine must not degrade this safety check away.
+    static func driverInputError(
+        expectedDriverBinary: String,
+        foregroundProcess: String?
+    ) -> EngineSendError? {
+        guard !expectedDriverBinary.isEmpty, foregroundProcess == expectedDriverBinary else {
+            return .driverExited(
+                expectedDriverBinary: expectedDriverBinary,
+                observedProcess: foregroundProcess
+            )
+        }
+        return nil
     }
 
     /// Bring the slot's libghostty surface to first responder and

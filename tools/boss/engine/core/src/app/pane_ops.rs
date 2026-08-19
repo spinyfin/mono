@@ -43,6 +43,16 @@ pub enum SendInputError {
     NotAcceptingInput {
         activity: Option<boss_protocol::WorkerActivity>,
     },
+    #[error(
+        "worker driver exited before pane input (expected {expected_driver_binary:?}, observed {observed_process:?}); \
+         the run was terminalized and its pane released"
+    )]
+    DriverExited {
+        expected_driver_binary: String,
+        observed_process: Option<String>,
+    },
+    #[error("worker driver liveness could not be established; no pane input was sent: {0}")]
+    DriverLivenessUnavailable(String),
     #[error("app reported error: {0:?}")]
     App(EngineToAppError),
     #[error(transparent)]
@@ -272,6 +282,16 @@ impl ServerState {
                 Ok(slot_id)
             }
             PaneInjectOutcome::NotAcceptingInput { activity } => Err(SendInputError::NotAcceptingInput { activity }),
+            PaneInjectOutcome::SendFailed(PaneSendFailure::DriverExited {
+                expected_driver_binary,
+                observed_process,
+            }) => Err(SendInputError::DriverExited {
+                expected_driver_binary,
+                observed_process,
+            }),
+            PaneInjectOutcome::SendFailed(PaneSendFailure::DriverLivenessUnavailable(reason)) => {
+                Err(SendInputError::DriverLivenessUnavailable(reason))
+            }
             PaneInjectOutcome::SendFailed(PaneSendFailure::App(err)) => Err(SendInputError::App(err)),
             PaneInjectOutcome::SendFailed(PaneSendFailure::Send(err)) => Err(SendInputError::Send(err)),
             PaneInjectOutcome::SendFailed(PaneSendFailure::Tmux(err)) => Err(SendInputError::Tmux(err)),

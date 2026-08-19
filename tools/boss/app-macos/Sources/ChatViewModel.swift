@@ -2270,7 +2270,7 @@ final class ChatViewModel: ObservableObject {
     var paneAttachHandler: ((EngineAttachRequest) -> EngineAttachResult)?
     var coordinatorPaneAttachHandler: ((EngineCoordinatorAttachRequest) -> EngineCoordinatorAttachResult)?
     var paneDetachHandler: ((Int) -> EngineReleaseResult)?
-    var paneSendHandler: ((Int, String) -> EngineSendResult)?
+    var paneSendHandler: ((Int, String, String) -> EngineSendResult)?
     var paneFocusHandler: ((Int) -> EngineFocusResult)?
     var paneInterruptHandler: ((Int) -> EngineInterruptResult)?
     /// Enumerates every slot the app currently hosts a session in,

@@ -1498,8 +1498,6 @@ async fn deliver_probe_via_pane_write(
     posture: PaneInputPosture,
     success_message: &'static str,
 ) -> ProbeDispatchOutcome {
-    use crate::protocol::{EngineToAppRequest, SendToPaneInput};
-
     let queued = server_state.pending_probe_count(run_id);
     if queued == 0 {
         tracing::debug!(run_id, slot_id, "pane write: nothing queued for this run");
@@ -1533,12 +1531,8 @@ async fn deliver_probe_via_pane_write(
     // is corrected to the real outcome below, and reset to `Queued` on the
     // requeue path.
     server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Injected);
-    let request = EngineToAppRequest::SendToPane(SendToPaneInput {
-        slot_id,
-        text: probe.text.clone(),
-    });
-    match server_state.send_to_app(request, Duration::from_secs(5)).await {
-        Ok(_) => {
+    match server_state.send_pane_text_checked(run_id, slot_id, &probe.text).await {
+        Ok(()) => {
             // The claim is conditional on somebody being home: `SendToPane`
             // returning Ok proves the app wrote bytes into the pty, not that a
             // process read them.
@@ -1556,6 +1550,24 @@ async fn deliver_probe_via_pane_write(
             )
             .await;
             ProbeDispatchOutcome::Dispatched(state)
+        }
+        Err(PaneSendFailure::DriverExited {
+            expected_driver_binary,
+            observed_process,
+        }) => {
+            // `send_pane_text_checked` synchronously terminalized the run and
+            // released its pane, which orphaned this in-flight probe with a
+            // durable lifecycle record. Never requeue text for a process that
+            // is gone: a later redispatch gets a new run and its own prompt.
+            tracing::error!(
+                run_id,
+                slot_id,
+                probe_id = %probe_id,
+                expected_driver_binary,
+                observed_process,
+                "probe refused because the foreground driver exited; run terminalized before any pane text was written",
+            );
+            ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Orphaned)
         }
         Err(err) => {
             tracing::warn!(
@@ -2033,6 +2045,24 @@ async fn inject_probe_mid_turn(
                     .await;
                 ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Abandoned)
             }
+        }
+        PaneInjectOutcome::SendFailed(PaneSendFailure::DriverExited {
+            expected_driver_binary,
+            observed_process,
+        }) => {
+            // The shared write layer already terminalized and released this
+            // run. `release_worker_pane` records the in-flight probe as
+            // orphaned, so do not requeue arbitrary prose for a shell that
+            // no longer belongs to a live agent.
+            tracing::error!(
+                run_id,
+                slot_id,
+                probe_id = %probe_id,
+                expected_driver_binary,
+                observed_process,
+                "mid-turn probe refused because the driver exited before input; run terminalized",
+            );
+            ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Orphaned)
         }
         PaneInjectOutcome::SendFailed(failure) => {
             tracing::warn!(

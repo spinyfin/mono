@@ -86,7 +86,7 @@ final class WorkersWorkspaceModelSendTests: XCTestCase {
         // like a successful injection, the engine moved on, and the
         // prompt was lost.
         let model = WorkersWorkspaceModel()
-        let result = model.sendToPane(slotId: 99, text: "echo hello")
+        let result = model.sendToPane(slotId: 99, text: "echo hello", expectedDriverBinary: "claude")
         guard case .failure(.unknownSlot) = result else {
             XCTFail("expected .unknownSlot for nonexistent slot, got \(result)")
             return
@@ -100,7 +100,7 @@ final class WorkersWorkspaceModelSendTests: XCTestCase {
         // `focusWorkerPane` test so the engine's failure-handling
         // path stays uniform across the three pane verbs.
         let model = WorkersWorkspaceModel()
-        let result = model.sendToPane(slotId: 1, text: "echo hello")
+        let result = model.sendToPane(slotId: 1, text: "echo hello", expectedDriverBinary: "claude")
         guard case .failure(.unknownSlot) = result else {
             XCTFail("expected .unknownSlot for idle slot, got \(result)")
             return
@@ -232,6 +232,31 @@ final class WorkersWorkspaceModelFocusTests: XCTestCase {
             XCTFail("expected .unknownSlot for idle slot, got \(result)")
             return
         }
+    }
+}
+
+@MainActor
+final class WorkersWorkspaceModelPaneInputTests: XCTestCase {
+    func testDriverInputRefusesWhenForegroundProcessIsTheShell() {
+        let error = WorkersWorkspaceModel.driverInputError(
+            expectedDriverBinary: "grok",
+            foregroundProcess: "zsh"
+        )
+        guard case .driverExited(let expected, let observed) = error else {
+            XCTFail("expected the shell foreground process to refuse agent input, got \(String(describing: error))")
+            return
+        }
+        XCTAssertEqual(expected, "grok")
+        XCTAssertEqual(observed, "zsh")
+    }
+
+    func testDriverInputAllowsTheLiveForegroundDriver() {
+        XCTAssertNil(
+            WorkersWorkspaceModel.driverInputError(
+                expectedDriverBinary: "grok",
+                foregroundProcess: "grok"
+            )
+        )
     }
 }
 
