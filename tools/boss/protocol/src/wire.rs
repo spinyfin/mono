@@ -8,6 +8,7 @@ use crate::host_registry_wire::HostSnapshot;
 use crate::hosted_pane_status::HostedPaneStatus;
 use crate::live_worker_state::LiveWorkerState;
 use crate::metrics_wire::MetricLiveEntry;
+use crate::tmux_worker_status::TmuxWorkerStatus;
 use crate::types::{
     AddDependencyInput, AnswerAgentRun, Attention, AttentionGroup, AttentionMerge, Automation,
     AutomationDedupSuppression, AutomationPatch, AutomationRun, BackgroundWorkItem, BoardDropTarget, CiBudgetSnapshot,
@@ -1428,6 +1429,12 @@ pub enum FrontendRequest {
         #[serde(default)]
         include_deleted: bool,
     },
+
+    /// Read tmux's current session evidence for every live worker. This is
+    /// intentionally on-demand rather than part of the hook-driven live-state
+    /// push, because every response shells out to tmux.
+    /// Replies with [`FrontendEvent::TmuxWorkerStatusesList`].
+    ListTmuxWorkerStatuses,
 
     /// Snapshot of every allocated worker slot's live state — what
     /// model it's running, what activity (working / waiting / idle /

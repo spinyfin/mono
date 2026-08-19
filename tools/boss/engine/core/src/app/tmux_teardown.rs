@@ -131,6 +131,19 @@ impl ServerState {
                     "reap_tmux_worker: live session token does not match the durably-recorded one; \
                      refusing to signal or kill it — a leaked-session sweep must reconcile this",
                 );
+                self.dispatch_events
+                    .emit(
+                        crate::dispatch_events::DispatchEvent::new(
+                            crate::dispatch_events::Stage::TmuxTokenMismatch,
+                            crate::dispatch_events::Outcome::Error,
+                            execution_id,
+                        )
+                        .with_details(serde_json::json!({
+                            "tmux_session_name": identity.session_name,
+                            "operation": "teardown_preflight",
+                        })),
+                    )
+                    .await;
                 return TmuxTeardownOutcome::Refused;
             }
             Ok(None) => {
@@ -184,6 +197,19 @@ impl ServerState {
                     "reap_tmux_worker: session token changed between verification and kill; refusing to \
                      kill it",
                 );
+                self.dispatch_events
+                    .emit(
+                        crate::dispatch_events::DispatchEvent::new(
+                            crate::dispatch_events::Stage::TmuxTokenMismatch,
+                            crate::dispatch_events::Outcome::Error,
+                            execution_id,
+                        )
+                        .with_details(serde_json::json!({
+                            "tmux_session_name": session,
+                            "operation": "teardown_kill",
+                        })),
+                    )
+                    .await;
                 TmuxTeardownOutcome::Refused
             }
             Err(KillSessionError::Tmux(err)) => {

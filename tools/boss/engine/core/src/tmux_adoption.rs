@@ -588,7 +588,7 @@ async fn adopt_one<S>(
 
     dispatch_events
         .emit(
-            DispatchEvent::new(Stage::TmuxWorkerAdopted, Outcome::Ok, execution_id)
+            DispatchEvent::new(Stage::TmuxAdopt, Outcome::Ok, execution_id)
                 .with_work_item(&execution.work_item_id)
                 .with_details(serde_json::json!({
                     "slot_id": slot_id,
@@ -629,6 +629,16 @@ async fn classify_untracked_session<S>(
     let execution_id = match work_db.execution_id_for_tmux_spawn_token(&session.spawn_token) {
         Ok(Some(id)) => id,
         Ok(None) => {
+            dispatch_events
+                .emit(
+                    DispatchEvent::new(Stage::TmuxLeakDetected, Outcome::Ok, session.spawn_token.clone()).with_details(
+                        serde_json::json!({
+                            "tmux_session_name": session.session_name,
+                            "reason": "spawn_token_not_found",
+                        }),
+                    ),
+                )
+                .await;
             outcome.untracked_sessions.push(session);
             return;
         }
@@ -1014,7 +1024,7 @@ async fn refuse_and_reap(
     dispatch_events
         .emit(
             DispatchEvent::new(
-                Stage::TmuxAdoptionRefused,
+                Stage::TmuxRefuseSkew,
                 if reaped { Outcome::Ok } else { Outcome::Error },
                 execution_id,
             )
@@ -1477,7 +1487,7 @@ mod tests {
 
         let events = sink.events_for(&execution_id).await;
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].stage, Stage::TmuxWorkerAdopted.as_str());
+        assert_eq!(events[0].stage, Stage::TmuxAdopt.as_str());
     }
 
     /// A crash between `tmux new-session` and the confirmation write leaves
@@ -1647,7 +1657,7 @@ mod tests {
 
         let events = sink.events_for(&execution_id).await;
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].stage, Stage::TmuxAdoptionRefused.as_str());
+        assert_eq!(events[0].stage, Stage::TmuxRefuseSkew.as_str());
         assert_eq!(events[0].details["schema_guard_failure"], serde_json::json!("missing"));
 
         let attentions = db.list_attention_items_for_work_item(&work_item_id).unwrap();
@@ -1691,8 +1701,11 @@ mod tests {
                 spawn_token: "tok-unknown".to_owned(),
             }]
         );
+        let events = sink.events_for("tok-unknown").await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].stage, Stage::TmuxLeakDetected.as_str());
+        assert_eq!(events[0].details["tmux_session_name"], "boss-worker-9");
         assert!(convergence.calls.lock().unwrap().is_empty());
-        assert!(sink.events().await.is_empty());
     }
 
     /// The coordinator's session shares the worker tmux server but must
@@ -1800,7 +1813,7 @@ mod tests {
 
         let events = sink.events_for(&execution_id).await;
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].stage, Stage::TmuxAdoptionRefused.as_str());
+        assert_eq!(events[0].stage, Stage::TmuxRefuseSkew.as_str());
         assert_eq!(events[0].details["schema_guard_failure"], serde_json::json!("missing"));
 
         let attentions = db.list_attention_items_for_work_item(&work_item_id).unwrap();
@@ -1869,7 +1882,7 @@ mod tests {
 
         let events = sink.events_for(&execution_id).await;
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].stage, Stage::TmuxAdoptionRefused.as_str());
+        assert_eq!(events[0].stage, Stage::TmuxRefuseSkew.as_str());
         assert_eq!(
             events[0].outcome,
             Outcome::Error.as_str(),

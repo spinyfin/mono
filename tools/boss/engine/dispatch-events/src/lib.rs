@@ -722,7 +722,7 @@ pub enum Stage {
     /// `tmux_spawn_state` was still `intended` — a crash between `tmux
     /// new-session` and its confirmation write — and this pass durably
     /// confirmed it before rebuilding the live state).
-    TmuxWorkerAdopted,
+    TmuxAdopt,
     /// The boot-time tmux adoption pass found a live session with an
     /// unsupported `BOSS_SESSION_SCHEMA` and refused to adopt it, reaping it
     /// instead — a version-skew guard, not a contradiction
@@ -751,7 +751,13 @@ pub enum Stage {
     /// work back up depends on whether the row was already terminal — a
     /// non-terminal row is left for the normal dead-worker reconcilers to
     /// redispatch, a terminal row has nothing left to redispatch.
-    TmuxAdoptionRefused,
+    TmuxRefuseSkew,
+    /// The tmux inventory found a Boss-tokened session that has no durable
+    /// run row. The husk sweep will independently confirm it before reaping.
+    TmuxLeakDetected,
+    /// A session name exists but its live spawn token differs from the
+    /// durable identity. The engine refused to touch that session.
+    TmuxTokenMismatch,
     /// The boot-time tmux adoption pass (`boss-engine`'s
     /// `tmux_adoption::claim_or_detect_conflicting_owner`) refused to run at
     /// all because the server-scoped `@boss_engine_owner` tmux option was
@@ -829,8 +835,10 @@ impl Stage {
             Stage::LiveWorkerReadopted => "live_worker_readopted",
             Stage::RedispatchBlockedLiveProcess => "redispatch_blocked_live_process",
             Stage::RedispatchGuardDeclined => "redispatch_guard_declined",
-            Stage::TmuxWorkerAdopted => "tmux_worker_adopted",
-            Stage::TmuxAdoptionRefused => "tmux_adoption_refused",
+            Stage::TmuxAdopt => "tmux_adopt",
+            Stage::TmuxRefuseSkew => "tmux_refuse_skew",
+            Stage::TmuxLeakDetected => "tmux_leak_detected",
+            Stage::TmuxTokenMismatch => "tmux_token_mismatch",
             Stage::TmuxAdoptionOwnerConflict => "tmux_adoption_owner_conflict",
         }
     }
@@ -1601,8 +1609,10 @@ mod tests {
             "redispatch_blocked_live_process"
         );
         assert_eq!(Stage::RedispatchGuardDeclined.as_str(), "redispatch_guard_declined");
-        assert_eq!(Stage::TmuxWorkerAdopted.as_str(), "tmux_worker_adopted");
-        assert_eq!(Stage::TmuxAdoptionRefused.as_str(), "tmux_adoption_refused");
+        assert_eq!(Stage::TmuxAdopt.as_str(), "tmux_adopt");
+        assert_eq!(Stage::TmuxRefuseSkew.as_str(), "tmux_refuse_skew");
+        assert_eq!(Stage::TmuxLeakDetected.as_str(), "tmux_leak_detected");
+        assert_eq!(Stage::TmuxTokenMismatch.as_str(), "tmux_token_mismatch");
         assert_eq!(
             Stage::TmuxAdoptionOwnerConflict.as_str(),
             "tmux_adoption_owner_conflict"
