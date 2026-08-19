@@ -32,10 +32,11 @@ const SPAWN_TOKEN_OPTION: &str = "@boss_spawn_token";
 const RENDERED_PROMPT_FILENAME: &str = "CLAUDE.md";
 
 /// Metadata key for the content hash of the rendered prompt as of the last
-/// *successfully delivered* re-read nudge. Absent means either no nudge has
-/// ever fired or this coordinator predates the feature — either way the
-/// next adoption compares against nothing and fires once to establish a
-/// baseline.
+/// successfully sent re-read nudge (or the baseline seeded at session
+/// creation / first adoption with no recorded hash). Absent means this
+/// coordinator predates the feature or seeding never persisted — an
+/// adoption with no recorded baseline seeds the current hash and returns
+/// without sending, because there is no evidence the prompt changed.
 const PROMPT_NUDGE_HASH_KEY: &str = "coordinator.prompt_nudge_hash";
 
 /// Create or recover the coordinator for an app that has just registered.
@@ -213,6 +214,12 @@ async fn confirm_existing_intent(work_db: &WorkDb, tmux: &Tmux, record: &Coordin
 
 /// Content hash of the rendered prompt the coordinator actually reads.
 /// Deliberately not mtime/size-based — see [`RENDERED_PROMPT_FILENAME`].
+///
+/// The hash is only meaningful once the app has prepared the session
+/// directory for this launch (rewritten `CLAUDE.md` into
+/// `working_directory`). Engine attach hashes this file after app
+/// registration; coordinator creation already depends on that same
+/// ordering.
 fn hash_rendered_prompt(working_directory: &Path) -> Result<String> {
     let path = working_directory.join(RENDERED_PROMPT_FILENAME);
     let contents =
@@ -248,12 +255,14 @@ fn seed_prompt_nudge_baseline(work_db: &WorkDb, working_directory: &Path) {
 }
 
 /// Nudge an *adopted* coordinator session to re-read its instructions when
-/// the rendered prompt has changed since the last successfully delivered
+/// the rendered prompt has changed since the last successfully sent
 /// nudge. Best-effort and non-fatal by design: this must never fail the
-/// attach flow adoption is part of. A delivery failure is recorded via
+/// attach flow adoption is part of. A send failure is recorded via
 /// `tracing` and the engine-audit log, and the stored hash is left
 /// unchanged so the next restart's adoption retries rather than silently
-/// dropping the change.
+/// dropping the change. `send_keys` succeeding only proves tmux accepted
+/// the bytes into the pane pty — not that the coordinator treated them as
+/// a pending prompt — so audit/log outcomes use `"sent"`, not `"delivered"`.
 async fn maybe_nudge_prompt_change(
     work_db: &WorkDb,
     tmux: &Tmux,
@@ -263,9 +272,18 @@ async fn maybe_nudge_prompt_change(
     let current_hash = match hash_rendered_prompt(working_directory) {
         Ok(hash) => hash,
         Err(error) => {
-            tracing::warn!(
-                error = %format!("{error:#}"),
+            let error = format!("{error:#}");
+            tracing::error!(
+                error = %error,
                 "coordinator prompt nudge: could not hash rendered prompt; skipping"
+            );
+            audit::record_event(
+                "coordinator_prompt_nudge",
+                &json!({
+                    "outcome": "skipped",
+                    "reason": "hash_unavailable",
+                    "error": error,
+                }),
             );
             return;
         }
@@ -273,14 +291,35 @@ async fn maybe_nudge_prompt_change(
     let last_nudged_hash = match work_db.get_metadata(PROMPT_NUDGE_HASH_KEY) {
         Ok(value) => value,
         Err(error) => {
+            let error = format!("{error:#}");
             tracing::warn!(
-                error = %format!("{error:#}"),
+                error = %error,
                 "coordinator prompt nudge: could not read last-nudged hash; skipping"
+            );
+            audit::record_event(
+                "coordinator_prompt_nudge",
+                &json!({
+                    "outcome": "skipped",
+                    "reason": "metadata_unavailable",
+                    "error": error,
+                }),
             );
             return;
         }
     };
-    if last_nudged_hash.as_deref() == Some(current_hash.as_str()) {
+    let Some(last_nudged_hash) = last_nudged_hash else {
+        // No recorded baseline: a live session from before this feature
+        // (or a failed seed) gives no evidence the prompt changed, so
+        // establish the current hash and do not send.
+        if let Err(error) = work_db.set_metadata(PROMPT_NUDGE_HASH_KEY, &current_hash) {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "coordinator prompt nudge: failed to seed baseline hash for session with no recorded baseline"
+            );
+        }
+        return;
+    };
+    if last_nudged_hash == current_hash {
         return;
     }
 
@@ -292,22 +331,31 @@ async fn maybe_nudge_prompt_change(
     match tmux.send_keys(&record.session_name, &message).await {
         Ok(()) => {
             if let Err(error) = work_db.set_metadata(PROMPT_NUDGE_HASH_KEY, &current_hash) {
-                // Delivered but couldn't persist: leave this to the next
+                // Sent but couldn't persist: leave this to the next
                 // restart's comparison rather than risk under-reporting a
-                // delivered nudge as a failed one.
+                // sent nudge as a failed one.
+                let error = format!("{error:#}");
                 tracing::error!(
-                    error = %format!("{error:#}"),
-                    "coordinator prompt nudge: delivered but failed to persist the new hash; will re-nudge next restart"
+                    error = %error,
+                    "coordinator prompt nudge: sent but failed to persist the new hash; will re-nudge next restart"
+                );
+                audit::record_event(
+                    "coordinator_prompt_nudge",
+                    &json!({
+                        "outcome": "sent_unpersisted",
+                        "session_name": record.session_name,
+                        "error": error,
+                    }),
                 );
                 return;
             }
             audit::record_event(
                 "coordinator_prompt_nudge",
-                &json!({"outcome": "delivered", "session_name": record.session_name}),
+                &json!({"outcome": "sent", "session_name": record.session_name}),
             );
             tracing::info!(
                 session_name = %record.session_name,
-                "coordinator prompt nudge delivered: instructions changed since session start"
+                "coordinator prompt nudge sent: instructions changed since session start"
             );
         }
         Err(error) => {
@@ -322,7 +370,7 @@ async fn maybe_nudge_prompt_change(
             tracing::error!(
                 error = %format!("{error:#}"),
                 session_name = %record.session_name,
-                "coordinator prompt nudge: delivery failed; stored hash left unchanged so the next restart retries"
+                "coordinator prompt nudge: send failed; stored hash left unchanged so the next restart retries"
             );
         }
     }
@@ -669,6 +717,33 @@ mod tests {
         assert!(
             send_keys_calls(&server.calls()).is_empty(),
             "an unchanged prompt across a restart must not nudge"
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_baseline_on_adoption_seeds_without_nudging() {
+        // Pre-feature live session: metadata singleton exists, prompt
+        // hash key does not. Adoption must establish a baseline, not
+        // claim the prompt changed.
+        let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(RENDERED_PROMPT_FILENAME), "prompt v1").unwrap();
+        db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus")
+            .unwrap();
+        db.record_coordinator_tmux_session_created("token").unwrap();
+        assert_eq!(db.get_metadata(PROMPT_NUDGE_HASH_KEY).unwrap(), None);
+
+        let (tmux, server) = tmux_for(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
+        ensure_for_attach(&db, &tmux, "opus", dir.path()).await.unwrap();
+
+        assert!(
+            send_keys_calls(&server.calls()).is_empty(),
+            "a session with no recorded baseline must not be nudged"
+        );
+        assert_eq!(
+            db.get_metadata(PROMPT_NUDGE_HASH_KEY).unwrap(),
+            Some(hash_rendered_prompt(dir.path()).unwrap()),
+            "adoption with no recorded baseline must persist the current hash"
         );
     }
 
