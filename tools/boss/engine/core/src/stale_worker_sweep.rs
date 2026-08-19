@@ -70,7 +70,7 @@ use anyhow::{Context, Result};
 use boss_protocol::{WorkerActivity, WorkerPaneDeathReason};
 use boss_tmux::{DisplayField, Tmux};
 
-use crate::coordinator::{ExecutionCoordinator, worker_id_for_slot};
+use crate::coordinator::{CubeClient, ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::hold_registry::HoldRegistry;
 use crate::live_worker_state::{LiveWorkerStateRegistry, iso8601_utc};
@@ -345,7 +345,7 @@ impl crate::sweep_loop::SweepOutcome for StaleWorkerSweepOutcome {
 }
 
 /// Shared-ownership collaborators [`spawn_loop`] clones into each pass.
-/// Bundled into one struct (rather than six positional `Arc` parameters)
+/// Bundled into one struct (rather than positional `Arc` parameters)
 /// to keep `spawn_loop` under clippy's argument-count lint once the
 /// operator-hold registry joined the sweep's dependencies.
 #[derive(bon::Builder)]
@@ -360,14 +360,18 @@ pub struct StaleWorkerSweepDeps {
     pub dispatch_events: Arc<dyn DispatchEventSink>,
     pub reaper: Arc<dyn StaleWorkerReaper>,
     pub hold_registry: Arc<HoldRegistry>,
+    /// Forwarded to [`crate::dead_pid_sweep::reap_reported_pane_death`] so a
+    /// tmux-confirmed dead pane can force-release its cube lease.
+    pub cube_client: Arc<dyn CubeClient>,
 }
 
-/// Borrowed control collaborators for a single pass. Keeping the two teardown
+/// Borrowed control collaborators for a single pass. Keeping teardown
 /// controls together prevents the terminal-aware pass from growing a broad
 /// positional argument list.
 pub struct StaleWorkerSweepControls<'a> {
     pub reaper: &'a dyn StaleWorkerReaper,
     pub hold_registry: &'a HoldRegistry,
+    pub cube_client: &'a dyn CubeClient,
 }
 
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`.
@@ -386,6 +390,7 @@ pub fn spawn_loop(
         dispatch_events,
         reaper,
         hold_registry,
+        cube_client,
     } = deps;
     crate::sweep_loop::spawn_sweep_loop(interval, move || {
         let work_db = Arc::clone(&work_db);
@@ -395,6 +400,7 @@ pub fn spawn_loop(
         let dispatch_events = Arc::clone(&dispatch_events);
         let reaper = Arc::clone(&reaper);
         let hold_registry = Arc::clone(&hold_registry);
+        let cube_client = Arc::clone(&cube_client);
         async move {
             run_one_pass_with_terminal(
                 work_db.as_ref(),
@@ -405,6 +411,7 @@ pub fn spawn_loop(
                 StaleWorkerSweepControls {
                     reaper: reaper.as_ref(),
                     hold_registry: hold_registry.as_ref(),
+                    cube_client: cube_client.as_ref(),
                 },
                 stale_threshold_secs,
             )
@@ -430,7 +437,13 @@ pub async fn run_one_pass(
         None,
         coordinator,
         dispatch_events,
-        StaleWorkerSweepControls { reaper, hold_registry },
+        StaleWorkerSweepControls {
+            reaper,
+            hold_registry,
+            // Cadence-fallback tests never take the tmux-dead arm that
+            // force-releases a cube lease.
+            cube_client: &crate::test_support::NoopCube,
+        },
         stale_threshold_secs,
     )
     .await
@@ -451,7 +464,11 @@ pub async fn run_one_pass_with_terminal(
     controls: StaleWorkerSweepControls<'_>,
     stale_threshold_secs: i64,
 ) -> StaleWorkerSweepOutcome {
-    let StaleWorkerSweepControls { reaper, hold_registry } = controls;
+    let StaleWorkerSweepControls {
+        reaper,
+        hold_registry,
+        cube_client,
+    } = controls;
     let mut outcome = StaleWorkerSweepOutcome::default();
     let snapshot = live_states.snapshot();
 
@@ -586,6 +603,7 @@ pub async fn run_one_pass_with_terminal(
                         live_states,
                         coordinator.clone(),
                         dispatch_events,
+                        cube_client,
                         &state.run_id,
                         WorkerPaneDeathReason::ChildProcessExited,
                     )
@@ -1114,6 +1132,7 @@ mod tests {
             StaleWorkerSweepControls {
                 reaper: reaper.as_ref(),
                 hold_registry: &hold_registry,
+                cube_client: &NoopCube,
             },
             ALWAYS_STALE,
         )
@@ -1181,6 +1200,7 @@ mod tests {
             StaleWorkerSweepControls {
                 reaper: reaper.as_ref(),
                 hold_registry: &hold_registry,
+                cube_client: &NoopCube,
             },
             ALWAYS_STALE,
         )
@@ -1238,6 +1258,7 @@ mod tests {
             StaleWorkerSweepControls {
                 reaper: reaper.as_ref(),
                 hold_registry: &hold_registry,
+                cube_client: &NoopCube,
             },
             ALWAYS_STALE,
         )
@@ -1292,6 +1313,7 @@ mod tests {
             StaleWorkerSweepControls {
                 reaper: reaper.as_ref(),
                 hold_registry: &hold_registry,
+                cube_client: &NoopCube,
             },
             ALWAYS_STALE,
         )
@@ -1352,6 +1374,7 @@ mod tests {
             StaleWorkerSweepControls {
                 reaper: reaper.as_ref(),
                 hold_registry: &hold_registry,
+                cube_client: &NoopCube,
             },
             ALWAYS_STALE,
         )

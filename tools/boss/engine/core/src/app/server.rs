@@ -1489,6 +1489,7 @@ pub async fn serve_with_merge_probe(
             // process tree before its slot/lease is freed.
             reaper: server_state.clone() as Arc<dyn crate::stale_worker_sweep::StaleWorkerReaper>,
             hold_registry: server_state.hold_registry.clone(),
+            cube_client: server_state.cube_client.clone(),
         },
         Duration::from_secs(60),
         crate::stale_worker_sweep::DEFAULT_STALE_THRESHOLD_SECS,
