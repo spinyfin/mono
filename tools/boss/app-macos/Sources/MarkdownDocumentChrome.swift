@@ -152,6 +152,15 @@ struct MarkdownDocumentChrome: View {
     /// Wall-clock time of the click that triggered this open, for the
     /// `phase=interactive` total. `nil` outside the async-design-doc flow.
     var clickStartTime: Date? = nil
+    /// Exact heading text(s) — level markers and surrounding whitespace
+    /// stripped, e.g. `"HARD RULE: no punting — do the actual work"` — that
+    /// should render collapsed by default via `CollapsibleMarkdownSection`.
+    /// Empty (the default) leaves `source` rendered exactly as it always
+    /// has been: this is what keeps every other document (design docs,
+    /// chores, postmortems, ...) unaffected. Only a caller that recognizes a
+    /// specific document shape (e.g. `ChatViewModel.openTaskDescription`,
+    /// which opts in for `task.kind == "revision"`) passes a non-empty set.
+    var collapsedByDefaultHeadings: Set<String> = []
 
     var body: some View {
         HStack(spacing: 0) {
@@ -175,7 +184,8 @@ struct MarkdownDocumentChrome: View {
             loadError: loadError,
             baseURL: baseURL,
             projectShortID: projectShortID,
-            clickStartTime: clickStartTime
+            clickStartTime: clickStartTime,
+            collapsedByDefaultHeadings: collapsedByDefaultHeadings
         )
     }
 
@@ -218,6 +228,7 @@ private struct MarkdownDocumentColumn: View {
     let baseURL: URL?
     let projectShortID: String
     let clickStartTime: Date?
+    let collapsedByDefaultHeadings: Set<String>
 
     @Environment(\.commentedAnchors) private var commentedAnchors
     @Environment(\.commentFlashAnchor) private var commentFlashAnchor
@@ -230,6 +241,11 @@ private struct MarkdownDocumentColumn: View {
     /// reconstructs this view struct).
     @State private var scrollController = MarkdownScrollController()
     @FocusState private var findFieldFocused: Bool
+    /// Headings (from `collapsedByDefaultHeadings`) the user has manually
+    /// expanded, keyed by exact heading text. Everything named in
+    /// `collapsedByDefaultHeadings` starts collapsed — i.e. absent here;
+    /// toggling a section adds/removes its heading text.
+    @State private var expandedSections: Set<String> = []
 
     /// Monotonically-increasing counter used as the `.id()` for `StructuredText`
     /// to force a fresh parse when comments/search change. A counter avoids hash
@@ -394,39 +410,101 @@ private struct MarkdownDocumentColumn: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         } else {
-            StructuredText(source, parser: markdownParser)
-                .bossMarkdown()
-                // Scoped to this document body only — the transcript viewer,
-                // comment sidebar, and release notes all call `.bossMarkdown()`
-                // bare and must keep rendering prose at its natural width.
-                .environment(\.markdownProseMeasure, MarkdownDocumentMeasure.readable)
-                .environment(\.markdownEditorialStyle, true)
-                .textual.textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                // Force StructuredText recreation when highlight state changes so
-                // the new parser instance re-parses the source. A monotonic
-                // counter (not a hashValue) guarantees a fresh identity on every
-                // comment/search update.
-                .id(parseVersion)
-                .onChange(of: commentedAnchors) { _, _ in bumpParseVersionPreservingScroll() }
-                .onChange(of: commentFlashAnchor) { _, _ in bumpParseVersionPreservingScroll() }
-                .background(
-                    GeometryReader { geo in
-                        Color.clear.preference(
-                            key: StructuredTextHeightKey.self,
-                            value: geo.size.height
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(renderedChunks) { entry in
+                    switch entry.chunk {
+                    case .plain(let text):
+                        StructuredText(text, parser: entry.parser)
+                            .textual.textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    case .collapsible(let heading, let body):
+                        CollapsibleMarkdownSection(
+                            heading: heading,
+                            sectionBody: body,
+                            parser: entry.parser,
+                            isExpanded: expandedSectionsBinding(for: heading)
                         )
                     }
-                )
+                }
+            }
+            .bossMarkdown()
+            // Scoped to this document body only — the transcript viewer,
+            // comment sidebar, and release notes all call `.bossMarkdown()`
+            // bare and must keep rendering prose at its natural width.
+            .environment(\.markdownProseMeasure, MarkdownDocumentMeasure.readable)
+            .environment(\.markdownEditorialStyle, true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            // Force StructuredText recreation when highlight state changes so
+            // the new parser instance re-parses the source. A monotonic
+            // counter (not a hashValue) guarantees a fresh identity on every
+            // comment/search update.
+            .id(parseVersion)
+            .onChange(of: commentedAnchors) { _, _ in bumpParseVersionPreservingScroll() }
+            .onChange(of: commentFlashAnchor) { _, _ in bumpParseVersionPreservingScroll() }
+            .background(
+                GeometryReader { geo in
+                    Color.clear.preference(
+                        key: StructuredTextHeightKey.self,
+                        value: geo.size.height
+                    )
+                }
+            )
         }
     }
 
-    /// Combined comment + search highlighting parser. Falls back to the plain
-    /// markdown parser when neither is active; layers
-    /// `SearchHighlightingMarkdownParser` over the comment highlighter (or the
-    /// plain base) while a find is active. `baseURL` is threaded through so
-    /// relative links/images resolve on every surface.
-    private var markdownParser: any MarkupParser {
+    private func expandedSectionsBinding(for heading: String) -> Binding<Bool> {
+        Binding(
+            get: { expandedSections.contains(heading) },
+            set: { expanded in
+                if expanded {
+                    expandedSections.insert(heading)
+                } else {
+                    expandedSections.remove(heading)
+                }
+            }
+        )
+    }
+
+    /// Splits `source` into chunks (see `MarkdownHeadingSections`) and builds
+    /// each chunk's own parser. Precomputed as a plain array — rather than
+    /// building parsers inline inside the `ForEach` below — so the running
+    /// `cumulativeMatchCount` used to map the find bar's single global
+    /// `currentIndex` onto whichever chunk contains it can be threaded
+    /// procedurally instead of as SwiftUI `ViewBuilder` state.
+    private var renderedChunks: [RenderedMarkdownChunk] {
+        let chunks = MarkdownHeadingSections.chunks(in: source, collapsibleHeadings: collapsedByDefaultHeadings)
+        var cumulativeMatchCount = 0
+        return chunks.enumerated().map { index, chunk in
+            let text: String
+            switch chunk {
+            case .plain(let value): text = value
+            case .collapsible(_, let body): text = body
+            }
+            let (parser, matchCount) = markdownParser(for: text, cumulativeMatchCountBefore: cumulativeMatchCount)
+            cumulativeMatchCount += matchCount
+            return RenderedMarkdownChunk(id: index, chunk: chunk, parser: parser)
+        }
+    }
+
+    /// Builds the parser for one rendered chunk: the same comment-highlighting
+    /// base every chunk shares, plus search-match highlighting recomputed
+    /// against just THIS chunk's own plain-text projection — not sliced from
+    /// a global offset array, which would misalign the moment a document
+    /// renders as more than one independently-parsed `StructuredText`.
+    /// `baseURL` is threaded through so relative links/images resolve.
+    ///
+    /// `cumulativeMatchCountBefore` is the running count of matches already
+    /// assigned to earlier chunks in document order; it's used only to map
+    /// the find bar's single global `currentIndex` onto whichever chunk
+    /// actually contains it. For the common case (no collapsible sections —
+    /// every document besides an engine-minted revision brief — `source`
+    /// renders as exactly one chunk), `cumulativeMatchCountBefore` is always
+    /// 0 and this reduces to exactly the matches/current-index findState
+    /// already computed, unchanged from before chunking existed.
+    private func markdownParser(
+        for segmentSource: String,
+        cumulativeMatchCountBefore: Int
+    ) -> (parser: any MarkupParser, matchCount: Int) {
         let base: any MarkupParser
         if commentedAnchors.isEmpty && commentFlashAnchor == nil {
             base = AttributedStringMarkdownParser.markdown(baseURL: baseURL)
@@ -437,11 +515,17 @@ private struct MarkdownDocumentColumn: View {
                 baseURL: baseURL
             )
         }
-        guard findState.isActive, !findState.matches.isEmpty else { return base }
-        return SearchHighlightingMarkdownParser(
-            inner: base,
-            matches: findState.matches,
-            currentMatchIndex: findState.currentIndex
+        guard findState.isActive, !findState.query.isEmpty else { return (base, 0) }
+        let plainText = CommentProjection.plainText(for: segmentSource, baseURL: baseURL)
+        let matches = MarkdownSearch.findMatches(of: findState.query, in: plainText)
+        guard !matches.isEmpty else { return (base, 0) }
+        let localCurrentIndex = findState.currentIndex.flatMap { global -> Int? in
+            let local = global - cumulativeMatchCountBefore
+            return (local >= 0 && local < matches.count) ? local : nil
+        }
+        return (
+            SearchHighlightingMarkdownParser(inner: base, matches: matches, currentMatchIndex: localCurrentIndex),
+            matches.count
         )
     }
 
@@ -470,5 +554,187 @@ private struct MarkdownDocumentColumn: View {
         findState.close()
         findFieldFocused = false
         suppressTypeToComment.wrappedValue = false
+    }
+}
+
+// MARK: - Collapsible sections
+
+/// Heading text(s) `ChatViewModel.openTaskDescription` passes as
+/// `MarkdownDocumentChrome.collapsedByDefaultHeadings` when opening a
+/// revision task's (`kind == "revision"`) description. Must stay byte-for-byte
+/// identical to the heading `render_revision_instructions` emits in
+/// `tools/boss/engine/pr-review/src/render.rs` (after stripping the `## `
+/// marker) — that Rust function's doc comment carries the matching half of
+/// this cross-language contract. A mismatch here doesn't corrupt anything a
+/// worker reads (this constant never touches `task.description`); it just
+/// silently stops the boilerplate from collapsing.
+enum RevisionBriefCollapsibleHeadings {
+    static let hardRule = "HARD RULE: no punting — do the actual work"
+}
+
+/// One chunk of a rendered markdown document: either ordinary content
+/// (rendered exactly as `StructuredText` always has) or a heading-delimited
+/// section a caller has opted into folding — see
+/// `MarkdownDocumentChrome.collapsedByDefaultHeadings`.
+enum MarkdownDocumentChunk: Equatable {
+    case plain(String)
+    case collapsible(heading: String, body: String)
+}
+
+/// One entry of `MarkdownDocumentColumn.renderedChunks`: a chunk paired with
+/// the parser built for its own text. `Identifiable` via document order so
+/// `ForEach` doesn't need `Equatable` on `any MarkupParser`.
+private struct RenderedMarkdownChunk: Identifiable {
+    let id: Int
+    let chunk: MarkdownDocumentChunk
+    let parser: any MarkupParser
+}
+
+/// Splits a markdown source into `MarkdownDocumentChunk`s at each heading
+/// whose exact text (level markers and surrounding whitespace stripped)
+/// appears in `collapsibleHeadings`. A pure function over `String` — no
+/// Textual/StructuredText involvement — because Textual's block rendering
+/// has no supported hook for grouping or hiding a run of blocks (see the
+/// `HeadingStyle`/`BlockStyleConfiguration` types in `BossMarkdownStyle.swift`:
+/// each block is styled in isolation, with no source range or sibling
+/// awareness). Splitting the *source text* before it ever reaches
+/// `StructuredText`, and rendering each collapsible chunk as its own
+/// independently-parsed `StructuredText` behind a native SwiftUI disclosure
+/// control, is the same shape `TranscriptView` already uses for its
+/// per-segment `DisclosureGroup`s.
+enum MarkdownHeadingSections {
+    /// A matched section spans from its heading's own line through the line
+    /// immediately before the NEXT heading of *any* level — not the next
+    /// heading of the *same* level. A revision brief's per-finding headings
+    /// render as `### [severity] ...` directly after the boilerplate's `##
+    /// HARD RULE ...` heading with no intervening heading in between; a
+    /// same-level rule would treat those (deeper) finding headings as
+    /// children of the H2 and fold them along with it — exactly the
+    /// "findings must never collapse" outcome this function exists to
+    /// avoid. Any-level is also simpler to reason about: "this heading's
+    /// own prose, stopping at the very next heading" needs no notion of
+    /// outline nesting at all.
+    static func chunks(in source: String, collapsibleHeadings: Set<String>) -> [MarkdownDocumentChunk] {
+        guard !collapsibleHeadings.isEmpty else { return [.plain(source)] }
+        let headings = headingLines(in: source)
+        let matchedIndices = headings.indices.filter { collapsibleHeadings.contains(headings[$0].text) }
+        guard !matchedIndices.isEmpty else { return [.plain(source)] }
+
+        var chunks: [MarkdownDocumentChunk] = []
+        var cursor = source.startIndex
+        for i in matchedIndices {
+            let heading = headings[i]
+            if heading.lineRange.lowerBound > cursor {
+                chunks.append(.plain(String(source[cursor..<heading.lineRange.lowerBound])))
+            }
+            let sectionEnd = (i + 1 < headings.count) ? headings[i + 1].lineRange.lowerBound : source.endIndex
+            let body = String(source[heading.lineRange.upperBound..<sectionEnd])
+            chunks.append(.collapsible(heading: heading.text, body: body))
+            cursor = sectionEnd
+        }
+        if cursor < source.endIndex {
+            chunks.append(.plain(String(source[cursor...])))
+        }
+        return chunks
+    }
+
+    private struct HeadingLine {
+        let text: String
+        /// Spans the heading's own line, INCLUDING its trailing newline (or
+        /// through end-of-source if the heading is the last line) — so a
+        /// section's body starts exactly at `lineRange.upperBound`.
+        let lineRange: Range<String.Index>
+    }
+
+    private static func headingLines(in source: String) -> [HeadingLine] {
+        var results: [HeadingLine] = []
+        var lineStart = source.startIndex
+        while lineStart < source.endIndex {
+            let newline = source[lineStart...].firstIndex(of: "\n")
+            let contentEnd = newline ?? source.endIndex
+            let lineEnd = newline.map(source.index(after:)) ?? source.endIndex
+            if let text = headingText(in: source[lineStart..<contentEnd]) {
+                results.append(HeadingLine(text: text, lineRange: lineStart..<lineEnd))
+            }
+            lineStart = lineEnd
+        }
+        return results
+    }
+
+    /// A markdown ATX heading (`^#{1,6}[ \t]+...`); returns its trimmed text
+    /// with the `#` markers stripped, or `nil` if `line` isn't a heading.
+    private static func headingText(in line: Substring) -> String? {
+        var index = line.startIndex
+        var level = 0
+        while index < line.endIndex, line[index] == "#" {
+            level += 1
+            index = line.index(after: index)
+        }
+        guard level >= 1, level <= 6, index < line.endIndex, line[index] == " " || line[index] == "\t" else {
+            return nil
+        }
+        let text = line[index...].trimmingCharacters(in: .whitespaces)
+        return text.isEmpty ? nil : text
+    }
+}
+
+/// A heading-delimited section of a markdown document that folds behind a
+/// disclosure affordance. Used only where a caller explicitly opts a
+/// heading in via `MarkdownDocumentChrome.collapsedByDefaultHeadings`. The
+/// heading itself always renders — bold, at roughly the document's H2
+/// weight — so the section is never invisible; only its body folds, and the
+/// collapsed state always names what's hidden (never a bare triangle).
+private struct CollapsibleMarkdownSection: View {
+    let heading: String
+    let sectionBody: String
+    let parser: any MarkupParser
+    @Binding var isExpanded: Bool
+
+    private var hiddenLineCount: Int {
+        max(sectionBody.split(separator: "\n", omittingEmptySubsequences: true).count, 1)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            toggleButton
+            Rectangle()
+                .fill(BossMarkdownPalette.hairline)
+                .frame(height: 1)
+            if isExpanded {
+                StructuredText(sectionBody, parser: parser)
+                    .textual.textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(.top, 16)
+        .padding(.bottom, 8)
+    }
+
+    private var toggleButton: some View {
+        Button {
+            isExpanded.toggle()
+        } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(BossMarkdownPalette.muted)
+                Text(heading)
+                    .font(.system(.body, design: .default).weight(.bold))
+                    .foregroundStyle(BossMarkdownPalette.ink)
+                    .tracking(-0.3)
+                Spacer(minLength: 8)
+                Text(isExpanded ? "Collapse" : "Collapsed — \(hiddenLineCount) lines hidden. Click to expand.")
+                    .font(.caption)
+                    .foregroundStyle(BossMarkdownPalette.muted)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("markdown-collapsible-section-toggle")
+        .accessibilityLabel(
+            isExpanded
+                ? "Collapse \(heading)"
+                : "Expand \(heading) — \(hiddenLineCount) lines hidden"
+        )
     }
 }

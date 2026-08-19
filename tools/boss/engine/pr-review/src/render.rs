@@ -58,6 +58,21 @@ pub fn render_revision_title(origin: ReviewOrigin, finding_count: usize) -> Stri
 /// Opens with `origin` (the PR reviewed and the work item that produced it)
 /// before the generic no-punting preamble, so the description alone
 /// identifies what the findings are about.
+///
+/// This string is stored verbatim (only `.trim()`'d) as the created
+/// revision's `description` and is what a worker actually reads: it is
+/// interpolated unmodified into the revision's prompt (see
+/// `compose_execution_prompt` / `compose_revision_directive` in
+/// `tools/boss/engine/core/src/runner/prompt.rs`). Nothing about the text
+/// itself may change presentationally without changing what the worker
+/// receives — the macOS app's document viewer instead collapses the
+/// `## HARD RULE: no punting — do the actual work` section by default
+/// purely in its own rendering, keyed on this exact heading text (see
+/// `RevisionBriefCollapsibleHeadings.hardRule` in
+/// `tools/boss/app-macos/Sources/MarkdownDocumentChrome.swift`). If this
+/// heading's wording ever changes, that Swift constant must change with it
+/// or the collapse silently stops applying — it does not affect what a
+/// worker reads either way.
 pub fn render_revision_instructions(result: &ReviewResult, origin: ReviewOrigin) -> String {
     let severity_rank = |s: &ReviewFindingSeverity| match s {
         ReviewFindingSeverity::Critical => 0u8,

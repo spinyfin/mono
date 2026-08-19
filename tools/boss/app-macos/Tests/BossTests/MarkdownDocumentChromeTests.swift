@@ -232,4 +232,130 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         hosting.layoutSubtreeIfNeeded()
         XCTAssertGreaterThan(hosting.fittingSize.height, 0)
     }
+
+    // MARK: - Collapsible sections
+
+    /// A revision brief's exact shape: a summary paragraph, the
+    /// `## HARD RULE ...` boilerplate heading, then findings rendered as
+    /// `### [severity] ...` headings with no intervening heading. The
+    /// literal text this test builds mirrors `render_revision_instructions`
+    /// in `tools/boss/engine/pr-review/src/render.rs`.
+    private static let revisionBrief = """
+    Automated PR review of PR #5 found 1 finding(s) requiring attention.
+    Address ALL findings before finalising this revision.
+
+    ## HARD RULE: no punting — do the actual work
+
+    Each finding below requires a real code change that resolves it.
+    The following are FORBIDDEN — they do NOT count as addressing a finding:
+
+    - Filing a follow-up task, chore, or issue in lieu of fixing the finding.
+
+    ### [high] Null pointer dereference
+
+    **File:** `src/main.rs`
+
+    The handle function dereferences without a null check; add a guard.
+
+    **Review summary:** One bug found.
+    """
+
+    /// Must stay byte-for-byte identical to the heading text
+    /// `render_revision_instructions` emits (after stripping `## `) — see
+    /// that function's doc comment in `render.rs` for the matching half of
+    /// this cross-language contract.
+    func testRevisionBriefHardRuleHeadingTextIsPinned() {
+        XCTAssertEqual(
+            RevisionBriefCollapsibleHeadings.hardRule,
+            "HARD RULE: no punting — do the actual work"
+        )
+    }
+
+    /// The default (empty) heading set must leave every document — every
+    /// caller except a revision task's description — split as a single
+    /// unmodified `.plain` chunk, so today's single-`StructuredText`
+    /// rendering path is unaffected.
+    func testHeadingSectionsWithNoCollapsibleHeadingsIsSinglePlainChunk() {
+        let chunks = MarkdownHeadingSections.chunks(in: Self.revisionBrief, collapsibleHeadings: [])
+        XCTAssertEqual(chunks.count, 1)
+        guard case .plain(let text) = chunks[0] else {
+            return XCTFail("expected a single .plain chunk")
+        }
+        XCTAssertEqual(text, Self.revisionBrief)
+    }
+
+    /// A heading set that names no heading actually present in the source
+    /// must also fall back to a single `.plain` chunk (e.g. a design doc
+    /// that happens to be checked against a heading text it doesn't have).
+    func testHeadingSectionsWithNonMatchingHeadingIsSinglePlainChunk() {
+        let chunks = MarkdownHeadingSections.chunks(in: Self.revisionBrief, collapsibleHeadings: ["Not present anywhere"])
+        XCTAssertEqual(chunks.count, 1)
+        guard case .plain = chunks[0] else {
+            return XCTFail("expected a single .plain chunk")
+        }
+    }
+
+    /// The core invariant: the `## HARD RULE ...` section folds, but the
+    /// findings after it (rendered as a *deeper* `###` heading, with no H2
+    /// in between) never end up inside the collapsible chunk. A same-level
+    /// boundary rule would get this wrong — this pins "next heading of any
+    /// level" as the actual behavior.
+    func testHeadingSectionsFoldsHardRuleButNeverFindings() {
+        let chunks = MarkdownHeadingSections.chunks(
+            in: Self.revisionBrief,
+            collapsibleHeadings: [RevisionBriefCollapsibleHeadings.hardRule]
+        )
+        XCTAssertEqual(chunks.count, 3, "expected prefix, collapsible section, suffix: \(chunks)")
+
+        guard case .plain(let prefix) = chunks[0] else { return XCTFail("expected a leading .plain chunk") }
+        XCTAssertTrue(prefix.contains("Automated PR review of PR #5"))
+        XCTAssertFalse(prefix.contains("HARD RULE"))
+
+        guard case .collapsible(let heading, let body) = chunks[1] else {
+            return XCTFail("expected a .collapsible chunk")
+        }
+        XCTAssertEqual(heading, RevisionBriefCollapsibleHeadings.hardRule)
+        XCTAssertTrue(body.contains("FORBIDDEN"))
+        XCTAssertFalse(body.contains("### [high]"), "a finding heading must never be folded into the collapsed body")
+        XCTAssertFalse(body.contains("Review summary"))
+
+        guard case .plain(let suffix) = chunks[2] else { return XCTFail("expected a trailing .plain chunk") }
+        XCTAssertTrue(suffix.contains("### [high] Null pointer dereference"))
+        XCTAssertTrue(suffix.contains("Review summary"))
+        XCTAssertFalse(suffix.contains("FORBIDDEN"))
+    }
+
+    /// Concatenating the three chunks (re-adding back the `## ` marker and
+    /// heading-line newline the collapsible chunk strips) must reconstruct
+    /// the original source exactly — chunking must never drop or duplicate
+    /// text, since this same text is what the app shows the reader.
+    func testHeadingSectionsChunksReassembleToOriginalSource() {
+        let chunks = MarkdownHeadingSections.chunks(
+            in: Self.revisionBrief,
+            collapsibleHeadings: [RevisionBriefCollapsibleHeadings.hardRule]
+        )
+        var reassembled = ""
+        for chunk in chunks {
+            switch chunk {
+            case .plain(let text):
+                reassembled += text
+            case .collapsible(let heading, let body):
+                reassembled += "## \(heading)\n\(body)"
+            }
+        }
+        XCTAssertEqual(reassembled, Self.revisionBrief)
+    }
+
+    func testChromeWithCollapsedByDefaultHeadingRenders() {
+        let view = MarkdownDocumentChrome(
+            title: "Revision brief",
+            source: Self.revisionBrief,
+            collapsedByDefaultHeadings: [RevisionBriefCollapsibleHeadings.hardRule]
+        )
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame = NSRect(x: 0, y: 0, width: 760, height: 640)
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
+        XCTAssertGreaterThan(hosting.fittingSize.width, 0)
+    }
 }

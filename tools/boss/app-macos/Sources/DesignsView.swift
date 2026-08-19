@@ -553,6 +553,9 @@ struct MarkdownViewerView: View {
     /// The comment artifact this doc corresponds to (e.g. `work_item` for a
     /// task/chore description). `nil` leaves comments in-memory.
     var artifact: CommentArtifactRef? = nil
+    /// Forwarded to `MarkdownDocumentChrome.collapsedByDefaultHeadings`.
+    /// Empty for every caller except a revision task's description.
+    var collapsedByDefaultHeadings: Set<String> = []
 
     var body: some View {
         MarkdownDocumentChrome(
@@ -560,7 +563,8 @@ struct MarkdownViewerView: View {
             source: source,
             artifact: artifact,
             projectShortID: projectShortID,
-            clickStartTime: clickStartTime
+            clickStartTime: clickStartTime,
+            collapsedByDefaultHeadings: collapsedByDefaultHeadings
         )
     }
 }
@@ -626,6 +630,15 @@ final class AsyncMarkdownViewerViewModel: ObservableObject {
     /// render-complete log entry can report the full parse+layout duration.
     var renderStartTime: Date? = nil
     var pendingRenderProjectShortID: String? = nil
+    /// Exact heading text(s) that should render collapsed by default in the
+    /// next `.loaded` content — see `MarkdownDocumentChrome.collapsedByDefaultHeadings`.
+    /// Set alongside `state` by whichever caller populates `.loaded` (e.g.
+    /// `ChatViewModel.openTaskDescription` opts in for a revision task's
+    /// description); every other producer of `.loaded` (design-doc fetches)
+    /// must reset this to `[]` since the viewer/VM is a shared singleton and
+    /// a stale value would otherwise leak a "collapsed section" affordance
+    /// into an unrelated document opened next in the same window.
+    var collapsedByDefaultHeadings: Set<String> = []
     /// Stamped alongside `renderStartTime`; applied as `.id()` to
     /// `MarkdownViewerView` so SwiftUI recreates the view on each content
     /// load, ensuring `.onAppear` fires even when the window is reused.
@@ -678,7 +691,8 @@ struct AsyncMarkdownViewerView: View {
                     source: markdown,
                     projectShortID: vm.pendingRenderProjectShortID ?? "",
                     clickStartTime: vm.clickStartTime,
-                    artifact: artifact
+                    artifact: artifact,
+                    collapsedByDefaultHeadings: vm.collapsedByDefaultHeadings
                 )
                 // .id() forces SwiftUI to destroy and recreate MarkdownViewerView on each
                 // content load, so .onAppear fires even when the window is reused across
