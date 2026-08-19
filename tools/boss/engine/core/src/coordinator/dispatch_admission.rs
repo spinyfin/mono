@@ -305,12 +305,22 @@ impl ExecutionCoordinator {
             Ok(false) => {
                 // Nothing to override: proceed exactly as an ordinary
                 // explicit start would, with none of the bypass machinery
-                // below. There was no pause to bypass, so this is as much
-                // a "claim" as any other ordinary explicit start.
+                // below. Capture the non-terminal rows first: the ordinary
+                // path can reuse an already-live execution, which this
+                // request did not claim or dispatch.
+                let pre_existing: HashSet<String> = self
+                    .work_db
+                    .list_executions(Some(&work_item_id))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|e| !e.status.is_terminal())
+                    .map(|e| e.id)
+                    .collect();
                 let execution = self.request_execution_ordinary(input, live_states).await?;
+                let claimed = !pre_existing.contains(&execution.id) || execution.status == ExecutionStatus::Ready;
                 return Ok(PauseBypassOutcome {
                     execution,
-                    claimed: true,
+                    claimed,
                     bypassed_active_pause: false,
                 });
             }

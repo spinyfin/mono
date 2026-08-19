@@ -989,7 +989,6 @@ impl ServerState {
     // trunk token store, trunk client, direct-merge executor) — the same
     // "production passes None, tests inject a fake" shape repeated once
     // more, not unrelated concerns that should be grouped into a struct.
-    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     fn new_arc_with_app_pid_and_merge_probe_and_dispatch_fakes(
         cfg: Arc<RuntimeConfig>,

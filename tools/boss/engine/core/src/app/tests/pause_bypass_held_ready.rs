@@ -227,8 +227,7 @@ async fn board_drag_without_bypass_skips_when_ready_execution_exists() {
 /// the already-live execution and never claims anything on this request's
 /// behalf, so the event must say so honestly rather than claiming a
 /// dispatch that did not happen.
-#[tokio::test]
-async fn board_drag_pause_bypass_onto_already_live_execution_reports_no_dispatch() {
+async fn assert_board_drag_pause_bypass_onto_already_live_execution_reports_no_dispatch(pause_lifted: bool) {
     let (server_state, _dir) = test_server_state_with_fakes();
     let product = create_test_product_with_repo(
         &server_state.work_db,
@@ -238,8 +237,7 @@ async fn board_drag_pause_bypass_onto_already_live_execution_reports_no_dispatch
     let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "Genuinely running chore");
 
     // A spawned execution is `waiting_human` (non-terminal, non-`ready`) —
-    // exactly the "a worker is genuinely running" shape this finding is
-    // about.
+    // exactly the "a worker is genuinely running" shape this test covers.
     let live_execution_id = create_spawned_execution(&server_state.work_db, &chore.id, 999_999);
     let live_execution = server_state.work_db.get_execution(&live_execution_id).unwrap();
     assert_ne!(
@@ -269,6 +267,9 @@ async fn board_drag_pause_bypass_onto_already_live_execution_reports_no_dispatch
 
     let live_gen = 1_700_000_000_u64;
     pause_operator(&server_state, live_gen);
+    if pause_lifted {
+        server_state.execution_coordinator.resume_dispatch();
+    }
 
     let sink = make_session_sink();
     let ctx = dispatch(&server_state, &sink);
@@ -338,4 +339,14 @@ async fn board_drag_pause_bypass_onto_already_live_execution_reports_no_dispatch
         skip.contains(&live_execution_id),
         "the skip reason must name the already-live execution that owns the slot, got: {skip}"
     );
+}
+
+#[tokio::test]
+async fn board_drag_pause_bypass_onto_already_live_execution_reports_no_dispatch() {
+    assert_board_drag_pause_bypass_onto_already_live_execution_reports_no_dispatch(false).await;
+}
+
+#[tokio::test]
+async fn board_drag_pause_bypass_after_pause_lifts_onto_already_live_execution_reports_no_dispatch() {
+    assert_board_drag_pause_bypass_onto_already_live_execution_reports_no_dispatch(true).await;
 }
