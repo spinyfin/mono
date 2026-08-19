@@ -1140,4 +1140,37 @@ extension EngineClient {
         }
         sendLine(payload)
     }
+
+    /// Fetch the merged, shallow engine-attempt feed. Detailed records remain
+    /// behind their source-specific get requests so list refreshes stay small.
+    func sendListEngineAttempts(limit: Int? = nil, includeBackgroundWork: Bool = false) {
+        var payload: [String: Any] = ["type": "list_engine_attempts"]
+        if let limit {
+            payload["limit"] = limit
+        }
+        if includeBackgroundWork {
+            payload["include_background_work"] = true
+        }
+        sendLine(payload)
+    }
+
+    /// Fetch detailed fields for a selected unified attempt row. Rebase rows
+    /// have no source-specific get endpoint yet, so their shared list fields
+    /// remain the complete available detail.
+    func sendGetEngineAttemptDetail(_ attempt: EngineAttemptListEntry) {
+        switch attempt.kind {
+        case "conflict":
+            sendLine([
+                "type": "get_conflict_resolution",
+                "attempt_id": attempt.id,
+            ])
+        case "ci":
+            sendLine([
+                "type": "get_ci_remediation",
+                "attempt_id": attempt.id,
+            ])
+        default:
+            break
+        }
+    }
 }

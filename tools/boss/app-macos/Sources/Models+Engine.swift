@@ -7,10 +7,65 @@ import Foundation
 // the repo's file-size check.
 // ===========================================================================
 
-/// Discriminator for the unified Engine-tab attempt feed. Phase 5 #14
-/// lists `conflict_resolutions`; Phase 11 #37 grows the enum with the
-/// CI subsystem (`ci_remediations`). The `rebase_attempts` row kind
-/// is reserved for when the `auto-rebase-stacked-prs` flow lands.
+/// Shared fields from the engine's unified attempt list. The list stays
+/// intentionally shallow; Activity requests the source-specific record only
+/// after the operator selects a row.
+struct EngineAttemptListEntry: Identifiable, Hashable {
+    let id: String
+    let productID: String
+    let createdAt: String
+    let extra: [String: String]
+    let kind: String
+    let prURL: String
+    let status: String
+    let failureReason: String?
+    let finishedAt: String?
+    let startedAt: String?
+    let workItemID: String?
+
+    var kindLabel: String {
+        switch kind {
+        case "conflict": return "Conflict"
+        case "ci":
+            switch extra["attempt_kind"] {
+            case "fix": return "CI fix"
+            case "retrigger": return "CI retrigger"
+            default: return "CI"
+            }
+        case "rebase": return "Rebase"
+        default: return kind
+        }
+    }
+
+    var hasKindSpecificDetail: Bool {
+        kind == "conflict" || kind == "ci"
+    }
+}
+
+/// The engine-owned sources that can surface in the toolbar's background-work
+/// snapshot. A closed enum keeps a new source visible at compile time.
+enum BackgroundWorkKind: String, Hashable {
+    case projectPlanner = "project_planner"
+    case conflictRemediation = "conflict_remediation"
+}
+
+/// One engine-authored item in the background-work snapshot returned alongside
+/// the unified attempt list when requested.
+struct BackgroundWorkItem: Identifiable, Hashable {
+    let id: String
+    let kind: BackgroundWorkKind
+    let phase: String
+    let productID: String
+    let sourceID: String
+    let title: String
+    let projectID: String?
+    let startedAt: String?
+    let workItemID: String?
+}
+
+/// Source-specific detail for a selected unified attempt row. The list itself
+/// uses `EngineAttemptListEntry`; this enum is populated only by a selected
+/// row's kind-specific get request.
 enum EngineAttemptRow: Identifiable, Hashable {
     case conflictResolution(WorkConflictResolution)
     case ciRemediation(WorkCiRemediation)

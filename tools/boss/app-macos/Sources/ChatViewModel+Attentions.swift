@@ -195,12 +195,18 @@ extension ChatViewModel {
         engine.sendListCiRemediations(limit: 200)
     }
 
-    /// Refresh both engine-tab attempt subsystems together — the
-    /// activity log surfaces a single button that should pull every
-    /// row kind in one call.
+    /// Refresh Activity's one authoritative engine-attempt list. The
+    /// background-work snapshot shares this response so the app need not
+    /// reconstruct either view from the source-specific attempt tables.
     func refreshEngineAttempts() {
-        engine.sendListConflictResolutions(limit: 200)
-        engine.sendListCiRemediations(limit: 200)
+        engine.sendListEngineAttempts(limit: 200, includeBackgroundWork: true)
+    }
+
+    /// Load source-specific fields only after an Activity row is selected.
+    /// Unknown future kinds remain inspectable through their shared list
+    /// fields until the engine exposes a matching detail endpoint.
+    func fetchEngineAttemptDetail(_ attempt: EngineAttemptListEntry) {
+        engine.sendGetEngineAttemptDetail(attempt)
     }
 
     // MARK: - Automation actions

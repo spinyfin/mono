@@ -69,6 +69,13 @@ enum EngineEvent {
     /// `ci_remediations` rows for the Engine tab. Phase 11 #37 of
     /// the merge-conflict design (CI extensions).
     case ciRemediationsList(attempts: [WorkCiRemediation])
+    /// Response to `list_engine_attempts`. This is the authoritative, merged
+    /// Activity list; source-specific details are loaded only after selection.
+    case engineAttemptsList(attempts: [EngineAttemptListEntry], backgroundWork: [BackgroundWorkItem])
+    /// Full conflict-resolution record loaded for a selected Activity row.
+    case conflictResolution(attempt: WorkConflictResolution)
+    /// Full CI-remediation record loaded for a selected Activity row.
+    case ciRemediation(attempt: WorkCiRemediation)
     /// Activity-feed push: a fresh conflict-resolution attempt was
     /// created (or a `retry` reset an existing one) and a worker is
     /// about to take over. The Engine tab refreshes; the badge state

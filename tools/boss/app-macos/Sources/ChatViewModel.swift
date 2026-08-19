@@ -416,6 +416,18 @@ final class ChatViewModel: ObservableObject {
         didSet { notePublishedWorkInputChanged() }
     }
 
+    /// The authoritative, merged attempt feed for Activity. Unlike the
+    /// source-specific arrays above, these entries deliberately contain only
+    /// shared list fields; a selected row loads its detailed record on demand.
+    @Published var engineAttempts: [EngineAttemptListEntry] = []
+
+    /// Engine-owned snapshot for the background-work toolbar affordance.
+    @Published var backgroundWork: [BackgroundWorkItem] = []
+
+    /// Source-specific records requested by selected Activity rows, keyed by
+    /// their shared-list attempt id.
+    @Published var engineAttemptDetails: [String: EngineAttemptRow] = [:]
+
     /// PR URLs whose most recent CI-remediation attempt succeeded,
     /// with the wall-clock timestamp the engine reported (or the local
     /// observation time as a fallback). Drives the `"✅ ci auto-fixed"`

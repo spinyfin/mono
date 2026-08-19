@@ -329,11 +329,13 @@ extension ChatViewModel {
             // arm that clears recentlyClearedCIPRs for the same reason.
             recentlyClearedConflictPRs.removeValue(forKey: prURL)
             engine.sendListConflictResolutions(limit: 200)
+            refreshEngineAttempts()
         case .conflictResolutionFailed, .conflictResolutionAbandoned:
             // Refreshes the engine-tab list so the status column re-renders.
             // These don't touch the badge: failure/abandon don't un-clear a
             // previously cleared conflict — only a new start signals re-conflict.
             engine.sendListConflictResolutions(limit: 200)
+            refreshEngineAttempts()
         case .conflictResolutionSucceeded(_, _, _, let prURL):
             // Stamp the PR url so the kanban card shows the
             // "🔧 conflict cleared" chip for the next 24h (#15). The
@@ -342,6 +344,7 @@ extension ChatViewModel {
             // for an ageing window measured in hours.
             recentlyClearedConflictPRs[prURL] = Date()
             engine.sendListConflictResolutions(limit: 200)
+            refreshEngineAttempts()
         case .ciRemediationsList(let attempts):
             ciRemediations = attempts
             // Reconcile both PR-card chips against the row list, which is
@@ -399,6 +402,13 @@ extension ChatViewModel {
                     break
                 }
             }
+        case .engineAttemptsList(let attempts, let backgroundWork):
+            engineAttempts = attempts
+            self.backgroundWork = backgroundWork
+        case .conflictResolution(let attempt):
+            engineAttemptDetails[attempt.id] = .conflictResolution(attempt)
+        case .ciRemediation(let attempt):
+            engineAttemptDetails[attempt.id] = .ciRemediation(attempt)
         case .ciRemediationStarted(_, _, _, let prURL, _):
             // A fresh CI attempt was created (detect path or `retry`).
             // The card stays in `blocked: ci_failure` — the in-flight
@@ -417,6 +427,7 @@ extension ChatViewModel {
                 ciFailureBadges[prURL] = existing
             }
             engine.sendListCiRemediations(limit: 200)
+            refreshEngineAttempts()
         case .ciRemediationSucceeded(_, _, _, let prURL):
             // Engine observed CI back at clean and retired the attempt.
             // Drop the failure chip and stamp the "✅ ci auto-fixed"
@@ -424,6 +435,7 @@ extension ChatViewModel {
             ciFailureBadges.removeValue(forKey: prURL)
             recentlyClearedCIPRs[prURL] = Date()
             engine.sendListCiRemediations(limit: 200)
+            refreshEngineAttempts()
         case .ciFailureCleared(_, _, let prURL):
             // Engine cleared `blocked: ci_failure` but found no active
             // remediation attempt (the prior attempt was already terminal).
@@ -436,6 +448,7 @@ extension ChatViewModel {
             // until the engine either retries or exhausts. The list
             // refresh keeps the engine tab consistent.
             engine.sendListCiRemediations(limit: 200)
+            refreshEngineAttempts()
         case .ciRemediationExhausted(_, _, let prURL, let used, let budget):
             // Budget exhausted means CI is still failing and auto-fix
             // cannot help further. Any prior "ci auto-fixed" claim is now
@@ -443,6 +456,7 @@ extension ChatViewModel {
             recentlyClearedCIPRs.removeValue(forKey: prURL)
             ciFailureBadges[prURL] = CiFailureBadge(state: .exhausted, attemptsUsed: used, budget: budget)
             engine.sendListCiRemediations(limit: 200)
+            refreshEngineAttempts()
         case .attentionItemsForWorkItemList(let workItemID, let items):
             attentionItemsByWorkItemID[workItemID] = items
         case .attentionItemCreated, .attentionItemUpdated, .attentionItemConverted, .deferredScopeAttentionsList:

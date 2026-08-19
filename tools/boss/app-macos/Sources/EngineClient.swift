@@ -543,6 +543,29 @@ final class EngineClient: @unchecked Sendable {
                 let raw = payload["attempts"] as? [[String: Any]] ?? []
                 let attempts = raw.compactMap(parseCiRemediation)
                 emit(.ciRemediationsList(attempts: attempts))
+            case "engine_attempts_list":
+                let rawAttempts = payload["attempts"] as? [[String: Any]] ?? []
+                let rawBackgroundWork = payload["background_work"] as? [[String: Any]] ?? []
+                emit(.engineAttemptsList(
+                    attempts: rawAttempts.compactMap(parseEngineAttemptListEntry),
+                    backgroundWork: rawBackgroundWork.compactMap(parseBackgroundWorkItem)
+                ))
+            case "conflict_resolution":
+                guard let raw = payload["attempt"] as? [String: Any],
+                      let attempt = parseConflictResolution(raw)
+                else {
+                    emit(.error(message: "received invalid conflict_resolution payload"))
+                    break
+                }
+                emit(.conflictResolution(attempt: attempt))
+            case "ci_remediation":
+                guard let raw = payload["attempt"] as? [String: Any],
+                      let attempt = parseCiRemediation(raw)
+                else {
+                    emit(.error(message: "received invalid ci_remediation payload"))
+                    break
+                }
+                emit(.ciRemediation(attempt: attempt))
             case "conflict_resolution_started":
                 emit(.conflictResolutionStarted(
                     productID: payload["product_id"] as? String ?? "",
