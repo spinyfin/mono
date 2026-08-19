@@ -2600,6 +2600,9 @@ pub enum FrontendRequest {
 pub enum WorkerPaneDeathReason {
     SurfaceCreationFailed,
     ChildProcessExited,
+    /// A pre-write foreground-process check found the driver's CLI had
+    /// returned and a shell (or no process) owned the worker PTY instead.
+    DriverExited,
     /// Compatibility value for reports from an app build that predates the
     /// reason field. New senders must always choose a specific variant.
     #[default]
@@ -2612,6 +2615,7 @@ impl WorkerPaneDeathReason {
         match self {
             Self::SurfaceCreationFailed => "surface creation failed before a child process attached",
             Self::ChildProcessExited => "attached child process exited",
+            Self::DriverExited => "worker driver exited before the engine delivered pane input",
             Self::Unknown => "app did not identify which pane-death callback fired",
         }
     }
@@ -2620,6 +2624,7 @@ impl WorkerPaneDeathReason {
         match self {
             Self::SurfaceCreationFailed => "surface_creation_failed",
             Self::ChildProcessExited => "child_process_exited",
+            Self::DriverExited => "driver_exited",
             Self::Unknown => "unknown",
         }
     }

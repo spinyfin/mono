@@ -149,8 +149,12 @@ struct ContentView: View {
             model.paneDetachHandler = { [workspace = workersWorkspace] slotId in
                 workspace.detachWorkerPane(slotId: slotId)
             }
-            model.paneSendHandler = { [workspace = workersWorkspace] slotId, text in
-                workspace.sendToPane(slotId: slotId, text: text)
+            model.paneSendHandler = { [workspace = workersWorkspace] slotId, text, expectedDriverBinary in
+                workspace.sendToPane(
+                    slotId: slotId,
+                    text: text,
+                    expectedDriverBinary: expectedDriverBinary
+                )
             }
             model.paneFocusHandler = { [workspace = workersWorkspace] slotId in
                 workspace.focusWorkerPane(slotId: slotId)

@@ -215,6 +215,10 @@ pub struct ListHostedPanesResult {
 pub struct SendToPaneInput {
     pub slot_id: u8,
     pub text: String,
+    /// The driver executable that must own the PTY foreground process at the
+    /// instant the app writes `text`. The app refuses rather than typing into
+    /// a shell after the driver has exited.
+    pub expected_driver_binary: String,
 }
 
 /// App's reply when text injection succeeds. Empty for now.
@@ -398,6 +402,17 @@ pub enum EngineToAppError {
     /// App-side failure with detail.
     #[error("app internal error: {message}")]
     Internal { message: String },
+    /// The app inspected the PTY immediately before input and found that the
+    /// run's driver was no longer foreground. This is terminal evidence for
+    /// the worker run, not a retryable pane-write error.
+    #[error(
+        "worker driver exited before pane input (expected {expected_driver_binary:?}, observed {observed_process:?})"
+    )]
+    DriverExited {
+        expected_driver_binary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_process: Option<String>,
+    },
 }
 
 #[cfg(test)]

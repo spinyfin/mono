@@ -443,9 +443,14 @@ final class EngineClient: @unchecked Sendable {
                 case "send_to_pane":
                     let slotId = (request["slot_id"] as? NSNumber)?.intValue ?? 0
                     let text = request["text"] as? String ?? ""
+                    let expectedDriverBinary = request["expected_driver_binary"] as? String ?? ""
                     emit(.engineRequest(
                         requestId: requestId,
-                        request: .sendToPane(slotId: slotId, text: text)
+                        request: .sendToPane(
+                            slotId: slotId,
+                            text: text,
+                            expectedDriverBinary: expectedDriverBinary
+                        )
                     ))
                 case "focus_worker_pane":
                     let slotId = (request["slot_id"] as? NSNumber)?.intValue ?? 0

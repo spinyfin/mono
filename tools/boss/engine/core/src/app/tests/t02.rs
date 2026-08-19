@@ -2150,10 +2150,17 @@ async fn chore_update_notify_sends_message_to_live_worker() {
     // worker bound to an active chore, then simulates the
     // UpdateWorkItem name-change flow and verifies a SendToPane
     // message is enqueued toward the app session.
-    use boss_protocol::{WorkItemBinding, WorkItemPatch};
+    use boss_protocol::{RequestExecutionInput, WorkItemBinding, WorkItemPatch};
 
     let (server_state, _dir) = test_server_state();
-    let (_dir, db, _, chore_id) = make_work_db_with_chore();
+    let product = create_test_product_with_repo(
+        &server_state.work_db,
+        "notify-product",
+        Some("git@example.com:notify-product.git"),
+    );
+    let chore = create_test_chore_manual(&server_state.work_db, product.id, "Test chore");
+    let chore_id = chore.id;
+    let db = &server_state.work_db;
 
     // Put the chore in active status.
     let active_item = db
@@ -2168,17 +2175,20 @@ async fn chore_update_notify_sends_message_to_live_worker() {
 
     // Register a live worker slot for this chore, parked at Idle so
     // the typed-input activity guard allows the chore-update inject.
-    let run_id = "exec-notify-test";
-    server_state.worker_registry.register_run_slot(run_id, 4);
+    let execution = db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore_id.clone()).build())
+        .expect("active chore needs an execution with a configured driver");
+    let run_id = execution.id;
+    server_state.worker_registry.register_run_slot(&run_id, 4);
     server_state.live_worker_states.register_spawn(
         4,
-        run_id,
+        &run_id,
         "claude-opus-4-7",
         9999,
         Some(WorkItemBinding {
             work_item_id: chore_id.clone(),
             work_item_name: "Test chore".into(),
-            execution_id: run_id.into(),
+            execution_id: run_id.clone(),
         }),
     );
     server_state.live_worker_states.apply_event(
@@ -2243,6 +2253,7 @@ async fn chore_update_notify_sends_message_to_live_worker() {
     match &request {
         EngineToAppRequest::SendToPane(input) => {
             assert_eq!(input.slot_id, 4);
+            assert_eq!(input.expected_driver_binary, "claude");
             assert!(
                 input.text.contains("[chore-update]"),
                 "message must contain [chore-update] tag"

@@ -91,6 +91,7 @@ struct CoordinatorModelRecreateConfirmation: Equatable {
 
 enum EngineSendError: Sendable {
     case unknownSlot
+    case driverExited(expectedDriverBinary: String, observedProcess: String?)
     case internalFailure(String)
 }
 
@@ -153,7 +154,7 @@ enum EngineRequestKind: Sendable {
     case attachWorkerPane(EngineAttachRequest)
     case attachCoordinatorPane(EngineCoordinatorAttachRequest)
     case detachWorkerPane(slotId: Int)
-    case sendToPane(slotId: Int, text: String)
+    case sendToPane(slotId: Int, text: String, expectedDriverBinary: String)
     case focusWorkerPane(slotId: Int)
     case interruptWorkerPane(slotId: Int)
     case revealWorkItem(workItemId: String, productId: String)

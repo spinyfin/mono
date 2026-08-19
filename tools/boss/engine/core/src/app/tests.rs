@@ -121,6 +121,19 @@ pub(super) fn register_idle_worker(server_state: &ServerState, run_id: &str, slo
     );
 }
 
+/// Like [`register_idle_worker`], but also creates the production-shaped
+/// execution row the pane-input liveness check resolves to find the driver's
+/// foreground executable.
+pub(super) fn register_idle_worker_with_driver(
+    server_state: &ServerState,
+    slot_id: u8,
+    driver: Option<&str>,
+) -> String {
+    let execution_id = execution_id_with_driver(server_state, driver);
+    register_idle_worker(server_state, &execution_id, slot_id);
+    execution_id
+}
+
 /// Like [`register_idle_worker`], but leaves activity at
 /// [`boss_protocol::WorkerActivity::Working`] (a PreToolUse with no
 /// balancing Stop). Used to assert the typed-input guard refuses

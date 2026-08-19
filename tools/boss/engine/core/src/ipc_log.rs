@@ -214,6 +214,7 @@ mod tests {
                 EngineToAppRequest::SendToPane(SendToPaneInput {
                     slot_id: 1,
                     text: "hi".into(),
+                    expected_driver_binary: "claude".into(),
                 }),
                 "send_to_pane",
             ),

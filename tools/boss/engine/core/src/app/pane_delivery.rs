@@ -216,6 +216,16 @@ pub(crate) enum PaneSendFailure {
     Send(SendToAppError),
     Tmux(anyhow::Error),
     ResponseKindMismatch(String),
+    /// The process that owned the pane immediately before delivery was not
+    /// the run's driver. The text was never written; the run has been
+    /// terminalized and its slot released before this error is returned.
+    DriverExited {
+        expected_driver_binary: String,
+        observed_process: Option<String>,
+    },
+    /// The engine could not identify the driver it must see in the foreground.
+    /// Fail closed instead of guessing that a live shell is an agent.
+    DriverLivenessUnavailable(String),
 }
 
 /// Collapse runs of whitespace (including newlines) to single spaces
@@ -395,9 +405,10 @@ impl ServerState {
     /// disagree about what is injectable.
     pub(super) fn pane_input_posture_for_run(&self, run_id: &str, slot_id: u8) -> PaneInputPosture {
         let activity = self.pane_typed_input_activity(slot_id);
-        // Skip the driver lookup entirely when the activity alone decides —
-        // parked slots are injectable under every driver, and pre-session /
-        // terminal slots under none. Only `Working` needs the DB round-trip.
+        // Skip the mid-turn capability lookup when activity alone decides.
+        // The later transport boundary still resolves the driver's executable
+        // for every permitted write, including parked slots, before it can
+        // prove the foreground process is an agent rather than a shell.
         if activity.is_some_and(WorkerActivity::accepts_typed_input) {
             return PaneInputPosture::Parked;
         }
@@ -405,6 +416,137 @@ impl ServerState {
             return PaneInputPosture::Refused;
         }
         PaneInputPosture::resolve(activity, self.run_mid_turn_pane_input(run_id))
+    }
+
+    /// Resolve the executable that must own the foreground process before any
+    /// text may enter this run's PTY. A missing or unknown driver is not a
+    /// harmless compatibility gap: without a concrete expected process the
+    /// engine cannot distinguish an agent prompt from a shell prompt.
+    fn expected_driver_binary(&self, run_id: &str) -> Result<String, PaneSendFailure> {
+        use crate::driver::DriverRegistry;
+
+        let slug = self
+            .work_db
+            .get_execution_driver_slug(run_id)
+            .map_err(|err| PaneSendFailure::DriverLivenessUnavailable(format!("driver lookup failed: {err:#}")))?
+            .ok_or_else(|| PaneSendFailure::DriverLivenessUnavailable("no driver recorded for run".to_owned()))?;
+        DriverRegistry::default()
+            .get(&slug)
+            .map(|driver| driver.descriptor().binary.to_owned())
+            .ok_or_else(|| PaneSendFailure::DriverLivenessUnavailable(format!("driver {slug:?} is not registered")))
+    }
+
+    /// Persist and visibly reconcile a driver exit observed at the pane-input
+    /// boundary. The app-hosted exit leaves a login shell behind, so the
+    /// dead-worker reconciler alone is insufficient: after it terminalizes the
+    /// execution and frees the worker-pool claim, release the mapped pane too.
+    async fn reconcile_driver_exit(
+        &self,
+        run_id: &str,
+        slot_id: u8,
+        expected_driver_binary: &str,
+        observed_process: Option<&str>,
+    ) {
+        tracing::error!(
+            run_id,
+            slot_id,
+            expected_driver_binary,
+            observed_process,
+            "pane delivery refused: the worker driver is no longer foreground; terminalizing the run before text can reach its shell",
+        );
+        let reaped = crate::dead_pid_sweep::reap_reported_pane_death(
+            self.work_db.as_ref(),
+            self.live_worker_states.as_ref(),
+            self.execution_coordinator.clone(),
+            self.dispatch_events.as_ref(),
+            self.cube_client.as_ref(),
+            run_id,
+            boss_protocol::WorkerPaneDeathReason::DriverExited,
+        )
+        .await;
+        let release = self.release_worker_pane(run_id).await;
+        tracing::error!(
+            run_id,
+            slot_id,
+            reaped,
+            ?release,
+            "pane delivery refused after driver exit; reconciliation and pane release completed",
+        );
+    }
+
+    /// The only shared text-write primitive. Every caller first resolves a
+    /// posture, then reaches this method immediately before it would invoke
+    /// `tmux send-keys` or app `SendToPane`. Both transports must prove that
+    /// the foreground process is the run's expected driver; a live pane or a
+    /// cached `Idle` activity is intentionally not sufficient.
+    pub(super) async fn send_pane_text_checked(
+        &self,
+        run_id: &str,
+        slot_id: u8,
+        text: &str,
+    ) -> Result<(), PaneSendFailure> {
+        let expected_driver_binary = self.expected_driver_binary(run_id)?;
+        let pane = self.worker_registry.pane_for_run(run_id);
+        match pane {
+            Some(pane) if pane.tmux_session_name.is_some() || pane.tmux_hosted => {
+                let Some(session_name) = pane.tmux_session_name else {
+                    return Err(PaneSendFailure::Tmux(anyhow::anyhow!(
+                        "tmux-hosted pane has no session name"
+                    )));
+                };
+                let tmux = self.tmux_for_pane_delivery().map_err(PaneSendFailure::Tmux)?;
+                let observed_process = tmux
+                    .display_message(&session_name, boss_tmux::DisplayField::PaneCurrentCommand)
+                    .await
+                    .map_err(PaneSendFailure::Tmux)?;
+                if observed_process != expected_driver_binary {
+                    self.reconcile_driver_exit(run_id, slot_id, &expected_driver_binary, Some(&observed_process))
+                        .await;
+                    return Err(PaneSendFailure::DriverExited {
+                        expected_driver_binary,
+                        observed_process: Some(observed_process),
+                    });
+                }
+                // Keep tmux's historical newline behavior while app-hosted
+                // panes retain their verbatim payload: `send_keys` submits
+                // the text separately from the trailing return key.
+                tmux.send_keys(&session_name, text.trim_end_matches(['\r', '\n']))
+                    .await
+                    .map_err(PaneSendFailure::Tmux)
+            }
+            _ => {
+                let request = EngineToAppRequest::SendToPane(SendToPaneInput {
+                    slot_id,
+                    text: text.to_owned(),
+                    expected_driver_binary: expected_driver_binary.clone(),
+                });
+                match self.send_to_app(request, Duration::from_secs(5)).await {
+                    Ok(EngineToAppResponse::SendToPane { result: Ok(_) }) => Ok(()),
+                    Ok(EngineToAppResponse::SendToPane {
+                        result:
+                            Err(EngineToAppError::DriverExited {
+                                expected_driver_binary,
+                                observed_process,
+                            }),
+                    }) => {
+                        self.reconcile_driver_exit(
+                            run_id,
+                            slot_id,
+                            &expected_driver_binary,
+                            observed_process.as_deref(),
+                        )
+                        .await;
+                        Err(PaneSendFailure::DriverExited {
+                            expected_driver_binary,
+                            observed_process,
+                        })
+                    }
+                    Ok(EngineToAppResponse::SendToPane { result: Err(err) }) => Err(PaneSendFailure::App(err)),
+                    Ok(other) => Err(PaneSendFailure::ResponseKindMismatch(format!("{other:?}"))),
+                    Err(err) => Err(PaneSendFailure::Send(err)),
+                }
+            }
+        }
     }
 
     /// Write `req.text` into `req.run_id`'s worker pane (`req.slot_id`) and
@@ -461,32 +603,7 @@ impl ServerState {
         // the app remains its single owner of app-pane normalization.
         let normalized_text = text.trim_end_matches(['\r', '\n']);
         let (token, waiter) = self.register_delivery_waiter(run_id, normalized_text);
-        let send_result = match self.worker_registry.pane_for_run(run_id) {
-            Some(pane) if pane.tmux_session_name.is_some() || pane.tmux_hosted => match pane.tmux_session_name {
-                Some(session_name) => match self.tmux_for_pane_delivery() {
-                    Ok(tmux) => tmux
-                        .send_keys(&session_name, normalized_text)
-                        .await
-                        .map_err(PaneSendFailure::Tmux),
-                    Err(err) => Err(PaneSendFailure::Tmux(err)),
-                },
-                None => Err(PaneSendFailure::Tmux(anyhow::anyhow!(
-                    "tmux-hosted pane has no session name"
-                ))),
-            },
-            _ => {
-                let request = EngineToAppRequest::SendToPane(SendToPaneInput {
-                    slot_id,
-                    text: text.clone(),
-                });
-                match self.send_to_app(request, Duration::from_secs(5)).await {
-                    Ok(EngineToAppResponse::SendToPane { result: Ok(_) }) => Ok(()),
-                    Ok(EngineToAppResponse::SendToPane { result: Err(err) }) => Err(PaneSendFailure::App(err)),
-                    Ok(other) => Err(PaneSendFailure::ResponseKindMismatch(format!("{other:?}"))),
-                    Err(err) => Err(PaneSendFailure::Send(err)),
-                }
-            }
-        };
+        let send_result = self.send_pane_text_checked(run_id, slot_id, &text).await;
         if let Err(err) = send_result {
             self.take_delivery_waiter(run_id, token);
             tracing::warn!(?err, run_id, slot_id, "pane injection transport failed");

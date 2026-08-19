@@ -1,6 +1,6 @@
 //! `ServerState` methods for the small, uniformly-shaped engine→app
 //! pane RPCs: focus / send-input / interrupt / reveal-work-item /
-//! retire-pane / list-husk-panes / open-document. Split out of `app.rs` for file-size
+//! retire-pane / list-hosted-pane-statuses / open-document. Split out of `app.rs` for file-size
 //! hygiene; behavior is unchanged from when these lived inline. See
 //! [`super::panes`] for the `FrontendRequest` handlers that call into
 //! most of these (`reveal_work_item` is called from `app/work_items.rs`
@@ -42,6 +42,16 @@ pub enum SendInputError {
     NotAcceptingInput {
         activity: Option<boss_protocol::WorkerActivity>,
     },
+    #[error(
+        "worker driver exited before pane input (expected {expected_driver_binary:?}, observed {observed_process:?}); \
+         the run was terminalized and its pane released"
+    )]
+    DriverExited {
+        expected_driver_binary: String,
+        observed_process: Option<String>,
+    },
+    #[error("worker driver liveness could not be established; no pane input was sent: {0}")]
+    DriverLivenessUnavailable(String),
     #[error("app reported error: {0:?}")]
     App(EngineToAppError),
     #[error(transparent)]
@@ -114,7 +124,7 @@ pub enum OpenDocumentError {
     ResponseKindMismatch(String),
 }
 
-/// Surfaced by [`ServerState::retire_pane`] / [`ServerState::list_husk_panes`].
+/// Surfaced by [`ServerState::retire_pane`] / [`ServerState::list_hosted_pane_statuses`].
 #[derive(Debug, thiserror::Error)]
 pub enum RetirePaneError {
     /// The engine's own `LiveWorkerStateRegistry` still shows a live,
@@ -240,6 +250,16 @@ impl ServerState {
                 Ok(slot_id)
             }
             PaneInjectOutcome::NotAcceptingInput { activity } => Err(SendInputError::NotAcceptingInput { activity }),
+            PaneInjectOutcome::SendFailed(PaneSendFailure::DriverExited {
+                expected_driver_binary,
+                observed_process,
+            }) => Err(SendInputError::DriverExited {
+                expected_driver_binary,
+                observed_process,
+            }),
+            PaneInjectOutcome::SendFailed(PaneSendFailure::DriverLivenessUnavailable(reason)) => {
+                Err(SendInputError::DriverLivenessUnavailable(reason))
+            }
             PaneInjectOutcome::SendFailed(PaneSendFailure::App(err)) => Err(SendInputError::App(err)),
             PaneInjectOutcome::SendFailed(PaneSendFailure::Send(err)) => Err(SendInputError::Send(err)),
             PaneInjectOutcome::SendFailed(PaneSendFailure::Tmux(err)) => Err(SendInputError::Tmux(err)),
@@ -550,8 +570,8 @@ impl ServerState {
     /// (`LiveProcessNoRegistry`), or a true husk. Powers `bossctl agents
     /// list --all` and worker-reference resolution (crew name / slot id
     /// / run id) for every `agents` verb — both need to see a pane the
-    /// live registry has dropped, which [`Self::list_husk_panes`]'s
-    /// husk-only filter deliberately hides.
+    /// live registry has dropped, which a caller filtering for
+    /// [`HostedPaneState::Husk`] would deliberately hide.
     ///
     /// Returns an empty list (not an error) when no app session is
     /// registered — there is nothing to diff, and an operator running
@@ -653,29 +673,6 @@ impl ServerState {
             });
         }
         Ok(statuses)
-    }
-
-    /// The subset of [`Self::list_hosted_pane_statuses`] classified as
-    /// [`HostedPaneState::Husk`] — slots the app hosts that the engine has
-    /// no live-tracked run for AND no durable evidence of a still-running
-    /// process. This is the automated husk sweep's candidate set
-    /// ([`crate::husk_pane_sweep`]): it must never see a `Live` or
-    /// `LiveProcessNoRegistry` pane, since two-pass-confirming either of
-    /// those and retiring it would kill a worker that might still be doing
-    /// real work.
-    pub async fn list_husk_panes(&self) -> Result<Vec<HostedPaneEntry>, RetirePaneError> {
-        Ok(self
-            .list_hosted_pane_statuses()
-            .await?
-            .into_iter()
-            .filter(|status| matches!(status.state, HostedPaneState::Husk))
-            .map(|status| HostedPaneEntry {
-                slot_id: status.slot_id,
-                run_id: status.run_id,
-                summary: status.summary,
-                task_title: status.task_title,
-            })
-            .collect())
     }
 
     /// The run id the app hosts a pane for in `slot_id`, or `None` when it
