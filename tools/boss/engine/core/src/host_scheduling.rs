@@ -449,6 +449,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unprobed_host_keeps_non_driver_capability_failures_visible() {
+        let reqs = ChoreRequirements {
+            required_capabilities: ["driver=claude".into(), "os=linux".into()].into_iter().collect(),
+            pinned_host_id: None,
+            requested_host_id: None,
+        };
+        let slots = vec![slot("anaplian", 3, 0, &[])];
+        let (picked, report) = select_host(&reqs, &slots);
+        assert!(picked.is_none());
+        assert!(report[0].reasons.contains(&IneligibilityReason::DriverProbeNotRun));
+        assert!(
+            report[0]
+                .reasons
+                .contains(&IneligibilityReason::MissingCapabilities(vec!["os=linux".into()]))
+        );
+    }
+
     /// No silent substitution to a different driver: if every enabled
     /// host lacks the required driver, nothing is picked — the
     /// coordinator holds the row with a reason naming the driver.

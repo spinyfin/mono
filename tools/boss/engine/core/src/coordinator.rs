@@ -2258,18 +2258,25 @@ fn summarize_ineligibility(report: &[host_scheduling::Eligibility], required_dri
     let per_host: Vec<String> = report
         .iter()
         .map(|h| {
+            let disabled = h.reasons.iter().any(|r| matches!(r, R::Disabled));
             let reasons: Vec<String> = h
                 .reasons
                 .iter()
-                .map(|r| match r {
-                    R::Disabled => "disabled".to_owned(),
-                    R::NoFreeSlots => "no free slots".to_owned(),
-                    R::NotSelectedHost => "not the requested/pinned host".to_owned(),
+                .filter_map(|r| match r {
+                    R::Disabled => Some("disabled".to_owned()),
+                    R::NoFreeSlots => Some("no free slots".to_owned()),
+                    R::NotSelectedHost => Some("not the requested/pinned host".to_owned()),
                     R::DriverProbeNotRun => {
+                        if disabled {
+                            return None;
+                        }
                         if h.host_id == "local" {
-                            "driver discovery has not run; restart Boss".to_owned()
+                            Some("driver discovery has not run; restart Boss".to_owned())
                         } else {
-                            format!("driver discovery has not run; run `bossctl hosts probe {}`", h.host_id)
+                            Some(format!(
+                                "driver discovery has not run; run `bossctl hosts probe {}`",
+                                h.host_id
+                            ))
                         }
                     }
                     R::MissingCapabilities(missing) => {
@@ -2280,9 +2287,9 @@ fn summarize_ineligibility(report: &[host_scheduling::Eligibility], required_dri
                             && missing.len() == 1
                             && missing.iter().any(|m| m == cap)
                         {
-                            return format!("missing driver {driver}");
+                            return Some(format!("missing driver {driver}"));
                         }
-                        format!("missing capabilities [{}]", missing.join(", "))
+                        Some(format!("missing capabilities [{}]", missing.join(", ")))
                     }
                 })
                 .collect();

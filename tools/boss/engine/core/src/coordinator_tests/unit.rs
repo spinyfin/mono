@@ -59,6 +59,16 @@ fn summarize_ineligibility_directs_an_unprobed_remote_host_to_discovery() {
     );
 }
 
+#[test]
+fn summarize_ineligibility_does_not_recommend_probing_a_disabled_host() {
+    let report = vec![ineligible_host(
+        "anaplian",
+        vec![IneligibilityReason::Disabled, IneligibilityReason::DriverProbeNotRun],
+    )];
+
+    assert_eq!(summarize_ineligibility(&report, Some("claude")), "anaplian: disabled");
+}
+
 /// Reproduces the live incident (flunge, PR brianduff/flunge#906,
 /// 2026-07-16): rung 1's `conflicted_files` come straight from `jj
 /// resolve --list`, whose entries carry a trailing conflict-type

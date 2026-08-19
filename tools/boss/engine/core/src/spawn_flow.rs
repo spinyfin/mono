@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration as StdDuration;
 
 use anyhow::{Context, anyhow};
@@ -54,11 +54,12 @@ pub(crate) const WORKER_SANITIZED_PATH: &str = "/opt/homebrew/bin:/usr/local/bin
 /// The shell and PATH seed shared by a worker pane and local capability
 /// discovery.
 ///
-/// A pane starts the user's login shell, which may intentionally extend the
-/// sanitized seed from shell-profile files. Keeping that setup here means a
-/// probe asks the same question as the pane: whether the login shell can
-/// resolve a command after receiving the worker PATH seed. In particular, the
-/// probe must not inherit the caller's ambient `PATH`.
+/// A pane starts the user's interactive login shell, which may intentionally
+/// extend the sanitized seed from shell-profile files. Keeping that setup here
+/// means the tmux launcher and local probe use the same shell mode and seed.
+/// The caller's ambient `PATH` never participates; the shell itself comes
+/// from `$SHELL`, so its profile-supplied entries resolve as they do for a
+/// pane.
 #[derive(Debug, Clone)]
 pub(crate) struct WorkerPaneLaunch {
     login_shell: PathBuf,
@@ -67,7 +68,8 @@ pub(crate) struct WorkerPaneLaunch {
 impl WorkerPaneLaunch {
     /// Build the launch configuration from the user's configured shell. A
     /// relative or absent `$SHELL` is not a runnable pane shell, so retain the
-    /// POSIX fallback used by terminal launchers.
+    /// POSIX fallback used by terminal launchers. Profile-selection environment
+    /// variables still inherit from the caller, just as they do for a pane.
     pub(crate) fn from_environment() -> Self {
         let login_shell = std::env::var_os("SHELL")
             .filter(|shell| Path::new(shell).is_absolute())
@@ -93,12 +95,28 @@ impl WorkerPaneLaunch {
         }
     }
 
-    /// Run `script` with exactly the shell and PATH setup used for worker-pane
-    /// command resolution. Profile files may extend the seed; the calling
-    /// process's ambient PATH never participates.
+    /// Build a tmux command that starts `script` with the same interactive
+    /// login shell used by a worker pane.
+    pub(crate) fn tmux_command(&self, script: &str) -> String {
+        format!(
+            "{} -l -i -c {}",
+            crate::ssh_transport::shell_quote(&self.login_shell.display().to_string()),
+            crate::ssh_transport::shell_quote(script),
+        )
+    }
+
+    /// Run `script` with exactly the shell mode and PATH seed used by the tmux
+    /// worker launcher. Profile files may extend the seed; the caller's
+    /// ambient PATH never participates. The probe has no terminal, so silence
+    /// all stdio rather than allowing profile output to leak to its caller.
     pub(crate) fn login_shell_command(&self, script: &str) -> Command {
         let mut command = Command::new(&self.login_shell);
-        command.env("PATH", WORKER_SANITIZED_PATH).args(["-l", "-c", script]);
+        command
+            .env("PATH", WORKER_SANITIZED_PATH)
+            .args(["-l", "-i", "-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         command
     }
 }
@@ -289,6 +307,7 @@ impl TmuxWorkerHost {
 /// from a session created just before a crash.
 async fn start_tmux_worker(
     host: &TmuxWorkerHost,
+    pane_launch: &WorkerPaneLaunch,
     execution_id: &str,
     workspace_path: &Path,
     command: &str,
@@ -322,7 +341,7 @@ async fn start_tmux_worker(
             name: host.session_name.clone(),
             environment,
             working_directory: workspace_path.to_path_buf(),
-            command: command.to_owned(),
+            command: pane_launch.tmux_command(command),
         })
         .await
         .context("creating detached tmux session")
@@ -690,6 +709,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     let (slot_id, shell_pid, ack_timed_out) = if let Some(tmux_host) = input.tmux_host.as_ref() {
         let shell_pid = match start_tmux_worker(
             tmux_host,
+            &pane_launch,
             &input.run_id,
             &input.workspace_path,
             &input.initial_input,
@@ -1111,6 +1131,10 @@ mod tests {
             create
                 .windows(2)
                 .any(|pair| pair == ["-e", "BOSS_EVENTS_SOCKET=/tmp/events.sock"])
+        );
+        assert!(
+            create.last().unwrap().contains(" -l -i -c "),
+            "tmux must launch through WorkerPaneLaunch's interactive login shell: {create:?}"
         );
         assert_eq!(
             &calls[1][..6],

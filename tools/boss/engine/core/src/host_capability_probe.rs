@@ -31,6 +31,8 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::ssh_transport::{SshOutput, SshTransport};
 
@@ -245,9 +247,10 @@ async fn probe_command_on_path(transport: &impl RemoteRunner, binary: &str) -> R
 }
 
 /// Local equivalent of [`probe_command_on_path`]. The probe starts the same
-/// login shell and sanitized PATH seed as a worker pane, so shell-profile PATH
-/// additions resolve identically while a CLI invocation cannot rewrite
-/// capabilities through its ambient environment.
+/// interactive login shell and sanitized PATH seed as the tmux worker
+/// launcher, so shell-profile PATH additions resolve identically. The caller's
+/// ambient PATH never participates, though the shell and its profile selection
+/// still come from the process environment as they do for a pane.
 fn local_command_on_path(binary: &str) -> bool {
     local_command_on_path_with(&crate::spawn_flow::WorkerPaneLaunch::from_environment(), binary)
 }
@@ -259,8 +262,34 @@ fn local_command_on_path_with(pane_launch: &crate::spawn_flow::WorkerPaneLaunch,
         return false;
     }
     let script = format!("command -v {binary} >/dev/null 2>&1");
-    let status = pane_launch.login_shell_command(&script).status();
-    matches!(status, Ok(s) if s.success())
+    let mut child = match pane_launch.login_shell_command(&script).spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            tracing::warn!(%binary, %error, "could not start local driver capability probe");
+            return false;
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                tracing::warn!(%binary, "local driver capability probe timed out");
+                if let Err(error) = child.kill() {
+                    tracing::warn!(%binary, %error, "could not terminate timed-out local driver capability probe");
+                }
+                if let Err(error) = child.wait() {
+                    tracing::warn!(%binary, %error, "could not reap timed-out local driver capability probe");
+                }
+                return false;
+            }
+            Err(error) => {
+                tracing::warn!(%binary, %error, "could not poll local driver capability probe");
+                return false;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -487,7 +516,8 @@ mod tests {
             format!(
                 "#!/bin/sh\n\
                  test \"$1\" = -l || exit 41\n\
-                 test \"$PATH\" = \"{}\" || exit 42\n\
+                 test \"$2\" = -i || exit 42\n\
+                 test \"$PATH\" = \"{}\" || exit 43\n\
                  PATH=\"{}:$PATH\"\n\
                  export PATH\n\
                  shift\n\
@@ -501,6 +531,12 @@ mod tests {
 
         let pane_launch = crate::spawn_flow::WorkerPaneLaunch::with_login_shell(login_shell);
         assert_eq!(pane_launch.path_env().value, crate::spawn_flow::WORKER_SANITIZED_PATH);
+        assert!(
+            pane_launch
+                .tmux_command("exec profile-only-driver")
+                .contains(" -l -i -c "),
+            "the tmux launcher must use the same interactive login shell mode as the probe"
+        );
         assert!(
             local_command_on_path_with(&pane_launch, "profile-only-driver"),
             "the probe must resolve binaries added by the pane login shell's profile"
