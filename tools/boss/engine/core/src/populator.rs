@@ -84,7 +84,7 @@ pub const CALLER_OPERATOR: &str = "operator";
 /// default `followup|{task_id}` derivation) so a populate outcome never
 /// collapses into — or reopens — a group formed by the design worker's own
 /// `FOLLOWUPS:` block on the same task; the two are unrelated sources.
-const ATTENTION_GROUP_KEY_PREFIX: &str = "followup|populate";
+pub(crate) const ATTENTION_GROUP_KEY_PREFIX: &str = "followup|populate";
 
 /// Fallback ref when the project's `design_doc_branch` pointer is unset. The
 /// design doc has merged, so it lives on the default branch.

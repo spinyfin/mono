@@ -1,5 +1,11 @@
 use super::*;
-use boss_protocol::{PLANNER_OUTCOME_APPLIED, PLANNER_OUTCOME_RUNNING, PLANNER_OUTCOME_STAGED, PlannerRun};
+use boss_protocol::{
+    PLANNER_OUTCOME_APPLIED, PLANNER_OUTCOME_PLANNER_FAILED, PLANNER_OUTCOME_RUNNING, PLANNER_OUTCOME_STAGED,
+    PlannerRun,
+};
+
+/// Audit summary recorded when an engine restart interrupts a Planner run.
+pub const PLANNER_RUN_ENGINE_RESTART_SUMMARY: &str = "engine restart interrupted the planner run";
 
 // ---- input types ----
 
@@ -61,6 +67,41 @@ const SELECT_PLANNER_RUN: &str = "SELECT id, project_id, product_id, design_task
 // ---- WorkDb accessors ----
 
 impl WorkDb {
+    /// Mark every Planner run inherited from a previous engine instance as
+    /// failed, releasing each project's idempotency gate for a later retry.
+    ///
+    /// A running Planner lives only in the engine process. Once that process
+    /// restarts, the row cannot have a live owner, so the whole sweep is
+    /// performed in one transaction before the replacement engine serves any
+    /// frontend requests or installs its Populator hook.
+    pub fn recover_running_planner_runs_on_engine_restart(&self) -> Result<Vec<PlannerRun>> {
+        let now = now_string();
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let mut recovered = {
+            let mut stmt = tx.prepare(&format!("{SELECT_PLANNER_RUN} WHERE outcome = ?1"))?;
+            collect_rows(stmt.query_map(params![PLANNER_OUTCOME_RUNNING], map_planner_run)?)?
+        };
+        tx.execute(
+            "UPDATE planner_runs
+             SET outcome = ?1, result_summary = ?2, updated_at = ?3
+             WHERE outcome = ?4",
+            params![
+                PLANNER_OUTCOME_PLANNER_FAILED,
+                PLANNER_RUN_ENGINE_RESTART_SUMMARY,
+                now,
+                PLANNER_OUTCOME_RUNNING,
+            ],
+        )?;
+        tx.commit()?;
+        for run in &mut recovered {
+            run.outcome = PLANNER_OUTCOME_PLANNER_FAILED.to_owned();
+            run.result_summary = Some(PLANNER_RUN_ENGINE_RESTART_SUMMARY.to_owned());
+            run.updated_at = now.clone();
+        }
+        Ok(recovered)
+    }
+
     /// Attempt to claim a planner run for `project_id` by inserting a row
     /// with `outcome = 'running'`.
     ///
@@ -411,6 +452,70 @@ mod tests {
             })
             .unwrap();
         assert!(retry.is_some(), "retry claim must succeed after terminal failure");
+    }
+
+    #[test]
+    fn restart_recovery_fails_running_rows_preserves_other_outcomes_and_is_idempotent() {
+        let db = open();
+        let (product_id, running_project_id) = product_and_project(&db);
+        let running = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &running_project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "merge_trigger",
+            })
+            .unwrap()
+            .unwrap();
+
+        let (_, staged_project_id) = product_and_project(&db);
+        let staged = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &staged_project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "operator",
+            })
+            .unwrap()
+            .unwrap();
+        db.update_planner_run(
+            &staged.id,
+            PlannerRunPatch::builder().outcome(PLANNER_OUTCOME_STAGED).build(),
+        )
+        .unwrap();
+
+        let recovered_runs = db.recover_running_planner_runs_on_engine_restart().unwrap();
+        assert_eq!(recovered_runs.len(), 1);
+        assert_eq!(recovered_runs[0].id, running.id);
+        let recovered = db.get_planner_run(&running.id).unwrap().unwrap();
+        assert_eq!(recovered.outcome, PLANNER_OUTCOME_PLANNER_FAILED);
+        assert_eq!(
+            recovered.result_summary.as_deref(),
+            Some(PLANNER_RUN_ENGINE_RESTART_SUMMARY)
+        );
+        assert_eq!(
+            db.get_planner_run(&staged.id).unwrap().unwrap().outcome,
+            PLANNER_OUTCOME_STAGED,
+            "restart recovery must preserve non-running outcomes"
+        );
+        assert_eq!(
+            db.recover_running_planner_runs_on_engine_restart().unwrap().len(),
+            0,
+            "a second startup sweep must be idempotent"
+        );
+
+        let retry = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &running_project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "operator",
+            })
+            .unwrap();
+        assert!(
+            retry.is_some(),
+            "restart recovery must release the project for a new claim"
+        );
     }
 
     #[test]
