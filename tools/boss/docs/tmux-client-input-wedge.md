@@ -80,9 +80,17 @@ This narrows the candidate list materially:
   roughly two minutes _after_ the wedge began at 09:18:46, and no mechanism
   exists by which another client affects the app's own pty write path.
 - **Still open — AppKit first-responder loss.** `GhosttyTerminalHostView`
-  only receives `keyDown` while it is first responder. `mouseDown` does call
+  may not receive `keyDown` while it is first responder. `mouseDown` does call
   `window?.makeFirstResponder(self)`, which weakens this without eliminating
-  it (we do not know a click was tried before the operator gave up).
+  it (we do not know a click was tried before the operator gave up). The app
+  also observes keys at the window boundary for the selected terminal pane,
+  so this failure can still supply an attempted-input report before responder
+  dispatch.
+- **Still open — a consuming AppKit local monitor.** `CommentLayer` installs
+  an app-wide `.keyDown` local monitor and returns `nil` for comment-editor
+  shortcuts. Its window and focus guards are intended to keep it out of
+  terminal panes, but a regression there has exactly the observed shape:
+  rendering continues while keys never reach the terminal surface.
 - **Still open — libghostty's key/write path.** Ghostty services pty reads on
   a separate thread from writes, so a stalled writer gives precisely
   "renders, does not type". This would be invisible to the app: every one of
@@ -99,16 +107,27 @@ the root cause remains narrowed rather than closed.
 
 The engine correlates the two sides:
 
-- The app reports `ReportPaneClientInput` — carrying the tmux session, the
-  client pid and an epoch-second stamp — on every input it delivers into a
-  tmux-hosted pane, coalesced to at most one report per second per pane.
+- The app observes `.keyDown` at the focused pane's window boundary and
+  reports `ReportPaneClientInput` — carrying the tmux session, the client pid
+  and an epoch-second stamp — before responder dispatch, coalesced to at most
+  one report per second per pane. `keyDown` also reports the same attempt for
+  paths that bypass the monitor; the reporter coalesces the duplicate.
 - The watch reads `list-clients -t <session>` and finds the row whose
   `#{client_pid}` matches the report.
 
 A wedge is `last_input_epoch > client_activity + 3s`, sustained for 3
-consecutive 5-second passes. An idle session cannot trip it by construction:
-with nothing typed there is no report to judge, and with a report the app's
-stamp is never ahead of what the server recorded.
+consecutive 5-second passes after a second attempted keystroke arrives while
+the server's activity remains frozen. Requiring that second attempt keeps one
+libghostty-consumed local binding (for example scrollback) from detaching a
+healthy client. An idle session cannot trip it by construction: with nothing
+typed there is no report to judge, and with a report the app's stamp is never
+ahead of what the server recorded.
+
+This signal cannot see a keystroke that never reaches either the window-level
+observer or the pane's `keyDown`, such as a first-responder failure that routes
+to another view or a local monitor that consumes the event before this observer
+runs. Those cases remain candidates for live instrumentation; the recovery
+cannot be triggered without an attempted-input observation.
 
 The watch only samples sessions the app has reported input for, so an idle
 Boss makes no tmux calls at all.

@@ -135,7 +135,11 @@ pub(crate) enum Verdict {
     /// stamp. Whatever the operator typed arrived.
     Delivered,
     /// The app delivered input the server never saw from that client.
-    Undelivered { tty: String, client_pid: i32 },
+    Undelivered {
+        tty: String,
+        client_pid: i32,
+        activity_epoch: i64,
+    },
     /// Nobody has typed into this pane in a long time. Not a wedge, and no
     /// longer worth sampling for — the watch drops the report, which is what
     /// keeps an idle Boss from making any tmux calls at all.
@@ -163,6 +167,7 @@ pub(crate) fn classify(report: InputReport, clients: &[TmuxClient], now_epoch: i
     Verdict::Undelivered {
         tty: client.tty.clone(),
         client_pid: client.pid,
+        activity_epoch: client.activity_epoch,
     }
 }
 
@@ -194,9 +199,17 @@ pub(crate) enum WatchOutcome {
     },
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, bon::Builder)]
+#[builder(on(String, into))]
 struct SessionWatch {
     consecutive_undelivered: u32,
+    /// The first unacknowledged input attempt and tmux activity that armed
+    /// this streak. A second attempt while activity remains frozen is needed
+    /// before a report can confirm a wedge: libghostty may consume one key
+    /// for a local binding without writing it to the pty.
+    armed_epoch: Option<i64>,
+    armed_activity_epoch: Option<i64>,
+    repeated_attempt_observed: bool,
     recoveries: VecDeque<Instant>,
     settle_until: Option<Instant>,
     escalated: bool,
@@ -205,6 +218,9 @@ struct SessionWatch {
 impl SessionWatch {
     fn reset_streak(&mut self) {
         self.consecutive_undelivered = 0;
+        self.armed_epoch = None;
+        self.armed_activity_epoch = None;
+        self.repeated_attempt_observed = false;
     }
 
     /// Drop recoveries that have aged out, then report how many remain.
@@ -245,10 +261,21 @@ impl InputWatch {
     ) -> Vec<WatchOutcome> {
         let mut outcomes = Vec::new();
         let reported = reports.snapshot();
-        // Sessions the app no longer reports (viewer gone, app restarted)
-        // must not keep stale streaks that would fire on a later reattach.
-        self.sessions
-            .retain(|session, _| reported.iter().any(|(name, _)| name == session));
+        // A consumed report must clear its streak, but it must not discard a
+        // recovery ledger or settle window. Recovery deliberately forgets the
+        // outgoing report, and another reporting pane can keep this loop
+        // alive during that gap.
+        for (session, watch) in &mut self.sessions {
+            if !reported.iter().any(|(name, _)| name == session) {
+                watch.reset_streak();
+            }
+            watch.recoveries_in_window(now);
+        }
+        self.sessions.retain(|_, watch| {
+            !watch.recoveries.is_empty()
+                || watch.settle_until.is_some_and(|until| now < until)
+                || watch.consecutive_undelivered > 0
+        });
 
         for (session, report) in reported {
             let watch = self.sessions.entry(session.clone()).or_default();
@@ -273,7 +300,7 @@ impl InputWatch {
                 }
             };
 
-            let (tty, client_pid) = match classify(report, &clients, now_epoch) {
+            let (tty, client_pid, activity_epoch) = match classify(report, &clients, now_epoch) {
                 Verdict::Delivered => {
                     watch.reset_streak();
                     continue;
@@ -291,10 +318,34 @@ impl InputWatch {
                     watch.reset_streak();
                     continue;
                 }
-                Verdict::Undelivered { tty, client_pid } => (tty, client_pid),
+                Verdict::Undelivered {
+                    tty,
+                    client_pid,
+                    activity_epoch,
+                } => (tty, client_pid, activity_epoch),
             };
 
-            watch.consecutive_undelivered += 1;
+            if watch.consecutive_undelivered == 0 {
+                watch.consecutive_undelivered = 1;
+                watch.armed_epoch = Some(report.last_input_epoch);
+                watch.armed_activity_epoch = Some(activity_epoch);
+            } else if Some(activity_epoch) != watch.armed_activity_epoch {
+                // tmux observed intervening input, so this is a new attempt
+                // rather than the same frozen client state.
+                watch.reset_streak();
+                watch.consecutive_undelivered = 1;
+                watch.armed_epoch = Some(report.last_input_epoch);
+                watch.armed_activity_epoch = Some(activity_epoch);
+            } else if !watch.repeated_attempt_observed {
+                if report.last_input_epoch > watch.armed_epoch.unwrap_or(report.last_input_epoch)
+                    && Some(activity_epoch) == watch.armed_activity_epoch
+                {
+                    watch.repeated_attempt_observed = true;
+                    watch.consecutive_undelivered += 1;
+                }
+            } else {
+                watch.consecutive_undelivered += 1;
+            }
             if watch.consecutive_undelivered < CONFIRM_TICKS {
                 continue;
             }
@@ -330,6 +381,16 @@ impl InputWatch {
                     tty,
                     error: format!("{error:#}"),
                 }),
+            }
+            if matches!(outcomes.last(), Some(WatchOutcome::Failed { .. })) {
+                watch.recoveries.push_back(now);
+                if watch.recoveries_in_window(now) >= MAX_RECOVERIES && !watch.escalated {
+                    watch.escalated = true;
+                    outcomes.push(WatchOutcome::Escalated {
+                        session: session.clone(),
+                        client_pid,
+                    });
+                }
             }
             watch.reset_streak();
             watch.settle_until = Some(now + SETTLE);

@@ -109,6 +109,7 @@ fn input_the_server_never_saw_is_undelivered() {
         Verdict::Undelivered {
             tty: "/dev/ttys002".to_owned(),
             client_pid: 13371,
+            activity_epoch: NOW - 400,
         }
     );
 }
@@ -190,7 +191,17 @@ async fn recovery_needs_a_sustained_streak_and_detaches_only_the_apps_own_tty() 
     let mut watch = InputWatch::default();
     let start = Instant::now();
 
-    for pass in 1..CONFIRM_TICKS {
+    // A second unacknowledged attempt is required before the streak can
+    // confirm: one key may have been a libghostty-local binding.
+    assert!(watch.tick(&tmux, &reports, start, NOW).await.is_empty());
+    reports.record(
+        SESSION,
+        InputReport {
+            client_pid: 13371,
+            last_input_epoch: NOW - 1,
+        },
+    );
+    for pass in 2..CONFIRM_TICKS {
         let outcomes = watch.tick(&tmux, &reports, start, NOW).await;
         assert!(outcomes.is_empty(), "recovered on pass {pass}");
         assert!(server.detaches().is_empty());
@@ -213,21 +224,19 @@ async fn recovery_needs_a_sustained_streak_and_detaches_only_the_apps_own_tty() 
     assert!(reports.snapshot().is_empty());
 }
 
-/// A single keystroke on a wedged pane leaves both sides frozen, so the
-/// streak still accumulates — but only while the report stays fresh. This is
-/// the real operator's experience: type once, nothing happens, stop typing.
+/// One unacknowledged attempt may be a local terminal binding rather than a
+/// pty write, so it cannot detach an otherwise healthy client by itself.
 #[tokio::test]
-async fn an_idle_session_never_recovers_no_matter_how_long_it_runs() {
+async fn one_unacknowledged_attempt_never_recovers_no_matter_how_long_it_runs() {
     let server = FakeServer::with_clients(&format!("/dev/ttys002\t13371\t{}\n", NOW - 900));
     let tmux = fixture(&server);
     let reports = PaneInputReports::default();
-    // Nobody has typed: the app's last delivery predates what the server
-    // already recorded, so no amount of pane output changes the verdict.
+    // tmux never sees this key, but the app does not report another attempt.
     reports.record(
         SESSION,
         InputReport {
             client_pid: 13371,
-            last_input_epoch: NOW - 900,
+            last_input_epoch: NOW - 5,
         },
     );
     let mut watch = InputWatch::default();
@@ -302,7 +311,11 @@ async fn a_tmux_read_failure_is_not_treated_as_a_wedge() {
 
 #[tokio::test]
 async fn repeated_wedges_latch_and_escalate_once_instead_of_churning() {
-    let server = FakeServer::with_clients(&format!("/dev/ttys002\t13371\t{}\n", NOW - 400));
+    let server = FakeServer::with_clients(&format!(
+        "/dev/ttys002\t13371\t{}\n/dev/ttys007\t40272\t{}\n",
+        NOW - 400,
+        NOW
+    ));
     let tmux = fixture(&server);
     let reports = PaneInputReports::default();
     let mut watch = InputWatch::default();
@@ -321,7 +334,15 @@ async fn repeated_wedges_latch_and_escalate_once_instead_of_churning() {
             },
         );
         let mut all = Vec::new();
-        for _ in 0..CONFIRM_TICKS {
+        all.extend(watch.tick(tmux, reports, at, NOW).await);
+        reports.record(
+            SESSION,
+            InputReport {
+                client_pid: 13371,
+                last_input_epoch: NOW - 1,
+            },
+        );
+        for _ in 1..CONFIRM_TICKS {
             all.extend(watch.tick(tmux, reports, at, NOW).await);
         }
         all
@@ -336,6 +357,17 @@ async fn repeated_wedges_latch_and_escalate_once_instead_of_churning() {
             "round {expected}: {outcomes:?}"
         );
         at += SETTLE + TICK;
+        // Keep a second pane reported through the outgoing viewer's report
+        // gap. This makes tick run after `reports.forget(SESSION)`, proving
+        // the recovery ledger survives independently of report presence.
+        reports.record(
+            "boss-worker",
+            InputReport {
+                client_pid: 40272,
+                last_input_epoch: NOW,
+            },
+        );
+        assert!(watch.tick(&tmux, &reports, at, NOW).await.is_empty());
     }
 
     let outcomes = wedge(&mut watch, &tmux, &reports, at).await;
@@ -376,7 +408,15 @@ async fn the_settle_period_spares_the_replacement_viewer() {
             last_input_epoch: NOW - 5,
         },
     );
-    for _ in 0..CONFIRM_TICKS {
+    watch.tick(&tmux, &reports, start, NOW).await;
+    reports.record(
+        SESSION,
+        InputReport {
+            client_pid: 13371,
+            last_input_epoch: NOW - 1,
+        },
+    );
+    for _ in 1..CONFIRM_TICKS {
         watch.tick(&tmux, &reports, start, NOW).await;
     }
     assert_eq!(server.detaches().len(), 1);
@@ -417,7 +457,15 @@ async fn a_client_that_left_before_the_detach_is_benign() {
     let mut watch = InputWatch::default();
     let start = Instant::now();
     let mut outcomes = Vec::new();
-    for _ in 0..CONFIRM_TICKS {
+    assert!(watch.tick(&tmux, &reports, start, NOW).await.is_empty());
+    reports.record(
+        SESSION,
+        InputReport {
+            client_pid: 13371,
+            last_input_epoch: NOW - 1,
+        },
+    );
+    for _ in 1..CONFIRM_TICKS {
         outcomes = watch.tick(&tmux, &reports, start, NOW).await;
     }
     assert_eq!(
@@ -427,6 +475,53 @@ async fn a_client_that_left_before_the_detach_is_benign() {
             tty: "/dev/ttys002".to_owned(),
         }]
     );
+}
+
+#[tokio::test]
+async fn repeated_detach_failures_escalate_instead_of_retrying_forever() {
+    let server = FakeServer::with_clients(&format!("/dev/ttys002\t13371\t{}\n", NOW - 400));
+    *server.detach_result.lock().unwrap() = Some(CommandOutput {
+        success: false,
+        code: Some(1),
+        stdout: String::new(),
+        stderr: "permission denied".to_owned(),
+    });
+    let tmux = fixture(&server);
+    let reports = PaneInputReports::default();
+    let mut watch = InputWatch::default();
+    let start = Instant::now();
+
+    for attempt in 1..=MAX_RECOVERIES {
+        let at = start + (SETTLE + TICK) * (attempt - 1);
+        reports.record(
+            SESSION,
+            InputReport {
+                client_pid: 13371,
+                last_input_epoch: NOW - 5,
+            },
+        );
+        assert!(watch.tick(&tmux, &reports, at, NOW).await.is_empty());
+        reports.record(
+            SESSION,
+            InputReport {
+                client_pid: 13371,
+                last_input_epoch: NOW - 1,
+            },
+        );
+        let mut outcomes = Vec::new();
+        for _ in 1..CONFIRM_TICKS {
+            outcomes = watch.tick(&tmux, &reports, at, NOW).await;
+        }
+        if attempt < MAX_RECOVERIES {
+            assert!(matches!(outcomes.as_slice(), [WatchOutcome::Failed { .. }]));
+        } else {
+            assert!(matches!(
+                outcomes.as_slice(),
+                [WatchOutcome::Failed { .. }, WatchOutcome::Escalated { .. }]
+            ));
+        }
+    }
+    assert_eq!(server.detaches().len(), MAX_RECOVERIES as usize);
 }
 
 #[tokio::test]

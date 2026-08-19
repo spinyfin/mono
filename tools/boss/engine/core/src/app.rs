@@ -71,6 +71,7 @@ mod decisions;
 mod dependencies;
 mod design_docs;
 mod effort;
+mod engine_health;
 mod engine_meta;
 mod executions;
 mod external_tracker;

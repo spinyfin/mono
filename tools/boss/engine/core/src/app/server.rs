@@ -2162,7 +2162,7 @@ pub async fn serve_with_merge_probe(
 /// attention feed. The supervisor resumes after `RESTART_FAILURE_WINDOW`;
 /// this makes the pause visible to the operator rather than only in tracing.
 async fn raise_coordinator_restart_ceiling_attention(server_state: &Arc<ServerState>) {
-    super::input_watch::raise_engine_health_attention(
+    super::engine_health::raise_engine_health_attention(
         server_state,
         "engine_health_coordinator_restart",
         "engine-health/coordinator-restart",
@@ -2177,7 +2177,7 @@ async fn raise_coordinator_restart_ceiling_attention(server_state: &Arc<ServerSt
 /// feed. Attentions require a work-item association, so project-scoped items
 /// are the durable global-notification representation available to the app.
 async fn raise_tmux_preflight_attention(server_state: &Arc<ServerState>, reason: &str) {
-    super::input_watch::raise_engine_health_attention(
+    super::engine_health::raise_engine_health_attention(
         server_state,
         "engine_health_tmux",
         "engine-health/tmux",
