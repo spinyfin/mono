@@ -1146,9 +1146,9 @@ extension EngineClient {
     /// `limit: 0` is the background-only polling form: `attempts` comes back
     /// empty while `background_work` is still populated when requested.
     /// Returns the envelope `request_id` so the model can drop out-of-order
-    /// snapshot replies.
+    /// snapshot replies, or `nil` when the line was not written.
     @discardableResult
-    func sendListEngineAttempts(limit: Int? = nil, includeBackgroundWork: Bool = false) -> String {
+    func sendListEngineAttempts(limit: Int? = nil, includeBackgroundWork: Bool = false) -> String? {
         var payload: [String: Any] = ["type": "list_engine_attempts"]
         if let limit {
             payload["limit"] = limit

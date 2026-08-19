@@ -427,11 +427,11 @@ final class ChatViewModel: ObservableObject {
     @Published var backgroundWork: [BackgroundWorkItem] = []
 
     /// Canonical five-second cadence for the connection-scoped background
-    /// snapshot poll. Tests shorten `backgroundWorkPollInterval`.
+    /// snapshot poll. Tests shorten the instance property.
     nonisolated static let backgroundWorkPollInterval: TimeInterval = 5
 
     /// Polling interval used by `startBackgroundWorkPolling()`. Defaults
-    /// to [[backgroundWorkPollInterval]]; tests assign a shorter value.
+    /// to ``ChatViewModel.backgroundWorkPollInterval``; tests assign a shorter value.
     var backgroundWorkPollInterval: TimeInterval = ChatViewModel.backgroundWorkPollInterval
 
     /// Cancellable connection-scoped poller. Non-nil while connected.
@@ -441,6 +441,9 @@ final class ChatViewModel: ObservableObject {
     /// `limit = 0` poll cannot overwrite a newer event-triggered refresh.
     var backgroundWorkSendGeneration: UInt64 = 0
     var backgroundWorkAppliedGeneration: UInt64 = 0
+    /// Independent of `backgroundWorkAppliedGeneration` so a history
+    /// refresh that loses the snapshot race can still replace Activity.
+    var attemptsAppliedGeneration: UInt64 = 0
     var backgroundWorkPending: [String: BackgroundWorkPendingRequest] = [:]
 
     /// Source-specific records requested by selected Activity rows, keyed by

@@ -199,7 +199,9 @@ extension ChatViewModel {
     /// background-work snapshot shares this response so the app need not
     /// reconstruct either view from the source-specific attempt tables.
     func refreshEngineAttempts() {
-        let requestId = engine.sendListEngineAttempts(limit: 200, includeBackgroundWork: true)
+        guard let requestId = engine.sendListEngineAttempts(limit: 200, includeBackgroundWork: true) else {
+            return
+        }
         registerBackgroundWorkRequest(requestId: requestId, replacesAttempts: true)
     }
 

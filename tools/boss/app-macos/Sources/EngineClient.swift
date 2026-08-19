@@ -125,8 +125,11 @@ final class EngineClient: @unchecked Sendable {
     // Not `private`: called from the `EngineClient+PaneResponses.swift`
     // extension, which needs file-scoped-`private` loosened to `internal`
     // to reach it.
+    /// Returns the envelope id after a socket write. `nil` when nothing
+    /// was sent (`connection == nil` or the payload failed to encode) so
+    /// callers do not register a pending reply that can never arrive.
     @discardableResult
-    func sendLine(_ payload: [String: Any]) -> String {
+    func sendLine(_ payload: [String: Any]) -> String? {
         let envelopeRequestId = UUID().uuidString
         outboundRecorder?(payload)
 
@@ -146,7 +149,7 @@ final class EngineClient: @unchecked Sendable {
 
         guard let connection else {
             emit(.error(message:"engine connection is not established"))
-            return envelopeRequestId
+            return nil
         }
 
         do {
@@ -163,10 +166,11 @@ final class EngineClient: @unchecked Sendable {
                     self.emit(.error(message:"socket send failed: \(error.localizedDescription)"))
                 }
             })
+            return envelopeRequestId
         } catch {
             emit(.error(message:"failed to encode payload: \(error.localizedDescription)"))
+            return nil
         }
-        return envelopeRequestId
     }
 
     private func receiveNext() {
@@ -336,7 +340,7 @@ final class EngineClient: @unchecked Sendable {
                 emit(.workItemDeleted(id: id))
             case "work_error":
                 let message = payload["message"] as? String ?? "unknown work error"
-                emit(.workError(message: message))
+                emit(.workError(message: message, requestId: envelopeRequestId))
             case "error":
                 let message = payload["message"] as? String ?? "unknown engine error"
                 emit(.error(message: message))

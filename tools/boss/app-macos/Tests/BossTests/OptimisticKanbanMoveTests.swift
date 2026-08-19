@@ -119,7 +119,7 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing)
 
         // Simulate engine rejecting the move.
-        model.applyEventForTest(.workError(message: "transition not allowed"))
+        model.applyEventForTest(.workError(message: "transition not allowed", requestId: nil))
 
         // Override cleared; card returns to its real boardColumn (.backlog for "todo").
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .backlog)
@@ -135,7 +135,7 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         model.choresByProductID = ["prod_test": [task]]
 
         _ = model.attemptDrop(task.id, onColumn: .doing, group: nil)
-        model.applyEventForTest(.workError(message: "test error"))
+        model.applyEventForTest(.workError(message: "test error", requestId: nil))
 
         // Inline drag-refusal notice is set for the affected task.
         XCTAssertNotNil(model.dragRefusalNotice, "inline notice must be shown")
@@ -148,7 +148,7 @@ final class OptimisticKanbanMoveTests: XCTestCase {
     func testWorkErrorFallsBackToModalWhenNoMovePending() {
         let model = makeModel()
         // No pending optimistic move.
-        model.applyEventForTest(.workError(message: "some other error"))
+        model.applyEventForTest(.workError(message: "some other error", requestId: nil))
         XCTAssertNotNil(model.workErrorMessage,
                         "modal must still show when no move is in-flight")
     }
