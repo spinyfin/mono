@@ -232,6 +232,23 @@ impl WorkDb {
         boss_engine_effort::resolve_driver(None, product_default_driver.as_deref())
     }
 
+    /// The driver actually recorded as launching this execution's worker
+    /// (`work_executions.driver`, frozen once by
+    /// [`Self::record_execution_launch_config`]), as opposed to
+    /// [`Self::get_execution_driver_slug`]'s live-pin resolution.
+    ///
+    /// A pin change (`tasks.driver` / `products.default_driver`) applied
+    /// after a worker has already launched must not retroactively change
+    /// which process the engine expects to see in that worker's PTY — the
+    /// pane-input boundary needs "which driver actually launched this run",
+    /// not "which driver would be chosen if dispatched right now". Returns
+    /// `Ok(None)` when the execution row is missing or has not launched a
+    /// worker yet (`driver` unset).
+    pub fn launched_driver_slug(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        Ok(query_execution(&conn, execution_id)?.and_then(|execution| execution.driver))
+    }
+
     /// `products.default_driver` for the product owning the document
     /// `comment_id` was left on, or `None` when any hop no longer resolves
     /// (comment deleted mid-flight, doc pointer moved, product gone). Every

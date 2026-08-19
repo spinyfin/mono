@@ -72,7 +72,7 @@
 
 use super::*;
 use boss_protocol::WorkerActivity;
-use boss_tmux::Tmux;
+use boss_tmux::{DisplayField, Tmux};
 
 /// Whether a pane write is permitted for a given `(activity, driver)` pair,
 /// and if so at which of the two delivery postures.
@@ -422,14 +422,37 @@ impl ServerState {
     /// text may enter this run's PTY. A missing or unknown driver is not a
     /// harmless compatibility gap: without a concrete expected process the
     /// engine cannot distinguish an agent prompt from a shell prompt.
+    ///
+    /// Prefers [`crate::work::WorkDb::launched_driver_slug`] — the driver
+    /// actually recorded at launch — over
+    /// [`crate::work::WorkDb::get_execution_driver_slug`]'s live-pin
+    /// resolution. The latter re-reads `tasks.driver` /
+    /// `products.default_driver` fresh on every call by design (correct for
+    /// spawn-time routing), so a pin applied after this run's worker already
+    /// launched would otherwise flip the expected binary out from under a
+    /// still-correctly-running worker and cause this boundary to see its
+    /// process as an unexplained mismatch. Falls back to the live
+    /// resolution only when no launch config has been recorded yet
+    /// (`record_execution_launch_config` stamps it immediately after a
+    /// successful spawn, before any pane write can reach this boundary in
+    /// production) — same semantics as before this run's launch config
+    /// existed, not a weakening of the frozen-identity guarantee once it
+    /// does.
     fn expected_driver_binary(&self, run_id: &str) -> Result<String, PaneSendFailure> {
         use crate::driver::DriverRegistry;
 
         let slug = self
             .work_db
-            .get_execution_driver_slug(run_id)
-            .map_err(|err| PaneSendFailure::DriverLivenessUnavailable(format!("driver lookup failed: {err:#}")))?
-            .ok_or_else(|| PaneSendFailure::DriverLivenessUnavailable("no driver recorded for run".to_owned()))?;
+            .launched_driver_slug(run_id)
+            .map_err(|err| PaneSendFailure::DriverLivenessUnavailable(format!("driver lookup failed: {err:#}")))?;
+        let slug = match slug {
+            Some(slug) => slug,
+            None => self
+                .work_db
+                .get_execution_driver_slug(run_id)
+                .map_err(|err| PaneSendFailure::DriverLivenessUnavailable(format!("driver lookup failed: {err:#}")))?
+                .ok_or_else(|| PaneSendFailure::DriverLivenessUnavailable("no driver recorded for run".to_owned()))?,
+        };
         DriverRegistry::default()
             .get(&slug)
             .map(|driver| driver.descriptor().binary.to_owned())
@@ -474,6 +497,33 @@ impl ServerState {
         );
     }
 
+    /// Establish tmux pane death from evidence that actually proves the
+    /// process is gone, mirroring what
+    /// `stale_worker_sweep::TmuxWorkerTerminalInspector` treats as
+    /// [`crate::stale_worker_sweep::TerminalLiveness::Dead`]: the session no
+    /// longer exists, or tmux itself reports the pane dead
+    /// (`#{pane_dead}`). A pane whose foreground command merely differs from
+    /// the driver binary is deliberately NOT evidence of death here — that
+    /// is the normal shape of the agent running a foreground child, and
+    /// conflating the two was the bug (see the module's `DriverExited`
+    /// history).
+    ///
+    /// `Ok(None)` means the pane is alive and a write may proceed; `Ok(Some(status))`
+    /// means the pane is confirmed dead, with `status` carrying
+    /// `#{pane_dead_status}` when tmux reported one.
+    async fn tmux_pane_confirmed_dead(tmux: &Tmux, session_name: &str) -> anyhow::Result<Option<Option<String>>> {
+        let sessions = tmux.list_sessions().await?;
+        if !sessions.iter().any(|session| session.name == session_name) {
+            return Ok(Some(None));
+        }
+        let pane_dead = tmux.display_message(session_name, DisplayField::PaneDead).await?;
+        if pane_dead == "1" {
+            let status = tmux.display_message(session_name, DisplayField::PaneDeadStatus).await?;
+            return Ok(Some((!status.is_empty()).then_some(status)));
+        }
+        Ok(None)
+    }
+
     /// The only shared text-write primitive. Every caller first resolves a
     /// posture, then reaches this method immediately before it would invoke
     /// `tmux send-keys` or app `SendToPane`. Both transports must prove that
@@ -495,24 +545,43 @@ impl ServerState {
                     )));
                 };
                 let tmux = self.tmux_for_pane_delivery().map_err(PaneSendFailure::Tmux)?;
-                let observed_process = tmux
-                    .display_message(&session_name, boss_tmux::DisplayField::PaneCurrentCommand)
-                    .await
-                    .map_err(PaneSendFailure::Tmux)?;
-                if observed_process != expected_driver_binary {
-                    self.reconcile_driver_exit(run_id, slot_id, &expected_driver_binary, Some(&observed_process))
+                match Self::tmux_pane_confirmed_dead(&tmux, &session_name).await {
+                    Ok(Some(pane_dead_status)) => {
+                        self.reconcile_driver_exit(
+                            run_id,
+                            slot_id,
+                            &expected_driver_binary,
+                            pane_dead_status.as_deref(),
+                        )
                         .await;
-                    return Err(PaneSendFailure::DriverExited {
-                        expected_driver_binary,
-                        observed_process: Some(observed_process),
-                    });
+                        return Err(PaneSendFailure::DriverExited {
+                            expected_driver_binary,
+                            observed_process: pane_dead_status,
+                        });
+                    }
+                    Ok(None) => {
+                        // The pane is alive: the session exists and tmux does
+                        // not report the pane as dead. That the pane's
+                        // foreground command may differ from the driver
+                        // binary (e.g. the agent is running a foreground
+                        // `bazel build`) is expected and is NOT evidence the
+                        // driver exited — see
+                        // `TmuxWorkerTerminalInspector`/`classify_worker_liveness`
+                        // in `stale_worker_sweep`, which assigns the same
+                        // signal the identical meaning. Only actual proof of
+                        // death (session absent or `#{pane_dead}`) may
+                        // terminalize the run.
+                    }
+                    Err(err) => {
+                        return Err(PaneSendFailure::DriverLivenessUnavailable(format!(
+                            "terminal liveness probe failed: {err:#}"
+                        )));
+                    }
                 }
-                // Keep tmux's historical newline behavior while app-hosted
-                // panes retain their verbatim payload: `send_keys` submits
-                // the text separately from the trailing return key.
-                tmux.send_keys(&session_name, text.trim_end_matches(['\r', '\n']))
-                    .await
-                    .map_err(PaneSendFailure::Tmux)
+                // `send_keys` strips trailing newlines itself and submits
+                // with a separate Return, so the caller passes the payload
+                // verbatim here.
+                tmux.send_keys(&session_name, text).await.map_err(PaneSendFailure::Tmux)
             }
             _ => {
                 let request = EngineToAppRequest::SendToPane(SendToPaneInput {

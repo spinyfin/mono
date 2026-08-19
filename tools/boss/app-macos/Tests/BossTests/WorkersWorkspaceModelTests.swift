@@ -201,17 +201,21 @@ final class WorkersWorkspaceModelFocusTests: XCTestCase {
 
 @MainActor
 final class WorkersWorkspaceModelPaneInputTests: XCTestCase {
-    func testDriverInputRefusesWhenForegroundProcessIsTheShell() {
+    /// The only signal trustworthy enough to refuse: no live process at all
+    /// resolves on the surface's controlling tty (`foregroundProcess ==
+    /// nil`, from `pidIsAlive` failing on whatever `foregroundPid`
+    /// returned, or the surface never attaching one).
+    func testDriverInputRefusesWhenNoForegroundProcessResolves() {
         let error = WorkersWorkspaceModel.driverInputError(
             expectedDriverBinary: "grok",
-            foregroundProcess: "zsh"
+            foregroundProcess: nil
         )
         guard case .driverExited(let expected, let observed) = error else {
-            XCTFail("expected the shell foreground process to refuse agent input, got \(String(describing: error))")
+            XCTFail("expected no live foreground process to refuse agent input, got \(String(describing: error))")
             return
         }
         XCTAssertEqual(expected, "grok")
-        XCTAssertEqual(observed, "zsh")
+        XCTAssertNil(observed)
     }
 
     func testDriverInputAllowsTheLiveForegroundDriver() {
@@ -219,6 +223,34 @@ final class WorkersWorkspaceModelPaneInputTests: XCTestCase {
             WorkersWorkspaceModel.driverInputError(
                 expectedDriverBinary: "grok",
                 foregroundProcess: "grok"
+            )
+        )
+    }
+
+    /// A live driver running a foreground child (e.g. a `bazel build` a
+    /// tool call shelled out to) is alive, not exited — the pane's
+    /// foreground command differing from the driver binary is the normal
+    /// shape of that, and must not refuse the write. This is the app-path
+    /// analogue of `TmuxWorkerTerminalInspector`/`classify_worker_liveness`
+    /// treating the identical tmux signal as `AliveAndWorking`.
+    func testDriverInputAllowsALiveForegroundChildOfTheDriver() {
+        XCTAssertNil(
+            WorkersWorkspaceModel.driverInputError(
+                expectedDriverBinary: "claude",
+                foregroundProcess: "bazel"
+            )
+        )
+    }
+
+    /// `proc_name` reports the kernel accounting name of whatever was
+    /// exec'd, which can differ from `DriverDescriptor.binary` for a
+    /// wrapped CLI (an interpreter or shim). That must not read as a
+    /// driver exit either — the decision no longer compares names at all.
+    func testDriverInputAllowsAProcessNameThatDiffersFromTheDriverInvocationName() {
+        XCTAssertNil(
+            WorkersWorkspaceModel.driverInputError(
+                expectedDriverBinary: "grok-cli",
+                foregroundProcess: "python3"
             )
         )
     }
