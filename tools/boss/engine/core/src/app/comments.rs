@@ -9,13 +9,10 @@ use super::*;
 
 use boss_protocol::{
     AnswerAgentRun, COMMENT_STATUS_ACTIVE, COMMENT_STATUS_ANSWERING, COMMENT_STATUS_DISMISSED, COMMENT_STATUS_RESOLVED,
-    CommentThreadEntry, INTENT_REVISION, THREAD_ENTRY_KIND_NUDGE, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP,
+    CommentThreadEntry, INTENT_REVISION, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP,
 };
 
 use crate::utility_model::UtilityTask;
-
-/// Design § "Buckets 1 & 3 — unified" example nudge text.
-const NUDGE_BODY: &str = "This looks like it wants a doc change — click [Revise] to start one.";
 
 pub(super) async fn handle_comments_create(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
@@ -127,14 +124,6 @@ fn spawn_comment_classifier(
         match crate::comment_classifier::classify(&call, &body, &anchor).await {
             Ok(result) => match work_db.set_comment_intent(&comment_id, &result.intent, result.confidence) {
                 Ok(classified) => {
-                    // Buckets 1&3 (P2b): nudge the operator toward a revision
-                    // immediately on classification, before `[Revise]` is
-                    // even clicked (design § "Buckets 1 & 3 — unified").
-                    // Scope-gated — see `post_nudge_once`.
-                    if result.intent.as_str() == INTENT_REVISION {
-                        post_nudge_once(&work_db, &artifact_kind, &artifact_id, &comment_id);
-                    }
-
                     publish_comment_invalidation(
                         &server_state,
                         &session_id,
@@ -844,7 +833,6 @@ fn spawn_followup_classifier(
                     );
                     return;
                 }
-                post_nudge_once(&work_db, &comment.artifact_kind, &comment.artifact_id, &comment.id);
                 publish_comment_invalidation(
                     &server_state,
                     &session_id,
@@ -1233,19 +1221,19 @@ pub(super) async fn handle_comments_set_status(ctx: Dispatch, req: FrontendReque
 /// Manually reclassify a comment's intent (the sidebar badge's override
 /// control), and **re-home** it: switching a comment's classification must
 /// land it exactly where it would have been had it been classified that way
-/// to begin with. `intent` alone is only the label;
-/// `status` is the field every consumer actually gates on
-/// (`revisable_comment_predicate`), and the nudge thread entry is what the
-/// sidebar's chip and banner gate on — so all three have to move together.
+/// to begin with. `intent` alone is only the label; `status` is the field
+/// every consumer actually gates on (`revisable_comment_predicate`), and the
+/// intent badge is what the sidebar surfaces the classification with — so
+/// both have to move together.
 ///
-/// The nine directed transitions, by the comment's status *before* the
+/// The eight directed transitions, by the comment's status *before* the
 /// override:
 ///
 /// | before | new intent | what happens |
 /// |---|---|---|
-/// | `answering` | `revision` | stand the live run down (`superseded`) and cancel + release its execution *before* the override write, then `→ active`, post the nudge |
-/// | `answered`/`awaiting_followup` | `revision` | `→ active`, post the nudge |
-/// | `active` | `revision` | post the nudge (no status change needed) |
+/// | `answering` | `revision` | stand the live run down (`superseded`) and cancel + release its execution *before* the override write, then `→ active` |
+/// | `answered`/`awaiting_followup` | `revision` | `→ active` |
+/// | `active` | `revision` | no status change needed |
 /// | `active` | `question` | spawn the answer agent → `answering` |
 /// | any | same track as before | no-op beyond the label |
 /// | `in_revision` | anything | label only — see below |
@@ -1256,9 +1244,9 @@ pub(super) async fn handle_comments_set_status(ctx: Dispatch, req: FrontendReque
 ///
 /// The `answering`-run stand-down runs *before* the `override_comment_intent`
 /// write (see `stand_down_answer_agent`'s doc for why); everything else is
-/// best-effort relative to that write — a failure to stand a run down or post
-/// a nudge is logged and the response still goes out. The answer-agent spawn
-/// is awaited rather than detached because `spawn_answer_agent` is itself only
+/// best-effort relative to that write — a failure to stand a run down is
+/// logged and the response still goes out. The answer-agent spawn is awaited
+/// rather than detached because `spawn_answer_agent` is itself only
 /// bookkeeping plus a coordinator kick — the agent runs out-of-process.
 pub(super) async fn handle_comments_set_intent(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
@@ -1340,12 +1328,6 @@ async fn rehome_reclassified_comment(
     comment: &WorkComment,
 ) {
     match comment.intent.as_deref() {
-        // A claimed comment stays claimed (see the table above): no nudge,
-        // because the chip already reads `in_revision` and a nudge would make
-        // it read `reopened` once the batch reconciles.
-        Some(INTENT_REVISION) if comment.status == COMMENT_STATUS_ACTIVE => {
-            post_nudge_once(work_db, &comment.artifact_kind, &comment.artifact_id, &comment.id);
-        }
         // The `active` guard is load-bearing: `transition_comment_to_answering`
         // only accepts that source status, and re-affirming `question` on a
         // comment already `answering`/`answered`/`awaiting_followup` (or one
@@ -1474,55 +1456,6 @@ async fn end_answer_agent_on_thread_terminal(
         return;
     }
     stand_down_answer_agent(server_state, work_db, &comment.id).await;
-}
-
-/// Post the bucket-1&3 nudge on a comment, unless one is already there.
-///
-/// The nudge is what `revisionChipState` (macOS `Comment.swift`) gates the
-/// "Nudge sent" chip and the "click [Revise] to start one" banner on — a
-/// comment that reaches `active` with a revisable intent and no nudge renders
-/// chip-less and visibly unlike its peers. Idempotent because a comment can be
-/// reclassified back and forth, and because the classifier or the follow-up
-/// bridge may already have posted one; a second identical entry would just
-/// duplicate the banner text in the thread.
-///
-/// Scope-gated on [`WorkDb::resolve_doc_owner`] — the same gate
-/// `comments_banner_state` and `CommentsReviseDoc` use to decide whether a
-/// `[Revise]` affordance can ever appear for this artifact. The classifier
-/// runs on every artifact kind, so without this gate a comment on an
-/// out-of-scope artifact (e.g. `artifact_kind = 'work_item'`) would be
-/// nudged toward a `[Revise]` button that can never appear.
-fn post_nudge_once(work_db: &Arc<WorkDb>, artifact_kind: &str, artifact_id: &str, comment_id: &str) {
-    match work_db.resolve_doc_owner(artifact_kind, artifact_id) {
-        Ok(Some(_)) => {}
-        Ok(None) => return,
-        Err(err) => {
-            tracing::warn!(
-                comment_id,
-                err = %err,
-                "comment nudge: failed to resolve the doc owner; skipping the nudge rather than risking a dead-end",
-            );
-            return;
-        }
-    }
-    match work_db.list_comment_thread_entries(comment_id) {
-        Ok(entries) if entries.iter().any(|e| e.entry_kind == THREAD_ENTRY_KIND_NUDGE) => return,
-        Ok(_) => {}
-        Err(err) => {
-            tracing::warn!(
-                comment_id,
-                err = %err,
-                "comment reclassification: failed to read the thread before posting the nudge; posting anyway",
-            );
-        }
-    }
-    if let Err(err) = work_db.create_nudge_thread_entry(comment_id, NUDGE_BODY) {
-        tracing::warn!(
-            comment_id,
-            err = %err,
-            "comment reclassification: failed to post the nudge thread entry",
-        );
-    }
 }
 
 /// Worker-callable: post the answer agent's reply (P3b). `run_id` is the
@@ -1720,9 +1653,9 @@ mod tests {
     ///
     /// Wires an investigation task's doc pointer at the artifact's
     /// `(repo, branch, path)` so `resolve_doc_owner` matches it — the same
-    /// scope gate `post_nudge_once` checks before posting the bucket-1&3
-    /// nudge (see `set_intent_from_a_live_answering_run_rehomes_stands_down_and_nudges`,
-    /// which asserts the nudge is posted on rehome).
+    /// scope gate `comments_banner_state` and `CommentsReviseDoc` use to
+    /// decide whether a `[Revise]` affordance can ever appear for the
+    /// artifact.
     fn seed_answering_comment(work_db: &Arc<WorkDb>) -> (String, String) {
         let product = work_db
             .create_product(
@@ -2302,7 +2235,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_intent_from_a_live_answering_run_rehomes_stands_down_and_nudges() {
+    async fn set_intent_from_a_live_answering_run_rehomes_and_stands_down() {
         let (server_state, _dir) = test_server_state();
         let work_db = server_state.work_db.clone();
         let sink = make_session_sink();
@@ -2346,51 +2279,6 @@ mod tests {
         assert!(
             work_db.get_execution(&execution_id).unwrap().status.is_terminal(),
             "the answer-agent execution must not outlive the question it was answering",
-        );
-
-        // 5. The nudge exists, so the sidebar renders the chip + banner the
-        //    originally-classified comments have.
-        let entries = work_db.list_comment_thread_entries(&comment_id).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].entry_kind, THREAD_ENTRY_KIND_NUDGE);
-        assert_eq!(entries[0].body, NUDGE_BODY);
-    }
-
-    #[tokio::test]
-    async fn set_intent_on_an_out_of_scope_artifact_does_not_nudge() {
-        let (server_state, _dir) = test_server_state();
-        let work_db = server_state.work_db.clone();
-        let sink = make_session_sink();
-        // `artifact_kind = "work_item"` never resolves via `resolve_doc_owner`
-        // (it only matches `pr_doc`), so a `[Revise]` affordance can never
-        // appear for this comment. Reclassifying it to `revision` must not
-        // post a nudge pointing at that nonexistent button.
-        let comment = work_db
-            .create_comment(boss_protocol::CreateCommentInput {
-                artifact_id: "t1".into(),
-                anchor: boss_protocol::CommentAnchor {
-                    exact: "the quoted text".into(),
-                    prefix: String::new(),
-                    suffix: String::new(),
-                },
-                artifact_kind: "work_item".into(),
-                author: "human".into(),
-                body: "What does this mean?".into(),
-                doc_version: "v1".into(),
-                plain_text_projection_version: 0,
-            })
-            .unwrap();
-        work_db.set_comment_intent(&comment.id, INTENT_QUESTION, 0.9).unwrap();
-
-        set_intent(&server_state, &work_db, &sink, &comment.id, INTENT_REVISION).await;
-
-        let reloaded = work_db.get_comment(&comment.id).unwrap().unwrap();
-        assert_eq!(reloaded.intent.as_deref(), Some(INTENT_REVISION));
-
-        let entries = work_db.list_comment_thread_entries(&comment.id).unwrap();
-        assert!(
-            entries.iter().all(|e| e.entry_kind != THREAD_ENTRY_KIND_NUDGE),
-            "an out-of-scope artifact must never get a nudge toward a nonexistent [Revise] button, got {entries:?}",
         );
     }
 
@@ -2537,25 +2425,6 @@ mod tests {
             1,
             "re-affirming the existing classification must be a no-op, not a second run",
         );
-    }
-
-    #[tokio::test]
-    async fn set_intent_posts_the_nudge_at_most_once_across_reclassifications() {
-        let (server_state, _dir) = test_server_state();
-        let work_db = server_state.work_db.clone();
-        let sink = make_session_sink();
-        let comment = seed_investigation_question_comment(&work_db, Some(DOC_REPO), None);
-
-        set_intent(&server_state, &work_db, &sink, &comment.id, INTENT_REVISION).await;
-        set_intent(&server_state, &work_db, &sink, &comment.id, INTENT_REVISION).await;
-
-        let nudges = work_db
-            .list_comment_thread_entries(&comment.id)
-            .unwrap()
-            .into_iter()
-            .filter(|e| e.entry_kind == THREAD_ENTRY_KIND_NUDGE)
-            .count();
-        assert_eq!(nudges, 1, "flip-flopping the classification must not spam the thread");
     }
 
     #[tokio::test]

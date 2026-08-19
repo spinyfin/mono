@@ -1,14 +1,17 @@
-//! `comment_thread_entries` persistence — engine-authored (and, in a later
-//! phase, operator-authored) turns in a comment's thread, shared by the
-//! bucket-1&3 nudge and the bucket-2 answer/follow-up paths (P3b of
-//! `comment-triggered-document-revisions.md` §"Reply/link mechanics").
+//! `comment_thread_entries` persistence — engine-authored (and
+//! operator-authored) turns in a comment's thread, shared by the answer and
+//! follow-up paths (`comment-triggered-document-revisions.md` §"Reply/link
+//! mechanics").
 //!
-//! P3b only ever writes `entry_kind = 'answer'` rows (via
+//! Writes `entry_kind = 'answer'` rows (via
 //! [`WorkDb::create_comment_thread_entry`], called from the
 //! `CommentsPostAnswer` handler and from `finalize_answer_agent`'s
-//! no-reply-posted path). `nudge` (phase 2b) and `operator_followup` (phase
-//! 3c) reuse the same table and constructor.
-
+//! no-reply-posted path) and `operator_followup` rows. The retired `nudge`
+//! kind (an engine-authored "this looks like a doc change" entry, superseded
+//! by the sidebar's intent badge, which already surfaces the same
+//! classification) is no longer written; existing `nudge` rows remain in the
+//! table as inert history and are filtered out at read time (see
+//! `list_comment_thread_entries` below).
 use super::*;
 
 impl WorkDb {
@@ -19,11 +22,10 @@ impl WorkDb {
     }
 
     /// Append a thread entry to a comment. `entry_kind` must be one of
-    /// `nudge` / `answer` / `operator_followup`
-    /// ([`boss_protocol::THREAD_ENTRY_KIND_NUDGE`] et al.). Unvalidated
-    /// against comment state — callers own the state-machine guard (e.g.
-    /// `CommentsPostAnswer` only calls this after confirming a `running`
-    /// answer-agent run exists for the comment).
+    /// `answer` / `operator_followup` ([`boss_protocol::THREAD_ENTRY_KIND_ANSWER`]
+    /// et al.). Unvalidated against comment state — callers own the
+    /// state-machine guard (e.g. `CommentsPostAnswer` only calls this after
+    /// confirming a `running` answer-agent run exists for the comment).
     pub fn create_comment_thread_entry(
         &self,
         comment_id: &str,
@@ -34,9 +36,7 @@ impl WorkDb {
         answer_agent_run_id: Option<&str>,
     ) -> Result<CommentThreadEntry> {
         match entry_kind {
-            boss_protocol::THREAD_ENTRY_KIND_NUDGE
-            | boss_protocol::THREAD_ENTRY_KIND_ANSWER
-            | boss_protocol::THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP => {}
+            boss_protocol::THREAD_ENTRY_KIND_ANSWER | boss_protocol::THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP => {}
             other => bail!("invalid comment thread entry_kind: {other}"),
         }
         let conn = self.connect()?;
@@ -63,33 +63,26 @@ impl WorkDb {
             .map_err(Into::into)
     }
 
-    /// List a comment's thread entries in chronological order. Not yet
-    /// consumed by any handler in P3b (no thread-read RPC exists until the
-    /// UI phase wires `CommentsList` to include them) — added now so the
-    /// table has symmetric CRUD from day one.
+    /// List a comment's thread entries in chronological order, excluding
+    /// retired `nudge` rows: every reader (the app, `bossctl`, the CLI, the
+    /// revision worker's directive, and the follow-up classifier's prompt)
+    /// goes through this method, so filtering here — rather than in each
+    /// client — keeps all of them in agreement about what counts as thread
+    /// history.
     pub fn list_comment_thread_entries(&self, comment_id: &str) -> Result<Vec<CommentThreadEntry>> {
         let conn = self.connect()?;
         let cols = Self::comment_thread_entry_columns();
-        let sql =
-            format!("SELECT {cols} FROM comment_thread_entries WHERE comment_id = ?1 ORDER BY created_at ASC, id ASC");
+        let sql = format!(
+            "SELECT {cols} FROM comment_thread_entries \
+             WHERE comment_id = ?1 AND entry_kind <> ?2 \
+             ORDER BY created_at ASC, id ASC"
+        );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([comment_id], map_comment_thread_entry)?;
+        let rows = stmt.query_map(
+            params![comment_id, boss_protocol::THREAD_ENTRY_KIND_NUDGE],
+            map_comment_thread_entry,
+        )?;
         collect_rows(rows)
-    }
-
-    /// Post an `entry_kind='nudge'` thread entry on `comment_id`. Called
-    /// immediately on `revision` classification (design §
-    /// "Buckets 1 & 3 — unified"); `revise_task_id` starts `NULL` and is
-    /// filled in later, once a `[Revise]` batch actually claims the comment.
-    pub fn create_nudge_thread_entry(&self, comment_id: &str, body: &str) -> Result<CommentThreadEntry> {
-        self.create_comment_thread_entry(
-            comment_id,
-            boss_protocol::THREAD_ENTRY_KIND_NUDGE,
-            boss_protocol::THREAD_ENTRY_AUTHOR_ENGINE,
-            body,
-            None,
-            None,
-        )
     }
 }
 
@@ -159,33 +152,54 @@ mod tests {
         );
     }
 
+    /// The retired nudge kind is no longer a writable entry_kind — only
+    /// pre-existing rows carry it, and they arrive via raw SQL/migration, not
+    /// this constructor.
     #[test]
-    fn create_nudge_entry_round_trips() {
+    fn rejects_the_retired_nudge_entry_kind() {
         let db = mem_db();
         let comment = make_comment(&db, "t1");
-        let entry = db
-            .create_nudge_thread_entry(
-                &comment,
-                "This looks like it wants a doc change — click [Revise] to start one.",
+        assert!(
+            db.create_comment_thread_entry(&comment, "nudge", "engine", "x", None, None)
+                .is_err()
+        );
+    }
+
+    /// Pre-existing `nudge` rows arrive via raw SQL (migration-era data, not
+    /// this constructor — see `rejects_the_retired_nudge_entry_kind` above)
+    /// and must not surface through the shared read path any reader uses.
+    #[test]
+    fn list_excludes_retired_nudge_rows() {
+        let db = mem_db();
+        let comment = make_comment(&db, "t1");
+        let kept = db
+            .create_comment_thread_entry(&comment, THREAD_ENTRY_KIND_ANSWER, "engine", "kept", None, None)
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO comment_thread_entries \
+                 (id, comment_id, entry_kind, author, body, revise_task_id, answer_agent_run_id, created_at) \
+                 VALUES ('cte_nudge', ?1, 'nudge', 'engine', 'legacy nudge', NULL, NULL, '2020-01-01T00:00:00Z')",
+                [&comment],
             )
             .unwrap();
-        assert_eq!(entry.comment_id, comment);
-        assert_eq!(entry.entry_kind, "nudge");
-        assert_eq!(entry.author, "engine");
-        assert!(entry.revise_task_id.is_none());
-        assert!(entry.answer_agent_run_id.is_none());
 
         let entries = db.list_comment_thread_entries(&comment).unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].id, entry.id);
+        assert_eq!(entries[0].id, kept.id);
     }
 
     #[test]
-    fn nudge_entries_list_oldest_first() {
+    fn entries_list_oldest_first() {
         let db = mem_db();
         let comment = make_comment(&db, "t1");
-        let first = db.create_nudge_thread_entry(&comment, "first").unwrap();
-        let second = db.create_nudge_thread_entry(&comment, "second").unwrap();
+        let first = db
+            .create_comment_thread_entry(&comment, THREAD_ENTRY_KIND_ANSWER, "engine", "first", None, None)
+            .unwrap();
+        let second = db
+            .create_comment_thread_entry(&comment, THREAD_ENTRY_KIND_ANSWER, "engine", "second", None, None)
+            .unwrap();
 
         let entries = db.list_comment_thread_entries(&comment).unwrap();
         assert_eq!(entries.len(), 2);

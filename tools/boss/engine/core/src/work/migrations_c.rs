@@ -729,6 +729,19 @@ pub(crate) fn migrate_resolve_open_orphan_sweep_churn_guard_parked(conn: &Connec
     Ok(())
 }
 
+/// Add `work_comments.reopened_at`: stamped when reconciliation puts a
+/// claimed comment back on the `[Revise]` banner because its task was
+/// abandoned, so the sidebar can distinguish "never claimed" from "claimed,
+/// then abandoned". Purely additive, `NULL` for every existing row. Mirrors
+/// `migrate_work_comments_revise_task_id_column`'s idempotent
+/// `ALTER TABLE ADD COLUMN` pattern.
+pub(crate) fn migrate_work_comments_reopened_at_column(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "work_comments", "reopened_at")? {
+        conn.execute("ALTER TABLE work_comments ADD COLUMN reopened_at TEXT", [])?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod churn_guard_migration_tests {
     use super::*;

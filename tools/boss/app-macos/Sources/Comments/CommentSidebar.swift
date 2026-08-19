@@ -154,7 +154,6 @@ private struct RevisionChip: View {
 
     private var text: String {
         switch state {
-        case .nudged: return "Nudge sent"
         case .inRevision: return "In revision"
         case .resolved: return "Resolved"
         case .reopened: return "Reopened"
@@ -163,7 +162,6 @@ private struct RevisionChip: View {
 
     private var symbolName: String {
         switch state {
-        case .nudged: return "bell.badge"
         case .inRevision: return "arrow.triangle.2.circlepath"
         case .resolved: return "checkmark.circle"
         case .reopened: return "arrow.uturn.backward.circle"
@@ -172,7 +170,6 @@ private struct RevisionChip: View {
 
     private var color: Color {
         switch state {
-        case .nudged: return .orange
         case .inRevision: return .blue
         case .resolved: return .green
         case .reopened: return .red
@@ -181,8 +178,6 @@ private struct RevisionChip: View {
 
     private var help: String {
         switch state {
-        case .nudged:
-            return "Classified as wanting a doc change — click [Revise] to start one"
         case .inRevision(let taskId):
             return "Addressed by \(taskId)"
         case .resolved(let taskId):
@@ -194,10 +189,12 @@ private struct RevisionChip: View {
 }
 
 /// Renders a comment's `comment_thread_entries` inline, oldest first.
-/// `nudge` (bucket 1&3) and `answer` (bucket 2, engine-authored) share a
-/// neutral background; `operator_followup` gets an accent tint so the
-/// back-and-forth of a bucket-2 conversation reads like a thread rather than
-/// a flat list.
+/// `answer` (bucket 2, engine-authored) gets a neutral background;
+/// `operator_followup` gets an accent tint so the back-and-forth of a
+/// bucket-2 conversation reads like a thread rather than a flat list. A
+/// retired `nudge` entry (bucket 1&3, pre-existing threads only — the intent
+/// badge already surfaces the same classification) never reaches this view:
+/// `Comment.from` filters it out on load.
 private struct ThreadEntriesView: View {
     let entries: [CommentThreadEntry]
 
@@ -229,7 +226,6 @@ private struct ThreadEntriesView: View {
 
     private func symbolName(for kind: ThreadEntryKind) -> String {
         switch kind {
-        case .nudge: return "bell"
         case .answer: return "text.bubble"
         case .operatorFollowup: return "arrowshape.turn.up.left"
         }
@@ -237,7 +233,7 @@ private struct ThreadEntriesView: View {
 
     private func backgroundColor(for kind: ThreadEntryKind) -> Color {
         switch kind {
-        case .nudge, .answer: return Color.secondary.opacity(0.08)
+        case .answer: return Color.secondary.opacity(0.08)
         case .operatorFollowup: return Color.accentColor.opacity(0.1)
         }
     }
