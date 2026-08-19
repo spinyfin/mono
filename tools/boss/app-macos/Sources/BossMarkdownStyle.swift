@@ -13,11 +13,96 @@ private struct MarkdownProseMeasureKey: EnvironmentKey {
     static let defaultValue: CGFloat? = nil
 }
 
+/// Opts a markdown surface into the document viewer's editorial treatment.
+/// Callers that only need compact structured text leave this false, retaining
+/// their existing system-font typography and compact block treatment.
+private struct MarkdownEditorialStyleKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
 extension EnvironmentValues {
     var markdownProseMeasure: CGFloat? {
         get { self[MarkdownProseMeasureKey.self] }
         set { self[MarkdownProseMeasureKey.self] = newValue }
     }
+
+    var markdownEditorialStyle: Bool {
+        get { self[MarkdownEditorialStyleKey.self] }
+        set { self[MarkdownEditorialStyleKey.self] = newValue }
+    }
+}
+
+/// The shared document palette. Dynamic colors keep each appearance designed
+/// independently instead of deriving one from the other at render time.
+enum BossMarkdownPalette {
+    static let ground = token(light: 0xFBFBFD, dark: 0x101218)
+    static let surface = token(light: 0xF1F2F7, dark: 0x191C24)
+    static let surface2 = token(light: 0xE7E9F1, dark: 0x21252F)
+    static let hairline = token(light: 0xD6D9E4, dark: 0x2E3340)
+    static let ink = token(light: 0x14161C, dark: 0xE8EAF0)
+    static let muted = token(light: 0x5A6070, dark: 0x98A0B2)
+    static let accent = token(light: 0x3D4E8F, dark: 0x93A2E4)
+    static let alert = token(light: 0xA6462F, dark: 0xE29379)
+    static let alertWash = token(light: 0xF6E9E5, dark: 0x2A1D19)
+    static let ok = token(light: 0x476B4F, dark: 0x8CBF95)
+    static let okWash = token(light: 0xE6EFE8, dark: 0x17231A)
+
+    private static func token(light: UInt, dark: UInt) -> DynamicColor {
+        DynamicColor(light: color(light), dark: color(dark))
+    }
+
+    private static func color(_ hex: UInt) -> Color {
+        Color(
+            red: Double((hex >> 16) & 0xFF) / 255,
+            green: Double((hex >> 8) & 0xFF) / 255,
+            blue: Double(hex & 0xFF) / 255
+        )
+    }
+}
+
+private enum BossMarkdownHighlighterTheme {
+    static let editorial = StructuredText.HighlighterTheme(
+        foregroundColor: BossMarkdownPalette.ink,
+        backgroundColor: BossMarkdownPalette.surface,
+        tokenProperties: [
+            .keyword: AnyTextProperty(.foregroundColor(BossMarkdownPalette.accent), .fontWeight(.semibold)),
+            .builtin: AnyTextProperty(.foregroundColor(BossMarkdownPalette.accent)),
+            .literal: AnyTextProperty(.foregroundColor(BossMarkdownPalette.accent), .fontWeight(.semibold)),
+            .boolean: AnyTextProperty(.foregroundColor(BossMarkdownPalette.accent), .fontWeight(.semibold)),
+            .string: AnyTextProperty(.foregroundColor(BossMarkdownPalette.ok)),
+            .char: AnyTextProperty(.foregroundColor(BossMarkdownPalette.ok)),
+            .regex: AnyTextProperty(.foregroundColor(BossMarkdownPalette.ok)),
+            .url: AnyTextProperty(.foregroundColor(BossMarkdownPalette.accent)),
+            .number: AnyTextProperty(.foregroundColor(BossMarkdownPalette.alert)),
+            .className: AnyTextProperty(.foregroundColor(BossMarkdownPalette.ink)),
+            .function: AnyTextProperty(.foregroundColor(BossMarkdownPalette.accent)),
+            .functionName: AnyTextProperty(.foregroundColor(BossMarkdownPalette.accent)),
+            .variable: AnyTextProperty(.foregroundColor(BossMarkdownPalette.ink)),
+            .constant: AnyTextProperty(.foregroundColor(BossMarkdownPalette.ink)),
+            .property: AnyTextProperty(.foregroundColor(BossMarkdownPalette.ink)),
+            .comment: AnyTextProperty(.foregroundColor(BossMarkdownPalette.muted)),
+            .blockComment: AnyTextProperty(.foregroundColor(BossMarkdownPalette.muted)),
+            .docComment: AnyTextProperty(.foregroundColor(BossMarkdownPalette.muted)),
+            .mark: AnyTextProperty(
+                .foregroundColor(BossMarkdownPalette.accent),
+                .backgroundColor(BossMarkdownPalette.surface2),
+                .fontWeight(.bold)
+            ),
+            .preprocessor: AnyTextProperty(.foregroundColor(BossMarkdownPalette.accent)),
+            .directive: AnyTextProperty(.foregroundColor(BossMarkdownPalette.accent)),
+            .attribute: AnyTextProperty(.foregroundColor(BossMarkdownPalette.muted)),
+            .tag: AnyTextProperty(.foregroundColor(BossMarkdownPalette.accent)),
+            .attributeName: AnyTextProperty(.foregroundColor(BossMarkdownPalette.muted)),
+            .inserted: AnyTextProperty(
+                .foregroundColor(BossMarkdownPalette.ok),
+                .backgroundColor(BossMarkdownPalette.okWash)
+            ),
+            .deleted: AnyTextProperty(
+                .foregroundColor(BossMarkdownPalette.alert),
+                .backgroundColor(BossMarkdownPalette.alertWash)
+            ),
+        ]
+    )
 }
 
 /// Applies `proseMeasureClamped()`'s frame math, but only once `measure` is
@@ -62,6 +147,8 @@ extension View {
 // MARK: - Heading
 
 struct BossHeadingStyle: StructuredText.HeadingStyle {
+    let editorial: Bool
+
     // Maps the Boss type scale (26 / 22 / 18 / 16 / 14 / 14 pt) onto
     // SwiftUI's body font (17 pt on macOS) via fontScale so the rendering
     // continues to respond to dynamic-type changes.
@@ -77,45 +164,90 @@ struct BossHeadingStyle: StructuredText.HeadingStyle {
         .bold, .semibold, .semibold, .semibold, .semibold, .semibold,
     ]
 
+    @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
         let level = min(max(configuration.headingLevel, 1), 6)
-        configuration.label
-            .textual.fontScale(Self.fontScales[level - 1])
-            .textual.lineSpacing(.fontScaled(0.125))
+        if editorial, level == 2 {
+            VStack(alignment: .leading, spacing: 6) {
+                headingLabel(configuration: configuration, level: level)
+                Rectangle()
+                    .fill(BossMarkdownPalette.hairline)
+                    .frame(height: 1)
+            }
             .textual.blockSpacing(.init(top: 16, bottom: 8))
-            .fontWeight(Self.weights[level - 1])
             .proseMeasureClamped()
+        } else {
+            headingLabel(configuration: configuration, level: level)
+                .textual.blockSpacing(.init(top: 16, bottom: 8))
+                .proseMeasureClamped()
+        }
+    }
+
+    @MainActor
+    @ViewBuilder
+    private func headingLabel(configuration: Configuration, level: Int) -> some View {
+        if editorial {
+            configuration.label
+                .textual.fontScale(Self.fontScales[level - 1])
+                .textual.lineSpacing(.fontScaled(0.125))
+                .font(.system(.body, design: .default))
+                .fontWeight(Self.weights[level - 1])
+                .foregroundStyle(BossMarkdownPalette.ink)
+                .tracking(level <= 2 ? -0.3 : 0)
+        } else {
+            configuration.label
+                .textual.fontScale(Self.fontScales[level - 1])
+                .textual.lineSpacing(.fontScaled(0.125))
+                .fontWeight(Self.weights[level - 1])
+        }
     }
 }
 
 extension StructuredText.HeadingStyle where Self == BossHeadingStyle {
-    static var boss: Self { .init() }
+    static func boss(editorial: Bool) -> Self { .init(editorial: editorial) }
 }
 
 // MARK: - Paragraph
 
 struct BossParagraphStyle: StructuredText.ParagraphStyle {
+    let editorial: Bool
+
     // Inlined from `StructuredText.GitHubParagraphStyle.makeBody` (Textual
     // 0.3.1) rather than delegated to: `ParagraphStyle` refines
     // `DynamicProperty`, and constructing that style and calling
     // `makeBody(configuration:)` on it directly would never install its
     // dynamic-property storage in the view hierarchy. Harmless today only
     // because the library style is stateless.
+    @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .textual.lineSpacing(.fontScaled(0.25))
-            .textual.blockSpacing(.init(top: 0, bottom: 16))
-            .proseMeasureClamped()
+        if editorial {
+            configuration.label
+                .font(.system(.body, design: .serif))
+                .foregroundStyle(BossMarkdownPalette.ink)
+                // SwiftUI `lineSpacing` is extra leading on top of the natural
+                // ~1.2em line box, so 0.45em additional lands near the 1.65
+                // reference line-height (0.65em additional was ~1.85).
+                .textual.lineSpacing(.fontScaled(0.45))
+                .textual.blockSpacing(.init(top: 0, bottom: 18))
+                .proseMeasureClamped()
+        } else {
+            configuration.label
+                .textual.lineSpacing(.fontScaled(0.25))
+                .textual.blockSpacing(.init(top: 0, bottom: 16))
+                .proseMeasureClamped()
+        }
     }
 }
 
 extension StructuredText.ParagraphStyle where Self == BossParagraphStyle {
-    static var boss: Self { .init() }
+    static func boss(editorial: Bool) -> Self { .init(editorial: editorial) }
 }
 
 // MARK: - List item
 
 struct BossListItemStyle: StructuredText.ListItemStyle {
+    let editorial: Bool
+
     // Delegates to `StructuredText.DefaultListItemStyle` (Textual 0.3.1)
     // rather than inlining it, unlike the paragraph/thematic-break styles
     // elsewhere in this file — its body reads a private
@@ -126,24 +258,35 @@ struct BossListItemStyle: StructuredText.ListItemStyle {
     // its dynamic-property storage; this is a no-op today only because
     // `DefaultListItemStyle` is stateless at the pinned revision. Re-check
     // this delegation on any Textual upgrade.
+    @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
-        StructuredText.DefaultListItemStyle.default
-            .makeBody(configuration: configuration)
-            .proseMeasureClamped()
+        if editorial {
+            StructuredText.DefaultListItemStyle.default
+                .makeBody(configuration: configuration)
+                .font(.system(.body, design: .serif))
+                .foregroundStyle(BossMarkdownPalette.ink)
+                .proseMeasureClamped()
+        } else {
+            StructuredText.DefaultListItemStyle.default
+                .makeBody(configuration: configuration)
+                .proseMeasureClamped()
+        }
     }
 }
 
 extension StructuredText.ListItemStyle where Self == BossListItemStyle {
-    static var boss: Self { .init() }
+    static func boss(editorial: Bool) -> Self { .init(editorial: editorial) }
 }
 
 // MARK: - Thematic break
 
 struct BossThematicBreakStyle: StructuredText.ThematicBreakStyle {
+    let editorial: Bool
+
     // Same GitHub-style border color `StructuredText.GitHubThematicBreakStyle`
     // (Textual 0.3.1) uses, reproduced here rather than referenced —
     // `DynamicColor.gitHubBorder` is `internal` to the Textual module.
-    private static let border = DynamicColor(
+    private static let compactBorder = DynamicColor(
         light: Color(red: 228 / 255, green: 228 / 255, blue: 232 / 255),
         dark: Color(red: 66 / 255, green: 68 / 255, blue: 78 / 255)
     )
@@ -152,77 +295,133 @@ struct BossThematicBreakStyle: StructuredText.ThematicBreakStyle {
     // rather than delegated to — see `BossParagraphStyle` for why
     // constructing the library style and calling `makeBody(configuration:)`
     // on it directly bypasses `DynamicProperty` installation.
+    @ViewBuilder
     func makeBody(configuration _: Configuration) -> some View {
-        Divider()
-            .textual.frame(height: .fontScaled(0.25))
-            .overlay(Self.border)
-            .textual.blockSpacing(.init(top: 24, bottom: 24))
-            .proseMeasureClamped()
+        if editorial {
+            Rectangle()
+                .fill(BossMarkdownPalette.hairline)
+                .frame(height: 1)
+                .textual.blockSpacing(.init(top: 24, bottom: 24))
+                .proseMeasureClamped()
+        } else {
+            Divider()
+                .textual.frame(height: .fontScaled(0.25))
+                .overlay(Self.compactBorder)
+                .textual.blockSpacing(.init(top: 24, bottom: 24))
+                .proseMeasureClamped()
+        }
     }
 }
 
 extension StructuredText.ThematicBreakStyle where Self == BossThematicBreakStyle {
-    static var boss: Self { .init() }
+    static func boss(editorial: Bool) -> Self { .init(editorial: editorial) }
 }
 
 // MARK: - Code block
 
 struct BossCodeBlockStyle: StructuredText.CodeBlockStyle {
+    let editorial: Bool
+
+    @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
-        Overflow {
-            configuration.label
-                .textual.lineSpacing(.fontScaled(0.225))
-                .textual.fontScale(0.85)
-                .fixedSize(horizontal: false, vertical: true)
-                .monospaced()
-                .padding(12)
+        if editorial {
+            Overflow {
+                configuration.label
+                    .textual.lineSpacing(.fontScaled(0.225))
+                    .textual.fontScale(0.85)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .monospaced()
+                    .padding(12)
+            }
+            .background(BossMarkdownPalette.surface)
+            .clipShape(RoundedRectangle(cornerRadius: 2))
+            .overlay(alignment: .leading) {
+                Rectangle()
+                    .fill(BossMarkdownPalette.muted)
+                    .frame(width: 2)
+            }
+            .overlay(
+                RoundedRectangle(cornerRadius: 2)
+                    .stroke(BossMarkdownPalette.hairline, lineWidth: 1)
+            )
+            .textual.blockSpacing(.init(top: 0, bottom: 16))
+            .proseMeasureClamped()
+        } else {
+            Overflow {
+                configuration.label
+                    .textual.lineSpacing(.fontScaled(0.225))
+                    .textual.fontScale(0.85)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .monospaced()
+                    .padding(12)
+            }
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color(nsColor: .quaternaryLabelColor).opacity(0.18))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color(nsColor: .separatorColor), lineWidth: 0.5)
+            )
+            .textual.blockSpacing(.init(top: 0, bottom: 16))
+            .proseMeasureClamped()
         }
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color(nsColor: .quaternaryLabelColor).opacity(0.18))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(Color(nsColor: .separatorColor), lineWidth: 0.5)
-        )
-        .textual.blockSpacing(.init(top: 0, bottom: 16))
-        .proseMeasureClamped()
     }
 }
 
 extension StructuredText.CodeBlockStyle where Self == BossCodeBlockStyle {
-    static var boss: Self { .init() }
+    static func boss(editorial: Bool) -> Self { .init(editorial: editorial) }
 }
 
 // MARK: - Block quote
 
 struct BossBlockQuoteStyle: StructuredText.BlockQuoteStyle {
+    let editorial: Bool
+
+    @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
-        HStack(spacing: 0) {
-            RoundedRectangle(cornerRadius: 1.5)
-                .fill(Color.accentColor.opacity(0.6))
-                .frame(width: 3)
-            configuration.label
-                .foregroundStyle(.secondary)
-                .textual.padding(.horizontal, .fontScaled(1))
+        if editorial {
+            HStack(spacing: 0) {
+                RoundedRectangle(cornerRadius: 1.5)
+                    .fill(BossMarkdownPalette.alert)
+                    .frame(width: 3)
+                configuration.label
+                    .foregroundStyle(BossMarkdownPalette.ink)
+                    .textual.padding(.horizontal, .fontScaled(1))
+                    .padding(.vertical, 8)
+            }
+            .background(BossMarkdownPalette.alertWash)
+            .clipShape(RoundedRectangle(cornerRadius: 2))
+            .proseMeasureClamped()
+        } else {
+            HStack(spacing: 0) {
+                RoundedRectangle(cornerRadius: 1.5)
+                    .fill(Color.accentColor.opacity(0.6))
+                    .frame(width: 3)
+                configuration.label
+                    .foregroundStyle(.secondary)
+                    .textual.padding(.horizontal, .fontScaled(1))
+            }
+            .proseMeasureClamped()
         }
-        .proseMeasureClamped()
     }
 }
 
 extension StructuredText.BlockQuoteStyle where Self == BossBlockQuoteStyle {
-    static var boss: Self { .init() }
+    static func boss(editorial: Bool) -> Self { .init(editorial: editorial) }
 }
 
 // MARK: - Table
 
 struct BossTableStyle: StructuredText.TableStyle {
     private static let borderWidth: CGFloat = 0.5
-    private static let cornerRadius: CGFloat = 6
+    private static let compactCornerRadius: CGFloat = 6
     // Same semantic color as the inline-code background (just fainter), so a
     // code span inside a striped row blends rather than stacking into a
     // third shade.
-    private static let stripeColor = Color(nsColor: .quaternaryLabelColor).opacity(0.35)
+    private static let compactStripeColor = Color(nsColor: .quaternaryLabelColor).opacity(0.35)
+
+    let editorial: Bool
 
     func makeBody(configuration: Configuration) -> some View {
         // `Overflow` is Textual's sanctioned horizontal-scroll container: a
@@ -266,28 +465,33 @@ struct BossTableStyle: StructuredText.TableStyle {
                         .fixedSize(horizontal: false, vertical: true)
                         .textual.tableBackground { layout in
                             Canvas { context, _ in
+                                guard !editorial else { return }
                                 for bounds in layout.stripedBodyRowBounds() {
-                                    context.fill(
-                                        Path(bounds.integral),
-                                        with: .style(Self.stripeColor)
-                                    )
+                                    context.fill(Path(bounds.integral), with: .style(Self.compactStripeColor))
                                 }
                             }
                         }
                         .textual.tableOverlay { layout in
                             Canvas { context, _ in
-                                for divider in layout.dividers() {
-                                    context.fill(
-                                        Path(divider),
-                                        with: .style(Color(nsColor: .separatorColor).opacity(0.4))
-                                    )
+                                if editorial {
+                                    drawEditorialRules(in: layout, context: &context)
+                                } else {
+                                    for divider in layout.dividers() {
+                                        context.fill(
+                                            Path(divider),
+                                            with: .style(Color(nsColor: .separatorColor).opacity(0.4))
+                                        )
+                                    }
                                 }
                             }
                         }
-                        .padding(Self.borderWidth)
+                        .padding(editorial ? 1 : Self.borderWidth)
                         .overlay(
-                            RoundedRectangle(cornerRadius: Self.cornerRadius)
-                                .stroke(Color(nsColor: .separatorColor), lineWidth: Self.borderWidth)
+                            RoundedRectangle(cornerRadius: editorial ? 2 : Self.compactCornerRadius)
+                                .stroke(
+                                    editorial ? BossMarkdownPalette.hairline : DynamicColor(Color(nsColor: .separatorColor)),
+                                    lineWidth: editorial ? 1 : Self.borderWidth
+                                )
                         )
                 }
                 .frame(minWidth: viewportWidth, alignment: .center)
@@ -299,10 +503,74 @@ struct BossTableStyle: StructuredText.TableStyle {
         )
         .textual.blockSpacing(.init(top: 0, bottom: 16))
     }
+
+    private func drawEditorialRules(
+        in layout: StructuredText.TableLayout,
+        context: inout GraphicsContext
+    ) {
+        guard let header = layout.rowIndices.first else { return }
+        for row in layout.rowIndices {
+            let bounds = layout.rowBounds(row)
+            let rule = CGRect(
+                x: layout.bounds.minX,
+                y: bounds.maxY - 0.5,
+                width: layout.bounds.width,
+                height: 1
+            )
+            if row == header {
+                context.fill(Path(rule), with: .style(BossMarkdownPalette.ink))
+            } else if row != layout.rowIndices.last {
+                context.fill(Path(rule), with: .style(BossMarkdownPalette.hairline))
+            }
+        }
+    }
 }
 
 extension StructuredText.TableStyle where Self == BossTableStyle {
-    static var boss: Self { .init() }
+    static func boss(editorial: Bool) -> Self { .init(editorial: editorial) }
+}
+
+struct BossTableCellStyle: StructuredText.TableCellStyle {
+    let editorial: Bool
+
+    @ViewBuilder
+    func makeBody(configuration: Configuration) -> some View {
+        if editorial, configuration.row == 0 {
+            // Font-level small caps, not `.textCase(.uppercase)`: Textual
+            // builds each cell as interpolated `Text(AttributedString(...))`
+            // runs, and SwiftUI's textCase environment does not apply to
+            // those. The caption font modifier does apply.
+            configuration.label
+                .font(.system(.caption, design: .default).smallCaps())
+                .fontWeight(.semibold)
+                .foregroundStyle(BossMarkdownPalette.muted)
+                .tracking(0.8)
+                .textual.lineSpacing(.fontScaled(0.2))
+                .padding(.vertical, 8)
+                .padding(.horizontal, 12)
+        } else if editorial {
+            configuration.label
+                .font(.system(.body, design: .serif))
+                .foregroundStyle(BossMarkdownPalette.ink)
+                .monospacedDigit()
+                .textual.lineSpacing(.fontScaled(0.4))
+                .padding(.vertical, 8)
+                .padding(.horizontal, 12)
+        } else {
+            // Inlined from Textual 0.3.1's `GitHubTableCellStyle` so the
+            // compact surfaces remain untouched without constructing a style
+            // with DynamicProperty storage outside Textual's view tree.
+            configuration.label
+                .fontWeight(configuration.row == 0 ? .semibold : .regular)
+                .padding(.vertical, 6)
+                .padding(.horizontal, 13)
+                .textual.lineSpacing(.fontScaled(0.25))
+        }
+    }
+}
+
+extension StructuredText.TableCellStyle where Self == BossTableCellStyle {
+    static func boss(editorial: Bool) -> Self { .init(editorial: editorial) }
 }
 
 /// Reports the width available to a block *before* it enters a horizontal
@@ -338,8 +606,9 @@ private struct AvailableWidthReader<Content: View>: View {
 }
 
 extension StructuredText.TableLayout {
-    /// Body rows to stripe — every other row after the header (row 0), which
-    /// keeps its own distinct (bold) treatment and is never striped.
+    /// Body rows to stripe in the compact treatment — every other row after
+    /// the header (row 0), which keeps its own distinct (bold) treatment and
+    /// is never striped. Editorial tables use rules rather than fills.
     fileprivate func stripedBodyRowBounds() -> [CGRect] {
         rowIndices
             .dropFirst()
@@ -351,46 +620,80 @@ extension StructuredText.TableLayout {
 // MARK: - Inline
 
 extension InlineStyle {
-    static var boss: InlineStyle {
-        InlineStyle()
-            .code(
-                .font(.system(.callout, design: .monospaced)),
-                .backgroundColor(Color(nsColor: .quaternaryLabelColor).opacity(0.18))
-            )
-            .strong(.fontWeight(.semibold))
-            .link(.foregroundColor(.accentColor))
+    static func boss(editorial: Bool) -> InlineStyle {
+        if editorial {
+            InlineStyle()
+                .code(
+                    .font(.system(.callout, design: .monospaced)),
+                    .foregroundColor(BossMarkdownPalette.ink),
+                    .backgroundColor(BossMarkdownPalette.surface)
+                )
+                .strong(.fontWeight(.semibold))
+                .link(
+                    .foregroundColor(BossMarkdownPalette.accent),
+                    .underlineStyle(.single)
+                )
+        } else {
+            InlineStyle()
+                .code(
+                    .font(.system(.callout, design: .monospaced)),
+                    .backgroundColor(Color(nsColor: .quaternaryLabelColor).opacity(0.18))
+                )
+                .strong(.fontWeight(.semibold))
+                .link(.foregroundColor(.accentColor))
+        }
     }
 }
 
 // MARK: - Bundle style
 
 struct BossStructuredTextStyle: StructuredText.Style {
-    let inlineStyle: InlineStyle = .boss
-    let headingStyle: BossHeadingStyle = .boss
-    let paragraphStyle: BossParagraphStyle = .boss
-    let blockQuoteStyle: BossBlockQuoteStyle = .boss
-    let codeBlockStyle: BossCodeBlockStyle = .boss
-    let listItemStyle: BossListItemStyle = .boss
-    let unorderedListMarker: StructuredText.HierarchicalSymbolListMarker =
-        .hierarchical(.disc, .circle, .square)
-    let orderedListMarker: StructuredText.DecimalListMarker = .decimal
-    let tableStyle: BossTableStyle = .boss
-    let tableCellStyle: StructuredText.GitHubTableCellStyle = .gitHub
-    let thematicBreakStyle: BossThematicBreakStyle = .boss
-}
+    let inlineStyle: InlineStyle
+    let headingStyle: BossHeadingStyle
+    let paragraphStyle: BossParagraphStyle
+    let blockQuoteStyle: BossBlockQuoteStyle
+    let codeBlockStyle: BossCodeBlockStyle
+    let listItemStyle: BossListItemStyle
+    let unorderedListMarker: StructuredText.HierarchicalSymbolListMarker
+    let orderedListMarker: StructuredText.DecimalListMarker
+    let tableStyle: BossTableStyle
+    let tableCellStyle: BossTableCellStyle
+    let thematicBreakStyle: BossThematicBreakStyle
 
-extension StructuredText.Style where Self == BossStructuredTextStyle {
-    static var boss: Self { .init() }
+    init(editorial: Bool) {
+        inlineStyle = .boss(editorial: editorial)
+        headingStyle = .boss(editorial: editorial)
+        paragraphStyle = .boss(editorial: editorial)
+        blockQuoteStyle = .boss(editorial: editorial)
+        codeBlockStyle = .boss(editorial: editorial)
+        listItemStyle = .boss(editorial: editorial)
+        unorderedListMarker = .hierarchical(.disc, .circle, .square)
+        orderedListMarker = .decimal
+        tableStyle = .boss(editorial: editorial)
+        tableCellStyle = .boss(editorial: editorial)
+        thematicBreakStyle = .boss(editorial: editorial)
+    }
 }
 
 // MARK: - Entry point
+
+private struct BossMarkdownTheme<Content: View>: View {
+    @Environment(\.markdownEditorialStyle) private var isEditorial
+    let content: Content
+
+    var body: some View {
+        content
+            .textual.structuredTextStyle(BossStructuredTextStyle(editorial: isEditorial))
+            .textual.highlighterTheme(isEditorial ? BossMarkdownHighlighterTheme.editorial : .default)
+    }
+}
 
 extension View {
     /// Applies the Boss markdown theme to any `StructuredText` (or
     /// `InlineText`) descendants. Single-line seam — every call site
     /// uses this so the visual language stays coherent.
     func bossMarkdown() -> some View {
-        self.textual.structuredTextStyle(BossStructuredTextStyle())
+        BossMarkdownTheme(content: self)
     }
 }
 

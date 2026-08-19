@@ -81,17 +81,22 @@ enum MarkdownDocumentMeasure {
     }
 }
 
+private enum MarkdownDocumentLayout {
+    static let horizontalPadding: CGFloat = 40
+    static let verticalPadding: CGFloat = 32
+}
+
 /// The single reconciled chrome every in-app markdown document viewer renders
 /// through. Previously the app had one markdown render core
 /// (`StructuredText(...).bossMarkdown()`) wrapped in three independently
 /// authored chromes that had drifted — File ▸ Open / project-pointer (disk,
-/// black background, rich header, questions panel), the kanban "Read full
+/// document ground, rich header, questions panel), the kanban "Read full
 /// description" + async design-doc viewer (string, ⌘F find, timing, no
 /// background), and the Designs-tab reader (GitHub string, no find, no
 /// background). Opening the same document two ways produced visibly different
 /// windows. This view folds all of them together:
 ///
-/// - **Background/foreground**: high-contrast black-in-dark-mode background,
+/// - **Background/foreground**: tokenized light/dark document ground,
 ///   applied to the scrolling document column so a comment sidebar / questions
 ///   panel to its right keeps its own `windowBackgroundColor` (the deliberate
 ///   layering from the original disk viewer).
@@ -197,7 +202,7 @@ private struct StructuredTextHeightKey: PreferenceKey {
 }
 
 /// The scrolling document column: find bar, rich header, and the shared markdown
-/// render core, over the high-contrast background. Reads the comment
+/// render core, over the tokenized document ground. Reads the comment
 /// environment injected by an enclosing `.withComments()` (when present) and
 /// feeds both comment and search highlights to the parser. Kept as a single view
 /// (rather than split render-core / find-bar subviews) because `parseVersion`,
@@ -214,7 +219,6 @@ private struct MarkdownDocumentColumn: View {
     let projectShortID: String
     let clickStartTime: Date?
 
-    @Environment(\.colorScheme) private var colorScheme
     @Environment(\.commentedAnchors) private var commentedAnchors
     @Environment(\.commentFlashAnchor) private var commentFlashAnchor
     @Environment(\.suppressTypeToComment) private var suppressTypeToComment
@@ -234,22 +238,21 @@ private struct MarkdownDocumentColumn: View {
     @State private var parseStartTime: Date? = nil
     @State private var parseLogged = false
 
-    /// High-contrast document background that follows light/dark mode. Black in
-    /// dark mode, white in light. Applied to the scrolling column only, so a
+    /// Tokenized document ground, applied to the scrolling column only, so a
     /// sibling comment sidebar / questions panel keeps `windowBackgroundColor`.
-    private var viewerBackground: Color {
-        colorScheme == .dark ? Color(white: 0.06) : .white
+    private var viewerBackground: DynamicColor {
+        BossMarkdownPalette.ground
     }
 
-    private var viewerForeground: Color {
-        colorScheme == .dark ? .white : .black
+    private var viewerForeground: DynamicColor {
+        BossMarkdownPalette.ink
     }
 
     var body: some View {
         VStack(spacing: 0) {
             if findState.isActive {
                 MarkdownFindBar(state: findState, isFocused: $findFieldFocused, onClose: closeFindBar)
-                Divider()
+                Divider().overlay(BossMarkdownPalette.hairline)
             }
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
@@ -263,13 +266,14 @@ private struct MarkdownDocumentColumn: View {
                         .frame(maxWidth: MarkdownDocumentMeasure.readable)
                         .frame(maxWidth: .infinity, alignment: .center)
                     Divider()
+                        .overlay(BossMarkdownPalette.hairline)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .frame(maxWidth: MarkdownDocumentMeasure.readable)
                         .frame(maxWidth: .infinity, alignment: .center)
                     documentBody
                 }
-                .padding(.horizontal, 24)
-                .padding(.vertical, 20)
+                .padding(.horizontal, MarkdownDocumentLayout.horizontalPadding)
+                .padding(.vertical, MarkdownDocumentLayout.verticalPadding)
                 .frame(maxWidth: MarkdownDocumentMeasure.forSource(source))
                 .frame(maxWidth: .infinity)
                 .background(MarkdownScrollViewCapture(controller: scrollController))
@@ -331,13 +335,16 @@ private struct MarkdownDocumentColumn: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(title)
-                    .font(.title3.weight(.semibold))
+                    .font(.system(.title3, design: .default).weight(.semibold))
+                    .foregroundStyle(BossMarkdownPalette.ink)
+                    .tracking(-0.2)
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 12)
                 if let url = githubURL {
                     Link(destination: url) {
                         Label("Open on GitHub", systemImage: "arrow.up.right.square")
                             .font(.callout)
+                            .foregroundStyle(BossMarkdownPalette.accent)
                     }
                     .buttonStyle(.link)
                     .accessibilityIdentifier("markdown-doc-github-link")
@@ -349,12 +356,12 @@ private struct MarkdownDocumentColumn: View {
                     if let repoLabel, !repoLabel.isEmpty {
                         Text(repoLabel)
                             .font(.caption.monospaced())
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(BossMarkdownPalette.muted)
                     }
                     if let subtitle, !subtitle.isEmpty {
                         Text(subtitle)
                             .font(.caption.monospaced())
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(BossMarkdownPalette.muted)
                             .lineLimit(1)
                             .truncationMode(.middle)
                             .help(subtitle)
@@ -378,7 +385,7 @@ private struct MarkdownDocumentColumn: View {
         if let loadError {
             VStack(alignment: .leading, spacing: 8) {
                 Text(loadError)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(BossMarkdownPalette.alert)
                     .font(.callout)
                 if let url = githubURL {
                     Link("Open on GitHub instead", destination: url)
@@ -393,6 +400,7 @@ private struct MarkdownDocumentColumn: View {
                 // comment sidebar, and release notes all call `.bossMarkdown()`
                 // bare and must keep rendering prose at its natural width.
                 .environment(\.markdownProseMeasure, MarkdownDocumentMeasure.readable)
+                .environment(\.markdownEditorialStyle, true)
                 .textual.textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 // Force StructuredText recreation when highlight state changes so
