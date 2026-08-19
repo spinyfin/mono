@@ -65,6 +65,13 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         XCTAssertFalse(EnvironmentValues().markdownEditorialStyle)
     }
 
+    func testEditorialTypographyRatiosAndCompactHeadingSpacing() {
+        XCTAssertEqual(MarkdownEditorialMetrics.headingScales[0] / MarkdownEditorialMetrics.bodyScale, 2.75)
+        XCTAssertEqual(MarkdownEditorialMetrics.codeBlockScale / MarkdownEditorialMetrics.bodyScale, 0.82)
+        XCTAssertEqual(MarkdownEditorialMetrics.compactHeadingSpacing.top, 16)
+        XCTAssertEqual(MarkdownEditorialMetrics.compactHeadingSpacing.bottom, 8)
+    }
+
     // MARK: - Document measure selection
 
     /// A wide table gets the extra document width; the delimiter row (e.g.

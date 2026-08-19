@@ -16,7 +16,9 @@ private let designDocTimingLog = Logger(subsystem: "com.boss.app", category: "De
 enum MarkdownDocumentMeasure {
     /// The prose reading measure, matched by `BossMarkdownStyle`'s per-block
     /// clamp so paragraphs stay this width even inside `wide` documents.
-    static let readable: CGFloat = 720
+    /// At the 1.12× editorial body size, the 0.5em average-character-width
+    /// heuristic yields about 65 characters per line (620 / 9.52 = 65.1).
+    static let readable: CGFloat = 620
     /// The document column width once a table is present.
     static let wide: CGFloat = 1440
 
