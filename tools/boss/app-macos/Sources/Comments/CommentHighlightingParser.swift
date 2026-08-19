@@ -25,7 +25,7 @@ private let highlightLog = Logger(subsystem: "com.boss.markdown", category: "com
 ///
 /// The highlight sets BOTH a `backgroundColor` and — on any inline-code run inside the
 /// anchored range — a colored `underlineStyle`. The background alone is not enough: the
-/// Boss inline style (`InlineStyle.boss`) gives inline code spans their own
+/// Boss inline style (`InlineStyle.boss(editorial:)`) gives inline code spans their own
 /// `backgroundColor`, and Textual's `WithInlineStyle` merges that in with
 /// `mergePolicy: .keepNew`, which *overwrites* the comment's background on exactly those
 /// runs. A comment anchored to an inline code span (e.g. `` `flavor` ``) would therefore

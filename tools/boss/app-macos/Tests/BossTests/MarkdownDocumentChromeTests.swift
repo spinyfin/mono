@@ -55,6 +55,16 @@ final class MarkdownDocumentChromeTests: XCTestCase {
     ---
     """
 
+    // MARK: - Editorial opt-in
+
+    /// The editorial treatment is opt-in. The environment default must stay
+    /// false so transcript bubbles, comment cards, release notes, and the
+    /// find bar keep compact system-font markdown unless a caller sets the
+    /// key (only `MarkdownDocumentChrome.documentBody` does).
+    func testEditorialStyleDefaultsOff() {
+        XCTAssertFalse(EnvironmentValues().markdownEditorialStyle)
+    }
+
     // MARK: - Document measure selection
 
     /// A wide table gets the extra document width; the delimiter row (e.g.

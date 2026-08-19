@@ -147,7 +147,7 @@ extension View {
 // MARK: - Heading
 
 struct BossHeadingStyle: StructuredText.HeadingStyle {
-    @Environment(\.markdownEditorialStyle) private var isEditorial
+    let editorial: Bool
 
     // Maps the Boss type scale (26 / 22 / 18 / 16 / 14 / 14 pt) onto
     // SwiftUI's body font (17 pt on macOS) via fontScale so the rendering
@@ -167,7 +167,7 @@ struct BossHeadingStyle: StructuredText.HeadingStyle {
     @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
         let level = min(max(configuration.headingLevel, 1), 6)
-        if isEditorial, level == 2 {
+        if editorial, level == 2 {
             VStack(alignment: .leading, spacing: 6) {
                 headingLabel(configuration: configuration, level: level)
                 Rectangle()
@@ -186,7 +186,7 @@ struct BossHeadingStyle: StructuredText.HeadingStyle {
     @MainActor
     @ViewBuilder
     private func headingLabel(configuration: Configuration, level: Int) -> some View {
-        if isEditorial {
+        if editorial {
             configuration.label
                 .textual.fontScale(Self.fontScales[level - 1])
                 .textual.lineSpacing(.fontScaled(0.125))
@@ -204,13 +204,13 @@ struct BossHeadingStyle: StructuredText.HeadingStyle {
 }
 
 extension StructuredText.HeadingStyle where Self == BossHeadingStyle {
-    static var boss: Self { .init() }
+    static func boss(editorial: Bool) -> Self { .init(editorial: editorial) }
 }
 
 // MARK: - Paragraph
 
 struct BossParagraphStyle: StructuredText.ParagraphStyle {
-    @Environment(\.markdownEditorialStyle) private var isEditorial
+    let editorial: Bool
 
     // Inlined from `StructuredText.GitHubParagraphStyle.makeBody` (Textual
     // 0.3.1) rather than delegated to: `ParagraphStyle` refines
@@ -220,11 +220,14 @@ struct BossParagraphStyle: StructuredText.ParagraphStyle {
     // because the library style is stateless.
     @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
-        if isEditorial {
+        if editorial {
             configuration.label
                 .font(.system(.body, design: .serif))
                 .foregroundStyle(BossMarkdownPalette.ink)
-                .textual.lineSpacing(.fontScaled(0.65))
+                // SwiftUI `lineSpacing` is extra leading on top of the natural
+                // ~1.2em line box, so 0.45em additional lands near the 1.65
+                // reference line-height (0.65em additional was ~1.85).
+                .textual.lineSpacing(.fontScaled(0.45))
                 .textual.blockSpacing(.init(top: 0, bottom: 18))
                 .proseMeasureClamped()
         } else {
@@ -237,13 +240,13 @@ struct BossParagraphStyle: StructuredText.ParagraphStyle {
 }
 
 extension StructuredText.ParagraphStyle where Self == BossParagraphStyle {
-    static var boss: Self { .init() }
+    static func boss(editorial: Bool) -> Self { .init(editorial: editorial) }
 }
 
 // MARK: - List item
 
 struct BossListItemStyle: StructuredText.ListItemStyle {
-    @Environment(\.markdownEditorialStyle) private var isEditorial
+    let editorial: Bool
 
     // Delegates to `StructuredText.DefaultListItemStyle` (Textual 0.3.1)
     // rather than inlining it, unlike the paragraph/thematic-break styles
@@ -257,7 +260,7 @@ struct BossListItemStyle: StructuredText.ListItemStyle {
     // this delegation on any Textual upgrade.
     @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
-        if isEditorial {
+        if editorial {
             StructuredText.DefaultListItemStyle.default
                 .makeBody(configuration: configuration)
                 .font(.system(.body, design: .serif))
@@ -272,13 +275,13 @@ struct BossListItemStyle: StructuredText.ListItemStyle {
 }
 
 extension StructuredText.ListItemStyle where Self == BossListItemStyle {
-    static var boss: Self { .init() }
+    static func boss(editorial: Bool) -> Self { .init(editorial: editorial) }
 }
 
 // MARK: - Thematic break
 
 struct BossThematicBreakStyle: StructuredText.ThematicBreakStyle {
-    @Environment(\.markdownEditorialStyle) private var isEditorial
+    let editorial: Bool
 
     // Same GitHub-style border color `StructuredText.GitHubThematicBreakStyle`
     // (Textual 0.3.1) uses, reproduced here rather than referenced —
@@ -294,7 +297,7 @@ struct BossThematicBreakStyle: StructuredText.ThematicBreakStyle {
     // on it directly bypasses `DynamicProperty` installation.
     @ViewBuilder
     func makeBody(configuration _: Configuration) -> some View {
-        if isEditorial {
+        if editorial {
             Rectangle()
                 .fill(BossMarkdownPalette.hairline)
                 .frame(height: 1)
@@ -311,17 +314,17 @@ struct BossThematicBreakStyle: StructuredText.ThematicBreakStyle {
 }
 
 extension StructuredText.ThematicBreakStyle where Self == BossThematicBreakStyle {
-    static var boss: Self { .init() }
+    static func boss(editorial: Bool) -> Self { .init(editorial: editorial) }
 }
 
 // MARK: - Code block
 
 struct BossCodeBlockStyle: StructuredText.CodeBlockStyle {
-    @Environment(\.markdownEditorialStyle) private var isEditorial
+    let editorial: Bool
 
     @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
-        if isEditorial {
+        if editorial {
             Overflow {
                 configuration.label
                     .textual.lineSpacing(.fontScaled(0.225))
@@ -367,17 +370,17 @@ struct BossCodeBlockStyle: StructuredText.CodeBlockStyle {
 }
 
 extension StructuredText.CodeBlockStyle where Self == BossCodeBlockStyle {
-    static var boss: Self { .init() }
+    static func boss(editorial: Bool) -> Self { .init(editorial: editorial) }
 }
 
 // MARK: - Block quote
 
 struct BossBlockQuoteStyle: StructuredText.BlockQuoteStyle {
-    @Environment(\.markdownEditorialStyle) private var isEditorial
+    let editorial: Bool
 
     @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
-        if isEditorial {
+        if editorial {
             HStack(spacing: 0) {
                 RoundedRectangle(cornerRadius: 1.5)
                     .fill(BossMarkdownPalette.alert)
@@ -405,7 +408,7 @@ struct BossBlockQuoteStyle: StructuredText.BlockQuoteStyle {
 }
 
 extension StructuredText.BlockQuoteStyle where Self == BossBlockQuoteStyle {
-    static var boss: Self { .init() }
+    static func boss(editorial: Bool) -> Self { .init(editorial: editorial) }
 }
 
 // MARK: - Table
@@ -418,7 +421,7 @@ struct BossTableStyle: StructuredText.TableStyle {
     // third shade.
     private static let compactStripeColor = Color(nsColor: .quaternaryLabelColor).opacity(0.35)
 
-    @Environment(\.markdownEditorialStyle) private var isEditorial
+    let editorial: Bool
 
     func makeBody(configuration: Configuration) -> some View {
         // `Overflow` is Textual's sanctioned horizontal-scroll container: a
@@ -462,7 +465,7 @@ struct BossTableStyle: StructuredText.TableStyle {
                         .fixedSize(horizontal: false, vertical: true)
                         .textual.tableBackground { layout in
                             Canvas { context, _ in
-                                guard !isEditorial else { return }
+                                guard !editorial else { return }
                                 for bounds in layout.stripedBodyRowBounds() {
                                     context.fill(Path(bounds.integral), with: .style(Self.compactStripeColor))
                                 }
@@ -470,7 +473,7 @@ struct BossTableStyle: StructuredText.TableStyle {
                         }
                         .textual.tableOverlay { layout in
                             Canvas { context, _ in
-                                if isEditorial {
+                                if editorial {
                                     drawEditorialRules(in: layout, context: &context)
                                 } else {
                                     for divider in layout.dividers() {
@@ -482,12 +485,12 @@ struct BossTableStyle: StructuredText.TableStyle {
                                 }
                             }
                         }
-                        .padding(isEditorial ? 1 : Self.borderWidth)
+                        .padding(editorial ? 1 : Self.borderWidth)
                         .overlay(
-                            RoundedRectangle(cornerRadius: isEditorial ? 2 : Self.compactCornerRadius)
+                            RoundedRectangle(cornerRadius: editorial ? 2 : Self.compactCornerRadius)
                                 .stroke(
-                                    isEditorial ? BossMarkdownPalette.hairline : DynamicColor(Color(nsColor: .separatorColor)),
-                                    lineWidth: isEditorial ? 1 : Self.borderWidth
+                                    editorial ? BossMarkdownPalette.hairline : DynamicColor(Color(nsColor: .separatorColor)),
+                                    lineWidth: editorial ? 1 : Self.borderWidth
                                 )
                         )
                 }
@@ -524,25 +527,28 @@ struct BossTableStyle: StructuredText.TableStyle {
 }
 
 extension StructuredText.TableStyle where Self == BossTableStyle {
-    static var boss: Self { .init() }
+    static func boss(editorial: Bool) -> Self { .init(editorial: editorial) }
 }
 
 struct BossTableCellStyle: StructuredText.TableCellStyle {
-    @Environment(\.markdownEditorialStyle) private var isEditorial
+    let editorial: Bool
 
     @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
-        if isEditorial, configuration.row == 0 {
+        if editorial, configuration.row == 0 {
+            // Font-level small caps, not `.textCase(.uppercase)`: Textual
+            // builds each cell as interpolated `Text(AttributedString(...))`
+            // runs, and SwiftUI's textCase environment does not apply to
+            // those. The caption font modifier does apply.
             configuration.label
-                .font(.system(.caption, design: .default))
+                .font(.system(.caption, design: .default).smallCaps())
                 .fontWeight(.semibold)
                 .foregroundStyle(BossMarkdownPalette.muted)
-                .textCase(.uppercase)
                 .tracking(0.8)
                 .textual.lineSpacing(.fontScaled(0.2))
                 .padding(.vertical, 8)
                 .padding(.horizontal, 12)
-        } else if isEditorial {
+        } else if editorial {
             configuration.label
                 .font(.system(.body, design: .serif))
                 .foregroundStyle(BossMarkdownPalette.ink)
@@ -564,7 +570,7 @@ struct BossTableCellStyle: StructuredText.TableCellStyle {
 }
 
 extension StructuredText.TableCellStyle where Self == BossTableCellStyle {
-    static var boss: Self { .init() }
+    static func boss(editorial: Bool) -> Self { .init(editorial: editorial) }
 }
 
 /// Reports the width available to a block *before* it enters a horizontal
@@ -656,21 +662,17 @@ struct BossStructuredTextStyle: StructuredText.Style {
 
     init(editorial: Bool) {
         inlineStyle = .boss(editorial: editorial)
-        headingStyle = .boss
-        paragraphStyle = .boss
-        blockQuoteStyle = .boss
-        codeBlockStyle = .boss
-        listItemStyle = .boss
+        headingStyle = .boss(editorial: editorial)
+        paragraphStyle = .boss(editorial: editorial)
+        blockQuoteStyle = .boss(editorial: editorial)
+        codeBlockStyle = .boss(editorial: editorial)
+        listItemStyle = .boss(editorial: editorial)
         unorderedListMarker = .hierarchical(.disc, .circle, .square)
         orderedListMarker = .decimal
-        tableStyle = .boss
-        tableCellStyle = .boss
-        thematicBreakStyle = .boss
+        tableStyle = .boss(editorial: editorial)
+        tableCellStyle = .boss(editorial: editorial)
+        thematicBreakStyle = .boss(editorial: editorial)
     }
-}
-
-extension StructuredText.Style where Self == BossStructuredTextStyle {
-    static var boss: Self { .init(editorial: false) }
 }
 
 // MARK: - Entry point
