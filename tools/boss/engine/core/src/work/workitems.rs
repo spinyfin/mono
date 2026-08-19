@@ -1233,21 +1233,46 @@ impl WorkDb {
         }
     }
 
-    /// Resolve a friendly work-item selector to a primary id, including
-    /// tombstoned rows. Used by restore — the one engine path that
-    /// intentionally operates on deleted work items — so a missing short
-    /// id reports "no such row" instead of being handed through
-    /// unresolved and misclassified downstream by `classify_id`.
+    /// Like [`Self::resolve_work_item_ref`], but a tombstoned row still
+    /// resolves. Used by restore and the dependency verbs (`depend
+    /// add`/`depend rm`) — the engine paths that must be able to name a
+    /// deleted work item explicitly, either to make it live again or to
+    /// reject/clean up a dependency edge that names it — so a missing id
+    /// reports "no such row" instead of being handed through unresolved
+    /// and misclassified downstream by `classify_id`, and a typed id that
+    /// names a tombstoned row is not mistaken for one that doesn't exist.
     ///
     /// `id` may be a bare short id (`T5`) for the no-selected-product
     /// fallback (ambiguity across products is a hard error, matching
-    /// [`Self::resolve_work_item_ref`]'s contract) or an already
-    /// product-scoped selector (`{product_id}/{n}`) when a product is
-    /// selected. Returns `Ok(None)` when nothing matches (live or
-    /// deleted); never guesses.
-    pub fn resolve_work_item_ref_for_restore(&self, id: &str) -> Result<Option<String>> {
+    /// [`Self::resolve_work_item_ref`]'s contract), an already
+    /// product-scoped selector (`{product_id}/{n}` or `slug/n`), or a
+    /// typed primary id.
+    pub fn resolve_work_item_ref_including_deleted(&self, id: &str) -> Result<String> {
+        let id = id.trim();
+        if id.is_empty() {
+            bail!("could not resolve id: empty selector");
+        }
         let conn = self.connect()?;
-        resolve_friendly_work_item_id_inner(&conn, id, true)
+        match resolve_friendly_work_item_id_inner(&conn, id, true)? {
+            Some(primary) => Ok(primary),
+            None if boss_protocol::is_friendly_work_item_selector(id) => {
+                bail!(
+                    "could not resolve id {id}: {}",
+                    boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER
+                )
+            }
+            None if boss_protocol::is_typed_work_item_id(id) => {
+                if typed_work_item_exists_including_deleted(&conn, id)? {
+                    Ok(id.to_owned())
+                } else {
+                    bail!(
+                        "could not resolve id {id}: {}",
+                        boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER
+                    )
+                }
+            }
+            None => Ok(id.to_owned()),
+        }
     }
 
     /// Like [`resolve_work_item_ref`], but opaque non-typed input that is

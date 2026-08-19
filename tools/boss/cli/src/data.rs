@@ -1471,6 +1471,26 @@ pub(crate) async fn restore_work_item(client: &mut BossClient, id: &str) -> Resu
     )
 }
 
+/// Format the dependency verbs' prerequisite selector for the RPC without
+/// resolving it CLI-side: `depend add`/`depend rm` must be able to name a
+/// prerequisite that has since been archived, but the CLI's normal
+/// short-id resolution (`resolve_selector_to_primary_id` →
+/// `GetWorkItem`/`GetWorkItemByShortId`) filters tombstoned rows before
+/// the RPC ever reaches the engine's tombstone-tolerant resolver
+/// (`resolve_work_item_id_including_deleted`). A bare short id combined
+/// with `--product` is rewritten to the explicit `slug/n` (or `id/n`)
+/// form the engine's resolver already understands, preserving the
+/// `--product` scoping the CLI-side resolution used to provide; every
+/// other selector shape (already product-scoped, typed, or opaque) is
+/// sent unchanged for the engine to resolve.
+fn dependency_prerequisite_selector(id: &str, product: Option<&str>) -> String {
+    let trimmed = id.trim();
+    match (boss_protocol::parse_work_item_selector(trimmed), product) {
+        (boss_protocol::WorkItemSelector::ShortId(n), Some(product)) => format!("{product}/{n}"),
+        _ => trimmed.to_owned(),
+    }
+}
+
 pub(crate) async fn run_depend_command(
     command: DependCommand,
     client: &mut BossClient,
@@ -1479,7 +1499,7 @@ pub(crate) async fn run_depend_command(
     match command {
         DependCommand::Add(args) => {
             let dependent = resolve_selector_to_primary_id(client, ctx, &args.dependent, args.product.clone()).await?;
-            let prerequisite = resolve_selector_to_primary_id(client, ctx, &args.prerequisite, args.product).await?;
+            let prerequisite = dependency_prerequisite_selector(&args.prerequisite, args.product.as_deref());
             let edge = add_dependency(
                 client,
                 AddDependencyInput {
@@ -1500,12 +1520,12 @@ pub(crate) async fn run_depend_command(
         }
         DependCommand::Rm(args) => {
             let dependent = resolve_selector_to_primary_id(client, ctx, &args.dependent, args.product.clone()).await?;
-            let prerequisite = resolve_selector_to_primary_id(client, ctx, &args.prerequisite, args.product).await?;
-            let removed = remove_dependency(
+            let prerequisite = dependency_prerequisite_selector(&args.prerequisite, args.product.as_deref());
+            let (dependent_id, prerequisite_id, removed) = remove_dependency(
                 client,
                 RemoveDependencyInput {
-                    dependent: dependent.clone(),
-                    prerequisite: prerequisite.clone(),
+                    dependent,
+                    prerequisite,
                     relation: Some(args.relation.clone()),
                 },
             )
@@ -1513,17 +1533,17 @@ pub(crate) async fn run_depend_command(
             print_entity(
                 ctx,
                 &serde_json::json!({
-                    "dependent_id": dependent,
-                    "prerequisite_id": prerequisite,
+                    "dependent_id": dependent_id,
+                    "prerequisite_id": prerequisite_id,
                     "relation": args.relation,
                     "removed": removed,
                 }),
                 || {
                     if !ctx.quiet {
                         if removed {
-                            println!("Removed dependency: {} → {}", dependent, prerequisite,);
+                            println!("Removed dependency: {} → {}", dependent_id, prerequisite_id,);
                         } else {
-                            println!("No dependency {} → {} (no-op)", dependent, prerequisite,);
+                            println!("No dependency {} → {} (no-op)", dependent_id, prerequisite_id,);
                         }
                     }
                 },
@@ -1558,12 +1578,20 @@ pub(crate) async fn add_dependency(
     )
 }
 
-pub(crate) async fn remove_dependency(client: &mut BossClient, input: RemoveDependencyInput) -> Result<bool, CliError> {
+/// Returns `(dependent_id, prerequisite_id, removed)` as the engine
+/// resolved them — not necessarily what the caller sent, since the
+/// prerequisite may have been an unresolved selector (see
+/// [`dependency_prerequisite_selector`]) that only the engine's
+/// tombstone-tolerant resolver can turn into a primary id.
+pub(crate) async fn remove_dependency(
+    client: &mut BossClient,
+    input: RemoveDependencyInput,
+) -> Result<(String, String, bool), CliError> {
     rpc_call!(
         client,
         FrontendRequest::RemoveDependency { input },
         "dependency remove",
-        FrontendEvent::DependencyRemoved { removed, .. } => removed,
+        FrontendEvent::DependencyRemoved { dependent_id, prerequisite_id, removed, .. } => (dependent_id, prerequisite_id, removed),
     )
 }
 

@@ -1207,7 +1207,7 @@ pub(super) async fn handle_restore_work_item(ctx: Dispatch, req: FrontendRequest
     let FrontendRequest::RestoreWorkItem { id } = req else {
         unreachable!()
     };
-    let id = match server_state.resolve_work_item_id_for_restore(&id).await {
+    let id = match server_state.resolve_work_item_id_including_deleted(&id).await {
         Ok(id) => id,
         Err(err) => {
             send_work_error(&sink, &request_id, &err);

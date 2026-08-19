@@ -6,7 +6,8 @@ use super::*;
 /// `RUNG0_APPLY_LIVE`) are both live on the `conflict_watch` path when the
 /// `conflict_ladder_mechanical_rebase` feature flag is enabled; rung 2 (the
 /// small pre-staged agent) is also live, bounded to a single residual file
-/// (T6 of `merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`).
+/// (the single-residual-file bound for rung 2 is specified in
+/// `merge-conflict-reduction-and-fast-resolution-for-parallel-tasks.md`).
 /// Every conflict not resolved by a mechanical rung — or evaluated while the
 /// ladder itself is disabled — still falls through to a full worker doing
 /// the whole job by hand.
@@ -471,7 +472,7 @@ impl WorkDb {
 
     /// Stamp `resolved_by_rung` on a still-live attempt *before* the
     /// resolution has actually completed — used by the escalation-ladder
-    /// harness (T6) when it hands the conflict to a rung-2 small focused
+    /// harness when it hands the conflict to a rung-2 small focused
     /// agent, so that whichever path later calls
     /// [`Self::mark_conflict_resolution_succeeded`] (which defaults to rung
     /// 3, the full-worker rung) finds `resolved_by_rung` already set and

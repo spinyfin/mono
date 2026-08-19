@@ -253,6 +253,31 @@ pub(crate) fn typed_work_item_exists(conn: &Connection, id: &str) -> Result<bool
     }
 }
 
+/// Like [`typed_work_item_exists`], but a tombstoned task row still counts
+/// as existing. Used by resolvers that must see archived work items
+/// (restore, the dependency verbs) so a typo'd id is still reported as
+/// "no matching work item" instead of a silent no-op downstream.
+pub(crate) fn typed_work_item_exists_including_deleted(conn: &Connection, id: &str) -> Result<bool> {
+    match classify_id(id)? {
+        ItemKind::Task => Ok(conn
+            .query_row("SELECT 1 FROM tasks WHERE id = ?1", params![id], |_| Ok(()))
+            .optional()?
+            .is_some()),
+        ItemKind::Project => Ok(conn
+            .query_row("SELECT 1 FROM projects WHERE id = ?1", params![id], |_| Ok(()))
+            .optional()?
+            .is_some()),
+        ItemKind::Product => Ok(conn
+            .query_row("SELECT 1 FROM products WHERE id = ?1", params![id], |_| Ok(()))
+            .optional()?
+            .is_some()),
+        ItemKind::Comment => Ok(conn
+            .query_row("SELECT 1 FROM work_comments WHERE id = ?1", params![id], |_| Ok(()))
+            .optional()?
+            .is_some()),
+    }
+}
+
 /// Resolve a single edge endpoint into its [`DependencyEdge`] view.
 /// `peer_id` is the *other* end of the edge (the prerequisite when
 /// the edge sits in the prerequisites list, the dependent when it
@@ -503,25 +528,38 @@ pub(crate) fn add_dependency_edge_in_tx(
     if dependent_id == prerequisite_id {
         bail!("a work item cannot depend on itself: {dependent_id}");
     }
-    if matches!(
-        deps::lookup_work_item_status_for_gating(conn, prerequisite_id)?.as_deref(),
-        Some("archived")
-    ) {
-        bail!(
-            "cannot add dependency on archived work item {prerequisite_id}: archived work items cannot be prerequisites"
-        );
-    }
-    // Both ids must resolve and live in the same product. Cross-
-    // product edges are tracked separately (see proj_18a2bbe20fc03718_8).
-    let dependent_product = product_id_for_work_item(conn, dependent_id)?;
-    let prerequisite_product = product_id_for_work_item(conn, prerequisite_id)?;
-    if dependent_product != prerequisite_product {
-        bail!(
-            "dependency edges must stay within a single product; cross-product edges are tracked in proj_18a2bbe20fc03718_8"
-        );
-    }
-    if deps::would_create_cycle(conn, dependent_id, prerequisite_id)? {
-        bail!("creating this edge would form a cycle: {prerequisite_id} → … → {dependent_id}");
+    // All of the validation below — the archived-prerequisite rejection,
+    // the same-product check, and the cycle check — only makes sense for a
+    // genuinely NEW edge. `WorkDb::add_dependency` documents idempotent
+    // re-add of an existing edge, and the materializer re-applies a design
+    // proposal's full edge set (including ones a deduped handle already
+    // established) on every populate; running e.g. `product_id_for_work_item`
+    // against a prerequisite that has since been archived (tombstoned) would
+    // itself fail with "unknown task" even though the edge needs no new
+    // validation at all. Skipping validation entirely for a pre-existing
+    // edge keeps both call sites a clean no-op.
+    let edge_already_exists = deps::query_edge(conn, dependent_id, prerequisite_id, relation)?.is_some();
+    if !edge_already_exists {
+        if matches!(
+            deps::lookup_work_item_status_for_gating(conn, prerequisite_id)?.as_deref(),
+            Some("archived")
+        ) {
+            bail!(
+                "cannot add dependency on archived work item {prerequisite_id}: archived work items cannot be prerequisites"
+            );
+        }
+        // Both ids must resolve and live in the same product. Cross-
+        // product edges are tracked separately (see proj_18a2bbe20fc03718_8).
+        let dependent_product = product_id_for_work_item(conn, dependent_id)?;
+        let prerequisite_product = product_id_for_work_item(conn, prerequisite_id)?;
+        if dependent_product != prerequisite_product {
+            bail!(
+                "dependency edges must stay within a single product; cross-product edges are tracked in proj_18a2bbe20fc03718_8"
+            );
+        }
+        if deps::would_create_cycle(conn, dependent_id, prerequisite_id)? {
+            bail!("creating this edge would form a cycle: {prerequisite_id} → … → {dependent_id}");
+        }
     }
     let (edge, _outcome): (WorkItemDependency, EdgeInsertOutcome) =
         deps::insert_edge(conn, dependent_id, prerequisite_id, relation, now_epoch)?;
