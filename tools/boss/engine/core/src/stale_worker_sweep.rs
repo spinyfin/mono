@@ -233,18 +233,14 @@ impl WorkerTerminalInspector for TmuxWorkerTerminalInspector {
             boss_protocol::TmuxAdoptionState::ProbeUnavailable => {
                 anyhow::bail!("tmux identity probe unavailable for session {}", run.tmux_session_name)
             }
-            boss_protocol::TmuxAdoptionState::SessionMissing => {
-                Ok(Some(TerminalLiveness::Dead {
-                    session_name: run.tmux_session_name,
-                    evidence: DeadPaneEvidence::SessionAbsent,
-                }))
-            }
-            boss_protocol::TmuxAdoptionState::TokenMismatch => {
-                Ok(Some(TerminalLiveness::Dead {
-                    session_name: run.tmux_session_name,
-                    evidence: DeadPaneEvidence::SpawnTokenMismatch,
-                }))
-            }
+            boss_protocol::TmuxAdoptionState::SessionMissing => Ok(Some(TerminalLiveness::Dead {
+                session_name: run.tmux_session_name,
+                evidence: DeadPaneEvidence::SessionAbsent,
+            })),
+            boss_protocol::TmuxAdoptionState::TokenMismatch => Ok(Some(TerminalLiveness::Dead {
+                session_name: run.tmux_session_name,
+                evidence: DeadPaneEvidence::SpawnTokenMismatch,
+            })),
             boss_protocol::TmuxAdoptionState::Adopted if observation.pane_dead == Some(true) => {
                 Ok(Some(TerminalLiveness::Dead {
                     session_name: run.tmux_session_name,
@@ -274,8 +270,7 @@ impl WorkerTerminalInspector for TmuxWorkerTerminalInspector {
                         );
                         String::new()
                     });
-                let foreground_command_mismatch =
-                    !driver_binary.is_empty() && current_command != driver_binary;
+                let foreground_command_mismatch = !driver_binary.is_empty() && current_command != driver_binary;
                 if foreground_command_mismatch {
                     tracing::warn!(
                         execution_id,
