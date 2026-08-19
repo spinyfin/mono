@@ -328,6 +328,10 @@ fn path_guard_blocks_a_machine_wide_recursive_walk() {
         // The root can arrive via a `cd` earlier in the same command line.
         "cd / && find . -name x",
         "cd /;find . -name x",
+        "(cd / && find . -name x)",
+        // POSIX -H/-L/-P precede path operands and must not hide the root.
+        "find -L / -name x",
+        "find -H /Users -name x",
         // A shell glob still denotes every user's protected Desktop.
         "find /Users/*/Desktop -name x",
         // Clustered short flags request recursion just as `-r` does.
@@ -408,6 +412,8 @@ fn path_guard_approves_scoped_searches_and_specific_external_files() {
         // The first non-flag grep-family operand is a regex pattern, not a
         // traversal root, and `find` expressions carry values not paths.
         bash("rg '/Users' tools/boss"),
+        bash("rg -A 3 '/Users' tools/boss"),
+        bash("rg --glob '*.rs' '/System' tools"),
         bash("find tools -name '*.rs' -newer /Users"),
         bash(&format!("rg needle {}", scoped.display())),
         // A cargo/bazel cache under the home directory: a real root, but a

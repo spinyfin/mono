@@ -1359,10 +1359,10 @@ SHELL_OPERATORS = frozenset((";", "&&", "||", "|", "&"))
 
 
 def command_segments(tokens):
-    """Shell command segments, with trailing operators removed defensively."""
+    """Shell command segments, with grouping and trailing operators stripped."""
     segment = []
     for token in tokens:
-        token = token.rstrip(";&|")
+        token = token.rstrip(";&|").lstrip("(").rstrip(")")
         if not token or token in SHELL_OPERATORS:
             if segment:
                 yield segment
@@ -1373,18 +1373,49 @@ def command_segments(tokens):
         yield segment
 
 
+# Grep-family flags whose next argument is a value, not a path or the pattern.
+# Consumed so `rg -A 3 '/Users' tools` does not treat `3` as the pattern.
+GREP_VALUE_FLAGS = frozenset((
+    "-e", "--regexp",
+    "-f", "--file",
+    "-g", "--glob",
+    "-t", "--type",
+    "-A", "-B", "-C",
+    "-m",
+    "--max-depth",
+    "--iglob",
+))
+
+
 def grep_roots(operands):
     """Traversal roots for grep-family commands after their regex pattern."""
-    non_flags = [token for token in operands if not token.startswith("-")]
+    non_flags = []
+    skip_next = False
+    for token in operands:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in GREP_VALUE_FLAGS:
+            skip_next = True
+            continue
+        if token.startswith("-"):
+            # `--flag=value` is one token and needs no skip.
+            continue
+        non_flags.append(token)
     return non_flags[1:]
 
 
 def find_roots(operands):
     """`find` roots are its positional paths before its expression starts."""
     roots = []
+    collecting = False
     for token in operands:
+        # POSIX `-H`/`-L`/`-P` (and `--`) legally precede the path operands.
+        if not collecting and token in ("-H", "-L", "-P", "--"):
+            continue
         if token.startswith("-"):
             break
+        collecting = True
         roots.append(token)
     return roots
 
@@ -1422,6 +1453,8 @@ def bash_traversal_roots(tokens):
         name = os.path.basename(segment[0])
         operands = segment[1:]
         if name == "cd" and operands:
+            # A `cd` is relevant only when it precedes a recursive walk;
+            # `cd /; echo ok` is not one.
             cd_roots.append(operands[0])
             continue
         if name == "mdfind":
@@ -1455,10 +1488,8 @@ def bash_traversal_roots(tokens):
             roots.extend(archive_roots(name, operands))
         else:
             roots.extend(token for token in operands if not token.startswith("-"))
-    # A `cd` is relevant only when it precedes a recursive walk; `cd /; echo
-    # ok` is not one. Bash receives globs before the shell expands them in the
-    # hook payload. Judge their literal prefix so `/Users/*/Desktop` cannot
-    # hide `/Users`.
+    # Bash receives globs before the shell expands them in the hook payload.
+    # Judge their literal prefix so `/Users/*/Desktop` cannot hide `/Users`.
     return [literal_prefix(root) or root for root in roots]
 
 
