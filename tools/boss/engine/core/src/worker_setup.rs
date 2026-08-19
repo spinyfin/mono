@@ -1138,6 +1138,28 @@ const CHECKLEFT_PUSH_GUARD_SCRIPT_NAME: &str = "boss-checkleft-push-guard.py";
 /// every `apply_patch` fell through the `tool == "Bash"` branch and was
 /// approved unread (evidence:
 /// `tools/boss/docs/investigations/codex-pretooluse-guard-coverage-2026-07-29.md`).
+///
+/// # Second boundary: no machine-wide recursive walks
+///
+/// The script also refuses to *start* a recursive directory walk rooted at
+/// the whole machine — `/`, `/Users` or a user home, `/Volumes` or a mounted
+/// volume, `/System`, `/Library`, `/private`, `/var`, and the `/net` and
+/// `/home` autofs maps (descending those mounts a network volume on demand).
+///
+/// This is a different hazard from the data dir, and it is not hypothetical:
+/// a worker's `claude` process walked `/` and logged 1970 kernel sandbox
+/// denials in a single run, reading into `~/Desktop`, `~/Documents`,
+/// `~/Downloads`, `~/Music`, `~/Pictures`, `~/Library` and **three other
+/// users' home directories** on the same Mac. Because every worker process
+/// inherits Boss.app's TCC identity, each such walk also raises macOS privacy
+/// prompts attributed to Boss. Evidence and full method:
+/// `tools/boss/docs/investigations/worker-filesystem-traversal-tcc-prompts-2026-08-19.md`.
+///
+/// Only the **root of a recursive walk** is judged — a `find`/`rg`/`du`-shaped
+/// command, or a `Glob`/`Grep` tool call, whose root resolves to one of those
+/// directories. Reading one specific file outside the workspace
+/// (`~/.gitconfig`, a bazel cache entry) is deliberately untouched: the defect
+/// is the breadth of the traversal, not the fact that a path is external.
 const PATH_GUARD_SCRIPT: &str = r#"#!/usr/bin/env python3
 """Deterministic Boss data-directory access gate (Claude Code PreToolUse hook).
 
@@ -1159,7 +1181,13 @@ Bash, and Codex's apply_patch -- fail CLOSED: an unreadable payload for those
 is blocked, because the guard then cannot tell whether the call targets the
 data directory. A payload that is not JSON, or not a JSON object, fails closed
 too: the gate cannot read the tool name from it, so it cannot claim to have
-nothing to say. The positive prefix match is the only path-based block.
+nothing to say.
+
+A second, independent boundary blocks any tool call that would *start* a
+recursive directory walk rooted at the whole machine -- /, /Users or a user
+home, /Volumes or a mounted volume, /System, /Library, /private, /var, and the
+/net and /home autofs maps. Only the root of a recursive walk is judged, so an
+ordinary read of one specific file outside the workspace is untouched.
 """
 import json
 import os
@@ -1212,12 +1240,173 @@ RECOVERY = (
     "gate."
 )
 
+# -- Broad-traversal boundary ------------------------------------------------
+#
+# Roots whose subtree spans the operator's whole machine. A recursive walk
+# rooted at one of these is never what a Boss worker needs: worker file access
+# belongs in the leased workspace, the cube workspace/repo directories, and
+# specific files a task actually names.
+STATIC_BROAD_ROOTS = frozenset((
+    "/",
+    "/Users",
+    "/Volumes",
+    "/System",
+    "/Library",
+    "/private",
+    "/var",
+    # autofs maps -- descending these mounts a network volume on demand.
+    "/net",
+    "/home",
+))
+
+# Direct children of these are individual user homes / mounted volumes, also
+# broader than any task root. Matched structurally so the guard never has to
+# list (and therefore read) the directory itself.
+BROAD_PARENTS = frozenset(("/Users", "/Volumes"))
+
+# Programs that descend every directory handed to them.
+ALWAYS_RECURSIVE = frozenset((
+    "find", "rg", "ripgrep", "ag", "ack", "fd", "fdfind",
+    "tree", "du", "ncdu", "mdfind", "locate",
+))
+
+# Programs that descend only when asked, keyed to the short flags that ask.
+RECURSIVE_WITH_FLAG = {
+    "grep": ("r", "R"),
+    "ls": ("R",),
+    "cp": ("r", "R"),
+    "rsync": ("r", "a"),
+}
+
+# Long-form spellings of the same request.
+RECURSIVE_LONG_FLAGS = frozenset((
+    "--recursive",
+    "--dereference-recursive",
+    "--archive",
+))
+
+TRAVERSAL_RECOVERY = (
+    "Blocked: this tool call starts a recursive directory walk rooted at %s, "
+    "which spans the operator's whole machine rather than the work. A Boss "
+    "worker reads inside its leased workspace, the cube workspace/repo "
+    "directories, and specific files a task names -- not the operator's home "
+    "directory, other users' home directories, mounted volumes, or /. A walk "
+    "that wide also reads private files belonging to other people on a shared "
+    "Mac, and raises macOS privacy (TCC) prompts attributed to Boss for "
+    "Desktop, Documents, Downloads, Photos and network volumes. Re-run the "
+    "search rooted at the directory you actually need -- the workspace root, "
+    "or a named subdirectory under it. If you need one specific file outside "
+    "the workspace, read that file directly instead of walking a tree to find "
+    "it. Do not work around this gate."
+)
+
+
+# macOS firmlink. The data volume is mounted at /System/Volumes/Data and
+# realpath() routinely resolves user-visible paths through it -- /home comes
+# back as /System/Volumes/Data/home, /Users/x as /System/Volumes/Data/Users/x.
+# The prefix is stripped before judging breadth so the same root is recognised
+# in either spelling.
+DATA_VOLUME_PREFIX = "/System/Volumes/Data"
+
+
+def unfirmlinked(path):
+    """`path` with the macOS data-volume firmlink prefix removed."""
+    if path == DATA_VOLUME_PREFIX:
+        return os.sep
+    if path.startswith(DATA_VOLUME_PREFIX + os.sep):
+        return path[len(DATA_VOLUME_PREFIX):]
+    return path
+
+
+def is_broad_root(path):
+    """True when `path` roots a subtree that is out of scope for a worker."""
+    for candidate in (path, unfirmlinked(path)):
+        if candidate in STATIC_BROAD_ROOTS:
+            return True
+        parent, _, leaf = candidate.rpartition(os.sep)
+        if leaf and parent in BROAD_PARENTS:
+            return True
+    try:
+        if path == os.path.realpath(os.path.expanduser("~")):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def asks_for_recursion(token, short_flags):
+    """True when `token` is a flag asking this program to recurse."""
+    if token in RECURSIVE_LONG_FLAGS:
+        return True
+    if not token.startswith("-") or token.startswith("--"):
+        return False
+    # Short flags cluster: `grep -rn` requests recursion just as `-r` does.
+    return any(flag in token[1:] for flag in short_flags)
+
+
+def walks_a_tree(tokens):
+    """True when the command line runs a program that recurses into a tree."""
+    for index, token in enumerate(tokens):
+        name = os.path.basename(token)
+        if name in ALWAYS_RECURSIVE:
+            return True
+        short_flags = RECURSIVE_WITH_FLAG.get(name)
+        if short_flags and any(asks_for_recursion(t, short_flags) for t in tokens[index + 1:]):
+            return True
+    return False
+
+
+def literal_prefix(pattern):
+    """The leading path of a glob pattern, before its first metacharacter."""
+    cut = len(pattern)
+    for meta in ("*", "?", "["):
+        found = pattern.find(meta)
+        if found != -1:
+            cut = min(cut, found)
+    return pattern[:cut]
+
+
+def traversal_roots(tool, tool_input, tokens):
+    """Candidate roots for a recursive walk this tool call would start.
+
+    Only the *root of a recursive walk* is judged -- an ordinary read of one
+    specific file outside the workspace is none of this boundary's business.
+    """
+    roots = []
+    if tool in ("Glob", "Grep", "Search"):
+        path = tool_input.get("path")
+        if isinstance(path, str) and path:
+            roots.append(path)
+        for key in ("pattern", "glob"):
+            value = tool_input.get(key)
+            if isinstance(value, str) and value.startswith("/"):
+                prefix = literal_prefix(value)
+                if prefix:
+                    roots.append(prefix)
+    elif tokens and walks_a_tree(tokens):
+        # Every token is considered rather than only those following the
+        # program name: a pipeline (`cd / && find . -name x`) puts the root
+        # somewhere else on the same line, and over-considering a token that
+        # is not a path is harmless (it will not resolve to a broad root).
+        roots.extend(tokens)
+    return roots
+
+
+def expanded_path(path, cwd):
+    """Absolute path with ~ and $VAR expanded, but symlinks left intact.
+
+    The pre-realpath spelling matters for the traversal boundary: on macOS an
+    autofs map such as /home realpath()s to a path that no longer looks like
+    the root the caller named.
+    """
+    value = os.path.expanduser(os.path.expandvars(path))
+    if not os.path.isabs(value):
+        value = os.path.join(cwd, value)
+    return os.path.normpath(value)
+
 
 def canonical(path, cwd):
-    expanded = os.path.expanduser(os.path.expandvars(path))
-    if not os.path.isabs(expanded):
-        expanded = os.path.join(cwd, expanded)
-    return os.path.realpath(expanded)
+    return os.path.realpath(expanded_path(path, cwd))
 
 
 def is_inside(child, parent):
@@ -1267,6 +1456,7 @@ def main():
             candidates.append(value)
 
     raw_command = ""
+    tokens = []
     if tool == "Bash":
         command = tool_input.get("command")
         if not isinstance(command, str):
@@ -1295,6 +1485,20 @@ def main():
                 emit("block", RECOVERY)
         except Exception:
             continue
+
+    # Second, independent boundary: refuse to *start* a recursive walk of the
+    # machine. A traversal rooted at /, at a home directory, or at a volume
+    # root reads the operator's private files (and, on a shared Mac, other
+    # people's), and each one raises macOS privacy prompts attributed to Boss.
+    # Evidence: tools/boss/docs/investigations/worker-filesystem-traversal-tcc-prompts-2026-08-19.md
+    for root in traversal_roots(tool, tool_input, tokens):
+        try:
+            forms = (canonical(root, cwd), expanded_path(root, cwd))
+        except Exception:
+            continue
+        for form in forms:
+            if is_broad_root(form):
+                emit("block", TRAVERSAL_RECOVERY % form)
 
     # Substring belt for Bash: catches $VAR / ~ indirection and backslash-
     # escaped spaces that tokenisation + canonicalisation miss (e.g.
