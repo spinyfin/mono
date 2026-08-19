@@ -244,19 +244,22 @@ async fn probe_command_on_path(transport: &impl RemoteRunner, binary: &str) -> R
     Ok(out.success() && !out.stdout.trim().is_empty())
 }
 
-/// Local equivalent of [`probe_command_on_path`]. The probe uses the pane
-/// launcher's sanitized PATH rather than the process opening state.db, so a
-/// CLI invocation cannot rewrite capabilities using its ambient environment.
+/// Local equivalent of [`probe_command_on_path`]. The probe starts the same
+/// login shell and sanitized PATH seed as a worker pane, so shell-profile PATH
+/// additions resolve identically while a CLI invocation cannot rewrite
+/// capabilities through its ambient environment.
 fn local_command_on_path(binary: &str) -> bool {
+    local_command_on_path_with(&crate::spawn_flow::WorkerPaneLaunch::from_environment(), binary)
+}
+
+fn local_command_on_path_with(pane_launch: &crate::spawn_flow::WorkerPaneLaunch, binary: &str) -> bool {
     // Reject anything that would break out of the `command -v` form. Driver
     // binaries are registry-owned static strings today; defend anyway.
     if binary.is_empty() || binary.chars().any(|c| c.is_whitespace() || c == '\'' || c == '"') {
         return false;
     }
-    let status = std::process::Command::new("sh")
-        .env("PATH", crate::spawn_flow::WORKER_SANITIZED_PATH)
-        .args(["-c", &format!("command -v {binary} >/dev/null 2>&1")])
-        .status();
+    let script = format!("command -v {binary} >/dev/null 2>&1");
+    let status = pane_launch.login_shell_command(&script).status();
     matches!(status, Ok(s) if s.success())
 }
 
@@ -264,6 +267,8 @@ fn local_command_on_path(binary: &str) -> bool {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
 
     struct FakeRunner {
@@ -460,6 +465,46 @@ mod tests {
     fn local_driver_probe_does_not_fabricate_missing_drivers() {
         let caps = discover_local_driver_capabilities_with(|_| false);
         assert_eq!(caps, vec![DRIVERS_PROBED_CAPABILITY.to_owned()]);
+    }
+
+    #[test]
+    fn local_driver_probe_uses_the_pane_login_shell_for_profile_only_binaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile_bin = temp.path().join("profile-bin");
+        fs::create_dir(&profile_bin).unwrap();
+        let driver = profile_bin.join("profile-only-driver");
+        fs::write(&driver, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&driver, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // This test shell models the worker pane's login-shell phase: it
+        // receives only the launcher seed, then a profile prepends the driver
+        // directory before evaluating the requested command. It is a script
+        // rather than zsh-specific setup so the regression is portable to the
+        // Linux Bazel test environment too.
+        let login_shell = temp.path().join("profile-login-shell");
+        fs::write(
+            &login_shell,
+            format!(
+                "#!/bin/sh\n\
+                 test \"$1\" = -l || exit 41\n\
+                 test \"$PATH\" = \"{}\" || exit 42\n\
+                 PATH=\"{}:$PATH\"\n\
+                 export PATH\n\
+                 shift\n\
+                 exec /bin/sh \"$@\"\n",
+                crate::spawn_flow::WORKER_SANITIZED_PATH,
+                profile_bin.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&login_shell, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let pane_launch = crate::spawn_flow::WorkerPaneLaunch::with_login_shell(login_shell);
+        assert_eq!(pane_launch.path_env().value, crate::spawn_flow::WORKER_SANITIZED_PATH);
+        assert!(
+            local_command_on_path_with(&pane_launch, "profile-only-driver"),
+            "the probe must resolve binaries added by the pane login shell's profile"
+        );
     }
 
     #[tokio::test]

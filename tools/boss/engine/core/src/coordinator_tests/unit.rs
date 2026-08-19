@@ -46,6 +46,19 @@ fn summarize_ineligibility_names_driver_only_when_every_host_lacks_it() {
     assert_eq!(summary, "local: missing driver codex; remote: no free slots");
 }
 
+#[test]
+fn summarize_ineligibility_directs_an_unprobed_remote_host_to_discovery() {
+    let report = vec![ineligible_host(
+        "anaplian",
+        vec![IneligibilityReason::DriverProbeNotRun],
+    )];
+
+    assert_eq!(
+        summarize_ineligibility(&report, Some("claude")),
+        "anaplian: driver discovery has not run; run `bossctl hosts probe anaplian`"
+    );
+}
+
 /// Reproduces the live incident (flunge, PR brianduff/flunge#906,
 /// 2026-07-16): rung 1's `conflicted_files` come straight from `jj
 /// resolve --list`, whose entries carry a trailing conflict-type

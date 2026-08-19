@@ -2265,6 +2265,13 @@ fn summarize_ineligibility(report: &[host_scheduling::Eligibility], required_dri
                     R::Disabled => "disabled".to_owned(),
                     R::NoFreeSlots => "no free slots".to_owned(),
                     R::NotSelectedHost => "not the requested/pinned host".to_owned(),
+                    R::DriverProbeNotRun => {
+                        if h.host_id == "local" {
+                            "driver discovery has not run; restart Boss".to_owned()
+                        } else {
+                            format!("driver discovery has not run; run `bossctl hosts probe {}`", h.host_id)
+                        }
+                    }
                     R::MissingCapabilities(missing) => {
                         // Prefer a driver-specific phrase when the only
                         // missing cap is the required driver so the hold
@@ -2288,6 +2295,7 @@ fn summarize_ineligibility(report: &[host_scheduling::Eligibility], required_dri
     if let Some(driver) = required_driver {
         let all_miss_driver = report.iter().all(|h| {
             !h.eligible
+                && !h.reasons.iter().any(|r| matches!(r, R::DriverProbeNotRun))
                 && h.reasons.iter().any(|r| match r {
                     R::MissingCapabilities(missing) => missing
                         .iter()
