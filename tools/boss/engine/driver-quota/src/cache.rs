@@ -138,7 +138,8 @@ impl QuotaCache {
     /// `refresh` marks an explicit refresh request from the UI. See the
     /// module doc for exactly what each flag combination does. The snapshot
     /// mutex is not held while probes run; concurrent callers share one
-    /// cycle via the cycle lock.
+    /// cycle via the cycle lock. The RPC handler uses [`Self::lookup`] to
+    /// reply immediately, then this method on a background task.
     pub async fn snapshot(&self, refresh: bool) -> DriverQuotaSnapshot {
         {
             let mut state = self.locks.state.lock().await;
@@ -160,13 +161,6 @@ impl QuotaCache {
         let mut state = self.locks.state.lock().await;
         state.snapshot = new_snapshot;
         state.snapshot.clone()
-    }
-
-    /// Return whatever is cached without ever probing. Used by the RPC
-    /// handler to reply before a cycle starts, so Preferences never waits
-    /// on a fetch.
-    pub async fn cached(&self) -> DriverQuotaSnapshot {
-        self.locks.state.lock().await.snapshot.clone()
     }
 
     /// Run every probe concurrently under its own deadline.
@@ -413,16 +407,6 @@ mod tests {
         assert!(!warm.should_probe);
         assert_eq!(warm.snapshot.entries.len(), 1);
         assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn cached_never_probes() {
-        let probe = CountingProbe::new("claude", 7.0);
-        let cache = QuotaCache::new(vec![probe.clone()]);
-        let snapshot = cache.cached().await;
-        assert!(snapshot.entries.is_empty());
-        assert_eq!(snapshot.generated_at_epoch_s, None);
-        assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
