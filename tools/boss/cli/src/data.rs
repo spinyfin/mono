@@ -1963,7 +1963,14 @@ pub(crate) fn format_dependency_edge_line(edge: &DependencyEdge, mark_incomplete
     } else {
         status_vocab::to_ui(&edge.status)
     };
-    format!("    {id:<32}  {status:<10}{name}{suffix}", id = edge.id,)
+    let mut line = format!("    {id:<32}  {status:<10}{name}{suffix}", id = edge.id,);
+    if edge.status == "archived" {
+        let mechanism = edge.archived_by.as_deref().unwrap_or("unknown");
+        let timestamp = edge.archived_at.as_deref().unwrap_or("unknown time");
+        let reason = edge.archived_reason.as_deref().unwrap_or("no reason recorded");
+        line.push_str(&format!("\n      archived: {mechanism} at {timestamp} — {reason}"));
+    }
+    line
 }
 
 /// Whether `status` counts as "this prereq is no longer gating its

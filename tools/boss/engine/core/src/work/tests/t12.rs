@@ -22,6 +22,21 @@ fn mark_chore_pr_merged_surfaces_moot_revision_archival() {
 
     let rem_id = "rem_fake_for_surfaced_test";
     let rev_id = insert_ci_fix_revision_row(&db, &product_id, &parent_id, rem_id);
+    let dependent = create_test_chore_manual(&db, product_id.clone(), "Blocked dependent");
+    db.add_dependency(AddDependencyInput {
+        dependent: dependent.id.clone(),
+        prerequisite: rev_id.clone(),
+        relation: None,
+    })
+    .unwrap();
+    db.update_work_item(
+        &dependent.id,
+        WorkItemPatch {
+            status: Some("blocked".to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
 
     db.mark_chore_pr_merged(&parent_id, pr_url).unwrap();
 
@@ -36,7 +51,39 @@ fn mark_chore_pr_merged_surfaces_moot_revision_archival() {
         reason.contains("parent PR merged"),
         "archived_reason must explain the parent-PR-merged trigger: {reason}"
     );
+    assert_eq!(task.archived_by.as_deref(), Some(ARCHIVE_MECHANISM_PARENT_CLOSE_SWEEP));
+    assert!(task.archived_at.as_deref().is_some_and(|at| !at.is_empty()));
+    assert_eq!(task.last_status_actor, "engine");
     drop(conn);
+
+    let shown = match db.get_work_item(&rev_id).unwrap() {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task,
+        other => panic!("expected archived revision task, got {other:?}"),
+    };
+    assert_eq!(shown.archived_reason.as_deref(), Some(reason));
+    assert_eq!(shown.archived_by.as_deref(), Some(ARCHIVE_MECHANISM_PARENT_CLOSE_SWEEP));
+    assert!(shown.archived_at.is_some());
+
+    db.list_dependencies_detailed(ListDependenciesInput {
+        work_item: rev_id.clone(),
+        direction: Some(DependencyDirection::Both),
+    })
+    .expect("archived task diagnostics must resolve its dependency section");
+
+    let dependencies = db
+        .list_dependencies_detailed(ListDependenciesInput {
+            work_item: dependent.id,
+            direction: Some(DependencyDirection::Prereqs),
+        })
+        .unwrap();
+    let prerequisite = dependencies.prerequisites.first().expect("archived prerequisite");
+    assert_eq!(prerequisite.status, "archived");
+    assert_eq!(prerequisite.archived_reason.as_deref(), Some(reason));
+    assert_eq!(
+        prerequisite.archived_by.as_deref(),
+        Some(ARCHIVE_MECHANISM_PARENT_CLOSE_SWEEP)
+    );
+    assert!(prerequisite.archived_at.is_some());
 
     let attentions = db.list_attention_items_for_work_item(&rev_id).unwrap();
     assert_eq!(
@@ -67,6 +114,15 @@ fn request_execution_refuses_archived_work_item() {
         },
     )
     .unwrap();
+
+    let archived = match db.get_work_item(&chore.id).unwrap() {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task,
+        other => panic!("expected archived chore, got {other:?}"),
+    };
+    assert_eq!(archived.archived_by.as_deref(), Some("manual_status_change"));
+    assert!(archived.archived_at.is_some());
+    assert!(archived.archived_reason.is_none());
+    assert_eq!(archived.last_status_actor, LAST_STATUS_ACTOR_HUMAN);
 
     let err = db
         .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())

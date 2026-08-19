@@ -9,13 +9,14 @@ use super::{
     TaskListCriteria, TaskPriority, TaskStatusArg, apply_project_list_filters, apply_task_list_filters,
     classify_bind_pr, classify_lint_finding, compile_schedule, decide_open_design_action, default_comment_author,
     dependency_status_is_satisfied, ensure_explicit_product_matches, expect_leaf_work_item,
-    format_project_design_doc_line, format_repo_line, is_typed_work_item_id, lint_summary_line,
-    parse_attention_group_selector, parse_automation_selector, pick_by_index, resolve_comments_artifact,
-    split_shake_report, status_vocab, task_json_with_runtime, validate_github_pr_url, with_display_status,
+    format_dependency_edge_line, format_project_design_doc_line, format_repo_line, is_typed_work_item_id,
+    lint_summary_line, parse_attention_group_selector, parse_automation_selector, pick_by_index,
+    resolve_comments_artifact, split_shake_report, status_vocab, task_json_with_runtime, validate_github_pr_url,
+    with_display_status,
 };
 use boss_protocol::{
-    Product, Project, ProjectDesignDocState, ProjectStatus, ResolvedDesignDoc, ResolvedDesignDocKind, Task, TaskKind,
-    TaskRuntime, TaskStatus, WorkItem,
+    DependencyEdge, Product, Project, ProjectDesignDocState, ProjectStatus, ResolvedDesignDoc, ResolvedDesignDocKind,
+    Task, TaskKind, TaskRuntime, TaskStatus, WorkItem,
 };
 
 #[test]
@@ -38,6 +39,27 @@ fn task_status_arg_maps_board_names_to_stored() {
     assert_eq!(TaskStatusArg::Done.as_str(), "done");
     assert_eq!(TaskStatusArg::Blocked.as_str(), "blocked");
     assert_eq!(TaskStatusArg::Archived.as_str(), "archived");
+}
+
+#[test]
+fn archived_dependency_edge_renders_its_provenance() {
+    let line = format_dependency_edge_line(
+        &DependencyEdge {
+            id: "task_archived".to_owned(),
+            kind: "task".to_owned(),
+            name: "Fix CI".to_owned(),
+            relation: "blocks".to_owned(),
+            status: "archived".to_owned(),
+            archived_by: Some("ci_watch_supersession".to_owned()),
+            archived_at: Some("1787115212".to_owned()),
+            archived_reason: Some("superseded by task_new after a fresh commit".to_owned()),
+        },
+        true,
+    );
+
+    assert!(line.contains("ci_watch_supersession"), "line: {line}");
+    assert!(line.contains("1787115212"), "line: {line}");
+    assert!(line.contains("superseded by task_new"), "line: {line}");
 }
 
 #[test]

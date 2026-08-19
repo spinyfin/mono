@@ -53,13 +53,25 @@ pub enum DependencyDirection {
 /// `kind` is `task`, `chore`, or `project` — derived from the id
 /// prefix and the row's `tasks.kind`. UI surfaces use it to choose
 /// the right icon / link.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct DependencyEdge {
     pub id: String,
     pub kind: String,
     pub name: String,
     pub relation: String,
     pub status: String,
+    /// Stable archival mechanism for an archived peer. Present so a blocked
+    /// row's dependency listing can explain an archived prerequisite without
+    /// requiring a separate lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_by: Option<String>,
+    /// Time the archived peer entered its archived status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<String>,
+    /// Actionable condition that caused an archived peer's transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_reason: Option<String>,
 }
 
 /// Predicate applied to `boss <kind> list` requests to surface only

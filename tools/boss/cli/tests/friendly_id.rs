@@ -14,9 +14,13 @@
 
 use anyhow::{Result, anyhow};
 use boss_client::BossClient;
-use boss_protocol::{CreateExecutionInput, CreateRunInput, ExecutionKind, ExecutionStatus};
+use boss_engine::work::{PrOpenState, StaticPrStateChecker};
+use boss_protocol::{
+    AddDependencyInput, CreateExecutionInput, CreateRevisionInput, CreateRunInput, ExecutionKind, ExecutionStatus,
+    WorkItemPatch,
+};
 
-use common::{run_boss, run_boss_expect_failure};
+use common::{run_boss, run_boss_expect_failure, run_boss_human};
 use harness::{TestEngine, create_chore, create_product, create_project, create_task};
 
 // ── task show — all selector forms ──────────────────────────────────────────
@@ -99,6 +103,94 @@ async fn task_show_primary_id_still_works() -> Result<()> {
 
     let value = run_boss(engine.socket_str(), &["task", "show", &chore.id])?;
     assert_eq!(value["id"].as_str(), Some(chore.id.as_str()));
+    Ok(())
+}
+
+/// An archived-and-tombstoned revision remains addressable by its canonical
+/// id so an investigator can read the persisted archival provenance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_show_primary_id_surfaces_archived_revision_provenance() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let product = create_product(&mut client, "Boss").await?;
+    let parent = create_chore(&mut client, &product.id, "Merge parent").await?;
+    let dependent = create_chore(&mut client, &product.id, "Blocked dependent").await?;
+    run_boss(
+        engine.socket_str(),
+        &["task", "bind-pr", &parent.id, "https://github.com/acme/repo/pull/1"],
+    )?;
+
+    let db = engine.db()?;
+    let revision = db.create_revision(
+        CreateRevisionInput::builder()
+            .parent_task_id(parent.id.clone())
+            .description("Archived because its parent merged")
+            .build(),
+        &StaticPrStateChecker(PrOpenState::Open),
+    )?;
+    db.update_work_item(
+        &revision.id,
+        WorkItemPatch {
+            status: Some("active".to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )?;
+    db.add_dependency(AddDependencyInput {
+        dependent: dependent.id.clone(),
+        prerequisite: revision.id.clone(),
+        relation: None,
+    })?;
+    db.mark_chore_pr_merged(&parent.id, "https://github.com/acme/repo/pull/1")?;
+    // Reproduce the diagnostic state of a stale blocked row without changing
+    // dependency-gate behavior: the show surface must retain the archived
+    // prerequisite's provenance even if a separate reconciler is responsible
+    // for resolving the stale block.
+    db.update_work_item(
+        &dependent.id,
+        WorkItemPatch {
+            status: Some("blocked".to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )?;
+
+    let value = run_boss(engine.socket_str(), &["task", "show", &revision.id])?;
+    assert_eq!(value["id"].as_str(), Some(revision.id.as_str()));
+    assert_eq!(value["status"].as_str(), Some("archived"));
+    assert_eq!(value["archived_by"].as_str(), Some("revision_parent_close_sweep"));
+    assert!(
+        value["archived_at"].as_str().is_some_and(|at| !at.is_empty()),
+        "archived_at missing from task show output: {value}"
+    );
+    assert!(
+        value["archived_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("superseded by chore task_")),
+        "archived_reason must identify the superseding chore: {value}"
+    );
+    let human = run_boss_human(engine.socket_str(), &["task", "show", &revision.id])?;
+    assert!(
+        human.contains("Archived by: revision_parent_close_sweep"),
+        "output: {human}"
+    );
+    assert!(human.contains("Archived actor: engine"), "output: {human}");
+    assert!(human.contains("Archived at:"), "output: {human}");
+    assert!(human.contains("Archived reason:"), "output: {human}");
+
+    let blocked = run_boss(engine.socket_str(), &["task", "show", &dependent.id])?;
+    assert_eq!(blocked["status"].as_str(), Some("blocked"));
+    let prerequisite = &blocked["dependencies"]["prerequisites"][0];
+    assert_eq!(prerequisite["id"].as_str(), Some(revision.id.as_str()));
+    assert_eq!(prerequisite["status"].as_str(), Some("archived"));
+    assert_eq!(
+        prerequisite["archived_by"].as_str(),
+        Some("revision_parent_close_sweep")
+    );
+    assert!(
+        prerequisite["archived_reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
+        "archived prerequisite reason missing from dependency JSON: {blocked}"
+    );
     Ok(())
 }
 

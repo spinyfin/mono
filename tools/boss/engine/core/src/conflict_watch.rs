@@ -39,7 +39,10 @@ use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::merge_poller::{PrLifecycleProbe, pr_labels_opt_out, stored_pr_number};
 #[cfg(test)]
 use crate::work::TaskStatus;
-use crate::work::{ConflictResolutionInsertInput, PendingMergeCheck, PrStateChecker, WorkDb};
+use crate::work::{
+    ARCHIVE_MECHANISM_CONFLICT_WATCH_SUPERSESSION, ArchiveProvenance, ConflictResolutionInsertInput, PendingMergeCheck,
+    PrStateChecker, WorkDb,
+};
 
 /// Decide whether the unified `auto_pr_maintenance_enabled` opt-out
 /// (per-product flag or per-PR label) suppresses this conflict-watch
@@ -1078,7 +1081,11 @@ fn close_superseded_moot_revision(work_db: &WorkDb, work_item_id: &str, revision
     let Some(revision_task_id) = revision_task_id else {
         return;
     };
-    match work_db.close_moot_revision_task(revision_task_id, reason) {
+    let archival_reason = format!("{reason} (work_item_id={work_item_id}, revision_task_id={revision_task_id})");
+    match work_db.close_moot_revision_task(
+        revision_task_id,
+        ArchiveProvenance::new(ARCHIVE_MECHANISM_CONFLICT_WATCH_SUPERSESSION, &archival_reason),
+    ) {
         Ok(Some(_)) => {
             tracing::info!(
                 work_item_id,
@@ -1514,7 +1521,14 @@ pub async fn on_resolved(
                     if let Some(revision_task_id) = succeeded.revision_task_id.as_deref() {
                         match work_db.close_moot_revision_task(
                             revision_task_id,
-                            "merge conflict resolved before parent PR merged; revision moot",
+                            ArchiveProvenance::new(
+                                ARCHIVE_MECHANISM_CONFLICT_WATCH_SUPERSESSION,
+                                &format!(
+                                    "merge conflict resolved before parent PR merged; revision moot \
+                                     (work_item_id={}, revision_task_id={revision_task_id})",
+                                    candidate.work_item_id,
+                                ),
+                            ),
                         ) {
                             Ok(Some(_)) => {
                                 tracing::info!(

@@ -716,7 +716,15 @@ pub(crate) fn reconcile_revision_execution(
         let now = now_string();
         // Drop any not-yet-live execution row before archiving the task.
         abandon_pending_executions(pending, conn, &task.id, &now)?;
-        resolve_revision_on_parent_close(pending, conn, task, &chain_root_task.id, &now, "reconcile_revision")?;
+        resolve_revision_on_parent_close(
+            pending,
+            conn,
+            task,
+            &chain_root_task.id,
+            &now,
+            "reconcile_revision",
+            ARCHIVE_MECHANISM_PARENT_CLOSE_DISPATCH_RECONCILIATION,
+        )?;
         return Ok(());
     }
 
@@ -2166,11 +2174,19 @@ mod tests {
         }
 
         let conn = db.connect().unwrap();
-        let (status, deleted_at): (String, Option<String>) = conn
+        let (status, deleted_at, archived_by, archived_at, archived_reason, actor): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+        ) = conn
             .query_row(
-                "SELECT status, deleted_at FROM tasks WHERE id = ?1",
+                "SELECT status, deleted_at, archived_by, archived_at, archived_reason, last_status_actor
+                 FROM tasks WHERE id = ?1",
                 params![revision_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )
             .unwrap();
         assert_eq!(
@@ -2182,6 +2198,13 @@ mod tests {
             "dispatch-time catch-up archive must also tombstone the row, matching \
              block_pending_revisions_on_parent_close"
         );
+        assert_eq!(
+            archived_by.as_deref(),
+            Some(ARCHIVE_MECHANISM_PARENT_CLOSE_DISPATCH_RECONCILIATION)
+        );
+        assert!(archived_at.as_deref().is_some_and(|at| !at.is_empty()));
+        assert!(archived_reason.as_deref().is_some_and(|reason| !reason.is_empty()));
+        assert_eq!(actor, "engine");
     }
 
     /// A revision that slipped through with `merge_queue_state = 'queued'`

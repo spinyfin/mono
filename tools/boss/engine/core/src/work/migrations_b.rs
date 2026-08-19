@@ -2016,6 +2016,41 @@ pub(crate) fn migrate_tasks_archived_reason(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Add the remaining task archival provenance columns. `archived_reason`
+/// shipped first for revision-chain reconciliation, but a reason on its own
+/// cannot identify the archive mechanism or the transition time. These
+/// fields deliberately remain `NULL` for pre-existing rows: guessing a
+/// mechanism or timestamp would turn a historical unknown into false
+/// diagnostic evidence.
+pub(crate) fn migrate_tasks_archival_provenance(conn: &Connection) -> Result<()> {
+    for (column, ddl) in [
+        ("archived_by", "ALTER TABLE tasks ADD COLUMN archived_by TEXT"),
+        ("archived_at", "ALTER TABLE tasks ADD COLUMN archived_at TEXT"),
+    ] {
+        if !table_has_column(conn, "tasks", column)? {
+            conn.execute(ddl, [])?;
+        }
+    }
+    Ok(())
+}
+
+/// Product deletion is an archive transition rather than a hard delete. Keep
+/// its operator attribution and status fact queryable, matching projects.
+pub(crate) fn migrate_products_status_provenance(conn: &Connection) -> Result<()> {
+    for (column, ddl) in [
+        (
+            "last_status_actor",
+            "ALTER TABLE products ADD COLUMN last_status_actor TEXT",
+        ),
+        ("status_basis", "ALTER TABLE products ADD COLUMN status_basis TEXT"),
+    ] {
+        if !table_has_column(conn, "products", column)? {
+            conn.execute(ddl, [])?;
+        }
+    }
+    Ok(())
+}
+
 /// Add `work_comments.revise_task_id` — Phase 2 task 2a of
 /// `comment-triggered-document-revisions.md` (unify buckets 1 & 3). Soft FK
 /// → `tasks.id`: the revision or chore that a `CommentsReviseDoc` batch

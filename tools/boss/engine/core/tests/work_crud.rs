@@ -131,6 +131,11 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
         .await?,
     )?;
     assert_eq!(archived_project.status, ProjectStatus::Archived);
+    assert_eq!(archived_project.last_status_actor, "human");
+    assert_eq!(
+        archived_project.status_basis.as_deref(),
+        Some("status transition requested by human: planned to archived")
+    );
 
     let archived_product = expect_product(
         update_work_item(
@@ -144,6 +149,11 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
         .await?,
     )?;
     assert_eq!(archived_product.status, "archived");
+    assert_eq!(archived_product.last_status_actor.as_deref(), Some("human"));
+    assert_eq!(
+        archived_product.status_basis.as_deref(),
+        Some("status transition requested by human: active to archived")
+    );
 
     Ok(())
 }

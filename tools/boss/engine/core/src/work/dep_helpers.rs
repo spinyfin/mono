@@ -232,7 +232,8 @@ pub(crate) fn typed_work_item_exists(conn: &Connection, id: &str) -> Result<bool
     match classify_id(id)? {
         ItemKind::Task => Ok(conn
             .query_row(
-                "SELECT 1 FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+                "SELECT 1 FROM tasks
+                 WHERE id = ?1 AND (deleted_at IS NULL OR status = 'archived')",
                 params![id],
                 |_| Ok(()),
             )
@@ -296,6 +297,9 @@ pub(crate) fn resolve_dependency_edge(conn: &Connection, peer_id: &str, relation
                 kind: "project".to_owned(),
                 name: project.name,
                 status: project.status.to_string(),
+                archived_by: None,
+                archived_at: None,
+                archived_reason: None,
             });
         }
     } else if peer_id.starts_with("task_")
@@ -311,6 +315,9 @@ pub(crate) fn resolve_dependency_edge(conn: &Connection, peer_id: &str, relation
             kind: kind.to_owned(),
             name: task.name,
             status: task.status.to_string(),
+            archived_by: task.archived_by,
+            archived_at: task.archived_at,
+            archived_reason: task.archived_reason,
         });
     }
     Ok(DependencyEdge {
@@ -319,6 +326,9 @@ pub(crate) fn resolve_dependency_edge(conn: &Connection, peer_id: &str, relation
         kind: "unknown".to_owned(),
         name: String::new(),
         status: "missing".to_owned(),
+        archived_by: None,
+        archived_at: None,
+        archived_reason: None,
     })
 }
 

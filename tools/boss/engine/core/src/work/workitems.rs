@@ -666,7 +666,7 @@ impl WorkDb {
     /// `"boss"`.
     pub fn update_work_item_as_actor(&self, id: &str, patch: WorkItemPatch, actor: &str) -> Result<WorkItem> {
         match classify_id(id)? {
-            ItemKind::Product => self.update_product(id, patch),
+            ItemKind::Product => self.update_product(id, patch, actor),
             ItemKind::Project => self.update_project(id, patch, actor),
             ItemKind::Task => self.update_task(id, patch, actor),
             ItemKind::Comment => bail!("comment ids are not product/project/task work items: {id}"),
@@ -1082,7 +1082,11 @@ impl WorkDb {
                 .with_context(|| format!("unknown project: {id}")),
             ItemKind::Task => {
                 let mut task = query_task(&conn, id)?
-                    .filter(|task| task.deleted_at.is_none())
+                    // Engine-retired revisions are both archived and
+                    // tombstoned. Permit that one inspectable terminal state
+                    // through `task show <primary-id>` while preserving the
+                    // normal soft-delete boundary for every other row.
+                    .filter(|task| task.deleted_at.is_none() || task.status == TaskStatus::Archived)
                     .with_context(|| format!("unknown task: {id}"))?;
                 // Surface the per-task doc pointer on the single-item read
                 // path, mirroring get_work_tree's attach step — the
@@ -1325,7 +1329,7 @@ impl WorkDb {
         let conn = self.connect()?;
         if let Some(mut task) = conn
             .query_row(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, parent_task_id, origin_task_short_id, origin_pr_number, completed_at, archived_reason, dispatch_failed_reason, dispatch_failed_error, dispatch_failed_at, blocked_detail, deferred, tags, human_driven, completion_summary, effort_matched_rule, effort_reasons
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, parent_task_id, origin_task_short_id, origin_pr_number, completed_at, archived_by, archived_at, archived_reason, dispatch_failed_reason, dispatch_failed_error, dispatch_failed_at, blocked_detail, deferred, tags, human_driven, completion_summary, effort_matched_rule, effort_reasons
                  FROM tasks
                  WHERE product_id = ?1 AND short_id = ?2 AND deleted_at IS NULL",
                 params![product_id, short_id],
@@ -1864,7 +1868,9 @@ impl WorkDb {
         // Validate the work item exists by classifying its id and
         // looking it up. Surfaces a clear error rather than returning
         // an empty list for typos.
-        let _ = product_id_for_work_item(&conn, work_item_id)?;
+        // Dependency inspection is a diagnostic read path. Keep archived
+        // tombstones inspectable here without changing mutation validation.
+        let _ = product_id_for_work_item_including_deleted(&conn, work_item_id)?;
 
         let direction = input.direction.unwrap_or_default();
         let prerequisites = match direction {
@@ -1896,7 +1902,9 @@ impl WorkDb {
             bail!("work_item id is required");
         }
         let conn = self.connect()?;
-        let _ = product_id_for_work_item(&conn, work_item_id)?;
+        // Dependency inspection is a diagnostic read path. Keep archived
+        // tombstones inspectable here without changing mutation validation.
+        let _ = product_id_for_work_item_including_deleted(&conn, work_item_id)?;
 
         let direction = input.direction.unwrap_or_default();
         let prerequisites = match direction {

@@ -46,8 +46,9 @@ use crate::merge_poller::{
     OpenPrCiStatus, PrLifecycleProbe, PrLifecycleState, RequiredCheckFailure, pr_labels_opt_out, stored_pr_number,
 };
 use crate::work::{
-    CiRemediation, CiRemediationInsertInput, CreateExecutionInput, PendingMergeCheck, PrStateChecker,
-    StrandedCiRemediationAttempt, TaskStatus, WorkDb, WorkItem,
+    ARCHIVE_MECHANISM_CI_WATCH_SUPERSESSION, ArchiveProvenance, CiRemediation, CiRemediationInsertInput,
+    CreateExecutionInput, PendingMergeCheck, PrStateChecker, StrandedCiRemediationAttempt, TaskStatus, WorkDb,
+    WorkItem,
 };
 
 /// Pre-spawn classification (design §Q4 "pre-triage"): if every failure
@@ -2008,7 +2009,11 @@ fn close_superseded_moot_revision(work_db: &WorkDb, work_item_id: &str, revision
     let Some(revision_task_id) = revision_task_id else {
         return;
     };
-    match work_db.close_moot_revision_task(revision_task_id, reason) {
+    let archival_reason = format!("{reason} (work_item_id={work_item_id}, revision_task_id={revision_task_id})");
+    match work_db.close_moot_revision_task(
+        revision_task_id,
+        ArchiveProvenance::new(ARCHIVE_MECHANISM_CI_WATCH_SUPERSESSION, &archival_reason),
+    ) {
         Ok(Some(_)) => {
             tracing::info!(
                 work_item_id,

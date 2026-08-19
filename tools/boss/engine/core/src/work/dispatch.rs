@@ -953,7 +953,10 @@ impl WorkDb {
     pub fn list_executions(&self, work_item_id: Option<&str>) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
         if let Some(work_item_id) = work_item_id {
-            let _ = product_id_for_work_item(&conn, work_item_id)?;
+            // Execution history is diagnostic-only. An archived revision is
+            // tombstoned from active lists but must retain inspectable
+            // provenance and execution context through `task show`.
+            let _ = product_id_for_work_item_including_deleted(&conn, work_item_id)?;
             let mut stmt = conn.prepare(
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
