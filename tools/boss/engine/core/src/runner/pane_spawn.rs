@@ -378,6 +378,24 @@ pub(crate) fn path_prepend_clause(var: &str) -> String {
     format!("[ -n \"${var}\" ] && export PATH=\"${var}:$PATH\"; ")
 }
 
+/// First statement on every local worker pane's assembled command: marks
+/// the pane's already-running login shell as Darwin background priority
+/// (`PRIO_DARWIN_BG`, via `taskpolicy -b`), which every process it
+/// subsequently execs or forks — the driver CLI and every build/test tool
+/// call it runs — inherits. Applied with `-p $$` to the current shell
+/// rather than by wrapping a new process, since this line is *sourced*
+/// (`. .boss/initial-input.sh`) into the pane's existing login shell, not
+/// exec'd as a fresh one.
+///
+/// Workers are batch CPU/IO consumers competing with the coordinator's
+/// interactive pane for the same host's scheduler; this makes them yield
+/// under contention without touching the workers' own nice value (which
+/// would need `setpriority` per spawned tool-call subprocess to have the
+/// same reach) and without requiring root. Absolute path, matching this
+/// clause's care elsewhere about not depending on a PATH a login shell's
+/// own init scripts might still be rebuilding.
+const WORKER_BACKGROUND_PRIORITY_CLAUSE: &str = "/usr/bin/taskpolicy -b -p $$ >/dev/null 2>&1; ";
+
 /// macOS tty canonical-mode line cap (`MAX_CANON`,
 /// `/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/syslimits.h:89`).
 /// Past this many bytes in one canonical-mode pty input line — content plus
@@ -874,7 +892,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         }
         let env_prefix: String = spawn_plan.env.iter().map(render_env_directive).collect();
         let assembled_command = format!(
-            "{}{}{env_prefix}{}",
+            "{WORKER_BACKGROUND_PRIORITY_CLAUSE}{}{}{env_prefix}{}",
             path_prepend_clause("BOSS_BIN_DIR"),
             path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
             spawn_plan.command,
@@ -1481,21 +1499,25 @@ mod pane_spawn_tests {
             script.contains(".claude/initial-prompt.txt"),
             "expected the initial-input script to read from the prompt file, got: {script:?}",
         );
-        // The first shell line re-prepends BOSS_BIN_DIR to PATH (so the
-        // bundled `cube`/`boss` win over any `~/bin` repobin shim the
-        // login-shell init re-prepends), then the per-workspace launcher
-        // dir on top of that (so `boss` is pinned to an absolute path even
-        // in dev mode, where BOSS_BIN_DIR is unset and the clause is a
-        // no-op), then unsets the API key and invokes claude. See the
-        // comment at the construction site.
+        // The first shell line marks the pane background priority (so the
+        // worker's build/test tool calls yield to the coordinator's
+        // interactive pane under contention), then re-prepends BOSS_BIN_DIR
+        // to PATH (so the bundled `cube`/`boss` win over any `~/bin`
+        // repobin shim the login-shell init re-prepends), then the
+        // per-workspace launcher dir on top of that (so `boss` is pinned to
+        // an absolute path even in dev mode, where BOSS_BIN_DIR is unset
+        // and the clause is a no-op), then unsets the API key and invokes
+        // claude. See the comment at the construction site.
         assert!(
             script.starts_with(
-                "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; \
+                "/usr/bin/taskpolicy -b -p $$ >/dev/null 2>&1; \
+                 [ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; \
                  [ -n \"$BOSS_WORKER_BIN_DIR\" ] && export PATH=\"$BOSS_WORKER_BIN_DIR:$PATH\"; \
                  unset ANTHROPIC_API_KEY; claude"
             ),
-            "expected the initial-input script to re-prepend BOSS_BIN_DIR then the worker \
-             launcher dir, unset ANTHROPIC_API_KEY, and invoke claude, got: {script:?}",
+            "expected the initial-input script to mark itself background priority, re-prepend \
+             BOSS_BIN_DIR then the worker launcher dir, unset ANTHROPIC_API_KEY, and invoke \
+             claude, got: {script:?}",
         );
     }
 
@@ -1621,7 +1643,8 @@ mod pane_spawn_tests {
         assert_eq!(
             script,
             format!(
-                "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; \
+                "/usr/bin/taskpolicy -b -p $$ >/dev/null 2>&1; \
+                 [ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; \
                  [ -n \"$BOSS_WORKER_BIN_DIR\" ] && export PATH=\"$BOSS_WORKER_BIN_DIR:$PATH\"; \
                  unset ANTHROPIC_API_KEY; claude --model {} --permission-mode auto --settings '{}' \"$(cat .claude/initial-prompt.txt)\"\n",
                 crate::driver::ClaudeDriver.descriptor().model_menu.engine_default,

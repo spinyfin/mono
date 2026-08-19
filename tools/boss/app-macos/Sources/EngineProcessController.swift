@@ -496,7 +496,15 @@ final class EngineProcessController: @unchecked Sendable {
     private func launchDetached(command: String, bossBinDir: String? = nil) throws {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        proc.arguments = ["-c", "nohup \(command) >/dev/null 2>&1 &"]
+        // zsh's BG_NICE option (on by default) reduces the priority of any
+        // job started with `&` by a non-interactive shell — nice(5) rather
+        // than the caller's own nice(0) — because a `zsh -c` script has no
+        // job control (monitor mode) active. That silently demoted the
+        // detached engine, and everything it forks (the private tmux
+        // server, then the coordinator's `claude` pane inside it) inherit
+        // that nice(5) by plain fork inheritance. `NO_BG_NICE` keeps the
+        // backgrounded engine at the same priority as this app.
+        proc.arguments = ["-c", "setopt NO_BG_NICE; nohup \(command) >/dev/null 2>&1 &"]
         proc.currentDirectoryURL = URL(fileURLWithPath: launchDirectory, isDirectory: true)
         // Tell the engine the app's pid explicitly. `bazel run`
         // daemonizes its server, which reparents the engine binary
