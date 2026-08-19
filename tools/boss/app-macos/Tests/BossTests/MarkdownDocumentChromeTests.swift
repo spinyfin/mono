@@ -358,4 +358,112 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         XCTAssertGreaterThan(hosting.fittingSize.height, 0)
         XCTAssertGreaterThan(hosting.fittingSize.width, 0)
     }
+
+    /// A '#' line inside a fenced code block must not be mistaken for a
+    /// heading/section boundary, matching the fence-aware convention
+    /// `MarkdownDocumentMeasure.containsTable` already establishes in this
+    /// same file.
+    func testHeadingLinesIgnoreHeadingsInsideFencedCodeBlocks() {
+        let doc = """
+        # Title
+
+        ```
+        # not a heading
+        ```
+
+        ## Real heading
+
+        body
+        """
+        let chunks = MarkdownHeadingSections.chunks(in: doc, collapsibleHeadings: ["not a heading"])
+        XCTAssertEqual(chunks.count, 1, "a '#' line inside a fence must not be treated as a heading/section boundary")
+        guard case .plain(let text) = chunks[0] else { return XCTFail("expected a single .plain chunk") }
+        XCTAssertEqual(text, doc)
+    }
+
+    /// CommonMark permits up to three leading spaces before an ATX heading's
+    /// `#` markers.
+    func testHeadingTextRecognizesUpToThreeLeadingSpaces() {
+        let doc = """
+        Intro
+
+           ## Indented heading
+
+        body
+
+        ### Next
+        """
+        let chunks = MarkdownHeadingSections.chunks(in: doc, collapsibleHeadings: ["Indented heading"])
+        XCTAssertEqual(chunks.count, 3, "expected prefix, collapsible section, suffix: \(chunks)")
+        guard case .collapsible(let heading, _) = chunks[1] else { return XCTFail("expected a .collapsible chunk") }
+        XCTAssertEqual(heading, "Indented heading")
+    }
+
+    // MARK: - Find-in-document over a chunked document
+
+    /// The invariant the index-shift bug violated: the sum of per-chunk
+    /// match counts must equal `MarkdownFindState`'s global `matches.count`
+    /// for the same source, and every global index must map to exactly one
+    /// in-range local index across the chunks. Before chunk-aware search,
+    /// `matches` was computed once over the whole source — including the
+    /// collapsible heading's own text, which no chunk's parser ever renders —
+    /// so the global index space and the sum of per-chunk match counts could
+    /// disagree.
+    @MainActor
+    func testFindStateEveryGlobalMatchIndexMapsToExactlyOneChunkLocalIndex() {
+        let state = MarkdownFindState()
+        let heading = RevisionBriefCollapsibleHeadings.hardRule
+        state.updateSource(Self.revisionBrief, baseURL: nil, collapsibleHeadings: [heading])
+        state.query = "the"
+
+        let chunkCount = MarkdownHeadingSections.chunks(in: Self.revisionBrief, collapsibleHeadings: [heading]).count
+        XCTAssertGreaterThan(
+            state.matches.count, 1,
+            "fixture must have more than one match, spanning more than one chunk, to exercise the mapping")
+
+        for global in 0..<state.matches.count {
+            if global > 0 { state.selectNext() }
+            XCTAssertEqual(state.currentIndex, global)
+
+            var chunksReportingCurrent: [Int] = []
+            for index in 0..<chunkCount {
+                let (matches, currentLocal) = state.chunkMatches(index)
+                if let currentLocal {
+                    XCTAssertTrue(matches.indices.contains(currentLocal), "chunk \(index) reported an out-of-range local index")
+                    chunksReportingCurrent.append(index)
+                }
+            }
+            XCTAssertEqual(
+                chunksReportingCurrent.count, 1,
+                "global match \(global) must map to exactly one chunk's local index, got \(chunksReportingCurrent)")
+        }
+
+        let summedLocalMatches = (0..<chunkCount).reduce(0) { $0 + state.chunkMatches($1).matches.count }
+        XCTAssertEqual(summedLocalMatches, state.matches.count)
+    }
+
+    /// A match inside a still-collapsed section must be identified so the
+    /// viewer can auto-expand it — otherwise the find bar counts a hit whose
+    /// highlight is never in the view hierarchy to paint.
+    @MainActor
+    func testFindStateIdentifiesCollapsedChunkForAutoExpand() {
+        let state = MarkdownFindState()
+        let heading = RevisionBriefCollapsibleHeadings.hardRule
+        state.updateSource(Self.revisionBrief, baseURL: nil, collapsibleHeadings: [heading])
+        state.query = "FORBIDDEN"
+        XCTAssertEqual(state.matches.count, 1)
+        XCTAssertEqual(state.currentCollapsibleHeadingToExpand, heading)
+    }
+
+    /// A match outside any collapsible chunk must not report a heading to
+    /// expand.
+    @MainActor
+    func testFindStateReportsNoHeadingToExpandForAPlainChunkMatch() {
+        let state = MarkdownFindState()
+        let heading = RevisionBriefCollapsibleHeadings.hardRule
+        state.updateSource(Self.revisionBrief, baseURL: nil, collapsibleHeadings: [heading])
+        state.query = "Null pointer"
+        XCTAssertEqual(state.matches.count, 1)
+        XCTAssertNil(state.currentCollapsibleHeadingToExpand)
+    }
 }
