@@ -66,8 +66,14 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
         let coordinator = server_state.execution_coordinator.clone();
         let live_states = server_state.live_worker_states.clone();
         match coordinator.dispatch_with_pause_bypass(input, live_states).await {
-            Ok(execution) => {
-                send_response(&sink, &request_id, FrontendEvent::ExecutionRequested { execution });
+            Ok(outcome) => {
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::ExecutionRequested {
+                        execution: outcome.execution,
+                    },
+                );
             }
             Err(err) => {
                 send_work_error(&sink, &request_id, &err);

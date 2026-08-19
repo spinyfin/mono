@@ -56,6 +56,39 @@ pub(super) fn test_server_state() -> (Arc<ServerState>, tempfile::TempDir) {
     (state, temp)
 }
 
+/// Like [`test_server_state`], but wires
+/// [`crate::test_support::AlwaysSucceedsCube`] /
+/// [`crate::test_support::AlwaysSucceedsRunner`] in place of the
+/// production `CommandCubeClient` / `PaneSpawnRunner`. Use this for any
+/// app-level test that drives a dispatch far enough to reach a real
+/// `drain_ready_queue` claim — the production collaborators shell out to
+/// the real `cube` binary and spawn a real pane, which makes such a test
+/// both side-effecting and dependent on host state (pool/capability/
+/// scheduling) rather than deterministic.
+pub(super) fn test_server_state_with_fakes() -> (Arc<ServerState>, tempfile::TempDir) {
+    let temp = tempfile::tempdir().unwrap();
+    let cfg = Arc::new(RuntimeConfig::from_parts(
+        crate::config::WorkConfig::builder()
+            .cwd(temp.path().to_path_buf())
+            .db_path(temp.path().join("state.db"))
+            .build(),
+        None,
+    ));
+    let state = ServerState::new_arc_with_app_pid_and_merge_probe_and_dispatch_fakes(
+        cfg,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::new(crate::test_support::AlwaysSucceedsCube)),
+        Some(Arc::new(crate::test_support::AlwaysSucceedsRunner)),
+    )
+    .unwrap();
+    (state, temp)
+}
+
 pub(super) fn make_session_sink() -> Arc<SessionSink> {
     let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
     Arc::new(SessionSink::new(shutdown_tx))

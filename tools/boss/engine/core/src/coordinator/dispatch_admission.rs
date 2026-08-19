@@ -39,6 +39,27 @@ const INFORMATIONAL_ONLY_BLOCKER_CODES: &[&str] = &[
     ADMISSION_BLOCKER_AUTOSTART_DISABLED,
 ];
 
+/// Result of [`ExecutionCoordinator::dispatch_with_pause_bypass`]: the
+/// execution row it settled on, and whether *this call* is the one that
+/// actually claimed/dispatched it. `claimed: false` means the row already
+/// belonged to something else — an already-live execution that predates
+/// this request — so the caller must not report a dispatch it didn't
+/// perform.
+#[derive(Debug)]
+pub struct PauseBypassOutcome {
+    pub execution: WorkExecution,
+    pub claimed: bool,
+    /// `true` only when this call went through the actual pause-bypass
+    /// claim machinery (marked the row bypass-eligible, drained it past an
+    /// active pause, and confirmed the claim). `false` for the "no pause
+    /// was active to bypass" ordinary path and for the idempotent
+    /// already-live-execution path — in both of those, nothing was ever
+    /// claimed past a pause, so a caller deciding whether a row is
+    /// genuinely still held by a pause must not treat either as if it
+    /// were.
+    pub bypassed_active_pause: bool,
+}
+
 fn entry_point_label(entry_point: DispatchAdmissionEntryPoint) -> &'static str {
     match entry_point {
         DispatchAdmissionEntryPoint::Cli => "cli",
@@ -271,7 +292,7 @@ impl ExecutionCoordinator {
         self: &Arc<Self>,
         input: RequestExecutionInput,
         live_states: Arc<crate::live_worker_state::LiveWorkerStateRegistry>,
-    ) -> Result<WorkExecution> {
+    ) -> Result<PauseBypassOutcome> {
         let entry_point = input
             .entry_point
             .context("bypass_dispatch_pause requires entry_point")?;
@@ -284,8 +305,14 @@ impl ExecutionCoordinator {
             Ok(false) => {
                 // Nothing to override: proceed exactly as an ordinary
                 // explicit start would, with none of the bypass machinery
-                // below.
-                return self.request_execution_ordinary(input, live_states).await;
+                // below. There was no pause to bypass, so this is as much
+                // a "claim" as any other ordinary explicit start.
+                let execution = self.request_execution_ordinary(input, live_states).await?;
+                return Ok(PauseBypassOutcome {
+                    execution,
+                    claimed: true,
+                    bypassed_active_pause: false,
+                });
             }
             Err(reason) => {
                 self.emit_pause_override_refused(&work_item_id, entry_point, &admission.pause, &reason)
@@ -313,8 +340,14 @@ impl ExecutionCoordinator {
 
         if execution.status != ExecutionStatus::Ready {
             // Idempotent path: an already-live execution already owns the
-            // dispatch slot for this work item — nothing to bypass.
-            return Ok(execution);
+            // dispatch slot for this work item — nothing to bypass. This
+            // request did not claim anything; report that honestly rather
+            // than letting the caller assume it dispatched.
+            return Ok(PauseBypassOutcome {
+                execution,
+                claimed: false,
+                bypassed_active_pause: false,
+            });
         }
 
         self.mark_dispatch_pause_bypass(&execution.id);
@@ -354,7 +387,11 @@ impl ExecutionCoordinator {
                         })),
                 )
                 .await;
-            return Ok(refreshed);
+            return Ok(PauseBypassOutcome {
+                execution: refreshed,
+                claimed: true,
+                bypassed_active_pause: true,
+            });
         }
 
         // Never claimed at all -- a dynamic constraint (interactive cap, a

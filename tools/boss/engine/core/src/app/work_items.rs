@@ -665,6 +665,15 @@ pub(super) async fn apply_work_item_patch(
                 // instead of a success response that would otherwise leave
                 // the card in Doing with no execution and no visible error.
                 let mut dispatch_failure_response: Option<String> = None;
+                // Set only inside the pause-bypass arm's genuine claim branch
+                // (`dispatch_with_pause_bypass` actually claimed a `ready` row
+                // past an active pause). Distinct from `consented_override`
+                // (which only records that a bypass was *requested*): a
+                // bypass request that hit the "pause already lifted" ordinary
+                // path, or reused an already-live execution, never claimed
+                // anything past a pause, so `dispatch_pause_hold` must still
+                // be free to report a genuinely held row for those cases.
+                let mut claimed_past_pause = false;
                 let product_id = item.product_id().to_string();
                 let mut topics = vec![work_product_topic(&product_id)];
                 if matches!(item, WorkItem::Product(_)) {
@@ -770,10 +779,6 @@ pub(super) async fn apply_work_item_patch(
                     );
                     let needs_dispatch =
                         !item_is_human_driven && work_item_needs_dispatch(&work_db, &work_item_id_for_event);
-                    // Captured before the match consumes `pause_bypass`, so
-                    // residual skip / event arms can still see that the
-                    // operator consented to a force-start.
-                    let consented_override = pause_bypass.is_some();
                     let (dispatched_execution_id, did_dispatch, skip_reason) = if item_is_human_driven {
                         (
                             None,
@@ -807,7 +812,23 @@ pub(super) async fn apply_work_item_patch(
                             .dispatch_with_pause_bypass(dispatch_input, live_states)
                             .await
                         {
-                            Ok(execution) => (Some(execution.id), true, None),
+                            Ok(outcome) if outcome.claimed => {
+                                claimed_past_pause = outcome.bypassed_active_pause;
+                                (Some(outcome.execution.id), true, None)
+                            }
+                            Ok(outcome) => {
+                                // Idempotent path: an already-live execution owns the
+                                // dispatch slot — this request did not claim or
+                                // dispatch anything, so it must not report a
+                                // dispatch it did not perform.
+                                let reason = format!(
+                                    "an execution already owns the dispatch slot for this work item \
+                                     (id={}, status={:?}); pause-bypass request reused it without \
+                                     dispatching",
+                                    outcome.execution.id, outcome.execution.status
+                                );
+                                (Some(outcome.execution.id), false, Some(reason))
+                            }
                             Err(err) => {
                                 // The pre-check in `handle_move_work_item_on_board`
                                 // already cleared this drag before the status
@@ -885,24 +906,11 @@ pub(super) async fn apply_work_item_patch(
                                 (None, false, Some(format!("{err:#}")))
                             }
                         }
-                    } else if consented_override {
-                        // Unreachable after the bypass arm above: a
-                        // consented override always enters
-                        // `dispatch_with_pause_bypass`. If a future
-                        // refactor reopens a skip here, fail loudly —
-                        // a check that cannot do its job must not
-                        // return success and leave the card in Doing
-                        // with no worker.
-                        let reason = "consented pause override did not dispatch \
-                            (held ready execution was not force-started)"
-                            .to_owned();
-                        tracing::error!(
-                            work_item_id = %work_item_id_for_event,
-                            "UpdateWorkItem → active: consented pause-bypass skipped dispatch"
-                        );
-                        dispatch_failure_response = Some(reason.clone());
-                        (None, false, Some(reason))
                     } else {
+                        // `pause_bypass` is `None` here: the `else if let
+                        // Some(bypass) = pause_bypass` arm above already
+                        // consumes the `Some` case, so a consented override
+                        // can never fall through to this arm.
                         // Ordinary (no-bypass) drag: an existing
                         // non-terminal execution already owns the
                         // slot. Before this event existed the skip
@@ -960,10 +968,19 @@ pub(super) async fn apply_work_item_patch(
                     // which never yields `PrReview` (reviews are enqueued by
                     // `request_pr_review`), so the operator pause's review
                     // exemption can never apply here.
+                    //
+                    // Suppression keys off `claimed_past_pause` — whether
+                    // this request actually claimed a row past an active
+                    // pause — not `consented_override`, which only records
+                    // that a bypass was requested. A bypass request that hit
+                    // the "pause already lifted" ordinary path, or reused an
+                    // already-live execution, never claimed anything past a
+                    // pause, so a row it left genuinely `ready` and held
+                    // must still get a `dispatch_pause_hold` note.
                     let pause_hold = server_state
                         .execution_coordinator
                         .dispatch_pause()
-                        .filter(|_| did_dispatch && !consented_override)
+                        .filter(|_| did_dispatch && !claimed_past_pause)
                         .map(|pause| {
                             serde_json::json!({
                                 "origin": pause.origin.as_metadata_str(),
