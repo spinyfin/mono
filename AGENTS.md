@@ -41,6 +41,10 @@ root-cause rule as the section below.
 - Failure-signal lifecycle (what raises an attention item / the card's
   "Failed to start" banner, and what specifically lowers it again):
   [`tools/boss/docs/attention-lifecycle.md`](tools/boss/docs/attention-lifecycle.md)
+- tmux client input wedge (a pane that renders output but accepts no input —
+  what the tmux activity fields actually mean, and how Boss detects and
+  recovers it):
+  [`tools/boss/docs/tmux-client-input-wedge.md`](tools/boss/docs/tmux-client-input-wedge.md)
 - Post-crash orphan recovery:
   [`tools/boss/docs/post-crash-recovery.md`](tools/boss/docs/post-crash-recovery.md)
 - Crash watchdog (why an abort always kills the app, and

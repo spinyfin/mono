@@ -170,6 +170,7 @@ pub mod terminal_work_sweep;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tmux_adoption;
+pub(crate) mod tmux_input_watch;
 pub(crate) mod tmux_session_options;
 pub use boss_transcript_tail as transcript_tail;
 pub mod trace_rotation;

@@ -242,6 +242,10 @@ impl ServerState {
         // window between registration and that report reads as "no
         // selection" rather than as the previous app's stale answer.
         self.clear_selected_product();
+        // Nor do its pane-input reports: they name pids from the previous
+        // app's viewers, and judging a new app's clients against them could
+        // detach a healthy one.
+        self.pane_input_reports.clear();
         match &prior {
             Some(prior) => tracing::info!(
                 session_id = %session_id,
@@ -278,6 +282,8 @@ impl ServerState {
                 .coordinator_attached_spawn_token
                 .lock()
                 .expect("coordinator attached token mutex poisoned") = None;
+            // The viewers these reports describe went with the app.
+            self.pane_input_reports.clear();
             tracing::warn!(
                 session_id = %session_id,
                 dropped_pending = prior.pending.len(),

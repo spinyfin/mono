@@ -596,6 +596,15 @@ pub async fn serve_with_merge_probe(
         }
     });
 
+    // A tmux viewer can keep rendering output while its input path is dead
+    // — the operator sees a live pane they cannot type into, with no way to
+    // recover from inside the app. Watch for it and detach the wedged client
+    // so the app rebuilds it. Its own task, not a step in the supervisor
+    // above: that loop stretches to a minute under restart backoff, and
+    // someone is sitting at the keyboard waiting for this one.
+    let input_watch_state = server_state.clone();
+    tokio::spawn(async move { super::input_watch::run(input_watch_state).await });
+
     // GitHub API usage telemetry: install the process-wide sink and start
     // its batching writer.
     //
@@ -2153,124 +2162,28 @@ pub async fn serve_with_merge_probe(
 /// attention feed. The supervisor resumes after `RESTART_FAILURE_WINDOW`;
 /// this makes the pause visible to the operator rather than only in tracing.
 async fn raise_coordinator_restart_ceiling_attention(server_state: &Arc<ServerState>) {
-    let products = match server_state.work_db.list_products() {
-        Ok(products) => products,
-        Err(err) => {
-            tracing::warn!(
-                ?err,
-                "coordinator restart ceiling: failed to list products for attention"
-            );
-            return;
-        }
-    };
-    for product in products.into_iter().filter(|product| product.status == "active") {
-        let projects = match server_state.work_db.list_projects(&product.id, None) {
-            Ok(projects) => projects,
-            Err(err) => {
-                tracing::warn!(
-                    product_id = %product.id,
-                    ?err,
-                    "coordinator restart ceiling: failed to list projects for attention"
-                );
-                continue;
-            }
-        };
-        for project in projects {
-            let input = boss_protocol::CreateAttentionInput::builder()
-                .kind("question")
-                .group_key(format!("engine_health_coordinator_restart|{}", project.id))
-                .association_project_id(project.id.clone())
-                .source_kind("manual")
-                .source_doc_path("engine-health/coordinator-restart")
-                .question_type("prompt")
-                .prompt_text(
-                    "Coordinator tmux recovery paused after repeated restart failures. \
-                     The engine will retry after a cooldown; check the coordinator model \
-                     and auth if the session keeps dying."
-                        .to_owned(),
-                )
-                .build();
-            match server_state.work_db.reconcile_attentions(vec![input]) {
-                Ok(Some((group, attentions))) => {
-                    for attention in attentions {
-                        server_state
-                            .publisher
-                            .publish_frontend_event_on_product(
-                                &group.product_id,
-                                boss_protocol::FrontendEvent::AttentionCreated {
-                                    attention,
-                                    group: group.clone(),
-                                },
-                            )
-                            .await;
-                    }
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    tracing::warn!(
-                        project_id = %project.id,
-                        ?err,
-                        "coordinator restart ceiling: failed to create attention"
-                    )
-                }
-            }
-        }
-    }
+    super::input_watch::raise_engine_health_attention(
+        server_state,
+        "engine_health_coordinator_restart",
+        "engine-health/coordinator-restart",
+        "Coordinator tmux recovery paused after repeated restart failures. The engine will retry \
+         after a cooldown; check the coordinator model and auth if the session keeps dying."
+            .to_owned(),
+    )
+    .await;
 }
 
 /// Surface a failed required-runtime check in each active project's attention
 /// feed. Attentions require a work-item association, so project-scoped items
 /// are the durable global-notification representation available to the app.
 async fn raise_tmux_preflight_attention(server_state: &Arc<ServerState>, reason: &str) {
-    let products = match server_state.work_db.list_products() {
-        Ok(products) => products,
-        Err(err) => {
-            tracing::warn!(?err, "tmux preflight: failed to list products for startup attention");
-            return;
-        }
-    };
-    for product in products.into_iter().filter(|product| product.status == "active") {
-        let projects = match server_state.work_db.list_projects(&product.id, None) {
-            Ok(projects) => projects,
-            Err(err) => {
-                tracing::warn!(product_id = %product.id, ?err, "tmux preflight: failed to list projects for startup attention");
-                continue;
-            }
-        };
-        for project in projects {
-            let input = boss_protocol::CreateAttentionInput::builder()
-                .kind("question")
-                .group_key(format!("engine_health_tmux|{}", project.id))
-                .association_project_id(project.id.clone())
-                .source_kind("manual")
-                .source_doc_path("engine-health/tmux")
-                .question_type("prompt")
-                .prompt_text(format!(
-                    "Local dispatch is blocked because tmux is unavailable: {reason}"
-                ))
-                .build();
-            match server_state.work_db.reconcile_attentions(vec![input]) {
-                Ok(Some((group, attentions))) => {
-                    for attention in attentions {
-                        server_state
-                            .publisher
-                            .publish_frontend_event_on_product(
-                                &group.product_id,
-                                boss_protocol::FrontendEvent::AttentionCreated {
-                                    attention,
-                                    group: group.clone(),
-                                },
-                            )
-                            .await;
-                    }
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    tracing::warn!(project_id = %project.id, ?err, "tmux preflight: failed to create startup attention")
-                }
-            }
-        }
-    }
+    super::input_watch::raise_engine_health_attention(
+        server_state,
+        "engine_health_tmux",
+        "engine-health/tmux",
+        format!("Local dispatch is blocked because tmux is unavailable: {reason}"),
+    )
+    .await;
 }
 
 /// Surface each Planner run interrupted by the previous engine as an

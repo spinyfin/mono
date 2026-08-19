@@ -26,6 +26,33 @@ struct EngineSpawnRequest: Sendable {
     /// the field — the app falls back to Claude's historical
     /// literals via `PaneMonitorSpec.claudeDefault`.
     let paneMonitor: PaneMonitorSpec?
+    /// tmux session this pane is a *viewer* for, when the pty runs
+    /// `tmux attach-session` rather than a shell of its own. Nil for a
+    /// directly-spawned worker: it has no tmux client, so there is nothing
+    /// for the engine's input-wedge watch to correlate against.
+    let tmuxSessionName: String?
+
+    init(
+        runId: String,
+        workspacePath: String,
+        slotId: Int,
+        initialInput: String,
+        env: [(String, String)],
+        summary: String?,
+        taskTitle: String?,
+        paneMonitor: PaneMonitorSpec?,
+        tmuxSessionName: String? = nil
+    ) {
+        self.runId = runId
+        self.workspacePath = workspacePath
+        self.slotId = slotId
+        self.initialInput = initialInput
+        self.env = env
+        self.summary = summary
+        self.taskTitle = taskTitle
+        self.paneMonitor = paneMonitor
+        self.tmuxSessionName = tmuxSessionName
+    }
 }
 
 enum EngineSpawnError: Sendable {

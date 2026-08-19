@@ -9,7 +9,7 @@ mod types;
 pub use boss_command_runner::{CommandOutput, CommandRunner, RealCommandRunner};
 pub use types::{
     DEFAULT_SEND_CHUNK_BYTES, DEFAULT_SEND_CHUNK_DELAY, DisplayField, MINIMUM_VERSION, NewSession, SERVER_LABEL,
-    Session, TMUX_SPAWN_TOKEN_ENV, TmuxVersion,
+    Session, TMUX_SPAWN_TOKEN_ENV, TmuxClient, TmuxVersion,
 };
 
 use std::ffi::OsString;
@@ -346,6 +346,65 @@ impl Tmux {
         self.invoke(args).await.map(|_| ())
     }
 
+    /// Lists the clients attached to `session`. Read-only: one format query
+    /// against the server, no pane capture and no mutation.
+    ///
+    /// A session with no clients is `Ok(vec![])`, not an error: tmux exits 0
+    /// with empty stdout in that case, and so does a server that is not
+    /// running at all (handled alongside the other absent-session shapes).
+    pub async fn list_clients(&self, session: &str) -> Result<Vec<TmuxClient>> {
+        validate_value("session name", session)?;
+        let mut args = self.server_args();
+        args.extend([
+            "list-clients".into(),
+            "-t".into(),
+            session.into(),
+            "-F".into(),
+            "#{client_tty}\t#{client_pid}\t#{client_activity}".into(),
+        ]);
+        let output = self.run(&args).await?;
+        if !output.success {
+            if is_absent_session_stderr(&output.stderr) {
+                return Ok(Vec::new());
+            }
+            return command_failed(&args, &output);
+        }
+        output
+            .stdout
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(parse_client)
+            .collect()
+    }
+
+    /// Detaches one client by its controlling terminal, leaving the session,
+    /// its windows, its panes and every process inside them untouched — the
+    /// client process running `attach-session` simply exits 0.
+    ///
+    /// This is the whole recovery for a viewer whose input path has died
+    /// (`tools/boss/docs/tmux-client-input-wedge.md`): the app observes its
+    /// child exiting and rebuilds a fresh surface plus a fresh client, while
+    /// the durable session — the entire point of tmux hosting — survives.
+    /// Deliberately addressed by tty rather than session: detaching *a*
+    /// session would also evict an operator's terminal attached to it.
+    ///
+    /// Returns `Ok(false)` when no client answers to that tty (it detached
+    /// on its own between the listing and this call), so repeated recovery
+    /// attempts stay idempotent.
+    pub async fn detach_client(&self, tty: &str) -> Result<bool> {
+        validate_value("client tty", tty)?;
+        let mut args = self.server_args();
+        args.extend(["detach-client".into(), "-t".into(), tty.into()]);
+        let output = self.run(&args).await?;
+        if output.success {
+            return Ok(true);
+        }
+        if output.stderr.contains("can't find client") || is_absent_session_stderr(&output.stderr) {
+            return Ok(false);
+        }
+        command_failed(&args, &output)
+    }
+
     /// Captures the visible text of a detached session's pane.
     pub async fn capture_pane(&self, session: &str) -> Result<String> {
         validate_value("session name", session)?;
@@ -473,6 +532,24 @@ fn parse_session(line: &str) -> Result<Session> {
     Ok(Session {
         name: name.to_owned(),
         spawn_token: (!token.is_empty()).then(|| token.to_owned()),
+    })
+}
+
+fn parse_client(line: &str) -> Result<TmuxClient> {
+    let mut fields = line.split('\t');
+    let (Some(tty), Some(pid), Some(activity), None) = (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        bail!("unexpected tmux list-clients row: {line:?}");
+    };
+    validate_value("client tty", tty)?;
+    Ok(TmuxClient {
+        tty: tty.to_owned(),
+        pid: pid
+            .parse()
+            .with_context(|| format!("parsing tmux client pid {pid:?}"))?,
+        activity_epoch: activity
+            .parse()
+            .with_context(|| format!("parsing tmux client activity {activity:?}"))?,
     })
 }
 

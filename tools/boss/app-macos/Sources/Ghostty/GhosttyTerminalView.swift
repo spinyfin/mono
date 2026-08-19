@@ -760,6 +760,7 @@ final class GhosttyTerminalHostView: NSView {
         text.withCString { ptr in
             ghostty_surface_text(surface, ptr, UInt(strlen(ptr)))
         }
+        session.onInputDelivered?()
     }
 
     @objc private func contextMenuSelectAll(_ sender: Any?) {
@@ -796,6 +797,25 @@ final class GhosttyTerminalHostView: NSView {
     override func keyDown(with event: NSEvent) {
         UISignpost.signposter.emitEvent(UISignpost.Name.keystroke)
         sendKey(event, action: event.isARepeat ? GHOSTTY_ACTION_REPEAT : GHOSTTY_ACTION_PRESS)
+        // Record that input was attempted, whatever becomes of it
+        // downstream. On a tmux-hosted pane this is the only evidence the
+        // engine can use to tell a viewer whose input path has died from one
+        // nobody is typing into — see `TmuxClientInputReporter`.
+        //
+        // Deliberately after the send, and not conditioned on
+        // `ghostty_surface_key`'s return: that return means "was the key
+        // consumed", not "was it written to the pty", so a delivery
+        // libghostty silently drops — exactly the case worth reporting —
+        // looks identical to a successful one.
+        //
+        // Command-modified keys are the one exclusion. A terminal never
+        // sends those to the pty (they are app and binding keys: Cmd-C,
+        // Cmd-W, Cmd-Tab), so reporting one would claim input the server can
+        // never acknowledge. Control and Option keys DO produce pty bytes
+        // and are reported.
+        if !event.modifierFlags.contains(.command) {
+            session.onInputDelivered?()
+        }
     }
 
     override func keyUp(with event: NSEvent) {
@@ -916,6 +936,7 @@ final class GhosttyTerminalHostView: NSView {
         if plan.sendReturn {
             sendReturnKey()
         }
+        session.onInputDelivered?()
     }
 
     /// Pure helper that decides how to break a `SendToPane` payload
@@ -985,6 +1006,7 @@ final class GhosttyTerminalHostView: NSView {
         keyEvent.composing = false
         keyEvent.unshifted_codepoint = 0x1B
         _ = ghostty_surface_key(surface, keyEvent)
+        session.onInputDelivered?()
     }
 
     func setCellSize(_ size: ghostty_action_cell_size_s) {

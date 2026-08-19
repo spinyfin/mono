@@ -162,6 +162,24 @@ struct ContentView: View {
             model.coordinatorPaneAttachHandler = { [boss = bossPane] request in
                 boss.attach(request)
             }
+            // Forward keystrokes delivered into tmux-hosted viewers so the
+            // engine can detect one that renders output but accepts no
+            // input. tmux cannot tell that apart from an idle pane on its
+            // own — only the app knows input was attempted.
+            bossPane.reportClientInput = { [model] sessionName, clientPid, epoch in
+                model.paneClientInputDelivered(
+                    sessionName: sessionName,
+                    clientPid: clientPid,
+                    lastInputEpoch: epoch
+                )
+            }
+            workersWorkspace.onClientInput = { [model] sessionName, clientPid, epoch in
+                model.paneClientInputDelivered(
+                    sessionName: sessionName,
+                    clientPid: clientPid,
+                    lastInputEpoch: epoch
+                )
+            }
             model.paneDetachHandler = { [workspace = workersWorkspace] slotId in
                 workspace.detachWorkerPane(slotId: slotId)
             }
