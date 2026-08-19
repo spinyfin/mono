@@ -166,6 +166,7 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::WorkerPaneInterrupted { .. }
         | FrontendEvent::EngineRequest { .. }
         | FrontendEvent::WorkerLiveStatesList { .. }
+        | FrontendEvent::TmuxWorkerStatusesList { .. }
         | FrontendEvent::PaneRetired { .. }
         | FrontendEvent::HostedPaneStatusList { .. }
         | FrontendEvent::RunTranscriptTail { .. }

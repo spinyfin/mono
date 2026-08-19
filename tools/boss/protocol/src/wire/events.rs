@@ -451,6 +451,12 @@ pub enum FrontendEvent {
     WorkerLiveStatesList {
         states: Vec<LiveWorkerState>,
     },
+    /// On-demand tmux evidence for the current live-worker snapshot. Kept
+    /// separate from [`Self::WorkerLiveStatesList`] so hook broadcasts do not
+    /// run external tmux probes.
+    TmuxWorkerStatusesList {
+        statuses: Vec<TmuxWorkerStatus>,
+    },
     /// Engine confirms an execution has been cancelled. The cancelled
     /// row's status is now `cancelled`; resource teardown (pane
     /// release, cube workspace release) is asynchronous.

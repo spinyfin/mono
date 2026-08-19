@@ -5,6 +5,10 @@
 //! behavioural change. See [`super::Dispatch`] for the per-request
 //! context every handler receives.
 
+use std::collections::HashSet;
+
+use boss_tmux::DisplayField;
+
 use super::*;
 
 pub(super) async fn handle_focus_worker_pane(ctx: Dispatch, req: FrontendRequest) {
@@ -194,6 +198,178 @@ pub(super) async fn handle_list_worker_live_states(ctx: Dispatch, req: FrontendR
     {
         let states = server_state.live_worker_states_snapshot();
         send_response(&sink, &request_id, FrontendEvent::WorkerLiveStatesList { states });
+    }
+}
+
+pub(super) async fn handle_list_tmux_worker_statuses(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::ListTmuxWorkerStatuses = req else {
+        unreachable!()
+    };
+    {
+        let statuses = server_state.tmux_worker_statuses().await;
+        send_response(&sink, &request_id, FrontendEvent::TmuxWorkerStatusesList { statuses });
+    }
+}
+
+impl ServerState {
+    /// Collect the tmux-only half of `agents list` on demand. The hook-driven
+    /// live-state feed intentionally does not call tmux: doing so on every
+    /// worker event would turn a lightweight broadcast into a process probe.
+    pub(super) async fn tmux_worker_statuses(&self) -> Vec<boss_protocol::TmuxWorkerStatus> {
+        let states = self.live_worker_states_snapshot();
+        let identities = states
+            .iter()
+            .map(|state| {
+                (
+                    state.run_id.clone(),
+                    self.work_db.tmux_identity_for_execution(&state.run_id),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let tmux = match self.tmux_for_pane_delivery() {
+            Ok(tmux) => tmux,
+            Err(err) => {
+                tracing::debug!(error = %format!("{err:#}"), "agents list: tmux evidence unavailable");
+                return identities
+                    .into_iter()
+                    .map(|(execution_id, identity)| match identity {
+                        Ok(Some(identity)) => boss_protocol::TmuxWorkerStatus {
+                            execution_id,
+                            session_name: Some(identity.session_name),
+                            adoption_state: boss_protocol::TmuxAdoptionState::ProbeUnavailable,
+                            pane_dead: None,
+                            last_output_at: None,
+                        },
+                        Ok(None) => not_tmux_hosted_status(execution_id),
+                        Err(err) => {
+                            tracing::warn!(execution_id, error = %format!("{err:#}"), "agents list: failed reading tmux identity");
+                            probe_unavailable_status(execution_id, None)
+                        }
+                    })
+                    .collect();
+            }
+        };
+        let session_names = match tmux.list_sessions().await {
+            Ok(sessions) => sessions.into_iter().map(|session| session.name).collect::<HashSet<_>>(),
+            Err(err) => {
+                tracing::debug!(error = %format!("{err:#}"), "agents list: tmux session inventory unavailable");
+                return identities
+                    .into_iter()
+                    .map(|(execution_id, identity)| match identity {
+                        Ok(Some(identity)) => probe_unavailable_status(execution_id, Some(identity.session_name)),
+                        Ok(None) => not_tmux_hosted_status(execution_id),
+                        Err(err) => {
+                            tracing::warn!(execution_id, error = %format!("{err:#}"), "agents list: failed reading tmux identity");
+                            probe_unavailable_status(execution_id, None)
+                        }
+                    })
+                    .collect();
+            }
+        };
+
+        let mut statuses = Vec::with_capacity(identities.len());
+        for (execution_id, identity) in identities {
+            let identity = match identity {
+                Ok(Some(identity)) => identity,
+                Ok(None) => {
+                    statuses.push(not_tmux_hosted_status(execution_id));
+                    continue;
+                }
+                Err(err) => {
+                    tracing::warn!(execution_id, error = %format!("{err:#}"), "agents list: failed reading tmux identity");
+                    statuses.push(probe_unavailable_status(execution_id, None));
+                    continue;
+                }
+            };
+            let session_name = identity.session_name;
+            if !session_names.contains(&session_name) {
+                statuses.push(boss_protocol::TmuxWorkerStatus {
+                    execution_id,
+                    session_name: Some(session_name),
+                    adoption_state: boss_protocol::TmuxAdoptionState::SessionMissing,
+                    pane_dead: None,
+                    last_output_at: None,
+                });
+                continue;
+            }
+            let token_matches = match crate::tmux_adoption::session_spawn_token(&tmux, &session_name).await {
+                Ok(token) => token.as_deref() == Some(identity.spawn_token.as_str()),
+                Err(err) => {
+                    tracing::debug!(execution_id, session = %session_name, error = %format!("{err:#}"), "agents list: tmux token probe unavailable");
+                    statuses.push(probe_unavailable_status(execution_id, Some(session_name)));
+                    continue;
+                }
+            };
+            if !token_matches {
+                statuses.push(boss_protocol::TmuxWorkerStatus {
+                    execution_id,
+                    session_name: Some(session_name),
+                    adoption_state: boss_protocol::TmuxAdoptionState::TokenMismatch,
+                    pane_dead: None,
+                    last_output_at: None,
+                });
+                continue;
+            }
+            let pane_dead = match tmux.display_message(&session_name, DisplayField::PaneDead).await {
+                Ok(value) => value.trim() == "1",
+                Err(err) => {
+                    tracing::debug!(execution_id, session = %session_name, error = %format!("{err:#}"), "agents list: tmux pane-dead probe unavailable");
+                    statuses.push(probe_unavailable_status(execution_id, Some(session_name)));
+                    continue;
+                }
+            };
+            let last_output_at = if pane_dead {
+                None
+            } else {
+                match tmux.display_message(&session_name, DisplayField::WindowActivity).await {
+                    Ok(value) => value
+                        .trim()
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|epoch| *epoch > 0)
+                        .map(crate::live_worker_state::iso8601_utc),
+                    Err(err) => {
+                        tracing::debug!(execution_id, session = %session_name, error = %format!("{err:#}"), "agents list: tmux output-time probe unavailable");
+                        None
+                    }
+                }
+            };
+            statuses.push(boss_protocol::TmuxWorkerStatus {
+                execution_id,
+                session_name: Some(session_name),
+                adoption_state: boss_protocol::TmuxAdoptionState::Adopted,
+                pane_dead: Some(pane_dead),
+                last_output_at,
+            });
+        }
+        statuses
+    }
+}
+
+fn not_tmux_hosted_status(execution_id: String) -> boss_protocol::TmuxWorkerStatus {
+    boss_protocol::TmuxWorkerStatus {
+        execution_id,
+        session_name: None,
+        adoption_state: boss_protocol::TmuxAdoptionState::NotTmuxHosted,
+        pane_dead: None,
+        last_output_at: None,
+    }
+}
+
+fn probe_unavailable_status(execution_id: String, session_name: Option<String>) -> boss_protocol::TmuxWorkerStatus {
+    boss_protocol::TmuxWorkerStatus {
+        execution_id,
+        session_name,
+        adoption_state: boss_protocol::TmuxAdoptionState::ProbeUnavailable,
+        pane_dead: None,
+        last_output_at: None,
     }
 }
 

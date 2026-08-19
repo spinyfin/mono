@@ -13,6 +13,7 @@ mod live_status_debug;
 mod live_worker_state;
 mod metrics_wire;
 pub mod planner;
+mod tmux_worker_status;
 mod types;
 mod wire;
 mod work_item_id;
@@ -31,6 +32,7 @@ pub use planner::{
     ApplyResult, Confidence, DocRef, PlannerInput, PlannerOutput, ProductContext, ProjectContext, ProposedEdge,
     ProposedMergeOrderHint, ProposedTask, TaskBrief, planner_output_schema,
 };
+pub use tmux_worker_status::*;
 pub use types::*;
 pub use wire::*;
 pub use work_item_id::{

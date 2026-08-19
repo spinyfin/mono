@@ -12,6 +12,7 @@
 //! print a structured "not_implemented" response so the Boss session
 //! can call them and see which ones are pending.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -38,7 +39,8 @@ use boss_engine::dispatch_reader;
 use boss_protocol::{
     DispatchAdmissionEntryPoint, FrontendEvent, FrontendRequest, HostedPaneState, HostedPaneStatus,
     LiveStatusDebugReport, LiveStatusSlotDebug, LiveWorkerState, MetricLiveEntry, ProposalKind, ProposalState, ROSTER,
-    RequestExecutionInput, WorkExecution, WorkItem, WorkRun, WorkerProposal, WorkspacePoolEntry,
+    RequestExecutionInput, TmuxAdoptionState, TmuxWorkerStatus, WorkExecution, WorkItem, WorkRun, WorkerProposal,
+    WorkspacePoolEntry,
 };
 use clap::{Parser, Subcommand};
 use command_types::{LogSource, TranscriptFormat};
@@ -692,6 +694,13 @@ enum AgentsAction {
         /// --help` for resolution order.
         agent: String,
     },
+    /// Print the exact command that attaches this terminal to a worker's
+    /// durable tmux session. The command never creates a session.
+    Attach {
+        /// Worker reference: execution id, run id, slot id, or crew name;
+        /// see `agents --help` for resolution order.
+        agent: String,
+    },
     /// Send text to a worker as if user-typed.
     Send {
         /// Worker reference: run id, slot id, or crew name; see `agents
@@ -1205,6 +1214,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Agents {
             action: AgentsAction::Focus { agent },
         } => agents::agents_focus(&cli.socket_path, cli.json, agent).await,
+        Command::Agents {
+            action: AgentsAction::Attach { agent },
+        } => agents::agents_attach(&cli.socket_path, cli.json, agent).await,
         Command::Agents {
             action: AgentsAction::Send { agent, text },
         } => agents::agents_send(&cli.socket_path, cli.json, agent, text).await,

@@ -226,6 +226,22 @@ pub(crate) async fn fetch_live_states(client: &mut BossClient) -> Result<Vec<Liv
     }
 }
 
+/// Fetch the on-demand tmux evidence paired with the live-state snapshot.
+/// The engine deliberately avoids putting process probes in hook broadcasts.
+pub(crate) async fn fetch_tmux_worker_statuses(client: &mut BossClient) -> Result<Vec<TmuxWorkerStatus>> {
+    match client
+        .send_request(&FrontendRequest::ListTmuxWorkerStatuses)
+        .await
+        .context("sending ListTmuxWorkerStatuses")?
+    {
+        FrontendEvent::TmuxWorkerStatusesList { statuses } => Ok(statuses),
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected tmux status list: {message}")
+        }
+        other => bail!("engine returned unexpected tmux status response: {other:?}"),
+    }
+}
+
 /// Fetch every pane the app hosts, classified against the engine's live
 /// registry and durable state (live / terminal-entry-with-live-process /
 /// husk) — see [`HostedPaneState`]. This is the durable-state fallback
@@ -597,6 +613,11 @@ fn print_run_lifecycle(json: bool, run: &WorkRun, live: Option<&LiveWorkerState>
 pub(crate) async fn agents_list_live(socket_path: &Option<String>, json: bool, all: bool) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
+    let tmux_statuses = fetch_tmux_worker_statuses(&mut client).await?;
+    let tmux_status_by_execution: HashMap<&str, &TmuxWorkerStatus> = tmux_statuses
+        .iter()
+        .map(|status| (status.execution_id.as_str(), status))
+        .collect();
 
     let hosted = if all {
         fetch_hosted_pane_statuses(&mut client).await?
@@ -609,6 +630,7 @@ pub(crate) async fn agents_list_live(socket_path: &Option<String>, json: bool, a
             "{}",
             serde_json::json!({
                 "live_worker_states": states,
+                "tmux_worker_statuses": tmux_statuses,
                 "hosted_pane_statuses": hosted,
             })
         );
@@ -619,7 +641,7 @@ pub(crate) async fn agents_list_live(socket_path: &Option<String>, json: bool, a
         println!("no active workers");
     } else {
         for state in &states {
-            print_live_state_short(state);
+            print_live_state_short(state, tmux_status_by_execution.get(state.run_id.as_str()).copied());
         }
     }
     if all {
@@ -650,6 +672,44 @@ pub(crate) async fn agents_list_live(socket_path: &Option<String>, json: bool, a
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Print the exact, non-creating tmux attach command for one live worker.
+/// Resolution deliberately shares the normal live-worker lookup tiers, then
+/// requires a currently token-matched session before printing anything.
+pub(crate) async fn agents_attach(socket_path: &Option<String>, json: bool, agent: String) -> Result<()> {
+    let mut client = connect(socket_path).await?;
+    let states = fetch_live_states(&mut client).await?;
+    let run_id = resolve_agent_ref(&agent, &states)?.run_id.clone();
+    let statuses = fetch_tmux_worker_statuses(&mut client).await?;
+    let status = statuses
+        .iter()
+        .find(|status| status.execution_id == run_id)
+        .ok_or_else(|| anyhow::anyhow!("engine returned no tmux status for live worker {run_id}"))?;
+    if status.adoption_state != TmuxAdoptionState::Adopted {
+        bail!(
+            "worker {run_id} is not attachable: tmux adoption_state={}",
+            tmux_adoption_state_label(status.adoption_state)
+        );
+    }
+    let session_name = status
+        .session_name
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("worker {run_id} is adopted but has no tmux session name"))?;
+    let command = format!("exec tmux -L boss attach-session -t {session_name}");
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "execution_id": run_id,
+                "session_name": session_name,
+                "command": command,
+            })
+        );
+    } else {
+        println!("{command}");
     }
     Ok(())
 }
@@ -1661,8 +1721,8 @@ fn print_live_state(json: bool, state: &LiveWorkerState) {
     }
 }
 
-fn print_live_state_short(state: &LiveWorkerState) {
-    println!("{}", format_live_state_short(state));
+fn print_live_state_short(state: &LiveWorkerState, tmux_status: Option<&TmuxWorkerStatus>) {
+    println!("{}", format_live_state_short(state, tmux_status));
 }
 
 /// Render a [`HostedPaneStatus`] resolved from the durable/hosted-pane
@@ -1717,7 +1777,7 @@ fn print_hosted_pane_status(json: bool, pane: &HostedPaneStatus) {
 
 /// One-line `agents list` row for a live worker. Pure so tests can pin
 /// the pool + exec-kind columns without capturing stdout.
-fn format_live_state_short(state: &LiveWorkerState) -> String {
+fn format_live_state_short(state: &LiveWorkerState, tmux_status: Option<&TmuxWorkerStatus>) -> String {
     let tool = state.current_tool.as_deref().unwrap_or("-");
     let work_item = state.work_item_id.as_deref().unwrap_or("-");
     let work_item_name = state.work_item_name.as_deref().unwrap_or("-");
@@ -1750,7 +1810,32 @@ fn format_live_state_short(state: &LiveWorkerState) -> String {
     if state.held {
         line.push_str("  held=true");
     }
+    match tmux_status {
+        Some(status) => {
+            let session = status.session_name.as_deref().unwrap_or("-");
+            let pane_dead = status.pane_dead.map_or("-", |dead| if dead { "true" } else { "false" });
+            let last_output = status.last_output_at.as_deref().unwrap_or("-");
+            line.push_str(&format!(
+                "  tmux_session={}  adoption_state={}  pane_dead={}  last_output_at={}",
+                session,
+                tmux_adoption_state_label(status.adoption_state),
+                pane_dead,
+                last_output,
+            ));
+        }
+        None => line.push_str("  tmux_session=-  adoption_state=probe_unavailable  pane_dead=-  last_output_at=-"),
+    }
     line
+}
+
+fn tmux_adoption_state_label(state: TmuxAdoptionState) -> &'static str {
+    match state {
+        TmuxAdoptionState::NotTmuxHosted => "not_tmux_hosted",
+        TmuxAdoptionState::Adopted => "adopted",
+        TmuxAdoptionState::SessionMissing => "session_missing",
+        TmuxAdoptionState::TokenMismatch => "token_mismatch",
+        TmuxAdoptionState::ProbeUnavailable => "probe_unavailable",
+    }
 }
 
 #[cfg(test)]
@@ -1772,7 +1857,7 @@ mod tests {
     #[test]
     fn format_live_state_short_shows_pool_and_kind_dashes_when_unset() {
         let state = worker(3, "run_a", "Riker");
-        let line = format_live_state_short(&state);
+        let line = format_live_state_short(&state, None);
         assert!(
             line.contains("pool=-") && line.contains("kind=-"),
             "expected pool=- and kind=- placeholders when unset: {line}"
@@ -1789,14 +1874,37 @@ mod tests {
         state.pool = Some("automation".to_owned());
         state.kind = Some("automation_triage".to_owned());
         state.held = true;
-        let line = format_live_state_short(&state);
+        let line = format_live_state_short(&state, None);
         assert!(
             line.contains("pool=automation") && line.contains("kind=automation_triage"),
             "expected stamped pool+kind: {line}"
         );
         assert!(
-            line.ends_with("held=true"),
-            "held suffix should still trail the row: {line}"
+            line.contains("held=true  tmux_session=-  adoption_state=probe_unavailable"),
+            "held and fallback tmux evidence should trail the row: {line}"
+        );
+    }
+
+    #[test]
+    fn format_live_state_short_renders_tmux_observability_fields() {
+        let state = worker(5, "exec_tmux", "Data");
+        let status = TmuxWorkerStatus {
+            execution_id: "exec_tmux".to_owned(),
+            session_name: Some("boss-worker-5".to_owned()),
+            adoption_state: TmuxAdoptionState::Adopted,
+            pane_dead: Some(false),
+            last_output_at: Some("2026-08-19T12:00:00Z".to_owned()),
+        };
+        let line = format_live_state_short(&state, Some(&status));
+        assert!(line.contains("tmux_session=boss-worker-5"), "missing session: {line}");
+        assert!(
+            line.contains("adoption_state=adopted"),
+            "missing adoption state: {line}"
+        );
+        assert!(line.contains("pane_dead=false"), "missing pane state: {line}");
+        assert!(
+            line.contains("last_output_at=2026-08-19T12:00:00Z"),
+            "missing output time: {line}"
         );
     }
 
