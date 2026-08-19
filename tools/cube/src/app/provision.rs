@@ -235,7 +235,21 @@ pub(super) fn run_setup_for_workspace(
         return Ok(SetupReport::empty());
     };
     let now = current_epoch_s()?;
-    run_setup_engine(store, runner, workspace, &config, now)
+    let report = run_setup_engine(store, runner, workspace, &config, now)?;
+    emit_tolerated_failure_warnings(&report);
+    Ok(report)
+}
+
+/// Write tolerated-failure warnings to stderr so they surface in `--json`
+/// mode as well as the human-readable `RunResult::message` path.
+fn emit_tolerated_failure_warnings(report: &SetupReport) {
+    for step in report.tolerated_failures() {
+        eprintln!(
+            "warning: setup step `{}` failed but was tolerated (allow_failure): {}",
+            step.id,
+            step.warning_detail().unwrap_or(""),
+        );
+    }
 }
 
 pub(super) fn format_lease_message(lease_message: &str, report: &SetupReport) -> String {
@@ -263,8 +277,12 @@ fn format_setup_counts(report: &SetupReport) -> String {
             .map(|step| step.id.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        let noun = if warnings.len() == 1 { "warning" } else { "warnings" };
-        out.push_str(&format!(", {} {noun} ({ids})", warnings.len()));
+        let noun = if report.warning_count() == 1 {
+            "warning"
+        } else {
+            "warnings"
+        };
+        out.push_str(&format!(", {} {noun} ({ids})", report.warning_count()));
     }
     out.push('.');
     for step in warnings {

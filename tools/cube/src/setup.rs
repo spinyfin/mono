@@ -122,7 +122,7 @@ pub enum StepStatus {
         error: String,
         /// Copied from the step's `allow_failure` declaration. Stays `Failed`
         /// even when tolerated — never rewritten to success or skipped.
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
         allow_failure: bool,
         /// Underlying command stderr when the runner captured a non-empty
         /// one. Printed verbatim on the tolerated-failure warning path.
