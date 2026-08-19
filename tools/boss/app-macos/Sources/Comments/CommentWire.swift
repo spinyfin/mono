@@ -84,6 +84,7 @@ struct WorkComment: Codable, Equatable, Sendable {
     let intentClassifiedAt: String?
     let intentOverriddenBy: String?
     let reviseTaskId: String?
+    let reopenedAt: String?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -105,6 +106,7 @@ struct WorkComment: Codable, Equatable, Sendable {
         case intentClassifiedAt = "intent_classified_at"
         case intentOverriddenBy = "intent_overridden_by"
         case reviseTaskId = "revise_task_id"
+        case reopenedAt = "reopened_at"
     }
 
     init(from decoder: Decoder) throws {
@@ -130,6 +132,7 @@ struct WorkComment: Codable, Equatable, Sendable {
         intentClassifiedAt = try c.decodeIfPresent(String.self, forKey: .intentClassifiedAt)
         intentOverriddenBy = try c.decodeIfPresent(String.self, forKey: .intentOverriddenBy)
         reviseTaskId = try c.decodeIfPresent(String.self, forKey: .reviseTaskId)
+        reopenedAt = try c.decodeIfPresent(String.self, forKey: .reopenedAt)
     }
 
     /// Memberwise-style init for tests (the decoder is the production path).
@@ -152,7 +155,8 @@ struct WorkComment: Codable, Equatable, Sendable {
         intentConfidence: Double? = nil,
         intentClassifiedAt: String? = nil,
         intentOverriddenBy: String? = nil,
-        reviseTaskId: String? = nil
+        reviseTaskId: String? = nil,
+        reopenedAt: String? = nil
     ) {
         self.id = id
         self.artifactId = artifactId
@@ -173,6 +177,7 @@ struct WorkComment: Codable, Equatable, Sendable {
         self.intentClassifiedAt = intentClassifiedAt
         self.intentOverriddenBy = intentOverriddenBy
         self.reviseTaskId = reviseTaskId
+        self.reopenedAt = reopenedAt
     }
 }
 

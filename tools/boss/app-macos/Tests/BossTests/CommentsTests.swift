@@ -453,14 +453,16 @@ final class CommentLayerTests: XCTestCase {
 
     // MARK: - `[Revise]` banner + chips (artifact-less fallback, unchanged behaviour)
 
-    func testRevisionClassificationPostsNudgeAndMakesBannerRevisable() {
+    /// A `revision`-classified, unclaimed comment renders no chip at all —
+    /// the intent badge and the always-visible `[Revise]` button already say
+    /// everything a chip would.
+    func testRevisionClassificationMakesBannerRevisableWithNoChip() {
         let layer = CommentLayer()
         layer.addComment(quoted: "some text", body: "a note")
         layer.setIntent(.revision, for: layer.comments[0])
         XCTAssertTrue(layer.bannerState.revisable)
-        XCTAssertEqual(layer.comments[0].threadEntries.count, 1)
-        XCTAssertEqual(layer.comments[0].threadEntries[0].entryKind, .nudge)
-        XCTAssertEqual(layer.comments[0].revisionChipState, .nudged)
+        XCTAssertTrue(layer.comments[0].threadEntries.isEmpty)
+        XCTAssertNil(layer.comments[0].revisionChipState)
     }
 
     func testReviseDocTransitionsMatchingCommentsToInRevision() {

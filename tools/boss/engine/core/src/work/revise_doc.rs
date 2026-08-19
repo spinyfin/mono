@@ -193,7 +193,8 @@ impl WorkDb {
         let revisable = comments::revisable_comment_predicate();
         let update_sql = format!(
             "UPDATE work_comments
-             SET status = '{COMMENT_STATUS_IN_REVISION}', revise_task_id = ?, status_actor = 'engine', updated_at = ?
+             SET status = '{COMMENT_STATUS_IN_REVISION}', revise_task_id = ?, status_actor = 'engine',
+                 updated_at = ?, reopened_at = NULL
              WHERE id IN ({placeholders}) AND {revisable}"
         );
         let mut update_params: Vec<&dyn rusqlite::ToSql> = vec![&task_id, &now];

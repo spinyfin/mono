@@ -131,10 +131,17 @@ struct Comment: Identifiable, Equatable {
     var reviseTaskId: String? = nil
     /// Mirrors `work_comments.status_actor`.
     var statusActor: String? = nil
+    /// Mirrors `work_comments.reopened_at`: stamped by the engine when a
+    /// claimed comment's task is abandoned and it's put back on the
+    /// `[Revise]` banner. Drives the `Reopened` chip — see
+    /// `revisionChipState`.
+    var reopenedAt: String? = nil
     /// How this comment's anchor last resolved on load (drives the ⚠/anchor-lost
     /// sidebar glyphs). `nil` until a `comments_resolve` round-trip lands.
     var lastResolvedWith: ResolvedWith? = nil
-    /// Engine-authored nudge/answer/follow-up entries, oldest first.
+    /// Engine-authored answer/follow-up entries, oldest first. May also
+    /// contain a retired `nudge` entry on a pre-existing thread — the
+    /// sidebar does not render those.
     var threadEntries: [CommentThreadEntry] = []
     /// Mirrors `CommentWithThread.answer_agent_running` — whether an
     /// answer-agent run is actually in flight for this comment. Only
@@ -177,9 +184,12 @@ struct Comment: Identifiable, Equatable {
     }
 
     /// The `[Revise]`-track chip state, derived from `status` /
-    /// `reviseTaskId` / thread history — mirrors the engine's comment state
+    /// `reviseTaskId` / `reopenedAt` — mirrors the engine's comment state
     /// machine (design § "Comment/thread state machine"). `nil` when the
-    /// comment isn't on the revision track at all.
+    /// comment isn't on the revision track at all, including a
+    /// `revision`-classified comment that has never been claimed: the intent
+    /// badge already says "Revision" and the `[Revise]` button is already
+    /// visible, so there's nothing left for a chip to add.
     var revisionChipState: RevisionChipState? {
         switch status {
         case .inRevision:
@@ -189,10 +199,7 @@ struct Comment: Identifiable, Equatable {
             guard let taskId = reviseTaskId else { return nil }
             return .resolved(taskId: taskId)
         case .active:
-            let wasInRevision = threadEntries.contains { $0.entryKind == .nudge && $0.reviseTaskId != nil }
-            if wasInRevision, statusActor == "engine" { return .reopened }
-            let hasNudge = threadEntries.contains { $0.entryKind == .nudge }
-            return hasNudge ? .nudged : nil
+            return reopenedAt != nil ? .reopened : nil
         case .answering, .answered, .answerFailed, .awaitingFollowup, .orphaned, .dismissed:
             return nil
         }
@@ -223,12 +230,15 @@ extension Comment {
         c.status = CommentStatus(rawValue: wc.status) ?? .active
         c.reviseTaskId = wc.reviseTaskId
         c.statusActor = wc.statusActor
+        c.reopenedAt = wc.reopenedAt
         // Prefer the fresh resolution kind when present, else the persisted
         // `last_resolved_with` the engine echoes on the row.
         c.lastResolvedWith =
             resolution.map { ResolvedWith(rawValue: $0.kind) ?? .exact }
             ?? wc.lastResolvedWith.flatMap(ResolvedWith.init(rawValue:))
-        c.threadEntries = threadEntries.map(CommentThreadEntry.from)
+        // A pre-existing thread may carry a retired `nudge` entry (the
+        // engine no longer writes them); drop it here so it never renders.
+        c.threadEntries = threadEntries.map(CommentThreadEntry.from).filter { $0.entryKind != .nudge }
         c.answerAgentRunning = answerAgentRunning
         c.answerAgentFailed = answerAgentFailed
         c.artifactKind = wc.artifactKind
@@ -265,12 +275,13 @@ extension Comment {
     }
 }
 
-/// The four `[Revise]`-track chip states 2f renders, per the design's
-/// comment/thread state machine.
+/// The `[Revise]`-track chip states 2f renders, per the design's
+/// comment/thread state machine. A `revision`-classified comment that has
+/// never been claimed renders no chip at all — the intent badge already
+/// says "Revision", and the sidebar's `[Revise]` button is always visible
+/// when there's something to revise, so a chip announcing the same fact
+/// would be redundant.
 enum RevisionChipState: Equatable {
-    /// Classified `revision`; nudge posted, `[Revise]` not
-    /// yet clicked.
-    case nudged
     case inRevision(taskId: String)
     case resolved(taskId: String)
     /// The claiming task was abandoned; the comment is back on the banner.

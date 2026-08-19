@@ -78,7 +78,7 @@ const COMMENT_COLUMNS: &str = "id, artifact_kind, artifact_id, doc_version, anch
      author, status, status_actor, last_resolved_with, plain_text_projection_version, \
      created_at, updated_at, dismissed_at, intent, intent_confidence, intent_classified_at, \
      intent_overridden_by, revise_task_id, intent_classification_failed_at, \
-     intent_classification_error";
+     intent_classification_error, reopened_at";
 
 /// The one definition of "this comment is a `[Revise]` candidate": `active`
 /// status **and** a `revision` intent. A SQL fragment rather than a Rust
@@ -275,7 +275,8 @@ impl WorkDb {
              SET status = ?2,
                  status_actor = ?3,
                  updated_at = ?4,
-                 dismissed_at = CASE WHEN ?2 IN ('resolved', 'dismissed') THEN ?4 ELSE NULL END
+                 dismissed_at = CASE WHEN ?2 IN ('resolved', 'dismissed') THEN ?4 ELSE NULL END,
+                 reopened_at = CASE WHEN ?2 = 'active' THEN NULL ELSE reopened_at END
              WHERE id = ?1",
             params![comment_id, status, actor, now],
         )?;
@@ -329,7 +330,7 @@ impl WorkDb {
         let now = now_string();
         let n = conn.execute(
             "UPDATE work_comments
-             SET status = ?2, status_actor = 'engine', updated_at = ?3
+             SET status = ?2, status_actor = 'engine', updated_at = ?3, reopened_at = NULL
              WHERE id = ?1 AND status = ?4",
             params![comment_id, COMMENT_STATUS_ACTIVE, now, COMMENT_STATUS_ANSWERING],
         )?;
@@ -366,7 +367,8 @@ impl WorkDb {
         let n = conn.execute(
             "UPDATE work_comments
              SET status = CASE WHEN intent = ?5 THEN ?6 ELSE ?2 END,
-                 status_actor = 'engine', updated_at = ?3
+                 status_actor = 'engine', updated_at = ?3,
+                 reopened_at = CASE WHEN intent = ?5 THEN NULL ELSE reopened_at END
              WHERE id = ?1 AND status = ?4",
             params![
                 comment_id,
@@ -408,7 +410,8 @@ impl WorkDb {
         let n = conn.execute(
             "UPDATE work_comments
              SET status = CASE WHEN intent = ?5 THEN ?6 ELSE ?2 END,
-                 status_actor = 'engine', updated_at = ?3
+                 status_actor = 'engine', updated_at = ?3,
+                 reopened_at = CASE WHEN intent = ?5 THEN NULL ELSE reopened_at END
              WHERE id = ?1 AND status = ?4",
             params![
                 comment_id,
@@ -530,7 +533,7 @@ impl WorkDb {
         let now = now_string();
         let n = conn.execute(
             "UPDATE work_comments
-             SET status = ?2, status_actor = 'engine', updated_at = ?3
+             SET status = ?2, status_actor = 'engine', updated_at = ?3, reopened_at = NULL
              WHERE id = ?1 AND status = ?4",
             params![comment_id, COMMENT_STATUS_ACTIVE, now, COMMENT_STATUS_AWAITING_FOLLOWUP],
         )?;
@@ -689,7 +692,8 @@ impl WorkDb {
                  intent_classification_failed_at = NULL, intent_classification_error = NULL,
                  status = CASE WHEN status IN (?4, ?5, ?8, ?9) AND ?2 = ?6 THEN ?7 ELSE status END,
                  status_actor = CASE WHEN status IN (?4, ?5, ?8, ?9) AND ?2 = ?6 THEN 'user' ELSE status_actor END,
-                 updated_at = CASE WHEN status IN (?4, ?5, ?8, ?9) AND ?2 = ?6 THEN ?3 ELSE updated_at END
+                 updated_at = CASE WHEN status IN (?4, ?5, ?8, ?9) AND ?2 = ?6 THEN ?3 ELSE updated_at END,
+                 reopened_at = CASE WHEN status IN (?4, ?5, ?8, ?9) AND ?2 = ?6 THEN NULL ELSE reopened_at END
              WHERE id = ?1",
             params![
                 comment_id,
@@ -1108,7 +1112,14 @@ pub(crate) enum CommentReconcileOutcome {
 ///   [`WorkComment::revise_task_id`]'s doc comment).
 /// - `Reopened` (the task was abandoned / its PR closed unmerged): the
 ///   requested change never shipped, so put the comment back on the
-///   `[Revise]` banner — `status='active'`, `revise_task_id` cleared. With
+///   `[Revise]` banner — `status='active'`, `revise_task_id` cleared,
+///   `reopened_at` stamped so the sidebar can tell this apart from a comment
+///   that was never claimed at all (`revisionChipState`'s `Reopened` chip).
+///   `reopened_at` is cleared by every other path that lands a comment back
+///   on `active` (manual status set, the bucket-2 compensation/bridge
+///   transitions, a fresh `[Revise]` claim) — see those functions' own SQL —
+///   so it only ever reads `Reopened` for the specific abandon this outcome
+///   records, not any active state in general. With
 ///   `include_resolved: true`, also matches comments already `resolved` by
 ///   a revision's commit landing: if the chain root's PR later closes
 ///   unmerged, that commit never made it to `main` either, so a comment
@@ -1161,7 +1172,8 @@ pub(crate) fn reconcile_comments_for_task(
                          revise_task_id = NULL,
                          status_actor = 'engine',
                          updated_at = ?2,
-                         dismissed_at = NULL
+                         dismissed_at = NULL,
+                         reopened_at = ?2
                      WHERE revise_task_id = ?1
                        AND {status_filter}"
                 ),

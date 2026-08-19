@@ -201,7 +201,7 @@ pub use boss_protocol::{
     ProjectDesignDocState, ProjectStatus, RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN,
     ReasoningMode, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment,
     ResolvedDesignDoc, ResolvedDesignDocKind, ReviseDocInput, ReviseDocOutcome, SetProjectDesignDocInput,
-    SetTaskDocPointerInput, StatusActor, THREAD_ENTRY_AUTHOR_ENGINE, THREAD_ENTRY_KIND_ANSWER, THREAD_ENTRY_KIND_NUDGE,
+    SetTaskDocPointerInput, StatusActor, THREAD_ENTRY_AUTHOR_ENGINE, THREAD_ENTRY_KIND_ANSWER,
     THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP, Task, TaskKind, TaskRuntime, TaskStatus, WorkAttentionItem, WorkComment,
     WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemExternalRef,
     WorkItemPatch, WorkRun, WorkTree, comment_status_is_closed, is_known_created_via,

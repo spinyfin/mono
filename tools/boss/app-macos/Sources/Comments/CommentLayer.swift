@@ -632,7 +632,7 @@ final class CommentLayer: NSObject, ObservableObject {
     /// re-runs routing from the new intent's entry point server-side — no
     /// local mutation here, since the RPC's `comment_result` echo (routed
     /// through `CommentEngineBridge.handleCommentResult`) reloads this layer,
-    /// so the badge, nudge, and revise banner all settle on the engine's
+    /// so the badge and revise banner both settle on the engine's
     /// authoritative state rather than a client-side guess. Artifact-less
     /// fallback (no persistence to defer to): simulates the same override +
     /// routing locally so that surface keeps working.
@@ -645,11 +645,6 @@ final class CommentLayer: NSObject, ObservableObject {
         comments[index].intent = intent
         comments[index].intentOverriddenByUser = true
 
-        // Mirrors the engine posting an `entry_kind='nudge'` thread entry
-        // immediately on `revision` classification (design §
-        // "Buckets 1 & 3 — unified"), before `[Revise]` is ever clicked.
-        // One-shot: a comment already carrying a nudge entry doesn't get a
-        // second one on reclassification.
         if intent == .revision {
             // Mirrors the engine's re-home (`override_comment_intent`): the
             // bucket-2 statuses only make sense for a question, so a comment
@@ -661,18 +656,6 @@ final class CommentLayer: NSObject, ObservableObject {
             if [.answering, .answered, .awaitingFollowup].contains(comments[index].status) {
                 comments[index].status = .active
                 comments[index].statusActor = "user"
-            }
-            let alreadyNudged = comments[index].threadEntries.contains { $0.entryKind == .nudge }
-            if !alreadyNudged {
-                comments[index].threadEntries.append(
-                    CommentThreadEntry(
-                        id: UUID().uuidString,
-                        entryKind: .nudge,
-                        author: "engine",
-                        body: Self.nudgeBody,
-                        createdAt: Date()
-                    )
-                )
             }
         } else if intent == .question, comments[index].status == .active {
             // Mirrors the engine's `classifying` → `answering` transition
@@ -751,9 +734,6 @@ final class CommentLayer: NSObject, ObservableObject {
 
     // MARK: - `[Revise]` banner + chips
 
-    /// Matches the engine's `NUDGE_BODY` (`engine/core/src/app/comments.rs`).
-    static let nudgeBody = "This looks like it wants a doc change — click [Revise] to start one."
-
     /// Local stand-in for the engine's `next_id("task")` allocator, used only
     /// by the artifact-less fallback path of `reviseDoc()` to synthesize a
     /// `revise_task_id` (there's no engine to mint a real one for).
@@ -798,11 +778,6 @@ final class CommentLayer: NSObject, ObservableObject {
             comments[i].status = .inRevision
             comments[i].reviseTaskId = taskId
             comments[i].statusActor = "engine"
-            // The nudge entry's `revise_task_id` postdates the entry itself —
-            // filled in only once a batch actually claims the comment.
-            if let nudgeIndex = comments[i].threadEntries.firstIndex(where: { $0.entryKind == .nudge }) {
-                comments[i].threadEntries[nudgeIndex].reviseTaskId = taskId
-            }
         }
     }
 

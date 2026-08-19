@@ -105,9 +105,9 @@ pub const RESOLVED_WITH_ORPHAN: &str = "orphan";
 /// `tools/boss/docs/designs/comment-triggered-document-revisions.md`.
 ///
 /// Intent is a binary routing decision: nothing downstream — the
-/// `[Revise]` batch predicate, the nudge trigger, the answered/active
-/// transitions, manual override — distinguishes a small edit from a
-/// substantive one, so both are `revision`.
+/// `[Revise]` batch predicate, the answered/active transitions, manual
+/// override — distinguishes a small edit from a substantive one, so both
+/// are `revision`.
 pub const INTENT_REVISION: &str = "revision";
 pub const INTENT_QUESTION: &str = "question";
 
@@ -331,19 +331,22 @@ pub struct AnswerAgentRun {
     pub completed_at: Option<String>,
 }
 
-// --- Comment thread entries (P2/P3: engine-authored nudge/answer/follow-up) ---
+// --- Comment thread entries (P2/P3: engine-authored answer/follow-up) ---
 
 /// An engine-authored (or operator-authored) turn in a comment's thread —
-/// `comment_thread_entries` table. Shared by both the bucket-1&3 nudge and
-/// the bucket-2 answer/follow-up paths (comment-triggered-document-revisions.md
+/// `comment_thread_entries` table (comment-triggered-document-revisions.md
 /// §"Reply/link mechanics"): the base comment model is single-level (P529
 /// non-goal), so this table is the minimal "conversation" shape layered on
 /// top of one `work_comments` row — every entry is a child of exactly one
 /// comment, never a sibling top-level comment.
 ///
-/// P3b wires only [`THREAD_ENTRY_KIND_ANSWER`] (the answer-agent's reply).
-/// `nudge` (bucket 1&3, phase 2b) and `operator_followup` (phase 3c) are
-/// declared here because the table is shared, but nothing yet writes them.
+/// Writes [`THREAD_ENTRY_KIND_ANSWER`] (the answer-agent's reply) and
+/// [`THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP`] (an operator's reply in a bucket-2
+/// thread). A retired `nudge` kind (bucket 1&3, phase 2b — an
+/// engine-authored "this looks like a doc change" entry) is no longer
+/// written: the sidebar's intent badge already surfaces that classification,
+/// so the announcement was pure duplication. Existing `nudge` rows remain in
+/// the table as inert history.
 ///
 /// 8 fields → builder pattern per project convention.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
@@ -351,15 +354,18 @@ pub struct AnswerAgentRun {
 pub struct CommentThreadEntry {
     pub id: String,
     pub comment_id: String,
-    /// `nudge` | `answer` | `operator_followup` — see the `THREAD_ENTRY_KIND_*`
-    /// constants.
+    /// `answer` | `operator_followup`, or the retired `nudge` on a
+    /// pre-existing row — see the `THREAD_ENTRY_KIND_*` constants.
     pub entry_kind: String,
-    /// `engine` for an engine-authored entry (nudge, answer, or the
-    /// no-reply-posted apology), or the operator's identity for a follow-up.
+    /// `engine` for an engine-authored entry (answer, or the no-reply-posted
+    /// apology), or the operator's identity for a follow-up.
     pub author: String,
     pub body: String,
-    /// Set on a `nudge` entry once a `[Revise]` batch actually claims the
-    /// comment (phase 2). Always `None` for `answer` entries.
+    /// Unused by any entry kind this struct is currently constructed with
+    /// (`answer` / `operator_followup`); always `None` on a freshly-written
+    /// row. Retained because a pre-existing `nudge` row may carry a value
+    /// here — see [`WorkComment::reopened_at`] for the signal that actually
+    /// drives the sidebar's `Reopened` state today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revise_task_id: Option<String>,
     /// Set on an `answer` entry — the [`AnswerAgentRun`] that produced it.
@@ -368,12 +374,15 @@ pub struct CommentThreadEntry {
     pub created_at: String,
 }
 
-/// `comment_thread_entries.entry_kind` values.
+/// `comment_thread_entries.entry_kind` values. `THREAD_ENTRY_KIND_NUDGE` is
+/// retired — no code path writes it any more — and is kept only to identify
+/// pre-existing rows carrying it.
 pub const THREAD_ENTRY_KIND_NUDGE: &str = "nudge";
 pub const THREAD_ENTRY_KIND_ANSWER: &str = "answer";
 pub const THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP: &str = "operator_followup";
 
-/// `comment_thread_entries.author` for engine-authored entries (nudge, answer).
+/// `comment_thread_entries.author` for engine-authored entries (answer, and
+/// the no-reply-posted apology).
 pub const THREAD_ENTRY_AUTHOR_ENGINE: &str = "engine";
 
 /// A comment paired with its resolution against the supplied plain text.
@@ -529,4 +538,15 @@ pub struct WorkComment {
     /// `intent_classification_failed_at`. `NULL` whenever that is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent_classification_error: Option<String>,
+
+    /// Stamped whenever [`COMMENT_STATUS_IN_REVISION`] (or a comment
+    /// `resolved` by a revision's commit) is reconciled back to `active`
+    /// because its claiming task was abandoned (PR closed unmerged) —
+    /// mirrors the reconciliation's `Reopened` outcome. `NULL` for a
+    /// comment that has never been claimed, or one whose most recent
+    /// claim/reclassify/status-set superseded the reopen. Distinguishes
+    /// "never revised" from "revised, then abandoned" for the sidebar's
+    /// `Reopened` chip — the two read identically from `status` alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reopened_at: Option<String>,
 }
