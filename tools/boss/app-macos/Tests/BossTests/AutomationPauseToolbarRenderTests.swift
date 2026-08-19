@@ -11,7 +11,11 @@ import XCTest
 @MainActor
 final class AutomationPauseToolbarRenderTests: XCTestCase {
     func testPausedAndRunningRendersDifferInBothAppearances() throws {
-        let dest = FileManager.default.temporaryDirectory
+        let temporaryDirectory = URL(
+            fileURLWithPath: ProcessInfo.processInfo.environment["TEST_TMPDIR"] ?? NSTemporaryDirectory(),
+            isDirectory: true
+        )
+        let dest = temporaryDirectory
             .appendingPathComponent("boss-auto-toolbar-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
 
