@@ -106,6 +106,23 @@ extension EngineClient {
         sendLine(["type": "set_dispatch_paused", "paused": paused])
     }
 
+    /// Pause or resume the automation scheduler — the same
+    /// `SetAutomationPaused` RPC `bossctl automation pause` /
+    /// `bossctl automation resume` drive. `reason` is required when
+    /// `paused` is true (the engine rejects an empty/missing reason);
+    /// omitted when resuming. The engine replies with
+    /// `automation_state_result` and broadcasts a fresh health report.
+    func sendSetAutomationPaused(paused: Bool, reason: String? = nil) {
+        var line: [String: Any] = [
+            "type": "set_automation_paused",
+            "paused": paused,
+        ]
+        if let reason {
+            line["reason"] = reason
+        }
+        sendLine(line)
+    }
+
     /// Set one per-installation setting. Engine persists to
     /// `settings.toml` and replies with `setting_set` once the
     /// in-memory store is updated.

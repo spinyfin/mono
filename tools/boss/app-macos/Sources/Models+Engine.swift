@@ -109,6 +109,10 @@ struct EngineSetting: Identifiable, Hashable {
 /// missing/invalid engine config — introduced after #699 where a
 /// missing `ANTHROPIC_API_KEY` silently broke summarization with no
 /// UI affordance.
+///
+/// `automationPausedKind` is still reported here (the engine remains
+/// authoritative) but is rendered by `AutomationPauseToolbarButton`,
+/// not `EngineHealthBanner`.
 struct EngineHealthIssue: Identifiable, Hashable {
     /// Stable lowercase snake_case kind id. Used as the `Identifiable`
     /// key so SwiftUI animations are stable across snapshots.
@@ -118,6 +122,10 @@ struct EngineHealthIssue: Identifiable, Hashable {
     let severity: String
     let title: String
     let body: String
+
+    /// Engine-emitted kind for a global automation pause. Kept on the
+    /// health report; the toolbar toggle is the presentation surface.
+    static let automationPausedKind = "automation_paused"
 }
 
 /// Live `getQueue` smoke-check outcome against a `trunk_queue`-mechanism
