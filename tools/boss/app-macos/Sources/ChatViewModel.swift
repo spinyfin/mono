@@ -448,7 +448,26 @@ final class ChatViewModel: ObservableObject {
     @Published var engineAttempts: [EngineAttemptListEntry] = []
 
     /// Engine-owned snapshot for the background-work toolbar affordance.
+    /// Replaced atomically from `ListEngineAttempts` responses; the app
+    /// must not filter or re-count by kind. Cleared on disconnect.
     @Published var backgroundWork: [BackgroundWorkItem] = []
+
+    /// Canonical five-second cadence for the connection-scoped background
+    /// snapshot poll. Tests shorten `backgroundWorkPollInterval`.
+    nonisolated static let backgroundWorkPollInterval: TimeInterval = 5
+
+    /// Polling interval used by `startBackgroundWorkPolling()`. Defaults
+    /// to [[backgroundWorkPollInterval]]; tests assign a shorter value.
+    var backgroundWorkPollInterval: TimeInterval = ChatViewModel.backgroundWorkPollInterval
+
+    /// Cancellable connection-scoped poller. Non-nil while connected.
+    var backgroundWorkPollTask: Task<Void, Never>?
+
+    /// Monotonic generation for in-flight snapshot requests so a late
+    /// `limit = 0` poll cannot overwrite a newer event-triggered refresh.
+    var backgroundWorkSendGeneration: UInt64 = 0
+    var backgroundWorkAppliedGeneration: UInt64 = 0
+    var backgroundWorkPending: [String: BackgroundWorkPendingRequest] = [:]
 
     /// Source-specific records requested by selected Activity rows, keyed by
     /// their shared-list attempt id.

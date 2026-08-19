@@ -91,12 +91,13 @@ final class ActivityLogDecoderTests: XCTestCase {
         let client = makeClient()
         let received = expectation(description: "engine attempts list")
         client.onEvent = { event in
-            guard case .engineAttemptsList(let attempts, let backgroundWork) = event else {
+            guard case .engineAttemptsList(let attempts, let backgroundWork, let requestId) = event else {
                 XCTFail("expected engine attempts list event")
                 return
             }
             XCTAssertEqual(attempts.map(\.id), ["cir_123"])
             XCTAssertTrue(backgroundWork.isEmpty)
+            XCTAssertEqual(requestId, "test")
             received.fulfill()
         }
 
@@ -130,7 +131,7 @@ final class ActivityAttemptDetailTests: XCTestCase {
         let conflict = makeAttempt(id: "crz_1", kind: "conflict")
         let ci = makeAttempt(id: "cir_1", kind: "ci")
 
-        model.applyEventForTest(.engineAttemptsList(attempts: [conflict, ci], backgroundWork: []))
+        model.applyEventForTest(.engineAttemptsList(attempts: [conflict, ci], backgroundWork: [], requestId: nil))
         model.applyEventForTest(.conflictResolution(attempt: makeConflictResolution(id: conflict.id)))
         model.applyEventForTest(.ciRemediation(attempt: makeCiRemediation(id: ci.id)))
 
