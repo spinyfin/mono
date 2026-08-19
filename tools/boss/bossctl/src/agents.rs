@@ -1757,9 +1757,10 @@ fn print_live_state_short(state: &LiveWorkerState, tmux: TmuxListEvidence<'_>) {
     println!("{}", format_live_state_short(state, tmux));
 }
 
-/// Why a live-list row has no `TmuxWorkerStatus`. The cause is rendered in
-/// the `adoption_state` column: `probe_unavailable` when the fetch failed,
-/// and `no_status` when the engine answered without a row for this worker.
+/// Why a live-list row has no `TmuxWorkerStatus`. The absent-status causes
+/// are distinguished in the rendered row: an engine that could not answer
+/// renders `probe_unavailable`, and an answered-but-rowless worker renders
+/// `no_status`.
 #[derive(Debug, Clone, Copy)]
 enum TmuxListEvidence<'a> {
     /// `ListTmuxWorkerStatuses` failed (older engine, RPC error).
