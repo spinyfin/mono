@@ -39,6 +39,10 @@ struct WorkConflictResolution: Identifiable, Hashable {
     /// Soft FK to the `tasks.id` of the revision task spawned by this attempt.
     /// `nil` for pre-unification rows and attempts retired before a revision was created.
     var revisionTaskId: String? = nil
+    /// The mechanical conflict-ladder rung currently running in-process, if
+    /// any. Unlike `resolvedByRung`, this is a live marker rather than
+    /// terminal telemetry.
+    var mechanicalRungInFlight: Int? = nil
 }
 
 /// PR-card chip state for the CI auto-fix flow (design Q11 / Phase

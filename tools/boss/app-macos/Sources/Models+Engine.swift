@@ -7,89 +7,87 @@ import Foundation
 // the repo's file-size check.
 // ===========================================================================
 
-/// Discriminator for the unified Engine-tab attempt feed. Phase 5 #14
-/// lists `conflict_resolutions`; Phase 11 #37 grows the enum with the
-/// CI subsystem (`ci_remediations`). The `rebase_attempts` row kind
-/// is reserved for when the `auto-rebase-stacked-prs` flow lands.
-enum EngineAttemptRow: Identifiable, Hashable {
-    case conflictResolution(WorkConflictResolution)
-    case ciRemediation(WorkCiRemediation)
-
-    var id: String {
-        switch self {
-        case .conflictResolution(let r):
-            return "crz:\(r.id)"
-        case .ciRemediation(let r):
-            return "cir:\(r.id)"
-        }
-    }
+/// Shared fields from the engine's unified attempt list. The list stays
+/// intentionally shallow; Activity requests the source-specific record only
+/// once a row is selected.
+struct EngineAttemptListEntry: Identifiable, Hashable {
+    let id: String
+    let productID: String
+    let createdAt: String
+    let extra: [String: String]
+    let kind: String
+    let prURL: String
+    let status: String
+    let failureReason: String?
+    let finishedAt: String?
+    let startedAt: String?
+    let workItemID: String?
 
     var kindLabel: String {
-        switch self {
-        case .conflictResolution:
-            return "Conflict"
-        case .ciRemediation(let r):
-            switch r.attemptKind {
+        switch kind {
+        case "conflict": return "Conflict"
+        case "ci":
+            switch extra["attempt_kind"] {
             case "fix": return "CI fix"
             case "retrigger": return "CI retrigger"
             default: return "CI"
             }
+        case "rebase": return "Rebase"
+        default: return kind
         }
     }
 
-    var status: String {
-        switch self {
-        case .conflictResolution(let r):
-            return r.status
-        case .ciRemediation(let r):
-            return r.status
+    var detailRequestType: String? {
+        switch kind {
+        case "conflict": return "get_conflict_resolution"
+        case "ci": return "get_ci_remediation"
+        default: return nil
         }
     }
 
-    var prURL: String {
-        switch self {
-        case .conflictResolution(let r):
-            return r.prURL
-        case .ciRemediation(let r):
-            return r.prURL
-        }
+    var hasKindSpecificDetail: Bool {
+        detailRequestType != nil
     }
+}
 
-    var workItemID: String {
-        switch self {
-        case .conflictResolution(let r):
-            return r.workItemID
-        case .ciRemediation(let r):
-            return r.workItemID
-        }
-    }
+/// The engine-owned sources that can surface in the toolbar's background-work
+/// snapshot. Unknown source values remain visible so the toolbar count stays
+/// faithful to the engine's snapshot.
+enum BackgroundWorkKind: Hashable {
+    case projectPlanner
+    case conflictRemediation
+    case unknown(String)
 
-    var createdAt: String {
-        switch self {
-        case .conflictResolution(let r):
-            return r.createdAt
-        case .ciRemediation(let r):
-            return r.createdAt
+    init(rawValue: String) {
+        switch rawValue {
+        case "project_planner": self = .projectPlanner
+        case "conflict_remediation": self = .conflictRemediation
+        default: self = .unknown(rawValue)
         }
     }
+}
 
-    var finishedAt: String? {
-        switch self {
-        case .conflictResolution(let r):
-            return r.finishedAt
-        case .ciRemediation(let r):
-            return r.finishedAt
-        }
-    }
+/// One engine-authored item in the background-work snapshot returned alongside
+/// the unified attempt list when requested.
+struct BackgroundWorkItem: Identifiable, Hashable {
+    let id: String
+    let kind: BackgroundWorkKind
+    let phase: String
+    let productID: String
+    let sourceID: String
+    let title: String
+    let projectID: String?
+    let startedAt: String?
+    let workItemID: String?
+}
 
-    var failureReason: String? {
-        switch self {
-        case .conflictResolution(let r):
-            return r.failureReason
-        case .ciRemediation(let r):
-            return r.failureReason
-        }
-    }
+/// Source-specific detail for a selected unified attempt row. The list itself
+/// uses `EngineAttemptListEntry`; this enum is populated only by a selected
+/// row's kind-specific get request.
+enum EngineAttemptRow: Hashable {
+    case conflictResolution(WorkConflictResolution)
+    case ciRemediation(WorkCiRemediation)
+
 }
 
 /// Snapshot of one per-installation setting, decoded from a

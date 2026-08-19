@@ -46,7 +46,7 @@ enum ActivityOutcome: String, CaseIterable, Identifiable {
 struct ActivityRow: Identifiable, Hashable {
     enum Payload: Hashable {
         case dispatch(DispatchEvent)
-        case engineAttempt(EngineAttemptRow)
+        case engineAttempt(EngineAttemptListEntry)
     }
 
     let id: String
@@ -106,7 +106,7 @@ struct ActivityRow: Identifiable, Hashable {
             return [e.executionId, e.workItemId ?? "", e.workerId ?? "",
                     e.errorMessage ?? "", e.stage].joined(separator: " ")
         case .engineAttempt(let r):
-            return [r.id, r.workItemID, r.prURL, r.failureReason ?? ""].joined(separator: " ")
+            return [r.id, r.workItemID ?? "", r.prURL, r.failureReason ?? ""].joined(separator: " ")
         }
     }
 
@@ -156,26 +156,18 @@ final class ActivityLogModel: ObservableObject {
         lastDispatchEventAt = new.last.map { $0.timestamp } ?? lastDispatchEventAt
     }
 
-    /// Build the merged, newest-first activity list. Engine attempts
-    /// are *derived* from the engine's `conflict_resolutions` +
-    /// `ci_remediations` snapshots (owned by `ChatViewModel`) rather
-    /// than mirrored into a `@Published` here — the caller threads the
-    /// current snapshots straight through. Keeping the merge a pure
-    /// function of upstream state means it can never publish a change
-    /// from within a view update. Design Phase 11 #37 grew this from
-    /// one row kind to two; future kinds (rebase, review-feedback) just
-    /// add another parameter and `map`.
+    /// Build the merged, newest-first Activity list from the dispatch tail and
+    /// the engine's unified attempt projection. Keeping the merge pure avoids
+    /// publishing view state during an update while preserving the existing
+    /// cross-source ordering.
     func makeRows(
         sourceFilter: ActivitySourceFilter,
-        conflicts: [WorkConflictResolution] = [],
-        ci: [WorkCiRemediation] = []
+        attempts: [EngineAttemptListEntry] = []
     ) -> [ActivityRow] {
         let d: [ActivityRow] = dispatchEvents.map { e in
             ActivityRow(id: "d:\(e.id)", timestamp: e.timestamp, payload: .dispatch(e))
         }
-        let engineAttempts = conflicts.map { EngineAttemptRow.conflictResolution($0) }
-            + ci.map { EngineAttemptRow.ciRemediation($0) }
-        let ea: [ActivityRow] = engineAttempts.map { r in
+        let ea: [ActivityRow] = attempts.map { r in
             ActivityRow(
                 id: "e:\(r.id)",
                 timestamp: isoFormatter.date(from: r.createdAt) ?? .distantPast,
@@ -228,8 +220,7 @@ struct ActivityLogView: View {
     private var filteredRows: [ActivityRow] {
         let raw = model.makeRows(
             sourceFilter: sourceFilter,
-            conflicts: chat.conflictResolutions,
-            ci: chat.ciRemediations
+            attempts: chat.engineAttempts
         )
         let outcomes = outcomeFilter
         let query = searchText.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
@@ -266,7 +257,7 @@ struct ActivityLogView: View {
                 .font(.title3.bold())
             Spacer()
             VStack(alignment: .trailing, spacing: 2) {
-                Text("\(model.dispatchEvents.count) dispatch • \(chat.conflictResolutions.count + chat.ciRemediations.count) engine")
+                Text("\(model.dispatchEvents.count) dispatch • \(chat.engineAttempts.count) engine")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if let last = model.lastDispatchEventAt {
@@ -336,7 +327,7 @@ struct ActivityLogView: View {
     @ViewBuilder
     private var mainContent: some View {
         let rows = filteredRows
-        if model.dispatchEvents.isEmpty && chat.conflictResolutions.isEmpty && chat.ciRemediations.isEmpty {
+        if model.dispatchEvents.isEmpty && chat.engineAttempts.isEmpty {
             emptyState
         } else {
             HSplitView {
@@ -662,8 +653,14 @@ private struct ActivityDispatchTimelineRow: View {
 // MARK: - Engine attempt detail pane
 
 private struct ActivityEngineDetailPane: View {
-    let row: EngineAttemptRow
+    @EnvironmentObject private var chat: ChatViewModel
+
+    let row: EngineAttemptListEntry
     let onClose: () -> Void
+
+    private var detail: EngineAttemptRow? {
+        chat.engineAttemptDetails[row.id]
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -685,76 +682,105 @@ private struct ActivityEngineDetailPane: View {
                         engineDetailRow("Attempt id", body: row.id)
                         engineDetailRow("Status", body: row.status)
                         engineDetailRow("PR", body: row.prURL)
-                        engineDetailRow("Work item", body: row.workItemID)
+                        engineDetailRow("Work item", body: row.workItemID ?? "—")
                         engineDetailRow("Created", body: row.createdAt)
                         engineDetailRow("Finished", body: row.finishedAt ?? "—")
                         if let reason = row.failureReason, !reason.isEmpty {
                             engineDetailRow("Failure reason", body: reason)
                         }
                     }
-                    switch row {
-                    case .conflictResolution(let resolution):
-                        if let diag = resolution.conflictDiagnosis, !diag.isEmpty {
-                            Text("Diagnosis")
-                                .font(.subheadline.bold())
-                                .padding(.top, 8)
-                            ScrollView {
-                                Text(diag)
-                                    .font(.system(.caption, design: .monospaced))
-                                    .textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .frame(maxHeight: 220)
-                            .background(Color(nsColor: .textBackgroundColor))
-                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                    if let detail {
+                        detailFields(detail)
+                    } else if chat.engineAttemptDetailErrors[row.id] != nil {
+                        Text("Could not load attempt details")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 8)
+                    } else if row.hasKindSpecificDetail {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Loading attempt details…")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
-                    case .ciRemediation(let remediation):
-                        engineDetailRow("Attempt kind", body: remediation.attemptKind)
-                        engineDetailRow(
-                            "Consumes budget",
-                            body: remediation.consumesBudget == 1 ? "yes" : "no"
-                        )
-                        engineDetailRow(
-                            "Triage class",
-                            body: remediation.triageClass ?? "—"
-                        )
-                        engineDetailRow("Head SHA", body: remediation.headSHAAtTrigger)
-                        if !remediation.failedChecks.isEmpty,
-                           remediation.failedChecks != "[]" {
-                            Text("Failed checks")
-                                .font(.subheadline.bold())
-                                .padding(.top, 8)
-                            ScrollView {
-                                Text(remediation.failedChecks)
-                                    .font(.system(.caption, design: .monospaced))
-                                    .textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .frame(maxHeight: 180)
-                            .background(Color(nsColor: .textBackgroundColor))
-                            .clipShape(RoundedRectangle(cornerRadius: 6))
-                        }
-                        if let log = remediation.logExcerpt, !log.isEmpty {
-                            Text("Log excerpt")
-                                .font(.subheadline.bold())
-                                .padding(.top, 8)
-                            ScrollView {
-                                Text(log)
-                                    .font(.system(.caption, design: .monospaced))
-                                    .textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .frame(maxHeight: 220)
-                            .background(Color(nsColor: .textBackgroundColor))
-                            .clipShape(RoundedRectangle(cornerRadius: 6))
-                        }
+                        .padding(.top, 8)
                     }
                 }
                 .padding(16)
                 .frame(maxWidth: .infinity, alignment: .topLeading)
             }
         }
+        .task(id: row.id) {
+            if row.hasKindSpecificDetail {
+                chat.fetchEngineAttemptDetail(row)
+            }
+        }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    @ViewBuilder
+    private func detailFields(_ detail: EngineAttemptRow) -> some View {
+        switch detail {
+        case .conflictResolution(let resolution):
+            if let rung = resolution.mechanicalRungInFlight {
+                engineDetailRow("Mechanical rung", body: String(rung))
+            }
+            if let diag = resolution.conflictDiagnosis, !diag.isEmpty {
+                Text("Diagnosis")
+                    .font(.subheadline.bold())
+                    .padding(.top, 8)
+                ScrollView {
+                    Text(diag)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 220)
+                .background(Color(nsColor: .textBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+            }
+        case .ciRemediation(let remediation):
+            engineDetailRow("Attempt kind", body: remediation.attemptKind)
+            engineDetailRow(
+                "Consumes budget",
+                body: remediation.consumesBudget == 1 ? "yes" : "no"
+            )
+            engineDetailRow(
+                "Triage class",
+                body: remediation.triageClass ?? "—"
+            )
+            engineDetailRow("Head SHA", body: remediation.headSHAAtTrigger)
+            if !remediation.failedChecks.isEmpty,
+               remediation.failedChecks != "[]" {
+                Text("Failed checks")
+                    .font(.subheadline.bold())
+                    .padding(.top, 8)
+                ScrollView {
+                    Text(remediation.failedChecks)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 180)
+                .background(Color(nsColor: .textBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+            }
+            if let log = remediation.logExcerpt, !log.isEmpty {
+                Text("Log excerpt")
+                    .font(.subheadline.bold())
+                    .padding(.top, 8)
+                ScrollView {
+                    Text(log)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 220)
+                .background(Color(nsColor: .textBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+            }
+        }
     }
 
     @ViewBuilder

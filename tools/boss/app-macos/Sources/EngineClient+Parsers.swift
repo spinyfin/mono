@@ -342,7 +342,62 @@ extension EngineClient {
             createdAt: createdAt,
             startedAt: payload["started_at"] as? String,
             finishedAt: payload["finished_at"] as? String,
-            revisionTaskId: payload["revision_task_id"] as? String
+            revisionTaskId: payload["revision_task_id"] as? String,
+            mechanicalRungInFlight: (payload["mechanical_rung_in_flight"] as? NSNumber)?.intValue
+        )
+    }
+
+    func parseEngineAttemptListEntry(_ payload: [String: Any]) -> EngineAttemptListEntry? {
+        guard let id = payload["id"] as? String,
+              let productID = payload["product_id"] as? String,
+              let createdAt = payload["created_at"] as? String,
+              let kind = payload["kind"] as? String,
+              let prURL = payload["pr_url"] as? String,
+              let status = payload["status"] as? String
+        else {
+            return nil
+        }
+        let extra = (payload["extra"] as? [String: Any] ?? [:]).reduce(into: [String: String]()) {
+            result, entry in
+            if let value = entry.value as? String {
+                result[entry.key] = value
+            }
+        }
+        return EngineAttemptListEntry(
+            id: id,
+            productID: productID,
+            createdAt: createdAt,
+            extra: extra,
+            kind: kind,
+            prURL: prURL,
+            status: status,
+            failureReason: payload["failure_reason"] as? String,
+            finishedAt: payload["finished_at"] as? String,
+            startedAt: payload["started_at"] as? String,
+            workItemID: payload["work_item_id"] as? String
+        )
+    }
+
+    func parseBackgroundWorkItem(_ payload: [String: Any]) -> BackgroundWorkItem? {
+        guard let id = payload["id"] as? String,
+              let kindRaw = payload["kind"] as? String,
+              let phase = payload["phase"] as? String,
+              let productID = payload["product_id"] as? String,
+              let sourceID = payload["source_id"] as? String,
+              let title = payload["title"] as? String
+        else {
+            return nil
+        }
+        return BackgroundWorkItem(
+            id: id,
+            kind: BackgroundWorkKind(rawValue: kindRaw),
+            phase: phase,
+            productID: productID,
+            sourceID: sourceID,
+            title: title,
+            projectID: payload["project_id"] as? String,
+            startedAt: payload["started_at"] as? String,
+            workItemID: payload["work_item_id"] as? String
         )
     }
 
