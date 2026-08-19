@@ -788,10 +788,9 @@ impl WorkDb {
         // `docs/designs/dispatch-halt-state-vs-attention-items.md`.
         // Idempotent; a no-op once no open items of this shape remain.
         migrate_resolve_open_orphan_sweep_churn_guard_parked(conn)?;
-        // Redundant-nudge-removal chore: `work_comments.reopened_at`, stamped
-        // by reconciliation's `Reopened` outcome so the sidebar can tell
-        // "never claimed" apart from "claimed, then abandoned" without the
-        // now-removed nudge thread entry. Purely additive.
+        // `work_comments.reopened_at`, stamped by reconciliation's
+        // `Reopened` outcome so the sidebar can tell "never claimed" apart
+        // from "claimed, then abandoned". Purely additive.
         migrate_work_comments_reopened_at_column(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '31')

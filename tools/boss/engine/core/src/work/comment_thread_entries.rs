@@ -1,17 +1,17 @@
 //! `comment_thread_entries` persistence — engine-authored (and
-//! operator-authored) turns in a comment's thread, shared by the bucket-2
-//! answer/follow-up paths (P3b of
-//! `comment-triggered-document-revisions.md` §"Reply/link mechanics").
+//! operator-authored) turns in a comment's thread, shared by the answer and
+//! follow-up paths (`comment-triggered-document-revisions.md` §"Reply/link
+//! mechanics").
 //!
 //! Writes `entry_kind = 'answer'` rows (via
 //! [`WorkDb::create_comment_thread_entry`], called from the
 //! `CommentsPostAnswer` handler and from `finalize_answer_agent`'s
-//! no-reply-posted path) and `operator_followup` rows (phase 3c). A prior
-//! `nudge` kind (phase 2b — an engine-authored "this looks like a doc
-//! change" thread entry, superseded by the sidebar's intent badge, which
-//! already surfaces the same classification) is no longer written; existing
-//! `nudge` rows remain in the table as inert history and are simply not
-//! rendered by the app.
+//! no-reply-posted path) and `operator_followup` rows. The retired `nudge`
+//! kind (an engine-authored "this looks like a doc change" entry, superseded
+//! by the sidebar's intent badge, which already surfaces the same
+//! classification) is no longer written; existing `nudge` rows remain in the
+//! table as inert history and are filtered out at read time (see
+//! `list_comment_thread_entries` below).
 use super::*;
 
 impl WorkDb {
@@ -63,17 +63,25 @@ impl WorkDb {
             .map_err(Into::into)
     }
 
-    /// List a comment's thread entries in chronological order. Not yet
-    /// consumed by any handler in P3b (no thread-read RPC exists until the
-    /// UI phase wires `CommentsList` to include them) — added now so the
-    /// table has symmetric CRUD from day one.
+    /// List a comment's thread entries in chronological order, excluding
+    /// retired `nudge` rows: every reader (the app, `bossctl`, the CLI, the
+    /// revision worker's directive, and the follow-up classifier's prompt)
+    /// goes through this method, so filtering here — rather than in each
+    /// client — keeps all of them in agreement about what counts as thread
+    /// history.
     pub fn list_comment_thread_entries(&self, comment_id: &str) -> Result<Vec<CommentThreadEntry>> {
         let conn = self.connect()?;
         let cols = Self::comment_thread_entry_columns();
-        let sql =
-            format!("SELECT {cols} FROM comment_thread_entries WHERE comment_id = ?1 ORDER BY created_at ASC, id ASC");
+        let sql = format!(
+            "SELECT {cols} FROM comment_thread_entries \
+             WHERE comment_id = ?1 AND entry_kind <> ?2 \
+             ORDER BY created_at ASC, id ASC"
+        );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([comment_id], map_comment_thread_entry)?;
+        let rows = stmt.query_map(
+            params![comment_id, boss_protocol::THREAD_ENTRY_KIND_NUDGE],
+            map_comment_thread_entry,
+        )?;
         collect_rows(rows)
     }
 }
@@ -155,6 +163,31 @@ mod tests {
             db.create_comment_thread_entry(&comment, "nudge", "engine", "x", None, None)
                 .is_err()
         );
+    }
+
+    /// Pre-existing `nudge` rows arrive via raw SQL (migration-era data, not
+    /// this constructor — see `rejects_the_retired_nudge_entry_kind` above)
+    /// and must not surface through the shared read path any reader uses.
+    #[test]
+    fn list_excludes_retired_nudge_rows() {
+        let db = mem_db();
+        let comment = make_comment(&db, "t1");
+        let kept = db
+            .create_comment_thread_entry(&comment, THREAD_ENTRY_KIND_ANSWER, "engine", "kept", None, None)
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO comment_thread_entries \
+                 (id, comment_id, entry_kind, author, body, revise_task_id, answer_agent_run_id, created_at) \
+                 VALUES ('cte_nudge', ?1, 'nudge', 'engine', 'legacy nudge', NULL, NULL, '2020-01-01T00:00:00Z')",
+                [&comment],
+            )
+            .unwrap();
+
+        let entries = db.list_comment_thread_entries(&comment).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, kept.id);
     }
 
     #[test]

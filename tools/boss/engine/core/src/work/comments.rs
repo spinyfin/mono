@@ -1186,6 +1186,7 @@ pub(crate) fn reconcile_comments_for_task(
 
 #[cfg(test)]
 mod tests {
+    use super::{CommentReconcileOutcome, reconcile_comments_for_task};
     use crate::comments_anchor::CommentFuzzyConfig;
     use crate::work::WorkDb;
     use boss_protocol::{CommentAnchor, CreateCommentInput, WorkComment};
@@ -1293,6 +1294,44 @@ mod tests {
         assert_eq!(reactivated.status, "active");
         assert!(reactivated.dismissed_at.is_none());
         assert_eq!(db.list_comments("work_item", "t1", false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn set_comment_status_active_clears_reopened_at() {
+        let db = mem_db();
+        let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+
+        // Simulate the claim + abandon that stamps `reopened_at`: claim the
+        // comment into `in_revision`, then reconcile it as `Reopened`.
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_comments SET status = 'in_revision', revise_task_id = 'task_1' WHERE id = ?1",
+                [&c.id],
+            )
+            .unwrap();
+            reconcile_comments_for_task(
+                &conn,
+                "task_1",
+                CommentReconcileOutcome::Reopened {
+                    include_resolved: false,
+                },
+                "now",
+            )
+            .unwrap();
+        }
+        let reopened = db.get_comment(&c.id).unwrap().unwrap();
+        assert_eq!(reopened.status, "active");
+        assert!(reopened.reopened_at.is_some(), "reconciliation must stamp reopened_at");
+
+        // Any explicit transition back to `active` must clear it — this is
+        // the regression that would silently restore the old "never
+        // claimed" vs "claimed, then abandoned" conflation.
+        let reactivated = db.set_comment_status(&c.id, "active", Some("user:me")).unwrap();
+        assert!(
+            reactivated.reopened_at.is_none(),
+            "set_comment_status(.., 'active', ..) must clear reopened_at"
+        );
     }
 
     #[test]

@@ -331,7 +331,7 @@ pub struct AnswerAgentRun {
     pub completed_at: Option<String>,
 }
 
-// --- Comment thread entries (P2/P3: engine-authored answer/follow-up) ---
+// --- Comment thread entries (engine-authored answer / operator follow-up) ---
 
 /// An engine-authored (or operator-authored) turn in a comment's thread —
 /// `comment_thread_entries` table (comment-triggered-document-revisions.md
@@ -342,11 +342,10 @@ pub struct AnswerAgentRun {
 ///
 /// Writes [`THREAD_ENTRY_KIND_ANSWER`] (the answer-agent's reply) and
 /// [`THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP`] (an operator's reply in a bucket-2
-/// thread). A retired `nudge` kind (bucket 1&3, phase 2b — an
-/// engine-authored "this looks like a doc change" entry) is no longer
-/// written: the sidebar's intent badge already surfaces that classification,
-/// so the announcement was pure duplication. Existing `nudge` rows remain in
-/// the table as inert history.
+/// thread). The retired `nudge` kind — an engine-authored "this looks like a
+/// doc change" entry — is no longer written: the sidebar's intent badge
+/// already surfaces that classification, so the announcement was pure
+/// duplication. Existing `nudge` rows remain in the table as inert history.
 ///
 /// 8 fields → builder pattern per project convention.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]

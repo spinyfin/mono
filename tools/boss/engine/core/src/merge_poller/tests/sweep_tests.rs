@@ -200,6 +200,10 @@ async fn closed_unmerged_pr_reopens_addressed_comments() {
     let reloaded = db.get_comment(&comment.id).unwrap().unwrap();
     assert_eq!(reloaded.status, "active");
     assert!(reloaded.revise_task_id.is_none());
+    assert!(
+        reloaded.reopened_at.is_some(),
+        "reopened comment must stamp reopened_at so the sidebar can render the Reopened chip"
+    );
 
     // The chore itself is retired to `done` — a closed-unmerged PR is a
     // definitive human signal that this attempt is over

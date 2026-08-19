@@ -958,6 +958,10 @@ mod tests {
             reloaded.revise_task_id.is_none(),
             "reopened comment must clear revise_task_id so a fresh [Revise] can re-claim it"
         );
+        assert!(
+            reloaded.reopened_at.is_some(),
+            "reopened comment must stamp reopened_at so the sidebar can render the Reopened chip"
+        );
     }
 
     #[test]
@@ -988,6 +992,10 @@ mod tests {
         assert!(
             reloaded.revise_task_id.is_none(),
             "reopened comment must clear revise_task_id so a fresh [Revise] can re-claim it"
+        );
+        assert!(
+            reloaded.reopened_at.is_some(),
+            "reopened comment must stamp reopened_at so the sidebar can render the Reopened chip"
         );
     }
 
@@ -1036,6 +1044,58 @@ mod tests {
         let reloaded = db.get_comment(&c1.id).unwrap().unwrap();
         assert_eq!(reloaded.status, "active");
         assert!(reloaded.revise_task_id.is_none());
+        assert!(
+            reloaded.reopened_at.is_some(),
+            "reopened comment must stamp reopened_at so the sidebar can render the Reopened chip"
+        );
+    }
+
+    #[test]
+    fn reclaiming_a_reopened_comment_clears_reopened_at() {
+        let db = mem_db();
+        let (_design, artifact_id) = seed_design_owned_artifact(&db);
+        let c1 = make_comment(&db, &artifact_id, "alpha");
+        db.set_comment_intent(&c1.id, "revision", 0.9).unwrap();
+
+        let outcome = db
+            .revise_doc(
+                ReviseDocInput::builder()
+                    .artifact_kind("pr_doc")
+                    .artifact_id(artifact_id.clone())
+                    .build(),
+                &open_checker(),
+            )
+            .unwrap();
+        let ReviseDocOutcome::Created { task_id, .. } = outcome else {
+            panic!("expected Created, got {outcome:?}");
+        };
+
+        let reopened = db.reopen_comments_for_closed_unmerged_pr(&task_id).unwrap();
+        assert_eq!(reopened, 1);
+        assert!(db.get_comment(&c1.id).unwrap().unwrap().reopened_at.is_some());
+
+        // A fresh [Revise] claim must clear `reopened_at`: that is the
+        // regression that would silently restore the old "never claimed"
+        // vs "claimed, then abandoned" conflation.
+        let reclaim_outcome = db
+            .revise_doc(
+                ReviseDocInput::builder()
+                    .artifact_kind("pr_doc")
+                    .artifact_id(artifact_id)
+                    .build(),
+                &open_checker(),
+            )
+            .unwrap();
+        assert!(
+            matches!(reclaim_outcome, ReviseDocOutcome::Created { .. }),
+            "expected a fresh claim to succeed, got {reclaim_outcome:?}"
+        );
+        let reclaimed = db.get_comment(&c1.id).unwrap().unwrap();
+        assert_eq!(reclaimed.status, "in_revision");
+        assert!(
+            reclaimed.reopened_at.is_none(),
+            "reclaiming a reopened comment must clear reopened_at"
+        );
     }
 
     #[test]

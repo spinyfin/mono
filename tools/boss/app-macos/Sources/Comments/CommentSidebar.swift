@@ -226,7 +226,6 @@ private struct ThreadEntriesView: View {
 
     private func symbolName(for kind: ThreadEntryKind) -> String {
         switch kind {
-        case .nudge: return "bell"
         case .answer: return "text.bubble"
         case .operatorFollowup: return "arrowshape.turn.up.left"
         }
@@ -234,7 +233,7 @@ private struct ThreadEntriesView: View {
 
     private func backgroundColor(for kind: ThreadEntryKind) -> Color {
         switch kind {
-        case .nudge, .answer: return Color.secondary.opacity(0.08)
+        case .answer: return Color.secondary.opacity(0.08)
         case .operatorFollowup: return Color.accentColor.opacity(0.1)
         }
     }

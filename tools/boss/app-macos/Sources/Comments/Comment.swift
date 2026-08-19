@@ -139,9 +139,8 @@ struct Comment: Identifiable, Equatable {
     /// How this comment's anchor last resolved on load (drives the ⚠/anchor-lost
     /// sidebar glyphs). `nil` until a `comments_resolve` round-trip lands.
     var lastResolvedWith: ResolvedWith? = nil
-    /// Engine-authored answer/follow-up entries, oldest first. May also
-    /// contain a retired `nudge` entry on a pre-existing thread — the
-    /// sidebar does not render those.
+    /// Engine-authored answer/follow-up entries, oldest first. `Comment.from`
+    /// filters out any retired `nudge` entry before it reaches this array.
     var threadEntries: [CommentThreadEntry] = []
     /// Mirrors `CommentWithThread.answer_agent_running` — whether an
     /// answer-agent run is actually in flight for this comment. Only
@@ -237,8 +236,14 @@ extension Comment {
             resolution.map { ResolvedWith(rawValue: $0.kind) ?? .exact }
             ?? wc.lastResolvedWith.flatMap(ResolvedWith.init(rawValue:))
         // A pre-existing thread may carry a retired `nudge` entry (the
-        // engine no longer writes them); drop it here so it never renders.
-        c.threadEntries = threadEntries.map(CommentThreadEntry.from).filter { $0.entryKind != .nudge }
+        // engine no longer writes them, and `list_comment_thread_entries`
+        // already excludes them, but this filters defensively on the wire
+        // value itself); an unrecognized future kind is deliberately left to
+        // reach `CommentThreadEntry.from`'s `.answer` fallback rather than
+        // being dropped here.
+        c.threadEntries = threadEntries
+            .filter { $0.entryKind != retiredNudgeEntryKindWireValue }
+            .map(CommentThreadEntry.from)
         c.answerAgentRunning = answerAgentRunning
         c.answerAgentFailed = answerAgentFailed
         c.artifactKind = wc.artifactKind

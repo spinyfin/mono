@@ -465,6 +465,33 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertNil(layer.comments[0].revisionChipState)
     }
 
+    /// `Comment.from` with `reopenedAt` set and `status == .active` derives
+    /// the `Reopened` chip; `reopenedAt == nil` derives no chip.
+    func testRevisionChipStateReflectsReopenedAt() {
+        let reopened = Self.wireComment(id: "cmt_1", exact: "a", body: "b", status: "active", reopenedAt: "2026-08-01T00:00:00Z")
+        let notReopened = Self.wireComment(id: "cmt_2", exact: "a", body: "b", status: "active", reopenedAt: nil)
+
+        let reopenedComment = Comment.from(reopened.comment, threadEntries: reopened.threadEntries)
+        let notReopenedComment = Comment.from(notReopened.comment, threadEntries: notReopened.threadEntries)
+
+        XCTAssertEqual(reopenedComment.revisionChipState, .reopened)
+        XCTAssertNil(notReopenedComment.revisionChipState)
+    }
+
+    /// A wire thread carrying a retired `entry_kind: "nudge"` row is dropped
+    /// by `Comment.from`; a recognized kind alongside it survives.
+    func testCommentFromDropsNudgeThreadEntries() {
+        let wire = Self.wireComment(
+            id: "cmt_1", exact: "a", body: "b",
+            threadEntries: [
+                Self.wireThreadEntry(id: "cte_1", entryKind: "nudge", body: "legacy nudge"),
+                Self.wireThreadEntry(id: "cte_2", entryKind: "answer", body: "a real answer"),
+            ]
+        )
+        let comment = Comment.from(wire.comment, threadEntries: wire.threadEntries)
+        XCTAssertEqual(comment.threadEntries.map(\.id), ["cte_2"])
+    }
+
     func testReviseDocTransitionsMatchingCommentsToInRevision() {
         let layer = CommentLayer()
         layer.addComment(quoted: "a", body: "first")
@@ -1086,7 +1113,9 @@ final class CommentLayerTests: XCTestCase {
         intent: String? = nil,
         lastResolvedWith: String? = nil,
         answerAgentFailed: Bool = false,
-        createdAt: String = "2026-07-04T12:00:00Z"
+        createdAt: String = "2026-07-04T12:00:00Z",
+        reopenedAt: String? = nil,
+        threadEntries: [WireCommentThreadEntry] = []
     ) -> CommentWithThread {
         CommentWithThread(
             comment: WorkComment(
@@ -1099,11 +1128,27 @@ final class CommentLayerTests: XCTestCase {
                 createdAt: createdAt,
                 status: status,
                 lastResolvedWith: lastResolvedWith,
-                intent: intent
+                intent: intent,
+                reopenedAt: reopenedAt
             ),
-            threadEntries: [],
+            threadEntries: threadEntries,
             answerAgentRunning: false,
             answerAgentFailed: answerAgentFailed
+        )
+    }
+
+    /// Build a `WireCommentThreadEntry` for feeding `wireComment`'s
+    /// `threadEntries` in tests.
+    static func wireThreadEntry(id: String, entryKind: String, body: String = "x") -> WireCommentThreadEntry {
+        WireCommentThreadEntry(
+            id: id,
+            commentId: "cmt_1",
+            entryKind: entryKind,
+            author: "engine",
+            body: body,
+            reviseTaskId: nil,
+            answerAgentRunId: nil,
+            createdAt: "2026-07-04T12:00:00Z"
         )
     }
 }
