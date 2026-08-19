@@ -76,7 +76,12 @@ pub mod parse {
     /// `num_turns: 0` and `total_cost_usd: 0`, and the human-readable report
     /// lands in `result`. The figure inside it is fetched by Claude Code from
     /// the provider, not computed by Boss.
-    pub fn parse_claude_usage_json(stdout: &str) -> DriverQuotaOutcome {
+    ///
+    /// `now_epoch_s` is used only to disambiguate the year in the provider's
+    /// reset clause (see [`parse_claude_reset_epoch`]) — passed in rather than
+    /// read from the wall clock so this parser stays a pure, deterministic
+    /// function of its inputs.
+    pub fn parse_claude_usage_json(stdout: &str, now_epoch_s: i64) -> DriverQuotaOutcome {
         let envelope: serde_json::Value = match serde_json::from_str(stdout) {
             Ok(v) => v,
             Err(err) => {
@@ -98,7 +103,7 @@ pub mod parse {
                 "`/usage` JSON had no `result` text".to_owned(),
             );
         };
-        parse_claude_usage_report(report)
+        parse_claude_usage_report(report, now_epoch_s)
     }
 
     /// Parse the human-readable `/usage` report body.
@@ -106,7 +111,7 @@ pub mod parse {
     /// The line looks like:
     /// `Current week (all models): 3% used · resets Aug 25 at 7pm (America/Chicago)`
     /// — with the reset clause sometimes absent entirely.
-    pub fn parse_claude_usage_report(report: &str) -> DriverQuotaOutcome {
+    pub fn parse_claude_usage_report(report: &str, now_epoch_s: i64) -> DriverQuotaOutcome {
         let Some(line) = report
             .lines()
             .map(str::trim)
@@ -138,18 +143,93 @@ pub mod parse {
                 format!("weekly percentage was not a number: {percent_text:?}"),
             );
         };
-        let resets_at_text = tail
+        let resets_clause = tail
             .split_once("resets")
             .map(|(_, after)| after.trim().to_owned())
             .filter(|s| !s.is_empty());
+        // Normalise to an instant here, at the parse boundary, so the view
+        // never has to know Claude phrases its own reset time as text. The
+        // raw clause survives only as a fallback for a shape this parser
+        // does not recognise.
+        let (resets_at_epoch_s, resets_at_text) = match &resets_clause {
+            Some(clause) => match parse_claude_reset_epoch(clause, now_epoch_s) {
+                Some(epoch) => (Some(epoch), None),
+                None => (None, Some(clause.clone())),
+            },
+            None => (None, None),
+        };
 
         DriverQuotaOutcome::Reading(DriverQuotaReading {
             used_percent,
             window: DriverQuotaWindow::Weekly,
-            resets_at_epoch_s: None,
+            resets_at_epoch_s,
             resets_at_text,
             source: SOURCE_CLAUDE.to_owned(),
         })
+    }
+
+    /// Month abbreviations as `/usage` prints them, in order.
+    const CLAUDE_MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    /// Parse Claude's own reset phrasing — e.g. `"Aug 25 at 7pm (America/Chicago)"`
+    /// or `"Aug 19 at 3:40am (America/Chicago)"` — into an epoch instant.
+    ///
+    /// The clause never states a year, so one is inferred: the stated
+    /// month/day/time is resolved in the stated zone, and if that instant is
+    /// more than a day in the past relative to `now_epoch_s` it is assumed to
+    /// mean next year rather than a year already gone — a reset window does
+    /// not describe the past.
+    fn parse_claude_reset_epoch(clause: &str, now_epoch_s: i64) -> Option<i64> {
+        use boss_engine_utils::local_time::resolve_local_to_utc;
+        use chrono::{Datelike, TimeZone};
+
+        let (date_part, tz_part) = clause.rsplit_once('(')?;
+        let tz: chrono_tz::Tz = tz_part.strip_suffix(')')?.trim().parse().ok()?;
+
+        let (md, time_part) = date_part.trim().split_once(" at ")?;
+        let (month_str, day_str) = md.trim().split_once(' ')?;
+        let month = CLAUDE_MONTHS.iter().position(|m| *m == month_str)? as u32 + 1;
+        let day: u32 = day_str.trim().parse().ok()?;
+
+        let time_part = time_part.trim();
+        let (hm, is_pm) = if let Some(s) = time_part.strip_suffix("am") {
+            (s, false)
+        } else if let Some(s) = time_part.strip_suffix("pm") {
+            (s, true)
+        } else {
+            return None;
+        };
+        let (hour_str, minute_str) = hm.split_once(':').unwrap_or((hm, "0"));
+        let mut hour: u32 = hour_str.trim().parse().ok()?;
+        let minute: u32 = minute_str.trim().parse().ok()?;
+        if hour == 0 || hour > 12 {
+            return None;
+        }
+        if is_pm && hour != 12 {
+            hour += 12;
+        }
+        if !is_pm && hour == 12 {
+            hour = 0;
+        }
+
+        // The clause never states a year, so one is inferred using the
+        // *local* (in-zone) "now" — `resolve_local_to_utc` below is what
+        // then turns the inferred month/day/time into a UTC instant,
+        // sharing the automation scheduler's DST gap/fold policy instead of
+        // aborting the whole parse on `.single()` returning `None`.
+        let now_local = tz.timestamp_opt(now_epoch_s, 0).single()?;
+        let year = now_local.year();
+        let naive = chrono::NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, minute, 0)?;
+        let this_year = resolve_local_to_utc(naive, tz)?;
+        let resolved = if this_year < (now_local - chrono::Duration::days(1)).timestamp() {
+            let naive_next = chrono::NaiveDate::from_ymd_opt(year + 1, month, day)?.and_hms_opt(hour, minute, 0)?;
+            resolve_local_to_utc(naive_next, tz)?
+        } else {
+            this_year
+        };
+        Some(resolved)
     }
 
     // ---------------------------------------------------------------------------
@@ -256,16 +336,25 @@ pub mod parse {
                 minutes: grok_period_minutes(config).unwrap_or(0),
             },
         };
-        let resets_at_text = config
+        let resets_end = config
             .pointer("/currentPeriod/end")
             .and_then(serde_json::Value::as_str)
-            .or_else(|| config.get("billingPeriodEnd").and_then(serde_json::Value::as_str))
-            .map(str::to_owned);
+            .or_else(|| config.get("billingPeriodEnd").and_then(serde_json::Value::as_str));
+        // Normalise the raw RFC-3339 instant to an epoch here, at the parse
+        // boundary, so the view never sees Grok's microsecond-precision UTC
+        // string. The raw text survives only if it fails to parse as RFC-3339.
+        let (resets_at_epoch_s, resets_at_text) = match resets_end {
+            Some(text) => match chrono::DateTime::parse_from_rfc3339(text) {
+                Ok(dt) => (Some(dt.timestamp()), None),
+                Err(_) => (None, Some(text.to_owned())),
+            },
+            None => (None, None),
+        };
 
         DriverQuotaOutcome::Reading(DriverQuotaReading {
             used_percent,
             window,
-            resets_at_epoch_s: None,
+            resets_at_epoch_s,
             resets_at_text,
             source: SOURCE_GROK.to_owned(),
         })
@@ -312,14 +401,53 @@ pub mod parse {
              Current week (all models): 3% used · resets Aug 25 at 7pm (America/Chicago)\n\
              Current week (Fable): 0% used\n";
 
+        /// A fixed "now" (2026-08-01 UTC) so year inference in reset-clause
+        /// parsing is deterministic rather than depending on the wall clock.
+        fn fixed_now_epoch_s() -> i64 {
+            use chrono::TimeZone;
+            chrono::Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap().timestamp()
+        }
+
         #[test]
         fn claude_weekly_line_parsed_from_real_report() {
-            let outcome = parse_claude_usage_report(CLAUDE_REPORT);
+            let outcome = parse_claude_usage_report(CLAUDE_REPORT, fixed_now_epoch_s());
             let r = reading(&outcome);
             assert_eq!(r.used_percent, 3.0);
             assert_eq!(r.window, DriverQuotaWindow::Weekly);
-            assert_eq!(r.resets_at_text.as_deref(), Some("Aug 25 at 7pm (America/Chicago)"));
+            assert_eq!(
+                r.resets_at_text, None,
+                "a recognised clause must not fall back to raw text"
+            );
+            let epoch = r.resets_at_epoch_s.expect("reset clause should parse to an instant");
+            use chrono::{Datelike, TimeZone, Timelike};
+            let local = chrono_tz::America::Chicago.timestamp_opt(epoch, 0).single().unwrap();
+            assert_eq!((local.year(), local.month(), local.day()), (2026, 8, 25));
+            assert_eq!((local.hour(), local.minute()), (19, 0));
             assert_eq!(r.source, SOURCE_CLAUDE);
+        }
+
+        #[test]
+        fn claude_reset_clause_past_this_year_rolls_to_next_year() {
+            // "now" is late in the year; a January reset must resolve to next
+            // January, not one already gone.
+            use chrono::TimeZone;
+            let now = chrono::Utc.with_ymd_and_hms(2026, 12, 20, 0, 0, 0).unwrap().timestamp();
+            let report = "Current week (all models): 5% used · resets Jan 3 at 9am (America/Chicago)\n";
+            let outcome = parse_claude_usage_report(report, now);
+            let r = reading(&outcome);
+            let epoch = r.resets_at_epoch_s.expect("reset clause should parse to an instant");
+            use chrono::Datelike;
+            let local = chrono_tz::America::Chicago.timestamp_opt(epoch, 0).single().unwrap();
+            assert_eq!(local.year(), 2027);
+        }
+
+        #[test]
+        fn claude_reset_clause_in_an_unrecognised_shape_falls_back_to_raw_text() {
+            let report = "Current week (all models): 5% used · resets sometime soon\n";
+            let outcome = parse_claude_usage_report(report, fixed_now_epoch_s());
+            let r = reading(&outcome);
+            assert_eq!(r.resets_at_epoch_s, None);
+            assert_eq!(r.resets_at_text.as_deref(), Some("sometime soon"));
         }
 
         #[test]
@@ -328,22 +456,23 @@ pub mod parse {
             // to the 4% session figure.
             let report = "Current session: 4% used · resets Aug 19 at 3:40am (America/Chicago)\n";
             assert_eq!(
-                failure_kind(&parse_claude_usage_report(report)),
+                failure_kind(&parse_claude_usage_report(report, fixed_now_epoch_s())),
                 DriverQuotaFailureKind::Unparseable
             );
         }
 
         #[test]
         fn claude_weekly_line_without_a_reset_clause_still_reads() {
-            let outcome = parse_claude_usage_report("Current week (all models): 12% used\n");
+            let outcome = parse_claude_usage_report("Current week (all models): 12% used\n", fixed_now_epoch_s());
             let r = reading(&outcome);
             assert_eq!(r.used_percent, 12.0);
             assert_eq!(r.resets_at_text, None);
+            assert_eq!(r.resets_at_epoch_s, None);
         }
 
         #[test]
         fn claude_zero_percent_is_a_reading_not_a_failure() {
-            let outcome = parse_claude_usage_report("Current week (all models): 0% used\n");
+            let outcome = parse_claude_usage_report("Current week (all models): 0% used\n", fixed_now_epoch_s());
             assert_eq!(reading(&outcome).used_percent, 0.0);
         }
 
@@ -355,7 +484,7 @@ pub mod parse {
                 "total_cost_usd": 0,
                 "result": CLAUDE_REPORT,
             });
-            let outcome = parse_claude_usage_json(&envelope.to_string());
+            let outcome = parse_claude_usage_json(&envelope.to_string(), fixed_now_epoch_s());
             assert_eq!(reading(&outcome).used_percent, 3.0);
         }
 
@@ -363,7 +492,7 @@ pub mod parse {
         fn claude_error_envelope_is_a_probe_failure() {
             let envelope = serde_json::json!({ "is_error": true, "result": "boom" });
             assert_eq!(
-                failure_kind(&parse_claude_usage_json(&envelope.to_string())),
+                failure_kind(&parse_claude_usage_json(&envelope.to_string(), fixed_now_epoch_s())),
                 DriverQuotaFailureKind::ProbeFailed
             );
         }
@@ -371,14 +500,15 @@ pub mod parse {
         #[test]
         fn claude_non_json_output_is_unparseable() {
             assert_eq!(
-                failure_kind(&parse_claude_usage_json("not json at all")),
+                failure_kind(&parse_claude_usage_json("not json at all", fixed_now_epoch_s())),
                 DriverQuotaFailureKind::Unparseable
             );
         }
 
         #[test]
         fn claude_logged_out_report_is_an_auth_failure() {
-            let outcome = parse_claude_usage_report("You are not logged in. Run /login to continue.");
+            let outcome =
+                parse_claude_usage_report("You are not logged in. Run /login to continue.", fixed_now_epoch_s());
             assert_eq!(failure_kind(&outcome), DriverQuotaFailureKind::NotAuthenticated);
         }
 
@@ -449,8 +579,21 @@ pub mod parse {
             let r = reading(&outcome);
             assert_eq!(r.used_percent, 3.0);
             assert_eq!(r.window, DriverQuotaWindow::Weekly);
-            assert_eq!(r.resets_at_text.as_deref(), Some("2026-08-21T22:22:42.845319+00:00"));
+            assert_eq!(
+                r.resets_at_text, None,
+                "a parseable RFC-3339 instant must not fall back to raw text"
+            );
+            assert_eq!(r.resets_at_epoch_s, Some(1_787_350_962));
             assert_eq!(r.source, SOURCE_GROK);
+        }
+
+        #[test]
+        fn grok_unparseable_reset_instant_falls_back_to_raw_text() {
+            let body = r#"{"creditUsagePercent":3.0,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"not a timestamp"}}"#;
+            let outcome = parse_grok_billing(body);
+            let r = reading(&outcome);
+            assert_eq!(r.resets_at_epoch_s, None);
+            assert_eq!(r.resets_at_text.as_deref(), Some("not a timestamp"));
         }
 
         #[test]

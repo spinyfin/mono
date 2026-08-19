@@ -121,7 +121,7 @@ pub mod claude {
                 return unavailable(kind, format!("`claude -p /usage` exited non-zero: {detail}"));
             }
 
-            parse_claude_usage_json(&String::from_utf8_lossy(&output.stdout))
+            parse_claude_usage_json(&String::from_utf8_lossy(&output.stdout), crate::now_epoch_s())
         }
     }
 

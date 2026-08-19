@@ -137,17 +137,49 @@ final class DriverQuotaSectionTests: XCTestCase {
         XCTAssertEqual(reading(percent: 12.5).usedPercentText, "12.5%")
     }
 
-    func testProviderResetWordingIsUsedVerbatimWhenThereIsNoTimestamp() {
+    func testProviderResetWordingIsUsedVerbatimOnlyAsAFallbackWithNoInstant() {
         var r = reading(percent: 3)
-        r.resetsAtText = "Aug 25 at 7pm (America/Chicago)"
+        r.resetsAtText = "some shape the parser did not recognise"
         XCTAssertEqual(
             r.resetsText(now: Date(timeIntervalSince1970: 1_787_000_000)),
-            "resets Aug 25 at 7pm (America/Chicago)"
+            "resets some shape the parser did not recognise"
         )
     }
 
     func testNoResetInformationYieldsNoResetClauseRatherThanAnInventedOne() {
         XCTAssertNil(reading(percent: 3).resetsText(now: Date()))
+    }
+
+    /// All three drivers normalise to `resetsAtEpochS` at the engine's parse
+    /// boundary; this view formats every one of them identically. Within the
+    /// coming week: weekday name and local time, never the zone name.
+    func testResetInstantWithinTheComingWeekUsesWeekdayAndTime() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "America/Chicago")!
+        // "now" is a Monday; the reset instant is that Friday at 4:04 PM.
+        let now = dateFrom("2026-08-17T09:00:00-05:00")
+        let resets = dateFrom("2026-08-21T16:04:00-05:00")
+        var r = reading(percent: 3)
+        r.resetsAtEpochS = Int(resets.timeIntervalSince1970)
+        XCTAssertEqual(r.resetsText(now: now, calendar: calendar), "resets Friday at 4:04 PM")
+    }
+
+    /// Beyond the coming week: a plain date, in one consistent style —
+    /// never a raw ISO string and never sub-second precision.
+    func testResetInstantBeyondTheComingWeekUsesAPlainDate() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "America/Chicago")!
+        let now = dateFrom("2026-08-01T09:00:00-05:00")
+        let resets = dateFrom("2026-08-25T18:59:00-05:00")
+        var r = reading(percent: 3)
+        r.resetsAtEpochS = Int(resets.timeIntervalSince1970)
+        XCTAssertEqual(r.resetsText(now: now, calendar: calendar), "resets Aug 25, 2026")
+    }
+
+    private func dateFrom(_ iso: String) -> Date {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: iso)!
     }
 
     func testNonWeeklyWindowIsNeverLabelledThisWeek() {
@@ -181,6 +213,69 @@ final class DriverQuotaSectionTests: XCTestCase {
             XCTAssertFalse(label.contains("0"), "a failure label must not read like a percentage")
             XCTAssertNotEqual(label, "—")
         }
+    }
+
+    // MARK: - Staleness
+
+    /// A reading that has never been observed (`observedAtEpochS <= 0`) is
+    /// never stale — there is nothing to measure age against.
+    func testNeverObservedReadingIsNeverStale() {
+        XCTAssertFalse(DriverQuotaRow.isStale(observedAtEpochS: 0, now: Date()))
+        XCTAssertFalse(DriverQuotaRow.isStale(observedAtEpochS: -1, now: Date()))
+    }
+
+    /// Just under the threshold: not stale. Just over: stale. This is an
+    /// absolute-age check against `now`, not a comparison against other rows
+    /// — the engine stamps every entry in one snapshot with the same
+    /// `observed_at_epoch_s`, so a roster-relative comparison could never
+    /// fire in production.
+    func testStalenessIsAnAbsoluteAgeCheckAgainstNow() {
+        let now = Date(timeIntervalSince1970: 1_787_100_000)
+        let threshold = DriverQuotaSection.staleThreshold
+        let justUnder = Int(now.timeIntervalSince1970 - threshold + 1)
+        let justOver = Int(now.timeIntervalSince1970 - threshold - 1)
+        XCTAssertFalse(DriverQuotaRow.isStale(observedAtEpochS: justUnder, now: now))
+        XCTAssertTrue(DriverQuotaRow.isStale(observedAtEpochS: justOver, now: now))
+    }
+
+    /// A reading well past the threshold (6h old against a 2h threshold) is
+    /// stale even though it is the only entry — proving the check fires from
+    /// absolute age alone, with nothing else in the roster to compare to.
+    func testSixHourOldReadingIsStaleOnItsOwn() {
+        let now = Date(timeIntervalSince1970: 1_787_100_000)
+        let sixHoursAgo = Int(now.timeIntervalSince1970) - 6 * 60 * 60
+        XCTAssertTrue(DriverQuotaRow.isStale(observedAtEpochS: sixHoursAgo, now: now))
+    }
+
+    /// The panel must not show provenance: a non-stale reading's detail line
+    /// carries neither the removed "via <source>" segment nor the removed
+    /// per-row "read just now" segment.
+    func testDetailLineForAFreshReadingDropsProvenanceAndFreshnessSegments() {
+        let now = Date(timeIntervalSince1970: 1_787_100_000)
+        let entry = DriverQuotaEntry(
+            driver: "claude",
+            observedAtEpochS: Int(now.timeIntervalSince1970) - 30,
+            outcome: .reading(reading(percent: 3))
+        )
+        let row = DriverQuotaRow(entry: entry, now: now, checking: false)
+        let line = row.detailLine(for: reading(percent: 3)) ?? ""
+        XCTAssertFalse(line.contains("via "), "provenance must not appear in the row: \(line)")
+        XCTAssertFalse(line.contains("read "), "a fresh row must not carry a freshness note: \(line)")
+    }
+
+    /// A genuinely stale reading (past the threshold) does get the "read …"
+    /// freshness note — the one case the indicator exists for.
+    func testDetailLineForAStaleReadingIncludesAFreshnessNote() {
+        let now = Date(timeIntervalSince1970: 1_787_100_000)
+        let sixHoursAgo = Int(now.timeIntervalSince1970) - 6 * 60 * 60
+        let entry = DriverQuotaEntry(
+            driver: "codex",
+            observedAtEpochS: sixHoursAgo,
+            outcome: .reading(reading(percent: 3))
+        )
+        let row = DriverQuotaRow(entry: entry, now: now, checking: false)
+        let line = row.detailLine(for: reading(percent: 3)) ?? ""
+        XCTAssertTrue(line.contains("read "), "a stale row must carry a freshness note: \(line)")
     }
 
     private func reading(percent: Double) -> DriverQuotaReading {

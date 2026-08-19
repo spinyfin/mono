@@ -6,3 +6,4 @@ workspace = "../../../.."
 
 [dependencies]
 chrono = { workspace = true }
+chrono-tz = { workspace = true }

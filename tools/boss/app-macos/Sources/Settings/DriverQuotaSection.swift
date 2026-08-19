@@ -217,21 +217,57 @@ extension DriverQuotaReading {
     }
 
     /// "resets …" clause, or `nil` when the provider gave no reset info.
-    /// Prefers the machine-readable instant, falling back to the provider's
-    /// own wording rather than inventing one.
+    /// Prefers the normalised instant every driver's parser now produces,
+    /// falling back to the provider's own wording only for the rare clause
+    /// the engine's parser could not turn into an instant.
     func resetsText(now: Date, calendar: Calendar = .current) -> String? {
         if let epoch = resetsAtEpochS {
             let date = Date(timeIntervalSince1970: TimeInterval(epoch))
-            let formatter = DateFormatter()
-            formatter.calendar = calendar
-            formatter.dateStyle = .medium
-            formatter.timeStyle = .short
-            return "resets \(formatter.string(from: date))"
+            // "reset" (past tense) for an instant that has already elapsed —
+            // never phrase an already-past reset as if it were still ahead.
+            let verb = date <= now ? "reset" : "resets"
+            return "\(verb) \(Self.formattedResetInstant(date, now: now, calendar: calendar))"
         }
         if let text = resetsAtText, !text.isEmpty {
             return "resets \(text)"
         }
         return nil
+    }
+
+    /// The one shared formatter for all three drivers' reset instants, so a
+    /// provider-specific string never reaches this view — the engine
+    /// normalises every driver's reading to `resets_at_epoch_s` at parse
+    /// time, and this is the single place that turns it into text.
+    ///
+    /// Within the coming week (including the recent past, so a reset that
+    /// just elapsed still shows a time of day rather than silently dropping
+    /// it): weekday name and local time, e.g. "Friday at 4:04 PM". Beyond
+    /// that in either direction: a plain local date, in one consistent
+    /// style. Always the machine's local time zone — the zone name itself is
+    /// never printed, and sub-second precision never survives to here.
+    static func formattedResetInstant(_ date: Date, now: Date, calendar: Calendar = .current) -> String {
+        let startOfToday = calendar.startOfDay(for: now)
+        let startOfTarget = calendar.startOfDay(for: date)
+        let daysAhead = calendar.dateComponents([.day], from: startOfToday, to: startOfTarget).day ?? 0
+
+        if daysAhead > -7, daysAhead < 7 {
+            let formatter = DateFormatter()
+            formatter.calendar = calendar
+            formatter.timeZone = calendar.timeZone
+            // The format string already hardcodes English wording ('at'), so
+            // pin the locale rather than let the weekday name and am/pm
+            // symbols localise around it — otherwise a non-English or
+            // 24-hour host renders something like "vendredi at 4:04 PM".
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "EEEE 'at' h:mm a"
+            return formatter.string(from: date)
+        }
+        let formatter = DateFormatter()
+        formatter.calendar = calendar
+        formatter.timeZone = calendar.timeZone
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .none
+        return formatter.string(from: date)
     }
 }
 
@@ -291,8 +327,9 @@ struct DriverQuotaSection: View {
     private let tick = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
 
     var body: some View {
+        let roster = DriverQuotaSection.roster(from: chatModel.driverQuota)
         Section {
-            ForEach(DriverQuotaSection.roster(from: chatModel.driverQuota), id: \.driver) { entry in
+            ForEach(roster, id: \.driver) { entry in
                 DriverQuotaRow(
                     entry: entry,
                     now: now,
@@ -318,13 +355,24 @@ struct DriverQuotaSection: View {
         } header: {
             Text("Driver Quota")
         } footer: {
-            Text("Each figure comes from that driver's own provider, read out of band — Claude Code's /usage in print mode, Codex's app-server rate-limit method, and the endpoint Grok's own /usage calls. These are provider numbers, not Boss's internal token accounting, which measures only work Boss dispatched and would understate the total. Read-only: nothing here throttles dispatch or changes the traffic split. Refreshed at most every 15 minutes on its own, or on demand with Refresh (declined if a check ran in the last minute). A driver Boss cannot read says so explicitly rather than showing nothing.")
+            Text("These are the providers' own figures, not Boss's internal token accounting. Nothing here affects dispatch.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .onReceive(tick) { now = $0 }
     }
+
+    /// How old a row's own reading has to be, in absolute wall-clock terms,
+    /// before it is flagged as stale — hours, not minutes, so the normal
+    /// ~15-minute refresh cadence never trips it. Measured against `now`
+    /// rather than against the rest of the roster: every entry in one
+    /// snapshot is stamped with the same `observed_at_epoch_s` by the
+    /// engine's `run_cycle` (each probe bounded by a ~25s timeout), so a
+    /// roster-relative lag can never exceed a few seconds and would never
+    /// fire. An absolute-age check does fire, and for the case that matters:
+    /// the engine has stopped refreshing and this reading is genuinely old.
+    static let staleThreshold: TimeInterval = 2 * 60 * 60
 
     /// Every driver Boss implements, in a stable order, with the engine's
     /// entry where there is one.
@@ -364,7 +412,7 @@ struct DriverQuotaSection: View {
 
 /// One driver's row: name, figure or failure, and the "as of" that makes the
 /// figure meaningful.
-private struct DriverQuotaRow: View {
+struct DriverQuotaRow: View {
     let entry: DriverQuotaEntry
     let now: Date
     let checking: Bool
@@ -401,10 +449,12 @@ private struct DriverQuotaRow: View {
             switch entry.outcome {
             case .reading(let reading):
                 DriverQuotaBar(usedPercent: reading.usedPercent)
-                Text(detailLine(for: reading))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                if let line = detailLine(for: reading) {
+                    Text(line)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             case .unavailable(_, let reason):
                 Text("\(reason) · tried \(observedText)")
                     .font(.caption)
@@ -422,15 +472,38 @@ private struct DriverQuotaRow: View {
         .accessibilityValue(accessibilityValue)
     }
 
-    /// Reset clause (when the provider gave one), the "as of", and the
-    /// mechanism that produced the figure — joined into one caption so a
-    /// number never stands alone.
-    private func detailLine(for reading: DriverQuotaReading) -> String {
+    /// Reset clause, when the provider gave one, plus a freshness note only
+    /// when this row is genuinely stale in absolute terms (see
+    /// `DriverQuotaSection.staleThreshold`). How the figure was obtained is
+    /// implementation detail and is not shown here; the panel's single
+    /// "Checked …" line at the bottom already covers the common case.
+    /// `nil` when there is nothing to say beyond the reset clause itself.
+    func detailLine(for reading: DriverQuotaReading) -> String? {
         var parts: [String] = []
         if let resets = reading.resetsText(now: now) { parts.append(resets) }
-        parts.append("read \(observedText)")
-        parts.append("via \(reading.source)")
-        return parts.joined(separator: " · ")
+        if isStale { parts.append("read \(observedText)") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    /// This row's reading is older than `DriverQuotaSection.staleThreshold`
+    /// measured against wall-clock `now` — the one case where a per-row
+    /// freshness note earns its place, because it names a reading the engine
+    /// has stopped refreshing.
+    private var isStale: Bool {
+        Self.isStale(observedAtEpochS: entry.observedAtEpochS, now: now)
+    }
+
+    /// Testable, parameter-only form of the staleness check: `observedAtEpochS
+    /// <= 0` (never observed) is never stale; otherwise stale when `now` is
+    /// more than `threshold` past the observation.
+    static func isStale(
+        observedAtEpochS: Int,
+        now: Date,
+        threshold: TimeInterval = DriverQuotaSection.staleThreshold
+    ) -> Bool {
+        guard observedAtEpochS > 0 else { return false }
+        let age = now.timeIntervalSince1970 - TimeInterval(observedAtEpochS)
+        return age > threshold
     }
 
     private var observedText: String {
