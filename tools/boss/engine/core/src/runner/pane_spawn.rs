@@ -378,6 +378,43 @@ pub(crate) fn path_prepend_clause(var: &str) -> String {
     format!("[ -n \"${var}\" ] && export PATH=\"${var}:$PATH\"; ")
 }
 
+/// First statement on every local worker pane's assembled command: marks
+/// the pane's already-running login shell as Darwin background priority
+/// (`PRIO_DARWIN_BG`, via `taskpolicy -b`), which every process it
+/// subsequently execs or forks — the driver CLI and every build/test tool
+/// call it runs — inherits. Applied with `-p $$` to the current shell
+/// rather than by wrapping a new process, since this line is *sourced*
+/// (`. .boss/initial-input.sh`) into the pane's existing login shell, not
+/// exec'd as a fresh one.
+///
+/// Workers are batch CPU/IO consumers competing with the coordinator's
+/// interactive pane for the same host's scheduler; this makes them yield
+/// under contention without touching the workers' own nice value (which
+/// would need `setpriority` per spawned tool-call subprocess to have the
+/// same reach) and without requiring root. Absolute path, matching this
+/// clause's care elsewhere about not depending on a PATH a login shell's
+/// own init scripts might still be rebuilding.
+///
+/// This is best-effort by design: `taskpolicy` failing (missing binary,
+/// unexpected sandbox) is swallowed by the trailing `>/dev/null 2>&1;` so a
+/// broken environment can never block a worker from starting, but that also
+/// means a pane that failed to enter background class looks identical to
+/// one that succeeded — there is no engine-side signal or scrollback trace.
+/// To check a live pane, run `ps -o nice -p <pane pid>` (background class
+/// shows up as nice 5) or `taskpolicy -p <pid>`.
+///
+/// The policy also outlives the pane it was applied to: every long-lived
+/// daemon a tool call forks from this shell (most notably a workspace's
+/// `bazel` server, which idles for hours after the pane exits) keeps
+/// `PRIO_DARWIN_BG` for the rest of its life, including for later
+/// invocations against that same daemon from outside a worker pane (a
+/// human, or the coordinator, re-leasing the workspace). If a bazel server
+/// (or other daemon) started by a worker seems to be running slower than
+/// expected, that is why — clear it with `bazel shutdown` (from within the
+/// tainted workspace) or `taskpolicy -B -p <server pid>` (unprivileged for
+/// one's own processes).
+pub(crate) const WORKER_BACKGROUND_PRIORITY_CLAUSE: &str = "/usr/bin/taskpolicy -b -p $$ >/dev/null 2>&1; ";
+
 /// macOS tty canonical-mode line cap (`MAX_CANON`,
 /// `/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/syslimits.h:89`).
 /// Past this many bytes in one canonical-mode pty input line — content plus
@@ -874,7 +911,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         }
         let env_prefix: String = spawn_plan.env.iter().map(render_env_directive).collect();
         let assembled_command = format!(
-            "{}{}{env_prefix}{}",
+            "{WORKER_BACKGROUND_PRIORITY_CLAUSE}{}{}{env_prefix}{}",
             path_prepend_clause("BOSS_BIN_DIR"),
             path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
             spawn_plan.command,
@@ -1481,21 +1518,25 @@ mod pane_spawn_tests {
             script.contains(".claude/initial-prompt.txt"),
             "expected the initial-input script to read from the prompt file, got: {script:?}",
         );
-        // The first shell line re-prepends BOSS_BIN_DIR to PATH (so the
-        // bundled `cube`/`boss` win over any `~/bin` repobin shim the
-        // login-shell init re-prepends), then the per-workspace launcher
-        // dir on top of that (so `boss` is pinned to an absolute path even
-        // in dev mode, where BOSS_BIN_DIR is unset and the clause is a
-        // no-op), then unsets the API key and invokes claude. See the
-        // comment at the construction site.
+        // The first shell line marks the pane background priority (so the
+        // worker's build/test tool calls yield to the coordinator's
+        // interactive pane under contention), then re-prepends BOSS_BIN_DIR
+        // to PATH (so the bundled `cube`/`boss` win over any `~/bin`
+        // repobin shim the login-shell init re-prepends), then the
+        // per-workspace launcher dir on top of that (so `boss` is pinned to
+        // an absolute path even in dev mode, where BOSS_BIN_DIR is unset
+        // and the clause is a no-op), then unsets the API key and invokes
+        // claude. See the comment at the construction site.
         assert!(
             script.starts_with(
-                "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; \
+                "/usr/bin/taskpolicy -b -p $$ >/dev/null 2>&1; \
+                 [ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; \
                  [ -n \"$BOSS_WORKER_BIN_DIR\" ] && export PATH=\"$BOSS_WORKER_BIN_DIR:$PATH\"; \
                  unset ANTHROPIC_API_KEY; claude"
             ),
-            "expected the initial-input script to re-prepend BOSS_BIN_DIR then the worker \
-             launcher dir, unset ANTHROPIC_API_KEY, and invoke claude, got: {script:?}",
+            "expected the initial-input script to mark itself background priority, re-prepend \
+             BOSS_BIN_DIR then the worker launcher dir, unset ANTHROPIC_API_KEY, and invoke \
+             claude, got: {script:?}",
         );
     }
 
@@ -1621,7 +1662,8 @@ mod pane_spawn_tests {
         assert_eq!(
             script,
             format!(
-                "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; \
+                "/usr/bin/taskpolicy -b -p $$ >/dev/null 2>&1; \
+                 [ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; \
                  [ -n \"$BOSS_WORKER_BIN_DIR\" ] && export PATH=\"$BOSS_WORKER_BIN_DIR:$PATH\"; \
                  unset ANTHROPIC_API_KEY; claude --model {} --permission-mode auto --settings '{}' \"$(cat .claude/initial-prompt.txt)\"\n",
                 crate::driver::ClaudeDriver.descriptor().model_menu.engine_default,
