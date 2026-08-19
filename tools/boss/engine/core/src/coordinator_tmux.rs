@@ -62,7 +62,11 @@ pub(crate) async fn restart_if_dead(
     }
     let live_token = tmux.show_environment(&record.session_name, SPAWN_TOKEN_ENV).await?;
     match live_token {
-        Some(token) if token == record.spawn_token => {}
+        Some(token) if token == record.spawn_token => {
+            crate::tmux_session_options::apply(tmux, &record.session_name)
+                .await
+                .context("applying Boss coordinator tmux session options")?;
+        }
         Some(_) => bail!("coordinator tmux token does not match the metadata singleton"),
         None => bail!("coordinator tmux session exists without the metadata singleton token"),
     }
@@ -131,6 +135,9 @@ async fn reconcile_existing(
     let live_token = tmux.show_environment(&record.session_name, SPAWN_TOKEN_ENV).await?;
     match live_token {
         Some(token) if token == record.spawn_token => {
+            crate::tmux_session_options::apply(tmux, &record.session_name)
+                .await
+                .context("applying Boss coordinator tmux session options")?;
             if tmux
                 .display_message(&record.session_name, DisplayField::PaneDead)
                 .await?
@@ -231,6 +238,9 @@ async fn start_new(
     })
     .await
     .context("creating detached coordinator tmux session")?;
+    crate::tmux_session_options::apply(tmux, COORDINATOR_SESSION_NAME)
+        .await
+        .context("applying Boss coordinator tmux session options")?;
     tmux.set_option(COORDINATOR_SESSION_NAME, SPAWN_TOKEN_OPTION, &spawn_token)
         .await
         .context("mirroring coordinator spawn token in tmux")?;
@@ -345,8 +355,10 @@ mod tests {
                 .any(|pair| pair[0] == "-c" && Path::new(&pair[1]) == dir.path())
         );
         assert_eq!(calls[1][2], "set-option");
-        assert_eq!(calls[1][5], "@boss_spawn_token");
-        assert_eq!(calls[2][5], "remain-on-exit");
+        assert_eq!(calls[1][5], "status");
+        assert_eq!(calls[1][6], "off");
+        assert_eq!(calls[2][5], "@boss_spawn_token");
+        assert_eq!(calls[3][5], "remain-on-exit");
     }
 
     #[tokio::test]
@@ -360,6 +372,12 @@ mod tests {
         assert!(
             calls
                 .iter()
+                .any(|call| call.get(5).map(String::as_str) == Some("status")
+                    && call.get(6).map(String::as_str) == Some("off"))
+        );
+        assert!(
+            calls
+                .iter()
                 .any(|call| call.get(2).map(String::as_str) == Some("set-option")
                     && call.get(5).map(String::as_str) == Some("@boss_spawn_token"))
         );
@@ -368,6 +386,23 @@ mod tests {
                 .iter()
                 .any(|call| call.get(5).map(String::as_str) == Some("remain-on-exit"))
         );
+    }
+
+    #[tokio::test]
+    async fn existing_live_session_reapplies_boss_presentation_options() {
+        let (db, tmux, server, dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
+        db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus")
+            .unwrap();
+        db.record_coordinator_tmux_session_created("token").unwrap();
+
+        ensure_for_attach(&db, &tmux, "opus", dir.path()).await.unwrap();
+
+        let calls = server.calls();
+        assert!(calls.iter().any(|call| {
+            call.get(2).map(String::as_str) == Some("set-option")
+                && call.get(5).map(String::as_str) == Some("status")
+                && call.get(6).map(String::as_str) == Some("off")
+        }));
     }
 
     #[tokio::test]
