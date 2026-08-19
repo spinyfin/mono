@@ -1146,7 +1146,7 @@ final class ChatViewModel: ObservableObject {
 
     let engine: EngineClient
     /// Routes engine comment RPC replies + `comments.artifact.*` invalidations
-    /// to the open [`CommentLayer`]s (P529 Phase 2). Injected into the markdown
+    /// to the open [`CommentLayer`]s. Injected into the markdown
     /// viewers via the `@EnvironmentObject` `ChatViewModel`.
     let commentBridge: CommentEngineBridge
     /// Test-only hook: forwarded to `EngineClient.outboundRecorder`
