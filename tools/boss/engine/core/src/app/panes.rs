@@ -7,8 +7,6 @@
 
 use std::collections::HashSet;
 
-use boss_tmux::DisplayField;
-
 use super::*;
 
 pub(super) async fn handle_focus_worker_pane(ctx: Dispatch, req: FrontendRequest) {
@@ -240,13 +238,7 @@ impl ServerState {
                 return identities
                     .into_iter()
                     .map(|(execution_id, identity)| match identity {
-                        Ok(Some(identity)) => boss_protocol::TmuxWorkerStatus {
-                            execution_id,
-                            session_name: Some(identity.session_name),
-                            adoption_state: boss_protocol::TmuxAdoptionState::ProbeUnavailable,
-                            pane_dead: None,
-                            last_output_at: None,
-                        },
+                        Ok(Some(identity)) => probe_unavailable_status(execution_id, Some(identity.session_name)),
                         Ok(None) => not_tmux_hosted_status(execution_id),
                         Err(err) => {
                             tracing::warn!(execution_id, error = %format!("{err:#}"), "agents list: failed reading tmux identity");
@@ -289,88 +281,70 @@ impl ServerState {
                 }
             };
             let session_name = identity.session_name;
-            if !session_names.contains(&session_name) {
-                statuses.push(boss_protocol::TmuxWorkerStatus {
-                    execution_id,
-                    session_name: Some(session_name),
-                    adoption_state: boss_protocol::TmuxAdoptionState::SessionMissing,
-                    pane_dead: None,
-                    last_output_at: None,
-                });
-                continue;
-            }
-            let token_matches = match crate::tmux_adoption::session_spawn_token(&tmux, &session_name).await {
-                Ok(token) => token.as_deref() == Some(identity.spawn_token.as_str()),
-                Err(err) => {
-                    tracing::debug!(execution_id, session = %session_name, error = %format!("{err:#}"), "agents list: tmux token probe unavailable");
-                    statuses.push(probe_unavailable_status(execution_id, Some(session_name)));
-                    continue;
-                }
-            };
-            if !token_matches {
-                statuses.push(boss_protocol::TmuxWorkerStatus {
-                    execution_id,
-                    session_name: Some(session_name),
-                    adoption_state: boss_protocol::TmuxAdoptionState::TokenMismatch,
-                    pane_dead: None,
-                    last_output_at: None,
-                });
-                continue;
-            }
-            let pane_dead = match tmux.display_message(&session_name, DisplayField::PaneDead).await {
-                Ok(value) => value.trim() == "1",
-                Err(err) => {
-                    tracing::debug!(execution_id, session = %session_name, error = %format!("{err:#}"), "agents list: tmux pane-dead probe unavailable");
-                    statuses.push(probe_unavailable_status(execution_id, Some(session_name)));
-                    continue;
-                }
-            };
-            let last_output_at = if pane_dead {
-                None
-            } else {
-                match tmux.display_message(&session_name, DisplayField::WindowActivity).await {
-                    Ok(value) => value
-                        .trim()
-                        .parse::<i64>()
-                        .ok()
-                        .filter(|epoch| *epoch > 0)
-                        .map(crate::live_worker_state::iso8601_utc),
-                    Err(err) => {
-                        tracing::debug!(execution_id, session = %session_name, error = %format!("{err:#}"), "agents list: tmux output-time probe unavailable");
-                        None
-                    }
-                }
-            };
-            statuses.push(boss_protocol::TmuxWorkerStatus {
+            let observation = crate::tmux_adoption::observe_tmux_identity(
+                &tmux,
+                &session_name,
+                &identity.spawn_token,
+                session_names.contains(&session_name),
+            )
+            .await;
+            let attach_command = (observation.adoption_state == boss_protocol::TmuxAdoptionState::Adopted)
+                .then(|| tmux.attach_session_command(&session_name));
+            let last_output_at = observation
+                .window_activity_epoch_secs
+                .filter(|epoch| *epoch > 0)
+                .map(crate::live_worker_state::iso8601_utc);
+            statuses.push(tmux_status(
                 execution_id,
-                session_name: Some(session_name),
-                adoption_state: boss_protocol::TmuxAdoptionState::Adopted,
-                pane_dead: Some(pane_dead),
+                Some(session_name),
+                observation.adoption_state,
+                observation.pane_dead,
                 last_output_at,
-            });
+                attach_command,
+            ));
         }
         statuses
     }
 }
 
-fn not_tmux_hosted_status(execution_id: String) -> boss_protocol::TmuxWorkerStatus {
-    boss_protocol::TmuxWorkerStatus {
-        execution_id,
-        session_name: None,
-        adoption_state: boss_protocol::TmuxAdoptionState::NotTmuxHosted,
-        pane_dead: None,
-        last_output_at: None,
-    }
-}
-
-fn probe_unavailable_status(execution_id: String, session_name: Option<String>) -> boss_protocol::TmuxWorkerStatus {
+fn tmux_status(
+    execution_id: String,
+    session_name: Option<String>,
+    adoption_state: boss_protocol::TmuxAdoptionState,
+    pane_dead: Option<bool>,
+    last_output_at: Option<String>,
+    attach_command: Option<String>,
+) -> boss_protocol::TmuxWorkerStatus {
     boss_protocol::TmuxWorkerStatus {
         execution_id,
         session_name,
-        adoption_state: boss_protocol::TmuxAdoptionState::ProbeUnavailable,
-        pane_dead: None,
-        last_output_at: None,
+        adoption_state,
+        pane_dead,
+        last_output_at,
+        attach_command,
     }
+}
+
+fn not_tmux_hosted_status(execution_id: String) -> boss_protocol::TmuxWorkerStatus {
+    tmux_status(
+        execution_id,
+        None,
+        boss_protocol::TmuxAdoptionState::NotTmuxHosted,
+        None,
+        None,
+        None,
+    )
+}
+
+fn probe_unavailable_status(execution_id: String, session_name: Option<String>) -> boss_protocol::TmuxWorkerStatus {
+    tmux_status(
+        execution_id,
+        session_name,
+        boss_protocol::TmuxAdoptionState::ProbeUnavailable,
+        None,
+        None,
+        None,
+    )
 }
 
 pub(super) async fn handle_retire_pane(ctx: Dispatch, req: FrontendRequest) {

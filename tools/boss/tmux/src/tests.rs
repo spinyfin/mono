@@ -153,6 +153,20 @@ async fn new_session_is_detached_private_and_carries_environment_atomically() {
     );
 }
 
+#[test]
+fn attach_session_command_uses_resolved_program_and_omits_exec() {
+    let (tmux, _runner) = tmux([]);
+    let command = tmux.attach_session_command("boss-worker-3");
+    assert_eq!(
+        command,
+        format!("{} -L boss attach-session -t boss-worker-3", tmux.program().display())
+    );
+    assert!(
+        !command.starts_with("exec "),
+        "operator paste must not replace the shell: {command}"
+    );
+}
+
 #[tokio::test]
 async fn list_sessions_parses_the_token_mirror() {
     let (tmux, runner) = tmux([success("boss-1-a\ttoken-a\nboss-2-b\t\n")]);
