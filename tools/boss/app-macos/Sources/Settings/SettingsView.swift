@@ -48,6 +48,10 @@ struct SettingsView: View {
             // current truth, not a snapshot from minutes ago.
             chatModel.refreshEngineHealth()
             chatModel.refreshDriverTrafficSplit()
+            // Cheap: the engine serves its cache unless the TTL has expired,
+            // so this is not three provider calls per Settings open. It is
+            // fire-and-forget either way — the window never waits on it.
+            chatModel.refreshDriverQuota()
         }
         .frame(minWidth: 560, minHeight: 400)
     }
@@ -157,6 +161,8 @@ private struct EngineConfigPane: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+
+            DriverQuotaSection()
 
             if !chatModel.engineHealthIssues.isEmpty {
                 Section {

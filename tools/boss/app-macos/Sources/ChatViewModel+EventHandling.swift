@@ -32,6 +32,10 @@ extension ChatViewModel {
         case .connected:
             markConnected()
             resetConnectionLostBanner()
+            // A quota request in flight when the socket dropped will never be
+            // answered, so clear the pending flag rather than leaving the
+            // pane's Refresh button disabled for the rest of the session.
+            isRefreshingDriverQuota = false
             engine.sendRegisterAppSession()
             refreshWorkSubscriptions()
             // Re-subscribe any open markdown viewers' comment topics and reload
@@ -262,6 +266,14 @@ extension ChatViewModel {
             engineHealthIssues = issues
         case .driverTrafficSplitResult(let split):
             driverTrafficSplit = split
+        case .driverQuotaUsageResult(let snapshot):
+            driverQuota = snapshot
+            // A cold-cache reply is empty and arrives immediately; keep the
+            // checking flag until a completed cycle lands so the pane can
+            // show "Checking…" rather than a false "not checked yet".
+            if !snapshot.neverChecked {
+                isRefreshingDriverQuota = false
+            }
         case .trunkStatus(let configured, let source, let queueCheck, let note):
             trunkTokenConfigured = configured
             trunkTokenSource = source

@@ -443,6 +443,7 @@ dependencies = [
  "boss-engine-day-rotated-log",
  "boss-engine-design-docs",
  "boss-engine-driver",
+ "boss-engine-driver-quota",
  "boss-engine-effort",
  "boss-engine-gh-invocation",
  "boss-engine-grok-home-retention",
@@ -619,6 +620,20 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "boss-engine-driver-quota"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "boss-engine-codex-hook-trust",
+ "boss-http-retry",
+ "boss-protocol",
+ "chrono",
+ "serde_json",
  "tokio",
  "tracing",
 ]

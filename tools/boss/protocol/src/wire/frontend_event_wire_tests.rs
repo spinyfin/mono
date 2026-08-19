@@ -1888,6 +1888,13 @@ fn tag_cases() -> Vec<TagCase> {
             },
             expected_tag: "driver_traffic_split_result",
         },
+        TagCase {
+            label: "DriverQuotaUsageResult",
+            event: FrontendEvent::DriverQuotaUsageResult {
+                snapshot: DriverQuotaSnapshot::default(),
+            },
+            expected_tag: "driver_quota_usage_result",
+        },
     ]
 }
 
@@ -2035,6 +2042,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::PrReconcilersKicked { .. }
         | FrontendEvent::DispatchConcurrencyResult { .. }
         | FrontendEvent::DriverTrafficSplitResult { .. }
+        | FrontendEvent::DriverQuotaUsageResult { .. }
         | FrontendEvent::DispatchStateResult { .. }
         | FrontendEvent::ExternalTrackerSyncStarted { .. }
         | FrontendEvent::CiRemediationsList { .. }

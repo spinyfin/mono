@@ -69,12 +69,10 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub use app_server::{AppServer, ClientInfo, Error as AppServerError};
 
 /// Wall-clock budget for a live `codex app-server` `hooks/list` observation.
 ///
@@ -635,153 +633,26 @@ pub struct CodexAppServerObserver {
 
 impl TrustObserver for CodexAppServerObserver {
     fn observe_hooks(&self, codex_home: &Path, cwd: &Path) -> Result<Vec<ObservedHook>, TrustGateError> {
-        let mut child = Command::new(&self.codex_bin)
-            .arg("app-server")
-            .arg("--listen")
-            .arg("stdio://")
-            .current_dir(cwd)
-            .env("CODEX_HOME", codex_home)
-            // Explicitly do NOT set any bypass-hook-trust flag/env.
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // Never pipe stderr without a drain — a full pipe deadlocks the child.
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|err| TrustGateError::ObservationFailed {
-                detail: format!("failed to spawn `{} app-server`: {err}", self.codex_bin.display()),
-            })?;
-
-        let stdin = child.stdin.take().ok_or_else(|| TrustGateError::ObservationFailed {
-            detail: "app-server stdin not piped".into(),
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| TrustGateError::ObservationFailed {
-            detail: "app-server stdout not piped".into(),
-        })?;
-
-        // Run the RPC on a side thread so a blocked read cannot hang dispatch
-        // past OBSERVE_TIMEOUT. The parent owns the Child and kills it on
-        // timeout (which unblocks the reader when stdout closes).
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let result = observe_hooks_rpc(stdin, stdout);
-            let _ = tx.send(result);
-        });
-
-        let result = match rx.recv_timeout(OBSERVE_TIMEOUT) {
-            Ok(r) => r,
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(TrustGateError::ObservationFailed {
-                detail: format!(
-                    "hooks/list observation timed out after {}s — silence is not success",
-                    OBSERVE_TIMEOUT.as_secs()
-                ),
-            }),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(TrustGateError::ObservationFailed {
-                detail: "hooks/list observer thread disconnected before responding".into(),
-            }),
-        };
-
-        // Always reap the child so we do not leave orphans after success,
-        // failure, or timeout.
-        let _ = child.kill();
-        let _ = child.wait();
-
-        result
-    }
-}
-
-fn write_rpc_line(stdin: &mut ChildStdin, msg: &JsonValue) -> Result<(), TrustGateError> {
-    let line = serde_json::to_string(msg).map_err(|err| TrustGateError::ObservationFailed {
-        detail: format!("serialize RPC: {err}"),
-    })?;
-    writeln!(stdin, "{line}").map_err(|err| TrustGateError::ObservationFailed {
-        detail: format!("write RPC: {err}"),
-    })?;
-    stdin.flush().map_err(|err| TrustGateError::ObservationFailed {
-        detail: format!("flush RPC: {err}"),
-    })?;
-    Ok(())
-}
-
-fn read_until_id(reader: &mut BufReader<ChildStdout>, want_id: u64) -> Result<JsonValue, TrustGateError> {
-    // Secondary line-count bound (wall-clock is the real cap via OBSERVE_TIMEOUT).
-    let mut line = String::new();
-    for _ in 0..200 {
-        line.clear();
-        let n = reader
-            .read_line(&mut line)
-            .map_err(|err| TrustGateError::ObservationFailed {
-                detail: format!("read RPC: {err}"),
-            })?;
-        if n == 0 {
-            return Err(TrustGateError::ObservationFailed {
-                detail: "app-server closed stdout before responding".into(),
-            });
+        // Shared client: spawn + initialize + notifications/initialized +
+        // method, under OBSERVE_TIMEOUT, then kill/reap. Never passes a
+        // bypass-hook-trust flag or env.
+        let result = AppServer {
+            program: self.codex_bin.clone(),
+            extra_env: vec![("CODEX_HOME".into(), codex_home.display().to_string())],
+            cwd: Some(cwd.to_path_buf()),
+            client_info: ClientInfo {
+                name: "boss-codex-hook-trust".into(),
+                title: None,
+                version: "0".into(),
+            },
+            timeout: OBSERVE_TIMEOUT,
         }
-        let Ok(val) = serde_json::from_str::<JsonValue>(line.trim()) else {
-            continue;
-        };
-        if val.get("id").and_then(|v| v.as_u64()) == Some(want_id) {
-            return Ok(val);
-        }
+        .request("hooks/list", serde_json::json!({}))
+        .map_err(|err| TrustGateError::ObservationFailed {
+            detail: err.to_string(),
+        })?;
+        parse_hooks_list_response(&serde_json::json!({ "result": result }))
     }
-    Err(TrustGateError::ObservationFailed {
-        detail: format!("no response for RPC id={want_id} within read bound"),
-    })
-}
-
-/// JSON-RPC `initialize` + `hooks/list` over an already-spawned app-server.
-fn observe_hooks_rpc(mut stdin: ChildStdin, stdout: ChildStdout) -> Result<Vec<ObservedHook>, TrustGateError> {
-    let mut reader = BufReader::new(stdout);
-
-    write_rpc_line(
-        &mut stdin,
-        &serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "clientInfo": { "name": "boss-codex-hook-trust", "version": "0" },
-                "capabilities": {}
-            }
-        }),
-    )?;
-    let init = read_until_id(&mut reader, 1)?;
-    if let Some(err) = init.get("error") {
-        return Err(TrustGateError::ObservationFailed {
-            detail: format!("initialize RPC error: {err}"),
-        });
-    }
-    if init.get("result").is_none() {
-        return Err(TrustGateError::ObservationFailed {
-            detail: format!("initialize response missing result: {init}"),
-        });
-    }
-
-    write_rpc_line(
-        &mut stdin,
-        &serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized"
-        }),
-    )?;
-
-    write_rpc_line(
-        &mut stdin,
-        &serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "hooks/list",
-            "params": {}
-        }),
-    )?;
-    let list_resp = read_until_id(&mut reader, 2)?;
-    if let Some(err) = list_resp.get("error") {
-        return Err(TrustGateError::ObservationFailed {
-            detail: format!("hooks/list RPC error: {err}"),
-        });
-    }
-
-    parse_hooks_list_response(&list_resp)
 }
 
 fn parse_hooks_list_response(resp: &JsonValue) -> Result<Vec<ObservedHook>, TrustGateError> {
@@ -1231,4 +1102,386 @@ pub fn write_attestation_file(path: &Path, attestation: &HookTrustAttestation) -
         path: path.to_path_buf(),
         detail: err.to_string(),
     })
+}
+
+/// Line-delimited JSON-RPC client for `codex app-server` over stdio.
+///
+/// Shared by the hook-trust gate and the quota probe so the handshake
+/// (`--listen stdio://`, `initialize`, `notifications/initialized`, then
+/// a method call) cannot drift between the two callers.
+pub mod app_server {
+    use std::io::{BufRead, BufReader, Write};
+    use std::path::{Path, PathBuf};
+    use std::process::{ChildStdin, ChildStdout, Command, Stdio};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    /// Args that put the app-server on stdio JSON-RPC rather than a TCP socket.
+    pub const APP_SERVER_ARGS: &[&str] = &["app-server", "--listen", "stdio://"];
+
+    const ID_INITIALIZE: u64 = 1;
+    const ID_REQUEST: u64 = 2;
+
+    /// Client identity sent in the `initialize` params.
+    #[derive(Debug, Clone)]
+    pub struct ClientInfo {
+        pub name: String,
+        pub title: Option<String>,
+        pub version: String,
+    }
+
+    /// How one JSON-RPC call against a freshly spawned app-server is set up.
+    #[derive(Debug, Clone)]
+    pub struct AppServer {
+        pub program: PathBuf,
+        pub extra_env: Vec<(String, String)>,
+        pub cwd: Option<PathBuf>,
+        pub client_info: ClientInfo,
+        pub timeout: Duration,
+    }
+
+    /// Failure from spawn, the handshake, or the method call. Never contains a
+    /// credential: the child reads `$CODEX_HOME/auth.json` itself.
+    #[derive(Debug)]
+    pub enum Error {
+        NotFound { program: PathBuf },
+        Spawn { program: PathBuf, detail: String },
+        Io { detail: String },
+        Rpc { method: String, message: String },
+        Timeout { after: Duration },
+        Closed { method: String },
+    }
+
+    impl std::fmt::Display for Error {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::NotFound { program } => {
+                    write!(f, "`{}` is not installed or not on PATH", program.display())
+                }
+                Self::Spawn { program, detail } => {
+                    write!(f, "could not start `{} app-server`: {detail}", program.display())
+                }
+                Self::Io { detail } => f.write_str(detail),
+                Self::Rpc { method, message } => write!(f, "codex {method} failed: {message}"),
+                Self::Timeout { after } => {
+                    write!(f, "codex app-server timed out after {}s", after.as_secs())
+                }
+                Self::Closed { method } => {
+                    write!(f, "codex app-server closed without answering {method}")
+                }
+            }
+        }
+    }
+
+    impl std::error::Error for Error {}
+
+    /// One stdout line, classified against the id we are waiting for.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum ServerLine {
+        Result(String),
+        Error(String),
+        Other,
+    }
+
+    /// Classify one stdout line against `awaiting_id`.
+    ///
+    /// The app-server interleaves unsolicited notifications with replies, so a
+    /// caller cannot take the next line — it matches on `id` and ignores
+    /// everything else, including non-JSON noise.
+    pub fn classify_line(line: &str, awaiting_id: u64) -> ServerLine {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            return ServerLine::Other;
+        };
+        if value.get("id").and_then(serde_json::Value::as_u64) != Some(awaiting_id) {
+            return ServerLine::Other;
+        }
+        if let Some(err) = value.get("error") {
+            let message = err
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("app-server returned an error");
+            // Truncated: an unknown-method error echoes the entire method list.
+            let message: String = message.chars().take(200).collect();
+            return ServerLine::Error(message);
+        }
+        match value.get("result") {
+            Some(result) => ServerLine::Result(result.to_string()),
+            None => ServerLine::Error("reply carried neither `result` nor `error`".to_owned()),
+        }
+    }
+
+    fn request_value(id: u64, method: &str, params: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        })
+    }
+
+    fn initialize_params(info: &ClientInfo) -> serde_json::Value {
+        let mut client_info = serde_json::json!({
+            "name": info.name,
+            "version": info.version,
+        });
+        if let Some(title) = &info.title {
+            client_info["title"] = serde_json::Value::String(title.clone());
+        }
+        serde_json::json!({
+            "clientInfo": client_info,
+            "capabilities": {},
+        })
+    }
+
+    fn initialized_notification() -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        })
+    }
+
+    fn write_rpc_line(stdin: &mut ChildStdin, msg: &serde_json::Value) -> Result<(), Error> {
+        let line = serde_json::to_string(msg).map_err(|err| Error::Io {
+            detail: format!("serialize RPC: {err}"),
+        })?;
+        writeln!(stdin, "{line}").map_err(|err| Error::Io {
+            detail: format!("write RPC: {err}"),
+        })?;
+        stdin.flush().map_err(|err| Error::Io {
+            detail: format!("flush RPC: {err}"),
+        })?;
+        Ok(())
+    }
+
+    fn read_until_id(reader: &mut BufReader<ChildStdout>, want_id: u64) -> Result<serde_json::Value, Error> {
+        let mut line = String::new();
+        for _ in 0..200 {
+            line.clear();
+            let n = reader.read_line(&mut line).map_err(|err| Error::Io {
+                detail: format!("read RPC: {err}"),
+            })?;
+            if n == 0 {
+                return Err(Error::Io {
+                    detail: "app-server closed stdout before responding".into(),
+                });
+            }
+            match classify_line(line.trim(), want_id) {
+                ServerLine::Other => continue,
+                ServerLine::Error(message) => {
+                    return Err(Error::Rpc {
+                        method: format!("id={want_id}"),
+                        message,
+                    });
+                }
+                ServerLine::Result(result) => {
+                    return serde_json::from_str(&result).map_err(|err| Error::Io {
+                        detail: format!("app-server result was not valid JSON: {err}"),
+                    });
+                }
+            }
+        }
+        Err(Error::Io {
+            detail: format!("no response for RPC id={want_id} within read bound"),
+        })
+    }
+
+    fn drive_request(
+        mut stdin: ChildStdin,
+        stdout: ChildStdout,
+        client_info: ClientInfo,
+        method: String,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, Error> {
+        let mut reader = BufReader::new(stdout);
+        write_rpc_line(
+            &mut stdin,
+            &request_value(ID_INITIALIZE, "initialize", initialize_params(&client_info)),
+        )?;
+        let _init = read_until_id(&mut reader, ID_INITIALIZE).map_err(|err| match err {
+            Error::Rpc { message, .. } => Error::Rpc {
+                method: "initialize".into(),
+                message,
+            },
+            other => other,
+        })?;
+        write_rpc_line(&mut stdin, &initialized_notification())?;
+        write_rpc_line(&mut stdin, &request_value(ID_REQUEST, &method, params))?;
+        read_until_id(&mut reader, ID_REQUEST).map_err(|err| match err {
+            Error::Io { detail } if detail.contains("closed stdout") => Error::Closed { method },
+            Error::Rpc { message, .. } => Error::Rpc { method, message },
+            other => other,
+        })
+    }
+
+    impl AppServer {
+        /// Spawn `codex app-server --listen stdio://`, handshake, call `method`,
+        /// then kill the child. Returns the JSON-RPC `result` payload.
+        pub fn request(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, Error> {
+            let mut command = Command::new(&self.program);
+            command.args(APP_SERVER_ARGS);
+            if let Some(cwd) = &self.cwd {
+                command.current_dir(cwd);
+            }
+            for (key, value) in &self.extra_env {
+                command.env(key, value);
+            }
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(Error::NotFound {
+                        program: self.program.clone(),
+                    });
+                }
+                Err(err) => {
+                    return Err(Error::Spawn {
+                        program: self.program.clone(),
+                        detail: err.to_string(),
+                    });
+                }
+            };
+
+            let stdin = child.stdin.take().ok_or_else(|| Error::Io {
+                detail: "app-server stdin not piped".into(),
+            })?;
+            let stdout = child.stdout.take().ok_or_else(|| Error::Io {
+                detail: "app-server stdout not piped".into(),
+            })?;
+
+            let (tx, rx) = mpsc::channel();
+            let client_info = self.client_info.clone();
+            let method_owned = method.to_owned();
+            thread::spawn(move || {
+                let result = drive_request(stdin, stdout, client_info, method_owned, params);
+                let _ = tx.send(result);
+            });
+
+            let result = match rx.recv_timeout(self.timeout) {
+                Ok(r) => r,
+                Err(mpsc::RecvTimeoutError::Timeout) => Err(Error::Timeout { after: self.timeout }),
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err(Error::Io {
+                    detail: "app-server observer thread disconnected before responding".into(),
+                }),
+            };
+
+            let _ = child.kill();
+            let _ = child.wait();
+            result
+        }
+    }
+
+    /// Convenience for a one-shot call with no extra env or cwd.
+    pub fn request(
+        program: impl AsRef<Path>,
+        client_info: ClientInfo,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, Error> {
+        AppServer {
+            program: program.as_ref().to_path_buf(),
+            extra_env: Vec::new(),
+            cwd: None,
+            client_info,
+            timeout,
+        }
+        .request(method, params)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn listen_args_put_the_server_on_stdio() {
+            assert_eq!(APP_SERVER_ARGS, &["app-server", "--listen", "stdio://"]);
+        }
+
+        #[test]
+        fn initialize_params_include_client_info_and_capabilities() {
+            let info = ClientInfo {
+                name: "boss-quota-probe".into(),
+                title: Some("Boss quota probe".into()),
+                version: "1.0.0".into(),
+            };
+            let params = initialize_params(&info);
+            assert_eq!(params["clientInfo"]["name"], "boss-quota-probe");
+            assert_eq!(params["clientInfo"]["title"], "Boss quota probe");
+            assert_eq!(params["clientInfo"]["version"], "1.0.0");
+            assert!(params.get("capabilities").is_some());
+        }
+
+        #[test]
+        fn initialized_notification_has_no_id() {
+            let n = initialized_notification();
+            assert_eq!(n["method"], "notifications/initialized");
+            assert!(n.get("id").is_none());
+        }
+
+        #[test]
+        fn unsolicited_notification_is_ignored() {
+            let line = r#"{"method":"remoteControl/status/changed","params":{"status":"disabled"}}"#;
+            assert_eq!(classify_line(line, ID_REQUEST), ServerLine::Other);
+        }
+
+        #[test]
+        fn initialize_reply_is_ignored_while_awaiting_the_method_reply() {
+            let line = r#"{"id":1,"result":{"codexHome":"/home/x/.codex"}}"#;
+            assert_eq!(classify_line(line, ID_REQUEST), ServerLine::Other);
+        }
+
+        #[test]
+        fn matching_result_is_captured() {
+            let line = r#"{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":5}}}}"#;
+            match classify_line(line, ID_REQUEST) {
+                ServerLine::Result(result) => {
+                    let value: serde_json::Value = serde_json::from_str(&result).expect("json");
+                    assert_eq!(
+                        value
+                            .pointer("/rateLimits/primary/usedPercent")
+                            .and_then(|v| v.as_f64()),
+                        Some(5.0)
+                    );
+                }
+                other => panic!("expected a result, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn jsonrpc_error_is_surfaced_and_truncated() {
+            let long = "x".repeat(500);
+            let line = serde_json::json!({ "id": 2, "error": { "code": -32600, "message": long } }).to_string();
+            match classify_line(&line, ID_REQUEST) {
+                ServerLine::Error(message) => assert_eq!(message.chars().count(), 200),
+                other => panic!("expected an error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn non_json_noise_on_stdout_is_ignored() {
+            assert_eq!(classify_line("warning: something", ID_REQUEST), ServerLine::Other);
+        }
+
+        #[test]
+        fn missing_executable_reports_not_found() {
+            let err = request(
+                "/nonexistent/definitely-not-codex",
+                ClientInfo {
+                    name: "test".into(),
+                    title: None,
+                    version: "0".into(),
+                },
+                "account/rateLimits/read",
+                serde_json::json!({}),
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::NotFound { .. }), "got {err:?}");
+        }
+    }
 }

@@ -4,24 +4,26 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 exports_files(["Cargo.toml"])
 
 rust_library(
-    name = "codex-hook-trust",
+    name = "driver-quota",
     srcs = glob(["src/**/*.rs"]),
-    crate_name = "boss_engine_codex_hook_trust",
+    crate_name = "boss_engine_driver_quota",
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/engine/core:__pkg__",
-        "//tools/boss/engine/driver:__pkg__",
-        "//tools/boss/engine/driver-quota:__pkg__",
     ],
-    deps = all_crate_deps(normal = True),
+    deps = all_crate_deps(normal = True) + [
+        "//tools/boss/engine/codex-hook-trust",
+        "//tools/boss/http_retry",
+        "//tools/boss/protocol",
+    ],
 )
 
 rust_test(
-    name = "codex-hook-trust_test",
+    name = "driver-quota_test",
     size = "small",
-    crate = ":codex-hook-trust",
+    crate = ":driver-quota",
     edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
@@ -30,5 +32,9 @@ rust_test(
     deps = all_crate_deps(
         normal = True,
         normal_dev = True,
-    ),
+    ) + [
+        "//tools/boss/engine/codex-hook-trust",
+        "//tools/boss/http_retry",
+        "//tools/boss/protocol",
+    ],
 )

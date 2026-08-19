@@ -311,6 +311,18 @@ final class ChatViewModel: ObservableObject {
     /// `setDriverTrafficShare` call.
     @Published var driverTrafficSplit: DriverTrafficSplit = .engineDefault
 
+    /// Per-driver provider quota usage, sourced from
+    /// `driver_quota_usage_result`. Starts empty (`neverChecked`), which the
+    /// Engine settings pane renders as "not checked yet" — deliberately not
+    /// as three zeroes, which would read as full headroom before the engine
+    /// has said anything at all.
+    @Published var driverQuota: DriverQuotaSnapshot = .empty
+
+    /// Whether a quota refresh request is outstanding. Drives the Refresh
+    /// button's disabled state only; the pane itself never blocks on a
+    /// fetch, and Settings opens regardless of whether one is in flight.
+    @Published var isRefreshingDriverQuota: Bool = false
+
     /// Whether a Trunk org API token is currently configured (env override
     /// or Keychain), sourced from `trunk_status` — on Settings-pane appear,
     /// after a `TrunkSetToken` save, and on product-settings appear so the
@@ -703,6 +715,17 @@ final class ChatViewModel: ObservableObject {
     /// value rather than whatever it last happened to show.
     func refreshDriverTrafficSplit() {
         engine.sendGetDriverTrafficSplit()
+    }
+
+    /// Ask the engine for the per-driver provider quota snapshot. Called on
+    /// Settings appear (cached, so usually free) and by the pane's Refresh
+    /// button (`refresh: true`).
+    ///
+    /// Fire-and-forget: the pane renders whatever it already has while this
+    /// is in flight, so opening Settings is never delayed by a fetch.
+    func refreshDriverQuota(force: Bool = false) {
+        isRefreshingDriverQuota = true
+        engine.sendGetDriverQuotaUsage(refresh: force)
     }
 
     /// Move `driver`'s share to `value`, letting the other two absorb the
