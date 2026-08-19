@@ -1481,24 +1481,28 @@ pub(crate) struct EngineCiBudgetSetArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct EngineAttemptsListArgs {
-    /// Attempt kinds (`conflict`, `rebase`, `ci`). Repeatable / comma-separated.
+    /// Filter to one or more attempt kinds. Repeatable /
+    /// comma-separated. Documented values: `conflict`, `rebase`, `ci`.
+    /// Omit to include all three.
     #[arg(long, value_delimiter = ',')]
     pub(crate) kind: Vec<String>,
-    /// Product id or slug. Omit for all products.
+    /// Filter to a single product (id or slug). Omit for all products.
     #[arg(long)]
     pub(crate) product: Option<String>,
-    /// Status filter. Repeatable / comma-separated.
+    /// Filter by status. Repeatable / comma-separated. Applied per
+    /// kind against each table's own `status` column.
     #[arg(long, value_delimiter = ',')]
     pub(crate) status: Vec<String>,
-    /// Parent work item id (primary or friendly short id).
+    /// Filter to a single parent work item id (primary or friendly short id).
     #[arg(long = "work-item", value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) work_item: Option<String>,
-    /// Cap returned rows. Defaults to 50; `--limit 0` is no cap.
+    /// Cap the number of returned rows. Defaults to 50; pass
+    /// `--limit 0` for no cap.
     #[arg(long)]
     pub(crate) limit: Option<u32>,
     /// Request and render the engine's live background-work snapshot.
     /// Read-only: prints the engine-provided count and items; does not
-    /// query source tables from the CLI.
+    /// query source tables from the CLI. JSON emits `background_work` only with this flag.
     #[arg(long)]
     pub(crate) background: bool,
 }

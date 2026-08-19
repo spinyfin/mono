@@ -550,24 +550,28 @@ pub(crate) async fn run_engine_attempts_command(
                     attempts,
                     background_work,
                 } => {
-                    // Always forward the additive `background_work` field so
-                    // `--json` matches the engine response. Human history
-                    // output stays the attempts table only unless `--background`
-                    // opted in to rendering the snapshot.
-                    print_entity(
-                        ctx,
-                        &serde_json::json!({
+                    // Omit `background_work` unless `--background` opted in.
+                    // The engine still returns an empty array when the flag
+                    // is off; echoing that as JSON would look like a live
+                    // empty snapshot. Human history stays the attempts
+                    // table only unless the flag also renders the snapshot.
+                    let json_value = if include_background_work {
+                        serde_json::json!({
                             "attempts": attempts,
                             "background_work": background_work,
-                        }),
-                        || {
-                            if include_background_work {
-                                print_background_work(&background_work);
-                                println!();
-                            }
-                            print_engine_attempts_table(&attempts)
-                        },
-                    )
+                        })
+                    } else {
+                        serde_json::json!({
+                            "attempts": attempts,
+                        })
+                    };
+                    print_entity(ctx, &json_value, || {
+                        if include_background_work {
+                            print_background_work(&background_work);
+                            println!();
+                        }
+                        print_engine_attempts_table(&attempts)
+                    })
                 }
                 FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
                     Err(CliError::application(message))
@@ -985,7 +989,7 @@ pub(crate) fn print_background_work(items: &[BackgroundWorkItem]) {
         println!("No live background work.");
         return;
     }
-    let mut table = new_dynamic_table(vec!["KIND", "ID", "TITLE", "PHASE", "STARTED", "CONTEXT"]);
+    let mut table = new_dynamic_table(vec!["KIND", "SOURCE ID", "TITLE", "PHASE", "STARTED", "CONTEXT"]);
     for item in items {
         let kind = match item.kind {
             BackgroundWorkKind::ProjectPlanner => "project_planner",
@@ -999,7 +1003,7 @@ pub(crate) fn print_background_work(items: &[BackgroundWorkItem]) {
             .unwrap_or("");
         table.add_row(vec![
             kind,
-            item.id.as_str(),
+            item.source_id.as_str(),
             item.title.as_str(),
             item.phase.as_str(),
             started,

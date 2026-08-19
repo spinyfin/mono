@@ -260,10 +260,9 @@ async fn engine_attempts_list_includes_all_three_kinds() -> Result<()> {
     let kinds: Vec<&str> = attempts.iter().filter_map(|r| r["kind"].as_str()).collect();
     assert!(kinds.contains(&"ci"), "expected ci kind in {kinds:?}");
     assert!(kinds.contains(&"conflict"), "expected conflict kind in {kinds:?}");
-    let background = listing["background_work"].as_array().expect("additive background_work");
     assert!(
-        background.is_empty(),
-        "without --background the snapshot must stay empty: {background:?}"
+        listing.get("background_work").is_none(),
+        "without --background JSON must omit background_work so an empty array cannot read as a live snapshot: {listing}"
     );
 
     // --kind filter narrows to one subsystem.
@@ -346,12 +345,50 @@ fn seed_chore_with_conflict_attempt(
     Ok((chore.id, attempt.id))
 }
 
+/// Guard that unregisters a lease from the process-wide
+/// `ladder_lease_registry` on drop.
+///
+/// Tests should prefer `snapshot_with_leases` (see `background_work`'s
+/// module doc) so they do not share that registry. This test cannot:
+/// it goes over RPC to a live engine that reads the process-wide set.
+/// Registration is still safe here because the window is kept as tight
+/// as possible around the `--background` invocations — every
+/// `TestEngine::spawn` in this binary starts
+/// `ladder_lease_heartbeat::spawn_loop`, whose first pass fires
+/// immediately and would `cube_client.heartbeat_lease` every
+/// registered lease, including a fabricated id, if another engine
+/// started while this lease was still live. The 120s sweep interval
+/// makes a later pass unlikely; the prompt drop is what keeps the
+/// first-pass race narrow.
 struct RegisteredLease(String);
 
 impl Drop for RegisteredLease {
     fn drop(&mut self) {
         ladder_lease_registry::unregister(&self.0);
     }
+}
+
+/// Locate `row_needle` in human table output, split on the comfy-table
+/// column separator, and return the cell under `header` (trimmed).
+fn table_cell<'a>(text: &'a str, row_needle: &str, header: &str) -> &'a str {
+    let header_line = text
+        .lines()
+        .find(|line| line.contains(header))
+        .unwrap_or_else(|| panic!("missing header {header:?} in:\n{text}"));
+    let row_line = text
+        .lines()
+        .find(|line| line.contains(row_needle))
+        .unwrap_or_else(|| panic!("missing row {row_needle:?} in:\n{text}"));
+    let headers: Vec<&str> = header_line.split('|').map(str::trim).collect();
+    let cells: Vec<&str> = row_line.split('|').map(str::trim).collect();
+    let idx = headers
+        .iter()
+        .position(|cell| *cell == header)
+        .unwrap_or_else(|| panic!("header {header:?} not a column in {header_line:?}"));
+    cells
+        .get(idx)
+        .copied()
+        .unwrap_or_else(|| panic!("row {row_line:?} has no cell at {idx}"))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -374,26 +411,29 @@ async fn conflict_list_and_show_render_mechanical_rung() -> Result<()> {
         text.contains("MECH RUNG"),
         "human table must include the mechanical-rung column: {text}"
     );
-    assert!(
-        text.contains(&attempt_id),
-        "human table must include the attempt id: {text}"
-    );
-    assert!(
-        text.contains('1'),
-        "human table must render the in-flight rung value: {text}"
+    assert_eq!(
+        table_cell(&text, &attempt_id, "MECH RUNG"),
+        "1",
+        "human table MECH RUNG cell must be the in-flight rung, not a digit from PR/created columns: {text}"
     );
 
     let shown = run_boss(engine.socket_str(), &["engine", "conflicts", "show", &attempt_id])?;
     assert_eq!(shown["attempt"]["mechanical_rung_in_flight"].as_i64(), Some(1));
 
     let detail = run_boss_human(engine.socket_str(), &["engine", "conflicts", "show", &attempt_id])?;
-    assert!(
-        detail.contains("mechanical_rung_in_flight"),
-        "human detail must name the field: {detail}"
-    );
-    assert!(
-        detail.contains('1'),
-        "human detail must render the in-flight rung value: {detail}"
+    let detail_row = detail
+        .lines()
+        .find(|line| line.contains("mechanical_rung_in_flight"))
+        .unwrap_or_else(|| panic!("human detail must name the field: {detail}"));
+    let detail_cells: Vec<&str> = detail_row
+        .split('|')
+        .map(str::trim)
+        .filter(|cell| !cell.is_empty())
+        .collect();
+    assert_eq!(
+        detail_cells,
+        ["mechanical_rung_in_flight", "1"],
+        "human detail must render the in-flight rung as the VALUE on the field's row: {detail}"
     );
     Ok(())
 }
@@ -409,21 +449,11 @@ async fn engine_attempts_list_background_renders_engine_snapshot() -> Result<()>
     let workspace_id = format!("cli-bg-ws-{attempt_id}");
     db.stamp_conflict_resolution_mechanical_rung(&attempt_id, 1, &lease_id, &workspace_id)?
         .expect("stamp applied");
-    ladder_lease_registry::register(&CubeWorkspaceLease {
-        lease_id: lease_id.clone(),
-        workspace_id,
-        workspace_path: "/tmp/cli-bg-ws".into(),
-        dirty_verified: None,
-    });
-    let _lease = RegisteredLease(lease_id);
 
     let without_flag = run_boss(engine.socket_str(), &["engine", "attempts", "list"])?;
-    let without_background = without_flag["background_work"]
-        .as_array()
-        .expect("additive background_work");
     assert!(
-        without_background.is_empty(),
-        "flag-absent JSON must not populate the snapshot: {without_background:?}"
+        without_flag.get("background_work").is_none(),
+        "flag-absent JSON must omit background_work: {without_flag}"
     );
     let without_text = run_boss_human(engine.socket_str(), &["engine", "attempts", "list"])?;
     assert!(
@@ -435,40 +465,59 @@ async fn engine_attempts_list_background_renders_engine_snapshot() -> Result<()>
         "flag-absent human output must still be the history table: {without_text}"
     );
 
-    let listing = run_boss(engine.socket_str(), &["engine", "attempts", "list", "--background"])?;
-    let background = listing["background_work"].as_array().expect("background_work");
-    assert_eq!(
-        background.len(),
-        1,
-        "CLI must report the engine-provided count, not re-query: {background:?}"
-    );
-    assert_eq!(background[0]["kind"].as_str(), Some("conflict_remediation"));
-    assert_eq!(background[0]["source_id"].as_str(), Some(attempt_id.as_str()));
-    assert_eq!(background[0]["phase"].as_str(), Some("Rebasing Fix the merge conflict"));
-    assert_eq!(background[0]["work_item_id"].as_str(), Some(chore_id.as_str()));
-    let attempts = listing["attempts"].as_array().expect("attempts array");
-    assert_eq!(
-        attempts.len(),
-        1,
-        "--background must not hide the history list: {attempts:?}"
-    );
+    {
+        ladder_lease_registry::register(&CubeWorkspaceLease {
+            lease_id: lease_id.clone(),
+            workspace_id,
+            workspace_path: "/tmp/cli-bg-ws".into(),
+            dirty_verified: None,
+        });
+        let _lease = RegisteredLease(lease_id);
 
-    let text = run_boss_human(engine.socket_str(), &["engine", "attempts", "list", "--background"])?;
-    assert!(
-        text.contains("Background work (1)"),
-        "human --background must render the engine-provided count: {text}"
-    );
-    assert!(
-        text.contains("conflict_remediation"),
-        "human --background must render the engine-provided kind: {text}"
-    );
-    assert!(
-        text.contains("Rebasing Fix the merge conflict"),
-        "human --background must render engine-authored phase text: {text}"
-    );
-    assert!(
-        text.contains("KIND"),
-        "human --background must still print the history table: {text}"
-    );
+        let listing = run_boss(engine.socket_str(), &["engine", "attempts", "list", "--background"])?;
+        let background = listing["background_work"].as_array().expect("background_work");
+        assert_eq!(
+            background.len(),
+            1,
+            "CLI must report the engine-provided count, not re-query: {background:?}"
+        );
+        assert_eq!(background[0]["kind"].as_str(), Some("conflict_remediation"));
+        assert_eq!(background[0]["source_id"].as_str(), Some(attempt_id.as_str()));
+        assert_eq!(background[0]["phase"].as_str(), Some("Rebasing Fix the merge conflict"));
+        assert_eq!(background[0]["work_item_id"].as_str(), Some(chore_id.as_str()));
+        let attempts = listing["attempts"].as_array().expect("attempts array");
+        assert_eq!(
+            attempts.len(),
+            1,
+            "--background must not hide the history list: {attempts:?}"
+        );
+
+        let text = run_boss_human(engine.socket_str(), &["engine", "attempts", "list", "--background"])?;
+        assert!(
+            text.contains("Background work (1)"),
+            "human --background must render the engine-provided count: {text}"
+        );
+        assert!(
+            text.contains("conflict_remediation"),
+            "human --background must render the engine-provided kind: {text}"
+        );
+        assert_eq!(
+            table_cell(&text, &attempt_id, "SOURCE ID"),
+            attempt_id.as_str(),
+            "human --background ID column must be source_id for other engine verbs: {text}"
+        );
+        assert!(
+            !text.contains(&format!("conflict_remediation:{attempt_id}")),
+            "human --background must not reprint the namespaced id: {text}"
+        );
+        assert!(
+            text.contains("Rebasing Fix the merge conflict"),
+            "human --background must render engine-authored phase text: {text}"
+        );
+        assert!(
+            text.contains("KIND"),
+            "human --background must still print the history table: {text}"
+        );
+    }
     Ok(())
 }
