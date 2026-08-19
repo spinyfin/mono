@@ -126,6 +126,8 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 let work_db2 = work_db.clone();
                 let product_name = product.name.clone();
                 let product_slug = product.slug.clone();
+                let publisher = server_state.publisher.clone();
+                let product_id2 = product_id.clone();
                 tokio::spawn(async move {
                     match direct_merge_executor.execute(&pr_url2).await {
                         Ok(action) => {
@@ -134,6 +136,47 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                             // state promptly without waiting for the next
                             // periodic sweep.
                             kick.notify_one();
+                            if action == merge_when_ready::MergeAction::Enqueued {
+                                // A successful `gh pr merge` enqueue into
+                                // GitHub's native merge queue is itself
+                                // authoritative evidence the PR is queued —
+                                // mirror `handle_trunk_queue_merge`'s
+                                // optimistic write (review.rs:351) instead
+                                // of waiting for the poller's first sweep
+                                // (already kicked above) to discover it.
+                                // The next un-gated sweep write in
+                                // `merge_poller::sweep::update_task_pr_poll_state`
+                                // (`preserve_merge_queue_state` is only set
+                                // for `trunk_queue` products — see
+                                // `is_trunk_queue_product`) supersedes this
+                                // placeholder with the real probe, and also
+                                // snaps it back out of Merging if the queue
+                                // evicts the PR before that probe runs.
+                                let detail = serde_json::json!({
+                                    "position": null,
+                                    "state": null,
+                                    "enqueued_at": null,
+                                    "section_order": crate::merge_poller::QUEUED_NO_POSITION_SECTION_ORDER,
+                                })
+                                .to_string();
+                                if let Err(err) =
+                                    work_db2.set_task_merge_queue_state(&work_item_id2, Some("queued"), Some(&detail))
+                                {
+                                    tracing::error!(
+                                        work_item_id = %work_item_id2,
+                                        ?err,
+                                        "merge_when_ready: gh merge-queue enqueue succeeded but optimistic merge_queue_state write failed",
+                                    );
+                                } else {
+                                    publisher
+                                        .publish_work_item_changed(
+                                            &product_id2,
+                                            &work_item_id2,
+                                            "gh_merge_queue_submitted",
+                                        )
+                                        .await;
+                                }
+                            }
                             send_response(
                                 &sink2,
                                 &request_id2,
@@ -1062,17 +1105,35 @@ mod trunk_queue_tests {
     /// Direct-branch routing tests below — records the PR URLs it was
     /// invoked with instead of shelling out to a real `gh` process, so
     /// these tests can pin the routing decision without any risk of
-    /// issuing a live, mutating `gh pr merge` call.
-    #[derive(Default)]
+    /// issuing a live, mutating `gh pr merge` call. Returns a configurable
+    /// [`crate::merge_when_ready::MergeAction`] (`Merged` unless
+    /// constructed via [`FakeDirectMergeExecutor::returning`]) so tests can
+    /// exercise the `Enqueued` / `AutoMergeEnabled` outcomes too.
     struct FakeDirectMergeExecutor {
         calls: std::sync::Mutex<Vec<String>>,
+        action: crate::merge_when_ready::MergeAction,
+    }
+
+    impl FakeDirectMergeExecutor {
+        fn returning(action: crate::merge_when_ready::MergeAction) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                action,
+            }
+        }
+    }
+
+    impl Default for FakeDirectMergeExecutor {
+        fn default() -> Self {
+            Self::returning(crate::merge_when_ready::MergeAction::Merged)
+        }
     }
 
     #[async_trait::async_trait]
     impl crate::merge_when_ready::DirectMergeExecutor for FakeDirectMergeExecutor {
         async fn execute(&self, pr_url: &str) -> anyhow::Result<crate::merge_when_ready::MergeAction> {
             self.calls.lock().unwrap().push(pr_url.to_owned());
-            Ok(crate::merge_when_ready::MergeAction::Merged)
+            Ok(self.action.clone())
         }
     }
 
@@ -1208,6 +1269,159 @@ mod trunk_queue_tests {
                 .is_none(),
             "an explicit direct-mechanism product must never create a trunk merge intent"
         );
+        server.verify().await;
+    }
+
+    /// A GitHub-native merge-queue enqueue (`MergeAction::Enqueued`) from
+    /// the Direct executor must transition the task into the Merging UI
+    /// immediately, the same way `trunk_queue_merge_submits_and_marks_task_queued`
+    /// pins the Trunk path — instead of leaving the card in Review until
+    /// the poller's next sweep discovers it.
+    #[tokio::test]
+    async fn direct_merge_enqueued_marks_task_queued_and_broadcasts() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/submitPullRequest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let direct_executor = Arc::new(FakeDirectMergeExecutor::returning(
+            crate::merge_when_ready::MergeAction::Enqueued,
+        ));
+        let (state, _temp) =
+            test_server_state_with_direct_executor(trunk_client_for(server.uri()), Some(direct_executor.clone()));
+        let product = create_test_product_with_repo(
+            &state.work_db,
+            "direct-enqueued-product",
+            Some("git@github.com:brianduff/flunge.git"),
+        );
+        let chore = create_test_chore_manual(&state.work_db, product.id.clone(), "direct-enqueued-chore");
+        state
+            .work_db
+            .update_work_item(
+                &chore.id,
+                WorkItemPatch {
+                    status: Some("in_review".into()),
+                    pr_url: Some("https://github.com/brianduff/flunge/pull/993".into()),
+                    ..WorkItemPatch::default()
+                },
+            )
+            .unwrap();
+        let sink = make_session_sink();
+
+        // Same registration as `trunk_queue_merge_submits_and_marks_task_queued`
+        // so we can assert the optimistic write reaches the (push-only) app
+        // as a `WorkInvalidated` event, not just a DB row.
+        state.topic_broker.register_session("s1", sink.clone()).await;
+        state
+            .topic_broker
+            .subscribe("s1", &[crate::protocol::work_product_topic(&product.id)])
+            .await;
+
+        handle_merge_when_ready(
+            dispatch_ctx(&state, &sink),
+            FrontendRequest::MergeWhenReady {
+                work_item_id: chore.id.clone(),
+            },
+        )
+        .await;
+
+        let invalidation = sink.next().await.expect("a work-item-changed push should be enqueued");
+        match invalidation.payload {
+            FrontendEvent::TopicEvent {
+                event: crate::protocol::TopicEventPayload::WorkInvalidated { reason, item_ids, .. },
+                ..
+            } => {
+                assert_eq!(reason, "gh_merge_queue_submitted");
+                assert_eq!(item_ids, vec![chore.id.clone()]);
+            }
+            other => panic!("expected a WorkInvalidated topic push naming the work item, got {other:?}"),
+        }
+
+        let envelope = sink.next().await.expect("a response should be enqueued");
+        match envelope.payload {
+            FrontendEvent::MergeWhenReadyAccepted { action, .. } => assert_eq!(action, "enqueued"),
+            other => panic!("expected MergeWhenReadyAccepted, got {other:?}"),
+        }
+
+        let item = state.work_db.get_work_item(&chore.id).unwrap();
+        let WorkItem::Chore(task) = item else {
+            panic!("expected a chore");
+        };
+        assert_eq!(task.merge_queue_state.as_deref(), Some("queued"));
+        assert_eq!(
+            task.status,
+            TaskStatus::InReview,
+            "a merge-queue submission must move the card into Merging without marking it done/merged"
+        );
+
+        server.verify().await;
+    }
+
+    /// `MergeAction::Merged` (checks were already green, no queue involved)
+    /// must NOT optimistically write `merge_queue_state` — only a confirmed
+    /// queue *submission* (`Enqueued`) does that. A merged task's status
+    /// transition is owned elsewhere (the poller observing the PR as
+    /// merged), not by this handler.
+    #[tokio::test]
+    async fn direct_merge_merged_does_not_write_queue_state() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/submitPullRequest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let direct_executor = Arc::new(FakeDirectMergeExecutor::returning(
+            crate::merge_when_ready::MergeAction::Merged,
+        ));
+        let (state, _temp) =
+            test_server_state_with_direct_executor(trunk_client_for(server.uri()), Some(direct_executor.clone()));
+        let product = create_test_product_with_repo(
+            &state.work_db,
+            "direct-merged-product",
+            Some("git@github.com:brianduff/flunge.git"),
+        );
+        let chore = create_test_chore_manual(&state.work_db, product.id.clone(), "direct-merged-chore");
+        state
+            .work_db
+            .update_work_item(
+                &chore.id,
+                WorkItemPatch {
+                    status: Some("in_review".into()),
+                    pr_url: Some("https://github.com/brianduff/flunge/pull/994".into()),
+                    ..WorkItemPatch::default()
+                },
+            )
+            .unwrap();
+        let sink = make_session_sink();
+
+        handle_merge_when_ready(
+            dispatch_ctx(&state, &sink),
+            FrontendRequest::MergeWhenReady {
+                work_item_id: chore.id.clone(),
+            },
+        )
+        .await;
+
+        let envelope = sink.next().await.expect("a response should be enqueued");
+        match envelope.payload {
+            FrontendEvent::MergeWhenReadyAccepted { action, .. } => assert_eq!(action, "merged"),
+            other => panic!("expected MergeWhenReadyAccepted, got {other:?}"),
+        }
+
+        let item = state.work_db.get_work_item(&chore.id).unwrap();
+        let WorkItem::Chore(task) = item else {
+            panic!("expected a chore");
+        };
+        assert_eq!(
+            task.merge_queue_state, None,
+            "a direct merge (no queue involved) must not write merge_queue_state"
+        );
+
         server.verify().await;
     }
 
