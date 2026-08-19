@@ -97,7 +97,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use boss_tmux::{DisplayField, Tmux};
+use boss_tmux::{DisplayField, TMUX_SPAWN_TOKEN_ENV, Tmux};
 
 use crate::coordinator::{ExecutionCoordinator, slot_id_from_worker_id};
 use crate::dead_pid_sweep::{PidStatus, probe_pid};
@@ -106,12 +106,6 @@ use crate::live_worker_state::{LiveSpawnRouting, ReadoptionEvidence, attributed_
 use crate::spawn_flow::{TMUX_SESSION_SCHEMA, WorkerSpawner};
 use crate::work::{TmuxRunHandle, WorkDb};
 use crate::worker_readoption::LiveWorkerConvergence;
-
-/// The tmux session environment variable carrying the durable spawn token.
-/// Mirrors [`crate::spawn_flow`]'s private constant of the same name — this
-/// module reads what that one writes, from a different process generation at
-/// boot, so it is redeclared rather than imported.
-pub(crate) const TMUX_SPAWN_TOKEN_ENV: &str = "BOSS_SPAWN_TOKEN";
 
 /// The tmux session environment variable carrying [`TMUX_SESSION_SCHEMA`].
 /// Redeclared rather than imported for the same reason as
@@ -133,7 +127,6 @@ const ENGINE_OWNER_OPTION: &str = "@boss_engine_owner";
 /// starting on the same work item is direct evidence the item is moving
 /// again, the same shape as [`crate::dead_pid_sweep::PANE_DEATH_ATTENTION_KIND`].
 pub const TMUX_ADOPTION_SCHEMA_SKEW_ATTENTION_KIND: &str = "tmux_adoption_schema_skew";
-
 /// Trigger name recorded on the dispatch event and carried into
 /// [`LiveWorkerConvergence::converge_live_worker`] for a session whose token
 /// matched a terminal execution — the third trigger alongside
@@ -149,6 +142,14 @@ const TERMINAL_HANDOFF_TRIGGER: &str = "tmux_session_sweep";
 pub struct UntrackedTmuxSession {
     pub session_name: String,
     pub spawn_token: String,
+}
+
+/// Read the authoritative durable identity token for a tmux session. Callers
+/// deliberately choose their mismatch policy: boot adoption leaves foreign
+/// sessions alone, while the liveness sweep treats a durable run's mismatch as
+/// evidence that its pane is gone.
+pub async fn session_spawn_token(tmux: &Tmux, session_name: &str) -> anyhow::Result<Option<String>> {
+    tmux.show_environment(session_name, TMUX_SPAWN_TOKEN_ENV).await
 }
 
 /// What one pass did; the caller logs it.
@@ -314,7 +315,7 @@ where
         if session.name == crate::coordinator_tmux::COORDINATOR_SESSION_NAME {
             continue;
         }
-        match tmux.show_environment(&session.name, TMUX_SPAWN_TOKEN_ENV).await {
+        match session_spawn_token(tmux, &session.name).await {
             Ok(Some(token)) => {
                 let schema_check = match tmux.show_environment(&session.name, TMUX_SESSION_SCHEMA_ENV).await {
                     Ok(value) => Some(check_session_schema(value.as_deref())),

@@ -243,6 +243,12 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     ),
     // ── The producer owns resolution ────────────────────────────────────
     entry(
+        crate::stale_worker_sweep::STALE_WORKER_ATTENTION_KIND,
+        ClearedBy::ProducerReconciles,
+        "The stale-worker sweep rechecks tmux evidence every pass and resolves this attention when the \
+         same worker resumes terminal activity or terminalizes.",
+    ),
+    entry(
         crate::worker_escalation::WORKER_ESCALATION_ATTENTION_KIND,
         ClearedBy::ProducerReconciles,
         "The coordinator's probe IS the documented ack gesture; \
@@ -571,6 +577,7 @@ mod tests {
             crate::completion::MID_TURN_REAP_ATTENTION_KIND,
             crate::coordinator::PANE_SPAWN_FAILED_ATTENTION_KIND,
             crate::coordinator::ANSWER_AGENT_READY_AGE_ATTENTION_KIND,
+            crate::stale_worker_sweep::STALE_WORKER_ATTENTION_KIND,
             crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND,
             crate::worker_escalation::WORKER_ESCALATION_ATTENTION_KIND,
             crate::worker_escalation::WORKER_BLOCKED_ATTENTION_KIND,

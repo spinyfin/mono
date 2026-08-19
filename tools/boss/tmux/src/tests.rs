@@ -209,7 +209,12 @@ async fn environment_and_option_reads_distinguish_absence() {
 
 #[tokio::test]
 async fn set_option_capture_and_display_use_the_private_server() {
-    let (tmux, runner) = tmux([success(""), success("pane text\n"), success("1234\n")]);
+    let (tmux, runner) = tmux([
+        success(""),
+        success("pane text\n"),
+        success("1234\n"),
+        success("claude\n"),
+    ]);
     tmux.set_option("boss-1", "@boss_spawn_token", "token").await.unwrap();
     assert_eq!(tmux.capture_pane("boss-1").await.unwrap(), "pane text\n");
     assert_eq!(
@@ -217,11 +222,26 @@ async fn set_option_capture_and_display_use_the_private_server() {
         "1234"
     );
     assert_eq!(
+        tmux.display_message("boss-1", DisplayField::PaneCurrentCommand)
+            .await
+            .unwrap(),
+        "claude"
+    );
+    assert_eq!(
         runner.calls(),
         vec![
             vec!["-L", "boss", "set-option", "-t", "boss-1", "@boss_spawn_token", "token"],
             vec!["-L", "boss", "capture-pane", "-p", "-t", "boss-1"],
             vec!["-L", "boss", "display-message", "-p", "-t", "boss-1", "#{pane_pid}"],
+            vec![
+                "-L",
+                "boss",
+                "display-message",
+                "-p",
+                "-t",
+                "boss-1",
+                "#{pane_current_command}",
+            ],
         ]
     );
 }

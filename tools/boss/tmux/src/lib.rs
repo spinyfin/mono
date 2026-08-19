@@ -9,7 +9,7 @@ mod types;
 pub use boss_command_runner::{CommandOutput, CommandRunner, RealCommandRunner};
 pub use types::{
     DEFAULT_SEND_CHUNK_BYTES, DEFAULT_SEND_CHUNK_DELAY, DisplayField, MINIMUM_VERSION, NewSession, SERVER_LABEL,
-    Session, TmuxVersion,
+    Session, TMUX_SPAWN_TOKEN_ENV, TmuxVersion,
 };
 
 use std::ffi::OsString;
