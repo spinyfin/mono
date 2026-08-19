@@ -1264,10 +1264,11 @@ STATIC_BROAD_ROOTS = frozenset((
 # list (and therefore read) the directory itself.
 BROAD_PARENTS = frozenset(("/Users", "/Volumes"))
 
-# Programs that descend every directory handed to them.
+# Programs that descend every directory handed to them. Their positional
+# operands are parsed below; a program name alone is never a traversal root.
 ALWAYS_RECURSIVE = frozenset((
     "find", "rg", "ripgrep", "ag", "ack", "fd", "fdfind",
-    "tree", "du", "ncdu", "mdfind", "locate",
+    "tree", "du", "ncdu", "tar", "zip", "ditto",
 ))
 
 # Programs that descend only when asked, keyed to the short flags that ask.
@@ -1344,18 +1345,6 @@ def asks_for_recursion(token, short_flags):
     return any(flag in token[1:] for flag in short_flags)
 
 
-def walks_a_tree(tokens):
-    """True when the command line runs a program that recurses into a tree."""
-    for index, token in enumerate(tokens):
-        name = os.path.basename(token)
-        if name in ALWAYS_RECURSIVE:
-            return True
-        short_flags = RECURSIVE_WITH_FLAG.get(name)
-        if short_flags and any(asks_for_recursion(t, short_flags) for t in tokens[index + 1:]):
-            return True
-    return False
-
-
 def literal_prefix(pattern):
     """The leading path of a glob pattern, before its first metacharacter."""
     cut = len(pattern)
@@ -1364,6 +1353,113 @@ def literal_prefix(pattern):
         if found != -1:
             cut = min(cut, found)
     return pattern[:cut]
+
+
+SHELL_OPERATORS = frozenset((";", "&&", "||", "|", "&"))
+
+
+def command_segments(tokens):
+    """Shell command segments, with trailing operators removed defensively."""
+    segment = []
+    for token in tokens:
+        token = token.rstrip(";&|")
+        if not token or token in SHELL_OPERATORS:
+            if segment:
+                yield segment
+                segment = []
+            continue
+        segment.append(token)
+    if segment:
+        yield segment
+
+
+def grep_roots(operands):
+    """Traversal roots for grep-family commands after their regex pattern."""
+    non_flags = [token for token in operands if not token.startswith("-")]
+    return non_flags[1:]
+
+
+def find_roots(operands):
+    """`find` roots are its positional paths before its expression starts."""
+    roots = []
+    for token in operands:
+        if token.startswith("-"):
+            break
+        roots.append(token)
+    return roots
+
+
+def archive_roots(name, operands):
+    """Traversal inputs for whole-tree archivers, excluding their outputs."""
+    positional = [token for token in operands if not token.startswith("-")]
+    if name == "ditto":
+        return positional[:1]
+    if name == "zip":
+        # The first positional argument is the archive being written.
+        return positional[1:]
+    if name == "tar":
+        # `-f archive` consumes its archive operand; the remaining positional
+        # arguments are inputs. Handle both `-cf out.tar root` and `-f out`.
+        roots = []
+        skip_next = False
+        for token in operands:
+            if skip_next:
+                skip_next = False
+                continue
+            if token == "-f" or (token.startswith("-") and "f" in token[1:]):
+                skip_next = True
+            elif not token.startswith("-"):
+                roots.append(token)
+        return roots
+    return positional
+
+
+def bash_traversal_roots(tokens):
+    """Roots actually consumed by recursive Bash programs and prior `cd`s."""
+    cd_roots = []
+    roots = []
+    for segment in command_segments(tokens):
+        name = os.path.basename(segment[0])
+        operands = segment[1:]
+        if name == "cd" and operands:
+            cd_roots.append(operands[0])
+            continue
+        if name == "mdfind":
+            # mdfind searches the whole metadata index unless -onlyin scopes
+            # it; its query string is not a path operand.
+            roots.extend(cd_roots)
+            for index, token in enumerate(operands[:-1]):
+                if token == "-onlyin":
+                    roots.append(operands[index + 1])
+                    break
+            else:
+                roots.append(os.sep)
+            continue
+        if name == "locate":
+            # locate has no directory-scoping flag: its database is global.
+            roots.extend(cd_roots)
+            roots.append(os.sep)
+            continue
+        recursive = name in ALWAYS_RECURSIVE
+        short_flags = RECURSIVE_WITH_FLAG.get(name)
+        if short_flags:
+            recursive = any(asks_for_recursion(token, short_flags) for token in operands)
+        if not recursive:
+            continue
+        roots.extend(cd_roots)
+        if name in ("grep", "rg", "ripgrep", "ag", "ack"):
+            roots.extend(grep_roots(operands))
+        elif name == "find":
+            roots.extend(find_roots(operands))
+        elif name in ("tar", "zip", "ditto"):
+            roots.extend(archive_roots(name, operands))
+        else:
+            roots.extend(token for token in operands if not token.startswith("-"))
+    # A `cd` is relevant only when it precedes a recursive walk; `cd /; echo
+    # ok` is not one. Bash receives globs before the shell expands them in the
+    # hook payload. Judge their literal prefix so `/Users/*/Desktop` cannot
+    # hide `/Users`.
+    return [literal_prefix(root) or root for root in roots]
 
 
 def traversal_roots(tool, tool_input, tokens):
@@ -1377,18 +1473,19 @@ def traversal_roots(tool, tool_input, tokens):
         path = tool_input.get("path")
         if isinstance(path, str) and path:
             roots.append(path)
-        for key in ("pattern", "glob"):
+        # Only Glob's pattern is a filesystem glob. Grep/Search patterns are
+        # regular expressions, so their traversal root is exclusively `path`.
+        for key in (("pattern", "glob") if tool == "Glob" else ()):
             value = tool_input.get(key)
             if isinstance(value, str) and value.startswith("/"):
                 prefix = literal_prefix(value)
                 if prefix:
                     roots.append(prefix)
-    elif tokens and walks_a_tree(tokens):
-        # Every token is considered rather than only those following the
-        # program name: a pipeline (`cd / && find . -name x`) puts the root
-        # somewhere else on the same line, and over-considering a token that
-        # is not a path is harmless (it will not resolve to a broad root).
-        roots.extend(tokens)
+    elif tokens:
+        # Extract only operands that can establish a traversal root. This keeps
+        # literal search patterns and flag values such as `-newer /Users` from
+        # being mistaken for paths while still following `cd / && find .`.
+        roots.extend(bash_traversal_roots(tokens))
     return roots
 
 
@@ -1463,7 +1560,9 @@ def main():
             emit("block", MALFORMED)
         raw_command = command
         try:
-            tokens = shlex.split(command)
+            lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+            lexer.whitespace_split = True
+            tokens = list(lexer)
         except Exception:
             tokens = command.split()
         candidates.extend(tokens)

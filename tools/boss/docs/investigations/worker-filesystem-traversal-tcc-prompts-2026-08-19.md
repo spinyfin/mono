@@ -86,7 +86,7 @@ sandbox-exec -f probe.sb /bin/echo hello
 Zero `kTCCServiceSystemPolicy*` events. Sandbox entry alone triggers nothing,
 so the observed events were **real file accesses**.
 
-### 4. Get the paths
+### 4. Get the paths and correlate process lifetime
 
 The kernel logs each denied read with its path, which TCC does not:
 
@@ -112,7 +112,26 @@ each burst resuming right after a prompt is answered. That is one traversal
 being stalled by modal dialogs and continuing, not many separate accesses.
 
 This is a walk of `/`, not of a user directory. Note the reach into other
-people's home directories — this is a shared family Mac.
+people’s home directories — this is a shared family Mac.
+
+The same predicate, without the `grep 'deny(1)'` filter, also supplies the
+process-lifetime correlation needed to distinguish startup from a later tool
+call. The first `file-read-data` denial is at 09:36:04; compare that timestamp
+with the earliest `(70839)` line that records the `claude` exec. A denial in
+the first seconds after exec is startup behaviour; a material gap is a
+mid-session tool call. The retained excerpt establishes the first half of that
+comparison but not the exec record, so startup cannot be excluded for this
+historical run.
+
+That uncertainty has a concrete Boss-side containment path rather than an
+open efficacy question: worker panes are launched with their cwd fixed to the
+leased workspace root (`runner/pane_spawn.rs`), and any startup-origin scan
+must be constrained there as well — launch `claude` with that workspace cwd
+and a worker-scoped home/config directory, rather than inheriting an
+operator-wide search root. The PreToolUse guard handles subsequent tool calls;
+the launch boundary is the control for startup work, so a fresh incident must
+record this exec-to-first-denial delta before claiming the hook alone stopped
+the symptom.
 
 ### 5. Confirm the mechanism by reproduction
 
@@ -173,12 +192,14 @@ boundary. This change adds a **second, independent boundary** to that guard:
 
 It judges the **root of a recursive walk** only:
 
-- `Bash` — a program that recurses (`find`, `rg`, `fd`, `du`, `tree`,
-  `mdfind`, …, plus `grep`/`ls`/`cp`/`rsync` when given a recursion flag)
-  paired with a broad root.
-- `Glob` / `Grep` — the `path` argument, or the literal prefix of an absolute
-  `pattern`, since Claude Code's `Glob` runs in-process with no shell command
-  to inspect.
+- `Bash` — a program that recurses (`find`, `rg`, `fd`, `du`, `tree`, whole-tree
+  archivers, and `mdfind`/`locate`, plus `grep`/`ls`/`cp`/`rsync` when given a
+  recursion flag) paired with its actual traversal operand. `mdfind` is broad
+  unless `-onlyin` supplies a narrow root; `locate` is always broad.
+- `Glob` — the `path` argument or the literal prefix of an absolute glob
+  pattern, since it runs in-process with no shell command to inspect.
+- `Grep` / `Search` — only the `path` argument: their patterns are regexes,
+  never filesystem roots.
 
 Reading one **specific named file** outside the workspace (`~/.gitconfig`, a
 bazel cache entry, `/etc/hosts`) stays approved. The defect is the breadth of
@@ -204,10 +225,10 @@ read would break ordinary worker work without addressing the cause.
 ## What this does not establish
 
 The traversal was caught in the kernel log after the fact, which names the
-process and every path but not the tool call that started it. Whether this
-particular walk was an agent choosing an over-broad search or something in the
-driver's own startup is not determined here. It does not change the fix: the
-guard blocks the traversal at its root either way, and the reproduction in
-step 5 confirms a worker Bash call is a sufficient route. Boss worker
-transcripts are coordinator-owned state a worker may not read, so attributing
-the specific call needs a coordinator-side look at that run.
+process and every path but not the tool call that started it. The correlation
+above leaves startup possible for this historical run, so the hook alone is
+not claimed to intercept that route. The workspace-cwd and worker-scoped-home
+launch boundary covers startup; the guard blocks later tool calls, and the
+reproduction in step 5 confirms a worker Bash call is a sufficient route.
+Boss worker transcripts are coordinator-owned state a worker may not read, so
+attributing the specific call still needs a coordinator-side look at that run.

@@ -327,8 +327,18 @@ fn path_guard_blocks_a_machine_wide_recursive_walk() {
         "find /Users/someone-else -name x",
         // The root can arrive via a `cd` earlier in the same command line.
         "cd / && find . -name x",
+        "cd /;find . -name x",
+        // A shell glob still denotes every user's protected Desktop.
+        "find /Users/*/Desktop -name x",
         // Clustered short flags request recursion just as `-r` does.
         "grep -rn needle /Users",
+        // Metadata searches are global unless mdfind receives a narrow root.
+        "mdfind 'kMDItemDisplayName == foo'",
+        "locate foo",
+        // Whole-tree archivers must judge their input tree, not their output.
+        "tar -cf out.tar /",
+        "zip -r out.zip /",
+        "ditto / /tmp/copy",
     ] {
         let (decision, reason) = run_guard_in(data.path(), cwd.path(), bash(command));
         assert_eq!(decision, "block", "must block a machine-wide walk: {command}");
@@ -395,19 +405,28 @@ fn path_guard_approves_scoped_searches_and_specific_external_files() {
     for payload in [
         bash("find . -name '*.rs'"),
         bash("rg needle src/"),
+        // The first non-flag grep-family operand is a regex pattern, not a
+        // traversal root, and `find` expressions carry values not paths.
+        bash("rg '/Users' tools/boss"),
+        bash("find tools -name '*.rs' -newer /Users"),
         bash(&format!("rg needle {}", scoped.display())),
         // A cargo/bazel cache under the home directory: a real root, but a
         // named one, not the home directory itself.
         bash("find ~/.cargo/registry -name x"),
         // Not recursive: listing a directory is not walking its tree.
         bash("ls /"),
+        // Changing directories alone is not a traversal.
+        bash("cd /; echo scoped-work"),
         bash("echo /"),
         bash("cat /etc/hosts"),
         bash("bazel test //tools/boss/engine/..."),
         // `git -C <home>` is not a traversal program at all.
         bash("git -C /Users/someone-else status"),
+        bash("mdfind -onlyin tools/boss 'kMDItemDisplayName == foo'"),
         serde_json::json!({"tool_name": "Read", "tool_input": {"file_path": "/etc/hosts"}}),
         serde_json::json!({"tool_name": "Glob", "tool_input": {"pattern": "**/*.rs"}}),
+        // Grep/Search patterns are regexes; only their `path` is a root.
+        serde_json::json!({"tool_name": "Grep", "tool_input": {"pattern": "/Users/brianduff", "path": "tools/boss"}}),
     ] {
         let (decision, reason) = run_guard_in(data.path(), cwd.path(), payload.clone());
         assert_eq!(
