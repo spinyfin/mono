@@ -68,7 +68,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use boss_protocol::WorkerActivity;
-use boss_tmux::{DisplayField, Tmux};
+use boss_tmux::Tmux;
 
 use crate::coordinator::{CubeClient, ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
@@ -255,82 +255,79 @@ impl WorkerTerminalInspector for TmuxWorkerTerminalInspector {
         };
         let tmux = self.tmux_for_run(&run.tmux_server_label);
 
-        if !tmux
+        let session_exists = tmux
             .list_sessions()
             .await?
             .iter()
-            .any(|session| session.name == run.tmux_session_name)
-        {
-            return Ok(Some(TerminalLiveness::Dead {
+            .any(|session| session.name == run.tmux_session_name);
+        let observation = crate::tmux_adoption::observe_tmux_identity(
+            tmux,
+            &run.tmux_session_name,
+            &run.tmux_spawn_token,
+            session_exists,
+        )
+        .await;
+        match observation.adoption_state {
+            boss_protocol::TmuxAdoptionState::NotTmuxHosted => Ok(None),
+            boss_protocol::TmuxAdoptionState::ProbeUnavailable => {
+                anyhow::bail!("tmux identity probe unavailable for session {}", run.tmux_session_name)
+            }
+            boss_protocol::TmuxAdoptionState::SessionMissing => Ok(Some(TerminalLiveness::Dead {
                 session_name: run.tmux_session_name,
                 evidence: DeadPaneEvidence::SessionAbsent,
-            }));
-        }
-
-        let token = crate::tmux_adoption::session_spawn_token(tmux, &run.tmux_session_name).await?;
-        if token.as_deref() != Some(run.tmux_spawn_token.as_str()) {
-            return Ok(Some(TerminalLiveness::Dead {
+            })),
+            boss_protocol::TmuxAdoptionState::TokenMismatch => Ok(Some(TerminalLiveness::Dead {
                 session_name: run.tmux_session_name,
                 evidence: DeadPaneEvidence::SpawnTokenMismatch,
-            }));
+            })),
+            boss_protocol::TmuxAdoptionState::Adopted if observation.pane_dead == Some(true) => {
+                Ok(Some(TerminalLiveness::Dead {
+                    session_name: run.tmux_session_name,
+                    evidence: DeadPaneEvidence::PaneExited {
+                        pane_dead_status: observation.pane_dead_status,
+                    },
+                }))
+            }
+            boss_protocol::TmuxAdoptionState::Adopted => {
+                let window_activity_epoch_secs = observation
+                    .window_activity_epoch_secs
+                    .context("tmux window_activity missing on a live pane")?;
+                let current_command = observation.current_command.unwrap_or_default();
+                let driver_slug = self
+                    .work_db
+                    .get_execution_driver_slug(execution_id)?
+                    .unwrap_or_default();
+                let driver_binary = crate::driver::DriverRegistry::default()
+                    .require(&driver_slug)
+                    .map(|driver| driver.descriptor().binary.to_owned())
+                    .unwrap_or_else(|err| {
+                        tracing::warn!(
+                            execution_id,
+                            driver_slug,
+                            ?err,
+                            "stale-worker sweep: unknown driver while inspecting tmux pane"
+                        );
+                        String::new()
+                    });
+                let foreground_command_mismatch = !driver_binary.is_empty() && current_command != driver_binary;
+                if foreground_command_mismatch {
+                    tracing::warn!(
+                        execution_id,
+                        driver_slug,
+                        expected_binary = driver_binary,
+                        observed_command = current_command,
+                        "stale-worker sweep: pane foreground command differs from driver binary; \
+                         AliveAndGenuinelyStuck is unreachable while this mismatch holds"
+                    );
+                }
+                Ok(Some(TerminalLiveness::Alive {
+                    session_name: run.tmux_session_name,
+                    window_activity_epoch_secs,
+                    agent_is_foreground: !driver_binary.is_empty() && current_command == driver_binary,
+                    foreground_command_mismatch,
+                }))
+            }
         }
-
-        let pane_dead = tmux
-            .display_message(&run.tmux_session_name, DisplayField::PaneDead)
-            .await?;
-        if pane_dead == "1" {
-            let status = tmux
-                .display_message(&run.tmux_session_name, DisplayField::PaneDeadStatus)
-                .await?;
-            return Ok(Some(TerminalLiveness::Dead {
-                session_name: run.tmux_session_name,
-                evidence: DeadPaneEvidence::PaneExited {
-                    pane_dead_status: (!status.is_empty()).then_some(status),
-                },
-            }));
-        }
-
-        let window_activity_epoch_secs = tmux
-            .display_message(&run.tmux_session_name, DisplayField::WindowActivity)
-            .await?
-            .parse::<i64>()
-            .context("parsing tmux window_activity as epoch seconds")?;
-        let current_command = tmux
-            .display_message(&run.tmux_session_name, DisplayField::PaneCurrentCommand)
-            .await?;
-        let driver_slug = self
-            .work_db
-            .get_execution_driver_slug(execution_id)?
-            .unwrap_or_default();
-        let driver_binary = crate::driver::DriverRegistry::default()
-            .require(&driver_slug)
-            .map(|driver| driver.descriptor().binary.to_owned())
-            .unwrap_or_else(|err| {
-                tracing::warn!(
-                    execution_id,
-                    driver_slug,
-                    ?err,
-                    "stale-worker sweep: unknown driver while inspecting tmux pane"
-                );
-                String::new()
-            });
-        let foreground_command_mismatch = !driver_binary.is_empty() && current_command != driver_binary;
-        if foreground_command_mismatch {
-            tracing::warn!(
-                execution_id,
-                driver_slug,
-                expected_binary = driver_binary,
-                observed_command = current_command,
-                "stale-worker sweep: pane foreground command differs from driver binary; \
-                 AliveAndGenuinelyStuck is unreachable while this mismatch holds"
-            );
-        }
-        Ok(Some(TerminalLiveness::Alive {
-            session_name: run.tmux_session_name,
-            window_activity_epoch_secs,
-            agent_is_foreground: !driver_binary.is_empty() && current_command == driver_binary,
-            foreground_command_mismatch,
-        }))
     }
 }
 
@@ -2360,6 +2357,15 @@ mod tests {
                     "-t".to_owned(),
                     "boss-worker-1".to_owned(),
                     "#{pane_dead_status}".to_owned(),
+                ],
+                vec![
+                    "-L".to_owned(),
+                    "boss".to_owned(),
+                    "display-message".to_owned(),
+                    "-p".to_owned(),
+                    "-t".to_owned(),
+                    "boss-worker-1".to_owned(),
+                    "#{window_activity}".to_owned(),
                 ],
             ]
         );

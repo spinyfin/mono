@@ -152,6 +152,18 @@ async fn token_mismatch_refuses_to_touch_anything() {
         Some(identity),
         "identity columns must survive a refused teardown for a later reconcile pass",
     );
+
+    let events = crate::dispatch_reader::read_current(&server_state.dispatch_event_root)
+        .expect("read dispatch events")
+        .events;
+    let mismatch = events
+        .iter()
+        .find(|event| event.stage == crate::dispatch_events::Stage::TmuxTokenMismatch.as_str())
+        .unwrap_or_else(|| panic!("expected tmux_token_mismatch, got: {events:?}"));
+    assert_eq!(mismatch.execution_id, execution_id);
+    assert_eq!(mismatch.outcome, crate::dispatch_events::Outcome::Error.as_str());
+    assert_eq!(mismatch.details["tmux_session_name"], "boss-1-example");
+    assert_eq!(mismatch.details["operation"], "teardown_preflight");
 }
 
 /// The session is already gone (or never carried a Boss token). Nothing to

@@ -754,6 +754,17 @@ pub enum Stage {
     TmuxRefuseSkew,
     /// The tmux inventory found a Boss-tokened session that has no durable
     /// run row. The husk sweep will independently confirm it before reaping.
+    /// Not scoped to any `work_runs` row — the only identifier we have is
+    /// the session's spawn token, and using that as `execution_id` would
+    /// mint a new JsonlFileSink mirror directory under
+    /// `executions/<token>/` on every leak. `execution_id` is therefore
+    /// the same constant sentinel `"engine-boot"` that
+    /// [`Stage::TmuxAdoptionOwnerConflict`] uses: one stable synthetic
+    /// mirror (`executions/engine-boot/`) shared with other boot-scoped
+    /// tmux events. The spawn token lives in `details.spawn_token`
+    /// alongside `tmux_session_name` and `reason`. Always
+    /// [`Outcome::Ok`] — detection is the success of this stage; reaping
+    /// is a later husk-sweep concern.
     TmuxLeakDetected,
     /// A session name exists but its live spawn token differs from the
     /// durable identity. The engine refused to touch that session.

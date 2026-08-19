@@ -27,7 +27,8 @@ pub enum TmuxAdoptionState {
 }
 
 /// Tmux liveness evidence associated with one live worker execution.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct TmuxWorkerStatus {
     /// The execution (`exec_*`) that owns this status row.
     pub execution_id: String,
@@ -40,5 +41,14 @@ pub struct TmuxWorkerStatus {
     pub pane_dead: Option<bool>,
     /// ISO-8601 rendering of tmux's `#{window_activity}` timestamp, when
     /// available. This advances while detached and is the last output time.
+    /// Present even when [`Self::pane_dead`] is `true`: `remain-on-exit`
+    /// keeps `#{window_activity}` readable after the pane dies, and that
+    /// is the most useful column when diagnosing a dead pane.
     pub last_output_at: Option<String>,
+    /// Ready-to-paste attach command for an [`TmuxAdoptionState::Adopted`]
+    /// session, built from the engine's resolved tmux program and the
+    /// private `-L boss` server label. Absent in every other adoption
+    /// state. No `exec` prefix — this is for an operator's existing shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attach_command: Option<String>,
 }
