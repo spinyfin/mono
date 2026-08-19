@@ -52,7 +52,7 @@ final class EngineUnreachableErrorRoutingTests: XCTestCase {
     /// transport-level `.error` variant) is still the modal path.
     func testWorkErrorEventStillSetsWorkErrorMessage() {
         let model = makeModel()
-        model.applyEventForTest(.workError(message: "work item could not be created"))
+        model.applyEventForTest(.workError(message: "work item could not be created", requestId: nil))
         XCTAssertEqual(model.workErrorMessage, "work item could not be created")
     }
 

@@ -27,7 +27,7 @@ enum EngineEvent {
     case workItemUpdated(item: WorkItemPayload)
     case projectTasksReordered(projectId: String, taskIds: [String])
     case workItemDeleted(id: String)
-    case workError(message: String)
+    case workError(message: String, requestId: String?)
     case error(message: String)
     /// Snapshot of every allocated worker slot's live runtime state.
     /// Delivered both as a one-shot reply to
@@ -73,7 +73,7 @@ enum EngineEvent {
     /// Activity list; source-specific details are loaded only after selection.
     /// `requestId` is the envelope id of the originating request so a late
     /// `limit = 0` poll can be dropped instead of overwriting a newer snapshot.
-    /// Synthetic test events may pass `nil`.
+    /// The engine always echoes a request id; a nil id is ignored.
     case engineAttemptsList(
         attempts: [EngineAttemptListEntry],
         backgroundWork: [BackgroundWorkItem],

@@ -48,11 +48,7 @@ final class BackgroundWorkSnapshotTests: XCTestCase {
     func testDisconnectClearsSnapshotAndIgnoresLateTaggedResponse() {
         let model = makeModel()
         model.applyEventForTest(.connected)
-        model.applyEventForTest(.engineAttemptsList(
-            attempts: [],
-            backgroundWork: [makeItem(id: "planner:run_1")],
-            requestId: nil
-        ))
+        applyList(model, requestId: "first", replacesAttempts: false, backgroundWork: [makeItem(id: "planner:run_1")])
         XCTAssertEqual(model.backgroundWork.map(\.id), ["planner:run_1"])
 
         model.registerBackgroundWorkRequest(requestId: "late", replacesAttempts: false)
@@ -75,11 +71,7 @@ final class BackgroundWorkSnapshotTests: XCTestCase {
         let recorder = installRecorder(on: model)
 
         model.applyEventForTest(.connected)
-        model.applyEventForTest(.engineAttemptsList(
-            attempts: [],
-            backgroundWork: [makeItem(id: "planner:run_1")],
-            requestId: nil
-        ))
+        applyList(model, requestId: "first", replacesAttempts: false, backgroundWork: [makeItem(id: "planner:run_1")])
         model.applyEventForTest(.disconnected)
         XCTAssertTrue(model.backgroundWork.isEmpty)
 
@@ -90,11 +82,7 @@ final class BackgroundWorkSnapshotTests: XCTestCase {
         XCTAssertTrue(model.isBackgroundWorkPolling)
         XCTAssertEqual(backgroundPolls(in: recorder).count, 1)
 
-        model.applyEventForTest(.engineAttemptsList(
-            attempts: [],
-            backgroundWork: [makeItem(id: "planner:run_2")],
-            requestId: nil
-        ))
+        applyList(model, requestId: "second", replacesAttempts: false, backgroundWork: [makeItem(id: "planner:run_2")])
         XCTAssertEqual(model.backgroundWork.map(\.id), ["planner:run_2"])
         model.applyEventForTest(.disconnected)
     }
@@ -121,19 +109,60 @@ final class BackgroundWorkSnapshotTests: XCTestCase {
         model.applyEventForTest(.disconnected)
     }
 
+    func testLateHistoryRefreshStillReplacesAttemptsAfterNewerPoll() {
+        let model = makeModel()
+        model.applyEventForTest(.connected)
+        model.registerBackgroundWorkRequest(requestId: "history", replacesAttempts: true)
+        model.registerBackgroundWorkRequest(requestId: "poll", replacesAttempts: false)
+
+        model.applyEventForTest(.engineAttemptsList(
+            attempts: [],
+            backgroundWork: [makeItem(id: "newer")],
+            requestId: "poll"
+        ))
+        XCTAssertEqual(model.backgroundWork.map(\.id), ["newer"])
+        XCTAssertTrue(model.engineAttempts.isEmpty)
+
+        let attempt = makeAttempt(id: "crz_1")
+        model.applyEventForTest(.engineAttemptsList(
+            attempts: [attempt],
+            backgroundWork: [makeItem(id: "older")],
+            requestId: "history"
+        ))
+
+        XCTAssertEqual(model.engineAttempts.map(\.id), ["crz_1"])
+        XCTAssertEqual(
+            model.backgroundWork.map(\.id),
+            ["newer"],
+            "a late history reply must not roll the snapshot back"
+        )
+        model.applyEventForTest(.disconnected)
+    }
+
+    func testNilRequestIdIsIgnored() {
+        let model = makeModel()
+        model.applyEventForTest(.connected)
+        model.applyEventForTest(.engineAttemptsList(
+            attempts: [makeAttempt(id: "cir_1")],
+            backgroundWork: [makeItem(id: "planner:run_1")],
+            requestId: nil
+        ))
+        XCTAssertTrue(model.backgroundWork.isEmpty)
+        XCTAssertTrue(model.engineAttempts.isEmpty)
+        model.applyEventForTest(.disconnected)
+    }
+
     func testCountEqualsReturnedListIncludingUnknownKinds() {
         let model = makeModel()
+        model.applyEventForTest(.connected)
+        defer { model.applyEventForTest(.disconnected) }
         let items = [
             makeItem(id: "planner:run_1", kind: "project_planner"),
             makeItem(id: "conflict_remediation:crz_1", kind: "conflict_remediation"),
             makeItem(id: "future_worker:src_1", kind: "future_worker"),
         ]
 
-        model.applyEventForTest(.engineAttemptsList(
-            attempts: [],
-            backgroundWork: items,
-            requestId: nil
-        ))
+        applyList(model, requestId: "count", replacesAttempts: false, backgroundWork: items)
 
         XCTAssertEqual(model.backgroundWork, items)
         XCTAssertEqual(model.backgroundWorkVisibleCount, items.count)
@@ -147,21 +176,20 @@ final class BackgroundWorkSnapshotTests: XCTestCase {
 
     func testCompletionReplacesTheSnapshotWithEmptyWithoutSourceLogic() {
         let model = makeModel()
-        model.applyEventForTest(.engineAttemptsList(
-            attempts: [],
+        model.applyEventForTest(.connected)
+        defer { model.applyEventForTest(.disconnected) }
+        applyList(
+            model,
+            requestId: "filled",
+            replacesAttempts: false,
             backgroundWork: [
                 makeItem(id: "planner:run_1", kind: "project_planner"),
                 makeItem(id: "conflict_remediation:crz_1", kind: "conflict_remediation"),
-            ],
-            requestId: nil
-        ))
+            ]
+        )
         XCTAssertEqual(model.backgroundWorkVisibleCount, 2)
 
-        model.applyEventForTest(.engineAttemptsList(
-            attempts: [],
-            backgroundWork: [],
-            requestId: nil
-        ))
+        applyList(model, requestId: "empty", replacesAttempts: false, backgroundWork: [])
 
         XCTAssertTrue(model.backgroundWork.isEmpty)
         XCTAssertEqual(model.backgroundWorkVisibleCount, 0)
@@ -171,19 +199,21 @@ final class BackgroundWorkSnapshotTests: XCTestCase {
         let model = makeModel()
         model.applyEventForTest(.connected)
         let attempt = makeAttempt(id: "cir_1")
-        model.applyEventForTest(.engineAttemptsList(
+        applyList(
+            model,
+            requestId: "history",
+            replacesAttempts: true,
             attempts: [attempt],
-            backgroundWork: [makeItem(id: "planner:run_1")],
-            requestId: nil
-        ))
+            backgroundWork: [makeItem(id: "planner:run_1")]
+        )
         XCTAssertEqual(model.engineAttempts.map(\.id), ["cir_1"])
 
-        model.registerBackgroundWorkRequest(requestId: "poll", replacesAttempts: false)
-        model.applyEventForTest(.engineAttemptsList(
-            attempts: [],
-            backgroundWork: [makeItem(id: "planner:run_2")],
-            requestId: "poll"
-        ))
+        applyList(
+            model,
+            requestId: "poll",
+            replacesAttempts: false,
+            backgroundWork: [makeItem(id: "planner:run_2")]
+        )
 
         XCTAssertEqual(model.engineAttempts.map(\.id), ["cir_1"])
         XCTAssertEqual(model.backgroundWork.map(\.id), ["planner:run_2"])
@@ -215,6 +245,81 @@ final class BackgroundWorkSnapshotTests: XCTestCase {
         model.applyEventForTest(.disconnected)
     }
 
+    func testEventTriggeredRefreshCoalescesWhileBackgroundPollIsPending() {
+        let model = makeModel()
+        let recorder = installRecorder(on: model)
+        model.applyEventForTest(.connected)
+        recorder.value.removeAll()
+        model.registerBackgroundWorkRequest(requestId: "inflight", replacesAttempts: false)
+
+        model.applyEventForTest(.workInvalidated(topic: "work.product.prod_1", productId: "prod_1", itemIds: []))
+        model.applyEventForTest(.workInvalidated(topic: "comments.artifact.x", productId: nil, itemIds: []))
+        model.applyEventForTest(.resyncRequired)
+
+        XCTAssertEqual(
+            backgroundPolls(in: recorder).count,
+            0,
+            "a background-only request already in flight must absorb the invalidation burst"
+        )
+        model.applyEventForTest(.disconnected)
+    }
+
+    func testSuccessfulApplyPrunesOlderBackgroundOnlyPending() {
+        let model = makeModel()
+        model.applyEventForTest(.connected)
+        model.registerBackgroundWorkRequest(requestId: "old", replacesAttempts: false)
+        model.registerBackgroundWorkRequest(requestId: "new", replacesAttempts: false)
+        XCTAssertEqual(model.backgroundWorkPending.count, 2)
+
+        model.applyEventForTest(.engineAttemptsList(
+            attempts: [],
+            backgroundWork: [makeItem(id: "newer")],
+            requestId: "new"
+        ))
+
+        XCTAssertNil(model.backgroundWorkPending["old"])
+        XCTAssertTrue(model.backgroundWorkPending.isEmpty)
+        model.applyEventForTest(.disconnected)
+    }
+
+    func testSuccessfulApplyKeepsOlderHistoryPendingThatCanStillWinAttempts() {
+        let model = makeModel()
+        model.applyEventForTest(.connected)
+        model.registerBackgroundWorkRequest(requestId: "history", replacesAttempts: true)
+        model.registerBackgroundWorkRequest(requestId: "poll", replacesAttempts: false)
+
+        model.applyEventForTest(.engineAttemptsList(
+            attempts: [],
+            backgroundWork: [makeItem(id: "newer")],
+            requestId: "poll"
+        ))
+
+        XCTAssertNotNil(
+            model.backgroundWorkPending["history"],
+            "a history refresh that can still update Activity must not be pruned with the stale snapshot"
+        )
+        model.applyEventForTest(.disconnected)
+    }
+
+    func testWorkErrorDropsMatchingPendingRequest() {
+        let model = makeModel()
+        model.applyEventForTest(.connected)
+        model.registerBackgroundWorkRequest(requestId: "failed", replacesAttempts: false)
+        model.registerBackgroundWorkRequest(requestId: "other", replacesAttempts: false)
+
+        model.applyEventForTest(.workError(message: "db failed", requestId: "failed"))
+
+        XCTAssertNil(model.backgroundWorkPending["failed"])
+        XCTAssertNotNil(model.backgroundWorkPending["other"])
+        model.applyEventForTest(.disconnected)
+    }
+
+    func testUnconnectedSendDoesNotRegisterPending() {
+        let model = makeModel()
+        model.sendBackgroundWorkPoll()
+        XCTAssertTrue(model.backgroundWorkPending.isEmpty)
+    }
+
     func testHistoryRefreshReplacesAttemptsAndSnapshotTogether() {
         let model = makeModel()
         model.applyEventForTest(.connected)
@@ -243,6 +348,21 @@ final class BackgroundWorkSnapshotTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    private func applyList(
+        _ model: ChatViewModel,
+        requestId: String,
+        replacesAttempts: Bool,
+        attempts: [EngineAttemptListEntry] = [],
+        backgroundWork: [BackgroundWorkItem]
+    ) {
+        model.registerBackgroundWorkRequest(requestId: requestId, replacesAttempts: replacesAttempts)
+        model.applyEventForTest(.engineAttemptsList(
+            attempts: attempts,
+            backgroundWork: backgroundWork,
+            requestId: requestId
+        ))
+    }
 
     private func makeModel(pollInterval: TimeInterval = ChatViewModel.backgroundWorkPollInterval) -> ChatViewModel {
         let model = ChatViewModel(socketPath: "/tmp/boss-bgwork-\(UUID().uuidString).sock")

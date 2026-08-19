@@ -131,7 +131,10 @@ final class ActivityAttemptDetailTests: XCTestCase {
         let conflict = makeAttempt(id: "crz_1", kind: "conflict")
         let ci = makeAttempt(id: "cir_1", kind: "ci")
 
-        model.applyEventForTest(.engineAttemptsList(attempts: [conflict, ci], backgroundWork: [], requestId: nil))
+        model.applyEventForTest(.connected)
+        defer { model.applyEventForTest(.disconnected) }
+        model.registerBackgroundWorkRequest(requestId: "list", replacesAttempts: true)
+        model.applyEventForTest(.engineAttemptsList(attempts: [conflict, ci], backgroundWork: [], requestId: "list"))
         model.applyEventForTest(.conflictResolution(attempt: makeConflictResolution(id: conflict.id)))
         model.applyEventForTest(.ciRemediation(attempt: makeCiRemediation(id: ci.id)))
 
@@ -163,7 +166,7 @@ final class ActivityAttemptDetailTests: XCTestCase {
         let model = makeModel()
         model.engineAttemptDetailRequestID = "crz_missing"
 
-        model.applyEventForTest(.workError(message: "attempt is unknown"))
+        model.applyEventForTest(.workError(message: "attempt is unknown", requestId: nil))
 
         XCTAssertEqual(model.engineAttemptDetailErrors["crz_missing"], "attempt is unknown")
         XCTAssertNil(model.engineAttemptDetailRequestID)
