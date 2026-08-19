@@ -17,7 +17,7 @@ use boss_protocol::{
 
 mod common;
 mod watcher_support;
-use common::TestEngine;
+use common::{TestEngine, TestEngineOptions};
 use watcher_support::subscribe_watcher;
 
 #[tokio::test]
@@ -1032,6 +1032,125 @@ async fn dependency_rpcs_round_trip_through_engine() -> Result<()> {
     )
     .await?;
     assert!(!removed_again);
+
+    Ok(())
+}
+
+/// Dependency verbs deliberately resolve tombstoned rows even though normal
+/// work-item commands keep their live-row resolver. That lets `depend add`
+/// explain why an archived prerequisite is illegal, and lets `depend rm`
+/// remove a historical edge pointing at it.
+#[tokio::test]
+async fn dependency_rpcs_reject_archived_prereqs_and_remove_archived_edges() -> Result<()> {
+    let engine = TestEngine::spawn_with(TestEngineOptions {
+        on_disk_db: true,
+        ..Default::default()
+    })
+    .await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = create_product(
+        &mut client,
+        CreateProductInput::builder()
+            .name("Archived dependency")
+            .repo_remote_url("git@example.com:boss.git")
+            .build(),
+    )
+    .await?;
+    let dependent = create_chore(
+        &mut client,
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("Dependent")
+            .build(),
+    )
+    .await?;
+    let archived_prereq = create_chore(
+        &mut client,
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("Prerequisite")
+            .build(),
+    )
+    .await?;
+    let another_dependent = create_chore(
+        &mut client,
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("Another dependent")
+            .build(),
+    )
+    .await?;
+
+    add_dependency(
+        &mut client,
+        AddDependencyInput {
+            dependent: dependent.id.clone(),
+            prerequisite: archived_prereq.id.clone(),
+            relation: None,
+        },
+    )
+    .await?;
+
+    // The production archival path sets status and tombstone atomically. Seed
+    // that durable state directly so the wire test can exercise the narrow
+    // dependency resolver without requiring a CI/remediation fixture.
+    {
+        let conn = rusqlite::Connection::open(&engine.db_path)?;
+        conn.execute(
+            "UPDATE tasks SET status = 'archived', deleted_at = '1' WHERE id = ?1",
+            rusqlite::params![archived_prereq.id],
+        )?;
+    }
+
+    match client
+        .send_request(&FrontendRequest::AddDependency {
+            input: AddDependencyInput {
+                dependent: another_dependent.id,
+                prerequisite: archived_prereq.id.clone(),
+                relation: None,
+            },
+        })
+        .await?
+    {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains(&archived_prereq.id),
+                "error must name the archived row: {message}"
+            );
+            assert!(
+                message.contains("archived"),
+                "error must explain the rejection: {message}"
+            );
+        }
+        other => return Err(unexpected_event("archived dependency add", other)),
+    }
+
+    assert!(
+        remove_dependency(
+            &mut client,
+            RemoveDependencyInput {
+                dependent: dependent.id.clone(),
+                prerequisite: archived_prereq.id.clone(),
+                relation: None,
+            },
+        )
+        .await?,
+        "depend rm must resolve an archived prerequisite and remove its edge"
+    );
+    assert!(
+        list_dependencies(
+            &mut client,
+            ListDependenciesInput {
+                work_item: dependent.id,
+                direction: Some(DependencyDirection::Prereqs),
+            },
+        )
+        .await?
+        .prerequisites
+        .is_empty(),
+        "the archived prerequisite edge must be gone after removal"
+    );
 
     Ok(())
 }

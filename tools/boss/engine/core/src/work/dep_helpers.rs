@@ -503,6 +503,14 @@ pub(crate) fn add_dependency_edge_in_tx(
     if dependent_id == prerequisite_id {
         bail!("a work item cannot depend on itself: {dependent_id}");
     }
+    if matches!(
+        deps::lookup_work_item_status_for_gating(conn, prerequisite_id)?.as_deref(),
+        Some("archived")
+    ) {
+        bail!(
+            "cannot add dependency on archived work item {prerequisite_id}: archived work items cannot be prerequisites"
+        );
+    }
     // Both ids must resolve and live in the same product. Cross-
     // product edges are tracked separately (see proj_18a2bbe20fc03718_8).
     let dependent_product = product_id_for_work_item(conn, dependent_id)?;

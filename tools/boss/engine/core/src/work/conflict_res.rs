@@ -458,12 +458,14 @@ impl WorkDb {
             return Ok(None);
         }
         let now = now_string();
+        let mut pending = PendingEvents::new();
         let rows_changed = archive_revision_task(&tx, &rev.id, &now, archived_reason)?;
         if rows_changed == 0 {
             return Ok(None);
         }
+        cascade_dependents_after_prereq_status_change(&mut pending, &tx, &rev.id, "archived", &now)?;
         let updated = query_task(&tx, revision_task_id)?;
-        tx.commit()?;
+        commit_and_publish(tx, pending, self.event_bus())?;
         Ok(updated)
     }
 

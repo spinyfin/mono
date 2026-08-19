@@ -310,6 +310,36 @@ pub fn lookup_work_item_status(conn: &Connection, work_item_id: &str) -> Result<
     Ok(None)
 }
 
+/// Look up a work item's status for dependency evaluation, including a
+/// tombstoned task row. An archived revision is tombstoned in the same write
+/// that gives it `status = 'archived'`; hiding it here would turn that known,
+/// satisfying status into an indistinguishable missing prerequisite.
+///
+/// This is deliberately narrower than [`lookup_work_item_status`]: ordinary
+/// work-item reads retain their live-row contract, while dependency code can
+/// still distinguish an archived prerequisite from a genuinely unknown id.
+pub fn lookup_work_item_status_for_gating(conn: &Connection, work_item_id: &str) -> Result<Option<String>> {
+    if work_item_id.starts_with("proj_") {
+        return conn
+            .query_row(
+                "SELECT status FROM projects WHERE id = ?1",
+                params![work_item_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into);
+    }
+    if work_item_id.starts_with("task_") {
+        return conn
+            .query_row("SELECT status FROM tasks WHERE id = ?1", params![work_item_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()
+            .map_err(Into::into);
+    }
+    Ok(None)
+}
+
 /// Return the prerequisite ids that currently *gate* `work_item_id`
 /// — `blocks` edges whose prereq has not reached a satisfied
 /// status. Used by both the dispatcher (to demote a gated dependent
@@ -324,7 +354,7 @@ pub fn gating_prereqs_for(conn: &Connection, work_item_id: &str) -> Result<Vec<S
     let edges = prerequisites_of(conn, work_item_id, Some(RELATION_BLOCKS))?;
     let mut gating = Vec::new();
     for edge in edges {
-        let status = lookup_work_item_status(conn, &edge.prerequisite_id)?;
+        let status = lookup_work_item_status_for_gating(conn, &edge.prerequisite_id)?;
         match status {
             Some(s) if status_satisfies_for_dependent(&s, dependent_kind.as_deref()) => {}
             _ => gating.push(edge.prerequisite_id),
