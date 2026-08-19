@@ -48,6 +48,12 @@ impl WorkDb {
         &self.event_bus
     }
 
+    /// Rebind this handle to the engine-wide event bus during startup.
+    pub fn with_event_bus(mut self, bus: Arc<boss_event_bus::EventBus>) -> Self {
+        self.event_bus = bus;
+        self
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

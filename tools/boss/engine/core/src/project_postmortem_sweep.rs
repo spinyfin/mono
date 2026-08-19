@@ -1255,7 +1255,9 @@ mod tests {
             &exec.id,
             "https://github.com/o/r/pull/1",
             None,
+            None,
             WorkerPrCompletionTarget::Done,
+            None,
         )
         .unwrap()
         .expect("execution was live");

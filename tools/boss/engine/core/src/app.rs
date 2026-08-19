@@ -8,7 +8,7 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, bail};
-use boss_event_bus::{EventKind, TopicFilter};
+use boss_event_bus::{EventBus, EventKind, TopicFilter};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command as TokioCommand;
@@ -510,6 +510,11 @@ struct ServerState {
     /// against the same files the sink populates.
     dispatch_event_root: PathBuf,
     topic_broker: Arc<TopicBroker>,
+    /// Shared in-process event bus. `WorkDb` publishes state transitions
+    /// onto this same instance after commits, and reconciler loops subscribe
+    /// here so producers and consumers do not drift onto separate buses.
+    #[builder(default = Arc::new(EventBus::new()))]
+    event_bus: Arc<EventBus>,
     worker_registry: WorkerRegistry,
     /// Live runtime state per allocated worker slot. Updated as hook
     /// events arrive on the events socket; surfaced to bossctl/UI via
@@ -1000,9 +1005,7 @@ impl ServerState {
         // `app/server.rs`) hold the same `Arc` so producer and subscriber
         // share one bus instance.
         let event_bus = Arc::new(boss_event_bus::EventBus::new());
-        let work_db = Arc::new(
-            WorkDb::open(cfg.work.db_path.clone())?.with_event_bus(Arc::clone(&event_bus)),
-        );
+        let work_db = Arc::new(WorkDb::open(cfg.work.db_path.clone())?.with_event_bus(Arc::clone(&event_bus)));
         let anthropic_api_key = cfg.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
         // Resolve the engine's own inference provider once, here, and install
         // it process-wide so paths too deep to thread a handle through (the
