@@ -464,6 +464,31 @@ rust_test(
     ),
 )
 
+rust_test(
+    name = "background_work_rpc_test",
+    size = "small",
+    timeout = "moderate",
+    srcs = [
+        "tests/background_work_rpc.rs",
+        "tests/common/mod.rs",
+    ],
+    crate_root = "tests/background_work_rpc.rs",
+    edition = "2024",
+    env = {"HOME": "/tmp"},
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":engine_lib",
+        "//tools/boss/client",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
 filegroup(
     name = "engine_srcs",
     srcs = glob(["src/**/*.rs"]),

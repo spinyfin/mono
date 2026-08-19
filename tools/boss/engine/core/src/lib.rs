@@ -16,6 +16,7 @@ pub mod automation_scheduler;
 pub mod automation_triage;
 pub mod awaiting_input_status;
 pub mod background_children;
+pub mod background_work;
 pub mod blocking_signal;
 pub mod boss_construct_scan;
 pub mod build_info;

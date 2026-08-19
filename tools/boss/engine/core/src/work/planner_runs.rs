@@ -9,6 +9,20 @@ pub const PLANNER_RUN_ENGINE_RESTART_SUMMARY: &str = "engine restart interrupted
 
 // ---- input types ----
 
+/// One row read by [`WorkDb::list_running_planner_runs_older_than`]: a
+/// `planner_runs` row still `outcome = 'running'`, joined to its
+/// project's name. Feeds `crate::background_work`'s toolbar snapshot —
+/// see the design's "Background task visibility" phase text
+/// (`Planning <project>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningPlannerRun {
+    pub id: String,
+    pub project_id: String,
+    pub product_id: String,
+    pub project_name: String,
+    pub created_at: String,
+}
+
 /// Input for creating a new `planner_runs` row via
 /// [`WorkDb::claim_planner_run`].
 pub struct ClaimPlannerRunInput<'a> {
@@ -100,6 +114,44 @@ impl WorkDb {
             run.updated_at = now.clone();
         }
         Ok(recovered)
+    }
+
+    /// Global candidate set for the background-work toolbar badge: every
+    /// `planner_runs` row still `outcome = 'running'` whose `created_at`
+    /// is at least `min_age_secs` old, joined to the owning project's
+    /// name for the phase text. Unlike every other planner accessor,
+    /// this is not scoped to a single project — the badge is a
+    /// cross-project snapshot.
+    ///
+    /// The age filter is the planner source's anti-flicker gate (design
+    /// "Background task visibility" v1): a row younger than the
+    /// threshold is omitted even though it is genuinely live, because
+    /// the common case finishes before a human could act on the badge.
+    /// Ordered `created_at ASC, id ASC` (oldest first), matching
+    /// `crate::background_work`'s stable "known starts oldest first"
+    /// ordering contract.
+    pub fn list_running_planner_runs_older_than(&self, min_age_secs: i64) -> Result<Vec<RunningPlannerRun>> {
+        let conn = self.connect()?;
+        let now_secs: i64 = now_string().parse().unwrap_or(0);
+        let cutoff = now_secs - min_age_secs;
+        let mut stmt = conn.prepare(
+            "SELECT pr.id, pr.project_id, pr.product_id, pr.created_at, p.name
+             FROM planner_runs pr
+             JOIN projects p ON p.id = pr.project_id
+             WHERE pr.outcome = ?1
+               AND CAST(pr.created_at AS INTEGER) <= ?2
+             ORDER BY pr.created_at ASC, pr.id ASC",
+        )?;
+        let rows = stmt.query_map(params![PLANNER_OUTCOME_RUNNING, cutoff], |row| {
+            Ok(RunningPlannerRun {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                product_id: row.get(2)?,
+                created_at: row.get(3)?,
+                project_name: row.get(4)?,
+            })
+        })?;
+        rows.map(|r| r.map_err(Into::into)).collect()
     }
 
     /// Attempt to claim a planner run for `project_id` by inserting a row
@@ -666,5 +718,143 @@ mod tests {
             })
             .unwrap();
         assert!(reclaimed.is_some(), "claim must succeed after undo delete");
+    }
+
+    /// Directly rewrites a `planner_runs` row's `created_at` so age-gate
+    /// tests can simulate "this run started N seconds ago" without
+    /// sleeping the test. Pure test plumbing — production code never
+    /// touches `created_at` after insert.
+    fn backdate_planner_run(db: &WorkDb, run_id: &str, secs_ago: i64) {
+        let now_secs: i64 = now_string().parse().unwrap();
+        let new_ts = (now_secs - secs_ago).to_string();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE planner_runs SET created_at = ?2 WHERE id = ?1",
+            params![run_id, new_ts],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn list_running_planner_runs_older_than_excludes_a_fresh_row() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        db.claim_planner_run(ClaimPlannerRunInput {
+            project_id: &project_id,
+            product_id: &product_id,
+            design_task_id: None,
+            caller: "merge_trigger",
+        })
+        .unwrap();
+        assert!(
+            db.list_running_planner_runs_older_than(15).unwrap().is_empty(),
+            "a just-claimed row must not clear the anti-flicker age gate"
+        );
+    }
+
+    #[test]
+    fn list_running_planner_runs_older_than_includes_rows_at_the_threshold() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        let run = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "merge_trigger",
+            })
+            .unwrap()
+            .unwrap();
+        // Exactly at the threshold: "at least N seconds old" is inclusive.
+        backdate_planner_run(&db, &run.id, 15);
+        let rows = db.list_running_planner_runs_older_than(15).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, run.id);
+        assert_eq!(rows[0].project_id, project_id);
+        assert_eq!(rows[0].product_id, product_id);
+        assert_eq!(rows[0].project_name, "Alpha");
+    }
+
+    #[test]
+    fn list_running_planner_runs_older_than_excludes_one_second_short_of_the_threshold() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        let run = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "merge_trigger",
+            })
+            .unwrap()
+            .unwrap();
+        backdate_planner_run(&db, &run.id, 14);
+        assert!(db.list_running_planner_runs_older_than(15).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_running_planner_runs_older_than_excludes_non_running_outcomes() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        let run = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &project_id,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "merge_trigger",
+            })
+            .unwrap()
+            .unwrap();
+        backdate_planner_run(&db, &run.id, 999);
+        db.update_planner_run(
+            &run.id,
+            PlannerRunPatch::builder().outcome(PLANNER_OUTCOME_STAGED).build(),
+        )
+        .unwrap();
+        assert!(
+            db.list_running_planner_runs_older_than(15).unwrap().is_empty(),
+            "a staged row is no longer an in-flight background operation"
+        );
+    }
+
+    #[test]
+    fn list_running_planner_runs_older_than_orders_oldest_first_across_projects() {
+        let db = open();
+        let (product_id, project_a) = product_and_project(&db);
+        let project_b = db
+            .create_project(
+                boss_protocol::CreateProjectInput::builder()
+                    .product_id(product_id.clone())
+                    .name("Beta")
+                    .goal("build it too")
+                    .build(),
+            )
+            .unwrap()
+            .id;
+        let newer = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &project_a,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "merge_trigger",
+            })
+            .unwrap()
+            .unwrap();
+        let older = db
+            .claim_planner_run(ClaimPlannerRunInput {
+                project_id: &project_b,
+                product_id: &product_id,
+                design_task_id: None,
+                caller: "merge_trigger",
+            })
+            .unwrap()
+            .unwrap();
+        backdate_planner_run(&db, &newer.id, 20);
+        backdate_planner_run(&db, &older.id, 40);
+        let rows = db.list_running_planner_runs_older_than(15).unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            vec![older.id, newer.id]
+        );
     }
 }
