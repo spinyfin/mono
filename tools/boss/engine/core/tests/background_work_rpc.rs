@@ -148,7 +148,7 @@ async fn list_engine_attempts_carries_the_opt_in_background_snapshot() -> Result
         .find(|item| item.kind == BackgroundWorkKind::ConflictRemediation)
         .ok_or_else(|| anyhow!("missing conflict_remediation background item"))?;
     assert_eq!(conflict_item.source_id, attempt.id);
-    assert_eq!(conflict_item.phase, format!("Rebasing {}", chore.id));
+    assert_eq!(conflict_item.phase, "Rebasing Fix the merge conflict");
     assert!(conflict_item.started_at.is_none());
 
     // `limit: Some(0)` is the background-only polling form: `attempts`

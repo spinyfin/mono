@@ -1244,7 +1244,11 @@ pub enum FrontendEvent {
     /// `include_background_work` — additive and backward-compatible,
     /// so existing callers keep reading identically. When populated it
     /// is ordered independently of `attempts`: known starts oldest
-    /// first, then items without a start ordered by `source_id`. See
+    /// first, then items without a start ordered by `source_id`. There
+    /// is no separate `visible_count` field: `background_work.len()` is
+    /// the badge count by construction, so the app reads the array
+    /// length verbatim rather than a second field that could desync.
+    /// See
     /// `background-task-visibility-toolbar-affordance-for-engine-background-work.md`.
     EngineAttemptsList {
         attempts: Vec<EngineAttemptListEntry>,

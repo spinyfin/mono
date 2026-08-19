@@ -51,9 +51,22 @@ const MECHANICAL_RUNG_DETERMINISTIC: i64 = 0;
 /// `conflict_resolutions`, and only reads
 /// [`crate::ladder_lease_registry`], never mutates it.
 pub fn snapshot(work_db: &WorkDb) -> anyhow::Result<Vec<BackgroundWorkItem>> {
+    snapshot_with_leases(work_db, &crate::ladder_lease_registry::snapshot())
+}
+
+/// Same projection as [`snapshot`], but the conflict-source lease veto
+/// is taken from `live_leases` instead of the process-wide
+/// [`crate::ladder_lease_registry`]. Production callers use
+/// [`snapshot`]; tests inject an explicit pair list so they do not
+/// share the registry with other tests in this binary (that registry
+/// is drained wholesale by `release_all_on_shutdown`).
+pub fn snapshot_with_leases(
+    work_db: &WorkDb,
+    live_leases: &[(String, String)],
+) -> anyhow::Result<Vec<BackgroundWorkItem>> {
     let mut items: Vec<BackgroundWorkItem> = Vec::new();
     items.extend(planner_items(work_db)?);
-    items.extend(conflict_remediation_items(work_db)?);
+    items.extend(conflict_remediation_items(work_db, live_leases)?);
     items.sort_by(order_key);
     Ok(items)
 }
@@ -76,14 +89,16 @@ fn planner_items(work_db: &WorkDb) -> anyhow::Result<Vec<BackgroundWorkItem>> {
         .collect())
 }
 
-fn conflict_remediation_items(work_db: &WorkDb) -> anyhow::Result<Vec<BackgroundWorkItem>> {
+fn conflict_remediation_items(
+    work_db: &WorkDb,
+    live_leases: &[(String, String)],
+) -> anyhow::Result<Vec<BackgroundWorkItem>> {
     // The same global open-attempt baseline Activity already reads —
     // reused here purely as the candidate set, per the design's "reuse
     // the global pending/running conflict query as a candidate set."
     let candidates =
         work_db.list_conflict_resolutions(None, &["pending".to_owned(), "running".to_owned()], None, None)?;
-    let live_leases = crate::ladder_lease_registry::snapshot();
-    let mut out = Vec::new();
+    let mut surviving = Vec::new();
     for c in candidates {
         let Some(rung) = c.mechanical_rung_in_flight else {
             continue;
@@ -95,10 +110,17 @@ fn conflict_remediation_items(work_db: &WorkDb) -> anyhow::Result<Vec<Background
         if !lease_still_live {
             continue;
         }
+        surviving.push((c, rung));
+    }
+    let work_item_ids: Vec<String> = surviving.iter().map(|(c, _)| c.work_item_id.clone()).collect();
+    let names = work_db.task_names(&work_item_ids)?;
+    let mut out = Vec::new();
+    for (c, rung) in surviving {
         let phase = if rung == MECHANICAL_RUNG_DETERMINISTIC {
             PHASE_DETERMINISTIC_RESOLUTION.to_owned()
         } else {
-            format!("Rebasing {}", c.work_item_id)
+            let label = names.get(&c.work_item_id).unwrap_or(&c.work_item_id);
+            format!("Rebasing {label}")
         };
         out.push(BackgroundWorkItem {
             id: format!("conflict_remediation:{}", c.id),
@@ -260,24 +282,55 @@ mod tests {
             .unwrap();
         db.stamp_conflict_resolution_mechanical_rung(&attempt.id, 1, "bgwork_test_lease_1", "bgwork_test_ws_1")
             .unwrap();
-        let lease = crate::coordinator::CubeWorkspaceLease {
-            lease_id: "bgwork_test_lease_1".to_owned(),
-            workspace_id: "bgwork_test_ws_1".to_owned(),
-            workspace_path: std::path::PathBuf::from("/tmp/ws-1"),
-            dirty_verified: None,
-        };
-        crate::ladder_lease_registry::register(&lease);
-        let items = snapshot(&db).unwrap();
-        crate::ladder_lease_registry::unregister("bgwork_test_lease_1");
+        let items = snapshot_with_leases(
+            &db,
+            &[("bgwork_test_lease_1".to_owned(), "bgwork_test_ws_1".to_owned())],
+        )
+        .unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind, BackgroundWorkKind::ConflictRemediation);
         assert_eq!(items[0].source_id, attempt.id);
         assert_eq!(items[0].id, format!("conflict_remediation:{}", attempt.id));
         assert_eq!(items[0].title, TITLE_CONFLICT_REMEDIATION);
-        assert_eq!(items[0].phase, format!("Rebasing {work_item_id}"));
+        assert_eq!(items[0].phase, "Rebasing Chore");
         assert_eq!(items[0].work_item_id.as_deref(), Some(work_item_id.as_str()));
         assert!(items[0].project_id.is_none());
         assert!(items[0].started_at.is_none());
+    }
+
+    #[test]
+    fn snapshot_falls_back_to_the_work_item_id_when_the_task_row_is_missing() {
+        let db = open();
+        let (product_id, _project_id) = product_and_project(&db, "Alpha");
+        let work_item_id = seed_task(&db, &product_id, "Chore");
+        let attempt = db
+            .insert_conflict_resolution(
+                ConflictResolutionInsertInput::builder()
+                    .product_id(product_id)
+                    .work_item_id(work_item_id.clone())
+                    .pr_url("https://github.com/test/test/pull/1")
+                    .pr_number(1)
+                    .head_branch("feature")
+                    .base_branch("main")
+                    .base_sha_at_trigger("abc")
+                    .head_sha_before("def")
+                    .build(),
+            )
+            .unwrap()
+            .unwrap();
+        db.stamp_conflict_resolution_mechanical_rung(&attempt.id, 1, "bgwork_test_lease_8", "bgwork_test_ws_8")
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute("DELETE FROM tasks WHERE id = ?1", rusqlite::params![work_item_id])
+            .unwrap();
+        let items = snapshot_with_leases(
+            &db,
+            &[("bgwork_test_lease_8".to_owned(), "bgwork_test_ws_8".to_owned())],
+        )
+        .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].phase, format!("Rebasing {work_item_id}"));
     }
 
     #[test]
@@ -302,15 +355,11 @@ mod tests {
             .unwrap();
         db.stamp_conflict_resolution_mechanical_rung(&attempt.id, 0, "bgwork_test_lease_2", "bgwork_test_ws_2")
             .unwrap();
-        let lease = crate::coordinator::CubeWorkspaceLease {
-            lease_id: "bgwork_test_lease_2".to_owned(),
-            workspace_id: "bgwork_test_ws_2".to_owned(),
-            workspace_path: std::path::PathBuf::from("/tmp/ws-2"),
-            dirty_verified: None,
-        };
-        crate::ladder_lease_registry::register(&lease);
-        let items = snapshot(&db).unwrap();
-        crate::ladder_lease_registry::unregister("bgwork_test_lease_2");
+        let items = snapshot_with_leases(
+            &db,
+            &[("bgwork_test_lease_2".to_owned(), "bgwork_test_ws_2".to_owned())],
+        )
+        .unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].phase, PHASE_DETERMINISTIC_RESOLUTION);
     }
@@ -341,7 +390,7 @@ mod tests {
         db.stamp_conflict_resolution_mechanical_rung(&attempt.id, 1, "bgwork_test_lease_3", "bgwork_test_ws_3")
             .unwrap();
         assert!(
-            snapshot(&db).unwrap().is_empty(),
+            snapshot_with_leases(&db, &[]).unwrap().is_empty(),
             "a marker with no live lease must be vetoed as stale"
         );
     }
@@ -368,20 +417,11 @@ mod tests {
             .unwrap();
         db.stamp_conflict_resolution_mechanical_rung(&attempt.id, 1, "bgwork_test_lease_4", "bgwork_test_ws_4")
             .unwrap();
-        // The registry holds the same lease id, but paired with a
-        // different workspace than the row stamped — must not count as a
-        // match.
-        let lease = crate::coordinator::CubeWorkspaceLease {
-            lease_id: "bgwork_test_lease_4".to_owned(),
-            workspace_id: "ws-other".to_owned(),
-            workspace_path: std::path::PathBuf::from("/tmp/ws-other"),
-            dirty_verified: None,
-        };
-        crate::ladder_lease_registry::register(&lease);
-        let result = snapshot(&db);
-        crate::ladder_lease_registry::unregister("bgwork_test_lease_4");
+        // The same lease id, paired with a different workspace than
+        // the row stamped — must not count as a match.
+        let items = snapshot_with_leases(&db, &[("bgwork_test_lease_4".to_owned(), "ws-other".to_owned())]).unwrap();
         assert!(
-            result.unwrap().is_empty(),
+            items.is_empty(),
             "a lease/workspace mismatch must not be treated as a live match"
         );
     }
@@ -408,20 +448,17 @@ mod tests {
             .unwrap();
         db.stamp_conflict_resolution_mechanical_rung(&attempt.id, 1, "bgwork_test_lease_5", "bgwork_test_ws_5")
             .unwrap();
-        let lease = crate::coordinator::CubeWorkspaceLease {
-            lease_id: "bgwork_test_lease_5".to_owned(),
-            workspace_id: "bgwork_test_ws_5".to_owned(),
-            workspace_path: std::path::PathBuf::from("/tmp/ws-5"),
-            dirty_verified: None,
-        };
-        crate::ladder_lease_registry::register(&lease);
-        assert_eq!(snapshot(&db).unwrap().len(), 1, "sanity: visible while registered");
+        let live = vec![("bgwork_test_lease_5".to_owned(), "bgwork_test_ws_5".to_owned())];
+        assert_eq!(
+            snapshot_with_leases(&db, &live).unwrap().len(),
+            1,
+            "sanity: visible while the lease is supplied"
+        );
         // Simulate the real cleanup order — unregister always runs even
         // when the DB marker-clear write failed — without the DB write.
-        crate::ladder_lease_registry::unregister("bgwork_test_lease_5");
         assert!(
-            snapshot(&db).unwrap().is_empty(),
-            "unregistering the lease must veto the surviving marker"
+            snapshot_with_leases(&db, &[]).unwrap().is_empty(),
+            "an empty live-lease set must veto the surviving marker"
         );
     }
 
@@ -489,15 +526,11 @@ mod tests {
             .unwrap();
         db.stamp_conflict_resolution_mechanical_rung(&attempt.id, 1, "bgwork_test_lease_7", "bgwork_test_ws_7")
             .unwrap();
-        let lease = crate::coordinator::CubeWorkspaceLease {
-            lease_id: "bgwork_test_lease_7".to_owned(),
-            workspace_id: "bgwork_test_ws_7".to_owned(),
-            workspace_path: std::path::PathBuf::from("/tmp/ws-7"),
-            dirty_verified: None,
-        };
-        crate::ladder_lease_registry::register(&lease);
-        let items = snapshot(&db).unwrap();
-        crate::ladder_lease_registry::unregister("bgwork_test_lease_7");
+        let items = snapshot_with_leases(
+            &db,
+            &[("bgwork_test_lease_7".to_owned(), "bgwork_test_ws_7".to_owned())],
+        )
+        .unwrap();
 
         assert_eq!(items.len(), 2, "the count must equal the returned list");
         assert_eq!(

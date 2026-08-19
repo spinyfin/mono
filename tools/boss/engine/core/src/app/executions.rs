@@ -1312,8 +1312,13 @@ pub(super) async fn handle_list_engine_attempts(ctx: Dispatch, req: FrontendRequ
         match crate::background_work::snapshot(&work_db) {
             Ok(items) => items,
             Err(err) => {
-                send_work_error(&sink, &request_id, &err);
-                return;
+                // Auxiliary view: a transient snapshot failure must not
+                // blank the primary attempts list. The next poll retries.
+                tracing::warn!(
+                    error = %err,
+                    "background_work snapshot failed; returning empty auxiliary list"
+                );
+                Vec::new()
             }
         }
     } else {
