@@ -215,6 +215,69 @@ final class DriverQuotaSectionTests: XCTestCase {
         }
     }
 
+    // MARK: - Staleness
+
+    /// A reading that has never been observed (`observedAtEpochS <= 0`) is
+    /// never stale — there is nothing to measure age against.
+    func testNeverObservedReadingIsNeverStale() {
+        XCTAssertFalse(DriverQuotaRow.isStale(observedAtEpochS: 0, now: Date()))
+        XCTAssertFalse(DriverQuotaRow.isStale(observedAtEpochS: -1, now: Date()))
+    }
+
+    /// Just under the threshold: not stale. Just over: stale. This is an
+    /// absolute-age check against `now`, not a comparison against other rows
+    /// — the engine stamps every entry in one snapshot with the same
+    /// `observed_at_epoch_s`, so a roster-relative comparison could never
+    /// fire in production.
+    func testStalenessIsAnAbsoluteAgeCheckAgainstNow() {
+        let now = Date(timeIntervalSince1970: 1_787_100_000)
+        let threshold = DriverQuotaSection.staleThreshold
+        let justUnder = Int(now.timeIntervalSince1970 - threshold + 1)
+        let justOver = Int(now.timeIntervalSince1970 - threshold - 1)
+        XCTAssertFalse(DriverQuotaRow.isStale(observedAtEpochS: justUnder, now: now))
+        XCTAssertTrue(DriverQuotaRow.isStale(observedAtEpochS: justOver, now: now))
+    }
+
+    /// A reading well past the threshold (6h old against a 2h threshold) is
+    /// stale even though it is the only entry — proving the check fires from
+    /// absolute age alone, with nothing else in the roster to compare to.
+    func testSixHourOldReadingIsStaleOnItsOwn() {
+        let now = Date(timeIntervalSince1970: 1_787_100_000)
+        let sixHoursAgo = Int(now.timeIntervalSince1970) - 6 * 60 * 60
+        XCTAssertTrue(DriverQuotaRow.isStale(observedAtEpochS: sixHoursAgo, now: now))
+    }
+
+    /// The panel must not show provenance: a non-stale reading's detail line
+    /// carries neither the removed "via <source>" segment nor the removed
+    /// per-row "read just now" segment.
+    func testDetailLineForAFreshReadingDropsProvenanceAndFreshnessSegments() {
+        let now = Date(timeIntervalSince1970: 1_787_100_000)
+        let entry = DriverQuotaEntry(
+            driver: "claude",
+            observedAtEpochS: Int(now.timeIntervalSince1970) - 30,
+            outcome: .reading(reading(percent: 3))
+        )
+        let row = DriverQuotaRow(entry: entry, now: now, checking: false)
+        let line = row.detailLine(for: reading(percent: 3)) ?? ""
+        XCTAssertFalse(line.contains("via "), "provenance must not appear in the row: \(line)")
+        XCTAssertFalse(line.contains("read "), "a fresh row must not carry a freshness note: \(line)")
+    }
+
+    /// A genuinely stale reading (past the threshold) does get the "read …"
+    /// freshness note — the one case the indicator exists for.
+    func testDetailLineForAStaleReadingIncludesAFreshnessNote() {
+        let now = Date(timeIntervalSince1970: 1_787_100_000)
+        let sixHoursAgo = Int(now.timeIntervalSince1970) - 6 * 60 * 60
+        let entry = DriverQuotaEntry(
+            driver: "codex",
+            observedAtEpochS: sixHoursAgo,
+            outcome: .reading(reading(percent: 3))
+        )
+        let row = DriverQuotaRow(entry: entry, now: now, checking: false)
+        let line = row.detailLine(for: reading(percent: 3)) ?? ""
+        XCTAssertTrue(line.contains("read "), "a stale row must carry a freshness note: \(line)")
+    }
+
     private func reading(percent: Double) -> DriverQuotaReading {
         DriverQuotaReading(
             usedPercent: percent,

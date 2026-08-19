@@ -7,6 +7,7 @@ workspace = "../../../.."
 [dependencies]
 async-trait = { workspace = true }
 boss-engine-codex-hook-trust = { path = "../codex-hook-trust" }
+boss-engine-utils = { path = "../utils" }
 boss-http-retry = { path = "../../http_retry" }
 boss-protocol = { path = "../../protocol" }
 chrono = { workspace = true }

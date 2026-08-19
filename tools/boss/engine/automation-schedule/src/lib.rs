@@ -37,7 +37,8 @@
 use std::collections::BTreeSet;
 use std::str::FromStr;
 
-use chrono::{DateTime, Datelike, Duration, MappedLocalTime, NaiveDate, TimeZone, Utc};
+use boss_engine_utils::local_time::resolve_local_to_utc;
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use chrono_tz::Tz;
 
 /// How far ahead [`next_occurrence_after`] will scan for a matching day
@@ -46,11 +47,6 @@ use chrono_tz::Tz;
 /// can never match (e.g. `0 0 31 2 *` — Feb 31st) correctly yields
 /// `None` after the horizon rather than looping forever.
 const SCAN_HORIZON_DAYS: i64 = 366 * 5;
-
-/// Maximum minutes we will advance a non-existent (spring-forward gap)
-/// wall-clock time looking for the next valid instant. Real DST gaps are
-/// ≤120 minutes; 240 is a generous safety bound.
-const MAX_GAP_ADVANCE_MINUTES: i64 = 240;
 
 /// A parsed, validated cron schedule. Construct via [`parse_cron`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,31 +282,6 @@ pub fn next_occurrence_after_str(
     let schedule = parse_cron(cron)?;
     let tz = parse_timezone(timezone)?;
     Ok(next_occurrence_after(&schedule, tz, after_epoch))
-}
-
-/// Resolve a local wall-clock `naive` time in `tz` to a UTC epoch second,
-/// applying the DST policy: gap → next valid instant (run later); fold →
-/// earliest of the two instants (fire once).
-fn resolve_local_to_utc(naive: chrono::NaiveDateTime, tz: Tz) -> Option<i64> {
-    match tz.from_local_datetime(&naive) {
-        MappedLocalTime::Single(dt) => Some(dt.timestamp()),
-        MappedLocalTime::Ambiguous(earliest, _latest) => Some(earliest.timestamp()),
-        MappedLocalTime::None => {
-            // Spring-forward gap: this wall time does not exist. Advance
-            // minute-by-minute to the first instant that does (the gap's
-            // far edge), so the job runs once, slightly later.
-            let mut candidate = naive;
-            for _ in 0..MAX_GAP_ADVANCE_MINUTES {
-                candidate += Duration::minutes(1);
-                match tz.from_local_datetime(&candidate) {
-                    MappedLocalTime::Single(dt) => return Some(dt.timestamp()),
-                    MappedLocalTime::Ambiguous(earliest, _) => return Some(earliest.timestamp()),
-                    MappedLocalTime::None => continue,
-                }
-            }
-            None
-        }
-    }
 }
 
 #[cfg(test)]

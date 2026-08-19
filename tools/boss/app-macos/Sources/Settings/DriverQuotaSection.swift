@@ -223,7 +223,10 @@ extension DriverQuotaReading {
     func resetsText(now: Date, calendar: Calendar = .current) -> String? {
         if let epoch = resetsAtEpochS {
             let date = Date(timeIntervalSince1970: TimeInterval(epoch))
-            return "resets \(Self.formattedResetInstant(date, now: now, calendar: calendar))"
+            // "reset" (past tense) for an instant that has already elapsed —
+            // never phrase an already-past reset as if it were still ahead.
+            let verb = date <= now ? "reset" : "resets"
+            return "\(verb) \(Self.formattedResetInstant(date, now: now, calendar: calendar))"
         }
         if let text = resetsAtText, !text.isEmpty {
             return "resets \(text)"
@@ -236,19 +239,26 @@ extension DriverQuotaReading {
     /// normalises every driver's reading to `resets_at_epoch_s` at parse
     /// time, and this is the single place that turns it into text.
     ///
-    /// Within the coming week: weekday name and local time, e.g. "Friday at
-    /// 4:04 PM". Beyond that: a plain local date, in one consistent style.
-    /// Always the machine's local time zone — the zone name itself is never
-    /// printed, and sub-second precision never survives to here.
+    /// Within the coming week (including the recent past, so a reset that
+    /// just elapsed still shows a time of day rather than silently dropping
+    /// it): weekday name and local time, e.g. "Friday at 4:04 PM". Beyond
+    /// that in either direction: a plain local date, in one consistent
+    /// style. Always the machine's local time zone — the zone name itself is
+    /// never printed, and sub-second precision never survives to here.
     static func formattedResetInstant(_ date: Date, now: Date, calendar: Calendar = .current) -> String {
         let startOfToday = calendar.startOfDay(for: now)
         let startOfTarget = calendar.startOfDay(for: date)
         let daysAhead = calendar.dateComponents([.day], from: startOfToday, to: startOfTarget).day ?? 0
 
-        if daysAhead >= 0, daysAhead < 7 {
+        if daysAhead > -7, daysAhead < 7 {
             let formatter = DateFormatter()
             formatter.calendar = calendar
             formatter.timeZone = calendar.timeZone
+            // The format string already hardcodes English wording ('at'), so
+            // pin the locale rather than let the weekday name and am/pm
+            // symbols localise around it — otherwise a non-English or
+            // 24-hour host renders something like "vendredi at 4:04 PM".
+            formatter.locale = Locale(identifier: "en_US_POSIX")
             formatter.dateFormat = "EEEE 'at' h:mm a"
             return formatter.string(from: date)
         }
@@ -318,14 +328,12 @@ struct DriverQuotaSection: View {
 
     var body: some View {
         let roster = DriverQuotaSection.roster(from: chatModel.driverQuota)
-        let freshestObservedAtEpochS = DriverQuotaSection.freshestObservedAtEpochS(in: roster)
         Section {
             ForEach(roster, id: \.driver) { entry in
                 DriverQuotaRow(
                     entry: entry,
                     now: now,
-                    checking: chatModel.isRefreshingDriverQuota,
-                    freshestObservedAtEpochS: freshestObservedAtEpochS
+                    checking: chatModel.isRefreshingDriverQuota
                 )
             }
             HStack(spacing: 8) {
@@ -355,22 +363,16 @@ struct DriverQuotaSection: View {
         .onReceive(tick) { now = $0 }
     }
 
-    /// How much older a row's own reading has to be than the freshest
-    /// reading in the roster before it is flagged as stale — hours, not
-    /// minutes, so ordinary skew between three independent probes never
-    /// trips it. Only a row that is genuinely the outlier gets the
-    /// indicator.
+    /// How old a row's own reading has to be, in absolute wall-clock terms,
+    /// before it is flagged as stale — hours, not minutes, so the normal
+    /// ~15-minute refresh cadence never trips it. Measured against `now`
+    /// rather than against the rest of the roster: every entry in one
+    /// snapshot is stamped with the same `observed_at_epoch_s` by the
+    /// engine's `run_cycle` (each probe bounded by a ~25s timeout), so a
+    /// roster-relative lag can never exceed a few seconds and would never
+    /// fire. An absolute-age check does fire, and for the case that matters:
+    /// the engine has stopped refreshing and this reading is genuinely old.
     static let staleThreshold: TimeInterval = 2 * 60 * 60
-
-    /// The most recent `observedAtEpochS` among readings in the roster, or
-    /// `0` when there are none to compare — a single reading (or none) has
-    /// no "rest" for it to be stale relative to.
-    static func freshestObservedAtEpochS(in roster: [DriverQuotaEntry]) -> Int {
-        roster.compactMap { entry -> Int? in
-            guard case .reading = entry.outcome else { return nil }
-            return entry.observedAtEpochS
-        }.max() ?? 0
-    }
 
     /// Every driver Boss implements, in a stable order, with the engine's
     /// entry where there is one.
@@ -410,14 +412,10 @@ struct DriverQuotaSection: View {
 
 /// One driver's row: name, figure or failure, and the "as of" that makes the
 /// figure meaningful.
-private struct DriverQuotaRow: View {
+struct DriverQuotaRow: View {
     let entry: DriverQuotaEntry
     let now: Date
     let checking: Bool
-    /// The freshest `observedAtEpochS` among all readings in the roster, so
-    /// this row can tell whether it is the stale outlier. `0` means there is
-    /// nothing to compare against.
-    let freshestObservedAtEpochS: Int
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -475,25 +473,37 @@ private struct DriverQuotaRow: View {
     }
 
     /// Reset clause, when the provider gave one, plus a freshness note only
-    /// when this row is genuinely stale relative to the rest of the roster
-    /// (see `DriverQuotaSection.staleThreshold`). How the figure was
-    /// obtained is implementation detail and is not shown here; the panel's
-    /// single "Checked …" line at the bottom already covers the common case.
+    /// when this row is genuinely stale in absolute terms (see
+    /// `DriverQuotaSection.staleThreshold`). How the figure was obtained is
+    /// implementation detail and is not shown here; the panel's single
+    /// "Checked …" line at the bottom already covers the common case.
     /// `nil` when there is nothing to say beyond the reset clause itself.
-    private func detailLine(for reading: DriverQuotaReading) -> String? {
+    func detailLine(for reading: DriverQuotaReading) -> String? {
         var parts: [String] = []
         if let resets = reading.resetsText(now: now) { parts.append(resets) }
         if isStale { parts.append("read \(observedText)") }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
-    /// This row's reading is older than the roster's freshest by more than
-    /// `DriverQuotaSection.staleThreshold` — the one case where a per-row
-    /// freshness note earns its place, because it names the exception.
+    /// This row's reading is older than `DriverQuotaSection.staleThreshold`
+    /// measured against wall-clock `now` — the one case where a per-row
+    /// freshness note earns its place, because it names a reading the engine
+    /// has stopped refreshing.
     private var isStale: Bool {
-        guard entry.observedAtEpochS > 0, freshestObservedAtEpochS > 0 else { return false }
-        let lag = TimeInterval(freshestObservedAtEpochS - entry.observedAtEpochS)
-        return lag > DriverQuotaSection.staleThreshold
+        Self.isStale(observedAtEpochS: entry.observedAtEpochS, now: now)
+    }
+
+    /// Testable, parameter-only form of the staleness check: `observedAtEpochS
+    /// <= 0` (never observed) is never stale; otherwise stale when `now` is
+    /// more than `threshold` past the observation.
+    static func isStale(
+        observedAtEpochS: Int,
+        now: Date,
+        threshold: TimeInterval = DriverQuotaSection.staleThreshold
+    ) -> Bool {
+        guard observedAtEpochS > 0 else { return false }
+        let age = now.timeIntervalSince1970 - TimeInterval(observedAtEpochS)
+        return age > threshold
     }
 
     private var observedText: String {

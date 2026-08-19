@@ -520,6 +520,7 @@ version = "0.1.0"
 name = "boss-engine-automation-schedule"
 version = "0.1.0"
 dependencies = [
+ "boss-engine-utils",
  "chrono",
  "chrono-tz",
 ]
@@ -630,6 +631,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "boss-engine-codex-hook-trust",
+ "boss-engine-utils",
  "boss-http-retry",
  "boss-protocol",
  "chrono",
@@ -772,6 +774,7 @@ name = "boss-engine-utils"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "chrono-tz",
 ]
 
 [[package]]

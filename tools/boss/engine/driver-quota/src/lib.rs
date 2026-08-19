@@ -182,6 +182,7 @@ pub mod parse {
     /// mean next year rather than a year already gone — a reset window does
     /// not describe the past.
     fn parse_claude_reset_epoch(clause: &str, now_epoch_s: i64) -> Option<i64> {
+        use boss_engine_utils::local_time::resolve_local_to_utc;
         use chrono::{Datelike, TimeZone};
 
         let (date_part, tz_part) = clause.rsplit_once('(')?;
@@ -213,15 +214,22 @@ pub mod parse {
             hour = 0;
         }
 
+        // The clause never states a year, so one is inferred using the
+        // *local* (in-zone) "now" — `resolve_local_to_utc` below is what
+        // then turns the inferred month/day/time into a UTC instant,
+        // sharing the automation scheduler's DST gap/fold policy instead of
+        // aborting the whole parse on `.single()` returning `None`.
         let now_local = tz.timestamp_opt(now_epoch_s, 0).single()?;
         let year = now_local.year();
-        let this_year = tz.with_ymd_and_hms(year, month, day, hour, minute, 0).single()?;
-        let resolved = if this_year < now_local - chrono::Duration::days(1) {
-            tz.with_ymd_and_hms(year + 1, month, day, hour, minute, 0).single()?
+        let naive = chrono::NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, minute, 0)?;
+        let this_year = resolve_local_to_utc(naive, tz)?;
+        let resolved = if this_year < (now_local - chrono::Duration::days(1)).timestamp() {
+            let naive_next = chrono::NaiveDate::from_ymd_opt(year + 1, month, day)?.and_hms_opt(hour, minute, 0)?;
+            resolve_local_to_utc(naive_next, tz)?
         } else {
             this_year
         };
-        Some(resolved.timestamp())
+        Some(resolved)
     }
 
     // ---------------------------------------------------------------------------
