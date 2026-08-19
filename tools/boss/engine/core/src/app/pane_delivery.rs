@@ -501,25 +501,40 @@ impl ServerState {
     /// process is gone, mirroring what
     /// `stale_worker_sweep::TmuxWorkerTerminalInspector` treats as
     /// [`crate::stale_worker_sweep::TerminalLiveness::Dead`]: the session no
-    /// longer exists, or tmux itself reports the pane dead
-    /// (`#{pane_dead}`). A pane whose foreground command merely differs from
-    /// the driver binary is deliberately NOT evidence of death here — that
-    /// is the normal shape of the agent running a foreground child, and
-    /// conflating the two was the bug (see the module's `DriverExited`
-    /// history).
+    /// longer exists, its spawn token no longer matches (a recycled session
+    /// name now belongs to a different, later-spawned session), or tmux
+    /// itself reports the pane dead (`#{pane_dead}`). A pane whose
+    /// foreground command merely differs from the driver binary is
+    /// deliberately NOT evidence of death here — that is the normal shape of
+    /// the agent running a foreground child, which `classify_worker_liveness`
+    /// (stale_worker_sweep.rs:144) classifies as `AliveAndWorking`. Only
+    /// session absence, a spawn-token mismatch, or `#{pane_dead}` may
+    /// terminalize a run here.
     ///
-    /// `Ok(None)` means the pane is alive and a write may proceed; `Ok(Some(status))`
-    /// means the pane is confirmed dead, with `status` carrying
-    /// `#{pane_dead_status}` when tmux reported one.
-    async fn tmux_pane_confirmed_dead(tmux: &Tmux, session_name: &str) -> anyhow::Result<Option<Option<String>>> {
+    /// `Ok(None)` means the pane is alive and a write may proceed; `Ok(Some(evidence))`
+    /// means the pane is confirmed dead, with `evidence` carrying a
+    /// self-describing diagnostic string (never a bare process name).
+    async fn tmux_pane_confirmed_dead(
+        tmux: &Tmux,
+        session_name: &str,
+        expected_spawn_token: &str,
+    ) -> anyhow::Result<Option<Option<String>>> {
         let sessions = tmux.list_sessions().await?;
         if !sessions.iter().any(|session| session.name == session_name) {
             return Ok(Some(None));
         }
+        let spawn_token = crate::tmux_adoption::session_spawn_token(tmux, session_name).await?;
+        if spawn_token.as_deref() != Some(expected_spawn_token) {
+            return Ok(Some(Some("spawn_token_mismatch".to_owned())));
+        }
         let pane_dead = tmux.display_message(session_name, DisplayField::PaneDead).await?;
         if pane_dead == "1" {
             let status = tmux.display_message(session_name, DisplayField::PaneDeadStatus).await?;
-            return Ok(Some((!status.is_empty()).then_some(status)));
+            return Ok(Some(Some(if status.is_empty() {
+                "pane_dead".to_owned()
+            } else {
+                format!("pane_dead_status={status}")
+            })));
         }
         Ok(None)
     }
@@ -545,7 +560,19 @@ impl ServerState {
                     )));
                 };
                 let tmux = self.tmux_for_pane_delivery().map_err(PaneSendFailure::Tmux)?;
-                match Self::tmux_pane_confirmed_dead(&tmux, &session_name).await {
+                let expected_spawn_token = self
+                    .work_db
+                    .tmux_run_for_execution(run_id)
+                    .map_err(|err| {
+                        PaneSendFailure::DriverLivenessUnavailable(format!("tmux run lookup failed: {err:#}"))
+                    })?
+                    .ok_or_else(|| {
+                        PaneSendFailure::DriverLivenessUnavailable(
+                            "no durable tmux identity recorded for run".to_owned(),
+                        )
+                    })?
+                    .tmux_spawn_token;
+                match Self::tmux_pane_confirmed_dead(&tmux, &session_name, &expected_spawn_token).await {
                     Ok(Some(pane_dead_status)) => {
                         self.reconcile_driver_exit(
                             run_id,
@@ -560,8 +587,9 @@ impl ServerState {
                         });
                     }
                     Ok(None) => {
-                        // The pane is alive: the session exists and tmux does
-                        // not report the pane as dead. That the pane's
+                        // The pane is alive: the session exists, its spawn
+                        // token matches the run row, and tmux does not
+                        // report the pane as dead. That the pane's
                         // foreground command may differ from the driver
                         // binary (e.g. the agent is running a foreground
                         // `bazel build`) is expected and is NOT evidence the

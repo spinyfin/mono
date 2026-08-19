@@ -96,9 +96,9 @@ pub struct Session {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayField {
     PanePid,
-    PaneCurrentCommand,
     PaneDead,
     PaneDeadStatus,
+    PaneCurrentCommand,
     WindowActivity,
 }
 
@@ -106,9 +106,9 @@ impl DisplayField {
     pub(crate) const fn format(self) -> &'static str {
         match self {
             Self::PanePid => "#{pane_pid}",
-            Self::PaneCurrentCommand => "#{pane_current_command}",
             Self::PaneDead => "#{pane_dead}",
             Self::PaneDeadStatus => "#{pane_dead_status}",
+            Self::PaneCurrentCommand => "#{pane_current_command}",
             Self::WindowActivity => "#{window_activity}",
         }
     }

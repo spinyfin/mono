@@ -215,9 +215,13 @@ pub struct ListHostedPanesResult {
 pub struct SendToPaneInput {
     pub slot_id: u8,
     pub text: String,
-    /// The driver executable that must own the PTY foreground process at the
-    /// instant the app writes `text`. The app refuses rather than typing into
-    /// a shell after the driver has exited.
+    /// The driver executable this run launched with. The app does not match
+    /// it against the observed foreground process (a live agent is often
+    /// inside a foreground child, e.g. a `bazel build` a tool call shelled
+    /// out to); it refuses when no live process owns the PTY at all, and
+    /// echoes this value back in `DriverExited` for diagnostics. An empty
+    /// value is treated as a malformed request and refused non-terminally,
+    /// without concluding the driver exited.
     pub expected_driver_binary: String,
 }
 
