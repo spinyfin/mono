@@ -1143,7 +1143,12 @@ extension EngineClient {
 
     /// Fetch the merged, shallow engine-attempt feed. Detailed records remain
     /// behind their source-specific get requests so list refreshes stay small.
-    func sendListEngineAttempts(limit: Int? = nil, includeBackgroundWork: Bool = false) {
+    /// `limit: 0` is the background-only polling form: `attempts` comes back
+    /// empty while `background_work` is still populated when requested.
+    /// Returns the envelope `request_id` so the model can drop out-of-order
+    /// snapshot replies.
+    @discardableResult
+    func sendListEngineAttempts(limit: Int? = nil, includeBackgroundWork: Bool = false) -> String {
         var payload: [String: Any] = ["type": "list_engine_attempts"]
         if let limit {
             payload["limit"] = limit
@@ -1151,7 +1156,7 @@ extension EngineClient {
         if includeBackgroundWork {
             payload["include_background_work"] = true
         }
-        sendLine(payload)
+        return sendLine(payload)
     }
 
     /// Fetch detailed fields for a selected unified attempt row. Rebase rows

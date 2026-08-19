@@ -61,6 +61,7 @@ extension ChatViewModel {
                 engine.sendGetWorkTree(productId: productID, flow: .coldStart)
                 engine.sendListAttentionGroups(productId: productID)
             }
+            startBackgroundWorkPolling()
         case .resyncRequired:
             handleResyncRequired() // socket never went down; see ChatViewModel+Connection.swift
         case .appSessionRegistered:
@@ -76,6 +77,7 @@ extension ChatViewModel {
             handleEngineRequest(requestId: requestId, request: request)
         case .disconnected:
             isConnected = false
+            stopBackgroundWorkPolling(clearSnapshot: true)
             isAppSessionRegistered = false
             subscribedWorkTopics.removeAll()
             for (productID, state) in automationsFetchStateByProductID {
@@ -120,6 +122,7 @@ extension ChatViewModel {
             for itemID in itemIDs where executionsByTaskID[itemID] != nil {
                 engine.sendListExecutions(taskId: itemID)
             }
+            requestBackgroundWorkRefresh()
         case .productsList(let products):
             self.products = products.sorted(by: { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending })
             let activeIDs = Set(activeProducts.map(\.id))
@@ -406,9 +409,12 @@ extension ChatViewModel {
                     break
                 }
             }
-        case .engineAttemptsList(let attempts, let backgroundWork):
-            engineAttempts = attempts
-            self.backgroundWork = backgroundWork
+        case .engineAttemptsList(let attempts, let backgroundWork, let requestId):
+            applyEngineAttemptsList(
+                attempts: attempts,
+                backgroundWork: backgroundWork,
+                requestId: requestId
+            )
         case .conflictResolution(let attempt):
             engineAttemptDetails[attempt.id] = .conflictResolution(attempt)
             engineAttemptDetailErrors.removeValue(forKey: attempt.id)

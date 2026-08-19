@@ -125,7 +125,9 @@ final class EngineClient: @unchecked Sendable {
     // Not `private`: called from the `EngineClient+PaneResponses.swift`
     // extension, which needs file-scoped-`private` loosened to `internal`
     // to reach it.
-    func sendLine(_ payload: [String: Any]) {
+    @discardableResult
+    func sendLine(_ payload: [String: Any]) -> String {
+        let envelopeRequestId = UUID().uuidString
         outboundRecorder?(payload)
 
         // Log outbound engine_response messages so both sides of every
@@ -144,12 +146,12 @@ final class EngineClient: @unchecked Sendable {
 
         guard let connection else {
             emit(.error(message:"engine connection is not established"))
-            return
+            return envelopeRequestId
         }
 
         do {
             let envelope: [String: Any] = [
-                "request_id": UUID().uuidString,
+                "request_id": envelopeRequestId,
                 "payload": payload,
             ]
             var data = try JSONSerialization.data(withJSONObject: envelope, options: [])
@@ -164,6 +166,7 @@ final class EngineClient: @unchecked Sendable {
         } catch {
             emit(.error(message:"failed to encode payload: \(error.localizedDescription)"))
         }
+        return envelopeRequestId
     }
 
     private func receiveNext() {
@@ -230,6 +233,7 @@ final class EngineClient: @unchecked Sendable {
                 emit(.error(message:"received invalid JSON message from engine"))
                 continue
             }
+            let envelopeRequestId = envelope["request_id"] as? String
 
             switch type {
             case "topic_event":
@@ -548,7 +552,8 @@ final class EngineClient: @unchecked Sendable {
                 let rawBackgroundWork = payload["background_work"] as? [[String: Any]] ?? []
                 emit(.engineAttemptsList(
                     attempts: rawAttempts.compactMap(parseEngineAttemptListEntry),
-                    backgroundWork: rawBackgroundWork.compactMap(parseBackgroundWorkItem)
+                    backgroundWork: rawBackgroundWork.compactMap(parseBackgroundWorkItem),
+                    requestId: envelopeRequestId
                 ))
             case "conflict_resolution":
                 guard let raw = payload["attempt"] as? [String: Any],

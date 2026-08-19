@@ -199,7 +199,8 @@ extension ChatViewModel {
     /// background-work snapshot shares this response so the app need not
     /// reconstruct either view from the source-specific attempt tables.
     func refreshEngineAttempts() {
-        engine.sendListEngineAttempts(limit: 200, includeBackgroundWork: true)
+        let requestId = engine.sendListEngineAttempts(limit: 200, includeBackgroundWork: true)
+        registerBackgroundWorkRequest(requestId: requestId, replacesAttempts: true)
     }
 
     /// Load source-specific fields only after an Activity row is selected.

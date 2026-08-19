@@ -71,7 +71,14 @@ enum EngineEvent {
     case ciRemediationsList(attempts: [WorkCiRemediation])
     /// Response to `list_engine_attempts`. This is the authoritative, merged
     /// Activity list; source-specific details are loaded only after selection.
-    case engineAttemptsList(attempts: [EngineAttemptListEntry], backgroundWork: [BackgroundWorkItem])
+    /// `requestId` is the envelope id of the originating request so a late
+    /// `limit = 0` poll can be dropped instead of overwriting a newer snapshot.
+    /// Synthetic test events may pass `nil`.
+    case engineAttemptsList(
+        attempts: [EngineAttemptListEntry],
+        backgroundWork: [BackgroundWorkItem],
+        requestId: String?
+    )
     /// Full conflict-resolution record loaded for a selected Activity row.
     case conflictResolution(attempt: WorkConflictResolution)
     /// Full CI-remediation record loaded for a selected Activity row.
