@@ -24,7 +24,7 @@
 **What actually shipped, against that verdict.**
 
 - The interactive-TUI topology, Boss-owned per-run `$TMPDIR/boss-grok-homes/<run>/` container (`grok-home` + `process-home`), driver-owned hooks, adapter, progress normaliser, PR-URL capture, structured-output file contract, transcript dialect, control verbs, Esc turn-end recovery via `events.jsonl`, and the driver-supplied pane monitor all landed.
-- Local macOS sandboxes diverge from the original "use Grok's built-in profiles" sketch: every non-`off` built-in Grok Seatbelt template blocks login-keychain IPC that `gh` needs, so Boss wraps the pane in a Boss-owned `sandbox-exec` profile and runs Grok with `--sandbox off` inside it, still layering `--deny` rules and (on non-macOS / remote) custom `sandbox.toml` profiles (mono#2513).
+- Local macOS sandboxes diverge from the original "use Grok's built-in profiles" sketch: every non-`off` built-in Grok Seatbelt template blocks login-keychain IPC that `gh` needs, so local macOS Grok runs with `--sandbox off` and no OS-level confinement. That leaves repository test actions free to apply their own hermetic Seatbelt profile. `--deny` rules still apply, and non-macOS / remote workers still use custom `sandbox.toml` profiles (mono#2513, mono#2793).
 - Two silent production bugs were found only on the real end-to-end path: the events socket resolved a single `ENGINE_DEFAULT_DRIVER` for every connection (Grok payloads normalised as Claude and dropped — mono#2520), and the hook adapter initially asserted `GROK_AGENT`, which the runner does not inject (every tool call denied — mono#2597). Both are closed.
 - Subagents stay disabled (`--no-subagents`), but for a **measured** reason rather than posture alone: a finishing child emits a top-level-shaped `session_end` that can mark the live slot `Terminated` while the parent is still alive (mono#2700).
 - Review is **not** Grok-dispatchable today: the review pool hardcodes `REVIEWER_POOL_DRIVER = "claude"`. Conflict-resolution / CI-remediation later gained a `CommandOutcomeObservation` required-strict escalation that Grok does not declare, so those execution kinds refuse Grok at the capability gate even though Phase 3 verified sandbox write/deny properties.
@@ -254,7 +254,7 @@ Layering, in the order Grok resolves it:
 - `$GROK_HOME/config.toml` — the user layer Boss owns (full `[compat.claude]` and `[compat.cursor]` disable block).
 - `$GROK_HOME/trusted_folders.toml` — folder-trust store, keyed by absolute path with a `decided_at` epoch. **macOS stamps both `/tmp`↔`/private/tmp` and `/var`↔`/private/var` forms** of the workspace path and its canonical root.
 - `$GROK_HOME/hooks/*.json` — global hooks, always trusted (Boss writes the adapter + guards + `boss-event` forwarder here).
-- `$GROK_HOME/sandbox.toml` — Boss custom profiles (`boss-workspace` / `boss-read-only`) on non-macOS-local paths; local macOS uses external Seatbelt instead (see [G-3](#g-3-permissionpolicy)).
+- `$GROK_HOME/sandbox.toml` — Boss custom profiles (`boss-workspace` / `boss-read-only`) on non-macOS-local paths; local macOS Grok runs `--sandbox off` with no OS-level confinement so repository tests can apply their own hermetic Seatbelt profile (see [G-3](#g-3-permissionpolicy)).
 - Process `HOME` → per-run `process-home/` — empty of Claude state; host `gh` / `ssh` / `git` / `cube` state is **bridged in** (symlinks / env redirects), not copied.
 - Auth → `GROK_AUTH_PATH` pointing at the host credential (`~/.grok/auth.json` or `BOSS_GROK_AUTH_SOURCE`); not a per-home copy, so concurrent workers share one refresh lock.
 - Project `<proj>/.grok/` — hooks, config, sandbox profiles. **Trust-gated**, and attacker-controllable in Boss's threat model. The driver does not depend on it.
@@ -270,7 +270,7 @@ Auth is the host `auth.json` selected through `GROK_AUTH_PATH` (grok.com OAuth o
 
 - Every worker uses the same explicit credential path. Grok places `auth.json.lock` beside that path, so concurrent workers share one refresh lock. A per-home symlink is not sufficient: an atomic refresh replaces the symlink with a private file while each home still uses a different lock.
 - Boss disables API-key auth and removes an inherited `XAI_API_KEY`; an OAuth refresh failure must not silently switch credential families or endpoints.
-- **Scoped process HOME + credential bridge (mono#2517).** The empty `process-home/` that closes D-1 also strips every credential `cube pr create` needs. As shipped, the driver bridges host `gh` config, login-keychain material, `ssh`, `git` user config, and cube data/config into `process-home` (and/or via env redirects such as `GH_CONFIG_DIR`, `CUBE_DATA_DIR`). Local macOS workers additionally run under a Boss-owned Seatbelt policy that preserves keychain IPC — Grok's built-in profiles block that IPC and make `gh` silently fall back to an invalid file credential; a keychain-file symlink alone cannot repair the kernel policy.
+- **Scoped process HOME + credential bridge (mono#2517).** The empty `process-home/` that closes D-1 also strips every credential `cube pr create` needs. As shipped, the driver bridges host `gh` config, login-keychain material, `ssh`, `git` user config, and cube data/config into `process-home` (and/or via env redirects such as `GH_CONFIG_DIR`, `CUBE_DATA_DIR`). Local macOS workers run Grok with `--sandbox off` and no Boss-owned Seatbelt wrapper, which is what preserves login-keychain IPC — Grok's built-in profiles block that IPC and make `gh` silently fall back to an invalid file credential; a keychain-file symlink alone cannot repair the kernel policy.
 - **No collision with `unset ANTHROPIC_API_KEY`** at the shared spawn wrapper — it is inert for Grok. It remains a Claude-ism in driver-generic code and belongs behind the driver.
 - `grok models` requires login, which makes it a cheap liveness check on the credential without an inference call.
 - **Concurrency is not entitlement-blocked at Boss's target scale**: the spike ran 16 concurrent sessions to completion, 16/16, ~12–16s each. That does not prove unlimited quota; it proves the design's premise is not immediately dead.
@@ -377,7 +377,7 @@ Classification per the house convention: **(a)** implementable against the curre
 | ---- | ----------------------- | ---------------------------------------------------- | ------- | ------------------------------------------------------------------------------ |
 | G-1  | `Spawn`                 | interactive TUI + positional prompt + flags          | **(a)** | **Shipped** — `SpawnRequest`/`SpawnPlan` as designed                           |
 | G-2  | `WorkspaceProvisioning` | `GROK_HOME`, `trusted_folders.toml`, `--trust`       | **(a)** | **Shipped** — scoped HOME + bridge; pre-trust driver-supplied; retention added |
-| G-3  | `PermissionPolicy`      | `--sandbox`, `--allow`/`--deny`, `--permission-mode` | **(a)** | **Shipped** — D-1 closed via scoped HOME; local macOS uses Boss Seatbelt       |
+| G-3  | `PermissionPolicy`      | `--sandbox`, `--allow`/`--deny`, `--permission-mode` | **(a)** | **Shipped** — D-1 closed via scoped HOME; local macOS uses `--sandbox off`     |
 | G-4  | `ModelAndEffortMenu`    | `-m`, `--reasoning-effort`, `grok models`            | **(a)** | **Shipped** — single SKU; effort collapsed to `low`/`medium`/`high`            |
 | G-5  | `ProgressObservation`   | hooks under a Boss-owned home                        | **(b)** | **Shipped** — destination named; normaliser live; per-connection socket fix    |
 | G-6  | `ToolUseInterception`   | `PreToolUse` deny, fail-open, deny-only              | **(b)** | **Shipped** — adapter translates `block`→`deny` + tool names                   |
@@ -411,7 +411,7 @@ The shared wrapper at the pane spawn site still hardcodes `unset ANTHROPIC_API_K
 
 `ClaudeDriver::write_permission_config` remains a **functional no-op** returning `PermissionArtifacts::default()`; the real Claude renderer still sits in `core/src/worker_setup.rs`. **Grok follows Codex**: `write_permission_config` is real. It writes hook wiring into `$GROK_HOME/hooks/`, and on non-macOS-local paths a Boss-owned `$GROK_HOME/sandbox.toml` (`boss-workspace` / `boss-read-only` extending the built-in bases), returning `PermissionArtifacts { config_files, extra_args, env }` with `--sandbox` / structural `--deny` rules in `extra_args`.
 
-**Local macOS diverges from the original "use Grok profiles" sketch — load-bearing.** Every non-`off` built-in Grok Seatbelt template blocks Security.framework mach services `gh` needs for the login keychain (and IOKit power-management Bazel needs at startup). As shipped, local macOS workers run under a **Boss-owned `sandbox-exec` wrapper** with Grok itself at `--sandbox off` inside it. That is not a relaxation of the filesystem posture: the Boss profile reconstructs workspace / read-only write rules, protects the Boss data directory and Grok's global hooks, and retains the CLI `--deny` rules. Remote workers get bare built-in profile names (`workspace` / `read-only`) with no local `sandbox.toml`. Non-macOS local workers use the custom `sandbox.toml` path.
+**Local macOS diverges from the original "use Grok profiles" sketch — load-bearing.** Every non-`off` built-in Grok Seatbelt template blocks Security.framework mach services `gh` needs for the login keychain (and IOKit power-management Bazel needs at startup). Local macOS Grok workers are uncontained at the OS level, matching Claude and Codex: they run with `--sandbox off` and no Boss-owned `sandbox-exec` wrapper so repository test actions can apply their own hermetic Seatbelt profile. The containment boundary is the repository test action (`bazel test` enters that hermetic profile; the Grok worker process itself does not). CLI `--deny` rules and PreToolUse guards remain, but they are not OS-level confinement. Remote workers get bare built-in profile names (`workspace` / `read-only`) with no local `sandbox.toml`. Non-macOS local workers use the custom `sandbox.toml` path.
 
 So Grok does **not** need the Claude extraction to land first. It routes around it. The extraction stays deferred ([T-28](#t-28-extract-claudes-permission-rendering-into-the-driver-crate)).
 
@@ -609,7 +609,7 @@ Drive **`grok` as a full interactive TUI in a GhosttyKit pane**, seeded by a pos
 export GROK_HOME=$TMPDIR/boss-grok-homes/<run_id>/grok-home
 export HOME=$TMPDIR/boss-grok-homes/<run_id>/process-home   # scoped; host tools bridged in
 export GROK_AUTH_PATH=<host>/.grok/auth.json                # shared credential + refresh lock
-# local macOS: the shell command is wrapped in Boss sandbox-exec; Grok sees --sandbox off
+# local macOS: Grok runs with --sandbox off and no OS-level confinement
 grok \
   --model grok-4.6 \
   --reasoning-effort <low|medium|high> \
@@ -631,7 +631,7 @@ Notes on each non-obvious element:
 - **`--trust` _and_ a pre-seeded `trusted_folders.toml`.** Redundant on purpose: `--trust` is hidden from `--help` (D-3), so the file is the belt that survives its removal. Conformance still fail-closes if the flag stops parsing. `GROK_FOLDER_TRUST=0` is rejected — it also ungates project hooks and MCP.
 - **`--no-alt-screen` settled (mono#2470).** `--minimal` has **no** busy `Esc:cancel` chrome (0 hits) — rejected for v1 monitor. Default fullscreen shares live markers but alt-screen teardown drops viewport chrome on exit. Inline is the recommended pane mode.
 - **`--always-approve`** rather than `--permission-mode bypassPermissions`: observed payloads already report `permissionMode: "bypassPermissions"` under it. Answer-agent would additionally force `--permission-mode dontAsk` if ever dispatched.
-- **Sandbox is platform-split.** Local macOS → Boss `sandbox-exec` + Grok `--sandbox off`. Non-macOS local → `--sandbox boss-workspace` / `boss-read-only` via `$GROK_HOME/sandbox.toml`. Remote → bare built-in `workspace` / `read-only`.
+- **Sandbox is platform-split.** Local macOS → Grok `--sandbox off` with no OS-level confinement so repository tests can apply their own hermetic Seatbelt profile. Non-macOS local → `--sandbox boss-workspace` / `boss-read-only` via `$GROK_HOME/sandbox.toml`. Remote → bare built-in `workspace` / `read-only`.
 - **No `-w` / `--worktree`, ever.** Cube owns workspace provisioning.
 - **`--no-subagents` / `--no-memory`** are explicit; `--no-subagents` is load-bearing for progress attribution (see [G-11](#g-11-toolprovisioning)).
 - **Vim mode must never be enabled** — Esc does not cancel in fullscreen vim mode, which would silently break interrupt.
@@ -714,7 +714,7 @@ Phased as planned; as-built status per phase:
 
 **Phase 3 — review and conflict resolution. Sandbox properties verified; dispatch still blocked on two independent pins (mono#2624 / T-23).**
 
-- Reviewer `boss-read-only` / Boss Seatbelt genuinely denies workspace writes (live denial, not model politeness). `ReviewResult` round-trips under that sandbox (artifact path is under the system temp tree, always writable). Standard-kind sandbox permits workspace writes.
+- Reviewer `boss-read-only` still applies on non-macOS / remote. On local macOS the reviewer read-only posture is no longer kernel-enforced: Grok runs `--sandbox off` with no Boss Seatbelt, so workspace writes are denied only by CLI `Edit(<workspace>)` `--deny` rules (a Bash-driven write still evades those). `ReviewResult` round-trips because the artifact path is under the system temp tree, always writable. Standard-kind workers need to write their workspace.
 - **`PrReview` cannot dispatch on Grok:** every such execution routes to the review pool, whose `REVIEWER_POOL_DRIVER = "claude"` overrides the row's driver. Changing that is a deliberate product decision (configurable reviewer model / load balancing), not a capability gap in this driver.
 - **`ConflictResolution` / `CiRemediation` refuse Grok at the capability gate** once `KindRequirements` marks `CommandOutcomeObservation` required-strict for those execution kinds. That escalation landed with the Codex capability split and post-dates the Phase 3 sandbox verification, which had concluded that the `TaskKind` gate already cleared. Main-pool conflict resolution for Grok is therefore not dispatchable today without either declaring the capability (if exit-code observation is considered honest for Grok) or revisiting the required-strict set.
 
@@ -993,7 +993,7 @@ Platform sandbox + structural `--deny` rules as real `PermissionArtifacts`.
 - **Effort:** `medium`
 - **Depends on:** T-07, T-16
 - **Scope: in-scope**
-- **Shipped:** mono#2513. Local macOS uses Boss Seatbelt + Grok `--sandbox off` (divergence from "Grok profiles only").
+- **Shipped:** mono#2513. Local macOS uses Grok `--sandbox off` with no OS-level confinement (mono#2793) so repository tests can apply their own hermetic Seatbelt; divergence from "Grok profiles only".
 
 ### T-18 Structured output for Grok
 

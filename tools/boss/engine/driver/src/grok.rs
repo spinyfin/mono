@@ -509,7 +509,7 @@ impl AgentDriver for GrokDriver {
             input.events_socket_path.parent().map(|p| p.to_path_buf())
         };
 
-        if !cfg!(target_os = "macos") && !input.is_remote {
+        if !permissions::grok_sandbox_disabled(input.is_remote) && !input.is_remote {
             let sandbox_toml_path = grok_home.join("sandbox.toml");
             fs::write(
                 &sandbox_toml_path,
@@ -519,7 +519,12 @@ impl AgentDriver for GrokDriver {
             config_files.push(sandbox_toml_path);
         }
 
-        let extra_args = permissions::extra_args(input.worker_kind, boss_data_dir.as_deref(), input.is_remote);
+        let extra_args = permissions::extra_args(
+            input.worker_kind,
+            boss_data_dir.as_deref(),
+            &input.workspace_path,
+            input.is_remote,
+        );
         let sandbox_profile = extra_args
             .get(1)
             .context("Grok permission rendering omitted the required --sandbox profile")?;
@@ -1904,8 +1909,8 @@ mod tests {
         }
     }
 
-    /// `write_permission_config` must render the platform sandbox artifact
-    /// and CLI structural deny rules, never leave permission artifacts empty.
+    /// `write_permission_config` must render sandbox.toml off macOS, no OS
+    /// profile on local macOS, and CLI structural deny rules on both.
     #[tokio::test]
     async fn write_permission_config_renders_sandbox_and_deny_extra_args() {
         let tmp = TempDir::new().unwrap();
@@ -1939,7 +1944,7 @@ mod tests {
         let artifacts = driver.write_permission_config(&input, tmp.path()).await.unwrap();
 
         let grok_home = grok_home_for_run(run_id).unwrap();
-        if cfg!(target_os = "macos") {
+        if permissions::grok_sandbox_disabled(false) {
             assert!(
                 !grok_home.join("boss-seatbelt.sb").exists(),
                 "local Grok workers must not materialize a Boss Seatbelt profile"
@@ -1970,7 +1975,7 @@ mod tests {
         assert_eq!(artifacts.extra_args[0], "--sandbox");
         assert_eq!(
             artifacts.extra_args[1],
-            if cfg!(target_os = "macos") {
+            if permissions::grok_sandbox_disabled(false) {
                 "off"
             } else {
                 "boss-workspace"
@@ -2048,15 +2053,31 @@ mod tests {
         assert_eq!(artifacts.extra_args[0], "--sandbox");
         assert_eq!(
             artifacts.extra_args[1],
-            if cfg!(target_os = "macos") {
+            if permissions::grok_sandbox_disabled(false) {
                 "off"
             } else {
                 "boss-read-only"
             }
         );
+        assert!(
+            artifacts
+                .extra_args
+                .windows(2)
+                .any(|w| w[0] == "--deny" && w[1] == format!("Edit({})", workspace.display())),
+            "reviewer must deny workspace Edit: {:?}",
+            artifacts.extra_args
+        );
+        assert!(
+            artifacts
+                .extra_args
+                .windows(2)
+                .any(|w| w[0] == "--deny" && w[1] == format!("Edit({}/**)", workspace.display())),
+            "reviewer must deny workspace Edit glob: {:?}",
+            artifacts.extra_args
+        );
 
         let grok_home = grok_home_for_run(run_id).unwrap();
-        if cfg!(target_os = "macos") {
+        if permissions::grok_sandbox_disabled(false) {
             assert!(
                 !grok_home.join("boss-seatbelt.sb").exists(),
                 "local macOS reviewer workers must not materialize a Boss Seatbelt profile"
@@ -2301,7 +2322,7 @@ mod tests {
         // Only the rm -rf rules — `--sandbox off` so the sandbox cannot
         // contribute to (or confound) this result.
         let mut extra_args = vec!["--sandbox".to_owned(), "off".to_owned()];
-        for rule in permissions::structural_deny_rules(None) {
+        for rule in permissions::structural_deny_rules(None, crate::WorkerKind::Standard, None) {
             if rule.starts_with("Bash(rm") {
                 extra_args.push("--deny".to_owned());
                 extra_args.push(rule);

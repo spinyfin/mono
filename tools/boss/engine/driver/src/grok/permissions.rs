@@ -27,10 +27,20 @@ use std::path::Path;
 
 use crate::WorkerKind;
 
+/// True when this host must launch Grok with `--sandbox off` and must not
+/// write `$GROK_HOME/sandbox.toml`: local macOS, so repository test actions
+/// can apply their own hermetic Seatbelt profile.
+pub fn grok_sandbox_disabled(is_remote: bool) -> bool {
+    cfg!(target_os = "macos") && !is_remote
+}
+
 /// Built-in sandbox profile `[profiles.NAME].extends` must name (never
-/// `off`/`none` — investigation §`sandbox.toml` schema). Reviewer is the only
-/// kind that needs the kernel-enforced no-CWD-write posture; every other kind
-/// needs to write its own workspace.
+/// `off`/`none` — investigation §`sandbox.toml` schema). Reviewer extends
+/// `read-only` so the custom `sandbox.toml` path (non-macOS / remote) has
+/// no-CWD-write. Local macOS Grok uses `--sandbox off` instead, so Reviewer
+/// workspace writes are denied only via the CLI `Edit(<workspace>)` rules
+/// in [`structural_deny_rules`]. Every other kind needs to write its own
+/// workspace.
 fn sandbox_base_profile(worker_kind: WorkerKind) -> &'static str {
     match worker_kind {
         WorkerKind::Reviewer => "read-only",
@@ -133,7 +143,11 @@ pub fn render_sandbox_toml(worker_kind: WorkerKind, boss_data_dir: Option<&Path>
 /// [`crate::PermissionInput::is_remote`]) — there is no Boss data dir on a
 /// remote host, so that pair of rules is omitted rather than fencing off the
 /// remote's unrelated `/tmp`.
-pub fn structural_deny_rules(boss_data_dir: Option<&Path>) -> Vec<String> {
+pub fn structural_deny_rules(
+    boss_data_dir: Option<&Path>,
+    worker_kind: WorkerKind,
+    workspace_path: Option<&Path>,
+) -> Vec<String> {
     let mut rules = Vec::new();
 
     if let Some(dir) = boss_data_dir {
@@ -145,6 +159,19 @@ pub fn structural_deny_rules(boss_data_dir: Option<&Path>) -> Vec<String> {
             rules.push(format!("{prefix}({dir})"));
             rules.push(format!("{prefix}({dir}/**)"));
         }
+    }
+
+    // Reviewer workspace belt: CLI-grammar only. Local macOS Grok has no
+    // OS-level confinement (`--sandbox off`), so this is the remaining
+    // enforcement against Edit/Write of the PR workspace. A Bash-driven
+    // write still evades it — Grok's `Edit(path)` rules do not match
+    // `run_terminal_command`.
+    if worker_kind == WorkerKind::Reviewer
+        && let Some(workspace) = workspace_path
+    {
+        let workspace = workspace.display().to_string();
+        rules.push(format!("Edit({workspace})"));
+        rules.push(format!("Edit({workspace}/**)"));
     }
 
     // Both confirmed-enforced spellings (investigation §B3): the `cmd:*`
@@ -182,16 +209,19 @@ pub fn permission_mode_for_worker_kind(worker_kind: WorkerKind) -> Option<&'stat
 /// one `--deny` per structural rule, then `--permission-mode` if forced.
 /// Order matches [`crate::apply_permission_extra_args`]'s flag/value pairing
 /// (every entry immediately followed by its value).
-pub fn extra_args(worker_kind: WorkerKind, boss_data_dir: Option<&Path>, is_remote: bool) -> Vec<String> {
-    let mut args = vec![
-        "--sandbox".to_owned(),
-        if cfg!(target_os = "macos") && !is_remote {
-            "off".to_owned()
-        } else {
-            sandbox_profile_arg(worker_kind, is_remote).to_owned()
-        },
-    ];
-    for rule in structural_deny_rules(boss_data_dir) {
+pub fn extra_args(
+    worker_kind: WorkerKind,
+    boss_data_dir: Option<&Path>,
+    workspace_path: &Path,
+    is_remote: bool,
+) -> Vec<String> {
+    let sandbox = if grok_sandbox_disabled(is_remote) {
+        "off".to_owned()
+    } else {
+        sandbox_profile_arg(worker_kind, is_remote).to_owned()
+    };
+    let mut args = vec!["--sandbox".to_owned(), sandbox];
+    for rule in structural_deny_rules(boss_data_dir, worker_kind, Some(workspace_path)) {
         args.push("--deny".to_owned());
         args.push(rule);
     }
@@ -264,7 +294,7 @@ mod tests {
     #[test]
     fn structural_deny_rules_cover_data_dir_rm_rf_sudo_bossctl() {
         let dir = PathBuf::from("/Users/x/Library/Application Support/Boss");
-        let rules = structural_deny_rules(Some(&dir));
+        let rules = structural_deny_rules(Some(&dir), WorkerKind::Standard, None);
         for expected in [
             format!("Read({})", dir.display()),
             format!("Read({}/**)", dir.display()),
@@ -286,9 +316,30 @@ mod tests {
 
     #[test]
     fn structural_deny_rules_omit_data_dir_pair_when_remote() {
-        let rules = structural_deny_rules(None);
+        let rules = structural_deny_rules(None, WorkerKind::Standard, None);
         assert!(!rules.iter().any(|r| r.starts_with("Read(") || r.starts_with("Edit(")));
         assert!(rules.contains(&"Bash(bossctl)".to_owned()));
+    }
+
+    #[test]
+    fn structural_deny_rules_reviewer_denies_workspace_edit_not_bash() {
+        let workspace = PathBuf::from("/tmp/review-ws");
+        let rules = structural_deny_rules(None, WorkerKind::Reviewer, Some(&workspace));
+        for expected in [
+            format!("Edit({})", workspace.display()),
+            format!("Edit({}/**)", workspace.display()),
+        ] {
+            assert!(rules.contains(&expected), "missing {expected:?} in {rules:?}");
+        }
+        assert!(
+            !rules.iter().any(|r| r.starts_with("Read(")),
+            "workspace belt is Edit-only: {rules:?}"
+        );
+        let standard = structural_deny_rules(None, WorkerKind::Standard, Some(&workspace));
+        assert!(
+            !standard.iter().any(|r| r.contains(&workspace.display().to_string())),
+            "standard workers must write their workspace: {standard:?}"
+        );
     }
 
     #[test]
@@ -305,11 +356,12 @@ mod tests {
     #[test]
     fn extra_args_orders_sandbox_then_deny_pairs_then_permission_mode() {
         let dir = PathBuf::from("/boss-data");
-        let args = extra_args(WorkerKind::AnswerAgent, Some(&dir), false);
+        let workspace = PathBuf::from("/ws");
+        let args = extra_args(WorkerKind::AnswerAgent, Some(&dir), &workspace, false);
         assert_eq!(args[0], "--sandbox");
         assert_eq!(
             args[1],
-            if cfg!(target_os = "macos") {
+            if grok_sandbox_disabled(false) {
                 "off"
             } else {
                 "boss-workspace"
@@ -326,11 +378,11 @@ mod tests {
 
     #[test]
     fn extra_args_standard_has_no_permission_mode_tail() {
-        let args = extra_args(WorkerKind::Standard, None, false);
+        let args = extra_args(WorkerKind::Standard, None, Path::new("/ws"), false);
         assert_eq!(args[0], "--sandbox");
         assert_eq!(
             args[1],
-            if cfg!(target_os = "macos") {
+            if grok_sandbox_disabled(false) {
                 "off"
             } else {
                 "boss-workspace"
