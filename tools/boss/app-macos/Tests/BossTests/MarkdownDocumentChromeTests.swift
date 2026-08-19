@@ -16,10 +16,22 @@ import XCTest
 @MainActor
 final class MarkdownDocumentChromeTests: XCTestCase {
     private static let representative = """
-    # Task title
+    # Incident review
 
     Some intro paragraph with **bold**, *italic*, `inline code`, and a
-    [link](https://example.com).
+    [link](https://example.com) for the document treatment.
+
+    ## Context
+
+    This heading carries the document rule that separates the following prose.
+
+    ### Findings
+
+    #### Evidence
+
+    ##### Supporting detail
+
+    ###### Footnote
 
     ```swift
     struct Greeter {
@@ -27,13 +39,20 @@ final class MarkdownDocumentChromeTests: XCTestCase {
     }
     ```
 
-    | Column A | Column B |
-    | -------- | -------- |
-    | one      | two      |
+    | Observed at | Build ID | Outcome |
+    | ----------- | -------- | ------- |
+    | 2026-08-18 15:42:00 | run-abc123 | completed |
+
+    > This callout preserves a warning-colored rail and a readable body.
 
     - top level
       - nested one
     - another top
+
+    1. first ordered item
+    2. second ordered item
+
+    ---
     """
 
     // MARK: - Document measure selection

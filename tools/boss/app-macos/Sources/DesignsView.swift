@@ -427,7 +427,7 @@ private struct DesignsStatusView: View {
 /// pane.
 ///
 /// The loaded document routes through the shared [[MarkdownDocumentChrome]] so it
-/// looks identical to the standalone window viewers (black background, ⌘F find,
+/// looks identical to the standalone window viewers (tokenized document ground, ⌘F find,
 /// rich header). Comments are disabled here (`commentsEnabled: false`): this
 /// reader is embedded in the main application window and has no document identity
 /// to persist comments against, so the comment layer's window-scoped NSEvent
@@ -718,4 +718,3 @@ struct AsyncMarkdownViewerView: View {
         .registeredInWindowMenu()
     }
 }
-
