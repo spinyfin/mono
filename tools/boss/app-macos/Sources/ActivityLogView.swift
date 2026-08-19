@@ -691,6 +691,11 @@ private struct ActivityEngineDetailPane: View {
                     }
                     if let detail {
                         detailFields(detail)
+                    } else if chat.engineAttemptDetailErrors[row.id] != nil {
+                        Text("Could not load attempt details")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 8)
                     } else if row.hasKindSpecificDetail {
                         HStack(spacing: 8) {
                             ProgressView()
@@ -717,65 +722,65 @@ private struct ActivityEngineDetailPane: View {
     @ViewBuilder
     private func detailFields(_ detail: EngineAttemptRow) -> some View {
         switch detail {
-                    case .conflictResolution(let resolution):
-                        if let rung = resolution.mechanicalRungInFlight {
-                            engineDetailRow("Mechanical rung", body: String(rung))
-                        }
-                        if let diag = resolution.conflictDiagnosis, !diag.isEmpty {
-                            Text("Diagnosis")
-                                .font(.subheadline.bold())
-                                .padding(.top, 8)
-                            ScrollView {
-                                Text(diag)
-                                    .font(.system(.caption, design: .monospaced))
-                                    .textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .frame(maxHeight: 220)
-                            .background(Color(nsColor: .textBackgroundColor))
-                            .clipShape(RoundedRectangle(cornerRadius: 6))
-                        }
-                    case .ciRemediation(let remediation):
-                        engineDetailRow("Attempt kind", body: remediation.attemptKind)
-                        engineDetailRow(
-                            "Consumes budget",
-                            body: remediation.consumesBudget == 1 ? "yes" : "no"
-                        )
-                        engineDetailRow(
-                            "Triage class",
-                            body: remediation.triageClass ?? "—"
-                        )
-                        engineDetailRow("Head SHA", body: remediation.headSHAAtTrigger)
-                        if !remediation.failedChecks.isEmpty,
-                           remediation.failedChecks != "[]" {
-                            Text("Failed checks")
-                                .font(.subheadline.bold())
-                                .padding(.top, 8)
-                            ScrollView {
-                                Text(remediation.failedChecks)
-                                    .font(.system(.caption, design: .monospaced))
-                                    .textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .frame(maxHeight: 180)
-                            .background(Color(nsColor: .textBackgroundColor))
-                            .clipShape(RoundedRectangle(cornerRadius: 6))
-                        }
-                        if let log = remediation.logExcerpt, !log.isEmpty {
-                            Text("Log excerpt")
-                                .font(.subheadline.bold())
-                                .padding(.top, 8)
-                            ScrollView {
-                                Text(log)
-                                    .font(.system(.caption, design: .monospaced))
-                                    .textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .frame(maxHeight: 220)
-                            .background(Color(nsColor: .textBackgroundColor))
-                            .clipShape(RoundedRectangle(cornerRadius: 6))
-                        }
-                    }
+        case .conflictResolution(let resolution):
+            if let rung = resolution.mechanicalRungInFlight {
+                engineDetailRow("Mechanical rung", body: String(rung))
+            }
+            if let diag = resolution.conflictDiagnosis, !diag.isEmpty {
+                Text("Diagnosis")
+                    .font(.subheadline.bold())
+                    .padding(.top, 8)
+                ScrollView {
+                    Text(diag)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 220)
+                .background(Color(nsColor: .textBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+            }
+        case .ciRemediation(let remediation):
+            engineDetailRow("Attempt kind", body: remediation.attemptKind)
+            engineDetailRow(
+                "Consumes budget",
+                body: remediation.consumesBudget == 1 ? "yes" : "no"
+            )
+            engineDetailRow(
+                "Triage class",
+                body: remediation.triageClass ?? "—"
+            )
+            engineDetailRow("Head SHA", body: remediation.headSHAAtTrigger)
+            if !remediation.failedChecks.isEmpty,
+               remediation.failedChecks != "[]" {
+                Text("Failed checks")
+                    .font(.subheadline.bold())
+                    .padding(.top, 8)
+                ScrollView {
+                    Text(remediation.failedChecks)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 180)
+                .background(Color(nsColor: .textBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+            }
+            if let log = remediation.logExcerpt, !log.isEmpty {
+                Text("Log excerpt")
+                    .font(.subheadline.bold())
+                    .padding(.top, 8)
+                ScrollView {
+                    Text(log)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 220)
+                .background(Color(nsColor: .textBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+            }
+        }
     }
 
     @ViewBuilder

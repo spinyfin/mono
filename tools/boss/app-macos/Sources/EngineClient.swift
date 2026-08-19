@@ -1086,6 +1086,13 @@ final class EngineClient: @unchecked Sendable {
         emit(event)
     }
 
+    /// Feed one complete wire envelope through the production decoder.
+    func consumeLineForTesting(_ line: String) {
+        buffer.append(contentsOf: line.utf8)
+        buffer.append(0x0A)
+        consumeLines()
+    }
+
     /// Number of completed main-actor drain turns since construction.
     /// A synchronous burst of `emitForTesting` calls must advance this
     /// by exactly one once the drain has run.

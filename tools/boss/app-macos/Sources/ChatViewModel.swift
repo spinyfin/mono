@@ -428,6 +428,12 @@ final class ChatViewModel: ObservableObject {
     /// their shared-list attempt id.
     @Published var engineAttemptDetails: [String: EngineAttemptRow] = [:]
 
+    /// Detail-fetch errors keyed by the selected shared-list attempt id.
+    @Published var engineAttemptDetailErrors: [String: String] = [:]
+
+    /// The source-specific detail request currently awaiting an engine reply.
+    var engineAttemptDetailRequestID: String?
+
     /// PR URLs whose most recent CI-remediation attempt succeeded,
     /// with the wall-clock timestamp the engine reported (or the local
     /// observation time as a fallback). Drives the `"✅ ci auto-fixed"`

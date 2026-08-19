@@ -381,7 +381,6 @@ extension EngineClient {
     func parseBackgroundWorkItem(_ payload: [String: Any]) -> BackgroundWorkItem? {
         guard let id = payload["id"] as? String,
               let kindRaw = payload["kind"] as? String,
-              let kind = BackgroundWorkKind(rawValue: kindRaw),
               let phase = payload["phase"] as? String,
               let productID = payload["product_id"] as? String,
               let sourceID = payload["source_id"] as? String,
@@ -391,7 +390,7 @@ extension EngineClient {
         }
         return BackgroundWorkItem(
             id: id,
-            kind: kind,
+            kind: BackgroundWorkKind(rawValue: kindRaw),
             phase: phase,
             productID: productID,
             sourceID: sourceID,

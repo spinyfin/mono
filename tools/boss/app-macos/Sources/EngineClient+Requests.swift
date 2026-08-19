@@ -1158,19 +1158,10 @@ extension EngineClient {
     /// have no source-specific get endpoint yet, so their shared list fields
     /// remain the complete available detail.
     func sendGetEngineAttemptDetail(_ attempt: EngineAttemptListEntry) {
-        switch attempt.kind {
-        case "conflict":
-            sendLine([
-                "type": "get_conflict_resolution",
-                "attempt_id": attempt.id,
-            ])
-        case "ci":
-            sendLine([
-                "type": "get_ci_remediation",
-                "attempt_id": attempt.id,
-            ])
-        default:
-            break
-        }
+        guard let requestType = attempt.detailRequestType else { return }
+        sendLine([
+            "type": requestType,
+            "attempt_id": attempt.id,
+        ])
     }
 }

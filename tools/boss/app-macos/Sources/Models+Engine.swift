@@ -9,7 +9,7 @@ import Foundation
 
 /// Shared fields from the engine's unified attempt list. The list stays
 /// intentionally shallow; Activity requests the source-specific record only
-/// after the operator selects a row.
+/// once a row is selected.
 struct EngineAttemptListEntry: Identifiable, Hashable {
     let id: String
     let productID: String
@@ -37,16 +37,34 @@ struct EngineAttemptListEntry: Identifiable, Hashable {
         }
     }
 
+    var detailRequestType: String? {
+        switch kind {
+        case "conflict": return "get_conflict_resolution"
+        case "ci": return "get_ci_remediation"
+        default: return nil
+        }
+    }
+
     var hasKindSpecificDetail: Bool {
-        kind == "conflict" || kind == "ci"
+        detailRequestType != nil
     }
 }
 
 /// The engine-owned sources that can surface in the toolbar's background-work
-/// snapshot. A closed enum keeps a new source visible at compile time.
-enum BackgroundWorkKind: String, Hashable {
-    case projectPlanner = "project_planner"
-    case conflictRemediation = "conflict_remediation"
+/// snapshot. Unknown source values remain visible so the toolbar count stays
+/// faithful to the engine's snapshot.
+enum BackgroundWorkKind: Hashable {
+    case projectPlanner
+    case conflictRemediation
+    case unknown(String)
+
+    init(rawValue: String) {
+        switch rawValue {
+        case "project_planner": self = .projectPlanner
+        case "conflict_remediation": self = .conflictRemediation
+        default: self = .unknown(rawValue)
+        }
+    }
 }
 
 /// One engine-authored item in the background-work snapshot returned alongside
@@ -66,85 +84,10 @@ struct BackgroundWorkItem: Identifiable, Hashable {
 /// Source-specific detail for a selected unified attempt row. The list itself
 /// uses `EngineAttemptListEntry`; this enum is populated only by a selected
 /// row's kind-specific get request.
-enum EngineAttemptRow: Identifiable, Hashable {
+enum EngineAttemptRow: Hashable {
     case conflictResolution(WorkConflictResolution)
     case ciRemediation(WorkCiRemediation)
 
-    var id: String {
-        switch self {
-        case .conflictResolution(let r):
-            return "crz:\(r.id)"
-        case .ciRemediation(let r):
-            return "cir:\(r.id)"
-        }
-    }
-
-    var kindLabel: String {
-        switch self {
-        case .conflictResolution:
-            return "Conflict"
-        case .ciRemediation(let r):
-            switch r.attemptKind {
-            case "fix": return "CI fix"
-            case "retrigger": return "CI retrigger"
-            default: return "CI"
-            }
-        }
-    }
-
-    var status: String {
-        switch self {
-        case .conflictResolution(let r):
-            return r.status
-        case .ciRemediation(let r):
-            return r.status
-        }
-    }
-
-    var prURL: String {
-        switch self {
-        case .conflictResolution(let r):
-            return r.prURL
-        case .ciRemediation(let r):
-            return r.prURL
-        }
-    }
-
-    var workItemID: String {
-        switch self {
-        case .conflictResolution(let r):
-            return r.workItemID
-        case .ciRemediation(let r):
-            return r.workItemID
-        }
-    }
-
-    var createdAt: String {
-        switch self {
-        case .conflictResolution(let r):
-            return r.createdAt
-        case .ciRemediation(let r):
-            return r.createdAt
-        }
-    }
-
-    var finishedAt: String? {
-        switch self {
-        case .conflictResolution(let r):
-            return r.finishedAt
-        case .ciRemediation(let r):
-            return r.finishedAt
-        }
-    }
-
-    var failureReason: String? {
-        switch self {
-        case .conflictResolution(let r):
-            return r.failureReason
-        case .ciRemediation(let r):
-            return r.failureReason
-        }
-    }
 }
 
 /// Snapshot of one per-installation setting, decoded from a

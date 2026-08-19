@@ -206,6 +206,9 @@ extension ChatViewModel {
     /// Unknown future kinds remain inspectable through their shared list
     /// fields until the engine exposes a matching detail endpoint.
     func fetchEngineAttemptDetail(_ attempt: EngineAttemptListEntry) {
+        guard attempt.detailRequestType != nil else { return }
+        engineAttemptDetailErrors.removeValue(forKey: attempt.id)
+        engineAttemptDetailRequestID = attempt.id
         engine.sendGetEngineAttemptDetail(attempt)
     }
 

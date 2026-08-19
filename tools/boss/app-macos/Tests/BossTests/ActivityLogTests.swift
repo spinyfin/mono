@@ -74,6 +74,37 @@ final class ActivityLogDecoderTests: XCTestCase {
         XCTAssertEqual(backgroundWork?.sourceID, "crz_123")
     }
 
+    func testRetainsUnknownBackgroundWorkKind() {
+        let backgroundWork = makeClient().parseBackgroundWorkItem([
+            "id": "future_worker:source_1",
+            "kind": "future_worker",
+            "phase": "Working",
+            "product_id": "prod_123",
+            "source_id": "source_1",
+            "title": "Future work",
+        ])
+
+        XCTAssertEqual(backgroundWork?.kind, .unknown("future_worker"))
+    }
+
+    func testDecodesEngineAttemptsListEnvelopeWithoutBackgroundWork() {
+        let client = makeClient()
+        let received = expectation(description: "engine attempts list")
+        client.onEvent = { event in
+            guard case .engineAttemptsList(let attempts, let backgroundWork) = event else {
+                XCTFail("expected engine attempts list event")
+                return
+            }
+            XCTAssertEqual(attempts.map(\.id), ["cir_123"])
+            XCTAssertTrue(backgroundWork.isEmpty)
+            received.fulfill()
+        }
+
+        client.consumeLineForTesting(#"{"request_id":"test","payload":{"type":"engine_attempts_list","attempts":[{"id":"cir_123","product_id":"prod_123","created_at":"2026-08-19T12:00:00Z","extra":{},"kind":"ci","pr_url":"https://github.com/example/repo/pull/42","status":"running"}]}}"#)
+
+        wait(for: [received], timeout: 1)
+    }
+
     func testParsesConflictMechanicalRung() {
         let resolution = makeClient().parseConflictResolution([
             "id": "crz_123",
@@ -89,6 +120,95 @@ final class ActivityLogDecoderTests: XCTestCase {
         ])
 
         XCTAssertEqual(resolution?.mechanicalRungInFlight, 1)
+    }
+}
+
+@MainActor
+final class ActivityAttemptDetailTests: XCTestCase {
+    func testListAndDetailEventsShareAttemptIDs() {
+        let model = makeModel()
+        let conflict = makeAttempt(id: "crz_1", kind: "conflict")
+        let ci = makeAttempt(id: "cir_1", kind: "ci")
+
+        model.applyEventForTest(.engineAttemptsList(attempts: [conflict, ci], backgroundWork: []))
+        model.applyEventForTest(.conflictResolution(attempt: makeConflictResolution(id: conflict.id)))
+        model.applyEventForTest(.ciRemediation(attempt: makeCiRemediation(id: ci.id)))
+
+        guard case .conflictResolution? = model.engineAttemptDetails[conflict.id] else {
+            return XCTFail("conflict detail must be keyed by its list id")
+        }
+        guard case .ciRemediation? = model.engineAttemptDetails[ci.id] else {
+            return XCTFail("CI detail must be keyed by its list id")
+        }
+    }
+
+    func testDetailRequestRoutesOnlyDetailCapableKinds() {
+        let client = EngineClient(socketPath: "/tmp/boss-activity-test-\(UUID().uuidString).sock")
+        var payloads: [[String: Any]] = []
+        client.outboundRecorder = { payload in payloads.append(payload) }
+
+        client.sendGetEngineAttemptDetail(makeAttempt(id: "crz_1", kind: "conflict"))
+        client.sendGetEngineAttemptDetail(makeAttempt(id: "cir_1", kind: "ci"))
+        client.sendGetEngineAttemptDetail(makeAttempt(id: "rbz_1", kind: "rebase"))
+
+        XCTAssertEqual(payloads.map { $0["type"] as? String }, [
+            "get_conflict_resolution",
+            "get_ci_remediation",
+        ])
+        XCTAssertEqual(payloads.map { $0["attempt_id"] as? String }, ["crz_1", "cir_1"])
+    }
+
+    func testDetailWorkErrorIsStoredForTheInFlightAttempt() {
+        let model = makeModel()
+        model.engineAttemptDetailRequestID = "crz_missing"
+
+        model.applyEventForTest(.workError(message: "attempt is unknown"))
+
+        XCTAssertEqual(model.engineAttemptDetailErrors["crz_missing"], "attempt is unknown")
+        XCTAssertNil(model.engineAttemptDetailRequestID)
+    }
+
+    private func makeModel() -> ChatViewModel {
+        ChatViewModel(socketPath: "/tmp/boss-activity-test-\(UUID().uuidString).sock")
+    }
+
+    private func makeAttempt(id: String, kind: String) -> EngineAttemptListEntry {
+        EngineAttemptListEntry(
+            id: id,
+            productID: "prod_1",
+            createdAt: "2026-08-19T12:00:00Z",
+            extra: [:],
+            kind: kind,
+            prURL: "https://github.com/example/repo/pull/42",
+            status: "running",
+            failureReason: nil,
+            finishedAt: nil,
+            startedAt: nil,
+            workItemID: "task_1"
+        )
+    }
+
+    private func makeConflictResolution(id: String) -> WorkConflictResolution {
+        WorkConflictResolution(
+            id: id, productID: "prod_1", workItemID: "task_1",
+            prURL: "https://github.com/example/repo/pull/42", prNumber: 42,
+            headBranch: "feature/test", baseBranch: "main", baseSHAAtTrigger: "abc",
+            headSHABefore: nil, headSHAAfter: nil, status: "running", failureReason: nil,
+            cubeLeaseID: nil, cubeWorkspaceID: nil, workerID: nil, conflictDiagnosis: nil,
+            createdAt: "2026-08-19T12:00:00Z", startedAt: nil, finishedAt: nil
+        )
+    }
+
+    private func makeCiRemediation(id: String) -> WorkCiRemediation {
+        WorkCiRemediation(
+            id: id, productID: "prod_1", workItemID: "task_1",
+            prURL: "https://github.com/example/repo/pull/42", prNumber: 42,
+            headBranch: "feature/test", headSHAAtTrigger: "abc", headSHAAfter: nil,
+            attemptKind: "fix", consumesBudget: 1, failedChecks: "[]", triageClass: nil,
+            logExcerpt: nil, status: "running", failureReason: nil, cubeLeaseID: nil,
+            cubeWorkspaceID: nil, workerID: nil, createdAt: "2026-08-19T12:00:00Z",
+            startedAt: nil, finishedAt: nil
+        )
     }
 }
 

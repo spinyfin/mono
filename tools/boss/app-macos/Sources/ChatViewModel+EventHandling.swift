@@ -178,6 +178,10 @@ extension ChatViewModel {
                 scheduleWorkTreeRefetch(productID: productID, flow: .itemRefetch)
             }
         case .workError(let message):
+            if let attemptID = engineAttemptDetailRequestID {
+                engineAttemptDetailErrors[attemptID] = message
+                engineAttemptDetailRequestID = nil
+            }
             // Allow the user to retry any in-flight review terminal or
             // merge-when-ready request that failed.
             if case .loading = editorialEvaluationState {
@@ -407,8 +411,16 @@ extension ChatViewModel {
             self.backgroundWork = backgroundWork
         case .conflictResolution(let attempt):
             engineAttemptDetails[attempt.id] = .conflictResolution(attempt)
+            engineAttemptDetailErrors.removeValue(forKey: attempt.id)
+            if engineAttemptDetailRequestID == attempt.id {
+                engineAttemptDetailRequestID = nil
+            }
         case .ciRemediation(let attempt):
             engineAttemptDetails[attempt.id] = .ciRemediation(attempt)
+            engineAttemptDetailErrors.removeValue(forKey: attempt.id)
+            if engineAttemptDetailRequestID == attempt.id {
+                engineAttemptDetailRequestID = nil
+            }
         case .ciRemediationStarted(_, _, _, let prURL, _):
             // A fresh CI attempt was created (detect path or `retry`).
             // The card stays in `blocked: ci_failure` — the in-flight
