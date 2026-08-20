@@ -14,13 +14,28 @@ private let designDocTimingLog = Logger(subsystem: "com.boss.app", category: "De
 /// inside the wider column. A pure function of the source text — no view
 /// state, no layout feedback — so widening never triggers a relayout loop.
 enum MarkdownDocumentMeasure {
-    /// The prose reading measure, matched by `BossMarkdownStyle`'s per-block
-    /// clamp so paragraphs stay this width even inside `wide` documents.
-    /// At the 1.12× editorial body size, the 0.5em average-character-width
-    /// heuristic yields about 65 characters per line (620 / 9.52 = 65.1).
-    static let readable: CGFloat = 620
+    /// The outer bound on the *padded* document column (see
+    /// `MarkdownDocumentColumn.body`, `MarkdownDocumentLayout.horizontalPadding`)
+    /// in a prose-only document. The actual glyph-rendering width is
+    /// `proseContent`, this value minus the 80pt of horizontal padding, not
+    /// this raw constant — see `proseContent` for the per-character math.
+    static let readable: CGFloat = 720
     /// The document column width once a table is present.
     static let wide: CGFloat = 1440
+    /// The actual glyph-rendering width prose gets: `readable` minus the
+    /// padding that sits inside the outer `.frame(maxWidth:)`. Matched by
+    /// `BossMarkdownStyle`'s per-block clamp so paragraphs stay this width
+    /// even inside `wide` documents, where the outer column widens for a
+    /// table and `readable` itself would no longer bound anything. This,
+    /// not `readable`, is what must be passed to the per-block prose clamp
+    /// (`markdownProseMeasure`) and to the header/divider frames, since
+    /// those bound content directly rather than a padded column. Measured
+    /// against the sans editorial body (`MarkdownEditorialMetrics.bodyScale`
+    /// × the 17pt system body, i.e. 19.04pt) with `NSAttributedString.size()`
+    /// over real technical-prose sentences: ~8.64pt/character, so the padded
+    /// column yields about 74 characters per line, at the top of the 65-75
+    /// reading-measure target.
+    static let proseContent: CGFloat = readable - 2 * MarkdownDocumentLayout.horizontalPadding
 
     static func forSource(_ source: String) -> CGFloat {
         containsTable(source) ? wide : readable
@@ -284,12 +299,12 @@ private struct MarkdownDocumentColumn: View {
                     // document column's left edge.
                     header
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .frame(maxWidth: MarkdownDocumentMeasure.readable)
+                        .frame(maxWidth: MarkdownDocumentMeasure.proseContent)
                         .frame(maxWidth: .infinity, alignment: .center)
                     Divider()
                         .overlay(BossMarkdownPalette.hairline)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .frame(maxWidth: MarkdownDocumentMeasure.readable)
+                        .frame(maxWidth: MarkdownDocumentMeasure.proseContent)
                         .frame(maxWidth: .infinity, alignment: .center)
                     documentBody
                 }
@@ -442,7 +457,7 @@ private struct MarkdownDocumentColumn: View {
             // Scoped to this document body only — the transcript viewer,
             // comment sidebar, and release notes all call `.bossMarkdown()`
             // bare and must keep rendering prose at its natural width.
-            .environment(\.markdownProseMeasure, MarkdownDocumentMeasure.readable)
+            .environment(\.markdownProseMeasure, MarkdownDocumentMeasure.proseContent)
             .environment(\.markdownEditorialStyle, true)
             .frame(maxWidth: .infinity, alignment: .leading)
             // Force StructuredText recreation when highlight state changes so
