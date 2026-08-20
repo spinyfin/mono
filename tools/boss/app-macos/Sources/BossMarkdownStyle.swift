@@ -331,13 +331,10 @@ struct BossParagraphStyle: StructuredText.ParagraphStyle {
                 .foregroundStyle(BossMarkdownPalette.ink)
                 // SwiftUI `lineSpacing` is extra leading on top of the font's
                 // own natural line box. Measured via NSFont at the enlarged
-                // editorial body size (19.04pt): the system sans's natural
-                // box is ~1.178em (vs. New York's ~1.193em when this was
-                // serif), so it needs *more* fontScaled leading than before
-                // to land in the same place — 0.47em on top of the 1.178em
-                // natural box yields ~1.65em effective line height, the top
-                // of the 1.6–1.65 reference range (was ~1.64em on the serif
-                // body at 0.45em extra leading).
+                // editorial body size (19.04pt), the system sans's natural
+                // box is ~1.178em, so 0.47em of additional fontScaled leading
+                // yields an effective line height of ~1.65em — the top of
+                // the 1.6–1.65 reference range.
                 .textual.lineSpacing(.fontScaled(0.47))
                 .textual.blockSpacing(.fontScaled(top: 0, bottom: 1))
                 .proseMeasureClamped()
