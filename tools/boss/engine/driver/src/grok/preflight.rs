@@ -3,7 +3,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, bail};
 
@@ -145,8 +145,7 @@ fn run_worker_preflight_with(
     workspace: &Path,
     environment: &GrokProcessEnvironment,
 ) -> anyhow::Result<()> {
-    let grok = runner.run("grok", &["models"], workspace, environment)?;
-    assert_grok_oauth(&grok)?;
+    assert_grok_oauth_with_reprobe(runner, workspace, environment)?;
 
     let workspace_arg = workspace.display().to_string();
     let cube = runner.run(
@@ -218,6 +217,55 @@ fn assert_session_store_writable(
         );
     }
     Ok(())
+}
+
+/// Cheap, content-blind snapshot of the shared OAuth credential's on-disk
+/// state, used to detect whether a refresh rewrote the file during the
+/// probe. Never reads the credential bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AuthFingerprint {
+    modified: SystemTime,
+    len: u64,
+}
+
+fn fingerprint_auth_credential(auth_path: &Path) -> Option<AuthFingerprint> {
+    let metadata = std::fs::metadata(auth_path).ok()?;
+    let modified = metadata.modified().ok()?;
+    Some(AuthFingerprint {
+        modified,
+        len: metadata.len(),
+    })
+}
+
+/// Run the Grok OAuth probe and assert its affirmation, tolerating exactly
+/// one race: the probe's own invocation of `grok models` can refresh an
+/// expired-but-refreshable shared token as a side effect, so that first run
+/// renders its authentication banner from the pre-refresh state even though
+/// the credential is valid by the time the process exits. Detected by
+/// fingerprinting the credential file before and after the probe — never by
+/// assuming a failure implies a refresh — and bounded to a single re-probe:
+/// no observed rewrite means no retry, so a genuine logout or an expired
+/// refresh token still fails on the first assertion, exactly as before.
+fn assert_grok_oauth_with_reprobe(
+    runner: &dyn PreflightRunner,
+    workspace: &Path,
+    environment: &GrokProcessEnvironment,
+) -> anyhow::Result<()> {
+    let before = fingerprint_auth_credential(environment.auth_path());
+    let output = runner.run("grok", &["models"], workspace, environment)?;
+    if assert_grok_oauth(&output).is_ok() {
+        return Ok(());
+    }
+    let after = fingerprint_auth_credential(environment.auth_path());
+    if before.is_none() || before == after {
+        return assert_grok_oauth(&output);
+    }
+    tracing::info!(
+        auth_path = %environment.auth_path().display(),
+        "Grok OAuth credential was rewritten during the preflight probe (likely an expiry refresh); re-probing once"
+    );
+    let output = runner.run("grok", &["models"], workspace, environment)?;
+    assert_grok_oauth(&output)
 }
 
 fn assert_grok_oauth(output: &PreflightOutput) -> anyhow::Result<()> {
@@ -446,6 +494,119 @@ mod tests {
         let output = success("You are not authenticated.\nDefault model: grok-4.6\n");
         let error = assert_grok_oauth(&output).unwrap_err().to_string();
         assert!(error.contains("Grok OAuth is unavailable"), "{error}");
+    }
+
+    /// Simulates `grok models`: each queued response is optionally paired
+    /// with a rewrite of the on-disk credential, standing in for the CLI's
+    /// own OAuth refresh side effect during the probe.
+    struct GrokReprobeRunner {
+        auth_path: PathBuf,
+        responses: RefCell<VecDeque<(PreflightOutput, bool)>>,
+        calls: RefCell<u32>,
+    }
+
+    impl GrokReprobeRunner {
+        fn new(auth_path: PathBuf, responses: Vec<(PreflightOutput, bool)>) -> Self {
+            Self {
+                auth_path,
+                responses: RefCell::new(responses.into()),
+                calls: RefCell::new(0),
+            }
+        }
+    }
+
+    impl PreflightRunner for GrokReprobeRunner {
+        fn run(
+            &self,
+            program: &str,
+            _args: &[&str],
+            _workspace: &Path,
+            _environment: &GrokProcessEnvironment,
+        ) -> anyhow::Result<PreflightOutput> {
+            assert_eq!(program, "grok");
+            let mut calls = self.calls.borrow_mut();
+            *calls += 1;
+            let (output, rewrite) = self
+                .responses
+                .borrow_mut()
+                .pop_front()
+                .expect("no fake grok response queued");
+            if rewrite {
+                // Length grows with the call count so the fingerprint's size
+                // check can't be flaked by same-second mtime resolution.
+                std::fs::write(&self.auth_path, "x".repeat(*calls as usize * 16)).unwrap();
+            }
+            Ok(output)
+        }
+    }
+
+    fn environment_with_auth_path(auth_path: PathBuf) -> GrokProcessEnvironment {
+        GrokProcessEnvironment::for_test_with_auth_path(auth_path)
+    }
+
+    /// The scenario this fix exists for: the probe's own side effect
+    /// refreshes an expired-but-refreshable token underneath it, so the
+    /// first run reports pre-refresh state. A rewrite observed via the
+    /// on-disk fingerprint earns exactly one re-probe, and that re-probe's
+    /// affirmation is what the preflight trusts.
+    #[test]
+    fn reprobe_succeeds_after_evidenced_refresh() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth_path = tmp.path().join("auth.json");
+        std::fs::write(&auth_path, "seed").unwrap();
+        let runner = GrokReprobeRunner::new(
+            auth_path.clone(),
+            vec![
+                (success("You are not authenticated.\nDefault model: grok-4.6\n"), true),
+                (success("You are logged in with grok.com.\n"), false),
+            ],
+        );
+
+        let environment = environment_with_auth_path(auth_path);
+        assert_grok_oauth_with_reprobe(&runner, Path::new("/workspace"), &environment).unwrap();
+        assert_eq!(*runner.calls.borrow(), 2);
+    }
+
+    /// A genuine logout, revoked credential, or expired refresh token
+    /// rewrites nothing. No evidenced refresh means no retry: this must fail
+    /// exactly as it did before the fix, on the first probe alone.
+    #[test]
+    fn no_reprobe_when_credential_unchanged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth_path = tmp.path().join("auth.json");
+        std::fs::write(&auth_path, "seed").unwrap();
+        let runner = GrokReprobeRunner::new(
+            auth_path.clone(),
+            vec![(success("You are not authenticated.\nDefault model: grok-4.6\n"), false)],
+        );
+
+        let environment = environment_with_auth_path(auth_path);
+        let error = assert_grok_oauth_with_reprobe(&runner, Path::new("/workspace"), &environment)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Grok OAuth is unavailable"), "{error}");
+        assert_eq!(
+            *runner.calls.borrow(),
+            1,
+            "must not re-probe without an evidenced rewrite"
+        );
+    }
+
+    /// The common case: a healthy credential affirms on the first probe, so
+    /// no fingerprint comparison or re-probe is needed at all.
+    #[test]
+    fn healthy_credential_probes_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth_path = tmp.path().join("auth.json");
+        std::fs::write(&auth_path, "seed").unwrap();
+        let runner = GrokReprobeRunner::new(
+            auth_path.clone(),
+            vec![(success("You are logged in with grok.com.\n"), false)],
+        );
+
+        let environment = environment_with_auth_path(auth_path);
+        assert_grok_oauth_with_reprobe(&runner, Path::new("/workspace"), &environment).unwrap();
+        assert_eq!(*runner.calls.borrow(), 1);
     }
 
     #[test]
