@@ -580,9 +580,13 @@ struct ServerState {
     /// `request_coordinator_attachment` so the coordinator supervisor's
     /// healthy-but-unattached retry loop (a flat 10s interval, see
     /// `app/server.rs`) does not shell out to `claude --version` on every
-    /// pass while an app keeps failing to attach. Invalidated implicitly:
-    /// a stored entry is only reused when its token still matches the
-    /// current coordinator record's `spawn_token`.
+    /// pass while an app keeps failing to attach. A stored entry is only
+    /// reused when its token still matches the current coordinator
+    /// record's `spawn_token`, *and* `attach_coordinator_to_registered_app`
+    /// clears this outright on every genuine app attach (launch, relaunch,
+    /// reconnect), so a `claude` upgrade installed after the cache was
+    /// populated is still observed on the next attach rather than only on
+    /// coordinator recreation or engine restart.
     #[builder(default)]
     coordinator_installed_version_cache: CoordinatorInstalledVersionCache,
     /// Per-slot trigger fan-in for the live-status summarizer. Started

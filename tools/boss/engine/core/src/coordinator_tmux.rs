@@ -707,8 +707,7 @@ mod tests {
     }
 
     /// Test double for [`ClaudeVersionProbe`] that never spawns a real
-    /// process, keeping every test in this module hermetic (see the
-    /// "hard-wired version probe" review finding on PR spinyfin/mono#2801).
+    /// process, keeping every test in this module hermetic.
     struct NoneProbe;
 
     #[async_trait::async_trait]
@@ -1003,8 +1002,30 @@ mod tests {
 
     // --- operator-confirmed reset (`recreate_after_confirmation`) ---
 
+    /// Drop guard that clears `AUDIT_PATH_ENV` even if the test body panics
+    /// on an assertion, so a failure here can't leak the env override into
+    /// every later test in this binary.
+    struct AuditPathEnvGuard;
+
+    impl Drop for AuditPathEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var(audit::AUDIT_PATH_ENV);
+            }
+        }
+    }
+
+    // The default `#[tokio::test]` flavor is single-threaded (`current_thread`),
+    // so holding this std `Mutex` across the `recreate_after_confirmation` await
+    // below cannot deadlock or block a sibling worker thread here; it is exactly
+    // what serializes this test against the other `AUDIT_PATH_ENV`/`AUDIT_PATH`
+    // mutators in this binary for the whole operation, not just the `set_var`
+    // call, which is the point (see `audit::lock_audit_globals_for_tests`'s docs).
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn operator_reset_kills_old_session_and_creates_a_fresh_one() {
+        let _audit_globals = audit::lock_audit_globals_for_tests();
+
         let (db, tmux, server, dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
         db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus", None)
             .unwrap();
@@ -1013,11 +1034,14 @@ mod tests {
         let audit_dir = tempfile::tempdir().unwrap();
         let audit_path = audit_dir.path().join("engine-audit.log");
         let audit_already_resolved = audit::path_already_resolved_for_tests();
-        if !audit_already_resolved {
+        let _env_guard = if audit_already_resolved {
+            None
+        } else {
             unsafe {
                 std::env::set_var(audit::AUDIT_PATH_ENV, &audit_path);
             }
-        }
+            Some(AuditPathEnvGuard)
+        };
 
         let record = recreate_after_confirmation(
             &db,
@@ -1061,9 +1085,6 @@ mod tests {
             assert_eq!(last["event"], "coordinator_recreate");
             assert_eq!(last["outcome"], "success");
             assert_eq!(last["reason"], "operator_reset");
-            unsafe {
-                std::env::remove_var(audit::AUDIT_PATH_ENV);
-            }
         }
     }
 
