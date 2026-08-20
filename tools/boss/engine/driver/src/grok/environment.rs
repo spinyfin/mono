@@ -106,6 +106,13 @@ impl GrokProcessEnvironment {
         &self.grok_home
     }
 
+    /// Path of the shared OAuth credential this environment points Grok at.
+    /// Preflight uses it to fingerprint the credential's on-disk state around
+    /// the OAuth probe, to detect an in-probe refresh.
+    pub fn auth_path(&self) -> &Path {
+        &self.auth_path
+    }
+
     /// Wait for Grok's `auth.json.lock` pidfile to clear, then verify the
     /// credential is a non-empty JSON object before probing it.
     ///
@@ -286,6 +293,14 @@ impl GrokProcessEnvironment {
             "TEST_TMPDIR",
         ] {
             command.env_remove(key);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test_with_auth_path(auth_path: PathBuf) -> Self {
+        Self {
+            auth_path,
+            ..Self::for_test()
         }
     }
 
