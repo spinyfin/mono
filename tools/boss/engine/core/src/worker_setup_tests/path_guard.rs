@@ -89,6 +89,7 @@ fn write_workspace_files_writes_path_guard_script_outside_workspace() {
         execution_kind: "chore_implementation".into(),
         task_kind: Some("chore".into()),
         worker_kind: WorkerKind::Standard,
+        automation_outcome_proposals_seam_enabled: false,
     };
     write_workspace_files(&input, &ClaudeDriver).unwrap();
 

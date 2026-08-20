@@ -652,6 +652,13 @@ impl ExecutionRunner for PaneSpawnRunner {
         // follow-ups seam migration must move together.
         let followup_proposals_seam_enabled = self.feature_flags.is_enabled("worker_proposals")
             && self.feature_flags.is_enabled("followup_proposals_seam");
+        // Mirrors `worker_signal_proposals_seam_enabled` above — see
+        // `WorkerSpawnOpts::automation_outcome_proposals_seam_enabled`'s doc:
+        // this same value also gates the triage worker's CLAUDE.md via
+        // `StartWorkerInput` below, so the preamble and CLAUDE.md never
+        // disagree about which decision-declaration mechanism is live.
+        let automation_outcome_proposals_seam_enabled = self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("automation_outcome_proposals_seam");
         let ComposedWorkerSpawn {
             prompt_text,
             spawn_config,
@@ -668,6 +675,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 worker_signal_proposals_seam_enabled,
                 deferred_scope_proposals_seam_enabled,
                 followup_proposals_seam_enabled,
+                automation_outcome_proposals_seam_enabled,
             },
         )
         .await
@@ -1015,6 +1023,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 // wiring and live-state capability flags use it too.
                 driver: driver.clone(),
                 tmux_host,
+                automation_outcome_proposals_seam_enabled,
             },
             StdDuration::from_secs(30),
         )

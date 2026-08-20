@@ -32,6 +32,12 @@ impl PureRebaseGateOutcome {
     }
 }
 
+/// `(outcome, produced_task_id, detail)` — the triple both
+/// [`WorkerCompletionHandler::automation_outcome_from_proposal`] and
+/// [`WorkerCompletionHandler::legacy_automation_triage_decision`] produce for
+/// [`WorkerCompletionHandler::finalize_automation_triage`] to record.
+type AutomationTriageDecision = (&'static str, Option<String>, Option<String>);
+
 impl WorkerCompletionHandler {
     /// Common Fresh/Merged transition path shared by `on_stop_inner`
     /// and `recheck_for_pr`. Records the completion, releases the
@@ -56,8 +62,269 @@ impl WorkerCompletionHandler {
     ///    `failed_will_retry` for a missing / ambiguous / unverifiable
     ///    decision);
     /// 4. finalise the execution (`completed`) and release pane + workspace.
+    ///
+    /// Design implementation task 11
+    /// (`worker-proposal-api-replace-fragile-worker-to-engine-seams.md` —
+    /// the automation-triage-outcome seam migration, the worst-failing seam
+    /// in the design's inventory: a measurement of 67 consecutive
+    /// `produced_task` finalizations found none decided by a valid marker):
+    /// when `automation_outcome_proposals_seam` is on (composed with the
+    /// `worker_proposals` master flag), this reads the execution's
+    /// `automation_outcome` worker-proposal row FIRST, via
+    /// [`Self::automation_outcome_from_proposal`] — task 6's applier
+    /// (`crate::work::proposal_apply::apply_automation_outcome`) already
+    /// decided it synchronously and provenance-checked at submission time, so
+    /// this never re-derives or re-guesses the decision, and a
+    /// `produced_task` proposal rejected for a provenance mismatch finalizes
+    /// `failed_will_retry` via that rejection rather than falling through to
+    /// the open-task guess below. Only when no `automation_outcome` proposal
+    /// exists does the legacy marker-parse + recovery-heuristic chain below
+    /// still run, counted via `AUTOMATION_OUTCOME_FALLBACK_HIT` and
+    /// WARN-logged — this seam's explicit exit criterion. Flag off
+    /// reproduces the legacy-only behavior exactly.
     pub(super) async fn finalize_automation_triage(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
         let automation_id = execution.work_item_id.clone();
+
+        let automation_outcome_proposals_first = self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("automation_outcome_proposals_seam");
+        let (from_proposal, proposal_row_existed) = if automation_outcome_proposals_first {
+            self.automation_outcome_from_proposal(&execution.id)
+        } else {
+            (None, false)
+        };
+        let used_proposal = from_proposal.is_some();
+
+        let (outcome, produced_task_id, detail): (&str, Option<String>, Option<String>) = match from_proposal {
+            Some(resolved) => resolved,
+            None => self.legacy_automation_triage_decision(execution, &automation_id).await,
+        };
+
+        match self.work_db.finalize_automation_triage_run(
+            &execution.id,
+            outcome,
+            produced_task_id.as_deref(),
+            detail.as_deref(),
+        ) {
+            Ok(true) => {
+                if automation_outcome_proposals_first && !used_proposal {
+                    self.record_automation_outcome_fallback_hit(
+                        execution,
+                        detail.as_deref().unwrap_or(""),
+                        proposal_row_existed,
+                    );
+                }
+            }
+            Ok(false) => tracing::warn!(
+                execution_id = %execution.id,
+                automation_id = %automation_id,
+                "no automation_runs row matched this triage execution; outcome not recorded",
+            ),
+            Err(err) => tracing::error!(
+                execution_id = %execution.id,
+                ?err,
+                "failed to finalise automation_runs row for triage execution",
+            ),
+        }
+
+        // The decision has been consumed and recorded; reap the artifact so a
+        // re-fired automation reusing this execution id can never read a stale
+        // one.
+        crate::structured_output::clear_all(&self.structured_output_dir, &execution.id);
+
+        // Finalise the execution + release pane and cube workspace, mirroring
+        // the PR-completion finalizer's release order. Capture the lease id
+        // before `complete_pane_parked_execution` nulls the lease columns.
+        //
+        // This unconditionally drives the execution to `completed` — it does
+        // NOT depend on there being a still-`active` work_runs row, because
+        // `PaneSpawnRunner` already closed that row out at spawn-confirm time
+        // (see `complete_pane_parked_execution`'s doc). Looping over
+        // `active_run_ids_for_execution` here (as this used to) found nothing
+        // in the common single-turn case, silently leaving the execution
+        // stuck `waiting_human` — which is exactly what let the pane-death
+        // sweep re-finalize an already-finalized triage run later with a
+        // misleading pane-died detail.
+        let lease_id = execution.cube_lease_id.clone();
+        let workspace_path = execution.workspace_path.clone();
+        // Marked before the terminalizing write — see `super::teardown`.
+        // `AutomationTriage` is one of the two kinds `terminal_work_sweep`
+        // reaps on execution terminality alone (it can never resolve their
+        // work-item ids), so this path is if anything MORE exposed to the
+        // race than the PR-completion one.
+        let teardown = self.begin_teardown(&execution.id);
+        match self.work_db.complete_pane_parked_execution(
+            &execution.id,
+            "completed",
+            Some(&format!("automation triage: {outcome}")),
+        ) {
+            Ok(Some(_)) => {}
+            Ok(None) => tracing::debug!(
+                execution_id = %execution.id,
+                "automation triage finalise: execution already terminal; nothing to do",
+            ),
+            Err(err) => tracing::error!(
+                execution_id = %execution.id,
+                ?err,
+                "failed to finalise triage execution row",
+            ),
+        }
+        self.finish_worker_teardown(
+            &execution.id,
+            lease_id.as_deref(),
+            workspace_path.as_deref().map(std::path::Path::new),
+            "automation_triage",
+            teardown,
+        )
+        .await;
+        self.publisher
+            .publish(
+                &execution.id,
+                &automation_id,
+                "completed",
+                "automation_triage_completed",
+            )
+            .await;
+
+        tracing::info!(
+            execution_id = %execution.id,
+            automation_id = %automation_id,
+            outcome,
+            produced_task_id = ?produced_task_id,
+            detail = ?detail,
+            "automation triage finalised",
+        );
+        StopOutcome::AutomationTriage {
+            outcome: outcome.to_owned(),
+        }
+    }
+
+    /// Read `execution`'s `automation_outcome` worker-proposal row and
+    /// translate its already-decided disposition into the
+    /// `(outcome, produced_task_id, detail)` triple
+    /// [`Self::finalize_automation_triage`] records — see that method's doc
+    /// for the design context. Returns `(None, row_existed)` when no operative
+    /// `automation_outcome` proposal is available (the caller then runs the
+    /// legacy marker-parse + recovery-heuristic chain as a counted fallback).
+    /// `row_existed` distinguishes why: `false` when no `automation_outcome`
+    /// proposal row exists for this execution at all (or the DB lookup itself
+    /// errored — fail open to the legacy path rather than silently dropping
+    /// the finalization), `true` when a row exists but was left in an
+    /// unexpected state (`Proposed`/`Superseded`/`Expired`, each already
+    /// WARN-logged below) — [`Self::record_automation_outcome_fallback_hit`]
+    /// uses this so its own WARN doesn't contradict the more specific one
+    /// just logged.
+    ///
+    /// [`crate::work::WorkDb::list_worker_proposals_for_execution`] orders by
+    /// `created_at DESC`, and task 6's applier
+    /// (`crate::work::proposal_apply::apply_automation_outcome`) marks every
+    /// PRIOR undecided/applied `automation_outcome` proposal `superseded` the
+    /// moment a new one applies — so the newest row is always the operative
+    /// one; it is never itself marked `superseded` (only older rows are, as a
+    /// side effect of a later submission). A triage worker that revises its
+    /// outcome mid-run (submits `boss propose automation-outcome` a second
+    /// time) is therefore handled for free: the newest row wins, with no
+    /// special-casing here.
+    fn automation_outcome_from_proposal(&self, execution_id: &str) -> (Option<AutomationTriageDecision>, bool) {
+        let proposals = match self
+            .work_db
+            .list_worker_proposals_for_execution(execution_id, ProposalKind::AutomationOutcome)
+        {
+            Ok(proposals) => proposals,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    ?err,
+                    "automation_outcome_proposals_seam: failed to look up proposals for this \
+                     execution; falling back to the legacy marker parser",
+                );
+                return (None, false);
+            }
+        };
+        let Some(latest) = proposals.first() else {
+            return (None, false);
+        };
+
+        let resolved = match latest.state {
+            ProposalState::Rejected => Some((
+                AUTOMATION_OUTCOME_FAILED_WILL_RETRY,
+                None,
+                Some(format!(
+                    "automation_outcome proposal {} rejected: {}",
+                    latest.id,
+                    latest.decision_reason.as_deref().unwrap_or("no reason recorded"),
+                )),
+            )),
+            ProposalState::Applied => match latest.applied_ref.clone() {
+                Some(task_id) => Some((
+                    AUTOMATION_OUTCOME_PRODUCED_TASK,
+                    Some(task_id.clone()),
+                    Some(format!(
+                        "produced task {task_id} (via automation-outcome proposal {})",
+                        latest.id
+                    )),
+                )),
+                None => {
+                    let reason = serde_json::from_str::<serde_json::Value>(&latest.payload_json)
+                        .ok()
+                        .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_owned))
+                        .unwrap_or_else(|| "no reason given".to_owned());
+                    Some((
+                        AUTOMATION_OUTCOME_SKIPPED,
+                        None,
+                        Some(format!("{reason} (via automation-outcome proposal {})", latest.id)),
+                    ))
+                }
+            },
+            // `AutomationOutcome` auto-applies synchronously at submission
+            // time (see `crate::work::proposal_apply::apply_policy`), so the
+            // newest row should never be `Proposed`/`Superseded` — but fail
+            // safe rather than guess: treat as "no operative proposal" so the
+            // legacy path still runs as a counted fallback. The row DOES
+            // exist here, so the fallback-hit WARN must say so.
+            ProposalState::Proposed | ProposalState::Superseded => {
+                tracing::warn!(
+                    execution_id,
+                    proposal_id = %latest.id,
+                    state = %latest.state,
+                    "automation_outcome_proposals_seam: newest automation_outcome proposal is \
+                     unexpectedly not Applied/Rejected; falling back to the legacy marker parser",
+                );
+                return (None, true);
+            }
+            ProposalState::Expired => {
+                tracing::warn!(
+                    execution_id,
+                    proposal_id = %latest.id,
+                    "automation_outcome_proposals_seam: newest automation_outcome proposal is \
+                     unexpectedly Expired (not an in-flight-only kind); falling back to the \
+                     legacy marker parser",
+                );
+                return (None, true);
+            }
+        };
+
+        (resolved, true)
+    }
+
+    /// The pre-migration marker-parse + recovery-heuristic chain, unchanged
+    /// in behavior: the worker was told to end its final message with
+    /// exactly one of `automation: task <id>` or `automation: skip — <reason>`.
+    /// Steps:
+    /// 1. read the final assistant message and parse the decision;
+    /// 2. for a `task` marker, verify the id resolves to a task carrying this
+    ///    automation's provenance — so a misbehaving agent can't pass off an
+    ///    unrelated task as its own output;
+    /// 3. record the terminal outcome (`produced_task` / `skipped`, or keep
+    ///    `failed_will_retry` for a missing / ambiguous / unverifiable marker).
+    ///
+    /// Called by [`Self::finalize_automation_triage`] either unconditionally
+    /// (seam off) or as the counted fallback (seam on, no `automation_outcome`
+    /// proposal found).
+    async fn legacy_automation_triage_decision(
+        &self,
+        execution: &crate::work::WorkExecution,
+        automation_id: &str,
+    ) -> AutomationTriageDecision {
         // The transcript state is still read (and kept) because the
         // no-decision detail below distinguishes "ran but reported nothing"
         // from "produced no transcript at all" — but it is only the *fallback*
@@ -74,11 +341,11 @@ impl WorkerCompletionHandler {
             final_message,
         );
 
-        let (outcome, produced_task_id, detail): (&str, Option<String>, Option<String>) = match &decision {
+        match &decision {
             TriageDecision::ProducedTask(marker_id) => {
                 match self.work_db.get_work_item_resolving_short_id(marker_id) {
                     Ok(Some(WorkItem::Task(t))) | Ok(Some(WorkItem::Chore(t)))
-                        if t.source_automation_id.as_deref() == Some(automation_id.as_str()) =>
+                        if t.source_automation_id.as_deref() == Some(automation_id) =>
                     {
                         // Explicit success detail (not `None`): it overwrites
                         // the pessimistic dispatch-time placeholder so a row
@@ -145,7 +412,7 @@ impl WorkerCompletionHandler {
                 // deliberately invisible to this lookup.)
                 match self
                     .work_db
-                    .find_most_recent_open_task_for_automation(&automation_id, execution.created_epoch())
+                    .find_most_recent_open_task_for_automation(automation_id, execution.created_epoch())
                 {
                     Ok(Some(task)) => {
                         tracing::info!(
@@ -234,96 +501,6 @@ impl WorkerCompletionHandler {
                     }
                 }
             }
-        };
-
-        match self.work_db.finalize_automation_triage_run(
-            &execution.id,
-            outcome,
-            produced_task_id.as_deref(),
-            detail.as_deref(),
-        ) {
-            Ok(true) => {}
-            Ok(false) => tracing::warn!(
-                execution_id = %execution.id,
-                automation_id = %automation_id,
-                "no automation_runs row matched this triage execution; outcome not recorded",
-            ),
-            Err(err) => tracing::error!(
-                execution_id = %execution.id,
-                ?err,
-                "failed to finalise automation_runs row for triage execution",
-            ),
-        }
-
-        // The decision has been consumed and recorded; reap the artifact so a
-        // re-fired automation reusing this execution id can never read a stale
-        // one.
-        crate::structured_output::clear_all(&self.structured_output_dir, &execution.id);
-
-        // Finalise the execution + release pane and cube workspace, mirroring
-        // the PR-completion finalizer's release order. Capture the lease id
-        // before `complete_pane_parked_execution` nulls the lease columns.
-        //
-        // This unconditionally drives the execution to `completed` — it does
-        // NOT depend on there being a still-`active` work_runs row, because
-        // `PaneSpawnRunner` already closed that row out at spawn-confirm time
-        // (see `complete_pane_parked_execution`'s doc). Looping over
-        // `active_run_ids_for_execution` here (as this used to) found nothing
-        // in the common single-turn case, silently leaving the execution
-        // stuck `waiting_human` — which is exactly what let the pane-death
-        // sweep re-finalize an already-finalized triage run later with a
-        // misleading pane-died detail.
-        let lease_id = execution.cube_lease_id.clone();
-        let workspace_path = execution.workspace_path.clone();
-        // Marked before the terminalizing write — see `super::teardown`.
-        // `AutomationTriage` is one of the two kinds `terminal_work_sweep`
-        // reaps on execution terminality alone (it can never resolve their
-        // work-item ids), so this path is if anything MORE exposed to the
-        // race than the PR-completion one.
-        let teardown = self.begin_teardown(&execution.id);
-        match self.work_db.complete_pane_parked_execution(
-            &execution.id,
-            "completed",
-            Some(&format!("automation triage: {outcome}")),
-        ) {
-            Ok(Some(_)) => {}
-            Ok(None) => tracing::debug!(
-                execution_id = %execution.id,
-                "automation triage finalise: execution already terminal; nothing to do",
-            ),
-            Err(err) => tracing::error!(
-                execution_id = %execution.id,
-                ?err,
-                "failed to finalise triage execution row",
-            ),
-        }
-        self.finish_worker_teardown(
-            &execution.id,
-            lease_id.as_deref(),
-            workspace_path.as_deref().map(std::path::Path::new),
-            "automation_triage",
-            teardown,
-        )
-        .await;
-        self.publisher
-            .publish(
-                &execution.id,
-                &automation_id,
-                "completed",
-                "automation_triage_completed",
-            )
-            .await;
-
-        tracing::info!(
-            execution_id = %execution.id,
-            automation_id = %automation_id,
-            outcome,
-            produced_task_id = ?produced_task_id,
-            detail = ?detail,
-            "automation triage finalised",
-        );
-        StopOutcome::AutomationTriage {
-            outcome: outcome.to_owned(),
         }
     }
 
