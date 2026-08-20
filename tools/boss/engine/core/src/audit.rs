@@ -281,6 +281,17 @@ fn resolve_path() -> Option<PathBuf> {
     Some(resolved)
 }
 
+/// Whether `AUDIT_PATH` has already been resolved in this test binary. The
+/// `OnceLock` is process-global, so any unit test elsewhere in this crate
+/// that wants to assert on `record_event`'s output must skip itself when
+/// another test won the race — mirrors `public_start_and_shutdown_path_emits_two_records`
+/// below, exposed crate-wide so callers outside this module (e.g.
+/// `coordinator_tmux`'s reset tests) can follow the same idiom.
+#[cfg(test)]
+pub(crate) fn path_already_resolved_for_tests() -> bool {
+    AUDIT_PATH.get().is_some()
+}
+
 fn append_to(path: &Path, value: &Value) -> std::io::Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()

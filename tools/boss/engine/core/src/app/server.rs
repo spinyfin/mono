@@ -535,6 +535,7 @@ pub async fn serve_with_merge_probe(
                     &tmux,
                     &coordinator_supervisor_state.coordinator_model,
                     &working_directory,
+                    &crate::coordinator_tmux::RealClaudeVersionProbe,
                 )
                 .await
             };

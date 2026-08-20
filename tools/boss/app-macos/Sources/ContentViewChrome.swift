@@ -365,7 +365,7 @@ struct CoordinatorUpdateBanner: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.accentColor.opacity(0.85))
+        .background(Color.blue.opacity(0.85))
         .accessibilityElement(children: .contain)
     }
 }

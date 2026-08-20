@@ -6,6 +6,7 @@
 //! context every handler receives.
 
 use super::*;
+use crate::coordinator_tmux::ClaudeVersionProbe;
 
 pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
@@ -195,6 +196,7 @@ async fn attach_coordinator_to_registered_app(server_state: Arc<ServerState>) {
             &tmux,
             &server_state.coordinator_model,
             &working_directory,
+            &crate::coordinator_tmux::RealClaudeVersionProbe,
         )
         .await
         {
@@ -218,10 +220,43 @@ pub(super) async fn request_coordinator_attachment(
         Err(error) => tracing::warn!(%error, "could not refresh coordinator trust-root pid"),
     }
     let tmux_program = tmux.program().display().to_string();
-    // Computed once per attach (app launch, relaunch, reconnect) — never on
-    // a hot path. Spawns `claude --version` at most once here; see
-    // `coordinator_update_available`'s doc comment.
-    let coordinator_update_available_version = crate::coordinator_tmux::coordinator_update_available(&record);
+    // This function has three call sites: app registration (above),
+    // the coordinator supervisor's restart branch (server.rs, exponential
+    // backoff), and its healthy `Ok(None)` branch (server.rs, a flat 10s
+    // retry while the app has registered but not yet acknowledged this
+    // spawn token). That last one repeats indefinitely whenever the app
+    // keeps failing to attach — exactly the degraded state where the
+    // engine can least afford an extra subprocess every pass. The probed
+    // installed version cannot change for a given `spawn_token` in any way
+    // that matters here (the *recorded launch* version is fixed at
+    // creation, which is the only thing `coordinator_update_available`
+    // compares against), so it is memoized on `ServerState` keyed by
+    // `spawn_token` — recomputed only when the coordinator itself is
+    // recreated, never on every attach attempt.
+    let cached_installed_version = {
+        let cache = server_state
+            .coordinator_installed_version_cache
+            .lock()
+            .expect("coordinator installed-version cache mutex poisoned");
+        cache
+            .as_ref()
+            .filter(|(token, _)| *token == record.spawn_token)
+            .map(|(_, installed)| installed.clone())
+    };
+    let installed_claude_version = match cached_installed_version {
+        Some(installed) => installed,
+        None => {
+            let probed = crate::coordinator_tmux::RealClaudeVersionProbe.probe().await;
+            *server_state
+                .coordinator_installed_version_cache
+                .lock()
+                .expect("coordinator installed-version cache mutex poisoned") =
+                Some((record.spawn_token.clone(), probed.clone()));
+            probed
+        }
+    };
+    let coordinator_update_available_version =
+        crate::coordinator_tmux::coordinator_update_available(&record, installed_claude_version.as_deref());
     match server_state
         .send_to_app(
             EngineToAppRequest::AttachCoordinatorPane(boss_protocol::AttachCoordinatorPaneInput {
@@ -346,6 +381,7 @@ pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequ
             &expected_spawn_token,
             &working_directory,
             reason,
+            &crate::coordinator_tmux::RealClaudeVersionProbe,
         )
         .await
     };

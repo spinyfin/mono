@@ -460,6 +460,10 @@ struct DeliveryWaiter {
     tx: oneshot::Sender<String>,
 }
 
+/// `(spawn_token, installed claude version)` — see
+/// `ServerState::coordinator_installed_version_cache`.
+type CoordinatorInstalledVersionCache = Arc<StdMutex<Option<(String, Option<String>)>>>;
+
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
 struct ServerState {
@@ -571,6 +575,16 @@ struct ServerState {
     /// fresh attach request.
     #[builder(default)]
     coordinator_attached_spawn_token: Arc<StdMutex<Option<String>>>,
+    /// Memoized `(spawn_token, installed claude version)` from the last
+    /// `probe_installed_claude_version` call, consulted by
+    /// `request_coordinator_attachment` so the coordinator supervisor's
+    /// healthy-but-unattached retry loop (a flat 10s interval, see
+    /// `app/server.rs`) does not shell out to `claude --version` on every
+    /// pass while an app keeps failing to attach. Invalidated implicitly:
+    /// a stored entry is only reused when its token still matches the
+    /// current coordinator record's `spawn_token`.
+    #[builder(default)]
+    coordinator_installed_version_cache: CoordinatorInstalledVersionCache,
     /// Per-slot trigger fan-in for the live-status summarizer. Started
     /// when `spawn_flow` calls `start_live_status_slot`; torn down
     /// in `release_worker_pane`.
