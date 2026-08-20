@@ -76,6 +76,11 @@ struct EngineCoordinatorAttachRequest: Sendable {
     let tmuxProgram: String
     /// tmux `-L` label for the engine-owned private server.
     let serverLabel: String
+    /// The installed `claude` version, present only when the engine has
+    /// confirmed it is newer than the one this session actually launched
+    /// with. `nil` means "nothing to show" — never render an "up to date"
+    /// state from its absence.
+    let newerInstalledClaudeVersion: String?
 }
 
 enum EngineCoordinatorAttachResult: Sendable {
@@ -87,6 +92,15 @@ struct CoordinatorModelRecreateConfirmation: Equatable {
     let currentModel: String
     let requestedModel: String
     let expectedSpawnToken: String
+}
+
+/// Mirrors `boss_protocol::CoordinatorRecreateReason` on the wire. Both
+/// paths call the same engine-owned recreate; the reason lets the engine's
+/// audit log tell an operator-initiated reset apart from the automatic
+/// model-mismatch replacement.
+enum CoordinatorRecreateReason: String {
+    case modelMismatch = "model_mismatch"
+    case operatorReset = "operator_reset"
 }
 
 enum EngineSendError: Sendable {

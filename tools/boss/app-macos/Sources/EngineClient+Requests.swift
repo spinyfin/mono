@@ -688,11 +688,14 @@ extension EngineClient {
 
     /// Request the engine-owned, explicitly confirmed replacement of the
     /// coordinator tmux session. The token guards against a delayed UI action
-    /// destroying a newer session after recovery.
-    func sendRecreateCoordinator(expectedSpawnToken: String) {
+    /// destroying a newer session after recovery. `reason` distinguishes an
+    /// operator-initiated reset from the automatic model-mismatch prompt in
+    /// the engine's audit log — both paths call the same engine-owned recreate.
+    func sendRecreateCoordinator(expectedSpawnToken: String, reason: CoordinatorRecreateReason) {
         sendLine([
             "type": "recreate_coordinator",
             "expected_spawn_token": expectedSpawnToken,
+            "reason": reason.rawValue,
         ])
     }
 

@@ -218,6 +218,10 @@ pub(super) async fn request_coordinator_attachment(
         Err(error) => tracing::warn!(%error, "could not refresh coordinator trust-root pid"),
     }
     let tmux_program = tmux.program().display().to_string();
+    // Computed once per attach (app launch, relaunch, reconnect) — never on
+    // a hot path. Spawns `claude --version` at most once here; see
+    // `coordinator_update_available`'s doc comment.
+    let coordinator_update_available_version = crate::coordinator_tmux::coordinator_update_available(&record);
     match server_state
         .send_to_app(
             EngineToAppRequest::AttachCoordinatorPane(boss_protocol::AttachCoordinatorPaneInput {
@@ -226,6 +230,7 @@ pub(super) async fn request_coordinator_attachment(
                 model: record.model.clone(),
                 tmux_program,
                 server_label: boss_tmux::SERVER_LABEL.to_owned(),
+                coordinator_update_available_version,
             }),
             Duration::from_secs(5),
         )
@@ -247,8 +252,9 @@ pub(super) async fn request_coordinator_attachment(
 }
 
 /// Replace the durable coordinator only after the UI has confirmed the loss
-/// of the current conversation. The app cannot choose a session
-/// name or model here; both remain engine-owned configuration.
+/// of the current conversation — either an automatic model-mismatch prompt
+/// or an operator-initiated reset (see `reason`). The app cannot choose a
+/// session name or model here; both remain engine-owned configuration.
 pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
@@ -257,7 +263,11 @@ pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequ
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::RecreateCoordinator { expected_spawn_token } = req else {
+    let FrontendRequest::RecreateCoordinator {
+        expected_spawn_token,
+        reason,
+    } = req
+    else {
         unreachable!()
     };
     let app_session_id = server_state
@@ -335,6 +345,7 @@ pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequ
             &server_state.coordinator_model,
             &expected_spawn_token,
             &working_directory,
+            reason,
         )
         .await
     };

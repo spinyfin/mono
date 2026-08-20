@@ -11,9 +11,9 @@
 
 use super::*;
 use boss_protocol::{
-    BranchNaming, ExecutionKind, ExecutionStatus, FrontendEvent, FrontendRequest, Product, ProposalKind, Task,
-    TaskKind, TaskStatus, WorkExecution, WorkItemDependencyDetail, WorkItemPatch, WorkRun, WorkerContextBundle,
-    WorkerTierDenialReason,
+    BranchNaming, CoordinatorRecreateReason, ExecutionKind, ExecutionStatus, FrontendEvent, FrontendRequest, Product,
+    ProposalKind, Task, TaskKind, TaskStatus, WorkExecution, WorkItemDependencyDetail, WorkItemPatch, WorkRun,
+    WorkerContextBundle, WorkerTierDenialReason,
 };
 use policy::variant_name;
 use serde_json::json;
@@ -309,6 +309,7 @@ fn coordinator_verbs_stay_closed() {
         },
         FrontendRequest::RecreateCoordinator {
             expected_spawn_token: "token".into(),
+            reason: CoordinatorRecreateReason::OperatorReset,
         },
     ] {
         let denial = assert_denied(request);

@@ -8,8 +8,10 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
+use boss_protocol::CoordinatorRecreateReason;
 use boss_tmux::{DisplayField, NewSession, Tmux};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -107,10 +109,49 @@ pub(crate) async fn restart_if_dead(
         .map(Some)
 }
 
-/// Recreate a model-mismatched coordinator after an explicit UI confirmation.
-/// The expected token prevents a delayed confirmation from killing a newer
-/// session created by a concurrent restart recovery.
+/// Recreate the coordinator after an explicit UI confirmation — either a
+/// model-mismatch replacement or an operator-initiated reset. The expected
+/// token prevents a delayed confirmation from killing a newer session
+/// created by a concurrent restart recovery. `reason` is recorded to the
+/// audit log so a manual reset is distinguishable there both from the
+/// automatic model-mismatch path and from a crash/session-loss restart
+/// (`restart_if_dead`/`reconcile_existing`), neither of which audits this
+/// event at all.
 pub(crate) async fn recreate_after_confirmation(
+    work_db: &WorkDb,
+    tmux: &Tmux,
+    requested_model: &str,
+    expected_spawn_token: &str,
+    working_directory: &Path,
+    reason: CoordinatorRecreateReason,
+) -> Result<CoordinatorTmuxRecord> {
+    let result =
+        recreate_after_confirmation_inner(work_db, tmux, requested_model, expected_spawn_token, working_directory)
+            .await;
+    match &result {
+        Ok(record) => audit::record_event(
+            "coordinator_recreate",
+            &json!({
+                "outcome": "success",
+                "reason": reason,
+                "old_spawn_token": expected_spawn_token,
+                "new_spawn_token": record.spawn_token,
+            }),
+        ),
+        Err(error) => audit::record_event(
+            "coordinator_recreate",
+            &json!({
+                "outcome": "failed",
+                "reason": reason,
+                "old_spawn_token": expected_spawn_token,
+                "error": format!("{error:#}"),
+            }),
+        ),
+    }
+    result
+}
+
+async fn recreate_after_confirmation_inner(
     work_db: &WorkDb,
     tmux: &Tmux,
     requested_model: &str,
@@ -400,7 +441,13 @@ async fn start_new(
         );
     }
     let spawn_token = generate_token();
-    work_db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, &spawn_token, model)?;
+    let claude_version = probe_installed_claude_version();
+    work_db.record_coordinator_tmux_spawn_intent(
+        COORDINATOR_SESSION_NAME,
+        &spawn_token,
+        model,
+        claude_version.as_deref(),
+    )?;
 
     let mut environment = BTreeMap::from([
         (SPAWN_TOKEN_ENV.to_owned(), spawn_token.clone()),
@@ -443,7 +490,64 @@ async fn start_new(
         spawn_token,
         spawn_state: "created".to_owned(),
         model: model.to_owned(),
+        launched_claude_version: claude_version,
     })
+}
+
+/// Parse `claude --version` stdout, e.g. `"2.1.237 (Claude Code)\n"` — the
+/// first whitespace-separated token, when it is a dotted run of digits.
+/// Mirrors the soft-parse shape `conformance::version_pin::parse_codex_version`
+/// uses for `codex` (which instead takes the *last* token; the two CLIs put
+/// the version in different positions).
+fn parse_claude_version(stdout: &str) -> Option<String> {
+    let line = stdout.lines().next()?.trim();
+    let version = line.split_whitespace().next()?;
+    let looks_like_semver = !version.is_empty()
+        && version
+            .split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()));
+    looks_like_semver.then(|| version.to_owned())
+}
+
+/// Probe the `claude` binary on `PATH` for its version. Best-effort and
+/// silent on any failure (binary absent, non-zero exit, unparseable output)
+/// — a coordinator session must never fail to launch because this probe
+/// did, and a failed probe must read as "can't tell", never "no update".
+/// Never call this from a hot path: it spawns a real process.
+fn probe_installed_claude_version() -> Option<String> {
+    let output = Command::new("claude").arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_claude_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Compare two `claude --version` strings as dotted numeric tuples (e.g.
+/// `"2.1.237"`). `true` only when both parse in that shape and `installed`
+/// is strictly greater component-wise — an unparseable, equal, or older
+/// version returns `false` rather than guessing which way a mismatched
+/// shape should be read.
+fn is_strictly_newer(installed: &str, running: &str) -> bool {
+    fn parts(v: &str) -> Option<Vec<u64>> {
+        v.split('.').map(|p| p.parse::<u64>().ok()).collect()
+    }
+    match (parts(installed), parts(running)) {
+        (Some(installed), Some(running)) => installed > running,
+        _ => false,
+    }
+}
+
+/// The installed `claude` version, but only when it is confidently newer
+/// than the one this coordinator session actually launched with. `None`
+/// covers "no update available", "can't tell" (no recorded launch version,
+/// probe failed, either version unparseable) and a downgrade alike — the
+/// caller must never distinguish those and must never render an "up to
+/// date" state from this. Never call from a hot path: probes the real
+/// binary once per call.
+pub(crate) fn coordinator_update_available(record: &CoordinatorTmuxRecord) -> Option<String> {
+    let running = record.launched_claude_version.as_deref()?;
+    let installed = probe_installed_claude_version()?;
+    is_strictly_newer(&installed, running).then_some(installed)
 }
 
 /// Resolve the production coordinator session directory under Application
@@ -467,6 +571,52 @@ mod tests {
     use boss_tmux::{CommandOutput, CommandRunner};
 
     use super::*;
+
+    // --- claude version probe / comparison ---
+
+    #[test]
+    fn parses_claude_version_line() {
+        assert_eq!(
+            parse_claude_version("2.1.237 (Claude Code)\n"),
+            Some("2.1.237".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_unparseable_version_output() {
+        assert_eq!(parse_claude_version(""), None);
+        assert_eq!(parse_claude_version("\n"), None);
+        assert_eq!(parse_claude_version("command not found\n"), None);
+        assert_eq!(
+            parse_claude_version("v2.1.237\n"),
+            None,
+            "leading 'v' is not a bare digit run"
+        );
+    }
+
+    #[test]
+    fn detects_strictly_newer_installed_version() {
+        assert!(is_strictly_newer("2.1.238", "2.1.237"));
+        assert!(is_strictly_newer("2.2.0", "2.1.237"));
+        assert!(is_strictly_newer("3.0.0", "2.9.999"));
+    }
+
+    #[test]
+    fn does_not_report_newer_for_equal_older_or_unparseable_versions() {
+        assert!(!is_strictly_newer("2.1.237", "2.1.237"), "equal versions are not newer");
+        assert!(
+            !is_strictly_newer("2.1.0", "2.1.237"),
+            "an older installed version is not newer"
+        );
+        assert!(
+            !is_strictly_newer("2.1.237", "not-a-version"),
+            "an unparseable running version can't be compared"
+        );
+        assert!(
+            !is_strictly_newer("not-a-version", "2.1.237"),
+            "an unparseable installed version can't be compared"
+        );
+    }
 
     struct FakeTmux {
         sessions: Vec<String>,
@@ -582,7 +732,7 @@ mod tests {
     #[tokio::test]
     async fn intended_live_session_repairs_its_tmux_mirrors() {
         let (db, tmux, server, dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
-        db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus")
+        db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus", None)
             .unwrap();
         let record = ensure_for_attach(&db, &tmux, "opus", dir.path()).await.unwrap();
         assert_eq!(record.spawn_state, "created");
@@ -609,7 +759,7 @@ mod tests {
     #[tokio::test]
     async fn existing_live_session_reapplies_boss_presentation_options() {
         let (db, tmux, server, dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
-        db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus")
+        db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus", None)
             .unwrap();
         db.record_coordinator_tmux_session_created("token").unwrap();
 
@@ -626,7 +776,7 @@ mod tests {
     #[tokio::test]
     async fn dead_matching_session_is_killed_before_recreation() {
         let (db, tmux, server, dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "1"));
-        db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus")
+        db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus", None)
             .unwrap();
         db.record_coordinator_tmux_session_created("token").unwrap();
         ensure_for_attach(&db, &tmux, "opus", dir.path()).await.unwrap();
@@ -645,7 +795,7 @@ mod tests {
     #[tokio::test]
     async fn mismatched_live_token_errors_without_killing() {
         let (db, tmux, server, dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("other"), "0"));
-        db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus")
+        db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus", None)
             .unwrap();
         db.record_coordinator_tmux_session_created("token").unwrap();
         assert!(ensure_for_attach(&db, &tmux, "opus", dir.path()).await.is_err());
@@ -662,7 +812,7 @@ mod tests {
         // A healthy matching-token session is never recreated, regardless
         // of the requested model (model replacement is confirmation-gated).
         let (db, tmux, server, dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
-        db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus")
+        db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus", None)
             .unwrap();
         db.record_coordinator_tmux_session_created("token").unwrap();
 
@@ -693,13 +843,20 @@ mod tests {
     #[tokio::test]
     async fn stale_confirmation_does_not_kill_current_session() {
         let (db, tmux, server, dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
-        db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus")
+        db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus", None)
             .unwrap();
         db.record_coordinator_tmux_session_created("token").unwrap();
         assert!(
-            recreate_after_confirmation(&db, &tmux, "sonnet", "stale", dir.path())
-                .await
-                .is_err()
+            recreate_after_confirmation(
+                &db,
+                &tmux,
+                "sonnet",
+                "stale",
+                dir.path(),
+                CoordinatorRecreateReason::OperatorReset
+            )
+            .await
+            .is_err()
         );
         assert!(
             !server
@@ -763,7 +920,7 @@ mod tests {
         let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(RENDERED_PROMPT_FILENAME), "prompt v1").unwrap();
-        db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus")
+        db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus", None)
             .unwrap();
         db.record_coordinator_tmux_session_created("token").unwrap();
         assert_eq!(db.get_metadata(PROMPT_NUDGE_HASH_KEY).unwrap(), None);
