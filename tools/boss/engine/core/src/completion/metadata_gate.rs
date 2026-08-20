@@ -176,6 +176,25 @@ impl WorkerCompletionHandler {
         )
     }
 
+    /// Compatibility adapter for callers that only need to know whether the
+    /// satisfied-deliverable gate finalized this Stop boundary.
+    #[cfg(test)]
+    pub(super) async fn try_finalize_satisfied_deliverable_on_stop(
+        &self,
+        execution_id: &str,
+        execution: &crate::work::WorkExecution,
+        bound_pr_url: &str,
+        contribution: ContributionEvidence,
+    ) -> Option<StopOutcome> {
+        match self
+            .evaluate_satisfied_deliverable_on_stop(execution_id, execution, bound_pr_url, contribution)
+            .await
+        {
+            SatisfiedDeliverableOutcome::Finalized(outcome) => Some(outcome),
+            SatisfiedDeliverableOutcome::AwaitingDeclaration | SatisfiedDeliverableOutcome::NotSatisfied => None,
+        }
+    }
+
     /// Deliverable-satisfied finalization gate (zombie-worker / "nothing
     /// left to do" loop fix).
     ///
