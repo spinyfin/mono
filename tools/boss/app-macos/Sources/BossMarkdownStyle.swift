@@ -174,9 +174,14 @@ enum MarkdownEditorialMetrics {
     /// heading rhythm even when their caller applies a smaller font scale.
     static let compactHeadingSpacing = StructuredText.BlockSpacing(top: 16, bottom: 8)
 
-    /// Editorial H2 headings use this font-scaled rhythm, including the
-    /// disclosure heading in a document reader.
+    /// Editorial H2 headings use this font-scaled rhythm.
     static let editorialH2Spacing = (top: CGFloat(3), bottom: CGFloat(0.75))
+
+    /// Rhythm for `CollapsibleMarkdownSection`'s disclosure summary. Kept
+    /// separate from `editorialH2Spacing` because the summary is a quiet
+    /// control, not a heading — it must not inherit the generous spacing
+    /// that goes with the (much larger) H2 type size.
+    static let disclosureControlSpacing = (top: CGFloat(1.0), bottom: CGFloat(0.5))
 }
 
 // MARK: - Heading

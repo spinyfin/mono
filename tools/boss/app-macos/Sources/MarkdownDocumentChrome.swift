@@ -708,11 +708,14 @@ enum MarkdownHeadingSections {
 /// A heading-delimited section of a markdown document that folds behind a
 /// disclosure affordance. Used only where a caller explicitly opts a
 /// heading in via `MarkdownDocumentChrome.collapsedByDefaultHeadings`. The
-/// heading itself always renders — at the document's real editorial H2
-/// size/weight, read from `BossHeadingStyle`'s shared metrics so it can
-/// never render smaller than the `###` findings nested beneath it — so the
-/// section is never invisible; only its body folds, and the collapsed state
-/// always names what's hidden (never a bare triangle).
+/// heading text always renders as the summary label — so the section is
+/// never invisible, and the collapsed state always names what's hidden
+/// (never a bare triangle) — but deliberately at quiet, near-body
+/// prominence rather than the source's real H2 size/weight: this is a
+/// disclosure control the reader is meant to skip, not a section title
+/// competing with the `###` findings nested beneath it. Styling it off the
+/// heading level it happens to be built from (rather than shrinking H2s in
+/// general) is the point — ordinary document H2s stay at full size.
 private struct CollapsibleMarkdownSection: View {
     let heading: String
     let sectionBody: String
@@ -768,25 +771,26 @@ private struct CollapsibleMarkdownSection: View {
 
     @ViewBuilder
     private var headingLabel: some View {
-        let label = Text(heading)
+        // Same fixed body-size tracking in both editorial and compact mode —
+        // unlike a real heading, this control doesn't scale with document
+        // typography, so it needs no `EditorialHeadingTracking` derivation.
+        Text(heading)
             .font(.system(size: headingPointSize, weight: headingWeight))
             .foregroundStyle(BossMarkdownPalette.ink)
-        if isEditorial {
-            label.modifier(EditorialHeadingTracking(headingScale: MarkdownEditorialMetrics.headingScales[1]))
-        } else {
-            label.tracking(-0.3)
-        }
+            .tracking(-0.3)
     }
 
+    /// Fixed at body size regardless of editorial/compact mode or the
+    /// source heading's level — a disclosure control reads as skippable
+    /// exactly because it does NOT scale up with document heading size.
     private var headingPointSize: CGFloat {
-        let scale = isEditorial
-            ? MarkdownEditorialMetrics.headingScales[1]
-            : BossHeadingStyle.compactFontScales[1]
-        return BossHeadingStyle.bodyPointSize * scale
+        BossHeadingStyle.bodyPointSize
     }
 
+    /// Semibold (not the heavier editorial H1/H2 weight) is enough to read
+    /// as an interactive control label without competing with real headings.
     private var headingWeight: Font.Weight {
-        isEditorial ? BossHeadingStyle.editorialWeights[1] : BossHeadingStyle.compactWeights[1]
+        .semibold
     }
 
     private var headingSpacing: (top: CGFloat, bottom: CGFloat) {
@@ -797,8 +801,8 @@ private struct CollapsibleMarkdownSection: View {
             )
         }
         return (
-            top: bodySize * MarkdownEditorialMetrics.editorialH2Spacing.top,
-            bottom: bodySize * MarkdownEditorialMetrics.editorialH2Spacing.bottom
+            top: bodySize * MarkdownEditorialMetrics.disclosureControlSpacing.top,
+            bottom: bodySize * MarkdownEditorialMetrics.disclosureControlSpacing.bottom
         )
     }
 }
