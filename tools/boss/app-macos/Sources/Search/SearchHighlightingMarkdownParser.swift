@@ -3,7 +3,7 @@ import Textual
 
 /// A `MarkupParser` decorator that paints find-in-document match highlights
 /// on top of whatever `inner` parser produces — including
-/// `HighlightingMarkdownParser`'s comment highlights (T548). This is the
+/// `HighlightingMarkdownParser`'s comment highlights. This is the
 /// composition layer the two features need: rather than one parser
 /// overwriting the other's attributes (last-one-wins), search wraps comments
 /// and adds its own attributes to the same `AttributedString` on top.

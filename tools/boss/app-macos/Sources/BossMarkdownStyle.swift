@@ -39,6 +39,8 @@ enum BossMarkdownPalette {
     static let surface = token(light: 0xF1F2F7, dark: 0x191C24)
     static let surface2 = token(light: 0xE7E9F1, dark: 0x21252F)
     static let hairline = token(light: 0xD6D9E4, dark: 0x2E3340)
+    static let inlineCodeFill = token(light: 0xE7E9F1, dark: 0x252B38)
+    static let inlineCodeBorder = token(light: 0xC3C8D8, dark: 0x475269)
     static let ink = token(light: 0x14161C, dark: 0xE8EAF0)
     static let muted = token(light: 0x5A6070, dark: 0x98A0B2)
     static let accent = token(light: 0x3D4E8F, dark: 0x93A2E4)
@@ -764,10 +766,10 @@ private struct EditorialInlineCodeBoxDecoration: ViewModifier {
                                     let padding = bounds.height * 0.1
                                     let box = bounds.insetBy(dx: -padding, dy: -padding)
                                     let path = Path(roundedRect: box, cornerRadius: 2)
-                                    layer.fill(path, with: .style(BossMarkdownPalette.surface))
+                                    layer.fill(path, with: .style(BossMarkdownPalette.inlineCodeFill))
                                     layer.stroke(
                                         path,
-                                        with: .style(BossMarkdownPalette.hairline),
+                                        with: .style(BossMarkdownPalette.inlineCodeBorder),
                                         lineWidth: 1
                                     )
                                 }
@@ -787,7 +789,7 @@ extension InlineStyle {
                 .code(
                     .font(.system(.callout, design: .monospaced)),
                     .foregroundColor(BossMarkdownPalette.ink),
-                    .backgroundColor(BossMarkdownPalette.surface),
+                    .backgroundColor(BossMarkdownPalette.inlineCodeFill),
                     EditorialInlineCodeBoxProperty()
                 )
                 .strong(.fontWeight(.semibold))

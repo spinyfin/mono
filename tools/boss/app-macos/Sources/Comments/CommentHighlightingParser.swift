@@ -16,21 +16,21 @@ private let highlightLog = Logger(subsystem: "com.boss.markdown", category: "com
 /// background to the text each comment is anchored to, and an orange background to the
 /// actively flashing anchor when a comment is clicked.
 ///
-/// Since P529 Phase 2 each anchor is a W3C `TextQuoteSelector` (`{exact, prefix, suffix}`):
-/// two comments on two different occurrences of the same word disambiguate by the
-/// surrounding `prefix`/`suffix` context rather than a stored occurrence index, so a
-/// highlight survives doc edits that don't touch the text immediately around the anchor.
+/// Each anchor is a W3C `TextQuoteSelector` (`{exact, prefix, suffix}`): two comments on
+/// two different occurrences of the same word disambiguate by surrounding context rather
+/// than a stored occurrence index, so a highlight survives doc edits that do not touch the
+/// text around the anchor.
 ///
 /// ## Why two attributes per highlight
 ///
 /// The highlight sets BOTH a `backgroundColor` and — on any inline-code run inside the
 /// anchored range — a colored `underlineStyle`. The background alone is not enough: the
-/// Boss inline style (`InlineStyle.boss(editorial:)`) gives inline code spans their own
-/// `backgroundColor`, and Textual's `WithInlineStyle` merges that in with
-/// `mergePolicy: .keepNew`, which *overwrites* the comment's background on exactly those
-/// runs. A comment anchored to an inline code span (e.g. `` `flavor` ``) would therefore
-/// be invisible. The colored underline is applied after the background and is never
-/// touched by the inline style, so code-span anchors still show a visible marker.
+/// inline styles give inline code spans their own `backgroundColor`, and Textual's
+/// `WithInlineStyle` merges that in with `mergePolicy: .keepNew`, which *overwrites* the
+/// comment's background on exactly those runs. In editorial mode, that color is also the
+/// fallback for paths where the canvas decoration that paints the inline-code box behind
+/// the text has no layout. The colored underline is the appearance-independent guarantee:
+/// it is applied after the background and is never touched by the inline style.
 @MainActor
 struct HighlightingMarkdownParser: MarkupParser {
     var highlightedAnchors: [CommentAnchor]
@@ -40,7 +40,7 @@ struct HighlightingMarkdownParser: MarkupParser {
     private static let yellowColor = Color(nsColor: NSColor.systemYellow).opacity(0.45)
     private static let orangeColor = Color(nsColor: NSColor.systemOrange).opacity(0.55)
     // Stronger, mostly-opaque variants used for the underline marker so it stays visible
-    // even when an inline-code background has overwritten the translucent fill.
+    // even when an inline-code background overwrites the translucent fill.
     private static let yellowUnderline = Color(nsColor: NSColor.systemYellow).opacity(0.9)
     private static let orangeUnderline = Color(nsColor: NSColor.systemOrange).opacity(0.9)
 
