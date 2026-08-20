@@ -322,17 +322,23 @@ struct BossParagraphStyle: StructuredText.ParagraphStyle {
         if editorial {
             configuration.label
                 // Keep fontScale innermost (applied first) so it reads the
-                // serif font set by the `.font` call below it in the chain
+                // sans font set by the `.font` call below it in the chain
                 // and scales *that*, mirroring BossHeadingStyle.headingLabel.
                 // Reversing this order lets the later `.font` win instead,
                 // silently discarding the scale.
                 .textual.fontScale(MarkdownEditorialMetrics.bodyScale)
-                .font(.system(.body, design: .serif))
+                .font(.system(.body, design: .default))
                 .foregroundStyle(BossMarkdownPalette.ink)
-                // SwiftUI `lineSpacing` is extra leading on top of the natural
-                // ~1.2em line box. With the enlarged editorial body, 0.45em
-                // additional leading produces the 1.65 reference line-height.
-                .textual.lineSpacing(.fontScaled(0.45))
+                // SwiftUI `lineSpacing` is extra leading on top of the font's
+                // own natural line box. Measured via NSFont at the enlarged
+                // editorial body size (19.04pt): the system sans's natural
+                // box is ~1.178em (vs. New York's ~1.193em when this was
+                // serif), so it needs *more* fontScaled leading than before
+                // to land in the same place — 0.47em on top of the 1.178em
+                // natural box yields ~1.65em effective line height, the top
+                // of the 1.6–1.65 reference range (was ~1.64em on the serif
+                // body at 0.45em extra leading).
+                .textual.lineSpacing(.fontScaled(0.47))
                 .textual.blockSpacing(.fontScaled(top: 0, bottom: 1))
                 .proseMeasureClamped()
         } else {
@@ -371,7 +377,7 @@ struct BossListItemStyle: StructuredText.ListItemStyle {
                 // fontScale innermost, `.font` outside it — see the matching
                 // comment in BossParagraphStyle.makeBody.
                 .textual.fontScale(MarkdownEditorialMetrics.bodyScale)
-                .font(.system(.body, design: .serif))
+                .font(.system(.body, design: .default))
                 .foregroundStyle(BossMarkdownPalette.ink)
                 .proseMeasureClamped()
         } else {
@@ -658,7 +664,7 @@ struct BossTableCellStyle: StructuredText.TableCellStyle {
                 .padding(.horizontal, 12)
         } else if editorial {
             configuration.label
-                .font(.system(.body, design: .serif))
+                .font(.system(.body, design: .default))
                 .foregroundStyle(BossMarkdownPalette.ink)
                 .monospacedDigit()
                 .textual.lineSpacing(.fontScaled(0.4))

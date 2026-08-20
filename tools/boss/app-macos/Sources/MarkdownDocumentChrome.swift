@@ -15,10 +15,18 @@ private let designDocTimingLog = Logger(subsystem: "com.boss.app", category: "De
 /// state, no layout feedback — so widening never triggers a relayout loop.
 enum MarkdownDocumentMeasure {
     /// The prose reading measure, matched by `BossMarkdownStyle`'s per-block
-    /// clamp so paragraphs stay this width even inside `wide` documents.
-    /// At the 1.12× editorial body size, the 0.5em average-character-width
-    /// heuristic yields about 65 characters per line (620 / 9.52 = 65.1).
-    static let readable: CGFloat = 620
+    /// clamp so paragraphs stay this width even inside `wide` documents. This
+    /// is the outer bound on the *padded* document column (see
+    /// `MarkdownDocumentColumn.body`, `MarkdownDocumentLayout.horizontalPadding`),
+    /// so the actual glyph-rendering width is this value minus the 80pt of
+    /// horizontal padding, not the raw constant. Measured against the sans
+    /// editorial body (`MarkdownEditorialMetrics.bodyScale` × the 17pt system
+    /// body, i.e. 19.04pt) with `NSAttributedString.size()` over real
+    /// technical-prose sentences: ~8.64pt/character. (720 - 80) / 8.64 ≈ 74
+    /// characters per line, at the top of the 65–75 target and comfortably
+    /// wider than the previous 620 (≈62 chars after the same padding
+    /// correction — under the target, which is why the column read narrow).
+    static let readable: CGFloat = 720
     /// The document column width once a table is present.
     static let wide: CGFloat = 1440
 
