@@ -6,6 +6,7 @@
 //! context every handler receives.
 
 use super::*;
+use crate::coordinator_tmux::ClaudeVersionProbe;
 
 pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
@@ -161,6 +162,16 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
 }
 
 async fn attach_coordinator_to_registered_app(server_state: Arc<ServerState>) {
+    // This is a genuine attach entry point (app launch/relaunch/reconnect),
+    // not the supervisor's flat 10s unattached-retry loop that
+    // `coordinator_installed_version_cache` exists to rate-limit. Clear it
+    // so registration always re-probes `claude --version`, otherwise an
+    // upgrade installed after the cache was first populated is never
+    // observed for the lifetime of this engine process.
+    *server_state
+        .coordinator_installed_version_cache
+        .lock()
+        .expect("coordinator installed-version cache mutex poisoned") = None;
     let program = match server_state.tmux_preflight.read() {
         Ok(guard) => match &*guard {
             crate::tmux_preflight::TmuxPreflight::Ready { program, .. } => program.clone(),
@@ -195,6 +206,7 @@ async fn attach_coordinator_to_registered_app(server_state: Arc<ServerState>) {
             &tmux,
             &server_state.coordinator_model,
             &working_directory,
+            &crate::coordinator_tmux::RealClaudeVersionProbe,
         )
         .await
         {
@@ -218,6 +230,42 @@ pub(super) async fn request_coordinator_attachment(
         Err(error) => tracing::warn!(%error, "could not refresh coordinator trust-root pid"),
     }
     let tmux_program = tmux.program().display().to_string();
+    // This function has three call sites: app registration (above, via
+    // `attach_coordinator_to_registered_app`), the coordinator supervisor's
+    // restart branch (server.rs, exponential backoff), and its healthy
+    // `Ok(None)` branch (server.rs, a flat 10s retry while the app has
+    // registered but not yet acknowledged this spawn token). That last one
+    // repeats indefinitely whenever the app keeps failing to attach —
+    // exactly the degraded state where the engine can least afford an
+    // extra subprocess every pass. The *installed* claude version can
+    // change at any time (an upgrade), so this cache exists purely to
+    // rate-limit that retry loop, not to assert the value is immutable —
+    // `attach_coordinator_to_registered_app` clears it on every genuine
+    // attach entry point so registration always re-probes.
+    let cached_installed_version = {
+        let cache = server_state
+            .coordinator_installed_version_cache
+            .lock()
+            .expect("coordinator installed-version cache mutex poisoned");
+        cache
+            .as_ref()
+            .filter(|(token, _)| *token == record.spawn_token)
+            .map(|(_, installed)| installed.clone())
+    };
+    let installed_claude_version = match cached_installed_version {
+        Some(installed) => installed,
+        None => {
+            let probed = crate::coordinator_tmux::RealClaudeVersionProbe.probe().await;
+            *server_state
+                .coordinator_installed_version_cache
+                .lock()
+                .expect("coordinator installed-version cache mutex poisoned") =
+                Some((record.spawn_token.clone(), probed.clone()));
+            probed
+        }
+    };
+    let coordinator_update_available_version =
+        crate::coordinator_tmux::coordinator_update_available(&record, installed_claude_version.as_deref());
     match server_state
         .send_to_app(
             EngineToAppRequest::AttachCoordinatorPane(boss_protocol::AttachCoordinatorPaneInput {
@@ -226,6 +274,7 @@ pub(super) async fn request_coordinator_attachment(
                 model: record.model.clone(),
                 tmux_program,
                 server_label: boss_tmux::SERVER_LABEL.to_owned(),
+                coordinator_update_available_version,
             }),
             Duration::from_secs(5),
         )
@@ -247,8 +296,9 @@ pub(super) async fn request_coordinator_attachment(
 }
 
 /// Replace the durable coordinator only after the UI has confirmed the loss
-/// of the current conversation. The app cannot choose a session
-/// name or model here; both remain engine-owned configuration.
+/// of the current conversation — either an automatic model-mismatch prompt
+/// or an operator-initiated reset (see `reason`). The app cannot choose a
+/// session name or model here; both remain engine-owned configuration.
 pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
@@ -257,7 +307,11 @@ pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequ
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::RecreateCoordinator { expected_spawn_token } = req else {
+    let FrontendRequest::RecreateCoordinator {
+        expected_spawn_token,
+        reason,
+    } = req
+    else {
         unreachable!()
     };
     let app_session_id = server_state
@@ -335,6 +389,8 @@ pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequ
             &server_state.coordinator_model,
             &expected_spawn_token,
             &working_directory,
+            reason,
+            &crate::coordinator_tmux::RealClaudeVersionProbe,
         )
         .await
     };

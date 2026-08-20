@@ -350,6 +350,7 @@ extension DriverSlug {
 /// "Workers" pane — worker defaults grouped by concern.
 private struct WorkerSettingsPane: View {
     @EnvironmentObject private var chatModel: ChatViewModel
+    @State private var showCoordinatorResetConfirm = false
 
     private var prSettings: [EngineSetting] {
         chatModel.engineSettings.filter { $0.key == "default_pr_draft_mode" }
@@ -390,22 +391,56 @@ private struct WorkerSettingsPane: View {
                         Text("Workers")
                     }
                 }
-                if !coordinatorSettings.isEmpty {
-                    Section {
-                        ForEach(coordinatorSettings) { setting in
-                            SettingToggleRow(setting: setting) { enabled in
-                                chatModel.setEngineSetting(key: setting.key, enabled: enabled)
-                            }
+                Section {
+                    ForEach(coordinatorSettings) { setting in
+                        SettingToggleRow(setting: setting) { enabled in
+                            chatModel.setEngineSetting(key: setting.key, enabled: enabled)
                         }
-                    } header: {
-                        Text("Coordinator")
                     }
+                    Button(role: .destructive) {
+                        showCoordinatorResetConfirm = true
+                    } label: {
+                        Text("Reset Coordinator Session…")
+                    }
+                    .disabled(chatModel.attachedCoordinatorSpawnToken == nil)
+                } header: {
+                    Text("Coordinator")
+                } footer: {
+                    Text(
+                        "Ends the coordinator's current session and starts a fresh one with the " +
+                        "currently installed claude binary and instructions."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 }
             }
         }
         .formStyle(.grouped)
         .padding()
+        .confirmationDialog(
+            CoordinatorResetCopy.title,
+            isPresented: $showCoordinatorResetConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Reset", role: .destructive) {
+                chatModel.resetCoordinator()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(CoordinatorResetCopy.message)
+        }
     }
+}
+
+/// Confirmation copy shared by every entry point into the coordinator reset
+/// flow (Settings ▸ Workers, and the update-available banner) so the two
+/// dialogs can never drift apart in wording.
+enum CoordinatorResetCopy {
+    static let title = "Reset the coordinator?"
+    static let message =
+        "This permanently ends the coordinator's current conversation and discards its context — " +
+        "this cannot be undone. A fresh session starts immediately with the current claude binary " +
+        "and instructions."
 }
 
 private struct SettingToggleRow: View {

@@ -203,6 +203,7 @@ mod tests {
                     model: "opus".into(),
                     tmux_program: "/usr/bin/tmux".into(),
                     server_label: "boss".into(),
+                    coordinator_update_available_version: None,
                 }),
                 "attach_coordinator_pane",
             ),

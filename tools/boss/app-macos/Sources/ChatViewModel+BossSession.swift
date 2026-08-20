@@ -15,18 +15,31 @@ extension ChatViewModel {
     func coordinatorPaneAttached(_ request: EngineCoordinatorAttachRequest) {
         attachedCoordinatorModel = request.model
         attachedCoordinatorSpawnToken = request.spawnToken
+        coordinatorUpdateAvailable = request.newerInstalledClaudeVersion
         refreshCoordinatorModelRecreateConfirmation()
     }
 
     func confirmCoordinatorModelRecreate() {
         guard let confirmation = coordinatorModelRecreateConfirmation else { return }
         coordinatorModelRecreateConfirmation = nil
-        engine.sendRecreateCoordinator(expectedSpawnToken: confirmation.expectedSpawnToken)
+        engine.sendRecreateCoordinator(expectedSpawnToken: confirmation.expectedSpawnToken, reason: .modelMismatch)
     }
 
     func cancelCoordinatorModelRecreate() {
         declinedCoordinatorRecreateToken = coordinatorModelRecreateConfirmation?.expectedSpawnToken
         coordinatorModelRecreateConfirmation = nil
+    }
+
+    /// Perform an operator-confirmed coordinator reset: destroys the current
+    /// tmux session and starts a fresh one through the normal creation path
+    /// (current binary, current instructions, no carried-over context). The
+    /// UI-side confirmation dialog (Settings ▸ Workers, or the update-available
+    /// banner) must call this only after the operator has explicitly confirmed
+    /// — this method itself does not prompt. A no-op when no coordinator is
+    /// currently attached (nothing to reset).
+    func resetCoordinator() {
+        guard let token = attachedCoordinatorSpawnToken else { return }
+        engine.sendRecreateCoordinator(expectedSpawnToken: token, reason: .operatorReset)
     }
 
     private func refreshCoordinatorModelRecreateConfirmation() {

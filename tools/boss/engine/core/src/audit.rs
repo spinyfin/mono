@@ -281,6 +281,27 @@ fn resolve_path() -> Option<PathBuf> {
     Some(resolved)
 }
 
+/// Whether `AUDIT_PATH` has already been resolved in this test binary. The
+/// `OnceLock` is process-global, so any unit test elsewhere in this crate
+/// that wants to assert on `record_event`'s output must skip itself when
+/// another test won the race — mirrors `public_start_and_shutdown_path_emits_two_records`
+/// below, exposed crate-wide so callers outside this module (e.g.
+/// `coordinator_tmux`'s reset tests) can follow the same idiom.
+#[cfg(test)]
+pub(crate) fn path_already_resolved_for_tests() -> bool {
+    AUDIT_PATH.get().is_some()
+}
+
+/// Crate-wide access to the same serializer `tests::lock_globals` uses, for
+/// callers outside this module (e.g. `coordinator_tmux`'s reset tests) that
+/// mutate `AUDIT_PATH_ENV` or otherwise touch these process-global statics.
+/// Must be held for the whole test, not just around the `set_var` call —
+/// see `tests::AUDIT_GLOBALS_LOCK`'s docs for the flake this prevents.
+#[cfg(test)]
+pub(crate) fn lock_audit_globals_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    tests::lock_globals()
+}
+
 fn append_to(path: &Path, value: &Value) -> std::io::Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -349,7 +370,7 @@ mod tests {
     /// so one failing test doesn't cascade into the others.
     static AUDIT_GLOBALS_LOCK: Mutex<()> = Mutex::new(());
 
-    fn lock_globals() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn lock_globals() -> std::sync::MutexGuard<'static, ()> {
         AUDIT_GLOBALS_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

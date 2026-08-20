@@ -2257,6 +2257,14 @@ final class ChatViewModel: ObservableObject {
     var declinedCoordinatorRecreateToken: String?
     @Published var coordinatorModelRecreateConfirmation: CoordinatorModelRecreateConfirmation?
 
+    /// The installed `claude` version, set only while the engine reports it
+    /// as newer than what the running coordinator session actually launched
+    /// with. Drives `CoordinatorUpdateBanner`; `nil` renders nothing. Clears
+    /// itself the moment a reset makes the versions match again — there is
+    /// no separate dismiss, since a wrong "up to date" reading is worse than
+    /// the banner persisting until the operator acts.
+    @Published var coordinatorUpdateAvailable: String?
+
     /// Whether the engine has confirmed this client is the registered app session.
     /// Reset on disconnect (see [[ChatViewModel+EventHandling.swift]]); set when
     /// `appSessionRegistered` is received.

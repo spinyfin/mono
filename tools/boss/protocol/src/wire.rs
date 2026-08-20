@@ -145,6 +145,27 @@ impl FrontendEventEnvelope {
     }
 }
 
+/// Why a [`FrontendRequest::RecreateCoordinator`] was confirmed. Both paths
+/// call the same engine-owned recreate, but the reason is recorded to the
+/// audit log so an operator-initiated reset is distinguishable there from an
+/// automatic model-mismatch replacement — and, separately, from a crash or
+/// unexpected session loss, which is never audited under this event at all.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinatorRecreateReason {
+    /// The coordinator's running model no longer matches the engine's
+    /// configured model; the operator confirmed replacing it. Also the
+    /// default: it was the only caller before `reason` existed, so an
+    /// older app talking to a newer engine (a `recreate_coordinator` line
+    /// with no `reason` field) can only have meant this.
+    #[default]
+    ModelMismatch,
+    /// The operator explicitly asked to reset the coordinator — to pick up
+    /// a newer `claude` binary, clear accumulated context, or apply an
+    /// environment change. Never triggered automatically.
+    OperatorReset,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FrontendRequest {
@@ -1799,11 +1820,14 @@ pub enum FrontendRequest {
         conflicted_files: Vec<String>,
     },
 
-    /// App-only acknowledgement of the destructive coordinator-model prompt.
-    /// The expected token prevents a delayed confirmation from destroying a
-    /// coordinator that recovery has already replaced.
+    /// App-only acknowledgement of a destructive coordinator recreate — either
+    /// the model-mismatch prompt or an operator-initiated reset. The expected
+    /// token prevents a delayed confirmation from destroying a coordinator
+    /// that recovery (or another confirmed recreate) has already replaced.
     RecreateCoordinator {
         expected_spawn_token: String,
+        #[serde(default)]
+        reason: CoordinatorRecreateReason,
     },
 
     /// App self-identifies as the singleton app session. The engine

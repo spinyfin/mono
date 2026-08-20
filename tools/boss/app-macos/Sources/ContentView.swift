@@ -26,6 +26,7 @@ struct ContentView: View {
     #endif
     @State private var isSearchExpanded: Bool = false
     @State private var workColumnVisibility: NavigationSplitViewVisibility = .all
+    @State private var showCoordinatorResetConfirmFromBanner = false
     @Environment(\.openWindow) private var openWindow
     @AppStorage("boss.ui.standardSearch", store: BossDefaults.store) private var useStandardSearch: Bool = false
     @AppStorage(KanbanBoardStyle.storageKey, store: BossDefaults.store) private var kanbanBoardStyle: KanbanBoardStyle = .productDefault
@@ -126,6 +127,21 @@ struct ContentView: View {
             if let confirmation = model.coordinatorModelRecreateConfirmation {
                 Text("Picard is running \(confirmation.currentModel). Restarting replaces its tmux session and permanently discards the current conversation.")
             }
+        }
+        // Same confirmed flow as the "Reset Coordinator Session…" control in
+        // Settings ▸ Workers (identical copy, via CoordinatorResetCopy) — the
+        // banner only offers the action, it never resets on a single click.
+        .confirmationDialog(
+            CoordinatorResetCopy.title,
+            isPresented: $showCoordinatorResetConfirmFromBanner,
+            titleVisibility: .visible
+        ) {
+            Button("Reset", role: .destructive) {
+                model.resetCoordinator()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(CoordinatorResetCopy.message)
         }
         #if canImport(GhosttyKit)
         .task {
@@ -457,6 +473,7 @@ struct ContentView: View {
         model.showConnectionLostBanner
             || model.engineSupervisionState != .running
             || (model.isConnected && !model.bannerHealthIssues.isEmpty)
+            || (model.isConnected && model.coordinatorUpdateAvailable != nil)
     }
 
     /// Insertion-only: a banner slides down into the gap AppKit has just
@@ -504,6 +521,20 @@ struct ContentView: View {
                 EngineHealthBanner(
                     issues: model.bannerHealthIssues,
                     onUnpauseDispatch: { model.resumeDispatch() }
+                )
+                .transition(bannerTransition)
+            }
+            // Informational, not a fault: deliberately not folded into
+            // EngineHealthBanner. That banner's severity vocabulary is
+            // error/warning and a single background color represents the
+            // *worst* issue in the list — an "update available" notice has
+            // no severity, and would either misrepresent itself as a fault
+            // color or force a co-occurring real fault to render as merely
+            // informational. This offers the reset; it never performs it.
+            if model.isConnected, let installedVersion = model.coordinatorUpdateAvailable {
+                CoordinatorUpdateBanner(
+                    installedVersion: installedVersion,
+                    onReset: { showCoordinatorResetConfirmFromBanner = true }
                 )
                 .transition(bannerTransition)
             }

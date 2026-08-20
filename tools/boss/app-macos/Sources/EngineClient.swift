@@ -427,6 +427,7 @@ final class EngineClient: @unchecked Sendable {
                     let model = request["model"] as? String ?? ""
                     let tmuxProgram = request["tmux_program"] as? String ?? ""
                     let serverLabel = request["server_label"] as? String ?? ""
+                    let newerInstalledClaudeVersion = request["coordinator_update_available_version"] as? String
                     emit(.engineRequest(
                         requestId: requestId,
                         request: .attachCoordinatorPane(EngineCoordinatorAttachRequest(
@@ -434,7 +435,8 @@ final class EngineClient: @unchecked Sendable {
                             spawnToken: spawnToken,
                             model: model,
                             tmuxProgram: tmuxProgram,
-                            serverLabel: serverLabel
+                            serverLabel: serverLabel,
+                            newerInstalledClaudeVersion: newerInstalledClaudeVersion
                         ))
                     ))
                 case "detach_worker_pane":

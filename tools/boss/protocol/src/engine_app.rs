@@ -151,7 +151,8 @@ pub struct AttachWorkerPaneResult {}
 /// Engine asks the app to attach its single Boss-pane surface to the durable
 /// coordinator tmux session. The engine owns session creation and restart;
 /// the app receives only the verified session identity needed to render it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(bon::Builder, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[builder(on(String, into))]
 pub struct AttachCoordinatorPaneInput {
     pub session_name: String,
     pub spawn_token: String,
@@ -160,6 +161,13 @@ pub struct AttachCoordinatorPaneInput {
     pub tmux_program: String,
     /// Private tmux server label (`-L`) the coordinator session runs on.
     pub server_label: String,
+    /// The installed `claude` version, present only when it is newer than
+    /// the version this coordinator session actually launched with. `None`
+    /// covers both "no upgrade available" and "can't tell" (missing launch
+    /// record, probe failed, unparseable output) — the app must never
+    /// distinguish those and must never render an "up to date" state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_update_available_version: Option<String>,
 }
 
 /// App's reply when its Boss pane is attached to the coordinator session.
@@ -648,9 +656,14 @@ mod tests {
             model: "opus".into(),
             tmux_program: "/opt/homebrew/bin/tmux".into(),
             server_label: "boss".into(),
+            coordinator_update_available_version: None,
         });
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("attach_coordinator_pane"));
+        assert!(
+            !json.contains("coordinator_update_available_version"),
+            "None must be omitted, not serialized as null: {json}"
+        );
         assert_eq!(serde_json::from_str::<EngineToAppRequest>(&json).unwrap(), request);
 
         let response = EngineToAppResponse::AttachCoordinatorPane {
@@ -660,6 +673,21 @@ mod tests {
             serde_json::from_str::<EngineToAppResponse>(&serde_json::to_string(&response).unwrap()).unwrap(),
             response
         );
+    }
+
+    #[test]
+    fn coordinator_attach_round_trips_a_present_update_available_version() {
+        let request = EngineToAppRequest::AttachCoordinatorPane(AttachCoordinatorPaneInput {
+            session_name: "boss-coordinator".into(),
+            spawn_token: "opaque-token".into(),
+            model: "opus".into(),
+            tmux_program: "/opt/homebrew/bin/tmux".into(),
+            server_label: "boss".into(),
+            coordinator_update_available_version: Some("2.2.0".into()),
+        });
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"coordinator_update_available_version\":\"2.2.0\""));
+        assert_eq!(serde_json::from_str::<EngineToAppRequest>(&json).unwrap(), request);
     }
 
     #[test]
