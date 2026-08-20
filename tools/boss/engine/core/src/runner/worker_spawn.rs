@@ -36,13 +36,30 @@ pub(crate) struct ComposedWorkerSpawn {
 /// [`super::prompt::ExecutionPromptParams`]'s matching fields for what each
 /// one does to the rendered prompt. All fields default OFF, matching every
 /// flag's registry default.
-#[derive(Debug, Default, Clone, Copy)]
+///
+/// `automation_outcome_proposals_seam_enabled` is the odd one out: it does
+/// not feed `ExecutionPromptParams` at all (triage executions render
+/// [`crate::automation_triage::render_triage_preamble`] directly, bypassing
+/// the standard prompt composition), and it ALSO gates the triage worker's
+/// CLAUDE.md (`crate::automation_triage::render_triage_claude_md`, threaded
+/// separately via `crate::worker_setup::WorkerSetupInput` — see
+/// `runner::pane_spawn`'s spawn call site for where both are computed from
+/// the same flag read).
+#[derive(Debug, Default, Clone, Copy, bon::Builder)]
+#[builder(on(String, into))]
 pub(crate) struct WorkerSpawnOpts {
+    #[builder(default)]
     pub(crate) editorial_enabled: bool,
+    #[builder(default)]
     pub(crate) max_embed_diff_lines: u64,
+    #[builder(default)]
     pub(crate) worker_signal_proposals_seam_enabled: bool,
+    #[builder(default)]
     pub(crate) deferred_scope_proposals_seam_enabled: bool,
+    #[builder(default)]
     pub(crate) followup_proposals_seam_enabled: bool,
+    #[builder(default)]
+    pub(crate) automation_outcome_proposals_seam_enabled: bool,
 }
 
 /// Fetch authoritative PR metadata for a reviewer worker's initial prompt.
@@ -315,6 +332,7 @@ pub(crate) async fn compose_worker_spawn(
         worker_signal_proposals_seam_enabled,
         deferred_scope_proposals_seam_enabled,
         followup_proposals_seam_enabled,
+        automation_outcome_proposals_seam_enabled,
     } = editorial_opts;
     // For any project-scoped task (the synthetic `kind = 'design'`
     // task and ordinary `project_task` rows alike), the richer
@@ -510,6 +528,7 @@ pub(crate) async fn compose_worker_spawn(
                     &siblings,
                     &triage_context,
                     &crate::structured_output::default_path_string(&execution.id, StructuredOutputKind::TriageDecision),
+                    automation_outcome_proposals_seam_enabled,
                 )
             }
             other => {
