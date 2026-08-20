@@ -23,6 +23,7 @@ extension ChatViewModel {
             engine.sendListDeferredScopeAttentions(productId: productID)
             refreshPlannerRuns(forProductID: productID)
         }
+        requestBackgroundWorkRefresh()
     }
 
     /// Clears the banner and supersedes any pending delayed reveal on a

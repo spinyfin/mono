@@ -61,6 +61,7 @@ extension ChatViewModel {
                 engine.sendGetWorkTree(productId: productID, flow: .coldStart)
                 engine.sendListAttentionGroups(productId: productID)
             }
+            startBackgroundWorkPolling()
         case .resyncRequired:
             handleResyncRequired() // socket never went down; see ChatViewModel+Connection.swift
         case .appSessionRegistered:
@@ -76,6 +77,7 @@ extension ChatViewModel {
             handleEngineRequest(requestId: requestId, request: request)
         case .disconnected:
             isConnected = false
+            stopBackgroundWorkPolling(clearSnapshot: true)
             isAppSessionRegistered = false
             subscribedWorkTopics.removeAll()
             for (productID, state) in automationsFetchStateByProductID {
@@ -120,6 +122,7 @@ extension ChatViewModel {
             for itemID in itemIDs where executionsByTaskID[itemID] != nil {
                 engine.sendListExecutions(taskId: itemID)
             }
+            requestBackgroundWorkRefresh()
         case .productsList(let products):
             self.products = products.sorted(by: { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending })
             let activeIDs = Set(activeProducts.map(\.id))
@@ -177,7 +180,8 @@ extension ChatViewModel {
             if let productID = deletedTask?.productID ?? currentSelectedProductID {
                 scheduleWorkTreeRefetch(productID: productID, flow: .itemRefetch)
             }
-        case .workError(let message):
+        case .workError(let message, let requestId):
+            abandonBackgroundWorkRequest(requestId: requestId)
             if let attemptID = engineAttemptDetailRequestID {
                 engineAttemptDetailErrors[attemptID] = message
                 engineAttemptDetailRequestID = nil
@@ -328,9 +332,9 @@ extension ChatViewModel {
             conflictResolutions = attempts
         case .conflictResolutionStarted(_, _, _, let prURL):
             // A (re)dispatch of the conflict resolver means the PR is
-            // conflicting again — the prior "conflict cleared" badge is
-            // stale and must be removed (T778). Mirrors the ciRemediationStarted
-            // arm that clears recentlyClearedCIPRs for the same reason.
+            // conflicting again, so the prior "conflict cleared" badge is
+            // stale. Mirrors the ciRemediationStarted arm that clears
+            // recentlyClearedCIPRs for the same reason.
             recentlyClearedConflictPRs.removeValue(forKey: prURL)
             engine.sendListConflictResolutions(limit: 200)
             refreshEngineAttempts()
@@ -406,9 +410,12 @@ extension ChatViewModel {
                     break
                 }
             }
-        case .engineAttemptsList(let attempts, let backgroundWork):
-            engineAttempts = attempts
-            self.backgroundWork = backgroundWork
+        case .engineAttemptsList(let attempts, let backgroundWork, let requestId):
+            applyEngineAttemptsList(
+                attempts: attempts,
+                backgroundWork: backgroundWork,
+                requestId: requestId
+            )
         case .conflictResolution(let attempt):
             engineAttemptDetails[attempt.id] = .conflictResolution(attempt)
             engineAttemptDetailErrors.removeValue(forKey: attempt.id)
@@ -430,7 +437,7 @@ extension ChatViewModel {
             // (0, 0) so the card surfaces the in-flight state until
             // the next list refresh fills in real numbers.
             // A new failure makes any prior "ci auto-fixed" claim stale:
-            // if the auto-fix didn't stick, the badge is misleading (T606).
+            // if the auto-fix didn't stick, the badge is misleading.
             recentlyClearedCIPRs.removeValue(forKey: prURL)
             if ciFailureBadges[prURL] == nil {
                 ciFailureBadges[prURL] = CiFailureBadge(state: .inFlight, attemptsUsed: 0, budget: 0)
@@ -452,7 +459,7 @@ extension ChatViewModel {
             // Engine cleared `blocked: ci_failure` but found no active
             // remediation attempt (the prior attempt was already terminal).
             // Clear the failure badge only — do NOT set the auto-fixed badge
-            // because the clearance was not driven by an auto-fix (T606).
+            // because the clearance was not driven by an auto-fix.
             ciFailureBadges.removeValue(forKey: prURL)
         case .ciRemediationFailed(_, _, _, _, _),
              .ciRemediationAbandoned(_, _, _, _, _):
@@ -464,7 +471,7 @@ extension ChatViewModel {
         case .ciRemediationExhausted(_, _, let prURL, let used, let budget):
             // Budget exhausted means CI is still failing and auto-fix
             // cannot help further. Any prior "ci auto-fixed" claim is now
-            // stale (T606).
+            // stale.
             recentlyClearedCIPRs.removeValue(forKey: prURL)
             ciFailureBadges[prURL] = CiFailureBadge(state: .exhausted, attemptsUsed: used, budget: budget)
             engine.sendListCiRemediations(limit: 200)
@@ -595,7 +602,7 @@ extension ChatViewModel {
                 findings: findings,
                 rewrittenBody: rewrittenBody
             )
-        // MARK: Comments (P529 Phase 2)
+        // MARK: Comments
         case .commentsList(let artifactKind, let artifactId, let comments):
             commentBridge.handleCommentsList(artifactKind: artifactKind, artifactId: artifactId, comments: comments)
         case .commentsResolved(let artifactKind, let artifactId, let comments):
