@@ -786,6 +786,7 @@ extension InlineStyle {
                 .code(
                     .font(.system(.callout, design: .monospaced)),
                     .foregroundColor(BossMarkdownPalette.ink),
+                    .backgroundColor(BossMarkdownPalette.inlineCodeFill),
                     EditorialInlineCodeBoxProperty()
                 )
                 .strong(.fontWeight(.semibold))
