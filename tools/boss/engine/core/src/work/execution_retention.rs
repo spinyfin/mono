@@ -37,7 +37,9 @@
 //! `work_runs.execution_id`, `work_attention_items.execution_id`, and
 //! `worker_proposals.execution_id` are all `ON DELETE CASCADE`, so a pruned
 //! execution's runs, any (typically already-resolved) attention items, and
-//! any worker proposals pointing at it go with it.
+//! any worker proposals pointing at it go with it. Screenshot attachments are
+//! deliberately not in that set: their own retention policy removes bytes and
+//! leaves a tombstone after its longer evidence window.
 //! `automation_runs.triage_execution_id` has no FK — that row's
 //! `outcome`/`detail` are denormalized at write time, so a pruned triage
 //! execution just leaves that column dangling; the automation's run
@@ -374,6 +376,49 @@ mod tests {
         assert_eq!(
             remaining_proposals, 0,
             "the cascade removes the proposal row along with its execution"
+        );
+    }
+
+    #[test]
+    fn prunes_execution_without_removing_its_attachment_evidence() {
+        let db = open_db();
+        let product_id = create_test_product_with_repo(&db, "p", Some("https://github.com/test/repo")).id;
+        let work_item_id = create_chore(&db, &product_id, "c1");
+        let now = 1_800_000_000i64;
+        let execution_id = insert_execution(&db, &work_item_id, "failed", now - 20 * DAY);
+        let attachment_id = "atc_execution_pruned";
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "INSERT INTO work_attachments
+                 (id, execution_id, work_item_id, caption, content_digest, media_type,
+                  pixel_width, pixel_height, size_bytes, source_name, created_at)
+             VALUES (?1, ?2, ?3, 'failure screenshot', 'attachment-digest', 'png',
+                     10, 10, 4, 'failure.png', ?4)",
+            rusqlite::params![attachment_id, execution_id, work_item_id, (now - DAY).to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let outcome = db
+            .prune_terminal_executions(
+                ExecutionRetentionPolicy {
+                    max_age_secs: DEFAULT_RETENTION_MAX_AGE_SECS,
+                    keep_per_work_item: 0,
+                },
+                now,
+                false,
+            )
+            .unwrap();
+        assert_eq!(outcome.deleted, 1);
+        assert!(db.list_executions(Some(&work_item_id)).unwrap().is_empty());
+        let attachment = db
+            .get_work_attachment(attachment_id)
+            .unwrap()
+            .expect("the attachment remains readable after its execution is pruned");
+        assert_eq!(attachment.caption, "failure screenshot");
+        assert!(
+            !attachment.is_reclaimed(),
+            "only attachment retention may stamp the evidence tombstone"
         );
     }
 

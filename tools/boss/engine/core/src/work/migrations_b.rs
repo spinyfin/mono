@@ -2890,19 +2890,20 @@ pub(crate) fn migrate_products_design_guidance(conn: &Connection) -> Result<()> 
 ///
 /// `reclaimed_at` is why the row outlives its blob. A stale gallery link an
 /// operator follows then answers "reclaimed by retention on <date>" rather
-/// than a bare 404 that reads like a bug. Tombstones are removed with their
-/// execution by the `ON DELETE CASCADE`, the same way `worker_proposals` and
-/// `work_runs` rows are.
+/// than a bare 404 that reads like a bug. The attachment's lifecycle is
+/// intentionally independent of its execution: execution retention removes
+/// noisy terminal runs after 14 days, while attachment retention keeps this
+/// self-describing evidence for its own longer policy. `execution_id` remains
+/// as historical provenance rather than a foreign key.
 ///
-/// Purely additive (`CREATE TABLE IF NOT EXISTS`) and independent of every
-/// other table except that reference.
+/// Nothing references this table as a parent.
 ///
 /// Design: tools/boss/docs/designs/worker-screenshot-evidence-attachments.md
 pub(crate) fn migrate_work_attachments_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS work_attachments (
              id             TEXT PRIMARY KEY,
-             execution_id   TEXT NOT NULL REFERENCES work_executions(id) ON DELETE CASCADE,
+             execution_id   TEXT NOT NULL,
              work_item_id   TEXT NOT NULL,
              caption        TEXT NOT NULL DEFAULT '',
              content_digest TEXT NOT NULL,

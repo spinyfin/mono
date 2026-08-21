@@ -4,6 +4,77 @@
 
 use super::*;
 
+/// An existing installation can carry attachment rows in the original schema
+/// where deleting an execution cascaded into evidence loss. Reopening must
+/// preserve those rows while removing that cascade.
+#[test]
+fn migration_detaches_existing_attachments_from_execution_retention() {
+    let (_dir, path) = disk_db_path("work-attachments-retention-upgrade");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
+    let chore = create_test_chore(&db, &product.id, "Legacy attachment");
+    let execution = create_ready_chore_execution(&db, &chore.id);
+    {
+        let conn = db.connect().unwrap();
+        conn.execute_batch(
+            "DROP TABLE work_attachments;
+             CREATE TABLE work_attachments (
+                 id             TEXT PRIMARY KEY,
+                 execution_id   TEXT NOT NULL REFERENCES work_executions(id) ON DELETE CASCADE,
+                 work_item_id   TEXT NOT NULL,
+                 caption        TEXT NOT NULL DEFAULT '',
+                 content_digest TEXT NOT NULL,
+                 media_type     TEXT NOT NULL,
+                 pixel_width    INTEGER NOT NULL,
+                 pixel_height   INTEGER NOT NULL,
+                 size_bytes     INTEGER NOT NULL,
+                 source_name    TEXT NOT NULL,
+                 created_at     TEXT NOT NULL,
+                 reclaimed_at   TEXT,
+                 UNIQUE (execution_id, content_digest)
+             );
+             CREATE INDEX work_attachments_work_item_idx
+                 ON work_attachments(work_item_id, created_at);
+             CREATE INDEX work_attachments_digest_idx
+                 ON work_attachments(content_digest);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO work_attachments
+                 (id, execution_id, work_item_id, caption, content_digest, media_type,
+                  pixel_width, pixel_height, size_bytes, source_name, created_at)
+             VALUES ('atc_legacy', ?1, ?2, 'preserved evidence', 'legacy-digest', 'png',
+                     10, 10, 4, 'legacy.png', '1700000000')",
+            rusqlite::params![execution.id, chore.id],
+        )
+        .unwrap();
+    }
+    drop(db);
+
+    let db = WorkDb::open(path).expect("the populated legacy attachment schema migrates cleanly");
+    let conn = db.connect().unwrap();
+    let has_execution_fk = conn
+        .prepare(
+            "SELECT 1 FROM pragma_foreign_key_list('work_attachments')
+             WHERE \"table\" = 'work_executions'",
+        )
+        .unwrap()
+        .exists([])
+        .unwrap();
+    assert!(
+        !has_execution_fk,
+        "attachment retention must no longer depend on execution rows"
+    );
+    conn.execute("DELETE FROM work_executions WHERE id = ?1", [&execution.id])
+        .unwrap();
+    drop(conn);
+    let attachment = db
+        .get_work_attachment("atc_legacy")
+        .unwrap()
+        .expect("the existing row survives an execution delete");
+    assert_eq!(attachment.caption, "preserved evidence");
+}
+
 /// Drop the `deferred` column (simulating a pre-classification DB) and
 /// re-open: `migrate_tasks_deferred`'s ALTER TABLE path must re-add it and
 /// leave existing rows at the `0` (not-future-scope) default, so an upgrade
