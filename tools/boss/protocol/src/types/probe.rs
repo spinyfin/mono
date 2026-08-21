@@ -325,6 +325,16 @@ pub enum ProbeInterruptOutcome {
     /// The gesture was delivered and the driver's whole attempt budget was
     /// spent without the turn ending. Nothing was typed into the pane.
     Failed,
+    /// No interrupt could be attempted (or one was cut short mid-attempt)
+    /// because the worker's own state disappeared out from under the
+    /// interrupt path: it was pre-session or terminal when the check ran, or
+    /// its slot mapping / live activity went away while an attempt was in
+    /// flight. Distinct from [`Self::Failed`], whose `describe()` states that
+    /// a gesture *was* delivered and a full attempt budget was spent — a
+    /// claim that does not hold here, where either no gesture was ever sent
+    /// or the reason it stopped was the worker vanishing, not the budget
+    /// running out.
+    WorkerGone,
     /// No interrupt was attempted because another delivery path had already
     /// claimed this probe (or the run's single in-flight slot) by the time
     /// the interrupting path reached it — a boundary fan-out that got there
@@ -344,6 +354,7 @@ impl ProbeInterruptOutcome {
             Self::EndedNaturally => "ended_naturally",
             Self::DriverCannotInterrupt => "driver_cannot_interrupt",
             Self::Failed => "failed",
+            Self::WorkerGone => "worker_gone",
             Self::NotAttempted => "not_attempted",
         }
     }
@@ -373,6 +384,10 @@ impl ProbeInterruptOutcome {
             Self::Failed => {
                 "the interrupt was delivered but the turn never ended within the driver's declared \
                  attempt budget; nothing was typed into the pane"
+            }
+            Self::WorkerGone => {
+                "the worker's own state disappeared before (or while) the interrupt was attempted, so \
+                 no gesture landed or none could be confirmed; nothing was typed into the pane"
             }
             Self::NotAttempted => {
                 "another delivery path already held this probe, so no interrupt was attempted and the \
@@ -530,6 +545,7 @@ mod tests {
             ProbeInterruptOutcome::EndedNaturally,
             ProbeInterruptOutcome::DriverCannotInterrupt,
             ProbeInterruptOutcome::Failed,
+            ProbeInterruptOutcome::WorkerGone,
             ProbeInterruptOutcome::NotAttempted,
         ] {
             let json = serde_json::to_string(&outcome).unwrap();
@@ -552,6 +568,7 @@ mod tests {
             ProbeInterruptOutcome::EndedNaturally,
             ProbeInterruptOutcome::DriverCannotInterrupt,
             ProbeInterruptOutcome::Failed,
+            ProbeInterruptOutcome::WorkerGone,
             ProbeInterruptOutcome::NotAttempted,
         ] {
             assert!(!cheap.discarded_in_flight_work(), "{}", cheap.as_str());

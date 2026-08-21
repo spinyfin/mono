@@ -56,7 +56,7 @@ use super::*;
 
 use boss_protocol::{ProbeInterruptOutcome, WorkerActivity};
 
-use crate::app::pane_delivery::{PaneInjectOutcome, PaneInjectRequest};
+use crate::app::pane_delivery::{PaneInjectOutcome, PaneInjectRequest, PaneInputPosture};
 use crate::app::probes::PendingProbe;
 use crate::driver::InterruptPlan;
 
@@ -171,11 +171,15 @@ pub(super) async fn deliver_probe_interrupting(
     // terminally; a claim left behind would pin the run's single delivery
     // slot against a probe nothing is going to deliver.
     let (transcript_path, offset_bytes) = super::worker_events::transcript_offset_for_run(server_state, run_id).await;
-    let Some(probe) = server_state.try_reserve_probe_for_delivery(run_id, transcript_path, offset_bytes) else {
-        // Another dispatch path holds the probe or the run's delivery slot.
-        // Report what the probe's own record says rather than guessing: if a
-        // racing boundary already delivered it, that is a success and saying
-        // otherwise would send the operator chasing a probe that landed.
+    let Some(probe) =
+        server_state.try_reserve_specific_probe_for_delivery(run_id, probe_id, transcript_path, offset_bytes)
+    else {
+        // Either another dispatch path holds the run's delivery slot, or this
+        // exact probe id is not present in the queue at all (already claimed
+        // by another dispatcher, or already settled). Report what the
+        // probe's own record says rather than guessing: if a racing boundary
+        // already delivered it, that is a success and saying otherwise would
+        // send the operator chasing a probe that landed.
         return raced_to_another_dispatcher(server_state, run_id, probe_id);
     };
 
@@ -223,7 +227,7 @@ async fn interrupt_and_confirm(
         // here, so reaching this is a race with teardown.
         other => {
             return Err(InterruptFailure {
-                outcome: ProbeInterruptOutcome::Failed,
+                outcome: ProbeInterruptOutcome::WorkerGone,
                 attempts: 0,
                 detail: format!(
                     "the worker's activity is {} — there is no in-flight turn to interrupt and no \
@@ -235,18 +239,38 @@ async fn interrupt_and_confirm(
         }
     }
 
-    let Some(plan) = server_state.interrupt_plan_for_run(run_id) else {
+    let plan = match server_state.interrupt_plan_lookup(run_id) {
+        super::pane_ops::InterruptPlanLookup::Plan(plan) => plan,
         // A declared property of the driver, not a silent fallback: we do not
         // quietly downgrade to boundary delivery and report success.
-        return Err(InterruptFailure {
-            outcome: ProbeInterruptOutcome::DriverCannotInterrupt,
-            attempts: 0,
-            detail: format!(
-                "the driver for run {run_id} declares no interrupt mechanism, so its in-flight turn \
-                 cannot be cut short; nothing was written into the pane"
-            ),
-            worker_gone: false,
-        });
+        super::pane_ops::InterruptPlanLookup::NotInterruptible => {
+            return Err(InterruptFailure {
+                outcome: ProbeInterruptOutcome::DriverCannotInterrupt,
+                attempts: 0,
+                detail: format!(
+                    "the driver for run {run_id} declares no interrupt mechanism, so its in-flight turn \
+                     cannot be cut short; nothing was written into the pane"
+                ),
+                worker_gone: false,
+            });
+        }
+        // Distinct from the above: no driver resolved at all (missing
+        // execution row, unregistered slug, DB error) rather than a driver
+        // that was resolved and genuinely declares itself uninterruptible.
+        // Every registered driver declares a runnable plan, so this is the
+        // case that actually occurs in practice, and it is a lookup failure
+        // an operator can fix, not a permanent capability gap.
+        super::pane_ops::InterruptPlanLookup::DriverUnresolved => {
+            return Err(InterruptFailure {
+                outcome: ProbeInterruptOutcome::DriverCannotInterrupt,
+                attempts: 0,
+                detail: format!(
+                    "the engine could not resolve a driver for run {run_id}, so no interrupt gesture \
+                     could be chosen; nothing was written into the pane"
+                ),
+                worker_gone: false,
+            });
+        }
     };
 
     let mut attempts: u8 = 0;
@@ -270,7 +294,7 @@ async fn interrupt_and_confirm(
             Some(WorkerActivity::Working) => {}
             other => {
                 return Err(InterruptFailure {
-                    outcome: ProbeInterruptOutcome::Failed,
+                    outcome: ProbeInterruptOutcome::WorkerGone,
                     attempts,
                     detail: format!(
                         "the worker went {} while its turn was being interrupted",
@@ -282,11 +306,16 @@ async fn interrupt_and_confirm(
         }
 
         if let Err(err) = server_state.deliver_interrupt_gesture(run_id, Some(&plan)).await {
+            let worker_gone = matches!(err, super::pane_ops::InterruptPaneError::UnknownRun);
             return Err(InterruptFailure {
-                outcome: ProbeInterruptOutcome::Failed,
+                outcome: if worker_gone {
+                    ProbeInterruptOutcome::WorkerGone
+                } else {
+                    ProbeInterruptOutcome::Failed
+                },
                 attempts,
                 detail: format!("the interrupt keystroke could not be delivered to the worker's pane: {err}"),
-                worker_gone: matches!(err, super::pane_ops::InterruptPaneError::UnknownRun),
+                worker_gone,
             });
         }
         attempts = attempt;
@@ -308,7 +337,7 @@ async fn interrupt_and_confirm(
             TurnEndWait::Ended => return Ok((ProbeInterruptOutcome::Interrupted, attempts)),
             TurnEndWait::WorkerGone => {
                 return Err(InterruptFailure {
-                    outcome: ProbeInterruptOutcome::Failed,
+                    outcome: ProbeInterruptOutcome::WorkerGone,
                     attempts,
                     detail: "the run's pane was released while its turn was being interrupted".to_owned(),
                     worker_gone: true,
@@ -432,7 +461,20 @@ async fn inject_after_interrupt(
     let (transcript_path, offset_bytes) = super::worker_events::transcript_offset_for_run(server_state, run_id).await;
     server_state.update_in_flight_probe_snapshot(run_id, transcript_path.clone(), offset_bytes);
 
-    let posture = server_state.pane_input_posture_for_run(run_id, slot_id);
+    let mut posture = server_state.pane_input_posture_for_run(run_id, slot_id);
+    if !posture.permits_write() && server_state.pane_text_shows_turn_ended(run_id).await {
+        // The live activity signal has not caught up yet (still `Working`,
+        // so `pane_input_posture_for_run` resolves `Refused` on a driver that
+        // rejects mid-turn input), but the pane's own text positively shows
+        // the worker parked — a prompt prefix present and no busy marker,
+        // exactly the fact `pane_text_shows_turn_ended` exists to confirm.
+        // Without this, the secondary confirmation signal could never
+        // actually complete a delivery on the driver class it exists for
+        // (one whose cancelled turn skips its own turn-boundary channel): it
+        // would confirm the turn ended, then immediately have the write
+        // guard refuse anyway, discarding the interrupted work for nothing.
+        posture = PaneInputPosture::Parked;
+    }
     if !posture.permits_write() {
         // The worker started another turn (or went away) between the
         // confirmation and this write. Give the claim back rather than
@@ -679,7 +721,7 @@ async fn abandon_before_write(
     }
     InterruptingDelivery {
         state: ProbeDeliveryState::Abandoned,
-        interrupt: ProbeInterruptOutcome::Failed,
+        interrupt: ProbeInterruptOutcome::WorkerGone,
         attempts: 0,
         detail: Some(cause.to_owned()),
     }

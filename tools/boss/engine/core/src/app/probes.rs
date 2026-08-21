@@ -454,6 +454,58 @@ impl ServerState {
         Some(probe)
     }
 
+    /// Like [`Self::try_reserve_probe_for_delivery`], but claims **only**
+    /// `probe_id` — wherever it sits in `run_id`'s queue — rather than
+    /// whatever happens to be at the front.
+    ///
+    /// The interrupting delivery path is handed a specific `probe_id` by its
+    /// caller and must claim *that* probe. Popping the front unconditionally
+    /// (as [`Self::try_reserve_probe_for_delivery`] does) is correct for
+    /// every boundary dispatcher, which has no particular probe in mind and
+    /// simply wants the next one — but it is wrong here: if a
+    /// `--no-interrupt` probe was queued earlier and is still waiting behind
+    /// nothing being delivered, an interrupting probe issued afterwards would
+    /// pop and deliver *that* older probe's text while answering with the
+    /// caller's own (different) probe id, reporting a delivery that never
+    /// happened for the probe the caller actually asked about. An interrupt
+    /// is a targeted, immediate action on one probe, not a "next in line"
+    /// dispatch, so this searches the whole queue rather than only the front
+    /// — the probes behind it keep their relative order.
+    ///
+    /// Returns `None` — routing the caller to
+    /// [`super::probe_interrupt::raced_to_another_dispatcher`] — both when
+    /// the run's slot is already claimed and when `probe_id` is not present
+    /// in the queue at all (already claimed by another dispatcher, or
+    /// already settled).
+    pub(super) fn try_reserve_specific_probe_for_delivery(
+        &self,
+        run_id: &str,
+        probe_id: &str,
+        transcript_path: Option<String>,
+        offset_bytes: u64,
+    ) -> Option<PendingProbe> {
+        let mut in_flight = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
+        if in_flight.contains_key(run_id) {
+            return None;
+        }
+        let mut pending = self.pending_probes.lock().expect("pending_probes mutex poisoned");
+        let queue = pending.get_mut(run_id)?;
+        let position = queue.iter().position(|probe| probe.probe_id == probe_id)?;
+        let probe = queue.remove(position)?;
+        if queue.is_empty() {
+            pending.remove(run_id);
+        }
+        in_flight.insert(
+            run_id.to_owned(),
+            InFlightProbe {
+                probe_id: probe.probe_id.clone(),
+                transcript_path,
+                offset_bytes,
+            },
+        );
+        Some(probe)
+    }
+
     /// Re-point the in-flight entry for `run_id` at a fresh transcript
     /// snapshot, without disturbing the claim itself.
     ///
