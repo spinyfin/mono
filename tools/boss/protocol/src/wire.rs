@@ -1117,6 +1117,26 @@ pub enum FrontendRequest {
         run_id: String,
     },
 
+    /// App-facing, read-only counterpart of [`Self::ListAttachments`]: every
+    /// `work_attachments` row for `work_item_id`, newest first, including
+    /// reclaimed tombstones.
+    ///
+    /// `ListAttachments` resolves its caller from the socket peer, which
+    /// only works for a worker's own run — the app is not a registered
+    /// worker run, so it needs a verb that names the work item explicitly,
+    /// exactly as [`Self::ListExecutions`] does for execution history.
+    ///
+    /// When `include_revision_chain` is `true` and `work_item_id` names a
+    /// chain root, the response also includes every revision task's own
+    /// attachments — the screenshot viewer's grouped "Original" / "R1" /
+    /// "R2" display needs the whole chain in one call. Replies with
+    /// [`FrontendEvent::AttachmentsList`].
+    ListAttachmentsForWorkItem {
+        work_item_id: String,
+        #[serde(default)]
+        include_revision_chain: bool,
+    },
+
     /// List attention groups for a product, with optional filters.
     /// Replies with [`FrontendEvent::AttentionGroupsList`].
     ListAttentionGroups {

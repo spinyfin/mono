@@ -140,6 +140,7 @@ _COMMENTS_TRANSCRIPT_SHARD_SRCS = [
 _SHARD1_SRCS = [
     "Tests/BossTests/APIKeyStoreTests.swift",
     "Tests/BossTests/ApplyAttentionGroupsListTests.swift",
+    "Tests/BossTests/AttachmentAffordanceTests.swift",
     "Tests/BossTests/DesignsTests.swift",
     "Tests/BossTests/EngineAutoChoreKanbanTests.swift",
     "Tests/BossTests/KanbanExternalRefLinkTests.swift",

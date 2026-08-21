@@ -170,6 +170,9 @@ struct WorkBoardCardItem: View {
             }
             return nil
         }()
+        let onOpenAttachments: (() -> Void)? = snapshot.showsAttachmentsAffordance
+            ? { openWindow(id: "attachment-viewer", value: AttachmentViewerRef(taskId: task.id)) }
+            : nil
 
         VStack(alignment: .leading, spacing: 6) {
             Button {
@@ -199,6 +202,7 @@ struct WorkBoardCardItem: View {
                     },
                     onOpenTerminal: onOpenTerminal,
                     onMergeWhenReady: onMergeWhenReady,
+                    onOpenAttachments: onOpenAttachments,
                     onRevealAIReviewFindings: onRevealAIReviewFindings,
                     onAcceptDeferredScope: { id in model.acceptDeferredScopeAttention(id: id) },
                     onCreateTaskFromDeferredScope: { id in
@@ -396,6 +400,9 @@ struct WorkBoardCardView: View, @MainActor Equatable {
     /// Invoked after the user confirms "Merge When Ready". `nil` hides
     /// the button (also gated by `snapshot.showsMergeWhenReady`).
     var onMergeWhenReady: (() -> Void)? = nil
+    /// Invoked when the user taps the screenshots affordance. `nil` hides
+    /// the button (also gated by `snapshot.showsAttachmentsAffordance`).
+    var onOpenAttachments: (() -> Void)? = nil
     /// Invoked when the user taps the `reviewed_with_findings` AI-review
     /// badge — reveals the follow-up revision carrying the review
     /// comments. Only called when `snapshot.aiReviewFindingsRevisionId`
@@ -439,6 +446,7 @@ struct WorkBoardCardView: View, @MainActor Equatable {
             WorkBoardCardBadgeStrip(
                 slice: WorkBoardCardBadgeStripSlice(snapshot: snap),
                 onOpenDesignDoc: onOpenDesignDoc,
+                onOpenAttachments: onOpenAttachments,
                 onDepBadgeHover: onDepBadgeHover,
                 onOpenTerminal: onOpenTerminal,
                 onMergeWhenReady: onMergeWhenReady,

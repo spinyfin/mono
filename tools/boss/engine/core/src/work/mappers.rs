@@ -270,6 +270,10 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         revision_parent_pr_url: None,
         // Computed by attach_in_progress_revision_flag in get_work_tree.
         has_in_progress_revision: false,
+        // Computed by attach_has_attachments_flag in get_work_tree; always
+        // false in single-item query paths where the derived projection is
+        // not computed.
+        has_attachments: false,
         // Populated by map_task_with_source_automation_id when the SELECT
         // includes that column; None for all standard task queries.
         source_automation_id: None,

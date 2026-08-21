@@ -242,6 +242,10 @@ enum EngineEvent {
     /// Response to `list_executions` — all historical execution rows for
     /// one task, newest-first. Drives the transcript viewer's left pane.
     case executionsList(taskId: String, executions: [ExecutionVM])
+    /// Response to `list_attachments_for_work_item` — every screenshot for
+    /// one task (and, when the request asked for the chain, every revision
+    /// task in it too), newest first. Drives the screenshot viewer.
+    case attachmentsList(taskId: String, attachments: [AttachmentVM])
     /// Reply to `execution_transcript` — the rendered, lazily-displayable
     /// segments for one execution plus live/complete flags. Drives the
     /// transcript viewer's right pane (transcript-viewer.md task 4).

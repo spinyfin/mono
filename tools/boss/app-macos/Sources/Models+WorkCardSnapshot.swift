@@ -112,6 +112,7 @@ struct WorkCardSnapshot: Equatable {
     let revisionSeq: Int?
     let createdVia: String
     let hasInProgressRevision: Bool
+    let hasAttachments: Bool
     let sourceAutomationId: String?
     /// Engine-origin badge for revision cards (`nil` when operator-driven).
     let engineRevisionOrigin: EngineRevisionOrigin?
@@ -187,6 +188,11 @@ struct WorkCardSnapshot: Equatable {
     let showsPlannerStagedBadge: Bool
     let showsExternalRefLink: Bool
     let showsDesignDocAffordance: Bool
+    /// True when this card has evidence to show in the screenshot viewer —
+    /// directly reflects `task.hasAttachments`. Mirrors
+    /// `showsDesignDocAffordance`'s shape: no extra column-based gating,
+    /// the engine already resolved eligibility.
+    let showsAttachmentsAffordance: Bool
     let showsTerminalButton: Bool
     let showsMergeWhenReady: Bool
     let showsDeferredScopeBadge: Bool
@@ -334,6 +340,7 @@ struct WorkCardSnapshot: Equatable {
             revisionSeq: task.revisionSeq,
             createdVia: task.createdVia,
             hasInProgressRevision: task.hasInProgressRevision,
+            hasAttachments: task.hasAttachments,
             sourceAutomationId: task.sourceAutomationId,
             engineRevisionOrigin: EngineRevisionOrigin(createdVia: task.createdVia),
             projectName: context.projectName,
@@ -395,6 +402,7 @@ struct WorkCardSnapshot: Equatable {
             showsPlannerStagedBadge: task.isPlannerStaged,
             showsExternalRefLink: context.externalRefLink != nil,
             showsDesignDocAffordance: designDocPresentation,
+            showsAttachmentsAffordance: task.hasAttachments,
             showsTerminalButton: context.showsTerminalButton,
             showsMergeWhenReady: context.showsMergeWhenReady,
             showsDeferredScopeBadge: !context.deferredScopeItems.isEmpty,

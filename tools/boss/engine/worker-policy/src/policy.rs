@@ -224,6 +224,16 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         // handler, not here, because this match is pure.
         FrontendRequest::ListAttachments { .. } | FrontendRequest::SubmitAttachment { .. } => Allow,
 
+        // ── Denied: app-only screenshot listing ────────────────────────────
+        //
+        // `ListAttachmentsForWorkItem` is the unscoped, app-facing
+        // counterpart to `ListAttachments` above — it names any work item
+        // directly rather than resolving one from the socket peer. A
+        // worker's own-item need is already met by the peer-attributed verb
+        // allowed above; this one has no worker-facing use, same as the
+        // rest of the runtime half below.
+        FrontendRequest::ListAttachmentsForWorkItem { .. } => runtime(variant_name(request)),
+
         // ── Allowed: the caller's own PR state ───────────────────────────
         //
         // `GetPrStatus` / `GetPrBody` are attributed identically to

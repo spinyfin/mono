@@ -1003,6 +1003,16 @@ impl WorkDb {
         }
         trace.record_plain(segment::DB_AI_REVIEW_STATE, elapsed_ms(t));
 
+        // Resolve has_attachments for every task/chore so the kanban card can
+        // gate its screenshot-viewer affordance without a per-card query.
+        // Errors are non-fatal — log and leave the field at its default
+        // (affordance hidden). Single batched `IN (...)` query.
+        let t = Instant::now();
+        if let Err(err) = attach_has_attachments_flag(&conn, &mut tasks, &mut chores) {
+            tracing::warn!(?err, "get_work_tree: failed to attach has_attachments flag; ignoring");
+        }
+        trace.record_plain(segment::DB_HAS_ATTACHMENTS, elapsed_ms(t));
+
         // Resolve the per-task doc-link state for project-less docs-backed
         // items (investigations / project-less designs) so their card renders
         // the Review-lane doc-link icon — parity with design cards, whose

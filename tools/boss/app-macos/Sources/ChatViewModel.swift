@@ -128,6 +128,11 @@ final class ChatViewModel: ObservableObject {
     /// the transcript viewer window sends `list_executions`. Cleared per-task
     /// before each fresh fetch so the viewer never shows stale rows.
     @Published var executionsByTaskID: [String: [ExecutionVM]] = [:]
+    /// Screenshot-evidence rows keyed by task id. Populated on demand when
+    /// the attachment viewer window sends `list_attachments_for_work_item`.
+    /// Cleared per-task before each fresh fetch, mirroring
+    /// [[executionsByTaskID]].
+    @Published var attachmentsByTaskID: [String: [AttachmentVM]] = [:]
     /// Transcript load state keyed by execution id. Populated on demand when
     /// the transcript viewer selects an execution (`execution_transcript`
     /// RPC). A `nil` (absent) entry means "not requested yet"; live
@@ -666,6 +671,15 @@ final class ChatViewModel: ObservableObject {
     func loadExecutions(taskId: String) {
         executionsByTaskID[taskId] = nil
         engine.sendListExecutions(taskId: taskId)
+    }
+
+    /// Fetch the screenshot evidence for `taskId`'s revision chain from the
+    /// engine. Clears any cached rows first so the viewer shows a loading
+    /// state. The engine replies with an `attachments_list` event that
+    /// populates [[attachmentsByTaskID]].
+    func loadAttachments(taskId: String) {
+        attachmentsByTaskID[taskId] = nil
+        engine.sendListAttachmentsForWorkItem(taskId: taskId)
     }
 
     /// Fetch the rendered transcript for `executionId` the first time it is

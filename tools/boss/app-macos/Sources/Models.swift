@@ -153,6 +153,11 @@ struct WorkTask: Identifiable, Hashable {
     /// PR should not be merged yet. Only meaningful on chain-root tasks that
     /// carry a `prURL`. Mirrors `has_in_progress_revision` on the wire.
     var hasInProgressRevision: Bool = false
+    /// `true` when this row's own attachments (or, for a chain-root task, a
+    /// direct revision child's own attachments) are non-empty. Derived
+    /// projection, not stored. Gates the kanban card's screenshot-viewer
+    /// affordance. Mirrors `has_attachments` on the wire.
+    var hasAttachments: Bool = false
     /// Size estimate for this work item. One of `trivial`, `small`, `medium`,
     /// `large`, `max`. `nil` when the row has no effort estimate (pre-column
     /// rows or items where the engine emitted `null`). Mirrors

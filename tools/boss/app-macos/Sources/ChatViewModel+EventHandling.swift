@@ -541,6 +541,8 @@ extension ChatViewModel {
             gitHubAuthState = state
         case .executionsList(let taskId, let executions):
             executionsByTaskID[taskId] = executions
+        case .attachmentsList(let taskId, let attachments):
+            attachmentsByTaskID[taskId] = attachments
         case .executionTranscriptResult(let executionId, let segments, let isLive, let complete):
             transcriptsByExecutionID[executionId] = .loaded(
                 TranscriptDoc(

@@ -768,6 +768,19 @@ extension EngineClient {
         ])
     }
 
+    /// Ask the engine for every screenshot filed against `taskId`'s revision
+    /// chain, newest first. The engine replies with `attachments_list`.
+    /// `list_attachments` (worker-facing, peer-attributed) doesn't work from
+    /// the app — this is the app-facing counterpart that names the work
+    /// item directly, exactly like `list_executions` above.
+    func sendListAttachmentsForWorkItem(taskId: String) {
+        sendLine([
+            "type": "list_attachments_for_work_item",
+            "work_item_id": taskId,
+            "include_revision_chain": true,
+        ])
+    }
+
     /// Ask the engine for the rendered transcript of one execution. The
     /// engine resolves the durable `work_executions` row (stable, even for
     /// finished/historical runs), reads the JSONL, and replies with

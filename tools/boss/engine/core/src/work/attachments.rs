@@ -198,6 +198,38 @@ impl WorkDb {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
+    /// Every attachment across a chain root and every revision task in its
+    /// chain, newest first. Mirrors [`WorkDb::list_executions_for_chain`]:
+    /// a revision chain produces several runs against one PR, and the
+    /// screenshot viewer's question is "what evidence exists for this
+    /// chain", not "what did this one work item's own executions render" —
+    /// `work_item_id` on each row (see the corrected doc comment on
+    /// [`WorkAttachment::work_item_id`]) is the executing row's own id, so a
+    /// revision's screenshots never surface under the chain root's id
+    /// without this union.
+    pub fn list_work_attachments_for_chain(&self, chain_root_id: &str) -> Result<Vec<WorkAttachment>> {
+        let conn = self.connect()?;
+        let revision_ids = collect_chain_revision_ids(&conn, chain_root_id)?;
+        let mut all_ids = vec![chain_root_id.to_owned()];
+        all_ids.extend(revision_ids);
+
+        let placeholders = all_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "{SELECT_WORK_ATTACHMENT}
+             WHERE work_item_id IN ({placeholders})
+             ORDER BY created_at DESC, id DESC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = all_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), map_work_attachment)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
     /// Every attachment in the install, newest first. Backs
     /// `bossctl attachments list`, which reads `state.db` directly and must
     /// work when the engine is wedged.
@@ -453,6 +485,77 @@ mod tests {
         assert!(
             db.referenced_attachment_digests().unwrap().is_empty(),
             "a reclaimed row no longer holds its blob alive"
+        );
+    }
+
+    #[test]
+    fn list_for_chain_unions_root_and_revisions_newest_first() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let root = create_test_chore(&db, &product.id, "chain-root");
+        let root_exec = create_ready_chore_execution(&db, root.id.clone());
+        db.submit_work_attachment(SubmitAttachmentInput {
+            execution_id: &root_exec.id,
+            work_item_id: &root.id,
+            image: &image("root-shot"),
+            caption: "root",
+        })
+        .unwrap()
+        .unwrap();
+
+        let revision_id = "task_revision_for_chain_test".to_owned();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id)
+                 VALUES (?1, ?2, 'revision', 'R1', '', 'todo', '1700000000', '1700000000', ?3)",
+                rusqlite::params![revision_id, product.id, root.id],
+            )
+            .unwrap();
+        }
+        let revision_exec = create_ready_chore_execution(&db, revision_id.clone());
+        db.submit_work_attachment(SubmitAttachmentInput {
+            execution_id: &revision_exec.id,
+            work_item_id: &revision_id,
+            image: &image("revision-shot"),
+            caption: "revision",
+        })
+        .unwrap()
+        .unwrap();
+
+        let chain = db.list_work_attachments_for_chain(&root.id).unwrap();
+        assert_eq!(
+            chain.len(),
+            2,
+            "must include both the root's and the revision's own attachments"
+        );
+        assert!(
+            chain.iter().any(|a| a.work_item_id == root.id && a.caption == "root"),
+            "root's own attachment must be present"
+        );
+        assert!(
+            chain
+                .iter()
+                .any(|a| a.work_item_id == revision_id && a.caption == "revision"),
+            "revision's own attachment must be present under its own id, not the root's"
+        );
+
+        // A work item outside the chain is not swept in.
+        let unrelated = create_test_chore(&db, &product.id, "unrelated");
+        let unrelated_exec = create_ready_chore_execution(&db, &unrelated.id);
+        db.submit_work_attachment(SubmitAttachmentInput {
+            execution_id: &unrelated_exec.id,
+            work_item_id: &unrelated.id,
+            image: &image("unrelated-shot"),
+            caption: "unrelated",
+        })
+        .unwrap()
+        .unwrap();
+        let chain_after = db.list_work_attachments_for_chain(&root.id).unwrap();
+        assert_eq!(
+            chain_after.len(),
+            2,
+            "an unrelated work item's attachments must not leak in"
         );
     }
 

@@ -637,6 +637,16 @@ pub struct Task {
     #[builder(default)]
     pub has_in_progress_revision: bool,
 
+    /// `true` when this row's own `work_attachments` (or, for a chain-root
+    /// task, any direct revision child's own attachments) are non-empty.
+    /// Derived projection, not stored — gates the kanban card's screenshot
+    /// affordance so it never issues a per-card query. A revision's row
+    /// reflects only its own attachments; it has no revisions of its own to
+    /// roll up.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[builder(default)]
+    pub has_attachments: bool,
+
     pub kind: TaskKind,
     /// Who made the most recent status change — `'human'`, `'boss'`,
     /// `'engine'`, or `'boothby'`. See `Project.last_status_actor` for
