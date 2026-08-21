@@ -26,15 +26,26 @@
 //! branch — the one input the sha probe cannot itself detect a change
 //! in.
 //!
-//! Document *bodies* are never cached. GitHub stays the source of
-//! truth; Boss holds only `(repo, path, ref)` triples.
+//! Document *bodies* use a revalidating cache keyed on `(repo, path, ref)`.
+//! GitHub stays the source of truth: a cached copy is served immediately
+//! and proven current with an HTTP conditional request (or skipped
+//! entirely for an immutable commit SHA). The cache is never written
+//! back, and a failed revalidation never replaces a good copy with an
+//! error page.
+
+mod body;
+mod cache;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use boss_github::trees::{RepoTree, TreeApiError, TreeApiErrorKind, is_markdown_path};
+use boss_github::trees::{BlobFetch, RepoTree, TreeApiError, TreeApiErrorKind, is_markdown_path};
 use boss_protocol::{DesignDocContent, DesignDocEntry, DesignDocTree, DesignDocTreeState};
+
+pub use body::is_immutable_git_ref;
+pub use cache::{BodyCache, CacheKey, DIR_NAME as BODY_CACHE_DIR_NAME, MAX_BYTES, MAX_ENTRIES};
 
 /// The GitHub reads this service needs, behind a trait so tests can
 /// exercise the cache and classification logic without a network call
@@ -44,7 +55,14 @@ pub trait GitHubTreeSource: Send + Sync {
     async fn default_branch(&self, owner: &str, repo: &str) -> Result<String, TreeApiError>;
     async fn head_sha(&self, owner: &str, repo: &str, git_ref: &str) -> Result<String, TreeApiError>;
     async fn markdown_tree(&self, owner: &str, repo: &str, sha: &str) -> Result<RepoTree, TreeApiError>;
-    async fn blob_text(&self, owner: &str, repo: &str, path: &str, git_ref: &str) -> Result<String, TreeApiError>;
+    async fn fetch_blob(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        git_ref: &str,
+        etag: Option<&str>,
+    ) -> Result<BlobFetch, TreeApiError>;
 }
 
 /// Production [`GitHubTreeSource`], backed by `gh api` via
@@ -66,8 +84,15 @@ impl GitHubTreeSource for GhTreeSource {
         boss_github::trees::fetch_tree(owner, repo, sha, is_markdown_path).await
     }
 
-    async fn blob_text(&self, owner: &str, repo: &str, path: &str, git_ref: &str) -> Result<String, TreeApiError> {
-        boss_github::trees::fetch_blob_text(owner, repo, path, git_ref).await
+    async fn fetch_blob(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        git_ref: &str,
+        etag: Option<&str>,
+    ) -> Result<BlobFetch, TreeApiError> {
+        boss_github::trees::fetch_blob(owner, repo, path, git_ref, etag).await
     }
 }
 
@@ -88,21 +113,39 @@ struct CachedListing {
 pub struct DesignDocsService {
     source: Arc<dyn GitHubTreeSource>,
     cache: Mutex<HashMap<String, CachedListing>>,
+    bodies: BodyCache,
+    /// Sleep between transient first-load / revalidation attempts.
+    /// Production uses 500ms; tests inject zero so failure paths don't
+    /// wait.
+    retry_delay: std::time::Duration,
 }
 
 impl DesignDocsService {
-    /// Service backed by the real `gh` CLI.
-    pub fn new() -> Self {
-        Self::with_source(Arc::new(GhTreeSource))
+    /// Service backed by the real `gh` CLI, with the body cache rooted
+    /// at `cache_dir` (typically `<state_root>/design-doc-cache`).
+    pub fn new(cache_dir: PathBuf) -> Self {
+        Self {
+            source: Arc::new(GhTreeSource),
+            cache: Mutex::new(HashMap::new()),
+            bodies: BodyCache::open(cache_dir),
+            retry_delay: std::time::Duration::from_millis(500),
+        }
     }
 
     /// Service backed by an injected source. `Arc` rather than `Box` so
     /// a test can retain its own handle on the fake and assert on how
-    /// many GitHub reads a flow actually performed.
+    /// many GitHub reads a flow actually performed. Body cache is
+    /// in-memory so tests don't need a tempfile unless they opt in.
     pub fn with_source(source: Arc<dyn GitHubTreeSource>) -> Self {
+        Self::with_source_and_cache(source, BodyCache::in_memory())
+    }
+
+    pub fn with_source_and_cache(source: Arc<dyn GitHubTreeSource>, bodies: BodyCache) -> Self {
         Self {
             source,
             cache: Mutex::new(HashMap::new()),
+            bodies,
+            retry_delay: std::time::Duration::ZERO,
         }
     }
 
@@ -140,24 +183,14 @@ impl DesignDocsService {
     }
 
     /// Fetch one document's body at the exact `git_ref` the listing was
-    /// read at. Always read through to GitHub — bodies are never cached.
+    /// read at. Cache-aware: a hit is returned immediately (see
+    /// [`Self::open_markdown_doc`]). Prefer that method plus
+    /// [`Self::revalidate_markdown_doc`] when the caller can stream an
+    /// update; this wrapper exists so existing one-shot call sites keep
+    /// compiling. It does **not** revalidate — the handler is what
+    /// splits serve-immediately from the background refresh.
     pub async fn fetch_markdown_doc(&self, repo_remote_url: &str, path: &str, git_ref: &str) -> DesignDocContent {
-        if !is_markdown_path(path) {
-            return DesignDocContent::Failed {
-                reason: format!("`{path}` is not a markdown file."),
-            };
-        }
-        let Ok((owner, repo)) = git_utils::repo_slug::parse_github_owner_repo(repo_remote_url) else {
-            return DesignDocContent::Failed {
-                reason: format!("`{repo_remote_url}` is not a github.com remote."),
-            };
-        };
-        match self.source.blob_text(owner, repo, path, git_ref).await {
-            Ok(markdown) => DesignDocContent::Loaded { markdown },
-            Err(err) => DesignDocContent::Failed {
-                reason: describe_failure(&format!("{owner}/{repo}"), &err),
-            },
-        }
+        self.open_markdown_doc(repo_remote_url, path, git_ref).await
     }
 
     /// Cache-validating resolution: probe HEAD, reuse the cached
@@ -224,7 +257,7 @@ impl DesignDocsService {
 
 impl Default for DesignDocsService {
     fn default() -> Self {
-        Self::new()
+        Self::with_source(Arc::new(GhTreeSource))
     }
 }
 
@@ -312,6 +345,28 @@ fn describe_failure(owner_repo: &str, err: &TreeApiError) -> String {
     format!("{headline}\n\n{}", err.message)
 }
 
+/// Operator-facing first-load failure. Technical `gh` / TLS / URL
+/// strings stay in the log (`open_markdown_doc` warns with the raw
+/// message); the UI gets a sentence it can act on plus a retry control.
+fn describe_doc_failure(owner_repo: &str, err: &TreeApiError) -> String {
+    match err.kind {
+        TreeApiErrorKind::RateLimited => {
+            "GitHub is rate-limiting this account. Wait for the limit to reset, then retry.".to_owned()
+        }
+        TreeApiErrorKind::NotAuthorized => {
+            format!("Not authorized to read `{owner_repo}`. Check that `gh` is signed in and can see this repo.")
+        }
+        TreeApiErrorKind::NotFound => {
+            format!(
+                "`{owner_repo}` was not found at that path and ref. The file may have moved, or the signed-in account cannot see a private repo by that name."
+            )
+        }
+        TreeApiErrorKind::Unreachable => {
+            "Couldn't reach GitHub. Check your connection and that `gh` is installed, then retry.".to_owned()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -336,6 +391,19 @@ mod tests {
         paths: Mutex<Vec<String>>,
         error: Mutex<Option<TreeApiError>>,
         blob: Mutex<String>,
+        blob_etag: Mutex<Option<String>>,
+        blob_calls: AtomicUsize,
+        /// When set, `fetch_blob` returns this error regardless of etag.
+        blob_error: Mutex<Option<TreeApiError>>,
+        /// When true and the caller sent an etag, return NotModified.
+        blob_not_modified: Mutex<bool>,
+        /// Recorded If-None-Match values, so tests can prove a
+        /// revalidation actually sent the stored ETag.
+        blob_etags_seen: Mutex<Vec<Option<String>>>,
+        /// Errors popped before the standing `blob_error`. Lets a test
+        /// script "404 once, then succeed" for the deleted-branch
+        /// fallback.
+        blob_error_script: Mutex<Vec<TreeApiError>>,
     }
 
     impl FakeSource {
@@ -381,6 +449,10 @@ mod tests {
                 self.tree_calls.load(Ordering::SeqCst),
             )
         }
+
+        fn blob_calls(&self) -> usize {
+            self.blob_calls.load(Ordering::SeqCst)
+        }
     }
 
     #[async_trait]
@@ -416,15 +488,36 @@ mod tests {
             })
         }
 
-        async fn blob_text(
+        async fn fetch_blob(
             &self,
             _owner: &str,
             _repo: &str,
             _path: &str,
             _git_ref: &str,
-        ) -> Result<String, TreeApiError> {
+            etag: Option<&str>,
+        ) -> Result<BlobFetch, TreeApiError> {
+            self.blob_calls.fetch_add(1, Ordering::SeqCst);
+            self.blob_etags_seen.lock().unwrap().push(etag.map(str::to_owned));
+            {
+                let mut script = self.blob_error_script.lock().unwrap();
+                if !script.is_empty() {
+                    return Err(script.remove(0));
+                }
+            }
+            if let Some(err) = self.blob_error.lock().unwrap().clone() {
+                return Err(err);
+            }
             self.check_error()?;
-            Ok(self.blob.lock().unwrap().clone())
+            if etag.is_some() && *self.blob_not_modified.lock().unwrap() {
+                return Ok(BlobFetch::NotModified {
+                    rate_limit_remaining: Some(4999),
+                });
+            }
+            Ok(BlobFetch::Content {
+                text: self.blob.lock().unwrap().clone(),
+                etag: self.blob_etag.lock().unwrap().clone(),
+                rate_limit_remaining: Some(4998),
+            })
         }
     }
 
@@ -647,9 +740,7 @@ mod tests {
         let svc = service(FakeSource::new(&["sha1"], &["a.md"]));
         assert_eq!(
             svc.fetch_markdown_doc(FLUNGE, "docs/a.md", "sha1").await,
-            DesignDocContent::Loaded {
-                markdown: "# doc".to_owned()
-            }
+            DesignDocContent::loaded("# doc")
         );
     }
 
@@ -660,7 +751,14 @@ mod tests {
             "gh: Not Found (HTTP 404)",
         ));
         match svc.fetch_markdown_doc(FLUNGE, "docs/gone.md", "sha1").await {
-            DesignDocContent::Failed { reason } => assert!(reason.contains("was not found"), "got: {reason}"),
+            DesignDocContent::Failed { reason, retryable } => {
+                assert!(reason.contains("was not found"), "got: {reason}");
+                assert!(retryable, "no-cache failure must offer retry");
+                assert!(
+                    !reason.contains("HTTP 404"),
+                    "operator-facing copy must not include the raw GitHub/gh string: {reason}"
+                );
+            }
             other => panic!("expected Failed, got {other:?}"),
         }
     }
@@ -672,7 +770,9 @@ mod tests {
             .fetch_markdown_doc("git@gitlab.com:foo/bar.git", "a.md", "sha1")
             .await
         {
-            DesignDocContent::Failed { reason } => assert!(reason.contains("not a github.com remote"), "got: {reason}"),
+            DesignDocContent::Failed { reason, .. } => {
+                assert!(reason.contains("not a github.com remote"), "got: {reason}")
+            }
             other => panic!("expected Failed, got {other:?}"),
         }
     }
@@ -687,7 +787,175 @@ mod tests {
             "should never be called",
         ));
         match svc.fetch_markdown_doc(FLUNGE, "src/main.rs", "sha1").await {
-            DesignDocContent::Failed { reason } => assert!(reason.contains("not a markdown file"), "got: {reason}"),
+            DesignDocContent::Failed { reason, .. } => assert!(reason.contains("not a markdown file"), "got: {reason}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[tokio::test]
+    async fn second_open_of_a_sha_ref_skips_the_network() {
+        let source = FakeSource::new(&[SHA], &["a.md"]);
+        source.blob_etag.lock().unwrap().replace("W/\"sha-etag\"".into());
+        let svc = service(source.clone());
+        let first = svc.open_markdown_doc(FLUNGE, "docs/a.md", SHA).await;
+        assert_eq!(first, DesignDocContent::loaded("# doc"));
+        assert_eq!(source.blob_calls(), 1);
+
+        let second = svc.open_markdown_doc(FLUNGE, "docs/a.md", SHA).await;
+        assert_eq!(second, DesignDocContent::loaded("# doc"));
+        assert_eq!(source.blob_calls(), 1, "immutable SHA must not re-fetch");
+        assert!(
+            svc.revalidate_markdown_doc(FLUNGE, "docs/a.md", SHA).await.is_none(),
+            "revalidate of a SHA is a no-op"
+        );
+        assert_eq!(source.blob_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn cached_open_of_a_branch_does_not_block_on_github() {
+        let source = FakeSource::new(&["sha1"], &["a.md"]);
+        let svc = service(source.clone());
+        svc.open_markdown_doc(FLUNGE, "docs/a.md", "main").await;
+        assert_eq!(source.blob_calls(), 1);
+        let start = std::time::Instant::now();
+        let again = svc.open_markdown_doc(FLUNGE, "docs/a.md", "main").await;
+        let elapsed = start.elapsed();
+        assert_eq!(again, DesignDocContent::loaded("# doc"));
+        assert_eq!(source.blob_calls(), 1, "open must not revalidate");
+        assert!(
+            elapsed < std::time::Duration::from_millis(20),
+            "cached open must not wait on the network; took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn revalidation_304_does_not_change_the_view_and_sends_etag() {
+        let source = FakeSource::new(&["sha1"], &["a.md"]);
+        source.blob_etag.lock().unwrap().replace("W/\"abc\"".into());
+        *source.blob_not_modified.lock().unwrap() = true;
+        let svc = service(source.clone());
+        // Prime the cache with an etag by doing a first load *before*
+        // flipping NotModified. First load sends no If-None-Match.
+        *source.blob_not_modified.lock().unwrap() = false;
+        svc.open_markdown_doc(FLUNGE, "docs/a.md", "main").await;
+        *source.blob_not_modified.lock().unwrap() = true;
+
+        let update = svc.revalidate_markdown_doc(FLUNGE, "docs/a.md", "main").await;
+        assert!(update.is_none(), "304 must not push a new view");
+        let seen = source.blob_etags_seen.lock().unwrap().clone();
+        assert_eq!(seen.last().cloned().flatten().as_deref(), Some("W/\"abc\""));
+    }
+
+    #[tokio::test]
+    async fn failed_revalidation_keeps_the_cached_copy() {
+        let source = FakeSource::new(&["sha1"], &["a.md"]);
+        let svc = service(source.clone());
+        svc.open_markdown_doc(FLUNGE, "docs/a.md", "main").await;
+        source.blob_error.lock().unwrap().replace(TreeApiError {
+            kind: TreeApiErrorKind::Unreachable,
+            message: "net/http: TLS handshake timeout".into(),
+        });
+        match svc.revalidate_markdown_doc(FLUNGE, "docs/a.md", "main").await {
+            Some(DesignDocContent::Loaded {
+                markdown,
+                stale_reason,
+                retryable,
+            }) => {
+                assert_eq!(markdown, "# doc");
+                assert!(retryable);
+                let reason = stale_reason.expect("stale banner");
+                assert!(reason.contains("Couldn't reach GitHub"), "got: {reason}");
+                assert!(
+                    !reason.contains("TLS"),
+                    "operator-facing stale banner must not include the raw error: {reason}"
+                );
+            }
+            other => panic!("expected stale Loaded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn deleted_branch_404_does_not_discard_the_cache() {
+        let source = FakeSource::new(&["sha1"], &["a.md"]);
+        let svc = service(source.clone());
+        svc.open_markdown_doc(FLUNGE, "docs/a.md", "boss/exec_gone").await;
+        source.blob_error.lock().unwrap().replace(TreeApiError {
+            kind: TreeApiErrorKind::NotFound,
+            message: "gh: Not Found (HTTP 404)".into(),
+        });
+        // default_branch still returns "main"; fetching main also 404s
+        // because blob_error is set. Cache must survive.
+        match svc.revalidate_markdown_doc(FLUNGE, "docs/a.md", "boss/exec_gone").await {
+            Some(DesignDocContent::Loaded {
+                markdown,
+                stale_reason,
+                retryable,
+            }) => {
+                assert_eq!(markdown, "# doc", "404 must not drop the cached body");
+                assert!(retryable);
+                let reason = stale_reason.expect("stale banner");
+                assert!(
+                    reason.contains("worker branch") || reason.contains("gone"),
+                    "got: {reason}"
+                );
+            }
+            other => panic!("expected stale Loaded, got {other:?}"),
+        }
+        // And a subsequent open still serves the cache without a
+        // successful fetch.
+        source.blob_error.lock().unwrap().replace(TreeApiError {
+            kind: TreeApiErrorKind::Unreachable,
+            message: "offline".into(),
+        });
+        assert_eq!(
+            svc.open_markdown_doc(FLUNGE, "docs/a.md", "boss/exec_gone").await,
+            DesignDocContent::loaded("# doc")
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_branch_resolves_to_default_branch_when_that_fetch_works() {
+        let source = FakeSource::new(&["sha1"], &["a.md"]);
+        let svc = service(source.clone());
+        svc.open_markdown_doc(FLUNGE, "docs/a.md", "boss/exec_gone").await;
+        *source.blob.lock().unwrap() = "# on main".to_owned();
+        source.blob_error_script.lock().unwrap().push(TreeApiError {
+            kind: TreeApiErrorKind::NotFound,
+            message: "gh: Not Found (HTTP 404)".into(),
+        });
+        match svc.revalidate_markdown_doc(FLUNGE, "docs/a.md", "boss/exec_gone").await {
+            Some(DesignDocContent::Loaded {
+                markdown,
+                stale_reason,
+                retryable,
+            }) => {
+                assert_eq!(markdown, "# on main");
+                assert!(stale_reason.is_none(), "resolved-to-default is current, not stale");
+                assert!(!retryable);
+            }
+            other => panic!("expected Loaded from default branch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn first_load_with_no_network_is_retryable_failure() {
+        let source = FakeSource::failing(TreeApiErrorKind::Unreachable, "net/http: TLS handshake timeout");
+        let svc = service(source);
+        match svc.open_markdown_doc(FLUNGE, "docs/a.md", "main").await {
+            DesignDocContent::Failed { reason, retryable } => {
+                assert!(retryable);
+                assert!(reason.contains("Couldn't reach GitHub"), "got: {reason}");
+                assert!(
+                    !reason.contains("TLS"),
+                    "raw TLS string must not reach the operator: {reason}"
+                );
+                assert!(
+                    !reason.contains("api.github.com"),
+                    "raw API URL must not reach the operator: {reason}"
+                );
+            }
             other => panic!("expected Failed, got {other:?}"),
         }
     }

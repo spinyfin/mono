@@ -555,6 +555,13 @@ final class ChatViewModel: ObservableObject {
     /// `openWindow` value type.
     let asyncMarkdownViewerVM = AsyncMarkdownViewerViewModel()
 
+    /// In-flight engine fetch for the async markdown viewer (project /
+    /// investigation doc icon). `applyProductDesignDocContent` updates
+    /// the window only when the reply's triple matches this.
+    var pendingAsyncViewerRef: DesignDocRef?
+    var pendingAsyncViewerTitle: String = ""
+    var pendingAsyncViewerArtifact: CommentArtifactRef?
+
     /// Indirection for fetching raw markdown content from a URL.
     /// Production default routes through [[GitHubContentFetcher]] so
     /// the request authenticates as the user's active `gh` session and
@@ -2006,28 +2013,30 @@ final class ChatViewModel: ObservableObject {
             // Prefer fetching via rawContentURL (GitHub API). This is correct
             // regardless of cube workspace state — the workspace may be on a
             // different branch even when resolved.branch == "main".
-            if let rawContentURL, let rawURL = URL(string: rawContentURL) {
+            if rawContentURL != nil {
                 let projectName = project.name
                 let clickStart = Date()
-                designDocTimingLog.info("phase=dispatch project=\(shortID, privacy: .public) path=rawContentURL")
+                designDocTimingLog.info("phase=dispatch project=\(shortID, privacy: .public) path=engine")
                 if let opener = asyncMarkdownViewerOpener {
-                    // Open the window immediately in a loading state, then
-                    // resolve the content asynchronously — the user sees a
-                    // window within one frame of the click (T-open-immediately).
+                    // Open the window immediately, then resolve through
+                    // the engine (cache + revalidate). App-side `gh api`
+                    // is no longer on this path.
                     asyncMarkdownViewerVM.state = .loading
                     asyncMarkdownViewerVM.clickStartTime = clickStart
                     let openWindowStart = Date()
                     opener()
                     let openWindowMs = Int(Date().timeIntervalSince(openWindowStart) * 1000)
                     designDocTimingLog.info("phase=open_window project=\(shortID, privacy: .public) duration_ms=\(openWindowMs, privacy: .public)")
-                    Task { @MainActor in
-                        await self.fetchAndUpdateAsyncMarkdownViewerVM(
-                            projectName: projectName,
-                            rawURL: rawURL,
-                            projectShortID: shortID,
-                            artifact: resolved.commentArtifact
-                        )
-                    }
+                    openDesignDocViaEngine(
+                        ref: DesignDocRef(
+                            repoRemoteURL: resolved.repoRemoteURL,
+                            path: resolved.path,
+                            gitRef: resolved.branch
+                        ),
+                        title: projectName,
+                        artifact: resolved.commentArtifact,
+                        projectShortID: shortID
+                    )
                 } else {
                     // Headless / test path: no in-app viewer wired.
                     openDesignDocFallback(webURL: webURL)

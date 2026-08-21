@@ -35,12 +35,20 @@ extension ChatViewModel {
     /// Request one document's body.
     ///
     /// `selectedDesignDocRef` is set synchronously so the reader pane
-    /// switches to the newly-clicked document immediately (in a loading
-    /// state) rather than continuing to show the previous one until the
-    /// fetch lands.
+    /// switches to the newly-clicked document immediately. Existing
+    /// cached content is kept on screen — the engine serves its local
+    /// copy immediately and revalidates in the background; wiping the
+    /// entry here would force a spinner on every re-open and defeat
+    /// that. A first open (no cache yet) still shows the loading state.
     func openDesignDoc(_ ref: DesignDocRef) {
         selectedDesignDocRef = ref
-        designDocContentByRef[ref] = nil
+        engine.sendGetProductDesignDoc(ref: ref)
+    }
+
+    /// Ask the engine to revalidate (or, with no cache, fetch again)
+    /// without navigating away. The engine still serves any cached copy
+    /// first — this is not a cache bypass.
+    func retryDesignDoc(_ ref: DesignDocRef) {
         engine.sendGetProductDesignDoc(ref: ref)
     }
 
@@ -49,9 +57,61 @@ extension ChatViewModel {
     /// Replies are keyed by their full `(repo, path, ref)` triple rather
     /// than written into a single "current document" slot, so a fetch
     /// that lands after the selection has moved on updates its own
-    /// entry and leaves the visible document alone.
+    /// entry and leaves the visible document alone. A matching
+    /// in-flight async-viewer open (project / investigation doc icon)
+    /// is updated in place so that path no longer fetches in the app.
     func applyProductDesignDocContent(ref: DesignDocRef, content: DesignDocContent) {
         designDocContentByRef[ref] = content
+        applyContentToAsyncViewerIfPending(ref: ref, content: content)
+    }
+
+    /// Open a project/investigation design doc through the engine rather
+    /// than an app-side `gh api` fetch. The window opens immediately;
+    /// cached content (if this session already has it) renders at once
+    /// and the engine reply updates the view if revalidation changes it.
+    func openDesignDocViaEngine(
+        ref: DesignDocRef,
+        title: String,
+        artifact: CommentArtifactRef?,
+        projectShortID: String
+    ) {
+        pendingAsyncViewerRef = ref
+        pendingAsyncViewerTitle = title
+        pendingAsyncViewerArtifact = artifact
+        asyncMarkdownViewerVM.clickStartTime = Date()
+        asyncMarkdownViewerVM.collapsedByDefaultHeadings = []
+        if let existing = designDocContentByRef[ref] {
+            applyContentToAsyncViewerIfPending(ref: ref, content: existing)
+        } else {
+            asyncMarkdownViewerVM.state = .loading
+            asyncMarkdownViewerVM.staleReason = nil
+            asyncMarkdownViewerVM.canRetry = false
+        }
+        asyncMarkdownViewerVM.onRetry = { [weak self] in
+            self?.retryDesignDoc(ref)
+        }
+        asyncMarkdownViewerVM.pendingRenderProjectShortID = projectShortID
+        engine.sendGetProductDesignDoc(ref: ref)
+    }
+
+    private func applyContentToAsyncViewerIfPending(ref: DesignDocRef, content: DesignDocContent) {
+        guard pendingAsyncViewerRef == ref else { return }
+        let title = pendingAsyncViewerTitle
+        let artifact = pendingAsyncViewerArtifact
+        switch content {
+        case .loaded(let markdown, let staleReason, let retryable):
+            asyncMarkdownViewerVM.pendingRenderProjectShortID = nil
+            asyncMarkdownViewerVM.renderStartTime = Date()
+            asyncMarkdownViewerVM.renderContentID = UUID()
+            asyncMarkdownViewerVM.collapsedByDefaultHeadings = []
+            asyncMarkdownViewerVM.staleReason = staleReason
+            asyncMarkdownViewerVM.canRetry = retryable
+            asyncMarkdownViewerVM.state = .loaded(title: title, markdown: markdown, artifact: artifact)
+        case .failed(let reason, let retryable):
+            asyncMarkdownViewerVM.staleReason = nil
+            asyncMarkdownViewerVM.canRetry = retryable
+            asyncMarkdownViewerVM.state = .failed(title: title, message: reason)
+        }
     }
 
     /// Content for `ref`, or `nil` while its fetch is still in flight.

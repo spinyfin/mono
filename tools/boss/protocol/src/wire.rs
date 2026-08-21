@@ -880,8 +880,12 @@ pub enum FrontendRequest {
     /// [`Self::ListProductDesignDocs`] handed out — `git_ref` is the
     /// commit sha that listing was read at, so the body returned is the
     /// one the operator saw listed even if the branch has moved since.
-    /// Bodies are always read through to GitHub; Boss never caches them.
-    /// Replies with [`FrontendEvent::ProductDesignDocContent`].
+    /// The engine serves a cached copy immediately when it has one,
+    /// then revalidates against GitHub (HTTP conditional request; an
+    /// immutable commit SHA skips the network). GitHub remains the
+    /// source of truth; the cache is not a mirror. Replies with
+    /// [`FrontendEvent::ProductDesignDocContent`], possibly more than
+    /// once (immediate cache, then a revalidation update).
     GetProductDesignDoc {
         repo_remote_url: String,
         path: String,

@@ -122,6 +122,23 @@ final class DesignDocTreeStateDecodingTests: XCTestCase {
             from: try JSONSerialization.data(withJSONObject: ["type": "failed", "reason": "Not Found"])
         )
         XCTAssertEqual(failed, .failed(reason: "Not Found"))
+        if case .failed(_, let retryable) = failed {
+            XCTAssertTrue(retryable, "omitted retryable on failed defaults to true")
+        }
+
+        let stale = try JSONDecoder().decode(
+            DesignDocContent.self,
+            from: try JSONSerialization.data(withJSONObject: [
+                "type": "loaded",
+                "markdown": "# cached",
+                "stale_reason": "Couldn't reach GitHub.",
+                "retryable": true,
+            ])
+        )
+        XCTAssertEqual(
+            stale,
+            .loaded(markdown: "# cached", staleReason: "Couldn't reach GitHub.", retryable: true)
+        )
     }
 }
 
@@ -295,6 +312,28 @@ final class DesignDocSelectionTests: XCTestCase {
         let model = makeModel()
         model.applyProductDesignDocContent(ref: ref, content: .failed(reason: "Not Found"))
         XCTAssertEqual(model.designDocContent(for: ref), .failed(reason: "Not Found"))
+    }
+
+    /// Re-opening a document must not wipe a cached body. The engine
+    /// serves its copy immediately; clearing here would force a spinner
+    /// and defeat the cache.
+    func testReopenKeepsCachedContentOnScreen() {
+        let model = makeModel()
+        model.applyProductDesignDocContent(ref: ref, content: .loaded(markdown: "# cached"))
+        model.openDesignDoc(ref)
+        XCTAssertEqual(model.designDocContent(for: ref), .loaded(markdown: "# cached"))
+        XCTAssertEqual(model.selectedDesignDocRef, ref)
+    }
+
+    func testStaleContentKeepsTheDocumentAndMarksRetryable() {
+        let model = makeModel()
+        let stale = DesignDocContent.loaded(
+            markdown: "# cached",
+            staleReason: "Couldn't reach GitHub.",
+            retryable: true
+        )
+        model.applyProductDesignDocContent(ref: ref, content: stale)
+        XCTAssertEqual(model.designDocContent(for: ref), stale)
     }
 
     func testListingReplyClearsTheLoadingFlag() {

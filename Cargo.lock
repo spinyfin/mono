@@ -597,7 +597,12 @@ dependencies = [
  "boss-github",
  "boss-protocol",
  "git-utils",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

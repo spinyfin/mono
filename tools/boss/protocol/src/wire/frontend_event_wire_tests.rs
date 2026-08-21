@@ -1018,9 +1018,7 @@ fn tag_cases() -> Vec<TagCase> {
                 repo_remote_url: "git@github.com:brianduff/flunge.git".into(),
                 path: "docs/design-docs/backend-preview-environments.md".into(),
                 git_ref: "b95bd654ec91f84f70f62127ef8d53317bd52ebb".into(),
-                content: DesignDocContent::Loaded {
-                    markdown: "# Backend preview environments".into(),
-                },
+                content: DesignDocContent::loaded("# Backend preview environments"),
             },
             expected_tag: "product_design_doc_content",
         },

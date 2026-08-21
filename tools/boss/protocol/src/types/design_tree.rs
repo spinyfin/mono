@@ -3,10 +3,12 @@
 //!
 //! GitHub is the source of truth: a document is identified by the
 //! `(repo_remote_url, path, git_ref)` triple carried on
-//! [`DesignDocTree`] + [`DesignDocEntry`], and Boss never mirrors
-//! document bodies into its own state as the canonical copy. The
-//! engine may cache a *listing* (see the design-docs service) because
-//! it can be invalidated against HEAD; bodies are always read through.
+//! [`DesignDocTree`] + [`DesignDocEntry`]. The engine may keep a
+//! *revalidating* cache of document bodies — a local copy that must
+//! prove it is still current (HTTP conditional request, or skip the
+//! network for an immutable commit SHA) before being trusted
+//! indefinitely. The cache is never the system of record and is never
+//! written back to GitHub.
 
 use serde::{Deserialize, Serialize};
 
@@ -98,11 +100,86 @@ pub enum DesignDocTreeState {
 /// than as a generic work-error, so a failed document open renders
 /// inline in the reader pane instead of as a global error banner
 /// detached from the document it refers to.
+///
+/// A cache hit that could not be revalidated is still [`Self::Loaded`]:
+/// a failed refresh must never replace a good document with an error
+/// page. [`Self::Loaded::stale_reason`] is the non-blocking indication
+/// that the copy may be out of date; [`Self::Loaded::retryable`] (and
+/// the same flag on [`Self::Failed`]) is the engine telling the app to
+/// offer a retry gesture. Retry policy itself lives engine-side.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DesignDocContent {
-    Loaded { markdown: String },
-    Failed { reason: String },
+    Loaded {
+        markdown: String,
+        /// Set when `markdown` came from the local cache and GitHub
+        /// could not confirm it is still current (network failure,
+        /// deleted branch, rate limit). The document is still shown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stale_reason: Option<String>,
+        /// Operator can ask the engine to revalidate (or, with no
+        /// cache, to fetch again). False when the ref is an immutable
+        /// SHA that already hit cache — retrying cannot change it.
+        #[serde(default, skip_serializing_if = "is_false")]
+        retryable: bool,
+    },
+    Failed {
+        reason: String,
+        /// No cached copy and the fetch failed. The app should offer
+        /// retry rather than leaving the operator at a dead-end.
+        /// Defaults to true so an older encoder that omits the field
+        /// still gets a retry control.
+        #[serde(default = "default_true", skip_serializing_if = "is_true")]
+        retryable: bool,
+    },
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl DesignDocContent {
+    /// Freshly fetched (or SHA-cached) document. Not stale, not retryable.
+    pub fn loaded(markdown: impl Into<String>) -> Self {
+        Self::Loaded {
+            markdown: markdown.into(),
+            stale_reason: None,
+            retryable: false,
+        }
+    }
+
+    /// Cached document whose revalidation failed. Shown with a stale
+    /// banner and a retry control.
+    pub fn stale(markdown: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::Loaded {
+            markdown: markdown.into(),
+            stale_reason: Some(reason.into()),
+            retryable: true,
+        }
+    }
+
+    /// No cached copy; fetch failed. Retryable by default.
+    pub fn failed(reason: impl Into<String>) -> Self {
+        Self::Failed {
+            reason: reason.into(),
+            retryable: true,
+        }
+    }
+
+    /// True when the operator should be offered a retry control.
+    pub fn retryable(&self) -> bool {
+        match self {
+            Self::Loaded { retryable, .. } | Self::Failed { retryable, .. } => *retryable,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -166,18 +243,43 @@ mod tests {
 
     #[test]
     fn doc_content_variants_are_type_tagged() {
-        let raw = serde_json::to_value(DesignDocContent::Loaded {
-            markdown: "# Title".to_owned(),
-        })
-        .unwrap();
+        let raw = serde_json::to_value(DesignDocContent::loaded("# Title")).unwrap();
         assert_eq!(raw["type"], "loaded");
         assert_eq!(raw["markdown"], "# Title");
+        // Fresh loads omit the optional flags so an older client still
+        // decodes them as "not stale / not retryable".
+        assert!(raw.get("stale_reason").is_none());
+        assert!(raw.get("retryable").is_none());
 
-        let raw = serde_json::to_value(DesignDocContent::Failed {
-            reason: "Not Found".to_owned(),
-        })
-        .unwrap();
+        let raw = serde_json::to_value(DesignDocContent::failed("Not Found")).unwrap();
         assert_eq!(raw["type"], "failed");
+        // Retryable-true is the default and is omitted on the wire.
+        assert!(raw.get("retryable").is_none());
+    }
+
+    #[test]
+    fn stale_loaded_doc_round_trips_reason_and_retryable() {
+        let content = DesignDocContent::stale("# cached", "Couldn't reach GitHub.");
+        let raw = serde_json::to_value(&content).unwrap();
+        assert_eq!(raw["type"], "loaded");
+        assert_eq!(raw["stale_reason"], "Couldn't reach GitHub.");
+        assert_eq!(raw["retryable"], true);
+        let back: DesignDocContent = serde_json::from_value(raw).unwrap();
+        assert_eq!(back, content);
+    }
+
+    /// An older engine that omits the new fields still decodes: loaded
+    /// is not stale, failed is retryable.
+    #[test]
+    fn doc_content_decodes_without_new_fields() {
+        let loaded: DesignDocContent =
+            serde_json::from_value(serde_json::json!({ "type": "loaded", "markdown": "# x" })).unwrap();
+        assert_eq!(loaded, DesignDocContent::loaded("# x"));
+
+        let failed: DesignDocContent =
+            serde_json::from_value(serde_json::json!({ "type": "failed", "reason": "offline" })).unwrap();
+        assert_eq!(failed, DesignDocContent::failed("offline"));
+        assert!(failed.retryable());
     }
 
     /// `size` is optional on the wire: GitHub omits it for some entry

@@ -341,15 +341,9 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
         var asyncWindowOpens = 0
         model.asyncMarkdownViewerOpener = { asyncWindowOpens += 1 }
 
-        // Record rawContentFetcher invocations.
-        let fetchExpectation = XCTestExpectation(description: "rawContentFetcher called")
-        model.rawContentFetcher = { _ in
-            fetchExpectation.fulfill()
-            return "# Design Doc"
-        }
-
         // Non-main branch with a workspace path and a rawContentURL present.
-        // This simulates an in_review design task (T371-style).
+        // This simulates an in_review design task. Fetch goes through the
+        // engine; tests apply the reply directly.
         let rawURL = "https://raw.githubusercontent.com/foo/bar/design-boss-ci-buildkite/tools/boss/docs/designs/x.md"
         model.designDocStateByProjectID[project.id] = .resolved(
             resolved: ResolvedDesignDoc(
@@ -371,12 +365,19 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
             XCTFail("expected .loading state immediately after click; got \(model.asyncMarkdownViewerVM.state)")
         }
 
-        await fulfillment(of: [fetchExpectation], timeout: 1.0)
+        model.applyProductDesignDocContent(
+            ref: DesignDocRef(
+                repoRemoteURL: "git@github.com:foo/bar.git",
+                path: "tools/boss/docs/designs/x.md",
+                gitRef: "design-boss-ci-buildkite"
+            ),
+            content: .loaded(markdown: "# Design Doc")
+        )
         XCTAssertTrue(
             openedLocalFiles.isEmpty,
             "expected no local-file open for in-review branch; got: \(openedLocalFiles)"
         )
-        // After the fetch settles the VM must be in the loaded state.
+        // After the engine reply the VM must be in the loaded state.
         if case .loaded(let title, let markdown, let artifact) = model.asyncMarkdownViewerVM.state {
             XCTAssertEqual(title, project.name)
             XCTAssertEqual(markdown, "# Design Doc")
@@ -414,13 +415,8 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
         var asyncWindowOpens = 0
         model.asyncMarkdownViewerOpener = { asyncWindowOpens += 1 }
 
-        let fetchExpectation = XCTestExpectation(description: "rawContentFetcher called")
-        model.rawContentFetcher = { _ in
-            fetchExpectation.fulfill()
-            return "# Merged design"
-        }
-
-        // main branch + rawContentURL + workspacePath — the P491 shape.
+        // main branch + rawContentURL + workspacePath — GitHub fetch
+        // goes through the engine; tests apply the reply directly.
         let rawURL = "https://raw.githubusercontent.com/foo/bar/main/tools/boss/docs/designs/x.md"
         model.designDocStateByProjectID[project.id] = .resolved(
             resolved: ResolvedDesignDoc(
@@ -441,7 +437,14 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
             XCTFail("expected .loading immediately after click; got \(model.asyncMarkdownViewerVM.state)")
         }
 
-        await fulfillment(of: [fetchExpectation], timeout: 1.0)
+        model.applyProductDesignDocContent(
+            ref: DesignDocRef(
+                repoRemoteURL: "git@github.com:foo/bar.git",
+                path: "tools/boss/docs/designs/x.md",
+                gitRef: "main"
+            ),
+            content: .loaded(markdown: "# Merged design")
+        )
         XCTAssertTrue(
             openedLocalFiles.isEmpty,
             "dispatcher must not open a local file when rawContentURL is present; got: \(openedLocalFiles)"

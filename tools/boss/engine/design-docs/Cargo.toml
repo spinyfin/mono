@@ -10,6 +10,12 @@ boss-engine-utils = { path = "../utils" }
 boss-github = { path = "../../github" }
 boss-protocol = { path = "../../protocol" }
 git-utils = { path = "../../../../lib/rust/git_utils" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tracing = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }

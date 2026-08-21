@@ -17,6 +17,7 @@
 //! pattern as the org-state re-probe in [`super::github_auth`].)
 
 use super::*;
+use boss_protocol::DesignDocContent;
 
 pub(super) async fn handle_list_product_design_docs(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
@@ -75,16 +76,87 @@ pub(super) async fn handle_get_product_design_doc(ctx: Dispatch, req: FrontendRe
 
     let design_docs = server_state.design_docs.clone();
     tokio::spawn(async move {
-        let content = design_docs.fetch_markdown_doc(&repo_remote_url, &path, &git_ref).await;
-        send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::ProductDesignDocContent {
-                repo_remote_url,
-                path,
-                git_ref,
+        let emit = |content: DesignDocContent, as_push: bool| {
+            let event = FrontendEvent::ProductDesignDocContent {
+                repo_remote_url: repo_remote_url.clone(),
+                path: path.clone(),
+                git_ref: git_ref.clone(),
                 content,
-            },
-        );
+            };
+            if as_push {
+                send_push(&sink, event);
+            } else {
+                send_response(&sink, &request_id, event);
+            }
+        };
+
+        // Serve immediately: cache hit does not wait on GitHub. A SHA
+        // ref never needs a follow-up; a branch ref is revalidated
+        // below and the view updates only if the body changed or the
+        // refresh failed (stale banner, cache kept).
+        let first = design_docs.open_markdown_doc(&repo_remote_url, &path, &git_ref).await;
+        let was_loaded = matches!(first, DesignDocContent::Loaded { .. });
+        emit(first, false);
+
+        if !was_loaded || design_docs_ref_is_immutable(&git_ref) {
+            return;
+        }
+
+        if let Some(update) = design_docs
+            .revalidate_markdown_doc(&repo_remote_url, &path, &git_ref)
+            .await
+        {
+            let still_retryable = update.retryable();
+            emit(update, true);
+            if still_retryable {
+                auto_retry_revalidation(&design_docs, &repo_remote_url, &path, &git_ref, &sink).await;
+            }
+        }
     });
+}
+
+fn design_docs_ref_is_immutable(git_ref: &str) -> bool {
+    boss_engine_design_docs::is_immutable_git_ref(git_ref)
+}
+
+/// Backed-off revalidation after a failed refresh. Does not hammer:
+/// three attempts at 2s / 8s / 32s, then stop until the operator
+/// retries. Each attempt still serves the cache; a success or a
+/// non-retryable outcome ends the loop.
+async fn auto_retry_revalidation(
+    design_docs: &boss_engine_design_docs::DesignDocsService,
+    repo_remote_url: &str,
+    path: &str,
+    git_ref: &str,
+    sink: &std::sync::Arc<super::SessionSink>,
+) {
+    const DELAYS: [std::time::Duration; 3] = [
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(8),
+        std::time::Duration::from_secs(32),
+    ];
+    for delay in DELAYS {
+        tokio::time::sleep(delay).await;
+        match design_docs
+            .revalidate_markdown_doc(repo_remote_url, path, git_ref)
+            .await
+        {
+            Some(content) => {
+                let retryable = content.retryable();
+                send_push(
+                    sink,
+                    FrontendEvent::ProductDesignDocContent {
+                        repo_remote_url: repo_remote_url.to_owned(),
+                        path: path.to_owned(),
+                        git_ref: git_ref.to_owned(),
+                        content,
+                    },
+                );
+                if !retryable {
+                    return;
+                }
+            }
+            None => return,
+        }
+    }
 }

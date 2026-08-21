@@ -283,7 +283,8 @@ struct DesignsView: View {
             DesignDocReaderView(
                 ref: ref,
                 ownerRepo: loadedTree?.ownerRepo,
-                content: chat.designDocContent(for: ref)
+                content: chat.designDocContent(for: ref),
+                onRetry: { chat.retryDesignDoc(ref) }
             )
             .id(ref)
         } else {
@@ -438,20 +439,46 @@ private struct DesignDocReaderView: View {
     let ref: DesignDocRef
     let ownerRepo: String?
     let content: DesignDocContent?
+    var onRetry: () -> Void = {}
 
     var body: some View {
         switch content {
-        case .loaded(let markdown):
-            MarkdownDocumentChrome(
-                title: ref.fileName,
-                subtitle: "\(ref.path) @ \(shortSHA(ref.gitRef))",
-                webURL: githubURL?.absoluteString,
-                source: markdown,
-                commentsEnabled: false
-            )
+        case .loaded(let markdown, let staleReason, let retryable):
+            VStack(spacing: 0) {
+                if let staleReason {
+                    staleBanner(reason: staleReason, retryable: retryable)
+                }
+                MarkdownDocumentChrome(
+                    title: ref.fileName,
+                    subtitle: "\(ref.path) @ \(shortSHA(ref.gitRef))",
+                    webURL: githubURL?.absoluteString,
+                    source: markdown,
+                    commentsEnabled: false
+                )
+            }
         default:
             statusScaffold
         }
+    }
+
+    @ViewBuilder
+    private func staleBanner(reason: String, retryable: Bool) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle")
+                .foregroundStyle(.orange)
+            Text(reason)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
+            if retryable {
+                Button("Retry", action: onRetry)
+                    .controlSize(.small)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.12))
     }
 
     /// Header + loading/failed status, in a plain scroll container. Used for the
@@ -498,7 +525,7 @@ private struct DesignDocReaderView: View {
     @ViewBuilder
     private func statusBody(for content: DesignDocContent?) -> some View {
         switch content {
-        case .failed(let reason):
+        case .failed(let reason, let retryable):
             VStack(alignment: .leading, spacing: 8) {
                 Label("Couldn't read this document", systemImage: "exclamationmark.triangle")
                     .font(.callout.weight(.semibold))
@@ -508,6 +535,9 @@ private struct DesignDocReaderView: View {
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
+                if retryable {
+                    Button("Retry", action: onRetry)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         default:
@@ -651,6 +681,16 @@ final class AsyncMarkdownViewerViewModel: ObservableObject {
     /// `parseLogged` flag guards against double-emission on a single
     /// content load — so we don't need to null it out after consumption.
     var clickStartTime: Date? = nil
+    /// Non-nil when the engine served a cached copy it could not
+    /// revalidate. Shown as a banner above the document; the document
+    /// itself stays on screen.
+    @Published var staleReason: String? = nil
+    /// Engine said a retry gesture is useful. The retry *action* is
+    /// `onRetry`; this flag only controls visibility.
+    @Published var canRetry: Bool = false
+    /// Engine-side revalidation. Nil when this viewer is showing
+    /// something that isn't a GitHub fetch (task description).
+    var onRetry: (() -> Void)?
 }
 
 /// Content view for the `"async-markdown-viewer"` Window scene. Shows a
@@ -686,14 +726,34 @@ struct AsyncMarkdownViewerView: View {
                 ProgressView("Loading…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             case .loaded(let title, let markdown, let artifact):
-                MarkdownViewerView(
-                    title: title,
-                    source: markdown,
-                    projectShortID: vm.pendingRenderProjectShortID ?? "",
-                    clickStartTime: vm.clickStartTime,
-                    artifact: artifact,
-                    collapsedByDefaultHeadings: vm.collapsedByDefaultHeadings
-                )
+                VStack(spacing: 0) {
+                    if let stale = vm.staleReason {
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle")
+                                .foregroundStyle(.orange)
+                            Text(stale)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Spacer(minLength: 8)
+                            if vm.canRetry {
+                                Button("Retry") { vm.onRetry?() }
+                                    .controlSize(.small)
+                            }
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(Color.orange.opacity(0.12))
+                    }
+                    MarkdownViewerView(
+                        title: title,
+                        source: markdown,
+                        projectShortID: vm.pendingRenderProjectShortID ?? "",
+                        clickStartTime: vm.clickStartTime,
+                        artifact: artifact,
+                        collapsedByDefaultHeadings: vm.collapsedByDefaultHeadings
+                    )
+                }
                 // .id() forces SwiftUI to destroy and recreate MarkdownViewerView on each
                 // content load, so .onAppear fires even when the window is reused across
                 // documents (stable case identity would otherwise suppress it).
@@ -723,6 +783,9 @@ struct AsyncMarkdownViewerView: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
+                    if vm.canRetry {
+                        Button("Retry") { vm.onRetry?() }
+                    }
                 }
                 .padding()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
