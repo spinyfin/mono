@@ -454,6 +454,50 @@ impl ServerState {
         Some(probe)
     }
 
+    /// Re-point the in-flight entry for `run_id` at a fresh transcript
+    /// snapshot, without disturbing the claim itself.
+    ///
+    /// The interrupting delivery path claims the probe *before* it cuts the
+    /// worker's turn short (so no other dispatcher can deliver the same text
+    /// on the boundary that interrupt produces), which means the snapshot
+    /// taken at claim time pre-dates the cancelled turn's own trailing
+    /// output. Left alone, `dispatch_probe_reply_on_stop` would read that
+    /// output back as the worker's "reply" to a probe it had not been shown
+    /// yet. Re-snapshotting immediately before the write closes that window
+    /// while keeping the claim — releasing and re-claiming would reopen the
+    /// race the early claim exists to prevent.
+    ///
+    /// A no-op when the run holds no in-flight entry.
+    pub(super) fn update_in_flight_probe_snapshot(
+        &self,
+        run_id: &str,
+        transcript_path: Option<String>,
+        offset_bytes: u64,
+    ) {
+        if let Some(entry) = self
+            .in_flight_probes
+            .lock()
+            .expect("in_flight_probes mutex poisoned")
+            .get_mut(run_id)
+        {
+            entry.transcript_path = transcript_path;
+            entry.offset_bytes = offset_bytes;
+        }
+    }
+
+    /// The probe id currently claimed for `run_id`, without taking the claim.
+    ///
+    /// Lets the reply path decide whether a boundary is *its* boundary before
+    /// it consumes the reservation — see the call site in
+    /// `dispatch_probe_reply_on_stop`.
+    pub(super) fn in_flight_probe_id(&self, run_id: &str) -> Option<String> {
+        self.in_flight_probes
+            .lock()
+            .expect("in_flight_probes mutex poisoned")
+            .get(run_id)
+            .map(|entry| entry.probe_id.clone())
+    }
+
     /// Give back a claim taken by [`Self::try_reserve_probe_for_delivery`]
     /// when the pane write did not happen: the probe returns to the front of
     /// the queue with its id intact (callers waiting on the matching

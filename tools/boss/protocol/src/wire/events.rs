@@ -335,6 +335,49 @@ pub enum FrontendEvent {
         probe_id: String,
         text: String,
     },
+    /// Engine **finished** delivering an interrupting probe and is reporting
+    /// what actually happened, answering a
+    /// [`crate::FrontendRequest::ProbeRun`] with `interrupt: true`.
+    ///
+    /// This is the honest counterpart to [`Self::ProbeQueued`]. `ProbeQueued`
+    /// reports an intention — a boundary the engine expects to use — and the
+    /// caller has to poll to learn whether it worked. This reports the
+    /// settled [`ProbeDeliveryState`], because the interrupting path runs
+    /// synchronously inside the RPC: it cuts the worker's turn short,
+    /// confirms the turn ended, writes the text, and waits for confirmation
+    /// before answering. A caller receiving this needs no follow-up
+    /// `ProbeStatus` query for the delivery verdict.
+    ///
+    /// `state` is authoritative, including when it is a failure:
+    /// [`ProbeDeliveryState::InterruptFailed`] means the turn would not end
+    /// and **nothing was typed into the pane**. `interrupt` says what was
+    /// done about the in-flight turn to get there, and `interrupt_attempts`
+    /// how many of the driver's declared attempts were spent — `0` when no
+    /// gesture was sent at all.
+    ProbeDelivered {
+        run_id: String,
+        probe_id: String,
+        /// Echoes the `urgent` flag from the originating `ProbeRun` request.
+        #[serde(default)]
+        urgent: bool,
+        /// The delivery state the engine actually recorded, not an
+        /// expectation. `consumed`/`buffered` mean the worker has the text;
+        /// `unconfirmed` means it was written but not proven; the
+        /// undeliverable states mean it was not.
+        state: ProbeDeliveryState,
+        /// What the engine did about the worker's in-flight turn.
+        interrupt: ProbeInterruptOutcome,
+        /// How many interrupt attempts were spent. `0` when the worker was
+        /// already parked, when it reached a boundary on its own first, or
+        /// when its driver declares no interrupt mechanism.
+        #[serde(default)]
+        interrupt_attempts: u8,
+        /// Operator-facing note about how the probe reached `state` — the
+        /// same text `bossctl probe-status` would show. `None` when the state
+        /// speaks for itself.
+        #[serde(default)]
+        detail: Option<String>,
+    },
     /// Push: a mid-turn probe write could not be confirmed delivered.
     /// NOT proof of loss — left `Unconfirmed` (not auto-re-queued, to
     /// avoid duplicate delivery); the observer decides on redelivery.

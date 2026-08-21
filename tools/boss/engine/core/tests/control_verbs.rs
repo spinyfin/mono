@@ -672,6 +672,8 @@ async fn probe_run_does_not_reject_local_caller_as_boss_only() -> Result<()> {
             run_id: "run-does-not-exist".to_owned(),
             text: "ping".to_owned(),
             urgent: false,
+            // Boundary delivery: this test is about the queue-and-wait path.
+            interrupt: false,
         })
         .await?;
     match response {
@@ -745,6 +747,8 @@ async fn probe_run_refuses_a_run_with_no_live_pane_rather_than_queueing_it() -> 
                 run_id: "run-xyz".to_owned(),
                 text: text.to_owned(),
                 urgent: false,
+                // Boundary delivery: this test is about the queue-and-wait path.
+                interrupt: false,
             })
             .await?;
         match response {
@@ -778,6 +782,8 @@ async fn urgent_probe_against_a_run_with_no_pane_is_refused_too() -> Result<()> 
             run_id: "run-urgent".to_owned(),
             text: "course-correct now".to_owned(),
             urgent: true,
+            // Boundary delivery: this test is about the queue-and-wait path.
+            interrupt: false,
         })
         .await?;
     match urgent_resp {
