@@ -323,41 +323,44 @@ pub(super) async fn refresh_coordinator_update_available(
     tmux: &boss_tmux::Tmux,
     record: crate::work::CoordinatorTmuxRecord,
 ) {
-    let should_probe = coordinator_update_probe_due(
-        server_state
-            .coordinator_installed_version_cache
-            .lock()
-            .expect("coordinator installed-version cache mutex poisoned")
-            .as_ref(),
-        &record.spawn_token,
-    );
-    if !should_probe {
-        return;
-    }
+    let existing_entry = server_state
+        .coordinator_installed_version_cache
+        .lock()
+        .expect("coordinator installed-version cache mutex poisoned")
+        .clone()
+        .filter(|entry| entry.spawn_token == record.spawn_token);
 
-    let installed_version = crate::coordinator_tmux::RealClaudeVersionProbe.probe().await;
-    let update_available_version =
-        crate::coordinator_tmux::coordinator_update_available(&record, installed_version.as_deref());
-    let changed = {
-        let mut cache = server_state
-            .coordinator_installed_version_cache
-            .lock()
-            .expect("coordinator installed-version cache mutex poisoned");
-        let advertised_update_available_version = cache
-            .as_ref()
-            .filter(|entry| entry.spawn_token == record.spawn_token)
-            .and_then(|entry| entry.advertised_update_available_version.clone());
-        let changed =
-            coordinator_update_banner_changed(&advertised_update_available_version, &update_available_version);
-        *cache = Some(CoordinatorInstalledVersionCacheEntry {
-            spawn_token: record.spawn_token.clone(),
-            installed_version,
-            probed_at: Instant::now(),
-            advertised_update_available_version,
-        });
-        changed
+    // Only the subprocess spawn needs rate-limiting to once a day; the
+    // comparison against the cached installed version below is free, so it
+    // always runs. This makes an un-acked push (the app's 5s attach timeout,
+    // a busy/disconnected app) self-healing on the very next 10s supervisor
+    // pass instead of being deferred by a full day alongside the probe.
+    let should_probe = coordinator_update_probe_due(existing_entry.as_ref(), &record.spawn_token);
+    let freshly_probed = if should_probe {
+        Some(crate::coordinator_tmux::RealClaudeVersionProbe.probe().await)
+    } else {
+        None
     };
-    if changed {
+
+    let decision = refresh_decision(existing_entry.as_ref(), &record, freshly_probed);
+    let probed_at = if should_probe {
+        Instant::now()
+    } else {
+        existing_entry
+            .as_ref()
+            .map_or_else(Instant::now, |entry| entry.probed_at)
+    };
+    *server_state
+        .coordinator_installed_version_cache
+        .lock()
+        .expect("coordinator installed-version cache mutex poisoned") = Some(CoordinatorInstalledVersionCacheEntry {
+        spawn_token: record.spawn_token.clone(),
+        installed_version: decision.installed_version,
+        probed_at,
+        advertised_update_available_version: existing_entry.and_then(|entry| entry.advertised_update_available_version),
+    });
+
+    if decision.should_push {
         request_coordinator_attachment(server_state, tmux, record).await;
     }
 }
@@ -368,43 +371,114 @@ fn coordinator_update_probe_due(cache: Option<&CoordinatorInstalledVersionCacheE
     })
 }
 
-fn coordinator_update_banner_changed(advertised: &Option<String>, current: &Option<String>) -> bool {
-    advertised != current
+/// Pure decision core of [`refresh_coordinator_update_available`]: given the
+/// cached entry (if any, already filtered to this spawn token), the
+/// coordinator record, and this pass's fresh probe result (`None` when the
+/// daily probe was not due), determines the installed version to carry
+/// forward and whether the advertised banner needs to be pushed again.
+struct RefreshDecision {
+    installed_version: Option<String>,
+    should_push: bool,
+}
+
+fn refresh_decision(
+    existing_entry: Option<&CoordinatorInstalledVersionCacheEntry>,
+    record: &crate::work::CoordinatorTmuxRecord,
+    freshly_probed: Option<Option<String>>,
+) -> RefreshDecision {
+    let installed_version = match freshly_probed {
+        Some(probed) => probed,
+        None => existing_entry.and_then(|entry| entry.installed_version.clone()),
+    };
+    let advertised_update_available_version =
+        existing_entry.and_then(|entry| entry.advertised_update_available_version.clone());
+    let update_available_version =
+        crate::coordinator_tmux::coordinator_update_available(record, installed_version.as_deref());
+    let should_push = advertised_update_available_version != update_available_version;
+    RefreshDecision {
+        installed_version,
+        should_push,
+    }
 }
 
 #[cfg(test)]
 mod update_available_tests {
     use super::*;
 
-    #[test]
-    fn update_banner_transitions_are_pushed_only_when_the_value_changes() {
-        let older = crate::work::CoordinatorTmuxRecord {
+    fn record_with_launched_version(version: &str) -> crate::work::CoordinatorTmuxRecord {
+        crate::work::CoordinatorTmuxRecord {
             session_name: "boss-coordinator".to_owned(),
             spawn_token: "token".to_owned(),
             spawn_state: "created".to_owned(),
             model: "opus".to_owned(),
-            launched_claude_version: Some("2.1.237".to_owned()),
-        };
+            launched_claude_version: Some(version.to_owned()),
+        }
+    }
+
+    #[test]
+    fn update_banner_transitions_are_pushed_only_when_the_value_changes() {
+        let older = record_with_launched_version("2.1.237");
         let shown = crate::coordinator_tmux::coordinator_update_available(&older, Some("2.1.238"));
         assert_eq!(
             shown.as_deref(),
             Some("2.1.238"),
             "an attached session discovers an upgrade without restart"
         );
-        assert!(
-            coordinator_update_banner_changed(&None, &shown),
-            "the changed value is pushed to show the banner"
-        );
 
-        let cleared = crate::coordinator_tmux::coordinator_update_available(&older, Some("2.1.237"));
-        assert_eq!(cleared, None, "a matching installed version clears the banner");
+        // No cache entry yet (nothing advertised): a due probe that finds the
+        // upgrade must push.
+        let decision = refresh_decision(None, &older, Some(Some("2.1.238".to_owned())));
+        assert_eq!(decision.installed_version.as_deref(), Some("2.1.238"));
+        assert!(decision.should_push, "the changed value is pushed to show the banner");
+
+        let advertised_shown = CoordinatorInstalledVersionCacheEntry {
+            spawn_token: "token".to_owned(),
+            installed_version: Some("2.1.238".to_owned()),
+            probed_at: Instant::now(),
+            advertised_update_available_version: shown.clone(),
+        };
+        // A downgrade back to the launched version clears the banner and must
+        // still push, since the advertised value changes from Some to None.
+        let clearing = refresh_decision(Some(&advertised_shown), &older, Some(Some("2.1.237".to_owned())));
+        assert_eq!(clearing.installed_version.as_deref(), Some("2.1.237"));
+        assert!(clearing.should_push, "the clear is another push-worthy transition");
+
+        let advertised_cleared = CoordinatorInstalledVersionCacheEntry {
+            advertised_update_available_version: None,
+            installed_version: Some("2.1.237".to_owned()),
+            ..advertised_shown
+        };
+        // Repeating an unchanged clear on a later pass emits no redundant push.
+        let repeat_clear = refresh_decision(Some(&advertised_cleared), &older, Some(Some("2.1.237".to_owned())));
         assert!(
-            coordinator_update_banner_changed(&shown, &cleared),
-            "the clear is another push-worthy transition"
+            !repeat_clear.should_push,
+            "repeating an unchanged clear emits no redundant update"
+        );
+    }
+
+    #[test]
+    fn unacked_push_is_retried_on_the_next_pass_without_waiting_for_the_next_probe() {
+        let older = record_with_launched_version("2.1.237");
+        // The app never acked the previous push: `advertised_update_available_version`
+        // is still `None` even though the installed version already reflects the
+        // upgrade from a prior probe.
+        let unacked = CoordinatorInstalledVersionCacheEntry {
+            spawn_token: "token".to_owned(),
+            installed_version: Some("2.1.238".to_owned()),
+            probed_at: Instant::now(),
+            advertised_update_available_version: None,
+        };
+        // No fresh probe this pass (not due yet) — the comparison must still
+        // recompute from the cached installed version and push again.
+        let decision = refresh_decision(Some(&unacked), &older, None);
+        assert_eq!(
+            decision.installed_version.as_deref(),
+            Some("2.1.238"),
+            "the cached installed version is carried forward when no probe ran"
         );
         assert!(
-            !coordinator_update_banner_changed(&cleared, &cleared),
-            "repeating an unchanged clear emits no redundant update"
+            decision.should_push,
+            "an un-acked push must retry on the next pass instead of waiting a full day"
         );
     }
 
