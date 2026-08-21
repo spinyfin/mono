@@ -178,24 +178,37 @@ extension ChatViewModel {
                 scheduleWorkTreeRefetch(productID: productID, flow: .itemRefetch)
             }
         case .workError(let message):
+            // The engine's WorkError reply carries no request context, so we
+            // can't tell which in-flight list_executions/list_attachments
+            // call failed. `hasOtherTrackedAppRequestInFlight` checks every
+            // other in-flight guard this same handler already reacts to
+            // (merge, review terminal, planner action, kanban move, engine
+            // attempt detail, …), captured BEFORE any of them are cleared
+            // below: when one is also outstanding, this WorkError is at
+            // least as likely to belong to it as to a transcript/attachment
+            // load, so painting "Couldn't Load Screenshots" with its
+            // message would misattribute someone else's failure. In that
+            // ambiguous case, leave the viewer spinning rather than show a
+            // wrong explanation — the real `executions_list`/
+            // `attachments_list` reply still clears the in-flight set on
+            // success. Only when no other tracked request is outstanding
+            // (the common case: one viewer window open, nothing else in
+            // flight) do we attribute the error to the waiting viewer(s).
+            let otherRequestInFlight = hasOtherTrackedAppRequestInFlight()
             if let attemptID = engineAttemptDetailRequestID {
                 engineAttemptDetailErrors[attemptID] = message
                 engineAttemptDetailRequestID = nil
             }
-            // The engine's WorkError reply carries no request context, so we
-            // can't tell which in-flight list_executions/list_attachments
-            // call failed — fail every task id that was still waiting. Rare
-            // in practice (normally at most one transcript/attachment
-            // viewer window is open at a time), and strictly better than
-            // the two viewers spinning forever with no explanation.
-            for taskId in executionsInFlightTaskIDs {
-                executionsLoadFailureByTaskID[taskId] = message
+            if !otherRequestInFlight {
+                for taskId in executionsInFlightTaskIDs {
+                    executionsLoadFailureByTaskID[taskId] = message
+                }
+                executionsInFlightTaskIDs.removeAll()
+                for taskId in attachmentsInFlightTaskIDs {
+                    attachmentsLoadFailureByTaskID[taskId] = message
+                }
+                attachmentsInFlightTaskIDs.removeAll()
             }
-            executionsInFlightTaskIDs.removeAll()
-            for taskId in attachmentsInFlightTaskIDs {
-                attachmentsLoadFailureByTaskID[taskId] = message
-            }
-            attachmentsInFlightTaskIDs.removeAll()
             // Allow the user to retry any in-flight review terminal or
             // merge-when-ready request that failed.
             if case .loading = editorialEvaluationState {
@@ -775,6 +788,26 @@ extension ChatViewModel {
         } else {
             automationsByProductID[productID] = [automation]
         }
+    }
+
+    /// Whether some other app-initiated request this handler tracks — other
+    /// than the executions/attachments loads themselves — is currently
+    /// outstanding. Used by the `.workError` arm to avoid attributing an
+    /// unrelated failure to the transcript/attachment viewers when a
+    /// WorkError arrives that could just as plausibly belong to one of
+    /// these other in-flight actions — the generic reply carries no
+    /// request id to disambiguate with.
+    private func hasOtherTrackedAppRequestInFlight() -> Bool {
+        if case .loading = editorialEvaluationState { return true }
+        if !openingReviewTerminalIDs.isEmpty { return true }
+        if !openingLiveWorkspaceTerminalIDs.isEmpty { return true }
+        if !mergingWhenReadyIDs.isEmpty { return true }
+        if !plannerActionInFlightProjectIDs.isEmpty { return true }
+        if !deferredScopeActionInFlightIDs.isEmpty { return true }
+        if !pendingMoveOriginByTaskID.isEmpty { return true }
+        if pendingDragAdmissionCheck != nil { return true }
+        if engineAttemptDetailRequestID != nil { return true }
+        return false
     }
 
     /// Whether an `.error` message is a transport-level signal from

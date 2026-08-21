@@ -256,7 +256,152 @@ final class AttachmentAffordanceTests: XCTestCase {
         XCTAssertEqual(AttachmentBlobPaths.blobURL(for: jpeg).lastPathComponent, "ffee5678.jpg")
     }
 
+    // MARK: - Revision-chain grouping (RevisionChainGrouping.swift)
+    //
+    // Exercised through `AttachmentVM`'s `RevisionChainItem` conformance —
+    // `TranscriptViewerView.executionGroups` and
+    // `AttachmentViewerView.attachmentGroups` both call the same generic
+    // `revisionChainGroups`, so pinning behavior through one conforming
+    // type covers both call sites.
+
+    /// A list entirely from the chain root collapses to a single group
+    /// with an empty label — callers render this as an unlabelled section.
+    func testRevisionChainGroupsRootOnlyYieldsSingleUnlabelledGroup() {
+        let items = [
+            makeAttachment(id: "atc_1", workItemId: "task_root"),
+            makeAttachment(id: "atc_2", workItemId: "task_root"),
+        ]
+
+        let groups = revisionChainGroups(items, rootTaskId: "task_root", revisions: [])
+
+        XCTAssertEqual(groups.count, 1)
+        XCTAssertEqual(groups[0].label, "")
+        XCTAssertEqual(groups[0].items.map(\.id), ["atc_1", "atc_2"])
+    }
+
+    /// Root plus revisions labels "Original" / "R<seq>" in sequence order.
+    func testRevisionChainGroupsLabelsRootAndRevisionsInSequenceOrder() {
+        var r1 = makeTask(id: "task_r1")
+        r1.revisionSeq = 1
+        var r2 = makeTask(id: "task_r2")
+        r2.revisionSeq = 2
+
+        let items = [
+            makeAttachment(id: "atc_root", workItemId: "task_root"),
+            makeAttachment(id: "atc_r1", workItemId: "task_r1"),
+            makeAttachment(id: "atc_r2", workItemId: "task_r2"),
+        ]
+
+        let groups = revisionChainGroups(items, rootTaskId: "task_root", revisions: [r1, r2])
+
+        XCTAssertEqual(groups.map(\.label), ["Original", "R1", "R2"])
+        XCTAssertEqual(groups.map { $0.items.map(\.id) }, [["atc_root"], ["atc_r1"], ["atc_r2"]])
+    }
+
+    /// An item whose `workItemId` matches no known revision falls back to
+    /// "Revision" and is appended last, rather than dropped.
+    func testRevisionChainGroupsFallsBackToRevisionLabelForUnknownTaskAndAppendsLast() {
+        var r1 = makeTask(id: "task_r1")
+        r1.revisionSeq = 1
+
+        let items = [
+            makeAttachment(id: "atc_unknown", workItemId: "task_mystery"),
+            makeAttachment(id: "atc_root", workItemId: "task_root"),
+            makeAttachment(id: "atc_r1", workItemId: "task_r1"),
+        ]
+
+        let groups = revisionChainGroups(items, rootTaskId: "task_root", revisions: [r1])
+
+        XCTAssertEqual(groups.map(\.label), ["Original", "R1", "Revision"])
+        XCTAssertEqual(groups.last?.items.map(\.id), ["atc_unknown"])
+    }
+
+    // MARK: - Load failure state (ChatViewModel+EventHandling.swift .workError arm)
+
+    /// A `WorkError` arriving while attachments are loading — with no
+    /// other tracked app request in flight — populates the failure map so
+    /// the viewer can render a Retry-able state instead of spinning
+    /// forever.
+    func testWorkErrorWhileAttachmentsInFlightPopulatesLoadFailure() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        model.outboundRecorder = { _ in }
+        model.loadAttachments(taskId: "task_xyz")
+
+        model.applyEventForTest(.workError(message: "boom"))
+
+        XCTAssertEqual(model.attachmentsLoadFailureByTaskID["task_xyz"], "boom")
+        XCTAssertTrue(model.attachmentsInFlightTaskIDs.isEmpty)
+    }
+
+    /// A subsequent successful `attachments_list` reply clears a
+    /// previously recorded load failure for the same task.
+    func testAttachmentsListEventClearsPriorLoadFailure() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        model.outboundRecorder = { _ in }
+        model.loadAttachments(taskId: "task_xyz")
+        model.applyEventForTest(.workError(message: "boom"))
+        XCTAssertNotNil(model.attachmentsLoadFailureByTaskID["task_xyz"])
+
+        model.applyEventForTest(.attachmentsList(taskId: "task_xyz", attachments: []))
+
+        XCTAssertNil(model.attachmentsLoadFailureByTaskID["task_xyz"])
+    }
+
+    /// Retrying via `loadAttachments` clears a stale failure so the viewer
+    /// shows the loading state again rather than the old error.
+    func testLoadAttachmentsClearsPriorLoadFailureOnRetry() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        model.outboundRecorder = { _ in }
+        model.loadAttachments(taskId: "task_xyz")
+        model.applyEventForTest(.workError(message: "boom"))
+        XCTAssertNotNil(model.attachmentsLoadFailureByTaskID["task_xyz"])
+
+        model.loadAttachments(taskId: "task_xyz")
+
+        XCTAssertNil(model.attachmentsLoadFailureByTaskID["task_xyz"])
+    }
+
+    /// A `WorkError` that arrives while some OTHER tracked app request is
+    /// also in flight (e.g. a merge-when-ready call) is ambiguous — it
+    /// must not be blamed on the attachments viewer, since the generic
+    /// reply carries no request id and the error may belong to the other
+    /// request instead.
+    func testWorkErrorDoesNotFalselyFailAttachmentsWhenAnotherRequestIsInFlight() {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        model.outboundRecorder = { _ in }
+        model.loadAttachments(taskId: "task_xyz")
+        model.mergingWhenReadyIDs.insert("task_other")
+
+        model.applyEventForTest(.workError(message: "merge failed"))
+
+        XCTAssertNil(
+            model.attachmentsLoadFailureByTaskID["task_xyz"],
+            "ambiguous WorkError must not paint an unrelated failure"
+        )
+        XCTAssertTrue(
+            model.attachmentsInFlightTaskIDs.contains("task_xyz"),
+            "viewer should keep spinning rather than show a wrong error"
+        )
+    }
+
     // MARK: - Fixture
+
+    private func makeAttachment(id: String, workItemId: String) -> AttachmentVM {
+        AttachmentVM(
+            id: id,
+            executionId: "exec_1",
+            workItemId: workItemId,
+            caption: "",
+            contentDigest: "digest_\(id)",
+            createdAt: "1700000000",
+            mediaType: "png",
+            pixelWidth: 10,
+            pixelHeight: 10,
+            sizeBytes: 100,
+            sourceName: "shot.png",
+            reclaimedAt: nil
+        )
+    }
 
     private func makeTask(id: String) -> WorkTask {
         WorkTask(

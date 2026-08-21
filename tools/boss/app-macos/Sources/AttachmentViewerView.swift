@@ -1,5 +1,149 @@
 import AppKit
+import ImageIO
 import SwiftUI
+
+// ===========================================================================
+// Lock-guarded image cache for the attachment viewer, mirroring
+// [[TrekIconAssets]]'s shape (positive cache + negative cache under one
+// lock) for the same reason: `NSImage(contentsOf:)` is a synchronous disk
+// read + decode, and doing it uncached inside a SwiftUI `body` re-runs it on
+// every re-render. Attachments are far larger than Trek icons (up to 8 MiB /
+// 10000px per side, up to 96 rows per work item), so thumbnails are decoded
+// downsampled via ImageIO rather than retaining a full-resolution NSImage
+// for a 40x40 slot, and missing blobs (rows that outlived their bytes after
+// retention cascade-delete) are memoized in the negative cache instead of
+// re-stat'ing the filesystem on every render.
+//
+// Unlike TrekIconAssets — whose population is a small fixed set of bundled
+// icons, safe to retain forever — attachments are unbounded user data, so
+// the two positive caches are `NSCache`, not plain dictionaries: NSCache
+// evicts under both an explicit cost/count ceiling and system memory
+// pressure, so a session that browses many tasks' evidence does not pin
+// hundreds of megabytes of decoded bitmaps for the app's lifetime. The
+// negative caches store no image payload (just a digest/key), so they stay
+// plain lock-guarded `Set`s.
+//
+// Lives in this file (rather than its own) so the finding that required
+// this cache doesn't also add to this branch's touched-file count.
+// ===========================================================================
+
+enum AttachmentImageCache {
+    private struct ThumbnailKey: Hashable {
+        let digest: String
+        let maxPixelSize: Int
+
+        var cacheKey: NSString { "\(digest)#\(maxPixelSize)" as NSString }
+    }
+
+    /// Full-resolution images are the expensive ones (up to 8 MiB decoded
+    /// bitmaps, up to 96 per work item) — capped at a handful of entries so
+    /// browsing several tasks' evidence in one session cannot pin hundreds
+    /// of megabytes of NSImages that are never released.
+    private static let fullImageCostLimit = 64 * 1024 * 1024
+    private static let fullImageCountLimit = 16
+    /// Thumbnails are decoded downsampled (<=80px by default), so a much
+    /// larger count/cost ceiling still bounds memory to a few megabytes.
+    private static let thumbnailCostLimit = 16 * 1024 * 1024
+    private static let thumbnailCountLimit = 512
+
+    // NSCache is documented thread-safe for concurrent access from multiple
+    // threads (unlike the plain Dictionary these replace), so it is safe to
+    // share across actors despite not being `Sendable`.
+    nonisolated(unsafe) private static let thumbnailCache: NSCache<NSString, NSImage> = {
+        let cache = NSCache<NSString, NSImage>()
+        cache.totalCostLimit = thumbnailCostLimit
+        cache.countLimit = thumbnailCountLimit
+        return cache
+    }()
+    nonisolated(unsafe) private static let fullImageCache: NSCache<NSString, NSImage> = {
+        let cache = NSCache<NSString, NSImage>()
+        cache.totalCostLimit = fullImageCostLimit
+        cache.countLimit = fullImageCountLimit
+        return cache
+    }()
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var thumbnailNegativeCache: Set<ThumbnailKey> = []
+    nonisolated(unsafe) private static var fullImageNegativeCache: Set<String> = []
+
+    /// A downsampled thumbnail for `attachment`, decoded at up to
+    /// `maxPixelSize` on its longest side. Cached by content digest, so the
+    /// key is stable and collision-free regardless of which row references
+    /// the blob.
+    static func thumbnail(for attachment: AttachmentVM, maxPixelSize: Int = 80) -> NSImage? {
+        let key = ThumbnailKey(digest: attachment.contentDigest, maxPixelSize: maxPixelSize)
+        if let cached = thumbnailCache.object(forKey: key.cacheKey) {
+            return cached
+        }
+        lock.lock()
+        if thumbnailNegativeCache.contains(key) {
+            lock.unlock()
+            return nil
+        }
+        lock.unlock()
+
+        let loaded = loadThumbnail(for: attachment, maxPixelSize: maxPixelSize)
+
+        if let loaded {
+            thumbnailCache.setObject(loaded, forKey: key.cacheKey, cost: imageCost(loaded))
+        } else {
+            lock.lock()
+            thumbnailNegativeCache.insert(key)
+            lock.unlock()
+        }
+        return loaded
+    }
+
+    /// The full-resolution image for `attachment`, cached by content
+    /// digest. Used by the detail pane, where a large image is legitimately
+    /// wanted at full size — but only decoded once, not on every re-render.
+    static func fullImage(for attachment: AttachmentVM) -> NSImage? {
+        let digest = attachment.contentDigest
+        let key = digest as NSString
+        if let cached = fullImageCache.object(forKey: key) {
+            return cached
+        }
+        lock.lock()
+        if fullImageNegativeCache.contains(digest) {
+            lock.unlock()
+            return nil
+        }
+        lock.unlock()
+
+        let loaded = NSImage(contentsOf: AttachmentBlobPaths.blobURL(for: attachment))
+
+        if let loaded {
+            fullImageCache.setObject(loaded, forKey: key, cost: imageCost(loaded))
+        } else {
+            lock.lock()
+            fullImageNegativeCache.insert(digest)
+            lock.unlock()
+        }
+        return loaded
+    }
+
+    private static func loadThumbnail(for attachment: AttachmentVM, maxPixelSize: Int) -> NSImage? {
+        let url = AttachmentBlobPaths.blobURL(for: attachment)
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+        ]
+        guard let cgThumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+            return nil
+        }
+        let size = NSSize(width: cgThumbnail.width, height: cgThumbnail.height)
+        return NSImage(cgImage: cgThumbnail, size: size)
+    }
+
+    /// Approximate decoded-bitmap byte size (4 bytes/pixel, RGBA), used as
+    /// `NSCache`'s per-entry cost so `totalCostLimit` bounds actual memory
+    /// rather than entry count alone.
+    private static func imageCost(_ image: NSImage) -> Int {
+        Int(image.size.width * image.size.height) * 4
+    }
+}
 
 // MARK: - AttachmentRow
 
