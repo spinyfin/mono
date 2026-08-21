@@ -241,21 +241,6 @@ pub enum BlobFetch {
     NotModified { rate_limit_remaining: Option<u32> },
 }
 
-/// Fetch one blob's raw text at `git_ref`.
-///
-/// Routed through the Contents API with the `raw` media type rather
-/// than the blobs API so GitHub does the base64 decoding; the response
-/// body is the file's bytes verbatim. Argv construction is shared with
-/// `contents::fetch_repo_file` via [`crate::contents::raw_content_args`]
-/// so there is exactly one place that knows the Contents-API invocation
-/// shape; this function keeps its own `TreeApiError` classification.
-pub async fn fetch_blob_text(owner: &str, repo: &str, path: &str, git_ref: &str) -> TreeResult<String> {
-    match fetch_blob(owner, repo, path, git_ref, None).await? {
-        BlobFetch::Content { text, .. } => Ok(text),
-        BlobFetch::NotModified { .. } => Ok(String::new()),
-    }
-}
-
 /// Contents-API GET with optional `If-None-Match`.
 ///
 /// A 304 is [`BlobFetch::NotModified`], not an error — the caller keeps

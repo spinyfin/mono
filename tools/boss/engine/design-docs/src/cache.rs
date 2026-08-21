@@ -99,16 +99,25 @@ struct Inner {
 pub struct BodyCache {
     dir: PathBuf,
     inner: Mutex<Inner>,
+    /// Serializes on-disk writes so two `put`s cannot clobber
+    /// `index.json.tmp`. Distinct from `inner` so `get` is not blocked
+    /// behind filesystem work.
+    persist_lock: Mutex<()>,
 }
 
 impl BodyCache {
     /// Load (or create) a cache rooted at `dir`.
     pub fn open(dir: PathBuf) -> Self {
         let inner = load_from_disk(&dir);
-        Self {
+        let cache = Self {
             dir,
             inner: Mutex::new(inner),
-        }
+            persist_lock: Mutex::new(()),
+        };
+        // Drop blobs (and leftover `*.tmp`) that the index no longer
+        // references. Run on open, not on the per-put hot path.
+        let _ = cache.gc_orphan_blobs();
+        cache
     }
 
     /// In-memory cache that never touches the filesystem.
@@ -119,6 +128,7 @@ impl BodyCache {
                 entries: HashMap::new(),
                 tick: 0,
             }),
+            persist_lock: Mutex::new(()),
         }
     }
 
@@ -145,11 +155,12 @@ impl BodyCache {
     pub fn put(&self, key: CacheKey, markdown: String, etag: Option<String>) {
         let blob_hex = blob_hex(&markdown);
         let size = markdown.len() as u64;
+        let mut needs_gc = false;
         {
             let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             inner.tick += 1;
             let last_access = inner.tick;
-            inner.entries.insert(
+            let old = inner.entries.insert(
                 key,
                 MemEntry {
                     markdown,
@@ -159,16 +170,28 @@ impl BodyCache {
                     blob_hex: blob_hex.clone(),
                 },
             );
+            if old.is_some_and(|prev| prev.blob_hex != blob_hex) {
+                needs_gc = true;
+            }
+            let before = inner.entries.len();
             evict_until_within_caps(&mut inner.entries);
+            if inner.entries.len() < before {
+                needs_gc = true;
+            }
         }
         if self.persist_enabled() {
             let _ = self.persist();
+            if needs_gc {
+                let _ = self.gc_orphan_blobs();
+            }
         }
     }
 
     /// Update only the ETag of an existing entry (304 Not Modified).
     /// Bumps last-access so a frequently-revalidated SHA/branch is not
-    /// the first to evict.
+    /// the first to evict. Does **not** persist: last-access drift
+    /// across a restart is harmless, and a 304 does not change the
+    /// stored ETag.
     pub fn touch_etag(&self, key: &CacheKey, etag: Option<String>) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if inner.entries.contains_key(key) {
@@ -180,10 +203,6 @@ impl BodyCache {
                 }
                 entry.last_access = last_access;
             }
-        }
-        drop(inner);
-        if self.persist_enabled() {
-            let _ = self.persist();
         }
     }
 
@@ -197,7 +216,27 @@ impl BodyCache {
     }
 
     fn persist(&self) -> io::Result<()> {
-        persist_to_disk(&self.dir, &self.inner.lock().unwrap_or_else(|p| p.into_inner()))
+        let snapshot = {
+            let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            snapshot_entries(&inner)
+        };
+        let _persist = self.persist_lock.lock().unwrap_or_else(|p| p.into_inner());
+        persist_snapshot(&self.dir, &snapshot)
+    }
+
+    fn gc_orphan_blobs(&self) -> io::Result<()> {
+        if !self.persist_enabled() {
+            return Ok(());
+        }
+        let live = {
+            let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            inner
+                .entries
+                .values()
+                .map(|e| e.blob_hex.clone())
+                .collect::<std::collections::HashSet<_>>()
+        };
+        gc_orphan_blobs(&self.dir, &live)
     }
 }
 
@@ -248,24 +287,34 @@ fn load_from_disk(dir: &Path) -> Inner {
     Inner { entries, tick }
 }
 
-fn persist_to_disk(dir: &Path, inner: &Inner) -> io::Result<()> {
+fn snapshot_entries(inner: &Inner) -> Vec<(IndexEntry, String)> {
+    inner
+        .entries
+        .iter()
+        .map(|(key, entry)| {
+            (
+                IndexEntry {
+                    key: key.clone(),
+                    etag: entry.etag.clone(),
+                    blob: entry.blob_hex.clone(),
+                    size: entry.size,
+                    last_access: entry.last_access,
+                },
+                entry.markdown.clone(),
+            )
+        })
+        .collect()
+}
+
+fn persist_snapshot(dir: &Path, entries: &[(IndexEntry, String)]) -> io::Result<()> {
     fs::create_dir_all(blobs_dir(dir))?;
     let mut index = IndexFile { entries: Vec::new() };
-    let mut live_blobs = std::collections::HashSet::new();
-    for (key, entry) in &inner.entries {
-        let blob_path = blobs_dir(dir).join(&entry.blob_hex);
+    for (meta, markdown) in entries {
+        let blob_path = blobs_dir(dir).join(&meta.blob);
         if !blob_path.exists() {
-            let mut file = fs::File::create(&blob_path)?;
-            file.write_all(entry.markdown.as_bytes())?;
+            write_blob_atomic(&blob_path, markdown.as_bytes())?;
         }
-        live_blobs.insert(entry.blob_hex.clone());
-        index.entries.push(IndexEntry {
-            key: key.clone(),
-            etag: entry.etag.clone(),
-            blob: entry.blob_hex.clone(),
-            size: entry.size,
-            last_access: entry.last_access,
-        });
+        index.entries.push(meta.clone());
     }
     let tmp = dir.join("index.json.tmp");
     fs::write(
@@ -273,14 +322,35 @@ fn persist_to_disk(dir: &Path, inner: &Inner) -> io::Result<()> {
         serde_json::to_vec_pretty(&index).unwrap_or_else(|_| b"{}".to_vec()),
     )?;
     fs::rename(&tmp, index_path(dir))?;
-    // Drop blob files no live entry references.
-    if let Ok(rd) = fs::read_dir(blobs_dir(dir)) {
-        for ent in rd.flatten() {
-            let name = ent.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if !live_blobs.contains(name) {
-                let _ = fs::remove_file(ent.path());
-            }
+    Ok(())
+}
+
+/// Write `bytes` to `final_path` via a sibling `*.tmp` then rename, so a
+/// crash mid-write cannot leave a truncated file at the content-addressed
+/// path (the `exists()` shortcut would then treat it as complete forever).
+fn write_blob_atomic(final_path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut tmp_name = final_path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp_path = PathBuf::from(tmp_name);
+    {
+        let mut file = fs::File::create(&tmp_path)?;
+        file.write_all(bytes)?;
+        let _ = file.sync_all();
+    }
+    fs::rename(&tmp_path, final_path)?;
+    Ok(())
+}
+
+fn gc_orphan_blobs(dir: &Path, live: &std::collections::HashSet<String>) -> io::Result<()> {
+    let Ok(rd) = fs::read_dir(blobs_dir(dir)) else {
+        return Ok(());
+    };
+    for ent in rd.flatten() {
+        let name = ent.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // Leftover atomic-write temps are never live, regardless of hex.
+        if name.ends_with(".tmp") || !live.contains(name) {
+            let _ = fs::remove_file(ent.path());
         }
     }
     Ok(())
@@ -364,5 +434,59 @@ mod tests {
         let hit = reopened.get(&key(7)).expect("survived reopen");
         assert_eq!(hit.markdown, "# persisted");
         assert_eq!(hit.etag.as_deref(), Some("etag-7"));
+    }
+
+    #[test]
+    fn touch_etag_does_not_rewrite_the_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        let cache = BodyCache::open(path.clone());
+        cache.put(key(1), "# hi".into(), Some("etag-1".into()));
+        let before = fs::read(index_path(&path)).expect("index written by put");
+        cache.touch_etag(&key(1), Some("etag-1-new".into()));
+        let after = fs::read(index_path(&path)).expect("index still there");
+        assert_eq!(before, after, "304 must not rewrite index.json");
+        // Memory still sees the touch.
+        assert_eq!(cache.get(&key(1)).unwrap().etag.as_deref(), Some("etag-1-new"));
+    }
+
+    #[test]
+    fn open_gcs_orphan_blobs_and_tmp_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        {
+            let cache = BodyCache::open(path.clone());
+            cache.put(key(1), "# keep".into(), None);
+        }
+        let blobs = blobs_dir(&path);
+        fs::write(blobs.join("deadbeef"), "orphan").expect("orphan blob");
+        fs::write(blobs.join("abc.tmp"), "partial").expect("tmp leftover");
+        let reopened = BodyCache::open(path);
+        assert!(reopened.get(&key(1)).is_some());
+        let names: Vec<String> = fs::read_dir(&blobs)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n == "deadbeef" || n.ends_with(".tmp")),
+            "open must drop orphans and leftover temps, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn blob_write_uses_temp_then_rename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        let cache = BodyCache::open(path.clone());
+        cache.put(key(1), "# atomic".into(), None);
+        let hex = blob_hex("# atomic");
+        let blob = blobs_dir(&path).join(&hex);
+        assert!(blob.exists(), "final blob path must exist after put");
+        assert!(
+            !blobs_dir(&path).join(format!("{hex}.tmp")).exists(),
+            "tmp sibling must not remain after a successful rename"
+        );
+        assert_eq!(fs::read_to_string(&blob).unwrap(), "# atomic");
     }
 }

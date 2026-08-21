@@ -8,6 +8,7 @@ workspace = "../../../.."
 async-trait = { workspace = true }
 boss-engine-utils = { path = "../utils" }
 boss-github = { path = "../../github" }
+boss-http-retry = { path = "../../http_retry" }
 boss-protocol = { path = "../../protocol" }
 git-utils = { path = "../../../../lib/rust/git_utils" }
 serde = { workspace = true, features = ["derive"] }

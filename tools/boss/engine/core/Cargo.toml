@@ -15,6 +15,7 @@ boss-engine-comment-classifier = { path = "../comment-classifier" }
 boss-gh-telemetry = { path = "../../gh_telemetry" }
 boss-github = { path = "../../github" }
 boss-github-tracker = { path = "../../github_tracker" }
+boss-http-retry = { path = "../../http_retry" }
 boss-trunk-auth = { path = "../../trunk_auth" }
 boss-trunk-client = { path = "../../trunk_client" }
 boss-transcript-markdown = { path = "../transcript-markdown" }

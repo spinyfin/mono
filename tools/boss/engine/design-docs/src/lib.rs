@@ -42,6 +42,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use boss_github::trees::{BlobFetch, RepoTree, TreeApiError, TreeApiErrorKind, is_markdown_path};
+use boss_http_retry::RetryPolicy;
 use boss_protocol::{DesignDocContent, DesignDocEntry, DesignDocTree, DesignDocTreeState};
 
 pub use body::is_immutable_git_ref;
@@ -114,10 +115,11 @@ pub struct DesignDocsService {
     source: Arc<dyn GitHubTreeSource>,
     cache: Mutex<HashMap<String, CachedListing>>,
     bodies: BodyCache,
-    /// Sleep between transient first-load / revalidation attempts.
-    /// Production uses 500ms; tests inject zero so failure paths don't
-    /// wait.
-    retry_delay: std::time::Duration,
+    /// Attempts and backoff for a single first-load / revalidation
+    /// fetch. Production is 3 attempts at 500ms; tests inject a zero
+    /// backoff so failure paths don't wait. Not a substitute for the
+    /// longer auto-retry schedule the handler owns.
+    retry: RetryPolicy,
 }
 
 impl DesignDocsService {
@@ -128,7 +130,7 @@ impl DesignDocsService {
             source: Arc::new(GhTreeSource),
             cache: Mutex::new(HashMap::new()),
             bodies: BodyCache::open(cache_dir),
-            retry_delay: std::time::Duration::from_millis(500),
+            retry: body::FETCH_RETRY,
         }
     }
 
@@ -145,7 +147,7 @@ impl DesignDocsService {
             source,
             cache: Mutex::new(HashMap::new()),
             bodies,
-            retry_delay: std::time::Duration::ZERO,
+            retry: RetryPolicy::new(3, std::time::Duration::ZERO, std::time::Duration::ZERO),
         }
     }
 

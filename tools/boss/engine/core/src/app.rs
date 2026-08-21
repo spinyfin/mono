@@ -631,6 +631,11 @@ struct ServerState {
     /// the revalidating body cache, so it lives on `ServerState`
     /// (process lifetime) rather than being constructed per request.
     design_docs: Arc<boss_engine_design_docs::DesignDocsService>,
+    /// In-flight auto-retry ladders for design-doc revalidation, keyed
+    /// by `(repo, path, ref)`. One ladder per triple — a later open or
+    /// Retry restarts the existing schedule instead of stacking another.
+    #[builder(default)]
+    design_doc_revalidation: Arc<design_docs::RevalidationRegistry>,
     /// Primary-path `execution_id → pr_url` staging cache. Populated
     /// by [`dispatch_live_worker_state`] from `PostToolUse` Bash
     /// hooks that surface a `gh pr create` (or `view` / `edit`)

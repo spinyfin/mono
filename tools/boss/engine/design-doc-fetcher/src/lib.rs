@@ -145,22 +145,21 @@ where
 ///
 /// Connection-level failures — TLS handshake timeout, connection reset,
 /// DNS lookup failure, timeouts, HTTP 5xx — are transient. HTTP 401/403
-/// (auth / permission) are not: retrying them just burns the attempt
-/// budget. Anything we don't recognise is treated as retryable so a new
-/// error string for a network blip still gets the bounded retries.
+/// (including the rate-limit 403) and HTTP 429 are not retried: this
+/// fetcher's 500ms budget cannot outlast a rate-limit window, and
+/// retrying auth failures just burns the attempt budget. Anything we
+/// don't recognise is treated as retryable so a new error string for a
+/// network blip still gets the bounded retries.
 pub fn is_retryable_fetch_error(reason: &str) -> bool {
     let lower = reason.to_lowercase();
     if lower.contains("http 401")
         || lower.contains("http 403")
+        || lower.contains("http 429")
         || lower.contains("bad credentials")
         || lower.contains("requires authentication")
+        || lower.contains("rate limit")
+        || lower.contains("secondary rate")
     {
-        // Rate-limit 403s *are* retryable-after-wait, but this fetcher's
-        // 500ms budget will not outlast a rate-limit window. Treat them
-        // as non-retryable here so we fail fast rather than hammer.
-        if lower.contains("rate limit") || lower.contains("secondary rate") {
-            return false;
-        }
         return false;
     }
     true
@@ -290,6 +289,8 @@ mod tests {
         assert!(!is_retryable_fetch_error("gh: Bad credentials (HTTP 401)"));
         assert!(!is_retryable_fetch_error("gh: Resource not accessible (HTTP 403)"));
         assert!(!is_retryable_fetch_error("gh: API rate limit exceeded (HTTP 403)"));
+        assert!(!is_retryable_fetch_error("gh: API rate limit exceeded (HTTP 429)"));
+        assert!(!is_retryable_fetch_error("gh: Too Many Requests (HTTP 429)"));
     }
 
     #[tokio::test]

@@ -20,7 +20,7 @@ use crate::gh_runner::{gh_output, parse_http_status_from_stderr};
 /// the Contents API: `repos/{owner}/{repo}/contents/{path}` with `ref=` in
 /// the query string and the raw media type.
 ///
-/// Shared by [`fetch_repo_file`] and [`crate::trees::fetch_blob_text`] so
+/// Shared by [`fetch_repo_file`] and [`crate::trees::fetch_blob`] so
 /// the endpoint shape and argv (in particular `--method GET`, required so
 /// `-f ref=` lands in the query string instead of gh switching to POST once
 /// a field is added — which also makes gh URL-encode slashed branch/ref

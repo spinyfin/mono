@@ -8,17 +8,22 @@
 //! never discards a good cache entry.
 
 use boss_github::trees::{BlobFetch, TreeApiError, TreeApiErrorKind, is_markdown_path};
+use boss_http_retry::{RetryPolicy, backoff_delay};
 use boss_protocol::DesignDocContent;
 use tokio::time::sleep;
 
 use crate::cache::CacheKey;
 use crate::{DesignDocsService, describe_doc_failure};
 
-/// Maximum fetch attempts for a *blocking* first load (no cache). Covers
-/// the initial attempt plus two retries — the same budget the populator's
-/// doc fetcher uses. Revalidation uses this too for a single refresh, not
-/// as a substitute for the longer auto-retry schedule the handler owns.
-const MAX_FETCH_ATTEMPTS: u32 = 3;
+/// Production fetch retry: initial attempt plus two retries, 500ms
+/// between them (capped equal to the base so this stays a fixed delay,
+/// matching the populator's doc-fetcher budget). Tests inject
+/// [`RetryPolicy`] with a zero backoff so failure paths don't wait.
+pub(crate) const FETCH_RETRY: RetryPolicy = RetryPolicy::new(
+    3,
+    std::time::Duration::from_millis(500),
+    std::time::Duration::from_millis(500),
+);
 
 impl DesignDocsService {
     /// Immediate payload for an open: cache hit if one exists, otherwise
@@ -192,17 +197,21 @@ impl DesignDocsService {
         etag: Option<&str>,
     ) -> Result<FetchOk, TreeApiError> {
         let mut last_err: Option<TreeApiError> = None;
-        for attempt in 1..=MAX_FETCH_ATTEMPTS {
+        let attempts = self.retry.max_attempts.max(1);
+        for attempt in 1..=attempts {
             match self.source.fetch_blob(owner, repo, path, git_ref, etag).await {
                 Ok(BlobFetch::Content { text, etag, .. }) => return Ok(FetchOk::Body { text, etag }),
                 Ok(BlobFetch::NotModified { .. }) => return Ok(FetchOk::NotModified),
                 Err(err) => {
                     let retryable = err.kind == TreeApiErrorKind::Unreachable;
                     last_err = Some(err);
-                    if !retryable || attempt == MAX_FETCH_ATTEMPTS {
+                    if !retryable || attempt == attempts {
                         break;
                     }
-                    sleep(self.retry_delay).await;
+                    let delay = backoff_delay(&self.retry, attempt);
+                    if !delay.is_zero() {
+                        sleep(delay).await;
+                    }
                 }
             }
         }

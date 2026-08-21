@@ -562,17 +562,6 @@ final class ChatViewModel: ObservableObject {
     var pendingAsyncViewerTitle: String = ""
     var pendingAsyncViewerArtifact: CommentArtifactRef?
 
-    /// Indirection for fetching raw markdown content from a URL.
-    /// Production default routes through [[GitHubContentFetcher]] so
-    /// the request authenticates as the user's active `gh` session and
-    /// works for private repos. An unauthenticated `URLSession` fetch
-    /// against `raw.githubusercontent.com` returns 404 for any private
-    /// repo (issue #732), so this path must never reach `URLSession`.
-    /// Tests inject a stub so the affordance tests never shell out.
-    var rawContentFetcher: (URL) async throws -> String = { url in
-        try await GitHubContentFetcher.fetch(url)
-    }
-
     /// Indirection for opening the review-terminal window. Installed by
     /// [[ContentView]] using `@Environment(\.openWindow)`. Called on
     /// click (before the engine responds) so the window opens immediately
@@ -1990,12 +1979,14 @@ final class ChatViewModel: ObservableObject {
     ///   the user can re-point. The re-point sheet is tracked
     ///   separately (design Q5).
     /// - `.resolved` — dispatch priority:
-    ///   1. `rawContentURL` present: fetch from GitHub via [[rawContentFetcher]]
-    ///      and open in the async markdown viewer. This is correct for both
-    ///      merged (main) and in-review (PR branch) docs — the GitHub ref in
-    ///      the URL is the authoritative source regardless of cube workspace
-    ///      state. A leased workspace may be on a different task's branch even
-    ///      when `resolved.branch == "main"`, so reading from disk is not safe.
+    ///   1. `rawContentURL` present: route through the engine via
+    ///      [[openDesignDocViaEngine]] (serves cache, revalidates in
+    ///      background) and open in the async markdown viewer. This is
+    ///      correct for both merged (main) and in-review (PR branch) docs —
+    ///      the GitHub ref is the authoritative source regardless of cube
+    ///      workspace state. A leased workspace may be on a different task's
+    ///      branch even when `resolved.branch == "main"`, so reading from
+    ///      disk is not safe.
     ///   2. `rawContentURL` absent (non-GitHub repo or older engine) AND a
     ///      workspace is leased for the resolved repo AND branch is `main`:
     ///      render via [[designRendererOpener]] (in-app renderer) when wired,
@@ -2159,44 +2150,6 @@ final class ChatViewModel: ObservableObject {
             artifact: .workItem(id: task.id)
         )
         asyncMarkdownViewerOpener?()
-    }
-
-    /// Fetch raw markdown from `rawURL` and update [[asyncMarkdownViewerVM]]
-    /// state. Called after the viewer window is already open in `.loading`
-    /// state. Transitions to `.loaded` on success or `.failed` on error so
-    /// the window always resolves to a terminal state. `artifact` (built by
-    /// the caller from the resolved doc's repo/branch/path, mirroring
-    /// `DesignRendererContent.commentArtifact`) is carried into `.loaded` so
-    /// comments on this viewer are engine-backed instead of in-memory.
-    @MainActor
-    func fetchAndUpdateAsyncMarkdownViewerVM(
-        projectName: String,
-        rawURL: URL,
-        projectShortID: String,
-        artifact: CommentArtifactRef? = nil
-    ) async {
-        let title = projectName.isEmpty ? rawURL.lastPathComponent : projectName
-        do {
-            let fetchStart = Date()
-            designDocTimingLog.info("phase=fetch_start project=\(projectShortID, privacy: .public) url=\(rawURL.absoluteString, privacy: .public)")
-            let markdown = try await rawContentFetcher(rawURL)
-            let fetchMs = Int(Date().timeIntervalSince(fetchStart) * 1000)
-            designDocTimingLog.info("phase=fetch_end project=\(projectShortID, privacy: .public) duration_ms=\(fetchMs, privacy: .public) bytes=\(markdown.utf8.count, privacy: .public)")
-            asyncMarkdownViewerVM.pendingRenderProjectShortID = projectShortID
-            asyncMarkdownViewerVM.renderStartTime = Date()
-            asyncMarkdownViewerVM.renderContentID = UUID()
-            // This is the design-doc/investigation-doc fetch path, never a
-            // revision brief — reset explicitly so a collapsed-by-default
-            // heading set left over from a previously-viewed revision brief
-            // (the VM/window are a shared singleton) can't leak in here.
-            asyncMarkdownViewerVM.collapsedByDefaultHeadings = []
-            asyncMarkdownViewerVM.state = .loaded(title: title, markdown: markdown, artifact: artifact)
-        } catch {
-            asyncMarkdownViewerVM.state = .failed(
-                title: title,
-                message: error.localizedDescription
-            )
-        }
     }
 
     /// Apply a resolve response and close out the in-flight batch's timing
