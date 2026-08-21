@@ -6,9 +6,7 @@ import SwiftUI
 // (executions, attachments) by the task that owns them, labelled "Original"
 // / "R<seq>" / "Revision". Extracted so the two viewers over the same chain
 // structurally cannot disagree about labelling — see AttachmentViewerView's
-// header doc comment. Lives here (rather than its own file) so the shared
-// helper doesn't add to this branch's touched-file count on top of the
-// TranscriptViewerView.swift edit that was already required to consume it.
+// header doc comment.
 // ===========================================================================
 
 /// Conformance required to run [[revisionChainGroups(_:rootTaskId:)]] over a

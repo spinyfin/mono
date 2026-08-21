@@ -365,8 +365,9 @@ final class AttachmentAffordanceTests: XCTestCase {
     /// also in flight (e.g. a merge-when-ready call) is ambiguous — it
     /// must not be blamed on the attachments viewer, since the generic
     /// reply carries no request id and the error may belong to the other
-    /// request instead.
-    func testWorkErrorDoesNotFalselyFailAttachmentsWhenAnotherRequestIsInFlight() {
+    /// request instead, so the viewer receives a neutral retry-able failure
+    /// rather than the unrelated error message.
+    func testWorkErrorRecordsNeutralFailureWhenAnotherRequestIsInFlight() {
         let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
         model.outboundRecorder = { _ in }
         model.loadAttachments(taskId: "task_xyz")
@@ -374,13 +375,14 @@ final class AttachmentAffordanceTests: XCTestCase {
 
         model.applyEventForTest(.workError(message: "merge failed"))
 
-        XCTAssertNil(
+        XCTAssertEqual(
             model.attachmentsLoadFailureByTaskID["task_xyz"],
-            "ambiguous WorkError must not paint an unrelated failure"
+            "Loading failed. Retry?",
+            "ambiguous WorkError must not paint the unrelated failure message"
         )
         XCTAssertTrue(
-            model.attachmentsInFlightTaskIDs.contains("task_xyz"),
-            "viewer should keep spinning rather than show a wrong error"
+            model.attachmentsInFlightTaskIDs.isEmpty,
+            "neutral failure must clear the in-flight state so the viewer stops spinning"
         )
     }
 

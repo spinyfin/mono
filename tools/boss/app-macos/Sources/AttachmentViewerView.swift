@@ -22,9 +22,6 @@ import SwiftUI
 // hundreds of megabytes of decoded bitmaps for the app's lifetime. The
 // negative caches store no image payload (just a digest/key), so they stay
 // plain lock-guarded `Set`s.
-//
-// Lives in this file (rather than its own) so the finding that required
-// this cache doesn't also add to this branch's touched-file count.
 // ===========================================================================
 
 enum AttachmentImageCache {
@@ -85,13 +82,13 @@ enum AttachmentImageCache {
         let loaded = loadThumbnail(for: attachment, maxPixelSize: maxPixelSize)
 
         if let loaded {
-            thumbnailCache.setObject(loaded, forKey: key.cacheKey, cost: imageCost(loaded))
+            thumbnailCache.setObject(loaded.image, forKey: key.cacheKey, cost: loaded.cost)
         } else {
             lock.lock()
             thumbnailNegativeCache.insert(key)
             lock.unlock()
         }
-        return loaded
+        return loaded?.image
     }
 
     /// The full-resolution image for `attachment`, cached by content
@@ -122,7 +119,10 @@ enum AttachmentImageCache {
         return loaded
     }
 
-    private static func loadThumbnail(for attachment: AttachmentVM, maxPixelSize: Int) -> NSImage? {
+    private static func loadThumbnail(
+        for attachment: AttachmentVM,
+        maxPixelSize: Int
+    ) -> (image: NSImage, cost: Int)? {
         let url = AttachmentBlobPaths.blobURL(for: attachment)
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let options: [CFString: Any] = [
@@ -134,14 +134,21 @@ enum AttachmentImageCache {
             return nil
         }
         let size = NSSize(width: cgThumbnail.width, height: cgThumbnail.height)
-        return NSImage(cgImage: cgThumbnail, size: size)
+        return (NSImage(cgImage: cgThumbnail, size: size), imageCost(width: cgThumbnail.width, height: cgThumbnail.height))
     }
 
     /// Approximate decoded-bitmap byte size (4 bytes/pixel, RGBA), used as
     /// `NSCache`'s per-entry cost so `totalCostLimit` bounds actual memory
     /// rather than entry count alone.
     private static func imageCost(_ image: NSImage) -> Int {
-        Int(image.size.width * image.size.height) * 4
+        if let bitmap = image.representations.compactMap({ $0 as? NSBitmapImageRep }).first {
+            return imageCost(width: bitmap.pixelsWide, height: bitmap.pixelsHigh)
+        }
+        return imageCost(width: Int(image.size.width), height: Int(image.size.height))
+    }
+
+    private static func imageCost(width: Int, height: Int) -> Int {
+        width * height * 4
     }
 }
 

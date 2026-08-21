@@ -188,27 +188,25 @@ extension ChatViewModel {
             // least as likely to belong to it as to a transcript/attachment
             // load, so painting "Couldn't Load Screenshots" with its
             // message would misattribute someone else's failure. In that
-            // ambiguous case, leave the viewer spinning rather than show a
-            // wrong explanation — the real `executions_list`/
-            // `attachments_list` reply still clears the in-flight set on
-            // success. Only when no other tracked request is outstanding
-            // (the common case: one viewer window open, nothing else in
-            // flight) do we attribute the error to the waiting viewer(s).
+            // ambiguous case, record a neutral retry-able failure and clear
+            // the in-flight sets, so the viewer does not spin forever. Only
+            // when no other tracked request is outstanding (the common
+            // case: one viewer window open, nothing else in flight) do we
+            // attribute the error to the waiting viewer(s).
             let otherRequestInFlight = hasOtherTrackedAppRequestInFlight()
             if let attemptID = engineAttemptDetailRequestID {
                 engineAttemptDetailErrors[attemptID] = message
                 engineAttemptDetailRequestID = nil
             }
-            if !otherRequestInFlight {
-                for taskId in executionsInFlightTaskIDs {
-                    executionsLoadFailureByTaskID[taskId] = message
-                }
-                executionsInFlightTaskIDs.removeAll()
-                for taskId in attachmentsInFlightTaskIDs {
-                    attachmentsLoadFailureByTaskID[taskId] = message
-                }
-                attachmentsInFlightTaskIDs.removeAll()
+            let viewerLoadFailure = otherRequestInFlight ? "Loading failed. Retry?" : message
+            for taskId in executionsInFlightTaskIDs {
+                executionsLoadFailureByTaskID[taskId] = viewerLoadFailure
             }
+            executionsInFlightTaskIDs.removeAll()
+            for taskId in attachmentsInFlightTaskIDs {
+                attachmentsLoadFailureByTaskID[taskId] = viewerLoadFailure
+            }
+            attachmentsInFlightTaskIDs.removeAll()
             // Allow the user to retry any in-flight review terminal or
             // merge-when-ready request that failed.
             if case .loading = editorialEvaluationState {
