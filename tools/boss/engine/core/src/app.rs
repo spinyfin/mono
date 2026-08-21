@@ -460,9 +460,18 @@ struct DeliveryWaiter {
     tx: oneshot::Sender<String>,
 }
 
-/// `(spawn_token, installed claude version)` — see
+/// The last installed-version probe and successfully advertised update state
+/// for a coordinator spawn token. See
 /// `ServerState::coordinator_installed_version_cache`.
-type CoordinatorInstalledVersionCache = Arc<StdMutex<Option<(String, Option<String>)>>>;
+#[derive(Clone, Debug)]
+struct CoordinatorInstalledVersionCacheEntry {
+    spawn_token: String,
+    installed_version: Option<String>,
+    probed_at: Instant,
+    advertised_update_available_version: Option<String>,
+}
+
+type CoordinatorInstalledVersionCache = Arc<StdMutex<Option<CoordinatorInstalledVersionCacheEntry>>>;
 
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
@@ -575,18 +584,13 @@ struct ServerState {
     /// fresh attach request.
     #[builder(default)]
     coordinator_attached_spawn_token: Arc<StdMutex<Option<String>>>,
-    /// Memoized `(spawn_token, installed claude version)` from the last
-    /// `probe_installed_claude_version` call, consulted by
-    /// `request_coordinator_attachment` so the coordinator supervisor's
-    /// healthy-but-unattached retry loop (a flat 10s interval, see
-    /// `app/server.rs`) does not shell out to `claude --version` on every
-    /// pass while an app keeps failing to attach. A stored entry is only
-    /// reused when its token still matches the current coordinator
-    /// record's `spawn_token`, *and* `attach_coordinator_to_registered_app`
-    /// clears this outright on every genuine app attach (launch, relaunch,
-    /// reconnect), so a `claude` upgrade installed after the cache was
-    /// populated is still observed on the next attach rather than only on
-    /// coordinator recreation or engine restart.
+    /// Memoized installed-version probe plus the last banner value pushed to
+    /// the app. It prevents the healthy-but-unattached retry loop (a flat
+    /// 10s interval) from spawning `claude --version` repeatedly, while the
+    /// attached supervisor refreshes it at a much lower cadence and pushes
+    /// only a changed banner value. A stored entry is reused only for its
+    /// matching coordinator spawn token. Every genuine app attach clears it
+    /// so registration immediately observes an upgrade.
     #[builder(default)]
     coordinator_installed_version_cache: CoordinatorInstalledVersionCache,
     /// Per-slot trigger fan-in for the live-status summarizer. Started

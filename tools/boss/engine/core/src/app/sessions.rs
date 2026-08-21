@@ -8,6 +8,8 @@
 use super::*;
 use crate::coordinator_tmux::ClaudeVersionProbe;
 
+const COORDINATOR_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
 pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
@@ -249,8 +251,8 @@ pub(super) async fn request_coordinator_attachment(
             .expect("coordinator installed-version cache mutex poisoned");
         cache
             .as_ref()
-            .filter(|(token, _)| *token == record.spawn_token)
-            .map(|(_, installed)| installed.clone())
+            .filter(|entry| entry.spawn_token == record.spawn_token)
+            .map(|entry| entry.installed_version.clone())
     };
     let installed_claude_version = match cached_installed_version {
         Some(installed) => installed,
@@ -260,7 +262,12 @@ pub(super) async fn request_coordinator_attachment(
                 .coordinator_installed_version_cache
                 .lock()
                 .expect("coordinator installed-version cache mutex poisoned") =
-                Some((record.spawn_token.clone(), probed.clone()));
+                Some(CoordinatorInstalledVersionCacheEntry {
+                    spawn_token: record.spawn_token.clone(),
+                    installed_version: probed.clone(),
+                    probed_at: Instant::now(),
+                    advertised_update_available_version: None,
+                });
             probed
         }
     };
@@ -274,7 +281,7 @@ pub(super) async fn request_coordinator_attachment(
                 model: record.model.clone(),
                 tmux_program,
                 server_label: boss_tmux::SERVER_LABEL.to_owned(),
-                coordinator_update_available_version,
+                coordinator_update_available_version: coordinator_update_available_version.clone(),
             }),
             Duration::from_secs(5),
         )
@@ -285,6 +292,15 @@ pub(super) async fn request_coordinator_attachment(
                 .coordinator_attached_spawn_token
                 .lock()
                 .expect("coordinator attached token mutex poisoned") = Some(record.spawn_token.clone());
+            if let Some(entry) = server_state
+                .coordinator_installed_version_cache
+                .lock()
+                .expect("coordinator installed-version cache mutex poisoned")
+                .as_mut()
+                .filter(|entry| entry.spawn_token == record.spawn_token)
+            {
+                entry.advertised_update_available_version = coordinator_update_available_version;
+            }
             tracing::info!("attached app Boss pane to coordinator tmux session");
         }
         Ok(response) => tracing::warn!(
@@ -292,6 +308,125 @@ pub(super) async fn request_coordinator_attachment(
             "coordinator session exists but app did not attach its viewer"
         ),
         Err(error) => tracing::debug!(%error, "coordinator session exists without an app viewer"),
+    }
+}
+
+/// Re-probe an already attached coordinator at a deliberately low cadence.
+/// `claude` upgrades happen on the order of days, so one short version
+/// process per attached session/day is enough to surface an update without
+/// turning the supervisor's 10-second health check into recurring process
+/// churn. Re-using `request_coordinator_attachment` pushes the same pane
+/// descriptor the app already renders, but only after the optional banner
+/// value changed; `Some` to `None` clears a banner after a downgrade or reset.
+pub(super) async fn refresh_coordinator_update_available(
+    server_state: Arc<ServerState>,
+    tmux: &boss_tmux::Tmux,
+    record: crate::work::CoordinatorTmuxRecord,
+) {
+    let should_probe = coordinator_update_probe_due(
+        server_state
+            .coordinator_installed_version_cache
+            .lock()
+            .expect("coordinator installed-version cache mutex poisoned")
+            .as_ref(),
+        &record.spawn_token,
+    );
+    if !should_probe {
+        return;
+    }
+
+    let installed_version = crate::coordinator_tmux::RealClaudeVersionProbe.probe().await;
+    let update_available_version =
+        crate::coordinator_tmux::coordinator_update_available(&record, installed_version.as_deref());
+    let changed = {
+        let mut cache = server_state
+            .coordinator_installed_version_cache
+            .lock()
+            .expect("coordinator installed-version cache mutex poisoned");
+        let advertised_update_available_version = cache
+            .as_ref()
+            .filter(|entry| entry.spawn_token == record.spawn_token)
+            .and_then(|entry| entry.advertised_update_available_version.clone());
+        let changed =
+            coordinator_update_banner_changed(&advertised_update_available_version, &update_available_version);
+        *cache = Some(CoordinatorInstalledVersionCacheEntry {
+            spawn_token: record.spawn_token.clone(),
+            installed_version,
+            probed_at: Instant::now(),
+            advertised_update_available_version,
+        });
+        changed
+    };
+    if changed {
+        request_coordinator_attachment(server_state, tmux, record).await;
+    }
+}
+
+fn coordinator_update_probe_due(cache: Option<&CoordinatorInstalledVersionCacheEntry>, spawn_token: &str) -> bool {
+    cache.is_none_or(|entry| {
+        entry.spawn_token != spawn_token || entry.probed_at.elapsed() >= COORDINATOR_UPDATE_CHECK_INTERVAL
+    })
+}
+
+fn coordinator_update_banner_changed(advertised: &Option<String>, current: &Option<String>) -> bool {
+    advertised != current
+}
+
+#[cfg(test)]
+mod update_available_tests {
+    use super::*;
+
+    #[test]
+    fn update_banner_transitions_are_pushed_only_when_the_value_changes() {
+        let older = crate::work::CoordinatorTmuxRecord {
+            session_name: "boss-coordinator".to_owned(),
+            spawn_token: "token".to_owned(),
+            spawn_state: "created".to_owned(),
+            model: "opus".to_owned(),
+            launched_claude_version: Some("2.1.237".to_owned()),
+        };
+        let shown = crate::coordinator_tmux::coordinator_update_available(&older, Some("2.1.238"));
+        assert_eq!(
+            shown.as_deref(),
+            Some("2.1.238"),
+            "an attached session discovers an upgrade without restart"
+        );
+        assert!(
+            coordinator_update_banner_changed(&None, &shown),
+            "the changed value is pushed to show the banner"
+        );
+
+        let cleared = crate::coordinator_tmux::coordinator_update_available(&older, Some("2.1.237"));
+        assert_eq!(cleared, None, "a matching installed version clears the banner");
+        assert!(
+            coordinator_update_banner_changed(&shown, &cleared),
+            "the clear is another push-worthy transition"
+        );
+        assert!(
+            !coordinator_update_banner_changed(&cleared, &cleared),
+            "repeating an unchanged clear emits no redundant update"
+        );
+    }
+
+    #[test]
+    fn attached_update_probe_runs_daily_not_on_every_supervisor_pass() {
+        let recent = CoordinatorInstalledVersionCacheEntry {
+            spawn_token: "token".to_owned(),
+            installed_version: Some("2.1.237".to_owned()),
+            probed_at: Instant::now(),
+            advertised_update_available_version: None,
+        };
+        assert!(
+            !coordinator_update_probe_due(Some(&recent), "token"),
+            "a healthy supervisor pass reuses the recent result"
+        );
+
+        let old = CoordinatorInstalledVersionCacheEntry {
+            probed_at: Instant::now() - COORDINATOR_UPDATE_CHECK_INTERVAL,
+            ..recent
+        };
+        assert!(coordinator_update_probe_due(Some(&old), "token"));
+        assert!(coordinator_update_probe_due(Some(&old), "replacement-token"));
     }
 }
 

@@ -253,6 +253,7 @@ async fn reconcile_existing(
                 confirm_existing_intent(work_db, tmux, &record).await?;
                 record.spawn_state = "created".to_owned();
             }
+            seed_claude_version_baseline_if_missing(work_db, &mut record, version_probe).await?;
             // This branch is reached only when the engine is *adopting* a
             // session that already existed (outlived a prior process) —
             // as opposed to one just created by `start_new` above/below,
@@ -263,6 +264,26 @@ async fn reconcile_existing(
         Some(_) => bail!("coordinator tmux token does not match the metadata singleton"),
         None => bail!("coordinator tmux session exists without the metadata singleton token"),
     }
+}
+
+/// An adopted session that predates version tracking has no trustworthy
+/// launch-version evidence. Seed it from a single current probe so this
+/// upgrade cycle fails closed; later upgrades compare against that honest
+/// baseline. This mirrors `seed_prompt_nudge_baseline`: best effort probe,
+/// durable seed, and never overwrite an existing baseline.
+async fn seed_claude_version_baseline_if_missing(
+    work_db: &WorkDb,
+    record: &mut CoordinatorTmuxRecord,
+    version_probe: &dyn ClaudeVersionProbe,
+) -> Result<()> {
+    if !work_db.coordinator_tmux_claude_version_is_missing()? {
+        return Ok(());
+    }
+    let current_version = version_probe.probe().await;
+    if work_db.seed_coordinator_tmux_claude_version_if_absent(current_version.as_deref())? {
+        record.launched_claude_version = current_version;
+    }
+    Ok(())
 }
 
 async fn session_exists(tmux: &Tmux, name: &str) -> Result<bool> {
@@ -849,6 +870,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adopted_pre_version_tracking_session_seeds_once_without_overwriting() {
+        let (db, tmux, _server, dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
+        db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus", None)
+            .unwrap();
+        db.record_coordinator_tmux_session_created("token").unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "DELETE FROM metadata WHERE key = ?1",
+                ["coordinator.tmux_claude_version"],
+            )
+            .unwrap();
+
+        let adopted = ensure_for_attach(&db, &tmux, "opus", dir.path(), &FixedProbe("2.1.238"))
+            .await
+            .unwrap();
+        assert_eq!(adopted.launched_claude_version.as_deref(), Some("2.1.238"));
+        assert_eq!(
+            db.coordinator_tmux_record()
+                .unwrap()
+                .unwrap()
+                .launched_claude_version
+                .as_deref(),
+            Some("2.1.238"),
+            "adoption persists its current-version baseline"
+        );
+
+        let later_adopt = ensure_for_attach(&db, &tmux, "opus", dir.path(), &FixedProbe("2.1.239"))
+            .await
+            .unwrap();
+        assert_eq!(
+            later_adopt.launched_claude_version.as_deref(),
+            Some("2.1.238"),
+            "a later adoption must retain the original baseline"
+        );
+    }
+
+    #[tokio::test]
     async fn intended_live_session_repairs_its_tmux_mirrors() {
         let (db, tmux, server, dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
         db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus", None)
@@ -1050,13 +1109,14 @@ mod tests {
             "token",
             dir.path(),
             CoordinatorRecreateReason::OperatorReset,
-            &NoneProbe,
+            &FixedProbe("2.1.238"),
         )
         .await
         .unwrap();
 
         assert_ne!(record.spawn_token, "token", "the replacement must mint a fresh token");
         assert_eq!(record.spawn_state, "created");
+        assert_eq!(record.launched_claude_version.as_deref(), Some("2.1.238"));
 
         let calls = server.calls();
         let kill = calls

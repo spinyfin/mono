@@ -108,6 +108,33 @@ impl WorkDb {
         )?;
         Ok(changed == 1)
     }
+
+    /// Whether a live coordinator record predates the durable Claude-version
+    /// baseline. An empty value is intentionally *not* missing: it records a
+    /// previous probe failure and must retain the update check's fail-closed
+    /// semantics.
+    pub(crate) fn coordinator_tmux_claude_version_is_missing(&self) -> Result<bool> {
+        let conn = self.connect()?;
+        let exists = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM metadata WHERE key = ?1)",
+            params![CLAUDE_VERSION_KEY],
+            |row| row.get::<_, bool>(0),
+        )?;
+        Ok(!exists)
+    }
+
+    /// Record an adopted session's current Claude version only if no prior
+    /// engine ever persisted a baseline. The launch version is unknowable for
+    /// an adopted pre-feature session, so callers seed from a current probe
+    /// rather than fabricating historical evidence.
+    pub(crate) fn seed_coordinator_tmux_claude_version_if_absent(&self, claude_version: Option<&str>) -> Result<bool> {
+        let conn = self.connect()?;
+        let inserted = conn.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO NOTHING",
+            params![CLAUDE_VERSION_KEY, claude_version.unwrap_or_default()],
+        )?;
+        Ok(inserted == 1)
+    }
 }
 
 #[cfg(test)]

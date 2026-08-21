@@ -585,6 +585,13 @@ pub async fn serve_with_merge_probe(
                                 record,
                             )
                             .await;
+                        } else {
+                            crate::app::sessions::refresh_coordinator_update_available(
+                                coordinator_supervisor_state.clone(),
+                                &tmux,
+                                record,
+                            )
+                            .await;
                         }
                     }
                 }
