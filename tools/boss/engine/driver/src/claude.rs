@@ -5,6 +5,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -16,10 +17,10 @@ use boss_ssh_transport::shell_quote;
 
 use super::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, EnvDirective, HookWiringDestination, InterruptDelivery,
-    MidTurnPaneInput, ModelMenu, PermissionArtifacts, PermissionInput, ProbeDelivery, ProgressFidelity,
-    ProgressIngress, ProgressObservationConfig, ProgressObservationWiring, ReapDelivery, SpawnPlan, SpawnRequest,
-    StopDelivery, StructuredOutputArtifacts, StructuredOutputRequest, ToolUseInterceptionConfig,
-    ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass, default_structured_output_wiring,
+    InterruptGesture, InterruptPlan, MidTurnPaneInput, ModelMenu, PermissionArtifacts, PermissionInput, ProbeDelivery,
+    ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressObservationWiring, ReapDelivery, SpawnPlan,
+    SpawnRequest, StopDelivery, StructuredOutputArtifacts, StructuredOutputRequest, ToolUseInterceptionConfig,
+    ToolUseInterceptionWiring, TurnEnd, TurnEndEvidence, WorkerErrorClass, default_structured_output_wiring,
 };
 
 pub mod structured_output;
@@ -891,6 +892,42 @@ impl AgentDriver for ClaudeDriver {
     /// in-flight turn; the process survives.
     fn interrupt(&self) -> InterruptDelivery {
         InterruptDelivery::PaneEsc
+    }
+
+    /// One Escape, and the cancelled turn still fires the `Stop` hook.
+    ///
+    /// Claude Code's TUI advertises the gesture itself — `"esc to interrupt"`
+    /// is this driver's own [`Self::pane_monitor_spec`] busy marker, so the
+    /// single press is the documented interactive contract, not an inference
+    /// from another driver. Because the cancelled turn still reaches the
+    /// ordinary `Stop` hook, the engine needs no recovery observer here
+    /// ([`Self::prepare_interrupt_recovery`] stays at the trait default
+    /// `None`) and the turn end arrives on the same channel a completed
+    /// turn's does — [`TurnEndEvidence::TurnBoundarySignal`].
+    ///
+    /// A second press is deliberately *not* part of one attempt: in Claude
+    /// Code a double Escape at the prompt opens the rewind/history picker,
+    /// which would leave the pane in a modal state that swallows the text the
+    /// engine is about to type. Retrying is therefore a whole attempt later
+    /// (after the confirm window has proven the first press did not take),
+    /// never two presses back to back.
+    ///
+    /// `confirm_window` is sized against the hook round trip rather than the
+    /// model: cancelling unwinds the current tool call and fires `Stop`
+    /// locally, so six seconds is generous. Two attempts, because the failure
+    /// this guards against (a press swallowed by a transient modal) is not
+    /// made likelier by repetition.
+    fn interrupt_plan(&self) -> Option<InterruptPlan> {
+        Some(InterruptPlan {
+            gesture: InterruptGesture {
+                key: "Escape",
+                presses: 1,
+                press_interval: Duration::from_millis(120),
+            },
+            confirm_window: Duration::from_secs(6),
+            max_attempts: 2,
+            turn_end_evidence: TurnEndEvidence::TurnBoundarySignal,
+        })
     }
 
     /// Stop is process-level only: `agents stop` cancels the execution and

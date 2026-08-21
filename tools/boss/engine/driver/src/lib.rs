@@ -796,6 +796,106 @@ pub enum InterruptDelivery {
     Unsupported,
 }
 
+/// What evidence tells the engine that an interrupted turn has actually
+/// ended, so it is safe to type into the pane.
+///
+/// Both variants are observed through the same place — the slot's live
+/// [`boss_protocol::WorkerActivity`] leaving `Working` — because every turn
+/// end the engine knows about arrives as a `WorkerEvent::Stop` on the events
+/// socket. What differs per driver is *what produces that event* for a
+/// **cancelled** turn, and a driver that gets it wrong would have the engine
+/// typing into a still-running turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnEndEvidence {
+    /// The interrupted turn still fires this driver's ordinary turn-boundary
+    /// signal, so nothing extra is needed: Claude's Esc-cancelled turn emits
+    /// its `Stop` hook, and Codex's rollout emits `turn_aborted`, which
+    /// [`crate::codex`]'s progress normalizer turns into a
+    /// `Stop { stop_reason: Interrupted }`.
+    TurnBoundarySignal,
+    /// The interrupted turn **skips** this driver's turn-boundary signal, and
+    /// the engine's bounded interrupt-recovery observer
+    /// ([`AgentDriver::prepare_interrupt_recovery`]) is what supplies the turn
+    /// end — by observing the driver's own cancellation record, or by
+    /// synthesizing one when the settle window elapses. Grok is this case:
+    /// an Esc-cancelled turn writes only a `turn_ended`/`cancelled` record to
+    /// `events.jsonl` and never fires `Stop`.
+    ///
+    /// A plan declaring this is asserting that the driver also returns `Some`
+    /// from `prepare_interrupt_recovery` — without it there is no path from
+    /// the interrupt to an observable turn end at all, and every interrupt
+    /// would time out. [`crate::registry::DriverRegistry`] refuses to
+    /// register a driver whose two declarations disagree.
+    RecoveryObserver,
+}
+
+/// Per-driver recipe for interrupting **one** in-flight turn and proving it
+/// stopped.
+///
+/// This exists because interrupt semantics are not portable. How many presses
+/// of which key cancel a turn, how long the TUI takes to unwind, and what
+/// record proves it unwound are properties of each agent's terminal UI, and
+/// assuming one driver's answer for another is how "we sent Escape" gets
+/// mistaken for "the turn ended". Every field here is a driver's own measured
+/// answer, and the engine executes the plan without knowing which agent it is
+/// driving.
+///
+/// The plan describes *one* probe's worth of interrupting: [`Self::presses`]
+/// keys per attempt, at most [`Self::max_attempts`] attempts, each attempt
+/// waited out for [`Self::confirm_window`]. Once those are exhausted the
+/// engine gives up loudly rather than escalating on its own — interrupting
+/// discards the worker's in-flight work, so an unbounded retry loop would
+/// keep destroying partial work with nothing to show for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterruptPlan {
+    /// What one attempt sends.
+    pub gesture: InterruptGesture,
+    /// How long one attempt waits for [`Self::turn_end_evidence`] before the
+    /// engine considers that attempt to have not taken.
+    pub confirm_window: Duration,
+    /// How many attempts before the interrupt is declared failed. Bounded by
+    /// construction — see the type doc.
+    pub max_attempts: u8,
+    /// What proves the turn ended for this driver.
+    pub turn_end_evidence: TurnEndEvidence,
+}
+
+/// The keystrokes one interrupt attempt delivers.
+///
+/// Split from the rest of [`InterruptPlan`] because it answers a different
+/// question — *what to send* versus *how to know it worked* — and only this
+/// half is transport-specific. The engine's pane transports execute this; the
+/// confirmation policy around it is transport-agnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterruptGesture {
+    /// tmux key name delivered to the pane (`send-keys <key>`), e.g.
+    /// `"Escape"`. Named rather than a raw byte so the app-hosted transport
+    /// (`EngineToAppRequest::InterruptWorkerPane`, which sends `kVK_Escape`)
+    /// and the tmux transport agree on the same gesture.
+    pub key: &'static str,
+    /// How many presses of [`Self::key`] make up one attempt. One is enough
+    /// for every driver measured so far; the field exists because a TUI that
+    /// needs a double-press (the human gesture some agents use to escape a
+    /// nested mode first) must be able to say so instead of the engine
+    /// hard-coding one press for everyone.
+    pub presses: u8,
+    /// Gap between presses inside a single attempt. Only meaningful when
+    /// [`Self::presses`] > 1.
+    pub press_interval: Duration,
+}
+
+impl InterruptPlan {
+    /// Total time the engine may spend trying to interrupt one turn: every
+    /// attempt's confirm window plus the presses inside it. Callers that need
+    /// to bound their own RPC against this (the probe path answers
+    /// synchronously) use it instead of re-deriving the arithmetic.
+    pub fn worst_case_duration(&self) -> Duration {
+        let per_attempt =
+            self.confirm_window + self.gesture.press_interval * u32::from(self.gesture.presses.saturating_sub(1));
+        per_attempt * u32::from(self.max_attempts.max(1))
+    }
+}
+
 /// How the engine should stop a worker (graceful path before process kill).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopDelivery {
@@ -1999,6 +2099,28 @@ pub trait AgentDriver: Send + Sync {
     /// [`InterruptDelivery::Unsupported`].
     fn interrupt(&self) -> InterruptDelivery {
         InterruptDelivery::Unsupported
+    }
+
+    /// The recipe for interrupting one in-flight turn on this driver: which
+    /// key, how many presses, how long to wait, how many attempts, and what
+    /// proves the turn ended.
+    ///
+    /// `None` — the default — is the declared property "this driver cannot be
+    /// interrupted", and it must agree with [`Self::interrupt`]: a driver
+    /// answering [`InterruptDelivery::Unsupported`] there must answer `None`
+    /// here, and one naming a transport must supply a plan.
+    /// [`crate::registry::DriverRegistry`] refuses to register a driver whose
+    /// two answers disagree, so a caller may branch on either and get the
+    /// same verdict.
+    ///
+    /// The point of separating this from `interrupt()` is that the two answer
+    /// different questions. `interrupt()` names the *transport* the engine
+    /// uses (pane keystroke vs. nothing); this names the driver-specific
+    /// *timing and evidence* that make the transport actually work. Callers
+    /// that only need "can this be interrupted at all" read `interrupt()`;
+    /// the one that has to drive the gesture reads this.
+    fn interrupt_plan(&self) -> Option<InterruptPlan> {
+        None
     }
 
     /// How the engine should stop a worker before process kill. Defaults to

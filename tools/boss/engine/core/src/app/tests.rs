@@ -233,6 +233,7 @@ mod pause_bypass_held_ready;
 mod pause_bypass_recheck;
 mod pr_status;
 mod probe_delivery;
+mod probe_interrupt;
 mod proposals;
 mod selected_product;
 mod session_sink_queue;

@@ -200,6 +200,27 @@ pub enum ProbeDeliveryState {
     /// of loss: if the worker answers anyway, the reply path corrects the
     /// record to [`Self::Replied`]. That is why it is not terminal.
     Orphaned,
+    /// The engine set out to interrupt the worker's in-flight turn so the
+    /// probe could land immediately, and the interrupt did not take: the
+    /// keystrokes were delivered, the driver's plan was given every attempt
+    /// it declares, and the turn never ended. **Nothing was typed into the
+    /// pane** — that is the whole point of confirming before injecting, since
+    /// text written into a still-running turn is the input that gets
+    /// swallowed or misread.
+    ///
+    /// Also the state for a worker whose driver declares no interrupt
+    /// mechanism at all when interrupting delivery was required: the engine
+    /// says so rather than silently falling back to a boundary it cannot
+    /// promise.
+    ///
+    /// Terminal and undeliverable. Unlike [`Self::Orphaned`] there is no
+    /// possibility of a late correction, because no bytes ever reached the
+    /// pane: the worker cannot reply to text it was never sent. Re-issuing
+    /// the same instruction is therefore safe — it cannot duplicate one that
+    /// landed — but it will hit the same wall unless the worker's state has
+    /// changed, so the honest advice is to use a channel that survives the
+    /// run (a work-item description edit) instead.
+    InterruptFailed,
 }
 
 impl ProbeDeliveryState {
@@ -214,6 +235,7 @@ impl ProbeDeliveryState {
             Self::Dropped => "dropped",
             Self::Abandoned => "abandoned",
             Self::Orphaned => "orphaned",
+            Self::InterruptFailed => "interrupt_failed",
         }
     }
 
@@ -233,7 +255,10 @@ impl ProbeDeliveryState {
     /// engine discarded the probe before any pane write, so there is nothing
     /// out there that could produce a reply.
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Replied | Self::Dropped | Self::Abandoned)
+        matches!(
+            self,
+            Self::Replied | Self::Dropped | Self::Abandoned | Self::InterruptFailed
+        )
     }
 
     /// True when the engine has given up on delivering this probe.
@@ -244,7 +269,116 @@ impl ProbeDeliveryState {
     /// a slow worker. Every path that removes a probe from the pending queue
     /// without delivering it must land on one of the states here.
     pub fn is_undeliverable(self) -> bool {
-        matches!(self, Self::Dropped | Self::Abandoned | Self::Orphaned)
+        matches!(
+            self,
+            Self::Dropped | Self::Abandoned | Self::Orphaned | Self::InterruptFailed
+        )
+    }
+
+    /// True when nothing was ever written into the worker's pane for this
+    /// probe, so re-issuing the same instruction cannot deliver it twice.
+    ///
+    /// This is the predicate a caller deciding "is it safe to send this
+    /// again?" wants, and it is deliberately narrower than
+    /// [`Self::is_undeliverable`]: [`Self::Orphaned`] is undeliverable but
+    /// the bytes *did* reach the pty, so a second copy could compound with a
+    /// first one that was quietly read. `Unconfirmed` is not here for the
+    /// same reason.
+    pub fn is_safe_to_reissue(self) -> bool {
+        matches!(self, Self::Dropped | Self::Abandoned | Self::InterruptFailed)
+    }
+}
+
+/// What the interrupting probe path did about the worker's in-flight turn.
+///
+/// Reported alongside the settled [`ProbeDeliveryState`] on
+/// `FrontendEvent::ProbeDelivered`, because "the probe landed" and "the
+/// engine had to destroy in-flight work to make it land" are different facts
+/// and the caller needs both. Interrupting is not free — it aborts whatever
+/// tool call was running — so a caller that sees [`Self::NotNeeded`] knows
+/// nothing was discarded, and one that sees [`Self::Interrupted`] knows
+/// something was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeInterruptOutcome {
+    /// The worker was mid-turn, the engine delivered the driver's interrupt
+    /// gesture, and the turn end was confirmed before anything was typed.
+    /// In-flight work was discarded.
+    Interrupted,
+    /// The worker was already parked at its prompt, so there was no turn to
+    /// interrupt and none was attempted. The text was written directly. No
+    /// work was discarded — this is the cheap case, and the reason the engine
+    /// checks posture before reaching for the keystroke.
+    NotNeeded,
+    /// The worker reached a turn boundary on its own between the engine
+    /// deciding to interrupt and the gesture being delivered. Nothing was
+    /// sent; the engine typed into the now-parked pane instead. Distinct from
+    /// [`Self::NotNeeded`] so the race is visible rather than looking like
+    /// the worker was idle all along.
+    EndedNaturally,
+    /// The run's driver declares no interrupt mechanism
+    /// (`AgentDriver::interrupt_plan() == None`). Nothing was attempted, and
+    /// the probe is *not* silently downgraded to boundary delivery — it
+    /// settles [`ProbeDeliveryState::InterruptFailed`] and the caller is told
+    /// which driver could not be interrupted.
+    DriverCannotInterrupt,
+    /// The gesture was delivered and the driver's whole attempt budget was
+    /// spent without the turn ending. Nothing was typed into the pane.
+    Failed,
+    /// No interrupt was attempted because another delivery path had already
+    /// claimed this probe (or the run's single in-flight slot) by the time
+    /// the interrupting path reached it — a boundary fan-out that got there
+    /// first. Deliberately distinct from [`Self::NotNeeded`] and
+    /// [`Self::EndedNaturally`]: both of those describe the *worker's* state,
+    /// and reporting either here would tell the operator something about the
+    /// worker that was never observed. The accompanying
+    /// [`ProbeDeliveryState`] is whatever that other path recorded.
+    NotAttempted,
+}
+
+impl ProbeInterruptOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Interrupted => "interrupted",
+            Self::NotNeeded => "not_needed",
+            Self::EndedNaturally => "ended_naturally",
+            Self::DriverCannotInterrupt => "driver_cannot_interrupt",
+            Self::Failed => "failed",
+            Self::NotAttempted => "not_attempted",
+        }
+    }
+
+    /// True when the engine actually cancelled in-flight work to make room
+    /// for this probe. Only [`Self::Interrupted`] destroys anything: the
+    /// other outcomes either found the worker already parked, raced with a
+    /// natural boundary, or never sent the gesture at all.
+    pub fn discarded_in_flight_work(self) -> bool {
+        matches!(self, Self::Interrupted)
+    }
+
+    /// One line for CLI output, phrased to follow "probe delivered; ".
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Interrupted => {
+                "the worker's in-flight turn was interrupted and confirmed ended first, so whatever \
+                 it was doing at that moment was abandoned mid-flight"
+            }
+            Self::NotNeeded => "the worker was already parked at its prompt, so no interrupt was needed",
+            Self::EndedNaturally => {
+                "the worker reached a turn boundary on its own before the interrupt was sent, so none was"
+            }
+            Self::DriverCannotInterrupt => {
+                "this worker's driver declares no interrupt mechanism, so its turn could not be cut short"
+            }
+            Self::Failed => {
+                "the interrupt was delivered but the turn never ended within the driver's declared \
+                 attempt budget; nothing was typed into the pane"
+            }
+            Self::NotAttempted => {
+                "another delivery path already held this probe, so no interrupt was attempted and the \
+                 state above is what that path recorded"
+            }
+        }
     }
 }
 
@@ -272,6 +406,7 @@ mod tests {
             ProbeDeliveryState::Dropped,
             ProbeDeliveryState::Abandoned,
             ProbeDeliveryState::Orphaned,
+            ProbeDeliveryState::InterruptFailed,
         ] {
             let json = serde_json::to_string(&state).unwrap();
             let parsed: ProbeDeliveryState = serde_json::from_str(&json).unwrap();
@@ -293,6 +428,7 @@ mod tests {
         assert!(!ProbeDeliveryState::Dropped.is_delivered());
         assert!(!ProbeDeliveryState::Abandoned.is_delivered());
         assert!(!ProbeDeliveryState::Orphaned.is_delivered());
+        assert!(!ProbeDeliveryState::InterruptFailed.is_delivered());
     }
 
     #[test]
@@ -308,6 +444,7 @@ mod tests {
             ProbeDeliveryState::Dropped,
             ProbeDeliveryState::Abandoned,
             ProbeDeliveryState::Orphaned,
+            ProbeDeliveryState::InterruptFailed,
         ] {
             assert!(gave_up.is_undeliverable(), "{} must be undeliverable", gave_up.as_str());
         }
@@ -344,6 +481,81 @@ mod tests {
         assert!(ProbeDeliveryExpectation::NextTurnBoundary.is_best_effort());
         assert!(!ProbeDeliveryExpectation::Immediate.is_best_effort());
         assert!(!ProbeDeliveryExpectation::NextToolBoundary.is_best_effort());
+    }
+
+    /// A failed interrupt must be as loud as any other give-up state, and
+    /// louder in one respect: it is settled for good. `Orphaned` can be
+    /// corrected by a late reply because bytes reached the pty; here nothing
+    /// did, so no reply can ever arrive to soften it.
+    #[test]
+    fn interrupt_failure_is_terminal_undeliverable_and_safe_to_reissue() {
+        let state = ProbeDeliveryState::InterruptFailed;
+        assert!(state.is_terminal());
+        assert!(state.is_undeliverable());
+        assert!(!state.is_delivered());
+        assert!(state.is_safe_to_reissue());
+    }
+
+    /// The reissue predicate must not collapse into `is_undeliverable`: the
+    /// difference between them is precisely whether bytes reached the pane,
+    /// which is the difference between a safe retry and a duplicated
+    /// instruction.
+    #[test]
+    fn only_states_that_wrote_nothing_are_safe_to_reissue() {
+        for wrote_nothing in [
+            ProbeDeliveryState::Dropped,
+            ProbeDeliveryState::Abandoned,
+            ProbeDeliveryState::InterruptFailed,
+        ] {
+            assert!(wrote_nothing.is_safe_to_reissue(), "{}", wrote_nothing.as_str());
+        }
+        // Bytes reached the pty in both of these, so a second copy could
+        // compound with a first one that was quietly read.
+        assert!(!ProbeDeliveryState::Orphaned.is_safe_to_reissue());
+        assert!(!ProbeDeliveryState::Unconfirmed.is_safe_to_reissue());
+        for delivered in [
+            ProbeDeliveryState::Consumed,
+            ProbeDeliveryState::Buffered,
+            ProbeDeliveryState::Replied,
+        ] {
+            assert!(!delivered.is_safe_to_reissue(), "{}", delivered.as_str());
+        }
+    }
+
+    #[test]
+    fn interrupt_outcome_round_trips_and_names_itself_consistently() {
+        for outcome in [
+            ProbeInterruptOutcome::Interrupted,
+            ProbeInterruptOutcome::NotNeeded,
+            ProbeInterruptOutcome::EndedNaturally,
+            ProbeInterruptOutcome::DriverCannotInterrupt,
+            ProbeInterruptOutcome::Failed,
+            ProbeInterruptOutcome::NotAttempted,
+        ] {
+            let json = serde_json::to_string(&outcome).unwrap();
+            assert_eq!(json, format!("\"{}\"", outcome.as_str()));
+            let parsed: ProbeInterruptOutcome = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, outcome);
+            assert!(!outcome.describe().is_empty());
+        }
+    }
+
+    /// Only an actual interrupt destroys work. Getting this wrong in either
+    /// direction misinforms the operator about what their probe cost: a false
+    /// positive makes a free delivery look destructive, a false negative
+    /// hides that a tool call was aborted.
+    #[test]
+    fn only_a_real_interrupt_reports_discarded_work() {
+        assert!(ProbeInterruptOutcome::Interrupted.discarded_in_flight_work());
+        for cheap in [
+            ProbeInterruptOutcome::NotNeeded,
+            ProbeInterruptOutcome::EndedNaturally,
+            ProbeInterruptOutcome::DriverCannotInterrupt,
+            ProbeInterruptOutcome::Failed,
+            ProbeInterruptOutcome::NotAttempted,
+        ] {
+            assert!(!cheap.discarded_in_flight_work(), "{}", cheap.as_str());
+        }
     }
 
     /// A best-effort acceptance must carry the explanation with it. Pairing

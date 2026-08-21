@@ -397,6 +397,29 @@ pub(super) async fn handle_get_run(ctx: Dispatch, req: FrontendRequest) {
     }
 }
 
+/// Handle `FrontendRequest::ProbeRun`.
+///
+/// Two shapes, chosen by the request's `interrupt` flag:
+///
+/// * **interrupting (the default)** — the delivery runs *inside this call*
+///   ([`super::probe_interrupt::deliver_probe_interrupting`]) and the answer
+///   is [`FrontendEvent::ProbeDelivered`] carrying the settled
+///   [`ProbeDeliveryState`]. That makes the RPC deliberately slow: it is
+///   bounded by the run driver's
+///   [`crate::driver::InterruptPlan::worst_case_duration`] plus one injection
+///   verification window — on the order of twenty seconds worst case, and
+///   typically well under a second. That is the cost of answering "did it
+///   land?" instead of "was it accepted?", which is the whole point.
+///   The connection's request loop is serial, so this holds up that one
+///   caller's next request; `bossctl` opens a connection per invocation, and
+///   the app never issues this verb.
+/// * **queued (`interrupt: false`)** — unchanged: the probe is queued, an
+///   immediate delivery attempt is spawned detached, and the answer is
+///   [`FrontendEvent::ProbeQueued`] naming the boundary the engine committed
+///   to.
+///
+/// Both are preceded by the same up-front deliverability check, so a run with
+/// no live pane is still refused before a probe id is minted.
 pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
@@ -405,7 +428,13 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
         peer_pid,
         ..
     } = ctx;
-    let FrontendRequest::ProbeRun { run_id, text, urgent } = req else {
+    let FrontendRequest::ProbeRun {
+        run_id,
+        text,
+        urgent,
+        interrupt,
+    } = req
+    else {
         unreachable!()
     };
     {
@@ -477,6 +506,48 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
                 .to_owned();
             tracing::warn!(run_id = %run_id, probe_id = %probe_id, %reason, "probe refused: abandoned before response");
             send_response(&sink, &request_id, FrontendEvent::ProbeRefused { run_id, reason });
+            return;
+        }
+        // Interrupting delivery: cut the worker's turn short so the text
+        // lands now, and answer with what actually happened rather than with
+        // an intention. Runs inside the RPC — bounded by the driver's own
+        // interrupt plan — because the whole point is that the caller learns
+        // the real outcome without having to poll for it.
+        //
+        // Only taken when there is a turn to interrupt or a pane to write
+        // into right now. A `Spawning` worker has neither, so it falls
+        // through to the queue below and is honestly reported as waiting for
+        // its first tool boundary — an interrupting answer there would have
+        // to invent an outcome for something that never happened.
+        if interrupt && expected_delivery != ProbeDeliveryExpectation::NextToolBoundary {
+            tracing::info!(
+                run_id = %run_id,
+                probe_id = %probe_id,
+                urgent,
+                "probe accepted for interrupting delivery; cutting the worker's turn short",
+            );
+            let delivered = super::probe_interrupt::deliver_probe_interrupting(&server_state, &run_id, &probe_id).await;
+            tracing::info!(
+                run_id = %run_id,
+                probe_id = %probe_id,
+                state = delivered.state.as_str(),
+                interrupt = delivered.interrupt.as_str(),
+                attempts = delivered.attempts,
+                "interrupting probe delivery settled",
+            );
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::ProbeDelivered {
+                    run_id,
+                    probe_id,
+                    urgent,
+                    state: delivered.state,
+                    interrupt: delivered.interrupt,
+                    interrupt_attempts: delivered.attempts,
+                    detail: delivered.detail,
+                },
+            );
             return;
         }
         tracing::info!(

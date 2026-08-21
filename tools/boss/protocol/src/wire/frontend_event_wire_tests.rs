@@ -784,6 +784,19 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "probe_status_result",
         },
         TagCase {
+            label: "ProbeDelivered",
+            event: FrontendEvent::ProbeDelivered {
+                run_id: "run_1".into(),
+                probe_id: "probe_1".into(),
+                urgent: false,
+                state: ProbeDeliveryState::Consumed,
+                interrupt: ProbeInterruptOutcome::Interrupted,
+                interrupt_attempts: 1,
+                detail: None,
+            },
+            expected_tag: "probe_delivered",
+        },
+        TagCase {
             label: "ProbeReplied",
             event: FrontendEvent::ProbeReplied {
                 run_id: "run_1".into(),
@@ -1956,6 +1969,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::AppSessionRegistered
         | FrontendEvent::EnginePoolConfig { .. }
         | FrontendEvent::ProbeQueued { .. }
+        | FrontendEvent::ProbeDelivered { .. }
         | FrontendEvent::ProbeReplied { .. }
         | FrontendEvent::ProbeDeliveryEscalated { .. }
         | FrontendEvent::RunStopped { .. }
