@@ -42,9 +42,9 @@ fn migration_detaches_existing_attachments_from_execution_retention() {
         conn.execute(
             "INSERT INTO work_attachments
                  (id, execution_id, work_item_id, caption, content_digest, media_type,
-                  pixel_width, pixel_height, size_bytes, source_name, created_at)
+                  pixel_width, pixel_height, size_bytes, source_name, created_at, reclaimed_at)
              VALUES ('atc_legacy', ?1, ?2, 'preserved evidence', 'legacy-digest', 'png',
-                     10, 10, 4, 'legacy.png', '1700000000')",
+                     10, 10, 4, 'legacy.png', '1700000000', '1700000100')",
             rusqlite::params![execution.id, chore.id],
         )
         .unwrap();
@@ -65,6 +65,47 @@ fn migration_detaches_existing_attachments_from_execution_retention() {
         !has_execution_fk,
         "attachment retention must no longer depend on execution rows"
     );
+    let reclaimed_at: Option<String> = conn
+        .query_row(
+            "SELECT reclaimed_at FROM work_attachments WHERE id = 'atc_legacy'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        reclaimed_at.as_deref(),
+        Some("1700000100"),
+        "the rebuild must copy an existing tombstone timestamp"
+    );
+    let index_names: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_index_list('work_attachments')")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(
+        index_names.iter().any(|name| name == "work_attachments_work_item_idx"),
+        "listing index must survive the rebuild, got {index_names:?}"
+    );
+    assert!(
+        index_names.iter().any(|name| name == "work_attachments_digest_idx"),
+        "orphan-sweep index must survive the rebuild, got {index_names:?}"
+    );
+    let duplicate_err = conn
+        .execute(
+            "INSERT INTO work_attachments
+                 (id, execution_id, work_item_id, caption, content_digest, media_type,
+                  pixel_width, pixel_height, size_bytes, source_name, created_at)
+             VALUES ('atc_dup', ?1, ?2, 'replay', 'legacy-digest', 'png',
+                     10, 10, 4, 'legacy.png', '1700000200')",
+            rusqlite::params![execution.id, chore.id],
+        )
+        .unwrap_err();
+    assert!(
+        duplicate_err.to_string().to_lowercase().contains("constraint"),
+        "UNIQUE (execution_id, content_digest) must survive the rebuild, got: {duplicate_err}"
+    );
     conn.execute("DELETE FROM work_executions WHERE id = ?1", [&execution.id])
         .unwrap();
     drop(conn);
@@ -73,6 +114,7 @@ fn migration_detaches_existing_attachments_from_execution_retention() {
         .unwrap()
         .expect("the existing row survives an execution delete");
     assert_eq!(attachment.caption, "preserved evidence");
+    assert_eq!(attachment.reclaimed_at.as_deref(), Some("1700000100"));
 }
 
 /// Drop the `deferred` column (simulating a pre-classification DB) and

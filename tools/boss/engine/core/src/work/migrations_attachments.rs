@@ -3,6 +3,24 @@
 
 use super::*;
 
+/// Columns this rebuild copies. A live column missing from this list would be
+/// dropped silently, so [`migrate_work_attachments_execution_retention`]
+/// refuses to proceed unless every live column is named here.
+const WORK_ATTACHMENTS_RETENTION_COLUMNS: &[&str] = &[
+    "id",
+    "execution_id",
+    "work_item_id",
+    "caption",
+    "content_digest",
+    "media_type",
+    "pixel_width",
+    "pixel_height",
+    "size_bytes",
+    "source_name",
+    "created_at",
+    "reclaimed_at",
+];
+
 /// Rebuild legacy `work_attachments` tables that cascade-delete evidence when
 /// an execution is pruned. The row has enough denormalized provenance to stay
 /// useful without the execution row, and attachment retention then remains the
@@ -17,6 +35,24 @@ pub(crate) fn migrate_work_attachments_execution_retention(conn: &Connection) ->
     // needed because `work_attachments` is the child, never an FK parent.
     conn.execute_batch("BEGIN IMMEDIATE;")?;
     let rebuilt = (|| -> Result<()> {
+        // Un-wedge a database left holding a committed scratch table from a
+        // previous interrupted rebuild (`migrate_projects_tasks_status_check`
+        // added the same first-statement DROP for that reason).
+        conn.execute_batch("DROP TABLE IF EXISTS work_attachments_v2;")?;
+        let live = live_column_names(conn, "work_attachments")?;
+        let unknown: Vec<&str> = live
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !WORK_ATTACHMENTS_RETENTION_COLUMNS.contains(name))
+            .collect();
+        if !unknown.is_empty() {
+            bail!(
+                "`work_attachments` carries column(s) [{}] that the retention rebuild has no \
+                 declaration for; add them to this migration's column list — rebuilding \
+                 without them would drop the data",
+                unknown.join(", ")
+            );
+        }
         conn.execute_batch(
             "CREATE TABLE work_attachments_v2 (
                  id             TEXT PRIMARY KEY,
