@@ -546,7 +546,7 @@ struct WorkItemDependency: Hashable {
 
 /// One execution of a task, mirroring `boss_protocol::WorkExecution`.
 /// Used by the transcript viewer's execution list.
-struct ExecutionVM: Identifiable, Hashable {
+struct ExecutionVM: Identifiable, Hashable, RevisionChainItem {
     let id: String
     /// The task id that owns this execution. When a transcript viewer
     /// loads the full revision chain, executions from revision tasks

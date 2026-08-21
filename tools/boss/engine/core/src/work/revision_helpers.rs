@@ -509,11 +509,15 @@ pub(crate) fn attach_ai_reviewing_flag(
 /// whose direct revision child has attachments of its own — the kanban
 /// card affordance to open the screenshot viewer.
 ///
-/// Mirrors [`attach_ai_reviewing_flag`]'s shape exactly: filter candidates
-/// in memory, early-return on an empty set, then one batched `SELECT
-/// DISTINCT … WHERE work_item_id IN (…)` with generated placeholders. Every
-/// task/chore id is a candidate — unlike the AI-reviewing flag, there is no
-/// cheaper pre-filter (any row could have evidence attached).
+/// Every task/chore id is a candidate — unlike [`attach_ai_reviewing_flag`],
+/// there is no cheaper status-based pre-filter (any row could have evidence
+/// attached). Rather than binding one placeholder per candidate id, this
+/// runs an unparameterized `SELECT DISTINCT work_item_id FROM
+/// work_attachments` (a covering index scan against
+/// `work_attachments_work_item_idx`) and intersects it against the
+/// in-memory candidate set — the `work_attachments` table is small relative
+/// to the board, so scanning it is cheaper than an `IN (...)` list and
+/// avoids `SQLITE_MAX_VARIABLE_NUMBER` at large board sizes.
 ///
 /// The root/child roll-up exists because an `in_review`/`done` revision
 /// never gets a standalone kanban card (it rolls up into its parent's card
@@ -528,23 +532,22 @@ pub(crate) fn attach_has_attachments_flag(
     tasks: &mut [Task],
     chores: &mut [Task],
 ) -> rusqlite::Result<()> {
-    let candidate_ids: Vec<&str> = tasks.iter().chain(chores.iter()).map(|t| t.id.as_str()).collect();
+    let candidate_ids: std::collections::HashSet<&str> =
+        tasks.iter().chain(chores.iter()).map(|t| t.id.as_str()).collect();
     if candidate_ids.is_empty() {
         return Ok(());
     }
 
-    let placeholders = candidate_ids
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("?{}", i + 1))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!("SELECT DISTINCT work_item_id FROM work_attachments WHERE work_item_id IN ({placeholders})");
-    let mut stmt = conn.prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::ToSql> = candidate_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    // `work_attachments_work_item_idx` covers `(work_item_id, created_at)`,
+    // so this is a covering index scan with zero bound parameters — cheaper
+    // than an `IN (...)` built from every board id, and not exposed to
+    // SQLITE_MAX_VARIABLE_NUMBER at large board sizes. Intersect against the
+    // in-memory candidate set for the identical result.
+    let mut stmt = conn.prepare("SELECT DISTINCT work_item_id FROM work_attachments")?;
     let own_attachments: std::collections::HashSet<String> = stmt
-        .query_map(params.as_slice(), |row| row.get::<_, String>(0))?
+        .query_map([], |row| row.get::<_, String>(0))?
         .filter_map(|r| r.ok())
+        .filter(|id| candidate_ids.contains(id.as_str()))
         .collect();
 
     if own_attachments.is_empty() {

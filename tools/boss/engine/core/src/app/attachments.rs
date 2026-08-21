@@ -328,7 +328,12 @@ pub(super) async fn handle_list_attachments_for_work_item(ctx: Dispatch, req: Fr
             FrontendEvent::AttachmentsList {
                 work_item_id,
                 attachments,
-                evidence_base_url: server_state.evidence_base_url(),
+                // The app tier reads attachment bytes straight off disk
+                // (see AttachmentBlobPaths in the macOS app) and never reads
+                // this field, so this app-facing verb deliberately does not
+                // mint a loopback evidence URL — only the worker-facing
+                // handle_list_attachments above does.
+                evidence_base_url: None,
             },
         ),
         Err(err) => {

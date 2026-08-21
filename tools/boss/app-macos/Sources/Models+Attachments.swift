@@ -20,7 +20,7 @@ struct AttachmentViewerRef: Codable, Hashable {
 
 /// One `work_attachments` row — a stored screenshot and its metadata.
 /// Mirrors `boss_protocol::WorkAttachment` on the wire.
-struct AttachmentVM: Identifiable, Hashable {
+struct AttachmentVM: Identifiable, Hashable, RevisionChainItem {
     let id: String
     /// The execution that submitted it.
     let executionId: String
@@ -86,19 +86,4 @@ enum AttachmentBlobPaths {
             .appendingPathComponent(shard, isDirectory: true)
             .appendingPathComponent("\(attachment.contentDigest).\(attachment.fileExtension)")
     }
-}
-
-// MARK: - Revision grouping
-
-/// One task's worth of attachments, labelled for the revision-chain
-/// grouping — mirrors `ExecutionGroup` in Models+Transcript.swift so the two
-/// viewers over the same chain never disagree about labelling.
-struct AttachmentGroup: Identifiable {
-    let taskId: String
-    /// Human-readable label: "Original" for the chain root, "R1", "R2", …
-    /// for revision tasks in sequence order.
-    let label: String
-    let attachments: [AttachmentVM]
-
-    var id: String { taskId }
 }

@@ -182,6 +182,20 @@ extension ChatViewModel {
                 engineAttemptDetailErrors[attemptID] = message
                 engineAttemptDetailRequestID = nil
             }
+            // The engine's WorkError reply carries no request context, so we
+            // can't tell which in-flight list_executions/list_attachments
+            // call failed — fail every task id that was still waiting. Rare
+            // in practice (normally at most one transcript/attachment
+            // viewer window is open at a time), and strictly better than
+            // the two viewers spinning forever with no explanation.
+            for taskId in executionsInFlightTaskIDs {
+                executionsLoadFailureByTaskID[taskId] = message
+            }
+            executionsInFlightTaskIDs.removeAll()
+            for taskId in attachmentsInFlightTaskIDs {
+                attachmentsLoadFailureByTaskID[taskId] = message
+            }
+            attachmentsInFlightTaskIDs.removeAll()
             // Allow the user to retry any in-flight review terminal or
             // merge-when-ready request that failed.
             if case .loading = editorialEvaluationState {
@@ -541,8 +555,12 @@ extension ChatViewModel {
             gitHubAuthState = state
         case .executionsList(let taskId, let executions):
             executionsByTaskID[taskId] = executions
+            executionsInFlightTaskIDs.remove(taskId)
+            executionsLoadFailureByTaskID.removeValue(forKey: taskId)
         case .attachmentsList(let taskId, let attachments):
             attachmentsByTaskID[taskId] = attachments
+            attachmentsInFlightTaskIDs.remove(taskId)
+            attachmentsLoadFailureByTaskID.removeValue(forKey: taskId)
         case .executionTranscriptResult(let executionId, let segments, let isLive, let complete):
             transcriptsByExecutionID[executionId] = .loaded(
                 TranscriptDoc(

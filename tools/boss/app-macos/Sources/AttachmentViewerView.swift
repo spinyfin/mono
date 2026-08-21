@@ -52,7 +52,7 @@ struct AttachmentThumbnail: View {
     }
 
     private var loadedImage: NSImage? {
-        NSImage(contentsOf: AttachmentBlobPaths.blobURL(for: attachment))
+        AttachmentImageCache.thumbnail(for: attachment)
     }
 }
 
@@ -77,7 +77,7 @@ struct AttachmentDetailView: View {
     let attachment: AttachmentVM
 
     private var loadedImage: NSImage? {
-        NSImage(contentsOf: AttachmentBlobPaths.blobURL(for: attachment))
+        AttachmentImageCache.fullImage(for: attachment)
     }
 
     var body: some View {
@@ -157,44 +157,25 @@ struct AttachmentViewerView: View {
     }
 
     private var isLoading: Bool {
-        chatModel.attachmentsByTaskID[ref.taskId] == nil
+        chatModel.attachmentsByTaskID[ref.taskId] == nil && loadFailureReason == nil
+    }
+
+    private var loadFailureReason: String? {
+        chatModel.attachmentsLoadFailureByTaskID[ref.taskId]
     }
 
     /// Attachments grouped by task. Returns a single unnamed group when the
     /// list is entirely from the chain root, and multiple labelled groups
-    /// when revisions contributed their own screenshots. Mirrors
-    /// `TranscriptViewerView.executionGroups` exactly.
-    private var attachmentGroups: [AttachmentGroup] {
-        let all = attachments
-        guard !all.isEmpty else { return [] }
-
-        var byTask: [String: [AttachmentVM]] = [:]
-        for attachment in all {
-            byTask[attachment.workItemId, default: []].append(attachment)
-        }
-
-        let revisions = chatModel.allRevisions(forParentTaskID: ref.taskId)
-        var orderedTaskIds: [String] = [ref.taskId]
-        orderedTaskIds.append(contentsOf: revisions.map { $0.id })
-        for taskId in byTask.keys where !orderedTaskIds.contains(taskId) {
-            orderedTaskIds.append(taskId)
-        }
-
-        let hasRevisionAttachments = orderedTaskIds.dropFirst().contains {
-            byTask[$0] != nil
-        }
-
-        return orderedTaskIds.compactMap { taskId -> AttachmentGroup? in
-            guard let items = byTask[taskId], !items.isEmpty else { return nil }
-            let label: String
-            if taskId == ref.taskId {
-                label = hasRevisionAttachments ? "Original" : ""
-            } else {
-                let seq = revisions.first(where: { $0.id == taskId })?.revisionSeq
-                label = seq.map { "R\($0)" } ?? "Revision"
-            }
-            return AttachmentGroup(taskId: taskId, label: label, attachments: items)
-        }
+    /// when revisions contributed their own screenshots. See
+    /// [[revisionChainGroups(_:rootTaskId:revisions:)]] — the same helper
+    /// backs `TranscriptViewerView.executionGroups`, so the two viewers over
+    /// the same chain structurally cannot disagree about labelling.
+    private var attachmentGroups: [RevisionChainGroup<AttachmentVM>] {
+        revisionChainGroups(
+            attachments,
+            rootTaskId: ref.taskId,
+            revisions: chatModel.allRevisions(forParentTaskID: ref.taskId)
+        )
     }
 
     var body: some View {
@@ -215,7 +196,15 @@ struct AttachmentViewerView: View {
     @ViewBuilder
     private var attachmentList: some View {
         Group {
-            if isLoading {
+            if let reason = loadFailureReason {
+                ContentUnavailableView {
+                    Label("Couldn't Load Screenshots", systemImage: "exclamationmark.triangle")
+                } description: {
+                    Text(reason)
+                } actions: {
+                    Button("Retry") { chatModel.loadAttachments(taskId: ref.taskId) }
+                }
+            } else if isLoading {
                 VStack {
                     Spacer()
                     ProgressView()
@@ -231,12 +220,12 @@ struct AttachmentViewerView: View {
                 List(selection: $selectedAttachmentId) {
                     ForEach(attachmentGroups) { group in
                         if group.label.isEmpty {
-                            ForEach(group.attachments) { attachment in
+                            ForEach(group.items) { attachment in
                                 AttachmentRow(attachment: attachment).tag(attachment.id)
                             }
                         } else {
                             Section(group.label) {
-                                ForEach(group.attachments) { attachment in
+                                ForEach(group.items) { attachment in
                                     AttachmentRow(attachment: attachment).tag(attachment.id)
                                 }
                             }

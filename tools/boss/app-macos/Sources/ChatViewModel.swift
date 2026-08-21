@@ -128,11 +128,32 @@ final class ChatViewModel: ObservableObject {
     /// the transcript viewer window sends `list_executions`. Cleared per-task
     /// before each fresh fetch so the viewer never shows stale rows.
     @Published var executionsByTaskID: [String: [ExecutionVM]] = [:]
+    /// Task ids with an in-flight `list_executions` request — tracked
+    /// separately from [[executionsByTaskID]] because a Swift dictionary
+    /// drops a key entirely on `= nil`, so the dictionary alone can't tell
+    /// "still loading" apart from "a `workError` arrived while loading".
+    /// Cleared on success ([[executionsByTaskID]] gets its rows) or failure
+    /// (see [[executionsLoadFailureByTaskID]]).
+    var executionsInFlightTaskIDs: Set<String> = []
+    /// Failure reason keyed by task id, set when a `workError` arrives
+    /// while that task's `list_executions` request was in flight. Cleared
+    /// at the start of the next [[loadExecutions(taskId:)]] call. The
+    /// transcript viewer renders this instead of spinning forever — see
+    /// [[TranscriptViewerView.executionList]].
+    @Published var executionsLoadFailureByTaskID: [String: String] = [:]
     /// Screenshot-evidence rows keyed by task id. Populated on demand when
     /// the attachment viewer window sends `list_attachments_for_work_item`.
     /// Cleared per-task before each fresh fetch, mirroring
     /// [[executionsByTaskID]].
     @Published var attachmentsByTaskID: [String: [AttachmentVM]] = [:]
+    /// Task ids with an in-flight `list_attachments_for_work_item` request.
+    /// Mirrors [[executionsInFlightTaskIDs]] for the same reason.
+    var attachmentsInFlightTaskIDs: Set<String> = []
+    /// Failure reason keyed by task id, set when a `workError` arrives
+    /// while that task's attachment request was in flight. Mirrors
+    /// [[executionsLoadFailureByTaskID]] — see
+    /// [[AttachmentViewerView.attachmentList]].
+    @Published var attachmentsLoadFailureByTaskID: [String: String] = [:]
     /// Transcript load state keyed by execution id. Populated on demand when
     /// the transcript viewer selects an execution (`execution_transcript`
     /// RPC). A `nil` (absent) entry means "not requested yet"; live
@@ -670,6 +691,8 @@ final class ChatViewModel: ObservableObject {
     /// [[executionsByTaskID]].
     func loadExecutions(taskId: String) {
         executionsByTaskID[taskId] = nil
+        executionsLoadFailureByTaskID.removeValue(forKey: taskId)
+        executionsInFlightTaskIDs.insert(taskId)
         engine.sendListExecutions(taskId: taskId)
     }
 
@@ -679,6 +702,8 @@ final class ChatViewModel: ObservableObject {
     /// populates [[attachmentsByTaskID]].
     func loadAttachments(taskId: String) {
         attachmentsByTaskID[taskId] = nil
+        attachmentsLoadFailureByTaskID.removeValue(forKey: taskId)
+        attachmentsInFlightTaskIDs.insert(taskId)
         engine.sendListAttachmentsForWorkItem(taskId: taskId)
     }
 
