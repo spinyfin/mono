@@ -17,20 +17,36 @@
 //! leaving the caller to discover it from a `probe-status` query it has no
 //! reason to run. Exit stays 0 — the probe genuinely may land, and refusing
 //! outright would remove the surface without fixing the capability.
+//!
+//! **Interrupting is the default**, and it removes that third answer
+//! entirely for the case it hurt most. With `interrupt` the engine cuts the
+//! worker's in-flight turn short, confirms the turn ended, writes the text
+//! and confirms the write — all inside the RPC — so this command reports the
+//! *settled* [`boss_protocol::ProbeDeliveryState`] instead of an intention,
+//! and a delivery that failed exits non-zero. `--no-interrupt` opts back into
+//! boundary delivery for a message that genuinely can wait, since an
+//! interrupt aborts whatever the worker was doing.
 
 use anyhow::{Context, Result, bail};
 use boss_protocol::{FrontendEvent, FrontendRequest};
 
 use crate::{agents, connect};
 
-/// Queue a probe for the worker named by `agent`, reporting honestly what the
-/// engine committed to — or failing when it committed to nothing.
+/// Send a probe to the worker named by `agent`.
+///
+/// With `interrupt` (the default from the CLI) the engine cuts the worker's
+/// in-flight turn short and delivers synchronously, so this reports the
+/// settled delivery state and exits non-zero when the text did not land.
+/// Without it the engine queues the probe for a boundary and this reports
+/// honestly what the engine *committed to* — or fails when it committed to
+/// nothing.
 pub async fn probe_run(
     socket_path: &Option<String>,
     json: bool,
     agent: String,
     text: String,
     urgent: bool,
+    interrupt: bool,
 ) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let states = agents::fetch_live_states(&mut client).await?;
@@ -40,10 +56,84 @@ pub async fn probe_run(
             run_id: run_id.clone(),
             text,
             urgent,
+            interrupt,
         })
         .await
         .context("sending ProbeRun")?;
     match response {
+        // Interrupting delivery: the engine already finished, so this is the
+        // real outcome, not an acceptance. Report it as such — and fail when
+        // it failed, since the whole reason to interrupt is that the message
+        // had to land, and a caller that cannot tell "landed" from "did not"
+        // is back where the boundary-only design left them.
+        FrontendEvent::ProbeDelivered {
+            run_id: returned,
+            probe_id,
+            urgent: is_urgent,
+            state,
+            interrupt: interrupt_outcome,
+            interrupt_attempts,
+            detail,
+        } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": if state.is_delivered() { "delivered" } else { "not_delivered" },
+                        "run_id": returned,
+                        "probe_id": probe_id,
+                        "urgent": is_urgent,
+                        "state": state.as_str(),
+                        "delivered": state.is_delivered(),
+                        "interrupt": interrupt_outcome.as_str(),
+                        "interrupt_attempts": interrupt_attempts,
+                        "interrupted_worker": interrupt_outcome.discarded_in_flight_work(),
+                        "safe_to_reissue": state.is_safe_to_reissue(),
+                        "detail": detail,
+                    })
+                );
+            } else {
+                let label = if is_urgent { "urgent probe" } else { "probe" };
+                let verdict = if state.is_delivered() {
+                    "delivered"
+                } else {
+                    "NOT delivered"
+                };
+                println!(
+                    "{label} {verdict} to run {returned} (probe_id={probe_id}); state={}",
+                    state.as_str(),
+                );
+                println!("  interrupt: {}", interrupt_outcome.describe());
+                if interrupt_attempts > 0 {
+                    println!("  interrupt attempts: {interrupt_attempts}");
+                }
+                if let Some(detail) = detail.as_deref() {
+                    println!("  {detail}");
+                }
+            }
+            if state.is_delivered() {
+                return Ok(());
+            }
+            // Not delivered. Say what to do instead rather than only what
+            // went wrong: for the states where nothing reached the pane,
+            // re-issuing cannot duplicate an instruction, and for a probe
+            // that must be obeyed the durable channel is a work-item
+            // description edit, not this one.
+            let advice = if state.is_safe_to_reissue() {
+                "Nothing was written into the worker's pane, so re-issuing this probe cannot \
+                 duplicate an instruction. If it must be obeyed, prefer a channel that survives \
+                 the run (edit the work item's description)."
+            } else {
+                "The text may have reached the pane — check the worker's transcript before \
+                 re-issuing, since a second copy would repeat the instruction."
+            };
+            bail!(
+                "probe {probe_id} was not delivered to run {returned} (state={}): {}{}. {advice}",
+                state.as_str(),
+                interrupt_outcome.describe(),
+                detail.map(|d| format!("; {d}")).unwrap_or_default(),
+            )
+        }
         FrontendEvent::ProbeQueued {
             run_id: returned,
             probe_id,
@@ -189,7 +279,15 @@ pub async fn probe_status(socket_path: &Option<String>, json: bool, probe_id: St
             // `delivered` / `state=` carry the judgement. Unconfirmed still
             // warrants a warning, on stderr so it does not corrupt `--json`
             // stdout.
-            if state == boss_protocol::ProbeDeliveryState::Unconfirmed {
+            if state == boss_protocol::ProbeDeliveryState::InterruptFailed {
+                eprintln!(
+                    "warning: probe {returned} was never delivered (state=interrupt_failed): the engine \
+                     interrupted the worker's turn to deliver it, the turn never ended within the driver's \
+                     declared attempt budget, and nothing was written into the pane. Re-issuing is safe — \
+                     nothing landed — but it will hit the same wall unless the worker's state has changed; \
+                     prefer a channel that survives the run (edit the work item's description).",
+                );
+            } else if state == boss_protocol::ProbeDeliveryState::Unconfirmed {
                 eprintln!(
                     "warning: probe {returned} is unconfirmed: the write reached the pane but the engine could \
                      not prove the worker took it. It may still have landed — check the worker's transcript \

@@ -19,6 +19,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
@@ -63,11 +64,12 @@ use turn_end_recovery::{is_cancelled_turn_end, prepare_snapshot};
 
 use super::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, HookWiringDestination,
-    InterruptDelivery, InterruptRecoverySnapshot, ModelMenu, PermissionArtifacts, PermissionInput, PrUrlCaptureFeed,
-    ProbeDelivery, ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressObservationWiring,
-    ProgressSessionNormalizer, ReapDelivery, SpawnPlan, SpawnRequest, StopDelivery, StructuredOutputArtifacts,
-    StructuredOutputRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, TranscriptSessionNormalizer,
-    TurnEnd, WorkerErrorClass, WorkerKind, default_structured_output_wiring,
+    InterruptDelivery, InterruptGesture, InterruptPlan, InterruptRecoverySnapshot, ModelMenu, PermissionArtifacts,
+    PermissionInput, PrUrlCaptureFeed, ProbeDelivery, ProgressFidelity, ProgressIngress, ProgressObservationConfig,
+    ProgressObservationWiring, ProgressSessionNormalizer, ReapDelivery, SpawnPlan, SpawnRequest, StopDelivery,
+    StructuredOutputArtifacts, StructuredOutputRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring,
+    TranscriptSessionNormalizer, TurnEnd, TurnEndEvidence, WorkerErrorClass, WorkerKind,
+    default_structured_output_wiring,
 };
 
 // ---------------------------------------------------------------------------
@@ -742,6 +744,47 @@ impl AgentDriver for GrokDriver {
     /// [`Self::is_interrupt_recovery_turn_end`] close that gap (design T-12).
     fn interrupt(&self) -> InterruptDelivery {
         InterruptDelivery::PaneEsc
+    }
+
+    /// One Escape, confirmed through the interrupt-recovery observer rather
+    /// than a `Stop` hook.
+    ///
+    /// Measured in `docs/investigations/ghostty-grok-pane-viability.md` Q8
+    /// (`SPIKE_SCENARIO=esc_interrupt`, session telemetry committed under
+    /// `ghosttykit_host/evidence/esc_interrupt/`): a single Esc at ~6s into a
+    /// `sleep 45` tool call cancelled the turn with
+    /// `cancellation_context.trigger = "esc"`, the process survived, and the
+    /// immediately following probe landed (`redirect_kind:
+    /// cancel_then_send`). That is exactly the gesture this plan encodes.
+    ///
+    /// The evidence is [`TurnEndEvidence::RecoveryObserver`] because a
+    /// Grok turn cancelled this way **skips the `Stop` hook entirely** — the
+    /// only record is `turn_ended`/`cancelled` in `events.jsonl`, which is
+    /// what [`Self::prepare_interrupt_recovery`] /
+    /// [`Self::is_interrupt_recovery_turn_end`] exist to read. The confirm
+    /// window matches that observer's own
+    /// [`crate::grok::turn_end_recovery::SETTLE_WINDOW`], so an attempt is
+    /// never declared failed while the observer it depends on is still
+    /// legitimately waiting.
+    ///
+    /// **Declared limitation:** Esc does not cancel when Grok's TUI is in
+    /// fullscreen vim mode (xAI's own docs; Ctrl+C is the gesture there).
+    /// Boss never enables vim mode for workers — [`crate::grok::home`] writes
+    /// the worker's config with `vim_mode` off precisely so this plan holds —
+    /// but if a worker ever ends up in that mode the interrupt will exhaust
+    /// its attempts and fail loudly rather than silently typing into a
+    /// running turn.
+    fn interrupt_plan(&self) -> Option<InterruptPlan> {
+        Some(InterruptPlan {
+            gesture: InterruptGesture {
+                key: "Escape",
+                presses: 1,
+                press_interval: Duration::from_millis(120),
+            },
+            confirm_window: turn_end_recovery::SETTLE_WINDOW,
+            max_attempts: 2,
+            turn_end_evidence: TurnEndEvidence::RecoveryObserver,
+        })
     }
 
     /// Stop is `/quit` typed into the pane, then pane release — Grok has no

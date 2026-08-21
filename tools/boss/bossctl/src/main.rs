@@ -42,6 +42,7 @@ use boss_protocol::{
 };
 use clap::{Parser, Subcommand};
 use command_types::{LogSource, TranscriptFormat};
+use hosts::{HostsAction, HostsTagAction};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -105,6 +106,23 @@ enum Command {
         /// picks the earliest boundary the worker's pane allows.
         #[arg(long)]
         urgent: bool,
+        /// Do NOT interrupt the worker's current turn; wait for a boundary
+        /// instead.
+        ///
+        /// Interrupting is the default because the common reason to probe a
+        /// running worker is to redirect it *now*, and the boundary a
+        /// non-interrupting probe waits for may be the run's last — in which
+        /// case the text is read by nobody. Use this only when the message
+        /// genuinely can wait: an interrupt aborts whatever the worker is
+        /// mid-way through (a partial edit, an in-flight build), so it is a
+        /// real cost paid on the worker's side.
+        ///
+        /// With this flag the command reports what the engine *accepted*
+        /// (and, for a best-effort acceptance, warns that it may never
+        /// arrive); without it, the command blocks until delivery settles and
+        /// reports what actually happened.
+        #[arg(long)]
+        no_interrupt: bool,
     },
     /// Report the delivery state of a previously accepted probe, by the
     /// `probe_id` that `bossctl probe` printed.
@@ -113,8 +131,10 @@ enum Command {
     /// awaiting confirmation), `consumed` (the worker's CLI took it as a
     /// prompt), `buffered` (written into a mid-turn agent's composer; it
     /// submits at the end of the turn), `unconfirmed` (written but unproven;
-    /// also warns on stderr), `replied` (the worker answered). Any state the
-    /// engine can report exits 0 — read `delivered` (or `state=`) for the
+    /// also warns on stderr), `replied` (the worker answered),
+    /// `interrupt_failed` (the engine tried to interrupt the worker's turn to
+    /// deliver it, the turn never ended, and nothing was written). Any state
+    /// the engine can report exits 0 — read `delivered` (or `state=`) for the
     /// delivery judgement; a non-zero exit means the id could not be read.
     /// Probe ids live in the running engine process and are not retained
     /// across a restart.
@@ -995,115 +1015,6 @@ enum MetricsAction {
 }
 
 #[derive(Subcommand, Debug)]
-enum HostsAction {
-    /// Register a new remote host. The host row is persisted to
-    /// `state.db`, then provisioned: push the `boss-remote-run` wrapper,
-    /// verify `cube` is invocable over non-interactive SSH, and discover
-    /// the host's capabilities (`os=`, `arch=`, `gh-authed=`, `driver=…`) by probing
-    /// it. The host is left enabled only if all of that succeeds;
-    /// otherwise it is disabled with the reason on `last_error`.
-    ///
-    /// `--skip-wrapper-push` suppresses the whole provisioning step
-    /// (offline / dry-run / test fixtures). A host registered that way is
-    /// enabled but unverified and reports no discovered capabilities until
-    /// something provisions it.
-    Add {
-        /// Unique identifier for this host (e.g. `zakalwe`).
-        id: String,
-        /// SSH target used to reach this host (alias or `user@host`).
-        #[arg(long)]
-        ssh_target: String,
-        /// Number of concurrent worker slots on this host.
-        #[arg(long, default_value_t = 1)]
-        pool_size: i64,
-        /// User-defined capability tags (e.g. `--tag os=macos --tag arch=arm64`).
-        #[arg(long = "tag", value_name = "TAG")]
-        tags: Vec<String>,
-        /// Skip the eager wrapper push at registration. The host row
-        /// is still created. Use when the host is offline at
-        /// registration time; the lazy push at dispatch will catch up.
-        #[arg(long)]
-        skip_wrapper_push: bool,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// List all registered hosts with their enabled state and capability count.
-    List {
-        /// Only show enabled hosts.
-        #[arg(long)]
-        enabled: bool,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// Show full details for a single host including all capabilities.
-    Show {
-        id: String,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// Re-run remote provisioning and capability discovery for a host.
-    Probe {
-        id: String,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// Add or remove user-defined capability tags on a host.
-    Tag {
-        #[command(subcommand)]
-        action: HostsTagAction,
-    },
-    /// Enable a previously disabled host.
-    Enable {
-        id: String,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// Disable a host so no new work is dispatched to it.
-    Disable {
-        id: String,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// Remove a host from the registry. Fails for the built-in `local` host.
-    Remove {
-        id: String,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum HostsTagAction {
-    /// Add one or more user capability tags to a host.
-    Add {
-        id: String,
-        /// Capability tag(s) to add (e.g. `os=macos`, `bazel=7`).
-        #[arg(required = true)]
-        tags: Vec<String>,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// Remove one or more user capability tags from a host.
-    Remove {
-        id: String,
-        /// Capability tag(s) to remove.
-        #[arg(required = true)]
-        tags: Vec<String>,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-}
-
-#[derive(Subcommand, Debug)]
 enum ExecutionsAction {
     /// Cancel a never-started (`queued` / `ready` / `waiting_dependency`)
     /// execution so dispatch will not spawn a worker for it.
@@ -1275,9 +1186,12 @@ fn main() -> ExitCode {
 
 async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Probe { agent, text, urgent } => {
-            probe::probe_run(&cli.socket_path, cli.json, agent, text, urgent).await
-        }
+        Command::Probe {
+            agent,
+            text,
+            urgent,
+            no_interrupt,
+        } => probe::probe_run(&cli.socket_path, cli.json, agent, text, urgent, !no_interrupt).await,
         Command::ProbeStatus { probe_id } => probe::probe_status(&cli.socket_path, cli.json, probe_id).await,
         Command::Agents {
             action: AgentsAction::Status { agent },

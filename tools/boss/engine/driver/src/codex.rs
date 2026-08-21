@@ -14,6 +14,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
@@ -49,11 +50,12 @@ use progress::{CodexRolloutProgressSession, CodexTranscriptSession, normalize_ro
 use super::claude::{BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND};
 use super::{
     AgentDriver, AgentJsonlFileIngress, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, EnvDirective,
-    InterruptDelivery, MidTurnPaneInput, ModelMenu, PermissionArtifacts, PermissionInput, PrUrlCaptureFeed,
-    ProbeDelivery, ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressSessionConfig,
-    ProgressSessionNormalizer, ReapDelivery, SpawnPlan, SpawnRequest, StopDelivery, StructuredOutputArtifacts,
-    StructuredOutputRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, TranscriptSessionNormalizer,
-    TurnEnd, WorkerErrorClass, WorkerKind, WorkerProcessLifetime, default_structured_output_wiring,
+    InterruptDelivery, InterruptGesture, InterruptPlan, MidTurnPaneInput, ModelMenu, PermissionArtifacts,
+    PermissionInput, PrUrlCaptureFeed, ProbeDelivery, ProgressFidelity, ProgressIngress, ProgressObservationConfig,
+    ProgressSessionConfig, ProgressSessionNormalizer, ReapDelivery, SpawnPlan, SpawnRequest, StopDelivery,
+    StructuredOutputArtifacts, StructuredOutputRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring,
+    TranscriptSessionNormalizer, TurnEnd, TurnEndEvidence, WorkerErrorClass, WorkerKind, WorkerProcessLifetime,
+    default_structured_output_wiring,
 };
 
 /// Marker prefix on a [`WorkerEvent::Notification`] message emitted by this
@@ -1853,6 +1855,36 @@ impl AgentDriver for CodexDriver {
     /// transport the engine uses today rather than inventing a signal path.
     fn interrupt(&self) -> InterruptDelivery {
         InterruptDelivery::PaneEsc
+    }
+
+    /// One Escape; the abort is observable and arrives on the ordinary
+    /// turn-boundary channel.
+    ///
+    /// Measured in `docs/investigations/ghostty-codex-pane-viability.md` Q5:
+    /// a single Esc into the interactive TUI mid-turn produces a rollout
+    /// `turn_aborted` (`reason: "interrupted"`), the process survives, and a
+    /// follow-up turn submitted afterwards completes normally. This driver's
+    /// own rollout normalizer ([`crate::codex::progress`]) turns that record
+    /// into `Notification` + `Stop { stop_reason: Interrupted }`, so the turn
+    /// end reaches the engine on the same channel a completed turn's does —
+    /// [`TurnEndEvidence::TurnBoundarySignal`], with no recovery observer
+    /// needed ([`Self::prepare_interrupt_recovery`] stays `None`).
+    ///
+    /// `confirm_window` is wider than Claude's because the evidence path is
+    /// longer: the abort has to be appended to the rollout file and read back
+    /// by the engine's rollout tail before the slot's activity moves, whereas
+    /// Claude's `Stop` hook posts straight to the events socket.
+    fn interrupt_plan(&self) -> Option<InterruptPlan> {
+        Some(InterruptPlan {
+            gesture: InterruptGesture {
+                key: "Escape",
+                presses: 1,
+                press_interval: Duration::from_millis(120),
+            },
+            confirm_window: Duration::from_secs(8),
+            max_attempts: 2,
+            turn_end_evidence: TurnEndEvidence::TurnBoundarySignal,
+        })
     }
 
     /// Stop is process-level only — same as Claude today.

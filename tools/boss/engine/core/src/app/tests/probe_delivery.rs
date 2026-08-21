@@ -283,6 +283,8 @@ async fn probe_run_steers_a_mid_turn_worker_without_any_boundary() {
             run_id: run_id.clone(),
             text: "stop — you are building the wrong target".into(),
             urgent: false,
+            // Boundary delivery: this test is about the queue-and-wait path.
+            interrupt: false,
         },
     )
     .await;
@@ -417,6 +419,8 @@ async fn probe_run_refuses_when_the_run_has_no_live_pane() {
             run_id: "run-with-no-pane".into(),
             text: "hello?".into(),
             urgent: false,
+            // Boundary delivery: this test is about the queue-and-wait path.
+            interrupt: false,
         },
     )
     .await;
@@ -448,6 +452,8 @@ async fn probe_run_accepts_urgent_for_a_driver_that_rejects_mid_turn_input() {
             run_id: run_id.clone(),
             text: "course-correct now".into(),
             urgent: true,
+            // Boundary delivery: this test is about the queue-and-wait path.
+            interrupt: false,
         },
     )
     .await;
@@ -488,6 +494,8 @@ async fn probe_run_promises_the_tool_boundary_for_a_spawning_buffering_worker() 
             run_id,
             text: "are you up yet".into(),
             urgent: true,
+            // Boundary delivery: this test is about the queue-and-wait path.
+            interrupt: false,
         },
     )
     .await;
@@ -513,6 +521,8 @@ async fn probe_run_promises_the_turn_boundary_for_a_spawning_non_buffering_worke
             run_id,
             text: "no rush".into(),
             urgent: false,
+            // Boundary delivery: this test is about the queue-and-wait path.
+            interrupt: false,
         },
     )
     .await;
@@ -539,6 +549,8 @@ async fn probe_run_promises_immediate_delivery_against_a_mid_turn_claude_worker(
             run_id: run_id.clone(),
             text: "course-correct now".into(),
             urgent: false,
+            // Boundary delivery: this test is about the queue-and-wait path.
+            interrupt: false,
         },
     )
     .await;
@@ -584,6 +596,8 @@ async fn probe_run_refuses_a_terminal_worker() {
             run_id: run_id.clone(),
             text: "anyone home?".into(),
             urgent: false,
+            // Boundary delivery: this test is about the queue-and-wait path.
+            interrupt: false,
         },
     )
     .await;

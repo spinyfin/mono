@@ -2212,6 +2212,26 @@ pub(super) async fn dispatch_probe_reply_on_stop(
     let Some(run_id) = incoming.run_id.as_deref() else {
         return;
     };
+    // Peek before taking. A claim whose probe is still `Queued` has not been
+    // written into the pane yet — the interrupting delivery path holds one
+    // across the whole interrupt, precisely so no other dispatcher can
+    // deliver the same probe on the boundary that interrupt produces. Taking
+    // it here would free the run's delivery slot out from under an in-progress
+    // delivery and let a second one start. Every other state means the write
+    // has at least been issued, which is the case the unconditional take was
+    // written for, so this leaves that behaviour exactly as it was.
+    if server_state
+        .in_flight_probe_id(run_id)
+        .and_then(|probe_id| server_state.probe_lifecycle_state(&probe_id))
+        == Some(ProbeDeliveryState::Queued)
+    {
+        tracing::debug!(
+            run_id,
+            "probe reply skipped: the run's in-flight claim is held by a delivery that has not \
+             written yet; leaving the claim in place",
+        );
+        return;
+    }
     let Some(in_flight) = server_state.take_in_flight_probe(run_id) else {
         return;
     };

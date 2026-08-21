@@ -53,6 +53,7 @@ impl Default for DriverRegistry {
         for (slug, driver) in &drivers {
             refuse_stdout_jsonl_ingress(slug, driver.as_ref());
             refuse_one_turn_per_process(slug, driver.as_ref());
+            refuse_inconsistent_interrupt_declaration(slug, driver.as_ref());
         }
         Self { drivers }
     }
@@ -118,6 +119,58 @@ fn refuse_one_turn_per_process(slug: &str, driver: &dyn AgentDriver) {
          driver can declare this lifetime — see \
          tools/boss/docs/investigations/codex-tui-pivot-pricing-2026-07-30.md"
     );
+}
+
+/// Registration-time guard that a driver's two interrupt answers agree.
+///
+/// [`AgentDriver::interrupt`] names the *transport* and
+/// [`AgentDriver::interrupt_plan`] the *timing and evidence*; both also
+/// encode "this driver cannot be interrupted" (as
+/// [`crate::InterruptDelivery::Unsupported`] and `None` respectively).
+/// Nothing in the type system stops one from saying yes while the other says
+/// no, and either mismatch is silently wrong in a way an operator would only
+/// notice as a probe that never lands:
+///
+/// * transport without a plan — the interrupting probe path finds no plan and
+///   reports the driver as non-interruptible, contradicting a
+///   `bossctl agents interrupt` that works; and
+/// * a plan without a transport — the plan is dead code that reads as proof
+///   the driver was measured.
+///
+/// A driver declaring [`crate::TurnEndEvidence::RecoveryObserver`] must
+/// additionally return `Some` from
+/// [`AgentDriver::prepare_interrupt_recovery`] for at least the shape of the
+/// contract to hold: that evidence *is* the recovery observer, so without one
+/// there is no path from the keystroke to an observable turn end and every
+/// interrupt would burn its full attempt budget before failing. (The probe
+/// here passes a synthetic run id, so a driver whose per-run state simply
+/// does not exist yet legitimately answers `None`; that is why this checks
+/// the declaration pair rather than the probe's result.)
+///
+/// Deliberately probes only the built-in slugs constructed above, mirroring
+/// [`refuse_stdout_jsonl_ingress`] and [`refuse_one_turn_per_process`].
+fn refuse_inconsistent_interrupt_declaration(slug: &str, driver: &dyn AgentDriver) {
+    let transport = driver.interrupt();
+    let plan = driver.interrupt_plan();
+    assert_eq!(
+        transport != crate::InterruptDelivery::Unsupported,
+        plan.is_some(),
+        "driver '{slug}' disagrees with itself about interrupts: interrupt() = {transport:?} but \
+         interrupt_plan() = {plan:?}. A driver that names an interrupt transport must supply the \
+         plan that drives it, and one that declares itself uninterruptible must supply neither."
+    );
+    if let Some(plan) = plan {
+        assert!(
+            plan.gesture.presses >= 1,
+            "driver '{slug}' declared an interrupt plan with zero presses; an attempt that sends \
+             nothing can never take"
+        );
+        assert!(
+            plan.max_attempts >= 1,
+            "driver '{slug}' declared an interrupt plan with zero attempts; the interrupt would \
+             always report failure without ever being tried"
+        );
+    }
 }
 
 impl DriverRegistry {
