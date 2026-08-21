@@ -69,6 +69,25 @@ pub enum InterruptPaneError {
     ResponseKindMismatch(String),
 }
 
+/// Outcome of [`ServerState::interrupt_plan_lookup`].
+///
+/// Splits what [`ServerState::interrupt_plan_for_run`]'s bare `Option`
+/// collapses: a driver that was resolved and declares no interrupt mechanism
+/// is a capability gap, but no driver resolving at all is a lookup failure —
+/// distinct causes an operator would take different action on.
+#[derive(Debug)]
+pub(crate) enum InterruptPlanLookup {
+    /// The driver was resolved and declares this plan.
+    Plan(crate::driver::InterruptPlan),
+    /// The driver was resolved and explicitly declares no interrupt
+    /// mechanism (`AgentDriver::interrupt_plan() == None`).
+    NotInterruptible,
+    /// No driver could be resolved for this run at all — missing execution
+    /// row, unregistered slug, or a DB error. Not a declared property of any
+    /// driver; a lookup failure the operator can potentially fix.
+    DriverUnresolved,
+}
+
 /// Surfaced by [`ServerState::reveal_work_item`]. Separates
 /// id-resolution failures from app-side / transport failures so
 /// `bossctl reveal` can produce a precise error.
@@ -283,9 +302,38 @@ impl ServerState {
     /// plan (the interrupting probe path) has a well-defined, visible failure
     /// for `None` — it says the driver cannot be interrupted instead of
     /// pretending otherwise.
+    ///
+    /// Collapses [`InterruptPlanLookup::NotInterruptible`] and
+    /// [`InterruptPlanLookup::DriverUnresolved`] onto the same `None` — fine
+    /// for [`Self::interrupt_worker_pane`], which falls back to a bare
+    /// `Escape` either way, but wrong for a caller that must tell the two
+    /// apart. Use [`Self::interrupt_plan_lookup`] there instead.
     pub(crate) fn interrupt_plan_for_run(&self, run_id: &str) -> Option<crate::driver::InterruptPlan> {
-        let driver = crate::driver_transcript::driver_for_execution(&self.work_db, run_id)?;
-        driver.interrupt_plan()
+        match self.interrupt_plan_lookup(run_id) {
+            InterruptPlanLookup::Plan(plan) => Some(plan),
+            InterruptPlanLookup::NotInterruptible | InterruptPlanLookup::DriverUnresolved => None,
+        }
+    }
+
+    /// Like [`Self::interrupt_plan_for_run`], but keeps apart the two reasons
+    /// a plan can be missing: a driver that was resolved and explicitly
+    /// declares no interrupt mechanism, versus no driver resolving at all
+    /// (missing execution row, unregistered slug, DB error). The interrupting
+    /// probe path needs this distinction — every registered driver declares a
+    /// runnable interrupt plan (`every_registered_driver_declares_a_runnable_interrupt_plan`),
+    /// so in production a genuinely uninterruptible driver cannot occur; a
+    /// `None` in practice almost always means the lookup itself failed, and
+    /// telling the operator "this driver declares no interrupt mechanism" for
+    /// what is actually a resolution failure points them at a permanent
+    /// capability gap when the real, fixable problem is the lookup.
+    pub(crate) fn interrupt_plan_lookup(&self, run_id: &str) -> InterruptPlanLookup {
+        let Some(driver) = crate::driver_transcript::driver_for_execution(&self.work_db, run_id) else {
+            return InterruptPlanLookup::DriverUnresolved;
+        };
+        match driver.interrupt_plan() {
+            Some(plan) => InterruptPlanLookup::Plan(plan),
+            None => InterruptPlanLookup::NotInterruptible,
+        }
     }
 
     /// Deliver one interrupt **attempt** — the driver's key, repeated

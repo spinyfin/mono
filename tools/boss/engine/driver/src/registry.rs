@@ -155,16 +155,20 @@ fn refuse_inconsistent_interrupt_declaration(slug: &str, driver: &dyn AgentDrive
     assert_eq!(
         transport != crate::InterruptDelivery::Unsupported,
         plan.is_some(),
-        "driver '{slug}' disagrees with itself about interrupts: interrupt() = {transport:?} but          interrupt_plan() = {plan:?}. A driver that names an interrupt transport must supply the          plan that drives it, and one that declares itself uninterruptible must supply neither."
+        "driver '{slug}' disagrees with itself about interrupts: interrupt() = {transport:?} but \
+         interrupt_plan() = {plan:?}. A driver that names an interrupt transport must supply the \
+         plan that drives it, and one that declares itself uninterruptible must supply neither."
     );
     if let Some(plan) = plan {
         assert!(
             plan.gesture.presses >= 1,
-            "driver '{slug}' declared an interrupt plan with zero presses; an attempt that sends              nothing can never take"
+            "driver '{slug}' declared an interrupt plan with zero presses; an attempt that sends \
+             nothing can never take"
         );
         assert!(
             plan.max_attempts >= 1,
-            "driver '{slug}' declared an interrupt plan with zero attempts; the interrupt would              always report failure without ever being tried"
+            "driver '{slug}' declared an interrupt plan with zero attempts; the interrupt would \
+             always report failure without ever being tried"
         );
     }
 }

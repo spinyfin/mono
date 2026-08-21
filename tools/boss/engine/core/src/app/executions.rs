@@ -514,12 +514,31 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
         // interrupt plan — because the whole point is that the caller learns
         // the real outcome without having to poll for it.
         //
-        // Only taken when there is a turn to interrupt or a pane to write
-        // into right now. A `Spawning` worker has neither, so it falls
-        // through to the queue below and is honestly reported as waiting for
-        // its first tool boundary — an interrupting answer there would have
-        // to invent an outcome for something that never happened.
-        if interrupt && expected_delivery != ProbeDeliveryExpectation::NextToolBoundary {
+        // Only taken when there is a turn to interrupt (`Working`) or a
+        // prompt to write to right now (`accepts_typed_input`). Gated on the
+        // worker's *actual* posture rather than on `expected_delivery`: that
+        // enum answers "which boundary", not "is there a live turn or prompt
+        // right now", and it only ever names `NextToolBoundary` for a
+        // `Spawning` worker on a driver that BUFFERS mid-turn input — every
+        // other `Spawning` worker (including one on a driver that rejects
+        // mid-turn input, e.g. grok, in the traffic split) answers
+        // `NextTurnBoundary` and would wrongly take this branch, where
+        // `interrupt_and_confirm` finds neither `Working` nor
+        // `accepts_typed_input` and settles the probe `Abandoned` instead of
+        // leaving it queued for the worker's first boundary. Every `Spawning`
+        // worker has neither a turn to interrupt nor a pane to write into
+        // yet, so it falls through to the queue below and is honestly
+        // reported as waiting for its first tool boundary — an interrupting
+        // answer there would have to invent an outcome for something that
+        // never happened.
+        let interrupt_worthy = server_state
+            .worker_registry
+            .slot_for_run(&run_id)
+            .and_then(|slot_id| server_state.pane_typed_input_activity(slot_id))
+            .is_some_and(|activity| {
+                activity == boss_protocol::WorkerActivity::Working || activity.accepts_typed_input()
+            });
+        if interrupt && interrupt_worthy {
             tracing::info!(
                 run_id = %run_id,
                 probe_id = %probe_id,

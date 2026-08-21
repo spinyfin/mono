@@ -328,6 +328,48 @@ async fn interrupting_probe_lands_on_a_driver_that_refuses_mid_turn_input() {
     }
 }
 
+/// Codex, the third driver in the traffic split. Its plan differs from
+/// Claude's and Grok's in `confirm_window` (8s, wider — the evidence path is
+/// longer: the abort has to be appended to the rollout file and read back by
+/// the engine's rollout tail before the slot's activity moves) and its
+/// turn-end evidence travels a different ingress (rollout `turn_aborted`
+/// normalized to `Stop { Interrupted }`), but that ingress is simulated the
+/// same way here as Claude's and Grok's: `park_once_interrupted` applies the
+/// `Stop` event directly once the Escape is observed, standing in for
+/// whichever channel actually produced it.
+#[tokio::test]
+async fn interrupting_probe_lands_on_the_codex_driver() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 12, Some("codex"));
+    let runner = tmux_hosted(&server_state, &run_id, 12);
+    let parker = park_once_interrupted(&server_state, &runner, 12);
+    let confirmer = confirm_write_when_it_lands(&server_state, &runner, &run_id);
+
+    let sink = make_session_sink();
+    executions::handle_probe_run(
+        dispatch_for(&server_state, &sink),
+        probe_request(&run_id, "the operator changed the plan; re-read the description"),
+    )
+    .await;
+    parker.await.expect("parker task");
+    confirmer.await.expect("confirmer task");
+
+    match sole_response(&sink).await {
+        FrontendEvent::ProbeDelivered {
+            state,
+            interrupt,
+            interrupt_attempts,
+            ..
+        } => {
+            assert_eq!(state, ProbeDeliveryState::Consumed);
+            assert_eq!(interrupt, ProbeInterruptOutcome::Interrupted);
+            assert_eq!(interrupt_attempts, 1, "one Escape was enough for this driver");
+        }
+        other => panic!("expected ProbeDelivered, got {other:?}"),
+    }
+    assert_eq!(runner.escape_presses(), 1);
+}
+
 /// An idle worker has no turn to interrupt, so none is attempted. Interrupting
 /// costs the worker whatever it was doing; spending that when it was doing
 /// nothing is pure loss — and on Claude Code a second Escape at the prompt
@@ -462,13 +504,15 @@ async fn an_interrupt_that_never_takes_fails_terminally_and_writes_nothing() {
     );
 }
 
-/// A driver that declares no interrupt mechanism is reported as such — the
-/// probe fails visibly rather than being silently downgraded to the boundary
-/// delivery the caller did not ask for and was not told about.
-///
-/// Reached here through a run whose driver cannot be resolved at all, which is
-/// the same declared answer (`interrupt_plan() == None`) arrived at by the
-/// fail-closed route.
+/// A run whose driver cannot be resolved at all (no execution row behind the
+/// slot) is reported as a lookup failure, not conflated with a driver that
+/// was actually resolved and genuinely declares no interrupt mechanism —
+/// those are different causes, and `every_registered_driver_declares_a_runnable_interrupt_plan`
+/// means the latter cannot happen for any shipped driver, so this
+/// unresolvable-driver route is the one that actually fires in production.
+/// Either way the probe fails visibly rather than being silently downgraded
+/// to the boundary delivery the caller did not ask for and was not told
+/// about.
 #[tokio::test(start_paused = true)]
 async fn a_driver_with_no_interrupt_mechanism_is_reported_not_silently_downgraded() {
     let (server_state, _dir) = test_server_state();
@@ -498,11 +542,11 @@ async fn a_driver_with_no_interrupt_mechanism_is_reported_not_silently_downgrade
                 interrupt_attempts, 0,
                 "no gesture may be sent for a driver that has none"
             );
+            let detail = detail.expect("a failure must say why");
             assert!(
-                detail
-                    .expect("a failure must say why")
-                    .contains("no interrupt mechanism"),
-                "the caller must be told which capability is missing",
+                detail.contains("could not resolve a driver"),
+                "an unresolvable driver must be reported as a lookup failure, not conflated with a \
+                 driver that was resolved and genuinely declares itself uninterruptible: {detail}",
             );
         }
         other => panic!("expected ProbeDelivered, got {other:?}"),
@@ -629,6 +673,57 @@ async fn a_spawning_worker_falls_through_to_boundary_delivery() {
     assert_eq!(runner.escape_presses(), 0);
 }
 
+/// A spawning worker on a driver that REJECTS mid-turn input (grok, in the
+/// traffic split) must fall through to the queue exactly like the buffering
+/// case above, not be routed into the interrupt branch and settled
+/// `Abandoned`. Before the fix this was gated on `expected_delivery !=
+/// NextToolBoundary` — grok's `Spawning` worker answers `NextTurnBoundary`
+/// (it does not buffer, so there is no earlier boundary to promise), which
+/// satisfied that gate and sent it into `interrupt_and_confirm`, where
+/// `Spawning` matches neither `Working` nor `accepts_typed_input()` and the
+/// probe was permanently dropped instead of queued for the worker's first
+/// turn boundary.
+#[tokio::test]
+async fn a_spawning_worker_on_a_non_buffering_driver_still_falls_through_to_the_queue() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_spawning_worker_with_driver(&server_state, 14, Some("grok"));
+    let runner = tmux_hosted(&server_state, &run_id, 14);
+
+    let sink = make_session_sink();
+    executions::handle_probe_run(
+        dispatch_for(&server_state, &sink),
+        probe_request(&run_id, "as soon as you are up: the spec changed"),
+    )
+    .await;
+
+    match sole_response(&sink).await {
+        FrontendEvent::ProbeQueued {
+            probe_id,
+            expected_delivery,
+            ..
+        } => {
+            assert_eq!(
+                expected_delivery,
+                Some(ProbeDeliveryExpectation::NextTurnBoundary),
+                "a spawning worker on a driver that rejects mid-turn input has no earlier boundary \
+                 to promise",
+            );
+            assert_eq!(
+                server_state.probe_lifecycle_state(&probe_id),
+                Some(ProbeDeliveryState::Queued),
+                "the probe must still be waiting for the worker's first turn boundary, not settled \
+                 abandoned before the worker ever started",
+            );
+        }
+        other => panic!("expected ProbeQueued, got {other:?}"),
+    }
+    assert_eq!(runner.escape_presses(), 0, "a spawning worker has nothing to interrupt");
+    assert!(
+        server_state.has_pending_probe(&run_id),
+        "the probe must remain queued rather than being dropped",
+    );
+}
+
 /// A run with no live pane is still refused before a probe id is minted —
 /// interrupting changes where a deliverable probe lands, not what counts as
 /// deliverable.
@@ -647,6 +742,95 @@ async fn an_interrupting_probe_to_a_dead_run_is_still_refused_up_front() {
         }
         other => panic!("expected ProbeRefused, got {other:?}"),
     }
+}
+
+// ── Interrupting delivery claims the probe it was asked about ───────────────
+
+/// A `--no-interrupt` probe queued first (and left waiting, since a mid-turn
+/// grok worker's posture refuses the immediate-dispatch attempt) must not be
+/// the one an interrupting probe issued afterwards delivers. Before the fix
+/// this claimed and wrote whatever sat at the queue's front — the earlier,
+/// unrelated probe — while reporting the caller's own (later) probe id as
+/// delivered, which fabricated a delivery for text that was never sent.
+#[tokio::test]
+async fn interrupting_delivery_claims_the_probe_it_was_asked_about_not_the_queue_head() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 13, Some("grok"));
+    let runner = tmux_hosted(&server_state, &run_id, 13);
+
+    // A `--no-interrupt` probe, queued first — via `queue_probe` directly
+    // rather than the `ProbeRun` RPC, so no detached immediate-dispatch
+    // attempt is racing against the interrupting call below (grok's posture
+    // would refuse it anyway, but only once its `Working` slot is re-checked
+    // — by which point the interrupt further down may already have parked
+    // it, and the point of this test is what the interrupting call itself
+    // claims, not a second dispatcher's timing).
+    let older_probe_id = server_state.queue_probe(
+        run_id.clone(),
+        "no rush — read this at your next boundary".into(),
+        false,
+    );
+    assert_eq!(
+        server_state.probe_lifecycle_state(&older_probe_id),
+        Some(ProbeDeliveryState::Queued),
+        "the older probe must still be waiting, not delivered",
+    );
+
+    let parker = park_once_interrupted(&server_state, &runner, 13);
+    let confirmer = confirm_write_when_it_lands(&server_state, &runner, &run_id);
+
+    let sink = make_session_sink();
+    executions::handle_probe_run(
+        dispatch_for(&server_state, &sink),
+        probe_request(&run_id, "stop — you are building the wrong target"),
+    )
+    .await;
+    parker.await.expect("parker task");
+    confirmer.await.expect("confirmer task");
+
+    let newer_probe_id = match sole_response(&sink).await {
+        FrontendEvent::ProbeDelivered {
+            probe_id,
+            state,
+            interrupt,
+            ..
+        } => {
+            assert_eq!(
+                state,
+                ProbeDeliveryState::Consumed,
+                "the caller's own probe must be the one actually delivered",
+            );
+            assert_eq!(interrupt, ProbeInterruptOutcome::Interrupted);
+            probe_id
+        }
+        other => panic!("expected ProbeDelivered, got {other:?}"),
+    };
+    assert_ne!(newer_probe_id, older_probe_id);
+
+    let written = String::from_utf8(runner.stdin().first().cloned().expect("text reached load-buffer")).unwrap();
+    assert!(
+        written.contains("stop — you are building the wrong target"),
+        "the text written must be the interrupting probe's own text, not the older queued probe's: {written}",
+    );
+    assert!(
+        !written.contains("no rush"),
+        "the older queued probe's text must never be written under the newer probe's id: {written}",
+    );
+
+    assert_eq!(
+        server_state.probe_lifecycle_state(&older_probe_id),
+        Some(ProbeDeliveryState::Queued),
+        "the older probe must still carry its own correct (queued) lifecycle state, not be \
+         consumed by proxy",
+    );
+    assert_eq!(
+        server_state.probe_lifecycle_state(&newer_probe_id),
+        Some(ProbeDeliveryState::Consumed),
+    );
+    assert!(
+        server_state.has_pending_probe(&run_id),
+        "the older probe must remain in the queue for its own later boundary",
+    );
 }
 
 // ── The claim held across the interrupt ─────────────────────────────────────
@@ -727,4 +911,91 @@ fn updating_the_snapshot_for_a_run_with_no_claim_does_nothing() {
     server_state.update_in_flight_probe_snapshot("run-none", Some("/tmp/x.jsonl".to_owned()), 7);
     assert!(!server_state.has_in_flight_probe("run-none"));
     assert_eq!(server_state.in_flight_probe_id("run-none"), None);
+}
+
+// ── `pane_text_shows_turn_ended`: the fail-closed secondary signal ─────────
+
+/// A `CommandRunner` that answers every `capture-pane` invocation with a
+/// fixed, pre-scripted snapshot of the pane — unlike [`RecordingTmux`], which
+/// always returns empty stdout and so can only ever exercise the
+/// blank-capture branch of [`ServerState::pane_text_shows_turn_ended`].
+struct ScriptedCapture(String);
+
+#[async_trait]
+impl CommandRunner for ScriptedCapture {
+    async fn run(&self, _program: &Path, args: &[OsString], _cwd: Option<&Path>) -> std::io::Result<CommandOutput> {
+        let is_capture_pane = args.iter().any(|arg| arg == "capture-pane");
+        Ok(CommandOutput {
+            success: true,
+            code: Some(0),
+            stdout: if is_capture_pane { self.0.clone() } else { String::new() },
+            stderr: String::new(),
+        })
+    }
+
+    async fn run_with_stdin(
+        &self,
+        program: &Path,
+        args: &[OsString],
+        cwd: Option<&Path>,
+        _stdin: &[u8],
+    ) -> std::io::Result<CommandOutput> {
+        self.run(program, args, cwd).await
+    }
+}
+
+/// Register `run_id` on `slot_id` as a tmux-hosted pane whose `capture-pane`
+/// always answers `pane_text`.
+fn pane_showing(server_state: &Arc<ServerState>, run_id: &str, slot_id: u8, pane_text: &str) {
+    server_state
+        .worker_registry
+        .register_tmux_run_slot(run_id, slot_id, "boss-probe-interrupt");
+    *server_state.pane_delivery_tmux_override.write().unwrap() =
+        Some(Tmux::with_runner("/usr/bin/tmux", Arc::new(ScriptedCapture(pane_text.to_owned()))).unwrap());
+}
+
+/// A Claude pane still showing its busy marker ("esc to interrupt") must never
+/// confirm a turn end — a busy marker present is exactly the negative case
+/// this signal exists to answer correctly, even though the fixture text below
+/// also happens to carry no prompt prefix.
+#[tokio::test]
+async fn pane_text_does_not_confirm_a_turn_end_while_the_busy_marker_is_present() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 15, None); // claude default
+    pane_showing(&server_state, &run_id, 15, "Building the widget...\nesc to interrupt\n");
+    assert!(!server_state.pane_text_shows_turn_ended(&run_id).await);
+}
+
+/// A Claude pane showing only its prompt prefix, with no busy marker, is the
+/// one positive case: the turn has visibly ended.
+#[tokio::test]
+async fn pane_text_confirms_a_turn_end_on_a_bare_prompt_prefix() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 16, None); // claude default
+    pane_showing(&server_state, &run_id, 16, "❯ \n");
+    assert!(server_state.pane_text_shows_turn_ended(&run_id).await);
+}
+
+/// A blank capture must never confirm a turn end — absence of the busy marker
+/// is not the same as a positive read of the prompt, and every existing test
+/// in this suite (via [`RecordingTmux`]'s always-empty stdout) already
+/// depends on this branch answering `false`.
+#[tokio::test]
+async fn pane_text_does_not_confirm_a_turn_end_on_an_empty_capture() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 17, None); // claude default
+    pane_showing(&server_state, &run_id, 17, "");
+    assert!(!server_state.pane_text_shows_turn_ended(&run_id).await);
+}
+
+/// A grok pane showing its busy marker (`[stop]`) alongside its own prompt
+/// prefix must not confirm a turn end — the busy-marker check must win even
+/// when a driver's prompt prefix can appear in the same capture as its own
+/// busy affordance.
+#[tokio::test]
+async fn pane_text_does_not_confirm_a_turn_end_on_a_grok_busy_marker() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 18, Some("grok"));
+    pane_showing(&server_state, &run_id, 18, "│ ❯ type your message\n[stop]\n");
+    assert!(!server_state.pane_text_shows_turn_ended(&run_id).await);
 }
