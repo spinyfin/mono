@@ -700,13 +700,19 @@ impl WorkDb {
                 let mut conn = self.connect()?;
                 let tx = conn.transaction()?;
                 let now = now_string();
-                // Pre-image, before the tombstone lands. Only read when the
-                // actor is Boothby — every other caller pays nothing.
-                let before = if boothby::is_boothby_actor(actor) {
-                    query_task(&tx, id)?
-                } else {
-                    None
-                };
+                // Pre-delete snapshot for the `ProjectImplDrained` staging
+                // check below — deletion is not a status write, so this
+                // task's own kind/status/project_id (as they stood before
+                // the tombstone) are what decide whether the project's last
+                // open trigger task is about to vanish. Cheap: a single
+                // primary-key lookup on the already-open transaction.
+                let task_before_delete = query_task(&tx, id)?;
+                // Pre-image, before the tombstone lands. Only Boothby pays
+                // for this — derived from the same lookup above rather than
+                // querying again.
+                let before = boothby::is_boothby_actor(actor)
+                    .then(|| task_before_delete.clone())
+                    .flatten();
                 let rows = tx.execute(
                     "UPDATE tasks SET deleted_at = ?2, updated_at = ?2
                      WHERE id = ?1 AND deleted_at IS NULL",
@@ -743,7 +749,17 @@ impl WorkDb {
                     let after = query_task(&tx, id).require("task", id)?;
                     boothby::capture_task_update(&tx, self, actor, &before, &after, &now)?;
                 }
-                tx.commit()?;
+                let mut pending = crate::event_publish::PendingEvents::new();
+                if let Some(task_before_delete) = task_before_delete {
+                    stage_project_impl_drained_on_trigger_task_deleted(
+                        &tx,
+                        &mut pending,
+                        task_before_delete.kind.clone(),
+                        task_before_delete.project_id.as_deref(),
+                        &task_before_delete.status,
+                    )?;
+                }
+                crate::event_publish::commit_and_publish(tx, pending, &self.event_bus)?;
                 let mut tombstoned_ids = vec![id.to_owned()];
                 tombstoned_ids.extend(revision_ids);
                 Ok(tombstoned_ids)
