@@ -9,6 +9,7 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, bail};
 use boss_event_bus::{EventBus, EventKind, TopicFilter};
+use boss_timer_wheel::TimerWheel;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command as TokioCommand;
@@ -528,7 +529,10 @@ struct ServerState {
     /// The events-socket accept loop publishes the hook-observable
     /// transitions onto it. The merge poller subscribes to the
     /// `PrReconcileRequested{pr_url}` topic here as the keyed companion to
-    /// the broad `pr_reconciler_kick` sweep.
+    /// the broad `pr_reconciler_kick` sweep, and the envelope-watch timer
+    /// subscriber consumes the `Timer` topic fed by `timer_wheel` below —
+    /// every producer and consumer shares this exact instance instead of
+    /// each standing up a private bus nothing else can reach.
     #[builder(default = Arc::new(EventBus::new()))]
     event_bus: Arc<EventBus>,
     worker_registry: WorkerRegistry,
@@ -951,6 +955,16 @@ struct ServerState {
     /// SIGTERM-style shutdown signal and exits the same graceful path
     /// when either fires.
     shutdown_trigger: Arc<Notify>,
+    /// The shared timer-wheel feeding `event_bus`'s `Timer` topic. Unlike
+    /// `EventBus::new`, `TimerWheel::spawn` spawns its background delivery
+    /// task, which requires a live Tokio runtime — many unit tests
+    /// construct `ServerState` outside one. So this starts empty and `serve`
+    /// initializes it (via `get_or_init`) once the runtime is confirmed
+    /// live, right before spawning the first consumer that needs it. Tests
+    /// that never call `serve` never touch this and so never spawn the
+    /// wheel's background task.
+    #[builder(default)]
+    timer_wheel: std::sync::OnceLock<Arc<TimerWheel>>,
 }
 
 impl ServerState {
