@@ -248,6 +248,15 @@ extension EngineClient {
         switch error {
         case .unknownSlot:
             return ["kind": "unknown_slot"]
+        case .driverExited(let expectedDriverBinary, let observedProcess):
+            var payload: [String: Any] = [
+                "kind": "driver_exited",
+                "expected_driver_binary": expectedDriverBinary,
+            ]
+            if let observedProcess {
+                payload["observed_process"] = observedProcess
+            }
+            return payload
         case .internalFailure(let message):
             return ["kind": "internal", "message": message]
         }

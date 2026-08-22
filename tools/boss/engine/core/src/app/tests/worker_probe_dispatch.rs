@@ -442,8 +442,7 @@ async fn dispatch_probe_on_idle_records_unconfirmed_without_redelivery() {
     use crate::protocol::WorkerEvent;
 
     let (server_state, _dir) = test_server_state();
-    let run_id = "run-urgent-idle-unconfirmed";
-    register_idle_worker(&server_state, run_id, 6);
+    let run_id = register_idle_worker_with_driver(&server_state, 6, None);
 
     let app_sink = make_session_sink();
     server_state
@@ -458,7 +457,7 @@ async fn dispatch_probe_on_idle_records_unconfirmed_without_redelivery() {
         .await;
     server_state
         .topic_broker
-        .subscribe(&watch_session_id, &[probe_topic(run_id)])
+        .subscribe(&watch_session_id, &[probe_topic(&run_id)])
         .await;
 
     let server_for_app = server_state.clone();
@@ -482,7 +481,7 @@ async fn dispatch_probe_on_idle_records_unconfirmed_without_redelivery() {
             .await;
     });
 
-    let probe_id = server_state.queue_probe(run_id.to_owned(), "what now?".into(), true);
+    let probe_id = server_state.queue_probe(run_id.clone(), "what now?".into(), true);
 
     let post_tool_use = crate::events_socket::IncomingHookEvent::for_test(
         WorkerEvent::PostToolUse {
@@ -491,7 +490,7 @@ async fn dispatch_probe_on_idle_records_unconfirmed_without_redelivery() {
             tool_input: serde_json::json!({}),
             tool_response: serde_json::json!({}),
         },
-        Some(run_id.to_owned()),
+        Some(run_id.clone()),
         None,
     );
     let dispatch = tokio::spawn({
@@ -504,7 +503,7 @@ async fn dispatch_probe_on_idle_records_unconfirmed_without_redelivery() {
     dispatch.await.expect("dispatch task");
 
     assert!(
-        server_state.pop_pending_probe(run_id).is_none(),
+        server_state.pop_pending_probe(&run_id).is_none(),
         "unconfirmed probe must not be auto-redelivered",
     );
     assert_eq!(
@@ -513,7 +512,7 @@ async fn dispatch_probe_on_idle_records_unconfirmed_without_redelivery() {
         "unconfirmed delivery must be recorded, not left unknown",
     );
     assert!(
-        server_state.take_in_flight_probe(run_id).is_some(),
+        server_state.take_in_flight_probe(&run_id).is_some(),
         "unconfirmed probe must still be tracked in-flight for reply capture",
     );
 
@@ -554,7 +553,7 @@ async fn probe_queued_for_idle_worker_dispatches_immediately() {
         .work_db
         .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
         .unwrap();
-    let run = server_state
+    let _run = server_state
         .work_db
         .create_run(crate::protocol::CreateRunInput {
             execution_id: execution.id.clone(),
@@ -570,10 +569,10 @@ async fn probe_queued_for_idle_worker_dispatches_immediately() {
         .unwrap();
 
     // Register slot and set activity to Idle (worker between turns).
-    server_state.worker_registry.register_run_slot(run.id.clone(), 1);
+    server_state.worker_registry.register_run_slot(execution.id.clone(), 1);
     server_state
         .live_worker_states
-        .register_spawn(1, run.id.clone(), "claude-opus-4-7", 0, None);
+        .register_spawn(1, execution.id.clone(), "claude-opus-4-7", 0, None);
     // Apply a Stop event to transition Spawning → Idle.
     server_state.live_worker_states.apply_event(
         1,
@@ -613,8 +612,8 @@ async fn probe_queued_for_idle_worker_dispatches_immediately() {
     });
 
     // Queue the probe and call dispatch_probe_now directly.
-    server_state.queue_probe(run.id.clone(), "coordinator nudge".into(), false);
-    dispatch_probe_now(&server_state, &run.id).await;
+    server_state.queue_probe(execution.id.clone(), "coordinator nudge".into(), false);
+    dispatch_probe_now(&server_state, &execution.id).await;
 
     // The app_responder task must have seen the SendToPane by now.
     tokio::time::timeout(Duration::from_secs(2), app_responder)
@@ -625,7 +624,7 @@ async fn probe_queued_for_idle_worker_dispatches_immediately() {
     // Probe must have been consumed (popped from pending_probes and
     // an in-flight entry recorded).
     assert!(
-        server_state.pop_pending_probe(&run.id).is_none(),
+        server_state.pop_pending_probe(&execution.id).is_none(),
         "probe must be consumed, not left in pending_probes",
     );
 }
@@ -653,7 +652,7 @@ async fn probe_queued_for_waiting_for_input_worker_dispatches_immediately() {
         .work_db
         .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
         .unwrap();
-    let run = server_state
+    let _run = server_state
         .work_db
         .create_run(crate::protocol::CreateRunInput {
             execution_id: execution.id.clone(),
@@ -670,10 +669,10 @@ async fn probe_queued_for_waiting_for_input_worker_dispatches_immediately() {
 
     // Register slot and drive activity to WaitingForInput: a
     // Notification (permission prompt) immediately followed by a Stop.
-    server_state.worker_registry.register_run_slot(run.id.clone(), 1);
+    server_state.worker_registry.register_run_slot(execution.id.clone(), 1);
     server_state
         .live_worker_states
-        .register_spawn(1, run.id.clone(), "claude-opus-4-7", 0, None);
+        .register_spawn(1, execution.id.clone(), "claude-opus-4-7", 0, None);
     server_state.live_worker_states.apply_event(
         1,
         &WorkerEvent::Notification {
@@ -722,8 +721,8 @@ async fn probe_queued_for_waiting_for_input_worker_dispatches_immediately() {
     });
 
     // Queue the probe and call dispatch_probe_now directly.
-    server_state.queue_probe(run.id.clone(), "coordinator nudge".into(), false);
-    dispatch_probe_now(&server_state, &run.id).await;
+    server_state.queue_probe(execution.id.clone(), "coordinator nudge".into(), false);
+    dispatch_probe_now(&server_state, &execution.id).await;
 
     tokio::time::timeout(Duration::from_secs(2), app_responder)
         .await
@@ -731,7 +730,7 @@ async fn probe_queued_for_waiting_for_input_worker_dispatches_immediately() {
         .expect("app_responder panicked");
 
     assert!(
-        server_state.pop_pending_probe(&run.id).is_none(),
+        server_state.pop_pending_probe(&execution.id).is_none(),
         "probe must be consumed, not left in pending_probes",
     );
 }
@@ -754,7 +753,7 @@ async fn completion_probe_dispatched_on_same_stop_as_completion() {
         .work_db
         .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
         .unwrap();
-    let run = server_state
+    let _run = server_state
         .work_db
         .create_run(crate::protocol::CreateRunInput {
             execution_id: execution.id.clone(),
@@ -769,12 +768,14 @@ async fn completion_probe_dispatched_on_same_stop_as_completion() {
         })
         .unwrap();
 
-    // Idle live state so the Stop-path fail-closed activity guard allows delivery.
-    register_idle_worker(&server_state, &run.id, 1);
+    // The engine maps hooks and pane delivery by execution id, not the
+    // bookkeeping work-run id. Keep the fixture on that production path so
+    // the driver liveness check resolves the task's configured driver.
+    register_idle_worker(&server_state, &execution.id, 1);
 
     // Queue a probe manually (simulating what the completion handler does)
     // BEFORE dispatch_probe_on_stop fires, to verify the dispatch picks it up.
-    server_state.queue_probe(run.id.clone(), "push your PR".into(), false);
+    server_state.queue_probe(execution.id.clone(), "push your PR".into(), false);
 
     // Register a fake app session to capture the SendToPane.
     let app_sink = make_session_sink();
@@ -810,7 +811,7 @@ async fn completion_probe_dispatched_on_same_stop_as_completion() {
             stop_hook_active: false,
             stop_reason: crate::protocol::StopReason::Completed,
         },
-        Some(run.id.clone()),
+        Some(execution.id.clone()),
         None,
     );
     dispatch_probe_on_stop(&server_state, &stop).await;
@@ -820,7 +821,7 @@ async fn completion_probe_dispatched_on_same_stop_as_completion() {
         .expect("app_responder panicked");
 
     assert!(
-        server_state.pop_pending_probe(&run.id).is_none(),
+        server_state.pop_pending_probe(&execution.id).is_none(),
         "probe must be consumed by dispatch_probe_on_stop",
     );
 }
@@ -988,26 +989,26 @@ async fn probe_multi_tool_post_tool_use_does_not_escalate_spam() {
     );
 }
 
-/// Production-shaped ordering for a worker whose driver cannot be resolved
-/// (so mid-turn input fails closed): `dispatch_worker_event_fanout` applies
-/// PostToolUse → Working before probe dispatch, and the tool-boundary path
-/// refuses. The probe stays queued, then delivers on the subsequent Stop
-/// when activity becomes Idle — the preserved last-resort transport.
+/// Production-shaped ordering for a driver that does not accept mid-turn
+/// input: `dispatch_worker_event_fanout` applies PostToolUse → Working before
+/// probe dispatch, and the tool-boundary path refuses. The probe stays queued,
+/// then delivers on the subsequent Stop when activity becomes Idle — the
+/// preserved last-resort transport.
 #[tokio::test]
 async fn probe_defers_through_fanout_then_delivers_on_stop() {
     use crate::protocol::WorkerEvent;
 
     let (server_state, _dir) = test_server_state();
-    let run_id = "run-urgent-fanout-stop";
-    // Start mid-turn so the first PostToolUse keeps Working.
-    register_working_worker(&server_state, run_id, 3);
+    // Grok rejects mid-turn stdin, but the execution still has a concrete
+    // driver identity that the terminal Stop-boundary delivery can verify.
+    let run_id = register_working_worker_with_driver(&server_state, 3, Some("grok"));
 
     let app_sink = make_session_sink();
     server_state
         .register_app_session("session-app".into(), app_sink.clone())
         .await;
 
-    let probe_id = server_state.queue_probe(run_id.to_owned(), "please pivot".into(), true);
+    let probe_id = server_state.queue_probe(run_id.clone(), "please pivot".into(), true);
 
     // Mid-turn tool boundary via full fan-out (production shape).
     let post_tool_use = crate::events_socket::IncomingHookEvent::for_test(
@@ -1017,7 +1018,7 @@ async fn probe_defers_through_fanout_then_delivers_on_stop() {
             tool_input: serde_json::json!({}),
             tool_response: serde_json::json!({}),
         },
-        Some(run_id.to_owned()),
+        Some(run_id.clone()),
         None,
     );
     dispatch_worker_event_fanout(&server_state, &post_tool_use).await;
@@ -1029,10 +1030,10 @@ async fn probe_defers_through_fanout_then_delivers_on_stop() {
     );
     // Peek without consuming for the Stop step: re-queue after assert.
     let still = server_state
-        .pop_pending_probe(run_id)
+        .pop_pending_probe(&run_id)
         .expect("probe must still be queued after mid-turn fan-out");
     assert_eq!(still.probe_id, probe_id);
-    server_state.requeue_probe_front(run_id.to_owned(), still);
+    server_state.requeue_probe_front(run_id.clone(), still);
 
     // Turn ends: Stop flips activity to Idle, then probe dispatches.
     let server_for_app = server_state.clone();
@@ -1062,7 +1063,7 @@ async fn probe_defers_through_fanout_then_delivers_on_stop() {
             stop_hook_active: false,
             stop_reason: crate::protocol::StopReason::Completed,
         },
-        Some(run_id.to_owned()),
+        Some(run_id.clone()),
         None,
     );
     // Production order: live-state (Idle) then probe dispatch.
@@ -1075,7 +1076,7 @@ async fn probe_defers_through_fanout_then_delivers_on_stop() {
         .expect("app_responder panicked");
 
     assert!(
-        server_state.pop_pending_probe(run_id).is_none(),
+        server_state.pop_pending_probe(&run_id).is_none(),
         "probe must be consumed on Stop after mid-turn deferral",
     );
     assert_eq!(

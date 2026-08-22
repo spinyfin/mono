@@ -102,12 +102,11 @@
 //! ## Immediate reconciliation
 //!
 //! [`reap_reported_pane_death`] is the event-driven counterpart: the app
-//! calls it (via `FrontendRequest::WorkerPaneDied`) the moment it
-//! directly observes a worker pane die — surface creation failed or the
-//! child process exited — instead of waiting for the next periodic
-//! pass. It shares [`run_one_pass`]'s reap effects but skips the grace
-//! period and PID probe, since the app's report is a direct observation
-//! rather than a speculative one.
+//! calls it (via `FrontendRequest::WorkerPaneDied`) when it directly observes
+//! a worker pane die, and the pane-input boundary calls it when its fresh
+//! foreground-driver check finds the agent gone. It shares [`run_one_pass`]'s
+//! reap effects but skips the grace period and PID probe, since either source
+//! is a direct observation rather than a speculative one.
 //!
 //! ## Every vanished process is a death
 //!
@@ -496,17 +495,16 @@ pub async fn run_one_pass(
     outcome
 }
 
-/// Immediately reap the execution behind `run_id` after the app reports
-/// its worker pane died — either `ghostty_surface_new` returned NULL
-/// (surface never attached) or the pane's child process exited with no
-/// app-side restart handler for it (only the Boss pane restarts itself;
-/// see `FrontendRequest::WorkerPaneDied`).
+/// Immediately reap the execution behind `run_id` after a direct pane-death
+/// report or a foreground-driver check finds it gone. App reports cover
+/// failed surface creation and child exit; the input boundary reports a
+/// driver that returned to a shell.
 ///
 /// Unlike [`run_one_pass`], this skips [`DEAD_PID_GRACE_SECS`] and the
 /// `kill(pid, 0)` liveness probe: those exist to protect the periodic
 /// sweep's *speculative* signal (a PID it can no longer find) from
-/// racing a worker that is merely slow to start. Here the app is
-/// reporting a *direct observation* of its own pane, so there is
+/// racing a worker that is merely slow to start. Here the caller is
+/// reporting a *direct observation*, so there is
 /// nothing to protect against racing — waiting the grace period would
 /// only delay reconciliation for no benefit. Returns `true` if an
 /// execution was actually reaped.
@@ -526,7 +524,7 @@ pub async fn reap_reported_pane_death(
     report_reason: WorkerPaneDeathReason,
 ) -> bool {
     let detail = report_reason.describe();
-    let reason = format!("worker-pane-died: app reported {detail}");
+    let reason = format!("worker-pane-died: reported {detail}");
     reap_live_nonterminal_worker(
         work_db,
         live_states,
@@ -791,13 +789,23 @@ async fn reap_dead_execution(
 
     // Append [engine-reconcile] audit line to the task description
     // so a human inspecting the chore can see why it was reset (and
-    // where to find the recovery patch, if one was captured).
+    // where to find the recovery patch, if one was captured). An
+    // authoritative foreground-driver report is intentionally not labelled
+    // as a PID probe: that would hide the safety boundary that refused pane
+    // input before a shell could receive it.
+    let detection_source = match app_report_reason {
+        Some(WorkerPaneDeathReason::DriverExited) => "the pre-write driver liveness check",
+        Some(_) => "an app pane-death report",
+        None => "a PID probe",
+    };
     if let Some(work_item_id) = &state.work_item_id
         && let Err(err) = crate::reconcile_audit::append_reconcile_audit(
             work_db,
             work_item_id,
             now_epoch_secs,
-            &format!("dead worker (exec {execution_id}) detected via PID probe; chore reset to todo for redispatch"),
+            &format!(
+                "dead worker (exec {execution_id}) detected via {detection_source}; chore reset to todo for redispatch"
+            ),
             recovery_patch.as_deref(),
         )
     {
@@ -1532,6 +1540,64 @@ mod tests {
         assert_eq!(
             events[0].details["app_report_reason"],
             WorkerPaneDeathReason::SurfaceCreationFailed.as_str(),
+        );
+    }
+
+    /// A foreground-driver mismatch is an authoritative delivery failure, not
+    /// a best-effort observation. It must produce the same terminal recovery
+    /// as any other pane death, and its reason must survive in the operator's
+    /// dispatch-event record.
+    #[tokio::test]
+    async fn reap_reported_driver_exit_records_the_refusal_reason_and_releases_the_slot() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+        let execution_id = create_execution_started_now(&db, &work_item_id);
+
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_binding(&live_states, 1, &execution_id, std::process::id() as i32, &work_item_id);
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+
+        let reaped = reap_reported_pane_death(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopCube,
+            &execution_id,
+            WorkerPaneDeathReason::DriverExited,
+        )
+        .await;
+
+        assert!(reaped, "a refused shell delivery must terminalize the execution");
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Orphaned
+        );
+        assert!(
+            !coordinator
+                .worker_pool()
+                .claimed_execution_ids()
+                .await
+                .contains(&execution_id),
+            "the refused delivery must not strand a worker-pool claim",
+        );
+        assert!(
+            live_states.get(1).is_none(),
+            "the dead run must not remain idle in the live registry"
+        );
+
+        let events = sink.events().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].stage, "dead_pid_reconcile");
+        assert_eq!(
+            events[0].details["app_report_reason"],
+            WorkerPaneDeathReason::DriverExited.as_str(),
+            "the dispatch log must identify the refused shell delivery",
         );
     }
 

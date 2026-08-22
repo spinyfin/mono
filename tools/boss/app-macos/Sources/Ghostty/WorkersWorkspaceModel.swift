@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import GhosttyKit
 
@@ -432,7 +433,7 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// for why a trailing `\n` inside the payload is not enough to
     /// land the prompt: libghostty's paste path delivers control
     /// characters as input-field content, not as a keystroke.
-    func sendToPane(slotId: Int, text: String) -> EngineSendResult {
+    func sendToPane(slotId: Int, text: String, expectedDriverBinary: String) -> EngineSendResult {
         let targetSlots = reviewSlotRange.contains(slotId) ? reviewSlots : (Self.automationSlotRange.contains(slotId) ? automationSlots : slots)
         guard let index = targetSlots.firstIndex(where: { $0.slotId == slotId }) else {
             return .failure(.unknownSlot)
@@ -443,8 +444,82 @@ final class WorkersWorkspaceModel: ObservableObject {
         guard let host = session.hostView else {
             return .failure(.internalFailure("pane has no live surface"))
         }
+        let liveness = foregroundLiveness(for: session)
+        if let error = Self.driverInputError(
+            expectedDriverBinary: expectedDriverBinary,
+            foregroundPidIsAlive: liveness.isAlive,
+            foregroundProcessName: liveness.name
+        ) {
+            return .failure(error)
+        }
         host.submitText(text)
         return .success
+    }
+
+    /// Freshly resolve foreground liveness immediately before injecting
+    /// text. A surface can remain alive after its agent returns to zsh, so a
+    /// live surface or a live PTY alone is never permission to type into it.
+    ///
+    /// `isAlive` is the actual gate: `false` means no live process could be
+    /// found on the surface's controlling tty at all — genuine death
+    /// evidence. `name` is diagnostics only, for
+    /// [`EngineSendError.driverExited`] — see [`Self.driverInputError`] for
+    /// why it is not compared against the expected driver binary. `name`
+    /// can legitimately be `nil` even when `isAlive` is `true`: `proc_name`
+    /// can transiently fail (an EPERM/ESRCH race, or a name the kernel
+    /// won't report) on a pid that is very much alive, and that must not be
+    /// conflated with "no process" — doing so would reap a healthy worker.
+    private func foregroundLiveness(for session: TerminalPaneSession) -> (isAlive: Bool, name: String?) {
+        guard let pid = foregroundPid(for: session), pidIsAlive(Int32(pid)) else {
+            return (false, nil)
+        }
+        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        guard proc_name(pid, &buffer, UInt32(buffer.count)) > 0 else {
+            return (true, nil)
+        }
+        let end = buffer.firstIndex(of: 0) ?? buffer.endIndex
+        return (true, String(decoding: buffer[..<end].map { UInt8(bitPattern: $0) }, as: UTF8.self))
+    }
+
+    /// Pure decision helper so the no-shell-input contract is testable without
+    /// a real Ghostty surface.
+    ///
+    /// An empty `expectedDriverBinary` (protocol skew: an older or
+    /// malformed engine omitted the field) is refused non-terminally —
+    /// `.internalFailure`, not `.driverExited` — because it says nothing
+    /// about whether the worker is alive; concluding death from "the engine
+    /// did not tell us what to expect" would orphan every live worker the
+    /// app writes to on a single bad frame.
+    ///
+    /// Deliberately does NOT compare `foregroundProcessName` against
+    /// `expectedDriverBinary` by name. `ghostty_surface_foreground_pid`
+    /// (see `foregroundPid`'s docstring) legitimately returns something
+    /// other than the driver's own pid while the driver is alive and
+    /// running a foreground child (e.g. a `bazel build` a tool call
+    /// shelled out to) — the same signal `TmuxWorkerTerminalInspector` /
+    /// `classify_worker_liveness` treats as `AliveAndWorking` on the tmux
+    /// path, not as exited. `proc_name`'s kernel accounting name is also
+    /// unreliable for this comparison: it names whatever was exec'd (an
+    /// interpreter or shim for a wrapped CLI), not necessarily
+    /// `DriverDescriptor.binary`. The only signal trustworthy enough to
+    /// terminalize a run is refused here: no live process at all on the
+    /// controlling tty (`foregroundPidIsAlive == false`) — the surface
+    /// genuinely has nothing running in it.
+    static func driverInputError(
+        expectedDriverBinary: String,
+        foregroundPidIsAlive: Bool,
+        foregroundProcessName: String?
+    ) -> EngineSendError? {
+        guard !expectedDriverBinary.isEmpty else {
+            return .internalFailure("engine did not supply expected_driver_binary")
+        }
+        guard foregroundPidIsAlive else {
+            return .driverExited(
+                expectedDriverBinary: expectedDriverBinary,
+                observedProcess: foregroundProcessName
+            )
+        }
+        return nil
     }
 
     /// Bring the slot's libghostty surface to first responder and
