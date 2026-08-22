@@ -536,6 +536,24 @@ Notes:
 - There is only one bundled check for file size. The `check: file/size` field in CHECKS config lets you create a named instance (e.g. `id: my-size-limit`) of the same underlying implementation — this is the aliasing feature, not a separate check.
 - For new configuration, prefer the framework-level `exclude` key (sibling to `config:`) over `exclude_files` inside `config:`. Both are equivalent and enforced by the framework; see [Excluding files from checks](checks-config.md#excluding-files-from-checks).
 
+## `checkleft/no-check-level-file-scoping`
+
+Purpose:
+
+- Guards checkleft's own check sources against re-implementing check-level file scoping in the check's config struct. Deciding "is this file a target of this check at all" is the framework's job via the check-entry `include` / `exclude` keys; a check must not ship a top-level config field that answers the same question.
+- Parses each in-scope source with `syn`, resolves the type deserialized at the config doorway (`CheckInput::config` for WASM guests; `try_into` of a `&toml::Value` configure parameter for built-ins), and applies a name denylist to that struct's top-level fields only — so nested finer-axis selectors such as `rules[].include` stay legal by construction.
+- Matches effective serde **config keys** (Rust ident, `rename`, `alias`, container `rename_all`), not bare identifiers alone.
+- Guest surface denylist includes the framework spellings `include` / `applies_to`; built-in surface omits those two so deliberate framework-key pass-throughs (e.g. `DocStructureConfig`) remain legal by rule definition.
+
+Config keys: none.
+
+Source surfaces (framework `include` on the check entry):
+
+- `tools/checkleft/checks/**/src/lib.rs` (WASM guest checks)
+- `tools/checkleft/src/checks/**/*.rs` (built-in Rust checks; sibling `tests.rs` modules are skipped)
+
+See [Configuring checks — Checks must not answer "is this file in scope" themselves](checks-config.md#checks-must-not-answer-is-this-file-in-scope-themselves).
+
 ## `change/file-count`
 
 Purpose:
