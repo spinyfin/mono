@@ -866,9 +866,13 @@ pub(crate) fn reconcile_revision_execution(
                 )?;
             }
         }
-        Some(existing) if existing.kind == ExecutionKind::RevisionImplementation && existing.status.is_live() => {
-            // A live execution (running or waiting_human) is already in
-            // progress — do not spawn a duplicate worker. Without this arm
+        Some(existing)
+            if existing.kind == ExecutionKind::RevisionImplementation
+                && (existing.status.is_live() || existing.status == ExecutionStatus::Dispatching) =>
+        {
+            // A worker is already attached (running or waiting_human), or
+            // the scheduler holds a dispatch claim — do not spawn a duplicate
+            // worker. Without this arm
             // the `_ =>` branch fires for every reconcile tick while the
             // execution is waiting_human, creating an unbounded cascade of
             // ready executions and spawning multiple concurrent workers on
@@ -1248,14 +1252,15 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
             // each having to instrument itself.
             let latest_id = latest.as_ref().map(|e| e.id.clone());
             let live_id = live.as_ref().map(|e| e.id.clone());
-            // Scoped to pre-dispatch statuses (queued/ready/waiting_dependency):
+            // Scoped to pre-run statuses (queued/ready/dispatching/waiting_dependency):
             // those are the only statuses a row can sit in before any worker
             // has ever attached, so `can_reconcile()` doubles as "this row
             // could plausibly still be un-claimed." Once a worker actually
             // attaches, status flips to running/waiting_human and a
             // `work_runs` row exists — so this never masks a genuinely dead
             // live-status row (see `request_execution_marks_existing_stale_when_no_live_worker`).
-            let never_dispatched = existing.status.can_reconcile() && query_latest_run(conn, &existing.id)?.is_none();
+            let never_dispatched = (existing.status.can_reconcile() || existing.status == ExecutionStatus::Dispatching)
+                && query_latest_run(conn, &existing.id)?.is_none();
             if never_dispatched || is_live(&existing.id) {
                 let (decision, message) = if never_dispatched {
                     (

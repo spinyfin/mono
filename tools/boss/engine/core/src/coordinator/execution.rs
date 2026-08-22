@@ -677,7 +677,8 @@ impl ExecutionCoordinator {
                     None,
                     ("work_item_unresolved", "Could not resolve work item for execution"),
                     &err,
-                )?;
+                )
+                .await?;
                 return Err(err);
             }
         };
@@ -828,7 +829,8 @@ impl ExecutionCoordinator {
                     None,
                     ("no_eligible_host", "No eligible host for execution"),
                     &err,
-                )?;
+                )
+                .await?;
                 return Err(err);
             }
         };
@@ -861,7 +863,8 @@ impl ExecutionCoordinator {
                     None,
                     ("host_adapter_unavailable", "Could not build host adapter"),
                     &err,
-                )?;
+                )
+                .await?;
                 return Err(err);
             }
         };
@@ -931,7 +934,8 @@ impl ExecutionCoordinator {
                     None,
                     ("cube_repo_ensure_failed", "Cube `repo ensure` failed"),
                     &err,
-                )?;
+                )
+                .await?;
                 return Err(err);
             }
             Err(_elapsed) => {
@@ -962,7 +966,8 @@ impl ExecutionCoordinator {
                     None,
                     ("cube_repo_ensure_failed", "Cube `repo ensure` timed out"),
                     &err,
-                )?;
+                )
+                .await?;
                 return Err(err);
             }
         };
@@ -1027,7 +1032,8 @@ impl ExecutionCoordinator {
                     Some(repo.repo_id.as_str()),
                     ("cube_workspace_lease_failed", "Cube `workspace lease` failed"),
                     &err,
-                )?;
+                )
+                .await?;
                 return Err(err);
             }
         };
@@ -1148,7 +1154,8 @@ impl ExecutionCoordinator {
                         "Cube leased a workspace occupied by a live worker",
                     ),
                     &err,
-                )?;
+                )
+                .await?;
                 return Err(err);
             }
         }
@@ -1338,7 +1345,8 @@ impl ExecutionCoordinator {
                             "Cube `workspace goto` positioning failed",
                         ),
                         &err,
-                    )?;
+                    )
+                    .await?;
                     return Err(err);
                 }
             }
@@ -1414,7 +1422,8 @@ impl ExecutionCoordinator {
                         Some(repo.repo_id.as_str()),
                         ("cube_change_create_failed", "Cube `change create` failed"),
                         &err,
-                    )?;
+                    )
+                    .await?;
                     return Err(err);
                 }
             }
@@ -1562,7 +1571,8 @@ impl ExecutionCoordinator {
                     Some(repo.repo_id.as_str()),
                     ("execution_run_start_failed", "`start_execution_run` failed"),
                     &err,
-                )?;
+                )
+                .await?;
                 Err(err)
             }
         }
@@ -2374,7 +2384,7 @@ impl ExecutionCoordinator {
     ///
     /// Do NOT call this for post-`run_started` failures — those require
     /// `finish_execution_run`.
-    fn record_start_failure(
+    async fn record_start_failure(
         &self,
         coordinator: Arc<ExecutionCoordinator>,
         execution: &WorkExecution,
@@ -2386,13 +2396,72 @@ impl ExecutionCoordinator {
         error: &anyhow::Error,
     ) -> Result<()> {
         let (attention_kind, attention_title) = attention;
-        let (execution, run, outcome) = self.work_db.record_pre_start_failure(
+        let recorded = self.work_db.record_pre_start_failure(
             &execution.id,
             worker_id,
             cube_repo_id,
             &error.to_string(),
             &self.pre_start_retry_delays,
-        )?;
+        );
+        let (execution, run, outcome) = match recorded {
+            Ok(recorded) => recorded,
+            Err(record_err) => {
+                let current = self.work_db.get_execution(&execution.id).ok();
+                let readiness_changed = current.as_ref().is_some_and(|current| {
+                    !matches!(current.status, ExecutionStatus::Ready | ExecutionStatus::Dispatching)
+                });
+                if !readiness_changed {
+                    return Err(record_err.context(format!("while recording pre-start failure for {error:#}")));
+                }
+
+                if matches!(
+                    current.as_ref().map(|current| current.status.clone()),
+                    Some(ExecutionStatus::Cancelled | ExecutionStatus::Abandoned)
+                ) {
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        worker_id,
+                        current_status = %current.as_ref().expect("status was checked").status,
+                        "pre-start failure followed a deliberate execution settlement; skipping readiness-violation recovery",
+                    );
+                    return Ok(());
+                }
+
+                let current_status = current
+                    .as_ref()
+                    .map(|current| current.status.as_str())
+                    .unwrap_or("unknown");
+                let attention_body = format!(
+                    "Execution `{}` reached a pre-run failure on worker `{worker_id}`, but its durable status had changed to `{current_status}` after dispatch began.\n\n\
+                     **Dispatch error:** {error:#}\n\n\
+                     **Failure bookkeeping error:** {record_err:#}",
+                    execution.id,
+                );
+                if let Err(attention_err) = self.work_db.create_attention_item(CreateAttentionItemInput {
+                    execution_id: Some(execution.id.clone()),
+                    work_item_id: None,
+                    kind: "execution_readiness_violation".to_owned(),
+                    status: None,
+                    title: "Execution readiness changed during dispatch".to_owned(),
+                    body_markdown: attention_body,
+                    resolved_at: None,
+                }) {
+                    tracing::error!(
+                        execution_id = %execution.id,
+                        ?attention_err,
+                        "failed to raise readiness-violation attention item",
+                    );
+                }
+                self.demote_failed_dispatch_with_event(
+                    execution,
+                    worker_id,
+                    "execution_readiness_violation",
+                    &format!("{error:#}"),
+                )
+                .await;
+                return Ok(());
+            }
+        };
 
         match outcome {
             PreStartFailureOutcome::Retry { delay } => {
@@ -2491,26 +2560,9 @@ impl ExecutionCoordinator {
                 // (`pr_review`, `ci_remediation`, `conflict_resolution`)
                 // whose work item sits in `in_review`/`blocked` — bouncing
                 // those would erase review context.
-                match self
-                    .work_db
-                    .bounce_dispatch_failed_to_backlog(&execution.work_item_id, attention_kind, &err)
-                {
-                    Ok(true) => tracing::info!(
-                        execution_id = %execution.id,
-                        work_item_id = %execution.work_item_id,
-                        reason = attention_kind,
-                        "bounced work item to backlog after permanent pre-start dispatch failure",
-                    ),
-                    Ok(false) => {}
-                    Err(bounce_err) => tracing::error!(
-                        ?bounce_err,
-                        execution_id = %execution.id,
-                        work_item_id = %execution.work_item_id,
-                        "failed to bounce work item to backlog after permanent pre-start dispatch failure",
-                    ),
-                }
+                self.demote_failed_dispatch_with_event(&execution, worker_id, attention_kind, &err)
+                    .await;
 
-                let publisher = self.publisher.clone();
                 let execution_id = execution.id.clone();
                 let work_item_id = execution.work_item_id.clone();
                 let status_str = execution.status.as_str();
@@ -2525,16 +2577,14 @@ impl ExecutionCoordinator {
                         None
                     }
                 };
-                tokio::spawn(async move {
-                    publisher
-                        .publish(&execution_id, &work_item_id, status_str, "execution_start_failed")
+                self.publisher
+                    .publish(&execution_id, &work_item_id, status_str, "execution_start_failed")
+                    .await;
+                if let Some(product_id) = product_id {
+                    self.publisher
+                        .publish_work_item_changed(&product_id, &work_item_id, "execution_start_failed")
                         .await;
-                    if let Some(product_id) = product_id {
-                        publisher
-                            .publish_work_item_changed(&product_id, &work_item_id, "execution_start_failed")
-                            .await;
-                    }
-                });
+                }
             }
         }
         Ok(())
@@ -2605,6 +2655,56 @@ impl ExecutionCoordinator {
                      leaving the --host constraint in place so a retry cannot land unpinned",
                 );
             }
+        }
+    }
+
+    async fn demote_failed_dispatch_with_event(
+        &self,
+        execution: &WorkExecution,
+        worker_id: &str,
+        reason: &str,
+        error_text: &str,
+    ) {
+        let prior_item = self.work_db.get_work_item(&execution.work_item_id).ok();
+        let from_status = prior_item.as_ref().and_then(|item| match item {
+            WorkItem::Task(task) | WorkItem::Chore(task) => Some(task.status.clone()),
+            WorkItem::Product(_) | WorkItem::Project(_) => None,
+        });
+        match self
+            .work_db
+            .bounce_dispatch_failed_to_backlog(&execution.work_item_id, reason, error_text)
+        {
+            Ok(true) => {
+                tracing::info!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    reason,
+                    "bounced work item to backlog after permanent pre-start dispatch failure",
+                );
+                if from_status == Some(TaskStatus::Active) {
+                    self.dispatch_events
+                        .emit(
+                            DispatchEvent::new(Stage::StatusTransition, DispatchOutcome::Ok, &execution.id)
+                                .with_work_item(&execution.work_item_id)
+                                .with_worker(worker_id)
+                                .with_details(serde_json::json!({
+                                    "from_status": "active",
+                                    "to_status": "todo",
+                                    "did_dispatch": false,
+                                    "reason": reason,
+                                    "failed_execution_id": execution.id,
+                                })),
+                        )
+                        .await;
+                }
+            }
+            Ok(false) => {}
+            Err(bounce_err) => tracing::error!(
+                ?bounce_err,
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                "failed to bounce work item to backlog after permanent pre-start dispatch failure",
+            ),
         }
     }
 }

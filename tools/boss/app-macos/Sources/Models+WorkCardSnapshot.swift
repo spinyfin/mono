@@ -489,7 +489,7 @@ enum WorkCardLiveStatus {
         // former misdirects diagnosis toward pool capacity when the
         // pool had free workers the whole time.
         if isDispatchPending {
-            return runtime?.executionStatus == "ready" ? "Waiting for a slot" : "Queued"
+            return ["ready", "dispatching"].contains(runtime?.executionStatus) ? "Waiting for a slot" : "Queued"
         }
         if isResolvingConflicts { return nil }
         if isRemediatingCI { return nil }

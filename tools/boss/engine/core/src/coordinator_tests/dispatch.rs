@@ -78,6 +78,36 @@ async fn schedules_ready_execution_into_running_run() {
     assert_eq!(runner.calls.lock().await[0].3.as_deref(), Some("chg-1"));
 }
 
+#[tokio::test]
+async fn waiting_dependency_execution_never_claims_worker_or_cube_resources() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Not ready");
+    db.reconcile_product_executions(&product.id).unwrap();
+    let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+    assert!(db.downgrade_ready_to_waiting_dependency(&execution.id).unwrap());
+
+    let cube = Arc::new(FakeCubeClient::default());
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        cube.clone(),
+        Arc::new(FakeExecutionRunner::default()),
+    ));
+    coordinator.kick();
+    sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(
+        db.get_execution(&execution.id).unwrap().status,
+        ExecutionStatus::WaitingDependency,
+    );
+    assert_eq!(coordinator.worker_pool().idle_count().await, 1);
+    assert!(cube.ensure_calls.lock().await.is_empty());
+    assert!(cube.lease_calls.lock().await.is_empty());
+    assert!(cube.create_calls.lock().await.is_empty());
+}
+
 /// Asserts that the normal-completion termination path invokes driver
 /// teardown exactly once — not zero times, not once per retry — driven
 /// through the real `coordinator.kick()` pipeline (dispatch →

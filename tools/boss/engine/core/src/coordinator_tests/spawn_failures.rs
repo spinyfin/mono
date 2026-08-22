@@ -1623,6 +1623,61 @@ async fn pre_start_failure_retries_then_permanently_fails() {
     assert_eq!(attention_items[0].kind, "cube_workspace_lease_failed");
 }
 
+#[tokio::test]
+async fn permanent_pre_start_failure_emits_backlog_status_transition() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Visible pre-start demote");
+    db.reconcile_product_executions(&product.id).unwrap();
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+
+    let cube = Arc::new(FakeCubeClient {
+        fail_lease: true,
+        ..FakeCubeClient::default()
+    });
+    let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube,
+            Arc::new(FakeExecutionRunner::default()),
+        )
+        .with_pre_start_retry_delays(vec![])
+        .with_dispatch_events(recording.clone()),
+    );
+    let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+
+    coordinator.kick();
+    wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Failed).await;
+    let demote = wait_for_dispatch_event(
+        &recording,
+        &execution_id,
+        |event| event.stage == "status_transition" && event.details["to_status"] == "todo",
+        "pre-start active-to-todo status_transition",
+    )
+    .await;
+
+    assert_eq!(demote.details["from_status"], "active");
+    assert_eq!(demote.details["to_status"], "todo");
+    assert_eq!(demote.details["did_dispatch"], false);
+    assert_eq!(demote.details["reason"], "cube_workspace_lease_failed");
+    let task = match db.get_work_item(&chore.id).unwrap() {
+        WorkItem::Chore(task) | WorkItem::Task(task) => task,
+        other => panic!("expected task/chore, got {other:?}"),
+    };
+    assert_eq!(task.status, TaskStatus::Todo);
+    assert_eq!(db.list_attention_items(&execution_id).unwrap().len(), 1);
+}
+
 /// Pre-start retry: when the FIRST attempt fails but a second succeeds,
 /// the execution reaches `running` and only one execution row is created.
 #[tokio::test]
