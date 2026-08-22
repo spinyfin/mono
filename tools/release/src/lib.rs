@@ -1,8 +1,10 @@
 //! Shared, deterministic primitives for repository release workflows.
 //!
-//! The command-line orchestration lives separately so this crate's release
-//! decisions can be tested with captured command output rather than a network
-//! connection or a checkout with remote credentials.
+//! The deterministic resolver is kept separate from command orchestration so
+//! release decisions can be tested with captured command output rather than a
+//! network connection or a checkout with remote credentials.
+
+pub mod commands;
 
 mod config;
 mod decision;
@@ -13,7 +15,7 @@ mod version;
 pub use config::{NotesConfig, NotesSource, ReleaseConfig, VersionConfig, VersionScheme};
 pub use decision::{SkipDecision, SkipInput, SkipReason, Trigger, assert_allowed_trigger, should_skip};
 pub use release_state::{GitHubRelease, LastReleases, ReleaseState, query_release_state, resolve_last_release};
-pub use runner::{Command, CommandOutput, CommandRunner, RunnerError};
+pub use runner::{Command, CommandOutput, CommandRunner, ProcessCommandRunner, RunnerError};
 pub use version::{NextVersion, compute_next_version};
 
 use thiserror::Error;
