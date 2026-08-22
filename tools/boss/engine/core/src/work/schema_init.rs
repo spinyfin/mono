@@ -776,9 +776,11 @@ impl WorkDb {
         // `work_attachments`: metadata for screenshot evidence kept for a
         // worker's own verification and for an operator inspecting a run
         // locally; bytes live content-addressed under the engine state root.
-        // Additive and independent of every other table.
+        // Independent of execution retention. Existing installations are
+        // upgraded transactionally so evidence rows outlive pruned runs.
         // Design: tools/boss/docs/designs/worker-screenshot-evidence-attachments.md
         migrate_work_attachments_table(conn)?;
+        migrate_work_attachments_execution_retention(conn)?;
         // Data correction: repair any `work_comments` row still reading
         // 'answered' off a failed, no-reply answer-agent run (the
         // "comment reads answered when its answer-agent run failed with no

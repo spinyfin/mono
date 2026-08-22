@@ -26,8 +26,14 @@
 //! 2. **Rows outlive blobs.** Reclaiming deletes bytes and stamps
 //!    `reclaimed_at`; it does not delete the row. A stale local gallery link
 //!    then answers "reclaimed on <date>" instead of a bare 404 that reads like
-//!    a bug. Tombstones are removed by execution retention, when the execution
-//!    they hang off is pruned.
+//!    a bug. A tombstone is not removed when its execution is pruned: the
+//!    row's provenance is denormalized, so it outlives the execution and only
+//!    attachment retention takes its bytes. Tombstone rows are kept
+//!    indefinitely by design. They are a few hundred bytes of metadata, they
+//!    are what makes a stale gallery link answer instead of 404, and there is
+//!    no later reconstruction of that provenance once the row is gone. Live
+//!    attachment caps count only `reclaimed_at IS NULL` rows, so a tombstone
+//!    does not consume ingest budget.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;

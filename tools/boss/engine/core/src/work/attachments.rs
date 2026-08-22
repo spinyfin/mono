@@ -90,11 +90,13 @@ fn find_by_digest(conn: &Connection, execution_id: &str, content_digest: &str) -
 }
 
 impl WorkDb {
-    /// Count what this run and this work item have already stored.
+    /// Count live attachments this run and this work item have already stored.
     ///
-    /// Read before the store writes any bytes, so a worker at its cap is
-    /// refused without a blob ever landing on disk. The transaction below
-    /// re-checks; this is the cheap pre-flight, not the authority.
+    /// Reclaimed tombstones are excluded: the caps are runaway-loop protection
+    /// against bytes landing on disk, not a lifetime ledger. Read before the
+    /// store writes any bytes, so a worker at its cap is refused without a
+    /// blob ever landing on disk. The transaction below re-checks; this is
+    /// the cheap pre-flight, not the authority.
     pub fn attachment_counts(&self, execution_id: &str, work_item_id: &str) -> Result<(usize, usize)> {
         let conn = self.connect()?;
         count_attachments(&conn, execution_id, work_item_id)
@@ -312,12 +314,14 @@ impl WorkDb {
 
 fn count_attachments(conn: &Connection, execution_id: &str, work_item_id: &str) -> Result<(usize, usize)> {
     let for_execution: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM work_attachments WHERE execution_id = ?1",
+        "SELECT COUNT(*) FROM work_attachments
+         WHERE execution_id = ?1 AND reclaimed_at IS NULL",
         params![execution_id],
         |row| row.get(0),
     )?;
     let for_work_item: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM work_attachments WHERE work_item_id = ?1",
+        "SELECT COUNT(*) FROM work_attachments
+         WHERE work_item_id = ?1 AND reclaimed_at IS NULL",
         params![work_item_id],
         |row| row.get(0),
     )?;
@@ -457,6 +461,40 @@ mod tests {
             .unwrap()
             .expect_err("the cap must refuse, not silently drop");
         assert_eq!(refusal.code, ProposalErrorCode::RateLimited);
+    }
+
+    #[test]
+    fn reclaimed_tombstones_do_not_count_against_caps() {
+        let (_dir, db) = open_db();
+        let (execution_id, work_item_id) = seed(&db);
+
+        let mut ids = Vec::new();
+        for n in 0..ATTACHMENT_CAP_PER_EXECUTION {
+            let stored = db
+                .submit_work_attachment(SubmitAttachmentInput {
+                    execution_id: &execution_id,
+                    work_item_id: &work_item_id,
+                    image: &image(&format!("digest-{n}")),
+                    caption: "",
+                })
+                .unwrap()
+                .unwrap();
+            ids.push(stored.attachment.id);
+        }
+        assert_eq!(
+            db.mark_attachments_reclaimed(&ids).unwrap(),
+            ATTACHMENT_CAP_PER_EXECUTION
+        );
+        assert_eq!(db.attachment_counts(&execution_id, &work_item_id).unwrap(), (0, 0));
+
+        db.submit_work_attachment(SubmitAttachmentInput {
+            execution_id: &execution_id,
+            work_item_id: &work_item_id,
+            image: &image("after-reclaim"),
+            caption: "",
+        })
+        .unwrap()
+        .expect("a reclaimed tombstone must free ingest budget");
     }
 
     #[test]

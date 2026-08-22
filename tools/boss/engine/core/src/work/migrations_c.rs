@@ -575,7 +575,7 @@ fn status_check_clause(sql: &str) -> Option<String> {
 }
 
 /// The column names `table` actually has right now, in schema order.
-fn live_column_names(conn: &Connection, table: &str) -> Result<Vec<String>> {
+pub(crate) fn live_column_names(conn: &Connection, table: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let names = stmt
         .query_map([], |row| row.get::<_, String>(1))?
