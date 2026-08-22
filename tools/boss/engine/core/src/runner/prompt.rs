@@ -80,6 +80,21 @@ pub(super) struct ExecutionPromptParams<'a> {
     /// included.
     #[builder(default)]
     followup_proposals_seam_enabled: bool,
+    /// Whether `run_done_proposals_seam` is on — gates the worker-facing
+    /// prompt half of the terminal-declaration migration:
+    /// [`run_done_directive`], and the sentence
+    /// [`pr_terminal_directive`] adds about declaring before the terminal
+    /// push. `false` (the flag's registry default) renders today's prompt
+    /// verbatim, with no mention of `boss propose done`; `true` teaches the
+    /// verb. This is the OTHER half of the flag: the engine's
+    /// `evaluate_satisfied_deliverable_on_stop` gate and the
+    /// `NO_CHANGES_NEEDED` proposals-first read are gated by the same flag
+    /// name read directly from `FeatureFlagsStore`. Teaching the verb while
+    /// the engine still infers would be harmless but pointless; gating the
+    /// engine while the worker is never told the verb would hold every run
+    /// to the backstop, so the two must move together.
+    #[builder(default)]
+    run_done_proposals_seam_enabled: bool,
     /// Already-merged `merge_order` siblings whose surfaces this forward-port
     /// must preserve (rendered lines). Empty for non-conflict revisions and
     /// for conflict revisions with no merged overlap partner.
@@ -314,6 +329,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
         worker_signal_proposals_seam_enabled,
         deferred_scope_proposals_seam_enabled,
         followup_proposals_seam_enabled,
+        run_done_proposals_seam_enabled,
         merge_order_preservation,
     } = params;
     // Phase 9 #29: ci_remediation has its own templated prompt — embed
@@ -590,7 +606,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
         // Warn that PR creation is terminal — the engine reaps the worker
         // immediately after the PR is opened. Workers must finish everything
         // BEFORE opening the PR; no followup turn is possible.
-        prompt.push_str(&pr_terminal_directive());
+        prompt.push_str(&pr_terminal_directive(run_done_proposals_seam_enabled));
         // Issue #899: hand the worker the engine's CI-completion definition
         // so it stops once CI is effectively green rather than polling
         // forever on human-gated checks (e.g. LinkedIn's `Owner Approval`).
@@ -643,6 +659,12 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
             followup_proposals_seam_enabled,
         ));
     }
+    // Terminal run-done declaration — emitted for EVERY execution kind,
+    // unlike every other seam directive above. The kinds that never open a
+    // PR (reviews, triage, conflict resolutions, revisions) are exactly the
+    // ones whose ending the engine could otherwise only infer, so scoping
+    // this to PR-producing kinds would miss the cases it exists for.
+    prompt.push_str(&run_done_directive(run_done_proposals_seam_enabled));
     prompt.push_str("\nRespond with concise markdown using exactly these sections:\n");
     prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
     prompt
@@ -890,12 +912,27 @@ fn render_editorial_rules_block(
 /// findings as followup commits. The engine terminated the worker the moment
 /// the PR was created, so the review was never consumed. This universal
 /// guidance applies to every execution kind and prevents that pattern.
-fn pr_terminal_directive() -> String {
+/// `seam_enabled` mirrors `run_done_proposals_seam`. When on, this block
+/// gains one sentence resolving what would otherwise be a direct
+/// contradiction between two directives: this one says PR creation is the
+/// last thing you do, and [`run_done_directive`] asks for a declaration.
+/// Both are true — the declaration goes immediately BEFORE the push, since
+/// the push is what may reap the worker — but a worker left to reconcile
+/// them itself will reasonably conclude it cannot do both, and drop one.
+fn pr_terminal_directive(seam_enabled: bool) -> String {
     let mut out = String::new();
     out.push_str("\n## Important: PR creation is your terminal act\n\n");
     out.push_str(
         "Opening the PR is the LAST thing you do. The engine reaps you immediately after the PR is created.\n\n",
     );
+    if seam_enabled {
+        out.push_str(
+            "The one thing that comes after everything else and BEFORE the push is your run-done \
+             declaration (`boss propose done`, see below) — submit it, then open/update the PR. \
+             Doing it in that order is deliberate: the push can reap you, so a declaration you \
+             planned to make afterwards may never happen.\n\n",
+        );
+    }
     out.push_str("You will NOT get another turn after `gh pr create` / `cube pr create` (or `cube pr update` for an existing PR). Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR while background work (parallel/sub-agent runs, backgrounded builds, code reviews) is still in flight expecting to consume its results.\n\n");
     out.push_str("Therefore: finish everything — including consuming any review/self-review findings you started — BEFORE you open the PR. If a background review is still running and you care about its results, wait for it and address all findings FIRST, then open the PR. If you don't intend to wait, don't start the review.\n");
     out
@@ -1013,6 +1050,65 @@ pub(crate) fn worker_escalation_protocol_directive(seam_enabled: bool) -> String
      work when `boss propose` itself is down, so it carries both signal kinds rather than teaching \
      a second marker grammar back. Do not use it once `boss propose` has already succeeded for this \
      signal; it is a last resort, not a second channel.\n"
+        .to_string()
+}
+
+/// Terminal run-done declaration directive — the worker-facing half of the
+/// `run_done_proposals_seam` migration.
+///
+/// `seam_enabled` mirrors the feature flag the engine's read path reads
+/// (see [`crate::completion::WorkerCompletionHandler::evaluate_satisfied_deliverable_on_stop`]
+/// and [`crate::run_done_backstop`]), threaded here so the two halves move
+/// together: a worker must never be taught a verb the engine won't act on,
+/// and flipping the flag off must restore today's prompt exactly. With the
+/// seam off this contributes nothing at all.
+///
+/// Unlike every other seam directive, this one is emitted for **every**
+/// execution kind. That is the requirement it exists to meet: revisions, CI
+/// fixes, conflict resolutions and reviewer passes all terminate without
+/// creating anything the engine can point at, so they are precisely the runs
+/// whose ending was previously guessed at. A directive scoped to
+/// PR-producing kinds would leave the failing cases uncovered.
+///
+/// Two things the wording works hard at, both learned from the incidents
+/// this closes:
+///
+/// - **When to declare.** Opening or updating a PR can reap the worker
+///   immediately, so "declare afterwards" is advice a worker cannot follow.
+///   The declaration goes immediately *before* the terminal push.
+/// - **Not declaring is not a shortcut to being left alone.** A worker that
+///   reads "the engine waits for my declaration" as "so I can just stop"
+///   would swap one silent failure for another. The directive states the
+///   real consequence: the run is held, then asked, then parked for a human
+///   — visibly unresolved, never quietly successful.
+pub(crate) fn run_done_directive(seam_enabled: bool) -> String {
+    if !seam_enabled {
+        return String::new();
+    }
+    "\n## Declaring your run finished\n\n\
+     When your run is over, say so:\n\n\
+     ```\n\
+     boss propose done --outcome <delivered|no-changes-needed|blocked> --summary \"<one line>\"\n\
+     ```\n\n\
+     This is what ends your run. The engine does not decide it from the state of your PR — for a \
+     run dispatched against a PR that is already open and green, that state says nothing about \
+     whether you did anything, and reading it as \"finished\" is how mid-investigation runs used to \
+     get terminated with their work lost.\n\n\
+     Pick the outcome that is true:\n\n\
+     - `delivered` — the deliverable exists (you opened or pushed to the PR, wrote the review, \
+     posted the reply).\n\
+     - `no-changes-needed` — you verified there was nothing to produce. This replaces the \
+     `NO_CHANGES_NEEDED` marker; you do not need both.\n\
+     - `blocked` — you are stopping without delivering. File `boss propose blocked --reason \"...\"` \
+     alongside it so the blocker itself is recorded, not just the fact that you stopped.\n\n\
+     **Declare immediately BEFORE your terminal push**, not after: `cube pr create` / `cube pr \
+     update` can reap you the moment the PR moves, so a declaration you planned to make afterwards \
+     may never happen. Declaring first costs nothing if the push then fails — re-declare with the \
+     accurate outcome, the newest declaration wins.\n\n\
+     If you simply stop without declaring, you are not left alone: the engine holds the run open \
+     while it can see you working, then asks you once whether you are finished, then parks the run \
+     for a human with the outcome recorded as unknown. That is worse for you and for the human than \
+     one command.\n"
         .to_string()
 }
 

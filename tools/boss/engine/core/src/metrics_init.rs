@@ -282,15 +282,29 @@ mod tests {
             names.contains(&"completion.mid_turn_reap.total".to_owned()),
             "init_all must register completion.mid_turn_reap.total"
         );
+        // Run-done declaration gate + backstop counters. `gate_held` is the
+        // soak's primary signal (how often the declaration requirement
+        // refused an inference that would have finalized); the other two
+        // measure how far the hold had to escalate.
+        for expected in [
+            "run_done.gate_held",
+            "run_done.backstop_asked",
+            "run_done.backstop_parked",
+        ] {
+            assert!(
+                names.contains(&expected.to_owned()),
+                "init_all must register {expected}"
+            );
+        }
         assert_eq!(
             names.len(),
             100,
             "expected 6 answer_agent + 6 pr_url_capture + 4 worker_proposals fallback_hit + 3 cube_workspace_lease + \
              10 dispatcher + 15 merge_poller + 18 external_tracker + 2 speculative_conflict + \
              1 stacked_pr_structuring + 1 dispatch_metrics + 9 trunk_queue_poller + \
-             9 worker_proposals submit + 1 worker_proposals channel_error + \
+             10 worker_proposals submit + 1 worker_proposals channel_error + \
              5 github_api + 2 codex_unobserved_command + 2 codex_guard_trace + \
-             4 work_attachments + 1 completion mid_turn_reap + 1 nudge_ladder counters"
+             4 work_attachments + 1 completion mid_turn_reap + 1 nudge_ladder + 3 run_done counters"
         );
         // Phase 3: dep_unblock gauge, plus the queue-level dispatch gauges.
         let gauge_names: Vec<_> = registry.gauge_snapshots().into_iter().map(|s| s.name).collect();

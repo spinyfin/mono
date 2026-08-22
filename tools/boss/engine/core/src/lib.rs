@@ -148,6 +148,7 @@ pub mod remote_wrapper;
 pub mod repo_slug;
 pub mod resolution_signal_capture;
 pub mod rotating_file;
+pub mod run_done_backstop;
 pub mod run_reconcile;
 pub mod runner;
 pub mod settings;

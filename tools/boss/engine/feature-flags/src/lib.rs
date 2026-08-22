@@ -314,6 +314,27 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         capability_id: None,
     },
     FeatureFlagSpec {
+        name: "run_done_proposals_seam",
+        description: "Make run completion wait for the worker's own `boss propose done` declaration instead \
+             of inferring it from the bound PR's state (design: \
+             worker-proposal-api-replace-fragile-worker-to-engine-seams.md). Two effects. (1) The \
+             satisfied-deliverable gate's HEALTH-ALONE arm — 'the bound PR is open, mergeable and \
+             CI-clean, so the run must be finished' — additionally requires a run_done declaration. That \
+             predicate is trivially true at t=0 for any run dispatched against an existing open PR, which \
+             is why revisions were being finalized 78s in with nothing pushed; without a declaration the \
+             run is now held by run_done_backstop rather than terminalized. The merged / merge-queue / \
+             conflict-cleared arms are untouched: each is a real delta or proof the deliverable has left \
+             the worker's hands. (2) The NO_CHANGES_NEEDED terminal reads `run_done --outcome \
+             no_changes_needed` first, with the transcript marker demoted to a counted fallback \
+             (worker_proposals.fallback_hit.run_done), so the declaration also covers the kinds that never \
+             open a PR. DEFAULT OFF: enable per operator once the proposal path is validated in staging. \
+             Kill switch: set false to restore today's inference exactly — the gate stops asking for a \
+             declaration and the backstop never runs.",
+        category: "completion",
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
         name: "codex_sandbox_enforced",
         description: "Run Codex Standard/Triage/AnswerAgent workers under the OS-enforced `--sandbox \
              workspace-write` seatbelt instead of `--sandbox danger-full-access` (design: \

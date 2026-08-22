@@ -32,6 +32,7 @@ pub enum ProposalKind {
     FollowupTask,
     AutomationOutcome,
     PrCreated,
+    RunDone,
 }
 
 impl ProposalKind {
@@ -43,6 +44,7 @@ impl ProposalKind {
         ProposalKind::FollowupTask,
         ProposalKind::AutomationOutcome,
         ProposalKind::PrCreated,
+        ProposalKind::RunDone,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -54,6 +56,7 @@ impl ProposalKind {
             ProposalKind::FollowupTask => "followup_task",
             ProposalKind::AutomationOutcome => "automation_outcome",
             ProposalKind::PrCreated => "pr_created",
+            ProposalKind::RunDone => "run_done",
         }
     }
 }
@@ -75,9 +78,10 @@ impl std::str::FromStr for ProposalKind {
             "followup_task" => Ok(ProposalKind::FollowupTask),
             "automation_outcome" => Ok(ProposalKind::AutomationOutcome),
             "pr_created" => Ok(ProposalKind::PrCreated),
+            "run_done" => Ok(ProposalKind::RunDone),
             other => Err(format!(
                 "unknown proposal kind `{other}`; expected one of: attention, effort_escalation, \
-                 blocked, deferred_scope, followup_task, automation_outcome, pr_created"
+                 blocked, deferred_scope, followup_task, automation_outcome, pr_created, run_done"
             )),
         }
     }
@@ -335,6 +339,92 @@ pub struct PrCreatedProposalPayload {
     pub pr_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+}
+
+/// How a run ended, as the worker itself states it in a
+/// [`RunDoneProposalPayload`]. Closed vocabulary: the engine branches on
+/// this, so "some other thing happened" is not an option a worker gets to
+/// invent — an outcome the list cannot express is a `blocked` declaration
+/// plus prose, not a new variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunDoneOutcome {
+    /// The run produced its deliverable: a PR was opened or pushed to, a
+    /// review verdict was written, a comment reply was posted, a triage
+    /// outcome was declared. What "the deliverable" is varies by execution
+    /// kind; that the worker is finished does not.
+    Delivered,
+    /// The run verified there was nothing to produce — the change is
+    /// already on the base branch, the reviewer finding needs no code
+    /// change, the automation found a clean repo. The same claim the
+    /// `NO_CHANGES_NEEDED` marker makes, on the declaration channel.
+    NoChangesNeeded,
+    /// The run is over without delivering: the worker cannot proceed. This
+    /// is a *terminal* declaration, distinct from
+    /// [`ProposalKind::Blocked`], which pauses a run that is still live —
+    /// a worker that is stopping for good after being blocked declares
+    /// both, and the pair is what tells the engine "the blocker is why
+    /// this run is finished" rather than "wake me when it clears".
+    Blocked,
+}
+
+impl RunDoneOutcome {
+    pub const ALL: &'static [RunDoneOutcome] = &[
+        RunDoneOutcome::Delivered,
+        RunDoneOutcome::NoChangesNeeded,
+        RunDoneOutcome::Blocked,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunDoneOutcome::Delivered => "delivered",
+            RunDoneOutcome::NoChangesNeeded => "no_changes_needed",
+            RunDoneOutcome::Blocked => "blocked",
+        }
+    }
+}
+
+impl std::fmt::Display for RunDoneOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for RunDoneOutcome {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "delivered" => Ok(RunDoneOutcome::Delivered),
+            "no_changes_needed" => Ok(RunDoneOutcome::NoChangesNeeded),
+            "blocked" => Ok(RunDoneOutcome::Blocked),
+            other => Err(format!(
+                "unknown run-done outcome `{other}`; expected one of: delivered, \
+                 no_changes_needed, blocked"
+            )),
+        }
+    }
+}
+
+/// Payload for [`ProposalKind::RunDone`] — the worker's terminal
+/// declaration that its run is finished.
+///
+/// This is the one proposal kind that is meaningful for **every** execution
+/// kind, because it says nothing about a PR: a revision that pushed to its
+/// chain root's branch, a reviewer that wrote a verdict artifact, an
+/// answer-agent that posted a reply, and a triage pass that created a task
+/// all declare with the same verb. That universality is the point — the
+/// kinds that terminate without creating anything are exactly the ones the
+/// engine could previously only guess about.
+///
+/// `summary` is required prose (single line, no markdown structure
+/// expected): a human reading the stored row must be able to tell what the
+/// worker claims it did without opening the transcript. It is deliberately
+/// not optional — a bare "done" is the same information vacuum the
+/// declaration exists to fill.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunDoneProposalPayload {
+    pub outcome: RunDoneOutcome,
+    pub summary: String,
 }
 
 // ---------------------------------------------------------------------------

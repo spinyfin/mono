@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 use boss_protocol::{
     FrontendEvent, FrontendRequest, ProposalErrorCode, ProposalKind, ProposalState, ProposalSubmissionError,
-    WorkerProposal,
+    RunDoneOutcome, WorkerProposal,
 };
 use clap::{Args, Subcommand, ValueEnum};
 
@@ -123,6 +123,20 @@ pub(crate) enum ProposeCommand {
     /// Example: `boss propose pr-created --url
     /// https://github.com/o/r/pull/123`
     PrCreated(PrCreatedArgs),
+    /// Declare that this run is finished — your terminal statement to the
+    /// engine, and the only one that applies to every execution kind
+    /// (a revision, a reviewer pass, a CI fix and a chore all end the same
+    /// way even though only some of them open a PR).
+    ///
+    /// Submit it as the last thing you do, after the deliverable exists.
+    /// Until you do, the engine does not treat your run as finished: it
+    /// waits, quietly, rather than guessing from the PR's state — which is
+    /// what used to end runs that were still mid-investigation.
+    ///
+    /// Examples: `boss propose done --outcome delivered --summary "opened
+    /// the PR with the md5 crate swap"` / `boss propose done --outcome
+    /// no-changes-needed --summary "already on main; empty diff"`
+    Done(RunDoneArgs),
 }
 
 /// Shared `--idempotency-key` override, flattened into every kind's args.
@@ -277,6 +291,46 @@ pub(crate) struct PrCreatedArgs {
     common: IdempotencyArgs,
 }
 
+#[derive(Debug, Clone, Args)]
+pub(crate) struct RunDoneArgs {
+    /// How the run ended. `delivered` = the deliverable exists;
+    /// `no-changes-needed` = you verified there was nothing to produce;
+    /// `blocked` = you are stopping without delivering (file a
+    /// `boss propose blocked` alongside it so the blocker itself is
+    /// recorded).
+    #[arg(long, value_enum)]
+    outcome: RunDoneOutcomeArg,
+
+    /// One line saying what you actually did, for the human reading the
+    /// row later. Required — a bare "done" is the information vacuum this
+    /// declaration exists to fill.
+    #[arg(long)]
+    summary: String,
+
+    #[command(flatten)]
+    common: IdempotencyArgs,
+}
+
+/// CLI-local mirror of [`RunDoneOutcome`], for the same reason as
+/// [`ProposalKindArg`]. Note the kebab-case `--outcome no-changes-needed`
+/// spelling clap derives; the wire value stays `no_changes_needed`.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub(crate) enum RunDoneOutcomeArg {
+    Delivered,
+    NoChangesNeeded,
+    Blocked,
+}
+
+impl From<RunDoneOutcomeArg> for RunDoneOutcome {
+    fn from(value: RunDoneOutcomeArg) -> Self {
+        match value {
+            RunDoneOutcomeArg::Delivered => RunDoneOutcome::Delivered,
+            RunDoneOutcomeArg::NoChangesNeeded => RunDoneOutcome::NoChangesNeeded,
+            RunDoneOutcomeArg::Blocked => RunDoneOutcome::Blocked,
+        }
+    }
+}
+
 /// CLI-local mirror of [`ProposalKind`] so `--kind` gets enumerated
 /// `--help` output and shell completion (clap's `ValueEnum` can't be
 /// implemented directly on the protocol type — neither it nor `ValueEnum`
@@ -290,6 +344,7 @@ pub(crate) enum ProposalKindArg {
     FollowupTask,
     AutomationOutcome,
     PrCreated,
+    RunDone,
 }
 
 impl From<ProposalKindArg> for ProposalKind {
@@ -302,6 +357,7 @@ impl From<ProposalKindArg> for ProposalKind {
             ProposalKindArg::FollowupTask => ProposalKind::FollowupTask,
             ProposalKindArg::AutomationOutcome => ProposalKind::AutomationOutcome,
             ProposalKindArg::PrCreated => ProposalKind::PrCreated,
+            ProposalKindArg::RunDone => ProposalKind::RunDone,
         }
     }
 }
@@ -405,7 +461,7 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
     use boss_protocol::{
         AttentionProposalPayload, AutomationOutcomeProposalPayload, BlockedProposalPayload,
         DeferredScopeProposalPayload, EffortEscalationProposalPayload, EffortLevel, FollowupTaskProposalPayload,
-        PrCreatedProposalPayload,
+        PrCreatedProposalPayload, RunDoneProposalPayload,
     };
 
     Ok(match command {
@@ -484,6 +540,15 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
             serde_json::to_value(PrCreatedProposalPayload {
                 pr_url: args.url,
                 branch: args.branch,
+            })
+            .map_err(CliError::internal)?,
+            args.common.idempotency_key,
+        ),
+        ProposeCommand::Done(args) => (
+            ProposalKind::RunDone,
+            serde_json::to_value(RunDoneProposalPayload {
+                outcome: RunDoneOutcome::from(args.outcome),
+                summary: args.summary,
             })
             .map_err(CliError::internal)?,
             args.common.idempotency_key,
@@ -618,6 +683,8 @@ fn flag_hint_for_field(kind: ProposalKind, field: &str) -> Option<&'static str> 
         (ProposalKind::AutomationOutcome, "reason") => Some("--reason"),
         (ProposalKind::PrCreated, "pr_url") => Some("--url"),
         (ProposalKind::PrCreated, "branch") => Some("--branch"),
+        (ProposalKind::RunDone, "outcome") => Some("--outcome"),
+        (ProposalKind::RunDone, "summary") => Some("--summary"),
         _ => None,
     }
 }

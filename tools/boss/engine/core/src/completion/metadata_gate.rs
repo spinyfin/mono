@@ -176,6 +176,25 @@ impl WorkerCompletionHandler {
         )
     }
 
+    /// Compatibility adapter for callers that only need to know whether the
+    /// satisfied-deliverable gate finalized this Stop boundary.
+    #[cfg(test)]
+    pub(super) async fn try_finalize_satisfied_deliverable_on_stop(
+        &self,
+        execution_id: &str,
+        execution: &crate::work::WorkExecution,
+        bound_pr_url: &str,
+        contribution: ContributionEvidence,
+    ) -> Option<StopOutcome> {
+        match self
+            .evaluate_satisfied_deliverable_on_stop(execution_id, execution, bound_pr_url, contribution)
+            .await
+        {
+            SatisfiedDeliverableOutcome::Finalized(outcome) => Some(outcome),
+            SatisfiedDeliverableOutcome::AwaitingDeclaration | SatisfiedDeliverableOutcome::NotSatisfied => None,
+        }
+    }
+
     /// Deliverable-satisfied finalization gate (zombie-worker / "nothing
     /// left to do" loop fix).
     ///
@@ -210,13 +229,25 @@ impl WorkerCompletionHandler {
     /// workers that still need reconciliation — the exact race rolled back
     /// in #1262. The `on_stop` path is safe because the Stop hook fires
     /// only when the worker completed a turn (real activity, not a crash).
-    pub(super) async fn try_finalize_satisfied_deliverable_on_stop(
+    ///
+    /// Return shape: this method used to return `Option<StopOutcome>`, and
+    /// was widened to [`SatisfiedDeliverableOutcome`] rather than wrapped,
+    /// because `None` now has to mean two different things to the caller.
+    /// "The PR looks satisfied and the only thing missing is the worker's
+    /// own declaration" demands a different response from "the PR is not
+    /// satisfied": the first goes to [`crate::run_done_backstop`], which
+    /// holds quietly, while the second falls through to the ordinary nudge,
+    /// still the right answer for a PR with failing CI or an unresolved
+    /// conflict. Collapsing them — as the `Option` form must — would put an
+    /// undeclared run straight into the nudge loop, which is precisely the
+    /// treatment a mid-investigation worker must not get.
+    pub(super) async fn evaluate_satisfied_deliverable_on_stop(
         &self,
         execution_id: &str,
         execution: &crate::work::WorkExecution,
         bound_pr_url: &str,
         contribution: ContributionEvidence,
-    ) -> Option<StopOutcome> {
+    ) -> SatisfiedDeliverableOutcome {
         let probe = match self.merge_probe.probe(bound_pr_url).await {
             Ok(p) => p,
             Err(err) => {
@@ -226,7 +257,7 @@ impl WorkerCompletionHandler {
                     ?err,
                     "satisfied-deliverable gate: PR probe failed; falling through to nudge"
                 );
-                return None;
+                return SatisfiedDeliverableOutcome::NotSatisfied;
             }
         };
 
@@ -269,6 +300,76 @@ impl WorkerCompletionHandler {
         // them apart.
         let health_alone_satisfies = health_alone_satisfies_deliverable(&execution.kind, contribution);
 
+        // Whether the health-alone arm may carry the finalize decision
+        // *at all* for this run, on top of `health_alone_satisfies`'s
+        // per-kind evidence question. With `run_done_proposals_seam` on,
+        // it may not until the worker has said so itself.
+        //
+        // Scoped to the health-alone arm deliberately. The merged,
+        // merge-queue and conflict-cleared arms below are untouched by this
+        // gate, because each of them is a real state change or proof the
+        // deliverable has passed out of the worker's hands — waiting for a
+        // declaration there would hang a run over a PR that has already
+        // merged, which no declaration can un-merge. It is only the
+        // "open + mergeable + CI clean" predicate that is trivially true
+        // for a run dispatched into an already-healthy PR, and therefore
+        // only that one that needs the worker to distinguish "delivered"
+        // from "has not started".
+        //
+        // Only `delivered` satisfies the arm — not merely "some declaration
+        // exists". The other two outcomes are the worker actively
+        // contradicting the reading it would take:
+        //
+        // - `no_changes_needed` says the run produced nothing, so
+        //   finalizing it as a delivery would advance the work item on a
+        //   claim of the opposite, and skip the no-op terminal whose whole
+        //   job is to file the attention that makes an unaddressed finding
+        //   visible.
+        // - `blocked` says the run stopped without delivering. Reading a
+        //   healthy PR over that would be the original bug committed with
+        //   the worker's own words available and ignored.
+        //
+        // Hence two booleans rather than one. `declared_delivered` gates the
+        // health-alone arm; `declared_at_all` is what separates the two
+        // ways of not satisfying it — a run that said nothing goes to the
+        // backstop (`AwaitingDeclaration`), a run that declared a
+        // non-delivery outcome does not (it already answered; there is
+        // nothing to wait for) and instead falls through as `NotSatisfied`
+        // to the paths that handle those claims: the no-op terminal reads a
+        // `no_changes_needed` declaration directly, and a `blocked` run's
+        // companion `blocked` proposal already suppresses the nudge loop.
+        //
+        // Both booleans are read only by the health-alone arm, so the
+        // merged / merge-queue / conflict-cleared arms stay reachable for a
+        // run whose declaration was `no_changes_needed` or `blocked` — a PR
+        // that merged after the worker gave up still finalizes to `done`.
+        let declaration_required = self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("run_done_proposals_seam");
+        let (declared_delivered, declared_at_all) = if declaration_required {
+            match self.work_db.execution_run_done_outcome(execution_id) {
+                Ok(outcome) => (
+                    outcome == Some(boss_protocol::RunDoneOutcome::Delivered),
+                    outcome.is_some(),
+                ),
+                Err(err) => {
+                    // Fails OPEN, matching every other proposals-first read
+                    // in this subsystem: a storage error must not be able to
+                    // hold a finished run open forever. The legacy inference
+                    // carries the decision for this Stop and the WARN says
+                    // it did.
+                    tracing::warn!(
+                        execution_id,
+                        ?err,
+                        "run_done gate: declaration lookup failed; allowing the legacy health-alone \
+                         inference to carry this Stop rather than holding the run open",
+                    );
+                    (true, true)
+                }
+            }
+        } else {
+            (true, true)
+        };
+
         let inner = match probe.state {
             PrLifecycleState::Merged => {
                 tracing::info!(
@@ -288,7 +389,9 @@ impl WorkerCompletionHandler {
                 if mergeability_satisfies_deliverable(open.mergeability, merge_conflict_revision)
                     && (merge_conflict_revision
                         || queued_for_merge
-                        || (matches!(open.ci, OpenPrCiStatus::Clean) && health_alone_satisfies)) =>
+                        || (matches!(open.ci, OpenPrCiStatus::Clean)
+                            && health_alone_satisfies
+                            && declared_delivered)) =>
             {
                 // A health-alone finalize with no SHA baseline rests on a
                 // precondition nothing verified — say so at WARN rather
@@ -334,6 +437,50 @@ impl WorkerCompletionHandler {
                 )
                 .await
             }
+            // Refused on the missing DECLARATION: the PR is open,
+            // mergeable and CI-clean, and (unlike the arm below) nothing
+            // contradicts the idea that this run delivered — but the run
+            // has not said so, and the engine no longer says it on the
+            // worker's behalf.
+            //
+            // Not a nudge and not a finalize: this returns
+            // `AwaitingDeclaration`, which the caller routes to
+            // [`crate::run_done_backstop`]. That is the whole behavioural
+            // change — the state the incident's revisions were in when the
+            // engine terminalized them 78 seconds in now holds the run
+            // open, quietly, until either a declaration arrives or the
+            // backstop's silence horizon says nobody is home.
+            //
+            // Reachable only when the CI-clean/health-alone predicate is
+            // what would have satisfied the gate: the `merge_conflict_revision`
+            // and `queued_for_merge` arms above match first and are
+            // deliberately exempt from the declaration requirement.
+            //
+            // `!declared_at_all`, not `!declared_delivered`: a run that
+            // declared `no_changes_needed` or `blocked` has answered the
+            // question this arm would wait on. Sending it to the backstop
+            // would hold it for an answer it already gave, so it skips this
+            // arm and falls through as `NotSatisfied` to the paths that
+            // handle those claims.
+            PrLifecycleState::Open(ref open)
+                if !declared_at_all
+                    && health_alone_satisfies
+                    && mergeability_satisfies_deliverable(open.mergeability, merge_conflict_revision)
+                    && matches!(open.ci, OpenPrCiStatus::Clean) =>
+            {
+                RUN_DONE_GATE_HELD.inc(&self.metrics);
+                tracing::info!(
+                    execution_id,
+                    bound_pr_url,
+                    kind = %execution.kind,
+                    ci_status = ?open.ci,
+                    ?contribution,
+                    "satisfied-deliverable gate: bound PR is open, mergeable and CI-clean, but this \
+                     run has not declared itself done (`boss propose done`) — holding instead of \
+                     finalizing on the PR's state, which is what this run was dispatched into"
+                );
+                return SatisfiedDeliverableOutcome::AwaitingDeclaration;
+            }
             // Refused on EVIDENCE, not on the PR being unhealthy: the PR
             // is open, mergeable and CI-clean, but that is precisely the
             // state this revision was dispatched into and the SHA-delta
@@ -358,7 +505,7 @@ impl WorkerCompletionHandler {
                      contributed nothing; falling through to the nudge/park path, which suppresses \
                      for a worker still doing background work and otherwise bounds itself"
                 );
-                return None;
+                return SatisfiedDeliverableOutcome::NotSatisfied;
             }
             _ => {
                 tracing::debug!(
@@ -367,7 +514,7 @@ impl WorkerCompletionHandler {
                     state = ?probe.state,
                     "satisfied-deliverable gate: PR not yet satisfied (CI in-flight / failing / conflict); falling through to nudge"
                 );
-                return None;
+                return SatisfiedDeliverableOutcome::NotSatisfied;
             }
         };
 
@@ -376,12 +523,209 @@ impl WorkerCompletionHandler {
         // ReviewerEnqueued is also a successful finalization — the PR
         // advanced to InReview and a reviewer pass was triggered; the
         // deliverable is still satisfied.
-        Some(match inner {
+        SatisfiedDeliverableOutcome::Finalized(match inner {
             StopOutcome::PrDetected { pr_url }
             | StopOutcome::PrMerged { pr_url }
             | StopOutcome::ReviewerEnqueued { pr_url } => StopOutcome::DeliverableSatisfied { pr_url },
             other => other,
         })
+    }
+
+    /// Run the run-done backstop for an execution whose Stop reached
+    /// [`SatisfiedDeliverableOutcome::AwaitingDeclaration`]: the bound PR
+    /// looks satisfied but the worker has not declared its run finished.
+    ///
+    /// See [`crate::run_done_backstop`] for the full argument. In short:
+    /// hold quietly while the worker shows life or the silence horizon has
+    /// not elapsed, then ask (bounded by the existing circuit breaker),
+    /// then — when the ask goes unanswered and the breaker parks the run —
+    /// stamp `run_undeclared_at` and file a distinct attention so the
+    /// ending is legible as "we never found out" rather than as a success.
+    ///
+    /// Never finalizes and never reaps. The only terminal-ish outcome it
+    /// can reach is a park, which leaves the execution `waiting_human` for
+    /// a human to redirect or re-dispatch.
+    pub(super) async fn await_run_done_declaration(
+        &self,
+        execution: &crate::work::WorkExecution,
+        bound_pr_url: &str,
+    ) -> StopOutcome {
+        let descendant_count = match self
+            .background_activity_probe
+            .live_delegated_descendant_count(&execution.id)
+        {
+            Ok(count) => count,
+            Err(reason) => {
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    %reason,
+                    "run_done backstop: background-child probe indeterminate — treating as no live descendants"
+                );
+                0
+            }
+        };
+        let decision = crate::run_done_backstop::decide(
+            &self.run_done_silence_tracker,
+            &execution.id,
+            &execution.kind,
+            descendant_count,
+            boss_engine_utils::epoch_time::now_epoch_secs(),
+        );
+        match decision {
+            crate::run_done_backstop::BackstopDecision::HoldingWorkerActive { descendant_count } => {
+                tracing::info!(
+                    execution_id = %execution.id,
+                    bound_pr_url,
+                    descendant_count,
+                    "run_done backstop: no declaration yet, but the worker's process tree still has \
+                     live descendants — it is working, not stalled. Holding quietly (no probe, no \
+                     breaker, no finalize)",
+                );
+                StopOutcome::AwaitingRunDoneDeclaration {
+                    reason: format!("worker has {descendant_count} live background child process(es)"),
+                }
+            }
+            crate::run_done_backstop::BackstopDecision::HoldingWithinHorizon {
+                waited_secs,
+                horizon_secs,
+            } => {
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    bound_pr_url,
+                    waited_secs,
+                    horizon_secs,
+                    kind = %execution.kind,
+                    "run_done backstop: no declaration yet and no sign of activity, but within the \
+                     silence horizon — holding quietly",
+                );
+                StopOutcome::AwaitingRunDoneDeclaration {
+                    reason: format!("silent for {waited_secs}s of a {horizon_secs}s declaration horizon"),
+                }
+            }
+            crate::run_done_backstop::BackstopDecision::Ask {
+                waited_secs,
+                horizon_secs,
+            } => {
+                RUN_DONE_BACKSTOP_ASKED.inc(&self.metrics);
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    bound_pr_url,
+                    waited_secs,
+                    horizon_secs,
+                    kind = %execution.kind,
+                    "run_done backstop: silence horizon elapsed with no `boss propose done` \
+                     declaration and no sign of worker activity — asking the worker whether it is \
+                     finished",
+                );
+                // The fingerprint is keyed on the *question*, not on any PR
+                // state, so the breaker counts "asks that changed nothing"
+                // — which is exactly the unproductive thing here. Keying it
+                // on the PR URL (as the push-to-existing nudge does) would
+                // collide with that nudge's own fingerprint and let one
+                // path's asks consume the other's cap.
+                let outcome = self
+                    .nudge_or_park(
+                        execution,
+                        crate::run_done_backstop::PROBE_DECLARE_DONE,
+                        &format!("run_done_undeclared:{}", execution.id),
+                        Some(bound_pr_url),
+                        StopOutcome::AwaitingRunDoneDeclaration {
+                            reason: format!("asked for a declaration after {waited_secs}s of silence"),
+                        },
+                    )
+                    .await;
+                match outcome {
+                    StopOutcome::NudgeBreakerParked { reason } => {
+                        self.record_run_undeclared_park(execution, bound_pr_url, waited_secs, &reason)
+                            .await;
+                        StopOutcome::RunUndeclaredParked { reason, waited_secs }
+                    }
+                    other => other,
+                }
+            }
+        }
+    }
+
+    /// Stamp and surface a park that happened because a run never declared
+    /// itself done.
+    ///
+    /// Two records, because the requirement is that this ending be
+    /// distinguishable from a declared one *both* in stored state and to a
+    /// human looking at the row:
+    ///
+    /// - `work_executions.run_undeclared_at` — the durable, queryable half.
+    ///   A declared run has `run_done_declared_at`/`run_done_outcome` set
+    ///   and this NULL; a backstopped run the reverse. Neither is inferred
+    ///   from the absence of the other.
+    /// - a [`RUN_UNDECLARED_ATTENTION_KIND`] attention — the human half,
+    ///   distinct from the nudge-breaker item the park itself files
+    ///   because "we never found out whether this run finished" is a
+    ///   different thing to tell someone than "we asked and nothing
+    ///   changed".
+    ///
+    /// Both are best-effort: a failure here must not turn a park into an
+    /// unhandled error, but it is logged loudly, because a park whose
+    /// provenance was not recorded is exactly the silent ending this
+    /// design exists to eliminate.
+    async fn record_run_undeclared_park(
+        &self,
+        execution: &crate::work::WorkExecution,
+        bound_pr_url: &str,
+        waited_secs: i64,
+        park_reason: &str,
+    ) {
+        RUN_DONE_BACKSTOP_PARKED.inc(&self.metrics);
+        if let Err(err) = self.work_db.mark_execution_run_undeclared(&execution.id) {
+            tracing::error!(
+                execution_id = %execution.id,
+                ?err,
+                "run_done backstop: failed to stamp run_undeclared_at — this park will be \
+                 indistinguishable in stored state from a declared completion",
+            );
+        }
+        let already_filed = self
+            .work_db
+            .list_attention_items(&execution.id)
+            .map(|items| {
+                items
+                    .iter()
+                    .any(|i| i.kind == RUN_UNDECLARED_ATTENTION_KIND && i.status != "resolved")
+            })
+            .unwrap_or(false);
+        if already_filed {
+            return;
+        }
+        let body = format!(
+            "This run ended without the worker ever declaring it finished.\n\n\
+             - execution: `{execution_id}`\n\
+             - work item: `{work_item_id}`\n\
+             - bound PR: {bound_pr_url}\n\
+             - silent for: {waited_secs}s before the engine asked\n\n\
+             The engine asked the worker to run `boss propose done` and got no declaration back \
+             before the auto-nudge breaker tripped ({park_reason}).\n\n\
+             **This is NOT a completion.** The run is parked, not `completed`, precisely because \
+             nobody established that it finished: the bound PR's state cannot answer that question \
+             for a run dispatched into an already-open PR, and the engine no longer pretends \
+             otherwise. Decide what actually happened — read the transcript, check whether the PR \
+             carries this run's work — and either re-dispatch or close it by hand.",
+            execution_id = execution.id,
+            work_item_id = execution.work_item_id,
+        );
+        if let Err(err) = self
+            .file_execution_attention(
+                execution,
+                RUN_UNDECLARED_ATTENTION_KIND,
+                "Run ended without declaring itself done",
+                body,
+            )
+            .await
+        {
+            tracing::warn!(
+                execution_id = %execution.id,
+                ?err,
+                "run_done backstop: failed to file the undeclared-run attention item (non-fatal)",
+            );
+        }
     }
 
     /// Evaluate the resume-bounce SHA-delta gate. The gate uses the
