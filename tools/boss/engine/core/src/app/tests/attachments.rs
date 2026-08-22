@@ -102,6 +102,9 @@ impl AttachFixture {
         match req {
             r @ FrontendRequest::SubmitAttachment { .. } => attachments::handle_submit_attachment(ctx, r).await,
             r @ FrontendRequest::ListAttachments { .. } => attachments::handle_list_attachments(ctx, r).await,
+            r @ FrontendRequest::ListAttachmentsForWorkItem { .. } => {
+                attachments::handle_list_attachments_for_work_item(ctx, r).await
+            }
             other => panic!("not an attachment verb: {other:?}"),
         }
         sink.close();
@@ -301,6 +304,120 @@ async fn lists_the_work_items_evidence_across_runs() {
         } => {
             assert_eq!(work_item_id, fixture.work_item_id);
             assert_eq!(attachments.len(), 2);
+        }
+        other => panic!("expected AttachmentsList, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn app_facing_list_reads_a_named_work_item_with_no_peer_attribution() {
+    let fixture = AttachFixture::new();
+    let png = fixture.write_png(&fixture.workspace, "shot.png", 50, 50);
+    expect_stored(fixture.attach(&png, Some("app view")).await);
+
+    // No local peer at all — the app is not a registered worker run, so
+    // this verb must not depend on peer attribution the way `ListAttachments`
+    // does.
+    let response = fixture
+        .call(
+            None,
+            FrontendRequest::ListAttachmentsForWorkItem {
+                work_item_id: fixture.work_item_id.clone(),
+                include_revision_chain: false,
+            },
+        )
+        .await;
+
+    match response {
+        FrontendEvent::AttachmentsList {
+            work_item_id,
+            attachments,
+            ..
+        } => {
+            assert_eq!(work_item_id, fixture.work_item_id);
+            assert_eq!(attachments.len(), 1);
+            assert_eq!(attachments[0].caption, "app view");
+        }
+        other => panic!("expected AttachmentsList, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn app_facing_list_with_revision_chain_includes_a_revisions_own_attachments() {
+    let fixture = AttachFixture::new();
+    let root_png = fixture.write_png(&fixture.workspace, "root.png", 40, 40);
+    expect_stored(fixture.attach(&root_png, Some("root evidence")).await);
+
+    let db = &fixture.server_state.work_db;
+    let revision_id = "task_revision_app_list_test";
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id)
+             SELECT ?1, product_id, 'revision', 'R1', '', 'todo', '1700000000', '1700000000', ?2
+             FROM tasks WHERE id = ?2",
+            rusqlite::params![revision_id, fixture.work_item_id],
+        )
+        .unwrap();
+    }
+    let revision_execution = crate::test_support::create_ready_chore_execution(db, revision_id);
+    let revision_image = boss_engine_attachments::IngestedImage {
+        content_digest: "revision-digest".to_owned(),
+        media_type: boss_protocol::AttachmentMediaType::Png,
+        pixel_width: 20,
+        pixel_height: 20,
+        size_bytes: 256,
+        source_name: "revision.png".to_owned(),
+    };
+    db.submit_work_attachment(crate::work::SubmitAttachmentInput {
+        execution_id: &revision_execution.id,
+        work_item_id: revision_id,
+        image: &revision_image,
+        caption: "revision evidence",
+    })
+    .unwrap()
+    .unwrap();
+
+    // Without the chain flag, only the named work item's own attachments come back.
+    let scoped = fixture
+        .call(
+            None,
+            FrontendRequest::ListAttachmentsForWorkItem {
+                work_item_id: fixture.work_item_id.clone(),
+                include_revision_chain: false,
+            },
+        )
+        .await;
+    match scoped {
+        FrontendEvent::AttachmentsList { attachments, .. } => {
+            assert_eq!(
+                attachments.len(),
+                1,
+                "must not include the revision's evidence when unscoped"
+            );
+        }
+        other => panic!("expected AttachmentsList, got {other:?}"),
+    }
+
+    // With the chain flag, the revision's own evidence joins the root's.
+    let chained = fixture
+        .call(
+            None,
+            FrontendRequest::ListAttachmentsForWorkItem {
+                work_item_id: fixture.work_item_id.clone(),
+                include_revision_chain: true,
+            },
+        )
+        .await;
+    match chained {
+        FrontendEvent::AttachmentsList {
+            work_item_id,
+            attachments,
+            ..
+        } => {
+            assert_eq!(work_item_id, fixture.work_item_id);
+            assert_eq!(attachments.len(), 2);
+            assert!(attachments.iter().any(|a| a.work_item_id == revision_id));
         }
         other => panic!("expected AttachmentsList, got {other:?}"),
     }

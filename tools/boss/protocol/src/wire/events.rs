@@ -973,11 +973,16 @@ pub enum FrontendEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         evidence_base_url: Option<String>,
     },
-    /// Response to [`FrontendRequest::ListAttachments`]: every attachment
-    /// filed against `work_item_id` across all its executions, newest first,
-    /// including reclaimed tombstones (so a stale local gallery link has an
-    /// explanation rather than a mystery). `evidence_base_url` carries the
-    /// same meaning as on [`Self::AttachmentStored`].
+    /// Response to [`FrontendRequest::ListAttachments`] (worker-tier) and
+    /// [`FrontendRequest::ListAttachmentsForWorkItem`] (app-tier): every
+    /// attachment filed against `work_item_id` across all its executions,
+    /// newest first, including reclaimed tombstones (so a stale local
+    /// gallery link has an explanation rather than a mystery).
+    /// `evidence_base_url` carries the same meaning as on
+    /// [`Self::AttachmentStored`], but is only ever populated on the
+    /// worker-tier reply — the app tier reads attachment bytes directly off
+    /// disk and always sends `None` here, deliberately never minting a
+    /// loopback URL for the app to follow.
     AttachmentsList {
         work_item_id: String,
         attachments: Vec<WorkAttachment>,

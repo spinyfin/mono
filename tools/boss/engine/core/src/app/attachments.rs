@@ -287,3 +287,62 @@ pub(super) async fn handle_list_attachments(ctx: Dispatch, req: FrontendRequest)
         }
     }
 }
+
+/// App-facing counterpart of [`handle_list_attachments`]: reads every
+/// attachment for a caller-named `work_item_id` rather than resolving the
+/// scope from the socket peer. The app is not a registered worker run, so
+/// `attribute_caller` would fail `AttributionUnresolved` here — this verb
+/// exists precisely because that path doesn't work for it, mirroring
+/// `handle_list_executions`.
+pub(super) async fn handle_list_attachments_for_work_item(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::ListAttachmentsForWorkItem {
+        work_item_id,
+        include_revision_chain,
+    } = req
+    else {
+        unreachable!()
+    };
+    let work_item_id = match server_state.resolve_work_item_id(&work_item_id).await {
+        Ok(id) => id,
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+            return;
+        }
+    };
+    let result = if include_revision_chain {
+        work_db.list_work_attachments_for_chain(&work_item_id)
+    } else {
+        work_db.list_work_attachments_for_work_item(&work_item_id)
+    };
+    match result {
+        Ok(attachments) => send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::AttachmentsList {
+                work_item_id,
+                attachments,
+                // The app tier reads attachment bytes straight off disk
+                // (see AttachmentBlobPaths in the macOS app) and never reads
+                // this field, so this app-facing verb deliberately does not
+                // mint a loopback evidence URL — only the worker-facing
+                // handle_list_attachments above does.
+                evidence_base_url: None,
+            },
+        ),
+        Err(err) => {
+            tracing::error!(
+                work_item_id = %work_item_id,
+                ?err,
+                "list_attachments_for_work_item failed to read",
+            );
+            send_work_error(&sink, &request_id, &err);
+        }
+    }
+}

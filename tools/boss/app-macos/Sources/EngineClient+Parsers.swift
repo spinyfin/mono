@@ -243,6 +243,7 @@ extension EngineClient {
             revisionSeq: (payload["revision_seq"] as? NSNumber)?.intValue,
             revisionParentPrUrl: payload["revision_parent_pr_url"] as? String,
             hasInProgressRevision: (payload["has_in_progress_revision"] as? Bool) ?? false,
+            hasAttachments: (payload["has_attachments"] as? Bool) ?? false,
             effortLevel: (payload["effort_level"] as? String)
                 .flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 },
             reasoning: (payload["reasoning"] as? String)
@@ -722,6 +723,36 @@ extension EngineClient {
             runId: payload["run_id"] as? String,
             startedAt: payload["started_at"] as? String,
             endedAt: payload["ended_at"] as? String
+        )
+    }
+
+    /// Decode one wire `WorkAttachment` row (screenshot evidence).
+    func parseAttachmentVM(_ payload: [String: Any]) -> AttachmentVM? {
+        guard let id = payload["id"] as? String,
+              !id.isEmpty,
+              let executionId = payload["execution_id"] as? String,
+              let workItemId = payload["work_item_id"] as? String,
+              !workItemId.isEmpty,
+              let contentDigest = payload["content_digest"] as? String,
+              let createdAt = payload["created_at"] as? String,
+              let mediaType = payload["media_type"] as? String,
+              let sourceName = payload["source_name"] as? String
+        else {
+            return nil
+        }
+        return AttachmentVM(
+            id: id,
+            executionId: executionId,
+            workItemId: workItemId,
+            caption: (payload["caption"] as? String) ?? "",
+            contentDigest: contentDigest,
+            createdAt: createdAt,
+            mediaType: mediaType,
+            pixelWidth: (payload["pixel_width"] as? NSNumber)?.intValue ?? 0,
+            pixelHeight: (payload["pixel_height"] as? NSNumber)?.intValue ?? 0,
+            sizeBytes: (payload["size_bytes"] as? NSNumber)?.int64Value ?? 0,
+            sourceName: sourceName,
+            reclaimedAt: payload["reclaimed_at"] as? String
         )
     }
 

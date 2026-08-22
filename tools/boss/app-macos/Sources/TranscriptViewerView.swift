@@ -1,5 +1,79 @@
 import SwiftUI
 
+// ===========================================================================
+// Shared revision-chain grouping algorithm for [[TranscriptViewerView]] and
+// [[AttachmentViewerView]]: both group a flat list of chain-scoped rows
+// (executions, attachments) by the task that owns them, labelled "Original"
+// / "R<seq>" / "Revision". Extracted so the two viewers over the same chain
+// structurally cannot disagree about labelling — see AttachmentViewerView's
+// header doc comment.
+// ===========================================================================
+
+/// Conformance required to run [[revisionChainGroups(_:rootTaskId:)]] over a
+/// flat list of chain-scoped rows.
+protocol RevisionChainItem: Identifiable {
+    /// The task/chore id this row is filed under — the chain root's id for
+    /// rows contributed before any revision, or a revision task's own id.
+    var workItemId: String { get }
+}
+
+/// One task's worth of chain-scoped rows, labelled for display. Generic
+/// replacement for the former `ExecutionGroup` / `AttachmentGroup` pair.
+struct RevisionChainGroup<Item: RevisionChainItem>: Identifiable {
+    let taskId: String
+    /// Human-readable label: "Original" for the chain root, "R1", "R2", …
+    /// for revision tasks in sequence order, or "" when the whole list is
+    /// from the chain root (the common pre-revision case — callers should
+    /// render an unlabelled section in that case).
+    let label: String
+    let items: [Item]
+
+    var id: String { taskId }
+}
+
+/// Groups `items` by `workItemId`, ordered root-first then by revision
+/// sequence, and labelled "Original" / "R<seq>" / "Revision". Returns a
+/// single unnamed group when every item is from `rootTaskId` itself.
+func revisionChainGroups<Item: RevisionChainItem>(
+    _ items: [Item],
+    rootTaskId: String,
+    revisions: [WorkTask]
+) -> [RevisionChainGroup<Item>] {
+    guard !items.isEmpty else { return [] }
+
+    // Partition by workItemId while preserving the chronological order
+    // within each bucket. The chain root's rows always go first; revision
+    // buckets follow in revisionSeq order.
+    var byTask: [String: [Item]] = [:]
+    for item in items {
+        byTask[item.workItemId, default: []].append(item)
+    }
+
+    // Build the ordered task list: root first, then revisions by seq.
+    var orderedTaskIds: [String] = [rootTaskId]
+    orderedTaskIds.append(contentsOf: revisions.map { $0.id })
+    // Append any task ids not covered above (defensive, shouldn't happen).
+    for taskId in byTask.keys where !orderedTaskIds.contains(taskId) {
+        orderedTaskIds.append(taskId)
+    }
+
+    let hasRevisionItems = orderedTaskIds.dropFirst().contains {
+        byTask[$0] != nil
+    }
+
+    return orderedTaskIds.compactMap { taskId -> RevisionChainGroup<Item>? in
+        guard let rows = byTask[taskId], !rows.isEmpty else { return nil }
+        let label: String
+        if taskId == rootTaskId {
+            label = hasRevisionItems ? "Original" : ""
+        } else {
+            let seq = revisions.first(where: { $0.id == taskId })?.revisionSeq
+            label = seq.map { "R\($0)" } ?? "Revision"
+        }
+        return RevisionChainGroup(taskId: taskId, label: label, items: rows)
+    }
+}
+
 // MARK: - ExecutionRow
 
 /// Renders one row of the transcript viewer's execution list.
@@ -92,19 +166,6 @@ struct ExecutionRow: View {
     }
 }
 
-// MARK: - ExecutionGroup
-
-/// One task's worth of executions, labelled for the revision-chain picker.
-struct ExecutionGroup: Identifiable {
-    let taskId: String
-    /// Human-readable label: "Original" for the chain root, "R1", "R2", …
-    /// for revision tasks in sequence order.
-    let label: String
-    let executions: [ExecutionVM]
-
-    var id: String { taskId }
-}
-
 // MARK: - TranscriptViewerView
 
 /// Master/detail transcript viewer: execution list on the left, transcript
@@ -121,48 +182,23 @@ struct TranscriptViewerView: View {
     }
 
     private var isLoading: Bool {
-        chatModel.executionsByTaskID[ref.taskId] == nil
+        chatModel.executionsByTaskID[ref.taskId] == nil && loadFailureReason == nil
+    }
+
+    private var loadFailureReason: String? {
+        chatModel.executionsLoadFailureByTaskID[ref.taskId]
     }
 
     /// Executions grouped by task. Returns a single unnamed group when the
     /// list is entirely from the chain root (the common pre-revision case),
     /// and multiple labelled groups when revisions contributed executions.
-    private var executionGroups: [ExecutionGroup] {
-        let all = executions
-        guard !all.isEmpty else { return [] }
-
-        // Partition by workItemId while preserving the chronological order
-        // within each bucket. The chain root's executions always go first;
-        // revision buckets follow in revisionSeq order.
-        var byTask: [String: [ExecutionVM]] = [:]
-        for exec in all {
-            byTask[exec.workItemId, default: []].append(exec)
-        }
-
-        // Build the ordered task list: root first, then revisions by seq.
-        let revisions = chatModel.allRevisions(forParentTaskID: ref.taskId)
-        var orderedTaskIds: [String] = [ref.taskId]
-        orderedTaskIds.append(contentsOf: revisions.map { $0.id })
-        // Append any task ids not covered above (defensive, shouldn't happen).
-        for taskId in byTask.keys where !orderedTaskIds.contains(taskId) {
-            orderedTaskIds.append(taskId)
-        }
-
-        let hasRevisionExecutions = orderedTaskIds.dropFirst().contains {
-            byTask[$0] != nil
-        }
-
-        return orderedTaskIds.compactMap { taskId -> ExecutionGroup? in
-            guard let execs = byTask[taskId], !execs.isEmpty else { return nil }
-            let label: String
-            if taskId == ref.taskId {
-                label = hasRevisionExecutions ? "Original" : ""
-            } else {
-                let seq = revisions.first(where: { $0.id == taskId })?.revisionSeq
-                label = seq.map { "R\($0)" } ?? "Revision"
-            }
-            return ExecutionGroup(taskId: taskId, label: label, executions: execs)
-        }
+    /// See [[revisionChainGroups(_:rootTaskId:revisions:)]].
+    private var executionGroups: [RevisionChainGroup<ExecutionVM>] {
+        revisionChainGroups(
+            executions,
+            rootTaskId: ref.taskId,
+            revisions: chatModel.allRevisions(forParentTaskID: ref.taskId)
+        )
     }
 
     var body: some View {
@@ -192,7 +228,15 @@ struct TranscriptViewerView: View {
     @ViewBuilder
     private var executionList: some View {
         Group {
-            if isLoading {
+            if let reason = loadFailureReason {
+                ContentUnavailableView {
+                    Label("Couldn't Load Executions", systemImage: "exclamationmark.triangle")
+                } description: {
+                    Text(reason)
+                } actions: {
+                    Button("Retry") { chatModel.loadExecutions(taskId: ref.taskId) }
+                }
+            } else if isLoading {
                 VStack {
                     Spacer()
                     ProgressView()
@@ -209,12 +253,12 @@ struct TranscriptViewerView: View {
                 List(selection: $selectedExecutionId) {
                     ForEach(groups) { group in
                         if group.label.isEmpty {
-                            ForEach(group.executions) { exec in
+                            ForEach(group.items) { exec in
                                 ExecutionRow(exec: exec).tag(exec.id)
                             }
                         } else {
                             Section(group.label) {
-                                ForEach(group.executions) { exec in
+                                ForEach(group.items) { exec in
                                     ExecutionRow(exec: exec).tag(exec.id)
                                 }
                             }

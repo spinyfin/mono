@@ -47,6 +47,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         "revisionSeq",
         "createdVia",
         "hasInProgressRevision",
+        "hasAttachments",
         "sourceAutomationId",
         "autostart",
         "blockedReason",
@@ -440,6 +441,18 @@ final class WorkCardSnapshotTests: XCTestCase {
                 },
                 mutate: {
                     var t = $0; t.hasInProgressRevision = true; return t
+                }
+            ),
+            Case(
+                name: "hasAttachments",
+                context: backlog,
+                base: {
+                    var t = Self.makeTask(id: "task_1")
+                    t.hasAttachments = false
+                    return t
+                },
+                mutate: {
+                    var t = $0; t.hasAttachments = true; return t
                 }
             ),
             Case(

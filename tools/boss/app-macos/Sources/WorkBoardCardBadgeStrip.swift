@@ -42,6 +42,7 @@ struct WorkBoardCardBadgeStripSlice: Equatable {
     let externalRefLink: ExternalRefLinkPresentation?
     let showsDesignDocAffordance: Bool
     let designDocState: ProjectDesignDocState?
+    let showsAttachmentsAffordance: Bool
     let showsTerminalButton: Bool
     let terminalTooltip: String
     let showsMergeWhenReady: Bool
@@ -80,6 +81,7 @@ struct WorkBoardCardBadgeStripSlice: Equatable {
         self.externalRefLink = snapshot.externalRefLink
         self.showsDesignDocAffordance = snapshot.showsDesignDocAffordance
         self.designDocState = snapshot.designDocState
+        self.showsAttachmentsAffordance = snapshot.showsAttachmentsAffordance
         self.showsTerminalButton = snapshot.showsTerminalButton
         self.terminalTooltip = snapshot.terminalTooltip
         self.showsMergeWhenReady = snapshot.showsMergeWhenReady
@@ -94,6 +96,9 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
     let slice: WorkBoardCardBadgeStripSlice
     /// Invoked when the user taps the design-doc affordance.
     var onOpenDesignDoc: (() -> Void)? = nil
+    /// Invoked when the user taps the screenshots affordance; also gated by
+    /// `slice.showsAttachmentsAffordance`.
+    var onOpenAttachments: (() -> Void)? = nil
     /// Dependency-badge hover enter/exit.
     var onDepBadgeHover: ((Bool) -> Void)? = nil
     /// Terminal open; also gated by `slice.showsTerminalButton`.
@@ -213,6 +218,18 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
                 }
                 .buttonStyle(.plain)
                 .help(presentation.tooltip)
+            }
+            if slice.showsAttachmentsAffordance {
+                Button {
+                    onOpenAttachments?()
+                } label: {
+                    Image(systemName: "photo.on.rectangle.angled")
+                        .font(.caption)
+                        .foregroundStyle(Color.secondary)
+                        .accessibilityLabel("View screenshots")
+                }
+                .buttonStyle(.plain)
+                .help("View screenshots attached to this task")
             }
             if slice.showsTerminalButton, let openTerminal = onOpenTerminal {
                 Button {

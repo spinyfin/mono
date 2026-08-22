@@ -132,8 +132,12 @@ pub struct WorkAttachment {
     /// The execution that submitted it. Verified from the socket peer at
     /// ingest — never a worker-supplied string.
     pub execution_id: String,
-    /// Derived from the execution at ingest, so a revision's attachments land
-    /// on the chain root's work item alongside its predecessors'.
+    /// Derived from the execution at ingest (`work_item_for_execution`) — the
+    /// executing row's own id, never the chain root's. A revision task is
+    /// its own work item, so a revision's attachments land under the
+    /// revision's own id, not the chain root's. Chain-wide reads (the app's
+    /// screenshot viewer) union this field across a chain root and its
+    /// revision ids explicitly; nothing about this column does that for you.
     pub work_item_id: String,
     /// Worker-supplied one-line description of what the image shows. Empty
     /// when the worker gave none; the gallery falls back to the filename.

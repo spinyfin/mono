@@ -148,6 +148,20 @@ struct BossMacApp: App {
         }
         .defaultSize(width: 900, height: 640)
 
+        // Screenshot viewer: shows every screenshot attached to one task's
+        // revision chain, grouped and labelled the same way the transcript
+        // viewer above groups executions. Keyed by AttachmentViewerRef
+        // (Hashable on taskId only) so re-invoking "View screenshots" for
+        // the same task focuses the existing window instead of spawning a
+        // duplicate.
+        WindowGroup("Screenshots", id: "attachment-viewer", for: AttachmentViewerRef.self) { $ref in
+            if let ref {
+                AttachmentViewerView(ref: ref)
+                    .environmentObject(chatModel)
+            }
+        }
+        .defaultSize(width: 900, height: 640)
+
         Window("Review Terminal", id: "review-terminal") {
             ReviewTerminalView()
         }

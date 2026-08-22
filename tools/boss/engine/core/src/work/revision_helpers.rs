@@ -502,6 +502,77 @@ pub(crate) fn attach_ai_reviewing_flag(
     Ok(())
 }
 
+// ── Attachments (screenshot evidence) presence flag ─────────────────────────
+
+/// Set `has_attachments = true` on every task/chore whose own
+/// `work_attachments` are non-empty, and additionally on a chain-root task
+/// whose direct revision child has attachments of its own — the kanban
+/// card affordance to open the screenshot viewer.
+///
+/// Every task/chore id is a candidate — unlike [`attach_ai_reviewing_flag`],
+/// there is no cheaper status-based pre-filter (any row could have evidence
+/// attached). Rather than binding one placeholder per candidate id, this
+/// runs an unparameterized `SELECT DISTINCT work_item_id FROM
+/// work_attachments` (a covering index scan against
+/// `work_attachments_work_item_idx`) and intersects it against the
+/// in-memory candidate set — the `work_attachments` table is small relative
+/// to the board, so scanning it is cheaper than an `IN (...)` list and
+/// avoids `SQLITE_MAX_VARIABLE_NUMBER` at large board sizes.
+///
+/// The root/child roll-up exists because an `in_review`/`done` revision
+/// never gets a standalone kanban card (it rolls up into its parent's card
+/// instead — see `ChatViewModel.revealCardTarget`), so a chain root whose
+/// own row has no attachments must still show the affordance when a
+/// revision under it does, or that revision's evidence would be
+/// unreachable from the board. A revision's own row reflects only its own
+/// attachments: revisions never have revisions of their own to roll up
+/// (`insert_revision_in_tx` always parents directly to the chain root).
+pub(crate) fn attach_has_attachments_flag(
+    conn: &Connection,
+    tasks: &mut [Task],
+    chores: &mut [Task],
+) -> rusqlite::Result<()> {
+    let candidate_ids: std::collections::HashSet<&str> =
+        tasks.iter().chain(chores.iter()).map(|t| t.id.as_str()).collect();
+    if candidate_ids.is_empty() {
+        return Ok(());
+    }
+
+    // `work_attachments_work_item_idx` covers `(work_item_id, created_at)`,
+    // so this is a covering index scan with zero bound parameters — cheaper
+    // than an `IN (...)` built from every board id, and not exposed to
+    // SQLITE_MAX_VARIABLE_NUMBER at large board sizes. Intersect against the
+    // in-memory candidate set for the identical result.
+    let mut stmt = conn.prepare("SELECT DISTINCT work_item_id FROM work_attachments")?;
+    let own_attachments: std::collections::HashSet<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .filter(|id| candidate_ids.contains(id.as_str()))
+        .collect();
+
+    if own_attachments.is_empty() {
+        return Ok(());
+    }
+
+    let mut roots_with_child_attachments: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for task in tasks.iter() {
+        if task.kind == TaskKind::Revision
+            && own_attachments.contains(&task.id)
+            && let Some(parent_id) = &task.parent_task_id
+        {
+            roots_with_child_attachments.insert(parent_id.clone());
+        }
+    }
+
+    for task in tasks.iter_mut() {
+        task.has_attachments = own_attachments.contains(&task.id) || roots_with_child_attachments.contains(&task.id);
+    }
+    for chore in chores.iter_mut() {
+        chore.has_attachments = own_attachments.contains(&chore.id) || roots_with_child_attachments.contains(&chore.id);
+    }
+    Ok(())
+}
+
 // ── AI review state ──────────────────────────────────────────────────────────
 
 /// Wire values for `Task.ai_review_state`. Plain string constants — not a
@@ -1117,6 +1188,112 @@ mod tests {
             canonicalize_created_via(Some(merge_conflict), "task_x", "revision"),
             merge_conflict
         );
+    }
+
+    // ── attach_has_attachments_flag ─────────────────────────────────────────
+
+    fn attachments_test_image() -> boss_engine_attachments::IngestedImage {
+        boss_engine_attachments::IngestedImage {
+            content_digest: "deadbeef".to_owned(),
+            media_type: boss_protocol::AttachmentMediaType::Png,
+            pixel_width: 10,
+            pixel_height: 10,
+            size_bytes: 128,
+            source_name: "shot.png".to_owned(),
+        }
+    }
+
+    fn attachments_test_task(id: &str, kind: TaskKind, parent_task_id: Option<&str>) -> Task {
+        Task::builder()
+            .id(id)
+            .product_id("prod_1")
+            .kind(kind)
+            .name("n")
+            .description("")
+            .status(TaskStatus::Todo)
+            .created_at("")
+            .updated_at("")
+            .maybe_parent_task_id(parent_task_id)
+            .build()
+    }
+
+    #[test]
+    fn flags_only_rows_with_their_own_attachments() {
+        let (_dir, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_test_product(&db);
+        let with_evidence = crate::test_support::create_test_chore(&db, &product.id, "has evidence");
+        let without_evidence = crate::test_support::create_test_chore(&db, &product.id, "no evidence");
+        let execution = crate::test_support::create_ready_chore_execution(&db, with_evidence.id.clone());
+        db.submit_work_attachment(crate::work::SubmitAttachmentInput {
+            execution_id: &execution.id,
+            work_item_id: &with_evidence.id,
+            image: &attachments_test_image(),
+            caption: "",
+        })
+        .unwrap()
+        .unwrap();
+
+        let mut tasks = vec![
+            attachments_test_task(&with_evidence.id, TaskKind::Chore, None),
+            attachments_test_task(&without_evidence.id, TaskKind::Chore, None),
+        ];
+        let conn = db.connect().unwrap();
+        attach_has_attachments_flag(&conn, &mut tasks, &mut []).unwrap();
+
+        assert!(
+            tasks[0].has_attachments,
+            "the row with its own evidence must be flagged"
+        );
+        assert!(!tasks[1].has_attachments, "a row with no evidence must not be flagged");
+    }
+
+    #[test]
+    fn chain_root_rolls_up_a_revision_childs_attachments() {
+        let (_dir, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_test_product(&db);
+        let root = crate::test_support::create_test_chore(&db, &product.id, "chain root, no evidence of its own");
+        let revision_id = "task_revision_flag_test";
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id)
+                 VALUES (?1, ?2, 'revision', 'R1', '', 'todo', '1700000000', '1700000000', ?3)",
+                rusqlite::params![revision_id, product.id, root.id],
+            )
+            .unwrap();
+        }
+        let revision_execution = crate::test_support::create_ready_chore_execution(&db, revision_id);
+        db.submit_work_attachment(crate::work::SubmitAttachmentInput {
+            execution_id: &revision_execution.id,
+            work_item_id: revision_id,
+            image: &attachments_test_image(),
+            caption: "",
+        })
+        .unwrap()
+        .unwrap();
+
+        let mut tasks = vec![
+            attachments_test_task(&root.id, TaskKind::Chore, None),
+            attachments_test_task(revision_id, TaskKind::Revision, Some(root.id.as_str())),
+        ];
+        let conn = db.connect().unwrap();
+        attach_has_attachments_flag(&conn, &mut tasks, &mut []).unwrap();
+
+        assert!(
+            tasks[0].has_attachments,
+            "the chain root must be flagged even though its OWN row has no evidence"
+        );
+        assert!(
+            tasks[1].has_attachments,
+            "the revision itself must also be flagged for its own evidence"
+        );
+    }
+
+    #[test]
+    fn empty_task_and_chore_slices_are_a_no_op() {
+        let (_dir, db) = crate::test_support::open_db();
+        let conn = db.connect().unwrap();
+        attach_has_attachments_flag(&conn, &mut [], &mut []).unwrap();
     }
 
     #[test]

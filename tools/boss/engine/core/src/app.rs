@@ -2492,6 +2492,9 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::ListProducts => products::handle_list_products(ctx, r).await,
             r @ FrontendRequest::ListProjects { .. } => projects::handle_list_projects(ctx, r).await,
             r @ FrontendRequest::ListAttachments { .. } => attachments::handle_list_attachments(ctx, r).await,
+            r @ FrontendRequest::ListAttachmentsForWorkItem { .. } => {
+                attachments::handle_list_attachments_for_work_item(ctx, r).await
+            }
             r @ FrontendRequest::ListProposals { .. } => proposals::handle_list_proposals(ctx, r).await,
             r @ FrontendRequest::ListRuns { .. } => executions::handle_list_runs(ctx, r).await,
             r @ FrontendRequest::ListTasks { .. } => work_items::handle_list_tasks(ctx, r).await,

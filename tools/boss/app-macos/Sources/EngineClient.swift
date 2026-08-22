@@ -874,6 +874,14 @@ final class EngineClient: @unchecked Sendable {
                 if !taskId.isEmpty {
                     emit(.executionsList(taskId: taskId, executions: executions))
                 }
+            case "attachments_list":
+                // Wire field is `work_item_id`, matching `executions_list`.
+                let taskId = payload["work_item_id"] as? String ?? ""
+                let raw = payload["attachments"] as? [[String: Any]] ?? []
+                let attachments = raw.compactMap(parseAttachmentVM)
+                if !taskId.isEmpty {
+                    emit(.attachmentsList(taskId: taskId, attachments: attachments))
+                }
             case "execution_transcript_result":
                 let executionId = payload["execution_id"] as? String ?? ""
                 let raw = payload["segments"] as? [[String: Any]] ?? []

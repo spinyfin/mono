@@ -96,6 +96,8 @@ pub mod segment {
     pub const DB_AI_REVIEWING: &str = "db.ai_reviewing";
     /// Batched `IN (...)` query for the resolved AI-review-state badge.
     pub const DB_AI_REVIEW_STATE: &str = "db.ai_review_state";
+    /// Batched `IN (...)` query for the screenshot-viewer card affordance.
+    pub const DB_HAS_ATTACHMENTS: &str = "db.has_attachments";
     /// Per-task doc-pointer resolution loop — a secondary, gated N+1.
     pub const DB_DOC_POINTERS: &str = "db.doc_pointers";
     /// In-memory projection / flag attachment (no DB).
