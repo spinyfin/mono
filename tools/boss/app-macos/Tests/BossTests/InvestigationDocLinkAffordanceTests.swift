@@ -41,12 +41,6 @@ final class InvestigationDocLinkAffordanceTests: XCTestCase {
         model.urlOpener = { if $0.isFileURL { openedLocalFiles.append($0) } }
         var asyncWindowOpens = 0
         model.asyncMarkdownViewerOpener = { asyncWindowOpens += 1 }
-        let fetched = XCTestExpectation(description: "rawContentFetcher called")
-        model.rawContentFetcher = { _ in
-            fetched.fulfill()
-            return "# Investigation"
-        }
-
         let rawURL = "https://raw.githubusercontent.com/spinyfin/mono/docs/investigations/x.md?ref=boss%2Fexec_1"
         let task = makeInvestigation(docLinkState: resolvedState(rawContentURL: rawURL))
         model.openTaskDoc(task)
@@ -55,7 +49,14 @@ final class InvestigationDocLinkAffordanceTests: XCTestCase {
         if case .loading = model.asyncMarkdownViewerVM.state {} else {
             XCTFail("expected .loading immediately after click; got \(model.asyncMarkdownViewerVM.state)")
         }
-        await fulfillment(of: [fetched], timeout: 1.0)
+        model.applyProductDesignDocContent(
+            ref: DesignDocRef(
+                repoRemoteURL: "git@github.com:spinyfin/mono.git",
+                path: "docs/investigations/x.md",
+                gitRef: "boss/exec_1"
+            ),
+            content: .loaded(markdown: "# Investigation")
+        )
         XCTAssertTrue(openedLocalFiles.isEmpty, "must not open a local file when rawContentURL is present")
         XCTAssertNil(model.workErrorMessage)
         if case .loaded(_, _, let artifact) = model.asyncMarkdownViewerVM.state {

@@ -3,9 +3,8 @@ import XCTest
 
 /// Covers the URL-parsing and endpoint-construction helpers on
 /// [[GitHubContentFetcher]]. The actual `gh` subprocess invocation
-/// is not exercised here — the affordance tests inject a stub via
-/// `ChatViewModel.rawContentFetcher` so neither suite ever shells
-/// out during `bazel test`.
+/// is not exercised here — `fetch` is only called with URLs that
+/// fail before spawning (`unsupportedHost` / `malformedRawURL`).
 final class GitHubContentFetcherTests: XCTestCase {
     // MARK: - parseRawContentURL (new format — ref in ?ref= query param)
 

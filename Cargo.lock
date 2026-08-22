@@ -463,6 +463,7 @@ dependencies = [
  "boss-gh-telemetry",
  "boss-github",
  "boss-github-tracker",
+ "boss-http-retry",
  "boss-log-files",
  "boss-metrics",
  "boss-pr-review",
@@ -595,9 +596,15 @@ dependencies = [
  "async-trait",
  "boss-engine-utils",
  "boss-github",
+ "boss-http-retry",
  "boss-protocol",
  "git-utils",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

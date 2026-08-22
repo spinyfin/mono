@@ -156,9 +156,23 @@ extension DesignDocTreeState: Codable {
 
 /// Swift mirror of `boss_protocol::DesignDocContent` — one document's
 /// body, or the classified reason it could not be read.
+///
+/// A failed revalidation is still `.loaded` with `staleReason` set:
+/// the engine never replaces a good cached copy with an error page.
+/// `retryable` is the engine telling the app to offer a retry
+/// gesture; retry policy itself lives engine-side.
 enum DesignDocContent: Hashable {
-    case loaded(markdown: String)
-    case failed(reason: String)
+    case loaded(markdown: String, staleReason: String?, retryable: Bool)
+    case failed(reason: String, retryable: Bool)
+
+    /// Fresh (or SHA-cached) document — the common construction for tests.
+    static func loaded(markdown: String) -> DesignDocContent {
+        .loaded(markdown: markdown, staleReason: nil, retryable: false)
+    }
+
+    static func failed(reason: String) -> DesignDocContent {
+        .failed(reason: reason, retryable: true)
+    }
 }
 
 extension DesignDocContent: Codable {
@@ -166,6 +180,8 @@ extension DesignDocContent: Codable {
         case type
         case markdown
         case reason
+        case staleReason = "stale_reason"
+        case retryable
     }
 
     init(from decoder: Decoder) throws {
@@ -173,9 +189,16 @@ extension DesignDocContent: Codable {
         let type = try container.decode(String.self, forKey: .type)
         switch type {
         case "loaded":
-            self = .loaded(markdown: try container.decode(String.self, forKey: .markdown))
+            self = .loaded(
+                markdown: try container.decode(String.self, forKey: .markdown),
+                staleReason: try container.decodeIfPresent(String.self, forKey: .staleReason),
+                retryable: try container.decodeIfPresent(Bool.self, forKey: .retryable) ?? false
+            )
         case "failed":
-            self = .failed(reason: try container.decode(String.self, forKey: .reason))
+            self = .failed(
+                reason: try container.decode(String.self, forKey: .reason),
+                retryable: try container.decodeIfPresent(Bool.self, forKey: .retryable) ?? true
+            )
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type,
@@ -188,12 +211,15 @@ extension DesignDocContent: Codable {
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch self {
-        case .loaded(let markdown):
+        case .loaded(let markdown, let staleReason, let retryable):
             try container.encode("loaded", forKey: .type)
             try container.encode(markdown, forKey: .markdown)
-        case .failed(let reason):
+            try container.encodeIfPresent(staleReason, forKey: .staleReason)
+            if retryable { try container.encode(true, forKey: .retryable) }
+        case .failed(let reason, let retryable):
             try container.encode("failed", forKey: .type)
             try container.encode(reason, forKey: .reason)
+            if !retryable { try container.encode(false, forKey: .retryable) }
         }
     }
 }

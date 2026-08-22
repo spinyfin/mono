@@ -117,6 +117,7 @@ rust_library(
         "//tools/boss/gh_telemetry",
         "//tools/boss/github",
         "//tools/boss/github_tracker",
+        "//tools/boss/http_retry",
         "//tools/boss/log-files",
         "//tools/boss/protocol",
         "//tools/boss/tmux",

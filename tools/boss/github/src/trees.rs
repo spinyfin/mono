@@ -225,19 +225,65 @@ where
     }
 }
 
-/// Fetch one blob's raw text at `git_ref`.
+/// Outcome of a blob read that may have been a conditional revalidation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobFetch {
+    /// HTTP 200: file text plus the ETag to store for the next
+    /// `If-None-Match`. `rate_limit_remaining` is GitHub's
+    /// `X-RateLimit-Remaining` when `--include` captured it.
+    Content {
+        text: String,
+        etag: Option<String>,
+        rate_limit_remaining: Option<u32>,
+    },
+    /// HTTP 304: the caller's cached copy is still current. A 304 does
+    /// not consume REST rate-limit quota.
+    NotModified { rate_limit_remaining: Option<u32> },
+}
+
+/// Contents-API GET with optional `If-None-Match`.
 ///
-/// Routed through the Contents API with the `raw` media type rather
-/// than the blobs API so GitHub does the base64 decoding; the response
-/// body is the file's bytes verbatim. Argv construction is shared with
-/// `contents::fetch_repo_file` via [`crate::contents::raw_content_args`]
-/// so there is exactly one place that knows the Contents-API invocation
-/// shape; this function keeps its own `TreeApiError` classification.
-pub async fn fetch_blob_text(owner: &str, repo: &str, path: &str, git_ref: &str) -> TreeResult<String> {
-    let (_endpoint, args) = crate::contents::raw_content_args(owner, repo, path, git_ref);
+/// A 304 is [`BlobFetch::NotModified`], not an error — the caller keeps
+/// serving its cached copy. A 404 is still [`TreeApiErrorKind::NotFound`]
+/// so the caller can decide whether to discard a cache entry (first
+/// load) or keep it (revalidation of a deleted branch).
+pub async fn fetch_blob(
+    owner: &str,
+    repo: &str,
+    path: &str,
+    git_ref: &str,
+    etag: Option<&str>,
+) -> TreeResult<BlobFetch> {
+    let (_endpoint, args) = crate::contents::raw_content_args_conditional(owner, repo, path, git_ref, etag);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let stdout = gh_api(&arg_refs).await?;
-    Ok(String::from_utf8_lossy(&stdout).into_owned())
+    let output = gh_output(&arg_refs).await.map_err(|e| TreeApiError {
+        kind: TreeApiErrorKind::Unreachable,
+        message: format!("could not run `gh`: {e}"),
+    })?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match crate::contents::classify_contents_with_headers(output.status.success(), &output.stdout, &stderr) {
+        Ok(crate::contents::ContentsFetch::Body {
+            text,
+            etag,
+            rate_limit_remaining,
+        }) => Ok(BlobFetch::Content {
+            text,
+            etag,
+            rate_limit_remaining,
+        }),
+        Ok(crate::contents::ContentsFetch::NotModified { rate_limit_remaining }) => {
+            Ok(BlobFetch::NotModified { rate_limit_remaining })
+        }
+        Ok(crate::contents::ContentsFetch::NotFound) => Err(TreeApiError {
+            kind: TreeApiErrorKind::NotFound,
+            message: if stderr.trim().is_empty() {
+                "GitHub returned 404".to_owned()
+            } else {
+                stderr.trim().to_owned()
+            },
+        }),
+        Err(err) => Err(classify_failure(&err.to_string())),
+    }
 }
 
 /// Whether `path` names a markdown file, by extension. Case-insensitive

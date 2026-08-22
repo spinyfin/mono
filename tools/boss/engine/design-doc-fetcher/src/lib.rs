@@ -125,6 +125,12 @@ where
                     "doc fetcher: gh api attempt failed"
                 );
                 last_reason = reason;
+                if !is_retryable_fetch_error(&last_reason) {
+                    // Auth / permission failures will not clear on retry.
+                    // Connection-level failures (TLS, reset, DNS) *are*
+                    // retryable — see [`is_retryable_fetch_error`].
+                    break;
+                }
                 if attempt < MAX_FETCH_ATTEMPTS {
                     sleep(retry_delay).await;
                 }
@@ -133,6 +139,30 @@ where
     }
 
     DocFetchOutcome::FetchFailed { reason: last_reason }
+}
+
+/// Whether a `FetchResult::Error` reason should be retried.
+///
+/// Connection-level failures — TLS handshake timeout, connection reset,
+/// DNS lookup failure, timeouts, HTTP 5xx — are transient. HTTP 401/403
+/// (including the rate-limit 403) and HTTP 429 are not retried: this
+/// fetcher's 500ms budget cannot outlast a rate-limit window, and
+/// retrying auth failures just burns the attempt budget. Anything we
+/// don't recognise is treated as retryable so a new error string for a
+/// network blip still gets the bounded retries.
+pub fn is_retryable_fetch_error(reason: &str) -> bool {
+    let lower = reason.to_lowercase();
+    if lower.contains("http 401")
+        || lower.contains("http 403")
+        || lower.contains("http 429")
+        || lower.contains("bad credentials")
+        || lower.contains("requires authentication")
+        || lower.contains("rate limit")
+        || lower.contains("secondary rate")
+    {
+        return false;
+    }
+    true
 }
 
 /// Production fetch of a single attempt: the thin wrapper over
@@ -238,6 +268,43 @@ mod tests {
             "expected Content once a later attempt succeeds, got {outcome:?}"
         );
         assert_eq!(attempts, 2, "must stop retrying as soon as an attempt succeeds");
+    }
+
+    #[tokio::test]
+    async fn tls_handshake_timeout_is_retryable() {
+        assert!(
+            is_retryable_fetch_error("net/http: TLS handshake timeout"),
+            "the observed viewer failure must be classified as transient"
+        );
+        assert!(is_retryable_fetch_error("connection reset by peer"));
+        assert!(is_retryable_fetch_error(
+            "dial tcp: lookup api.github.com: no such host"
+        ));
+        assert!(is_retryable_fetch_error("Get https://api.github.com: EOF"));
+        assert!(is_retryable_fetch_error("HTTP 503: Service Unavailable"));
+    }
+
+    #[tokio::test]
+    async fn auth_failures_are_not_retryable() {
+        assert!(!is_retryable_fetch_error("gh: Bad credentials (HTTP 401)"));
+        assert!(!is_retryable_fetch_error("gh: Resource not accessible (HTTP 403)"));
+        assert!(!is_retryable_fetch_error("gh: API rate limit exceeded (HTTP 403)"));
+        assert!(!is_retryable_fetch_error("gh: API rate limit exceeded (HTTP 429)"));
+        assert!(!is_retryable_fetch_error("gh: Too Many Requests (HTTP 429)"));
+    }
+
+    #[tokio::test]
+    async fn auth_error_does_not_consume_the_retry_budget() {
+        let (outcome, attempts) = run_scripted(vec![
+            FetchResult::Error("gh: Bad credentials (HTTP 401)".into()),
+            FetchResult::Content("unreached".into()),
+        ])
+        .await;
+        assert!(
+            matches!(outcome, DocFetchOutcome::FetchFailed { ref reason } if reason.contains("401")),
+            "expected FetchFailed without retrying auth, got {outcome:?}"
+        );
+        assert_eq!(attempts, 1, "an auth failure must not be retried");
     }
 
     #[tokio::test]

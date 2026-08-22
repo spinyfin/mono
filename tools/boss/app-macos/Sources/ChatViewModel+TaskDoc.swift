@@ -24,23 +24,25 @@ extension ChatViewModel {
             // Prefer fetching via rawContentURL (GitHub API): correct for both
             // the in-review (PR head branch) and merged (main) cases, because
             // the ref is baked into the URL.
-            if let rawContentURL, let rawURL = URL(string: rawContentURL) {
+            if rawContentURL != nil {
                 let displayName = task.name
                 if let opener = asyncMarkdownViewerOpener {
-                    // Open the window immediately in a loading state, then
-                    // resolve the content asynchronously (parity with the
-                    // project path's open-immediately behaviour).
+                    // Open the window immediately, then resolve through
+                    // the engine (cache + revalidate). Parity with the
+                    // project path; no app-side `gh api`.
                     asyncMarkdownViewerVM.state = .loading
                     asyncMarkdownViewerVM.clickStartTime = Date()
                     opener()
-                    Task { @MainActor in
-                        await self.fetchAndUpdateAsyncMarkdownViewerVM(
-                            projectName: displayName,
-                            rawURL: rawURL,
-                            projectShortID: shortID,
-                            artifact: resolved.commentArtifact
-                        )
-                    }
+                    openDesignDocViaEngine(
+                        ref: DesignDocRef(
+                            repoRemoteURL: resolved.repoRemoteURL,
+                            path: resolved.path,
+                            gitRef: resolved.branch
+                        ),
+                        title: displayName,
+                        artifact: resolved.commentArtifact,
+                        projectShortID: shortID
+                    )
                 } else {
                     // Headless / test path: no in-app viewer wired.
                     openDesignDocFallback(webURL: webURL)
