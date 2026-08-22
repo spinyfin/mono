@@ -657,6 +657,7 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
                     file_diffs: cs.file_diffs.into_iter().map(from_wit_file_diff).collect(),
                     commit_description: cs.commit_description,
                     pr_description: cs.pr_description,
+                    pr_description_unavailable_reason: cs.pr_description_unavailable_reason,
                     change_id: cs.change_id,
                     repository: cs.repository,
                     base_files: cs.base_files.into_iter().map(|bf| ::checkleft_check_sdk::BaseFile {

@@ -32,6 +32,18 @@ pub struct ChangeSet {
     pub bypass_commit_descriptions: Option<String>,
     #[serde(default)]
     pub pr_description: Option<String>,
+    /// When set, a PR was identified (or the environment indicated one) but
+    /// its description could not be retrieved. Mutually exclusive with a
+    /// present [`Self::pr_description`].
+    ///
+    /// **Bypass parsing ignores this field** and continues to use only
+    /// [`Self::pr_description`] text (plus commit messages). An unresolved
+    /// description therefore neither grants nor revokes a bypass — the same
+    /// as today's `pr_description: None` behaviour. Checks that *scan* the PR
+    /// description as a subject (e.g. `text/forbidden-pattern` with
+    /// `surfaces: [changeset]`) must treat a present reason as a hard failure.
+    #[serde(default)]
+    pub pr_description_unavailable_reason: Option<String>,
     #[serde(default)]
     pub change_id: Option<String>,
     #[serde(default)]
@@ -56,6 +68,7 @@ impl ChangeSet {
             commit_description: None,
             bypass_commit_descriptions: None,
             pr_description: None,
+            pr_description_unavailable_reason: None,
             change_id: None,
             repository: None,
             whole_repo: false,
@@ -78,6 +91,11 @@ impl ChangeSet {
 
     pub fn with_pr_description(mut self, pr_description: Option<String>) -> Self {
         self.pr_description = pr_description;
+        self
+    }
+
+    pub fn with_pr_description_unavailable_reason(mut self, reason: Option<String>) -> Self {
+        self.pr_description_unavailable_reason = reason;
         self
     }
 
@@ -255,6 +273,43 @@ mod tests {
         assert_eq!(
             changeset.bypass_reason("BYPASS_API_BREAKING_SURFACE"),
             Some("From PR.".to_owned())
+        );
+    }
+
+    /// Unavailable PR description must not grant or revoke bypass: only the
+    /// resolved body text (and commit messages) feed directive parsing.
+    #[test]
+    fn bypass_reason_ignores_pr_description_unavailable_reason() {
+        let with_commit_only = ChangeSet::new(vec![ChangedFile {
+            path: "backend/blob/src/v3/auth.rs".into(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }])
+        .with_commit_description(Some("BYPASS_API_BREAKING_SURFACE=Still valid from commit.".to_owned()))
+        .with_pr_description_unavailable_reason(Some(
+            "GitHub API did not return a description for PR 1 in o/r".to_owned(),
+        ));
+
+        assert_eq!(
+            with_commit_only.bypass_reason("BYPASS_API_BREAKING_SURFACE"),
+            Some("Still valid from commit.".to_owned()),
+            "unavailable PR body must not revoke a commit-message bypass"
+        );
+
+        let no_directive = ChangeSet::new(vec![ChangedFile {
+            path: "backend/blob/src/v3/auth.rs".into(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }])
+        .with_commit_description(Some("ordinary commit".to_owned()))
+        .with_pr_description_unavailable_reason(Some(
+            "GitHub API did not return a description for PR 1 in o/r".to_owned(),
+        ));
+
+        assert_eq!(
+            no_directive.bypass_reason("BYPASS_API_BREAKING_SURFACE"),
+            None,
+            "unavailable PR body must not invent a bypass"
         );
     }
 
