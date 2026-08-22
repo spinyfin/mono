@@ -2386,11 +2386,19 @@ impl ExecutionCoordinator {
         error: &anyhow::Error,
     ) -> Result<()> {
         let (attention_kind, attention_title) = attention;
+        // Flattened chain, matching the pane-spawn termination path in
+        // `run.rs`: anyhow's `Display` renders only the outermost context,
+        // so a bare `to_string()` here persisted "cube workspace lease
+        // failed" onto the run row and dropped the cube stderr that says
+        // *why*. The truncation was never specific to one error path — it
+        // was every run-row error capture that started from an
+        // `anyhow::Error`.
+        let error_text = format!("{error:#}");
         let (execution, run, outcome) = self.work_db.record_pre_start_failure(
             &execution.id,
             worker_id,
             cube_repo_id,
-            &error.to_string(),
+            &error_text,
             &self.pre_start_retry_delays,
         )?;
 
@@ -2455,11 +2463,10 @@ impl ExecutionCoordinator {
                 // Surface every permanent pre-start failure as a
                 // `WorkAttentionItem` so the failure is diagnosable in one
                 // bossctl call instead of needing a tracing-log tail.
-                let err = format!("{error:#}");
                 let attention_body = format!(
                     "Execution `{execution_id}` could not start on worker `{worker_id}` \
                      after {attempts} attempt(s).\n\n\
-                     **Error:** {err}\n\n\
+                     **Error:** {error_text}\n\n\
                      Inspect `dispatch-events/executions/{execution_id}/dispatch.jsonl` \
                      for the full stage timeline.",
                     execution_id = execution.id,
@@ -2491,10 +2498,11 @@ impl ExecutionCoordinator {
                 // (`pr_review`, `ci_remediation`, `conflict_resolution`)
                 // whose work item sits in `in_review`/`blocked` — bouncing
                 // those would erase review context.
-                match self
-                    .work_db
-                    .bounce_dispatch_failed_to_backlog(&execution.work_item_id, attention_kind, &err)
-                {
+                match self.work_db.bounce_dispatch_failed_to_backlog(
+                    &execution.work_item_id,
+                    attention_kind,
+                    &error_text,
+                ) {
                     Ok(true) => tracing::info!(
                         execution_id = %execution.id,
                         work_item_id = %execution.work_item_id,

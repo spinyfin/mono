@@ -7,7 +7,13 @@ use super::*;
 /// drop, slot busy, prompt composition error). See
 /// [`crate::attention_lifecycle::ATTENTION_LIFECYCLES`] for its clearing
 /// rule: `ClearedBy::WorkResumed`, since a later run starting for the item
-/// is direct evidence the pane-spawn problem is no longer blocking it.
+/// is direct evidence the pane-spawn problem is no longer blocking it —
+/// provided that run did not itself fail to spawn, which the evidence clause
+/// in [`crate::work::attention_reconcile`] enforces.
+///
+/// Filed execution-scoped (`finish_execution_run` rejects a work-item id);
+/// `WorkDb::list_attention_items_for_work_item` is what makes it reachable
+/// from the work item's own surfaces.
 pub const PANE_SPAWN_FAILED_ATTENTION_KIND: &str = "pane_spawn_failed";
 
 impl ExecutionCoordinator {
@@ -295,6 +301,13 @@ impl ExecutionCoordinator {
                 // Report it, but at WARN, and tag every abort with
                 // `slot_busy` so the two classes stay filterable either way.
                 let slot_busy = slot_busy_occupant(&err).is_some();
+                // Which spawn step refused, and what it refused — the
+                // machine-readable half of `err_detail`. Rides on both
+                // dispatch events below and on the attention item, so
+                // `bossctl dispatch diagnose` can match a signature on the
+                // step instead of regexing the prose message. `None` for a
+                // failure that never reached the spawn flow.
+                let spawn_failure = spawn_failure_classification(&err);
                 let abort_message = "spawn aborted: ExecutionRunner::run_execution returned an \
                                      error before any pane existed; tearing down and releasing \
                                      the workspace";
@@ -337,6 +350,7 @@ impl ExecutionCoordinator {
                                 "run_id": run.id,
                                 "slot_id": slot_id,
                                 "page": slot_id.and_then(worker_page_label),
+                                "spawn_failure": spawn_failure,
                             })),
                     )
                     .await;
@@ -370,7 +384,16 @@ impl ExecutionCoordinator {
                         false
                     }
                 };
-                let error_text = err.to_string();
+                // The FLATTENED chain, not `err.to_string()`. anyhow's
+                // `Display` renders only the outermost context, so the run
+                // row used to store bare
+                // `spawning worker pane for run <exec>` while the whole
+                // actionable half of the message — `: preparing progress
+                // ingress: <path> is not a real directory` — lived only in
+                // the dispatch event. `boss task show --json` is the first
+                // surface an operator reaches for, and it was showing a
+                // sentence with no cause in it.
+                let error_text = err_detail.clone();
 
                 // A `SlotBusy` app rejection means the engine and the app
                 // disagree about this specific slot's occupancy — the app
@@ -395,6 +418,27 @@ impl ExecutionCoordinator {
                 // turns up in the kanban "Attention" lane and via
                 // `ListAttentionItems`. The structured event below
                 // gives tooling a parallel signal.
+                //
+                // The item is execution-scoped (`work_item_id: None`) —
+                // `finish_execution_run` rejects anything else. That is why
+                // `list_attention_items_for_work_item`, which backs
+                // `boss task show` / `boss chore show --json` (NOT the app's
+                // per-product Attention lane, which the app queries by
+                // product id and which this change does not touch), has to
+                // resolve an item's work item through its execution: fifteen
+                // consecutive spawn failures filed fifteen of these rows and
+                // not one of them reached a work-item surface.
+                //
+                // The body must carry the underlying cause, never just
+                // "spawn failed" — `err_detail` is the flattened chain, and
+                // the rejected precondition is called out separately when the
+                // failure was classified, since that is the line an operator
+                // acts on.
+                let precondition_line = spawn_failure
+                    .as_ref()
+                    .and_then(|failure| Some((failure.get("class")?.as_str()?, failure.get("cause")?.as_str()?)))
+                    .map(|(class, cause)| format!("**Rejected precondition** (`{class}`): {cause}\n\n"))
+                    .unwrap_or_default();
                 let attention = Some(CreateAttentionItemInput {
                     execution_id: Some(execution.id.clone()),
                     work_item_id: None,
@@ -404,8 +448,10 @@ impl ExecutionCoordinator {
                     body_markdown: format!(
                         "Execution `{exec_id}` leased workspace `{ws}` but the worker pane never came up.\n\n\
                          **Error:** {err_detail}\n\n\
+                         {precondition_line}\
                          The lease was {release_state}. Inspect \
-                         `dispatch-events/executions/{exec_id}/dispatch.jsonl` for the full stage timeline.",
+                         `dispatch-events/executions/{exec_id}/dispatch.jsonl` for the full stage timeline, \
+                         or run `bossctl dispatch diagnose {exec_id}`.",
                         exec_id = execution.id,
                         ws = lease.workspace_id,
                         release_state = if released {
@@ -453,6 +499,7 @@ impl ExecutionCoordinator {
                             "page": slot_id.and_then(worker_page_label),
                             "pre_start_failure_count": execution.pre_start_failure_count,
                             "transient_failure_count": execution.transient_failure_count,
+                            "spawn_failure": spawn_failure,
                         });
                         // A `SlotBusy` spawn rejection means the engine and
                         // the app disagree about slot occupancy — the
