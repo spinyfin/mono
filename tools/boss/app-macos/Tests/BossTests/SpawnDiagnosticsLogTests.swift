@@ -49,6 +49,7 @@ final class SpawnDiagnosticsLogTests: XCTestCase {
         log.surfaceFailed(
             runId: "exec-99",
             reason: "ghostty_surface_new returned NULL",
+            environmental: true,
             host: .make(
                 activeDisplayCount: 0,
                 onlineDisplayCount: 1,
@@ -80,5 +81,6 @@ final class SpawnDiagnosticsLogTests: XCTestCase {
         // Rejected-input block is durable here (fd 2 is /dev/null in prod).
         XCTAssertTrue(lines[1].contains("\"diagnostic\""), lines[1])
         XCTAssertTrue(lines[1].contains("workingDirectory"), lines[1])
+        XCTAssertTrue(lines[1].contains("\"environmental\":true"), lines[1])
     }
 }

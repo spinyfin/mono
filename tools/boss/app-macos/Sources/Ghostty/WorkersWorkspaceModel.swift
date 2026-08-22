@@ -64,6 +64,14 @@ final class WorkersWorkspaceModel: ObservableObject {
         slots.filter { Self.lowerDecksSlotRange.contains($0.slotId) }
     }
 
+    /// Host pre-flight consulted before a spawn allocates anything. Injected
+    /// so slot-bookkeeping tests are not at the mercy of whether the machine
+    /// running them has an active display — a real hazard, since a locked
+    /// screen drops `CGGetActiveDisplayList` to zero (measured) and would
+    /// otherwise make the whole suite fail whenever the operator stepped
+    /// away. Tests that specifically exercise the pre-flight override it.
+    var spawnCapabilityCheck: () -> SpawnCapability.Verdict = { SpawnCapability.current() }
+
     init() {
         self.runtime = GhosttyRuntime.shared
         self.slots = (1...Self.workerSlotCount).map { slot in
@@ -99,12 +107,14 @@ final class WorkersWorkspaceModel: ObservableObject {
     var onPaneDied: ((String, WorkerPaneDeathReason) -> Void)?
 
     /// Called when a worker pane's libghostty surface FAILS to create so no
-    /// shell ever comes up (the post-sleep "no active display" condition).
+    /// shell ever comes up (most often the no-active-display condition).
     /// `ContentView` installs this closure to NACK the engine via
     /// `sendReportWorkerSpawnFailed`, so it fails the spawn fast instead of
     /// waiting out the 60s spawn-ack timeout. `runId` is the raw execution id;
-    /// `reason` is a short human-readable cause.
-    var onSpawnFailed: ((String, String) -> Void)?
+    /// `reason` is a short human-readable cause; `environmental` is true only
+    /// when the failure was measured to be a host condition rather than
+    /// anything about this work item (see [[SpawnCapability]]).
+    var onSpawnFailed: ((_ runId: String, _ reason: String, _ environmental: Bool) -> Void)?
 
     /// Update pool capacities from the engine's EnginePoolConfig push.
     /// Called every time the app registers a session, so the slot ranges
@@ -181,6 +191,18 @@ final class WorkersWorkspaceModel: ObservableObject {
             return .failure(.slotBusy(occupyingRunId: targetSlots[index].runId))
         }
 
+        // Pre-flight the host BEFORE anything is allocated. `ghostty_surface_new`
+        // cannot succeed with zero active displays (measured — see
+        // [[SpawnCapability]]), and that is true of every work item equally.
+        // Rejecting here means the engine can defer the row instead of
+        // discovering the wall by consuming a spawn: no slot is taken, no
+        // session is built, no diagnostics record claims this run was honored.
+        // The engine's spawn-capability breaker stays the backstop for causes
+        // this check cannot see in advance, rather than being the detector.
+        if case .environmentUnavailable(let reason) = spawnCapabilityCheck() {
+            return .failure(.hostEnvironmentUnavailable(reason: reason))
+        }
+
         let slotId: Int
         if isReview {
             slotId = reviewSlots[index].slotId
@@ -229,6 +251,8 @@ final class WorkersWorkspaceModel: ObservableObject {
             slots[index].summary = request.summary
             slots[index].taskTitle = request.taskTitle
         }
+
+        reconcileLiveWorkDisplayAssertion()
 
         // Return shell_pid 0 now — the libghostty surface is created
         // asynchronously by SwiftUI after this RPC returns. Once the surface
@@ -282,17 +306,18 @@ final class WorkersWorkspaceModel: ObservableObject {
             // mirror the failure into the durable spawn diagnostics keyed by
             // execution id, with a measured host-display snapshot so the rejected
             // precondition is visible from `bossctl logs spawn`.
-            session.onSurfaceCreationFailed = { [weak self] reason, host, diagnostic in
+            session.onSurfaceCreationFailed = { [weak self] reason, environmental, host, diagnostic in
                 // Use the host + diagnostic measured at rejection — do not
                 // re-capture here, or a mid-transition wake can put a
                 // contradictory host object next to the reason string.
                 SpawnDiagnosticsLog.shared.surfaceFailed(
                     runId: capturedRunId,
                     reason: reason,
+                    environmental: environmental,
                     host: host,
                     diagnostic: diagnostic
                 )
-                self?.onSpawnFailed?(capturedRunId, reason)
+                self?.onSpawnFailed?(capturedRunId, reason, environmental)
             }
         }
 
@@ -385,6 +410,7 @@ final class WorkersWorkspaceModel: ObservableObject {
         } else {
             slots = targetSlots
         }
+        reconcileLiveWorkDisplayAssertion()
         return (.success, foregroundPid)
     }
 
@@ -403,6 +429,24 @@ final class WorkersWorkspaceModel: ObservableObject {
                 taskTitle: slot.taskTitle
             )
         }
+    }
+
+    /// Number of slots currently hosting a pane session, across all three
+    /// pools. This is the app's own view of "is there live work", which is
+    /// what the display assertion is scoped to.
+    var liveWorkerPaneCount: Int {
+        (slots + automationSlots + reviewSlots).count { $0.session != nil }
+    }
+
+    /// Converge the idle-display-sleep assertion after any slot mutation.
+    /// Called from both `spawnWorkerPane` and `releaseWorkerPane` rather
+    /// than tracking transitions by hand — `update(liveWorkerCount:)` is
+    /// idempotent, so a redundant call costs nothing and a missed call is
+    /// the only way this can go wrong. See [[LiveWorkDisplayAssertion]] for
+    /// why it is scoped to live work instead of held for the process
+    /// lifetime.
+    private func reconcileLiveWorkDisplayAssertion() {
+        LiveWorkDisplayAssertion.shared.update(liveWorkerCount: liveWorkerPaneCount)
     }
 
     /// Resolve the foreground pid of the pty hosting `session`, or

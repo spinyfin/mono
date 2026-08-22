@@ -132,6 +132,10 @@ final class GhosttyRuntime: @unchecked Sendable {
     /// different center than `observers`, which uses `NotificationCenter.default`
     /// — removal must go through the same center that created the token).
     private var workspaceObservers: [NSObjectProtocol] = []
+    /// Tokens registered on `DistributedNotificationCenter.default()` — a
+    /// third center, for the system-wide screen lock/unlock notifications
+    /// that no per-process center publishes. Same removal rule as above.
+    private var distributedObservers: [NSObjectProtocol] = []
 
     /// Invoked after `.ghosttyDisplaysDidWake` is broadcast, once per wake.
     /// `ContentView` wires this to report "spawn capability restored" to the
@@ -178,6 +182,9 @@ final class GhosttyRuntime: @unchecked Sendable {
         }
         for observer in workspaceObservers {
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
+        for observer in distributedObservers {
+            DistributedNotificationCenter.default().removeObserver(observer)
         }
         ghostty_app_free(app)
         ghostty_config_free(config)
@@ -240,11 +247,50 @@ final class GhosttyRuntime: @unchecked Sendable {
                 self?.handleDisplaysDidWake()
             }
         )
+        // A screen *unlock* is not a wake: neither workspace notification
+        // above fires for it, and on a host whose lock policy is immediate
+        // (`sysadminctl -screenLock status`) lock and display-off are welded
+        // together — so a locked machine that the operator unlocks would
+        // otherwise regain an active display with nothing telling the engine.
+        // That is the gap outcome D closes: recovery must not require the
+        // operator to run a command.
+        distributedObservers.append(
+            DistributedNotificationCenter.default().addObserver(
+                forName: Notification.Name("com.apple.screenIsUnlocked"),
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.handleDisplaysDidWake()
+            }
+        )
+        // Display reconnect / reconfiguration — the "external monitor came
+        // back" path, which also flips the active-display count above 0.
+        observers.append(
+            NotificationCenter.default.addObserver(
+                forName: NSApplication.didChangeScreenParametersNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.handleDisplaysDidWake()
+            }
+        )
     }
 
+    /// Fan out a "displays may have come back" signal.
+    ///
+    /// The in-app broadcast is unconditional: panes parked in the
+    /// surface-less placeholder retry cheaply and simply re-arm if the
+    /// display is still gone. The *engine* notification is gated on the
+    /// measured verdict — telling the engine spawn capability is restored
+    /// while the host still cannot host a pane would resume dispatch
+    /// straight back into the same wall, which is the churn this whole
+    /// change exists to stop. See [[SpawnCapability]].
     private func handleDisplaysDidWake() {
         NotificationCenter.default.post(name: .ghosttyDisplaysDidWake, object: nil)
-        onDisplaysDidWake?()
+        Task { @MainActor [weak self] in
+            guard !SpawnCapability.current().isBlocked else { return }
+            self?.onDisplaysDidWake?()
+        }
     }
 
     fileprivate static func runtime(from userdata: UnsafeMutableRawPointer?) -> GhosttyRuntime? {

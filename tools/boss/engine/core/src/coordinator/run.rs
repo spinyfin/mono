@@ -11,6 +11,84 @@ use super::*;
 pub const PANE_SPAWN_FAILED_ATTENTION_KIND: &str = "pane_spawn_failed";
 
 impl ExecutionCoordinator {
+    /// Handle a spawn the app refused on a measured host condition: return
+    /// the execution to the queue and hold dispatch until the host recovers.
+    ///
+    /// Deliberately does **not** mirror the terminal-failure path around it.
+    /// It writes no `failed` row (so
+    /// [`crate::work::WorkDb::count_recent_terminal_executions`] has nothing
+    /// to count against the work item), files no `pane_spawn_failed`
+    /// attention item (the pane never failed — it was never attempted), and
+    /// does not demote the work item to To-Do (the card belongs exactly
+    /// where it is; it is waiting, not regressed).
+    ///
+    /// The workspace lease has already been released by the caller, which is
+    /// why the requeue clears the lease columns.
+    ///
+    /// It does resolve the half-open recovery probe, though. A rejection at
+    /// the app's pre-flight never reaches `spawn_ack_sweep`'s reap (this
+    /// method handles the synchronous error itself), so if the rejected
+    /// spawn was the canary admitted through a Breaker pause, nothing else
+    /// would clear it until the 120s stall backstop — flattening the probe
+    /// backoff and logging a bogus "went stale" warning for a probe that
+    /// resolved promptly. `record_probe_failure` no-ops for any other
+    /// execution id, so it is safe to call unconditionally.
+    async fn handle_host_environment_spawn_rejection(
+        &self,
+        execution: &WorkExecution,
+        worker_id: &str,
+        lease: &CubeWorkspaceLease,
+        host_reason: &str,
+    ) {
+        let now_epoch_secs = boss_engine_utils::epoch_time::now_epoch_secs();
+        if let Some(spawn_health) = self.spawn_health() {
+            spawn_health.record_probe_failure(&execution.id, now_epoch_secs);
+        }
+        match self
+            .work_db
+            .requeue_execution_after_environmental_failure(&execution.id, host_reason)
+        {
+            Ok(_) => tracing::warn!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                host_reason,
+                "worker pane refused by host environment; execution returned to the queue (no work consumed)",
+            ),
+            Err(err) => tracing::error!(
+                ?err,
+                execution_id = %execution.id,
+                host_reason,
+                "failed to requeue execution after host-environment spawn rejection; \
+                 the row may be left mid-dispatch and need a manual `bossctl work start`",
+            ),
+        }
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::PaneSpawned, DispatchOutcome::Skipped, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_worker(worker_id)
+                    .with_cube_lease(&lease.lease_id)
+                    .with_cube_workspace(&lease.workspace_id)
+                    .with_details(serde_json::json!({
+                        "deferred": true,
+                        "host_environment_unavailable": true,
+                        "host_reason": host_reason,
+                        "slot_id": slot_id_from_worker_id(worker_id),
+                    })),
+            )
+            .await;
+        crate::spawn_health::hold_dispatch_for_host_environment(
+            self.work_db.as_ref(),
+            self,
+            self.dispatch_events.as_ref(),
+            &execution.id,
+            &execution.work_item_id,
+            host_reason,
+            now_epoch_secs,
+        )
+        .await;
+    }
+
     // `change` is `None` for `pr_review` executions that checked out the PR
     // head directly; `Some` for all other executions that created a jj change.
     #[allow(clippy::too_many_arguments)]
@@ -372,314 +450,334 @@ impl ExecutionCoordinator {
                 };
                 let error_text = err.to_string();
 
-                // A `SlotBusy` app rejection means the engine and the app
-                // disagree about this specific slot's occupancy — the app
-                // itself documents this as "the engine should reconcile
-                // rather than retry blindly" (see
-                // `WorkersWorkspaceModel.spawnWorkerPane`'s doc comment).
-                // It is an engine/app desync, not a genuine task or
-                // automation failure, so it is handled differently below:
-                // the work stays queued instead of bouncing to a terminal
-                // state, and the offending slot is held out of rotation
-                // (rather than freed) so the very next dispatch pass
-                // doesn't just re-select the same bad slot and repeat the
-                // rejection — see the tail of this function.
-                let is_slot_busy = slot_busy;
+                // The app rejected this spawn *before allocating anything*
+                // because it measured that this HOST cannot create a
+                // libghostty surface at all (no active display —
+                // `ghostty_surface_new` provably cannot succeed, see the
+                // app's `SpawnCapability`). Nothing about this execution
+                // was consumed: no slot was taken, no session was built, no
+                // shell ran.
+                //
+                // So this must NOT take the terminal-failure path below. A
+                // `failed` row here would count against the work item's
+                // churn budget and demote the card to To-Do, punishing the
+                // work for the operator's display having gone to sleep —
+                // the work-destroying half of the 2026-07-30 incident.
+                // Instead the execution goes back to `ready`, and dispatch
+                // is held until the host recovers.
+                if let Some(host_reason) = host_environment_unavailable_reason(&err) {
+                    self.handle_host_environment_spawn_rejection(&execution, &worker_id, &lease, &host_reason)
+                        .await;
+                } else {
+                    // A `SlotBusy` app rejection means the engine and the app
+                    // disagree about this specific slot's occupancy — the app
+                    // itself documents this as "the engine should reconcile
+                    // rather than retry blindly" (see
+                    // `WorkersWorkspaceModel.spawnWorkerPane`'s doc comment).
+                    // It is an engine/app desync, not a genuine task or
+                    // automation failure, so it is handled differently below:
+                    // the work stays queued instead of bouncing to a terminal
+                    // state, and the offending slot is held out of rotation
+                    // (rather than freed) so the very next dispatch pass
+                    // doesn't just re-select the same bad slot and repeat the
+                    // rejection — see the tail of this function.
+                    let is_slot_busy = slot_busy;
 
-                // Historical silent-release path: a pane-spawn
-                // failure (libghostty IPC drop, slot busy, prompt
-                // composition error) inside `run_execution` marked
-                // the run `failed` and released the lease without
-                // raising anything the operator could see. Attach a
-                // `WorkAttentionItem` to this run so the failure
-                // turns up in the kanban "Attention" lane and via
-                // `ListAttentionItems`. The structured event below
-                // gives tooling a parallel signal.
-                let attention = Some(CreateAttentionItemInput {
-                    execution_id: Some(execution.id.clone()),
-                    work_item_id: None,
-                    kind: PANE_SPAWN_FAILED_ATTENTION_KIND.to_owned(),
-                    status: None,
-                    title: "Worker pane failed to spawn".to_owned(),
-                    body_markdown: format!(
-                        "Execution `{exec_id}` leased workspace `{ws}` but the worker pane never came up.\n\n\
-                         **Error:** {err_detail}\n\n\
-                         The lease was {release_state}. Inspect \
-                         `dispatch-events/executions/{exec_id}/dispatch.jsonl` for the full stage timeline.",
-                        exec_id = execution.id,
-                        ws = lease.workspace_id,
-                        release_state = if released {
-                            "released back to cube"
-                        } else {
-                            "still held by the engine (release failed — see the engine log)"
-                        },
-                    ),
-                    resolved_at: None,
-                });
+                    // Historical silent-release path: a pane-spawn
+                    // failure (libghostty IPC drop, slot busy, prompt
+                    // composition error) inside `run_execution` marked
+                    // the run `failed` and released the lease without
+                    // raising anything the operator could see. Attach a
+                    // `WorkAttentionItem` to this run so the failure
+                    // turns up in the kanban "Attention" lane and via
+                    // `ListAttentionItems`. The structured event below
+                    // gives tooling a parallel signal.
+                    let attention = Some(CreateAttentionItemInput {
+                        execution_id: Some(execution.id.clone()),
+                        work_item_id: None,
+                        kind: PANE_SPAWN_FAILED_ATTENTION_KIND.to_owned(),
+                        status: None,
+                        title: "Worker pane failed to spawn".to_owned(),
+                        body_markdown: format!(
+                            "Execution `{exec_id}` leased workspace `{ws}` but the worker pane never came up.\n\n\
+                             **Error:** {err_detail}\n\n\
+                             The lease was {release_state}. Inspect \
+                             `dispatch-events/executions/{exec_id}/dispatch.jsonl` for the full stage timeline.",
+                            exec_id = execution.id,
+                            ws = lease.workspace_id,
+                            release_state = if released {
+                                "released back to cube"
+                            } else {
+                                "still held by the engine (release failed — see the engine log)"
+                            },
+                        ),
+                        resolved_at: None,
+                    });
 
-                match self.work_db.finish_execution_run(
-                    FinishExecutionRunInput::builder()
-                        .execution_id(&execution.id)
-                        .run_id(&run.id)
-                        .execution_status(ExecutionStatus::Failed)
-                        .run_status("failed")
-                        .error_text(error_text.as_str())
-                        .clear_workspace_lease(released)
-                        .increment_pre_start_failure_count(!is_slot_busy)
-                        .maybe_attention(attention)
-                        .build(),
-                ) {
-                    Ok((execution, _run, _)) => {
-                        // Driver teardown for this termination path already
-                        // ran unconditionally above, before the cube release.
-                        // The execution is now durably `failed` in the DB —
-                        // safe to have `pool_claim_sweep` own reclaiming this
-                        // slot instead of releasing it immediately (see the
-                        // `hold_slot_busy` declaration above and the tail of
-                        // this function).
-                        hold_slot_busy = is_slot_busy;
-                        tracing::warn!(
-                            execution_id = %execution.id,
-                            run_id = %run.id,
-                            worker_id = %worker_id,
-                            error = %err,
-                            released_workspace = released,
-                            "execution run failed"
-                        );
-                        let mut error_details = serde_json::json!({
-                            "run_id": run.id,
-                            "released_workspace": released,
-                            "slot_id": slot_id,
-                            "page": slot_id.and_then(worker_page_label),
-                            "pre_start_failure_count": execution.pre_start_failure_count,
-                            "transient_failure_count": execution.transient_failure_count,
-                        });
-                        // A `SlotBusy` spawn rejection means the engine and
-                        // the app disagree about slot occupancy — the
-                        // engine already knew which slot it requested
-                        // (`worker_id` above), but not which pane the app
-                        // reports as squatting it. Surface both explicitly
-                        // so `dispatch.jsonl` is self-diagnosing instead of
-                        // requiring a coordinator to cross-reference the
-                        // husk pane by hand.
-                        if let Some(occupying_run_id) = slot_busy_occupant(&err) {
-                            error_details["slot_busy"] = serde_json::json!({
-                                "slot_id": slot_id,
-                                "occupying_run_id": occupying_run_id,
-                            });
-                        }
-                        self.dispatch_events
-                            .emit(
-                                DispatchEvent::new(Stage::PaneSpawned, DispatchOutcome::Error, &execution.id)
-                                    .with_work_item(&execution.work_item_id)
-                                    .with_worker(&worker_id)
-                                    .with_cube_lease(&lease.lease_id)
-                                    .with_cube_workspace(&lease.workspace_id)
-                                    .with_error(&err)
-                                    .with_details(error_details),
-                            )
-                            .await;
-                        // Clear the card out of `active`. The run is
-                        // already recorded `failed` and the workspace
-                        // released, but the work item itself stays
-                        // `active` — so the kanban keeps the green
-                        // "Doing" card and the orphan-active sweep
-                        // re-dispatches the same doomed spawn every
-                        // cycle. Demote it back to To-Do so the failure
-                        // (already surfaced as a `pane_spawn_failed`
-                        // attention item) is recoverable rather than a
-                        // silent green-flicker strand.
-                        //
-                        // Exception: PrReview spawn failures are engine
-                        // infrastructure bugs (e.g. slot-range mismatch),
-                        // not task regressions. Demoting the work item
-                        // here would silently move a reviewed PR back to
-                        // To-Do, erasing the review context. Leave the
-                        // task in place — the attention item already
-                        // surfaces the failure for the operator.
-                        //
-                        // Exception: a `SlotBusy` rejection is likewise an
-                        // engine-side infrastructure issue (see `is_slot_busy`
-                        // above), not a real dispatch failure of the task
-                        // itself — demoting to To-Do would require a human to
-                        // notice and manually re-drag the card. Leaving the
-                        // item `active` lets the tail of this function's
-                        // rescan (`rescan_active_dispatch_after_release`)
-                        // queue a fresh execution automatically, so the item
-                        // stays in Doing and dispatches onto the next free
-                        // slot exactly like a plain pool-exhaustion wait.
-                        if execution.kind != ExecutionKind::PrReview && !is_slot_busy {
-                            match self.work_db.bounce_dispatch_failed_to_backlog(
-                                &execution.work_item_id,
-                                "pane_spawn_failed",
-                                error_text.as_str(),
-                            ) {
-                                Ok(true) => {
-                                    tracing::info!(
-                                        execution_id = %execution.id,
-                                        work_item_id = %execution.work_item_id,
-                                        "demoted work item to todo after pane-spawn failure",
-                                    );
-                                    self.dispatch_events
-                                        .emit(
-                                            DispatchEvent::new(
-                                                Stage::StatusTransition,
-                                                DispatchOutcome::Ok,
-                                                &execution.id,
-                                            )
-                                            .with_work_item(&execution.work_item_id)
-                                            .with_worker(&worker_id)
-                                            .with_details(
-                                                serde_json::json!({
-                                                    "from_status": "active",
-                                                    "to_status": "todo",
-                                                    "did_dispatch": false,
-                                                    "reason": "pane_spawn_failure",
-                                                    "failed_execution_id": execution.id,
-                                                }),
-                                            ),
-                                        )
-                                        .await;
-                                }
-                                Ok(false) => {}
-                                Err(demote_err) => tracing::error!(
-                                    ?demote_err,
-                                    work_item_id = %execution.work_item_id,
-                                    "failed to demote work item out of active after pane-spawn failure",
-                                ),
-                            }
-                        } else {
-                            tracing::info!(
+                    match self.work_db.finish_execution_run(
+                        FinishExecutionRunInput::builder()
+                            .execution_id(&execution.id)
+                            .run_id(&run.id)
+                            .execution_status(ExecutionStatus::Failed)
+                            .run_status("failed")
+                            .error_text(error_text.as_str())
+                            .clear_workspace_lease(released)
+                            .increment_pre_start_failure_count(!is_slot_busy)
+                            .maybe_attention(attention)
+                            .build(),
+                    ) {
+                        Ok((execution, _run, _)) => {
+                            // Driver teardown for this termination path already
+                            // ran unconditionally above, before the cube release.
+                            // The execution is now durably `failed` in the DB —
+                            // safe to have `pool_claim_sweep` own reclaiming this
+                            // slot instead of releasing it immediately (see the
+                            // `hold_slot_busy` declaration above and the tail of
+                            // this function).
+                            hold_slot_busy = is_slot_busy;
+                            tracing::warn!(
                                 execution_id = %execution.id,
-                                work_item_id = %execution.work_item_id,
-                                is_slot_busy,
-                                "skipping demote for pr_review or slot-busy spawn failure — engine infrastructure issue, not a task regression",
+                                run_id = %run.id,
+                                worker_id = %worker_id,
+                                error = %err,
+                                released_workspace = released,
+                                "execution run failed"
                             );
-                        }
-                        self.publisher
-                            .publish(
-                                &execution.id,
-                                &execution.work_item_id,
-                                execution.status.as_str(),
-                                "execution_run_failed",
-                            )
-                            .await;
-                        if let Ok(item) = self.work_db.get_work_item(&execution.work_item_id) {
-                            self.publisher
-                                .publish_work_item_changed(
-                                    item.product_id(),
+                            let mut error_details = serde_json::json!({
+                                "run_id": run.id,
+                                "released_workspace": released,
+                                "slot_id": slot_id,
+                                "page": slot_id.and_then(worker_page_label),
+                                "pre_start_failure_count": execution.pre_start_failure_count,
+                                "transient_failure_count": execution.transient_failure_count,
+                            });
+                            // A `SlotBusy` spawn rejection means the engine and
+                            // the app disagree about slot occupancy — the
+                            // engine already knew which slot it requested
+                            // (`worker_id` above), but not which pane the app
+                            // reports as squatting it. Surface both explicitly
+                            // so `dispatch.jsonl` is self-diagnosing instead of
+                            // requiring a coordinator to cross-reference the
+                            // husk pane by hand.
+                            if let Some(occupying_run_id) = slot_busy_occupant(&err) {
+                                error_details["slot_busy"] = serde_json::json!({
+                                    "slot_id": slot_id,
+                                    "occupying_run_id": occupying_run_id,
+                                });
+                            }
+                            self.dispatch_events
+                                .emit(
+                                    DispatchEvent::new(Stage::PaneSpawned, DispatchOutcome::Error, &execution.id)
+                                        .with_work_item(&execution.work_item_id)
+                                        .with_worker(&worker_id)
+                                        .with_cube_lease(&lease.lease_id)
+                                        .with_cube_workspace(&lease.workspace_id)
+                                        .with_error(&err)
+                                        .with_details(error_details),
+                                )
+                                .await;
+                            // Clear the card out of `active`. The run is
+                            // already recorded `failed` and the workspace
+                            // released, but the work item itself stays
+                            // `active` — so the kanban keeps the green
+                            // "Doing" card and the orphan-active sweep
+                            // re-dispatches the same doomed spawn every
+                            // cycle. Demote it back to To-Do so the failure
+                            // (already surfaced as a `pane_spawn_failed`
+                            // attention item) is recoverable rather than a
+                            // silent green-flicker strand.
+                            //
+                            // Exception: PrReview spawn failures are engine
+                            // infrastructure bugs (e.g. slot-range mismatch),
+                            // not task regressions. Demoting the work item
+                            // here would silently move a reviewed PR back to
+                            // To-Do, erasing the review context. Leave the
+                            // task in place — the attention item already
+                            // surfaces the failure for the operator.
+                            //
+                            // Exception: a `SlotBusy` rejection is likewise an
+                            // engine-side infrastructure issue (see `is_slot_busy`
+                            // above), not a real dispatch failure of the task
+                            // itself — demoting to To-Do would require a human to
+                            // notice and manually re-drag the card. Leaving the
+                            // item `active` lets the tail of this function's
+                            // rescan (`rescan_active_dispatch_after_release`)
+                            // queue a fresh execution automatically, so the item
+                            // stays in Doing and dispatches onto the next free
+                            // slot exactly like a plain pool-exhaustion wait.
+                            if execution.kind != ExecutionKind::PrReview && !is_slot_busy {
+                                match self.work_db.bounce_dispatch_failed_to_backlog(
                                     &execution.work_item_id,
+                                    "pane_spawn_failed",
+                                    error_text.as_str(),
+                                ) {
+                                    Ok(true) => {
+                                        tracing::info!(
+                                            execution_id = %execution.id,
+                                            work_item_id = %execution.work_item_id,
+                                            "demoted work item to todo after pane-spawn failure",
+                                        );
+                                        self.dispatch_events
+                                            .emit(
+                                                DispatchEvent::new(
+                                                    Stage::StatusTransition,
+                                                    DispatchOutcome::Ok,
+                                                    &execution.id,
+                                                )
+                                                .with_work_item(&execution.work_item_id)
+                                                .with_worker(&worker_id)
+                                                .with_details(
+                                                    serde_json::json!({
+                                                        "from_status": "active",
+                                                        "to_status": "todo",
+                                                        "did_dispatch": false,
+                                                        "reason": "pane_spawn_failure",
+                                                        "failed_execution_id": execution.id,
+                                                    }),
+                                                ),
+                                            )
+                                            .await;
+                                    }
+                                    Ok(false) => {}
+                                    Err(demote_err) => tracing::error!(
+                                        ?demote_err,
+                                        work_item_id = %execution.work_item_id,
+                                        "failed to demote work item out of active after pane-spawn failure",
+                                    ),
+                                }
+                            } else {
+                                tracing::info!(
+                                    execution_id = %execution.id,
+                                    work_item_id = %execution.work_item_id,
+                                    is_slot_busy,
+                                    "skipping demote for pr_review or slot-busy spawn failure — engine infrastructure issue, not a task regression",
+                                );
+                            }
+                            self.publisher
+                                .publish(
+                                    &execution.id,
+                                    &execution.work_item_id,
+                                    execution.status.as_str(),
                                     "execution_run_failed",
                                 )
                                 .await;
-                        }
-                        // A pane-spawn failure is terminal — the execution is
-                        // now `failed` and the workspace has been released. If
-                        // this was an automation triage run, the matching
-                        // `automation_runs` row is still sitting at the
-                        // pessimistic `failed_will_retry` that the scheduler
-                        // stamped when it dispatched the triage execution.
-                        //
-                        // A genuine spawn failure (bad config, IPC down, …)
-                        // flips it to `failed_gave_up` so the Automations tab
-                        // shows an accurate terminal state instead of implying
-                        // a self-healing retry is pending — it will not
-                        // recover on its own. A `SlotBusy` rejection is the
-                        // opposite: it self-heals as soon as the offending
-                        // slot is reconciled (see the tail of this function),
-                        // so instead of giving up we fire a fresh triage
-                        // execution immediately — same automation, same repo
-                        // — and re-point this occurrence's `automation_runs`
-                        // row at it, mirroring `EngineTriageDispatcher::fire`
-                        // rather than waiting for the automation's next
-                        // scheduled occurrence.
-                        if execution.kind == ExecutionKind::AutomationTriage {
-                            if is_slot_busy {
-                                match self.work_db.create_automation_triage_execution(
-                                    &execution.work_item_id,
-                                    &execution.repo_remote_url,
-                                ) {
-                                    Ok(retry_execution) => {
-                                        if let Err(err) =
-                                            self.work_db.requeue_automation_run_after_transient_spawn_failure(
-                                                &execution.id,
-                                                &retry_execution.id,
-                                                &format!("slot busy at spawn; requeued as {}", retry_execution.id),
-                                            )
-                                        {
-                                            tracing::warn!(
+                            if let Ok(item) = self.work_db.get_work_item(&execution.work_item_id) {
+                                self.publisher
+                                    .publish_work_item_changed(
+                                        item.product_id(),
+                                        &execution.work_item_id,
+                                        "execution_run_failed",
+                                    )
+                                    .await;
+                            }
+                            // A pane-spawn failure is terminal — the execution is
+                            // now `failed` and the workspace has been released. If
+                            // this was an automation triage run, the matching
+                            // `automation_runs` row is still sitting at the
+                            // pessimistic `failed_will_retry` that the scheduler
+                            // stamped when it dispatched the triage execution.
+                            //
+                            // A genuine spawn failure (bad config, IPC down, …)
+                            // flips it to `failed_gave_up` so the Automations tab
+                            // shows an accurate terminal state instead of implying
+                            // a self-healing retry is pending — it will not
+                            // recover on its own. A `SlotBusy` rejection is the
+                            // opposite: it self-heals as soon as the offending
+                            // slot is reconciled (see the tail of this function),
+                            // so instead of giving up we fire a fresh triage
+                            // execution immediately — same automation, same repo
+                            // — and re-point this occurrence's `automation_runs`
+                            // row at it, mirroring `EngineTriageDispatcher::fire`
+                            // rather than waiting for the automation's next
+                            // scheduled occurrence.
+                            if execution.kind == ExecutionKind::AutomationTriage {
+                                if is_slot_busy {
+                                    match self.work_db.create_automation_triage_execution(
+                                        &execution.work_item_id,
+                                        &execution.repo_remote_url,
+                                    ) {
+                                        Ok(retry_execution) => {
+                                            if let Err(err) =
+                                                self.work_db.requeue_automation_run_after_transient_spawn_failure(
+                                                    &execution.id,
+                                                    &retry_execution.id,
+                                                    &format!("slot busy at spawn; requeued as {}", retry_execution.id),
+                                                )
+                                            {
+                                                tracing::warn!(
+                                                    execution_id = %execution.id,
+                                                    retry_execution_id = %retry_execution.id,
+                                                    ?err,
+                                                    "failed to re-point automation run at retry execution after slot-busy spawn failure",
+                                                );
+                                            }
+                                            tracing::info!(
                                                 execution_id = %execution.id,
                                                 retry_execution_id = %retry_execution.id,
-                                                ?err,
-                                                "failed to re-point automation run at retry execution after slot-busy spawn failure",
+                                                "requeued automation triage after slot-busy pane-spawn failure",
                                             );
                                         }
-                                        tracing::info!(
-                                            execution_id = %execution.id,
-                                            retry_execution_id = %retry_execution.id,
-                                            "requeued automation triage after slot-busy pane-spawn failure",
-                                        );
-                                    }
-                                    Err(create_err) => {
-                                        tracing::error!(
-                                            execution_id = %execution.id,
-                                            ?create_err,
-                                            "failed to create retry triage execution after slot-busy spawn failure; giving up",
-                                        );
-                                        if let Err(finalize_err) = self.work_db.finalize_automation_triage_run(
-                                            &execution.id,
-                                            boss_protocol::AUTOMATION_OUTCOME_FAILED_GAVE_UP,
-                                            None,
-                                            Some(&format!(
-                                                "pane spawn failed: {error_text}; retry creation also failed: {create_err:#}"
-                                            )),
-                                        ) {
-                                            tracing::warn!(
+                                        Err(create_err) => {
+                                            tracing::error!(
                                                 execution_id = %execution.id,
-                                                ?finalize_err,
-                                                "failed to mark automation run failed_gave_up after retry-creation failure",
+                                                ?create_err,
+                                                "failed to create retry triage execution after slot-busy spawn failure; giving up",
                                             );
+                                            if let Err(finalize_err) = self.work_db.finalize_automation_triage_run(
+                                                &execution.id,
+                                                boss_protocol::AUTOMATION_OUTCOME_FAILED_GAVE_UP,
+                                                None,
+                                                Some(&format!(
+                                                    "pane spawn failed: {error_text}; retry creation also failed: {create_err:#}"
+                                                )),
+                                            ) {
+                                                tracing::warn!(
+                                                    execution_id = %execution.id,
+                                                    ?finalize_err,
+                                                    "failed to mark automation run failed_gave_up after retry-creation failure",
+                                                );
+                                            }
                                         }
                                     }
+                                } else if let Err(finalize_err) = self.work_db.finalize_automation_triage_run(
+                                    &execution.id,
+                                    boss_protocol::AUTOMATION_OUTCOME_FAILED_GAVE_UP,
+                                    None,
+                                    Some(&format!("pane spawn failed: {error_text}")),
+                                ) {
+                                    tracing::warn!(
+                                        execution_id = %execution.id,
+                                        ?finalize_err,
+                                        "failed to mark automation run failed_gave_up after pane-spawn failure",
+                                    );
                                 }
-                            } else if let Err(finalize_err) = self.work_db.finalize_automation_triage_run(
-                                &execution.id,
-                                boss_protocol::AUTOMATION_OUTCOME_FAILED_GAVE_UP,
-                                None,
-                                Some(&format!("pane spawn failed: {error_text}")),
-                            ) {
-                                tracing::warn!(
-                                    execution_id = %execution.id,
-                                    ?finalize_err,
-                                    "failed to mark automation run failed_gave_up after pane-spawn failure",
-                                );
                             }
                         }
-                    }
-                    Err(record_err) => {
-                        // Double fault: the spawn failed AND the terminalizing
-                        // write was rejected (in the field: the row had been
-                        // cancelled during the minutes this arm spent in the
-                        // cube release, so `finish_execution_run` refused with
-                        // "cannot finish a run from status `cancelled`").
-                        //
-                        // Carry the original spawn error on this line too.
-                        // Without it, this arm was the one path where the
-                        // abort cause reached no log at all — the
-                        // `execution run failed` line that renders it lives in
-                        // the sibling `Ok` branch and never runs here. The
-                        // `spawn_failed` dispatch event emitted at the top of
-                        // this arm is the structured counterpart, and is
-                        // likewise unaffected by this failure.
-                        tracing::error!(
-                            ?record_err,
-                            execution_id = %execution.id,
-                            run_id = %run.id,
-                            worker_id = %worker_id,
-                            spawn_error = %err_detail,
-                            released_workspace = released,
-                            "failed to record execution run failure"
-                        );
+                        Err(record_err) => {
+                            // Double fault: the spawn failed AND the terminalizing
+                            // write was rejected (in the field: the row had been
+                            // cancelled during the minutes this arm spent in the
+                            // cube release, so `finish_execution_run` refused with
+                            // "cannot finish a run from status `cancelled`").
+                            //
+                            // Carry the original spawn error on this line too.
+                            // Without it, this arm was the one path where the
+                            // abort cause reached no log at all — the
+                            // `execution run failed` line that renders it lives in
+                            // the sibling `Ok` branch and never runs here. The
+                            // `spawn_failed` dispatch event emitted at the top of
+                            // this arm is the structured counterpart, and is
+                            // likewise unaffected by this failure.
+                            tracing::error!(
+                                ?record_err,
+                                execution_id = %execution.id,
+                                run_id = %run.id,
+                                worker_id = %worker_id,
+                                spawn_error = %err_detail,
+                                released_workspace = released,
+                                "failed to record execution run failure"
+                            );
+                        }
                     }
                 }
             }

@@ -402,6 +402,17 @@ impl crate::stale_worker_sweep::StaleWorkerReaper for ServerState {
 }
 
 #[async_trait]
+impl crate::coordinator::EngineHealthNotifier for ServerState {
+    /// Let the coordinator push a fresh health snapshot whenever the
+    /// dispatch-pause state changes, so a pause the operator did not
+    /// initiate (the spawn-capability breaker, a host-environment defer)
+    /// reaches the app's banner immediately instead of on next reconnect.
+    async fn broadcast_engine_health(&self) {
+        ServerState::broadcast_engine_health(self).await;
+    }
+}
+
+#[async_trait]
 impl crate::spawn_ack_sweep::SpawnAckReaper for ServerState {
     /// Route the spawn-ack-timeout reconcile through the same
     /// `release_worker_pane` teardown as the stale-worker sweep: tears
