@@ -729,9 +729,13 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
                 .await;
         }
         send_response(&sink, &request_id, dispatch_state_result(coordinator.dispatch_pause()));
-        // Broadcast the new health report to all connected app clients so
-        // the pause banner updates live without requiring an app restart.
-        server_state.broadcast_engine_health().await;
+        // NOTE: this handler deliberately does NOT broadcast the new health
+        // report itself. `coordinator.pause_dispatch` / `resume_dispatch`
+        // above already notified every subscriber of the pause-state
+        // transition, and `ServerState::spawn_pause_state_health_broadcaster`
+        // turns that into the engine-health push. Broadcasting here would
+        // double-push and would tempt the next programmatic pauser to add
+        // its own call; the transition subscriber is the single seam.
     }
 }
 
@@ -882,9 +886,10 @@ pub(super) async fn handle_set_automation_paused(ctx: Dispatch, req: FrontendReq
                 reason: coordinator.automation_paused_reason(),
             },
         );
-        // Broadcast the new health report to all connected app clients so
-        // the pause banner updates live without requiring an app restart.
-        server_state.broadcast_engine_health().await;
+        // No broadcast here for the same reason as
+        // `handle_set_dispatch_paused`: `coordinator.pause_automation` /
+        // `resume_automation` above notified the transition, and the
+        // pause-state broadcaster turns that into the health push.
     }
 }
 

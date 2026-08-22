@@ -2188,6 +2188,28 @@ pub struct ExecutionCoordinator {
     /// cap doesn't collide with the path under test.
     #[builder(default = AtomicUsize::new(MAX_CONCURRENT_INTERACTIVE_WORKERS))]
     max_concurrent_interactive_workers: AtomicUsize,
+    /// Change notifier for the four pause flags above (`dispatch_paused` /
+    /// `automation_paused` and their since/origin/reason companions). Every
+    /// state-changing [`Self::pause_dispatch`] / [`Self::resume_dispatch`] /
+    /// [`Self::pause_automation`] / [`Self::resume_automation`] call bumps
+    /// the generation counter; [`Self::subscribe_pause_state`] hands out
+    /// receivers.
+    ///
+    /// This is keyed to the **state transition**, deliberately not to any
+    /// caller: every pauser — the `Set*Paused` RPC handlers, the
+    /// spawn-capability circuit breaker
+    /// ([`crate::spawn_health::trip_spawn_capability_circuit`]), or any
+    /// future programmatic one — is observed by construction and none of
+    /// them needs to fire a notification itself. See
+    /// `ServerState::spawn_pause_state_health_broadcaster`.
+    ///
+    /// A `watch` (not the engine [`EventBus`]) because this is
+    /// latest-state-wins with no payload to lose: a subscriber that misses
+    /// two rapid toggles still re-reads current state and pushes one
+    /// correct snapshot, and the channel needs no opt-in flag or filter
+    /// wiring to be live in every build.
+    #[builder(default = tokio::sync::watch::channel(0).0)]
+    pause_state_changed: tokio::sync::watch::Sender<u64>,
 }
 
 mod config;
