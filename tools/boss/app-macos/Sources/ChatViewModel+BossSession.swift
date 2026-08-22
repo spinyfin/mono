@@ -78,6 +78,21 @@ extension ChatViewModel {
         engine.sendWorkerPaneDied(runId: runId, reason: reason)
     }
 
+    /// Called by a tmux-hosted pane's `TmuxClientInputReporter` when the app
+    /// delivers keyboard input into it. The engine correlates the stamp
+    /// against the tmux server's own record of that client's last input; a
+    /// stamp the server never caught up to is a viewer whose input path has
+    /// died, which the engine recovers by detaching the client so the app
+    /// rebuilds it.
+    func paneClientInputDelivered(sessionName: String, clientPid: Int32, lastInputEpoch: Int64) {
+        guard isAppSessionRegistered else { return }
+        engine.sendReportPaneClientInput(
+            sessionName: sessionName,
+            clientPid: clientPid,
+            lastInputEpoch: lastInputEpoch
+        )
+    }
+
     /// Called by ContentView when `GhosttyRuntime` observes the system's
     /// displays waking from sleep. Reports it to the engine so a
     /// worker-pane spawn stranded by the sleep is redispatched

@@ -798,6 +798,62 @@ pub(super) async fn handle_worker_pane_died(ctx: Dispatch, req: FrontendRequest)
     tokio::spawn(async move { resolve_reported_pane_death(&server_state, &run_id, reason).await });
 }
 
+/// Record the app's latest keyboard-input delivery for one tmux-hosted
+/// pane, for [`crate::tmux_input_watch`] to correlate against the tmux
+/// server's own view of that client.
+///
+/// Storing a report is all this does: it never touches tmux, never decides
+/// anything, and is cheap enough to run inline on the app's serial request
+/// loop. The judgement — and the only thing that can detach a client — lives
+/// in the watch's own task.
+///
+/// Rejected unless the caller is the registered app session. The report
+/// names a pid that recovery is allowed to detach, so accepting one from an
+/// arbitrary CLI would hand any local process a way to evict a tmux client.
+pub(super) async fn handle_report_pane_client_input(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        session_id,
+        ..
+    } = ctx;
+    let FrontendRequest::ReportPaneClientInput {
+        session_name,
+        client_pid,
+        last_input_epoch,
+    } = req
+    else {
+        unreachable!()
+    };
+    let app_session_id = server_state
+        .app_session
+        .lock()
+        .await
+        .as_ref()
+        .map(|handle| handle.session_id.clone());
+    if app_session_id.as_deref() != Some(session_id.as_str()) {
+        tracing::warn!(
+            %session_name,
+            "report_pane_client_input rejected: caller is not the registered app session",
+        );
+        return;
+    }
+    if session_name.is_empty() || client_pid <= 0 {
+        tracing::warn!(
+            %session_name,
+            client_pid,
+            "report_pane_client_input ignored: incomplete pane identity",
+        );
+        return;
+    }
+    server_state.pane_input_reports.record(
+        &session_name,
+        crate::tmux_input_watch::InputReport {
+            client_pid,
+            last_input_epoch,
+        },
+    );
+}
+
 /// Classify and resolve one app-reported pane death — the body of
 /// [`handle_worker_pane_died`], split out so the routing decision is
 /// directly awaitable in tests instead of racing a detached `tokio::spawn`.

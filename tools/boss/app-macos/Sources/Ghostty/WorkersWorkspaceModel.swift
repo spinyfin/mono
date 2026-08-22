@@ -106,6 +106,17 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// `reason` is a short human-readable cause.
     var onSpawnFailed: ((String, String) -> Void)?
 
+    /// Called when the app delivers keyboard input into a tmux-hosted worker
+    /// viewer. `ContentView` installs this closure to report it to the
+    /// engine, which correlates it against the tmux server's own view of
+    /// that client to detect a viewer whose input path has died.
+    var onClientInput: ((_ sessionName: String, _ clientPid: Int32, _ lastInputEpoch: Int64) -> Void)?
+
+    /// One input reporter per tmux-hosted slot, held for the pane's lifetime
+    /// and dropped when the slot is released — a reporter that outlived its
+    /// surface would keep naming a tmux client pid that no longer exists.
+    private var clientInputReporters: [Int: TmuxClientInputReporter] = [:]
+
     /// Update pool capacities from the engine's EnginePoolConfig push.
     /// Called every time the app registers a session, so the slot ranges
     /// always mirror the live engine rather than independently-maintained
@@ -150,7 +161,8 @@ final class WorkersWorkspaceModel: ObservableObject {
             env: [],
             summary: request.summary,
             taskTitle: request.taskTitle,
-            paneMonitor: .claudeDefault
+            paneMonitor: .claudeDefault,
+            tmuxSessionName: request.sessionName
         )
         switch hostWorkerPane(launch, reportsWorkerLifecycle: false) {
         case .success:
@@ -228,6 +240,20 @@ final class WorkersWorkspaceModel: ObservableObject {
             slots[index].runId = request.runId
             slots[index].summary = request.summary
             slots[index].taskTitle = request.taskTitle
+        }
+
+        // A tmux-hosted worker viewer is the same shape as the coordinator's
+        // — a Ghostty surface whose pty runs `tmux attach-session` — so the
+        // same input wedge is reachable for it once `workers.tmux_hosting`
+        // is on. Reporting its input too means the engine's watch covers it
+        // with no further wiring.
+        if let tmuxSessionName = request.tmuxSessionName {
+            clientInputReporters[slotId] = TmuxClientInputReporter(
+                sessionName: tmuxSessionName,
+                session: session
+            ) { [weak self] name, clientPid, epoch in
+                self?.onClientInput?(name, clientPid, epoch)
+            }
         }
 
         // Return shell_pid 0 now — the libghostty surface is created
@@ -369,6 +395,10 @@ final class WorkersWorkspaceModel: ObservableObject {
         // can't create a fresh surface and spawn a duplicate `claude` for the
         // run the engine just gave up on.
         session.markReleased()
+        // Drop the input reporter with the pane: it names a tmux client pid
+        // that is about to stop existing, and a stale report would leave the
+        // engine judging whatever client inherits that session next.
+        clientInputReporters[slotId] = nil
 
         targetSlots[index].session = nil
         targetSlots[index].runId = nil

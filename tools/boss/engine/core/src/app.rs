@@ -71,6 +71,7 @@ mod decisions;
 mod dependencies;
 mod design_docs;
 mod effort;
+mod engine_health;
 mod engine_meta;
 mod executions;
 mod external_tracker;
@@ -81,6 +82,7 @@ mod github_auth;
 // `pub(super)`; only the module path is widened.
 pub(crate) mod handler_helpers;
 mod hosts;
+mod input_watch;
 /// Public so `tests/isolation_guard.rs` can drive `IsolationPaths::derive*`
 /// directly.
 pub mod isolation;
@@ -593,6 +595,20 @@ struct ServerState {
     /// so registration immediately observes an upgrade.
     #[builder(default)]
     coordinator_installed_version_cache: CoordinatorInstalledVersionCache,
+    /// Latest app-reported keyboard input per tmux-hosted pane, keyed by
+    /// tmux session name. Half of the wedge correlation in
+    /// [`crate::tmux_input_watch`]: tmux can see that a client sent it
+    /// nothing, but only the app knows whether anything was typed, so an
+    /// idle viewer and a dead-input viewer are indistinguishable without
+    /// this. Cleared with the app session — a report from a departed app
+    /// describes a client that no longer exists.
+    #[builder(default)]
+    pane_input_reports: Arc<crate::tmux_input_watch::PaneInputReports>,
+    /// Cross-tick wedge state for [`input_watch::run`]. Owned here rather
+    /// than by the loop so the streak, recovery budget and settle period
+    /// survive as one addressable piece of engine state.
+    #[builder(default)]
+    tmux_input_watch: Arc<Mutex<crate::tmux_input_watch::InputWatch>>,
     /// Per-slot trigger fan-in for the live-status summarizer. Started
     /// when `spawn_flow` calls `start_live_status_slot`; torn down
     /// in `release_worker_pane`.
@@ -2620,6 +2636,9 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::UpdateAutomation { .. } => automations::handle_update_automation(ctx, r).await,
             r @ FrontendRequest::MoveWorkItemOnBoard { .. } => work_items::handle_move_work_item_on_board(ctx, r).await,
             r @ FrontendRequest::UpdateWorkItem { .. } => work_items::handle_update_work_item(ctx, r).await,
+            r @ FrontendRequest::ReportPaneClientInput { .. } => {
+                sessions::handle_report_pane_client_input(ctx, r).await
+            }
             r @ FrontendRequest::ReportSelectedProduct { .. } => {
                 selected_product::handle_report_selected_product(ctx, r).await
             }

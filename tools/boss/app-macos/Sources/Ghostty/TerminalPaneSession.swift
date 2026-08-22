@@ -267,6 +267,17 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     /// uses it to rebuild its local tmux client while the engine-owned
     /// detached coordinator session remains unaffected.
     var onChildExited: (() -> Void)?
+    /// Called on the main actor every time the app delivers keyboard input
+    /// into this pane's surface — a real keystroke, or a programmatic one
+    /// from an engine `SendToPane` / interrupt. All of them travel the same
+    /// route into the pty, so all of them are evidence input was attempted.
+    ///
+    /// Only tmux-hosted panes install this ([`TmuxClientInputReporter`]).
+    /// It is what lets the engine separate a viewer whose input path has
+    /// died from one nobody is typing into: tmux can see that a client sent
+    /// it nothing, but not whether anything was typed.
+    var onInputDelivered: (() -> Void)?
+
     /// Called on the main actor each time a libghostty surface is
     /// successfully attached to this session. Fires on initial creation
     /// and on every surface recreation. Worker panes use this to report a

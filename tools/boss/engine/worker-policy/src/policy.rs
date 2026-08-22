@@ -430,6 +430,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::RecreateCoordinator { .. }
         | FrontendRequest::RegisterAppSession
         | FrontendRequest::RegisterCapabilities { .. }
+        | FrontendRequest::ReportPaneClientInput { .. }
         | FrontendRequest::ReportSelectedProduct { .. }
         | FrontendRequest::ReportWorkerSpawnFailed { .. }
         | FrontendRequest::Shutdown { .. }

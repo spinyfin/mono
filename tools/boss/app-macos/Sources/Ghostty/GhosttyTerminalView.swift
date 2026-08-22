@@ -68,6 +68,14 @@ final class GhosttyTerminalHostView: NSView {
     private(set) var surface: ghostty_surface_t?
 
     private var trackingAreaRef: NSTrackingArea?
+    /// Window-level observation of attempted keyboard input. This runs before
+    /// responder dispatch, so a pane can report an attempt even if AppKit has
+    /// lost its first responder; it never consumes or rewrites the event.
+    private var inputAttemptMonitor: Any?
+    /// The last terminal selected in a window remains the intended input
+    /// target when AppKit transiently clears the first responder. A real
+    /// non-terminal responder always wins over this fallback.
+    private static weak var lastInputTarget: GhosttyTerminalHostView?
     private var currentCursor: NSCursor = .iBeam
     private var cursorVisible = true
     private var backgroundColor = NSColor.black
@@ -480,6 +488,7 @@ final class GhosttyTerminalHostView: NSView {
         pendingGeometrySync?.cancel()
         paneMonitorTimer?.invalidate()
         removeScreenObserver()
+        removeInputAttemptMonitor()
         // Stop the event-loop sampler from probing a pane that's going
         // away (the bypass teardown path that skips `tearDown`).
         TerminalLoopMonitor.shared.unregister(self)
@@ -548,6 +557,7 @@ final class GhosttyTerminalHostView: NSView {
         paneMonitorTimer?.invalidate()
         paneMonitorTimer = nil
         removeScreenObserver()
+        removeInputAttemptMonitor()
 
         // Drain any in-flight async focus call (focusQueue is serial) before
         // freeing so `ghostty_surface_set_focus` can't run on a freed
@@ -570,6 +580,7 @@ final class GhosttyTerminalHostView: NSView {
     override func becomeFirstResponder() -> Bool {
         let accepted = super.becomeFirstResponder()
         if accepted, let surface {
+            Self.lastInputTarget = self
             UISignpost.signposter.emitEvent(UISignpost.Name.focusSwitch, "become")
             // Dispatch off the main thread — see focusQueue doc-comment above.
             let box = SurfaceBox(surface: surface)
@@ -596,6 +607,8 @@ final class GhosttyTerminalHostView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
 
+        reconcileInputAttemptMonitor()
+
         // If surface creation failed earlier (e.g. no active display at
         // init time), gaining a window is a good moment to retry — the
         // window carries a screen once one is available.
@@ -605,6 +618,46 @@ final class GhosttyTerminalHostView: NSView {
 
         reconcilePaneMonitor()
         syncGeometry()
+    }
+
+    /// Observe keys at the window boundary in addition to `keyDown`. The
+    /// latter is still responsible for forwarding keys to libghostty; this
+    /// observer records only that the focused tmux pane was targeted and
+    /// always hands the event back to AppKit unchanged.
+    private func reconcileInputAttemptMonitor() {
+        guard inputAttemptMonitor == nil, window != nil else { return }
+        inputAttemptMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, self.isWindowInputTarget(for: event) else { return event }
+            if !event.modifierFlags.contains(.command) {
+                self.session.onInputDelivered?()
+            }
+            return event
+        }
+    }
+
+    private func removeInputAttemptMonitor() {
+        if let inputAttemptMonitor {
+            NSEvent.removeMonitor(inputAttemptMonitor)
+            self.inputAttemptMonitor = nil
+        }
+        if Self.lastInputTarget === self {
+            Self.lastInputTarget = nil
+        }
+    }
+
+    private func isWindowInputTarget(for event: NSEvent) -> Bool {
+        guard event.window === window else { return false }
+        guard let responder = event.window?.firstResponder else {
+            return Self.lastInputTarget === self
+        }
+        guard let responderView = responder as? NSView else {
+            return Self.lastInputTarget === self
+        }
+        if responderView === self || responderView.isDescendant(of: self) {
+            Self.lastInputTarget = self
+            return true
+        }
+        return false
     }
 
     override func layout() {
@@ -679,6 +732,7 @@ final class GhosttyTerminalHostView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
+        Self.lastInputTarget = self
         // The left press→release span is the selection-drag interaction
         // the shake flagged. Bracket it with a signpost interval and run
         // the dropped-frame counter so a stuttery drag is measurable.
@@ -698,6 +752,7 @@ final class GhosttyTerminalHostView: NSView {
 
     override func rightMouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
+        Self.lastInputTarget = self
         NSMenu.popUpContextMenu(buildContextMenu(), with: event, for: self)
     }
 
@@ -760,6 +815,7 @@ final class GhosttyTerminalHostView: NSView {
         text.withCString { ptr in
             ghostty_surface_text(surface, ptr, UInt(strlen(ptr)))
         }
+        session.onInputDelivered?()
     }
 
     @objc private func contextMenuSelectAll(_ sender: Any?) {
@@ -796,6 +852,25 @@ final class GhosttyTerminalHostView: NSView {
     override func keyDown(with event: NSEvent) {
         UISignpost.signposter.emitEvent(UISignpost.Name.keystroke)
         sendKey(event, action: event.isARepeat ? GHOSTTY_ACTION_REPEAT : GHOSTTY_ACTION_PRESS)
+        // Record that input was attempted, whatever becomes of it
+        // downstream. On a tmux-hosted pane this is the only evidence the
+        // engine can use to tell a viewer whose input path has died from one
+        // nobody is typing into — see `TmuxClientInputReporter`.
+        //
+        // Deliberately after the send, and not conditioned on
+        // `ghostty_surface_key`'s return: that return means "was the key
+        // consumed", not "was it written to the pty", so a delivery
+        // libghostty silently drops — exactly the case worth reporting —
+        // looks identical to a successful one.
+        //
+        // Command-modified keys are the one exclusion. A terminal never
+        // sends those to the pty (they are app and binding keys: Cmd-C,
+        // Cmd-W, Cmd-Tab), so reporting one would claim input the server can
+        // never acknowledge. Control and Option keys DO produce pty bytes
+        // and are reported.
+        if !event.modifierFlags.contains(.command) {
+            session.onInputDelivered?()
+        }
     }
 
     override func keyUp(with event: NSEvent) {
@@ -916,6 +991,7 @@ final class GhosttyTerminalHostView: NSView {
         if plan.sendReturn {
             sendReturnKey()
         }
+        session.onInputDelivered?()
     }
 
     /// Pure helper that decides how to break a `SendToPane` payload
@@ -985,6 +1061,7 @@ final class GhosttyTerminalHostView: NSView {
         keyEvent.composing = false
         keyEvent.unshifted_codepoint = 0x1B
         _ = ghostty_surface_key(surface, keyEvent)
+        session.onInputDelivered?()
     }
 
     func setCellSize(_ size: ghostty_action_cell_size_s) {
