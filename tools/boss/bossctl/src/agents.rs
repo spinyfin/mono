@@ -226,6 +226,22 @@ pub(crate) async fn fetch_live_states(client: &mut BossClient) -> Result<Vec<Liv
     }
 }
 
+/// Fetch the on-demand tmux evidence paired with the live-state snapshot.
+/// The engine deliberately avoids putting process probes in hook broadcasts.
+pub(crate) async fn fetch_tmux_worker_statuses(client: &mut BossClient) -> Result<Vec<TmuxWorkerStatus>> {
+    match client
+        .send_request(&FrontendRequest::ListTmuxWorkerStatuses)
+        .await
+        .context("sending ListTmuxWorkerStatuses")?
+    {
+        FrontendEvent::TmuxWorkerStatusesList { statuses } => Ok(statuses),
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected tmux status list: {message}")
+        }
+        other => bail!("engine returned unexpected tmux status response: {other:?}"),
+    }
+}
+
 /// Fetch every pane the app hosts, classified against the engine's live
 /// registry and durable state (live / terminal-entry-with-live-process /
 /// husk) — see [`HostedPaneState`]. This is the durable-state fallback
@@ -597,6 +613,17 @@ fn print_run_lifecycle(json: bool, run: &WorkRun, live: Option<&LiveWorkerState>
 pub(crate) async fn agents_list_live(socket_path: &Option<String>, json: bool, all: bool) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
+    let (tmux_statuses, tmux_fetch_failed) = match fetch_tmux_worker_statuses(&mut client).await {
+        Ok(statuses) => (statuses, false),
+        Err(err) => {
+            eprintln!("warning: tmux worker statuses unavailable ({err}); listing workers without tmux evidence");
+            (Vec::new(), true)
+        }
+    };
+    let tmux_status_by_execution: HashMap<&str, &TmuxWorkerStatus> = tmux_statuses
+        .iter()
+        .map(|status| (status.execution_id.as_str(), status))
+        .collect();
 
     let hosted = if all {
         fetch_hosted_pane_statuses(&mut client).await?
@@ -609,6 +636,7 @@ pub(crate) async fn agents_list_live(socket_path: &Option<String>, json: bool, a
             "{}",
             serde_json::json!({
                 "live_worker_states": states,
+                "tmux_worker_statuses": tmux_statuses,
                 "hosted_pane_statuses": hosted,
             })
         );
@@ -619,7 +647,15 @@ pub(crate) async fn agents_list_live(socket_path: &Option<String>, json: bool, a
         println!("no active workers");
     } else {
         for state in &states {
-            print_live_state_short(state);
+            let evidence = if tmux_fetch_failed {
+                TmuxListEvidence::FetchFailed
+            } else {
+                match tmux_status_by_execution.get(state.run_id.as_str()) {
+                    Some(status) => TmuxListEvidence::Present(status),
+                    None => TmuxListEvidence::Missing,
+                }
+            };
+            print_live_state_short(state, evidence);
         }
     }
     if all {
@@ -652,6 +688,62 @@ pub(crate) async fn agents_list_live(socket_path: &Option<String>, json: bool, a
         }
     }
     Ok(())
+}
+
+/// Print the exact, non-creating tmux attach command for one live worker.
+/// Resolution deliberately shares the normal live-worker lookup tiers, then
+/// requires a currently token-matched session before printing anything.
+pub(crate) async fn agents_attach(socket_path: &Option<String>, json: bool, agent: String) -> Result<()> {
+    let mut client = connect(socket_path).await?;
+    let states = fetch_live_states(&mut client).await?;
+    let run_id = resolve_agent_ref(&agent, &states)?.run_id.clone();
+    let statuses = fetch_tmux_worker_statuses(&mut client).await?;
+    let status = statuses
+        .iter()
+        .find(|status| status.execution_id == run_id)
+        .ok_or_else(|| anyhow::anyhow!("engine returned no tmux status for live worker {run_id}"))?;
+    let attach = attach_command_from_status(&run_id, status)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "execution_id": run_id,
+                "session_name": attach.session_name,
+                "command": attach.command,
+            })
+        );
+    } else {
+        println!("{}", attach.command);
+    }
+    Ok(())
+}
+
+/// Decide whether a status row is safe to attach to, and take the
+/// engine-authored command rather than reconstructing one client-side.
+fn attach_command_from_status(run_id: &str, status: &TmuxWorkerStatus) -> Result<AttachTarget> {
+    if status.adoption_state != TmuxAdoptionState::Adopted {
+        bail!(
+            "worker {run_id} is not attachable: tmux adoption_state={}",
+            tmux_adoption_state_label(status.adoption_state)
+        );
+    }
+    let session_name = status
+        .session_name
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("worker {run_id} is adopted but has no tmux session name"))?
+        .to_owned();
+    let command = status
+        .attach_command
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("worker {run_id} is adopted but has no attach command"))?
+        .to_owned();
+    Ok(AttachTarget { session_name, command })
+}
+
+#[derive(Debug)]
+struct AttachTarget {
+    session_name: String,
+    command: String,
 }
 
 /// Resolve `agent` (run id, slot id, or crew name) to the slot to retire.
@@ -1661,8 +1753,21 @@ fn print_live_state(json: bool, state: &LiveWorkerState) {
     }
 }
 
-fn print_live_state_short(state: &LiveWorkerState) {
-    println!("{}", format_live_state_short(state));
+fn print_live_state_short(state: &LiveWorkerState, tmux: TmuxListEvidence<'_>) {
+    println!("{}", format_live_state_short(state, tmux));
+}
+
+/// Why a live-list row has no `TmuxWorkerStatus`. The absent-status causes
+/// are distinguished in the rendered row: an engine that could not answer
+/// renders `probe_unavailable`, and an answered-but-rowless worker renders
+/// `no_status`.
+#[derive(Debug, Clone, Copy)]
+enum TmuxListEvidence<'a> {
+    /// `ListTmuxWorkerStatuses` failed (older engine, RPC error).
+    FetchFailed,
+    /// The engine answered, but this worker had no row.
+    Missing,
+    Present(&'a TmuxWorkerStatus),
 }
 
 /// Render a [`HostedPaneStatus`] resolved from the durable/hosted-pane
@@ -1717,7 +1822,7 @@ fn print_hosted_pane_status(json: bool, pane: &HostedPaneStatus) {
 
 /// One-line `agents list` row for a live worker. Pure so tests can pin
 /// the pool + exec-kind columns without capturing stdout.
-fn format_live_state_short(state: &LiveWorkerState) -> String {
+fn format_live_state_short(state: &LiveWorkerState, tmux: TmuxListEvidence<'_>) -> String {
     let tool = state.current_tool.as_deref().unwrap_or("-");
     let work_item = state.work_item_id.as_deref().unwrap_or("-");
     let work_item_name = state.work_item_name.as_deref().unwrap_or("-");
@@ -1750,7 +1855,37 @@ fn format_live_state_short(state: &LiveWorkerState) -> String {
     if state.held {
         line.push_str("  held=true");
     }
+    match tmux {
+        TmuxListEvidence::Present(status) => {
+            let session = status.session_name.as_deref().unwrap_or("-");
+            let pane_dead = status.pane_dead.map_or("-", |dead| if dead { "true" } else { "false" });
+            let last_output = status.last_output_at.as_deref().unwrap_or("-");
+            line.push_str(&format!(
+                "  tmux_session={}  adoption_state={}  pane_dead={}  last_output_at={}",
+                session,
+                tmux_adoption_state_label(status.adoption_state),
+                pane_dead,
+                last_output,
+            ));
+        }
+        TmuxListEvidence::FetchFailed => {
+            line.push_str("  tmux_session=-  adoption_state=probe_unavailable  pane_dead=-  last_output_at=-")
+        }
+        TmuxListEvidence::Missing => {
+            line.push_str("  tmux_session=-  adoption_state=no_status  pane_dead=-  last_output_at=-")
+        }
+    }
     line
+}
+
+fn tmux_adoption_state_label(state: TmuxAdoptionState) -> &'static str {
+    match state {
+        TmuxAdoptionState::NotTmuxHosted => "not_tmux_hosted",
+        TmuxAdoptionState::Adopted => "adopted",
+        TmuxAdoptionState::SessionMissing => "session_missing",
+        TmuxAdoptionState::TokenMismatch => "token_mismatch",
+        TmuxAdoptionState::ProbeUnavailable => "probe_unavailable",
+    }
 }
 
 #[cfg(test)]
@@ -1772,7 +1907,7 @@ mod tests {
     #[test]
     fn format_live_state_short_shows_pool_and_kind_dashes_when_unset() {
         let state = worker(3, "run_a", "Riker");
-        let line = format_live_state_short(&state);
+        let line = format_live_state_short(&state, TmuxListEvidence::Missing);
         assert!(
             line.contains("pool=-") && line.contains("kind=-"),
             "expected pool=- and kind=- placeholders when unset: {line}"
@@ -1789,14 +1924,103 @@ mod tests {
         state.pool = Some("automation".to_owned());
         state.kind = Some("automation_triage".to_owned());
         state.held = true;
-        let line = format_live_state_short(&state);
+        let line = format_live_state_short(&state, TmuxListEvidence::FetchFailed);
         assert!(
             line.contains("pool=automation") && line.contains("kind=automation_triage"),
             "expected stamped pool+kind: {line}"
         );
         assert!(
-            line.ends_with("held=true"),
-            "held suffix should still trail the row: {line}"
+            line.contains("held=true  tmux_session=-  adoption_state=probe_unavailable"),
+            "held and fetch-failed tmux evidence should trail the row: {line}"
+        );
+    }
+
+    #[test]
+    fn format_live_state_short_renders_tmux_observability_fields() {
+        let state = worker(5, "exec_tmux", "Data");
+        let status = TmuxWorkerStatus::builder()
+            .execution_id("exec_tmux")
+            .session_name("boss-worker-5")
+            .adoption_state(TmuxAdoptionState::Adopted)
+            .pane_dead(false)
+            .last_output_at("2026-08-19T12:00:00Z")
+            .attach_command("/opt/homebrew/bin/tmux -L boss attach-session -t boss-worker-5")
+            .build();
+        let line = format_live_state_short(&state, TmuxListEvidence::Present(&status));
+        assert!(line.contains("tmux_session=boss-worker-5"), "missing session: {line}");
+        assert!(
+            line.contains("adoption_state=adopted"),
+            "missing adoption state: {line}"
+        );
+        assert!(line.contains("pane_dead=false"), "missing pane state: {line}");
+        assert!(
+            line.contains("last_output_at=2026-08-19T12:00:00Z"),
+            "missing output time: {line}"
+        );
+    }
+
+    #[test]
+    fn format_live_state_short_distinguishes_missing_row_from_fetch_failure() {
+        let state = worker(1, "run_c", "Geordi");
+        let missing = format_live_state_short(&state, TmuxListEvidence::Missing);
+        let failed = format_live_state_short(&state, TmuxListEvidence::FetchFailed);
+        assert!(
+            missing.contains("adoption_state=no_status"),
+            "engine answered with no row: {missing}"
+        );
+        assert!(
+            failed.contains("adoption_state=probe_unavailable"),
+            "engine could not answer: {failed}"
+        );
+    }
+
+    fn adopted_status(session_name: Option<&str>, attach_command: Option<&str>) -> TmuxWorkerStatus {
+        TmuxWorkerStatus::builder()
+            .execution_id("exec_attach")
+            .maybe_session_name(session_name)
+            .adoption_state(TmuxAdoptionState::Adopted)
+            .pane_dead(false)
+            .maybe_attach_command(attach_command)
+            .build()
+    }
+
+    #[test]
+    fn attach_command_from_status_refuses_non_adopted() {
+        let status = TmuxWorkerStatus::builder()
+            .execution_id("exec_attach")
+            .session_name("boss-worker-1")
+            .adoption_state(TmuxAdoptionState::TokenMismatch)
+            .pane_dead(false)
+            .attach_command("tmux -L boss attach-session -t boss-worker-1")
+            .build();
+        let err = attach_command_from_status("exec_attach", &status).unwrap_err();
+        assert!(
+            err.to_string().contains("adoption_state=token_mismatch"),
+            "unexpected refusal: {err}"
+        );
+    }
+
+    #[test]
+    fn attach_command_from_status_refuses_adopted_without_session_name() {
+        let status = adopted_status(None, Some("/usr/bin/tmux -L boss attach-session -t missing"));
+        let err = attach_command_from_status("exec_attach", &status).unwrap_err();
+        assert!(
+            err.to_string().contains("has no tmux session name"),
+            "unexpected refusal: {err}"
+        );
+    }
+
+    #[test]
+    fn attach_command_from_status_prints_engine_command_without_exec() {
+        let command = "/opt/homebrew/bin/tmux -L boss attach-session -t boss-worker-5";
+        let status = adopted_status(Some("boss-worker-5"), Some(command));
+        let attach = attach_command_from_status("exec_attach", &status).expect("adopted status is attachable");
+        assert_eq!(attach.session_name, "boss-worker-5");
+        assert_eq!(attach.command, command);
+        assert!(
+            !attach.command.starts_with("exec "),
+            "operator paste must not exec the shell: {}",
+            attach.command
         );
     }
 

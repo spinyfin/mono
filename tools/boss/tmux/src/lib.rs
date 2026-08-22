@@ -137,6 +137,19 @@ impl Tmux {
         &self.program
     }
 
+    /// Operator-facing attach command for an already-verified session.
+    ///
+    /// Uses this handle's resolved executable and [`SERVER_LABEL`]. No
+    /// `exec` prefix: this is meant to be pasted into an existing shell,
+    /// so detaching from the session should return to a prompt.
+    pub fn attach_session_command(&self, session_name: &str) -> String {
+        format!(
+            "{} -L {} attach-session -t {session_name}",
+            self.program.display(),
+            SERVER_LABEL,
+        )
+    }
+
     /// Probes the resolved executable's version before the engine accepts work.
     pub async fn version(&self) -> Result<TmuxVersion> {
         let mut args = self.server_args();

@@ -101,7 +101,7 @@ use boss_tmux::{DisplayField, TMUX_SPAWN_TOKEN_ENV, Tmux};
 
 use crate::coordinator::{ExecutionCoordinator, slot_id_from_worker_id};
 use crate::dead_pid_sweep::{PidStatus, probe_pid};
-use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
+use crate::dispatch_events::{DispatchEvent, DispatchEventSink, ENGINE_BOOT_EXECUTION_ID, Outcome, Stage};
 use crate::live_worker_state::{LiveSpawnRouting, ReadoptionEvidence, attributed_pool_label};
 use crate::spawn_flow::{TMUX_SESSION_SCHEMA, WorkerSpawner};
 use crate::work::{TmuxRunHandle, WorkDb};
@@ -151,6 +151,162 @@ pub struct UntrackedTmuxSession {
 /// evidence that its pane is gone.
 pub async fn session_spawn_token(tmux: &Tmux, session_name: &str) -> anyhow::Result<Option<String>> {
     tmux.show_environment(session_name, TMUX_SPAWN_TOKEN_ENV).await
+}
+
+/// Fine-grained classification of one durable tmux identity against the live
+/// server. Shared by `ServerState::tmux_worker_statuses` and
+/// [`crate::stale_worker_sweep::TmuxWorkerTerminalInspector`] so the two
+/// cannot drift on the interrogation sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxIdentityObservation {
+    pub adoption_state: boss_protocol::TmuxAdoptionState,
+    pub pane_dead: Option<bool>,
+    pub pane_dead_status: Option<String>,
+    pub window_activity_epoch_secs: Option<i64>,
+    pub current_command: Option<String>,
+}
+
+fn probe_unavailable_observation() -> TmuxIdentityObservation {
+    TmuxIdentityObservation {
+        adoption_state: boss_protocol::TmuxAdoptionState::ProbeUnavailable,
+        pane_dead: None,
+        pane_dead_status: None,
+        window_activity_epoch_secs: None,
+        current_command: None,
+    }
+}
+
+/// Probe one durable tmux identity.
+///
+/// `session_exists` is supplied by the caller so a batch collector can
+/// `list_sessions` once. When the session is missing, no further tmux
+/// calls are issued. A live session is classified by spawn-token match,
+/// then `#{pane_dead}` / `#{pane_dead_status}` / `#{window_activity}` /
+/// `#{pane_current_command}` — `#{window_activity}` is read even on a
+/// dead pane because `remain-on-exit` keeps it readable.
+pub async fn observe_tmux_identity(
+    tmux: &Tmux,
+    session_name: &str,
+    expected_spawn_token: &str,
+    session_exists: bool,
+) -> TmuxIdentityObservation {
+    if !session_exists {
+        return TmuxIdentityObservation {
+            adoption_state: boss_protocol::TmuxAdoptionState::SessionMissing,
+            pane_dead: None,
+            pane_dead_status: None,
+            window_activity_epoch_secs: None,
+            current_command: None,
+        };
+    }
+    let token = match session_spawn_token(tmux, session_name).await {
+        Ok(token) => token,
+        Err(err) => {
+            tracing::debug!(
+                session = %session_name,
+                error = %format!("{err:#}"),
+                "tmux identity probe: spawn token unreadable"
+            );
+            return probe_unavailable_observation();
+        }
+    };
+    if token.as_deref() != Some(expected_spawn_token) {
+        return TmuxIdentityObservation {
+            adoption_state: boss_protocol::TmuxAdoptionState::TokenMismatch,
+            pane_dead: None,
+            pane_dead_status: None,
+            window_activity_epoch_secs: None,
+            current_command: None,
+        };
+    }
+    let pane_dead = match tmux.display_message(session_name, DisplayField::PaneDead).await {
+        Ok(value) => value == "1",
+        Err(err) => {
+            tracing::debug!(
+                session = %session_name,
+                error = %format!("{err:#}"),
+                "tmux identity probe: pane_dead unreadable"
+            );
+            return probe_unavailable_observation();
+        }
+    };
+    let pane_dead_status = if pane_dead {
+        match tmux.display_message(session_name, DisplayField::PaneDeadStatus).await {
+            Ok(status) => (!status.is_empty()).then_some(status),
+            Err(err) => {
+                tracing::debug!(
+                    session = %session_name,
+                    error = %format!("{err:#}"),
+                    "tmux identity probe: pane_dead_status unreadable"
+                );
+                return probe_unavailable_observation();
+            }
+        }
+    } else {
+        None
+    };
+    let window_activity_epoch_secs = match tmux.display_message(session_name, DisplayField::WindowActivity).await {
+        Ok(value) => match value.parse::<i64>() {
+            Ok(epoch) => Some(epoch),
+            Err(err) if pane_dead => {
+                tracing::debug!(
+                    session = %session_name,
+                    error = %err,
+                    "tmux identity probe: window_activity unparseable on a dead pane"
+                );
+                None
+            }
+            Err(err) => {
+                tracing::debug!(
+                    session = %session_name,
+                    error = %err,
+                    "tmux identity probe: window_activity unparseable"
+                );
+                return probe_unavailable_observation();
+            }
+        },
+        Err(err) if pane_dead => {
+            tracing::debug!(
+                session = %session_name,
+                error = %format!("{err:#}"),
+                "tmux identity probe: window_activity unreadable on a dead pane"
+            );
+            None
+        }
+        Err(err) => {
+            tracing::debug!(
+                session = %session_name,
+                error = %format!("{err:#}"),
+                "tmux identity probe: window_activity unreadable"
+            );
+            return probe_unavailable_observation();
+        }
+    };
+    let current_command = if pane_dead {
+        None
+    } else {
+        match tmux
+            .display_message(session_name, DisplayField::PaneCurrentCommand)
+            .await
+        {
+            Ok(command) => Some(command),
+            Err(err) => {
+                tracing::debug!(
+                    session = %session_name,
+                    error = %format!("{err:#}"),
+                    "tmux identity probe: pane_current_command unreadable"
+                );
+                return probe_unavailable_observation();
+            }
+        }
+    };
+    TmuxIdentityObservation {
+        adoption_state: boss_protocol::TmuxAdoptionState::Adopted,
+        pane_dead: Some(pane_dead),
+        pane_dead_status,
+        window_activity_epoch_secs,
+        current_command,
+    }
 }
 
 /// What one pass did; the caller logs it.
@@ -237,7 +393,7 @@ where
                     DispatchEvent::new(
                         Stage::TmuxAdoptionOwnerConflict,
                         Outcome::Error,
-                        "engine-boot".to_string(),
+                        ENGINE_BOOT_EXECUTION_ID.to_string(),
                     )
                     .with_details(serde_json::json!({
                         "other_pid": other_pid,
@@ -588,7 +744,7 @@ async fn adopt_one<S>(
 
     dispatch_events
         .emit(
-            DispatchEvent::new(Stage::TmuxWorkerAdopted, Outcome::Ok, execution_id)
+            DispatchEvent::new(Stage::TmuxAdopt, Outcome::Ok, execution_id)
                 .with_work_item(&execution.work_item_id)
                 .with_details(serde_json::json!({
                     "slot_id": slot_id,
@@ -629,6 +785,26 @@ async fn classify_untracked_session<S>(
     let execution_id = match work_db.execution_id_for_tmux_spawn_token(&session.spawn_token) {
         Ok(Some(id)) => id,
         Ok(None) => {
+            dispatch_events
+                .emit(
+                    // Not a real execution: the token has no `work_runs` row.
+                    // `"engine-boot"` is the same sentinel
+                    // `TmuxAdoptionOwnerConflict` uses, so the JSONL sink
+                    // mirrors into one stable `executions/engine-boot/`
+                    // directory instead of minting a phantom timeline per
+                    // leaked token. The token itself is in `details`.
+                    DispatchEvent::new(
+                        Stage::TmuxLeakDetected,
+                        Outcome::Ok,
+                        ENGINE_BOOT_EXECUTION_ID.to_string(),
+                    )
+                    .with_details(serde_json::json!({
+                        "tmux_session_name": session.session_name,
+                        "spawn_token": session.spawn_token,
+                        "reason": "spawn_token_not_found",
+                    })),
+                )
+                .await;
             outcome.untracked_sessions.push(session);
             return;
         }
@@ -1014,7 +1190,7 @@ async fn refuse_and_reap(
     dispatch_events
         .emit(
             DispatchEvent::new(
-                Stage::TmuxAdoptionRefused,
+                Stage::TmuxRefuseSkew,
                 if reaped { Outcome::Ok } else { Outcome::Error },
                 execution_id,
             )
@@ -1477,7 +1653,7 @@ mod tests {
 
         let events = sink.events_for(&execution_id).await;
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].stage, Stage::TmuxWorkerAdopted.as_str());
+        assert_eq!(events[0].stage, Stage::TmuxAdopt.as_str());
     }
 
     /// A crash between `tmux new-session` and the confirmation write leaves
@@ -1647,7 +1823,7 @@ mod tests {
 
         let events = sink.events_for(&execution_id).await;
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].stage, Stage::TmuxAdoptionRefused.as_str());
+        assert_eq!(events[0].stage, Stage::TmuxRefuseSkew.as_str());
         assert_eq!(events[0].details["schema_guard_failure"], serde_json::json!("missing"));
 
         let attentions = db.list_attention_items_for_work_item(&work_item_id).unwrap();
@@ -1691,8 +1867,13 @@ mod tests {
                 spawn_token: "tok-unknown".to_owned(),
             }]
         );
+        let events = sink.events_for(ENGINE_BOOT_EXECUTION_ID).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].stage, Stage::TmuxLeakDetected.as_str());
+        assert_eq!(events[0].execution_id, ENGINE_BOOT_EXECUTION_ID);
+        assert_eq!(events[0].details["tmux_session_name"], "boss-worker-9");
+        assert_eq!(events[0].details["spawn_token"], "tok-unknown");
         assert!(convergence.calls.lock().unwrap().is_empty());
-        assert!(sink.events().await.is_empty());
     }
 
     /// The coordinator's session shares the worker tmux server but must
@@ -1800,7 +1981,7 @@ mod tests {
 
         let events = sink.events_for(&execution_id).await;
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].stage, Stage::TmuxAdoptionRefused.as_str());
+        assert_eq!(events[0].stage, Stage::TmuxRefuseSkew.as_str());
         assert_eq!(events[0].details["schema_guard_failure"], serde_json::json!("missing"));
 
         let attentions = db.list_attention_items_for_work_item(&work_item_id).unwrap();
@@ -1869,7 +2050,7 @@ mod tests {
 
         let events = sink.events_for(&execution_id).await;
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].stage, Stage::TmuxAdoptionRefused.as_str());
+        assert_eq!(events[0].stage, Stage::TmuxRefuseSkew.as_str());
         assert_eq!(
             events[0].outcome,
             Outcome::Error.as_str(),
@@ -2007,7 +2188,7 @@ mod tests {
         );
         assert_eq!(events[0].stage, Stage::TmuxAdoptionOwnerConflict.as_str());
         assert_eq!(events[0].outcome, Outcome::Error.as_str());
-        assert_eq!(events[0].execution_id, "engine-boot");
+        assert_eq!(events[0].execution_id, ENGINE_BOOT_EXECUTION_ID);
         assert_eq!(events[0].details["other_pid"], serde_json::json!(1));
         assert_eq!(events[0].details["this_pid"], serde_json::json!(std::process::id()));
     }
