@@ -403,6 +403,15 @@ fn apply_automation_outcome(
                 )));
             }
 
+            // The worker only ever sees the friendly `T<n>` id printed by
+            // `boss task create --automation`, so resolve that to the
+            // primary id before the provenance query — mirrors how
+            // `get_work_item_resolving_short_id` resolves short ids on the
+            // legacy marker path (`completion.rs:2414`). Falls back to the
+            // literal id when it isn't a friendly-id form, so a primary id
+            // passed directly still works.
+            let resolved_task_id = resolve_friendly_work_item_id(tx, &task_id)?.unwrap_or_else(|| task_id.clone());
+
             // `query_task`'s column list omits `source_automation_id` (it is
             // not part of the standard task-read shape most callers need),
             // so the provenance check reads it directly rather than through
@@ -411,14 +420,14 @@ fn apply_automation_outcome(
             let task_source_automation_id: Option<Option<String>> = tx
                 .query_row(
                     "SELECT source_automation_id FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
-                    [&task_id],
+                    [&resolved_task_id],
                     |row| row.get::<_, Option<String>>(0),
                 )
                 .optional()?;
 
             match task_source_automation_id {
                 Some(Some(actual)) if actual == automation_id => ApplyDecision::Applied(ApplyOutcome {
-                    applied_ref: Some(task_id),
+                    applied_ref: Some(resolved_task_id),
                     post_commit_audit_line: None,
                 }),
                 Some(_) => ApplyDecision::Rejected(format!(

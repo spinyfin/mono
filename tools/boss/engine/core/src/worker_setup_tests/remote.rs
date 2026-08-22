@@ -15,6 +15,7 @@ fn remote_settings_drop_data_dir_sandbox_but_keep_hooks_and_static_denies() {
         execution_kind: "task_implementation".into(),
         task_kind: Some("task".into()),
         worker_kind: WorkerKind::Standard,
+        automation_outcome_proposals_seam_enabled: false,
     };
     let parsed: serde_json::Value = serde_json::from_str(&render_remote_settings_json(&input, &ClaudeDriver)).unwrap();
 
