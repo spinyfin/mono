@@ -17,6 +17,7 @@ rust_library(
         "//tools/boss/engine/dispatch-reader:__pkg__",
         "//tools/boss/engine/driver:__pkg__",
         "//tools/boss/engine/recovery:__pkg__",
+        "//tools/boss/tmux:__pkg__",
     ],
     deps = all_crate_deps(normal = True),
 )

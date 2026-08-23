@@ -9,6 +9,7 @@ final class WorkersWorkspaceModelSendTests: XCTestCase {
             runId: "run-tmux",
             slotId: 1,
             sessionName: "boss-1-run-tmux",
+            tmuxSocketPath: "/tmp/boss-tmux.sock",
             summary: nil,
             taskTitle: nil
         ))
@@ -18,7 +19,7 @@ final class WorkersWorkspaceModelSendTests: XCTestCase {
         }
 
         let session = model.slots.first(where: { $0.slotId == 1 })?.session
-        XCTAssertEqual(session?.launchSpec.initialInput, "exec tmux -L boss attach-session -t boss-1-run-tmux\n")
+        XCTAssertEqual(session?.launchSpec.initialInput, "exec tmux -S '/tmp/boss-tmux.sock' attach-session -t 'boss-1-run-tmux'\n")
         XCTAssertTrue(session?.launchSpec.env.isEmpty ?? false)
     }
 
@@ -28,6 +29,7 @@ final class WorkersWorkspaceModelSendTests: XCTestCase {
             runId: "run-tmux",
             slotId: 1,
             sessionName: "boss-1-run-tmux",
+            tmuxSocketPath: "/tmp/boss-tmux.sock",
             summary: nil,
             taskTitle: nil
         ))

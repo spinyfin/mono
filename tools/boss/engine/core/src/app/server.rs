@@ -516,7 +516,9 @@ pub async fn serve_with_merge_probe(
                     return;
                 }
             };
-            let Ok(tmux) = boss_tmux::Tmux::from_path(program) else {
+            let Ok(tmux) = boss_tmux::private_socket_path()
+                .and_then(|socket| boss_tmux::Tmux::from_path_with_socket(program, socket))
+            else {
                 tracing::error!("coordinator tmux supervisor stopped: preflight supplied an invalid path");
                 return;
             };

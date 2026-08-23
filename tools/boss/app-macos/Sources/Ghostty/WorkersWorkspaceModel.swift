@@ -146,7 +146,7 @@ final class WorkersWorkspaceModel: ObservableObject {
             runId: request.runId,
             workspacePath: FileManager.default.homeDirectoryForCurrentUser.path,
             slotId: request.slotId,
-            initialInput: "exec tmux -L boss attach-session -t \(request.sessionName)\n",
+            initialInput: "exec tmux -S \(bossShellQuote(request.tmuxSocketPath)) attach-session -t \(bossShellQuote(request.sessionName))\n",
             env: [],
             summary: request.summary,
             taskTitle: request.taskTitle,

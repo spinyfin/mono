@@ -103,6 +103,16 @@ fn relative_executable_path_is_rejected() {
     assert!(error.to_string().contains("absolute"));
 }
 
+#[tokio::test]
+async fn explicit_socket_path_scopes_commands_without_tmp_label_resolution() {
+    let runner = StubRunner::replies([success("tmux 3.6\n")]);
+    let tmux = Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", runner.clone(), "/state/boss/tmux.sock").unwrap();
+
+    tmux.version().await.unwrap();
+
+    assert_eq!(runner.calls(), vec![vec!["-S", "/state/boss/tmux.sock", "-V"]]);
+}
+
 #[test]
 fn version_parser_accepts_letter_suffixes_and_enforces_floor() {
     assert_eq!(

@@ -1,8 +1,9 @@
 //! Typed control surface for Boss's private tmux server.
 //!
-//! Every command is scoped to `tmux -L boss`, so Boss's sessions are isolated
-//! from any tmux server running on the default socket. The process runner is injectable so callers
-//! can test command construction without a live tmux daemon.
+//! Every production command is scoped to an explicit socket beneath Boss's
+//! durable state root. This avoids tmux's label-based default socket directory
+//! under `/tmp`. The process runner is injectable so callers can test command
+//! construction without a live tmux daemon.
 
 mod types;
 
@@ -94,11 +95,34 @@ impl From<anyhow::Error> for KillSessionError {
 /// `load-buffer` and `paste-buffer` so concurrent deliveries cannot steal each
 /// other's content off tmux's unnamed buffer stack.
 static PASTE_BUFFER_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Filename for Boss's private tmux socket under the state root.
+pub const SOCKET_FILENAME: &str = "tmux.sock";
+
+/// Resolve the private socket from Boss's durable state root.
+pub fn private_socket_path() -> Result<PathBuf> {
+    if let Some(db_path) = std::env::var_os("BOSS_DB_PATH") {
+        let db_path = PathBuf::from(db_path);
+        if let Some(state_root) = db_path.parent().filter(|path| !path.as_os_str().is_empty()) {
+            return Ok(state_root.join(SOCKET_FILENAME));
+        }
+    }
+    let state_root = boss_log_files::default_state_root()
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve Boss state root for tmux socket"))?;
+    Ok(state_root.join(SOCKET_FILENAME))
+}
+
+#[derive(Clone)]
+enum ServerAddress {
+    Label,
+    Socket(PathBuf),
+}
 /// Handle for one resolved tmux executable and Boss's private server.
 #[derive(Clone)]
 pub struct Tmux {
     program: PathBuf,
     runner: Arc<dyn CommandRunner>,
+    server: ServerAddress,
 }
 
 impl std::fmt::Debug for Tmux {
@@ -116,7 +140,7 @@ impl Tmux {
         let program = which::which("tmux").context("locating tmux on PATH")?;
         let program =
             std::fs::canonicalize(&program).with_context(|| format!("canonicalizing tmux path {program:?}"))?;
-        Self::from_path(program)
+        Self::from_path_with_socket(program, private_socket_path()?)
     }
 
     /// Creates a controller for an already-resolved absolute executable path.
@@ -124,13 +148,44 @@ impl Tmux {
         Self::with_runner(program, Arc::new(RealCommandRunner))
     }
 
+    /// Creates a production controller targeting one explicit private socket.
+    pub fn from_path_with_socket(program: impl Into<PathBuf>, socket_path: impl Into<PathBuf>) -> Result<Self> {
+        Self::with_runner_and_socket(program, Arc::new(RealCommandRunner), socket_path)
+    }
+
     /// Creates a controller with a test or host-specific process runner.
     pub fn with_runner(program: impl Into<PathBuf>, runner: Arc<dyn CommandRunner>) -> Result<Self> {
+        Self::with_runner_for_server(program, runner, ServerAddress::Label)
+    }
+
+    /// Creates a controller with an explicit socket, for production and
+    /// command-construction tests that need to exercise `-S`.
+    pub fn with_runner_and_socket(
+        program: impl Into<PathBuf>,
+        runner: Arc<dyn CommandRunner>,
+        socket_path: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        let socket_path = socket_path.into();
+        if !socket_path.is_absolute() {
+            bail!("tmux socket path must be absolute: {socket_path:?}");
+        }
+        Self::with_runner_for_server(program, runner, ServerAddress::Socket(socket_path))
+    }
+
+    fn with_runner_for_server(
+        program: impl Into<PathBuf>,
+        runner: Arc<dyn CommandRunner>,
+        server: ServerAddress,
+    ) -> Result<Self> {
         let program = program.into();
         if !program.is_absolute() {
             bail!("tmux executable path must be absolute: {program:?}");
         }
-        Ok(Self { program, runner })
+        Ok(Self {
+            program,
+            runner,
+            server,
+        })
     }
 
     pub fn program(&self) -> &Path {
@@ -432,7 +487,10 @@ impl Tmux {
     }
 
     fn server_args(&self) -> Vec<OsString> {
-        vec!["-L".into(), SERVER_LABEL.into()]
+        match &self.server {
+            ServerAddress::Label => vec!["-L".into(), SERVER_LABEL.into()],
+            ServerAddress::Socket(path) => vec!["-S".into(), path.clone().into_os_string()],
+        }
     }
 
     async fn invoke(&self, args: Vec<OsString>) -> Result<CommandOutput> {

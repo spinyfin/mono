@@ -706,6 +706,10 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     }
 
     let claimed_slot = input.slot_id;
+    let tmux_socket_path = boss_tmux::private_socket_path()
+        .map_err(StartWorkerError::Tmux)?
+        .display()
+        .to_string();
     let (slot_id, shell_pid, ack_timed_out) = if let Some(tmux_host) = input.tmux_host.as_ref() {
         let shell_pid = match start_tmux_worker(
             tmux_host,
@@ -733,6 +737,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
                     run_id: input.run_id.clone(),
                     slot_id: claimed_slot,
                     session_name: tmux_host.session_name().to_owned(),
+                    tmux_socket_path: tmux_socket_path.clone(),
                     summary: input.title_summary.clone(),
                     task_title: input.task_title.clone(),
                 }),

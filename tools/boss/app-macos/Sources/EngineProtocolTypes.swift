@@ -60,6 +60,7 @@ struct EngineAttachRequest: Sendable {
     let runId: String
     let slotId: Int
     let sessionName: String
+    let tmuxSocketPath: String
     let summary: String?
     let taskTitle: String?
 }
@@ -74,8 +75,8 @@ struct EngineCoordinatorAttachRequest: Sendable {
     let spawnToken: String
     let model: String
     let tmuxProgram: String
-    /// tmux `-L` label for the engine-owned private server.
-    let serverLabel: String
+    /// Explicit tmux `-S` path for the engine-owned private server.
+    let tmuxSocketPath: String
     /// The installed `claude` version, present only when the engine has
     /// confirmed it is newer than the one this session actually launched
     /// with. `nil` means "nothing to show" — never render an "up to date"

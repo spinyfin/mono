@@ -274,7 +274,9 @@ impl ServerState {
         let crate::tmux_preflight::TmuxPreflight::Ready { program, .. } = &*preflight else {
             anyhow::bail!("tmux is unavailable for pane delivery")
         };
-        Tmux::from_path(program.clone()).context("creating tmux pane-delivery controller")
+        boss_tmux::private_socket_path()
+            .and_then(|socket| Tmux::from_path_with_socket(program.clone(), socket))
+            .context("creating tmux pane-delivery controller")
     }
 
     /// Register a one-shot waiter for the next `UserPromptSubmit` hook
