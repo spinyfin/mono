@@ -506,7 +506,10 @@ pub async fn serve_with_merge_probe(
             let program = match coordinator_supervisor_state.tmux_preflight.read() {
                 Ok(guard) => match &*guard {
                     crate::tmux_preflight::TmuxPreflight::Ready { program, .. } => program.clone(),
-                    crate::tmux_preflight::TmuxPreflight::Unavailable { .. } => continue,
+                    crate::tmux_preflight::TmuxPreflight::Unavailable { .. } => {
+                        delay = RESTART_BACKOFF_CAP;
+                        continue;
+                    }
                 },
                 Err(_) => {
                     tracing::error!("coordinator tmux supervisor stopped: preflight lock poisoned");
