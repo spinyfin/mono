@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use boss_protocol::CoordinatorRecreateReason;
@@ -151,27 +151,42 @@ pub(crate) async fn restart_if_dead(
 
 /// Consecutive-failure tracker for the coordinator tmux supervisor.
 ///
-/// The supervisor used to increment its counter on a *successful* restart
-/// (`Ok(Some(record))`) and leave it untouched on `Err`. Five healthy
-/// recoveries in a minute therefore tripped the ceiling, while an unbounded
-/// run of hard failures — the case the ceiling exists to surface — never
-/// did. Failures now increment; a healthy or recovered pass resets the count.
+/// Counts consecutive failed supervisor passes. A failed pass
+/// (`restart_if_dead` returning `Err`, or a session directory that cannot
+/// be resolved) increments; a healthy or recovered pass resets the count.
+/// Reaching `LIMIT` raises the operator-facing restart-failure ceiling
+/// attention once per streak.
 ///
 /// The count is consecutive, not windowed: the supervisor already backs off
 /// a full minute between hard failures, so a wall-clock window of that same
 /// minute would reset the counter on every retry and the ceiling would still
 /// never fire.
+///
+/// Separately tracks consecutive *successful* restarts (`Ok(Some(record))`
+/// from `restart_if_dead`): a coordinator whose `claude` child exits
+/// immediately (bad model, expired auth, `claude` missing from `PATH`) kills
+/// and recreates the tmux session on every pass, which is a technically
+/// successful restart and never touches the failure counter above. Left
+/// unchecked that churns forever with no backoff and no operator signal, so
+/// `record_restart` gives that path its own escalating backoff and its own
+/// ceiling attention, reset only by a genuinely idle pass (`Ok(None)`).
 pub(crate) struct CoordinatorRestartFailures {
     consecutive_failures: u32,
     ceiling_notified: bool,
-    pause_until: Option<Instant>,
+    restart_churn: u32,
+    restart_churn_notified: bool,
 }
 
 /// What the supervisor should do after recording a failed pass.
 pub(crate) struct RestartFailureDecision {
     pub delay: Duration,
-    /// This failure reached or is already past the ceiling.
-    pub at_ceiling: bool,
+    /// Raise the operator attention; true only the first time we reach the ceiling.
+    pub notify: bool,
+}
+
+/// What the supervisor should do after recording a successful restart.
+pub(crate) struct RestartChurnDecision {
+    pub delay: Duration,
     /// Raise the operator attention; true only the first time we reach the ceiling.
     pub notify: bool,
 }
@@ -184,7 +199,8 @@ impl CoordinatorRestartFailures {
         Self {
             consecutive_failures: 0,
             ceiling_notified: false,
-            pause_until: None,
+            restart_churn: 0,
+            restart_churn_notified: false,
         }
     }
 
@@ -192,43 +208,59 @@ impl CoordinatorRestartFailures {
         self.consecutive_failures
     }
 
-    /// Remaining pause after the ceiling, if recovery is currently latched.
-    ///
-    /// When the pause has elapsed, clears the latch so the caller retries
-    /// once. The consecutive count is left in place: a further failure
-    /// re-enters the pause without re-notifying; a success resets everything.
-    pub(crate) fn pause_delay(&mut self, now: Instant) -> Option<Duration> {
-        let until = self.pause_until?;
-        if now < until {
-            return Some(until.saturating_duration_since(now).max(Duration::from_millis(1)));
-        }
-        self.pause_until = None;
-        None
+    pub(crate) fn restart_churn(&self) -> u32 {
+        self.restart_churn
     }
 
+    /// Record a genuinely healthy pass: no restart was needed. Resets both
+    /// the failure counter and the restart-churn counter.
     pub(crate) fn record_success(&mut self) {
         self.consecutive_failures = 0;
         self.ceiling_notified = false;
-        self.pause_until = None;
+        self.restart_churn = 0;
+        self.restart_churn_notified = false;
     }
 
-    pub(crate) fn record_failure(&mut self, now: Instant) -> RestartFailureDecision {
+    /// Record a failed pass (`Err`, or session directory not ready). The
+    /// retry cadence stays flat at `BACKOFF_CAP` once the ceiling is
+    /// reached — the supervisor keeps retrying, it does not pause.
+    pub(crate) fn record_failure(&mut self) -> RestartFailureDecision {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         if self.consecutive_failures < Self::LIMIT {
             return RestartFailureDecision {
                 delay: Self::BACKOFF_CAP,
-                at_ceiling: false,
                 notify: false,
             };
         }
         let notify = !self.ceiling_notified;
         self.ceiling_notified = true;
-        self.pause_until = Some(now + Self::BACKOFF_CAP);
         RestartFailureDecision {
             delay: Self::BACKOFF_CAP,
-            at_ceiling: true,
             notify,
         }
+    }
+
+    /// Record a successful kill-and-recreate (`Ok(Some(record))`). This is
+    /// not an `Err`, so it resets the hard-failure counter, but it escalates
+    /// its own backoff (2s, 4s, 8s, 16s, 32s, capped at `BACKOFF_CAP`) so a
+    /// crash-looping `claude` child cannot respawn every 2s forever, and
+    /// raises its own ceiling attention once per streak.
+    pub(crate) fn record_restart(&mut self) -> RestartChurnDecision {
+        self.consecutive_failures = 0;
+        self.ceiling_notified = false;
+        self.restart_churn = self.restart_churn.saturating_add(1);
+        let delay = Self::churn_backoff(self.restart_churn);
+        if self.restart_churn < Self::LIMIT {
+            return RestartChurnDecision { delay, notify: false };
+        }
+        let notify = !self.restart_churn_notified;
+        self.restart_churn_notified = true;
+        RestartChurnDecision { delay, notify }
+    }
+
+    fn churn_backoff(count: u32) -> Duration {
+        let secs = 2u64.saturating_pow(count.min(6));
+        Duration::from_secs(secs).min(Self::BACKOFF_CAP)
     }
 }
 
@@ -823,78 +855,94 @@ mod tests {
     #[test]
     fn consecutive_failures_trip_the_restart_ceiling() {
         let mut failures = CoordinatorRestartFailures::new();
-        let t0 = Instant::now();
-        // Space failures a full backoff-cap apart — the incident cadence —
-        // so a wall-clock window of that same duration cannot be what trips.
         for i in 0..CoordinatorRestartFailures::LIMIT - 1 {
-            let decision = failures.record_failure(t0 + CoordinatorRestartFailures::BACKOFF_CAP * i);
+            let decision = failures.record_failure();
             assert!(
-                !decision.at_ceiling,
-                "failure {} of {} must not trip the ceiling",
+                !decision.notify,
+                "failure {} of {} must not notify",
                 i + 1,
                 CoordinatorRestartFailures::LIMIT
             );
-            assert!(!decision.notify);
             assert_eq!(decision.delay, CoordinatorRestartFailures::BACKOFF_CAP);
         }
-        let decision = failures
-            .record_failure(t0 + CoordinatorRestartFailures::BACKOFF_CAP * (CoordinatorRestartFailures::LIMIT - 1));
+        let decision = failures.record_failure();
         assert!(
-            decision.at_ceiling,
+            decision.notify,
             "the {limit}th consecutive failure must trip the ceiling",
             limit = CoordinatorRestartFailures::LIMIT
         );
-        assert!(decision.notify);
         assert_eq!(decision.delay, CoordinatorRestartFailures::BACKOFF_CAP);
         assert_eq!(failures.consecutive_failures(), CoordinatorRestartFailures::LIMIT);
     }
 
     #[test]
-    fn successful_restarts_do_not_trip_the_restart_ceiling() {
+    fn successful_restarts_do_not_trip_the_restart_failure_ceiling() {
         let mut failures = CoordinatorRestartFailures::new();
         for _ in 0..CoordinatorRestartFailures::LIMIT + 3 {
             failures.record_success();
             assert_eq!(failures.consecutive_failures(), 0);
-            assert!(failures.pause_delay(Instant::now()).is_none());
         }
     }
 
     #[test]
     fn a_success_resets_consecutive_failures() {
         let mut failures = CoordinatorRestartFailures::new();
-        let t0 = Instant::now();
         for _ in 0..CoordinatorRestartFailures::LIMIT - 1 {
-            assert!(!failures.record_failure(t0).at_ceiling);
+            assert!(!failures.record_failure().notify);
         }
         failures.record_success();
         for _ in 0..CoordinatorRestartFailures::LIMIT - 1 {
-            assert!(!failures.record_failure(t0).at_ceiling);
+            assert!(!failures.record_failure().notify);
         }
-        let decision = failures.record_failure(t0);
-        assert!(decision.at_ceiling);
+        let decision = failures.record_failure();
         assert!(decision.notify);
     }
 
     #[test]
-    fn ceiling_pauses_then_retries_without_renotifying() {
+    fn ceiling_keeps_retrying_at_the_flat_backoff_without_renotifying() {
         let mut failures = CoordinatorRestartFailures::new();
-        let t0 = Instant::now();
         for _ in 0..CoordinatorRestartFailures::LIMIT {
-            failures.record_failure(t0);
+            failures.record_failure();
         }
-        assert!(failures.pause_delay(t0).is_some());
-        assert!(
-            failures
-                .pause_delay(t0 + CoordinatorRestartFailures::BACKOFF_CAP)
-                .is_none(),
-            "the pause must elapse after BACKOFF_CAP so recovery can retry"
-        );
-        let again = failures.record_failure(t0 + CoordinatorRestartFailures::BACKOFF_CAP);
-        assert!(again.at_ceiling);
+        let again = failures.record_failure();
+        assert_eq!(again.delay, CoordinatorRestartFailures::BACKOFF_CAP);
         assert!(!again.notify, "still at the ceiling: do not raise a second attention");
         failures.record_success();
         assert_eq!(failures.consecutive_failures(), 0);
-        assert!(failures.pause_delay(Instant::now()).is_none());
+    }
+
+    #[test]
+    fn consecutive_restarts_escalate_and_trip_their_own_ceiling() {
+        let mut failures = CoordinatorRestartFailures::new();
+        let expected_delays = [2, 4, 8, 16, 32];
+        for (i, &expected_secs) in expected_delays.iter().enumerate() {
+            let decision = failures.record_restart();
+            assert_eq!(decision.delay, Duration::from_secs(expected_secs));
+            assert_eq!(
+                decision.notify,
+                i + 1 >= CoordinatorRestartFailures::LIMIT as usize,
+                "restart {} of {}",
+                i + 1,
+                CoordinatorRestartFailures::LIMIT
+            );
+        }
+        let further = failures.record_restart();
+        assert_eq!(further.delay, CoordinatorRestartFailures::BACKOFF_CAP);
+        assert!(
+            !further.notify,
+            "still at the churn ceiling: do not raise a second attention"
+        );
+        assert_eq!(failures.restart_churn(), 6);
+    }
+
+    #[test]
+    fn a_healthy_pass_resets_restart_churn_but_a_restart_does_not() {
+        let mut failures = CoordinatorRestartFailures::new();
+        failures.record_restart();
+        failures.record_restart();
+        assert_eq!(failures.restart_churn(), 2);
+        failures.record_success();
+        assert_eq!(failures.restart_churn(), 0);
     }
 
     // --- claude version probe / comparison ---

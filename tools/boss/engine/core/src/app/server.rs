@@ -496,19 +496,11 @@ pub async fn serve_with_merge_probe(
         let mut delay = Duration::from_millis(500);
         loop {
             tokio::time::sleep(delay).await;
-            if let Some(paused) = restart_failures.pause_delay(std::time::Instant::now()) {
-                tracing::error!(
-                    restart_failures = restart_failures.consecutive_failures(),
-                    "coordinator restart limit reached; pausing recovery until the failure window expires"
-                );
-                delay = paused;
-                continue;
-            }
             let program = match coordinator_supervisor_state.tmux_preflight.read() {
                 Ok(guard) => match &*guard {
                     crate::tmux_preflight::TmuxPreflight::Ready { program, .. } => program.clone(),
                     crate::tmux_preflight::TmuxPreflight::Unavailable { .. } => {
-                        delay = RESTART_BACKOFF_CAP;
+                        delay = crate::coordinator_tmux::CoordinatorRestartFailures::BACKOFF_CAP;
                         continue;
                     }
                 },
@@ -522,46 +514,66 @@ pub async fn serve_with_merge_probe(
                 return;
             };
             let legacy_tmux = boss_tmux::Tmux::for_legacy_label_server(tmux.program().to_path_buf()).ok();
+            // Only the lock-held span is computed here; any await that can
+            // raise an attention (note_coordinator_restart_failure /
+            // raise_coordinator_restart_churn_attention) happens after the
+            // guard drops below, so a slow attention publish never blocks
+            // coordinator attach/recreate.
             let (restart, active_tmux) = {
                 let _guard = coordinator_supervisor_state.coordinator_tmux_lock.lock().await;
                 let working_directory = match crate::coordinator_tmux::coordinator_working_directory() {
-                    Ok(path) => path,
+                    Ok(path) => Some(path),
                     Err(error) => {
                         tracing::warn!(
                             error = %format!("{error:#}"),
                             "coordinator tmux supervisor: session directory not ready"
                         );
-                        delay = note_coordinator_restart_failure(&mut restart_failures, &coordinator_supervisor_state)
-                            .await;
-                        continue;
+                        None
                     }
                 };
                 let active_tmux = crate::coordinator_tmux::resolve_active_handle(&tmux, legacy_tmux.as_ref())
                     .await
                     .clone();
-                let restart = crate::coordinator_tmux::restart_if_dead(
-                    coordinator_supervisor_state.work_db.as_ref(),
-                    &active_tmux,
-                    &tmux,
-                    &coordinator_supervisor_state.coordinator_model,
-                    &working_directory,
-                    &crate::coordinator_tmux::RealClaudeVersionProbe,
-                )
-                .await;
+                let restart = match working_directory {
+                    Some(working_directory) => Some(
+                        crate::coordinator_tmux::restart_if_dead(
+                            coordinator_supervisor_state.work_db.as_ref(),
+                            &active_tmux,
+                            &tmux,
+                            &coordinator_supervisor_state.coordinator_model,
+                            &working_directory,
+                            &crate::coordinator_tmux::RealClaudeVersionProbe,
+                        )
+                        .await,
+                    ),
+                    None => None,
+                };
                 (restart, active_tmux)
             };
             match restart {
-                Ok(Some(record)) => {
-                    restart_failures.record_success();
+                None => {
+                    delay =
+                        note_coordinator_restart_failure(&mut restart_failures, &coordinator_supervisor_state).await;
+                }
+                Some(Ok(Some(record))) => {
+                    let churn = restart_failures.record_restart();
+                    if churn.notify {
+                        raise_coordinator_restart_churn_attention(&coordinator_supervisor_state).await;
+                    }
+                    tracing::warn!(
+                        restart_churn = restart_failures.restart_churn(),
+                        delay_secs = churn.delay.as_secs(),
+                        "coordinator tmux supervisor: recreated a dead coordinator session"
+                    );
                     crate::app::sessions::request_coordinator_attachment(
                         coordinator_supervisor_state.clone(),
                         &tmux,
                         record,
                     )
                     .await;
-                    delay = Duration::from_secs(2);
+                    delay = churn.delay;
                 }
-                Ok(None) => {
+                Some(Ok(None)) => {
                     restart_failures.record_success();
                     delay = Duration::from_secs(10);
                     let app_registered = coordinator_supervisor_state.app_session.lock().await.is_some();
@@ -593,7 +605,7 @@ pub async fn serve_with_merge_probe(
                         }
                     }
                 }
-                Err(error) => {
+                Some(Err(error)) => {
                     tracing::warn!(error = %format!("{error:#}"), "coordinator tmux supervisor pass failed");
                     delay =
                         note_coordinator_restart_failure(&mut restart_failures, &coordinator_supervisor_state).await;
@@ -2183,23 +2195,23 @@ async fn note_coordinator_restart_failure(
     restart_failures: &mut crate::coordinator_tmux::CoordinatorRestartFailures,
     server_state: &Arc<ServerState>,
 ) -> Duration {
-    let decision = restart_failures.record_failure(std::time::Instant::now());
+    let decision = restart_failures.record_failure();
     if decision.notify {
         raise_coordinator_restart_ceiling_attention(server_state).await;
     }
-    if decision.at_ceiling {
+    if restart_failures.consecutive_failures() >= crate::coordinator_tmux::CoordinatorRestartFailures::LIMIT {
         tracing::error!(
             restart_failures = restart_failures.consecutive_failures(),
-            "coordinator restart limit reached; pausing recovery until the failure window expires"
+            "coordinator restart limit reached; still retrying every 60s"
         );
     }
     decision.delay
 }
 
 /// Surface a latched coordinator restart ceiling in each active project's
-/// attention feed. The supervisor resumes after the consecutive-failure
-/// pause; this makes the pause visible to the operator rather than only
-/// in tracing.
+/// attention feed. The supervisor keeps retrying at the flat `BACKOFF_CAP`
+/// cadence after the ceiling; this makes that condition visible to the
+/// operator rather than only in tracing.
 async fn raise_coordinator_restart_ceiling_attention(server_state: &Arc<ServerState>) {
     let products = match server_state.work_db.list_products() {
         Ok(products) => products,
@@ -2232,9 +2244,9 @@ async fn raise_coordinator_restart_ceiling_attention(server_state: &Arc<ServerSt
                 .source_doc_path("engine-health/coordinator-restart")
                 .question_type("prompt")
                 .prompt_text(
-                    "Coordinator tmux recovery paused after repeated restart failures. \
-                     The engine will retry after a cooldown; check the coordinator model \
-                     and auth if the session keeps dying."
+                    "Coordinator tmux recovery has hit repeated restart failures. \
+                     The engine keeps retrying every 60s; check the coordinator model \
+                     and auth if the session keeps failing to come back."
                         .to_owned(),
                 )
                 .build();
@@ -2259,6 +2271,76 @@ async fn raise_coordinator_restart_ceiling_attention(server_state: &Arc<ServerSt
                         project_id = %project.id,
                         ?err,
                         "coordinator restart ceiling: failed to create attention"
+                    )
+                }
+            }
+        }
+    }
+}
+
+/// Surface a coordinator that is successfully recreated over and over — the
+/// tmux session comes back up each pass, but the `claude` child inside it
+/// keeps dying immediately (bad model, expired auth, `claude` missing from
+/// `PATH`), so the supervisor churns kill-and-recreate cycles with no
+/// restart-failure counted. Distinct `group_key`/prompt from
+/// [`raise_coordinator_restart_ceiling_attention`] so the two conditions
+/// read as different incidents in the attention feed.
+async fn raise_coordinator_restart_churn_attention(server_state: &Arc<ServerState>) {
+    let products = match server_state.work_db.list_products() {
+        Ok(products) => products,
+        Err(err) => {
+            tracing::warn!(?err, "coordinator restart churn: failed to list products for attention");
+            return;
+        }
+    };
+    for product in products.into_iter().filter(|product| product.status == "active") {
+        let projects = match server_state.work_db.list_projects(&product.id, None) {
+            Ok(projects) => projects,
+            Err(err) => {
+                tracing::warn!(
+                    product_id = %product.id,
+                    ?err,
+                    "coordinator restart churn: failed to list projects for attention"
+                );
+                continue;
+            }
+        };
+        for project in projects {
+            let input = boss_protocol::CreateAttentionInput::builder()
+                .kind("question")
+                .group_key(format!("engine_health_coordinator_restart_churn|{}", project.id))
+                .association_project_id(project.id.clone())
+                .source_kind("manual")
+                .source_doc_path("engine-health/coordinator-restart-churn")
+                .question_type("prompt")
+                .prompt_text(
+                    "The coordinator keeps dying and being recreated: the tmux session comes back \
+                     each pass but the claude process inside it exits immediately. Check the \
+                     coordinator model and auth."
+                        .to_owned(),
+                )
+                .build();
+            match server_state.work_db.reconcile_attentions(vec![input]) {
+                Ok(Some((group, attentions))) => {
+                    for attention in attentions {
+                        server_state
+                            .publisher
+                            .publish_frontend_event_on_product(
+                                &group.product_id,
+                                boss_protocol::FrontendEvent::AttentionCreated {
+                                    attention,
+                                    group: group.clone(),
+                                },
+                            )
+                            .await;
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        project_id = %project.id,
+                        ?err,
+                        "coordinator restart churn: failed to create attention"
                     )
                 }
             }
