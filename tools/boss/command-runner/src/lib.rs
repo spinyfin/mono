@@ -75,6 +75,48 @@ fn forced_locale() -> Option<(&'static str, &'static str)> {
     (!already_utf8).then_some(FALLBACK_LC_CTYPE)
 }
 
+/// What this process inherited for the locale, and what children will get.
+///
+/// Exposed so a host can log its own environment at startup rather than
+/// leaving it to be reconstructed later. Incident 006 was diagnosed by
+/// inferring the engine's locale from a *statistical* argument about how
+/// often an unrelated parse failed, because nothing recorded the value
+/// itself; see `tools/boss/docs/postmortems/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocaleDiagnostics {
+    /// Inherited `LC_ALL`, `LC_CTYPE`, `LANG`, in that order. `None` means
+    /// the variable is unset — distinct from `Some("")`, which some
+    /// launchers do set and which POSIX treats as unset.
+    pub inherited: [(&'static str, Option<String>); 3],
+    /// True when at least one inherited variable names a UTF-8 charset.
+    pub has_utf8_locale: bool,
+    /// The variable and value forced onto children, if any.
+    pub forced: Option<(&'static str, &'static str)>,
+}
+
+impl LocaleDiagnostics {
+    pub fn probe() -> Self {
+        let inherited = LOCALE_VARS.map(|name| (name, std::env::var(name).ok()));
+        Self {
+            inherited,
+            has_utf8_locale: forced_locale().is_none(),
+            forced: forced_locale(),
+        }
+    }
+
+    /// Compact `LC_ALL=…,LC_CTYPE=<unset>,LANG=…` rendering for one log field.
+    pub fn inherited_summary(&self) -> String {
+        self.inherited
+            .iter()
+            .map(|(name, value)| match value {
+                Some(value) => format!("{name}={value}"),
+                None => format!("{name}=<unset>"),
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
 /// Runs commands through Tokio's process API.
 #[derive(Debug, Default)]
 pub struct RealCommandRunner;

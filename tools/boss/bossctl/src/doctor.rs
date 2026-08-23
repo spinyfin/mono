@@ -23,6 +23,14 @@ use serde_json::Value;
 /// a blocked local dispatcher without first starting the app.
 pub async fn run_tmux_preflight(json: bool) -> Result<()> {
     let preflight = boss_engine::tmux_preflight::TmuxPreflight::probe().await;
+    // Reported alongside the version because a usable tmux binary is only
+    // half of "tmux works": without a UTF-8 locale, tmux sanitizes the
+    // non-printable bytes out of everything it prints, including the TAB
+    // that `list_sessions` splits on. This reports *this* process's locale,
+    // which is the shell's — an engine launched from Finder has a different
+    // (emptier) one, so the engine's own startup log is authoritative for
+    // the engine. See `tools/boss/docs/postmortems/`.
+    let locale = boss_command_runner::LocaleDiagnostics::probe();
     match preflight {
         boss_engine::tmux_preflight::TmuxPreflight::Ready { program, version } => {
             if json {
@@ -32,10 +40,19 @@ pub async fn run_tmux_preflight(json: bool) -> Result<()> {
                         "ready": true,
                         "program": program,
                         "version": format!("{}.{}", version.major, version.minor),
+                        "locale_inherited": locale.inherited_summary(),
+                        "locale_has_utf8": locale.has_utf8_locale,
+                        "locale_forced_for_children": locale.forced.map(|(n, v)| format!("{n}={v}")),
                     })
                 );
             } else {
                 println!("tmux ready: {} {}.{}", program.display(), version.major, version.minor);
+                println!("locale (this shell): {}", locale.inherited_summary());
+                if locale.has_utf8_locale {
+                    println!("locale charset: UTF-8");
+                } else {
+                    println!("locale charset: none inherited — children get LC_CTYPE=UTF-8 forced");
+                }
             }
             Ok(())
         }

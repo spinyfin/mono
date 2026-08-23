@@ -73,6 +73,7 @@ rust_library(
         "//tools/boss/build-provenance",
         "//tools/boss/claude_client",
         "//tools/boss/codex_auth",
+        "//tools/boss/command-runner",
         "//tools/boss/comment_anchor",
         "//tools/boss/engine/attachments",
         "//tools/boss/engine/automation-dedup",
