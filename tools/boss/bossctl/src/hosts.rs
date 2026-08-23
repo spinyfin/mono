@@ -1,10 +1,4 @@
-//! `bossctl hosts` command definitions and handlers.
-//!
-//! The `hosts` subcommand tree ([`HostsAction`] / [`HostsTagAction`]) is
-//! declared here rather than in `main.rs`, next to the handlers that consume
-//! it — the same arrangement [`crate::review::ReviewAction`] already uses, and
-//! it keeps `main.rs` a dispatch table rather than the union of every
-//! subcommand's argument surface.
+//! `bossctl hosts` command handlers.
 
 use std::path::PathBuf;
 
@@ -13,118 +7,8 @@ use boss_engine::host_provisioning::{RemoteProvisionOutcome, provision_remote_ho
 use boss_engine::host_registry::{Host, HostCapability};
 use boss_engine::remote_wrapper::expected_version;
 use boss_engine::work::WorkDb;
-use clap::Subcommand;
 
 use crate::open_state_db;
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum HostsAction {
-    /// Register a new remote host. The host row is persisted to
-    /// `state.db`, then provisioned: push the `boss-remote-run` wrapper,
-    /// verify `cube` is invocable over non-interactive SSH, and discover
-    /// the host's capabilities (`os=`, `arch=`, `gh-authed=`, `driver=…`) by probing
-    /// it. The host is left enabled only if all of that succeeds;
-    /// otherwise it is disabled with the reason on `last_error`.
-    ///
-    /// `--skip-wrapper-push` suppresses the whole provisioning step
-    /// (offline / dry-run / test fixtures). A host registered that way is
-    /// enabled but unverified and reports no discovered capabilities until
-    /// something provisions it.
-    Add {
-        /// Unique identifier for this host (e.g. `zakalwe`).
-        id: String,
-        /// SSH target used to reach this host (alias or `user@host`).
-        #[arg(long)]
-        ssh_target: String,
-        /// Number of concurrent worker slots on this host.
-        #[arg(long, default_value_t = 1)]
-        pool_size: i64,
-        /// User-defined capability tags (e.g. `--tag os=macos --tag arch=arm64`).
-        #[arg(long = "tag", value_name = "TAG")]
-        tags: Vec<String>,
-        /// Skip the eager wrapper push at registration. The host row
-        /// is still created. Use when the host is offline at
-        /// registration time; the lazy push at dispatch will catch up.
-        #[arg(long)]
-        skip_wrapper_push: bool,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// List all registered hosts with their enabled state and capability count.
-    List {
-        /// Only show enabled hosts.
-        #[arg(long)]
-        enabled: bool,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// Show full details for a single host including all capabilities.
-    Show {
-        id: String,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// Re-run remote provisioning and capability discovery for a host.
-    Probe {
-        id: String,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// Add or remove user-defined capability tags on a host.
-    Tag {
-        #[command(subcommand)]
-        action: HostsTagAction,
-    },
-    /// Enable a previously disabled host.
-    Enable {
-        id: String,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// Disable a host so no new work is dispatched to it.
-    Disable {
-        id: String,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// Remove a host from the registry. Fails for the built-in `local` host.
-    Remove {
-        id: String,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum HostsTagAction {
-    /// Add one or more user capability tags to a host.
-    Add {
-        id: String,
-        /// Capability tag(s) to add (e.g. `os=macos`, `bazel=7`).
-        #[arg(required = true)]
-        tags: Vec<String>,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// Remove one or more user capability tags from a host.
-    Remove {
-        id: String,
-        /// Capability tag(s) to remove.
-        #[arg(required = true)]
-        tags: Vec<String>,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-}
 
 pub(crate) async fn hosts_add(
     json: bool,
