@@ -187,6 +187,43 @@ async fn no_private_server_is_an_empty_session_inventory() {
     assert!(tmux.list_sessions().await.unwrap().is_empty());
 }
 
+/// A host reboot clears `/tmp`, so the private socket is absent rather than
+/// stale and tmux reports a `connect(2)` ENOENT instead of "no server
+/// running". Every coordinator recovery path funnels through
+/// `list_sessions`, so this must read as an empty inventory — an `Err` here
+/// strands the coordinator pane blank until the socket reappears.
+#[tokio::test]
+async fn a_missing_private_socket_is_an_empty_session_inventory() {
+    let (tmux, _) = tmux([failure(
+        "error connecting to /private/tmp/tmux-501/boss (No such file or directory)",
+    )]);
+    assert!(tmux.list_sessions().await.unwrap().is_empty());
+}
+
+/// The inverse guard: a socket that exists but refuses us is not evidence
+/// that no sessions exist, so it must stay a hard error.
+#[tokio::test]
+async fn an_unreadable_private_socket_is_still_an_error() {
+    let (tmux, _) = tmux([failure(
+        "error connecting to /private/tmp/tmux-501/boss (Permission denied)",
+    )]);
+    assert!(tmux.list_sessions().await.is_err());
+}
+
+#[tokio::test]
+async fn kill_session_verified_treats_a_missing_private_socket_as_already_torn_down() {
+    let (tmux, runner) = tmux([failure(
+        "error connecting to /private/tmp/tmux-501/boss (No such file or directory)",
+    )]);
+    let outcome = tmux.kill_session_verified("boss-1", "secret").await.unwrap();
+    assert_eq!(outcome, KillSessionOutcome::Absent);
+    assert_eq!(
+        runner.calls().len(),
+        1,
+        "a missing socket must never issue kill-session",
+    );
+}
+
 #[tokio::test]
 async fn environment_and_option_reads_distinguish_absence() {
     let (tmux, _) = tmux([
@@ -604,4 +641,25 @@ async fn show_environment_rejects_unexpected_output() {
         error.contains("unexpected tmux environment output"),
         "error was: {error}"
     );
+}
+
+/// A row sanitized by tmux (no UTF-8 locale on the client) is otherwise
+/// indistinguishable from a session name containing an underscore, so the
+/// error must name the locale cause rather than just echoing the row.
+#[tokio::test]
+async fn a_sanitized_session_row_error_names_the_locale_cause() {
+    let (tmux, _) = tmux([success("boss-coordinator_deadbeef\n")]);
+    let error = format!("{:#}", tmux.list_sessions().await.unwrap_err());
+    assert!(error.contains("utf8_sanitize"), "{error}");
+    assert!(error.contains("LC_CTYPE"), "{error}");
+}
+
+/// The generic message is still used when the row is malformed for some
+/// reason other than sanitization.
+#[tokio::test]
+async fn an_unparseable_row_without_underscores_keeps_the_plain_error() {
+    let (tmux, _) = tmux([success("boss-coordinator\n")]);
+    let error = format!("{:#}", tmux.list_sessions().await.unwrap_err());
+    assert!(error.contains("unexpected tmux list-sessions row"), "{error}");
+    assert!(!error.contains("utf8_sanitize"), "{error}");
 }

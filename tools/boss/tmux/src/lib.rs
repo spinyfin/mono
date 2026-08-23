@@ -468,7 +468,7 @@ impl Tmux {
 fn parse_session(line: &str) -> Result<Session> {
     let (name, token) = line
         .split_once('\t')
-        .ok_or_else(|| anyhow::anyhow!("unexpected tmux list-sessions row: {line:?}"))?;
+        .ok_or_else(|| unparseable_session_row_error(line))?;
     validate_value("session name", name)?;
     Ok(Session {
         name: name.to_owned(),
@@ -476,16 +476,65 @@ fn parse_session(line: &str) -> Result<Session> {
     })
 }
 
+/// Diagnose a `list-sessions` row that carries no TAB delimiter.
+///
+/// The overwhelmingly likely cause is that the calling process had no UTF-8
+/// locale: tmux's `server_client_print()` runs output through
+/// `utf8_sanitize()` for any client it does not consider UTF-8 capable, and
+/// that rewrites every non-printable byte — the TAB delimiter included — to
+/// `_`. Naming that here turns an otherwise baffling parse failure into a
+/// self-diagnosing one, because the sanitized row is indistinguishable from a
+/// session whose name simply contains an underscore.
+///
+/// `boss_command_runner::RealCommandRunner` forces `LC_CTYPE=UTF-8` precisely
+/// so this cannot happen in production; seeing it means some other spawner
+/// reached tmux without a locale.
+fn unparseable_session_row_error(line: &str) -> anyhow::Error {
+    if line.contains('_') && !line.contains('\t') {
+        return anyhow::anyhow!(
+            "unexpected tmux list-sessions row: {line:?} — the TAB delimiter is missing and the row \
+             contains '_', which is how tmux's utf8_sanitize() rewrites non-printable bytes for a \
+             client with no UTF-8 locale. Check that LC_CTYPE/LC_ALL/LANG reach the tmux process."
+        );
+    }
+    anyhow::anyhow!("unexpected tmux list-sessions row: {line:?}")
+}
+
 /// True when tmux's stderr indicates the target session (or the whole
 /// private server) simply does not exist, as opposed to a real command
 /// failure. tmux reports this a few different ways depending on whether the
-/// session is missing or the server itself was never started:
-/// `"can't find session: <name>"`, `"session not found: <name>"`, and
-/// `"no server running on <socket>"`.
+/// session is missing, the server exited leaving its socket behind, or the
+/// socket file is gone entirely:
+/// `"can't find session: <name>"`, `"session not found: <name>"`,
+/// `"no server running on <socket>"`, and
+/// `"error connecting to <socket> (No such file or directory)"`.
+///
+/// That last shape is the one a host reboot produces. macOS clears `/tmp`
+/// on boot, so Boss's private socket at `/tmp/tmux-<uid>/boss` is not just
+/// stale but absent, and tmux switches from "no server running" to a
+/// `connect(2)` error. Reading that as a hard failure strands the
+/// coordinator: every recovery path funnels through
+/// [`Tmux::list_sessions`], which would return `Err` instead of an empty
+/// inventory, so `coordinator_tmux` never reaches the branch that recreates
+/// the session and the pane stays blank until the socket reappears by some
+/// other means.
+///
+/// Only `ENOENT` counts. Other `connect(2)` failures — `Permission denied`
+/// on a socket owned by another uid, `Connection refused` — describe a
+/// socket that exists and is not ours to assume is empty, and must keep
+/// surfacing as real errors.
 fn is_absent_session_stderr(stderr: &str) -> bool {
     stderr.contains("can't find session")
         || stderr.contains("session not found")
         || stderr.contains("no server running")
+        || is_missing_socket_stderr(stderr)
+}
+
+/// True for tmux's `connect(2)` failure against a socket path that does not
+/// exist. See [`is_absent_session_stderr`] for why this is "absent" rather
+/// than "failed".
+fn is_missing_socket_stderr(stderr: &str) -> bool {
+    stderr.contains("error connecting to") && stderr.contains("No such file or directory")
 }
 
 fn command_failed<T>(args: &[OsString], output: &CommandOutput) -> Result<T> {
