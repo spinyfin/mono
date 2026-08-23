@@ -36,7 +36,7 @@
 //! server is asked directly what exists, so no teardown RPC failure mode
 //! can hide a leaked session from it.
 //!
-//! [`crate::app::ServerState::list_husk_panes`] and
+//! [`crate::app::ServerState::list_hosted_pane_statuses`] and
 //! [`crate::app::ServerState::retire_pane`] remain as the manual,
 //! operator-invoked break-glass path (`bossctl agents list --all` /
 //! `bossctl agents retire-pane`) over the app's own hosted-pane inventory.
@@ -68,8 +68,8 @@
 //! wrong, which is what happened on 2026-07-26: six live workers received a
 //! synchronized `SessionEnd { reason: "other" }` burst inside 250ms while
 //! their `claude` processes kept running. `apply_event` flipped each to
-//! `WorkerActivity::Terminated`, [`crate::app::ServerState::list_husk_panes`]
-//! filters terminal entries out of its live set, and so five slots looked
+//! `WorkerActivity::Terminated`, [`crate::app::ServerState::list_hosted_pane_statuses`]
+//! classified those terminal entries as husks, and so five slots looked
 //! like husks on two consecutive passes and were retired 107 seconds later —
 //! SIGTERMing five workers mid-work, three of them inside a foreground
 //! `bazel` build. `retire_pane`'s own guard re-read the same wrong
@@ -79,12 +79,13 @@
 //! engine bookkeeping as its only input. [`live_process_evidence`] is the
 //! second, independent opinion: the OS (`kill(pid, 0)`) plus the worker's
 //! own hook stream. It backs the manual, app-hosted-pane break-glass path
-//! instead — `list_husk_panes`'s own classification (so a live worker is
-//! never flagged, never counted, and never appears in `bossctl agents list
-//! --all` as a husk) and again inside `retire_pane`'s guard (so the
-//! break-glass verb and any future caller inherit it too). This periodic
-//! sweep does not need a separate liveness probe for the same reason: a
-//! session only reaches it as an [`crate::tmux_adoption::UntrackedTmuxSession`]
+//! instead — `list_hosted_pane_statuses`'s own classification (so a live
+//! worker is never flagged, never counted, and never appears in
+//! `bossctl agents list --all` as a husk) and again inside `retire_pane`'s
+//! guard (so the break-glass verb and any future caller inherit it too).
+//! This periodic sweep does not need a separate liveness probe for the same
+//! reason: a session only reaches it as an
+//! [`crate::tmux_adoption::UntrackedTmuxSession`]
 //! after [`crate::tmux_adoption::classify_untracked_session`] has already
 //! failed to resolve its token to ANY execution, live or dead — there is no
 //! `LiveWorkerState` for it to corroborate against in the first place.
@@ -152,7 +153,7 @@
 //! there (`request_resume_execution`, `mark_execution_orphaned`, the
 //! completion path). So [`death_evidence_from_db`] is a second opinion the
 //! husk classifier cannot supply — note that a pane whose live-state entry
-//! was *released* reaches [`crate::app::ServerState::list_husk_panes`]'s
+//! was *released* reaches [`crate::app::ServerState::list_hosted_pane_statuses`]'s
 //! "no entry at all" arm, where [`live_process_evidence`] is never consulted
 //! and there is no per-candidate corroboration to weigh at all.
 //!

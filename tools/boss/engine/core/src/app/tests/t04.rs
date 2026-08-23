@@ -1,11 +1,13 @@
 use super::*;
 
-// Tests for `ServerState::retire_pane` / `ServerState::list_husk_panes` —
-// the break-glass "husk pane" verb. A husk is a pane the app still hosts
+// Tests for `ServerState::retire_pane` / `ServerState::list_hosted_pane_statuses` —
+// the break-glass "husk pane" path. A husk is a pane the app still hosts
 // a session in that the engine has NO live-tracked run for (crash,
 // terminal-fail path bug, spawn-ack timeout); neither `stop_run` nor
 // `reap_run` can reach it since both resolve through a run id the
-// engine no longer maps to a slot.
+// engine no longer maps to a slot. The classifier lives on
+// `list_hosted_pane_statuses` (`bossctl agents list --all`); `retire_pane`
+// is the operator verb that acts on a slot.
 
 #[tokio::test]
 async fn retire_pane_refuses_when_live_run_tracked_in_slot() {
@@ -133,16 +135,16 @@ async fn retire_pane_sends_slot_keyed_release_request_with_no_run_id_resolution(
 }
 
 #[tokio::test]
-async fn list_husk_panes_returns_empty_when_no_app_session_registered() {
+async fn list_hosted_pane_statuses_returns_empty_when_no_app_session_registered() {
     // Best-effort query: with no app session there is nothing to
     // diff, so this must not be a hard error.
     let (server_state, _dir) = test_server_state();
-    let panes = server_state.list_husk_panes().await.expect("expected Ok");
+    let panes = server_state.list_hosted_pane_statuses().await.expect("expected Ok");
     assert!(panes.is_empty());
 }
 
 #[tokio::test]
-async fn list_husk_panes_filters_out_slots_the_engine_still_tracks_live() {
+async fn list_hosted_pane_statuses_filters_out_slots_the_engine_still_tracks_live() {
     // The app reports two hosted slots: one the engine still has a
     // live (non-terminal) run for — not a husk, must be filtered —
     // and one the engine has no live entry for at all — a genuine
@@ -158,7 +160,7 @@ async fn list_husk_panes_filters_out_slots_the_engine_still_tracks_live() {
         .await;
 
     let server_clone = server_state.clone();
-    let list = tokio::spawn(async move { server_clone.list_husk_panes().await });
+    let list = tokio::spawn(async move { server_clone.list_hosted_pane_statuses().await });
 
     let envelope = sink.next().await.expect("an EngineRequest event should be enqueued");
     let request_id = match envelope.payload {
@@ -197,7 +199,7 @@ async fn list_husk_panes_filters_out_slots_the_engine_still_tracks_live() {
         )
         .await;
 
-    let panes = list.await.expect("list task").expect("expected Ok");
+    let panes = husk_subset(list.await.expect("list task").expect("expected Ok"));
     assert_eq!(
         panes.len(),
         1,
@@ -211,10 +213,10 @@ async fn list_husk_panes_filters_out_slots_the_engine_still_tracks_live() {
 //
 // Six live workers received a synchronized `SessionEnd { reason: "other" }`
 // burst inside 250ms while their `claude` processes kept running. That flipped
-// each live-state entry to `Terminated`; `list_husk_panes` filtered terminal
-// entries out of its live set, so five slots classified as husks, and
-// `retire_pane` re-read the same wrong bookkeeping and agreed. Five workers
-// were SIGTERMed mid-work, three of them inside a foreground `bazel` build.
+// each live-state entry to `Terminated`; `list_hosted_pane_statuses`
+// classified those terminal entries as husks, and `retire_pane` re-read the
+// same wrong bookkeeping and agreed. Five workers were SIGTERMed mid-work,
+// three of them inside a foreground `bazel` build.
 //
 // Both the classifier and the retire guard now take a second opinion from the
 // OS and the worker's own hook stream before acting.
@@ -306,11 +308,12 @@ async fn retire_pane_still_retires_a_terminal_slot_with_no_live_process() {
 }
 
 #[tokio::test]
-async fn list_husk_panes_does_not_flag_a_terminal_slot_whose_worker_is_alive() {
+async fn list_hosted_pane_statuses_does_not_flag_a_terminal_slot_whose_worker_is_alive() {
     // The classifier half. Slot 2 is the incident shape (terminal entry, live
     // process); slot 6 is a genuine husk the engine has no entry for at all.
-    // Only slot 6 may be reported — a live worker must never even be flagged,
-    // since being flagged is what starts the two-pass clock toward the kill.
+    // Only slot 6 may be reported as a husk — a live worker must never even
+    // be flagged, because `agents list --all` and any future caller inherit
+    // this classification.
     let (server_state, _dir) = test_server_state();
     drive_spurious_session_end_mid_tool(&server_state, 2, "run-victim");
 
@@ -320,7 +323,7 @@ async fn list_husk_panes_does_not_flag_a_terminal_slot_whose_worker_is_alive() {
         .await;
 
     let server_clone = server_state.clone();
-    let list = tokio::spawn(async move { server_clone.list_husk_panes().await });
+    let list = tokio::spawn(async move { server_clone.list_hosted_pane_statuses().await });
 
     let envelope = sink.next().await.expect("an EngineRequest event should be enqueued");
     let request_id = match envelope.payload {
@@ -353,7 +356,7 @@ async fn list_husk_panes_does_not_flag_a_terminal_slot_whose_worker_is_alive() {
         )
         .await;
 
-    let panes = list.await.expect("list task").expect("expected Ok");
+    let panes = husk_subset(list.await.expect("list task").expect("expected Ok"));
     assert_eq!(
         panes.iter().map(|pane| pane.slot_id).collect::<Vec<_>>(),
         vec![6],
@@ -362,7 +365,7 @@ async fn list_husk_panes_does_not_flag_a_terminal_slot_whose_worker_is_alive() {
 }
 
 #[tokio::test]
-async fn list_husk_panes_flags_a_recycled_slot_even_though_its_entry_looks_alive() {
+async fn list_hosted_pane_statuses_flags_a_recycled_slot_even_though_its_entry_looks_alive() {
     // The `run_id` match in the classifier. The app is hosting a pane for
     // `run-old`, but the engine's entry for that slot belongs to `run-new`.
     // The slot was recycled: `run-new`'s liveness signals say nothing about
@@ -376,7 +379,7 @@ async fn list_husk_panes_flags_a_recycled_slot_even_though_its_entry_looks_alive
         .await;
 
     let server_clone = server_state.clone();
-    let list = tokio::spawn(async move { server_clone.list_husk_panes().await });
+    let list = tokio::spawn(async move { server_clone.list_hosted_pane_statuses().await });
 
     let envelope = sink.next().await.expect("an EngineRequest event should be enqueued");
     let request_id = match envelope.payload {
@@ -401,7 +404,7 @@ async fn list_husk_panes_flags_a_recycled_slot_even_though_its_entry_looks_alive
         )
         .await;
 
-    let panes = list.await.expect("list task").expect("expected Ok");
+    let panes = husk_subset(list.await.expect("list task").expect("expected Ok"));
     assert_eq!(
         panes.iter().map(|pane| pane.run_id.as_str()).collect::<Vec<_>>(),
         vec!["run-old"],
@@ -422,16 +425,23 @@ async fn list_husk_panes_flags_a_recycled_slot_even_though_its_entry_looks_alive
 // the execution's status — for exactly the slots its in-memory corroboration
 // cannot reach.
 
+fn husk_subset(statuses: Vec<crate::protocol::HostedPaneStatus>) -> Vec<crate::protocol::HostedPaneStatus> {
+    statuses
+        .into_iter()
+        .filter(|status| matches!(status.state, crate::protocol::HostedPaneState::Husk))
+        .collect()
+}
+
 /// Drive the app's `ListHostedPanes` round-trip for `panes` and return the
-/// classifier's verdict. Factors out the request/response dance the husk tests
-/// above all repeat.
+/// classifier's husk subset. Factors out the request/response dance the
+/// hosted-pane classification tests above all repeat.
 async fn husk_panes_for(
     server_state: &Arc<ServerState>,
     sink: &Arc<SessionSink>,
     panes: Vec<crate::protocol::HostedPaneEntry>,
-) -> Vec<crate::protocol::HostedPaneEntry> {
+) -> Vec<crate::protocol::HostedPaneStatus> {
     let server_clone = server_state.clone();
-    let list = tokio::spawn(async move { server_clone.list_husk_panes().await });
+    let list = tokio::spawn(async move { server_clone.list_hosted_pane_statuses().await });
 
     let envelope = sink.next().await.expect("an EngineRequest event should be enqueued");
     let request_id = match envelope.payload {
@@ -447,7 +457,7 @@ async fn husk_panes_for(
             },
         )
         .await;
-    list.await.expect("list task").expect("expected Ok")
+    husk_subset(list.await.expect("list task").expect("expected Ok"))
 }
 
 fn hosted(slot_id: u8, run_id: &str) -> crate::protocol::HostedPaneEntry {
@@ -460,7 +470,7 @@ fn hosted(slot_id: u8, run_id: &str) -> crate::protocol::HostedPaneEntry {
 }
 
 #[tokio::test]
-async fn list_husk_panes_spares_an_untracked_slot_whose_durable_process_is_alive() {
+async fn list_hosted_pane_statuses_spares_an_untracked_slot_whose_durable_process_is_alive() {
     use crate::test_support::*;
 
     let (server_state, _dir) = test_server_state();
@@ -489,7 +499,7 @@ async fn list_husk_panes_spares_an_untracked_slot_whose_durable_process_is_alive
 }
 
 #[tokio::test]
-async fn list_husk_panes_still_retires_an_untracked_slot_whose_process_is_gone() {
+async fn list_hosted_pane_statuses_still_retires_an_untracked_slot_whose_process_is_gone() {
     use crate::test_support::*;
 
     let (server_state, _dir) = test_server_state();
@@ -514,7 +524,7 @@ async fn list_husk_panes_still_retires_an_untracked_slot_whose_process_is_gone()
 }
 
 #[tokio::test]
-async fn list_husk_panes_still_retires_a_lingering_shell_under_a_cancelled_run() {
+async fn list_hosted_pane_statuses_still_retires_a_lingering_shell_under_a_cancelled_run() {
     use crate::test_support::*;
 
     // The shape the durable guard must NOT protect, and the reason it keys on
