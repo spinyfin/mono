@@ -490,32 +490,18 @@ pub async fn serve_with_merge_probe(
     // to app registration, after that app has prepared the session files.
     let coordinator_supervisor_state = server_state.clone();
     tokio::spawn(async move {
-        const RESTART_FAILURE_LIMIT: u32 = 5;
-        const RESTART_BACKOFF_CAP: Duration = Duration::from_secs(60);
-        const RESTART_FAILURE_WINDOW: Duration = Duration::from_secs(60);
-        let mut restart_failures = 0_u32;
-        let mut last_restart: Option<std::time::Instant> = None;
-        let mut ceiling_notified = false;
+        let mut restart_failures = crate::coordinator_tmux::CoordinatorRestartFailures::new();
         // Short first delay so a registration-time attach miss is retried
-        // promptly; later passes use the adaptive backoff below.
+        // promptly; later passes set delay from the pass outcome.
         let mut delay = Duration::from_millis(500);
         loop {
             tokio::time::sleep(delay).await;
-            if last_restart.is_some_and(|last| last.elapsed() > RESTART_FAILURE_WINDOW) {
-                restart_failures = 0;
-                last_restart = None;
-                ceiling_notified = false;
-            }
-            if restart_failures >= RESTART_FAILURE_LIMIT {
-                if !ceiling_notified {
-                    raise_coordinator_restart_ceiling_attention(&coordinator_supervisor_state).await;
-                    ceiling_notified = true;
-                }
+            if let Some(paused) = restart_failures.pause_delay(std::time::Instant::now()) {
                 tracing::error!(
-                    restart_failures,
+                    restart_failures = restart_failures.consecutive_failures(),
                     "coordinator restart limit reached; pausing recovery until the failure window expires"
                 );
-                delay = RESTART_BACKOFF_CAP;
+                delay = paused;
                 continue;
             }
             let program = match coordinator_supervisor_state.tmux_preflight.read() {
@@ -545,7 +531,8 @@ pub async fn serve_with_merge_probe(
                             error = %format!("{error:#}"),
                             "coordinator tmux supervisor: session directory not ready"
                         );
-                        delay = RESTART_BACKOFF_CAP;
+                        delay = note_coordinator_restart_failure(&mut restart_failures, &coordinator_supervisor_state)
+                            .await;
                         continue;
                     }
                 };
@@ -565,30 +552,17 @@ pub async fn serve_with_merge_probe(
             };
             match restart {
                 Ok(Some(record)) => {
-                    let now = std::time::Instant::now();
-                    last_restart = Some(now);
-                    restart_failures += 1;
+                    restart_failures.record_success();
                     crate::app::sessions::request_coordinator_attachment(
                         coordinator_supervisor_state.clone(),
                         &tmux,
                         record,
                     )
                     .await;
-                    if restart_failures >= RESTART_FAILURE_LIMIT {
-                        if !ceiling_notified {
-                            raise_coordinator_restart_ceiling_attention(&coordinator_supervisor_state).await;
-                            ceiling_notified = true;
-                        }
-                        delay = RESTART_BACKOFF_CAP;
-                        continue;
-                    }
-                    delay = Duration::from_secs(
-                        2_u64
-                            .saturating_pow(restart_failures)
-                            .min(RESTART_BACKOFF_CAP.as_secs()),
-                    );
+                    delay = Duration::from_secs(2);
                 }
                 Ok(None) => {
+                    restart_failures.record_success();
                     delay = Duration::from_secs(10);
                     let app_registered = coordinator_supervisor_state.app_session.lock().await.is_some();
                     let record = coordinator_supervisor_state
@@ -621,7 +595,8 @@ pub async fn serve_with_merge_probe(
                 }
                 Err(error) => {
                     tracing::warn!(error = %format!("{error:#}"), "coordinator tmux supervisor pass failed");
-                    delay = RESTART_BACKOFF_CAP;
+                    delay =
+                        note_coordinator_restart_failure(&mut restart_failures, &coordinator_supervisor_state).await;
                 }
             }
         }
@@ -2201,9 +2176,30 @@ pub async fn serve_with_merge_probe(
     }
 }
 
+/// Record a failed coordinator-supervisor pass: increment the consecutive
+/// failure counter, raise the ceiling attention the first time it trips,
+/// and return the delay until the next attempt.
+async fn note_coordinator_restart_failure(
+    restart_failures: &mut crate::coordinator_tmux::CoordinatorRestartFailures,
+    server_state: &Arc<ServerState>,
+) -> Duration {
+    let decision = restart_failures.record_failure(std::time::Instant::now());
+    if decision.notify {
+        raise_coordinator_restart_ceiling_attention(server_state).await;
+    }
+    if decision.at_ceiling {
+        tracing::error!(
+            restart_failures = restart_failures.consecutive_failures(),
+            "coordinator restart limit reached; pausing recovery until the failure window expires"
+        );
+    }
+    decision.delay
+}
+
 /// Surface a latched coordinator restart ceiling in each active project's
-/// attention feed. The supervisor resumes after `RESTART_FAILURE_WINDOW`;
-/// this makes the pause visible to the operator rather than only in tracing.
+/// attention feed. The supervisor resumes after the consecutive-failure
+/// pause; this makes the pause visible to the operator rather than only
+/// in tracing.
 async fn raise_coordinator_restart_ceiling_attention(server_state: &Arc<ServerState>) {
     let products = match server_state.work_db.list_products() {
         Ok(products) => products,
