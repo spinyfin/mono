@@ -105,6 +105,18 @@ enum Command {
         /// picks the earliest boundary the worker's pane allows.
         #[arg(long)]
         urgent: bool,
+        /// Do NOT interrupt the worker's current turn; wait for a boundary
+        /// instead.
+        ///
+        /// Interrupting is the default: a running worker is usually probed to
+        /// redirect it *now*, and the boundary a non-interrupting probe waits
+        /// for may be the run's last. Use this only when the message can wait
+        /// — an interrupt aborts in-flight work (a partial edit, a build).
+        /// With this flag the command reports what the engine accepted (and
+        /// warns if delivery may never arrive); without it, it blocks until
+        /// delivery settles and reports what actually happened.
+        #[arg(long)]
+        no_interrupt: bool,
     },
     /// Report the delivery state of a previously accepted probe, by the
     /// `probe_id` that `bossctl probe` printed.
@@ -113,8 +125,10 @@ enum Command {
     /// awaiting confirmation), `consumed` (the worker's CLI took it as a
     /// prompt), `buffered` (written into a mid-turn agent's composer; it
     /// submits at the end of the turn), `unconfirmed` (written but unproven;
-    /// also warns on stderr), `replied` (the worker answered). Any state the
-    /// engine can report exits 0 — read `delivered` (or `state=`) for the
+    /// also warns on stderr), `replied` (the worker answered),
+    /// `interrupt_failed` (the engine tried to interrupt the worker's turn to
+    /// deliver it, the turn never ended, and nothing was written). Any state
+    /// the engine can report exits 0 — read `delivered` (or `state=`) for the
     /// delivery judgement; a non-zero exit means the id could not be read.
     /// Probe ids live in the running engine process and are not retained
     /// across a restart.
@@ -1275,9 +1289,12 @@ fn main() -> ExitCode {
 
 async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Probe { agent, text, urgent } => {
-            probe::probe_run(&cli.socket_path, cli.json, agent, text, urgent).await
-        }
+        Command::Probe {
+            agent,
+            text,
+            urgent,
+            no_interrupt,
+        } => probe::probe_run(&cli.socket_path, cli.json, agent, text, urgent, !no_interrupt).await,
         Command::ProbeStatus { probe_id } => probe::probe_status(&cli.socket_path, cli.json, probe_id).await,
         Command::Agents {
             action: AgentsAction::Status { agent },

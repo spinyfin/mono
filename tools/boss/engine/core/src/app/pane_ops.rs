@@ -70,6 +70,25 @@ pub enum InterruptPaneError {
     ResponseKindMismatch(String),
 }
 
+/// Outcome of [`ServerState::interrupt_plan_lookup`].
+///
+/// Splits what [`ServerState::interrupt_plan_for_run`]'s bare `Option`
+/// collapses: a driver that was resolved and declares no interrupt mechanism
+/// is a capability gap, but no driver resolving at all is a lookup failure —
+/// distinct causes an operator would take different action on.
+#[derive(Debug)]
+pub(crate) enum InterruptPlanLookup {
+    /// The driver was resolved and declares this plan.
+    Plan(crate::driver::InterruptPlan),
+    /// The driver was resolved and explicitly declares no interrupt
+    /// mechanism (`AgentDriver::interrupt_plan() == None`).
+    NotInterruptible,
+    /// No driver could be resolved for this run at all — missing execution
+    /// row, unregistered slug, or a DB error. Not a declared property of any
+    /// driver; a lookup failure the operator can potentially fix.
+    DriverUnresolved,
+}
+
 /// Surfaced by [`ServerState::reveal_work_item`]. Separates
 /// id-resolution failures from app-side / transport failures so
 /// `bossctl reveal` can produce a precise error.
@@ -270,40 +289,110 @@ impl ServerState {
     /// unaffected: their driver's `prepare_interrupt_recovery` default
     /// returns `None`, so nothing is spawned for them.
     pub async fn interrupt_worker_pane(&self, run_id: &str) -> Result<u8, InterruptPaneError> {
+        let plan = self.interrupt_plan_for_run(run_id);
+        self.deliver_interrupt_gesture(run_id, plan.as_ref()).await
+    }
+
+    /// The driver-declared [`crate::driver::InterruptPlan`] for `run_id`, or
+    /// `None` when the run's driver cannot be resolved or declares itself
+    /// uninterruptible.
+    ///
+    /// An unresolvable driver answers `None` rather than a default plan on
+    /// purpose: guessing a gesture for an unknown agent is how one driver's
+    /// keystroke gets typed into another's TUI, and the caller that needs a
+    /// plan (the interrupting probe path) has a well-defined, visible failure
+    /// for `None` — it says the driver cannot be interrupted instead of
+    /// pretending otherwise.
+    ///
+    /// Collapses [`InterruptPlanLookup::NotInterruptible`] and
+    /// [`InterruptPlanLookup::DriverUnresolved`] onto the same `None` — fine
+    /// for [`Self::interrupt_worker_pane`], which falls back to a bare
+    /// `Escape` either way, but wrong for a caller that must tell the two
+    /// apart. Use [`Self::interrupt_plan_lookup`] there instead.
+    pub(crate) fn interrupt_plan_for_run(&self, run_id: &str) -> Option<crate::driver::InterruptPlan> {
+        match self.interrupt_plan_lookup(run_id) {
+            InterruptPlanLookup::Plan(plan) => Some(plan),
+            InterruptPlanLookup::NotInterruptible | InterruptPlanLookup::DriverUnresolved => None,
+        }
+    }
+
+    /// Like [`Self::interrupt_plan_for_run`], but keeps apart the two reasons
+    /// a plan can be missing: a driver that was resolved and explicitly
+    /// declares no interrupt mechanism, versus no driver resolving at all
+    /// (missing execution row, unregistered slug, DB error). The interrupting
+    /// probe path needs this distinction — every registered driver declares a
+    /// runnable interrupt plan (`every_registered_driver_declares_a_runnable_interrupt_plan`),
+    /// so in production a genuinely uninterruptible driver cannot occur; a
+    /// `None` in practice almost always means the lookup itself failed, and
+    /// telling the operator "this driver declares no interrupt mechanism" for
+    /// what is actually a resolution failure points them at a permanent
+    /// capability gap when the real, fixable problem is the lookup.
+    pub(crate) fn interrupt_plan_lookup(&self, run_id: &str) -> InterruptPlanLookup {
+        let Some(driver) = crate::driver_transcript::driver_for_execution(&self.work_db, run_id) else {
+            return InterruptPlanLookup::DriverUnresolved;
+        };
+        match driver.interrupt_plan() {
+            Some(plan) => InterruptPlanLookup::Plan(plan),
+            None => InterruptPlanLookup::NotInterruptible,
+        }
+    }
+
+    /// Deliver one interrupt **attempt** — the driver's key, repeated
+    /// `plan.presses` times — into `run_id`'s pane, and arm the bounded
+    /// turn-end recovery observer for a driver that needs one.
+    ///
+    /// This is the primitive both interrupt callers share: `bossctl agents
+    /// interrupt` (one attempt, fire and forget) and the interrupting probe
+    /// path (one attempt per retry, each followed by its own confirmation
+    /// wait). Sharing it is what keeps "what Boss sends to interrupt this
+    /// driver" in exactly one place — the driver's plan — rather than a
+    /// hard-coded `Escape` at each site.
+    ///
+    /// `plan` is `None` for a run whose driver could not be resolved or
+    /// declares no interrupt mechanism. Rather than refuse, this falls back
+    /// to a single `Escape`, preserving the pre-existing behaviour of
+    /// `bossctl agents interrupt` for such a run: that verb is an operator
+    /// reaching for the same key they would press by hand, and it worked
+    /// before any plan existed. Callers for which a missing plan is
+    /// *meaningful* — the probe path, which must not claim to have
+    /// interrupted a driver that declares it cannot be — check
+    /// [`Self::interrupt_plan_for_run`] first and never reach here with
+    /// `None`.
+    ///
+    /// The recovery snapshot is taken **before** the keys go out (see
+    /// [`crate::driver::InterruptRecoverySnapshot`] for why), and the
+    /// observer runs detached — it does not delay this call. Claude and Codex
+    /// arm nothing: their `prepare_interrupt_recovery` returns `None` because
+    /// their cancelled turns reach the ordinary turn-boundary channel.
+    pub(crate) async fn deliver_interrupt_gesture(
+        &self,
+        run_id: &str,
+        plan: Option<&crate::driver::InterruptPlan>,
+    ) -> Result<u8, InterruptPaneError> {
         let Some(slot_id) = self.worker_registry.slot_for_run(run_id) else {
             return Err(InterruptPaneError::UnknownRun);
         };
+        let key = plan.map(|p| p.gesture.key).unwrap_or("Escape");
+        let presses = plan.map(|p| p.gesture.presses.max(1)).unwrap_or(1);
+        let press_interval = plan.map(|p| p.gesture.press_interval).unwrap_or(Duration::ZERO);
         let recovery_prep = crate::driver_transcript::driver_for_execution(&self.work_db, run_id).and_then(|driver| {
             driver
                 .prepare_interrupt_recovery(run_id)
                 .map(|snapshot| (driver, snapshot))
         });
-        let result = match self.worker_registry.pane_for_run(run_id) {
-            Some(pane) if pane.tmux_session_name.is_some() || pane.tmux_hosted => match pane.tmux_session_name {
-                Some(session_name) => match self.tmux_for_pane_delivery() {
-                    Ok(tmux) => tmux
-                        .send_key(&session_name, "Escape")
-                        .await
-                        .map(|_| slot_id)
-                        .map_err(InterruptPaneError::Tmux),
-                    Err(err) => Err(InterruptPaneError::Tmux(err)),
-                },
-                None => Err(InterruptPaneError::Tmux(anyhow::anyhow!(
-                    "tmux-hosted pane has no session name"
-                ))),
-            },
-            _ => {
-                let request = EngineToAppRequest::InterruptWorkerPane(InterruptWorkerPaneInput { slot_id });
-                match self.send_to_app(request, Duration::from_secs(5)).await {
-                    Ok(EngineToAppResponse::InterruptWorkerPane { result: Ok(_) }) => Ok(slot_id),
-                    Ok(EngineToAppResponse::InterruptWorkerPane { result: Err(err) }) => {
-                        Err(InterruptPaneError::App(err))
-                    }
-                    Ok(other) => Err(InterruptPaneError::ResponseKindMismatch(format!("{other:?}"))),
-                    Err(err) => Err(InterruptPaneError::Send(err)),
-                }
+        let mut result = Ok(slot_id);
+        for press in 0..presses {
+            if press > 0 && !press_interval.is_zero() {
+                tokio::time::sleep(press_interval).await;
             }
-        };
+            result = self.send_interrupt_key(run_id, slot_id, key).await;
+            if result.is_err() {
+                // A failed press aborts the rest of the attempt: repeating a
+                // gesture the transport just refused cannot succeed, and the
+                // caller needs the transport error, not the last press's.
+                break;
+            }
+        }
         if result.is_ok()
             && let Some((driver, snapshot)) = recovery_prep
         {
@@ -318,6 +407,53 @@ impl ServerState {
             }
         }
         result
+    }
+
+    /// One keypress into the run's pane, over whichever transport hosts it:
+    /// tmux `send-keys <key>` for a tmux-backed session, the app's
+    /// `InterruptWorkerPane` RPC for a legacy app-owned pane.
+    ///
+    /// The app transport sends `kVK_Escape` unconditionally, so a driver plan
+    /// naming any other key is only honoured on tmux-hosted panes. That is
+    /// recorded here rather than silently ignored: every registered driver's
+    /// plan names `Escape` today, and a future plan that does not must extend
+    /// the app RPC rather than assume this path carries it.
+    async fn send_interrupt_key(&self, run_id: &str, slot_id: u8, key: &str) -> Result<u8, InterruptPaneError> {
+        match self.worker_registry.pane_for_run(run_id) {
+            Some(pane) if pane.tmux_session_name.is_some() || pane.tmux_hosted => match pane.tmux_session_name {
+                Some(session_name) => match self.tmux_for_pane_delivery() {
+                    Ok(tmux) => tmux
+                        .send_key(&session_name, key)
+                        .await
+                        .map(|_| slot_id)
+                        .map_err(InterruptPaneError::Tmux),
+                    Err(err) => Err(InterruptPaneError::Tmux(err)),
+                },
+                None => Err(InterruptPaneError::Tmux(anyhow::anyhow!(
+                    "tmux-hosted pane has no session name"
+                ))),
+            },
+            _ => {
+                if key != "Escape" {
+                    tracing::warn!(
+                        run_id,
+                        slot_id,
+                        key,
+                        "app-hosted pane transport only sends Escape; the driver's interrupt key is \
+                         being delivered as Escape",
+                    );
+                }
+                let request = EngineToAppRequest::InterruptWorkerPane(InterruptWorkerPaneInput { slot_id });
+                match self.send_to_app(request, Duration::from_secs(5)).await {
+                    Ok(EngineToAppResponse::InterruptWorkerPane { result: Ok(_) }) => Ok(slot_id),
+                    Ok(EngineToAppResponse::InterruptWorkerPane { result: Err(err) }) => {
+                        Err(InterruptPaneError::App(err))
+                    }
+                    Ok(other) => Err(InterruptPaneError::ResponseKindMismatch(format!("{other:?}"))),
+                    Err(err) => Err(InterruptPaneError::Send(err)),
+                }
+            }
+        }
     }
 
     /// Resolve `id` (short-form `T607` or canonical) to a work item

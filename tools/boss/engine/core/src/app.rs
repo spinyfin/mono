@@ -94,6 +94,7 @@ mod pr_status;
 // `pub(crate)` so `crate::attention_lifecycle` can bind
 // `PROBE_UNDELIVERED_ATTENTION_KIND` rather than re-spelling the string.
 // Individual items stay `pub(super)`; only the module path is widened.
+mod probe_interrupt;
 pub(crate) mod probes;
 mod products;
 mod projects;

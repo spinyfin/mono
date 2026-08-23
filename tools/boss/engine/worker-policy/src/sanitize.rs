@@ -155,6 +155,7 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::AppSessionRegistered
         | FrontendEvent::EnginePoolConfig { .. }
         | FrontendEvent::ProbeQueued { .. }
+        | FrontendEvent::ProbeDelivered { .. }
         | FrontendEvent::ProbeRefused { .. }
         | FrontendEvent::ProbeStatusResult { .. }
         | FrontendEvent::ProbeReplied { .. }

@@ -18,7 +18,7 @@ use crate::types::{
     Decision, DeferredScopeAttention, DependencyFilter, DesignDocContent, DesignDocTreeState, DispatchAdmission,
     DriverQuotaSnapshot, DriverTrafficSplit, EditorialAction, EngineAttemptListEntry, FollowupMemberOverride,
     GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch,
-    ProbeDeliveryExpectation, ProbeDeliveryState, Product, Project, ProposalKind, ProposalState,
+    ProbeDeliveryExpectation, ProbeDeliveryState, ProbeInterruptOutcome, Product, Project, ProposalKind, ProposalState,
     ProposalSubmissionError, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
     ResolvedComment, ReviseDocInput, ReviseDocOutcome, SelectedProductState, SetProductEditorialRulesInput,
     SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskDocPointerInput, Task, TaskRuntime,
@@ -85,6 +85,16 @@ pub fn editorial_actions_topic(product_id: &str) -> String {
 
 fn default_pool_size() -> i64 {
     1
+}
+
+/// Serde default for [`FrontendRequest::ProbeRun`]'s `interrupt` field.
+///
+/// `true`, so a payload written before the field existed gets the
+/// interrupting behaviour rather than the old wait-for-a-boundary one. That
+/// direction is deliberate: the boundary-only path is the one that silently
+/// lost probes, so an unspecified request must not opt into it by accident.
+fn default_probe_interrupt() -> bool {
+    true
 }
 
 /// One task preserved (not deleted) by [`FrontendRequest::UnpopulateProject`]
@@ -1782,6 +1792,30 @@ pub enum FrontendRequest {
         /// it is not a precondition for mid-turn delivery.
         #[serde(default)]
         urgent: bool,
+        /// Interrupt the worker's in-flight turn so the text lands **now**,
+        /// rather than waiting for a boundary the worker may never reach.
+        ///
+        /// Defaults to `true`, including for a payload from a client too old
+        /// to send the field, because that is the behaviour the common case
+        /// needs: a probe exists to redirect a worker that is *currently*
+        /// going the wrong way, and the boundary a non-interrupting probe
+        /// waits for is — for an autonomous run that ends by opening its PR —
+        /// the run's last. Waiting for it means the text is read by nobody.
+        ///
+        /// When `true` the engine answers [`FrontendEvent::ProbeDelivered`]
+        /// with the *settled* delivery state: the call blocks for the
+        /// driver's declared interrupt budget plus the injection's
+        /// verification window, so the caller is told what actually happened
+        /// instead of what was accepted. When `false` the engine queues the
+        /// probe and answers [`FrontendEvent::ProbeQueued`] exactly as before.
+        ///
+        /// Setting this to `false` is a real choice with a real cost on the
+        /// other side: interrupting aborts whatever the worker was doing —
+        /// possibly a partial edit or an in-flight build — so a probe that
+        /// genuinely can wait for a boundary should say so and let the
+        /// worker finish.
+        #[serde(default = "default_probe_interrupt")]
+        interrupt: bool,
     },
 
     /// Boss-tier RPC: read the current delivery state of one probe, by the

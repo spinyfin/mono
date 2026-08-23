@@ -753,3 +753,141 @@ fn env_name_helper_splits_pr_url_from_designated_payload() {
         boss_engine_structured_output::STRUCTURED_OUTPUT_ENV,
     );
 }
+
+// ── Interrupt plans ─────────────────────────────────────────────────────────
+
+/// The safe default: a driver that says nothing about interrupting cannot be
+/// interrupted, and the two declarations that encode that agree.
+///
+/// This direction matters more than it looks. If the default were "one
+/// Escape", every future driver would silently inherit Claude's gesture, and
+/// the first one whose TUI reads Escape as something else would have the
+/// engine typing into a turn that never stopped — the exact corruption the
+/// confirm step exists to prevent, reintroduced through a default.
+#[test]
+fn interrupt_plan_defaults_to_none_and_agrees_with_the_transport() {
+    let stub = test_support::StubDriver::new(test_support::stub_descriptor(), CapabilitySet::new([]));
+    assert_eq!(stub.interrupt_plan(), None);
+    assert_eq!(stub.interrupt(), InterruptDelivery::Unsupported);
+}
+
+/// Every registered driver must declare an interrupt plan that its own
+/// transport declaration agrees with, and the plan must be able to run at all
+/// (at least one press, at least one attempt).
+///
+/// Asserted over `DriverRegistry::slugs()` rather than a hand-listed set, so a
+/// driver added tomorrow is covered the day it is registered rather than the
+/// day someone remembers to extend this list.
+#[test]
+fn every_registered_driver_declares_a_runnable_interrupt_plan() {
+    let registry = registry::DriverRegistry::default();
+    for slug in registry.slugs() {
+        let driver = registry.require(slug).expect("slug came from the registry");
+        let plan = driver
+            .interrupt_plan()
+            .unwrap_or_else(|| panic!("driver {slug} declares no interrupt plan"));
+        assert_ne!(
+            driver.interrupt(),
+            InterruptDelivery::Unsupported,
+            "driver {slug} supplied a plan but declares no interrupt transport",
+        );
+        assert!(
+            plan.gesture.presses >= 1,
+            "driver {slug}: an attempt that sends nothing cannot take",
+        );
+        assert!(
+            plan.max_attempts >= 1,
+            "driver {slug}: zero attempts would report failure without ever trying",
+        );
+        assert!(
+            !plan.confirm_window.is_zero(),
+            "driver {slug}: a zero confirm window is a fixed sleep of zero — it would report the \
+             turn ended without ever checking",
+        );
+        assert!(
+            !plan.gesture.key.is_empty(),
+            "driver {slug}: the plan must name the key the engine sends",
+        );
+    }
+}
+
+/// A plan that names [`TurnEndEvidence::RecoveryObserver`] is asserting that
+/// the engine's interrupt-recovery observer is what supplies its turn end, so
+/// the driver must actually implement that observer's other half. Without it
+/// there is no path at all from the keystroke to an observable turn end, and
+/// every interrupt on that driver would burn its whole attempt budget before
+/// failing — a capability gap that would look like a wedged worker.
+///
+/// Checked as a *declaration* pair rather than by calling
+/// `prepare_interrupt_recovery` (which legitimately answers `None` for a run
+/// whose per-run state does not exist): a driver whose recovery is
+/// unimplemented returns the trait default for both, which this catches.
+#[test]
+fn a_recovery_observer_plan_comes_with_a_recovery_implementation() {
+    let registry = registry::DriverRegistry::default();
+    for slug in registry.slugs() {
+        let driver = registry.require(slug).expect("slug came from the registry");
+        let Some(plan) = driver.interrupt_plan() else {
+            continue;
+        };
+        if plan.turn_end_evidence != TurnEndEvidence::RecoveryObserver {
+            continue;
+        }
+        // The trait default recognises nothing, so a driver relying on the
+        // observer must have overridden the matcher.
+        assert!(
+            driver.is_interrupt_recovery_turn_end(&serde_json::json!({
+                "type": "turn_ended",
+                "outcome": "cancelled",
+            })) || driver.is_interrupt_recovery_turn_end(&serde_json::json!({
+                "type": "turn.aborted",
+                "reason": "interrupted",
+            })),
+            "driver {slug} declares RecoveryObserver evidence but recognises no cancellation \
+             record, so nothing could ever confirm its interrupts",
+        );
+    }
+}
+
+/// The bound the probe path uses to keep its synchronous RPC finite. It must
+/// account for every attempt, not just one, or a caller could be held for
+/// longer than the engine claimed.
+#[test]
+fn worst_case_duration_covers_every_attempt() {
+    let plan = InterruptPlan {
+        gesture: InterruptGesture {
+            key: "Escape",
+            presses: 3,
+            press_interval: Duration::from_millis(100),
+        },
+        confirm_window: Duration::from_secs(2),
+        max_attempts: 2,
+        turn_end_evidence: TurnEndEvidence::TurnBoundarySignal,
+    };
+    // Two attempts, each: 2s of waiting plus the gaps between 3 presses.
+    assert_eq!(plan.worst_case_duration(), Duration::from_millis(4400));
+}
+
+/// A single-press plan has no inter-press gaps to add, and a plan claiming
+/// zero attempts is still charged for one — the executor runs
+/// `max_attempts.max(1)`, so the bound must not report zero and let a caller
+/// think the call is instant.
+#[test]
+fn worst_case_duration_handles_the_degenerate_plans() {
+    let single = InterruptPlan {
+        gesture: InterruptGesture {
+            key: "Escape",
+            presses: 1,
+            press_interval: Duration::from_secs(9),
+        },
+        confirm_window: Duration::from_secs(5),
+        max_attempts: 1,
+        turn_end_evidence: TurnEndEvidence::TurnBoundarySignal,
+    };
+    assert_eq!(single.worst_case_duration(), Duration::from_secs(5));
+    let zero_attempts = InterruptPlan {
+        max_attempts: 0,
+        ..single
+    };
+    assert_eq!(zero_attempts.worst_case_duration(), Duration::from_secs(5));
+}

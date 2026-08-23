@@ -55,11 +55,16 @@ The `agents` family steers individual workers — listing live slots,
 showing status, focusing or stopping a pane, sending user-typed text,
 interrupting a turn, launching or reaping an execution, and dumping the
 recent transcript (text / raw JSONL / engine-rendered markdown). `probe`
-injects a coordinator prompt at the earliest point the worker's pane can
-take one — straight into the agent's composer for a live Claude worker,
-mid-turn, so it can steer work in flight; only a driver that reads no
-mid-turn input waits for a boundary. `--urgent` is queue priority, not a
-different transport. `work` mirrors `boss`'s
+**interrupts the worker's current turn** and delivers the coordinator's
+prompt there and then: it sends the driver's own interrupt gesture, waits
+for the turn to actually end, writes the text, and reports the settled
+delivery state — so the command blocks for a few seconds and exits non-zero
+when the text did not land. Interrupting is the default because the reason
+to probe a running worker is almost always to redirect it _now_, and the
+boundary a waiting probe watches for may be the run's last. `--no-interrupt`
+opts back into boundary delivery for a message that genuinely can wait,
+since an interrupt aborts whatever the worker was mid-way through.
+`--urgent` is queue priority, not a different transport. `work` mirrors `boss`'s
 dispatch verbs for symmetry. `dispatch` and `live-status` expose the
 internals of the dispatch pipeline for triage when a work item never
 reaches a worker pane.
