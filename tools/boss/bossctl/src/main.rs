@@ -234,7 +234,7 @@ enum Command {
     /// capabilities over SSH when `hosts add` provisions it.
     Hosts {
         #[command(subcommand)]
-        action: HostsAction,
+        action: hosts::HostsAction,
     },
     /// Cancel never-started executions, or prune terminal ones (retention).
     ///
@@ -1009,115 +1009,6 @@ enum MetricsAction {
 }
 
 #[derive(Subcommand, Debug)]
-enum HostsAction {
-    /// Register a new remote host. The host row is persisted to
-    /// `state.db`, then provisioned: push the `boss-remote-run` wrapper,
-    /// verify `cube` is invocable over non-interactive SSH, and discover
-    /// the host's capabilities (`os=`, `arch=`, `gh-authed=`, `driver=…`) by probing
-    /// it. The host is left enabled only if all of that succeeds;
-    /// otherwise it is disabled with the reason on `last_error`.
-    ///
-    /// `--skip-wrapper-push` suppresses the whole provisioning step
-    /// (offline / dry-run / test fixtures). A host registered that way is
-    /// enabled but unverified and reports no discovered capabilities until
-    /// something provisions it.
-    Add {
-        /// Unique identifier for this host (e.g. `zakalwe`).
-        id: String,
-        /// SSH target used to reach this host (alias or `user@host`).
-        #[arg(long)]
-        ssh_target: String,
-        /// Number of concurrent worker slots on this host.
-        #[arg(long, default_value_t = 1)]
-        pool_size: i64,
-        /// User-defined capability tags (e.g. `--tag os=macos --tag arch=arm64`).
-        #[arg(long = "tag", value_name = "TAG")]
-        tags: Vec<String>,
-        /// Skip the eager wrapper push at registration. The host row
-        /// is still created. Use when the host is offline at
-        /// registration time; the lazy push at dispatch will catch up.
-        #[arg(long)]
-        skip_wrapper_push: bool,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// List all registered hosts with their enabled state and capability count.
-    List {
-        /// Only show enabled hosts.
-        #[arg(long)]
-        enabled: bool,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// Show full details for a single host including all capabilities.
-    Show {
-        id: String,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// Re-run remote provisioning and capability discovery for a host.
-    Probe {
-        id: String,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// Add or remove user-defined capability tags on a host.
-    Tag {
-        #[command(subcommand)]
-        action: HostsTagAction,
-    },
-    /// Enable a previously disabled host.
-    Enable {
-        id: String,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// Disable a host so no new work is dispatched to it.
-    Disable {
-        id: String,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// Remove a host from the registry. Fails for the built-in `local` host.
-    Remove {
-        id: String,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum HostsTagAction {
-    /// Add one or more user capability tags to a host.
-    Add {
-        id: String,
-        /// Capability tag(s) to add (e.g. `os=macos`, `bazel=7`).
-        #[arg(required = true)]
-        tags: Vec<String>,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// Remove one or more user capability tags from a host.
-    Remove {
-        id: String,
-        /// Capability tag(s) to remove.
-        #[arg(required = true)]
-        tags: Vec<String>,
-        /// Override the Boss state-root directory.
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-}
-
-#[derive(Subcommand, Debug)]
 enum ExecutionsAction {
     /// Cancel a never-started (`queued` / `ready` / `waiting_dependency`)
     /// execution so dispatch will not spawn a worker for it.
@@ -1503,7 +1394,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::Hosts {
             action:
-                HostsAction::Add {
+                hosts::HostsAction::Add {
                     id,
                     ssh_target,
                     pool_size,
@@ -1513,34 +1404,34 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 },
         } => hosts::hosts_add(cli.json, state_root, id, ssh_target, pool_size, tags, skip_wrapper_push).await,
         Command::Hosts {
-            action: HostsAction::List { enabled, state_root },
+            action: hosts::HostsAction::List { enabled, state_root },
         } => hosts::hosts_list(cli.json, state_root, enabled),
         Command::Hosts {
-            action: HostsAction::Show { id, state_root },
+            action: hosts::HostsAction::Show { id, state_root },
         } => hosts::hosts_show(cli.json, state_root, id),
         Command::Hosts {
-            action: HostsAction::Probe { id, state_root },
+            action: hosts::HostsAction::Probe { id, state_root },
         } => hosts::hosts_probe(cli.json, state_root, id).await,
         Command::Hosts {
             action:
-                HostsAction::Tag {
-                    action: HostsTagAction::Add { id, tags, state_root },
+                hosts::HostsAction::Tag {
+                    action: hosts::HostsTagAction::Add { id, tags, state_root },
                 },
         } => hosts::hosts_tag_add(cli.json, state_root, id, tags),
         Command::Hosts {
             action:
-                HostsAction::Tag {
-                    action: HostsTagAction::Remove { id, tags, state_root },
+                hosts::HostsAction::Tag {
+                    action: hosts::HostsTagAction::Remove { id, tags, state_root },
                 },
         } => hosts::hosts_tag_remove(cli.json, state_root, id, tags),
         Command::Hosts {
-            action: HostsAction::Enable { id, state_root },
+            action: hosts::HostsAction::Enable { id, state_root },
         } => hosts::hosts_set_enabled(cli.json, state_root, id, true),
         Command::Hosts {
-            action: HostsAction::Disable { id, state_root },
+            action: hosts::HostsAction::Disable { id, state_root },
         } => hosts::hosts_set_enabled(cli.json, state_root, id, false),
         Command::Hosts {
-            action: HostsAction::Remove { id, state_root },
+            action: hosts::HostsAction::Remove { id, state_root },
         } => hosts::hosts_remove(cli.json, state_root, id),
         Command::Executions {
             action:
