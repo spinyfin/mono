@@ -11,6 +11,7 @@
 set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
+ensure_npx
 
 echo "--- [checks] running checks"
 # checkleft already defaults --show-progress off outside an interactive

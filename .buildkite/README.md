@@ -51,7 +51,7 @@ Runs `bazel build //...` then `bazel test //...` in one step, on one agent. The 
 
 ### `checks.sh`
 
-Runs the `CHECKS.yaml` checks via `checkleft` (or the equivalent runner). Scoped to changed paths on PR builds. Does not invoke `jj`; base-ref detection uses git.
+Runs the `CHECKS.yaml` checks via `checkleft` (or the equivalent runner). Scoped to changed paths on PR builds. Does not invoke `jj`; base-ref detection uses git. Calls `ensure_npx` so checkleft's npm-provisioned checks (`format/oxc` and friends) still run on a `bazel-any` agent that has no Node on PATH: well-known install dirs first, then a pinned Node 24.8.0 tarball cached under `$HOME/.cache/mono-ci-node` or `/mnt/ssd/mono-ci-node`.
 
 ## Agents and queue
 
