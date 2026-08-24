@@ -1131,6 +1131,11 @@ impl WorkDb {
                 // design) are the only ones that carry `tasks.doc_*` at all.
                 let mut doc_pointer_queries = 0u64;
                 attach_task_doc_link_state(&conn, &mut task, "get_work_item", &mut doc_pointer_queries);
+                // Same derived projections get_work_tree attaches (in-progress
+                // revision, attachments, AI-review, ready-for-review, R-seq).
+                // Without this, WorkItemUpdated from a same-column drop would
+                // ship mapper zeros and the client would treat them as truth.
+                attach_task_derived_projections(&conn, &mut task)?;
                 Ok(task_to_item(task))
             }
             // Answer-agent executions bind a comment id, but comments are not
@@ -1363,29 +1368,26 @@ impl WorkDb {
     /// (design Q1), so each short_id belongs to at most one row across
     /// both tables for a given product.
     pub fn get_work_item_by_short_id(&self, product_id: &str, short_id: i64) -> Result<Option<WorkItem>> {
-        let conn = self.connect()?;
-        if let Some(mut task) = conn
-            .query_row(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, parent_task_id, origin_task_short_id, origin_pr_number, completed_at, archived_by, archived_at, archived_reason, dispatch_failed_reason, dispatch_failed_error, dispatch_failed_at, blocked_detail, deferred, tags, human_driven, completion_summary, effort_matched_rule, effort_reasons
-                 FROM tasks
+        // Resolve to a primary id, then reuse `get_work_item` so the
+        // short-id path (`boss task show <n>`) cannot drift from the
+        // canonical single-item projection (doc-link + derived flags).
+        // Drop the connection guard before `get_work_item`: WorkDb
+        // serializes on one mutex, and a nested connect would deadlock.
+        let task_id: Option<String> = {
+            let conn = self.connect()?;
+            conn.query_row(
+                "SELECT id FROM tasks
                  WHERE product_id = ?1 AND short_id = ?2
                    AND (deleted_at IS NULL OR status = 'archived')",
                 params![product_id, short_id],
-                map_task_with_parent_provenance_and_archived_reason,
+                |row| row.get(0),
             )
             .optional()?
-        {
-            // Same doc-link resolution as get_work_item — this is the other
-            // single-item read path (`boss task show <short-id>`).
-            let mut doc_pointer_queries = 0u64;
-            attach_task_doc_link_state(
-                &conn,
-                &mut task,
-                "get_work_item_by_short_id",
-                &mut doc_pointer_queries,
-            );
-            return Ok(Some(task_to_item(task)));
+        };
+        if let Some(id) = task_id {
+            return Ok(Some(self.get_work_item(&id)?));
         }
+        let conn = self.connect()?;
         if let Some(project) = conn
             .query_row(
                 "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor,

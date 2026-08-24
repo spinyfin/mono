@@ -738,6 +738,102 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
     Ok(())
 }
 
+/// Populate engine-derived `Task` projection fields for a single row so
+/// `WorkItemUpdated` payloads are complete rather than carrying mapper
+/// defaults. Mirrors the attach_* pipeline `get_work_tree` runs over the
+/// full product, loading just this row's revision chain.
+///
+/// `attach_ai_reviewing_flag` / `attach_ai_review_state` /
+/// `attach_has_attachments_flag` stay non-fatal here the same way they
+/// are in `get_work_tree` — a side-query failure must not take down
+/// `GetWorkItem`. Chain loading errors (BFS / point reads) propagate:
+/// those are the same class of failure as the row read itself.
+pub(crate) fn attach_task_derived_projections(conn: &Connection, task: &mut Task) -> Result<()> {
+    let (mut tasks, mut chores) = load_chain_slices_for_projection(conn, task)?;
+    tasks = attach_revision_projections(tasks, &chores);
+    attach_in_progress_revision_flag(&mut tasks, &mut chores);
+    attach_ready_for_review_flag(&mut tasks, &mut chores);
+    if let Err(err) = attach_ai_reviewing_flag(conn, &mut tasks, &mut chores) {
+        tracing::warn!(
+            ?err,
+            task_id = %task.id,
+            "attach_task_derived_projections: ai_reviewing failed; ignoring"
+        );
+    }
+    if let Err(err) = attach_ai_review_state(conn, &mut tasks, &mut chores) {
+        tracing::warn!(
+            ?err,
+            task_id = %task.id,
+            "attach_task_derived_projections: ai_review_state failed; ignoring"
+        );
+    }
+    if let Err(err) = attach_has_attachments_flag(conn, &mut tasks, &mut chores) {
+        tracing::warn!(
+            ?err,
+            task_id = %task.id,
+            "attach_task_derived_projections: has_attachments failed; ignoring"
+        );
+    }
+    if let Some(projected) = tasks.iter().chain(chores.iter()).find(|t| t.id == task.id) {
+        copy_derived_projection_fields(task, projected);
+    }
+    Ok(())
+}
+
+fn copy_derived_projection_fields(dst: &mut Task, src: &Task) {
+    dst.revision_seq = src.revision_seq;
+    dst.revision_parent_pr_url = src.revision_parent_pr_url.clone();
+    dst.has_in_progress_revision = src.has_in_progress_revision;
+    dst.has_attachments = src.has_attachments;
+    dst.ai_reviewing = src.ai_reviewing;
+    dst.ai_review_state = src.ai_review_state.clone();
+    dst.ai_review_findings_revision_id = src.ai_review_findings_revision_id.clone();
+    dst.ready_for_review = src.ready_for_review;
+}
+
+fn push_projection_row(task: Task, tasks: &mut Vec<Task>, chores: &mut Vec<Task>) {
+    match task.kind {
+        TaskKind::Chore | TaskKind::Followup => chores.push(task),
+        _ => tasks.push(task),
+    }
+}
+
+/// Load the requested row plus its revision chain so the in-memory
+/// attach_* helpers see the same sibling/root shape `get_work_tree`
+/// builds. Chain roots go in `chores` when they are chore-like; every
+/// revision lives in `tasks` (revisions are never chores).
+fn load_chain_slices_for_projection(conn: &Connection, task: &Task) -> Result<(Vec<Task>, Vec<Task>)> {
+    let mut tasks = Vec::new();
+    let mut chores = Vec::new();
+
+    let root_id = if task.kind == TaskKind::Revision {
+        match get_chain_root_task(conn, &task.id)? {
+            Some(root) => {
+                let id = root.id.clone();
+                if root.id != task.id {
+                    push_projection_row(root, &mut tasks, &mut chores);
+                }
+                id
+            }
+            None => task.id.clone(),
+        }
+    } else {
+        task.id.clone()
+    };
+
+    for rev_id in collect_chain_revision_ids(conn, &root_id)? {
+        if rev_id == task.id {
+            continue;
+        }
+        if let Some(rev) = query_task(conn, &rev_id)? {
+            push_projection_row(rev, &mut tasks, &mut chores);
+        }
+    }
+
+    push_projection_row(task.clone(), &mut tasks, &mut chores);
+    Ok((tasks, chores))
+}
+
 /// Default `effort_level` for a revision the caller didn't supply one for.
 ///
 /// Design-family chain roots (`design`/`investigation`/`design_postmortem`)

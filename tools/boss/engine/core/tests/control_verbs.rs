@@ -32,9 +32,11 @@ use boss_engine::merge_poller::{
     MergeProbe, OpenPrCiStatus, OpenPrMergeability, OpenPrStatus, PrLifecycleProbe, PrLifecycleState, PrReviewState,
 };
 use boss_engine::work::WorkDb;
+use boss_engine::work::{PrOpenState, StaticPrStateChecker};
 use boss_protocol::{
-    BoardColumn, BoardDropTarget, BoardGroup, CreateChoreInput, CreateProductInput, CreateRunInput, ExecutionStatus,
-    FrontendEvent, FrontendRequest, RequestExecutionInput, Task, TaskStatus, WorkItem, WorkItemPatch,
+    BoardColumn, BoardDropTarget, BoardGroup, CreateChoreInput, CreateProductInput, CreateRevisionInput,
+    CreateRunInput, ExecutionStatus, FrontendEvent, FrontendRequest, RequestExecutionInput, Task, TaskStatus, WorkItem,
+    WorkItemPatch,
 };
 
 mod common;
@@ -1662,6 +1664,25 @@ async fn board_drop_inside_merging_group_does_not_complete_the_merge() -> Result
     );
     assert_eq!(fetch_task_status(&mut client, &chore.id).await?, TaskStatus::InReview);
 
+    // Same-column drop used to ship mapper zeros for every derived field
+    // (the "In revision" badge vanishing after a click-wobble). Seed the
+    // projections a live in-review card actually carries, then assert the
+    // reorder payload keeps them.
+    work_db.create_revision(
+        CreateRevisionInput::builder()
+            .parent_task_id(chore.id.clone())
+            .description("in-flight revision")
+            .autostart(false)
+            .build(),
+        &StaticPrStateChecker(PrOpenState::Open),
+    )?;
+    work_db.set_external_ref(
+        &chore.id,
+        "github",
+        "spinyfin/mono#1",
+        &serde_json::json!({"issue_number": 1}),
+    )?;
+
     // The gesture from the bug report: a reorder inside the group.
     match client
         .send_request(&move_on_board_request(
@@ -1683,6 +1704,31 @@ async fn board_drop_inside_merging_group_does_not_complete_the_merge() -> Result
                     Some("queued"),
                     "the row must still be tracked as an in-flight merge"
                 );
+                assert!(
+                    t.has_in_progress_revision,
+                    "same-column drop must not zero has_in_progress_revision"
+                );
+                assert_eq!(
+                    t.external_ref.as_ref().map(|r| r.canonical_id.as_str()),
+                    Some("spinyfin/mono#1"),
+                    "same-column drop must not drop the bound tracker issue"
+                );
+                assert!(
+                    t.parent_task_id.is_none(),
+                    "chain-root parent_task_id must stay unset, not get clobbered"
+                );
+                assert!(t.completed_at.is_none());
+                assert!(t.revision_seq.is_none());
+                assert!(t.revision_parent_pr_url.is_none());
+                assert!(
+                    !t.ready_for_review,
+                    "an in-progress revision must keep ready_for_review false"
+                );
+                assert!(!t.ai_reviewing);
+                assert!(t.ai_review_state.is_none());
+                assert!(t.ai_review_findings_revision_id.is_none());
+                assert!(!t.has_attachments);
+                assert!(t.source_automation_id.is_none());
             }
             other => return Err(anyhow!("unexpected item kind: {other:?}")),
         },

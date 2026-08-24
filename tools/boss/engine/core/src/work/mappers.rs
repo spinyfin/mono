@@ -264,35 +264,27 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         // map_task_with_external_ref_parent_source_and_provenance) read it
         // from the appended column in their respective SELECTs.
         completed_at: None,
-        // Revision projections are computed in attach_revision_projections
-        // (get_work_tree); they are never stored as columns.
+        // Derived; never stored. Populated after mapping by
+        // attach_revision_projections (get_work_tree and get_work_item).
         revision_seq: None,
         revision_parent_pr_url: None,
-        // Computed by attach_in_progress_revision_flag in get_work_tree.
+        // Derived; populated after mapping by attach_in_progress_revision_flag.
         has_in_progress_revision: false,
-        // Computed by attach_has_attachments_flag in get_work_tree; always
-        // false in single-item query paths where the derived projection is
-        // not computed.
+        // Derived; populated after mapping by attach_has_attachments_flag.
         has_attachments: false,
         // Populated by map_task_with_source_automation_id when the SELECT
-        // includes that column; None for all standard task queries.
+        // includes that column; also by the single-item mapper below.
         source_automation_id: None,
         // review_cycle/last_reviewed_sha are appended right after
         // `reasoning` (index 33) in the base SELECT, i.e. indices 34-35.
         review_cycle: row.get(34)?,
         last_reviewed_sha: row.get::<_, Option<String>>(35)?.filter(|s| !s.is_empty()),
-        // Computed by attach_ai_reviewing_flag in get_work_tree; always false
-        // in single-item query paths (get_work_item etc.) where the derived
-        // projection is not computed.
+        // Derived; populated after mapping by attach_ai_reviewing_flag.
         ai_reviewing: false,
-        // Computed by attach_ai_review_state in get_work_tree; always None
-        // in single-item query paths where the derived projection is not
-        // computed.
+        // Derived; populated after mapping by attach_ai_review_state.
         ai_review_state: None,
         ai_review_findings_revision_id: None,
-        // Computed by attach_ready_for_review_flag in get_work_tree; always
-        // false in single-item query paths where the derived projection is
-        // not computed.
+        // Derived; populated after mapping by attach_ready_for_review_flag.
         ready_for_review: false,
         // Resolved per-task doc-link state for project-less docs-backed
         // items (investigations). Computed by attach_task_doc_links in
@@ -418,12 +410,14 @@ pub(crate) fn map_task_with_parent_provenance_and_tags(row: &Row<'_>) -> rusqlit
 /// `archived_by` / `archived_at` / `archived_reason` columns (40-42),
 /// `dispatch_failed_*` (43-45), `blocked_detail` (46), `deferred` (47),
 /// `tags` (48), `human_driven` (49), `completion_summary` (50),
-/// `effort_matched_rule` (51), and `effort_reasons` (52). Used by `query_task` and
-/// `get_work_item_by_short_id` so single-item lookups (`boss task show`,
-/// `get_work_item`) surface complete archival provenance, the verbatim
-/// blocked-status detail, future-scope / human-driven classification,
-/// free-form kanban tags, any human close summary, and effort-classification
-/// provenance.
+/// `effort_matched_rule` (51), `effort_reasons` (52), the external-ref
+/// columns (53-57), and `source_automation_id` (58). Used by `query_task`
+/// and `get_work_item_by_short_id` so single-item lookups (`boss task show`,
+/// `get_work_item`, `WorkItemUpdated`) surface complete archival provenance,
+/// the verbatim blocked-status detail, future-scope / human-driven
+/// classification, free-form kanban tags, any human close summary,
+/// effort-classification provenance, the bound tracker issue, and
+/// automation provenance.
 pub(crate) fn map_task_with_parent_provenance_and_archived_reason(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_parent_and_provenance(row)?;
     task.archived_by = row.get::<_, Option<String>>(40)?.filter(|s| !s.is_empty());
@@ -439,7 +433,31 @@ pub(crate) fn map_task_with_parent_provenance_and_archived_reason(row: &Row<'_>)
     task.completion_summary = row.get::<_, Option<String>>(50)?.filter(|s| !s.is_empty());
     task.effort_matched_rule = row.get::<_, Option<String>>(51)?.filter(|s| !s.is_empty());
     task.effort_reasons = row.get::<_, Option<String>>(52)?.filter(|s| !s.is_empty());
+    populate_external_ref_from_row(&mut task, row, 53)?;
+    task.source_automation_id = row.get::<_, Option<String>>(58)?.filter(|s| !s.is_empty());
     Ok(task)
+}
+
+/// Fill `Task.external_ref` from five consecutive SELECT columns starting
+/// at `kind_idx` (`kind`, `canonical_id`, `raw`, `synced_at`, `unbound_at`).
+/// Shared by the single-item mapper and [`map_task_with_external_ref`].
+fn populate_external_ref_from_row(task: &mut Task, row: &Row<'_>, kind_idx: usize) -> rusqlite::Result<()> {
+    let kind: Option<String> = row.get(kind_idx)?;
+    let canonical_id: Option<String> = row.get(kind_idx + 1)?;
+    if let (Some(kind), Some(canonical_id)) = (kind, canonical_id) {
+        let raw_json: Option<String> = row.get(kind_idx + 2)?;
+        let raw: serde_json::Value = deserialize_json_or_default(raw_json.as_deref());
+        let web_url = derive_external_ref_web_url(&kind, &canonical_id);
+        task.external_ref = Some(WorkItemExternalRef {
+            kind,
+            canonical_id,
+            raw,
+            web_url,
+            synced_at: row.get(kind_idx + 3)?,
+            unbound_at: row.get(kind_idx + 4)?,
+        });
+    }
+    Ok(())
 }
 
 /// Derives the canonical browser URL from an external-ref kind and
@@ -463,21 +481,7 @@ pub(crate) fn derive_external_ref_web_url(kind: &str, canonical_id: &str) -> Str
 /// all part of the base SELECT.)
 pub(crate) fn map_task_with_external_ref(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task(row)?;
-    let kind: Option<String> = row.get(36)?;
-    let canonical_id: Option<String> = row.get(37)?;
-    if let (Some(kind), Some(canonical_id)) = (kind, canonical_id) {
-        let raw_json: Option<String> = row.get(38)?;
-        let raw: serde_json::Value = deserialize_json_or_default(raw_json.as_deref());
-        let web_url = derive_external_ref_web_url(&kind, &canonical_id);
-        task.external_ref = Some(WorkItemExternalRef {
-            kind,
-            canonical_id,
-            raw,
-            web_url,
-            synced_at: row.get(39)?,
-            unbound_at: row.get(40)?,
-        });
-    }
+    populate_external_ref_from_row(&mut task, row, 36)?;
     Ok(task)
 }
 
