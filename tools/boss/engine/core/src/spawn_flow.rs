@@ -1063,6 +1063,12 @@ mod tests {
                 .collect::<Vec<_>>();
             let (step, stdout) = match args.get(2).map(String::as_str) {
                 Some("new-session") => ("new-session", ""),
+                Some("set-option") if args.get(3).map(String::as_str) == Some("-s") => {
+                    match args.get(4).map(String::as_str) {
+                        Some("terminal-features[100]") | Some("extended-keys") => ("presentation", ""),
+                        other => panic!("unexpected tmux server set-option: {other:?}, args={args:?}"),
+                    }
+                }
                 Some("set-option") => match args.get(5).map(|option| option.as_str()) {
                     Some("status") => ("presentation", ""),
                     Some("@boss_spawn_token") => ("label", ""),
@@ -1118,7 +1124,16 @@ mod tests {
         }
         assert_eq!(
             store.steps(),
-            vec!["intent", "new-session", "presentation", "label", "pane-pid", "created"]
+            vec![
+                "intent",
+                "new-session",
+                "presentation",
+                "presentation",
+                "presentation",
+                "label",
+                "pane-pid",
+                "created"
+            ]
         );
 
         let calls = runner.calls();
@@ -1141,16 +1156,44 @@ mod tests {
             "tmux must launch through WorkerPaneLaunch's interactive login shell: {create:?}"
         );
         assert_eq!(
-            &calls[1][..6],
+            calls[1],
+            vec![
+                "-L",
+                "boss",
+                "set-option",
+                "-s",
+                "terminal-features[100]",
+                "xterm*:extkeys"
+            ]
+        );
+        assert_eq!(calls[2], vec!["-L", "boss", "set-option", "-s", "extended-keys", "on"]);
+        assert_eq!(
+            &calls[3][..6],
             ["-L", "boss", "set-option", "-t", "boss-3-run-test", "status"]
         );
-        assert_eq!(calls[1][6], "off");
+        assert_eq!(calls[3][6], "off");
         assert_eq!(
-            &calls[2][..6],
+            &calls[4][..6],
             ["-L", "boss", "set-option", "-t", "boss-3-run-test", "@boss_spawn_token"]
         );
+        let pane_pid = calls
+            .iter()
+            .position(|call| call.get(2).map(String::as_str) == Some("display-message"))
+            .expect("expected pane-pid read after options");
+        let features = calls
+            .iter()
+            .position(|call| call.get(4).map(String::as_str) == Some("terminal-features[100]"))
+            .expect("expected terminal-features write");
+        let extended = calls
+            .iter()
+            .position(|call| call.get(4).map(String::as_str) == Some("extended-keys"))
+            .expect("expected extended-keys write");
+        assert!(
+            features < pane_pid && extended < pane_pid,
+            "extended-key options must be set before the attach identity is returned"
+        );
         assert_eq!(
-            calls[3],
+            calls[5],
             vec![
                 "-L",
                 "boss",
