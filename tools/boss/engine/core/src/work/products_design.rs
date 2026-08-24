@@ -787,13 +787,14 @@ impl WorkDb {
     ///   `project_id = Some(...)`. This is the *project-level* design-doc
     ///   pointer, a separate concept from the per-task `doc_*` columns.
     ///
-    /// - **Per-task-doc tasks**: the task's own `doc_path` is set but
-    ///   `doc_branch` is `NULL`. Independent of `kind` — any in-review
-    ///   work item with a stored per-task pointer may need its branch
-    ///   backfilled. The caller should invoke
-    ///   [`crate::design_detector::on_task_doc_pr_detected`]. `project_id`
-    ///   is returned as `NULL` on this arm so the backfill dispatcher
-    ///   routes to the per-task detector rather than the project one.
+    /// - **Per-task-doc tasks**: a task's `doc_path` is set but
+    ///   `doc_branch` is `NULL`, or it is a design/investigation with no
+    ///   pointer yet. The latter preserves startup retry after a detector
+    ///   scan fails before it can persist the discovered pointer. The caller
+    ///   should invoke [`crate::design_detector::on_task_doc_pr_detected`].
+    ///   `project_id` is returned as `NULL` on this arm so the backfill
+    ///   dispatcher routes to the per-task detector rather than the project
+    ///   one.
     ///
     /// Only tasks with a non-null `pr_url` and `deleted_at IS NULL` are
     /// returned; tasks without a PR cannot be scanned.
@@ -814,15 +815,17 @@ impl WorkDb {
                AND p.design_doc_branch IS NULL
              UNION ALL
              -- Per-task doc pointer: every in-review work item with an
-             -- existing pointer. A project-design task can intentionally
-             -- appear in both arms because it owns independent project and
-             -- task-level pointers, each needing its own detector update.
+             -- existing pointer, plus pointer-less designs/investigations
+             -- so startup can retry detector discovery. A project-design
+             -- task can intentionally appear in both arms because it owns
+             -- independent project and task-level pointers, each needing
+             -- its own detector update.
              SELECT t.id, t.product_id, NULL, t.pr_url
              FROM tasks t
              WHERE t.status = 'in_review'
                AND t.pr_url IS NOT NULL
                AND t.deleted_at IS NULL
-               AND t.doc_path IS NOT NULL
+               AND (t.doc_path IS NOT NULL OR t.kind IN ('design', 'investigation'))
                AND t.doc_branch IS NULL",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -860,31 +863,13 @@ pub(crate) fn attach_task_doc_link_state(conn: &Connection, task: &mut Task, cal
 /// Attach [`Task::doc_link_state`] for items in `tasks` that have a
 /// per-task doc pointer. The one bulk query avoids resolving the absent
 /// pointer for every card returned by list and work-tree paths.
-pub(crate) fn attach_task_doc_link_states(conn: &Connection, tasks: &mut [Task], caller: &str) -> (usize, u64) {
-    let Some(product_id) = tasks.first().map(|task| task.product_id.as_str()) else {
-        return (0, 0);
-    };
-    let mut queries = 1;
-    let ids_with_pointers = match task_ids_with_doc_pointers(conn, product_id) {
-        Ok(ids) => ids,
-        Err(err) => {
-            tracing::warn!(
-                product_id,
-                ?err,
-                "{caller}: failed to prefilter task doc pointers; resolving all returned items"
-            );
-            let n = tasks.len();
-            for task in tasks {
-                attach_task_doc_link_state(conn, task, caller, &mut queries);
-            }
-            return (n, queries);
-        }
-    };
-    let n = tasks.iter().filter(|task| ids_with_pointers.contains(&task.id)).count();
-    for task in tasks.iter_mut().filter(|task| ids_with_pointers.contains(&task.id)) {
-        attach_task_doc_link_state(conn, task, caller, &mut queries);
-    }
-    (n, queries)
+pub(crate) fn attach_task_doc_link_states(
+    conn: &Connection,
+    tasks: &mut [Task],
+    caller: &str,
+    product_id: &str,
+) -> (usize, u64) {
+    attach_task_doc_link_states_for_groups(conn, &mut [tasks], caller, product_id)
 }
 
 /// Resolve doc-link states for several work-tree collections with one
@@ -893,13 +878,11 @@ pub(crate) fn attach_task_doc_link_states_for_groups(
     conn: &Connection,
     groups: &mut [&mut [Task]],
     caller: &str,
+    product_id: &str,
 ) -> (usize, u64) {
-    let Some(product_id) = groups
-        .iter()
-        .find_map(|tasks| tasks.first().map(|task| task.product_id.as_str()))
-    else {
+    if groups.iter().all(|tasks| tasks.is_empty()) {
         return (0, 0);
-    };
+    }
     let mut queries = 1;
     let ids_with_pointers = match task_ids_with_doc_pointers(conn, product_id) {
         Ok(ids) => ids,
@@ -930,8 +913,7 @@ pub(crate) fn attach_task_doc_link_states_for_groups(
 }
 
 fn task_ids_with_doc_pointers(conn: &Connection, product_id: &str) -> Result<HashSet<String>> {
-    let mut stmt =
-        conn.prepare("SELECT id FROM tasks WHERE product_id = ?1 AND doc_path IS NOT NULL AND deleted_at IS NULL")?;
+    let mut stmt = conn.prepare("SELECT id FROM tasks WHERE product_id = ?1 AND doc_path IS NOT NULL")?;
     let rows = stmt.query_map(params![product_id], |row| row.get::<_, String>(0))?;
     Ok(collect_rows(rows)?.into_iter().collect())
 }

@@ -1028,8 +1028,12 @@ impl WorkDb {
         // pointer-bearing items and `doc_pointer_queries` is the aggregate
         // statement count, recorded alongside `db.task_runtimes`.
         let t = Instant::now();
-        let (resolved, doc_pointer_queries) =
-            attach_task_doc_link_states_for_groups(&conn, &mut [&mut tasks[..], &mut chores[..]], "get_work_tree");
+        let (resolved, doc_pointer_queries) = attach_task_doc_link_states_for_groups(
+            &conn,
+            &mut [&mut tasks[..], &mut chores[..]],
+            "get_work_tree",
+            product_id,
+        );
         trace.record_nplus1(segment::DB_DOC_POINTERS, elapsed_ms(t), resolved, doc_pointer_queries);
 
         Ok(WorkTree {
@@ -1510,7 +1514,7 @@ impl WorkDb {
                 &mut tasks,
             )?;
         }
-        attach_task_doc_link_states(&conn, &mut tasks, "list_tasks");
+        attach_task_doc_link_states(&conn, &mut tasks, "list_tasks", product_id);
         Ok(tasks)
     }
 
@@ -1632,7 +1636,7 @@ impl WorkDb {
                 &mut revisions,
             )?;
         }
-        attach_task_doc_link_states(&conn, &mut revisions, "list_revisions");
+        attach_task_doc_link_states(&conn, &mut revisions, "list_revisions", product_id);
         Ok(revisions)
     }
 
@@ -1664,7 +1668,7 @@ impl WorkDb {
                 &mut chores,
             )?;
         }
-        attach_task_doc_link_states(&conn, &mut chores, "list_chores");
+        attach_task_doc_link_states(&conn, &mut chores, "list_chores", product_id);
         Ok(chores)
     }
 
