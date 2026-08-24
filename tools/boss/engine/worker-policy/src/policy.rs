@@ -267,9 +267,9 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         // - `SetProjectDesignDoc` is the design worker recording where it
         //   put the doc it just wrote — named explicitly in the design's
         //   worker-tier verb policy.
-        // - `SetTaskDocPointer` is the investigation / project-less-design
-        //   worker recording where its deliverable doc lives (the task-
-        //   level analogue of `SetProjectDesignDoc`).
+        // - `SetTaskDocPointer` is a worker recording where its
+        //   deliverable doc lives (the task-level analogue of
+        //   `SetProjectDesignDoc`). Independent of kind.
         // - `CommentsPostAnswer` is the answer agent's reply; it already
         //   resolves comment and run from the caller's own `BOSS_RUN_ID`
         //   and cannot target another thread (see `app/comments.rs`).

@@ -1,22 +1,5 @@
 use super::*;
 
-/// Whether a docs-backed work item routes through the **per-task** doc
-/// pointer (`design_detector`'s `on_task_doc_pr_*` + the `tasks.doc_*`
-/// columns) rather than the per-project design-doc pointer.
-///
-/// `true` for every `kind = investigation` (its deliverable doc is never
-/// a project's design doc) and for project-less `kind = design` tasks
-/// (which have no project pointer to populate). `false` for design tasks
-/// that have a project — those keep using the per-project pointer — and
-/// for every kind that produces no doc.
-///
-/// Lives here, next to the `tasks.doc_*` reads it gates, rather than in
-/// `design_detector`: the persistence layer must not depend on the
-/// detector that writes through it.
-pub(crate) fn task_uses_per_task_doc(kind: &TaskKind, has_project: bool) -> bool {
-    matches!(kind, TaskKind::Investigation) || (matches!(kind, TaskKind::Design) && !has_project)
-}
-
 impl WorkDb {
     /// Fetch a single project by id. Used by the runner when it
     /// composes the worker prompt for a `kind = 'design'` task —
@@ -499,9 +482,8 @@ impl WorkDb {
     /// Sync a `(repo, branch, path)` triple discovered by the doc
     /// detector into a **task's** own `doc_*` pointer columns, **iff**
     /// the task's `doc_path` is currently `NULL`. The task-level analogue
-    /// of [`Self::sync_project_design_doc_from_detector`] for project-less
-    /// docs-backed items (investigations), which have no project pointer
-    /// to populate.
+    /// of [`Self::sync_project_design_doc_from_detector`]. Independent of
+    /// `kind` — any work item may receive a per-task pointer this way.
     ///
     /// One-way auto-populate: a task that already carries a pointer wins;
     /// a task with no pointer benefits from the detector's discovery. The
@@ -604,8 +586,8 @@ impl WorkDb {
     /// uses); `unset = true` clears all three columns.
     ///
     /// Returns the updated `Task`, with `doc_link_state` resolved from the
-    /// just-written `doc_*` columns for the kinds that carry a per-task
-    /// pointer, so the caller can observe the write without a second read.
+    /// just-written `doc_*` columns so the caller can observe the write
+    /// without a second read. Independent of `kind`.
     pub fn set_task_doc(&self, input: SetTaskDocPointerInput) -> Result<Task> {
         let conn = self.connect()?;
         let _ = query_task(&conn, &input.task_id).require("task", &input.task_id)?;
@@ -672,11 +654,17 @@ impl WorkDb {
     /// `tools/boss/docs/designs/comment-triggered-document-revisions.md`
     /// §"The revision-vs-general-task decision".
     ///
+    /// This kind filter is **not** the per-task doc-pointer gate (that
+    /// gate was deleted: any work item may carry `tasks.doc_*`). It is
+    /// the comment-classifier / `[Revise]`-banner scope, which remains
+    /// Design/Investigation-only by that design.
+    ///
     /// `None` for any `artifact_kind` other than `"pr_doc"` (per the design,
     /// `work_item` comments — engine-owned task descriptions — are never
     /// design/investigation docs and get no comment-driven affordance at
     /// all), for an artifact id that doesn't parse, or when the matched
-    /// task's `kind` is not `Design`/`Investigation` — the scope guard.
+    /// task's `kind` is not `Design`/`Investigation` — the classifier
+    /// scope guard.
     ///
     /// Resolution order:
     /// 1. If `<branch>` is the engine-supplied `expected_branch` of a live
@@ -796,20 +784,24 @@ impl WorkDb {
     /// - **Project-design tasks** (`kind='design'`, `project_id IS NOT NULL`):
     ///   the associated project's `design_doc_branch` is `NULL`. The caller
     ///   should invoke [`crate::design_detector::on_design_pr_detected`] with
-    ///   `project_id = Some(...)`.
+    ///   `project_id = Some(...)`. This is the *project-level* design-doc
+    ///   pointer, a separate concept from the per-task `doc_*` columns.
     ///
-    /// - **Per-task-doc tasks** (`kind='investigation'`, or `kind='design'`
-    ///   with `project_id IS NULL`): the task's own `doc_branch` is `NULL`.
-    ///   The caller should invoke
-    ///   [`crate::design_detector::on_task_doc_pr_detected`] with
-    ///   `project_id = None`.
+    /// - **Per-task-doc tasks**: the task's own `doc_branch` is `NULL`.
+    ///   Independent of `kind` — any in-review work item with a PR may
+    ///   carry a per-task pointer. The caller should invoke
+    ///   [`crate::design_detector::on_task_doc_pr_detected`]. `project_id`
+    ///   is returned as `NULL` on this arm so the backfill dispatcher
+    ///   routes to the per-task detector rather than the project one.
     ///
     /// Only tasks with a non-null `pr_url` and `deleted_at IS NULL` are
     /// returned; tasks without a PR cannot be scanned.
     pub fn list_in_review_tasks_for_doc_branch_backfill(&self) -> Result<Vec<DocBranchBackfillCandidate>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            // Project-design tasks: join to the project to check design_doc_branch.
+            // Project-level design-doc pointer (separate from per-task
+            // `doc_*`). Kind filter here is the project-design mechanism,
+            // not the deleted per-task-doc kind gate.
             "SELECT t.id, t.product_id, t.project_id, t.pr_url
              FROM tasks t
              JOIN projects p ON t.project_id = p.id
@@ -820,12 +812,10 @@ impl WorkDb {
                AND t.deleted_at IS NULL
                AND p.design_doc_branch IS NULL
              UNION ALL
-             -- Per-task-doc tasks: tasks.doc_branch is the relevant pointer.
+             -- Per-task doc pointer: every in-review work item with a PR.
              SELECT t.id, t.product_id, NULL, t.pr_url
              FROM tasks t
-             WHERE (t.kind = 'investigation'
-                    OR (t.kind = 'design' AND t.project_id IS NULL))
-               AND t.status = 'in_review'
+             WHERE t.status = 'in_review'
                AND t.pr_url IS NOT NULL
                AND t.deleted_at IS NULL
                AND t.doc_branch IS NULL",
@@ -842,20 +832,16 @@ impl WorkDb {
     }
 }
 
-/// Resolve and attach [`Task::doc_link_state`] for a single task when it is a
-/// per-task-doc kind (`task_uses_per_task_doc`). Shared by the work-tree loop,
-/// single-item read paths, and `set_task_doc`'s return so a change to the
-/// resolution contract only needs to land once.
+/// Resolve and attach [`Task::doc_link_state`] for a single task from its
+/// `doc_*` columns. Independent of `kind` — any work item may carry a
+/// per-task pointer. Shared by the work-tree loop, list/show read paths,
+/// and `set_task_doc`'s return so a change to the resolution contract
+/// only needs to land once.
 ///
-/// Returns `true` when the kind gate passed and resolution was attempted
-/// (so `get_work_tree` can keep its N+1 `resolved` count accurate). Errors
-/// are non-fatal: log with `caller` as the message prefix and leave the
-/// field `None` (affordance hidden). The workspace lookup is always `|_| None`:
-/// cube is not consulted on these paths.
-pub(crate) fn attach_task_doc_link_state(conn: &Connection, task: &mut Task, caller: &str, queries: &mut u64) -> bool {
-    if !task_uses_per_task_doc(&task.kind, task.project_id.is_none()) {
-        return false;
-    }
+/// Errors are non-fatal: log with `caller` as the message prefix and
+/// leave the field `None` (affordance hidden). The workspace lookup is
+/// always `|_| None`: cube is not consulted on these paths.
+pub(crate) fn attach_task_doc_link_state(conn: &Connection, task: &mut Task, caller: &str, queries: &mut u64) {
     match resolve_task_doc_pointer(conn, &task.id, |_| None, queries) {
         Ok(state) => task.doc_link_state = state,
         Err(err) => tracing::warn!(
@@ -864,7 +850,22 @@ pub(crate) fn attach_task_doc_link_state(conn: &Connection, task: &mut Task, cal
             "{caller}: failed to resolve task doc-link state; leaving affordance hidden"
         ),
     }
-    true
+}
+
+/// Attach [`Task::doc_link_state`] for every item in `tasks`. Returns the
+/// number of items visited so N+1 callers (`get_work_tree`) can report
+/// an accurate `resolved` count.
+pub(crate) fn attach_task_doc_link_states(
+    conn: &Connection,
+    tasks: &mut [Task],
+    caller: &str,
+    queries: &mut u64,
+) -> usize {
+    let n = tasks.len();
+    for task in tasks {
+        attach_task_doc_link_state(conn, task, caller, queries);
+    }
+    n
 }
 
 /// Resolve a task's per-task doc pointer (`doc_*` columns) into a
@@ -1246,23 +1247,5 @@ mod tests {
             .pr_doc_artifact_hint("pr_doc:spinyfin/mono:boss/exec_x:docs/foo.md")
             .unwrap();
         assert_eq!(hint, None);
-    }
-
-    // ---- task_uses_per_task_doc routing ------------------------------
-
-    #[test]
-    fn task_doc_routing_matches_investigations_and_project_less_designs() {
-        // Investigations always route to the per-task pointer.
-        assert!(task_uses_per_task_doc(&TaskKind::Investigation, true));
-        assert!(task_uses_per_task_doc(&TaskKind::Investigation, false));
-        // Design with a project uses the per-project pointer; project-less
-        // design falls back to the per-task pointer.
-        assert!(!task_uses_per_task_doc(&TaskKind::Design, true));
-        assert!(task_uses_per_task_doc(&TaskKind::Design, false));
-        // Kinds that produce no doc never route to the per-task pointer.
-        assert!(!task_uses_per_task_doc(&TaskKind::Task, false));
-        assert!(!task_uses_per_task_doc(&TaskKind::Chore, false));
-        assert!(!task_uses_per_task_doc(&TaskKind::ProjectTask, false));
-        assert!(!task_uses_per_task_doc(&TaskKind::Revision, false));
     }
 }

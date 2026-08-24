@@ -1,14 +1,12 @@
 import XCTest
 @testable import Boss
 
-/// Coverage for the project-less doc-link icon on investigation cards
-/// (the T1705 fix). Investigations have no project, so their doc-link
-/// state can't come from `designDocStateByProjectID`; the engine resolves
-/// the task's own `doc_*` columns and delivers a `ProjectDesignDocState`
-/// directly on `WorkTask.docLinkState`. The card feeds that into the same
+/// Coverage for the per-task doc-link icon on work-item cards.
+/// Any kind may carry a `docLinkState`; the engine resolves the task's
+/// own `doc_*` columns and delivers a `ProjectDesignDocState` on
+/// `WorkTask.docLinkState`. The card feeds that into the same
 /// `ProjectDesignDocAffordancePresentation` design cards use, and taps
-/// route to `openTaskDoc` (the task-level analogue of
-/// `openProjectDesignDoc`).
+/// route to `openWorkItemDoc` / `openTaskDoc`.
 @MainActor
 final class InvestigationDocLinkAffordanceTests: XCTestCase {
     // MARK: - Presentation (icon renders from the per-task state)
@@ -28,6 +26,35 @@ final class InvestigationDocLinkAffordanceTests: XCTestCase {
     func testInvestigationWithoutDocLinkStateHasNoState() {
         let task = makeInvestigation(docLinkState: nil)
         XCTAssertNil(task.docLinkState, "no pointer -> no doc-link state -> hidden affordance")
+    }
+
+    /// A non-investigation work item with a resolved per-task pointer
+    /// must render the same card affordance as an investigation. The
+    /// historical kind gate hid this icon on chores even when `set-doc`
+    /// had written a pointer.
+    func testChoreWithResolvedDocLinkStateShowsCardAffordance() {
+        let task = makeWorkItem(kind: "chore", docLinkState: resolvedState(rawContentURL: nil))
+        let ctx = WorkCardSnapshotContext(
+            column: .review,
+            designDocState: task.docLinkState
+        )
+        let snap = WorkCardSnapshot.build(task: task, context: ctx)
+        XCTAssertTrue(
+            snap.showsDesignDocAffordance,
+            "a chore with a resolved per-task doc must show the card affordance"
+        )
+        let presentation = ProjectDesignDocAffordancePresentation.from(state: task.docLinkState!)
+        XCTAssertEqual(presentation?.systemImage, "doc.text")
+        XCTAssertEqual(presentation?.kind, .resolved)
+    }
+
+    /// `workItemDocState` must return a chore's per-task pointer so the
+    /// selected-card detail popover (and the kanban snapshot builder)
+    /// agree with the card icon.
+    func testWorkItemDocStateReturnsChorePerTaskPointer() {
+        let model = makeModel()
+        let task = makeWorkItem(kind: "chore", docLinkState: resolvedState(rawContentURL: nil))
+        XCTAssertEqual(model.workItemDocState(for: task), task.docLinkState)
     }
 
     // MARK: - openTaskDoc dispatch
@@ -124,12 +151,16 @@ final class InvestigationDocLinkAffordanceTests: XCTestCase {
     }
 
     private func makeInvestigation(docLinkState: ProjectDesignDocState?) -> WorkTask {
+        makeWorkItem(kind: "investigation", docLinkState: docLinkState)
+    }
+
+    private func makeWorkItem(kind: String, docLinkState: ProjectDesignDocState?) -> WorkTask {
         WorkTask(
-            id: "task_inv",
+            id: "task_\(kind)",
             productID: "prod_test",
             projectID: nil,
-            kind: "investigation",
-            name: "Investigate the thing",
+            kind: kind,
+            name: "\(kind) with a doc",
             description: "",
             status: "in_review",
             priority: "medium",

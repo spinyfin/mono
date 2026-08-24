@@ -405,23 +405,17 @@ impl WorkerCompletionHandler {
         self.publisher
             .publish_work_item_changed(&product_id, &work_item_id, publish_reason)
             .await;
-        // Doc-link auto-population. The doc-link card affordance is driven
-        // by a resolved doc pointer, and which pointer depends on the item:
-        //  - design tasks WITH a project -> the PROJECT's `design_doc_*`
-        //    pointer (`design_detector::on_design_pr_*`), surfaced on
-        //    design cards.
-        //  - project-less docs-backed items (investigations, and any
-        //    project-less design task) -> the TASK's own `doc_*` pointer
-        //    (`design_detector::on_task_doc_pr_*`), surfaced on
-        //    investigation cards.
+        // Doc-link auto-population. Two independent pointers:
+        //  - every leaf work item -> the TASK's own `doc_*` pointer
+        //    (`design_detector::on_task_doc_pr_*`). Independent of kind.
+        //  - design tasks WITH a project (and design_postmortem) ALSO
+        //    populate the PROJECT's `design_doc_*` pointer
+        //    (`design_detector::on_design_pr_*`). That is a separate
+        //    concept; this change does not merge the two.
         // The routing decision is logged ABOVE the per-branch dispatch so a
         // skip/proceed is ALWAYS visible without entering a gated block.
-        // This closes the historical diagnostic blind spot: investigations
-        // failed BOTH the old `kind == Design` and `project_id.is_some()`
-        // gates, so every diagnostic that lived inside the block stayed
-        // silent for them. Detector errors are logged inside the detector —
-        // they must not surface here because they'd mask the successful PR
-        // transition.
+        // Detector errors are logged inside the detector — they must not
+        // surface here because they'd mask the successful PR transition.
         //
         // `design_postmortem` completions skip the generic best-effort
         // followups mechanism entirely (see the guard below) in favour of
@@ -434,13 +428,10 @@ impl WorkerCompletionHandler {
         if let WorkItem::Task(ref task) | WorkItem::Chore(ref task) = completion.work_item {
             let produces_project_design =
                 matches!(task.kind, TaskKind::Design | TaskKind::DesignPostmortem) && task.project_id.is_some();
-            let uses_task_doc = crate::work::task_uses_per_task_doc(&task.kind, task.project_id.is_none());
             let decision = if produces_project_design {
-                "project-design-doc"
-            } else if uses_task_doc {
-                "per-task-doc"
+                "per-task-doc+project-design-doc"
             } else {
-                "skipped: kind produces no doc"
+                "per-task-doc"
             };
             tracing::info!(
                 execution_id,
@@ -452,28 +443,25 @@ impl WorkerCompletionHandler {
                 "doc-detection: routing PR completion"
             );
 
-            if uses_task_doc {
-                if merged {
-                    // Worker merged directly during its session; the detector
-                    // fetches base_ref_name from the PR (unknown here).
-                    design_detector::on_task_doc_pr_merged(&self.work_db, &task.id, &task.product_id, &pr_url, None)
-                        .await;
-                } else {
-                    design_detector::on_task_doc_pr_detected(&self.work_db, &task.id, &task.product_id, &pr_url).await;
-                }
-                // The earlier `publish_work_item_changed` above ran BEFORE
-                // this detector call, so the client's refetch it triggers
-                // can race the doc-pointer write and land the doc link
-                // absent — leaving it visible only when some later,
-                // unrelated event happens to refetch the tree. Publish a
-                // second invalidation now that the pointer write (or its
-                // no-op) has actually completed, mirroring the manual
-                // `boss task set-doc` path (`app/work_items.rs`, reason
-                // `task_doc_pointer_set`).
-                self.publisher
-                    .publish_work_item_changed(&task.product_id, &task.id, "task_doc_pointer_set")
-                    .await;
+            if merged {
+                // Worker merged directly during its session; the detector
+                // fetches base_ref_name from the PR (unknown here).
+                design_detector::on_task_doc_pr_merged(&self.work_db, &task.id, &task.product_id, &pr_url, None).await;
+            } else {
+                design_detector::on_task_doc_pr_detected(&self.work_db, &task.id, &task.product_id, &pr_url).await;
             }
+            // The earlier `publish_work_item_changed` above ran BEFORE
+            // this detector call, so the client's refetch it triggers
+            // can race the doc-pointer write and land the doc link
+            // absent — leaving it visible only when some later,
+            // unrelated event happens to refetch the tree. Publish a
+            // second invalidation now that the pointer write (or its
+            // no-op) has actually completed, mirroring the manual
+            // `boss task set-doc` path (`app/work_items.rs`, reason
+            // `task_doc_pointer_set`).
+            self.publisher
+                .publish_work_item_changed(&task.product_id, &task.id, "task_doc_pointer_set")
+                .await;
         }
 
         // Per-project design-doc pointer + design-doc questions pipeline:

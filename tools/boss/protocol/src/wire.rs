@@ -2363,13 +2363,14 @@ pub enum FrontendRequest {
         enabled: bool,
     },
 
-    /// Set (or clear) a task's per-task doc pointer (investigations and
-    /// project-less designs). Persists the three `tasks.doc_*` columns
-    /// per [`SetTaskDocPointerInput`]'s semantics and replies with the
-    /// updated `Task` row wrapped in a `WorkItemUpdated` event — same
-    /// shape `UpdateWorkItem` returns. Publishes a `work_invalidated`
-    /// topic event on the task's product so other connected clients
-    /// see the change (and `get_work_tree` re-resolves `doc_link_state`).
+    /// Set (or clear) a task's per-task doc pointer. Independent of
+    /// `kind` — any leaf work item may carry one. Persists the three
+    /// `tasks.doc_*` columns per [`SetTaskDocPointerInput`]'s semantics
+    /// and replies with the updated `Task` row wrapped in a
+    /// `WorkItemUpdated` event — same shape `UpdateWorkItem` returns.
+    /// Publishes a `work_invalidated` topic event on the task's product
+    /// so other connected clients see the change (and `get_work_tree`
+    /// re-resolves `doc_link_state`).
     SetTaskDocPointer {
         #[serde(flatten)]
         input: SetTaskDocPointerInput,

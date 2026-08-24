@@ -343,14 +343,13 @@ pub async fn on_design_pr_merged(
     }
 }
 
-/// Per-task analogue of [`on_design_pr_detected`] for project-less
-/// docs-backed items (investigations and postmortems). Fired on the
-/// `in_review` transition. Scans the PR's changed files for a single
-/// `docs/designs/*.md`, `docs/design-docs/*.md`, `docs/investigations/*.md`,
-/// or `docs/postmortems/*.md` and populates the task's own `doc_*`
-/// columns (or, when already set, updates `doc_branch` to the PR
-/// **head** branch so the in-app viewer can fetch the doc while the PR
-/// is open).
+/// Per-task analogue of [`on_design_pr_detected`]. Fired on the
+/// `in_review` transition for **every** work-item kind. Scans the PR's
+/// changed files for a single `docs/designs/*.md`, `docs/design-docs/*.md`,
+/// `docs/investigations/*.md`, or `docs/postmortems/*.md` and populates
+/// the task's own `doc_*` columns (or, when already set, updates
+/// `doc_branch` to the PR **head** branch so the in-app viewer can fetch
+/// the doc while the PR is open).
 pub async fn on_task_doc_pr_detected(work_db: &WorkDb, task_id: &str, product_id: &str, pr_url: &str) {
     let scan = match scan_pr_for_task_doc(task_id, pr_url).await {
         Some(s) => s,
@@ -464,10 +463,10 @@ pub async fn on_task_doc_pr_detected(work_db: &WorkDb, task_id: &str, product_id
     }
 }
 
-/// Per-task analogue of [`on_design_pr_merged`]. Fired when a project-less
-/// docs-backed item's PR merges. If the task already has a `doc_path`,
-/// only `doc_branch` is updated to the PR's base branch (typically
-/// `"main"`); otherwise the PR is scanned and the full pointer written.
+/// Per-task analogue of [`on_design_pr_merged`]. Fired when any work
+/// item's PR merges. If the task already has a `doc_path`, only
+/// `doc_branch` is updated to the PR's base branch (typically `"main"`);
+/// otherwise the PR is scanned and the full pointer written.
 pub async fn on_task_doc_pr_merged(
     work_db: &WorkDb,
     task_id: &str,
@@ -577,9 +576,9 @@ pub(crate) async fn scan_pr(task_id: &str, pr_url: &str) -> Option<PrScanResult>
 }
 
 /// Like [`scan_pr`] but selects the doc among the PR's changed files with
-/// the project-less matcher (`docs/designs/*.md`, `docs/investigations/*.md`,
-/// OR `docs/postmortems/*.md`). Used by the per-task detector that serves
-/// investigations, postmortems, and project-less design tasks.
+/// the per-task matcher (`docs/designs/*.md`, `docs/investigations/*.md`,
+/// OR `docs/postmortems/*.md`). Used by the per-task detector, which
+/// runs for every work-item kind.
 pub(crate) async fn scan_pr_for_task_doc(task_id: &str, pr_url: &str) -> Option<PrScanResult> {
     match fetch_pr_view_json(pr_url).await {
         Ok(root) => Some(parse_pr_scan_matching(
@@ -774,10 +773,9 @@ fn is_postmortem_doc_path(path: &str) -> bool {
     is_doc_path_under(path, "postmortems")
 }
 
-/// Matches a **project-less** docs-backed item's deliverable: a single
-/// `docs/designs/*.md`, `docs/investigations/*.md`, or
-/// `docs/postmortems/*.md`. Used by the per-task detector, which serves
-/// project-less design tasks, investigations, and postmortems.
+/// Matches a per-task doc deliverable: a single `docs/designs/*.md`,
+/// `docs/investigations/*.md`, or `docs/postmortems/*.md`. Used by the
+/// per-task detector, which runs for every work-item kind.
 fn is_project_less_doc_path(path: &str) -> bool {
     is_design_doc_path(path) || is_investigation_doc_path(path) || is_postmortem_doc_path(path)
 }

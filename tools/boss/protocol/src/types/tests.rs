@@ -249,6 +249,29 @@ fn task_skips_none_short_id_on_encode() {
     assert!(!encoded.as_object().unwrap().contains_key("short_id"));
 }
 
+/// `doc_link_state` is a first-class field on every work item, including
+/// kinds that historically had no doc pointer. When no doc is attached
+/// it must serialize as JSON `null` — not be omitted — so consumers can
+/// distinguish "no doc" from "field missing" (the defect that made the
+/// kind-gated gap invisible on `boss task show --json`).
+#[test]
+fn task_doc_link_state_serializes_null_when_unset() {
+    let task: Task = serde_json::from_value(sample_task_json(json!({}))).unwrap();
+    assert!(task.doc_link_state.is_none());
+    let encoded = serde_json::to_value(&task).unwrap();
+    let obj = encoded.as_object().unwrap();
+    assert!(
+        obj.contains_key("doc_link_state"),
+        "doc_link_state must be present on the wire even when unset; got keys {:?}",
+        obj.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        encoded["doc_link_state"].is_null(),
+        "unset doc_link_state must be JSON null, not absent; got {}",
+        encoded["doc_link_state"]
+    );
+}
+
 #[test]
 fn task_roundtrips_with_short_id() {
     let raw = sample_task_json(json!({"short_id": 99}));

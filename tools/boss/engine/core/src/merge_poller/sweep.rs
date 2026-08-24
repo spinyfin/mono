@@ -2178,21 +2178,18 @@ pub(crate) async fn mark_merged(
         pr_url = %candidate.pr_url,
         "merge poller: PR merged; work item moved to done",
     );
-    // Auto-populate the doc pointer on merge, mirroring the
-    // completion.rs routing: design-with-project -> the project's
-    // `design_doc_*` pointer; project-less docs-backed items
-    // (investigations / project-less designs) -> the task's own `doc_*`
-    // pointer. Errors are logged inside the detector.
-    if crate::work::task_uses_per_task_doc(&updated.kind, updated.project_id.is_none()) {
-        design_detector::on_task_doc_pr_merged(
-            work_db,
-            &updated.id,
-            &candidate.product_id,
-            &candidate.pr_url,
-            probe.base_ref_name.as_deref(),
-        )
-        .await;
-    }
+    // Auto-populate the per-task doc pointer on merge for every kind.
+    // The project-level design-doc pointer is a separate mechanism
+    // (the `kind=design` + project_id arm below). Errors are logged
+    // inside the detector.
+    design_detector::on_task_doc_pr_merged(
+        work_db,
+        &updated.id,
+        &candidate.product_id,
+        &candidate.pr_url,
+        probe.base_ref_name.as_deref(),
+    )
+    .await;
     if matches!(updated.kind, TaskKind::Design | TaskKind::DesignPostmortem)
         && let Some(ref project_id) = updated.project_id
     {

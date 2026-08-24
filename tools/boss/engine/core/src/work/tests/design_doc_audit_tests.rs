@@ -1,6 +1,6 @@
 //! Design-doc pointer tests: project-level detector sync, property-audit
-//! row recording, on-approve conflict surfacing, and the task-level
-//! doc-pointer analogue for project-less investigations.
+//! row recording, on-approve conflict surfacing, and the per-task
+//! doc-pointer (any work-item kind).
 
 use super::*;
 
@@ -312,13 +312,13 @@ fn surface_design_doc_conflict_on_approve_emits_attention_item_when_pointer_diff
     let _ = std::fs::remove_file(path);
 }
 
-// ── Per-task doc-pointer (project-less investigations) ──────────────────
+// ── Per-task doc-pointer (any work-item kind) ──────────────────────────
 // The task-level analogue of the project design-doc pointer tests above.
 // These exercise the storage + resolution layer that backs the doc-link
-// card affordance for project-less docs-backed items (investigations),
-// which have no project pointer to populate. The gh PR scan that feeds
-// these methods is covered by `design_detector`'s `parse_pr_scan_matching`
-// unit tests; here we drive the columns directly.
+// card affordance. Independent of kind: any work item may carry `doc_*`.
+// The gh PR scan that feeds these methods is covered by
+// `design_detector`'s `parse_pr_scan_matching` unit tests; here we drive
+// the columns directly.
 
 #[test]
 fn sync_task_doc_pointer_from_detector_populates_when_null() {
@@ -400,10 +400,8 @@ fn set_task_doc_pointer_branch_only_keeps_path() {
 /// every read path that returns a `Task` surfaces a resolved
 /// `doc_link_state` (`set_task_doc` itself, `get_work_item`,
 /// `get_work_item_by_short_id`, `get_work_tree`), then `--unset` clears the
-/// affordance on all of them. Also pins that non-per-task-doc kinds keep
-/// `doc_link_state == None` so the `task_uses_per_task_doc` gate is not
-/// silently dropped. Round-trips the same write path the detector uses
-/// (`set_task_doc_pointer`) under a structured input.
+/// affordance on all of them. Round-trips the same write path the
+/// detector uses (`set_task_doc_pointer`) under a structured input.
 #[test]
 fn set_task_doc_round_trip_exposes_doc_link_in_work_tree() {
     let db = WorkDb::open(temp_db_path("task-doc-cli-roundtrip")).unwrap();
@@ -532,9 +530,11 @@ fn set_task_doc_round_trip_exposes_doc_link_in_work_tree() {
         found_cleared.doc_link_state.is_none(),
         "unset must hide the doc-link affordance",
     );
+    assert_doc_link_json_null(found_cleared, "get_work_tree after unset");
 
-    // Gate pin: non-per-task-doc kinds must not get a doc_link_state even
-    // when read through the same attach helper.
+    // A chore with no pointer still serializes `doc_link_state: null`
+    // (field present, not absent) — this is how `boss task show --json`
+    // distinguishes "no doc" from "field missing".
     let chore = db
         .create_chore(
             CreateChoreInput::builder()
@@ -549,13 +549,14 @@ fn set_task_doc_round_trip_exposes_doc_link_in_work_tree() {
     };
     assert!(
         chore_item.doc_link_state.is_none(),
-        "chore must not receive doc_link_state (task_uses_per_task_doc gate)",
+        "chore with no pointer still has None doc_link_state",
     );
+    assert_doc_link_json_null(&chore_item, "get_work_item chore with no pointer");
 
+    // Design-with-project and no per-task pointer: project-level
+    // design_doc is a separate concept, so Task.doc_link_state stays
+    // None until a per-task pointer is written.
     let (_prod2, project) = seed_project_for_design_doc(&db);
-    // create_project with no_design_task=false seeds a Design task under the
-    // project — that kind has a project, so it must keep using the
-    // project-level design_doc pointer, not Task.doc_link_state.
     let tree_with_project = db.get_work_tree(&project.product_id).unwrap();
     let design_with_project = tree_with_project
         .tasks
@@ -568,7 +569,7 @@ fn set_task_doc_round_trip_exposes_doc_link_in_work_tree() {
     };
     assert!(
         design_item.doc_link_state.is_none(),
-        "design task WITH a project must not receive per-task doc_link_state",
+        "design task WITH a project and no per-task pointer has None doc_link_state",
     );
 }
 
@@ -583,6 +584,154 @@ fn assert_doc_link_resolved(state: Option<&ProjectDesignDocState>, path: &str, b
         }
         other => panic!("{where_}: expected Resolved, got {other:?}"),
     }
+}
+
+fn assert_doc_link_json_null(task: &Task, where_: &str) {
+    let json = serde_json::to_value(task).expect("task must serialize");
+    assert!(
+        json.get("doc_link_state").is_some(),
+        "{where_}: doc_link_state must be present in JSON; keys {:?}",
+        json.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>())
+    );
+    assert!(
+        json["doc_link_state"].is_null(),
+        "{where_}: unset doc_link_state must be JSON null, got {}",
+        json["doc_link_state"]
+    );
+}
+
+fn leaf_task(item: WorkItem) -> Task {
+    match item {
+        WorkItem::Task(t) | WorkItem::Chore(t) => t,
+        other => panic!("expected leaf work item, got {other:?}"),
+    }
+}
+
+/// The detector write path (`sync_task_doc_pointer_from_detector`) plus
+/// every read path that returns a Task must surface the pointer for
+/// **every** kind — a newly added kind is covered by `TaskKind::ALL`
+/// rather than by someone remembering to extend an allowlist.
+#[test]
+fn detector_populates_per_task_doc_for_every_kind() {
+    let db = WorkDb::open(temp_db_path("task-doc-every-kind")).unwrap();
+    let product = create_test_product(&db);
+    for kind in TaskKind::ALL {
+        let task = seed_work_item_of_kind(&db, &product, kind);
+        let wrote = db
+            .sync_task_doc_pointer_from_detector(&task.id, None, Some("boss/exec_kind"), "docs/investigations/foo.md")
+            .unwrap();
+        assert!(wrote, "detector must write an empty pointer for kind={kind}");
+
+        let by_id = leaf_task(db.get_work_item(&task.id).unwrap());
+        assert_doc_link_resolved(
+            by_id.doc_link_state.as_ref(),
+            "docs/investigations/foo.md",
+            "boss/exec_kind",
+            &format!("get_work_item kind={kind}"),
+        );
+
+        let tree = db.get_work_tree(&product.id).unwrap();
+        if let Some(found) = tree.tasks.iter().chain(tree.chores.iter()).find(|t| t.id == task.id) {
+            assert_doc_link_resolved(
+                found.doc_link_state.as_ref(),
+                "docs/investigations/foo.md",
+                "boss/exec_kind",
+                &format!("get_work_tree kind={kind}"),
+            );
+        }
+    }
+}
+
+/// `set-doc` then `show` (get_work_item) round-trips the pointer for two
+/// different kinds — a chore (the reported miss) and an investigation
+/// (the historical allowlist). Combined with
+/// `detector_populates_per_task_doc_for_every_kind` this is the
+/// write/read contract for any kind.
+#[test]
+fn set_doc_then_show_round_trips_for_chore_and_investigation() {
+    let db = WorkDb::open(temp_db_path("task-doc-set-show-kinds")).unwrap();
+    let product = create_test_product(&db);
+    for kind in [TaskKind::Chore, TaskKind::Investigation] {
+        let task = seed_work_item_of_kind(&db, &product, &kind);
+        let updated = db
+            .set_task_doc(SetTaskDocPointerInput {
+                task_id: task.id.clone(),
+                doc_path: Some("docs/investigations/manual.md".to_owned()),
+                doc_branch: Some("main".to_owned()),
+                doc_repo_remote_url: None,
+                unset: false,
+            })
+            .unwrap();
+        assert_doc_link_resolved(
+            updated.doc_link_state.as_ref(),
+            "docs/investigations/manual.md",
+            "main",
+            &format!("set_task_doc return kind={kind}"),
+        );
+        let shown = leaf_task(db.get_work_item(&task.id).unwrap());
+        assert_doc_link_resolved(
+            shown.doc_link_state.as_ref(),
+            "docs/investigations/manual.md",
+            "main",
+            &format!("get_work_item after set-doc kind={kind}"),
+        );
+        let listed = db.list_tasks(&product.id, None, None, false).unwrap();
+        let listed_row = listed
+            .iter()
+            .find(|t| t.id == task.id)
+            .unwrap_or_else(|| panic!("list_tasks must include kind={kind}"));
+        assert_doc_link_resolved(
+            listed_row.doc_link_state.as_ref(),
+            "docs/investigations/manual.md",
+            "main",
+            &format!("list_tasks kind={kind}"),
+        );
+        if kind == TaskKind::Chore {
+            let chores = db.list_chores(&product.id, None, false).unwrap();
+            let chore_row = chores
+                .iter()
+                .find(|t| t.id == task.id)
+                .expect("list_chores must include the chore");
+            assert_doc_link_resolved(
+                chore_row.doc_link_state.as_ref(),
+                "docs/investigations/manual.md",
+                "main",
+                "list_chores",
+            );
+        }
+    }
+}
+
+/// Design-with-a-project still owns the *project-level* design-doc
+/// pointer, but a per-task pointer written on that row must also
+/// surface — the two concepts stay separate, and neither is gated
+/// off the other.
+#[test]
+fn design_with_project_still_surfaces_per_task_doc_pointer() {
+    let db = WorkDb::open(temp_db_path("task-doc-design-with-project")).unwrap();
+    let (_product, project) = seed_project_for_design_doc(&db);
+    let tree = db.get_work_tree(&project.product_id).unwrap();
+    let design = tree
+        .tasks
+        .iter()
+        .find(|t| t.kind == TaskKind::Design && t.project_id.as_deref() == Some(project.id.as_str()))
+        .expect("project-seeded design task")
+        .clone();
+    db.set_task_doc(SetTaskDocPointerInput {
+        task_id: design.id.clone(),
+        doc_path: Some("docs/designs/also-on-the-task.md".to_owned()),
+        doc_branch: Some("main".to_owned()),
+        unset: false,
+        ..SetTaskDocPointerInput::default()
+    })
+    .unwrap();
+    let shown = leaf_task(db.get_work_item(&design.id).unwrap());
+    assert_doc_link_resolved(
+        shown.doc_link_state.as_ref(),
+        "docs/designs/also-on-the-task.md",
+        "main",
+        "design-with-project per-task pointer",
+    );
 }
 
 #[test]
