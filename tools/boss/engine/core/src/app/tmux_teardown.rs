@@ -79,7 +79,7 @@ impl ServerState {
                 return self.reap_tmux_worker_with(&tmux, execution_id, &identity).await;
             }
         }
-        let tmux = match Tmux::resolve() {
+        let tmux = match Tmux::resolve(&self.tmux_socket_path) {
             Ok(tmux) => tmux,
             Err(err) => {
                 tracing::error!(

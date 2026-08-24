@@ -9,7 +9,7 @@ final class WorkersWorkspaceModelSendTests: XCTestCase {
             runId: "run-tmux",
             slotId: 1,
             sessionName: "boss-1-run-tmux",
-            tmuxSocketPath: "/tmp/boss-tmux.sock",
+            tmuxSocketPath: "/state/boss/tmux.sock",
             summary: nil,
             taskTitle: nil
         ))
@@ -19,7 +19,7 @@ final class WorkersWorkspaceModelSendTests: XCTestCase {
         }
 
         let session = model.slots.first(where: { $0.slotId == 1 })?.session
-        XCTAssertEqual(session?.launchSpec.initialInput, "exec tmux -S '/tmp/boss-tmux.sock' attach-session -t 'boss-1-run-tmux'\n")
+        XCTAssertEqual(session?.launchSpec.initialInput, "exec tmux -S '/state/boss/tmux.sock' attach-session -t 'boss-1-run-tmux'\n")
         XCTAssertTrue(session?.launchSpec.env.isEmpty ?? false)
     }
 
@@ -29,7 +29,7 @@ final class WorkersWorkspaceModelSendTests: XCTestCase {
             runId: "run-tmux",
             slotId: 1,
             sessionName: "boss-1-run-tmux",
-            tmuxSocketPath: "/tmp/boss-tmux.sock",
+            tmuxSocketPath: "/state/boss/tmux.sock",
             summary: nil,
             taskTitle: nil
         ))
@@ -40,6 +40,40 @@ final class WorkersWorkspaceModelSendTests: XCTestCase {
             return
         }
         XCTAssertNil(model.slots.first(where: { $0.slotId == 1 })?.session)
+    }
+
+    func testAttachRejectsEmptyTmuxSocketPath() {
+        let model = WorkersWorkspaceModel()
+        let result = model.attachWorkerPane(EngineAttachRequest(
+            runId: "run-tmux",
+            slotId: 1,
+            sessionName: "boss-1-run-tmux",
+            tmuxSocketPath: "",
+            summary: nil,
+            taskTitle: nil
+        ))
+        guard case .failure(.internalFailure(let message)) = result else {
+            XCTFail("expected .internalFailure for empty socket path, got \(result)")
+            return
+        }
+        XCTAssertTrue(message.contains("tmux socket path"), "got \(message)")
+    }
+
+    func testAttachRejectsRelativeTmuxSocketPath() {
+        let model = WorkersWorkspaceModel()
+        let result = model.attachWorkerPane(EngineAttachRequest(
+            runId: "run-tmux",
+            slotId: 1,
+            sessionName: "boss-1-run-tmux",
+            tmuxSocketPath: "tmux.sock",
+            summary: nil,
+            taskTitle: nil
+        ))
+        guard case .failure(.internalFailure(let message)) = result else {
+            XCTFail("expected .internalFailure for relative socket path, got \(result)")
+            return
+        }
+        XCTAssertTrue(message.contains("tmux socket path"), "got \(message)")
     }
 
     func testSendToUnknownSlotReturnsUnknownSlot() {

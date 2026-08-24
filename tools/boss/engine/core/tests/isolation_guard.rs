@@ -134,6 +134,7 @@ fn all_derived() -> EnginePaths {
         events_socket: Some(PathBuf::from("/tmp/boss-test-guard-1234.events.sock")),
         pid: Some(PathBuf::from("/tmp/boss-test-guard-1234.pid")),
         control_token: Some(PathBuf::from("/tmp/boss-test-guard-1234.control-token")),
+        tmux_socket: Some(PathBuf::from("/tmp/boss-test-guard-1234.tmux.sock")),
     }
 }
 
@@ -147,7 +148,7 @@ fn derive_stands_down_entirely_for_the_production_socket() {
 }
 
 #[test]
-fn derive_isolates_all_four_paths_when_no_env_is_set() {
+fn derive_isolates_all_five_paths_when_no_env_is_set() {
     let paths = derive(IsolationOverrides::default());
     assert!(paths.is_test_fixture);
     assert_eq!(paths.derived, all_derived());

@@ -21,6 +21,9 @@ pub const STATE_DB_FILENAME: &str = "state.db";
 /// Filename of the worker events socket under the state root.
 pub const EVENTS_SOCKET_FILENAME: &str = "events.sock";
 
+/// Filename of Boss's private tmux server socket under the state root.
+pub const TMUX_SOCKET_FILENAME: &str = "tmux.sock";
+
 /// Filename of the engine-control token under the state root.
 pub const CONTROL_TOKEN_FILENAME: &str = "engine-control.token";
 
@@ -120,6 +123,12 @@ pub fn default_state_db_path() -> Option<PathBuf> {
 /// `<default_state_root>/events.sock`. `None` when `HOME` is unset.
 pub fn default_events_socket_path() -> Option<PathBuf> {
     Some(default_state_root()?.join(EVENTS_SOCKET_FILENAME))
+}
+
+/// Production location of Boss's private tmux server socket:
+/// `<default_state_root>/tmux.sock`. `None` when `HOME` is unset.
+pub fn default_tmux_socket_path() -> Option<PathBuf> {
+    Some(default_state_root()?.join(TMUX_SOCKET_FILENAME))
 }
 
 /// Production location of the engine-control token:

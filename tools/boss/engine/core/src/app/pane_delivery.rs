@@ -274,8 +274,7 @@ impl ServerState {
         let crate::tmux_preflight::TmuxPreflight::Ready { program, .. } = &*preflight else {
             anyhow::bail!("tmux is unavailable for pane delivery")
         };
-        boss_tmux::private_socket_path()
-            .and_then(|socket| Tmux::from_path_with_socket(program.clone(), socket))
+        Tmux::from_path_with_socket(program.clone(), self.tmux_socket_path.clone())
             .context("creating tmux pane-delivery controller")
     }
 

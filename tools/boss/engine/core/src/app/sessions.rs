@@ -187,9 +187,7 @@ async fn attach_coordinator_to_registered_app(server_state: Arc<ServerState>) {
             return;
         }
     };
-    let tmux = match boss_tmux::private_socket_path()
-        .and_then(|socket| boss_tmux::Tmux::from_path_with_socket(program, socket))
-    {
+    let tmux = match server_state.tmux_from_program(program) {
         Ok(tmux) => tmux,
         Err(error) => {
             tracing::error!(%error, "coordinator tmux attach skipped: resolved tmux path is invalid");
@@ -234,12 +232,9 @@ pub(super) async fn request_coordinator_attachment(
         Err(error) => tracing::warn!(%error, "could not refresh coordinator trust-root pid"),
     }
     let tmux_program = tmux.program().display().to_string();
-    let tmux_socket_path = match boss_tmux::private_socket_path() {
-        Ok(path) => path.display().to_string(),
-        Err(error) => {
-            tracing::error!(%error, "coordinator tmux attach skipped: socket path is unavailable");
-            return;
-        }
+    let Some(tmux_socket_path) = tmux.socket_path().map(|path| path.display().to_string()) else {
+        tracing::error!("coordinator tmux attach skipped: handle has no socket path");
+        return;
     };
     // This function has three call sites: app registration (above, via
     // `attach_coordinator_to_registered_app`), the coordinator supervisor's
@@ -573,9 +568,7 @@ pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequ
             return;
         }
     };
-    let tmux = match boss_tmux::private_socket_path()
-        .and_then(|socket| boss_tmux::Tmux::from_path_with_socket(program, socket))
-    {
+    let tmux = match server_state.tmux_from_program(program) {
         Ok(tmux) => tmux,
         Err(error) => {
             send_response(

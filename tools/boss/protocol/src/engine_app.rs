@@ -630,7 +630,7 @@ mod tests {
             run_id: "run-tmux".into(),
             slot_id: 3,
             session_name: "boss-3-run-tmux".into(),
-            tmux_socket_path: "/tmp/boss-tmux.sock".into(),
+            tmux_socket_path: "/state/boss/tmux.sock".into(),
             summary: Some("implementing attach mode".into()),
             task_title: Some("attach panes".into()),
         });
@@ -659,7 +659,7 @@ mod tests {
             spawn_token: "opaque-token".into(),
             model: "opus".into(),
             tmux_program: "/opt/homebrew/bin/tmux".into(),
-            tmux_socket_path: "/tmp/boss-tmux.sock".into(),
+            tmux_socket_path: "/state/boss/tmux.sock".into(),
             coordinator_update_available_version: None,
         });
         let json = serde_json::to_string(&request).unwrap();
@@ -686,7 +686,7 @@ mod tests {
             spawn_token: "opaque-token".into(),
             model: "opus".into(),
             tmux_program: "/opt/homebrew/bin/tmux".into(),
-            tmux_socket_path: "/tmp/boss-tmux.sock".into(),
+            tmux_socket_path: "/state/boss/tmux.sock".into(),
             coordinator_update_available_version: Some("2.2.0".into()),
         });
         let json = serde_json::to_string(&request).unwrap();

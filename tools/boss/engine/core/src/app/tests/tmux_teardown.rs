@@ -66,22 +66,28 @@ async fn matched_token_signals_kills_and_clears_identity() {
         runner.calls(),
         vec![
             vec![
-                "-L",
-                "boss",
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
                 "show-environment",
                 "-t",
                 "boss-1-example",
                 "BOSS_SPAWN_TOKEN"
             ],
             vec![
-                "-L",
-                "boss",
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
                 "show-environment",
                 "-t",
                 "boss-1-example",
                 "BOSS_SPAWN_TOKEN"
             ],
-            vec!["-L", "boss", "kill-session", "-t", "boss-1-example"],
+            vec![
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
+                "kill-session",
+                "-t",
+                "boss-1-example"
+            ],
         ],
     );
 
@@ -124,8 +130,8 @@ async fn token_mismatch_refuses_to_touch_anything() {
     assert_eq!(
         runner.calls(),
         vec![vec![
-            "-L",
-            "boss",
+            "-S",
+            boss_tmux::TEST_SOCKET_PATH,
             "show-environment",
             "-t",
             "boss-1-example",
@@ -171,8 +177,8 @@ async fn absent_session_clears_identity_without_signalling() {
     assert_eq!(
         runner.calls(),
         vec![vec![
-            "-L",
-            "boss",
+            "-S",
+            boss_tmux::TEST_SOCKET_PATH,
             "show-environment",
             "-t",
             "boss-1-example",

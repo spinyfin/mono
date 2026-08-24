@@ -842,14 +842,14 @@ mod tests {
 
     fn fixture(server: FakeTmux) -> (WorkDb, Tmux, Arc<FakeTmux>, tempfile::TempDir) {
         let server = Arc::new(server);
-        let tmux = Tmux::with_runner("/usr/bin/tmux", server.clone()).unwrap();
+        let tmux = Tmux::with_runner_and_socket("/usr/bin/tmux", server.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap();
         let dir = tempfile::tempdir().unwrap();
         (WorkDb::open(PathBuf::from(":memory:")).unwrap(), tmux, server, dir)
     }
 
     fn tmux_for(server: FakeTmux) -> (Tmux, Arc<FakeTmux>) {
         let server = Arc::new(server);
-        let tmux = Tmux::with_runner("/usr/bin/tmux", server.clone()).unwrap();
+        let tmux = Tmux::with_runner_and_socket("/usr/bin/tmux", server.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap();
         (tmux, server)
     }
 

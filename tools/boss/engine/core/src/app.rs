@@ -516,6 +516,10 @@ type CoordinatorInstalledVersionCache = Arc<StdMutex<Option<CoordinatorInstalled
 #[builder(on(String, into))]
 struct ServerState {
     work_db: Arc<WorkDb>,
+    /// Socket this engine's tmux handle must target. Resolved once from
+    /// [`crate::config::WorkConfig`] (and isolation) so no downstream call
+    /// re-derives it from the environment.
+    tmux_socket_path: PathBuf,
     execution_coordinator: Arc<ExecutionCoordinator>,
     completion_handler: Arc<WorkerCompletionHandler>,
     /// Direct handle to the cube client, used by control verbs that
@@ -638,7 +642,7 @@ struct ServerState {
     live_status_manager: Arc<LiveStatusManager>,
     /// Test-only override for the [`boss_tmux::Tmux`] handle
     /// [`Self::reap_tmux_worker`] resolves. Production leaves this `None`
-    /// and always resolves a real handle via `Tmux::resolve()`. Exists so
+    /// and always resolves a real handle via `Tmux::resolve(socket_path)`. Exists so
     /// `release_worker_pane` / `reap_untracked_worker_process`'s wiring
     /// into the tmux reap can be exercised end-to-end against a stubbed
     /// `Tmux` (mirroring `reap_tmux_worker_with`'s injected-runner tests)
@@ -995,6 +999,14 @@ struct ServerState {
 }
 
 impl ServerState {
+    fn resolve_tmux(&self) -> anyhow::Result<boss_tmux::Tmux> {
+        boss_tmux::Tmux::resolve(&self.tmux_socket_path)
+    }
+
+    fn tmux_from_program(&self, program: PathBuf) -> anyhow::Result<boss_tmux::Tmux> {
+        boss_tmux::Tmux::from_path_with_socket(program, self.tmux_socket_path.clone())
+    }
+
     /// The origin evidence links are minted against, e.g.
     /// `http://127.0.0.1:8419`.
     ///
@@ -1486,6 +1498,7 @@ impl ServerState {
 
             ServerState::builder()
                 .work_db(work_db)
+                .tmux_socket_path(cfg.work.resolved_tmux_socket_path())
                 .execution_coordinator(execution_coordinator)
                 .completion_handler(completion_handler)
                 .cube_client(cube_client_for_state)

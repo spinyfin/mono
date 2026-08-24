@@ -128,6 +128,11 @@ const ENGINE_OWNER_OPTION: &str = "@boss_engine_owner";
 /// again, the same shape as [`crate::dead_pid_sweep::PANE_DEATH_ATTENTION_KIND`].
 pub const TMUX_ADOPTION_SCHEMA_SKEW_ATTENTION_KIND: &str = "tmux_adoption_schema_skew";
 
+/// `work_attention_items.kind` filed when live sessions remain on the
+/// pre-move `tmux -L boss` server after the engine has switched to an
+/// explicit socket. Cleared when a later run starts on the same item.
+pub const TMUX_LEGACY_LABEL_SERVER_ATTENTION_KIND: &str = "tmux_legacy_label_server";
+
 /// Trigger name recorded on the dispatch event and carried into
 /// [`LiveWorkerConvergence::converge_live_worker`] for a session whose token
 /// matched a terminal execution — the third trigger alongside
@@ -261,6 +266,99 @@ where
     }
 
     run_adoption_pass(work_db, tmux, coordinator, spawner, convergence, dispatch_events).await
+}
+
+/// One-time drain of sessions still living on the pre-move `-L boss` server.
+/// Adopts matching runs against that server for the rest of their life so
+/// they are not invisible to `WorkerPool` / stale sweep, and files an
+/// attention item naming each surviving session plus the exact
+/// `tmux -L boss attach` / `kill-session` command. New sessions are created
+/// on the durable socket, not here.
+pub async fn drain_legacy_label_server<S>(
+    work_db: &WorkDb,
+    program: &Path,
+    coordinator: &ExecutionCoordinator,
+    spawner: &S,
+    convergence: &dyn LiveWorkerConvergence,
+    dispatch_events: &dyn DispatchEventSink,
+    identity_probe: &dyn EngineOwnerProbe,
+) -> TmuxAdoptionOutcome
+where
+    S: WorkerSpawner + ?Sized,
+{
+    let tmux = match Tmux::for_legacy_label_server(program) {
+        Ok(tmux) => tmux,
+        Err(err) => {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                "tmux boot: could not construct a handle for the pre-move -L boss server; skipping drain"
+            );
+            return TmuxAdoptionOutcome::default();
+        }
+    };
+    let sessions = match tmux.list_sessions().await {
+        Ok(sessions) if sessions.is_empty() => return TmuxAdoptionOutcome::default(),
+        Ok(sessions) => sessions,
+        Err(err) => {
+            tracing::debug!(
+                error = %format!("{err:#}"),
+                "tmux boot: pre-move -L boss server is absent; no legacy drain needed"
+            );
+            return TmuxAdoptionOutcome::default();
+        }
+    };
+    tracing::warn!(
+        count = sessions.len(),
+        sessions = ?sessions.iter().map(|session| session.name.as_str()).collect::<Vec<_>>(),
+        "tmux boot: live sessions remain on the pre-move -L boss server; adopting them there and \
+         raising attention so they are not redispatched onto the new socket"
+    );
+    file_legacy_label_server_attention(work_db, &sessions);
+    run_boot_time_adoption(
+        work_db,
+        &tmux,
+        coordinator,
+        spawner,
+        convergence,
+        dispatch_events,
+        identity_probe,
+    )
+    .await
+}
+
+fn file_legacy_label_server_attention(work_db: &WorkDb, sessions: &[boss_tmux::Session]) {
+    for session in sessions {
+        let Some(token) = session.spawn_token.as_deref() else {
+            continue;
+        };
+        let Ok(Some(execution_id)) = work_db.execution_id_for_tmux_spawn_token(token) else {
+            continue;
+        };
+        let Ok(execution) = work_db.get_execution(&execution_id) else {
+            continue;
+        };
+        let body = format!(
+            "This worker's tmux session `{name}` is still on the pre-move `tmux -L boss` server. \
+             The engine adopted it there so it will not be redispatched, but new sessions (and the \
+             in-app viewer) use `tmux -S <state-root>/tmux.sock`.\n\n\
+             Inspect:\n\n```sh\ntmux -L boss attach -t {name}\n```\n\n\
+             When finished, kill it so the next run lands on the durable socket:\n\n\
+             ```sh\ntmux -L boss kill-session -t {name}\n```",
+            name = session.name,
+        );
+        if let Err(err) = work_db.upsert_work_item_attention(
+            &execution.work_item_id,
+            TMUX_LEGACY_LABEL_SERVER_ATTENTION_KIND,
+            "Worker still running on the pre-move tmux server",
+            &body,
+        ) {
+            tracing::warn!(
+                execution_id,
+                ?err,
+                "tmux boot: failed to file legacy-label-server attention (non-fatal)"
+            );
+        }
+    }
 }
 
 /// Run one tmux-server adoption pass. Startup and the periodic leaked-session
@@ -1075,11 +1173,12 @@ async fn refuse_and_reap(
              This is expected after an engine upgrade that changed the tmux session contract — the \
              session was written by a build this engine no longer trusts to attach to safely. The \
              engine's attempt to kill the session ALSO FAILED, so it may still be running \
-             unattended in tmux session `{session_name}`. Run `tmux -L boss kill-session -t \
+             unattended in tmux session `{session_name}`. Run `{} kill-session -t \
              {session_name}` manually to reap it. {after_kill}\n\n\
              This item is informational; dismiss it once you've manually killed the session and \
              confirmed the chore resumed.",
             failure.describe(),
+            tmux.operator_prefix(),
         )
     };
     if let Err(err) = work_db.upsert_work_item_attention(
@@ -1259,7 +1358,12 @@ mod tests {
     fn fake_tmux(server: FakeTmuxServer) -> (Tmux, Arc<FakeTmuxServer>) {
         let server = Arc::new(server);
         (
-            Tmux::with_runner("/opt/homebrew/bin/tmux", Arc::clone(&server) as Arc<dyn CommandRunner>).unwrap(),
+            Tmux::with_runner_and_socket(
+                "/opt/homebrew/bin/tmux",
+                Arc::clone(&server) as Arc<dyn CommandRunner>,
+                boss_tmux::TEST_SOCKET_PATH,
+            )
+            .unwrap(),
             server,
         )
     }

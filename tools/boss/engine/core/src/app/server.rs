@@ -21,6 +21,11 @@ pub async fn run(cli: Cli) -> Result<()> {
     if let Some(ref iso_events) = isolation.derived.events_socket {
         work.events_socket_path = Some(iso_events.clone());
     }
+    if let Some(ref iso_tmux) = isolation.derived.tmux_socket {
+        work.tmux_socket_path = Some(iso_tmux.clone());
+    } else {
+        work.tmux_socket_path = Some(crate::config::tmux_socket_path_beside_db(&work.db_path));
+    }
     let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(work, None));
 
     run_server(cli, cfg, isolation).await
@@ -69,6 +74,7 @@ fn resolve_engine_paths(
         events_socket: Some(events_socket_path),
         pid: Some(pid_file_path),
         control_token: control_token_path,
+        tmux_socket: Some(cfg.work.resolved_tmux_socket_path()),
     };
 
     // Hard gate, before anything is bound, written, or unlinked: a fixture
@@ -92,6 +98,10 @@ async fn run_server(cli: Cli, cfg: Arc<RuntimeConfig>, isolation: IsolationPaths
         .clone()
         .expect("resolve_engine_paths always sets events_socket or returns Err");
     let control_token_path = resolved.control_token.clone();
+    let tmux_socket_path = resolved
+        .tmux_socket
+        .clone()
+        .unwrap_or_else(|| cfg.work.resolved_tmux_socket_path());
 
     // Log the paths the engine will actually use, after every fallback has
     // been applied. `ensure_isolated` has already run (inside
@@ -141,6 +151,7 @@ async fn run_server(cli: Cli, cfg: Arc<RuntimeConfig>, isolation: IsolationPaths
             db_path: &cfg.work.db_path,
             pid_path: &pid_file_path,
             token_path: control_token_path.as_deref(),
+            tmux_socket: &tmux_socket_path,
         },
         boss_log_files::default_state_root().as_deref(),
         super::agent_launch_guard::classify_ownership(|key| std::env::var(key).ok(), std::env::current_exe().ok()),
@@ -219,7 +230,7 @@ impl crate::terminal_work_sweep::WorkerReaper for ServerState {
 #[async_trait::async_trait]
 impl crate::husk_pane_sweep::HuskPaneSweepSource for ServerState {
     async fn list_husk_candidates(&self) -> Option<Vec<crate::tmux_adoption::UntrackedTmuxSession>> {
-        let tmux = match boss_tmux::Tmux::resolve() {
+        let tmux = match self.resolve_tmux() {
             Ok(tmux) => tmux,
             Err(err) => {
                 tracing::debug!(?err, "husk-pane sweep: tmux resolution failed; skipping this pass");
@@ -240,8 +251,12 @@ impl crate::husk_pane_sweep::HuskPaneSweepSource for ServerState {
         )
     }
 
+    fn tmux_operator_prefix(&self) -> String {
+        format!("tmux -S {}", self.tmux_socket_path.display())
+    }
+
     async fn retire_husk(&self, session: &crate::tmux_adoption::UntrackedTmuxSession) {
-        match boss_tmux::Tmux::resolve() {
+        match self.resolve_tmux() {
             Ok(tmux) => {
                 match tmux
                     .kill_session_verified(&session.session_name, &session.spawn_token)
@@ -453,7 +468,7 @@ pub async fn serve_with_merge_probe(
         None,
     )?;
 
-    let tmux_preflight = crate::tmux_preflight::TmuxPreflight::probe().await;
+    let tmux_preflight = crate::tmux_preflight::TmuxPreflight::probe_with_socket(&server_state.tmux_socket_path).await;
     if let Some(reason) = tmux_preflight.unavailable_reason() {
         tracing::error!(%reason, "tmux preflight failed; refusing all new local dispatches");
         server_state
@@ -516,9 +531,7 @@ pub async fn serve_with_merge_probe(
                     return;
                 }
             };
-            let Ok(tmux) = boss_tmux::private_socket_path()
-                .and_then(|socket| boss_tmux::Tmux::from_path_with_socket(program, socket))
-            else {
+            let Ok(tmux) = coordinator_supervisor_state.tmux_from_program(program) else {
                 tracing::error!("coordinator tmux supervisor stopped: preflight supplied an invalid path");
                 return;
             };
@@ -937,9 +950,15 @@ pub async fn serve_with_merge_probe(
     // Best-effort: a host with no `tmux` on PATH (or one that never enabled
     // tmux hosting) simply skips this pass, exactly like every other
     // best-effort startup reconciler above.
-    let tmux_adoption_report = match boss_tmux::Tmux::resolve() {
+    let tmux_adoption_report = match server_state.resolve_tmux() {
         Ok(tmux) => {
-            crate::tmux_adoption::run_boot_time_adoption(
+            if let Err(err) = tmux.unlink_stale_socket_file() {
+                tracing::warn!(
+                    error = %format!("{err:#}"),
+                    "engine startup: failed to unlink a stale tmux socket file (non-fatal)"
+                );
+            }
+            let report = crate::tmux_adoption::run_boot_time_adoption(
                 server_state.work_db.as_ref(),
                 &tmux,
                 server_state.execution_coordinator.as_ref(),
@@ -948,7 +967,18 @@ pub async fn serve_with_merge_probe(
                 server_state.dispatch_events.as_ref(),
                 &crate::tmux_adoption::PsEngineOwnerProbe,
             )
-            .await
+            .await;
+            crate::tmux_adoption::drain_legacy_label_server(
+                server_state.work_db.as_ref(),
+                tmux.program(),
+                server_state.execution_coordinator.as_ref(),
+                server_state.as_ref(),
+                server_state.as_ref(),
+                server_state.dispatch_events.as_ref(),
+                &crate::tmux_adoption::PsEngineOwnerProbe,
+            )
+            .await;
+            report
         }
         Err(err) => {
             tracing::warn!(
@@ -1476,12 +1506,16 @@ pub async fn serve_with_merge_probe(
     // pane death. A quietly stuck but live pane raises an attention item;
     // confirmed death remains with the existing death reconcilers. Runs every
     // 60s and fires on boot.
-    let stale_worker_terminal_inspector = match boss_tmux::Tmux::resolve() {
-        Ok(tmux) => Some(Arc::new(crate::stale_worker_sweep::TmuxWorkerTerminalInspector::new(
-            server_state.work_db.clone(),
-            tmux,
-        ))
-            as Arc<dyn crate::stale_worker_sweep::WorkerTerminalInspector>),
+    let stale_worker_terminal_inspector = match server_state.resolve_tmux() {
+        Ok(tmux) => {
+            let legacy_tmux = boss_tmux::Tmux::for_legacy_label_server(tmux.program().to_path_buf()).ok();
+            Some(Arc::new(crate::stale_worker_sweep::TmuxWorkerTerminalInspector::new(
+                server_state.work_db.clone(),
+                tmux,
+                legacy_tmux,
+            ))
+                as Arc<dyn crate::stale_worker_sweep::WorkerTerminalInspector>)
+        }
         Err(err) => {
             tracing::warn!(
                 error = %format!("{err:#}"),
@@ -2700,6 +2734,7 @@ mod resolve_engine_paths_tests {
             .cwd(PathBuf::from("/tmp"))
             .db_path(PathBuf::from("/tmp/boss-test-resolve-abc.db"))
             .events_socket_path(events_socket)
+            .tmux_socket_path(PathBuf::from("/tmp/boss-test-resolve-abc.tmux.sock"))
             .build();
         RuntimeConfig::from_parts(work, None)
     }
@@ -2718,6 +2753,7 @@ mod resolve_engine_paths_tests {
         assert_eq!(resolved.events_socket, isolation.derived.events_socket);
         assert_eq!(resolved.pid, isolation.derived.pid);
         assert_eq!(resolved.control_token, isolation.derived.control_token);
+        assert_eq!(resolved.tmux_socket, isolation.derived.tmux_socket);
     }
 
     /// If the config's events socket resolves onto production — e.g. the

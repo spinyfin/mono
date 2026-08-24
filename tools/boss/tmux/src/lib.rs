@@ -96,24 +96,17 @@ impl From<anyhow::Error> for KillSessionError {
 /// other's content off tmux's unnamed buffer stack.
 static PASTE_BUFFER_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Filename for Boss's private tmux socket under the state root.
-pub const SOCKET_FILENAME: &str = "tmux.sock";
-
-/// Resolve the private socket from Boss's durable state root.
-pub fn private_socket_path() -> Result<PathBuf> {
-    if let Some(db_path) = std::env::var_os("BOSS_DB_PATH") {
-        let db_path = PathBuf::from(db_path);
-        if let Some(state_root) = db_path.parent().filter(|path| !path.as_os_str().is_empty()) {
-            return Ok(state_root.join(SOCKET_FILENAME));
-        }
-    }
-    let state_root = boss_log_files::default_state_root()
-        .ok_or_else(|| anyhow::anyhow!("cannot resolve Boss state root for tmux socket"))?;
-    Ok(state_root.join(SOCKET_FILENAME))
-}
+/// Absolute socket path used by command-construction tests. Production
+/// callers pass a resolved path from engine config instead of reading
+/// the environment here.
+pub const TEST_SOCKET_PATH: &str = "/state/boss/tmux.sock";
 
 #[derive(Clone)]
 enum ServerAddress {
+    /// Pre-move private server addressed with `tmux -L boss`. Production
+    /// reaches this only through [`Tmux::for_legacy_label_server`] so a
+    /// boot-time drain can still see sessions that survived the socket
+    /// move. New sessions never use it.
     Label,
     Socket(PathBuf),
 }
@@ -135,27 +128,17 @@ impl std::fmt::Debug for Tmux {
 }
 
 impl Tmux {
-    /// Resolves tmux once to a canonical absolute path for durable use.
-    pub fn resolve() -> Result<Self> {
+    /// Resolves tmux once to a canonical absolute path, scoped to `socket_path`.
+    pub fn resolve(socket_path: impl Into<PathBuf>) -> Result<Self> {
         let program = which::which("tmux").context("locating tmux on PATH")?;
         let program =
             std::fs::canonicalize(&program).with_context(|| format!("canonicalizing tmux path {program:?}"))?;
-        Self::from_path_with_socket(program, private_socket_path()?)
-    }
-
-    /// Creates a controller for an already-resolved absolute executable path.
-    pub fn from_path(program: impl Into<PathBuf>) -> Result<Self> {
-        Self::with_runner(program, Arc::new(RealCommandRunner))
+        Self::from_path_with_socket(program, socket_path)
     }
 
     /// Creates a production controller targeting one explicit private socket.
     pub fn from_path_with_socket(program: impl Into<PathBuf>, socket_path: impl Into<PathBuf>) -> Result<Self> {
         Self::with_runner_and_socket(program, Arc::new(RealCommandRunner), socket_path)
-    }
-
-    /// Creates a controller with a test or host-specific process runner.
-    pub fn with_runner(program: impl Into<PathBuf>, runner: Arc<dyn CommandRunner>) -> Result<Self> {
-        Self::with_runner_for_server(program, runner, ServerAddress::Label)
     }
 
     /// Creates a controller with an explicit socket, for production and
@@ -170,6 +153,22 @@ impl Tmux {
             bail!("tmux socket path must be absolute: {socket_path:?}");
         }
         Self::with_runner_for_server(program, runner, ServerAddress::Socket(socket_path))
+    }
+
+    /// Controller for the pre-move `tmux -L boss` server. Used only by the
+    /// boot-time drain that adopts or surfaces sessions that survived the
+    /// socket relocation. New sessions must not be created on this handle.
+    pub fn for_legacy_label_server(program: impl Into<PathBuf>) -> Result<Self> {
+        Self::for_legacy_label_server_with_runner(program, Arc::new(RealCommandRunner))
+    }
+
+    /// Test/drain variant of [`Self::for_legacy_label_server`] with an
+    /// injectable process runner.
+    pub fn for_legacy_label_server_with_runner(
+        program: impl Into<PathBuf>,
+        runner: Arc<dyn CommandRunner>,
+    ) -> Result<Self> {
+        Self::with_runner_for_server(program, runner, ServerAddress::Label)
     }
 
     fn with_runner_for_server(
@@ -190,6 +189,42 @@ impl Tmux {
 
     pub fn program(&self) -> &Path {
         &self.program
+    }
+
+    /// Socket this handle addresses. `None` for a legacy `-L boss` handle.
+    pub fn socket_path(&self) -> Option<&Path> {
+        match &self.server {
+            ServerAddress::Socket(path) => Some(path),
+            ServerAddress::Label => None,
+        }
+    }
+
+    /// Durable server identity recorded on `work_runs.tmux_server_label`:
+    /// the absolute socket path, or the literal [`SERVER_LABEL`] for a
+    /// session that still lives on the pre-move `-L boss` server.
+    pub fn server_identity(&self) -> String {
+        match &self.server {
+            ServerAddress::Socket(path) => path.display().to_string(),
+            ServerAddress::Label => SERVER_LABEL.to_owned(),
+        }
+    }
+
+    /// Operator-facing command prefix (`tmux -S <socket>` or `tmux -L boss`).
+    pub fn operator_prefix(&self) -> String {
+        match &self.server {
+            ServerAddress::Socket(path) => format!("tmux -S {}", path.display()),
+            ServerAddress::Label => format!("tmux -L {SERVER_LABEL}"),
+        }
+    }
+
+    /// If this handle targets a socket file that exists but no server is
+    /// listening, unlink it so later commands can start a fresh server.
+    /// No-op for a label-addressed handle, a missing file, or a live server.
+    pub fn unlink_stale_socket_file(&self) -> Result<bool> {
+        let Some(path) = self.socket_path() else {
+            return Ok(false);
+        };
+        unlink_stale_unix_socket(path)
     }
 
     /// Probes the resolved executable's version before the engine accepts work.
@@ -562,13 +597,13 @@ fn unparseable_session_row_error(line: &str) -> anyhow::Error {
 /// private server) simply does not exist, as opposed to a real command
 /// failure. tmux reports this a few different ways depending on whether the
 /// session is missing, the server exited leaving its socket behind, or the
-/// socket file is gone entirely:
+/// socket file cannot be connected:
 /// `"can't find session: <name>"`, `"session not found: <name>"`,
 /// `"no server running on <socket>"`, and
-/// `"error connecting to <socket> (No such file or directory)"`.
+/// `"error connecting to <socket> (No such file or directory|Connection refused)"`.
 ///
-/// That last shape is the one a host reboot produces. macOS clears `/tmp`
-/// on boot, so Boss's private socket at `/tmp/tmux-<uid>/boss` is not just
+/// `ENOENT` is the shape a host reboot produces for the legacy `-L boss`
+/// server. macOS clears `/tmp` on boot, so `/tmp/tmux-<uid>/boss` is not just
 /// stale but absent, and tmux switches from "no server running" to a
 /// `connect(2)` error. Reading that as a hard failure strands the
 /// coordinator: every recovery path funnels through
@@ -577,22 +612,50 @@ fn unparseable_session_row_error(line: &str) -> anyhow::Error {
 /// the session and the pane stays blank until the socket reappears by some
 /// other means.
 ///
-/// Only `ENOENT` counts. Other `connect(2)` failures — `Permission denied`
-/// on a socket owned by another uid, `Connection refused` — describe a
-/// socket that exists and is not ours to assume is empty, and must keep
-/// surfacing as real errors.
+/// `Connection refused` is the matching shape for a leftover durable socket
+/// file (`<state-root>/tmux.sock`) with no listener. That path survives
+/// `/tmp` cleanup, so a dead server leaves a unix socket that `connect(2)`
+/// refuses rather than `ENOENT`. [`Tmux::unlink_stale_socket_file`] removes
+/// that file at startup; treating the stderr as absent keeps `list_sessions`
+/// empty if a command races ahead of the unlink.
+///
+/// Other `connect(2)` failures — `Permission denied` on a socket owned by
+/// another uid — describe a socket that exists and is not ours to assume is
+/// empty, and must keep surfacing as real errors.
 fn is_absent_session_stderr(stderr: &str) -> bool {
     stderr.contains("can't find session")
         || stderr.contains("session not found")
         || stderr.contains("no server running")
-        || is_missing_socket_stderr(stderr)
+        || is_absent_socket_stderr(stderr)
 }
 
-/// True for tmux's `connect(2)` failure against a socket path that does not
-/// exist. See [`is_absent_session_stderr`] for why this is "absent" rather
-/// than "failed".
-fn is_missing_socket_stderr(stderr: &str) -> bool {
-    stderr.contains("error connecting to") && stderr.contains("No such file or directory")
+/// True for tmux's `connect(2)` failure against a socket that is gone or has
+/// no listener. See [`is_absent_session_stderr`] for why these are "absent"
+/// rather than "failed".
+fn is_absent_socket_stderr(stderr: &str) -> bool {
+    stderr.contains("error connecting to")
+        && (stderr.contains("No such file or directory") || stderr.contains("Connection refused"))
+}
+
+/// Unlink `path` when it exists as a unix socket with no listener. A live
+/// server, a missing file, or any other connect error is left alone.
+fn unlink_stale_unix_socket(path: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => Ok(false),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            std::fs::remove_file(path).with_context(|| format!("unlinking stale tmux socket {}", path.display()))?;
+            Ok(true)
+        }
+        Err(_) => Ok(false),
+    }
 }
 
 fn command_failed<T>(args: &[OsString], output: &CommandOutput) -> Result<T> {

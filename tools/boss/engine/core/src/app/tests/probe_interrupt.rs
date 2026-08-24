@@ -117,7 +117,7 @@ fn tmux_hosted(server_state: &Arc<ServerState>, run_id: &str, slot_id: u8) -> Ar
         .worker_registry
         .register_tmux_run_slot(run_id, slot_id, "boss-probe-interrupt");
     *server_state.pane_delivery_tmux_override.write().unwrap() =
-        Some(Tmux::with_runner("/usr/bin/tmux", runner.clone()).unwrap());
+        Some(Tmux::with_runner_and_socket("/usr/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap());
     runner
 }
 
@@ -950,8 +950,14 @@ fn pane_showing(server_state: &Arc<ServerState>, run_id: &str, slot_id: u8, pane
     server_state
         .worker_registry
         .register_tmux_run_slot(run_id, slot_id, "boss-probe-interrupt");
-    *server_state.pane_delivery_tmux_override.write().unwrap() =
-        Some(Tmux::with_runner("/usr/bin/tmux", Arc::new(ScriptedCapture(pane_text.to_owned()))).unwrap());
+    *server_state.pane_delivery_tmux_override.write().unwrap() = Some(
+        Tmux::with_runner_and_socket(
+            "/usr/bin/tmux",
+            Arc::new(ScriptedCapture(pane_text.to_owned())),
+            boss_tmux::TEST_SOCKET_PATH,
+        )
+        .unwrap(),
+    );
 }
 
 /// A Claude pane still showing its busy marker ("esc to interrupt") must never

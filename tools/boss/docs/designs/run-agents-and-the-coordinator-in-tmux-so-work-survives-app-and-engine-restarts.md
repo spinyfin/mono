@@ -167,9 +167,9 @@ Not chosen, but not dismissed either: it is a strictly larger change that alters
 
 **One detached tmux session per execution, one window, one pane, on a private tmux server.**
 
-- Private server: every invocation uses `tmux -L boss`. This isolates Boss entirely from the operator's own tmux server (validated: a session created under `-L bosstest` is invisible to the default server, and `kill-server` scopes cleanly). It also means "kill everything Boss owns" is one command with no collateral damage.
+- Private server: every production invocation uses `tmux -S <state-root>/tmux.sock` (next to `state.db` and `events.sock`). An explicit socket path, not a `-L` label, is what keeps Boss off tmux's default `/tmp/tmux-<uid>/` directory — that directory is cleaned on reboot and by `/tmp` sweepers, which is how a coordinator session can vanish while the rest of engine state survives. The tradeoff versus a label: `-L boss` was shorter and isolated from the operator's default server, but the resulting socket still lived under `/tmp` and was invisible to fixture-isolation gates that compare resolved paths. The socket path is resolved once onto `WorkConfig` (and `EnginePaths`) so a fixture cannot re-derive production's server from `$BOSS_DB_PATH`. `kill-server` still scopes cleanly to that one socket.
 - One session per **execution**, not per slot. A per-slot session would be reused across executions, which makes the durable pointer mutable and makes teardown ambiguous — "is this session's content the execution that just finished or the one that just started?". Per-execution sessions are created and destroyed with the execution and their token is immutable for the session's whole life.
-- Session name: `boss-<slot>-<short-exec-id>`, e.g. `boss-6-1d64a2ab588`. **The name is display ergonomics for a human running `tmux -L boss ls`. It is never identity.**
+- Session name: `boss-<slot>-<short-exec-id>`, e.g. `boss-6-1d64a2ab588`. **The name is display ergonomics for a human running `tmux -S <state-root>/tmux.sock ls`. It is never identity.**
 
 **Relationship to slot identity.** Slot identity is unchanged and remains authoritative: the `WorkerPool` claim, the `LiveWorkerState` key, the display name, and the pane the operator looks at are all slot-keyed exactly as today. The tmux session is _addressed by_ the engine through one row in `state.db`; it introduces no second notion of who a worker is. Concretely, the mapping is `execution_id → (session_name, spawn_token)`, and slot never appears on the left-hand side of a lookup.
 
@@ -187,20 +187,20 @@ And the equivalence caveat: session name and execution id are equivalent **for d
 
 New columns on `work_runs`:
 
-| Column              | Meaning                                                                          |
-| ------------------- | -------------------------------------------------------------------------------- |
-| `tmux_server_label` | The `-L` label (`boss`), recorded so a future relabel does not orphan old rows   |
-| `tmux_session_name` | Display/addressing name. Never used for matching                                 |
-| `tmux_spawn_token`  | The secret. Unique index. The only thing adoption matches on                     |
-| `tmux_spawn_state`  | `intended` → `created`. Distinguishes the two crash windows                      |
-| `tmux_pane_pid`     | `#{pane_pid}` read back at creation; supersedes today's async `shell_pid` report |
+| Column              | Meaning                                                                                                                                                                            |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tmux_server_label` | Server identity: the absolute `-S` socket path, or the literal `boss` for a session still on the pre-move `-L boss` server. Recorded so a future relocate does not orphan old rows |
+| `tmux_session_name` | Display/addressing name. Never used for matching                                                                                                                                   |
+| `tmux_spawn_token`  | The secret. Unique index. The only thing adoption matches on                                                                                                                       |
+| `tmux_spawn_state`  | `intended` → `created`. Distinguishes the two crash windows                                                                                                                        |
+| `tmux_pane_pid`     | `#{pane_pid}` read back at creation; supersedes today's async `shell_pid` report                                                                                                   |
 
 Write ordering, and why each step is where it is:
 
 1. **Mint** `spawn_token`.
 2. **Commit** `(tmux_server_label, tmux_session_name, tmux_spawn_token, tmux_spawn_state='intended')` to `work_runs`. _This commit strictly precedes any tmux call._ That ordering is the whole safety argument: it makes "a live Boss session whose token the DB has never seen" an impossible state under normal operation, so encountering one is unambiguous evidence of DB loss rather than a race to reason about.
 3. **Create** the session:
-   `tmux -L boss new-session -d -s <name> -e BOSS_SPAWN_TOKEN=<token> -e BOSS_SESSION_SCHEMA=<n> -e BOSS_RUN_ID=<exec> -e … -c <workspace> <agent-command>`
+   `tmux -S <state-root>/tmux.sock new-session -d -s <name> -e BOSS_SPAWN_TOKEN=<token> -e BOSS_SESSION_SCHEMA=<n> -e BOSS_RUN_ID=<exec> -e … -c <workspace> <agent-command>`
    The `-e` flags set session environment **atomically with session creation** — there is no window in which the session exists without its token. (Validated on tmux 3.6a; `-e` on `new-session` requires tmux ≥ 3.2, which sets the version floor.)
 4. **Label and confirm**: set the mirror user option `tmux set-option -t <name> @boss_spawn_token <token>` (so one `list-sessions -F` call can enumerate tokens cheaply), read `#{pane_pid}`, then write `tmux_spawn_state='created'` and `tmux_pane_pid`.
 
@@ -219,12 +219,14 @@ The environment variable is the **authority**; the user option is a convenience 
 
 **Boot-time adoption algorithm** (engine-side, before the existing `run_reconcile` pass):
 
-1. `tmux -L boss list-sessions -F '#{session_name}\t#{@boss_spawn_token}'`. If the server is not running the command fails with `no server running on …` — that is a clean zero-session answer, not an error, and every non-terminal local run falls through to existing reconciliation.
+1. `tmux -S <state-root>/tmux.sock list-sessions -F '#{session_name}\t#{@boss_spawn_token}'`. If the server is not running the command fails with `no server running on …` (or `error connecting to … (Connection refused)` for a leftover socket file) — that is a clean zero-session answer, not an error, and every non-terminal local run falls through to existing reconciliation. A leftover socket file with no listener is unlinked at engine start before this command runs.
 2. For each session, read the authoritative token with `show-environment -t <name> BOSS_SPAWN_TOKEN`. Bounded work: at most 32 local slots plus the coordinator.
 3. Look the token up in `work_runs`. **Exact full-token match or no adoption.** No prefix matching, no name fallback, no "closest execution".
 4. Token found, execution non-terminal → **adopt**: re-claim the slot recorded on the run, restore `WorkerRegistry`'s run→slot and pid→run entries from `tmux_pane_pid`, register `LiveWorkerState` seeded from durable state, and restart the live-status summarizer against `work_runs.transcript_path`. The worker's buffered hook events (`.boss/events-pending.jsonl`) drain on its next hook and reconcile activity naturally.
 5. Token found, execution terminal → hand straight to `worker_readoption::classify_contradiction` (`worker_readoption.rs:155`). That policy is unchanged and needs no new cases: a live session is simply a new, stronger way of observing the same contradiction it already handles.
 6. Token not found → leaked. See [Lifecycle and cleanup](#6-lifecycle-and-cleanup).
+
+**Migrating an already-running `-L boss` server.** tmux cannot relocate a live server's socket. On the first boot after the socket move, the engine also constructs a label-addressed handle (`Tmux::for_legacy_label_server`), lists that server, and runs the same adoption pass against it. Matching runs stay registered in `WorkerPool` / `WorkerRegistry` / `LiveWorkerState` for the rest of their life, addressed via `-L boss`; their `tmux_server_label` remains the literal `boss` so the stale-worker inspector probes the right server. An attention item names each surviving session and the exact `tmux -L boss attach` / `kill-session` command. New sessions are created only on the durable socket. The old server is not killed automatically: killing it would SIGTERM live agents. Once those runs finish, the label server is empty and the drain is a no-op.
 
 **Precedence over the existing lease probe.** `run_reconcile`'s cube-lease oracle stays, but it runs _after_ tmux adoption and only over what adoption did not claim. A token match is direct evidence about the worker; a green lease is circumstantial evidence about a directory. Adoption outranking it also removes the `Unknown`-treated-as-`Live` limbo for the majority of cases (`run_reconcile.rs:29-33`).
 
@@ -236,7 +238,7 @@ The app stops owning worker ptys and becomes an attacher.
 
 **What changes:**
 
-- `TerminalLaunchSpec` for a worker pane no longer carries env, cwd, or an agent command. Its `initialInput` becomes `exec tmux -L boss attach-session -t <session>`. This is the same mechanism `BossPaneModel` already uses for the coordinator (`BossPaneModel.swift:138-140`), so it is a substitution rather than a new capability.
+- `TerminalLaunchSpec` for a worker pane no longer carries env, cwd, or an agent command. Its `initialInput` becomes `exec tmux -S <socket> attach-session -t <session>`, with `<socket>` taken from the same `Tmux` handle that created the session. This is the same mechanism `BossPaneModel` already uses for the coordinator, so it is a substitution rather than a new capability.
 - `SpawnWorkerPane` becomes `AttachWorkerPane { slot_id, session_name, summary, task_title }`. The engine has already created the session and already knows the pid; the app is told what to display.
 - `ReleaseWorkerPane` becomes `DetachWorkerPane`, and **must stop killing anything**. `WorkerProcessKiller.killForegroundProcessTree` leaves the worker path entirely (`WorkersWorkspaceModel.swift:310-317`) — under tmux, killing what the app is merely _viewing_ is precisely the bug this project exists to prevent. Detach tears down the surface and nothing else.
 - `SendToPane` and `InterruptWorkerPane` move engine-side, onto `tmux send-keys` (two-phase: `send-keys -l <text>` then a separate `send-keys C-m`, per the measured finding in `claude-tmux-pane-controller.md:309-335`, re-validated here). `inject_pane_text_verified`'s posture checks and delivery-verification semantics are unchanged — only the transport moves.
@@ -295,11 +297,11 @@ That definition produced the incident's third bullet: a worker whose backgrounde
 
 **The three-way classification:**
 
-| Class                         | Signals                                                                                                                                                                      | Reconciler action                                                                                                                                                                                                                                                                                                 |
-| ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **alive-and-working**         | session + token present, `pane_dead=0`, **and any of**: a hook within threshold; `window_activity` advanced within threshold; `pane_current_command` is not the agent binary | Nothing.                                                                                                                                                                                                                                                                                                          |
-| **alive-and-genuinely-stuck** | session + token present, `pane_dead=0`, **and all of**: no hook, no `window_activity` advance, `pane_current_command` _is_ the agent binary — sustained past the threshold   | **Escalate, do not silently reap.** Raise an attention item naming the execution, the session, the last output time, and the exact `tmux -L boss attach -t <name>` command an operator can run to look. Auto-reap only after a second, much longer window, and only with the reason recorded on a dispatch event. |
-| **dead**                      | session absent (token unresolvable) **or** `pane_dead=1`                                                                                                                     | Existing reconciliation, now recording `pane_dead_status` as the cause.                                                                                                                                                                                                                                           |
+| Class                         | Signals                                                                                                                                                                      | Reconciler action                                                                                                                                                                                                                                                                                                                   |
+| ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **alive-and-working**         | session + token present, `pane_dead=0`, **and any of**: a hook within threshold; `window_activity` advanced within threshold; `pane_current_command` is not the agent binary | Nothing.                                                                                                                                                                                                                                                                                                                            |
+| **alive-and-genuinely-stuck** | session + token present, `pane_dead=0`, **and all of**: no hook, no `window_activity` advance, `pane_current_command` _is_ the agent binary — sustained past the threshold   | **Escalate, do not silently reap.** Raise an attention item naming the execution, the session, the last output time, and the exact `tmux -S <state-root>/tmux.sock attach -t <name>` command an operator can run to look. Auto-reap only after a second, much longer window, and only with the reason recorded on a dispatch event. |
+| **dead**                      | session absent (token unresolvable) **or** `pane_dead=1`                                                                                                                     | Existing reconciliation, now recording `pane_dead_status` as the cause.                                                                                                                                                                                                                                                             |
 
 **Why both output signals are needed, precisely.** A _foreground_ `bazel build` is caught by `pane_current_command` alone. A **backgrounded** `bazel test &` — the actual incident shape — leaves `pane_current_command` as the agent binary, so only `window_activity` catches it, because the build's output still lands in the pane. Either signal alone reproduces the incident; the pair does not.
 
@@ -316,7 +318,7 @@ That definition produced the incident's third bullet: a worker whose backgrounde
 1. Resolve the session from `work_runs.tmux_session_name`.
 2. **Read the token back and require an exact match against `tmux_spawn_token`.** A `kill-session` on a name alone is forbidden — that is the mechanism by which a rebooted-into-reused-name session gets destroyed.
 3. Run the existing SIGTERM→SIGKILL ladder against `#{pane_pid}`'s process group (`app/server.rs:2055-2069`). This stays because the reason it exists stays: node-based agents commonly ignore the SIGHUP that pty teardown delivers (`WorkersWorkspaceModel.swift:250-268`).
-4. `tmux -L boss kill-session -t <name>`.
+4. `tmux -S <state-root>/tmux.sock kill-session -t <name>`.
 5. Clear the token columns.
 
 **Leaked-session detection** folds into `husk_pane_sweep`, whose shape is already exactly this diff. It enumerates the tmux server and compares against `work_runs` rows with tokens:
@@ -459,7 +461,7 @@ Scope: in-scope
 
 **5. App: attach-mode worker panes**
 
-Scope: `AttachWorkerPane` / `DetachWorkerPane` replace `SpawnWorkerPane` / `ReleaseWorkerPane` for tmux-hosted runs. The Ghostty surface's launch line becomes `exec tmux -L boss attach-session -t <session>`. `WorkerProcessKiller` is removed from the worker release path — detach tears down the surface and kills nothing. Both RPC shapes coexist while the legacy path is live.
+Scope: `AttachWorkerPane` / `DetachWorkerPane` replace `SpawnWorkerPane` / `ReleaseWorkerPane` for tmux-hosted runs. The Ghostty surface's launch line becomes `exec tmux -S <socket> attach-session -t <session>`. `WorkerProcessKiller` is removed from the worker release path — detach tears down the surface and kills nothing. Both RPC shapes coexist while the legacy path is live.
 
 Effort hint: `medium`
 

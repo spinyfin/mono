@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, bail};
@@ -140,6 +140,11 @@ pub struct WorkConfig {
     /// `None` means "this engine binds no events socket" — the in-process
     /// `serve(..., None, ...)` shape used by tests.
     pub events_socket_path: Option<PathBuf>,
+    /// Socket for Boss's private tmux server. Resolved once next to
+    /// `db_path` (or overwritten by the isolation guard for a fixture).
+    /// Everything downstream that talks to tmux reads it from here rather
+    /// than re-deriving it from the environment.
+    pub tmux_socket_path: Option<PathBuf>,
     /// Defaults to 1 so test call sites don't need updating when new pool
     /// fields are added.
     #[builder(default = 1)]
@@ -241,6 +246,7 @@ impl WorkConfig {
             Some(path) => Some(PathBuf::from(path)),
             None => boss_log_files::default_events_socket_path(),
         };
+        let tmux_socket_path = Some(tmux_socket_path_beside_db(&db_path));
         // Default to the hard cap so the engine pool tracks the macOS
         // app's slot count (`WorkersWorkspaceModel.workerSlotCount = 8`).
         // A smaller default left slots 5–8 idle while the dispatcher
@@ -275,6 +281,7 @@ impl WorkConfig {
             .cwd(cwd)
             .db_path(db_path)
             .maybe_events_socket_path(events_socket_path)
+            .maybe_tmux_socket_path(tmux_socket_path)
             .worker_pool_size(worker_pool_size)
             .automation_pool_size(automation_pool_size)
             .review_pool_size(review_pool_size)
@@ -287,6 +294,22 @@ impl WorkConfig {
             .enable_dispatch_ready_bus(enable_dispatch_ready_bus)
             .coordinator_model(coordinator_model)
             .build())
+    }
+
+    /// Socket this engine's tmux handle must target. Falls back to the
+    /// file beside `db_path` when the field was left unset (test builders).
+    pub fn resolved_tmux_socket_path(&self) -> PathBuf {
+        self.tmux_socket_path
+            .clone()
+            .unwrap_or_else(|| tmux_socket_path_beside_db(&self.db_path))
+    }
+}
+
+/// `<db_path's parent>/tmux.sock` — the production layout next to `state.db`.
+pub fn tmux_socket_path_beside_db(db_path: &Path) -> PathBuf {
+    match db_path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        Some(root) => root.join(boss_log_files::TMUX_SOCKET_FILENAME),
+        None => boss_log_files::default_tmux_socket_path().unwrap_or_else(|| PathBuf::from("/state/boss/tmux.sock")),
     }
 }
 
@@ -572,6 +595,10 @@ mod tests {
         })
         .unwrap();
         assert_eq!(config.cwd, tempdir.path());
+        assert_eq!(
+            config.resolved_tmux_socket_path(),
+            tempdir.path().join(boss_log_files::TMUX_SOCKET_FILENAME)
+        );
     }
 
     /// `WorkConfig::load_from` must default to the hard cap

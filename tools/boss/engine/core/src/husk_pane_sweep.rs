@@ -42,7 +42,7 @@
 //! `bossctl agents retire-pane`) over the app's own hosted-pane inventory.
 //! This sweep is the automatic backstop over the tmux server's inventory
 //! instead: once a leaked session has been reported untracked on two
-//! consecutive passes, it retires it (`tmux -L boss kill-session`),
+//! consecutive passes, it retires it (`tmux -S <state-root>/tmux.sock kill-session`),
 //! regardless of which terminal-transition site produced the divergence.
 //!
 //! ## Two-pass confirmation
@@ -439,6 +439,11 @@ pub trait HuskPaneSweepSource: Send + Sync {
     /// Retire this exact leaked tmux session. The session name, not a pool
     /// slot, is the tmux resource identity.
     async fn retire_husk(&self, session: &crate::tmux_adoption::UntrackedTmuxSession);
+
+    /// Operator-facing `tmux …` prefix used in attention items.
+    fn tmux_operator_prefix(&self) -> String {
+        format!("tmux -S {}", boss_tmux::TEST_SOCKET_PATH)
+    }
 }
 
 /// Counts from one sweep pass; logged at `info` when any pane was retired.
@@ -604,6 +609,7 @@ pub async fn run_one_pass(
     let mut to_retire = independently_dead;
     if unconfirmed.len() > MAX_UNCONFIRMED_RETIREMENTS_PER_PASS {
         outcome.breaker_tripped = Some(unconfirmed.len());
+        let tmux_prefix = source.tmux_operator_prefix();
         tracing::error!(
             unconfirmed = unconfirmed.len(),
             max_per_pass = MAX_UNCONFIRMED_RETIREMENTS_PER_PASS,
@@ -615,7 +621,7 @@ pub async fn run_one_pass(
              the engine's own execution rows still disagreeing is far better explained by engine bookkeeping that \
              went wrong for every slot at once than by that many simultaneously-orphaned panes, and retiring a live \
              worker is unrecoverable. Verify the sessions named below by hand and reclaim genuine husks with \
-             `tmux -L boss kill-session -t <session>`.",
+             `{tmux_prefix} kill-session -t <session>`.",
             unconfirmed.len(),
         );
         for (pane, evidence) in &unconfirmed {
@@ -629,7 +635,7 @@ pub async fn run_one_pass(
         // Defect the 2026-07-26 breaker shipped with: declining silently.
         // The log line above is not a channel anyone watches, so raise the
         // refusal where an operator actually sees it.
-        outcome.escalated = file_breaker_attention(work_db, &unconfirmed);
+        outcome.escalated = file_breaker_attention(work_db, &unconfirmed, &source.tmux_operator_prefix());
         for (pane, evidence) in unconfirmed {
             dispatch_events
                 .emit(
@@ -710,6 +716,7 @@ pub async fn run_one_pass(
 fn file_breaker_attention(
     work_db: &WorkDb,
     held_back: &[(crate::tmux_adoption::UntrackedTmuxSession, HuskDeathEvidence)],
+    tmux_prefix: &str,
 ) -> bool {
     let mut ordered: Vec<&(crate::tmux_adoption::UntrackedTmuxSession, HuskDeathEvidence)> = held_back.iter().collect();
     ordered.sort_by_key(|(pane, _)| (pane.session_name.clone(), pane.spawn_token.clone()));
@@ -732,7 +739,7 @@ fn file_breaker_attention(
         tracing::error!(
             held_back = held_back.len(),
             "husk-pane sweep: circuit breaker tripped but NO held-back pane resolved to a work item, so the \
-             refusal could not be escalated. Reclaim the sessions by hand, e.g. `tmux -L boss kill-session -t <session>`.",
+             refusal could not be escalated. Reclaim the sessions by hand, e.g. `{tmux_prefix} kill-session -t <session>`.",
         );
         return false;
     };
@@ -744,7 +751,7 @@ fn file_breaker_attention(
         .join("\n");
     let retire_lines = ordered
         .iter()
-        .map(|(pane, _)| format!("tmux -L boss kill-session -t {}", pane.session_name))
+        .map(|(pane, _)| format!("{tmux_prefix} kill-session -t {}", pane.session_name))
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -1344,9 +1351,10 @@ mod tests {
                 attentions[0].body_markdown,
             );
             assert!(
-                attentions[0]
-                    .body_markdown
-                    .contains(&format!("tmux -L boss kill-session -t boss-worker-{slot}")),
+                attentions[0].body_markdown.contains(&format!(
+                    "tmux -S {} kill-session -t boss-worker-{slot}",
+                    boss_tmux::TEST_SOCKET_PATH
+                )),
                 "the escalation must carry the manual reclaim command",
             );
         }

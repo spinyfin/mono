@@ -26,7 +26,7 @@ use std::time::Duration as StdDuration;
 use anyhow::{Context, anyhow};
 use boss_protocol::WorkItemBinding;
 use boss_tmux::TMUX_SPAWN_TOKEN_ENV;
-use boss_tmux::{DisplayField, NewSession, SERVER_LABEL, Tmux};
+use boss_tmux::{DisplayField, NewSession, Tmux};
 use thiserror::Error;
 use tokio::time::Duration;
 
@@ -294,6 +294,10 @@ impl TmuxWorkerHost {
     fn session_name(&self) -> &str {
         &self.session_name
     }
+
+    fn socket_path(&self) -> Option<&Path> {
+        self.tmux.socket_path()
+    }
 }
 
 /// Create one detached tmux session using the durable write ordering required
@@ -312,7 +316,12 @@ async fn start_tmux_worker(
     let spawn_token = crate::engine_control::generate_token();
     let intent_recorded = host
         .spawn_store
-        .record_tmux_spawn_intent(execution_id, SERVER_LABEL, &host.session_name, &spawn_token)
+        .record_tmux_spawn_intent(
+            execution_id,
+            &host.tmux.server_identity(),
+            &host.session_name,
+            &spawn_token,
+        )
         .context("recording tmux spawn intent")
         .map_err(StartWorkerError::Tmux)?;
     if !intent_recorded {
@@ -706,10 +715,6 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     }
 
     let claimed_slot = input.slot_id;
-    let tmux_socket_path = boss_tmux::private_socket_path()
-        .map_err(StartWorkerError::Tmux)?
-        .display()
-        .to_string();
     let (slot_id, shell_pid, ack_timed_out) = if let Some(tmux_host) = input.tmux_host.as_ref() {
         let shell_pid = match start_tmux_worker(
             tmux_host,
@@ -731,13 +736,23 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         // Ghostty surface is best-effort presentation only: an app restart or
         // a missing app session must not turn a successfully-created worker
         // into a failed spawn.
+        let tmux_socket_path = tmux_host
+            .socket_path()
+            .ok_or_else(|| {
+                StartWorkerError::Tmux(anyhow!(
+                    "tmux host for {} has no socket path; cannot attach a viewer",
+                    input.run_id
+                ))
+            })?
+            .display()
+            .to_string();
         match spawner
             .send_to_app_request(
                 EngineToAppRequest::AttachWorkerPane(AttachWorkerPaneInput {
                     run_id: input.run_id.clone(),
                     slot_id: claimed_slot,
                     session_name: tmux_host.session_name().to_owned(),
-                    tmux_socket_path: tmux_socket_path.clone(),
+                    tmux_socket_path,
                     summary: input.title_summary.clone(),
                     task_title: input.task_title.clone(),
                 }),
@@ -1105,7 +1120,8 @@ mod tests {
         };
         let store = Arc::new(RecordingTmuxStore::default());
         let runner = Arc::new(RecordingTmuxRunner::new(store.clone()));
-        let tmux = Tmux::with_runner("/opt/homebrew/bin/tmux", runner.clone()).unwrap();
+        let tmux = Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH)
+            .unwrap();
         let mut input = sample_input(&workspace);
         input.tmux_host = Some(TmuxWorkerHost::new(tmux, store.clone(), "boss-3-run-test".to_owned()));
 
@@ -1124,6 +1140,7 @@ mod tests {
                 assert_eq!(request.run_id, "run-test");
                 assert_eq!(request.slot_id, 3);
                 assert_eq!(request.session_name, "boss-3-run-test");
+                assert_eq!(request.tmux_socket_path, boss_tmux::TEST_SOCKET_PATH);
             }
             other => panic!("expected AttachWorkerPane request, got {other:?}"),
         }
@@ -1143,7 +1160,10 @@ mod tests {
 
         let calls = runner.calls();
         let create = &calls[0];
-        assert_eq!(&create[..5], ["-L", "boss", "new-session", "-d", "-s"]);
+        assert_eq!(
+            &create[..5],
+            ["-S", boss_tmux::TEST_SOCKET_PATH, "new-session", "-d", "-s"]
+        );
         assert!(create.windows(2).any(|pair| pair == ["-e", "BOSS_RUN_ID=run-test"]));
         assert!(create.windows(2).any(|pair| pair == ["-e", "BOSS_SESSION_SCHEMA=1"]));
         assert!(
@@ -1163,23 +1183,40 @@ mod tests {
         assert_eq!(
             calls[1],
             vec![
-                "-L",
-                "boss",
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
                 "set-option",
                 "-s",
                 "terminal-features[100]",
                 "xterm*:extkeys"
             ]
         );
-        assert_eq!(calls[2], vec!["-L", "boss", "set-option", "-s", "extended-keys", "on"]);
+        assert_eq!(
+            calls[2],
+            vec!["-S", boss_tmux::TEST_SOCKET_PATH, "set-option", "-s", "extended-keys", "on"]
+        );
         assert_eq!(
             &calls[3][..6],
-            ["-L", "boss", "set-option", "-t", "boss-3-run-test", "status"]
+            [
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
+                "set-option",
+                "-t",
+                "boss-3-run-test",
+                "status"
+            ]
         );
         assert_eq!(calls[3][6], "off");
         assert_eq!(
             &calls[4][..6],
-            ["-L", "boss", "set-option", "-t", "boss-3-run-test", "@boss_spawn_token"]
+            [
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
+                "set-option",
+                "-t",
+                "boss-3-run-test",
+                "@boss_spawn_token"
+            ]
         );
         let pane_pid = calls
             .iter()
@@ -1200,8 +1237,8 @@ mod tests {
         assert_eq!(
             calls[5],
             vec![
-                "-L",
-                "boss",
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
                 "display-message",
                 "-p",
                 "-t",
