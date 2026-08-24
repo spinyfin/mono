@@ -1,4 +1,13 @@
 import Foundation
+import os.log
+
+/// Debug-only substitute for the engine's "board drop is a reorder" log
+/// line, which stops firing once the client no longer sends same-column
+/// drops to the engine at all. Silent in normal use.
+private let kanbanSameColumnDropLog = Logger(
+    subsystem: "dev.spinyfin.bossmacapp",
+    category: "kanban-same-column-drop"
+)
 
 extension ChatViewModel {
     struct DragRefusalNotice: Equatable {
@@ -62,16 +71,25 @@ extension ChatViewModel {
 
         // Whether the card visibly moved. This is a *rendering* fact the
         // client already owns (it is how the board lays sections out), not a
-        // status decision — it gates the pre-flight warning and the
-        // optimistic reposition below, never what gets sent. A drop that
-        // leaves the card where it is has nothing to warn about and nothing
-        // to animate; the engine still resolves it (and logs the reorder).
+        // status decision. Kanban lanes are not user-ordered, so a drop that
+        // leaves the card where it started carries no intent to record —
+        // see the early return just below.
         let origin = effectiveBoardColumn(for: task)
         let originGroup = boardGroup(for: task)
         let staysPut = origin == column && (group == nil || originGroup == group)
 
-        if !staysPut,
-           task.status == "blocked",
+        if staysPut {
+            // Kanban lanes are not user-ordered, so a drop that lands back on
+            // the card's own column (and group) carries no user intent to
+            // record — nothing moved, nothing to send. Kept as a debug log
+            // rather than silence: it is the client-side substitute for the
+            // engine's now-unreachable "board drop is a reorder" log line,
+            // which stops firing once the client never sends this drop.
+            kanbanSameColumnDropLog.debug("same-column drop is a no-op: task=\(task.id, privacy: .public)")
+            return true
+        }
+
+        if task.status == "blocked",
            hasGatingPrereqs(task)
         {
             let count = gatingPrereqs(for: task.id).count
@@ -87,8 +105,7 @@ extension ChatViewModel {
         // Moving out of Doing while a live worker is attached is blocked
         // except for two intentional gestures — see `moveTask`, which applies
         // the same rule to the popover's explicit Move buttons.
-        if !staysPut,
-           origin == .doing,
+        if origin == .doing,
            column != .backlog,
            column != .done,
            hasLiveWorker(forTaskID: taskID)
@@ -100,19 +117,15 @@ extension ChatViewModel {
             return false
         }
 
-        if !staysPut {
-            // Optimistic reposition: draw the card at the drop site until the
-            // engine's answer arrives. `bounceBackOptimisticMoves` returns it
-            // to `origin` if the engine refuses, and
-            // `reconcileOptimisticOverrides` drops the override once real
-            // state agrees — including when the engine resolved the drop to a
-            // reorder and the real column never changed.
-            pendingMoveOriginByTaskID[taskID] = origin
-            optimisticColumnByTaskID[taskID] = column
-            invalidateWorkCache()
-        }
+        // Optimistic reposition: draw the card at the drop site until the
+        // engine's answer arrives. `bounceBackOptimisticMoves` returns it to
+        // `origin` if the engine refuses, and `reconcileOptimisticOverrides`
+        // drops the override once real state agrees.
+        pendingMoveOriginByTaskID[taskID] = origin
+        optimisticColumnByTaskID[taskID] = column
+        invalidateWorkCache()
 
-        if !staysPut, column == .doing, !task.humanDriven {
+        if column == .doing, !task.humanDriven {
             // Entering Doing may request execution. Check dispatch
             // admission before sending the drop so a paused engine offers
             // a confirmation instead of either silently queuing the card
