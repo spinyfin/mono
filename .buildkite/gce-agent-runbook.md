@@ -9,7 +9,7 @@ Companion to `linux-agents-runbook.md`, which covers diagnosing an _existing_ ho
 Order matters — step 3 creates the user that steps 4 onward depend on. Steps 4, 8 and 10 are where this goes wrong; the rest is mechanical.
 
 1. **x86_64 only.** `n2-standard-16`, 500 GB pd-balanced. Do not pick an Axion/`t2a` type.
-2. Install packages (§ Packages).
+2. Install packages (§ Packages), plus Node ≥ 22 and `npx` (§ Node).
 3. **Install the `buildkite-agent` package.** This creates the `buildkite-agent` user that later steps run as.
 4. **Disable the AppArmor userns restriction** (Ubuntu). Without this every `bazel test` fails.
 5. `mkdir -p /mnt/ssd/bazel`, chown to `buildkite-agent`.
@@ -90,7 +90,7 @@ Why each — this list is derived from the build graph, not generic:
 - **`patch`** — `MODULE.bazel` patches `rules_rust` and `rules_apple`.
 - **`pkg-config` + `libssl-dev`** — **flunge only, not mono.** The `openssl-sys` crate's build script shells out to `pkg-config` and fails with exit code 101 without it. The error names only `pkg-config` because that check runs first; installing it alone gets you the missing-headers failure next.
 
-**Not needed:** Node, pnpm, npm — zero references in the build graph, no `package.json`. Not rustup either: Rust comes hermetically from `rules_rust` via `rust-toolchain.toml`, and `rustup` appears only in the darwin-only cross-build phase.
+**Not needed:** pnpm, and npm as a package manager — no `package.json`, no `rules_js`. Node and `npx` **are** required; see § Node. Not rustup either: Rust comes hermetically from `rules_rust` via `rust-toolchain.toml`, and `rustup` appears only in the darwin-only cross-build phase.
 
 **Expect more of these.** The base list was derived from mono's graph. Any `-sys` crate in another pipeline can want a system library the image lacks. Read the build script's stderr; it names the package.
 
@@ -200,6 +200,30 @@ This happened on the first GCE host: flunge's `MODULE.bazel` pinned `rules_mypy`
 **Read the failure before reaching for credentials.** GitHub answers a nonexistent or inaccessible repo over HTTPS with an auth challenge — `could not read Username for 'https://github.com'` — which reads exactly like a missing credential and is not one. Over SSH the same condition says `Repository not found`. If a public dependency asks for authentication, the URL is wrong, not your key.
 
 **Do not add a `url.*.insteadOf` rewrite or a credential helper to make it go away.** No such mechanism exists anywhere in the fleet; adding one on a single host is an invisible divergence that outlives the outage. Fix the dependency declaration.
+
+## Node
+
+```sh
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt-get install -y nodejs
+node --version && npx --version
+```
+
+`checks` shells out to `npx --yes oxfmt@0.55.0` and `oxlint@1.70.0` via checkleft's declarative external-tool resolution. Node is a host package, not a Bazel toolchain — `MODULE.bazel` has no `rules_js`, `rules_nodejs`, or node `http_archive`.
+
+Node **≥ 22** specifically, enforced by `MIN_NODE_MAJOR_VERSION` in `tools/checkleft/src/external/declarative/resolve.rs:218`. A Node 20 host fails with `ERR_UNKNOWN_FILE_EXTENSION`, which does not look like a Node version problem.
+
+If the agent is already running, restart it so it picks up the new PATH:
+
+```sh
+sudo systemctl restart buildkite-agent
+```
+
+`checks` is a **required merge context** (`REQUIRED_CHECKS.md:19`), and `format/oxc`'s include glob covers `md, markdown, mdx, yaml, yml, toml, json, css, html`, so it fires on nearly every PR — including doc-only ones. Without Node a fresh host can run `bazel-build-test` fine but cannot pass PR CI at all.
+
+`mono-integrity` → `integrity-checkleft` (`.buildkite/steps/integrity-checkleft.sh:15`) also needs it. `bazel-build-test`, `mac-app-build`, `boss-release`, `checkleft-release` and `changelog-release` do not.
+
+There is a declared fallback to a bare `oxfmt`/`oxlint` on `PATH`, but on a host with neither `npx` nor those binaries it resolves to the bare name and then fails at spawn — it does not save you.
 
 ## Configure the agent
 
@@ -452,5 +476,22 @@ Pauses auto-expire, so pick the timeout generously.
 2. **How `gh` was authenticated** on the dead hosts — same limitation.
 3. **CPU/RAM of the dead hosts** — never recorded; sizing here is inferred.
 4. **Full `buildkite-agent.cfg` contents** — needs root on a surviving host.
+5. **Node is required but no provisioning artifact in the fleet installs it.** Long-lived hosts have it incidentally from a base image or a hand install. That is why a clean host failed `checks` while surviving hosts did not.
 
 If you ever have root on a surviving Linux agent, capturing those four things and folding them into this document is worth the ten minutes.
+
+## Appendix: required vs optional
+
+**Required to run at all** — without these the agent cannot take `bazel-build-test` and `checks` to green:
+
+- x86_64 host (`n2-standard-16`, 500 GB pd-balanced)
+- packages in § Packages
+- `node` / `npx` (Node ≥ 22; § Node)
+- `buildkite-agent` 3.127.1 (creates the `buildkite-agent` user)
+- AppArmor userns restriction off (Ubuntu)
+- `/mnt/ssd/bazel` owned by `buildkite-agent`
+- bazelisk as `/usr/bin/bazel`
+- cluster token and `tags="queue=bazel-any,os=linux,arch=amd64"`
+- SSH credential at `/var/lib/buildkite-agent/.ssh/`, mode 0600, plus `known_hosts`
+
+**Not required to run at all:** `gh` (release pipelines only), Azure CLI (flunge deploy), tailnet / passwordless SSH, `/etc/bazel.bazelrc`, rustup, pnpm, npm-as-a-package-manager.
