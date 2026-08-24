@@ -583,7 +583,7 @@ pub(crate) async fn scan_pr_for_task_doc(task_id: &str, pr_url: &str) -> Option<
     match fetch_pr_view_json(pr_url).await {
         Ok(root) => Some(parse_pr_scan_matching(
             &root,
-            is_project_less_doc_path,
+            is_per_task_doc_path,
             "docs/designs/*.md, docs/design-docs/*.md, docs/investigations/*.md, or docs/postmortems/*.md",
         )),
         Err(err) => {
@@ -776,7 +776,7 @@ fn is_postmortem_doc_path(path: &str) -> bool {
 /// Matches a per-task doc deliverable: a single `docs/designs/*.md`,
 /// `docs/investigations/*.md`, or `docs/postmortems/*.md`. Used by the
 /// per-task detector, which runs for every work-item kind.
-fn is_project_less_doc_path(path: &str) -> bool {
+fn is_per_task_doc_path(path: &str) -> bool {
     is_design_doc_path(path) || is_investigation_doc_path(path) || is_postmortem_doc_path(path)
 }
 
@@ -792,7 +792,7 @@ mod tests {
             "tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirroring-flunge.md"
         ));
         assert!(is_design_doc_path("tools/boss/docs/designs/x.markdown"));
-        // Non-boss product directories are also accepted (regression for P844).
+        // Regression: non-boss product directories are also accepted.
         assert!(is_design_doc_path(
             "tools/checkleft/docs/designs/robust-change-detection-in-checkleft.md"
         ));
@@ -882,7 +882,7 @@ mod tests {
         assert_eq!(scan.doc_path, None);
     }
 
-    /// T285/P284 regression: the exact PR #794 changed-files shape — a
+    /// Regression: the exact PR #794 changed-files shape — a
     /// flunge design PR using the repo's `docs/design-docs/` convention
     /// (not `docs/designs/`). Before this fix, `is_design_doc_path` never
     /// matched any of these paths, so the pointer was silently never
@@ -912,7 +912,7 @@ mod tests {
         );
     }
 
-    /// T1897 regression: a design PR that adds a new doc AND modifies an
+    /// Regression: a design PR that adds a new doc AND modifies an
     /// existing main.md index. The ADDED file is the new design doc; the
     /// MODIFIED file is just the index being updated. Before this fix the
     /// scanner found two matches and returned None, preventing the pointer
@@ -1072,12 +1072,12 @@ mod tests {
 
     #[test]
     fn project_less_matcher_accepts_designs_and_investigations() {
-        assert!(is_project_less_doc_path("tools/boss/docs/designs/foo.md"));
-        assert!(is_project_less_doc_path("docs/design-docs/foo.md"));
-        assert!(is_project_less_doc_path("docs/investigations/foo.md"));
-        assert!(is_project_less_doc_path("docs/postmortems/foo.md"));
-        assert!(!is_project_less_doc_path("README.md"));
-        assert!(!is_project_less_doc_path("docs/other/foo.md"));
+        assert!(is_per_task_doc_path("tools/boss/docs/designs/foo.md"));
+        assert!(is_per_task_doc_path("docs/design-docs/foo.md"));
+        assert!(is_per_task_doc_path("docs/investigations/foo.md"));
+        assert!(is_per_task_doc_path("docs/postmortems/foo.md"));
+        assert!(!is_per_task_doc_path("README.md"));
+        assert!(!is_per_task_doc_path("docs/other/foo.md"));
     }
 
     /// Regression: `tools/boss/docs/postmortems/` is an established
@@ -1114,7 +1114,7 @@ mod tests {
             "headRefName": "boss/exec_postmortem_1",
             "baseRefName": "main",
         });
-        let scan = parse_pr_scan_matching(&root, is_project_less_doc_path, "label");
+        let scan = parse_pr_scan_matching(&root, is_per_task_doc_path, "label");
         assert_eq!(
             scan.doc_path.as_deref(),
             Some("tools/boss/docs/postmortems/incident-004-live-revision-workers-reaped-mid-turn.md")
@@ -1136,7 +1136,7 @@ mod tests {
 
     #[test]
     fn parse_pr_scan_matching_selects_single_investigation_doc() {
-        // The T1705 repro shape: one investigation doc among code files.
+        // The reported repro shape: one investigation doc among code files.
         let root = serde_json::json!({
             "files": files_json(&[
                 "tools/checkleft/runtime/tests.rs",
@@ -1145,7 +1145,7 @@ mod tests {
             "headRefName": "boss/exec_abc_1",
             "baseRefName": "main",
         });
-        let scan = parse_pr_scan_matching(&root, is_project_less_doc_path, "label");
+        let scan = parse_pr_scan_matching(&root, is_per_task_doc_path, "label");
         assert_eq!(
             scan.doc_path.as_deref(),
             Some("docs/investigations/checkleft-lib-test-wasm-compile-timeout.md")
@@ -1162,7 +1162,7 @@ mod tests {
                 "docs/investigations/probe.md",
             ]),
         });
-        let scan = parse_pr_scan_matching(&root, is_project_less_doc_path, "label");
+        let scan = parse_pr_scan_matching(&root, is_per_task_doc_path, "label");
         assert_eq!(scan.doc_path, None);
     }
 

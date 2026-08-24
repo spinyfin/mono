@@ -180,7 +180,7 @@ The two axes are orthogonal _in storage_ but constrained by **flavor-specific in
 | `investigation` | optional                      | NULL             | own PR                    | `investigation`                      |
 | `revision`      | inherited from parent         | **required**     | **NULL** (parent owns it) | `revision`                           |
 
-**`design` no longer requires a `project_id`, and the project-less case is deliberate, implemented, and tested.** `task_uses_per_task_doc(kind, has_project)` (`design_detector.rs:355-357`) returns `true` for `TaskKind::Investigation` and for `TaskKind::Design` _when it has no project_, routing such a row to the per-task `doc_*` pointer columns instead of the per-project design-doc pointer. Its own doc comment: "`true` … for project-less `kind = design` tasks (which have no project pointer to populate)." There is an explicit assertion for it at `design_detector.rs:1155`. The project-side path correspondingly requires `project_id.is_some()` (`completion/pr_transition.rs:269`).
+**`design` no longer requires a `project_id`, and the project-less case is deliberate, implemented, and tested.** Superseded by mono#2820: the former kind predicate was deleted and per-task doc pointers are now kind-independent, while project-level design-doc pointers still require `project_id.is_some()`.
 
 This is **Risk 6 of the original doc, materialized**. The original wrote: "If a future 'free-floating design' use case appears, the invariant must relax. Out of scope now." It appeared. The invariant must relax, and it is no longer a hypothetical.
 
@@ -188,7 +188,7 @@ Two invariant rows that did _not_ drift and remain load-bearing: `revision` inhe
 
 **Why orthogonal, not folded:** the issue brief recommends the orthogonal-axis model "unless there's a concrete reason not to," and there isn't one. Promotion is a `project_id` write that never touches `flavor`; the list surface becomes a filter over two independent dimensions instead of a partition over one conflated enum; and engine code that only cares about membership (`is this free-floating?`) tests `project_id IS NULL` without consulting the deliverable axis.
 
-Note also that `task_uses_per_task_doc` is _already a function of `(kind, has_project)`_ — the exact pair this design proposes to make first-class. The codebase reached for the two-axis predicate on its own where it needed it, which is independent corroboration of the orthogonality argument above.
+The former per-task doc predicate is no longer corroborating evidence for the two-axis model: mono#2820 removed it when per-task doc pointers became kind-independent. The storage and invariant arguments above stand independently of that retired implementation detail.
 
 ### Does the collapse still fit? Eight kinds, four flavors
 

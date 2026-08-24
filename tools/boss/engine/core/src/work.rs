@@ -539,7 +539,10 @@ pub(crate) use migrations_b::*;
 pub(crate) use migrations_boothby::*;
 pub(crate) use migrations_c::*;
 pub(crate) use pr_state::stored_pr_number;
-pub(crate) use products_design::{attach_task_doc_link_state, attach_task_doc_link_states, parse_pr_doc_artifact_id};
+pub(crate) use products_design::{
+    attach_task_doc_link_state, attach_task_doc_link_states, attach_task_doc_link_states_for_groups,
+    parse_pr_doc_artifact_id,
+};
 // Only the unit-test suite (and the resolver itself) call this directly;
 // production attach sites go through `attach_task_doc_link_state`.
 #[cfg(test)]

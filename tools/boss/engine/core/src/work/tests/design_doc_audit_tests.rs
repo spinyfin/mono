@@ -620,7 +620,7 @@ fn detector_populates_per_task_doc_for_every_kind() {
         let wrote = db
             .sync_task_doc_pointer_from_detector(&task.id, None, Some("boss/exec_kind"), "docs/investigations/foo.md")
             .unwrap();
-        assert!(wrote, "detector must write an empty pointer for kind={kind}");
+        assert!(wrote, "detector must write a pointer for kind={kind}");
 
         let by_id = leaf_task(db.get_work_item(&task.id).unwrap());
         assert_doc_link_resolved(
@@ -631,14 +631,25 @@ fn detector_populates_per_task_doc_for_every_kind() {
         );
 
         let tree = db.get_work_tree(&product.id).unwrap();
-        if let Some(found) = tree.tasks.iter().chain(tree.chores.iter()).find(|t| t.id == task.id) {
-            assert_doc_link_resolved(
-                found.doc_link_state.as_ref(),
-                "docs/investigations/foo.md",
-                "boss/exec_kind",
-                &format!("get_work_tree kind={kind}"),
+        if *kind == TaskKind::Task {
+            assert!(
+                tree.tasks.iter().chain(tree.chores.iter()).all(|t| t.id != task.id),
+                "get_work_tree intentionally excludes plain kind={kind}"
             );
+            continue;
         }
+        let found = tree
+            .tasks
+            .iter()
+            .chain(tree.chores.iter())
+            .find(|t| t.id == task.id)
+            .unwrap_or_else(|| panic!("get_work_tree must return kind={kind}"));
+        assert_doc_link_resolved(
+            found.doc_link_state.as_ref(),
+            "docs/investigations/foo.md",
+            "boss/exec_kind",
+            &format!("get_work_tree kind={kind}"),
+        );
     }
 }
 

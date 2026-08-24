@@ -1023,14 +1023,13 @@ impl WorkDb {
         // task are non-fatal — log and leave the field None (affordance
         // hidden).
         //
-        // N+1: `resolve_task_doc_pointer` is 1-3 queries each. `resolved`
-        // is the number of items this loop touched; `doc_pointer_queries`
-        // is the aggregate statement count, exposing the per-row fan-out
-        // the same way `db.task_runtimes` does.
+        // A single prefilter finds the rows with a pointer; each of those
+        // costs 1-3 resolution queries. `resolved` is the number of
+        // pointer-bearing items and `doc_pointer_queries` is the aggregate
+        // statement count, recorded alongside `db.task_runtimes`.
         let t = Instant::now();
-        let mut doc_pointer_queries = 0u64;
-        let mut resolved = attach_task_doc_link_states(&conn, &mut tasks, "get_work_tree", &mut doc_pointer_queries);
-        resolved += attach_task_doc_link_states(&conn, &mut chores, "get_work_tree", &mut doc_pointer_queries);
+        let (resolved, doc_pointer_queries) =
+            attach_task_doc_link_states_for_groups(&conn, &mut [&mut tasks[..], &mut chores[..]], "get_work_tree");
         trace.record_nplus1(segment::DB_DOC_POINTERS, elapsed_ms(t), resolved, doc_pointer_queries);
 
         Ok(WorkTree {
@@ -1511,8 +1510,7 @@ impl WorkDb {
                 &mut tasks,
             )?;
         }
-        let mut doc_pointer_queries = 0u64;
-        attach_task_doc_link_states(&conn, &mut tasks, "list_tasks", &mut doc_pointer_queries);
+        attach_task_doc_link_states(&conn, &mut tasks, "list_tasks");
         Ok(tasks)
     }
 
@@ -1634,8 +1632,7 @@ impl WorkDb {
                 &mut revisions,
             )?;
         }
-        let mut doc_pointer_queries = 0u64;
-        attach_task_doc_link_states(&conn, &mut revisions, "list_revisions", &mut doc_pointer_queries);
+        attach_task_doc_link_states(&conn, &mut revisions, "list_revisions");
         Ok(revisions)
     }
 
@@ -1667,8 +1664,7 @@ impl WorkDb {
                 &mut chores,
             )?;
         }
-        let mut doc_pointer_queries = 0u64;
-        attach_task_doc_link_states(&conn, &mut chores, "list_chores", &mut doc_pointer_queries);
+        attach_task_doc_link_states(&conn, &mut chores, "list_chores");
         Ok(chores)
     }
 

@@ -787,9 +787,10 @@ impl WorkDb {
     ///   `project_id = Some(...)`. This is the *project-level* design-doc
     ///   pointer, a separate concept from the per-task `doc_*` columns.
     ///
-    /// - **Per-task-doc tasks**: the task's own `doc_branch` is `NULL`.
-    ///   Independent of `kind` — any in-review work item with a PR may
-    ///   carry a per-task pointer. The caller should invoke
+    /// - **Per-task-doc tasks**: the task's own `doc_path` is set but
+    ///   `doc_branch` is `NULL`. Independent of `kind` — any in-review
+    ///   work item with a stored per-task pointer may need its branch
+    ///   backfilled. The caller should invoke
     ///   [`crate::design_detector::on_task_doc_pr_detected`]. `project_id`
     ///   is returned as `NULL` on this arm so the backfill dispatcher
     ///   routes to the per-task detector rather than the project one.
@@ -812,12 +813,16 @@ impl WorkDb {
                AND t.deleted_at IS NULL
                AND p.design_doc_branch IS NULL
              UNION ALL
-             -- Per-task doc pointer: every in-review work item with a PR.
+             -- Per-task doc pointer: every in-review work item with an
+             -- existing pointer. A project-design task can intentionally
+             -- appear in both arms because it owns independent project and
+             -- task-level pointers, each needing its own detector update.
              SELECT t.id, t.product_id, NULL, t.pr_url
              FROM tasks t
              WHERE t.status = 'in_review'
                AND t.pr_url IS NOT NULL
                AND t.deleted_at IS NULL
+               AND t.doc_path IS NOT NULL
                AND t.doc_branch IS NULL",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -852,20 +857,83 @@ pub(crate) fn attach_task_doc_link_state(conn: &Connection, task: &mut Task, cal
     }
 }
 
-/// Attach [`Task::doc_link_state`] for every item in `tasks`. Returns the
-/// number of items visited so N+1 callers (`get_work_tree`) can report
-/// an accurate `resolved` count.
-pub(crate) fn attach_task_doc_link_states(
-    conn: &Connection,
-    tasks: &mut [Task],
-    caller: &str,
-    queries: &mut u64,
-) -> usize {
-    let n = tasks.len();
-    for task in tasks {
-        attach_task_doc_link_state(conn, task, caller, queries);
+/// Attach [`Task::doc_link_state`] for items in `tasks` that have a
+/// per-task doc pointer. The one bulk query avoids resolving the absent
+/// pointer for every card returned by list and work-tree paths.
+pub(crate) fn attach_task_doc_link_states(conn: &Connection, tasks: &mut [Task], caller: &str) -> (usize, u64) {
+    let Some(product_id) = tasks.first().map(|task| task.product_id.as_str()) else {
+        return (0, 0);
+    };
+    let mut queries = 1;
+    let ids_with_pointers = match task_ids_with_doc_pointers(conn, product_id) {
+        Ok(ids) => ids,
+        Err(err) => {
+            tracing::warn!(
+                product_id,
+                ?err,
+                "{caller}: failed to prefilter task doc pointers; resolving all returned items"
+            );
+            let n = tasks.len();
+            for task in tasks {
+                attach_task_doc_link_state(conn, task, caller, &mut queries);
+            }
+            return (n, queries);
+        }
+    };
+    let n = tasks.iter().filter(|task| ids_with_pointers.contains(&task.id)).count();
+    for task in tasks.iter_mut().filter(|task| ids_with_pointers.contains(&task.id)) {
+        attach_task_doc_link_state(conn, task, caller, &mut queries);
     }
-    n
+    (n, queries)
+}
+
+/// Resolve doc-link states for several work-tree collections with one
+/// pointer prefilter query for their shared product.
+pub(crate) fn attach_task_doc_link_states_for_groups(
+    conn: &Connection,
+    groups: &mut [&mut [Task]],
+    caller: &str,
+) -> (usize, u64) {
+    let Some(product_id) = groups
+        .iter()
+        .find_map(|tasks| tasks.first().map(|task| task.product_id.as_str()))
+    else {
+        return (0, 0);
+    };
+    let mut queries = 1;
+    let ids_with_pointers = match task_ids_with_doc_pointers(conn, product_id) {
+        Ok(ids) => ids,
+        Err(err) => {
+            tracing::warn!(
+                product_id,
+                ?err,
+                "{caller}: failed to prefilter task doc pointers; resolving all returned items"
+            );
+            let mut n = 0;
+            for tasks in groups {
+                n += tasks.len();
+                for task in tasks.iter_mut() {
+                    attach_task_doc_link_state(conn, task, caller, &mut queries);
+                }
+            }
+            return (n, queries);
+        }
+    };
+    let mut n = 0;
+    for tasks in groups {
+        n += tasks.iter().filter(|task| ids_with_pointers.contains(&task.id)).count();
+        for task in tasks.iter_mut().filter(|task| ids_with_pointers.contains(&task.id)) {
+            attach_task_doc_link_state(conn, task, caller, &mut queries);
+        }
+    }
+    (n, queries)
+}
+
+fn task_ids_with_doc_pointers(conn: &Connection, product_id: &str) -> Result<HashSet<String>> {
+    let mut stmt =
+        conn.prepare("SELECT id FROM tasks WHERE product_id = ?1 AND doc_path IS NOT NULL AND deleted_at IS NULL")?;
+    let rows = stmt.query_map(params![product_id], |row| row.get::<_, String>(0))?;
+    Ok(collect_rows(rows)?.into_iter().collect())
 }
 
 /// Resolve a task's per-task doc pointer (`doc_*` columns) into a
@@ -1071,22 +1139,38 @@ fn find_design_task_by_project_doc_pointer(
 
 /// Match a project-less task's own `doc_repo_remote_url` / `doc_branch` /
 /// `doc_path` columns against `(repo, branch, path)` — the task-level
-/// analogue of [`find_design_task_by_project_doc_pointer`], covering
-/// investigations and project-less design tasks.
+/// analogue of [`find_design_task_by_project_doc_pointer`]. Per-task
+/// pointers are kind-independent, but doc-comment revisions can only be
+/// owned by designs and investigations, so those owners win collisions.
 fn find_task_by_doc_pointer(conn: &Connection, repo: &str, branch: &str, path: &str) -> Result<Option<String>> {
-    conn.query_row(
-        "SELECT id FROM tasks
+    let found: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT id, COUNT(*) OVER () FROM tasks
          WHERE doc_repo_remote_url = ?1
            AND doc_branch = ?2
            AND doc_path = ?3
            AND deleted_at IS NULL
-         ORDER BY created_at ASC, id ASC
+         ORDER BY (kind IN ('design', 'investigation')) DESC, created_at ASC, id ASC
          LIMIT 1",
-        params![repo, branch, path],
-        |row| row.get(0),
-    )
-    .optional()
-    .map_err(Into::into)
+            params![repo, branch, path],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((task_id, count)) = found {
+        if count > 1 {
+            tracing::warn!(
+                repo,
+                branch,
+                path,
+                matching_tasks = count,
+                selected_task_id = task_id,
+                "multiple tasks share a per-task doc pointer; preferring a revision-capable owner"
+            );
+        }
+        Ok(Some(task_id))
+    } else {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

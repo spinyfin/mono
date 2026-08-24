@@ -124,7 +124,7 @@ Key structural properties:
 `get_work_tree` issues a fixed handful of list queries **plus** a per-work-item fan-out:
 
 - `collect_task_runtimes` (`dispatch_helpers.rs:231`) loops over **every task + chore** returned by the two list queries and runs, per item: `query_latest_execution_for_work_item`; then (if the latest row isn't `running`/`waiting_human`) `query_live_execution_for_work_item`; then (if an execution exists) `query_latest_run`. On the real snapshot that's **2-3 queries x 1,908 items** (933 tasks incl. revisions + 975 chores - §3), not the 395 the original pass modeled.
-- A second loop resolves `resolve_task_doc_pointer` for each design/investigation (per-task-doc) item - cardinality unchanged from the original estimate (<=64, gated on `task_uses_per_task_doc`; `workitems.rs:363`), contributes a small, roughly-constant addition not separately re-measured here.
+- Superseded by mono#2820: the former kind predicate was deleted and per-task doc pointers are now kind-independent. The earlier <=64 bound no longer holds; the read path now prefilters rows with a non-null pointer in one query before resolving them.
 
 **Measured on `boss-real.db` for the real Boss-product population (1,908 items):**
 

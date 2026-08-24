@@ -8,7 +8,7 @@ import XCTest
 /// `ProjectDesignDocAffordancePresentation` design cards use, and taps
 /// route to `openWorkItemDoc` / `openTaskDoc`.
 @MainActor
-final class InvestigationDocLinkAffordanceTests: XCTestCase {
+final class WorkItemDocLinkAffordanceTests: XCTestCase {
     // MARK: - Presentation (icon renders from the per-task state)
 
     /// An investigation carrying a resolved `docLinkState` must produce a

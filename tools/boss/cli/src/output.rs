@@ -825,13 +825,6 @@ pub(crate) fn lint_summary_line(entries: &[LintDesignDocEntry]) -> String {
     format!("{} finding(s): {}", entries.len(), parts.join(", "))
 }
 
-/// Format the "Design doc:" line appended by `boss project show` /
-/// `boss project set-design-doc`. `None` means "no line should be
-/// emitted" — used by `Show` so the unset case stays silent rather
-/// than printing "Design doc: (not set)" on every project that
-/// hasn't been pointed yet. The set / broken cases produce a
-/// concrete line so the user can see at a glance which path the doc
-/// resolves to and whether the pointer is healthy.
 /// Table-cell rendering of a task's per-task doc pointer. Empty when
 /// unset so `print_tasks_table` can hide the DOC column until a row
 /// actually carries one.
@@ -843,6 +836,13 @@ fn task_doc_table_cell(task: &Task) -> String {
     }
 }
 
+/// Format the "Design doc:" line appended by `boss project show` /
+/// `boss project set-design-doc`. `None` means "no line should be
+/// emitted" — used by `Show` so the unset case stays silent rather
+/// than printing "Design doc: (not set)" on every project that
+/// hasn't been pointed yet. The set / broken cases produce a
+/// concrete line so the user can see at a glance which path the doc
+/// resolves to and whether the pointer is healthy.
 pub(crate) fn format_project_design_doc_line(state: &ProjectDesignDocState) -> Option<String> {
     match state {
         ProjectDesignDocState::NotSet => None,
