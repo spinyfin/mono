@@ -25,6 +25,7 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
     integrity-checkleft.sh    # mono-integrity: checkleft check
   README.md               # this file
   linux-agents-runbook.md # Linux bazel-any host config + maintenance runbook
+  gce-agent-runbook.md    # Standing up a new Linux CI agent on GCE
 ```
 
 ## Pipeline shape
@@ -55,7 +56,7 @@ Runs the `CHECKS.yaml` checks via `checkleft` (or the equivalent runner). Scoped
 
 ## Agents and queue
 
-Most steps run on the `bazel-any` queue (`${BUILDKITE_ANY_QUEUE:-bazel-any}` in `pipeline.yml`), a heterogeneous fleet mixing personal Macs and Linux cloud agents — see "Pushing from CI" below for why that matters. `mac-app-build` and `boss-release` pin to `macos-arm64` (`${BUILDKITE_MACOS_QUEUE:-macos-arm64}`) since they need a real Mac toolchain. Each step's `ci-env.sh` / inline setup handles toolchain provisioning (rust, bazel, pnpm) on whatever agent it lands on.
+Most steps run on the `bazel-any` queue (`${BUILDKITE_ANY_QUEUE:-bazel-any}` in `pipeline.yml`), a heterogeneous fleet mixing personal Macs and Linux cloud agents — see "Pushing from CI" below for why that matters. `mac-app-build` and `boss-release` pin to `macos-arm64` (`${BUILDKITE_MACOS_QUEUE:-macos-arm64}`) since they need a real Mac toolchain. Each step's `ci-env.sh` / inline setup handles hermetic Rust and Bazel provisioning; see [`gce-agent-runbook.md`](gce-agent-runbook.md) for the real Linux host requirements.
 
 For the Linux `bazel-any` hosts specifically — host inventory, the unprivileged-user-namespace requirement `linux-sandbox` depends on, the Bazel-server-restart procedure, and safe maintenance steps — see [`linux-agents-runbook.md`](linux-agents-runbook.md).
 

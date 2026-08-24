@@ -1,5 +1,7 @@
 # Linux CI agent host runbook
 
+For standing up a **new** Linux agent from scratch, including on GCE, see [`gce-agent-runbook.md`](gce-agent-runbook.md).
+
 This runbook documents the configuration of the Linux hosts backing the `bazel-any` Buildkite queue, and the maintenance procedures for touching them safely. It exists because a 2026-07-27 incident (below) cost hours to diagnose purely because none of this was written down anywhere durable — it lived only in a person's head and in an incident thread.
 
 Host facts here were verified against the live hosts (`ssh empiricist` / `ssh zoologist` / `ssh diziet` as the `bduff` user) and the live Buildkite agent registrations (`bk agent list`) on 2026-07-27, except where explicitly noted as unverified. There is **no passwordless sudo** on any of these hosts for the `bduff` account, so anything that requires root is called out explicitly in "Needs operator input" at the end rather than guessed.
