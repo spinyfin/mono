@@ -194,6 +194,7 @@ async fn attach_coordinator_to_registered_app(server_state: Arc<ServerState>) {
             return;
         }
     };
+    let legacy_tmux = boss_tmux::Tmux::for_legacy_label_server(tmux.program().to_path_buf()).ok();
     let working_directory = match crate::coordinator_tmux::coordinator_working_directory() {
         Ok(path) => path,
         Err(error) => {
@@ -201,10 +202,14 @@ async fn attach_coordinator_to_registered_app(server_state: Arc<ServerState>) {
             return;
         }
     };
-    let record = {
+    let (record, active_tmux) = {
         let _guard = server_state.coordinator_tmux_lock.lock().await;
-        match crate::coordinator_tmux::ensure_for_attach(
+        let active_tmux = crate::coordinator_tmux::resolve_active_handle(&tmux, legacy_tmux.as_ref())
+            .await
+            .clone();
+        let record = match crate::coordinator_tmux::ensure_for_attach(
             server_state.work_db.as_ref(),
+            &active_tmux,
             &tmux,
             &server_state.coordinator_model,
             &working_directory,
@@ -217,9 +222,10 @@ async fn attach_coordinator_to_registered_app(server_state: Arc<ServerState>) {
                 tracing::error!(error = %format!("{error:#}"), "failed to create or recover coordinator tmux session");
                 return;
             }
-        }
+        };
+        (record, active_tmux)
     };
-    request_coordinator_attachment(server_state, &tmux, record).await;
+    request_coordinator_attachment(server_state, &active_tmux, record).await;
 }
 
 pub(super) async fn request_coordinator_attachment(
@@ -594,10 +600,13 @@ pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequ
             return;
         }
     };
+    let legacy_tmux = boss_tmux::Tmux::for_legacy_label_server(tmux.program().to_path_buf()).ok();
     let replacement = {
         let _guard = server_state.coordinator_tmux_lock.lock().await;
+        let active_tmux = crate::coordinator_tmux::resolve_active_handle(&tmux, legacy_tmux.as_ref()).await;
         crate::coordinator_tmux::recreate_after_confirmation(
             server_state.work_db.as_ref(),
+            active_tmux,
             &tmux,
             &server_state.coordinator_model,
             &expected_spawn_token,
@@ -608,6 +617,10 @@ pub(super) async fn handle_recreate_coordinator(ctx: Dispatch, req: FrontendRequ
         .await
     };
     match replacement {
+        // The replacement is always freshly created on the durable socket
+        // (`recreate_after_confirmation`'s `create_tmux` argument, above) —
+        // it never lands on the legacy `-L boss` server, even when the old
+        // session being replaced did, so this attach always targets `tmux`.
         Ok(record) => request_coordinator_attachment(server_state, &tmux, record).await,
         Err(error) => send_response(
             &sink,

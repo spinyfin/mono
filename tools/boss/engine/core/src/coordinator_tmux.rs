@@ -75,14 +75,24 @@ impl ClaudeVersionProbe for RealClaudeVersionProbe {
 pub(crate) async fn ensure_for_attach(
     work_db: &WorkDb,
     tmux: &Tmux,
+    create_tmux: &Tmux,
     requested_model: &str,
     working_directory: &Path,
     version_probe: &dyn ClaudeVersionProbe,
 ) -> Result<CoordinatorTmuxRecord> {
     match work_db.coordinator_tmux_record()? {
-        None => start_new(work_db, tmux, requested_model, working_directory, version_probe).await,
+        None => start_new(work_db, create_tmux, requested_model, working_directory, version_probe).await,
         Some(record) => {
-            reconcile_existing(work_db, tmux, requested_model, record, working_directory, version_probe).await
+            reconcile_existing(
+                work_db,
+                tmux,
+                create_tmux,
+                requested_model,
+                record,
+                working_directory,
+                version_probe,
+            )
+            .await
         }
     }
 }
@@ -97,6 +107,7 @@ pub(crate) async fn ensure_for_attach(
 pub(crate) async fn restart_if_dead(
     work_db: &WorkDb,
     tmux: &Tmux,
+    create_tmux: &Tmux,
     requested_model: &str,
     working_directory: &Path,
     version_probe: &dyn ClaudeVersionProbe,
@@ -105,7 +116,7 @@ pub(crate) async fn restart_if_dead(
         return Ok(None);
     };
     if !session_exists(tmux, &record.session_name).await? {
-        return start_new(work_db, tmux, requested_model, working_directory, version_probe)
+        return start_new(work_db, create_tmux, requested_model, working_directory, version_probe)
             .await
             .map(Some);
     }
@@ -133,7 +144,7 @@ pub(crate) async fn restart_if_dead(
     tmux.kill_session_verified(&record.session_name, &record.spawn_token)
         .await
         .context("removing dead coordinator tmux session before restart")?;
-    start_new(work_db, tmux, requested_model, working_directory, version_probe)
+    start_new(work_db, create_tmux, requested_model, working_directory, version_probe)
         .await
         .map(Some)
 }
@@ -146,9 +157,11 @@ pub(crate) async fn restart_if_dead(
 /// automatic model-mismatch path and from a crash/session-loss restart
 /// (`restart_if_dead`/`reconcile_existing`), neither of which audits this
 /// event at all.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn recreate_after_confirmation(
     work_db: &WorkDb,
     tmux: &Tmux,
+    create_tmux: &Tmux,
     requested_model: &str,
     expected_spawn_token: &str,
     working_directory: &Path,
@@ -158,6 +171,7 @@ pub(crate) async fn recreate_after_confirmation(
     let result = recreate_after_confirmation_inner(
         work_db,
         tmux,
+        create_tmux,
         requested_model,
         expected_spawn_token,
         working_directory,
@@ -190,6 +204,7 @@ pub(crate) async fn recreate_after_confirmation(
 async fn recreate_after_confirmation_inner(
     work_db: &WorkDb,
     tmux: &Tmux,
+    create_tmux: &Tmux,
     requested_model: &str,
     expected_spawn_token: &str,
     working_directory: &Path,
@@ -212,12 +227,13 @@ async fn recreate_after_confirmation_inner(
             None => bail!("coordinator tmux session exists without the metadata singleton token"),
         }
     }
-    start_new(work_db, tmux, requested_model, working_directory, version_probe).await
+    start_new(work_db, create_tmux, requested_model, working_directory, version_probe).await
 }
 
 async fn reconcile_existing(
     work_db: &WorkDb,
     tmux: &Tmux,
+    create_tmux: &Tmux,
     requested_model: &str,
     mut record: CoordinatorTmuxRecord,
     working_directory: &Path,
@@ -227,7 +243,7 @@ async fn reconcile_existing(
         // Covers both crash windows in which metadata was committed but
         // `new-session` never happened, and normal session loss. No live
         // conversation remains, so recreation is non-destructive.
-        return start_new(work_db, tmux, requested_model, working_directory, version_probe).await;
+        return start_new(work_db, create_tmux, requested_model, working_directory, version_probe).await;
     }
     let live_token = tmux.show_environment(&record.session_name, SPAWN_TOKEN_ENV).await?;
     match live_token {
@@ -244,7 +260,7 @@ async fn reconcile_existing(
                 tmux.kill_session_verified(&record.session_name, &record.spawn_token)
                     .await
                     .context("removing dead coordinator tmux session before restart")?;
-                return start_new(work_db, tmux, requested_model, working_directory, version_probe).await;
+                return start_new(work_db, create_tmux, requested_model, working_directory, version_probe).await;
             }
             // Live matching-token sessions are left alone (including
             // model mismatches, which the app surfaces for confirmation).
@@ -314,6 +330,53 @@ async fn seed_claude_version_baseline_if_missing(
 
 async fn session_exists(tmux: &Tmux, name: &str) -> Result<bool> {
     Ok(tmux.list_sessions().await?.iter().any(|session| session.name == name))
+}
+
+/// Resolve which tmux server currently hosts the coordinator session:
+/// `socket_tmux` (the durable `-S` socket) unless a live
+/// [`COORDINATOR_SESSION_NAME`] session survives on the pre-move `-L boss`
+/// server, in which case `legacy_tmux`.
+///
+/// Every coordinator lifecycle entry point (`ensure_for_attach`,
+/// `restart_if_dead`, `recreate_after_confirmation`) takes a single `&Tmux`
+/// and, before this routing existed, every caller always passed the socket
+/// handle. That meant `session_exists(tmux, ...)` reported "absent" for a
+/// coordinator the boot-time drain had adopted on the legacy server (it
+/// lives on a different server entirely), so the supervisor's restart loop
+/// would spawn a brand-new coordinator on the socket on top of the still-live
+/// legacy one — two agents driving the same `state.db`. Calling this once,
+/// before invoking any lifecycle function, and passing its result through
+/// for that call routes every check (`session_exists`, `show_environment`,
+/// `kill_session_verified`, `new_session`) at the server that actually holds
+/// the session, so the legacy coordinator is recovered/replaced in place
+/// rather than shadowed by a second one.
+///
+/// `legacy_tmux` is `None` when the caller could not build a legacy handle
+/// (e.g. no resolved tmux executable yet) — in that case this always
+/// returns `socket_tmux`, matching the engine's pre-migration behavior.
+pub(crate) async fn resolve_active_handle<'a>(socket_tmux: &'a Tmux, legacy_tmux: Option<&'a Tmux>) -> &'a Tmux {
+    let Some(legacy) = legacy_tmux else {
+        return socket_tmux;
+    };
+    match session_exists(legacy, COORDINATOR_SESSION_NAME).await {
+        Ok(true) => {
+            tracing::warn!(
+                "coordinator tmux: a live coordinator session survives on the pre-move -L boss server; \
+                 routing this lifecycle call through it instead of the durable socket so the engine does \
+                 not spawn a second live coordinator on top of it",
+            );
+            legacy
+        }
+        Ok(false) => socket_tmux,
+        Err(err) => {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                "coordinator tmux: failed to probe the legacy -L boss server for a surviving coordinator \
+                 session (best-effort); assuming it is not there",
+            );
+            socket_tmux
+        }
+    }
 }
 
 /// Read the detached coordinator pane's real pid for the engine's trust
@@ -853,6 +916,12 @@ mod tests {
         (tmux, server)
     }
 
+    fn legacy_tmux_for(server: FakeTmux) -> (Tmux, Arc<FakeTmux>) {
+        let server = Arc::new(server);
+        let tmux = Tmux::for_legacy_label_server_with_runner("/usr/bin/tmux", server.clone()).unwrap();
+        (tmux, server)
+    }
+
     fn send_keys_calls(calls: &[Vec<String>]) -> Vec<&Vec<String>> {
         calls
             .iter()
@@ -882,10 +951,80 @@ mod tests {
         );
     }
 
+    // --- legacy-server routing (`resolve_active_handle`) ---
+
+    #[tokio::test]
+    async fn resolve_active_handle_prefers_socket_when_no_legacy_coordinator_survives() {
+        let (socket_tmux, _socket_server) = tmux_for(FakeTmux::new(vec![], None, "0"));
+        let (legacy_tmux, _legacy_server) = legacy_tmux_for(FakeTmux::new(vec![], None, "0"));
+
+        let resolved = resolve_active_handle(&socket_tmux, Some(&legacy_tmux)).await;
+        assert_eq!(resolved.operator_prefix(), socket_tmux.operator_prefix());
+    }
+
+    #[tokio::test]
+    async fn resolve_active_handle_routes_to_the_legacy_server_when_a_coordinator_survives_there() {
+        let (socket_tmux, socket_server) = tmux_for(FakeTmux::new(vec![], None, "0"));
+        let (legacy_tmux, _legacy_server) =
+            legacy_tmux_for(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("legacy-token"), "0"));
+
+        let resolved = resolve_active_handle(&socket_tmux, Some(&legacy_tmux)).await;
+        assert_eq!(
+            resolved.operator_prefix(),
+            format!("tmux -L {}", boss_tmux::SERVER_LABEL),
+            "a coordinator surviving on -L boss must be routed to instead of the durable socket",
+        );
+        assert!(
+            socket_server.calls().is_empty(),
+            "resolving which handle to use must never itself probe the socket server",
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_active_handle_falls_back_to_socket_with_no_legacy_handle() {
+        let (socket_tmux, _socket_server) = tmux_for(FakeTmux::new(vec![], None, "0"));
+        let resolved = resolve_active_handle(&socket_tmux, None).await;
+        assert_eq!(resolved.operator_prefix(), socket_tmux.operator_prefix());
+    }
+
+    /// A live coordinator surviving on the legacy server must be recovered
+    /// in place — options reapplied against `-L boss` — never shadowed by a
+    /// second coordinator spawned fresh on the durable socket.
+    #[tokio::test]
+    async fn ensure_for_attach_recovers_a_legacy_coordinator_without_spawning_a_second_one() {
+        let (db, socket_tmux, socket_server, dir) = fixture(FakeTmux::new(vec![], None, "0"));
+        db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "legacy-token", "opus", None)
+            .unwrap();
+        db.record_coordinator_tmux_session_created("legacy-token").unwrap();
+        let (legacy_tmux, legacy_server) =
+            legacy_tmux_for(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("legacy-token"), "0"));
+
+        let active_tmux = resolve_active_handle(&socket_tmux, Some(&legacy_tmux)).await;
+        let record = ensure_for_attach(&db, active_tmux, &socket_tmux, "opus", dir.path(), &NoneProbe)
+            .await
+            .unwrap();
+
+        assert_eq!(record.spawn_state, "created");
+        assert!(
+            socket_server
+                .calls()
+                .iter()
+                .all(|call| call.get(2).map(String::as_str) != Some("new-session")),
+            "the durable socket must never see a new-session call while the legacy coordinator is live",
+        );
+        assert!(
+            legacy_server
+                .calls()
+                .iter()
+                .any(|call| call.get(2).map(String::as_str) == Some("set-option")),
+            "the legacy session's options must be reapplied in place",
+        );
+    }
+
     #[tokio::test]
     async fn ensure_without_record_writes_intent_before_new_session_and_mirrors_options() {
         let (db, tmux, server, dir) = fixture(FakeTmux::new(vec![], None, "0"));
-        let record = ensure_for_attach(&db, &tmux, "opus", dir.path(), &NoneProbe)
+        let record = ensure_for_attach(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe)
             .await
             .unwrap();
         assert_eq!(record.spawn_state, "created");
@@ -914,7 +1053,7 @@ mod tests {
     #[tokio::test]
     async fn new_session_records_the_injected_claude_version_without_a_real_probe() {
         let (db, tmux, _server, dir) = fixture(FakeTmux::new(vec![], None, "0"));
-        let record = ensure_for_attach(&db, &tmux, "opus", dir.path(), &FixedProbe("2.1.237"))
+        let record = ensure_for_attach(&db, &tmux, &tmux, "opus", dir.path(), &FixedProbe("2.1.237"))
             .await
             .unwrap();
         assert_eq!(record.launched_claude_version.as_deref(), Some("2.1.237"));
@@ -934,7 +1073,7 @@ mod tests {
             )
             .unwrap();
 
-        let adopted = ensure_for_attach(&db, &tmux, "opus", dir.path(), &FixedProbe("2.1.238"))
+        let adopted = ensure_for_attach(&db, &tmux, &tmux, "opus", dir.path(), &FixedProbe("2.1.238"))
             .await
             .unwrap();
         assert_eq!(adopted.launched_claude_version.as_deref(), Some("2.1.238"));
@@ -948,7 +1087,7 @@ mod tests {
             "adoption persists its current-version baseline"
         );
 
-        let later_adopt = ensure_for_attach(&db, &tmux, "opus", dir.path(), &FixedProbe("2.1.239"))
+        let later_adopt = ensure_for_attach(&db, &tmux, &tmux, "opus", dir.path(), &FixedProbe("2.1.239"))
             .await
             .unwrap();
         assert_eq!(
@@ -972,7 +1111,7 @@ mod tests {
             )
             .unwrap();
 
-        let adopted = ensure_for_attach(&db, &tmux, "opus", dir.path(), &NoneProbe)
+        let adopted = ensure_for_attach(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe)
             .await
             .unwrap();
         assert_eq!(
@@ -984,7 +1123,7 @@ mod tests {
             "the baseline must still read as missing after a failed probe"
         );
 
-        let retried = ensure_for_attach(&db, &tmux, "opus", dir.path(), &FixedProbe("2.1.238"))
+        let retried = ensure_for_attach(&db, &tmux, &tmux, "opus", dir.path(), &FixedProbe("2.1.238"))
             .await
             .unwrap();
         assert_eq!(
@@ -999,7 +1138,7 @@ mod tests {
         let (db, tmux, server, dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
         db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus", None)
             .unwrap();
-        let record = ensure_for_attach(&db, &tmux, "opus", dir.path(), &NoneProbe)
+        let record = ensure_for_attach(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe)
             .await
             .unwrap();
         assert_eq!(record.spawn_state, "created");
@@ -1030,7 +1169,7 @@ mod tests {
             .unwrap();
         db.record_coordinator_tmux_session_created("token").unwrap();
 
-        ensure_for_attach(&db, &tmux, "opus", dir.path(), &NoneProbe)
+        ensure_for_attach(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe)
             .await
             .unwrap();
 
@@ -1050,7 +1189,7 @@ mod tests {
             .unwrap();
         db.record_coordinator_tmux_session_created("token").unwrap();
 
-        let replacement = restart_if_dead(&db, &tmux, "opus", dir.path(), &NoneProbe)
+        let replacement = restart_if_dead(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe)
             .await
             .unwrap();
         assert!(replacement.is_none(), "a live session must not force reattach");
@@ -1063,7 +1202,7 @@ mod tests {
         db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "token", "opus", None)
             .unwrap();
         db.record_coordinator_tmux_session_created("token").unwrap();
-        ensure_for_attach(&db, &tmux, "opus", dir.path(), &NoneProbe)
+        ensure_for_attach(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe)
             .await
             .unwrap();
         let calls = server.calls();
@@ -1085,7 +1224,7 @@ mod tests {
             .unwrap();
         db.record_coordinator_tmux_session_created("token").unwrap();
         assert!(
-            ensure_for_attach(&db, &tmux, "opus", dir.path(), &NoneProbe)
+            ensure_for_attach(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe)
                 .await
                 .is_err()
         );
@@ -1106,7 +1245,7 @@ mod tests {
             .unwrap();
         db.record_coordinator_tmux_session_created("token").unwrap();
 
-        let record = ensure_for_attach(&db, &tmux, "sonnet", dir.path(), &NoneProbe)
+        let record = ensure_for_attach(&db, &tmux, &tmux, "sonnet", dir.path(), &NoneProbe)
             .await
             .unwrap();
 
@@ -1124,7 +1263,7 @@ mod tests {
     async fn unprepared_working_directory_bails_before_new_session() {
         let (db, tmux, server, _dir) = fixture(FakeTmux::new(vec![], None, "0"));
         let missing = PathBuf::from("/tmp/boss-coordinator-session-does-not-exist");
-        let err = ensure_for_attach(&db, &tmux, "opus", &missing, &NoneProbe)
+        let err = ensure_for_attach(&db, &tmux, &tmux, "opus", &missing, &NoneProbe)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not prepared"), "unexpected error: {err:#}");
@@ -1143,6 +1282,7 @@ mod tests {
         assert!(
             recreate_after_confirmation(
                 &db,
+                &tmux,
                 &tmux,
                 "sonnet",
                 "stale",
@@ -1207,6 +1347,7 @@ mod tests {
         let record = recreate_after_confirmation(
             &db,
             &tmux,
+            &tmux,
             "opus",
             "token",
             dir.path(),
@@ -1260,6 +1401,7 @@ mod tests {
         let record = recreate_after_confirmation(
             &db,
             &tmux,
+            &tmux,
             "sonnet",
             "token",
             dir.path(),
@@ -1309,6 +1451,7 @@ mod tests {
         recreate_after_confirmation(
             &db,
             &tmux,
+            &tmux,
             "opus",
             "token",
             dir.path(),
@@ -1336,6 +1479,7 @@ mod tests {
 
         recreate_after_confirmation(
             &db,
+            &tmux,
             &tmux,
             "opus",
             "token",
@@ -1370,6 +1514,7 @@ mod tests {
         let err = recreate_after_confirmation(
             &db,
             &tmux,
+            &tmux,
             "opus",
             "token",
             &missing,
@@ -1390,7 +1535,7 @@ mod tests {
         std::fs::write(dir.path().join(RENDERED_PROMPT_FILENAME), "prompt v1").unwrap();
 
         let (tmux, server) = tmux_for(FakeTmux::new(vec![], None, "0"));
-        ensure_for_attach(&db, &tmux, "opus", dir.path(), &NoneProbe)
+        ensure_for_attach(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe)
             .await
             .unwrap();
 
@@ -1412,7 +1557,7 @@ mod tests {
         std::fs::write(dir.path().join(RENDERED_PROMPT_FILENAME), "prompt v1").unwrap();
 
         let (tmux, _server) = tmux_for(FakeTmux::new(vec![], None, "0"));
-        let created = ensure_for_attach(&db, &tmux, "opus", dir.path(), &NoneProbe)
+        let created = ensure_for_attach(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe)
             .await
             .unwrap();
 
@@ -1423,7 +1568,7 @@ mod tests {
             Some(&created.spawn_token),
             "0",
         ));
-        ensure_for_attach(&db, &tmux, "opus", dir.path(), &NoneProbe)
+        ensure_for_attach(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe)
             .await
             .unwrap();
 
@@ -1447,7 +1592,7 @@ mod tests {
         assert_eq!(db.get_metadata(PROMPT_NUDGE_HASH_KEY).unwrap(), None);
 
         let (tmux, server) = tmux_for(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
-        ensure_for_attach(&db, &tmux, "opus", dir.path(), &NoneProbe)
+        ensure_for_attach(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe)
             .await
             .unwrap();
 
@@ -1469,7 +1614,7 @@ mod tests {
         std::fs::write(dir.path().join(RENDERED_PROMPT_FILENAME), "prompt v1").unwrap();
 
         let (tmux, _server) = tmux_for(FakeTmux::new(vec![], None, "0"));
-        let created = ensure_for_attach(&db, &tmux, "opus", dir.path(), &NoneProbe)
+        let created = ensure_for_attach(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe)
             .await
             .unwrap();
 
@@ -1479,7 +1624,7 @@ mod tests {
             Some(&created.spawn_token),
             "0",
         ));
-        ensure_for_attach(&db, &tmux, "opus", dir.path(), &NoneProbe)
+        ensure_for_attach(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe)
             .await
             .unwrap();
 
@@ -1508,7 +1653,7 @@ mod tests {
         std::fs::write(dir.path().join(RENDERED_PROMPT_FILENAME), "prompt v1").unwrap();
 
         let (tmux, _server) = tmux_for(FakeTmux::new(vec![], None, "0"));
-        let created = ensure_for_attach(&db, &tmux, "opus", dir.path(), &NoneProbe)
+        let created = ensure_for_attach(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe)
             .await
             .unwrap();
 
@@ -1518,7 +1663,7 @@ mod tests {
             Some(&created.spawn_token),
             "0",
         ));
-        ensure_for_attach(&db, &tmux, "opus", dir.path(), &NoneProbe)
+        ensure_for_attach(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe)
             .await
             .unwrap();
 
@@ -1528,7 +1673,7 @@ mod tests {
             Some(&created.spawn_token),
             "0",
         ));
-        ensure_for_attach(&db, &tmux, "opus", dir.path(), &NoneProbe)
+        ensure_for_attach(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe)
             .await
             .unwrap();
 
@@ -1545,7 +1690,7 @@ mod tests {
         std::fs::write(dir.path().join(RENDERED_PROMPT_FILENAME), "prompt v1").unwrap();
 
         let (tmux, _server) = tmux_for(FakeTmux::new(vec![], None, "0"));
-        let created = ensure_for_attach(&db, &tmux, "opus", dir.path(), &NoneProbe)
+        let created = ensure_for_attach(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe)
             .await
             .unwrap();
         let hash_v1 = hash_rendered_prompt(dir.path()).unwrap();
@@ -1558,7 +1703,7 @@ mod tests {
             "0",
             true,
         ));
-        ensure_for_attach(&db, &tmux, "opus", dir.path(), &NoneProbe)
+        ensure_for_attach(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe)
             .await
             .unwrap();
         assert!(
@@ -1578,7 +1723,7 @@ mod tests {
             Some(&created.spawn_token),
             "0",
         ));
-        ensure_for_attach(&db, &tmux, "opus", dir.path(), &NoneProbe)
+        ensure_for_attach(&db, &tmux, &tmux, "opus", dir.path(), &NoneProbe)
             .await
             .unwrap();
         assert_eq!(

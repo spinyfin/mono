@@ -79,7 +79,7 @@ impl ServerState {
                 return self.reap_tmux_worker_with(&tmux, execution_id, &identity).await;
             }
         }
-        let tmux = match Tmux::resolve(&self.tmux_socket_path) {
+        let socket_tmux = match Tmux::resolve(&self.tmux_socket_path) {
             Ok(tmux) => tmux,
             Err(err) => {
                 tracing::error!(
@@ -88,6 +88,20 @@ impl ServerState {
                     error = %format!("{err:#}"),
                     "reap_tmux_worker: tmux unresolvable; cannot verify or destroy the recorded session — \
                      leaving the identity columns for a retry",
+                );
+                return TmuxTeardownOutcome::Refused;
+            }
+        };
+        let tmux = match self.tmux_for_run(&socket_tmux, &identity.server_label) {
+            Ok(tmux) => tmux,
+            Err(err) => {
+                tracing::error!(
+                    execution_id,
+                    session = %identity.session_name,
+                    server_label = %identity.server_label,
+                    error = %format!("{err:#}"),
+                    "reap_tmux_worker: could not build a handle for the recorded server; leaving the \
+                     identity columns for a retry",
                 );
                 return TmuxTeardownOutcome::Refused;
             }

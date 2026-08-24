@@ -421,7 +421,7 @@ impl ServerState {
     async fn send_interrupt_key(&self, run_id: &str, slot_id: u8, key: &str) -> Result<u8, InterruptPaneError> {
         match self.worker_registry.pane_for_run(run_id) {
             Some(pane) if pane.tmux_session_name.is_some() || pane.tmux_hosted => match pane.tmux_session_name {
-                Some(session_name) => match self.tmux_for_pane_delivery() {
+                Some(session_name) => match self.tmux_for_pane_delivery(run_id) {
                     Ok(tmux) => tmux
                         .send_key(&session_name, key)
                         .await

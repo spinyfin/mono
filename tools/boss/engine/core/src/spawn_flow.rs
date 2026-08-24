@@ -1193,7 +1193,14 @@ mod tests {
         );
         assert_eq!(
             calls[2],
-            vec!["-S", boss_tmux::TEST_SOCKET_PATH, "set-option", "-s", "extended-keys", "on"]
+            vec![
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
+                "set-option",
+                "-s",
+                "extended-keys",
+                "on"
+            ]
         );
         assert_eq!(
             &calls[3][..6],

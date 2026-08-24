@@ -198,6 +198,16 @@ pub trait WorkerTerminalInspector: Send + Sync {
     fn operator_prefix(&self) -> String {
         format!("tmux -S {}", boss_tmux::TEST_SOCKET_PATH)
     }
+
+    /// Operator-facing `tmux …` prefix for `execution_id`'s specific run —
+    /// the durable socket, unless that run's recorded identity still lives
+    /// on the pre-move `-L boss` server, in which case a command addressed
+    /// there instead. Defaults to [`Self::operator_prefix`] for implementors
+    /// (including test stubs) that never route by run.
+    fn operator_prefix_for_run(&self, execution_id: &str) -> String {
+        let _ = execution_id;
+        self.operator_prefix()
+    }
 }
 
 /// Production tmux inspector. A run without tmux identity returns `None` so
@@ -230,6 +240,13 @@ impl TmuxWorkerTerminalInspector {
 impl WorkerTerminalInspector for TmuxWorkerTerminalInspector {
     fn operator_prefix(&self) -> String {
         self.tmux.operator_prefix()
+    }
+
+    fn operator_prefix_for_run(&self, execution_id: &str) -> String {
+        match self.work_db.tmux_run_for_execution(execution_id) {
+            Ok(Some(run)) => self.tmux_for_run(&run.tmux_server_label).operator_prefix(),
+            Ok(None) | Err(_) => self.tmux.operator_prefix(),
+        }
     }
 
     async fn inspect(&self, execution_id: &str) -> Result<Option<TerminalLiveness>> {
@@ -629,6 +646,10 @@ pub async fn run_one_pass_with_terminal(
             None => None,
         };
         if let Some(terminal) = terminal {
+            // `terminal` is only ever `Some` when `terminal_inspector` produced
+            // it (the `None => None` arm above), so an inspector is always
+            // available here — never fall back to a fabricated tmux prefix.
+            let inspector = terminal_inspector.expect("terminal evidence implies an inspector produced it");
             if let TerminalLiveness::Alive {
                 foreground_command_mismatch: true,
                 ..
@@ -660,10 +681,10 @@ pub async fn run_one_pass_with_terminal(
                     window_activity_epoch_secs,
                 } => {
                     outcome.genuinely_stuck += 1;
-                    let attach_cmd = match terminal_inspector {
-                        Some(inspector) => format!("{} attach -t {session_name}", inspector.operator_prefix()),
-                        None => format!("tmux -S {} attach -t {session_name}", boss_tmux::TEST_SOCKET_PATH),
-                    };
+                    let attach_cmd = format!(
+                        "{} attach -t {session_name}",
+                        inspector.operator_prefix_for_run(&state.run_id)
+                    );
                     let body = format!(
                         "Worker execution `{}` has had no hook or pane output for more than {} seconds while its agent remains the foreground command. The session is still live, so Boss did not reap it.\n\nSession: `{session_name}`\n\nLast pane output: {}\n\nInspect it with:\n\n```sh\n{attach_cmd}\n```",
                         state.run_id,
@@ -2431,6 +2452,82 @@ mod tests {
                 agent_is_foreground: false,
                 foreground_command_mismatch: true,
             })
+        );
+    }
+
+    /// [`TmuxWorkerTerminalInspector::tmux_for_run`] routing: a run recorded
+    /// with the literal legacy label must be inspected against the `-L boss`
+    /// server, never the durable socket — the correctness gap a
+    /// legacy-adopted worker's liveness probe would otherwise hit.
+    #[tokio::test]
+    async fn inspector_routes_legacy_labeled_run_to_the_label_server() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = create_old_execution(&db, &work_item_id);
+        // Explicitly record the legacy label — mirrors what the boot drain
+        // adopts a surviving `-L boss` session with.
+        db.start_execution_run(&execution_id, "worker-1", "repo-1", "lease-1", "ws-1", "/tmp/ws")
+            .unwrap();
+        assert!(
+            db.record_tmux_spawn_intent_for_execution(&execution_id, boss_tmux::SERVER_LABEL, "boss-worker-1", "tok-1")
+                .unwrap()
+        );
+        assert!(
+            db.record_tmux_session_created_for_execution(&execution_id, "tok-1", 4242)
+                .unwrap()
+        );
+
+        let legacy_server = std::sync::Arc::new(
+            ScriptedTmux::new()
+                .with_session("boss-worker-1", "tok-1")
+                .with_field("boss-worker-1", "#{pane_dead}", "0")
+                .with_field("boss-worker-1", "#{window_activity}", "9000")
+                .with_field("boss-worker-1", "#{pane_current_command}", CLASSIFIER_DRIVER_BINARY),
+        );
+        let socket_server = std::sync::Arc::new(ScriptedTmux::new());
+        let socket_tmux = Tmux::with_runner_and_socket(
+            "/opt/homebrew/bin/tmux",
+            std::sync::Arc::clone(&socket_server) as std::sync::Arc<dyn boss_tmux::CommandRunner>,
+            boss_tmux::TEST_SOCKET_PATH,
+        )
+        .unwrap();
+        let legacy_tmux = Tmux::for_legacy_label_server_with_runner(
+            "/opt/homebrew/bin/tmux",
+            std::sync::Arc::clone(&legacy_server) as std::sync::Arc<dyn boss_tmux::CommandRunner>,
+        )
+        .unwrap();
+        let inspector = TmuxWorkerTerminalInspector::new(std::sync::Arc::new(db), socket_tmux, Some(legacy_tmux));
+
+        let verdict = inspector.inspect(&execution_id).await.unwrap();
+        assert_eq!(
+            verdict,
+            Some(TerminalLiveness::Alive {
+                session_name: "boss-worker-1".to_owned(),
+                window_activity_epoch_secs: 9000,
+                agent_is_foreground: true,
+                foreground_command_mismatch: false,
+            }),
+            "the run must be inspected against the legacy server, not the socket",
+        );
+        assert!(
+            socket_server.calls().is_empty(),
+            "a legacy-labeled run must never be probed against the durable socket",
+        );
+        assert!(
+            legacy_server
+                .calls()
+                .iter()
+                .any(|call| call[0] == "-L" && call[1] == boss_tmux::SERVER_LABEL),
+            "expected at least one -L boss call, got {:?}",
+            legacy_server.calls(),
+        );
+
+        let prefix = inspector.operator_prefix_for_run(&execution_id);
+        assert_eq!(
+            prefix,
+            format!("tmux -L {}", boss_tmux::SERVER_LABEL),
+            "the operator-facing prefix for a legacy-labeled run must also address -L boss",
         );
     }
 }
