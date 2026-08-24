@@ -17,6 +17,7 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
     bazel-build-test.sh    # bazel build //... then bazel test //... (one agent, reuses build outputs)
     mac-app-build.sh       # macOS app build
     checks.sh              # CHECKS.yaml runner (checkleft, no-generated-artifacts, etc.)
+    ensure-node.sh         # sourced by checkleft steps: pin Node >= 22 when host npx is missing
     boss-release.sh        # boss release (main only, macos-arm64)
     checkleft-release.sh   # checkleft prebuilt-binary release (prepare/linux/musl/darwin phases)
     ci-env.sh              # shared env/toolchain setup sourced by other steps
@@ -52,7 +53,7 @@ Runs `bazel build //...` then `bazel test //...` in one step, on one agent. The 
 
 ### `checks.sh`
 
-Runs the `CHECKS.yaml` checks via `checkleft` (or the equivalent runner). Scoped to changed paths on PR builds. Does not invoke `jj`; base-ref detection uses git. Calls `ensure_npx` so checkleft's npm-provisioned checks (`format/oxc` and friends) still run on a `bazel-any` agent that has no Node on PATH: well-known install dirs first, then a pinned Node 24.8.0 tarball cached under `$HOME/.cache/mono-ci-node` or `/mnt/ssd/mono-ci-node`.
+Runs the `CHECKS.yaml` checks via `checkleft` (or the equivalent runner). Scoped to changed paths on PR builds. Does not invoke `jj`; base-ref detection uses git. Sources `ensure-node.sh` so `format/oxc` / `lint/oxc` have Node >= 22 (`npx`) even on Linux agents that do not install Node as a host package, then calls the shared `ensure_npx` fallback from `ci-env.sh` to retain the existing cache and well-known-install-directory recovery path.
 
 ## Agents and queue
 

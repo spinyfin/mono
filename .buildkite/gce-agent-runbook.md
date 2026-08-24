@@ -45,7 +45,7 @@ build-essential git perl python3 unzip zip jq curl ca-certificates gnupg patch c
 - `patch` — `MODULE.bazel` patches `rules_rust` and `rules_apple`.
 - `pkg-config` + `libssl-dev` — **flunge only, not mono.** The `openssl-sys` crate's build script shells out to `pkg-config` and fails with exit code 101 without it. The error names only `pkg-config` because that check runs first; installing it alone gets you the missing-headers failure next.
 
-**Not needed:** Node, pnpm, npm (zero references in the build graph, no `package.json`). Not rustup either — Rust comes hermetically from `rules_rust`.
+**Not a host package:** rustup — Rust comes hermetically from `rules_rust`. Node/npm/pnpm are also not bazel-graph dependencies (no `package.json`), but **checkleft still needs Node >= 22 on PATH**: `format/oxc` and `lint/oxc` provision `oxfmt`/`oxlint` via `npx --yes <package>@<version>`. Do not apt-install Ubuntu's `nodejs` package (too old). The `checks` and integrity-checkleft steps source `steps/ensure-node.sh`, which downloads a pinned official Node tarball into the agent user's cache when `npx` is missing or too old, so a host without Node still runs those steps. Installing Node >= 22 on the host is optional and only skips that download.
 
 **Expect more of these.** The base list was derived from mono's graph. Any `-sys` crate in another pipeline can want a system library the image lacks. Read the build script's stderr; it names the package.
 
