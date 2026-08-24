@@ -550,10 +550,46 @@ pub(crate) fn attach_has_attachments_flag(
         .filter(|id| candidate_ids.contains(id.as_str()))
         .collect();
 
-    if own_attachments.is_empty() {
+    apply_has_attachments_flag(tasks, chores, &own_attachments);
+    Ok(())
+}
+
+/// Like [`attach_has_attachments_flag`], but queries only the supplied
+/// candidate rows. This is for single-row projections, whose revision-chain
+/// slices are small enough that keyed lookups beat a board-wide index scan.
+fn attach_has_attachments_flag_for_ids(
+    conn: &Connection,
+    tasks: &mut [Task],
+    chores: &mut [Task],
+) -> rusqlite::Result<()> {
+    let candidate_ids: Vec<&str> = tasks.iter().chain(chores.iter()).map(|task| task.id.as_str()).collect();
+    if candidate_ids.is_empty() {
         return Ok(());
     }
 
+    let placeholders = candidate_ids
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("?{}", index + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("SELECT DISTINCT work_item_id FROM work_attachments WHERE work_item_id IN ({placeholders})");
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> = candidate_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let own_attachments: std::collections::HashSet<String> = stmt
+        .query_map(params.as_slice(), |row| row.get::<_, String>(0))?
+        .filter_map(|row| row.ok())
+        .collect();
+
+    apply_has_attachments_flag(tasks, chores, &own_attachments);
+    Ok(())
+}
+
+fn apply_has_attachments_flag(
+    tasks: &mut [Task],
+    chores: &mut [Task],
+    own_attachments: &std::collections::HashSet<String>,
+) {
     let mut roots_with_child_attachments: std::collections::HashSet<String> = std::collections::HashSet::new();
     for task in tasks.iter() {
         if task.kind == TaskKind::Revision
@@ -570,7 +606,6 @@ pub(crate) fn attach_has_attachments_flag(
     for chore in chores.iter_mut() {
         chore.has_attachments = own_attachments.contains(&chore.id) || roots_with_child_attachments.contains(&chore.id);
     }
-    Ok(())
 }
 
 // ── AI review state ──────────────────────────────────────────────────────────
@@ -744,7 +779,7 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
 /// full product, loading just this row's revision chain.
 ///
 /// `attach_ai_reviewing_flag` / `attach_ai_review_state` /
-/// `attach_has_attachments_flag` stay non-fatal here the same way they
+/// `attach_has_attachments_flag_for_ids` stay non-fatal here the same way they
 /// are in `get_work_tree` — a side-query failure must not take down
 /// `GetWorkItem`. Chain loading errors (BFS / point reads) propagate:
 /// those are the same class of failure as the row read itself.
@@ -767,7 +802,7 @@ pub(crate) fn attach_task_derived_projections(conn: &Connection, task: &mut Task
             "attach_task_derived_projections: ai_review_state failed; ignoring"
         );
     }
-    if let Err(err) = attach_has_attachments_flag(conn, &mut tasks, &mut chores) {
+    if let Err(err) = attach_has_attachments_flag_for_ids(conn, &mut tasks, &mut chores) {
         tracing::warn!(
             ?err,
             task_id = %task.id,

@@ -32,11 +32,12 @@ use boss_engine::merge_poller::{
     MergeProbe, OpenPrCiStatus, OpenPrMergeability, OpenPrStatus, PrLifecycleProbe, PrLifecycleState, PrReviewState,
 };
 use boss_engine::work::WorkDb;
-use boss_engine::work::{PrOpenState, StaticPrStateChecker};
+use boss_engine::work::{PrOpenState, StaticPrStateChecker, SubmitAttachmentInput};
+use boss_engine_attachments::IngestedImage;
 use boss_protocol::{
-    BoardColumn, BoardDropTarget, BoardGroup, CreateChoreInput, CreateProductInput, CreateRevisionInput,
-    CreateRunInput, ExecutionStatus, FrontendEvent, FrontendRequest, RequestExecutionInput, Task, TaskStatus, WorkItem,
-    WorkItemPatch,
+    AttachmentMediaType, BoardColumn, BoardDropTarget, BoardGroup, CreateChoreInput, CreateProductInput,
+    CreateRevisionInput, CreateRunInput, ExecutionKind, ExecutionStatus, FrontendEvent, FrontendRequest,
+    RequestExecutionInput, Task, TaskStatus, WorkItem, WorkItemPatch,
 };
 
 mod common;
@@ -1682,6 +1683,29 @@ async fn board_drop_inside_merging_group_does_not_complete_the_merge() -> Result
         "spinyfin/mono#1",
         &serde_json::json!({"issue_number": 1}),
     )?;
+    let attachment_execution = work_db.create_execution(
+        boss_protocol::CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::Ready)
+            .build(),
+    )?;
+    let attachment_image = IngestedImage::builder()
+        .content_digest("merging-group-evidence")
+        .media_type(AttachmentMediaType::Png)
+        .pixel_width(10)
+        .pixel_height(10)
+        .size_bytes(4)
+        .source_name("shot.png")
+        .build();
+    work_db
+        .submit_work_attachment(SubmitAttachmentInput {
+            execution_id: &attachment_execution.id,
+            work_item_id: &chore.id,
+            image: &attachment_image,
+            caption: "evidence",
+        })?
+        .map_err(|err| anyhow!("attachment seed unexpectedly refused: {err:?}"))?;
 
     // The gesture from the bug report: a reorder inside the group.
     match client
@@ -1727,7 +1751,10 @@ async fn board_drop_inside_merging_group_does_not_complete_the_merge() -> Result
                 assert!(!t.ai_reviewing);
                 assert!(t.ai_review_state.is_none());
                 assert!(t.ai_review_findings_revision_id.is_none());
-                assert!(!t.has_attachments);
+                assert!(
+                    t.has_attachments,
+                    "same-column drop must retain the attachment projection"
+                );
                 assert!(t.source_automation_id.is_none());
             }
             other => return Err(anyhow!("unexpected item kind: {other:?}")),

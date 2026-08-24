@@ -137,8 +137,9 @@ final class KanbanInRevisionWarningTests: XCTestCase {
         )
     }
 
-    /// After the engine fix, the reorder payload includes the derived flag.
-    /// Applying that complete row must keep the badge.
+    /// A `workItemUpdated` payload that carries the derived projections must
+    /// keep the In revision badge through `applyIncrementalTaskUpdate`'s
+    /// evict-and-reinsert.
     func testWorkItemUpdatedCompletePayloadKeepsInRevisionBadge() {
         let model = makeModel()
         var seeded = makeTaskWithPR(id: "chore_in_rev", prURL: "https://github.com/org/repo/pull/9")

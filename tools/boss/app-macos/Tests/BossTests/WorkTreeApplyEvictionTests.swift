@@ -80,9 +80,7 @@ final class WorkTreeApplyEvictionTests: XCTestCase {
 
     /// `applyIncrementalTaskUpdate` evicts the row from every bucket and
     /// re-inserts the wire payload verbatim. A complete payload that still
-    /// carries `hasInProgressRevision` must survive that eviction — this is
-    /// the client half of a same-column drop after the engine started
-    /// sending derived projections on the single-row path.
+    /// carries `hasInProgressRevision` must survive bucket eviction.
     func testWorkItemUpdatedCompletePayloadSurvivesBucketEviction() {
         let model = makeModel()
         var seeded = makeTask(id: "task_x", projectID: "proj_a")

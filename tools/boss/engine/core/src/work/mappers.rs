@@ -411,9 +411,9 @@ pub(crate) fn map_task_with_parent_provenance_and_tags(row: &Row<'_>) -> rusqlit
 /// `dispatch_failed_*` (43-45), `blocked_detail` (46), `deferred` (47),
 /// `tags` (48), `human_driven` (49), `completion_summary` (50),
 /// `effort_matched_rule` (51), `effort_reasons` (52), the external-ref
-/// columns (53-57), and `source_automation_id` (58). Used by `query_task`
-/// and `get_work_item_by_short_id` so single-item lookups (`boss task show`,
-/// `get_work_item`, `WorkItemUpdated`) surface complete archival provenance,
+/// columns (53-57), and `source_automation_id` (58). Used by `query_task`,
+/// which backs every single-item lookup (`boss task show`, `get_work_item`,
+/// `get_work_item_by_short_id`, `WorkItemUpdated`), so those surface complete archival provenance,
 /// the verbatim blocked-status detail, future-scope / human-driven
 /// classification, free-form kanban tags, any human close summary,
 /// effort-classification provenance, the bound tracker issue, and

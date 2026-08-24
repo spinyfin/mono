@@ -1642,6 +1642,22 @@ fn get_work_item_has_in_progress_revision() {
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
     let revision = db.create_revision(revision_input(&parent_id), &checker).unwrap();
+    let automation = db
+        .create_automation(boss_protocol::CreateAutomationInput {
+            product_id: product_id.clone(),
+            name: "projection provenance".to_owned(),
+            repo_remote_url: None,
+            trigger: boss_protocol::AutomationTrigger::Schedule {
+                cron: "0 14 * * 1-5".to_owned(),
+                timezone: "America/Los_Angeles".to_owned(),
+            },
+            standing_instruction: "test".to_owned(),
+            open_task_limit: 1,
+            catch_up_window_secs: None,
+            enabled: true,
+            created_via: None,
+        })
+        .unwrap();
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
@@ -1661,6 +1677,11 @@ fn get_work_item_has_in_progress_revision() {
              VALUES ('atc_flag_item', ?1, ?2, 'evidence', 'digest', 'image/png',
                      10, 10, 4, 'shot.png', '2026-08-24T00:00:00Z')",
             rusqlite::params![execution.id, parent_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET source_automation_id = ?1 WHERE id = ?2",
+            rusqlite::params![automation.id, parent_id],
         )
         .unwrap();
     }
@@ -1684,7 +1705,11 @@ fn get_work_item_has_in_progress_revision() {
         root.has_attachments,
         "get_work_item must set has_attachments when the row has evidence"
     );
-    assert!(root.source_automation_id.is_none());
+    assert_eq!(
+        root.source_automation_id.as_deref(),
+        Some(automation.id.as_str()),
+        "get_work_item must retain source_automation_id from the widened SELECT"
+    );
     assert_eq!(
         root.external_ref.as_ref().map(|r| r.canonical_id.as_str()),
         Some("spinyfin/mono#502")
@@ -1730,7 +1755,7 @@ fn get_work_item_has_in_progress_revision() {
         "update_work_item must return the projected row, not mapper zeros"
     );
     assert!(renamed.has_attachments);
-    assert!(renamed.source_automation_id.is_none());
+    assert_eq!(renamed.source_automation_id.as_deref(), Some(automation.id.as_str()));
     assert_eq!(
         renamed.external_ref.as_ref().map(|r| r.canonical_id.as_str()),
         Some("spinyfin/mono#502")
