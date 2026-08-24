@@ -193,6 +193,21 @@ pub fn classify_worker_liveness(
 #[async_trait::async_trait]
 pub trait WorkerTerminalInspector: Send + Sync {
     async fn inspect(&self, execution_id: &str) -> Result<Option<TerminalLiveness>>;
+
+    /// Operator-facing `tmux …` prefix for inspect/kill commands in attention items.
+    fn operator_prefix(&self) -> String {
+        format!("tmux -S {}", boss_tmux::TEST_SOCKET_PATH)
+    }
+
+    /// Operator-facing `tmux …` prefix for `execution_id`'s specific run —
+    /// the durable socket, unless that run's recorded identity still lives
+    /// on the pre-move `-L boss` server, in which case a command addressed
+    /// there instead. Defaults to [`Self::operator_prefix`] for implementors
+    /// (including test stubs) that never route by run.
+    fn operator_prefix_for_run(&self, execution_id: &str) -> String {
+        let _ = execution_id;
+        self.operator_prefix()
+    }
 }
 
 /// Production tmux inspector. A run without tmux identity returns `None` so
@@ -200,23 +215,47 @@ pub trait WorkerTerminalInspector: Send + Sync {
 pub struct TmuxWorkerTerminalInspector {
     work_db: Arc<WorkDb>,
     tmux: Tmux,
+    legacy_tmux: Option<Tmux>,
 }
 
 impl TmuxWorkerTerminalInspector {
-    pub fn new(work_db: Arc<WorkDb>, tmux: Tmux) -> Self {
-        Self { work_db, tmux }
+    pub fn new(work_db: Arc<WorkDb>, tmux: Tmux, legacy_tmux: Option<Tmux>) -> Self {
+        Self {
+            work_db,
+            tmux,
+            legacy_tmux,
+        }
+    }
+
+    fn tmux_for_run(&self, server_label: &str) -> &Tmux {
+        if server_label == boss_tmux::SERVER_LABEL {
+            self.legacy_tmux.as_ref().unwrap_or(&self.tmux)
+        } else {
+            &self.tmux
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl WorkerTerminalInspector for TmuxWorkerTerminalInspector {
+    fn operator_prefix(&self) -> String {
+        self.tmux.operator_prefix()
+    }
+
+    fn operator_prefix_for_run(&self, execution_id: &str) -> String {
+        match self.work_db.tmux_run_for_execution(execution_id) {
+            Ok(Some(run)) => self.tmux_for_run(&run.tmux_server_label).operator_prefix(),
+            Ok(None) | Err(_) => self.tmux.operator_prefix(),
+        }
+    }
+
     async fn inspect(&self, execution_id: &str) -> Result<Option<TerminalLiveness>> {
         let Some(run) = self.work_db.tmux_run_for_execution(execution_id)? else {
             return Ok(None);
         };
+        let tmux = self.tmux_for_run(&run.tmux_server_label);
 
-        if !self
-            .tmux
+        if !tmux
             .list_sessions()
             .await?
             .iter()
@@ -228,7 +267,7 @@ impl WorkerTerminalInspector for TmuxWorkerTerminalInspector {
             }));
         }
 
-        let token = crate::tmux_adoption::session_spawn_token(&self.tmux, &run.tmux_session_name).await?;
+        let token = crate::tmux_adoption::session_spawn_token(tmux, &run.tmux_session_name).await?;
         if token.as_deref() != Some(run.tmux_spawn_token.as_str()) {
             return Ok(Some(TerminalLiveness::Dead {
                 session_name: run.tmux_session_name,
@@ -236,13 +275,11 @@ impl WorkerTerminalInspector for TmuxWorkerTerminalInspector {
             }));
         }
 
-        let pane_dead = self
-            .tmux
+        let pane_dead = tmux
             .display_message(&run.tmux_session_name, DisplayField::PaneDead)
             .await?;
         if pane_dead == "1" {
-            let status = self
-                .tmux
+            let status = tmux
                 .display_message(&run.tmux_session_name, DisplayField::PaneDeadStatus)
                 .await?;
             return Ok(Some(TerminalLiveness::Dead {
@@ -253,14 +290,12 @@ impl WorkerTerminalInspector for TmuxWorkerTerminalInspector {
             }));
         }
 
-        let window_activity_epoch_secs = self
-            .tmux
+        let window_activity_epoch_secs = tmux
             .display_message(&run.tmux_session_name, DisplayField::WindowActivity)
             .await?
             .parse::<i64>()
             .context("parsing tmux window_activity as epoch seconds")?;
-        let current_command = self
-            .tmux
+        let current_command = tmux
             .display_message(&run.tmux_session_name, DisplayField::PaneCurrentCommand)
             .await?;
         let driver_slug = self
@@ -611,6 +646,10 @@ pub async fn run_one_pass_with_terminal(
             None => None,
         };
         if let Some(terminal) = terminal {
+            // `terminal` is only ever `Some` when `terminal_inspector` produced
+            // it (the `None => None` arm above), so an inspector is always
+            // available here — never fall back to a fabricated tmux prefix.
+            let inspector = terminal_inspector.expect("terminal evidence implies an inspector produced it");
             if let TerminalLiveness::Alive {
                 foreground_command_mismatch: true,
                 ..
@@ -642,8 +681,12 @@ pub async fn run_one_pass_with_terminal(
                     window_activity_epoch_secs,
                 } => {
                     outcome.genuinely_stuck += 1;
+                    let attach_cmd = format!(
+                        "{} attach -t {session_name}",
+                        inspector.operator_prefix_for_run(&state.run_id)
+                    );
                     let body = format!(
-                        "Worker execution `{}` has had no hook or pane output for more than {} seconds while its agent remains the foreground command. The session is still live, so Boss did not reap it.\n\nSession: `{session_name}`\n\nLast pane output: {}\n\nInspect it with:\n\n```sh\ntmux -L boss attach -t {session_name}\n```",
+                        "Worker execution `{}` has had no hook or pane output for more than {} seconds while its agent remains the foreground command. The session is still live, so Boss did not reap it.\n\nSession: `{session_name}`\n\nLast pane output: {}\n\nInspect it with:\n\n```sh\n{attach_cmd}\n```",
                         state.run_id,
                         stale_threshold_secs,
                         iso8601_utc(window_activity_epoch_secs),
@@ -1225,7 +1268,7 @@ mod tests {
         assert!(
             attention
                 .body_markdown
-                .contains("tmux -L boss attach -t boss-worker-test")
+                .contains("tmux -S /state/boss/tmux.sock attach -t boss-worker-test")
         );
     }
 
@@ -2097,12 +2140,13 @@ mod tests {
         server: ScriptedTmux,
     ) -> (Result<Option<TerminalLiveness>>, Vec<Vec<String>>) {
         let server = std::sync::Arc::new(server);
-        let tmux = Tmux::with_runner(
+        let tmux = Tmux::with_runner_and_socket(
             "/opt/homebrew/bin/tmux",
             std::sync::Arc::clone(&server) as std::sync::Arc<dyn boss_tmux::CommandRunner>,
+            boss_tmux::TEST_SOCKET_PATH,
         )
         .unwrap();
-        let inspector = TmuxWorkerTerminalInspector::new(std::sync::Arc::new(db), tmux);
+        let inspector = TmuxWorkerTerminalInspector::new(std::sync::Arc::new(db), tmux, None);
         let verdict = inspector.inspect(execution_id).await;
         (verdict, server.calls())
     }
@@ -2139,23 +2183,23 @@ mod tests {
             calls,
             vec![
                 vec![
-                    "-L".to_owned(),
-                    "boss".to_owned(),
+                    "-S".to_owned(),
+                    boss_tmux::TEST_SOCKET_PATH.to_owned(),
                     "list-sessions".to_owned(),
                     "-F".to_owned(),
                     "#{session_name}\t#{@boss_spawn_token}".to_owned(),
                 ],
                 vec![
-                    "-L".to_owned(),
-                    "boss".to_owned(),
+                    "-S".to_owned(),
+                    boss_tmux::TEST_SOCKET_PATH.to_owned(),
                     "show-environment".to_owned(),
                     "-t".to_owned(),
                     "boss-worker-1".to_owned(),
                     "BOSS_SPAWN_TOKEN".to_owned(),
                 ],
                 vec![
-                    "-L".to_owned(),
-                    "boss".to_owned(),
+                    "-S".to_owned(),
+                    boss_tmux::TEST_SOCKET_PATH.to_owned(),
                     "display-message".to_owned(),
                     "-p".to_owned(),
                     "-t".to_owned(),
@@ -2163,8 +2207,8 @@ mod tests {
                     "#{pane_dead}".to_owned(),
                 ],
                 vec![
-                    "-L".to_owned(),
-                    "boss".to_owned(),
+                    "-S".to_owned(),
+                    boss_tmux::TEST_SOCKET_PATH.to_owned(),
                     "display-message".to_owned(),
                     "-p".to_owned(),
                     "-t".to_owned(),
@@ -2172,8 +2216,8 @@ mod tests {
                     "#{window_activity}".to_owned(),
                 ],
                 vec![
-                    "-L".to_owned(),
-                    "boss".to_owned(),
+                    "-S".to_owned(),
+                    boss_tmux::TEST_SOCKET_PATH.to_owned(),
                     "display-message".to_owned(),
                     "-p".to_owned(),
                     "-t".to_owned(),
@@ -2203,8 +2247,8 @@ mod tests {
         assert_eq!(
             calls,
             vec![vec![
-                "-L".to_owned(),
-                "boss".to_owned(),
+                "-S".to_owned(),
+                boss_tmux::TEST_SOCKET_PATH.to_owned(),
                 "list-sessions".to_owned(),
                 "-F".to_owned(),
                 "#{session_name}\t#{@boss_spawn_token}".to_owned(),
@@ -2237,15 +2281,15 @@ mod tests {
             calls,
             vec![
                 vec![
-                    "-L".to_owned(),
-                    "boss".to_owned(),
+                    "-S".to_owned(),
+                    boss_tmux::TEST_SOCKET_PATH.to_owned(),
                     "list-sessions".to_owned(),
                     "-F".to_owned(),
                     "#{session_name}\t#{@boss_spawn_token}".to_owned(),
                 ],
                 vec![
-                    "-L".to_owned(),
-                    "boss".to_owned(),
+                    "-S".to_owned(),
+                    boss_tmux::TEST_SOCKET_PATH.to_owned(),
                     "show-environment".to_owned(),
                     "-t".to_owned(),
                     "boss-worker-1".to_owned(),
@@ -2285,23 +2329,23 @@ mod tests {
             calls,
             vec![
                 vec![
-                    "-L".to_owned(),
-                    "boss".to_owned(),
+                    "-S".to_owned(),
+                    boss_tmux::TEST_SOCKET_PATH.to_owned(),
                     "list-sessions".to_owned(),
                     "-F".to_owned(),
                     "#{session_name}\t#{@boss_spawn_token}".to_owned(),
                 ],
                 vec![
-                    "-L".to_owned(),
-                    "boss".to_owned(),
+                    "-S".to_owned(),
+                    boss_tmux::TEST_SOCKET_PATH.to_owned(),
                     "show-environment".to_owned(),
                     "-t".to_owned(),
                     "boss-worker-1".to_owned(),
                     "BOSS_SPAWN_TOKEN".to_owned(),
                 ],
                 vec![
-                    "-L".to_owned(),
-                    "boss".to_owned(),
+                    "-S".to_owned(),
+                    boss_tmux::TEST_SOCKET_PATH.to_owned(),
                     "display-message".to_owned(),
                     "-p".to_owned(),
                     "-t".to_owned(),
@@ -2309,8 +2353,8 @@ mod tests {
                     "#{pane_dead}".to_owned(),
                 ],
                 vec![
-                    "-L".to_owned(),
-                    "boss".to_owned(),
+                    "-S".to_owned(),
+                    boss_tmux::TEST_SOCKET_PATH.to_owned(),
                     "display-message".to_owned(),
                     "-p".to_owned(),
                     "-t".to_owned(),
@@ -2346,23 +2390,23 @@ mod tests {
             calls,
             vec![
                 vec![
-                    "-L".to_owned(),
-                    "boss".to_owned(),
+                    "-S".to_owned(),
+                    boss_tmux::TEST_SOCKET_PATH.to_owned(),
                     "list-sessions".to_owned(),
                     "-F".to_owned(),
                     "#{session_name}\t#{@boss_spawn_token}".to_owned(),
                 ],
                 vec![
-                    "-L".to_owned(),
-                    "boss".to_owned(),
+                    "-S".to_owned(),
+                    boss_tmux::TEST_SOCKET_PATH.to_owned(),
                     "show-environment".to_owned(),
                     "-t".to_owned(),
                     "boss-worker-1".to_owned(),
                     "BOSS_SPAWN_TOKEN".to_owned(),
                 ],
                 vec![
-                    "-L".to_owned(),
-                    "boss".to_owned(),
+                    "-S".to_owned(),
+                    boss_tmux::TEST_SOCKET_PATH.to_owned(),
                     "display-message".to_owned(),
                     "-p".to_owned(),
                     "-t".to_owned(),
@@ -2370,8 +2414,8 @@ mod tests {
                     "#{pane_dead}".to_owned(),
                 ],
                 vec![
-                    "-L".to_owned(),
-                    "boss".to_owned(),
+                    "-S".to_owned(),
+                    boss_tmux::TEST_SOCKET_PATH.to_owned(),
                     "display-message".to_owned(),
                     "-p".to_owned(),
                     "-t".to_owned(),
@@ -2408,6 +2452,82 @@ mod tests {
                 agent_is_foreground: false,
                 foreground_command_mismatch: true,
             })
+        );
+    }
+
+    /// [`TmuxWorkerTerminalInspector::tmux_for_run`] routing: a run recorded
+    /// with the literal legacy label must be inspected against the `-L boss`
+    /// server, never the durable socket — the correctness gap a
+    /// legacy-adopted worker's liveness probe would otherwise hit.
+    #[tokio::test]
+    async fn inspector_routes_legacy_labeled_run_to_the_label_server() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = create_old_execution(&db, &work_item_id);
+        // Explicitly record the legacy label — mirrors what the boot drain
+        // adopts a surviving `-L boss` session with.
+        db.start_execution_run(&execution_id, "worker-1", "repo-1", "lease-1", "ws-1", "/tmp/ws")
+            .unwrap();
+        assert!(
+            db.record_tmux_spawn_intent_for_execution(&execution_id, boss_tmux::SERVER_LABEL, "boss-worker-1", "tok-1")
+                .unwrap()
+        );
+        assert!(
+            db.record_tmux_session_created_for_execution(&execution_id, "tok-1", 4242)
+                .unwrap()
+        );
+
+        let legacy_server = std::sync::Arc::new(
+            ScriptedTmux::new()
+                .with_session("boss-worker-1", "tok-1")
+                .with_field("boss-worker-1", "#{pane_dead}", "0")
+                .with_field("boss-worker-1", "#{window_activity}", "9000")
+                .with_field("boss-worker-1", "#{pane_current_command}", CLASSIFIER_DRIVER_BINARY),
+        );
+        let socket_server = std::sync::Arc::new(ScriptedTmux::new());
+        let socket_tmux = Tmux::with_runner_and_socket(
+            "/opt/homebrew/bin/tmux",
+            std::sync::Arc::clone(&socket_server) as std::sync::Arc<dyn boss_tmux::CommandRunner>,
+            boss_tmux::TEST_SOCKET_PATH,
+        )
+        .unwrap();
+        let legacy_tmux = Tmux::for_legacy_label_server_with_runner(
+            "/opt/homebrew/bin/tmux",
+            std::sync::Arc::clone(&legacy_server) as std::sync::Arc<dyn boss_tmux::CommandRunner>,
+        )
+        .unwrap();
+        let inspector = TmuxWorkerTerminalInspector::new(std::sync::Arc::new(db), socket_tmux, Some(legacy_tmux));
+
+        let verdict = inspector.inspect(&execution_id).await.unwrap();
+        assert_eq!(
+            verdict,
+            Some(TerminalLiveness::Alive {
+                session_name: "boss-worker-1".to_owned(),
+                window_activity_epoch_secs: 9000,
+                agent_is_foreground: true,
+                foreground_command_mismatch: false,
+            }),
+            "the run must be inspected against the legacy server, not the socket",
+        );
+        assert!(
+            socket_server.calls().is_empty(),
+            "a legacy-labeled run must never be probed against the durable socket",
+        );
+        assert!(
+            legacy_server
+                .calls()
+                .iter()
+                .any(|call| call[0] == "-L" && call[1] == boss_tmux::SERVER_LABEL),
+            "expected at least one -L boss call, got {:?}",
+            legacy_server.calls(),
+        );
+
+        let prefix = inspector.operator_prefix_for_run(&execution_id);
+        assert_eq!(
+            prefix,
+            format!("tmux -L {}", boss_tmux::SERVER_LABEL),
+            "the operator-facing prefix for a legacy-labeled run must also address -L boss",
         );
     }
 }

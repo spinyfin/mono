@@ -142,11 +142,14 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// those were fixed when the engine created the detached tmux session.
     /// Closing this surface must therefore not report a worker death.
     func attachWorkerPane(_ request: EngineAttachRequest) -> EngineAttachResult {
+        guard !request.tmuxSocketPath.isEmpty, request.tmuxSocketPath.hasPrefix("/") else {
+            return .failure(.internalFailure("engine supplied an invalid tmux socket path"))
+        }
         let launch = EngineSpawnRequest(
             runId: request.runId,
             workspacePath: FileManager.default.homeDirectoryForCurrentUser.path,
             slotId: request.slotId,
-            initialInput: "exec tmux -L boss attach-session -t \(request.sessionName)\n",
+            initialInput: "exec tmux -S \(bossShellQuote(request.tmuxSocketPath)) attach-session -t \(bossShellQuote(request.sessionName))\n",
             env: [],
             summary: request.summary,
             taskTitle: request.taskTitle,

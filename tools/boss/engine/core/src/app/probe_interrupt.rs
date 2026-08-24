@@ -792,7 +792,7 @@ impl ServerState {
         if spec.busy_markers.is_empty() || spec.prompt_prefixes.is_empty() {
             return false;
         }
-        let Ok(tmux) = self.tmux_for_pane_delivery() else {
+        let Ok(tmux) = self.tmux_for_pane_delivery(run_id) else {
             return false;
         };
         let Ok(text) = tmux.capture_pane(&session_name).await else {

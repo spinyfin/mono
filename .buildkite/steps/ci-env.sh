@@ -94,3 +94,90 @@ bazel() {
 echo "+++ installing repobin tools into bin/"
 bazel build //tools/repobin:repobin
 ./bazel-bin/tools/repobin/repobin install --bin-dir bin/ --no-defaults
+
+# checkleft's npm-provisioned checks (`format/oxc`, `lint/oxc`, …) run
+# `npx --yes <package>@<pin>`. Node is not part of the Bazel toolchain;
+# hosts are expected to have Node >= 22 on PATH. The bazel-any fleet is
+# heterogeneous, and at least one Linux agent (greyarea-1) has neither
+# `npx` nor a PATH `oxfmt`, which fails those checks with ENOENT. Call
+# `ensure_npx` from steps that run checkleft so a missing host Node is
+# filled in with a pinned official tarball instead of failing closed.
+CI_NODE_VERSION="24.8.0"
+
+ensure_npx() {
+  if command -v npx >/dev/null 2>&1; then
+    return 0
+  fi
+  local extra
+  for extra in /usr/local/bin /opt/homebrew/bin; do
+    if [[ -x "${extra}/npx" ]]; then
+      export PATH="${extra}:${PATH}"
+      echo "--- [ci-env] found npx at ${extra}/npx; prepended to PATH"
+      return 0
+    fi
+  done
+
+  local os arch sha
+  case "$(uname -s)" in
+    Linux) os=linux ;;
+    Darwin) os=darwin ;;
+    *)
+      echo "error: npx is required for checkleft npm checks but is not on PATH (OS $(uname -s) has no CI Node bootstrap)" >&2
+      return 1
+      ;;
+  esac
+  case "$(uname -m)" in
+    x86_64) arch=x64 ;;
+    aarch64 | arm64) arch=arm64 ;;
+    *)
+      echo "error: npx is required for checkleft npm checks but is not on PATH (arch $(uname -m) has no CI Node bootstrap)" >&2
+      return 1
+      ;;
+  esac
+  case "${os}-${arch}" in
+    linux-x64) sha=daf68404b478b4c3616666580d02500a24148c0c8d88648372078c03655ec0f7 ;;
+    linux-arm64) sha=5eb16b14af5a5f494ed54770822144e847c744fe590f8df093ad4927cf3dd7fd ;;
+    darwin-arm64) sha=d81191a1866760eb918caa976c023036bc1fc7405ea31b148905211522045767 ;;
+    darwin-x64) sha=6fd8496b59baa8f86a24e3eb03308b763091716ffc6b6e1094d1a5e5697dd6dd ;;
+    *)
+      echo "error: no pinned Node tarball for ${os}-${arch}" >&2
+      return 1
+      ;;
+  esac
+
+  local tarball="node-v${CI_NODE_VERSION}-${os}-${arch}.tar.gz"
+  local cache_root="${HOME}/.cache/mono-ci-node"
+  if [[ -d /mnt/ssd && -w /mnt/ssd ]]; then
+    cache_root="/mnt/ssd/mono-ci-node"
+  fi
+  local prefix="${cache_root}/node-v${CI_NODE_VERSION}-${os}-${arch}"
+  if [[ -x "${prefix}/bin/npx" ]]; then
+    export PATH="${prefix}/bin:${PATH}"
+    echo "--- [ci-env] using cached Node ${CI_NODE_VERSION} at ${prefix}"
+    return 0
+  fi
+
+  echo "--- [ci-env] npx not on PATH; downloading Node ${CI_NODE_VERSION} (${os}-${arch})"
+  local tmp
+  tmp=$(mktemp -d)
+  # Cleanup even if curl/tar/sha fail; mktemp dirs otherwise leak on `return 1`.
+  # shellcheck disable=SC2064
+  trap "rm -rf '${tmp}'" RETURN
+  curl -fsSL "https://nodejs.org/dist/v${CI_NODE_VERSION}/${tarball}" -o "${tmp}/${tarball}"
+  local actual
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual=$(sha256sum "${tmp}/${tarball}" | awk '{print $1}')
+  else
+    actual=$(shasum -a 256 "${tmp}/${tarball}" | awk '{print $1}')
+  fi
+  if [[ "${actual}" != "${sha}" ]]; then
+    echo "error: Node tarball sha256 mismatch (got ${actual}, expected ${sha})" >&2
+    return 1
+  fi
+  tar -xzf "${tmp}/${tarball}" -C "${tmp}"
+  mkdir -p "${cache_root}"
+  rm -rf "${prefix}"
+  mv "${tmp}/node-v${CI_NODE_VERSION}-${os}-${arch}" "${prefix}"
+  export PATH="${prefix}/bin:${PATH}"
+  command -v npx >/dev/null 2>&1
+}

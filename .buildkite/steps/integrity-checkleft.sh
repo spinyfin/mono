@@ -10,6 +10,7 @@
 set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
+ensure_npx
 
 echo "--- [integrity-checkleft] running checkleft --all"
 CLICOLOR_FORCE=1 bin/checkleft run --all

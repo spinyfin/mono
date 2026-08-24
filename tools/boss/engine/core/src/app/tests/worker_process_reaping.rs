@@ -165,22 +165,28 @@ async fn release_worker_pane_still_reaps_a_tmux_session_for_a_dead_recorded_pid(
         runner.calls(),
         vec![
             vec![
-                "-L",
-                "boss",
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
                 "show-environment",
                 "-t",
                 "boss-1-example",
                 "BOSS_SPAWN_TOKEN"
             ],
             vec![
-                "-L",
-                "boss",
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
                 "show-environment",
                 "-t",
                 "boss-1-example",
                 "BOSS_SPAWN_TOKEN"
             ],
-            vec!["-L", "boss", "kill-session", "-t", "boss-1-example"],
+            vec![
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
+                "kill-session",
+                "-t",
+                "boss-1-example"
+            ],
         ],
         "the dead-pid reap path must issue show-environment then kill-session, nothing else",
     );

@@ -261,7 +261,13 @@ async fn transcript_shows_text(transcript_path: &str, offset_bytes: u64, text: &
 }
 
 impl ServerState {
-    pub(super) fn tmux_for_pane_delivery(&self) -> anyhow::Result<Tmux> {
+    /// Resolve the tmux handle to deliver into `run_id`'s pane: the durable
+    /// socket, unless `run_id`'s recorded identity still lives on the
+    /// pre-move `-L boss` server (see [`Self::tmux_for_run`]) — otherwise a
+    /// legacy-adopted worker would be reported as unreachable (the posture
+    /// check hits a server that never held its session) even while its
+    /// agent is alive and working.
+    pub(super) fn tmux_for_pane_delivery(&self, run_id: &str) -> anyhow::Result<Tmux> {
         if let Some(tmux) = self
             .pane_delivery_tmux_override
             .read()
@@ -274,7 +280,16 @@ impl ServerState {
         let crate::tmux_preflight::TmuxPreflight::Ready { program, .. } = &*preflight else {
             anyhow::bail!("tmux is unavailable for pane delivery")
         };
-        Tmux::from_path(program.clone()).context("creating tmux pane-delivery controller")
+        let socket_tmux = Tmux::from_path_with_socket(program.clone(), self.tmux_socket_path.clone())
+            .context("creating tmux pane-delivery controller")?;
+        let server_label = self
+            .work_db
+            .tmux_identity_for_execution(run_id)
+            .ok()
+            .flatten()
+            .map(|identity| identity.server_label)
+            .unwrap_or_default();
+        self.tmux_for_run(&socket_tmux, &server_label)
     }
 
     /// Register a one-shot waiter for the next `UserPromptSubmit` hook
@@ -463,7 +478,7 @@ impl ServerState {
         let (token, waiter) = self.register_delivery_waiter(run_id, normalized_text);
         let send_result = match self.worker_registry.pane_for_run(run_id) {
             Some(pane) if pane.tmux_session_name.is_some() || pane.tmux_hosted => match pane.tmux_session_name {
-                Some(session_name) => match self.tmux_for_pane_delivery() {
+                Some(session_name) => match self.tmux_for_pane_delivery(run_id) {
                     Ok(tmux) => tmux
                         .send_keys(&session_name, normalized_text)
                         .await

@@ -239,7 +239,7 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
         .register_tmux_run_slot("run-tmux-send", 7, "boss-tmux-send");
     let runner = Arc::new(PaneDeliveryRunner::default());
     *server_state.pane_delivery_tmux_override.write().unwrap() =
-        Some(Tmux::with_runner("/usr/bin/tmux", runner.clone()).unwrap());
+        Some(Tmux::with_runner_and_socket("/usr/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap());
 
     // No app session is registered. The runner notification proves the
     // waiter has been registered and the direct tmux path was selected before
@@ -269,7 +269,7 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
     assert_eq!(send.await.expect("send task").expect("tmux send succeeds"), 7);
     let calls = runner.calls();
     assert_eq!(calls.len(), 3);
-    assert_eq!(calls[0][..3], ["-L", "boss", "load-buffer"]);
+    assert_eq!(calls[0][..3], ["-S", boss_tmux::TEST_SOCKET_PATH, "load-buffer"]);
     assert_eq!(calls[0][3], "-b");
     let buffer_name = calls[0][4].clone();
     assert!(
@@ -280,8 +280,8 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
     assert_eq!(
         calls[1],
         vec![
-            "-L",
-            "boss",
+            "-S",
+            boss_tmux::TEST_SOCKET_PATH,
             "paste-buffer",
             "-b",
             buffer_name.as_str(),
@@ -291,7 +291,17 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
             "boss-tmux-send",
         ]
     );
-    assert_eq!(calls[2], vec!["-L", "boss", "send-keys", "-t", "boss-tmux-send", "C-m"]);
+    assert_eq!(
+        calls[2],
+        vec![
+            "-S",
+            boss_tmux::TEST_SOCKET_PATH,
+            "send-keys",
+            "-t",
+            "boss-tmux-send",
+            "C-m"
+        ]
+    );
     assert_eq!(runner.stdin(), vec![b"first line\nsecond line".to_vec()]);
 }
 

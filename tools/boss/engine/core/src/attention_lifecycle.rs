@@ -196,6 +196,12 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          the item. A later run start is the redispatch that refusal deliberately made room for.",
     ),
     entry(
+        crate::tmux_adoption::TMUX_LEGACY_LABEL_SERVER_ATTENTION_KIND,
+        ClearedBy::WorkResumed,
+        "Records that a worker session is still on the pre-move tmux -L boss server. A later \
+         run start means that session has finished and the next worker landed on the durable socket.",
+    ),
+    entry(
         crate::spawn_ack_sweep::DRIVER_START_ATTENTION_KIND,
         ClearedBy::WorkResumed,
         "Asserts the worker's driver never started. A later run start is the direct contradiction.",
@@ -567,6 +573,7 @@ mod tests {
             crate::dead_pid_sweep::PANE_DEATH_ATTENTION_KIND,
             crate::remote_lease_reconcile::REMOTE_WORKER_DIED_ATTENTION_KIND,
             crate::tmux_adoption::TMUX_ADOPTION_SCHEMA_SKEW_ATTENTION_KIND,
+            crate::tmux_adoption::TMUX_LEGACY_LABEL_SERVER_ATTENTION_KIND,
             crate::spawn_ack_sweep::DRIVER_START_ATTENTION_KIND,
             crate::app::readoption::PROGRESS_INGRESS_UNRECOVERABLE_ATTENTION_KIND,
             crate::app::probes::PROBE_UNDELIVERED_ATTENTION_KIND,

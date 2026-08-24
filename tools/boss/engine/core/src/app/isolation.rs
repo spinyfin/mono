@@ -55,7 +55,7 @@ const DEFAULT_PID_FILENAME: &str = "boss-engine.pid";
 /// process's `$HOME`.
 const STATE_ROOT_SUFFIX: &str = "Library/Application Support/Boss";
 
-/// The four pieces of engine-owned state a test fixture could collide with.
+/// The five pieces of engine-owned state a test fixture could collide with.
 ///
 /// One shape serves three roles: where production keeps each file
 /// ([`EnginePaths::production`]), what a fixture derived for itself
@@ -72,6 +72,7 @@ pub struct EnginePaths {
     pub events_socket: Option<PathBuf>,
     pub pid: Option<PathBuf>,
     pub control_token: Option<PathBuf>,
+    pub tmux_socket: Option<PathBuf>,
 }
 
 impl EnginePaths {
@@ -97,6 +98,7 @@ impl EnginePaths {
             events_socket: boss_log_files::default_events_socket_path(),
             pid: Some(PathBuf::from(DEFAULT_PID_PATH)),
             control_token: boss_log_files::default_control_token_path(),
+            tmux_socket: boss_log_files::default_tmux_socket_path(),
         }
     }
 
@@ -108,18 +110,21 @@ impl EnginePaths {
             events_socket: Some(root.join(boss_log_files::EVENTS_SOCKET_FILENAME)),
             pid: Some(pid.to_path_buf()),
             control_token: Some(root.join(boss_log_files::CONTROL_TOKEN_FILENAME)),
+            tmux_socket: Some(root.join(boss_log_files::TMUX_SOCKET_FILENAME)),
         }
     }
 
-    /// The four fields, paired with a label and the env var an operator would
+    /// The five fields, paired with a label and the env var an operator would
     /// change to move that file. Drives both the derivation and the gate, so
-    /// neither can quietly forget a field.
-    fn fields(&self) -> [(&'static str, &'static str, Option<&Path>); 4] {
+    /// neither can quietly forget a field. The tmux socket has no env override
+    /// of its own: it follows the state root, so the gate names `state-root`.
+    fn fields(&self) -> [(&'static str, &'static str, Option<&Path>); 5] {
         [
             ("state database", DB_PATH_ENV, self.db.as_deref()),
             ("events socket", EVENTS_SOCKET_ENV, self.events_socket.as_deref()),
             ("pid file", PID_PATH_ENV, self.pid.as_deref()),
             ("engine-control token", TOKEN_PATH_ENV, self.control_token.as_deref()),
+            ("tmux socket", "state-root", self.tmux_socket.as_deref()),
         ]
     }
 }
@@ -270,6 +275,9 @@ impl IsolationPaths {
                     boss_log_files::CONTROL_TOKEN_FILENAME,
                     "control-token",
                 ),
+                // No env override: a fixture always gets its own socket so it
+                // cannot stamp `@boss_engine_owner` on production's tmux server.
+                tmux_socket: Some(dir.join(format!("{stem}.tmux.sock"))),
             },
             state_root: Some(dir),
             stem,
@@ -488,6 +496,7 @@ mod tests {
             events_socket: Some(PathBuf::from("/tmp/boss-test-abc123.events.sock")),
             pid: Some(PathBuf::from("/tmp/boss-test-abc123.pid")),
             control_token: Some(PathBuf::from("/tmp/boss-test-abc123.control-token")),
+            tmux_socket: Some(PathBuf::from("/tmp/boss-test-abc123.tmux.sock")),
         }
     }
 
@@ -554,7 +563,14 @@ mod tests {
             pid_path: Some(private.clone()),
             control_token_path: Some(private),
         });
-        assert_eq!(paths.derived, EnginePaths::default());
+        assert_eq!(
+            paths.derived,
+            EnginePaths {
+                tmux_socket: Some(PathBuf::from("/tmp/boss-test-abc123.tmux.sock")),
+                ..EnginePaths::default()
+            },
+            "tmux has no env override, so a fixture still derives its own socket"
+        );
     }
 
     // -- the regression: an override that IS production ------------------
@@ -723,6 +739,13 @@ mod tests {
                 TOKEN_PATH_ENV,
                 EnginePaths {
                     control_token: prod.control_token.clone(),
+                    ..all_derived()
+                },
+            ),
+            (
+                "state-root",
+                EnginePaths {
+                    tmux_socket: prod.tmux_socket.clone(),
                     ..all_derived()
                 },
             ),

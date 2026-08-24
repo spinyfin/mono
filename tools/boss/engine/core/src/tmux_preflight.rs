@@ -17,7 +17,13 @@ pub enum TmuxPreflight {
 
 impl TmuxPreflight {
     pub async fn probe() -> Self {
-        let tmux = match Tmux::resolve() {
+        let socket =
+            boss_log_files::default_tmux_socket_path().unwrap_or_else(|| PathBuf::from("/state/boss/tmux.sock"));
+        Self::probe_with_socket(&socket).await
+    }
+
+    pub async fn probe_with_socket(socket_path: &std::path::Path) -> Self {
+        let tmux = match Tmux::resolve(socket_path) {
             Ok(tmux) => tmux,
             Err(error) => {
                 return Self::Unavailable {

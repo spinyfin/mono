@@ -77,7 +77,9 @@ pub struct TmuxRunHandle {
     pub agent_id: String,
     /// Transcript to resume after re-adopting the live worker, if captured.
     pub transcript_path: Option<String>,
-    /// Tmux server `-L` label recorded when the session was created.
+    /// Tmux server identity recorded when the session was created: the
+    /// absolute `-S` socket path, or the literal `boss` label for a session
+    /// that still lives on the pre-move `-L boss` server.
     pub tmux_server_label: String,
     /// Human-readable tmux session name. Not an adoption key.
     pub tmux_session_name: String,
@@ -96,6 +98,12 @@ pub struct TmuxRunHandle {
 /// gone terminal, which is precisely when most teardown calls happen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxIdentity {
+    /// Tmux server identity recorded when the session was created: the
+    /// absolute `-S` socket path, or the literal [`boss_tmux::SERVER_LABEL`]
+    /// for a session that still lives on the pre-move `-L boss` server. Set
+    /// atomically alongside `session_name`/`spawn_token`, so it is always
+    /// present whenever those are.
+    pub server_label: String,
     /// Human-readable tmux session name. Not an adoption/teardown key on
     /// its own — see [`TmuxRunHandle::tmux_session_name`].
     pub session_name: String,

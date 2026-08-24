@@ -339,8 +339,8 @@ impl PaneSpawnRunner {
             anyhow::bail!("cannot derive tmux session name from empty execution id");
         }
         let session_name = format!("boss-{slot_id}-{short_execution_id}");
-        let tmux =
-            boss_tmux::Tmux::resolve().with_context(|| format!("resolving tmux for execution {execution_id}"))?;
+        let tmux = boss_tmux::Tmux::resolve(self.cfg.work.resolved_tmux_socket_path())
+            .with_context(|| format!("resolving tmux for execution {execution_id}"))?;
         let spawn_store: Arc<dyn crate::spawn_flow::TmuxSpawnStore> = self.work_db.clone();
         Ok(TmuxWorkerHost::new(tmux, spawn_store, session_name))
     }

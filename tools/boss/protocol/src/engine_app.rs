@@ -133,11 +133,14 @@ pub struct ReleaseWorkerPaneResult {}
 /// running in a Boss-owned tmux session. Unlike [`SpawnWorkerPaneInput`], the
 /// app does not start a shell or supply an environment: tmux owns the worker
 /// process and the app is only a viewer.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(bon::Builder, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[builder(on(String, into))]
 pub struct AttachWorkerPaneInput {
     pub run_id: String,
     pub slot_id: u8,
     pub session_name: String,
+    /// Explicit private tmux socket path used to attach the worker viewer.
+    pub tmux_socket_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -159,8 +162,8 @@ pub struct AttachCoordinatorPaneInput {
     pub model: String,
     /// Absolute tmux binary selected by the engine preflight.
     pub tmux_program: String,
-    /// Private tmux server label (`-L`) the coordinator session runs on.
-    pub server_label: String,
+    /// Explicit private tmux socket path used to attach the coordinator.
+    pub tmux_socket_path: String,
     /// The installed `claude` version, present only when it is newer than
     /// the version this coordinator session actually launched with. `None`
     /// covers both "no upgrade available" and "can't tell" (missing launch
@@ -627,6 +630,7 @@ mod tests {
             run_id: "run-tmux".into(),
             slot_id: 3,
             session_name: "boss-3-run-tmux".into(),
+            tmux_socket_path: "/state/boss/tmux.sock".into(),
             summary: Some("implementing attach mode".into()),
             task_title: Some("attach panes".into()),
         });
@@ -655,7 +659,7 @@ mod tests {
             spawn_token: "opaque-token".into(),
             model: "opus".into(),
             tmux_program: "/opt/homebrew/bin/tmux".into(),
-            server_label: "boss".into(),
+            tmux_socket_path: "/state/boss/tmux.sock".into(),
             coordinator_update_available_version: None,
         });
         let json = serde_json::to_string(&request).unwrap();
@@ -682,7 +686,7 @@ mod tests {
             spawn_token: "opaque-token".into(),
             model: "opus".into(),
             tmux_program: "/opt/homebrew/bin/tmux".into(),
-            server_label: "boss".into(),
+            tmux_socket_path: "/state/boss/tmux.sock".into(),
             coordinator_update_available_version: Some("2.2.0".into()),
         });
         let json = serde_json::to_string(&request).unwrap();

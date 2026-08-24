@@ -197,13 +197,14 @@ impl std::error::Error for AgentLaunchRefusal {}
 /// Borrowed rather than owned so the caller can hand over what it
 /// already computed without cloning, and so the whole decision is a pure
 /// function of its inputs.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, bon::Builder)]
 pub(crate) struct ResolvedPaths<'a> {
     pub socket_path: &'a Path,
     pub events_socket: &'a Path,
     pub db_path: &'a Path,
     pub pid_path: &'a Path,
     pub token_path: Option<&'a Path>,
+    pub tmux_socket: &'a Path,
 }
 
 /// Decide whether to refuse this start.
@@ -248,6 +249,7 @@ fn production_collisions(paths: ResolvedPaths<'_>, production_root: Option<&Path
         ("events socket", paths.events_socket, Some("BOSS_EVENTS_SOCKET")),
         ("state db", paths.db_path, Some("BOSS_DB_PATH")),
         ("pid file", paths.pid_path, Some("BOSS_ENGINE_PID_PATH")),
+        ("tmux socket", paths.tmux_socket, None),
     ] {
         if is_inside(path, root) {
             collisions.push(Collision {
@@ -360,19 +362,20 @@ mod tests {
     }
 
     /// Paths as a production engine resolves them.
-    fn production_paths() -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
+    fn production_paths() -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
         (
             PathBuf::from(super::super::DEFAULT_SOCKET_PATH),
             prod_root().join("events.sock"),
             prod_root().join("state.db"),
             PathBuf::from("/tmp/boss-engine.pid"),
             prod_root().join("engine-control.token"),
+            prod_root().join("tmux.sock"),
         )
     }
 
     /// Paths as an isolated fixture resolves them from
     /// `--socket-path /tmp/boss-test-<id>.sock`.
-    fn fixture_paths(stem: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
+    fn fixture_paths(stem: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
         let base = PathBuf::from("/tmp");
         (
             base.join(format!("{stem}.sock")),
@@ -380,6 +383,7 @@ mod tests {
             base.join(format!("{stem}.db")),
             base.join(format!("{stem}.pid")),
             base.join(format!("{stem}.token")),
+            base.join(format!("{stem}.tmux.sock")),
         )
     }
 
@@ -480,6 +484,7 @@ mod tests {
         let db = PathBuf::from("/tmp/scratch/bosshome/state.db");
         let pid = PathBuf::from("/tmp/boss-dsgn.pid");
         let token = PathBuf::from("/tmp/boss-dsgn.token");
+        let tmux = PathBuf::from("/tmp/boss-dsgn.tmux.sock");
         let refusal = evaluate(
             ResolvedPaths {
                 socket_path: &socket,
@@ -487,6 +492,7 @@ mod tests {
                 db_path: &db,
                 pid_path: &pid,
                 token_path: Some(&token),
+                tmux_socket: &tmux,
             },
             Some(&prod_root()),
             classify_ownership(env_of(WORKER_ENV), None),
@@ -507,7 +513,7 @@ mod tests {
             "/private/tmp/claude-501/-Users-dev--local-share-cube-workspaces-mono-agent-135/\
              97a79896/scratchpad/boss-app-run/Boss.app/Contents/Resources/bin/engine",
         );
-        let (socket, events, db, pid, token) = production_paths();
+        let (socket, events, db, pid, token, tmux) = production_paths();
         let refusal = evaluate(
             ResolvedPaths {
                 socket_path: &socket,
@@ -515,6 +521,7 @@ mod tests {
                 db_path: &db,
                 pid_path: &pid,
                 token_path: Some(&token),
+                tmux_socket: &tmux,
             },
             Some(&prod_root()),
             classify_ownership(env_of(NO_ENV), Some(exe)),
@@ -523,7 +530,13 @@ mod tests {
         let labels: Vec<&str> = refusal.collisions.iter().map(|c| c.label).collect();
         assert_eq!(
             labels,
-            vec!["frontend socket", "events socket", "state db", "engine-control token"],
+            vec![
+                "frontend socket",
+                "events socket",
+                "state db",
+                "tmux socket",
+                "engine-control token",
+            ],
             "every production path must be reported, not just the first",
         );
         assert!(matches!(refusal.ownership, AgentOwnership::BinaryLocation { .. }));
@@ -536,7 +549,7 @@ mod tests {
     /// Run from a worker session, which is where fixtures normally run.
     #[test]
     fn allows_isolated_fixture_from_a_worker_session() {
-        let (socket, events, db, pid, token) = fixture_paths("boss-test-9d3f0f22");
+        let (socket, events, db, pid, token, tmux) = fixture_paths("boss-test-9d3f0f22");
         assert!(
             evaluate(
                 ResolvedPaths {
@@ -545,6 +558,7 @@ mod tests {
                     db_path: &db,
                     pid_path: &pid,
                     token_path: Some(&token),
+                    tmux_socket: &tmux,
                 },
                 Some(&prod_root()),
                 classify_ownership(env_of(WORKER_ENV), None),
@@ -565,6 +579,7 @@ mod tests {
         let db = demo.join("state.db");
         let pid = PathBuf::from("/tmp/boss-iso-demo/engine.pid");
         let token = demo.join("engine-control.token");
+        let tmux = demo.join("tmux.sock");
         let exe = PathBuf::from("/Users/dev/.local/share/cube/workspaces/mono-agent-131/bazel-bin/engine");
         assert!(
             evaluate(
@@ -574,6 +589,7 @@ mod tests {
                     db_path: &db,
                     pid_path: &pid,
                     token_path: Some(&token),
+                    tmux_socket: &tmux,
                 },
                 Some(&prod_root()),
                 classify_ownership(env_of(NO_ENV), Some(exe)),
@@ -587,7 +603,7 @@ mod tests {
     /// gate must never touch, however the paths are spelled.
     #[test]
     fn allows_production_engine_that_is_not_agent_owned() {
-        let (socket, events, db, pid, token) = production_paths();
+        let (socket, events, db, pid, token, tmux) = production_paths();
         assert!(
             evaluate(
                 ResolvedPaths {
@@ -596,6 +612,7 @@ mod tests {
                     db_path: &db,
                     pid_path: &pid,
                     token_path: Some(&token),
+                    tmux_socket: &tmux,
                 },
                 Some(&prod_root()),
                 classify_ownership(env_of(NO_ENV), Some(PathBuf::from("/Applications/Boss.app/x/engine"))),
@@ -609,7 +626,7 @@ mod tests {
     /// production even though the test binary sits in a workspace.
     #[test]
     fn allows_a_test_binary_with_no_production_paths() {
-        let (socket, events, db, pid, token) = fixture_paths("boss-unit-test");
+        let (socket, events, db, pid, token, tmux) = fixture_paths("boss-unit-test");
         assert!(
             evaluate(
                 ResolvedPaths {
@@ -618,6 +635,7 @@ mod tests {
                     db_path: &db,
                     pid_path: &pid,
                     token_path: Some(&token),
+                    tmux_socket: &tmux,
                 },
                 None,
                 classify_ownership(env_of(WORKER_ENV), None),
@@ -638,7 +656,7 @@ mod tests {
             "/tmp/x/../boss-engine.sock",
         ] {
             let socket = PathBuf::from(socket);
-            let (_, events, db, pid, token) = fixture_paths("boss-test-spelling");
+            let (_, events, db, pid, token, tmux) = fixture_paths("boss-test-spelling");
             let refusal = evaluate(
                 ResolvedPaths {
                     socket_path: &socket,
@@ -646,6 +664,7 @@ mod tests {
                     db_path: &db,
                     pid_path: &pid,
                     token_path: Some(&token),
+                    tmux_socket: &tmux,
                 },
                 Some(&prod_root()),
                 classify_ownership(env_of(WORKER_ENV), None),
@@ -660,7 +679,7 @@ mod tests {
     /// second-guessing the user.
     #[test]
     fn ownership_is_required_for_any_refusal() {
-        let (socket, events, db, pid, token) = production_paths();
+        let (socket, events, db, pid, token, tmux) = production_paths();
         assert!(
             evaluate(
                 ResolvedPaths {
@@ -669,6 +688,7 @@ mod tests {
                     db_path: &db,
                     pid_path: &pid,
                     token_path: Some(&token),
+                    tmux_socket: &tmux,
                 },
                 Some(&prod_root()),
                 None,

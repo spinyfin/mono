@@ -71,7 +71,7 @@ pub(crate) fn failure(stderr: &str) -> CommandOutput {
 pub(crate) fn fake_tmux(replies: impl IntoIterator<Item = CommandOutput>) -> (Tmux, Arc<StubRunner>) {
     let runner = StubRunner::replies(replies);
     (
-        Tmux::with_runner("/opt/homebrew/bin/tmux", runner.clone()).unwrap(),
+        Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap(),
         runner,
     )
 }

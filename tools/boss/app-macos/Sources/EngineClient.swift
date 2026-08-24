@@ -409,6 +409,7 @@ final class EngineClient: @unchecked Sendable {
                     let runId = request["run_id"] as? String ?? ""
                     let slotId = (request["slot_id"] as? NSNumber)?.intValue ?? 0
                     let sessionName = request["session_name"] as? String ?? ""
+                    let tmuxSocketPath = request["tmux_socket_path"] as? String ?? ""
                     let summary = request["summary"] as? String
                     let taskTitle = request["task_title"] as? String
                     emit(.engineRequest(
@@ -417,6 +418,7 @@ final class EngineClient: @unchecked Sendable {
                             runId: runId,
                             slotId: slotId,
                             sessionName: sessionName,
+                            tmuxSocketPath: tmuxSocketPath,
                             summary: summary,
                             taskTitle: taskTitle
                         ))
@@ -426,7 +428,7 @@ final class EngineClient: @unchecked Sendable {
                     let spawnToken = request["spawn_token"] as? String ?? ""
                     let model = request["model"] as? String ?? ""
                     let tmuxProgram = request["tmux_program"] as? String ?? ""
-                    let serverLabel = request["server_label"] as? String ?? ""
+                    let tmuxSocketPath = request["tmux_socket_path"] as? String ?? ""
                     let newerInstalledClaudeVersion = request["coordinator_update_available_version"] as? String
                     emit(.engineRequest(
                         requestId: requestId,
@@ -435,7 +437,7 @@ final class EngineClient: @unchecked Sendable {
                             spawnToken: spawnToken,
                             model: model,
                             tmuxProgram: tmuxProgram,
-                            serverLabel: serverLabel,
+                            tmuxSocketPath: tmuxSocketPath,
                             newerInstalledClaudeVersion: newerInstalledClaudeVersion
                         ))
                     ))

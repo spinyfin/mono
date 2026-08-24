@@ -1036,7 +1036,7 @@ impl WorkDb {
     pub fn tmux_identity_for_execution(&self, execution_id: &str) -> Result<Option<TmuxIdentity>> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT tmux_session_name, tmux_spawn_token, tmux_pane_pid
+            "SELECT tmux_server_label, tmux_session_name, tmux_spawn_token, tmux_pane_pid
              FROM work_runs
              WHERE execution_id = ?1 AND tmux_session_name IS NOT NULL AND tmux_spawn_token IS NOT NULL
              ORDER BY created_at DESC, id DESC
@@ -1044,9 +1044,17 @@ impl WorkDb {
             params![execution_id],
             |row| {
                 Ok(TmuxIdentity {
-                    session_name: row.get(0)?,
-                    spawn_token: row.get(1)?,
-                    pane_pid: row.get(2)?,
+                    // Written atomically with session_name/spawn_token by
+                    // `record_tmux_spawn_intent_for_execution` — the row
+                    // invariant this query's WHERE clause relies on for
+                    // session_name/spawn_token holds for this column too, but
+                    // an old row from before this column existed could still
+                    // read NULL, so fall back to the durable socket rather
+                    // than failing the row read.
+                    server_label: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    session_name: row.get(1)?,
+                    spawn_token: row.get(2)?,
+                    pane_pid: row.get(3)?,
                 })
             },
         )

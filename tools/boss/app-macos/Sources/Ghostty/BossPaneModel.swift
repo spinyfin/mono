@@ -44,8 +44,8 @@ final class BossPaneModel: ObservableObject {
         guard !request.tmuxProgram.isEmpty, request.tmuxProgram.hasPrefix("/") else {
             return .failure(.internalFailure("engine supplied an invalid tmux program"))
         }
-        guard !request.serverLabel.isEmpty else {
-            return .failure(.internalFailure("engine supplied an empty tmux server label"))
+        guard !request.tmuxSocketPath.isEmpty else {
+            return .failure(.internalFailure("engine supplied an empty tmux socket path"))
         }
         lastRequest = request
         guard attachedSpawnToken != request.spawnToken || session == nil else {
@@ -64,7 +64,7 @@ final class BossPaneModel: ObservableObject {
         let launchSpec = TerminalLaunchSpec(
             fontSize: 11.0,
             workingDirectory: FileManager.default.homeDirectoryForCurrentUser.path,
-            initialInput: "exec \(bossShellQuote(request.tmuxProgram)) -L \(bossShellQuote(request.serverLabel)) attach-session -t \(bossShellQuote(request.sessionName))\n",
+            initialInput: "exec \(bossShellQuote(request.tmuxProgram)) -S \(bossShellQuote(request.tmuxSocketPath)) attach-session -t \(bossShellQuote(request.sessionName))\n",
             env: []
         )
         let viewer = TerminalPaneSession(

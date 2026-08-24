@@ -93,14 +93,43 @@ fn failure(stderr: &str) -> CommandOutput {
 
 fn tmux(replies: impl IntoIterator<Item = CommandOutput>) -> (Tmux, Arc<StubRunner>) {
     let runner = StubRunner::replies(replies);
-    let tmux = Tmux::with_runner("/opt/homebrew/bin/tmux", runner.clone()).unwrap();
+    let tmux = Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", runner.clone(), TEST_SOCKET_PATH).unwrap();
     (tmux, runner)
 }
 
 #[test]
 fn relative_executable_path_is_rejected() {
-    let error = Tmux::with_runner("tmux", StubRunner::replies([])).unwrap_err();
+    let error = Tmux::with_runner_and_socket("tmux", StubRunner::replies([]), TEST_SOCKET_PATH).unwrap_err();
     assert!(error.to_string().contains("absolute"));
+}
+
+#[tokio::test]
+async fn explicit_socket_path_scopes_commands_without_tmp_label_resolution() {
+    let runner = StubRunner::replies([success("tmux 3.6\n")]);
+    let tmux = Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", runner.clone(), TEST_SOCKET_PATH).unwrap();
+
+    tmux.version().await.unwrap();
+
+    assert_eq!(runner.calls(), vec![vec!["-S", TEST_SOCKET_PATH, "-V"]]);
+}
+
+#[tokio::test]
+async fn legacy_label_server_still_emits_the_pre_move_argv() {
+    let runner = StubRunner::replies([success("tmux 3.6\n")]);
+    let tmux = Tmux::for_legacy_label_server_with_runner("/opt/homebrew/bin/tmux", runner.clone()).unwrap();
+    tmux.version().await.unwrap();
+    assert_eq!(runner.calls(), vec![vec!["-L", "boss", "-V"]]);
+    assert_eq!(tmux.socket_path(), None);
+    assert_eq!(tmux.server_identity(), SERVER_LABEL);
+}
+
+#[test]
+fn socket_handle_exposes_the_path_as_server_identity() {
+    let tmux =
+        Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", StubRunner::replies([]), TEST_SOCKET_PATH).unwrap();
+    assert_eq!(tmux.socket_path(), Some(Path::new(TEST_SOCKET_PATH)));
+    assert_eq!(tmux.server_identity(), TEST_SOCKET_PATH);
+    assert_eq!(tmux.operator_prefix(), format!("tmux -S {TEST_SOCKET_PATH}"));
 }
 
 #[test]
@@ -122,7 +151,7 @@ fn version_parser_accepts_letter_suffixes_and_enforces_floor() {
 async fn version_uses_resolved_program() {
     let (tmux, runner) = tmux([success("tmux 3.6a\n")]);
     assert_eq!(tmux.version().await.unwrap(), TmuxVersion { major: 3, minor: 6 });
-    assert_eq!(runner.calls(), vec![vec!["-L", "boss", "-V"]]);
+    assert_eq!(runner.calls(), vec![vec!["-S", TEST_SOCKET_PATH, "-V"]]);
 }
 
 #[tokio::test]
@@ -138,8 +167,8 @@ async fn new_session_is_detached_private_and_carries_environment_atomically() {
     assert_eq!(
         runner.calls(),
         vec![vec![
-            "-L",
-            "boss",
+            "-S",
+            TEST_SOCKET_PATH,
             "new-session",
             "-d",
             "-s",
@@ -172,8 +201,8 @@ async fn list_sessions_parses_the_token_mirror() {
     assert_eq!(
         runner.calls(),
         vec![vec![
-            "-L",
-            "boss",
+            "-S",
+            TEST_SOCKET_PATH,
             "list-sessions",
             "-F",
             "#{session_name}\t#{@boss_spawn_token}"
@@ -267,12 +296,28 @@ async fn set_option_capture_and_display_use_the_private_server() {
     assert_eq!(
         runner.calls(),
         vec![
-            vec!["-L", "boss", "set-option", "-t", "boss-1", "@boss_spawn_token", "token"],
-            vec!["-L", "boss", "capture-pane", "-p", "-t", "boss-1"],
-            vec!["-L", "boss", "display-message", "-p", "-t", "boss-1", "#{pane_pid}"],
             vec![
-                "-L",
-                "boss",
+                "-S",
+                TEST_SOCKET_PATH,
+                "set-option",
+                "-t",
+                "boss-1",
+                "@boss_spawn_token",
+                "token"
+            ],
+            vec!["-S", TEST_SOCKET_PATH, "capture-pane", "-p", "-t", "boss-1"],
+            vec![
+                "-S",
+                TEST_SOCKET_PATH,
+                "display-message",
+                "-p",
+                "-t",
+                "boss-1",
+                "#{pane_pid}"
+            ],
+            vec![
+                "-S",
+                TEST_SOCKET_PATH,
                 "display-message",
                 "-p",
                 "-t",
@@ -291,8 +336,15 @@ async fn kill_session_verified_kills_only_on_an_exact_token_match() {
     assert_eq!(
         runner.calls(),
         vec![
-            vec!["-L", "boss", "show-environment", "-t", "boss-1", "BOSS_SPAWN_TOKEN"],
-            vec!["-L", "boss", "kill-session", "-t", "boss-1"],
+            vec![
+                "-S",
+                TEST_SOCKET_PATH,
+                "show-environment",
+                "-t",
+                "boss-1",
+                "BOSS_SPAWN_TOKEN"
+            ],
+            vec!["-S", TEST_SOCKET_PATH, "kill-session", "-t", "boss-1"],
         ]
     );
 }
@@ -313,8 +365,15 @@ async fn kill_session_verified_treats_a_session_destroyed_just_before_the_kill_a
     assert_eq!(
         runner.calls(),
         vec![
-            vec!["-L", "boss", "show-environment", "-t", "boss-1", "BOSS_SPAWN_TOKEN"],
-            vec!["-L", "boss", "kill-session", "-t", "boss-1"],
+            vec![
+                "-S",
+                TEST_SOCKET_PATH,
+                "show-environment",
+                "-t",
+                "boss-1",
+                "BOSS_SPAWN_TOKEN"
+            ],
+            vec!["-S", TEST_SOCKET_PATH, "kill-session", "-t", "boss-1"],
         ],
     );
 }
@@ -338,8 +397,8 @@ async fn kill_session_verified_refuses_a_token_mismatch_and_never_kills() {
     assert_eq!(
         runner.calls(),
         vec![vec![
-            "-L",
-            "boss",
+            "-S",
+            TEST_SOCKET_PATH,
             "show-environment",
             "-t",
             "boss-1",
@@ -357,8 +416,8 @@ async fn kill_session_verified_treats_an_absent_session_as_already_torn_down() {
     assert_eq!(
         runner.calls(),
         vec![vec![
-            "-L",
-            "boss",
+            "-S",
+            TEST_SOCKET_PATH,
             "show-environment",
             "-t",
             "boss-1",
@@ -376,8 +435,8 @@ async fn kill_session_verified_treats_a_missing_session_as_already_torn_down() {
     assert_eq!(
         runner.calls(),
         vec![vec![
-            "-L",
-            "boss",
+            "-S",
+            TEST_SOCKET_PATH,
             "show-environment",
             "-t",
             "boss-1",
@@ -395,8 +454,8 @@ async fn kill_session_verified_treats_a_dead_server_as_already_torn_down() {
     assert_eq!(
         runner.calls(),
         vec![vec![
-            "-L",
-            "boss",
+            "-S",
+            TEST_SOCKET_PATH,
             "show-environment",
             "-t",
             "boss-1",
@@ -412,7 +471,15 @@ async fn standard_tmux_options_are_supported() {
     tmux.set_option("boss-1", "remain-on-exit", "on").await.unwrap();
     assert_eq!(
         runner.calls(),
-        vec![vec!["-L", "boss", "set-option", "-t", "boss-1", "remain-on-exit", "on"]]
+        vec![vec![
+            "-S",
+            TEST_SOCKET_PATH,
+            "set-option",
+            "-t",
+            "boss-1",
+            "remain-on-exit",
+            "on"
+        ]]
     );
 }
 
@@ -427,8 +494,8 @@ async fn server_option_set_and_read_carry_no_session_target() {
     assert_eq!(
         runner.calls(),
         vec![
-            vec!["-L", "boss", "set-option", "-s", "@boss_engine_owner", "4242"],
-            vec!["-L", "boss", "show-options", "-s", "-v", "@boss_engine_owner"],
+            vec!["-S", TEST_SOCKET_PATH, "set-option", "-s", "@boss_engine_owner", "4242"],
+            vec!["-S", TEST_SOCKET_PATH, "show-options", "-s", "-v", "@boss_engine_owner"],
         ]
     );
 }
@@ -448,8 +515,8 @@ async fn send_keys_chunks_utf8_then_submits_in_a_separate_command() {
         runner.calls(),
         vec![
             vec![
-                "-L",
-                "boss",
+                "-S",
+                TEST_SOCKET_PATH,
                 "send-keys",
                 "-t",
                 "boss-1",
@@ -457,8 +524,8 @@ async fn send_keys_chunks_utf8_then_submits_in_a_separate_command() {
                 "--",
                 "x".repeat(DEFAULT_SEND_CHUNK_BYTES).as_str()
             ],
-            vec!["-L", "boss", "send-keys", "-t", "boss-1", "-l", "--", "é"],
-            vec!["-L", "boss", "send-keys", "-t", "boss-1", "C-m"],
+            vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "-l", "--", "é"],
+            vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "C-m"],
         ]
     );
 }
@@ -470,8 +537,17 @@ async fn send_keys_marks_dash_prefixed_literal_input_as_an_argument() {
     assert_eq!(
         runner.calls(),
         vec![
-            vec!["-L", "boss", "send-keys", "-t", "boss-1", "-l", "--", "-R dashdash"],
-            vec!["-L", "boss", "send-keys", "-t", "boss-1", "C-m"],
+            vec![
+                "-S",
+                TEST_SOCKET_PATH,
+                "send-keys",
+                "-t",
+                "boss-1",
+                "-l",
+                "--",
+                "-R dashdash"
+            ],
+            vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "C-m"],
         ]
     );
 }
@@ -482,7 +558,7 @@ async fn send_keys_pastes_multiline_text_then_submits_once() {
     tmux.send_keys("boss-1", "first\nsecond\n").await.unwrap();
     let calls = runner.calls();
     assert_eq!(calls.len(), 3);
-    assert_eq!(calls[0][..3], ["-L", "boss", "load-buffer"]);
+    assert_eq!(calls[0][..3], ["-S", TEST_SOCKET_PATH, "load-buffer"]);
     assert_eq!(calls[0][3], "-b");
     let buffer_name = calls[0][4].clone();
     assert!(
@@ -493,8 +569,8 @@ async fn send_keys_pastes_multiline_text_then_submits_once() {
     assert_eq!(
         calls[1],
         vec![
-            "-L",
-            "boss",
+            "-S",
+            TEST_SOCKET_PATH,
             "paste-buffer",
             "-b",
             buffer_name.as_str(),
@@ -504,7 +580,10 @@ async fn send_keys_pastes_multiline_text_then_submits_once() {
             "boss-1",
         ]
     );
-    assert_eq!(calls[2], vec!["-L", "boss", "send-keys", "-t", "boss-1", "C-m"]);
+    assert_eq!(
+        calls[2],
+        vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "C-m"]
+    );
     assert_eq!(runner.stdin(), vec![b"first\nsecond".to_vec()]);
 }
 
@@ -515,8 +594,8 @@ async fn send_keys_strips_trailing_newlines_on_single_line_path() {
     assert_eq!(
         runner.calls(),
         vec![
-            vec!["-L", "boss", "send-keys", "-t", "boss-1", "-l", "--", "hello"],
-            vec!["-L", "boss", "send-keys", "-t", "boss-1", "C-m"],
+            vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "-l", "--", "hello"],
+            vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "C-m"],
         ]
     );
 }
@@ -527,7 +606,7 @@ async fn send_key_uses_a_single_named_keypress_without_return() {
     tmux.send_key("boss-1", "Escape").await.unwrap();
     assert_eq!(
         runner.calls(),
-        vec![vec!["-L", "boss", "send-keys", "-t", "boss-1", "Escape"]]
+        vec![vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "Escape"]]
     );
 }
 
@@ -662,4 +741,49 @@ async fn an_unparseable_row_without_underscores_keeps_the_plain_error() {
     let error = format!("{:#}", tmux.list_sessions().await.unwrap_err());
     assert!(error.contains("unexpected tmux list-sessions row"), "{error}");
     assert!(!error.contains("utf8_sanitize"), "{error}");
+}
+
+#[tokio::test]
+async fn list_sessions_treats_connecting_enoent_as_an_absent_server() {
+    let (tmux, _) = tmux([failure(
+        "error connecting to /state/boss/tmux.sock (No such file or directory)",
+    )]);
+    assert!(tmux.list_sessions().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn list_sessions_treats_connecting_refused_as_an_absent_server() {
+    let (tmux, _) = tmux([failure(
+        "error connecting to /state/boss/tmux.sock (Connection refused)",
+    )]);
+    assert!(tmux.list_sessions().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn list_sessions_still_fails_on_a_generic_connecting_error() {
+    let (tmux, _) = tmux([failure("error connecting to /tmp/tmux-0/default (boss-1)")]);
+    let error = tmux.list_sessions().await.unwrap_err().to_string();
+    assert!(error.contains("error connecting to"), "error was: {error}");
+}
+
+#[test]
+fn unlink_stale_socket_removes_a_dead_unix_socket() {
+    let path = std::env::temp_dir().join(format!("boss-tmux-unlink-test-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    drop(listener);
+    assert!(path.exists());
+    let tmux = Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", StubRunner::replies([]), &path).unwrap();
+    assert!(tmux.unlink_stale_socket_file().unwrap());
+    assert!(!path.exists());
+}
+
+#[test]
+fn unlink_stale_socket_leaves_a_regular_file_alone() {
+    let path = std::env::temp_dir().join(format!("boss-tmux-unlink-regular-{}", std::process::id()));
+    std::fs::write(&path, b"not a socket").unwrap();
+    let tmux = Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", StubRunner::replies([]), &path).unwrap();
+    assert!(!tmux.unlink_stale_socket_file().unwrap());
+    assert!(path.exists());
+    std::fs::remove_file(&path).unwrap();
 }
