@@ -64,16 +64,9 @@ async fn not_tmux_hosted_when_the_live_worker_has_no_durable_identity() {
     assert_eq!(statuses[0].adoption_state, TmuxAdoptionState::NotTmuxHosted);
     assert!(statuses[0].session_name.is_none());
     assert!(statuses[0].attach_command.is_none());
-    assert_eq!(
-        runner.calls(),
-        vec![vec![
-            "-L",
-            "boss",
-            "list-sessions",
-            "-F",
-            "#{session_name}\t#{@boss_spawn_token}"
-        ]],
-    );
+    // No durable tmux identity means no tmux call is issued at all — see
+    // the doc comment on `tmux_worker_statuses`.
+    assert_eq!(runner.calls(), Vec::<Vec<&str>>::new());
 }
 
 #[tokio::test]
@@ -90,8 +83,8 @@ async fn list_sessions_failure_is_probe_unavailable() {
     assert_eq!(
         runner.calls(),
         vec![vec![
-            "-L",
-            "boss",
+            "-S",
+            boss_tmux::TEST_SOCKET_PATH,
             "list-sessions",
             "-F",
             "#{session_name}\t#{@boss_spawn_token}"
@@ -114,8 +107,8 @@ async fn session_missing_issues_only_list_sessions() {
     assert_eq!(
         runner.calls(),
         vec![vec![
-            "-L",
-            "boss",
+            "-S",
+            boss_tmux::TEST_SOCKET_PATH,
             "list-sessions",
             "-F",
             "#{session_name}\t#{@boss_spawn_token}"
@@ -142,15 +135,15 @@ async fn token_mismatch_stops_after_show_environment() {
         runner.calls(),
         vec![
             vec![
-                "-L",
-                "boss",
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
                 "list-sessions",
                 "-F",
                 "#{session_name}\t#{@boss_spawn_token}"
             ],
             vec![
-                "-L",
-                "boss",
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
                 "show-environment",
                 "-t",
                 "boss-1-example",
@@ -190,23 +183,23 @@ async fn adopted_live_pane_reads_activity_and_returns_attach_command() {
         runner.calls(),
         vec![
             vec![
-                "-L",
-                "boss",
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
                 "list-sessions",
                 "-F",
                 "#{session_name}\t#{@boss_spawn_token}"
             ],
             vec![
-                "-L",
-                "boss",
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
                 "show-environment",
                 "-t",
                 "boss-1-example",
                 "BOSS_SPAWN_TOKEN"
             ],
             vec![
-                "-L",
-                "boss",
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
                 "display-message",
                 "-p",
                 "-t",
@@ -214,8 +207,8 @@ async fn adopted_live_pane_reads_activity_and_returns_attach_command() {
                 "#{pane_dead}"
             ],
             vec![
-                "-L",
-                "boss",
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
                 "display-message",
                 "-p",
                 "-t",
@@ -223,8 +216,8 @@ async fn adopted_live_pane_reads_activity_and_returns_attach_command() {
                 "#{window_activity}"
             ],
             vec![
-                "-L",
-                "boss",
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
                 "display-message",
                 "-p",
                 "-t",
@@ -261,23 +254,23 @@ async fn adopted_dead_pane_still_reports_last_output_at() {
         runner.calls(),
         vec![
             vec![
-                "-L",
-                "boss",
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
                 "list-sessions",
                 "-F",
                 "#{session_name}\t#{@boss_spawn_token}"
             ],
             vec![
-                "-L",
-                "boss",
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
                 "show-environment",
                 "-t",
                 "boss-1-example",
                 "BOSS_SPAWN_TOKEN"
             ],
             vec![
-                "-L",
-                "boss",
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
                 "display-message",
                 "-p",
                 "-t",
@@ -285,8 +278,8 @@ async fn adopted_dead_pane_still_reports_last_output_at() {
                 "#{pane_dead}"
             ],
             vec![
-                "-L",
-                "boss",
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
                 "display-message",
                 "-p",
                 "-t",
@@ -294,8 +287,8 @@ async fn adopted_dead_pane_still_reports_last_output_at() {
                 "#{pane_dead_status}"
             ],
             vec![
-                "-L",
-                "boss",
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
                 "display-message",
                 "-p",
                 "-t",
@@ -323,15 +316,15 @@ async fn token_probe_failure_is_probe_unavailable() {
         runner.calls(),
         vec![
             vec![
-                "-L",
-                "boss",
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
                 "list-sessions",
                 "-F",
                 "#{session_name}\t#{@boss_spawn_token}"
             ],
             vec![
-                "-L",
-                "boss",
+                "-S",
+                boss_tmux::TEST_SOCKET_PATH,
                 "show-environment",
                 "-t",
                 "boss-1-example",

@@ -2361,8 +2361,8 @@ mod tests {
                     "#{pane_dead_status}".to_owned(),
                 ],
                 vec![
-                    "-L".to_owned(),
-                    "boss".to_owned(),
+                    "-S".to_owned(),
+                    boss_tmux::TEST_SOCKET_PATH.to_owned(),
                     "display-message".to_owned(),
                     "-p".to_owned(),
                     "-t".to_owned(),
