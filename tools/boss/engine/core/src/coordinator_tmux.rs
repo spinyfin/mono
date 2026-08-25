@@ -332,51 +332,96 @@ async fn session_exists(tmux: &Tmux, name: &str) -> Result<bool> {
     Ok(tmux.list_sessions().await?.iter().any(|session| session.name == name))
 }
 
-/// Resolve which tmux server currently hosts the coordinator session:
-/// `socket_tmux` (the durable `-S` socket) unless a live
-/// [`COORDINATOR_SESSION_NAME`] session survives on the pre-move `-L boss`
-/// server, in which case `legacy_tmux`.
+/// Complete the socket migration for a coordinator session left behind on
+/// the pre-move `-L boss` server, returning whether one was removed.
 ///
-/// Every coordinator lifecycle entry point (`ensure_for_attach`,
-/// `restart_if_dead`, `recreate_after_confirmation`) takes a single `&Tmux`
-/// and, before this routing existed, every caller always passed the socket
-/// handle. That meant `session_exists(tmux, ...)` reported "absent" for a
-/// coordinator the boot-time drain had adopted on the legacy server (it
-/// lives on a different server entirely), so the supervisor's restart loop
-/// would spawn a brand-new coordinator on the socket on top of the still-live
-/// legacy one — two agents driving the same `state.db`. Calling this once,
-/// before invoking any lifecycle function, and passing its result through
-/// for that call routes every check (`session_exists`, `show_environment`,
-/// `kill_session_verified`, `new_session`) at the server that actually holds
-/// the session, so the legacy coordinator is recovered/replaced in place
-/// rather than shadowed by a second one.
+/// The socket move (#2816) changed the attach protocol from a server *label*
+/// to a socket *path*: `request_coordinator_attachment` sends
+/// `tmux_socket_path`, and the app runs `tmux -S <path> attach-session`.
+/// There is no longer any way to express `-L boss` to the app. A coordinator
+/// session that predates the move is therefore unreachable — it can be
+/// probed and managed by the engine, but never attached to.
 ///
-/// `legacy_tmux` is `None` when the caller could not build a legacy handle
-/// (e.g. no resolved tmux executable yet) — in that case this always
-/// returns `socket_tmux`, matching the engine's pre-migration behavior.
-pub(crate) async fn resolve_active_handle<'a>(socket_tmux: &'a Tmux, legacy_tmux: Option<&'a Tmux>) -> &'a Tmux {
+/// The first version of this routed lifecycle calls at whichever server held
+/// the session, to avoid spawning a second coordinator on top of a live one.
+/// That guarded the right invariant but produced an absorbing state: the
+/// legacy session satisfied every liveness check, so no replacement was ever
+/// created, while every attach was refused for want of a socket path. The
+/// pane stayed blank across restarts and nothing converged, because nothing
+/// ever removed the session that was blocking progress.
+///
+/// So: migrate rather than route. Removing the legacy session first, then
+/// letting the ordinary lifecycle create a replacement on the durable
+/// socket, preserves the "never two live coordinators" guarantee the routing
+/// was protecting while actually terminating. The cost is the old
+/// conversation, once, at the upgrade boundary — a conversation that was
+/// already unreachable and would not have survived the next reboot either,
+/// since the legacy server lives in `/tmp`.
+pub(crate) async fn migrate_legacy_coordinator_if_present(work_db: &WorkDb, legacy_tmux: Option<&Tmux>) -> bool {
     let Some(legacy) = legacy_tmux else {
-        return socket_tmux;
+        return false;
     };
     match session_exists(legacy, COORDINATOR_SESSION_NAME).await {
-        Ok(true) => {
-            tracing::warn!(
-                "coordinator tmux: a live coordinator session survives on the pre-move -L boss server; \
-                 routing this lifecycle call through it instead of the durable socket so the engine does \
-                 not spawn a second live coordinator on top of it",
-            );
-            legacy
-        }
-        Ok(false) => socket_tmux,
+        Ok(false) => return false,
         Err(err) => {
             tracing::warn!(
                 error = %format!("{err:#}"),
                 "coordinator tmux: failed to probe the legacy -L boss server for a surviving coordinator \
                  session (best-effort); assuming it is not there",
             );
-            socket_tmux
+            return false;
         }
+        Ok(true) => {}
     }
+
+    let recorded_token = work_db
+        .coordinator_tmux_record()
+        .ok()
+        .flatten()
+        .map(|record| record.spawn_token);
+    let removal = match recorded_token.as_deref() {
+        Some(token) => match legacy.kill_session_verified(COORDINATOR_SESSION_NAME, token).await {
+            Ok(_) => Ok("verified"),
+            Err(err) => Err(format!("{err}")),
+        },
+        None => Err("no coordinator metadata singleton to verify against".to_owned()),
+    };
+    // A token mismatch (or no record at all) must not leave the session in
+    // place: it is unreachable either way, and leaving it is precisely what
+    // wedges the coordinator. Fall back to the legacy-only unchecked kill.
+    let how = match removal {
+        Ok(how) => how,
+        Err(reason) => {
+            tracing::warn!(
+                %reason,
+                "coordinator tmux migration: could not verify the legacy session's identity; removing it \
+                 unverified, because a session on the pre-move server is unreachable by the app either way",
+            );
+            match legacy.kill_legacy_label_session(COORDINATOR_SESSION_NAME).await {
+                Ok(_) => "unverified",
+                Err(err) => {
+                    tracing::error!(
+                        error = %format!("{err:#}"),
+                        "coordinator tmux migration: failed to remove the legacy coordinator session; the \
+                         coordinator cannot start until it is gone (kill it by hand with \
+                         `tmux -L boss kill-session -t boss-coordinator`)",
+                    );
+                    return false;
+                }
+            }
+        }
+    };
+    tracing::warn!(
+        removal = how,
+        "coordinator tmux migration: removed a coordinator session stranded on the pre-move -L boss server \
+         so a replacement can be created on the durable socket. The previous coordinator conversation ends \
+         here — it was already unreachable, because the app can only attach over -S <socket>.",
+    );
+    audit::record_event(
+        "coordinator_legacy_migration",
+        &json!({ "outcome": "removed", "removal": how }),
+    );
+    true
 }
 
 /// Read the detached coordinator pane's real pid for the engine's trust
@@ -951,56 +996,85 @@ mod tests {
         );
     }
 
-    // --- legacy-server routing (`resolve_active_handle`) ---
+    // --- legacy-server migration (`migrate_legacy_coordinator_if_present`) ---
 
-    #[tokio::test]
-    async fn resolve_active_handle_prefers_socket_when_no_legacy_coordinator_survives() {
-        let (socket_tmux, _socket_server) = tmux_for(FakeTmux::new(vec![], None, "0"));
-        let (legacy_tmux, _legacy_server) = legacy_tmux_for(FakeTmux::new(vec![], None, "0"));
-
-        let resolved = resolve_active_handle(&socket_tmux, Some(&legacy_tmux)).await;
-        assert_eq!(resolved.operator_prefix(), socket_tmux.operator_prefix());
+    fn killed_coordinator(server: &std::sync::Arc<FakeTmux>) -> bool {
+        server.calls().iter().any(|call| {
+            call.get(2).map(String::as_str) == Some("kill-session")
+                && call.iter().any(|arg| arg == COORDINATOR_SESSION_NAME)
+        })
     }
 
     #[tokio::test]
-    async fn resolve_active_handle_routes_to_the_legacy_server_when_a_coordinator_survives_there() {
-        let (socket_tmux, socket_server) = tmux_for(FakeTmux::new(vec![], None, "0"));
-        let (legacy_tmux, _legacy_server) =
-            legacy_tmux_for(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("legacy-token"), "0"));
+    async fn migrate_is_a_no_op_when_no_legacy_coordinator_survives() {
+        let (db, _socket_tmux, socket_server, _dir) = fixture(FakeTmux::new(vec![], None, "0"));
+        let (legacy_tmux, legacy_server) = legacy_tmux_for(FakeTmux::new(vec![], None, "0"));
 
-        let resolved = resolve_active_handle(&socket_tmux, Some(&legacy_tmux)).await;
-        assert_eq!(
-            resolved.operator_prefix(),
-            format!("tmux -L {}", boss_tmux::SERVER_LABEL),
-            "a coordinator surviving on -L boss must be routed to instead of the durable socket",
-        );
+        assert!(!migrate_legacy_coordinator_if_present(&db, Some(&legacy_tmux)).await);
+        assert!(!killed_coordinator(&legacy_server));
         assert!(
             socket_server.calls().is_empty(),
-            "resolving which handle to use must never itself probe the socket server",
+            "the migration probe must never touch the durable socket server",
         );
     }
 
     #[tokio::test]
-    async fn resolve_active_handle_falls_back_to_socket_with_no_legacy_handle() {
-        let (socket_tmux, _socket_server) = tmux_for(FakeTmux::new(vec![], None, "0"));
-        let resolved = resolve_active_handle(&socket_tmux, None).await;
-        assert_eq!(resolved.operator_prefix(), socket_tmux.operator_prefix());
+    async fn migrate_is_a_no_op_without_a_legacy_handle() {
+        let (db, _socket_tmux, _socket_server, _dir) = fixture(FakeTmux::new(vec![], None, "0"));
+        assert!(!migrate_legacy_coordinator_if_present(&db, None).await);
     }
 
-    /// A live coordinator surviving on the legacy server must be recovered
-    /// in place — options reapplied against `-L boss` — never shadowed by a
-    /// second coordinator spawned fresh on the durable socket.
     #[tokio::test]
-    async fn ensure_for_attach_recovers_a_legacy_coordinator_without_spawning_a_second_one() {
-        let (db, socket_tmux, socket_server, dir) = fixture(FakeTmux::new(vec![], None, "0"));
+    async fn migrate_removes_a_coordinator_stranded_on_the_legacy_server() {
+        let (db, _socket_tmux, _socket_server, _dir) = fixture(FakeTmux::new(vec![], None, "0"));
         db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "legacy-token", "opus", None)
             .unwrap();
         db.record_coordinator_tmux_session_created("legacy-token").unwrap();
         let (legacy_tmux, legacy_server) =
             legacy_tmux_for(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("legacy-token"), "0"));
 
-        let active_tmux = resolve_active_handle(&socket_tmux, Some(&legacy_tmux)).await;
-        let record = ensure_for_attach(&db, active_tmux, &socket_tmux, "opus", dir.path(), &NoneProbe)
+        assert!(migrate_legacy_coordinator_if_present(&db, Some(&legacy_tmux)).await);
+        assert!(
+            killed_coordinator(&legacy_server),
+            "a coordinator on the pre-move server must be removed, not routed to",
+        );
+    }
+
+    /// The anti-wedge guarantee. A legacy session whose identity cannot be
+    /// verified is still unreachable by the app, so leaving it in place would
+    /// suppress the replacement forever — which is the incident this
+    /// migration exists to end. It must be removed regardless.
+    #[tokio::test]
+    async fn migrate_removes_the_legacy_session_even_when_its_token_does_not_match() {
+        let (db, _socket_tmux, _socket_server, _dir) = fixture(FakeTmux::new(vec![], None, "0"));
+        db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "recorded-token", "opus", None)
+            .unwrap();
+        db.record_coordinator_tmux_session_created("recorded-token").unwrap();
+        let (legacy_tmux, legacy_server) = legacy_tmux_for(FakeTmux::new(
+            vec![COORDINATOR_SESSION_NAME],
+            Some("a-different-token"),
+            "0",
+        ));
+
+        assert!(migrate_legacy_coordinator_if_present(&db, Some(&legacy_tmux)).await);
+        assert!(killed_coordinator(&legacy_server));
+    }
+
+    /// End to end: once the stranded session is gone, the ordinary lifecycle
+    /// creates the replacement on the durable socket — the state the previous
+    /// routing behaviour could never reach, because the legacy session
+    /// satisfied every liveness check and nothing removed it.
+    #[tokio::test]
+    async fn after_migration_the_replacement_is_created_on_the_durable_socket() {
+        let (db, socket_tmux, socket_server, dir) = fixture(FakeTmux::new(vec![], None, "0"));
+        db.record_coordinator_tmux_spawn_intent(COORDINATOR_SESSION_NAME, "legacy-token", "opus", None)
+            .unwrap();
+        db.record_coordinator_tmux_session_created("legacy-token").unwrap();
+        let (legacy_tmux, _legacy_server) =
+            legacy_tmux_for(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("legacy-token"), "0"));
+
+        migrate_legacy_coordinator_if_present(&db, Some(&legacy_tmux)).await;
+        let record = ensure_for_attach(&db, &socket_tmux, &socket_tmux, "opus", dir.path(), &NoneProbe)
             .await
             .unwrap();
 
@@ -1009,15 +1083,8 @@ mod tests {
             socket_server
                 .calls()
                 .iter()
-                .all(|call| call.get(2).map(String::as_str) != Some("new-session")),
-            "the durable socket must never see a new-session call while the legacy coordinator is live",
-        );
-        assert!(
-            legacy_server
-                .calls()
-                .iter()
-                .any(|call| call.get(2).map(String::as_str) == Some("set-option")),
-            "the legacy session's options must be reapplied in place",
+                .any(|call| call.get(2).map(String::as_str) == Some("new-session")),
+            "the replacement coordinator must be created on the durable socket",
         );
     }
 
