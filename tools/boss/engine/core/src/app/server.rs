@@ -536,7 +536,7 @@ pub async fn serve_with_merge_probe(
                 return;
             };
             let legacy_tmux = boss_tmux::Tmux::for_legacy_label_server(tmux.program().to_path_buf()).ok();
-            let (restart, active_tmux) = {
+            let restart = {
                 let _guard = coordinator_supervisor_state.coordinator_tmux_lock.lock().await;
                 let working_directory = match crate::coordinator_tmux::coordinator_working_directory() {
                     Ok(path) => path,
@@ -549,19 +549,25 @@ pub async fn serve_with_merge_probe(
                         continue;
                     }
                 };
-                let active_tmux = crate::coordinator_tmux::resolve_active_handle(&tmux, legacy_tmux.as_ref())
-                    .await
-                    .clone();
-                let restart = crate::coordinator_tmux::restart_if_dead(
+                // See `migrate_legacy_coordinator_if_present`: a coordinator
+                // stranded on the pre-move `-L boss` server passes every
+                // liveness check here but can never be attached to, so it
+                // must be cleared before `restart_if_dead` concludes the
+                // coordinator is healthy and leaves it alone.
+                crate::coordinator_tmux::migrate_legacy_coordinator_if_present(
                     coordinator_supervisor_state.work_db.as_ref(),
-                    &active_tmux,
+                    legacy_tmux.as_ref(),
+                )
+                .await;
+                crate::coordinator_tmux::restart_if_dead(
+                    coordinator_supervisor_state.work_db.as_ref(),
+                    &tmux,
                     &tmux,
                     &coordinator_supervisor_state.coordinator_model,
                     &working_directory,
                     &crate::coordinator_tmux::RealClaudeVersionProbe,
                 )
-                .await;
-                (restart, active_tmux)
+                .await
             };
             match restart {
                 Ok(Some(record)) => {
@@ -605,14 +611,14 @@ pub async fn serve_with_merge_probe(
                         if attached.as_deref() != Some(record.spawn_token.as_str()) {
                             crate::app::sessions::request_coordinator_attachment(
                                 coordinator_supervisor_state.clone(),
-                                &active_tmux,
+                                &tmux,
                                 record,
                             )
                             .await;
                         } else {
                             crate::app::sessions::refresh_coordinator_update_available(
                                 coordinator_supervisor_state.clone(),
-                                &active_tmux,
+                                &tmux,
                                 record,
                             )
                             .await;

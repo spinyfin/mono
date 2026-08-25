@@ -488,11 +488,33 @@ impl Tmux {
         }
     }
 
+    /// Destroy a session on the pre-move `-L boss` server without identity
+    /// verification. Returns `Ok(true)` when it was killed, `Ok(false)` when
+    /// it had already vanished.
+    ///
+    /// Deliberately narrow: this refuses on a socket handle, so
+    /// [`Self::kill_session_verified`] remains the only teardown entry point
+    /// for the durable server. The exception exists because a session
+    /// stranded on the legacy server is unreachable by any other means — the
+    /// app can only attach over `-S <socket>`, so a legacy session can be
+    /// neither used nor handed back to its owner. Requiring a token match to
+    /// remove it would let an unrecognized token wedge the coordinator
+    /// permanently, which is the failure this exists to end.
+    pub async fn kill_legacy_label_session(&self, session: &str) -> Result<bool> {
+        if !matches!(self.server, ServerAddress::Label) {
+            bail!("kill_legacy_label_session is only valid on the pre-move -L boss server handle");
+        }
+        self.kill_session_unchecked(session).await
+    }
+
     /// Low-level `kill-session -t <name>`, with no identity verification.
     /// Private: [`Self::kill_session_verified`] is this crate's only public
-    /// teardown entry point, by design — see its doc comment. Returns
-    /// `Ok(true)` when the session was actually killed, `Ok(false)` when it
-    /// had already vanished (a real command failure still becomes `Err`).
+    /// teardown entry point for the durable server, by design — see its doc
+    /// comment. [`Self::kill_legacy_label_session`] is the one narrow
+    /// exception, scoped to the pre-move `-L boss` server.
+    /// Returns `Ok(true)` when the session was actually killed, `Ok(false)`
+    /// when it had already vanished (a real command failure still becomes
+    /// `Err`).
     async fn kill_session_unchecked(&self, session: &str) -> Result<bool> {
         validate_value("session name", session)?;
         let mut args = self.server_args();
