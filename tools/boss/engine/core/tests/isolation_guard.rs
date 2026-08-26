@@ -39,9 +39,7 @@
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
-#[cfg(target_os = "macos")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use boss_client::wait_for_socket;
@@ -679,10 +677,8 @@ async fn events_socket_collision_is_refused_before_any_destructive_write() -> Re
 /// Duplicate launch on the same pid path must lose the instance flock
 /// immediately — not wait out `SQLITE_BUSY_TIMEOUT` on `state.db`.
 ///
-/// `flock` is per-fd on macOS (two `open`s in one process contend) and
-/// per-process on Linux (they do not). This test therefore runs only on
-/// macOS; the Linux cross-process case is `pid_file::tests::second_process_loses_held_lock`.
-#[cfg(target_os = "macos")]
+/// `flock` is associated with an open file description on both macOS and
+/// Linux, so two independently opened lock files contend in this process.
 #[tokio::test]
 async fn duplicate_pid_path_is_refused_before_opening_the_database() -> Result<()> {
     let temp = tempfile::tempdir()?;

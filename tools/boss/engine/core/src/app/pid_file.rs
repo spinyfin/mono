@@ -7,15 +7,18 @@
 //! treated "no pid file" as "engine exited" and launched a second copy that
 //! lost the SQLite busy-timeout and died with `error:database is locked`.
 //!
-//! [`PidFileGuard::acquire`] takes a non-blocking exclusive `flock` on the
-//! pid file and writes this process's pid while holding it. The flock is
-//! released when the guard (and its fd) is dropped. A second engine that
-//! reaches this path while the first is still opening the database fails
-//! immediately with [`AcquireError::AlreadyHeld`] instead of racing SQLite.
+//! [`PidFileGuard::acquire`] takes a non-blocking exclusive `flock` on a
+//! dedicated sibling lock file and writes this process's pid to the pid file.
+//! The flock is released when the guard (and its fd) is dropped. The lock must
+//! not live on the pid-file inode: consumers remove the pid file while
+//! stopping or cleaning up stale engines, and unlinking a locked path creates
+//! a new inode that would defeat mutual exclusion. A second engine that reaches
+//! this path while the first is still opening the database fails immediately
+//! with [`AcquireError::AlreadyHeld`] instead of racing SQLite.
 
+use fs4::fs_std::FileExt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 /// RAII guard that holds the instance lock and removes the pid file on drop
@@ -25,7 +28,7 @@ pub(super) struct PidFileGuard {
     pub(super) path: String,
     pub(super) pid: u32,
     /// Kept open so the exclusive flock lives for the process lifetime.
-    _file: File,
+    _lock_file: File,
 }
 
 /// Why [`PidFileGuard::acquire`] refused to take the pid file.
@@ -71,9 +74,9 @@ impl std::error::Error for AcquireError {
 }
 
 impl PidFileGuard {
-    /// Open `path`, take a non-blocking exclusive flock, and write this
-    /// process's pid. Fails immediately if another process already holds
-    /// the lock — no wait, no retry.
+    /// Take a non-blocking exclusive flock on a dedicated sibling lock file,
+    /// then write this process's pid to `path`. Fails immediately if another
+    /// process already holds the lock — no wait, no retry.
     pub(super) fn acquire(path: &Path) -> Result<Self, AcquireError> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -84,9 +87,36 @@ impl PidFileGuard {
             })?;
         }
 
-        // Do not truncate on open: a loser of the flock must still be able
-        // to read the winner's pid, and truncating before `flock` would
-        // wipe it. The winner truncates explicitly after it holds the lock.
+        let lock_path = instance_lock_path(path);
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .map_err(|source| AcquireError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+
+        match FileExt::try_lock_exclusive(&lock_file) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(AcquireError::AlreadyHeld {
+                    path: path.to_path_buf(),
+                    holder_pid: read_holder_pid(path),
+                });
+            }
+            Err(source) => {
+                return Err(AcquireError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        }
+
+        // The winner truncates only after it holds the separate instance-lock
+        // inode, leaving its pid readable to contenders that fail the lock.
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -97,16 +127,6 @@ impl PidFileGuard {
                 path: path.to_path_buf(),
                 source,
             })?;
-
-        // SAFETY: `file` is a valid open fd; `flock` does not take ownership.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            let holder_pid = read_holder_pid(path);
-            return Err(AcquireError::AlreadyHeld {
-                path: path.to_path_buf(),
-                holder_pid,
-            });
-        }
 
         let pid = std::process::id();
         file.set_len(0).map_err(|source| AcquireError::Io {
@@ -130,7 +150,7 @@ impl PidFileGuard {
         Ok(Self {
             path: path.to_string_lossy().into_owned(),
             pid,
-            _file: file,
+            _lock_file: lock_file,
         })
     }
 }
@@ -150,7 +170,14 @@ impl Drop for PidFileGuard {
 
 fn read_holder_pid(path: &Path) -> Option<u32> {
     let content = std::fs::read_to_string(path).ok()?;
-    content.trim().parse().ok().filter(|&pid| pid > 1)
+    let pid = content.trim().parse().ok().filter(|&pid| pid > 1)?;
+    crate::app::server::process_is_alive(pid as libc::pid_t).then_some(pid)
+}
+
+fn instance_lock_path(pid_path: &Path) -> PathBuf {
+    let mut lock_path = pid_path.as_os_str().to_owned();
+    lock_path.push(".instance.lock");
+    PathBuf::from(lock_path)
 }
 
 #[cfg(test)]
@@ -194,13 +221,10 @@ mod tests {
         drop(guard);
     }
 
-    /// Same-process second acquire. On kernels that associate flock with the
-    /// fd (macOS) this returns `AlreadyHeld`. On kernels that associate it
-    /// with the process (Linux) the second call succeeds — cross-process
-    /// exclusion still holds, and [`second_process_loses_held_lock`] covers
-    /// that case.
+    /// `flock` is associated with an open file description, so a second open
+    /// of the same instance-lock file must contend even in this process.
     #[test]
-    fn same_process_second_acquire_is_already_held_or_is_the_same_process() {
+    fn second_acquire_is_already_held() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("engine.pid");
         let first = PidFileGuard::acquire(&path).expect("first acquire");
@@ -208,11 +232,8 @@ mod tests {
             Err(AcquireError::AlreadyHeld { holder_pid, .. }) => {
                 assert_eq!(holder_pid, Some(std::process::id()));
             }
-            Ok(second) => {
-                assert_eq!(second.pid, first.pid);
-                drop(second);
-            }
             Err(other) => panic!("unexpected acquire error: {other}"),
+            Ok(_) => panic!("second acquire must contend with the first flock"),
         }
         drop(first);
     }
@@ -226,9 +247,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("engine.pid");
         let ready = dir.path().join("ready");
-        let Some(mut child) = spawn_lock_holder(&path, &ready) else {
-            eprintln!("skipping: no python3/perl available to hold a foreign flock");
-            return;
+        let lock_path = instance_lock_path(&path);
+        let Some(mut child) = spawn_lock_holder(&lock_path, &ready) else {
+            panic!("no python3/perl available to hold a foreign flock");
         };
         let err = PidFileGuard::acquire(&path).expect_err("foreign holder must win the flock");
         match err {
@@ -242,6 +263,14 @@ mod tests {
         }
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn read_holder_pid_ignores_a_dead_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine.pid");
+        std::fs::write(&path, format!("{}\n", u32::MAX)).unwrap();
+        assert_eq!(read_holder_pid(&path), None);
     }
 
     fn spawn_lock_holder(path: &Path, ready: &Path) -> Option<std::process::Child> {
