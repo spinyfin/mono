@@ -1144,7 +1144,7 @@ mod tests {
             && call.get(5).map(String::as_str) == Some(value)
     }
 
-    /// Boss-owned extended-key options must be present in the recorded argv
+    /// Boss-owned server options must be present in the recorded argv
     /// by the time the caller returns an attach identity.
     fn assert_extended_keys_applied(calls: &[Vec<String>]) {
         assert!(
@@ -1156,6 +1156,10 @@ mod tests {
         assert!(
             calls.iter().any(|call| is_server_option(call, "extended-keys", "on")),
             "expected set-option -s extended-keys on, got {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|call| is_server_option(call, "focus-events", "on")),
+            "expected set-option -s focus-events on, got {calls:?}"
         );
     }
 
@@ -1250,11 +1254,12 @@ mod tests {
         );
         assert!(is_server_option(&calls[1], "terminal-features[100]", "xterm*:extkeys"));
         assert!(is_server_option(&calls[2], "extended-keys", "on"));
-        assert_eq!(calls[3][2], "set-option");
-        assert_eq!(calls[3][5], "status");
-        assert_eq!(calls[3][6], "off");
-        assert_eq!(calls[4][5], "@boss_spawn_token");
-        assert_eq!(calls[5][5], "remain-on-exit");
+        assert!(is_server_option(&calls[3], "focus-events", "on"));
+        assert_eq!(calls[4][2], "set-option");
+        assert_eq!(calls[4][5], "status");
+        assert_eq!(calls[4][6], "off");
+        assert_eq!(calls[5][5], "@boss_spawn_token");
+        assert_eq!(calls[6][5], "remain-on-exit");
         assert_extended_keys_applied(&calls);
     }
 
