@@ -14,6 +14,7 @@ pub use types::{
 };
 
 use std::ffi::OsString;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -638,9 +639,21 @@ fn is_absent_socket_stderr(stderr: &str) -> bool {
 }
 
 /// Unlink `path` when it exists as a unix socket with no listener. A live
-/// server, a missing file, or any other connect error is left alone.
+/// server, a missing file, a non-socket file, or any other connect error is
+/// left alone.
+///
+/// Linux `connect(2)` returns `ECONNREFUSED` for a regular file as well as
+/// for a socket with no listener, so the file-type check is load-bearing:
+/// matching on the connect error alone would delete non-socket files.
 fn unlink_stale_unix_socket(path: &Path) -> Result<bool> {
-    if !path.exists() {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| format!("stat tmux socket {}", path.display()));
+        }
+    };
+    if !metadata.file_type().is_socket() {
         return Ok(false);
     }
     match std::os::unix::net::UnixStream::connect(path) {

@@ -59,7 +59,7 @@ use boss_dispatch_events::{DispatchEvent, DispatchEventSink, Outcome as Dispatch
 
 pub use index::{RefreshStats, SharedTimelineIndex, TimelineIndex};
 pub use integrity::{DamageShape, DamagedLine, StreamRead};
-pub use timeline::{StageThresholds, StalledStage, TimelineState, is_terminal_event};
+pub use timeline::{LastRealEvent, StageThresholds, StalledStage, TimelineState, is_terminal_event};
 
 /// Default Boss state root used by the file-scan readers when the
 /// caller didn't override it. Mirrors the writer's default (see
@@ -153,12 +153,17 @@ fn parse_lines<R: BufRead>(path: &Path, reader: R) -> Result<StreamRead> {
 }
 
 /// One entry in the `ghost-active` listing: an execution whose
-/// dispatch timeline started but never reached a terminal stage
-/// (`pane_spawned ok|error`, `run_started error`).
+/// dispatch timeline started but whose last *real* event
+/// ([`TimelineState::live_summary`] — i.e. ignoring `stage_stalled`
+/// observation records) never reached a terminal stage
+/// (`pane_spawned ok`, or any `error` outcome).
 ///
 /// Surfaced by [`ghost_active`] for inspection through `bossctl
-/// dispatch ghost-active`. Detection is event-shape only: we don't
-/// need DB access to spot a timeline that just stops.
+/// dispatch ghost-active`. Detection here is event-shape only: we
+/// don't need DB access to spot a timeline that just stops. Callers
+/// that can open the work DB (bossctl does) additionally drop
+/// entries whose bound work item is already closed — that clause
+/// lives at the CLI layer so this crate stays file-scan-only.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct GhostActiveEntry {
@@ -202,10 +207,17 @@ pub struct GhostActiveReport {
 pub fn ghost_active(root: &Path, now_ms: u128, stalled_threshold_ms: u128) -> Result<GhostActiveReport> {
     let mut damage = Vec::new();
     let mut entries = for_each_timeline(root, &mut damage, |execution_id, events| {
-        let last = events.last()?;
-        if is_terminal_event(last) {
-            return None;
-        }
+        // Fold through `TimelineState` rather than reading `events.last()`
+        // directly: a `stage_stalled` record is an *observation*, not a step
+        // in the timeline, and can land after a genuine terminal event (e.g.
+        // a stray stall check racing a `pane_spawned ok`). Reading the raw
+        // last line would then see that non-terminal `stage_stalled` record
+        // and keep the execution on this list forever, even though it
+        // reached a terminal stage and — per this crate's single definition
+        // of "stalled" (see the module docs) — is not live. `live_summary`
+        // is exactly the reduction that skips those flags.
+        let state = TimelineState::from_events(events)?;
+        let last = state.live_summary()?;
         let elapsed = now_ms.saturating_sub(last.ts_epoch_ms);
         Some(GhostActiveEntry {
             execution_id: execution_id.to_owned(),
@@ -1020,6 +1032,92 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].execution_id, "exec-stuck");
         assert_eq!(entries[0].last_stage, "cube_change_created");
+        assert_eq!(entries[0].elapsed_since_last_ms, 9_000);
+        assert!(entries[0].stalled);
+    }
+
+    /// The regression this crate exists to prevent: a `stage_stalled`
+    /// observation written *after* a genuine terminal event must not pin the
+    /// execution on the list forever. Before this fix, `ghost_active` read
+    /// `events.last()` directly and a trailing `stage_stalled` record — which
+    /// is never terminal — kept a completed execution on the list
+    /// permanently, even though its last *real* event was `pane_spawned ok`.
+    #[tokio::test]
+    async fn ghost_active_drops_an_execution_whose_trailing_event_is_a_stray_stall_flag() {
+        let dir = TempDir::new().unwrap();
+        let sink = JsonlFileSink::new(dir.path());
+
+        write(
+            &sink,
+            DispatchEvent::new(Stage::RequestRecorded, Outcome::Ok, "exec-done"),
+        )
+        .await;
+        let mut event = DispatchEvent::new(Stage::CubeChangeCreated, Outcome::Ok, "exec-done");
+        event.ts_epoch_ms = 1_000;
+        write(&sink, event).await;
+        let mut spawned = DispatchEvent::new(Stage::PaneSpawned, Outcome::Ok, "exec-done");
+        spawned.ts_epoch_ms = 2_000;
+        write(&sink, spawned).await;
+        // Stray stall observation racing the terminal event, appended after it.
+        let mut stalled = DispatchEvent::new(Stage::StageStalled, Outcome::Ok, "exec-done");
+        stalled.ts_epoch_ms = 3_000;
+        stalled.details = serde_json::json!({
+            "stalled_stage": "cube_change_created",
+            "stalled_outcome": "ok",
+            "stalled_at_ts_epoch_ms": 1_000,
+        });
+        write(&sink, stalled).await;
+
+        let entries = ghost_active(dir.path(), 10_000, 5_000).unwrap().entries;
+        assert!(
+            entries.is_empty(),
+            "an execution whose last real event is terminal must not be ghost-active, \
+             regardless of a trailing stage_stalled record: {entries:?}"
+        );
+    }
+
+    /// The opposite of the stray-flag drop: a genuinely stalled
+    /// execution whose last *real* event is non-terminal must stay on
+    /// the list even when a trailing `stage_stalled` observation is
+    /// the last line of the mirror. `stage_stalled` is a stall
+    /// observation, not a terminal stage — treating it as one would
+    /// drop the exact rows this listing exists to surface.
+    ///
+    /// Also pins the field-semantics change: `last_stage` /
+    /// `elapsed_since_last_ms` / `stalled` are taken from the real
+    /// event, not from the trailing flag (so elapsed is measured from
+    /// `cube_change_created` at t=1_000, not the stall record at t=3_000).
+    #[tokio::test]
+    async fn ghost_active_keeps_a_never_recovered_stall_and_reports_the_real_event() {
+        let dir = TempDir::new().unwrap();
+        let sink = JsonlFileSink::new(dir.path());
+
+        write(
+            &sink,
+            DispatchEvent::new(Stage::RequestRecorded, Outcome::Ok, "exec-stuck"),
+        )
+        .await;
+        let mut event = DispatchEvent::new(Stage::CubeChangeCreated, Outcome::Ok, "exec-stuck");
+        event.ts_epoch_ms = 1_000;
+        write(&sink, event).await;
+        let mut stalled = DispatchEvent::new(Stage::StageStalled, Outcome::Ok, "exec-stuck");
+        stalled.ts_epoch_ms = 3_000;
+        stalled.details = serde_json::json!({
+            "stalled_stage": "cube_change_created",
+            "stalled_outcome": "ok",
+            "stalled_at_ts_epoch_ms": 1_000,
+        });
+        write(&sink, stalled).await;
+
+        let entries = ghost_active(dir.path(), 10_000, 5_000).unwrap().entries;
+        assert_eq!(
+            entries.len(),
+            1,
+            "a never-recovered stall must stay listed: {entries:?}"
+        );
+        assert_eq!(entries[0].execution_id, "exec-stuck");
+        assert_eq!(entries[0].last_stage, "cube_change_created");
+        assert_eq!(entries[0].last_outcome, "ok");
         assert_eq!(entries[0].elapsed_since_last_ms, 9_000);
         assert!(entries[0].stalled);
     }

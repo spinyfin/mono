@@ -474,9 +474,11 @@ enum DispatchAction {
         signatures_only: bool,
     },
     /// List executions whose dispatch timeline started but never
-    /// reached a terminal stage (`pane_spawned ok` or any error).
-    /// Useful when the engine logs a successful dispatch but no
-    /// worker pane ever appeared in the Doing column.
+    /// reached a terminal stage (`pane_spawned ok` or any error),
+    /// and whose bound work item is not already closed (`done` /
+    /// `archived`, or a closed comment). Useful when the engine logs
+    /// a successful dispatch but no worker pane ever appeared in the
+    /// Doing column.
     GhostActive {
         /// Override the Boss state root.
         #[arg(long)]
@@ -1641,29 +1643,36 @@ fn dispatch_ghost_active(
     stalled_after_secs: u64,
     include_stalled: bool,
 ) -> Result<()> {
-    let root = resolve_state_root(state_root)?;
+    let root = resolve_state_root(state_root.clone())?;
     let now = now_epoch_ms();
     let threshold_ms = (stalled_after_secs as u128).saturating_mul(1000);
     let report = dispatch_reader::ghost_active(&root, now, threshold_ms)?;
     // Every entry here is an absence claim ("never reached a terminal stage"),
     // so the integrity of the mirrors it was derived from is part of the answer.
     let integrity = stream_integrity::IntegrityReport::new(report.damage);
-    let mut entries = report.entries;
+    // The reader crate is file-scan-only. A completed work item (or a
+    // closed comment) can still have a non-terminal dispatch timeline
+    // — comment executions often never reach `pane_spawned ok` — so
+    // those rows are not ghost-active regardless of the last event.
+    // Missing / unreadable `state.db` is non-fatal: keep the
+    // event-shape list rather than failing the command, but surface
+    // that the closed-work-item filter did not run (help text promises
+    // it, so a silent skip would be an unannounced weaker answer).
+    let db_result = open_state_db(state_root);
+    let work_item_filter = work_item_filter_status(&db_result);
+    let mut entries = drop_closed_work_items(report.entries, db_result.as_ref().ok());
     if include_stalled {
         entries.retain(|e| e.stalled);
     }
 
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "ghost_active": entries,
-                "stream_integrity": integrity.to_json(),
-            })
-        );
+        println!("{}", ghost_active_json_payload(&entries, &integrity, work_item_filter));
         return Ok(());
     }
     integrity.print_notice();
+    if let Err(err) = &db_result {
+        eprintln!("{}", work_item_filter_unavailable_notice(err));
+    }
     if entries.is_empty() {
         println!("no ghost-active executions");
     } else {
@@ -1678,6 +1687,64 @@ fn dispatch_ghost_active(
         }
     }
     Ok(())
+}
+
+/// `"applied"` when `state.db` opened and the closed-work-item filter
+/// ran; `"skipped: state.db unavailable"` when it did not, so a
+/// `--json` consumer can tell a filtered list from an unfiltered one.
+fn work_item_filter_status<T, E>(db: &Result<T, E>) -> &'static str {
+    match db {
+        Ok(_) => "applied",
+        Err(_) => "skipped: state.db unavailable",
+    }
+}
+
+fn work_item_filter_unavailable_notice(err: &impl std::fmt::Display) -> String {
+    format!("note: state.db unavailable ({err:#}); closed work items were not filtered out")
+}
+
+fn ghost_active_json_payload(
+    entries: &[dispatch_reader::GhostActiveEntry],
+    integrity: &stream_integrity::IntegrityReport,
+    work_item_filter: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "ghost_active": entries,
+        "stream_integrity": integrity.to_json(),
+        "work_item_filter": work_item_filter,
+    })
+}
+
+/// Drop ghost-active entries whose bound work item (or comment) is already
+/// closed. The reader crate stays file-scan-only; this is the CLI-layer
+/// counterpart of "a terminal work-item status is not ghost-active
+/// regardless of the last event".
+///
+/// Entries with no `work_item_id`, an unknown/unreadable id, or a row
+/// that cannot be loaded are kept: those are still event-shape ghost
+/// timelines, and dropping them would hide the rows this listing exists
+/// to surface. When `db` is `None` (state.db missing), every entry is
+/// kept — callers must surface that skip (human notice / `--json`
+/// `work_item_filter`) rather than emitting an unannounced weaker list.
+fn drop_closed_work_items(
+    entries: Vec<dispatch_reader::GhostActiveEntry>,
+    db: Option<&WorkDb>,
+) -> Vec<dispatch_reader::GhostActiveEntry> {
+    let Some(db) = db else {
+        return entries;
+    };
+    entries
+        .into_iter()
+        .filter(|entry| {
+            let Some(id) = entry.work_item_id.as_deref() else {
+                return true;
+            };
+            match db.is_bound_work_item_closed(id) {
+                Ok(closed) => !closed,
+                Err(_) => true,
+            }
+        })
+        .collect()
 }
 
 /// Current interactive-pool concurrency cap as returned by

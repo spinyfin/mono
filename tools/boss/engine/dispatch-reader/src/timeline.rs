@@ -118,14 +118,19 @@ pub fn is_terminal_event(event: &DispatchEvent) -> bool {
 }
 
 /// The last non-`stage_stalled` event of a timeline, reduced to the fields
-/// a stall decision needs.
+/// a stall decision or a `ghost-active` listing needs.
+///
+/// Returned by [`TimelineState::live_summary`] (as a reference, and only
+/// when `terminal` is false). `terminal` is part of the reduction so a
+/// caller that already folded through [`TimelineState`] does not have to
+/// re-run [`is_terminal_event`] on a discarded original record.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LastRealEvent {
-    work_item_id: Option<String>,
-    stage: String,
-    outcome: String,
-    ts_epoch_ms: u128,
-    terminal: bool,
+pub struct LastRealEvent {
+    pub work_item_id: Option<String>,
+    pub stage: String,
+    pub outcome: String,
+    pub ts_epoch_ms: u128,
+    pub terminal: bool,
 }
 
 /// Fixed-size reduction of one execution's dispatch timeline.
@@ -244,6 +249,22 @@ impl TimelineState {
     fn live_last_real(&self) -> Option<&LastRealEvent> {
         let last = self.last_real.as_ref()?;
         if last.terminal { None } else { Some(last) }
+    }
+
+    /// The last non-`stage_stalled` event — or `None` when the timeline's
+    /// last real event already reached [`is_terminal_event`].
+    ///
+    /// This is the terminal-stage check `ghost_active` must use instead of
+    /// looking at the raw last line of a mirror: a `stage_stalled` record
+    /// written after a genuine terminal event (e.g. a stray stall
+    /// observation racing a `pane_spawned ok`) must not make the timeline
+    /// look non-terminal again. Because `TimelineState` folds
+    /// `stage_stalled` records as flags rather than as steps (see the module
+    /// docs), `last_real` already skips them — this just exposes that
+    /// reduction for a caller that isn't deciding a stall, only whether the
+    /// timeline is still open at all.
+    pub fn live_summary(&self) -> Option<&LastRealEvent> {
+        self.live_last_real()
     }
 
     fn already_flagged(&self, last: &LastRealEvent) -> bool {
