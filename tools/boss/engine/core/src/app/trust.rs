@@ -5,30 +5,11 @@
 //! privileged RPC is admitted by walking the calling peer's process tree
 //! against those roots — see [`RpcTier`] and
 //! [`ServerState::authorize_rpc`] for the tiers and their semantics.
-//! Also holds [`PidFileGuard`], which cleans up the engine's own pid file.
+//! The engine's own pid file and instance lock live in [`super::pid_file`].
 //!
 //! Split out of `app.rs`; pure structural move — no behavioural change.
 
 use super::*;
-
-pub(super) struct PidFileGuard {
-    pub(super) path: String,
-    pub(super) pid: u32,
-}
-
-impl Drop for PidFileGuard {
-    fn drop(&mut self) {
-        let content = match std::fs::read_to_string(&self.path) {
-            Ok(content) => content,
-            Err(_) => return,
-        };
-
-        let parsed = content.trim().parse::<u32>().ok();
-        if parsed == Some(self.pid) {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
 
 /// Authorization tier for a frontend RPC.
 ///

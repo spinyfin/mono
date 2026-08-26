@@ -589,6 +589,12 @@ final class EngineProcessController: @unchecked Sendable {
         return prefix.isEmpty ? current : "\(prefix):\(current)"
     }
 
+    /// Poll the pid file until a live engine pid appears or `timeoutSeconds`
+    /// elapses. The engine writes this file (and takes the instance flock)
+    /// before opening `state.db`, so a slow WAL/schema open is still visible
+    /// as a live pid. If this wait times out, `enableSupervision` treats a
+    /// missing pid as "engine exited" and will launch a replacement — that
+    /// is the duplicate-engine path this contract exists to avoid.
     private func waitForEnginePID(timeoutSeconds: TimeInterval) -> pid_t? {
         let deadline = Date().addingTimeInterval(timeoutSeconds)
         while Date() < deadline {

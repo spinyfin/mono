@@ -89,6 +89,7 @@ mod metrics;
 mod pane_delivery;
 mod pane_ops;
 mod panes;
+mod pid_file;
 mod planner_ops;
 mod pr_status;
 // `pub(crate)` so `crate::attention_lifecycle` can bind
@@ -154,8 +155,8 @@ use pane_delivery::{PaneInjectOutcome, PaneInjectRequest, PaneInputPosture, Pane
 // keep their public `boss_engine::app::` paths.
 pub use app_session::SendToAppError;
 use app_session::{APP_CHANNEL_UNHEALTHY_STREAK, AppChannelHealth, AppSessionHandle};
+use pid_file::PidFileGuard;
 use probes::{InFlightProbe, PendingProbe, ProbeDispatchOutcome, ProbeRecord, ServerStateProbeQueuer};
-use trust::PidFileGuard;
 pub use trust::{PeerClass, RpcTier};
 
 // The worker exposure boundary: the verb policy `trust::worker_tier_denial`

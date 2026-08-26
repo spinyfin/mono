@@ -36,12 +36,22 @@ row", "what surface issued this change").
   `BOSS_ENGINE_TRACE_MAX_FILES` / `BOSS_ENGINE_TRACE_MAX_BYTES`. A
   high-volume incident can still rotate past the window you care about.
 
-Lifecycle event shapes (`start` / `socket_bound` / `shutdown`) are also
-documented in [`tools/boss/app-macos/README.md`](../app-macos/README.md)
-under "Forensic / audit log". That README also notes an in-process
-~2 MiB half-drop bound; under normal load the file stays well under
-that ceiling, which is why multi-month retention is observed in
-practice.
+Lifecycle event shapes (`start` / `socket_bound` / `instance_lock_failed` /
+`shutdown`) are also documented in
+[`tools/boss/app-macos/README.md`](../app-macos/README.md) under
+"Forensic / audit log". That README also notes an in-process ~2 MiB
+half-drop bound; under normal load the file stays well under that
+ceiling, which is why multi-month retention is observed in practice.
+
+A `start` whose `parent_command` is launchd is not evidence that
+launchd spawned the engine: the macOS app detaches with `nohup`, so
+both app-spawned and orphaned CLI engines reparent to pid 1. Use
+`launched_by` (`app` vs `standalone`) and `app_pid` (`BOSS_APP_PID`)
+to name the launcher. A `start` followed ~seconds later by
+`instance_lock_failed` / `error:instance lock held by pid …` is a
+duplicate launch that lost the pid-file flock; historically this
+showed up as `error:database is locked` after two 5s SQLite busy
+timeouts because the pid file was written only after `WorkDb::open`.
 
 ### `work_item_deleted` events
 

@@ -265,6 +265,9 @@ fn build_start_context(isolation: &IsolationPaths) -> StartContext {
         state_db_path,
         prior_state_db_size,
         parent_command,
+        launched_by: Some(audit::launched_by_label().to_owned()),
+        app_pid: audit::app_pid_from_env(),
+        exe_path: std::env::current_exe().ok(),
     }
 }
 
