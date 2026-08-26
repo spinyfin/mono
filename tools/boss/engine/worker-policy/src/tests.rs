@@ -148,8 +148,8 @@ fn design_worker_design_doc_pointer_stays_allowed() {
 
 #[test]
 fn investigation_worker_task_doc_pointer_stays_allowed() {
-    // `boss task set-doc` — task-level analogue of set-design-doc for
-    // investigations / project-less designs when the detector misses.
+    // `boss task set-doc` — task-level analogue of set-design-doc when
+    // the detector misses. Independent of kind.
     assert_allowed(FrontendRequest::SetTaskDocPointer {
         input: boss_protocol::SetTaskDocPointerInput {
             task_id: "task_1".into(),

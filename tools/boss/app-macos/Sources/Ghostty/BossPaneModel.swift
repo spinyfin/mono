@@ -633,7 +633,7 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
 
     ### 1. JSON envelope shapes
 
-    - `boss task show --json` / `boss chore show --json` → flat row object: the row's own fields at the top level, plus `dependencies`, `executions`, `attention_items`, `attention_groups`. No wrapper.
+    - `boss task show --json` / `boss chore show --json` → flat row object: the row's own fields at the top level, plus `dependencies`, `executions`, `attention_items`, `attention_groups`. No wrapper. `doc_link_state` is always present (`null` when no doc is attached).
     - `boss project show --json` → `{project, dependencies, design_doc}`.
     - `boss task list --json` → `{tasks: [...]}`; `boss chore list --json` → `{chores: [...]}`.
 

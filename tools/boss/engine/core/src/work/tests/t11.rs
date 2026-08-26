@@ -265,3 +265,43 @@ fn resolve_doc_owner_matches_task_doc_pointer_for_project_less_investigation() {
 
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn resolve_doc_owner_prefers_revision_capable_task_when_doc_pointers_collide() {
+    let path = temp_db_path("doc-owner-colliding-task-pointers");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some(MONO_REPO));
+    let chore = create_test_chore(&db, product.id.clone(), "Older chore");
+    let investigation = db
+        .create_investigation(
+            boss_protocol::CreateInvestigationInput::builder()
+                .product_id(product.id.clone())
+                .name("Newer investigation")
+                .build(),
+        )
+        .unwrap();
+    let pointer_path = "tools/boss/docs/investigations/collision.md";
+
+    // Ensure the non-revision-capable chore is the oldest candidate, so the
+    // preference ordering rather than accidental creation order selects the owner.
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE tasks SET created_at = '2000-01-01T00:00:00Z' WHERE id = ?1",
+        params![chore.id],
+    )
+    .unwrap();
+    drop(conn);
+    for task_id in [&chore.id, &investigation.id] {
+        db.set_task_doc_pointer(task_id, Some(MONO_REPO), Some("main"), Some(pointer_path))
+            .unwrap();
+    }
+
+    let artifact_id = pr_doc_artifact_id(MONO_REPO, "main", pointer_path);
+    let owner = db
+        .resolve_doc_owner("pr_doc", &artifact_id)
+        .unwrap()
+        .expect("should resolve collision to the investigation");
+    assert_eq!(owner.task_id, investigation.id);
+
+    let _ = std::fs::remove_file(path);
+}

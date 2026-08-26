@@ -1013,29 +1013,27 @@ impl WorkDb {
         }
         trace.record_plain(segment::DB_HAS_ATTACHMENTS, elapsed_ms(t));
 
-        // Resolve the per-task doc-link state for project-less docs-backed
-        // items (investigations / project-less designs) so their card renders
-        // the Review-lane doc-link icon — parity with design cards, whose
-        // state is resolved from the parent project's `design_doc_*` columns.
-        // Pass `|_| None` for the workspace lookup: cube is not consulted in
-        // get_work_tree, and the app prefers the GitHub raw-content URL for
-        // in-review docs on the PR head branch anyway. Errors per task are
-        // non-fatal — log and leave the field None (affordance hidden).
+        // Resolve the per-task doc-link state for every work item so a
+        // card with `tasks.doc_*` set renders the Review-lane doc-link
+        // icon — independent of `kind`. Design cards with a project also
+        // overlay the parent project's `design_doc_*` state in the app.
+        // Pass `|_| None` for the workspace lookup: cube is not consulted
+        // in get_work_tree, and the app prefers the GitHub raw-content URL
+        // for in-review docs on the PR head branch anyway. Errors per
+        // task are non-fatal — log and leave the field None (affordance
+        // hidden).
         //
-        // Secondary, gated N+1: only the docs-backed subset enters
-        // `resolve_task_doc_pointer` (2-3 queries each). `resolved` is the
-        // number of items that did, i.e. the rows this loop touched;
-        // `doc_pointer_queries` is the aggregate statement count across all
-        // of them, exposing the per-row fan-out the same way
-        // `db.task_runtimes` does.
+        // A single prefilter finds the rows with a pointer; each of those
+        // costs 1-3 resolution queries. `resolved` is the number of
+        // pointer-bearing items and `doc_pointer_queries` is the aggregate
+        // statement count, recorded alongside `db.task_runtimes`.
         let t = Instant::now();
-        let mut resolved = 0usize;
-        let mut doc_pointer_queries = 0u64;
-        for task in &mut tasks {
-            if attach_task_doc_link_state(&conn, task, "get_work_tree", &mut doc_pointer_queries) {
-                resolved += 1;
-            }
-        }
+        let (resolved, doc_pointer_queries) = attach_task_doc_link_states_for_groups(
+            &conn,
+            &mut [&mut tasks[..], &mut chores[..]],
+            "get_work_tree",
+            product_id,
+        );
         trace.record_nplus1(segment::DB_DOC_POINTERS, elapsed_ms(t), resolved, doc_pointer_queries);
 
         Ok(WorkTree {
@@ -1126,9 +1124,8 @@ impl WorkDb {
                     .filter(|task| task.deleted_at.is_none() || task.status == TaskStatus::Archived)
                     .with_context(|| format!("unknown task: {id}"))?;
                 // Surface the per-task doc pointer on the single-item read
-                // path, mirroring get_work_tree's attach step — the
-                // project-less docs-backed kinds (investigation, project-less
-                // design) are the only ones that carry `tasks.doc_*` at all.
+                // path, mirroring get_work_tree's attach step. Independent
+                // of `kind`.
                 let mut doc_pointer_queries = 0u64;
                 attach_task_doc_link_state(&conn, &mut task, "get_work_item", &mut doc_pointer_queries);
                 Ok(task_to_item(task))
@@ -1517,6 +1514,7 @@ impl WorkDb {
                 &mut tasks,
             )?;
         }
+        attach_task_doc_link_states(&conn, &mut tasks, "list_tasks", product_id);
         Ok(tasks)
     }
 
@@ -1638,6 +1636,7 @@ impl WorkDb {
                 &mut revisions,
             )?;
         }
+        attach_task_doc_link_states(&conn, &mut revisions, "list_revisions", product_id);
         Ok(revisions)
     }
 
@@ -1669,6 +1668,7 @@ impl WorkDb {
                 &mut chores,
             )?;
         }
+        attach_task_doc_link_states(&conn, &mut chores, "list_chores", product_id);
         Ok(chores)
     }
 

@@ -293,6 +293,26 @@ fn seed_investigation_for_doc(db: &WorkDb) -> (Product, Task) {
     (product, investigation)
 }
 
+/// Seed a live work item of `kind` on `product`. Inserts a chore and
+/// rewrites `tasks.kind` when needed: the per-task doc pointer does not
+/// require a project, and rewriting the column covers [`TaskKind::ALL`]
+/// without hitting revision-parent / postmortem gates.
+fn seed_work_item_of_kind(db: &WorkDb, product: &Product, kind: &TaskKind) -> Task {
+    let task = create_test_chore(db, product.id.clone(), format!("doc-item-{kind}"));
+    if *kind != TaskKind::Chore {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET kind = ?1 WHERE id = ?2",
+            params![kind.as_str(), task.id],
+        )
+        .unwrap();
+    }
+    match db.get_work_item(&task.id).unwrap() {
+        WorkItem::Task(t) | WorkItem::Chore(t) => t,
+        other => panic!("expected leaf work item for kind {kind}, got {other:?}"),
+    }
+}
+
 /// Convenience: rebuild a `set_project_design_doc` input with
 /// just the project id and path filled in. Most pointer tests
 /// only care about the path; defaulting the rest keeps signal

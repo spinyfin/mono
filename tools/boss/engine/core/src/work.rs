@@ -378,10 +378,9 @@ pub struct DeadPrReviewCandidate {
 /// `in_review` task whose doc-branch pointer is `NULL` and that has a
 /// `pr_url` the design detector can scan.
 ///
-/// - `project_id = Some(id)` → project-design path; call
+/// - `project_id = Some(id)` → project-level design-doc path; call
 ///   [`crate::design_detector::on_design_pr_detected`].
-/// - `project_id = None` → per-task-doc path (investigation or
-///   project-less design); call
+/// - `project_id = None` → per-task `doc_*` path (any kind); call
 ///   [`crate::design_detector::on_task_doc_pr_detected`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocBranchBackfillCandidate {
@@ -554,7 +553,10 @@ pub(crate) use migrations_b::*;
 pub(crate) use migrations_boothby::*;
 pub(crate) use migrations_c::*;
 pub(crate) use pr_state::stored_pr_number;
-pub(crate) use products_design::{attach_task_doc_link_state, parse_pr_doc_artifact_id, task_uses_per_task_doc};
+pub(crate) use products_design::{
+    attach_task_doc_link_state, attach_task_doc_link_states, attach_task_doc_link_states_for_groups,
+    parse_pr_doc_artifact_id,
+};
 // Only the unit-test suite (and the resolver itself) call this directly;
 // production attach sites go through `attach_task_doc_link_state`.
 #[cfg(test)]

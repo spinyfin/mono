@@ -463,18 +463,11 @@ extension ChatViewModel {
             && task.lastStatusActor == "engine"
             && !cachedGating.isEmpty
 
-        let designDocProject: WorkProject? = (task.kind == "design" || task.kind == "design_postmortem")
-            ? task.projectID.flatMap { project(withID: $0) }
-            : nil
-        // Design and design-postmortem cards resolve their doc-link state
-        // from the parent PROJECT; project-less docs-backed items
-        // (investigations) carry an engine-resolved state on the task itself
-        // (`docLinkState`). Prefer the project state when present, else fall
-        // back to the per-task state so investigation cards render the same
-        // Review-lane doc-link icon.
-        let designDocState: ProjectDesignDocState? = designDocProject
-            .map { designDocStateByProjectID[$0.id] ?? .notSet }
-            ?? task.docLinkState
+        // Design / design-postmortem cards still prefer a presentable
+        // project-level design-doc pointer (a separate concept). Every
+        // other kind — and a design whose project has no pointer —
+        // falls through to the per-task `docLinkState`.
+        let designDocState: ProjectDesignDocState? = workItemDocState(for: task)
 
         // Roll-up rows must render wherever the parent's OWN card lands, not
         // just in Review/Done. A revision that reaches in_review/done never

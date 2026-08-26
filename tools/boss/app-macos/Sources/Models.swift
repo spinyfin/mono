@@ -203,14 +203,13 @@ struct WorkTask: Identifiable, Hashable {
     /// CLI and any future surface agree with the board. Mirrors
     /// `Task.ready_for_review` on the wire; `false` when absent.
     var readyForReview: Bool = false
-    /// Resolved doc-link state for a **project-less** docs-backed item —
-    /// chiefly `kind == "investigation"`. Mirrors `Task.doc_link_state`
+    /// Resolved doc-link state for this work item. Independent of `kind`
+    /// — any task may carry a per-task pointer. Mirrors `Task.doc_link_state`
     /// on the wire: the engine resolves the task's own `doc_*` columns
     /// into the same `ProjectDesignDocState` the kanban already renders
-    /// for design cards (whose state comes from the parent project). The
-    /// card feeds this into the doc-link affordance so investigations get
-    /// the Review-lane icon — parity with design cards. `nil` when the
-    /// item has no per-task pointer (hides the affordance).
+    /// for project design docs (a separate, project-level pointer). The
+    /// card feeds this into the doc-link affordance. `nil` when the item
+    /// has no per-task pointer (hides the affordance).
     var docLinkState: ProjectDesignDocState? = nil
 
     /// Short id of the reviewed task that produced this follow-up.

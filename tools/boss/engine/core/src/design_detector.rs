@@ -343,14 +343,13 @@ pub async fn on_design_pr_merged(
     }
 }
 
-/// Per-task analogue of [`on_design_pr_detected`] for project-less
-/// docs-backed items (investigations and postmortems). Fired on the
-/// `in_review` transition. Scans the PR's changed files for a single
-/// `docs/designs/*.md`, `docs/design-docs/*.md`, `docs/investigations/*.md`,
-/// or `docs/postmortems/*.md` and populates the task's own `doc_*`
-/// columns (or, when already set, updates `doc_branch` to the PR
-/// **head** branch so the in-app viewer can fetch the doc while the PR
-/// is open).
+/// Per-task analogue of [`on_design_pr_detected`]. Fired on the
+/// `in_review` transition for **every** work-item kind. Scans the PR's
+/// changed files for a single `docs/designs/*.md`, `docs/design-docs/*.md`,
+/// `docs/investigations/*.md`, or `docs/postmortems/*.md` and populates
+/// the task's own `doc_*` columns (or, when already set, updates
+/// `doc_branch` to the PR **head** branch so the in-app viewer can fetch
+/// the doc while the PR is open).
 pub async fn on_task_doc_pr_detected(work_db: &WorkDb, task_id: &str, product_id: &str, pr_url: &str) {
     let scan = match scan_pr_for_task_doc(task_id, pr_url).await {
         Some(s) => s,
@@ -464,10 +463,10 @@ pub async fn on_task_doc_pr_detected(work_db: &WorkDb, task_id: &str, product_id
     }
 }
 
-/// Per-task analogue of [`on_design_pr_merged`]. Fired when a project-less
-/// docs-backed item's PR merges. If the task already has a `doc_path`,
-/// only `doc_branch` is updated to the PR's base branch (typically
-/// `"main"`); otherwise the PR is scanned and the full pointer written.
+/// Per-task analogue of [`on_design_pr_merged`]. Fired when any work
+/// item's PR merges. If the task already has a `doc_path`, only
+/// `doc_branch` is updated to the PR's base branch (typically `"main"`);
+/// otherwise the PR is scanned and the full pointer written.
 pub async fn on_task_doc_pr_merged(
     work_db: &WorkDb,
     task_id: &str,
@@ -577,14 +576,14 @@ pub(crate) async fn scan_pr(task_id: &str, pr_url: &str) -> Option<PrScanResult>
 }
 
 /// Like [`scan_pr`] but selects the doc among the PR's changed files with
-/// the project-less matcher (`docs/designs/*.md`, `docs/investigations/*.md`,
-/// OR `docs/postmortems/*.md`). Used by the per-task detector that serves
-/// investigations, postmortems, and project-less design tasks.
+/// the per-task matcher (`docs/designs/*.md`, `docs/investigations/*.md`,
+/// OR `docs/postmortems/*.md`). Used by the per-task detector, which
+/// runs for every work-item kind.
 pub(crate) async fn scan_pr_for_task_doc(task_id: &str, pr_url: &str) -> Option<PrScanResult> {
     match fetch_pr_view_json(pr_url).await {
         Ok(root) => Some(parse_pr_scan_matching(
             &root,
-            is_project_less_doc_path,
+            is_per_task_doc_path,
             "docs/designs/*.md, docs/design-docs/*.md, docs/investigations/*.md, or docs/postmortems/*.md",
         )),
         Err(err) => {
@@ -774,11 +773,10 @@ fn is_postmortem_doc_path(path: &str) -> bool {
     is_doc_path_under(path, "postmortems")
 }
 
-/// Matches a **project-less** docs-backed item's deliverable: a single
-/// `docs/designs/*.md`, `docs/investigations/*.md`, or
-/// `docs/postmortems/*.md`. Used by the per-task detector, which serves
-/// project-less design tasks, investigations, and postmortems.
-fn is_project_less_doc_path(path: &str) -> bool {
+/// Matches a per-task doc deliverable: a single `docs/designs/*.md`,
+/// `docs/investigations/*.md`, or `docs/postmortems/*.md`. Used by the
+/// per-task detector, which runs for every work-item kind.
+fn is_per_task_doc_path(path: &str) -> bool {
     is_design_doc_path(path) || is_investigation_doc_path(path) || is_postmortem_doc_path(path)
 }
 
@@ -794,7 +792,7 @@ mod tests {
             "tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirroring-flunge.md"
         ));
         assert!(is_design_doc_path("tools/boss/docs/designs/x.markdown"));
-        // Non-boss product directories are also accepted (regression for P844).
+        // Regression: non-boss product directories are also accepted.
         assert!(is_design_doc_path(
             "tools/checkleft/docs/designs/robust-change-detection-in-checkleft.md"
         ));
@@ -884,7 +882,7 @@ mod tests {
         assert_eq!(scan.doc_path, None);
     }
 
-    /// T285/P284 regression: the exact PR #794 changed-files shape — a
+    /// Regression: the exact PR #794 changed-files shape — a
     /// flunge design PR using the repo's `docs/design-docs/` convention
     /// (not `docs/designs/`). Before this fix, `is_design_doc_path` never
     /// matched any of these paths, so the pointer was silently never
@@ -914,7 +912,7 @@ mod tests {
         );
     }
 
-    /// T1897 regression: a design PR that adds a new doc AND modifies an
+    /// Regression: a design PR that adds a new doc AND modifies an
     /// existing main.md index. The ADDED file is the new design doc; the
     /// MODIFIED file is just the index being updated. Before this fix the
     /// scanner found two matches and returned None, preventing the pointer
@@ -1074,12 +1072,12 @@ mod tests {
 
     #[test]
     fn project_less_matcher_accepts_designs_and_investigations() {
-        assert!(is_project_less_doc_path("tools/boss/docs/designs/foo.md"));
-        assert!(is_project_less_doc_path("docs/design-docs/foo.md"));
-        assert!(is_project_less_doc_path("docs/investigations/foo.md"));
-        assert!(is_project_less_doc_path("docs/postmortems/foo.md"));
-        assert!(!is_project_less_doc_path("README.md"));
-        assert!(!is_project_less_doc_path("docs/other/foo.md"));
+        assert!(is_per_task_doc_path("tools/boss/docs/designs/foo.md"));
+        assert!(is_per_task_doc_path("docs/design-docs/foo.md"));
+        assert!(is_per_task_doc_path("docs/investigations/foo.md"));
+        assert!(is_per_task_doc_path("docs/postmortems/foo.md"));
+        assert!(!is_per_task_doc_path("README.md"));
+        assert!(!is_per_task_doc_path("docs/other/foo.md"));
     }
 
     /// Regression: `tools/boss/docs/postmortems/` is an established
@@ -1116,7 +1114,7 @@ mod tests {
             "headRefName": "boss/exec_postmortem_1",
             "baseRefName": "main",
         });
-        let scan = parse_pr_scan_matching(&root, is_project_less_doc_path, "label");
+        let scan = parse_pr_scan_matching(&root, is_per_task_doc_path, "label");
         assert_eq!(
             scan.doc_path.as_deref(),
             Some("tools/boss/docs/postmortems/incident-004-live-revision-workers-reaped-mid-turn.md")
@@ -1138,7 +1136,7 @@ mod tests {
 
     #[test]
     fn parse_pr_scan_matching_selects_single_investigation_doc() {
-        // The T1705 repro shape: one investigation doc among code files.
+        // The reported repro shape: one investigation doc among code files.
         let root = serde_json::json!({
             "files": files_json(&[
                 "tools/checkleft/runtime/tests.rs",
@@ -1147,7 +1145,7 @@ mod tests {
             "headRefName": "boss/exec_abc_1",
             "baseRefName": "main",
         });
-        let scan = parse_pr_scan_matching(&root, is_project_less_doc_path, "label");
+        let scan = parse_pr_scan_matching(&root, is_per_task_doc_path, "label");
         assert_eq!(
             scan.doc_path.as_deref(),
             Some("docs/investigations/checkleft-lib-test-wasm-compile-timeout.md")
@@ -1164,7 +1162,7 @@ mod tests {
                 "docs/investigations/probe.md",
             ]),
         });
-        let scan = parse_pr_scan_matching(&root, is_project_less_doc_path, "label");
+        let scan = parse_pr_scan_matching(&root, is_per_task_doc_path, "label");
         assert_eq!(scan.doc_path, None);
     }
 

@@ -3,7 +3,7 @@ import os.log
 import SwiftUI
 import UpdateCore
 
-// Debug logger for the investigation doc-link render path. Uses .debug() so
+// Debug logger for the work-item doc-link render path. Uses .debug() so
 // it is silent in normal use; enable via Console.app subsystem filter or
 // Xcode debug console. Surfaces work_item_id, kind, pr_url value, column,
 // and whether PRURLLink will render — letting the operator identify which
@@ -150,25 +150,7 @@ struct WorkBoardCardItem: View {
         }
         let onOpenDesignDoc: (() -> Void)? = {
             guard snapshot.showsDesignDocAffordance else { return nil }
-            if (task.kind == "design" || task.kind == "design_postmortem"),
-               let projectID = task.projectID,
-               let proj = model.project(withID: projectID) {
-                return { model.openProjectDesignDoc(proj) }
-            }
-            if task.docLinkState != nil {
-                return { model.openTaskDoc(task) }
-            }
-            // Snapshot said the affordance shows (resolved design-doc
-            // state) but project lookup failed at action-build time —
-            // still wire a best-effort open via project re-lookup on tap.
-            if let projectID = task.projectID {
-                return {
-                    if let proj = model.project(withID: projectID) {
-                        model.openProjectDesignDoc(proj)
-                    }
-                }
-            }
-            return nil
+            return { model.openWorkItemDoc(task) }
         }()
         let onOpenAttachments: (() -> Void)? = snapshot.showsAttachmentsAffordance
             ? { openWindow(id: "attachment-viewer", value: AttachmentViewerRef(taskId: task.id)) }

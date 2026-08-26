@@ -121,6 +121,7 @@ struct WorkCardPopoverView: View {
                     metadataRow("Phase", value: "\(ordinal)")
                 }
                 metadataPRRow(prURL: task.prURL)
+                docRow
                 if task.kind == "followup" {
                     let originParts = [
                         task.originTaskShortId.map { "T\($0)" },
@@ -431,6 +432,36 @@ struct WorkCardPopoverView: View {
             } else {
                 Text("Not set")
                     .font(.body)
+            }
+        }
+    }
+
+    /// Doc affordance on the selected-card detail popover. Independent of
+    /// `kind` — any work item with a presentable pointer (project-level
+    /// for design cards, per-task otherwise) shows the same row.
+    @ViewBuilder
+    private var docRow: some View {
+        if let state = model.workItemDocState(for: task),
+           let presentation = ProjectDesignDocAffordancePresentation.from(state: state) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Doc")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button {
+                    model.openWorkItemDoc(task)
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: presentation.systemImage)
+                            .foregroundStyle(presentation.tint)
+                        Text(presentation.tooltip)
+                            .font(.body)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+                .buttonStyle(.plain)
+                .help(presentation.tooltip)
+                .accessibilityLabel(presentation.accessibilityLabel)
             }
         }
     }

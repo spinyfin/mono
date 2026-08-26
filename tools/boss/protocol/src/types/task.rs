@@ -1038,22 +1038,23 @@ pub struct Task {
     #[builder(default)]
     pub ready_for_review: bool,
 
-    /// Resolved doc-link state for a **project-less** docs-backed work
-    /// item — chiefly `kind = 'investigation'`. Parity with the design
-    /// card's doc-link icon, which is resolved from the parent
-    /// *project's* `design_doc_*` columns; an investigation has no
-    /// project, so the engine resolves the task's own `doc_*` columns
-    /// (populated by the doc detector from the PR's changed files) into
-    /// the same `ProjectDesignDocState` the kanban already renders.
+    /// Resolved doc-link state for this work item, derived from the
+    /// task's own `doc_*` columns. Independent of `kind`: any work item
+    /// may carry a per-task doc pointer. The engine resolves those
+    /// columns into the same `ProjectDesignDocState` the kanban already
+    /// renders for project design docs (a separate, project-level
+    /// pointer — not this field).
     ///
-    /// A derived projection the engine resolves on the read paths that
-    /// return a task (`get_work_tree`, `get_work_item`,
-    /// `get_work_item_by_short_id`) and on `set_task_doc`'s return — not
-    /// a stored DB column, and never set for design tasks that have a
-    /// project. `None` when the item has no per-task pointer (the common
-    /// case), which hides the affordance exactly like
-    /// `ProjectDesignDocState::NotSet`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// A derived projection the engine resolves on every read path that
+    /// returns a task (`get_work_tree`, `get_work_item`,
+    /// `get_work_item_by_short_id`, `list_tasks`, `list_chores`,
+    /// `list_revisions`) and on `set_task_doc`'s return — not a stored
+    /// DB column. `None` when the item has no per-task pointer (the
+    /// common case), which hides the affordance exactly like
+    /// `ProjectDesignDocState::NotSet`. Always serialized (JSON `null`
+    /// when unset) so consumers can distinguish "no doc" from "field
+    /// missing".
+    #[serde(default)]
     pub doc_link_state: Option<ProjectDesignDocState>,
 
     /// Per-product short id of the task whose PR-review produced this
@@ -1171,10 +1172,11 @@ pub struct TaskRuntime {
     pub dispatch_wait_since: Option<String>,
 }
 
-/// Input to the `SetTaskDocPointer` RPC: point a project-less docs-backed
-/// task (investigation, or design without a project) at its deliverable
-/// markdown doc. Three optional fields (mirroring the three `tasks.doc_*`
-/// columns), plus an `unset` switch that clears the pointer.
+/// Input to the `SetTaskDocPointer` RPC: point a work item at its
+/// deliverable markdown doc. Independent of `kind` — any leaf work item
+/// may carry a per-task pointer. Three optional fields (mirroring the
+/// three `tasks.doc_*` columns), plus an `unset` switch that clears the
+/// pointer.
 ///
 /// Resolution semantics (also enforced engine-side; mirror
 /// [`crate::SetProjectDesignDocInput`]):

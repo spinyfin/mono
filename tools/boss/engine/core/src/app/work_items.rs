@@ -1405,8 +1405,8 @@ pub(super) async fn handle_create_revision(ctx: Dispatch, req: FrontendRequest) 
 }
 
 /// Set (or clear) a task's per-task doc pointer — operator CLI
-/// (`boss task set-doc`) and the investigation/project-less-design
-/// manual-override path when the doc detector cannot auto-populate.
+/// (`boss task set-doc`) and the manual-override path when the doc
+/// detector cannot auto-populate. Independent of `kind`.
 pub(super) async fn handle_set_task_doc_pointer(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,

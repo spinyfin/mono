@@ -277,8 +277,8 @@ extension EngineClient {
     }
 
     /// Decode the per-task `doc_link_state` wire object (engine-resolved
-    /// `ProjectDesignDocState`) for project-less docs-backed items. Absent
-    /// / null on every task that has no per-task pointer. Reuses the
+    /// `ProjectDesignDocState`) for any work item. Absent / null on every
+    /// task that has no per-task pointer. Reuses the
     /// `ProjectDesignDocState` Codable decoder so the resolved/broken/
     /// not_set shapes stay in lockstep with the project RPC path.
     func parseDocLinkState(_ value: Any?) -> ProjectDesignDocState? {

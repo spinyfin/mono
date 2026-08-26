@@ -277,6 +277,9 @@ pub(crate) fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
     // the field is only meaningful for Review-lane tasks. Mirrors the
     // `show_effort` pattern.
     let show_ready = tasks.iter().any(|t| t.pr_url.is_some());
+    // DOC is rendered only when at least one row carries a per-task
+    // pointer — same "narrow until it matters" pattern as EFFORT.
+    let show_doc = tasks.iter().any(|t| !task_doc_table_cell(t).is_empty());
     // KIND is rendered whenever the view mixes kinds (or is pure
     // chore/revision/etc.). Homogeneous project-task lists stay narrow;
     // once `boss task list` can return every leaf kind, the column is what
@@ -306,6 +309,9 @@ pub(crate) fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
         header.push("REASONING");
     }
     header.extend_from_slice(&["PROJECT", "ORDINAL", "PR URL"]);
+    if show_doc {
+        header.push("DOC");
+    }
     if show_ready {
         header.push("READY");
     }
@@ -340,6 +346,9 @@ pub(crate) fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
         row.push(task.project_id.clone().unwrap_or_default());
         row.push(ordinal);
         row.push(task.pr_url.clone().unwrap_or_default());
+        if show_doc {
+            row.push(task_doc_table_cell(task));
+        }
         if show_ready {
             row.push(if task.ready_for_review {
                 "yes".to_owned()
@@ -816,6 +825,17 @@ pub(crate) fn lint_summary_line(entries: &[LintDesignDocEntry]) -> String {
     format!("{} finding(s): {}", entries.len(), parts.join(", "))
 }
 
+/// Table-cell rendering of a task's per-task doc pointer. Empty when
+/// unset so `print_tasks_table` can hide the DOC column until a row
+/// actually carries one.
+fn task_doc_table_cell(task: &Task) -> String {
+    match task.doc_link_state.as_ref() {
+        Some(ProjectDesignDocState::Resolved { resolved, .. }) => resolved.path.clone(),
+        Some(ProjectDesignDocState::Broken { reason }) => format!("(broken) {reason}"),
+        Some(ProjectDesignDocState::NotSet) | None => String::new(),
+    }
+}
+
 /// Format the "Design doc:" line appended by `boss project show` /
 /// `boss project set-design-doc`. `None` means "no line should be
 /// emitted" — used by `Show` so the unset case stays silent rather
@@ -1036,6 +1056,11 @@ pub(crate) fn print_task_details(title: &str, task: &Task, parent_product: Optio
     if let Some(pr_url) = &task.pr_url {
         println!("PR URL: {}", pr_url);
         println!("Ready for review: {}", if task.ready_for_review { "yes" } else { "no" });
+    }
+    if let Some(state) = &task.doc_link_state
+        && let Some(line) = format_project_design_doc_line(state)
+    {
+        println!("Doc: {line}");
     }
     if !task.description.is_empty() {
         println!("Description: {}", task.description);

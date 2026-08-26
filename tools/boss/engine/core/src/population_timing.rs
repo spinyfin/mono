@@ -21,7 +21,7 @@
 //!   db.dependencies
 //!   db.ai_reviewing
 //!   db.ai_review_state
-//!   db.doc_pointers  per-task doc-pointer resolution (gated N+1)
+//!   db.doc_pointers  per-task doc-pointer resolution (N+1)
 //!   assemble         in-memory projection / flag attachment
 //!   queue_wait       handler enqueue → writer-task dequeue (session backlog)
 //!   serialize        serde_json of the whole WorkTree response
