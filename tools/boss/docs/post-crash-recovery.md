@@ -47,7 +47,14 @@ every non-terminal `work_executions` row that carries a recorded
 asks cube whether the lease is still bound to the same workspace and
 not yet expired; the verdict is one of:
 
-- `Live` — cube confirms the lease. The engine leaves the row alone.
+- `Live` — cube confirms the lease. The engine re-heartbeats it so the
+  workspace survives the restart gap. If the row is `running` and no
+  pane was ever registered (tmux adoption missed it, no shell pid, the
+  app does not host one), startup recovery re-issues the pane spawn
+  against the already-leased workspace instead of waiting for the 300 s
+  never-attached reaper. If pane presence cannot be determined (no app
+  session yet), that is a loud `startup_pane_respawn` error, retried
+  when the app session registers — never a silent pass.
 - `Dead` — cube says the workspace is free, the lease id has changed,
   or the lease has logically expired (TTL passed). The engine marks
   the execution `orphaned` immediately and inherits the workspace_id

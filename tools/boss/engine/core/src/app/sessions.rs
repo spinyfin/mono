@@ -118,6 +118,16 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
             .await;
         tracing::info!(session_id = %session_id, "app session registered");
         send_response(&sink, &request_id, FrontendEvent::AppSessionRegistered);
+        // Engine restart can land between `run_started` and `spawn_requested`.
+        // Startup reconcile may have been unable to ask the app which panes
+        // it hosts; now that a session is registered, retry so those rows
+        // are respawned promptly instead of waiting out the 300s reaper.
+        let pane_reconcile_state = server_state.clone();
+        tokio::spawn(async move {
+            pane_reconcile_state
+                .reconcile_unspawned_running_panes(&std::collections::HashSet::new())
+                .await;
+        });
         // A fresh app session is the operator's natural recovery action
         // (e.g. relaunching the app after waking the display) — clear the
         // spawn-capability breaker's failure window and any half-open probe

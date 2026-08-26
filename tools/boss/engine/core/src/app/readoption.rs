@@ -11,6 +11,8 @@
 
 use super::*;
 
+use std::collections::HashSet;
+
 use boss_protocol::CreateAttentionItemInput;
 
 use crate::agent_jsonl_progress::IngressCheckpointStore;
@@ -560,5 +562,66 @@ impl ServerState {
                 None
             }
         }
+    }
+
+    /// Run ids the app currently hosts a pane for. `Err` when the app
+    /// could not be asked — callers must not treat that as "no panes".
+    pub(crate) async fn hosted_pane_run_ids(&self) -> Result<HashSet<String>, String> {
+        let request = EngineToAppRequest::ListHostedPanes(ListHostedPanesInput {});
+        match self.send_to_app(request, Duration::from_secs(5)).await {
+            Ok(EngineToAppResponse::ListHostedPanes { result: Ok(result) }) => {
+                Ok(result.panes.into_iter().map(|pane| pane.run_id).collect())
+            }
+            Ok(EngineToAppResponse::ListHostedPanes { result: Err(err) }) => {
+                Err(format!("app rejected list_hosted_panes: {err}"))
+            }
+            Ok(other) => Err(format!("unexpected list_hosted_panes response: {other:?}")),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    /// Re-drive pane spawn for `running` executions whose cube lease was
+    /// re-adopted across the restart but whose pane was never issued.
+    /// See [`crate::startup_pane_reconcile`].
+    pub(crate) async fn reconcile_unspawned_running_panes(&self, tmux_adopted: &HashSet<String>) {
+        let in_flight = match self.work_db.list_in_flight_executions() {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::error!(
+                    error = %format!("{err:#}"),
+                    "startup pane reconcile: failed to list in-flight executions"
+                );
+                return;
+            }
+        };
+        if in_flight.is_empty() {
+            return;
+        }
+        let now_epoch_s = boss_engine_utils::epoch_time::now_epoch_secs();
+        let probe_report =
+            crate::run_reconcile::probe_in_flight_runs(self.cube_client.as_ref(), &in_flight, now_epoch_s).await;
+        let tmux_hosted_ids = in_flight
+            .iter()
+            .filter(|execution| {
+                let pool = self.execution_coordinator.attributed_pool_label(execution);
+                self.settings.tmux_hosting_enabled_for(pool)
+            })
+            .map(|execution| execution.id.clone())
+            .collect();
+        let oracle = crate::startup_pane_reconcile::EnginePaneOracle {
+            live_states: Some(self.live_worker_states.clone()),
+            tmux_adopted: tmux_adopted.clone(),
+            hosted_run_ids: self.hosted_pane_run_ids().await,
+            tmux_hosted_ids,
+        };
+        crate::startup_pane_reconcile::reconcile_unspawned_running(
+            self.work_db.as_ref(),
+            &in_flight,
+            &probe_report.verdicts,
+            &oracle,
+            &self.execution_coordinator,
+            self.dispatch_events.as_ref(),
+        )
+        .await;
     }
 }

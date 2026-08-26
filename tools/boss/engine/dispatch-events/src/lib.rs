@@ -770,6 +770,18 @@ pub enum Stage {
     /// tmux-hosted workers is itself an operational problem, not a routine
     /// outcome.
     TmuxAdoptionOwnerConflict,
+    /// Startup recovery re-issued the pane spawn for a `running` execution
+    /// whose cube lease was re-adopted across an engine restart but whose
+    /// worker pane was never registered (the previous process died between
+    /// `run_started` / driver resolution and `spawn_requested`). Complements
+    /// `cube-lease heartbeat: re-adopted live lease at startup`: that path
+    /// keeps the workspace, this path re-drives the pane. `outcome=ok` means
+    /// the spawn was handed back to the runner; `outcome=error` means a
+    /// required pane-presence oracle could not be asked (must not be treated
+    /// as either present or absent) or the respawn itself failed;
+    /// `outcome=skipped` means a pane was already present. `details` carries
+    /// `reason` and, when relevant, the oracle diagnostic.
+    StartupPaneRespawn,
 }
 
 impl Stage {
@@ -832,6 +844,7 @@ impl Stage {
             Stage::TmuxWorkerAdopted => "tmux_worker_adopted",
             Stage::TmuxAdoptionRefused => "tmux_adoption_refused",
             Stage::TmuxAdoptionOwnerConflict => "tmux_adoption_owner_conflict",
+            Stage::StartupPaneRespawn => "startup_pane_respawn",
         }
     }
 }
@@ -1607,6 +1620,7 @@ mod tests {
             Stage::TmuxAdoptionOwnerConflict.as_str(),
             "tmux_adoption_owner_conflict"
         );
+        assert_eq!(Stage::StartupPaneRespawn.as_str(), "startup_pane_respawn");
     }
 
     /// `Outcome::as_str` strings are the on-disk outcome identifiers;
