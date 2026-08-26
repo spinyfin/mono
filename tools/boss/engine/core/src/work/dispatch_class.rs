@@ -396,6 +396,35 @@ mod tests {
     }
 
     #[test]
+    fn stagger_stamps_a_claimed_row() {
+        let db = open_db();
+        let product = product_with_repo(&db, Some("git@github.com:spinyfin/mono.git"));
+        let first = insert_raw_task_with_created_via(&db.connect().unwrap(), &product, "task", "cli");
+        let later = insert_raw_task_with_created_via(&db.connect().unwrap(), &product, "task", "cli");
+        wire_merge_order(&db, &later, &first);
+        let exec = ready_execution_for(&db, &later, ExecutionKind::TaskImplementation);
+        assert_eq!(
+            db.claim_execution_for_dispatch(&exec).unwrap(),
+            DispatchClaimOutcome::Won
+        );
+
+        let stamped = db.maybe_stagger_merge_order_dispatch(&exec, &later, 60).unwrap();
+        assert!(
+            stamped.is_some(),
+            "later side must still be staggered after the drain-loop claim CAS"
+        );
+        assert!(
+            dispatch_not_before(&db, &exec).is_some(),
+            "dispatch_not_before must be stamped on a claimed execution",
+        );
+        assert_eq!(
+            db.get_execution(&exec).unwrap().status,
+            ExecutionStatus::Claimed,
+            "stagger stamps the offset; it does not itself unclaim"
+        );
+    }
+
+    #[test]
     fn stagger_never_delays_the_first_side() {
         let db = open_db();
         let product = product_with_repo(&db, Some("git@github.com:spinyfin/mono.git"));

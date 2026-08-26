@@ -614,6 +614,7 @@ fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, 
     }
 }
 
+mod claimed_dispatch_tests;
 mod t01;
 mod t02;
 mod t03;

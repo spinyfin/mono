@@ -1243,9 +1243,11 @@ async fn executions_cancel_for_work_item(
     // the resolved id for RPC filters above.
     let work_item_id = resolved_work_item_id;
     // Never-started only — same gate the engine enforces under
-    // `queued_only`. Filter client-side so we don't spam WorkErrors for
-    // every historical terminal/running row on the item.
-    let candidates: Vec<_> = executions.into_iter().filter(|e| e.status.can_reconcile()).collect();
+    // `queued_only` (`ExecutionStatus::is_pre_run`). Filter client-side
+    // so we don't spam WorkErrors for every historical terminal/running
+    // row on the item. `claimed` is included: the spawn window has no
+    // run yet, matching the engine's queued_only gate.
+    let candidates: Vec<_> = executions.into_iter().filter(|e| e.status.is_pre_run()).collect();
     if candidates.is_empty() {
         if json {
             println!(
@@ -1257,7 +1259,7 @@ async fn executions_cancel_for_work_item(
                 })
             );
         } else {
-            println!("no never-started (queued/ready/waiting_dependency) executions for {work_item_id}");
+            println!("no never-started (queued/ready/waiting_dependency/claimed) executions for {work_item_id}");
         }
         return Ok(());
     }

@@ -1052,6 +1052,23 @@ pub async fn serve_with_merge_probe(
             server_state.cube_client.clone(),
         ));
 
+    match server_state.work_db.release_stale_claimed_executions() {
+        Ok(released) if !released.is_empty() => {
+            tracing::warn!(
+                count = released.len(),
+                ids = ?released,
+                "startup: reverted leftover claimed executions to ready (spawn died with the previous process)"
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::error!(
+                ?err,
+                "startup: failed to revert leftover claimed executions; they will sit unpicked until a human retries"
+            );
+        }
+    }
+
     let in_flight = match server_state.work_db.list_in_flight_executions() {
         Ok(rows) => rows
             .into_iter()

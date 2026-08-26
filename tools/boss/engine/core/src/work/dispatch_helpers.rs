@@ -537,8 +537,11 @@ pub(crate) fn reconcile_work_item_execution(
     }
     match query_latest_execution_for_work_item(conn, work_item_id)? {
         Some(execution) => {
-            if execution.kind == kind && execution.status.can_reconcile() && execution.status != effective_status {
-                let updated = update_execution_status(conn, &execution.id, effective_status)?;
+            if execution.kind == kind
+                && execution.status.can_reconcile()
+                && execution.status != effective_status
+                && let Some(updated) = update_execution_status(conn, &execution.id, effective_status)?
+            {
                 result.updated.push(updated);
             }
         }
@@ -843,7 +846,9 @@ pub(crate) fn reconcile_revision_execution(
                 && existing.status.can_reconcile()
                 && existing.status != effective_status =>
         {
-            let updated = update_execution_status(conn, &existing.id, effective_status)?;
+            let Some(updated) = update_execution_status(conn, &existing.id, effective_status)? else {
+                return Ok(());
+            };
             // Back-fill pr_url if missing: the execution may have been created by
             // reconcile_active_dispatch before the parent chore opened its PR (a
             // race that leaves pr_url = NULL, causing --resume-pr to be skipped
@@ -866,13 +871,17 @@ pub(crate) fn reconcile_revision_execution(
                 )?;
             }
         }
-        Some(existing) if existing.kind == ExecutionKind::RevisionImplementation && existing.status.is_live() => {
-            // A live execution (running or waiting_human) is already in
-            // progress — do not spawn a duplicate worker. Without this arm
-            // the `_ =>` branch fires for every reconcile tick while the
-            // execution is waiting_human, creating an unbounded cascade of
-            // ready executions and spawning multiple concurrent workers on
-            // the same revision task (T1503/T1496 regression).
+        Some(existing)
+            if existing.kind == ExecutionKind::RevisionImplementation
+                && (existing.status.is_live() || existing.status == ExecutionStatus::Claimed) =>
+        {
+            // A live execution (running or waiting_human) or a `claimed`
+            // spawn still in cube setup is already in progress — do not
+            // mint a duplicate. `Claimed` is neither `is_live()` (no pane
+            // yet) nor `can_reconcile()` (the reconciler must not clobber
+            // the CAS), so without this arm the `_ =>` branch would create
+            // a fresh `ready` row that the redundant-spawn guard later
+            // abandons, shadowing the in-flight spawn.
         }
         _ => {
             // Cross-kind live-execution guard. The `RevisionImplementation`
@@ -1222,8 +1231,9 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
             //     `dispatch_decision` evaluations landing within the
             //     scheduler pickup window (e.g. the product-executions
             //     reconciler racing the normal RequestExecution path)
-            //     must not abandon-and-recreate a `ready` row the
-            //     scheduler simply hasn't picked up yet.
+            //     must not abandon-and-recreate a `ready` or `claimed`
+            //     row the scheduler simply hasn't picked up yet (or
+            //     has claimed and is still inside cube setup).
             //   - is_live=true: a worker is genuinely attached to the
             //     slot. Keep the row, refresh priority / preferred
             //     workspace, return the same execution. (Idempotent —
@@ -1248,14 +1258,16 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
             // each having to instrument itself.
             let latest_id = latest.as_ref().map(|e| e.id.clone());
             let live_id = live.as_ref().map(|e| e.id.clone());
-            // Scoped to pre-dispatch statuses (queued/ready/waiting_dependency):
+            // Scoped to pre-run statuses (queued/ready/waiting_dependency/claimed):
             // those are the only statuses a row can sit in before any worker
-            // has ever attached, so `can_reconcile()` doubles as "this row
-            // could plausibly still be un-claimed." Once a worker actually
-            // attaches, status flips to running/waiting_human and a
-            // `work_runs` row exists — so this never masks a genuinely dead
-            // live-status row (see `request_execution_marks_existing_stale_when_no_live_worker`).
-            let never_dispatched = existing.status.can_reconcile() && query_latest_run(conn, &existing.id)?.is_none();
+            // has ever attached. `can_reconcile()` is the subset the product
+            // reconciler may rewrite; `is_pre_run()` also covers `claimed`,
+            // which is the scheduler's cube-setup CAS and must not be
+            // abandoned-and-recreated. Once a worker actually attaches,
+            // status flips to running/waiting_human and a `work_runs` row
+            // exists — so this never masks a genuinely dead live-status row
+            // (see `request_execution_marks_existing_stale_when_no_live_worker`).
+            let never_dispatched = existing.status.is_pre_run() && query_latest_run(conn, &existing.id)?.is_none();
             if never_dispatched || is_live(&existing.id) {
                 let (decision, message) = if never_dispatched {
                     (

@@ -256,7 +256,7 @@ impl WorkDb {
                 "SELECT we.id, we.work_item_id
                  FROM work_executions we
                  JOIN tasks t ON t.id = we.work_item_id
-                 WHERE we.status IN ('queued', 'ready', 'waiting_dependency')
+                 WHERE we.status IN ('queued', 'ready', 'waiting_dependency', 'claimed')
                    AND (t.status IN ('done', 'archived') OR t.deleted_at IS NOT NULL)",
             )?;
             stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
@@ -271,7 +271,7 @@ impl WorkDb {
                  SET status = 'abandoned',
                      finished_at = COALESCE(finished_at, ?2)
                  WHERE id = ?1
-                   AND status IN ('queued', 'ready', 'waiting_dependency')",
+                   AND status IN ('queued', 'ready', 'waiting_dependency', 'claimed')",
                 params![execution_id, now],
             )?;
             if updated > 0 {
@@ -781,7 +781,7 @@ impl WorkDb {
                AND NOT EXISTS (
                    SELECT 1 FROM work_executions we
                    WHERE we.work_item_id = t.id
-                     AND we.status IN ('ready', 'running', 'waiting_human')
+                     AND we.status IN ('ready', 'claimed', 'running', 'waiting_human')
                )
                AND NOT EXISTS (
                    SELECT 1 FROM work_attention_items a
@@ -1239,24 +1239,26 @@ impl WorkDb {
         if !first_in_flight {
             return Ok(None);
         }
-        // One-shot guard: only a `ready` row that has never been deferred.
+        // One-shot guard: only a `ready`/`claimed` row that has never been
+        // deferred. The drain loop CAS's `ready → claimed` before this gate,
+        // so a `status = 'ready'` predicate would silently never stagger.
         let current: Option<Option<String>> = conn
             .query_row(
-                "SELECT dispatch_not_before FROM work_executions WHERE id = ?1 AND status = 'ready'",
+                "SELECT dispatch_not_before FROM work_executions WHERE id = ?1 AND status IN ('ready', 'claimed')",
                 params![execution_id],
                 |row| row.get::<_, Option<String>>(0),
             )
             .optional()?;
         match current {
-            Some(None) => {}                  // ready and never deferred → eligible
+            Some(None) => {}                  // ready/claimed and never deferred → eligible
             Some(Some(_)) => return Ok(None), // already deferred once
-            None => return Ok(None),          // not a ready row (raced away)
+            None => return Ok(None),          // not a ready/claimed row (raced away)
         }
         let not_before = boss_engine_utils::epoch_time::now_epoch_secs() + stagger_secs as i64;
         let updated = conn.execute(
             "UPDATE work_executions
              SET dispatch_not_before = ?2
-             WHERE id = ?1 AND status = 'ready' AND dispatch_not_before IS NULL",
+             WHERE id = ?1 AND status IN ('ready', 'claimed') AND dispatch_not_before IS NULL",
             params![execution_id, not_before.to_string()],
         )?;
         if updated == 0 {
@@ -1368,18 +1370,19 @@ impl WorkDb {
         Ok(())
     }
 
-    /// Atomically move a `ready` execution back to `waiting_dependency` when
-    /// the dispatcher discovers at dispatch time that the work item is still
-    /// gated by an unmet prereq. A no-op (returns `false`) when the execution
-    /// is not in `ready` status — it may have been promoted or claimed by
-    /// a concurrent path. Returns `true` when the row was actually updated.
+    /// Atomically move a `ready` or `claimed` execution back to
+    /// `waiting_dependency` when the dispatcher discovers at dispatch time
+    /// that the work item is still gated by an unmet prereq. A no-op
+    /// (returns `false`) when the execution is in any other status — it may
+    /// have been promoted or settled by a concurrent path. Returns `true`
+    /// when the row was actually updated.
     pub fn downgrade_ready_to_waiting_dependency(&self, execution_id: &str) -> Result<bool> {
         let conn = self.connect()?;
         let affected = conn.execute(
             "UPDATE work_executions
              SET status = 'waiting_dependency'
              WHERE id = ?1
-               AND status = 'ready'",
+               AND status IN ('ready', 'claimed')",
             rusqlite::params![execution_id],
         )?;
         Ok(affected > 0)
@@ -1448,8 +1451,8 @@ impl WorkDb {
     /// (or a concurrent path) already moved to `blocked`/`in_review`/a
     /// terminal status is left alone. Returns `true` iff the task actually
     /// transitioned; the execution abandon always applies (best-effort,
-    /// WHERE-guarded on `status = 'ready'` so a concurrent claim isn't
-    /// clobbered).
+    /// WHERE-guarded on `status IN ('ready', 'claimed')` so a drain-loop
+    /// claim is retired with the unused spawn rather than left hanging).
     pub fn retire_stale_revision_before_dispatch(&self, execution_id: &str, task_id: &str) -> Result<bool> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
@@ -1459,7 +1462,7 @@ impl WorkDb {
              SET status = 'abandoned',
                  finished_at = COALESCE(finished_at, ?2)
              WHERE id = ?1
-               AND status = 'ready'",
+               AND status IN ('ready', 'claimed')",
             params![execution_id, now],
         )?;
         let mut pending = PendingEvents::new();

@@ -207,6 +207,20 @@ pub use boss_protocol::{
     WorkItemPatch, WorkRun, WorkTree, comment_status_is_closed, is_known_created_via,
 };
 
+/// Outcome of [`WorkDb::claim_execution_for_dispatch`]: the Ready → Claimed
+/// compare-and-swap that keeps `reconcile_product_executions` from rewriting
+/// a row the scheduler has already picked up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchClaimOutcome {
+    /// This caller won the `ready → claimed` CAS.
+    Won,
+    /// The row was already `claimed` (another drain or `force_dispatch` holds it).
+    AlreadyHeld,
+    /// The row is no longer dispatchable — typically the reconciler won and
+    /// moved it to `waiting_dependency`, or it left the ready set some other way.
+    Rejected,
+}
+
 /// Outcome of `WorkDb::record_pre_start_failure`. The coordinator uses
 /// this to decide whether to schedule a delayed kick (retry) or surface
 /// a permanent failure to the operator.
@@ -310,7 +324,7 @@ pub struct HealedGhostActive {
 
 /// One execution row abandoned by
 /// [`WorkDb::abandon_stranded_executions_on_closed_work_items`] — a
-/// `queued`/`ready`/`waiting_dependency` execution that pointed at a
+/// `queued`/`ready`/`waiting_dependency`/`claimed` execution that pointed at a
 /// work item already in a terminal status or soft-deleted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbandonedStrandedExecution {

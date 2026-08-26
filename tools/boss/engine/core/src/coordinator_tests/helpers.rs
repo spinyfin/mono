@@ -11,7 +11,7 @@ pub(super) use crate::test_support::*;
 pub(super) use std::future::pending;
 pub(super) use std::path::PathBuf;
 pub(super) use std::sync::Arc;
-pub(super) use std::sync::atomic::Ordering;
+pub(super) use std::sync::atomic::{AtomicBool, Ordering};
 pub(super) use std::time::Duration;
 
 pub(super) use anyhow::{Result, anyhow};
@@ -25,8 +25,8 @@ pub(super) use boss_protocol::{CreateRunInput, EngineToAppError, ExecutionStatus
 pub(super) use crate::runner::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
 pub(super) use crate::work::{
     AddDependencyInput, CreateChoreInput, CreateExecutionInput, CreateProductInput, CreateProjectInput,
-    CreateTaskInput, FinishExecutionRunInput, RequestExecutionInput, TaskStatus, WorkDb, WorkExecution, WorkItem,
-    WorkItemPatch,
+    CreateTaskInput, DispatchClaimOutcome, FinishExecutionRunInput, RequestExecutionInput, TaskStatus, WorkDb,
+    WorkExecution, WorkItem, WorkItemPatch,
 };
 
 /// Coordinator fixtures that exercise a launch seed the local driver's
@@ -74,6 +74,10 @@ pub(super) struct FakeCubeClient {
     pub(super) slow_ensure_origin: Option<String>,
     pub(super) slow_ensure_delay: Duration,
     pub(super) fail_lease: bool,
+    /// Panic on the next `lease_workspace` call (once). Models a spawned
+    /// dispatch task aborting while the row is `claimed`, so tests can
+    /// assert the RAII guard reverts the row to `ready`.
+    pub(super) panic_on_next_lease: AtomicBool,
     /// Model the anaplian failure-mode A: cube exits non-zero on a
     /// post-lease setup step, surfaced as a typed [`CubeCliError`]
     /// carrying the exit code + stderr (as the remote SSH adapter
@@ -167,6 +171,9 @@ crate::stub_cube_client! { FakeCubeClient {
             exclude_workspace_ids.iter().map(|s| s.to_string()).collect(),
         ));
         drop(calls);
+        if self.panic_on_next_lease.swap(false, Ordering::SeqCst) {
+            panic!("fake cube lease panicked (claimed-dispatch RAII test)");
+        }
         if self.fail_lease_with_cube_cli_error {
             return Err(crate::cube_commands::CubeCliError {
                 host: "anaplian".to_owned(),

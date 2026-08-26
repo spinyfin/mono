@@ -332,7 +332,37 @@ impl ExecutionCoordinator {
                         })),
                 )
                 .await;
+            // Drain may already have CAS'd this row to `claimed`. A pause is
+            // not a spawn failure — revert so the next kick can pick it up.
+            if let Err(err) = self.work_db.release_dispatch_claim(&execution.id) {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "failed to release dispatch claim after pause hold"
+                );
+            }
             return Err(anyhow!("{hold}"));
+        }
+        // Durable spawn-window claim. The drain loop usually already won
+        // this CAS; `AlreadyHeld` is that case. `force_dispatch` and any
+        // path that skipped the drain pickup claim it here. Rejected means
+        // the reconciler (or another writer) moved the row off `ready`
+        // before we took the window — fail closed rather than leasing a
+        // workspace we cannot start.
+        match self.work_db.claim_execution_for_dispatch(&execution.id) {
+            Ok(DispatchClaimOutcome::Won | DispatchClaimOutcome::AlreadyHeld) => {}
+            Ok(DispatchClaimOutcome::Rejected) => {
+                let status = self
+                    .work_db
+                    .get_execution(&execution.id)
+                    .map(|e| e.status.to_string())
+                    .unwrap_or_else(|_| "unknown".to_owned());
+                return Err(anyhow!(
+                    "execution {} is not ready and cannot be dispatched from status `{status}`",
+                    execution.id
+                ));
+            }
+            Err(err) => return Err(err),
         }
         // Double-spawn guard (Bug A): if another execution for this
         // work_item is already live (running or waiting_human), this
@@ -528,9 +558,9 @@ impl ExecutionCoordinator {
                     "spawn_attempt: deferred — another execution on the same PR/chain is live; \
                      serializing behind it rather than co-dispatching onto the shared jj store",
                 );
-                // Leave the execution `ready` (do NOT abandon). The caller
-                // releases the claimed worker on this `Err`, and the next
-                // kick re-evaluates the still-`ready` row.
+                // Leave the execution `ready` (do NOT abandon). Revert a
+                // drain-loop `claimed` CAS so the next kick can see the row.
+                // The caller releases the claimed worker on this `Err`.
                 //
                 // Emit a terminal event so the dispatch timeline advances
                 // past `worker_claimed/ok` immediately — otherwise the
@@ -553,6 +583,13 @@ impl ExecutionCoordinator {
                             })),
                     )
                     .await;
+                if let Err(err) = self.work_db.release_dispatch_claim(&execution.id) {
+                    tracing::error!(
+                        execution_id = %execution.id,
+                        ?err,
+                        "failed to release dispatch claim after chain-serialization backstop"
+                    );
+                }
                 return Err(anyhow::anyhow!(
                     "serialized: execution {} for work_item {} deferred behind live chain sibling {} (work_item {})",
                     execution.id,
@@ -1205,14 +1242,22 @@ impl ExecutionCoordinator {
                             })),
                     )
                     .await;
-                // Hand the workspace back so it isn't stranded, then leave
-                // the execution `ready` (the deferral path) so it re-attempts
-                // once the sibling reaps.
+                // Hand the workspace back so it isn't stranded, then unclaim
+                // so the row returns to `ready` (the deferral path) and
+                // `recover_failed_dispatch` does not count this serialization
+                // as a spawn failure.
                 if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
                     tracing::error!(
                         ?release_err,
                         lease_id = %lease.lease_id,
                         "failed to release workspace after refusing a chain-sibling-racing spawn",
+                    );
+                }
+                if let Err(err) = self.work_db.release_dispatch_claim(&execution.id) {
+                    tracing::error!(
+                        execution_id = %execution.id,
+                        ?err,
+                        "failed to release dispatch claim after post-lease chain-sibling refusal"
                     );
                 }
                 return Err(anyhow!(
@@ -2374,7 +2419,7 @@ impl ExecutionCoordinator {
     ///
     /// Do NOT call this for post-`run_started` failures — those require
     /// `finish_execution_run`.
-    fn record_start_failure(
+    pub(super) fn record_start_failure(
         &self,
         coordinator: Arc<ExecutionCoordinator>,
         execution: &WorkExecution,

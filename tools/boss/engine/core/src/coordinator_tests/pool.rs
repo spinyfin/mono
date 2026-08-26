@@ -2438,17 +2438,17 @@ async fn fast_items_dispatch_without_waiting_behind_a_slow_one() {
     // ...while the slow row is still stuck in its `ensure_repo`.
     assert_eq!(
         db.get_execution(&slow).unwrap().status,
-        ExecutionStatus::Ready,
-        "the slow row should still be dispatching — the point is that the fast rows \
-         overtook it rather than queueing behind it",
+        ExecutionStatus::Claimed,
+        "the slow row should still be dispatching (claimed, not yet running) — the \
+         point is that the fast rows overtook it rather than queueing behind it",
     );
 }
 
 /// A slow row must not be dispatched twice when a re-drain overlaps its
 /// hand-off.
 ///
-/// A handed-off row keeps `status = 'ready'` until its run starts, so it
-/// is still returned by `list_ready_executions`. Now that the drain loop
+/// A handed-off row is CAS'd to `claimed` at pickup so the reconciler
+/// cannot rewrite it; overlapping drains must not spawn it twice. Now that the drain loop
 /// returns without awaiting dispatch, a kick landing mid-flight re-enters
 /// the loop and sees that row again — and neither the chain guard nor the
 /// double-spawn guard would catch the duplicate, since both exclude the
@@ -2687,8 +2687,9 @@ async fn a_chain_sibling_defers_behind_a_dispatch_still_in_flight() {
     );
     assert_eq!(
         db.get_execution(&revision_exec.id).unwrap().status,
-        ExecutionStatus::Ready,
-        "sanity: the revision is still mid-dispatch, so the deferral above was \
-         decided against an in-flight sibling and not a DB-visible live one",
+        ExecutionStatus::Claimed,
+        "sanity: the revision is still mid-dispatch (claimed, not yet running), so \
+         the deferral above was decided against an in-flight sibling and not a \
+         DB-visible live one",
     );
 }
