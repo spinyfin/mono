@@ -580,6 +580,12 @@ struct ServerState {
     /// `ListWorkerLiveStates` and pushed on the
     /// `worker.live_states` topic whenever any slot changes.
     live_worker_states: Arc<LiveWorkerStateRegistry>,
+    /// Executions whose startup pane reconcile could not ask the app about
+    /// pane presence. App registration consumes this one-shot restart cohort;
+    /// ordinary in-flight executions must never be retried here because a
+    /// dispatch may still be completing its initial pane-spawn round-trip.
+    #[builder(default)]
+    startup_pane_retry_ids: Arc<StdMutex<HashSet<String>>>,
     /// Operator-placed holds (`bossctl agents hold`/`release-hold`) that
     /// exempt a live run from the idle-park and auto-reap sweeps. Shared
     /// with the completion handler (idle-park) and the stale-worker sweep

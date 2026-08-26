@@ -1181,7 +1181,11 @@ pub async fn serve_with_merge_probe(
     // app-hosted rows whose pane presence cannot be asked yet emit a
     // loud diagnostic and are retried when the app session registers.
     server_state
-        .reconcile_unspawned_running_panes(&tmux_adoption_report.adopted_execution_ids)
+        .reconcile_unspawned_running_panes(
+            &tmux_adoption_report.adopted_execution_ids,
+            &probe_report.verdicts,
+            None,
+        )
         .await;
 
     match server_state

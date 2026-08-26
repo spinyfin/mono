@@ -71,6 +71,9 @@ pub struct StartupPaneReconcileOutcome {
     pub skipped_present: usize,
     pub undetermined: usize,
     pub failed: usize,
+    /// Rows whose pane state was unknowable at startup. This is the only
+    /// cohort eligible for an app-registration retry.
+    pub undetermined_execution_ids: HashSet<String>,
 }
 
 /// Combined pane-presence view used at engine startup and again when the
@@ -141,7 +144,10 @@ pub async fn reconcile_unspawned_running(
         match consider_one(work_db, execution, probe_verdicts, oracle, resumer, dispatch_events).await {
             OneOutcome::Respawned => outcome.respawned += 1,
             OneOutcome::SkippedPresent => outcome.skipped_present += 1,
-            OneOutcome::Undetermined => outcome.undetermined += 1,
+            OneOutcome::Undetermined => {
+                outcome.undetermined += 1;
+                outcome.undetermined_execution_ids.insert(execution.id.clone());
+            }
             OneOutcome::Failed => outcome.failed += 1,
             OneOutcome::NotCandidate => {}
         }
@@ -587,6 +593,21 @@ mod tests {
         };
         assert_eq!(oracle.pane_presence("exec-hosted").await, PanePresence::Present);
         assert_eq!(oracle.pane_presence("exec-missing").await, PanePresence::Absent);
+    }
+
+    #[tokio::test]
+    async fn engine_oracle_keeps_a_tmux_run_present_from_live_state_after_retry_loses_adoption_set() {
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        live_states.register_spawn(1, "exec-tmux", "claude-opus-4-7", 0, None);
+        let oracle = EnginePaneOracle {
+            live_states: Some(live_states),
+            // App-registration retry deliberately has no boot adoption set.
+            tmux_adopted: HashSet::new(),
+            hosted_run_ids: Err("no app session is registered".into()),
+            tmux_hosted_ids: ["exec-tmux".to_owned()].into_iter().collect(),
+        };
+
+        assert_eq!(oracle.pane_presence("exec-tmux").await, PanePresence::Present);
     }
 
     #[tokio::test]
