@@ -117,6 +117,17 @@ pub fn is_terminal_event(event: &DispatchEvent) -> bool {
     false
 }
 
+/// The last non-`stage_stalled` event of a timeline, reduced to the fields a
+/// `ghost-active` listing needs. Returned by [`TimelineState::live_summary`]
+/// when that event is not terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveTimelineSummary {
+    pub work_item_id: Option<String>,
+    pub stage: String,
+    pub outcome: String,
+    pub ts_epoch_ms: u128,
+}
+
 /// The last non-`stage_stalled` event of a timeline, reduced to the fields
 /// a stall decision needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,6 +255,28 @@ impl TimelineState {
     fn live_last_real(&self) -> Option<&LastRealEvent> {
         let last = self.last_real.as_ref()?;
         if last.terminal { None } else { Some(last) }
+    }
+
+    /// The last non-`stage_stalled` event, reduced to the fields a
+    /// `ghost-active` listing needs — or `None` when the timeline's last
+    /// real event already reached [`is_terminal_event`].
+    ///
+    /// This is the terminal-stage check `ghost_active` must use instead of
+    /// looking at the raw last line of a mirror: a `stage_stalled` record
+    /// written after a genuine terminal event (e.g. a stray stall
+    /// observation racing a `pane_spawned ok`) must not make the timeline
+    /// look non-terminal again. Because `TimelineState` folds
+    /// `stage_stalled` records as flags rather than as steps (see the module
+    /// docs), `last_real` already skips them — this just exposes that
+    /// reduction for a caller that isn't deciding a stall, only whether the
+    /// timeline is still open at all.
+    pub fn live_summary(&self) -> Option<LiveTimelineSummary> {
+        self.live_last_real().map(|last| LiveTimelineSummary {
+            work_item_id: last.work_item_id.clone(),
+            stage: last.stage.clone(),
+            outcome: last.outcome.clone(),
+            ts_epoch_ms: last.ts_epoch_ms,
+        })
     }
 
     fn already_flagged(&self, last: &LastRealEvent) -> bool {
