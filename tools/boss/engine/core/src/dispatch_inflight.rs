@@ -6,10 +6,11 @@
 //! Every dispatch guard that asks "is another execution already working this
 //! PR/chain?" ([`crate::coordinator::ExecutionCoordinator::resolve_chain_hold`]
 //! and the double-spawn guard in `schedule_execution`) answers from the DB:
-//! `work_executions.status IN ('running', 'waiting_human')`. An execution only
-//! reaches that status when `start_execution_run_on_host` commits — the *last*
-//! step of `schedule_execution`, after `cube repo ensure`, the workspace lease,
-//! `cube workspace goto` and `cube change create` have all returned.
+//! `work_executions.status IN ('running', 'waiting_human')`. An execution is
+//! CAS'd to `claimed` at pickup so the product reconciler cannot rewrite it,
+//! but `claimed` is not live — `start_execution_run_on_host` still commits
+//! `running` as the last step of `schedule_execution`, after `cube repo ensure`,
+//! the workspace lease, `cube workspace goto` and `cube change create`.
 //!
 //! While `drain_ready_queue` awaited `schedule_execution` inline, that was
 //! sound by construction: item A was `running` in the DB before item B's guard
@@ -39,7 +40,7 @@
 //! until `schedule_execution` returns, by which point either
 //! `start_execution_run_on_host` has committed (the DB now shows `running`, so
 //! the registry can safely forget it — there is no gap) or dispatch failed and
-//! the row is back to `ready`/`failed` with its claim and lease released.
+//! the row is back to `ready`/`failed` (from `claimed`) with its claim and lease released.
 //!
 //! [`DispatchReservation`] de-registers on `Drop` rather than at an explicit
 //! call site. `schedule_execution` has well over a dozen early-return paths

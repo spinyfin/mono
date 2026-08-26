@@ -537,8 +537,11 @@ pub(crate) fn reconcile_work_item_execution(
     }
     match query_latest_execution_for_work_item(conn, work_item_id)? {
         Some(execution) => {
-            if execution.kind == kind && execution.status.can_reconcile() && execution.status != effective_status {
-                let updated = update_execution_status(conn, &execution.id, effective_status)?;
+            if execution.kind == kind
+                && execution.status.can_reconcile()
+                && execution.status != effective_status
+                && let Some(updated) = update_execution_status(conn, &execution.id, effective_status)?
+            {
                 result.updated.push(updated);
             }
         }
@@ -843,7 +846,9 @@ pub(crate) fn reconcile_revision_execution(
                 && existing.status.can_reconcile()
                 && existing.status != effective_status =>
         {
-            let updated = update_execution_status(conn, &existing.id, effective_status)?;
+            let Some(updated) = update_execution_status(conn, &existing.id, effective_status)? else {
+                return Ok(());
+            };
             // Back-fill pr_url if missing: the execution may have been created by
             // reconcile_active_dispatch before the parent chore opened its PR (a
             // race that leaves pr_url = NULL, causing --resume-pr to be skipped

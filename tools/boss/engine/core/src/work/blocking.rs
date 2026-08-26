@@ -21,7 +21,7 @@ impl WorkDb {
     /// CI-remediation attempts that are stranded: the parent task is
     /// `blocked: ci_failure`, the `ci_remediations` row is `pending`,
     /// and no live execution (`kind='ci_remediation'` AND
-    /// `status IN ('ready','running','waiting_human')`) exists for that
+    /// `status IN ('ready','claimed','running','waiting_human')`) exists for that
     /// `work_item_id`. This occurs when two merge-queue dequeue events
     /// land in the same sweep: the first flips the task (consuming the
     /// `status='in_review'` WHERE guard on `mark_chore_blocked_ci_failure`)
@@ -58,7 +58,7 @@ impl WorkDb {
                    SELECT 1 FROM work_executions we
                    WHERE we.work_item_id = cr.work_item_id
                      AND we.kind = 'ci_remediation'
-                     AND we.status IN ('ready', 'running', 'waiting_human')
+                     AND we.status IN ('ready', 'claimed', 'running', 'waiting_human')
                )
              ORDER BY cr.created_at ASC",
         )?;

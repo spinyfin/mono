@@ -1479,6 +1479,7 @@ fn all_execution_statuses() -> Vec<ExecutionStatus> {
         Queued,
         Ready,
         WaitingDependency,
+        Claimed,
         Running,
         WaitingHuman,
         WaitingReview,
@@ -1491,8 +1492,8 @@ fn all_execution_statuses() -> Vec<ExecutionStatus> {
     ];
     for status in &all {
         match status {
-            Queued | Ready | WaitingDependency | Running | WaitingHuman | WaitingReview | WaitingMerge | Completed
-            | Failed | Abandoned | Cancelled | Orphaned => {}
+            Queued | Ready | WaitingDependency | Claimed | Running | WaitingHuman | WaitingReview | WaitingMerge
+            | Completed | Failed | Abandoned | Cancelled | Orphaned => {}
         }
     }
     all
@@ -1508,6 +1509,7 @@ fn execution_status_is_terminal_marks_only_closed_states() {
         Queued,
         Ready,
         WaitingDependency,
+        Claimed,
         Running,
         WaitingHuman,
         WaitingReview,
@@ -1527,6 +1529,7 @@ fn execution_status_is_live_marks_only_active_states() {
         Queued,
         Ready,
         WaitingDependency,
+        Claimed,
         WaitingReview,
         WaitingMerge,
         Completed,
@@ -1546,6 +1549,7 @@ fn execution_status_can_reconcile_marks_only_pre_dispatch_states() {
         assert!(status.can_reconcile(), "{status} should be reconcilable");
     }
     for status in [
+        Claimed,
         Running,
         WaitingHuman,
         WaitingReview,
@@ -1557,6 +1561,29 @@ fn execution_status_can_reconcile_marks_only_pre_dispatch_states() {
         Orphaned,
     ] {
         assert!(!status.can_reconcile(), "{status} should not be reconcilable");
+    }
+}
+
+#[test]
+fn execution_status_can_begin_run_marks_ready_and_claimed() {
+    use ExecutionStatus::*;
+    for status in [Ready, Claimed] {
+        assert!(status.can_begin_run(), "{status} should be allowed to begin a run");
+    }
+    for status in [
+        Queued,
+        WaitingDependency,
+        Running,
+        WaitingHuman,
+        WaitingReview,
+        WaitingMerge,
+        Completed,
+        Failed,
+        Abandoned,
+        Cancelled,
+        Orphaned,
+    ] {
+        assert!(!status.can_begin_run(), "{status} should not be allowed to begin a run");
     }
 }
 
@@ -1585,6 +1612,18 @@ fn execution_status_waiting_review_and_merge_are_unclassified() {
         assert!(!status.is_live(), "{status} should not be live");
         assert!(!status.can_reconcile(), "{status} should not be reconcilable");
     }
+}
+
+#[test]
+fn execution_status_claimed_is_unclassified() {
+    // Claimed is the scheduler's spawn-window token: not reconcilable (so
+    // the product reconciler cannot clobber it), not live (no pane yet),
+    // not terminal. Pin that so a future reclassification is deliberate.
+    let status = ExecutionStatus::Claimed;
+    assert!(!status.is_terminal(), "{status} should not be terminal");
+    assert!(!status.is_live(), "{status} should not be live");
+    assert!(!status.can_reconcile(), "{status} should not be reconcilable");
+    assert!(status.can_begin_run(), "{status} should be allowed to begin a run");
 }
 
 /// Every `TaskStatus` variant, with the same compile-time tripwire as

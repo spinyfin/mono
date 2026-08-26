@@ -96,6 +96,8 @@ enum AgentActivityState: Equatable {
             self = .active
         case "ready":
             self = .waiting(reason: "Queued for a worker")
+        case "claimed":
+            self = .waiting(reason: "Starting worker")
         case "waiting_human":
             self = .waiting(reason: "Waiting on human input")
         case "waiting_review":

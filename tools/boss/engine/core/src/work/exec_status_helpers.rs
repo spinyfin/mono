@@ -200,16 +200,27 @@ pub(crate) fn update_execution_status(
     conn: &Connection,
     execution_id: &str,
     status: ExecutionStatus,
-) -> Result<WorkExecution> {
+) -> Result<Option<WorkExecution>> {
+    // CAS on the reconcilable set: a scheduler pickup that flipped the row
+    // to `claimed` (or any other non-reconcilable status) between our
+    // snapshot read and this write must win. An unconditional `WHERE id`
+    // write is what let `reconcile_product_executions` clobber an
+    // in-flight spawn to `waiting_dependency`.
     let updated = conn.execute(
-        "UPDATE work_executions SET status = ?2 WHERE id = ?1",
+        "UPDATE work_executions
+         SET status = ?2
+         WHERE id = ?1
+           AND status IN ('queued', 'ready', 'waiting_dependency')",
         params![execution_id, status.as_str()],
     )?;
     if updated == 0 {
-        bail!("unknown execution: {execution_id}");
+        query_execution(conn, execution_id).require("execution", execution_id)?;
+        return Ok(None);
     }
 
-    query_execution(conn, execution_id).require("execution", execution_id)
+    Ok(Some(
+        query_execution(conn, execution_id).require("execution", execution_id)?,
+    ))
 }
 
 pub(crate) fn task_accepts_execution(task: &Task) -> bool {
@@ -566,7 +577,16 @@ mod tests {
         for status in [Queued, Ready, WaitingDependency] {
             assert!(status.can_reconcile(), "{status} should be reconcilable");
         }
-        for status in [Running, WaitingHuman, Completed, Failed, Abandoned, Cancelled, Orphaned] {
+        for status in [
+            Claimed,
+            Running,
+            WaitingHuman,
+            Completed,
+            Failed,
+            Abandoned,
+            Cancelled,
+            Orphaned,
+        ] {
             assert!(!status.can_reconcile(), "{status} should not be reconcilable");
         }
     }
@@ -579,7 +599,7 @@ mod tests {
         for status in [Completed, Failed, Abandoned, Cancelled, Orphaned] {
             assert!(status.is_terminal(), "{status} should be terminal");
         }
-        for status in [Queued, Ready, Running, WaitingHuman, WaitingDependency] {
+        for status in [Queued, Ready, Claimed, Running, WaitingHuman, WaitingDependency] {
             assert!(!status.is_terminal(), "{status} should not be terminal");
         }
     }
@@ -596,6 +616,7 @@ mod tests {
             Queued,
             Ready,
             WaitingDependency,
+            Claimed,
             Completed,
             Failed,
             Abandoned,

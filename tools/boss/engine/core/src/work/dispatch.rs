@@ -256,7 +256,7 @@ impl WorkDb {
                 "SELECT we.id, we.work_item_id
                  FROM work_executions we
                  JOIN tasks t ON t.id = we.work_item_id
-                 WHERE we.status IN ('queued', 'ready', 'waiting_dependency')
+                 WHERE we.status IN ('queued', 'ready', 'waiting_dependency', 'claimed')
                    AND (t.status IN ('done', 'archived') OR t.deleted_at IS NOT NULL)",
             )?;
             stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
@@ -271,7 +271,7 @@ impl WorkDb {
                  SET status = 'abandoned',
                      finished_at = COALESCE(finished_at, ?2)
                  WHERE id = ?1
-                   AND status IN ('queued', 'ready', 'waiting_dependency')",
+                   AND status IN ('queued', 'ready', 'waiting_dependency', 'claimed')",
                 params![execution_id, now],
             )?;
             if updated > 0 {
@@ -781,7 +781,7 @@ impl WorkDb {
                AND NOT EXISTS (
                    SELECT 1 FROM work_executions we
                    WHERE we.work_item_id = t.id
-                     AND we.status IN ('ready', 'running', 'waiting_human')
+                     AND we.status IN ('ready', 'claimed', 'running', 'waiting_human')
                )
                AND NOT EXISTS (
                    SELECT 1 FROM work_attention_items a
@@ -1368,18 +1368,19 @@ impl WorkDb {
         Ok(())
     }
 
-    /// Atomically move a `ready` execution back to `waiting_dependency` when
-    /// the dispatcher discovers at dispatch time that the work item is still
-    /// gated by an unmet prereq. A no-op (returns `false`) when the execution
-    /// is not in `ready` status — it may have been promoted or claimed by
-    /// a concurrent path. Returns `true` when the row was actually updated.
+    /// Atomically move a `ready` or `claimed` execution back to
+    /// `waiting_dependency` when the dispatcher discovers at dispatch time
+    /// that the work item is still gated by an unmet prereq. A no-op
+    /// (returns `false`) when the execution is in any other status — it may
+    /// have been promoted or settled by a concurrent path. Returns `true`
+    /// when the row was actually updated.
     pub fn downgrade_ready_to_waiting_dependency(&self, execution_id: &str) -> Result<bool> {
         let conn = self.connect()?;
         let affected = conn.execute(
             "UPDATE work_executions
              SET status = 'waiting_dependency'
              WHERE id = ?1
-               AND status = 'ready'",
+               AND status IN ('ready', 'claimed')",
             rusqlite::params![execution_id],
         )?;
         Ok(affected > 0)
@@ -1459,7 +1460,7 @@ impl WorkDb {
              SET status = 'abandoned',
                  finished_at = COALESCE(finished_at, ?2)
              WHERE id = ?1
-               AND status = 'ready'",
+               AND status IN ('ready', 'claimed')",
             params![execution_id, now],
         )?;
         let mut pending = PendingEvents::new();

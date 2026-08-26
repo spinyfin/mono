@@ -12,8 +12,9 @@ pub struct CancelExecutionOpts {
     pub reason: Option<String>,
     /// When true, refuse any execution that is not never-started
     /// (`queued` / `ready` / `waiting_dependency` — see
-    /// [`ExecutionStatus::can_reconcile`]). Live workers must be
-    /// stopped via `bossctl agents stop` instead.
+    /// [`ExecutionStatus::can_reconcile`]). A `claimed` row is already in
+    /// the spawn window and is not cancellable via this gate. Live workers
+    /// must be stopped via `bossctl agents stop` instead.
     pub queued_only: bool,
 }
 
@@ -66,19 +67,19 @@ impl WorkDb {
                 existing.status
             );
         }
-        if opts.queued_only && !existing.status.can_reconcile() {
+        if opts.queued_only && !existing.status.can_reconcile() && existing.status != ExecutionStatus::Claimed {
             if existing.status.is_live() {
                 bail!(
                     "execution {execution_id} is `{}` (already started); \
                      use `bossctl agents stop {execution_id}` to stop a live worker — \
                      `executions cancel` only accepts never-started \
-                     (queued/ready/waiting_dependency) rows",
+                     (queued/ready/waiting_dependency/claimed) rows",
                     existing.status
                 );
             }
             bail!(
                 "execution {execution_id} is `{}` and has already left the \
-                 never-started set (queued/ready/waiting_dependency); \
+                 never-started set (queued/ready/waiting_dependency/claimed); \
                  use `bossctl work cancel {execution_id}` for any non-terminal \
                  row, or `bossctl agents stop` if a live worker still backs it",
                 existing.status
@@ -666,6 +667,69 @@ impl WorkDb {
         collect_rows(rows)
     }
 
+    /// Compare-and-swap `ready → claimed` so the product reconciler cannot
+    /// rewrite this row while cube setup is in flight.
+    ///
+    /// `Won` means this caller now owns the spawn window. `AlreadyHeld` means
+    /// another drain/`force_dispatch` already claimed it — do not spawn a
+    /// second worker. `Rejected` means the row left `ready` (typically
+    /// `waiting_dependency` after a reconciler write that won the race).
+    pub fn claim_execution_for_dispatch(&self, execution_id: &str) -> Result<DispatchClaimOutcome> {
+        let conn = self.connect()?;
+        let updated = conn.execute(
+            "UPDATE work_executions SET status = 'claimed' WHERE id = ?1 AND status = 'ready'",
+            [execution_id],
+        )?;
+        if updated > 0 {
+            return Ok(DispatchClaimOutcome::Won);
+        }
+        let execution = query_execution(&conn, execution_id).require("execution", execution_id)?;
+        Ok(match execution.status {
+            ExecutionStatus::Claimed => DispatchClaimOutcome::AlreadyHeld,
+            _ => DispatchClaimOutcome::Rejected,
+        })
+    }
+
+    /// Revert `claimed → ready` when a drain path claimed the row and then
+    /// deferred without spawning (chain hold, pool exhausted, inflight
+    /// reservation lost). No-op if the row is no longer `claimed`.
+    pub fn release_dispatch_claim(&self, execution_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let updated = conn.execute(
+            "UPDATE work_executions SET status = 'ready' WHERE id = ?1 AND status = 'claimed'",
+            [execution_id],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Boot-only: every leftover `claimed` row belongs to a spawn task that
+    /// died with the previous engine process. Revert them to `ready` so
+    /// `list_ready_executions` can pick them up; the cube lease, if any,
+    /// was never persisted on the row (it is written at `start_execution_run`)
+    /// and is reclaimed by cube TTL / the next lease of that workspace.
+    pub fn release_stale_claimed_executions(&self) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        let mut stmt =
+            conn.prepare("SELECT id FROM work_executions WHERE status = 'claimed' ORDER BY created_at ASC, id ASC")?;
+        let ids: Vec<String> = stmt.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        let mut released = Vec::new();
+        for id in ids {
+            let updated = conn.execute(
+                "UPDATE work_executions SET status = 'ready' WHERE id = ?1 AND status = 'claimed'",
+                [&id],
+            )?;
+            if updated > 0 {
+                tracing::warn!(
+                    execution_id = %id,
+                    "startup: reverted leftover claimed execution to ready (spawn died with the previous process)"
+                );
+                released.push(id);
+            }
+        }
+        Ok(released)
+    }
+
     /// Return every `work_executions` row the engine considers "in
     /// flight": status is non-terminal AND a cube workspace lease was
     /// recorded against it (`cube_lease_id IS NOT NULL`). The startup
@@ -697,8 +761,8 @@ impl WorkDb {
     ///
     /// A worker parked in `running` / `waiting_human` keeps a live cube
     /// workspace checkout at `workspace_path` for the lifetime of its pane;
-    /// pre-dispatch statuses (`queued` / `ready` / `waiting_dependency`)
-    /// never have a `workspace_path` because it is only stamped at
+    /// pre-dispatch statuses (`queued` / `ready` / `waiting_dependency` /
+    /// `claimed`) never have a `workspace_path` because it is only stamped at
     /// lease time. Filtering on `workspace_path IS NOT NULL AND != ''`
     /// therefore selects exactly the rows whose liveness can be judged by
     /// whether that directory still exists on disk. Unlike
@@ -858,6 +922,17 @@ impl WorkDb {
                     .then_with(|| left.id.cmp(&right.id))
             });
 
+            // Ordinal-chain readiness: only the single lowest-ordinal
+            // incomplete task in a project is `ready`; every other project
+            // task is forced to `waiting_dependency`. The declared `blocks`
+            // prerequisite graph is NOT consulted here — that gate lives in
+            // `reconcile_work_item_execution` (and the dispatcher). The two
+            // rules disagree: a later-ordinal task with an empty prerequisite
+            // list is still flipped to `waiting_dependency` by this loop.
+            // That disagreement is what made the ready-window race reachable
+            // (the scheduler had already picked the row up as `ready`). The
+            // `claimed` status + CAS write close the race; aligning this
+            // rule with the prerequisite graph is a separate change.
             let first_incomplete = tasks.iter().position(task_accepts_execution);
 
             for (index, task) in tasks.iter().enumerate() {
@@ -938,7 +1013,7 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        if execution.status != ExecutionStatus::Ready {
+        if !execution.status.can_begin_run() {
             bail!(
                 "execution {execution_id} is not ready and cannot start a run from status `{}`",
                 execution.status
@@ -946,7 +1021,7 @@ impl WorkDb {
         }
 
         let now = now_string();
-        tx.execute(
+        let updated = tx.execute(
             "UPDATE work_executions
              SET status = 'running',
                  cube_repo_id = ?2,
@@ -956,7 +1031,8 @@ impl WorkDb {
                  host_id = ?7,
                  started_at = COALESCE(started_at, ?6),
                  finished_at = NULL
-             WHERE id = ?1",
+             WHERE id = ?1
+               AND status IN ('ready', 'claimed')",
             params![
                 execution_id,
                 cube_repo_id,
@@ -967,6 +1043,13 @@ impl WorkDb {
                 host_id
             ],
         )?;
+        if updated == 0 {
+            let current = query_execution(&tx, execution_id).require("execution", execution_id)?;
+            bail!(
+                "execution {execution_id} is not ready and cannot start a run from status `{}`",
+                current.status
+            );
+        }
 
         // Auto-advance the work item's kanban status to `active` so
         // the card moves into the Doing column when work begins.
@@ -1397,12 +1480,13 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        if execution.status != ExecutionStatus::Ready {
+        if !execution.status.can_begin_run() {
             bail!(
                 "execution {execution_id} is not ready and cannot fail startup from status `{}`",
                 execution.status
             );
         }
+        let from_status = execution.status.clone();
 
         let now = now_string();
         tx.execute(
@@ -1433,7 +1517,7 @@ impl WorkDb {
         tracing::warn!(
             execution_id = %execution_id,
             work_item_id = %execution.work_item_id,
-            from_status = %ExecutionStatus::Ready,
+            from_status = %from_status,
             to_status = %execution.status,
             reason = %error_text,
             "execution terminalized: fail start",
@@ -1484,7 +1568,7 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        if execution.status != ExecutionStatus::Ready {
+        if !execution.status.can_begin_run() {
             bail!(
                 "execution {execution_id} is not ready and cannot record pre-start failure \
                  from status `{}`",
@@ -1495,6 +1579,7 @@ impl WorkDb {
         let now = now_string();
         let new_count = execution.pre_start_failure_count + 1;
         let max_retries = retry_delays.len() as i64;
+        let from_status = execution.status.clone();
 
         let (outcome, run_id) = if new_count <= max_retries {
             let delay = retry_delays[(new_count - 1) as usize];
@@ -1502,7 +1587,8 @@ impl WorkDb {
                 (boss_engine_utils::epoch_time::now_epoch_secs() as u64 + delay.as_secs()).to_string();
             tx.execute(
                 "UPDATE work_executions
-                 SET pre_start_failure_count = ?2,
+                 SET status = 'ready',
+                     pre_start_failure_count = ?2,
                      cube_repo_id = COALESCE(?3, cube_repo_id),
                      cube_lease_id = NULL,
                      cube_workspace_id = NULL,
@@ -1510,7 +1596,8 @@ impl WorkDb {
                      started_at = NULL,
                      finished_at = NULL,
                      dispatch_not_before = ?4
-                 WHERE id = ?1",
+                 WHERE id = ?1
+                   AND status IN ('ready', 'claimed')",
                 params![execution_id, new_count, cube_repo_id, dispatch_not_before],
             )?;
             (PreStartFailureOutcome::Retry { delay }, None)
@@ -1534,7 +1621,8 @@ impl WorkDb {
                      workspace_path = NULL,
                      started_at = COALESCE(started_at, ?4),
                      finished_at = ?4
-                 WHERE id = ?1",
+                 WHERE id = ?1
+                   AND status IN ('ready', 'claimed')",
                 params![execution_id, new_count, cube_repo_id, now],
             )?;
             (PreStartFailureOutcome::PermanentFail, Some(run_id))
@@ -1551,7 +1639,7 @@ impl WorkDb {
             tracing::warn!(
                 execution_id = %execution_id,
                 work_item_id = %execution.work_item_id,
-                from_status = %ExecutionStatus::Ready,
+                from_status = %from_status,
                 to_status = %execution.status,
                 reason = %error_text,
                 "execution terminalized: pre-start failure exhausted retries",

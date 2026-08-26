@@ -201,6 +201,7 @@ mod tests {
             ExecutionStatus::Running,
             ExecutionStatus::WaitingHuman,
             ExecutionStatus::Ready,
+            ExecutionStatus::Claimed,
         ] {
             assert_eq!(
                 classify_contradiction(&status, false, None),

@@ -224,7 +224,7 @@ pub(crate) fn abandon_pending_executions(
     let mut stmt = conn.prepare(
         "SELECT id, status FROM work_executions
          WHERE work_item_id = ?1
-           AND status IN ('queued', 'ready', 'waiting_dependency')",
+           AND status IN ('queued', 'ready', 'waiting_dependency', 'claimed')",
     )?;
     let doomed: Vec<(String, String)> = stmt
         .query_map(params![work_item_id], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -236,7 +236,7 @@ pub(crate) fn abandon_pending_executions(
          SET status = 'abandoned',
              finished_at = COALESCE(finished_at, ?2)
          WHERE work_item_id = ?1
-           AND status IN ('queued', 'ready', 'waiting_dependency')",
+           AND status IN ('queued', 'ready', 'waiting_dependency', 'claimed')",
         params![work_item_id, now],
     )?;
     for (execution_id, from_status) in &doomed {

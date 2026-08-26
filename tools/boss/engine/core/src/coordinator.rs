@@ -28,8 +28,8 @@ use crate::metrics::Registry;
 use crate::runner::{ExecutionRunner, RunOutcome, RunWaitState};
 use crate::spawn_flow::StartWorkerError;
 use crate::work::{
-    CreateAttentionItemInput, DispatchClass, FinishExecutionRunInput, PreStartFailureOutcome, WorkDb, WorkExecution,
-    WorkItem, WorkRun,
+    CreateAttentionItemInput, DispatchClaimOutcome, DispatchClass, FinishExecutionRunInput, PreStartFailureOutcome,
+    WorkDb, WorkExecution, WorkItem, WorkRun,
 };
 
 // Phase-3 counter handles for the cube workspace lease boundary.
@@ -58,7 +58,7 @@ pub fn register_metrics(registry: &Registry) {
 }
 
 /// Hook invoked once per execution at the moment it transitions from
-/// `ready` to `running` (`start_execution_run` succeeded). Production
+/// `claimed`/`ready` to `running` (`start_execution_run` succeeded). Production
 /// wiring routes this into [`crate::completion::WorkerCompletionHandler::on_execution_started`],
 /// which snapshots the bound chore PR's head SHA into
 /// `work_executions.pr_head_before` for the Stop-boundary SHA-delta

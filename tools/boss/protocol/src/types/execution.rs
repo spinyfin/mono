@@ -124,6 +124,20 @@ pub enum ExecutionStatus {
     Queued,
     Ready,
     WaitingDependency,
+    /// The scheduler has claimed this execution for spawn: a worker slot is
+    /// (or is about to be) held and cube setup may be in flight, but
+    /// [`Self::Running`] has not been written yet because `start_execution_run`
+    /// has not committed.
+    ///
+    /// This is the missing intermediate between [`Self::Ready`] and
+    /// [`Self::Running`]. Without it the row stays `ready` for the whole
+    /// 1–10s cube-setup window, and `reconcile_product_executions` — which
+    /// rewrites any status [`Self::can_reconcile`] allows — can flip it to
+    /// `waiting_dependency` mid-spawn. `can_reconcile` excludes this variant
+    /// so that write is a no-op. It is not [`Self::is_live`]: there is no
+    /// pane yet, and death sweeps that assume a workspace/pane exist must
+    /// not treat a cube-setup row as a live worker.
+    Claimed,
     /// The engine has dispatched this execution and its agent is working:
     /// either the engine is still inside `run_execution` (the spawn
     /// window), or the spawn completed and the worker's agent now owns the
@@ -165,6 +179,7 @@ impl ExecutionStatus {
             Self::Queued => "queued",
             Self::Ready => "ready",
             Self::WaitingDependency => "waiting_dependency",
+            Self::Claimed => "claimed",
             Self::Running => "running",
             Self::WaitingHuman => "waiting_human",
             Self::WaitingReview => "waiting_review",
@@ -191,6 +206,16 @@ impl ExecutionStatus {
     pub fn can_reconcile(&self) -> bool {
         matches!(self, Self::Queued | Self::Ready | Self::WaitingDependency)
     }
+
+    /// Statuses from which `start_execution_run` and the pre-start-failure
+    /// write may proceed. [`Self::Ready`] is the pre-claim queue state;
+    /// [`Self::Claimed`] is the scheduler's CAS token covering cube setup.
+    /// Everything else — including [`Self::WaitingDependency`] — is rejected.
+    /// This is the readiness guard, updated for the claimed-status model;
+    /// it is not a weakening of the `waiting_dependency` rejection.
+    pub fn can_begin_run(&self) -> bool {
+        matches!(self, Self::Ready | Self::Claimed)
+    }
 }
 
 impl std::fmt::Display for ExecutionStatus {
@@ -206,6 +231,7 @@ impl std::str::FromStr for ExecutionStatus {
             "queued" => Ok(Self::Queued),
             "ready" => Ok(Self::Ready),
             "waiting_dependency" => Ok(Self::WaitingDependency),
+            "claimed" => Ok(Self::Claimed),
             "running" => Ok(Self::Running),
             "waiting_human" => Ok(Self::WaitingHuman),
             "waiting_review" => Ok(Self::WaitingReview),
@@ -217,7 +243,7 @@ impl std::str::FromStr for ExecutionStatus {
             "orphaned" => Ok(Self::Orphaned),
             other => Err(format!(
                 "unknown execution status: `{other}`; expected one of: \
-                 queued, ready, waiting_dependency, running, waiting_human, \
+                 queued, ready, waiting_dependency, claimed, running, waiting_human, \
                  waiting_review, waiting_merge, completed, failed, abandoned, \
                  cancelled, orphaned"
             )),
