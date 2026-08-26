@@ -19,6 +19,14 @@ final class BossPaneModel: ObservableObject {
     private var consecutiveImmediateExits = 0
     private var viewerInstalledAt: Date?
     private var reattachTask: Task<Void, Never>?
+    /// Reports keystrokes delivered into the current viewer so the engine can
+    /// detect one whose input path has died. Held for the viewer's lifetime
+    /// and replaced with it; a reporter for a torn-down surface would keep
+    /// naming a tmux client pid that no longer exists.
+    private var clientInputReporter: TmuxClientInputReporter?
+    /// Installed by `ContentView`; forwards an input observation to the
+    /// engine. Nil in previews and tests, which simply report nothing.
+    var reportClientInput: ((_ sessionName: String, _ clientPid: Int32, _ lastInputEpoch: Int64) -> Void)?
 
     private static let minStableUptime: TimeInterval = 5
     private static let maxConsecutiveImmediateExits = 8
@@ -76,6 +84,12 @@ final class BossPaneModel: ObservableObject {
             Task { @MainActor [weak self] in
                 self?.reattachViewer(generation: generation)
             }
+        }
+        clientInputReporter = TmuxClientInputReporter(
+            sessionName: request.sessionName,
+            session: viewer
+        ) { [weak self] sessionName, clientPid, epoch in
+            self?.reportClientInput?(sessionName, clientPid, epoch)
         }
         session = viewer
         attachedSpawnToken = request.spawnToken

@@ -92,6 +92,39 @@ pub struct Session {
     pub spawn_token: Option<String>,
 }
 
+/// One client attached to Boss's private tmux server, as reported by
+/// `list-clients`.
+///
+/// The two timestamps a wedge diagnosis needs sit on opposite sides of the
+/// protocol and mean different things — see
+/// `tools/boss/docs/tmux-client-input-wedge.md`:
+///
+/// - [`Self::activity_epoch`] (`#{client_activity}`) advances **only when
+///   this client sends something to the server**, i.e. on input. Rendering
+///   output to the client does not touch it, and neither does a
+///   server-driven `refresh-client`.
+/// - `#{window_activity}` (via [`crate::DisplayField::WindowActivity`])
+///   advances on **pane output**, with or without any client attached.
+///
+/// So a frozen `activity_epoch` alone says nothing: it is equally the
+/// signature of a healthy client whose operator is not typing. It only
+/// becomes evidence when paired with an independent report that input WAS
+/// delivered into that client's pty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxClient {
+    /// Controlling terminal of the client, e.g. `/dev/ttys002`. This is
+    /// what `detach-client -t` addresses.
+    pub tty: String,
+    /// Pid of the process that ran `attach-session`. Boss's viewers
+    /// `exec` tmux from their launch shell, so this equals the pid the
+    /// app reads back from `ghostty_surface_foreground_pid` — which is
+    /// how a wedged viewer is told apart from an operator's terminal
+    /// attached to the same session.
+    pub pid: i32,
+    /// Unix seconds of this client's last input to the server.
+    pub activity_epoch: i64,
+}
+
 /// Fields that can be read without parsing a pane capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayField {

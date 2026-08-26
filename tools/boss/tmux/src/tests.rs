@@ -742,7 +742,6 @@ async fn an_unparseable_row_without_underscores_keeps_the_plain_error() {
     assert!(error.contains("unexpected tmux list-sessions row"), "{error}");
     assert!(!error.contains("utf8_sanitize"), "{error}");
 }
-
 #[tokio::test]
 async fn list_sessions_treats_connecting_enoent_as_an_absent_server() {
     let (tmux, _) = tmux([failure(
@@ -786,4 +785,82 @@ fn unlink_stale_socket_leaves_a_regular_file_alone() {
     assert!(!tmux.unlink_stale_socket_file().unwrap());
     assert!(path.exists());
     std::fs::remove_file(&path).unwrap();
+}
+
+#[tokio::test]
+async fn list_clients_parses_tty_pid_and_activity_for_one_session() {
+    let (tmux, runner) = tmux([success(
+        "/dev/ttys002\t13371\t1787149126\n/dev/ttys007\t42\t1787149452\n",
+    )]);
+    let clients = tmux.list_clients("boss-coordinator").await.unwrap();
+    assert_eq!(
+        clients,
+        vec![
+            TmuxClient {
+                tty: "/dev/ttys002".to_owned(),
+                pid: 13371,
+                activity_epoch: 1_787_149_126,
+            },
+            TmuxClient {
+                tty: "/dev/ttys007".to_owned(),
+                pid: 42,
+                activity_epoch: 1_787_149_452,
+            },
+        ]
+    );
+    assert_eq!(
+        runner.calls(),
+        vec![vec![
+            "-S",
+            TEST_SOCKET_PATH,
+            "list-clients",
+            "-t",
+            "boss-coordinator",
+            "-F",
+            "#{client_tty}\t#{client_pid}\t#{client_activity}",
+        ]]
+    );
+}
+
+#[tokio::test]
+async fn list_clients_treats_an_unattached_session_as_empty_not_an_error() {
+    // tmux exits 0 with empty stdout when a session has no clients, and
+    // reports the absent-session shapes when the server is not running at
+    // all. Neither is a wedge signal, and neither may surface as an error.
+    let (unattached, _) = tmux([success("")]);
+    assert!(unattached.list_clients("boss-coordinator").await.unwrap().is_empty());
+
+    let (no_server, _) = tmux([failure("no server running on /tmp/tmux-501/boss")]);
+    assert!(no_server.list_clients("boss-coordinator").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn list_clients_rejects_a_malformed_row_rather_than_guessing() {
+    let (tmux, _) = tmux([success("/dev/ttys002\t13371\n")]);
+    let error = tmux.list_clients("boss-coordinator").await.unwrap_err();
+    assert!(error.to_string().contains("list-clients row"), "{error:#}");
+}
+
+#[tokio::test]
+async fn detach_client_addresses_the_tty_and_never_the_session() {
+    // Addressing the session would also evict an operator's terminal
+    // attached to it; only the wedged viewer's own tty may be detached.
+    let (tmux, runner) = tmux([success("")]);
+    assert!(tmux.detach_client("/dev/ttys002").await.unwrap());
+    assert_eq!(
+        runner.calls(),
+        vec![vec!["-S", TEST_SOCKET_PATH, "detach-client", "-t", "/dev/ttys002"]]
+    );
+}
+
+#[tokio::test]
+async fn detach_client_is_idempotent_when_the_client_already_left() {
+    let (tmux, _) = tmux([failure("can't find client: /dev/ttys002")]);
+    assert!(!tmux.detach_client("/dev/ttys002").await.unwrap());
+}
+
+#[tokio::test]
+async fn detach_client_surfaces_a_real_failure() {
+    let (tmux, _) = tmux([failure("permission denied")]);
+    assert!(tmux.detach_client("/dev/ttys002").await.is_err());
 }

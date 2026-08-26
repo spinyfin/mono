@@ -724,6 +724,26 @@ extension EngineClient {
         ])
     }
 
+    /// Report that the app just delivered keyboard input into a pane whose
+    /// pty is a `tmux attach-session` client, so the engine can tell a
+    /// viewer whose input path has died from one nobody is typing into.
+    ///
+    /// The server-side half is not diagnostic on its own: tmux's
+    /// `#{client_activity}` advances only when a client sends the server
+    /// something, so a frozen value describes an idle client and a wedged
+    /// client identically. Only the app knows input was attempted.
+    /// `clientPid` is the `tmux attach-session` process — what the engine
+    /// matches against `#{client_pid}` so recovery can only ever detach this
+    /// app's own client. Fire-and-forget; no response expected.
+    func sendReportPaneClientInput(sessionName: String, clientPid: Int32, lastInputEpoch: Int64) {
+        sendLine([
+            "type": "report_pane_client_input",
+            "session_name": sessionName,
+            "client_pid": Int(clientPid),
+            "last_input_epoch": Int(lastInputEpoch),
+        ])
+    }
+
     /// Report that the app can once again host worker panes after a
     /// sleep/wake cycle — `GhosttyRuntime` observed `NSWorkspace`
     /// sleep/wake notifications and confirmed an active display is

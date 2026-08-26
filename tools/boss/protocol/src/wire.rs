@@ -1961,6 +1961,39 @@ pub enum FrontendRequest {
         task_ids: Vec<String>,
     },
 
+    /// App reports that it has just delivered keyboard input into a
+    /// Ghostty surface whose pty is running `tmux attach-session`, so the
+    /// engine can tell a viewer whose input path has died apart from one
+    /// nobody is typing into.
+    ///
+    /// This exists because the server-side signal alone is not diagnostic.
+    /// tmux's `#{client_activity}` advances **only** when that client sends
+    /// something to the server; rendering output to it does not move the
+    /// value, and neither does a server-driven `refresh-client`. A client
+    /// sitting at a frozen `client_activity` while its pane streams output
+    /// is therefore *also* the exact signature of a healthy client whose
+    /// operator is not typing — which is the coordinator's normal state.
+    /// Only the app knows input was attempted, so the app is the only
+    /// place that half of the correlation can come from.
+    ///
+    /// `client_pid` is the pid of the `tmux attach-session` process — the
+    /// viewers `exec` tmux from their launch shell, so it is what the app
+    /// reads back from `ghostty_surface_foreground_pid`. The engine matches
+    /// it against `#{client_pid}` so recovery can only ever detach the
+    /// app's own client, never an operator's terminal attached to the same
+    /// session. `last_input_epoch` is Unix seconds from the same wall clock
+    /// tmux stamps `client_activity` with.
+    ///
+    /// Rate-limited app-side to at most one report per second per pane, and
+    /// sent only for tmux-hosted panes. Fire-and-forget; no response
+    /// expected. Only the registered app session may call this — it is a
+    /// report of app-observed input, not a way to inject any.
+    ReportPaneClientInput {
+        session_name: String,
+        client_pid: i32,
+        last_input_epoch: i64,
+    },
+
     /// App reports which product its chooser is now set to, so the
     /// engine — not the app, and not a coordinator-side cache — is the
     /// system of record for the current selection. `product_id` is

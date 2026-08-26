@@ -614,6 +614,15 @@ pub async fn serve_with_merge_probe(
         }
     });
 
+    // A tmux viewer can keep rendering output while its input path is dead
+    // — the operator sees a live pane they cannot type into, with no way to
+    // recover from inside the app. Watch for it and detach the wedged client
+    // so the app rebuilds it. Its own task, not a step in the supervisor
+    // above: that loop stretches to a minute under restart backoff, and
+    // someone is sitting at the keyboard waiting for this one.
+    let input_watch_state = server_state.clone();
+    tokio::spawn(async move { super::input_watch::run(input_watch_state).await });
+
     // GitHub API usage telemetry: install the process-wide sink and start
     // its batching writer.
     //
@@ -2225,81 +2234,12 @@ async fn note_coordinator_restart_failure(
     decision.delay
 }
 
-/// Shared fan-out for the engine-health attentions below: list active
-/// products/projects, reconcile one attention per project with the given
-/// distinguishing strings, and publish each created attention. `log_context`
-/// prefixes the tracing labels so failures in each caller's log lines stay
-/// distinguishable.
-async fn raise_project_scoped_engine_health_attention(
-    server_state: &Arc<ServerState>,
-    group_key_prefix: &str,
-    source_doc_path: &str,
-    prompt_text: String,
-    log_context: &str,
-) {
-    let products = match server_state.work_db.list_products() {
-        Ok(products) => products,
-        Err(err) => {
-            tracing::warn!(?err, "{log_context}: failed to list products for attention");
-            return;
-        }
-    };
-    for product in products.into_iter().filter(|product| product.status == "active") {
-        let projects = match server_state.work_db.list_projects(&product.id, None) {
-            Ok(projects) => projects,
-            Err(err) => {
-                tracing::warn!(
-                    product_id = %product.id,
-                    ?err,
-                    "{log_context}: failed to list projects for attention"
-                );
-                continue;
-            }
-        };
-        for project in projects {
-            let input = boss_protocol::CreateAttentionInput::builder()
-                .kind("question")
-                .group_key(format!("{group_key_prefix}|{}", project.id))
-                .association_project_id(project.id.clone())
-                .source_kind("manual")
-                .source_doc_path(source_doc_path)
-                .question_type("prompt")
-                .prompt_text(prompt_text.clone())
-                .build();
-            match server_state.work_db.reconcile_attentions(vec![input]) {
-                Ok(Some((group, attentions))) => {
-                    for attention in attentions {
-                        server_state
-                            .publisher
-                            .publish_frontend_event_on_product(
-                                &group.product_id,
-                                boss_protocol::FrontendEvent::AttentionCreated {
-                                    attention,
-                                    group: group.clone(),
-                                },
-                            )
-                            .await;
-                    }
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    tracing::warn!(
-                        project_id = %project.id,
-                        ?err,
-                        "{log_context}: failed to create attention"
-                    )
-                }
-            }
-        }
-    }
-}
-
 /// Surface a latched coordinator restart ceiling in each active project's
 /// attention feed. The supervisor keeps retrying at the flat `BACKOFF_CAP`
 /// cadence after the ceiling; this makes that condition visible to the
 /// operator rather than only in tracing.
 async fn raise_coordinator_restart_ceiling_attention(server_state: &Arc<ServerState>) {
-    raise_project_scoped_engine_health_attention(
+    super::engine_health::raise_engine_health_attention(
         server_state,
         "engine_health_coordinator_restart",
         "engine-health/coordinator-restart",
@@ -2307,7 +2247,6 @@ async fn raise_coordinator_restart_ceiling_attention(server_state: &Arc<ServerSt
          The engine keeps retrying every 60s; check the coordinator model \
          and auth if the session keeps failing to come back."
             .to_owned(),
-        "coordinator restart ceiling",
     )
     .await;
 }
@@ -2320,7 +2259,7 @@ async fn raise_coordinator_restart_ceiling_attention(server_state: &Arc<ServerSt
 /// [`raise_coordinator_restart_ceiling_attention`] so the two conditions
 /// read as different incidents in the attention feed.
 async fn raise_coordinator_restart_churn_attention(server_state: &Arc<ServerState>) {
-    raise_project_scoped_engine_health_attention(
+    super::engine_health::raise_engine_health_attention(
         server_state,
         "engine_health_coordinator_restart_churn",
         "engine-health/coordinator-restart-churn",
@@ -2328,7 +2267,6 @@ async fn raise_coordinator_restart_churn_attention(server_state: &Arc<ServerStat
          each pass but the claude process inside it exits immediately. Check the \
          coordinator model and auth."
             .to_owned(),
-        "coordinator restart churn",
     )
     .await;
 }
@@ -2337,12 +2275,11 @@ async fn raise_coordinator_restart_churn_attention(server_state: &Arc<ServerStat
 /// feed. Attentions require a work-item association, so project-scoped items
 /// are the durable global-notification representation available to the app.
 async fn raise_tmux_preflight_attention(server_state: &Arc<ServerState>, reason: &str) {
-    raise_project_scoped_engine_health_attention(
+    super::engine_health::raise_engine_health_attention(
         server_state,
         "engine_health_tmux",
         "engine-health/tmux",
         format!("Local dispatch is blocked because tmux is unavailable: {reason}"),
-        "tmux preflight",
     )
     .await;
 }

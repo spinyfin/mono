@@ -181,6 +181,35 @@ fn report_worker_spawn_failed_round_trips_with_expected_tag() {
     }
 }
 
+/// The tmux-viewer input report serializes with the snake_case `type` tag
+/// and carries the session, the client pid and the epoch-second stamp.
+/// Pins the wire shape the Swift app hand-encodes against the engine's
+/// `handle_report_pane_client_input` decode — the pid in particular, since
+/// it is what confines recovery to the app's own tmux client.
+#[test]
+fn report_pane_client_input_round_trips_with_expected_tag() {
+    let original = FrontendRequest::ReportPaneClientInput {
+        session_name: "boss-coordinator".to_owned(),
+        client_pid: 13371,
+        last_input_epoch: 1_787_149_126,
+    };
+    let value = serde_json::to_value(&original).unwrap();
+    assert_eq!(value["type"], "report_pane_client_input");
+    assert_eq!(value["session_name"], "boss-coordinator");
+    assert_eq!(value["client_pid"], 13371);
+    assert_eq!(value["last_input_epoch"], 1_787_149_126_i64);
+
+    let parsed: FrontendRequest = serde_json::from_value(value).unwrap();
+    assert!(matches!(
+        parsed,
+        FrontendRequest::ReportPaneClientInput {
+            session_name,
+            client_pid: 13371,
+            last_input_epoch: 1_787_149_126,
+        } if session_name == "boss-coordinator"
+    ));
+}
+
 /// Pane-death provenance is part of the request payload, not inferred from a
 /// generic engine reason after the fact. This pins the Swift app's hand-built
 /// JSON keys and the enum's snake-case values together.
