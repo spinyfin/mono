@@ -708,6 +708,47 @@ fn drop_closed_work_items_keeps_everything_when_db_is_absent() {
 }
 
 #[test]
+fn work_item_filter_status_distinguishes_applied_from_skipped() {
+    let ok: Result<(), anyhow::Error> = Ok(());
+    assert_eq!(work_item_filter_status(&ok), "applied");
+    let err: Result<(), anyhow::Error> = Err(anyhow::anyhow!("opening state.db"));
+    assert_eq!(work_item_filter_status(&err), "skipped: state.db unavailable");
+}
+
+#[test]
+fn work_item_filter_unavailable_notice_names_the_error_and_the_skip() {
+    let err = anyhow::anyhow!("opening state.db");
+    let notice = work_item_filter_unavailable_notice(&err);
+    assert!(
+        notice.starts_with("note: state.db unavailable ("),
+        "expected the documented one-line prefix, got: {notice}"
+    );
+    assert!(
+        notice.contains("opening state.db"),
+        "notice must name the open error: {notice}"
+    );
+    assert!(
+        notice.ends_with("closed work items were not filtered out"),
+        "notice must say the filter did not run: {notice}"
+    );
+}
+
+#[test]
+fn ghost_active_json_payload_carries_work_item_filter_as_a_sibling() {
+    let skipped = ghost_active_json_payload(
+        &[],
+        &stream_integrity::IntegrityReport::default(),
+        "skipped: state.db unavailable",
+    );
+    assert!(skipped.get("ghost_active").is_some());
+    assert!(skipped.get("stream_integrity").is_some());
+    assert_eq!(skipped["work_item_filter"], "skipped: state.db unavailable");
+
+    let applied = ghost_active_json_payload(&[], &stream_integrity::IntegrityReport::default(), "applied");
+    assert_eq!(applied["work_item_filter"], "applied");
+}
+
+#[test]
 fn drop_closed_work_items_drops_terminal_work_items_and_keeps_open_or_unknown() {
     let db = WorkDb::open(":memory:".into()).unwrap();
     let product = db
