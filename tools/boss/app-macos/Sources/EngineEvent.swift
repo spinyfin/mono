@@ -27,7 +27,7 @@ enum EngineEvent {
     case workItemUpdated(item: WorkItemPayload)
     case projectTasksReordered(projectId: String, taskIds: [String])
     case workItemDeleted(id: String)
-    case workError(message: String)
+    case workError(message: String, requestId: String?)
     case error(message: String)
     /// Snapshot of every allocated worker slot's live runtime state.
     /// Delivered both as a one-shot reply to
@@ -71,7 +71,14 @@ enum EngineEvent {
     case ciRemediationsList(attempts: [WorkCiRemediation])
     /// Response to `list_engine_attempts`. This is the authoritative, merged
     /// Activity list; source-specific details are loaded only after selection.
-    case engineAttemptsList(attempts: [EngineAttemptListEntry], backgroundWork: [BackgroundWorkItem])
+    /// `requestId` is the envelope id of the originating request so a late
+    /// `limit = 0` poll can be dropped instead of overwriting a newer snapshot.
+    /// The engine always echoes a request id; a nil id is ignored.
+    case engineAttemptsList(
+        attempts: [EngineAttemptListEntry],
+        backgroundWork: [BackgroundWorkItem],
+        requestId: String?
+    )
     /// Full conflict-resolution record loaded for a selected Activity row.
     case conflictResolution(attempt: WorkConflictResolution)
     /// Full CI-remediation record loaded for a selected Activity row.

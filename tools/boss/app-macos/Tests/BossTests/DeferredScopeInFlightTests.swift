@@ -42,7 +42,7 @@ final class DeferredScopeInFlightTests: XCTestCase {
         let model = makeModel()
         model.deferredScopeActionInFlightIDs = ["attn_1", "attn_2"]
 
-        model.applyEventForTest(.workError(message: "boom"))
+        model.applyEventForTest(.workError(message: "boom", requestId: nil))
 
         XCTAssertTrue(model.deferredScopeActionInFlightIDs.isEmpty)
     }

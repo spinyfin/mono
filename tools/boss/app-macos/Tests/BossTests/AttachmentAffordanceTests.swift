@@ -327,7 +327,7 @@ final class AttachmentAffordanceTests: XCTestCase {
         model.outboundRecorder = { _ in }
         model.loadAttachments(taskId: "task_xyz")
 
-        model.applyEventForTest(.workError(message: "boom"))
+        model.applyEventForTest(.workError(message: "boom", requestId: nil))
 
         XCTAssertEqual(model.attachmentsLoadFailureByTaskID["task_xyz"], "boom")
         XCTAssertTrue(model.attachmentsInFlightTaskIDs.isEmpty)
@@ -339,7 +339,7 @@ final class AttachmentAffordanceTests: XCTestCase {
         let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
         model.outboundRecorder = { _ in }
         model.loadAttachments(taskId: "task_xyz")
-        model.applyEventForTest(.workError(message: "boom"))
+        model.applyEventForTest(.workError(message: "boom", requestId: nil))
         XCTAssertNotNil(model.attachmentsLoadFailureByTaskID["task_xyz"])
 
         model.applyEventForTest(.attachmentsList(taskId: "task_xyz", attachments: []))
@@ -353,7 +353,7 @@ final class AttachmentAffordanceTests: XCTestCase {
         let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
         model.outboundRecorder = { _ in }
         model.loadAttachments(taskId: "task_xyz")
-        model.applyEventForTest(.workError(message: "boom"))
+        model.applyEventForTest(.workError(message: "boom", requestId: nil))
         XCTAssertNotNil(model.attachmentsLoadFailureByTaskID["task_xyz"])
 
         model.loadAttachments(taskId: "task_xyz")
@@ -373,7 +373,7 @@ final class AttachmentAffordanceTests: XCTestCase {
         model.loadAttachments(taskId: "task_xyz")
         model.mergingWhenReadyIDs.insert("task_other")
 
-        model.applyEventForTest(.workError(message: "merge failed"))
+        model.applyEventForTest(.workError(message: "merge failed", requestId: nil))
 
         XCTAssertEqual(
             model.attachmentsLoadFailureByTaskID["task_xyz"],

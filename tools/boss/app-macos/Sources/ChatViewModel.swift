@@ -448,7 +448,29 @@ final class ChatViewModel: ObservableObject {
     @Published var engineAttempts: [EngineAttemptListEntry] = []
 
     /// Engine-owned snapshot for the background-work toolbar affordance.
+    /// Replaced atomically from `ListEngineAttempts` responses; the app
+    /// must not filter or re-count by kind. Cleared on disconnect.
     @Published var backgroundWork: [BackgroundWorkItem] = []
+
+    /// Canonical five-second cadence for the connection-scoped background
+    /// snapshot poll. Tests shorten the instance property.
+    nonisolated static let backgroundWorkPollInterval: TimeInterval = 5
+
+    /// Polling interval used by `startBackgroundWorkPolling()`. Defaults
+    /// to ``ChatViewModel.backgroundWorkPollInterval``; tests assign a shorter value.
+    var backgroundWorkPollInterval: TimeInterval = ChatViewModel.backgroundWorkPollInterval
+
+    /// Cancellable connection-scoped poller. Non-nil while connected.
+    var backgroundWorkPollTask: Task<Void, Never>?
+
+    /// Monotonic generation for in-flight snapshot requests so a late
+    /// `limit = 0` poll cannot overwrite a newer event-triggered refresh.
+    var backgroundWorkSendGeneration: UInt64 = 0
+    var backgroundWorkAppliedGeneration: UInt64 = 0
+    /// Independent of `backgroundWorkAppliedGeneration` so a history
+    /// refresh that loses the snapshot race can still replace Activity.
+    var attemptsAppliedGeneration: UInt64 = 0
+    var backgroundWorkPending: [String: BackgroundWorkPendingRequest] = [:]
 
     /// Source-specific records requested by selected Activity rows, keyed by
     /// their shared-list attempt id.
@@ -1124,7 +1146,7 @@ final class ChatViewModel: ObservableObject {
 
     let engine: EngineClient
     /// Routes engine comment RPC replies + `comments.artifact.*` invalidations
-    /// to the open [`CommentLayer`]s (P529 Phase 2). Injected into the markdown
+    /// to the open [`CommentLayer`]s. Injected into the markdown
     /// viewers via the `@EnvironmentObject` `ChatViewModel`.
     let commentBridge: CommentEngineBridge
     /// Test-only hook: forwarded to `EngineClient.outboundRecorder`
