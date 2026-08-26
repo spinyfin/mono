@@ -149,6 +149,121 @@ pub(crate) async fn restart_if_dead(
         .map(Some)
 }
 
+/// Consecutive-failure tracker for the coordinator tmux supervisor.
+///
+/// Counts consecutive failed supervisor passes. A failed pass
+/// (`restart_if_dead` returning `Err`, or a session directory that cannot
+/// be resolved) increments; a healthy or recovered pass resets the count.
+/// Reaching `LIMIT` raises the operator-facing restart-failure ceiling
+/// attention once per streak.
+///
+/// The count is consecutive, not windowed: the supervisor already backs off
+/// a full minute between hard failures, so a wall-clock window of that same
+/// minute would reset the counter on every retry and the ceiling would still
+/// never fire.
+///
+/// Separately tracks consecutive *successful* restarts (`Ok(Some(record))`
+/// from `restart_if_dead`): a coordinator whose `claude` child exits
+/// immediately (bad model, expired auth, `claude` missing from `PATH`) kills
+/// and recreates the tmux session on every pass, which is a technically
+/// successful restart and never touches the failure counter above. Left
+/// unchecked that churns forever with no backoff and no operator signal, so
+/// `record_restart` gives that path its own escalating backoff and its own
+/// ceiling attention, reset only by a genuinely idle pass (`Ok(None)`).
+pub(crate) struct CoordinatorRestartFailures {
+    consecutive_failures: u32,
+    ceiling_notified: bool,
+    restart_churn: u32,
+    restart_churn_notified: bool,
+}
+
+/// What the supervisor should do after recording a failed pass.
+pub(crate) struct RestartFailureDecision {
+    pub delay: Duration,
+    /// Raise the operator attention; true only the first time we reach the ceiling.
+    pub notify: bool,
+}
+
+/// What the supervisor should do after recording a successful restart.
+pub(crate) struct RestartChurnDecision {
+    pub delay: Duration,
+    /// Raise the operator attention; true only the first time we reach the ceiling.
+    pub notify: bool,
+}
+
+impl CoordinatorRestartFailures {
+    pub(crate) const LIMIT: u32 = 5;
+    pub(crate) const BACKOFF_CAP: Duration = Duration::from_secs(60);
+
+    pub(crate) fn new() -> Self {
+        Self {
+            consecutive_failures: 0,
+            ceiling_notified: false,
+            restart_churn: 0,
+            restart_churn_notified: false,
+        }
+    }
+
+    pub(crate) fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+
+    pub(crate) fn restart_churn(&self) -> u32 {
+        self.restart_churn
+    }
+
+    /// Record a genuinely healthy pass: no restart was needed. Resets both
+    /// the failure counter and the restart-churn counter.
+    pub(crate) fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.ceiling_notified = false;
+        self.restart_churn = 0;
+        self.restart_churn_notified = false;
+    }
+
+    /// Record a failed pass (`Err`, or session directory not ready). The
+    /// retry cadence stays flat at `BACKOFF_CAP` once the ceiling is
+    /// reached — the supervisor keeps retrying, it does not pause.
+    pub(crate) fn record_failure(&mut self) -> RestartFailureDecision {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if self.consecutive_failures < Self::LIMIT {
+            return RestartFailureDecision {
+                delay: Self::BACKOFF_CAP,
+                notify: false,
+            };
+        }
+        let notify = !self.ceiling_notified;
+        self.ceiling_notified = true;
+        RestartFailureDecision {
+            delay: Self::BACKOFF_CAP,
+            notify,
+        }
+    }
+
+    /// Record a successful kill-and-recreate (`Ok(Some(record))`). This is
+    /// not an `Err`, so it resets the hard-failure counter, but it escalates
+    /// its own backoff (2s, 4s, 8s, 16s, 32s, capped at `BACKOFF_CAP`) so a
+    /// crash-looping `claude` child cannot respawn every 2s forever, and
+    /// raises its own ceiling attention once per streak.
+    pub(crate) fn record_restart(&mut self) -> RestartChurnDecision {
+        self.consecutive_failures = 0;
+        self.ceiling_notified = false;
+        self.restart_churn = self.restart_churn.saturating_add(1);
+        let delay = Self::churn_backoff(self.restart_churn);
+        if self.restart_churn < Self::LIMIT {
+            return RestartChurnDecision { delay, notify: false };
+        }
+        let notify = !self.restart_churn_notified;
+        self.restart_churn_notified = true;
+        RestartChurnDecision { delay, notify }
+    }
+
+    fn churn_backoff(count: u32) -> Duration {
+        let secs = 2u64.saturating_pow(count.min(6));
+        Duration::from_secs(secs).min(Self::BACKOFF_CAP)
+    }
+}
+
 /// Recreate the coordinator after an explicit UI confirmation — either a
 /// model-mismatch replacement or an operator-initiated reset. The expected
 /// token prevents a delayed confirmation from killing a newer session
@@ -736,6 +851,99 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+
+    #[test]
+    fn consecutive_failures_trip_the_restart_ceiling() {
+        let mut failures = CoordinatorRestartFailures::new();
+        for i in 0..CoordinatorRestartFailures::LIMIT - 1 {
+            let decision = failures.record_failure();
+            assert!(
+                !decision.notify,
+                "failure {} of {} must not notify",
+                i + 1,
+                CoordinatorRestartFailures::LIMIT
+            );
+            assert_eq!(decision.delay, CoordinatorRestartFailures::BACKOFF_CAP);
+        }
+        let decision = failures.record_failure();
+        assert!(
+            decision.notify,
+            "the {limit}th consecutive failure must trip the ceiling",
+            limit = CoordinatorRestartFailures::LIMIT
+        );
+        assert_eq!(decision.delay, CoordinatorRestartFailures::BACKOFF_CAP);
+        assert_eq!(failures.consecutive_failures(), CoordinatorRestartFailures::LIMIT);
+    }
+
+    #[test]
+    fn successful_restarts_do_not_trip_the_restart_failure_ceiling() {
+        let mut failures = CoordinatorRestartFailures::new();
+        for _ in 0..CoordinatorRestartFailures::LIMIT + 3 {
+            failures.record_success();
+            assert_eq!(failures.consecutive_failures(), 0);
+        }
+    }
+
+    #[test]
+    fn a_success_resets_consecutive_failures() {
+        let mut failures = CoordinatorRestartFailures::new();
+        for _ in 0..CoordinatorRestartFailures::LIMIT - 1 {
+            assert!(!failures.record_failure().notify);
+        }
+        failures.record_success();
+        for _ in 0..CoordinatorRestartFailures::LIMIT - 1 {
+            assert!(!failures.record_failure().notify);
+        }
+        let decision = failures.record_failure();
+        assert!(decision.notify);
+    }
+
+    #[test]
+    fn ceiling_keeps_retrying_at_the_flat_backoff_without_renotifying() {
+        let mut failures = CoordinatorRestartFailures::new();
+        for _ in 0..CoordinatorRestartFailures::LIMIT {
+            failures.record_failure();
+        }
+        let again = failures.record_failure();
+        assert_eq!(again.delay, CoordinatorRestartFailures::BACKOFF_CAP);
+        assert!(!again.notify, "still at the ceiling: do not raise a second attention");
+        failures.record_success();
+        assert_eq!(failures.consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn consecutive_restarts_escalate_and_trip_their_own_ceiling() {
+        let mut failures = CoordinatorRestartFailures::new();
+        let expected_delays = [2, 4, 8, 16, 32];
+        for (i, &expected_secs) in expected_delays.iter().enumerate() {
+            let decision = failures.record_restart();
+            assert_eq!(decision.delay, Duration::from_secs(expected_secs));
+            assert_eq!(
+                decision.notify,
+                i + 1 >= CoordinatorRestartFailures::LIMIT as usize,
+                "restart {} of {}",
+                i + 1,
+                CoordinatorRestartFailures::LIMIT
+            );
+        }
+        let further = failures.record_restart();
+        assert_eq!(further.delay, CoordinatorRestartFailures::BACKOFF_CAP);
+        assert!(
+            !further.notify,
+            "still at the churn ceiling: do not raise a second attention"
+        );
+        assert_eq!(failures.restart_churn(), 6);
+    }
+
+    #[test]
+    fn a_healthy_pass_resets_restart_churn_but_a_restart_does_not() {
+        let mut failures = CoordinatorRestartFailures::new();
+        failures.record_restart();
+        failures.record_restart();
+        assert_eq!(failures.restart_churn(), 2);
+        failures.record_success();
+        assert_eq!(failures.restart_churn(), 0);
+    }
 
     // --- claude version probe / comparison ---
 
