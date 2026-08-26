@@ -207,6 +207,16 @@ impl ExecutionStatus {
         matches!(self, Self::Queued | Self::Ready | Self::WaitingDependency)
     }
 
+    /// No worker has started a run yet: the reconcilable queue states plus
+    /// [`Self::Claimed`] (scheduler CAS covering cube setup). Use this
+    /// instead of [`Self::can_reconcile`] at sites that must treat the
+    /// spawn window as still pre-run — `can_reconcile` deliberately
+    /// excludes [`Self::Claimed`] so the product reconciler cannot clobber
+    /// an in-flight dispatch.
+    pub fn is_pre_run(&self) -> bool {
+        self.can_reconcile() || matches!(self, Self::Claimed)
+    }
+
     /// Statuses from which `start_execution_run` and the pre-start-failure
     /// write may proceed. [`Self::Ready`] is the pre-claim queue state;
     /// [`Self::Claimed`] is the scheduler's CAS token covering cube setup.

@@ -1623,7 +1623,29 @@ fn execution_status_claimed_is_unclassified() {
     assert!(!status.is_terminal(), "{status} should not be terminal");
     assert!(!status.is_live(), "{status} should not be live");
     assert!(!status.can_reconcile(), "{status} should not be reconcilable");
+    assert!(status.is_pre_run(), "{status} should still count as pre-run");
     assert!(status.can_begin_run(), "{status} should be allowed to begin a run");
+}
+
+#[test]
+fn execution_status_is_pre_run_covers_queue_and_claim_window() {
+    use ExecutionStatus::*;
+    for status in [Queued, Ready, WaitingDependency, Claimed] {
+        assert!(status.is_pre_run(), "{status} should be pre-run");
+    }
+    for status in [
+        Running,
+        WaitingHuman,
+        WaitingReview,
+        WaitingMerge,
+        Completed,
+        Failed,
+        Abandoned,
+        Cancelled,
+        Orphaned,
+    ] {
+        assert!(!status.is_pre_run(), "{status} should not be pre-run");
+    }
 }
 
 /// Every `TaskStatus` variant, with the same compile-time tripwire as

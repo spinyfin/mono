@@ -2,6 +2,7 @@
 //! the concern each module exercises. Shared fixtures live in [`helpers`].
 
 mod automation;
+mod claimed_dispatch;
 mod dispatch;
 mod helpers;
 mod pause_admission;

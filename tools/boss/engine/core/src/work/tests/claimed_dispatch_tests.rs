@@ -213,6 +213,61 @@ fn downgrade_ready_to_waiting_dependency_accepts_claimed() {
 }
 
 #[test]
+fn request_execution_reuses_claimed_row_when_live_oracle_is_false() {
+    let db = WorkDb::open(temp_db_path("request-claimed-reuse")).unwrap();
+    let (product_id, first, _) = two_incomplete_project_tasks(&db);
+    db.reconcile_product_executions(&product_id).unwrap();
+    let execution_id = db.list_executions(Some(&first.id)).unwrap()[0].id.clone();
+    assert_eq!(
+        db.claim_execution_for_dispatch(&execution_id).unwrap(),
+        DispatchClaimOutcome::Won
+    );
+
+    let reused = db
+        .request_execution_with_live_check(
+            RequestExecutionInput::builder().work_item_id(first.id.clone()).build(),
+            |_| false,
+        )
+        .unwrap();
+
+    assert_eq!(
+        reused.id, execution_id,
+        "a claimed row with no work_runs must be reused, not abandoned"
+    );
+    assert_eq!(reused.status, ExecutionStatus::Claimed);
+    let rows = db.list_executions(Some(&first.id)).unwrap();
+    assert_eq!(rows.len(), 1, "must not mint a duplicate ready execution: {rows:?}");
+    assert_eq!(rows[0].status, ExecutionStatus::Claimed);
+}
+
+#[test]
+fn reconcile_does_not_create_duplicate_execution_for_claimed_revision() {
+    let db = WorkDb::open(temp_db_path("revision-no-dup-claimed")).unwrap();
+    let product_id = make_revision_product(&db, "no-dup-claimed");
+    let pr_url = "https://github.com/spinyfin/mono/pull/2823";
+    let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+    let revision_id = insert_revision_row(&db, &product_id, &parent_id);
+
+    db.reconcile_product_executions(&product_id).unwrap();
+    let execs = executions_for(&db, &revision_id);
+    assert_eq!(execs.len(), 1, "first reconcile must create exactly one execution");
+    assert_eq!(execs[0].1, "ready");
+    assert_eq!(
+        db.claim_execution_for_dispatch(&execs[0].0).unwrap(),
+        DispatchClaimOutcome::Won
+    );
+
+    db.reconcile_product_executions(&product_id).unwrap();
+    let after = executions_for(&db, &revision_id);
+    assert_eq!(
+        after.len(),
+        1,
+        "reconcile must not mint a duplicate while a claimed revision spawn is in flight: {after:?}"
+    );
+    assert_eq!(after[0].1, "claimed");
+}
+
+#[test]
 fn release_stale_claimed_executions_reverts_leftover_claimed_rows() {
     let db = WorkDb::open(temp_db_path("stale-claimed")).unwrap();
     let (product_id, first, _) = two_incomplete_project_tasks(&db);

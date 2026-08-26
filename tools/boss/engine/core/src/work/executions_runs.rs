@@ -11,10 +11,12 @@ pub struct CancelExecutionOpts {
     /// audit trail). Empty/whitespace is treated as unset.
     pub reason: Option<String>,
     /// When true, refuse any execution that is not never-started
-    /// (`queued` / `ready` / `waiting_dependency` — see
-    /// [`ExecutionStatus::can_reconcile`]). A `claimed` row is already in
-    /// the spawn window and is not cancellable via this gate. Live workers
-    /// must be stopped via `bossctl agents stop` instead.
+    /// (`queued` / `ready` / `waiting_dependency` / `claimed` — see
+    /// [`ExecutionStatus::is_pre_run`]). A `claimed` row is still accepted
+    /// here: it is in the spawn window but no run has started, and the
+    /// requested-host pre-start cancel depends on being able to
+    /// terminalize it. Live workers must be stopped via
+    /// `bossctl agents stop` instead.
     pub queued_only: bool,
 }
 
@@ -67,7 +69,7 @@ impl WorkDb {
                 existing.status
             );
         }
-        if opts.queued_only && !existing.status.can_reconcile() && existing.status != ExecutionStatus::Claimed {
+        if opts.queued_only && !existing.status.is_pre_run() {
             if existing.status.is_live() {
                 bail!(
                     "execution {execution_id} is `{}` (already started); \

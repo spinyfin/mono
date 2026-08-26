@@ -1239,24 +1239,26 @@ impl WorkDb {
         if !first_in_flight {
             return Ok(None);
         }
-        // One-shot guard: only a `ready` row that has never been deferred.
+        // One-shot guard: only a `ready`/`claimed` row that has never been
+        // deferred. The drain loop CAS's `ready → claimed` before this gate,
+        // so a `status = 'ready'` predicate would silently never stagger.
         let current: Option<Option<String>> = conn
             .query_row(
-                "SELECT dispatch_not_before FROM work_executions WHERE id = ?1 AND status = 'ready'",
+                "SELECT dispatch_not_before FROM work_executions WHERE id = ?1 AND status IN ('ready', 'claimed')",
                 params![execution_id],
                 |row| row.get::<_, Option<String>>(0),
             )
             .optional()?;
         match current {
-            Some(None) => {}                  // ready and never deferred → eligible
+            Some(None) => {}                  // ready/claimed and never deferred → eligible
             Some(Some(_)) => return Ok(None), // already deferred once
-            None => return Ok(None),          // not a ready row (raced away)
+            None => return Ok(None),          // not a ready/claimed row (raced away)
         }
         let not_before = boss_engine_utils::epoch_time::now_epoch_secs() + stagger_secs as i64;
         let updated = conn.execute(
             "UPDATE work_executions
              SET dispatch_not_before = ?2
-             WHERE id = ?1 AND status = 'ready' AND dispatch_not_before IS NULL",
+             WHERE id = ?1 AND status IN ('ready', 'claimed') AND dispatch_not_before IS NULL",
             params![execution_id, not_before.to_string()],
         )?;
         if updated == 0 {
@@ -1449,8 +1451,8 @@ impl WorkDb {
     /// (or a concurrent path) already moved to `blocked`/`in_review`/a
     /// terminal status is left alone. Returns `true` iff the task actually
     /// transitioned; the execution abandon always applies (best-effort,
-    /// WHERE-guarded on `status = 'ready'` so a concurrent claim isn't
-    /// clobbered).
+    /// WHERE-guarded on `status IN ('ready', 'claimed')` so a drain-loop
+    /// claim is retired with the unused spawn rather than left hanging).
     pub fn retire_stale_revision_before_dispatch(&self, execution_id: &str, task_id: &str) -> Result<bool> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;

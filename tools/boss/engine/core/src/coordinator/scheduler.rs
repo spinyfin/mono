@@ -389,9 +389,10 @@ impl ExecutionCoordinator {
         }
         // `ready` is necessary but not sufficient: the auto-dispatcher may
         // already have handed this row (or a duplicate of it) off, and it
-        // stays `ready` until its run starts. Force-dispatching over the top
-        // would claim a second slot and spawn a second worker for one work
-        // item.
+        // sits in `claimed` until its run starts. Force-dispatching over
+        // the top would claim a second slot and spawn a second worker for
+        // one work item. A non-`ready` status (including `claimed`) is
+        // refused above.
         //
         // Claimed BEFORE the worker, and via the atomic `try_reserve` rather
         // than a check-then-reserve pair: a concurrent `drain_ready_queue`
@@ -415,11 +416,13 @@ impl ExecutionCoordinator {
                     cap = pool.hard_cap(),
                 )
             })?;
+        let mut spawn_claim = DrainDispatchClaim::already_held(Arc::clone(&self.work_db), execution.id.clone());
         if let Err(err) = self.schedule_execution(&execution, &worker_id, admission).await {
             pool.release_worker(&worker_id, preferred_workspace_id.as_deref()).await;
             self.recover_failed_dispatch(&execution, &worker_id, &err).await;
             return Err(err);
         }
+        spawn_claim.disarm();
         Ok(worker_id)
     }
 
@@ -1420,10 +1423,12 @@ impl ExecutionCoordinator {
             // dispatch offset so the two workers' diffs interleave less. This is
             // NOT a block and never waits for a merge — the row simply becomes
             // dispatchable again after the window via the `dispatch_not_before`
-            // gate + the scheduler heartbeat. It runs after the chain-hold gate
-            // (so a serialized row is never double-handled) and before claiming a
-            // slot (so a staggered row never burns a worker). Fail open on any DB
-            // error — a stagger check must never wedge the queue.
+            // gate + the scheduler heartbeat. It runs after the drain-loop
+            // `ready → claimed` CAS and the chain-hold gate (so a serialized
+            // row is never double-handled). A stagger `continue` relies on
+            // `DrainDispatchClaim`'s Drop to revert `claimed → ready` so the
+            // row never burns a worker. Fail open on any DB error — a stagger
+            // check must never wedge the queue.
             if self.merge_order_stagger_secs > 0 {
                 match self.work_db.maybe_stagger_merge_order_dispatch(
                     &execution.id,
@@ -1452,7 +1457,7 @@ impl ExecutionCoordinator {
                                     })),
                             )
                             .await;
-                        // Leave the row `ready` (now with a future
+                        // Drop reverts `claimed → ready` (now with a future
                         // `dispatch_not_before`); do NOT mark any pool exhausted.
                         continue;
                     }
@@ -2049,6 +2054,11 @@ impl ExecutionCoordinator {
                 return;
             }
         }
+        // RAII over the DB claim for the detached spawn. The drain loop
+        // disarms its own guard before calling us; without this, a panic
+        // or abort inside `schedule_execution` would leave the row
+        // `claimed` until the next engine boot.
+        let mut spawn_claim = DrainDispatchClaim::already_held(Arc::clone(&self.work_db), execution.id.clone());
         // Record the physical slot + page the claim landed on so a later
         // spawn failure on this slot is attributable to Bridge Crew vs
         // Lower Decks in `bossctl dispatch diagnose` (the page is `null`
@@ -2122,13 +2132,7 @@ impl ExecutionCoordinator {
                 worker_id = %worker_id,
                 "spawn_attempt status=ready -> deferred reason=dispatch_already_in_flight"
             );
-            if let Err(err) = self.work_db.release_dispatch_claim(&execution.id) {
-                tracing::error!(
-                    execution_id = %execution.id,
-                    ?err,
-                    "failed to release dispatch claim after inflight reservation loss"
-                );
-            }
+            // `spawn_claim` is still armed: Drop reverts `claimed → ready`.
             self.pool_for_worker_id(worker_id)
                 .release_worker(worker_id, execution.preferred_workspace_id.as_deref())
                 .await;
@@ -2150,23 +2154,16 @@ impl ExecutionCoordinator {
             let _permit = match dispatch_slots.acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_) => {
-                    // Unreachable — nothing closes the semaphore. Release
-                    // the claim anyway: bailing out silently would strand
-                    // this worker slot forever, since `pool_claim_sweep`
-                    // only reclaims slots whose execution went terminal and
-                    // this row is still `ready`.
+                    // Unreachable — nothing closes the semaphore. Drop of
+                    // `spawn_claim` reverts `claimed → ready`; bailing out
+                    // silently would strand this worker slot forever, since
+                    // `pool_claim_sweep` only reclaims slots whose execution
+                    // went terminal and this row is still `claimed`.
                     tracing::error!(
                         execution_id = %execution.id,
                         worker_id = %worker_id,
                         "dispatch semaphore closed; releasing the claim instead of stranding the slot"
                     );
-                    if let Err(err) = coordinator.work_db.release_dispatch_claim(&execution.id) {
-                        tracing::error!(
-                            execution_id = %execution.id,
-                            ?err,
-                            "failed to release dispatch claim after dispatch semaphore close"
-                        );
-                    }
                     coordinator
                         .pool_for_worker_id(&worker_id)
                         .release_worker(&worker_id, execution.preferred_workspace_id.as_deref())
@@ -2176,6 +2173,7 @@ impl ExecutionCoordinator {
             };
             match coordinator.schedule_execution(&execution, &worker_id, admission).await {
                 Ok(()) => {
+                    spawn_claim.disarm();
                     tracing::info!(
                         execution_id = %execution.id,
                         work_item_id = %execution.work_item_id,
@@ -2208,7 +2206,7 @@ impl ExecutionCoordinator {
     /// where they could not — historically because the reconciler had
     /// flipped the row to `waiting_dependency` and the Ready guard
     /// rejected the write, leaving the orphan sweeper as the only recovery.
-    async fn recover_failed_dispatch(
+    pub(super) async fn recover_failed_dispatch(
         self: &Arc<Self>,
         execution: &WorkExecution,
         worker_id: &str,
@@ -2279,6 +2277,17 @@ impl DrainDispatchClaim {
                 armed: true,
             })),
             DispatchClaimOutcome::AlreadyHeld | DispatchClaimOutcome::Rejected => Ok(None),
+        }
+    }
+
+    /// Wrap an already-won `claimed` row so Drop still reverts it. Used
+    /// inside the detached spawn after the drain loop has disarmed its
+    /// pickup guard.
+    fn already_held(work_db: Arc<WorkDb>, execution_id: String) -> Self {
+        Self {
+            work_db,
+            execution_id,
+            armed: true,
         }
     }
 

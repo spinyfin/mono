@@ -1646,6 +1646,25 @@ final class WorkCardSnapshotTests: XCTestCase {
         )
     }
 
+    func testLiveStatusDispatchPendingClaimedIsStartingWorker() {
+        let task = Self.makeTask(status: "todo", autostart: true)
+        let runtime = WorkTaskRuntime(
+            workItemID: task.id,
+            executionStatus: "claimed",
+            runStatus: nil,
+            executionID: "exec-1",
+            dispatchRetryAt: nil,
+            dispatchWaitReason: nil,
+            dispatchWaitSince: nil
+        )
+        XCTAssertEqual(
+            WorkCardLiveStatus.resolve(
+                task: task, column: .doing, runtime: runtime, liveState: nil
+            ),
+            "Starting worker"
+        )
+    }
+
     func testLiveStatusDispatchPendingNotReadyIsQueued() {
         let task = Self.makeTask(status: "todo", autostart: true)
         let runtime = WorkTaskRuntime(

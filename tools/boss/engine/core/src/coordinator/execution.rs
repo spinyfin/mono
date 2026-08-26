@@ -1242,14 +1242,22 @@ impl ExecutionCoordinator {
                             })),
                     )
                     .await;
-                // Hand the workspace back so it isn't stranded, then leave
-                // the execution `ready` (the deferral path) so it re-attempts
-                // once the sibling reaps.
+                // Hand the workspace back so it isn't stranded, then unclaim
+                // so the row returns to `ready` (the deferral path) and
+                // `recover_failed_dispatch` does not count this serialization
+                // as a spawn failure.
                 if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
                     tracing::error!(
                         ?release_err,
                         lease_id = %lease.lease_id,
                         "failed to release workspace after refusing a chain-sibling-racing spawn",
+                    );
+                }
+                if let Err(err) = self.work_db.release_dispatch_claim(&execution.id) {
+                    tracing::error!(
+                        execution_id = %execution.id,
+                        ?err,
+                        "failed to release dispatch claim after post-lease chain-sibling refusal"
                     );
                 }
                 return Err(anyhow!(

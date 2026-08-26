@@ -1273,6 +1273,11 @@ async fn chain_serialized_backstop_emits_terminal_host_selected_error() {
         "chain-serialized execution must stay ready (deferred, not abandoned); got {:?}",
         after.status,
     );
+    assert_eq!(
+        after.pre_start_failure_count, 0,
+        "chain-serialized deferral must not count as a spawn failure; got {}",
+        after.pre_start_failure_count,
+    );
 
     // No cube workspace was touched.
     assert!(
