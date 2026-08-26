@@ -736,9 +736,23 @@ impl WorkDb {
             record_ci_failure_suppression_in_tx(&tx, id, &task.updated_at)?;
         }
 
-        let updated = query_task(&tx, id).require("task", id)?;
+        let mut updated = query_task(&tx, id).require("task", id)?;
+        // Same single-item projection `get_work_item` runs, so SetStatus's
+        // WorkItemUpdated does not flicker derived flags to mapper zeros
+        // for the 150 ms until the invalidation refetch lands.
+        let mut doc_pointer_queries = 0u64;
+        attach_task_doc_link_state(&tx, &mut updated, "update_task", &mut doc_pointer_queries);
+        if let Err(err) = attach_task_derived_projections(&tx, &mut updated) {
+            tracing::warn!(
+                ?err,
+                task_id = %id,
+                "update_task: derived projections failed; returning unprojected row"
+            );
+        }
         // Audit inside `tx`: the action row and the write it describes
         // commit together or not at all. Inert unless `actor` is Boothby.
+        // Derived fields are not part of `task_image`, so projecting
+        // before capture does not journal a no-op as a mutation.
         boothby::capture_task_update(&tx, self, actor, &before, &updated, &task.updated_at)?;
         commit_and_publish(tx, pending, self.event_bus())?;
         Ok(task_to_item(updated))

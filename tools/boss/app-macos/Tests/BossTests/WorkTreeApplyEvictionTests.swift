@@ -78,6 +78,32 @@ final class WorkTreeApplyEvictionTests: XCTestCase {
         )
     }
 
+    /// `applyIncrementalTaskUpdate` evicts the row from every bucket and
+    /// re-inserts the wire payload verbatim. A complete payload that still
+    /// carries `hasInProgressRevision` must survive bucket eviction.
+    func testWorkItemUpdatedCompletePayloadSurvivesBucketEviction() {
+        let model = makeModel()
+        var seeded = makeTask(id: "task_x", projectID: "proj_a")
+        seeded.status = "in_review"
+        seeded.prURL = "https://github.com/org/repo/pull/9"
+        seeded.hasInProgressRevision = true
+        seeded.hasAttachments = true
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [seeded]))
+        XCTAssertEqual(
+            model.tasksByProjectID["proj_a"]?.first?.hasInProgressRevision,
+            true
+        )
+
+        var updated = seeded
+        updated.hasInProgressRevision = true
+        updated.hasAttachments = true
+        model.applyEventForTest(.workItemUpdated(item: .task(updated)))
+
+        let after = model.tasksByProjectID["proj_a"]?.first { $0.id == seeded.id }
+        XCTAssertEqual(after?.hasInProgressRevision, true)
+        XCTAssertEqual(after?.hasAttachments, true)
+    }
+
     // MARK: - Helpers
 
     private func makeTask(id: String, projectID: String?) -> WorkTask {

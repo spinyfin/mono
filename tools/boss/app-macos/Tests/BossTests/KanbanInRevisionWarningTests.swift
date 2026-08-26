@@ -106,6 +106,63 @@ final class KanbanInRevisionWarningTests: XCTestCase {
                     "done/in_review revisions must not resolve as the in-progress revision")
     }
 
+    /// `applyIncrementalTaskUpdate` treats a `workItemUpdated` payload as a
+    /// complete row. A wire object that omits `has_in_progress_revision`
+    /// (the pre-fix single-row shape) therefore clears the "In revision"
+    /// badge — which is why the engine must send the derived field.
+    func testWorkItemUpdatedPayloadMissingKeyClearsInRevisionBadge() {
+        let model = makeModel()
+        var seeded = makeTaskWithPR(id: "chore_in_rev", prURL: "https://github.com/org/repo/pull/9")
+        seeded.hasInProgressRevision = true
+        model.applyEventForTest(makeWorkTreeEvent(chores: [seeded]))
+
+        let before = model.choresByProductID["prod_test"]?.first { $0.id == seeded.id }
+        XCTAssertEqual(before?.hasInProgressRevision, true)
+        XCTAssertTrue(
+            footerSlice(for: before!).hasInProgressRevision,
+            "seeded card must show the In revision badge"
+        )
+
+        let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        let parsed = client.parseTask(wirePayload(for: seeded, includeHasInProgressRevision: false))
+        XCTAssertEqual(parsed?.hasInProgressRevision, false,
+                       "omitting the key must decode as false — the client does not merge")
+        model.applyEventForTest(.workItemUpdated(item: .chore(parsed!)))
+
+        let after = model.choresByProductID["prod_test"]?.first { $0.id == seeded.id }
+        XCTAssertEqual(after?.hasInProgressRevision, false)
+        XCTAssertFalse(
+            footerSlice(for: after!).hasInProgressRevision,
+            "a de-projected workItemUpdated must hide the In revision badge"
+        )
+    }
+
+    /// A `workItemUpdated` payload that carries the derived projections must
+    /// keep the In revision badge through `applyIncrementalTaskUpdate`'s
+    /// evict-and-reinsert.
+    func testWorkItemUpdatedCompletePayloadKeepsInRevisionBadge() {
+        let model = makeModel()
+        var seeded = makeTaskWithPR(id: "chore_in_rev", prURL: "https://github.com/org/repo/pull/9")
+        seeded.hasInProgressRevision = true
+        seeded.hasAttachments = true
+        seeded.readyForReview = false
+        model.applyEventForTest(makeWorkTreeEvent(chores: [seeded]))
+
+        let client = EngineClient(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        let parsed = client.parseTask(wirePayload(for: seeded, includeHasInProgressRevision: true))
+        XCTAssertEqual(parsed?.hasInProgressRevision, true)
+        XCTAssertEqual(parsed?.hasAttachments, true)
+        model.applyEventForTest(.workItemUpdated(item: .chore(parsed!)))
+
+        let after = model.choresByProductID["prod_test"]?.first { $0.id == seeded.id }
+        XCTAssertEqual(after?.hasInProgressRevision, true)
+        XCTAssertEqual(after?.hasAttachments, true)
+        XCTAssertTrue(
+            footerSlice(for: after!).hasInProgressRevision,
+            "a complete workItemUpdated must keep the In revision badge"
+        )
+    }
+
     /// A revision-of-revision (nested chain: task -> R1(done) -> R2(active))
     /// must still resolve against the chain ROOT, mirroring the engine's
     /// `attach_in_progress_revision_flag` walk — the badge is set on the
@@ -220,11 +277,11 @@ final class KanbanInRevisionWarningTests: XCTestCase {
         return model
     }
 
-    private func makeTaskWithPR(prURL: String) -> WorkTask {
+    private func makeTaskWithPR(id: String? = nil, prURL: String) -> WorkTask {
         WorkTask(
-            id: "task_\(UUID().uuidString)",
+            id: id ?? "task_\(UUID().uuidString)",
             productID: "prod_test",
-            projectID: "proj_1",
+            projectID: nil,
             kind: "chore",
             name: "PR task",
             description: "",
@@ -236,6 +293,57 @@ final class KanbanInRevisionWarningTests: XCTestCase {
             createdAt: "2026-05-28T00:00:00Z",
             updatedAt: "2026-05-28T00:00:00Z"
         )
+    }
+
+    private func footerSlice(for task: WorkTask) -> WorkBoardCardFooterSlice {
+        WorkBoardCardFooterSlice(
+            snapshot: WorkCardSnapshot.build(
+                task: task,
+                context: WorkCardSnapshotContext(column: .review)
+            )
+        )
+    }
+
+    private func makeWorkTreeEvent(chores: [WorkTask]) -> EngineEvent {
+        .workTree(
+            product: WorkProduct(
+                id: "prod_test",
+                name: "Test Product",
+                slug: "test",
+                description: "",
+                repoRemoteURL: nil,
+                status: "active",
+                createdAt: "2026-05-28T00:00:00Z",
+                updatedAt: "2026-05-28T00:00:00Z"
+            ),
+            projects: [],
+            tasks: [],
+            chores: chores,
+            taskRuntimes: [],
+            dependencies: []
+        )
+    }
+
+    private func wirePayload(for task: WorkTask, includeHasInProgressRevision: Bool) -> [String: Any] {
+        var payload: [String: Any] = [
+            "id": task.id,
+            "product_id": task.productID,
+            "kind": task.kind,
+            "name": task.name,
+            "description": task.description,
+            "status": task.status,
+            "created_at": task.createdAt,
+            "updated_at": task.updatedAt,
+        ]
+        if let prURL = task.prURL {
+            payload["pr_url"] = prURL
+        }
+        if includeHasInProgressRevision {
+            payload["has_in_progress_revision"] = task.hasInProgressRevision
+            payload["has_attachments"] = task.hasAttachments
+            payload["ready_for_review"] = task.readyForReview
+        }
+        return payload
     }
 
     private func makeTask(status: String) -> WorkTask {

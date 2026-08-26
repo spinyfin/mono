@@ -1631,6 +1631,138 @@ fn get_work_tree_has_in_progress_revision() {
 }
 
 #[test]
+fn get_work_item_has_in_progress_revision() {
+    // Single-row read must match get_work_tree for derived projections —
+    // WorkItemUpdated (same-column drop, SetStatus) is this path, and the
+    // macOS client treats the payload as a complete row.
+    let db = WorkDb::open(temp_db_path("get-work-item-in-progress-rev-flag")).unwrap();
+    let product_id = make_revision_product(&db, "flag-item");
+    let pr_url = "https://github.com/spinyfin/mono/pull/502";
+    let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db.create_revision(revision_input(&parent_id), &checker).unwrap();
+    let automation = db
+        .create_automation(boss_protocol::CreateAutomationInput {
+            product_id: product_id.clone(),
+            name: "projection provenance".to_owned(),
+            repo_remote_url: None,
+            trigger: boss_protocol::AutomationTrigger::Schedule {
+                cron: "0 14 * * 1-5".to_owned(),
+                timezone: "America/Los_Angeles".to_owned(),
+            },
+            standing_instruction: "test".to_owned(),
+            open_task_limit: 1,
+            catch_up_window_secs: None,
+            enabled: true,
+            created_via: None,
+        })
+        .unwrap();
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(parent_id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "INSERT INTO work_attachments
+                 (id, execution_id, work_item_id, caption, content_digest, media_type,
+                  pixel_width, pixel_height, size_bytes, source_name, created_at)
+             VALUES ('atc_flag_item', ?1, ?2, 'evidence', 'digest', 'image/png',
+                     10, 10, 4, 'shot.png', '2026-08-24T00:00:00Z')",
+            rusqlite::params![execution.id, parent_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET source_automation_id = ?1 WHERE id = ?2",
+            rusqlite::params![automation.id, parent_id],
+        )
+        .unwrap();
+    }
+    db.set_external_ref(
+        &parent_id,
+        "github",
+        "spinyfin/mono#502",
+        &serde_json::json!({"issue_number": 502}),
+    )
+    .unwrap();
+
+    let root = match db.get_work_item(&parent_id).unwrap() {
+        WorkItem::Chore(t) | WorkItem::Task(t) => t,
+        other => panic!("expected chore, got {other:?}"),
+    };
+    assert!(
+        root.has_in_progress_revision,
+        "get_work_item must set has_in_progress_revision when a todo revision exists"
+    );
+    assert!(
+        root.has_attachments,
+        "get_work_item must set has_attachments when the row has evidence"
+    );
+    assert_eq!(
+        root.source_automation_id.as_deref(),
+        Some(automation.id.as_str()),
+        "get_work_item must retain source_automation_id from the widened SELECT"
+    );
+    assert_eq!(
+        root.external_ref.as_ref().map(|r| r.canonical_id.as_str()),
+        Some("spinyfin/mono#502")
+    );
+    assert!(
+        !root.ready_for_review,
+        "an in-progress revision must keep ready_for_review false"
+    );
+    assert!(!root.ai_reviewing, "in_review is not the AI-reviewing lane");
+    assert!(root.ai_review_state.is_none());
+    assert!(root.ai_review_findings_revision_id.is_none());
+    assert!(root.revision_seq.is_none(), "chain roots are not sequenced");
+    assert!(root.revision_parent_pr_url.is_none());
+    assert!(root.parent_task_id.is_none());
+    assert!(root.completed_at.is_none());
+
+    let rev = match db.get_work_item(&revision.id).unwrap() {
+        WorkItem::Task(t) | WorkItem::Chore(t) => t,
+        other => panic!("expected revision task, got {other:?}"),
+    };
+    assert_eq!(rev.revision_seq, Some(1));
+    assert_eq!(rev.revision_parent_pr_url.as_deref(), Some(pr_url));
+    assert_eq!(rev.parent_task_id.as_deref(), Some(parent_id.as_str()));
+    assert!(!rev.has_in_progress_revision);
+
+    // SetStatus / rename uses the same return path as a kanban drop that
+    // actually mutates. Derived fields must survive that read too.
+    let renamed = match db
+        .update_work_item(
+            &parent_id,
+            WorkItemPatch {
+                name: Some("renamed for projection".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap()
+    {
+        WorkItem::Chore(t) | WorkItem::Task(t) => t,
+        other => panic!("expected chore, got {other:?}"),
+    };
+    assert!(
+        renamed.has_in_progress_revision,
+        "update_work_item must return the projected row, not mapper zeros"
+    );
+    assert!(renamed.has_attachments);
+    assert_eq!(renamed.source_automation_id.as_deref(), Some(automation.id.as_str()));
+    assert_eq!(
+        renamed.external_ref.as_ref().map(|r| r.canonical_id.as_str()),
+        Some("spinyfin/mono#502")
+    );
+}
+
+#[test]
 fn get_work_tree_flag_cleared_when_revision_in_review() {
     // A revision that moves to in_review no longer triggers the flag.
     let db = WorkDb::open(temp_db_path("in-progress-rev-cleared")).unwrap();

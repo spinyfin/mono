@@ -199,74 +199,108 @@ final class OptimisticKanbanMoveTests: XCTestCase {
                        "card must move to Backlog immediately")
     }
 
-    // MARK: - Reorder drops leave the card alone
+    // MARK: - Same-column drops are a client-side no-op
 
-    /// The defect this drop path was rebuilt for. A chore whose PR is in the
-    /// merge queue is `in_review` and renders in Done ▸ Merging — in flight,
-    /// not complete. Reordering it inside that group must not stage any move:
-    /// the engine resolves the drop and answers "reorder", so an optimistic
-    /// reposition here would flash the card into a completion bucket and, if
-    /// the client had computed the status itself (as it used to), would have
-    /// marked the merge done.
-    func testReorderWithinMergingGroupStagesNoMove() {
+    /// A same-column, same-group drop is a no-op: the client must not stage
+    /// an optimistic move and must not send `move_work_item_on_board` at
+    /// all. Kanban lanes are not user-ordered, so a drag that ends where it
+    /// began carries no user intent to record.
+    func testReorderWithinMergingGroupSendsNoRPC() {
         let model = makeModel()
         var task = makeTask(status: "in_review")
         task.mergeQueueState = "queued"
         model.choresByProductID = ["prod_test": [task]]
+        var sent: [[String: Any]] = []
+        model.outboundRecorder = { sent.append($0) }
 
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .done)
         XCTAssertEqual(model.boardGroup(for: task), .merging)
 
         let accepted = model.attemptDrop(task.id, onColumn: .done, group: .merging)
-        XCTAssertTrue(accepted, "the drop is still reported — the engine decides what it meant")
+        XCTAssertTrue(accepted, "a same-column drop is a handled no-op, not a refusal")
         XCTAssertNil(model.optimisticColumnByTaskID[task.id],
-                     "a reorder must not stage an optimistic column change")
+                     "a same-column drop must not stage an optimistic column change")
         XCTAssertNil(model.pendingMoveOriginByTaskID[task.id],
-                     "a reorder has no origin to bounce back to")
+                     "a same-column drop has no origin to bounce back to")
         XCTAssertEqual(model.boardGroup(for: task), .merging,
                        "card must stay in Merging")
+        XCTAssertTrue(sent.isEmpty, "a same-column drop must not send any RPC to the engine")
     }
 
     /// A drop that misses every group and lands on the Done column's padding
     /// is unqualified — less intent than a group-qualified drop, not more. It
-    /// must not stage a move for a card already in that column.
-    func testUnqualifiedDropOnOwnColumnStagesNoMove() {
+    /// must not stage a move, and must not send an RPC, for a card already
+    /// in that column.
+    func testUnqualifiedDropOnOwnColumnSendsNoRPC() {
         let model = makeModel()
         var task = makeTask(status: "in_review")
         task.mergeQueueState = "queued"
         model.choresByProductID = ["prod_test": [task]]
+        var sent: [[String: Any]] = []
+        model.outboundRecorder = { sent.append($0) }
 
         XCTAssertTrue(model.attemptDrop(task.id, onColumn: .done, group: nil))
         XCTAssertNil(model.optimisticColumnByTaskID[task.id])
         XCTAssertNil(model.pendingMoveOriginByTaskID[task.id])
+        XCTAssertTrue(sent.isEmpty, "a same-column drop must not send any RPC to the engine")
     }
 
     /// The legitimate transition the fix must preserve: dragging an in-flight
-    /// merge out of Merging and into a completion group means "this is done",
-    /// and it is distinguishable from the reorder above purely by the group.
-    func testMergingToCompletionGroupStagesTheMove() {
+    /// merge out of Merging and into a completion group means "this is
+    /// done", and it is distinguishable from the same-column drop above
+    /// purely by the group — it is a real change and must still be sent.
+    func testMergingToCompletionGroupStillSendsRPC() {
         let model = makeModel()
         var task = makeTask(status: "in_review")
         task.mergeQueueState = "queued"
         model.choresByProductID = ["prod_test": [task]]
+        var sent: [[String: Any]] = []
+        model.outboundRecorder = { sent.append($0) }
 
         XCTAssertTrue(model.attemptDrop(task.id, onColumn: .done, group: .completed))
         XCTAssertEqual(model.optimisticColumnByTaskID[task.id], .done,
                        "a cross-group drop is a real move and is staged optimistically")
         XCTAssertEqual(model.pendingMoveOriginByTaskID[task.id], .done)
+        XCTAssertEqual(sent.count, 1, "a cross-group drop is a real change and must be sent")
+        XCTAssertEqual(sent.first?["type"] as? String, "move_work_item_on_board")
     }
 
-    /// Same rule in a column with no groups: reordering a dispatch-pending
-    /// card inside Doing must not force it to start.
-    func testReorderWithinDoingStagesNoMove() {
+    /// Same rule in a column with no groups: dropping a dispatch-pending
+    /// card back into Doing must not force it to start, and must not send
+    /// an RPC.
+    func testReorderWithinDoingSendsNoRPC() {
         let model = makeModel()
         let task = makeTask(status: "todo", autostart: true)
         model.choresByProductID = ["prod_test": [task]]
+        var sent: [[String: Any]] = []
+        model.outboundRecorder = { sent.append($0) }
 
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing)
         XCTAssertTrue(model.attemptDrop(task.id, onColumn: .doing, group: nil))
         XCTAssertNil(model.optimisticColumnByTaskID[task.id])
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing)
+        XCTAssertTrue(sent.isEmpty, "a same-column drop must not send any RPC to the engine")
+    }
+
+    /// Cross-column drags are unaffected: they still send
+    /// `move_work_item_on_board` and still move the card. Uses a
+    /// dispatch-pending card dropped to Backlog (rather than into Doing) so
+    /// the drop takes the direct `sendMoveWorkItemOnBoard` path rather than
+    /// the dispatch-admission detour that a drop *into* Doing triggers.
+    func testCrossColumnDropStillSendsRPCAndMoves() {
+        let model = makeModel()
+        let task = makeTask(status: "todo", autostart: true)
+        model.choresByProductID = ["prod_test": [task]]
+        var sent: [[String: Any]] = []
+        model.outboundRecorder = { sent.append($0) }
+
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing)
+        let accepted = model.attemptDrop(task.id, onColumn: .backlog, group: nil)
+        XCTAssertTrue(accepted)
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .backlog,
+                       "card must move to Backlog immediately after a cross-column drop")
+        XCTAssertEqual(sent.count, 1, "a cross-column drop is a real change and must be sent")
+        XCTAssertEqual(sent.first?["type"] as? String, "move_work_item_on_board")
     }
 
     // MARK: - Helpers

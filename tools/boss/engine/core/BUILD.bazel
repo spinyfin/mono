@@ -329,6 +329,7 @@ rust_test(
     deps = [
         ":engine_lib",
         "//tools/boss/client",
+        "//tools/boss/engine/attachments",
         "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,
