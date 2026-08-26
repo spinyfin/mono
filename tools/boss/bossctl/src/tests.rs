@@ -1,5 +1,5 @@
 use super::*;
-use boss_protocol::WorkerActivity;
+use boss_protocol::{CreateChoreInput, CreateProductInput, WorkItemPatch, WorkerActivity};
 
 fn live(slot: u8, run: &str) -> LiveWorkerState {
     LiveWorkerState {
@@ -683,4 +683,79 @@ fn resolve_diagnose_id_rejects_unresolvable_short_id() {
 fn resolve_diagnose_id_passes_through_execution_ids() {
     let resolved = resolve_diagnose_id(None, "exec_18cb2cafec048218_1e").unwrap();
     assert_eq!(resolved, "exec_18cb2cafec048218_1e");
+}
+
+fn ghost_entry(exec: &str, work_item: Option<&str>) -> dispatch_reader::GhostActiveEntry {
+    dispatch_reader::GhostActiveEntry::builder()
+        .execution_id(exec)
+        .maybe_work_item_id(work_item.map(str::to_owned))
+        .last_stage("cube_change_created")
+        .last_outcome("ok")
+        .last_ts_epoch_ms(1_000u128)
+        .elapsed_since_last_ms(9_000u128)
+        .stalled(true)
+        .build()
+}
+
+#[test]
+fn drop_closed_work_items_keeps_everything_when_db_is_absent() {
+    let entries = vec![
+        ghost_entry("exec-open", Some("task_missing")),
+        ghost_entry("exec-none", None),
+    ];
+    let kept = drop_closed_work_items(entries.clone(), None);
+    assert_eq!(kept, entries);
+}
+
+#[test]
+fn drop_closed_work_items_drops_terminal_work_items_and_keeps_open_or_unknown() {
+    let db = WorkDb::open(":memory:".into()).unwrap();
+    let product = db
+        .create_product(
+            CreateProductInput::builder()
+                .name("ghost-filter")
+                .repo_remote_url("git@github.com:test/ghost-filter.git")
+                .build(),
+        )
+        .unwrap();
+    let open = db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("still open")
+                .autostart(false)
+                .build(),
+        )
+        .unwrap();
+    let closed = db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("already done")
+                .autostart(false)
+                .build(),
+        )
+        .unwrap();
+    db.update_work_item(
+        &closed.id,
+        WorkItemPatch {
+            status: Some("done".to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+
+    let entries = vec![
+        ghost_entry("exec-open", Some(&open.id)),
+        ghost_entry("exec-done", Some(&closed.id)),
+        ghost_entry("exec-none", None),
+        ghost_entry("exec-unknown", Some("task_does_not_exist")),
+    ];
+    let kept = drop_closed_work_items(entries, Some(&db));
+    let ids: Vec<_> = kept.iter().map(|e| e.execution_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["exec-open", "exec-none", "exec-unknown"],
+        "closed work items are dropped; missing ids and unbound executions stay: {kept:?}"
+    );
 }
