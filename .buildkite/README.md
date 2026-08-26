@@ -17,6 +17,7 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
     bazel-build-test.sh    # bazel build //... then bazel test //... (one agent, reuses build outputs)
     mac-app-build.sh       # macOS app build
     checks.sh              # CHECKS.yaml runner (checkleft, no-generated-artifacts, etc.)
+    ensure-node.sh         # sourced by checkleft steps: pin Node >= 22 when host npx is missing
     boss-release.sh        # boss release (main only, macos-arm64)
     checkleft-release.sh   # checkleft prebuilt-binary release (prepare/linux/musl/darwin phases)
     ci-env.sh              # shared env/toolchain setup sourced by other steps
@@ -25,6 +26,7 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
     integrity-checkleft.sh    # mono-integrity: checkleft check
   README.md               # this file
   linux-agents-runbook.md # Linux bazel-any host config + maintenance runbook
+  gce-agent-runbook.md    # Standing up a new Linux CI agent on GCE
 ```
 
 ## Pipeline shape
@@ -51,11 +53,11 @@ Runs `bazel build //...` then `bazel test //...` in one step, on one agent. The 
 
 ### `checks.sh`
 
-Runs the `CHECKS.yaml` checks via `checkleft` (or the equivalent runner). Scoped to changed paths on PR builds. Does not invoke `jj`; base-ref detection uses git. Calls `ensure_npx` so checkleft's npm-provisioned checks (`format/oxc` and friends) still run on a `bazel-any` agent that has no Node on PATH: well-known install dirs first, then a pinned Node 24.8.0 tarball cached under `$HOME/.cache/mono-ci-node` or `/mnt/ssd/mono-ci-node`.
+Runs the `CHECKS.yaml` checks via `checkleft` (or the equivalent runner). Scoped to changed paths on PR builds. Does not invoke `jj`; base-ref detection uses git. Sources `ensure-node.sh` so `format/oxc` / `lint/oxc` have Node >= 22 (`npx`) even on Linux agents that do not install Node as a host package, then calls the shared `ensure_npx` fallback from `ci-env.sh` to retain the existing cache and well-known-install-directory recovery path.
 
 ## Agents and queue
 
-Most steps run on the `bazel-any` queue (`${BUILDKITE_ANY_QUEUE:-bazel-any}` in `pipeline.yml`), a heterogeneous fleet mixing personal Macs and Linux cloud agents — see "Pushing from CI" below for why that matters. `mac-app-build` and `boss-release` pin to `macos-arm64` (`${BUILDKITE_MACOS_QUEUE:-macos-arm64}`) since they need a real Mac toolchain. Each step's `ci-env.sh` / inline setup handles toolchain provisioning (rust, bazel, pnpm) on whatever agent it lands on.
+Most steps run on the `bazel-any` queue (`${BUILDKITE_ANY_QUEUE:-bazel-any}` in `pipeline.yml`), a heterogeneous fleet mixing personal Macs and Linux cloud agents — see "Pushing from CI" below for why that matters. `mac-app-build` and `boss-release` pin to `macos-arm64` (`${BUILDKITE_MACOS_QUEUE:-macos-arm64}`) since they need a real Mac toolchain. Each step's `ci-env.sh` / inline setup handles hermetic Rust and Bazel provisioning; see [`gce-agent-runbook.md`](gce-agent-runbook.md) for the real Linux host requirements.
 
 For the Linux `bazel-any` hosts specifically — host inventory, the unprivileged-user-namespace requirement `linux-sandbox` depends on, the Bazel-server-restart procedure, and safe maintenance steps — see [`linux-agents-runbook.md`](linux-agents-runbook.md).
 
