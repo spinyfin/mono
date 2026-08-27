@@ -361,6 +361,8 @@ Its existing `MAX_UNCONFIRMED_RETIREMENTS_PER_PASS` breaker (`husk_pane_sweep.rs
 
 **Incremental, pool by pool, in increasing blast radius.** Gated on one engine setting, `workers.tmux_hosting`, whose value is a set of pools rather than a boolean:
 
+**Operator-facing control: one on/off switch, not a per-pool selector.** The setting's storage stays a pool set — that is what lets the sweep below enable review, then automation, then interactive independently, and what lets a rollback drain one pool without touching the others. But the control the Boss UI actually exposes ("Host workers in tmux" in Settings ▸ Workers) is a single boolean applied to all three pools at once: `true` maps onto the full set, `false` clears it. The operator made this call explicitly to keep the settings surface simple, superseding the earlier assumption (visible in `SettingsStore::set_tmux_hosting_pools`'s original doc comment) that staged pool enablement would need its own multi-select. Pool-by-pool enablement for the sweep itself still happens — just through `SettingsStore::set_tmux_hosting_pools` directly (or a hand edit of `settings.toml`), not through the UI toggle. A future per-pool selector remains possible without a protocol change, since the boolean is a thin projection over the same underlying setting.
+
 1. **Review pool (25-32) first.** Reviewer runs are short and non-interactive in practice; a botched reviewer costs a re-review.
 2. **Automation pool (17-24).**
 3. **Interactive pool (1-16).**

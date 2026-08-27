@@ -341,9 +341,13 @@ pub(super) async fn handle_get_settings(ctx: Dispatch, req: FrontendRequest) {
         unreachable!()
     };
     {
-        let settings = server_state
-            .settings
-            .snapshot_all()
+        // `snapshot_all` only enumerates the boolean `REGISTRY`; the
+        // tmux-hosting switch is appended separately since it is a
+        // projection over `workers.tmux_hosting`'s pool set, not a
+        // registry-backed boolean — see `SettingsStore::tmux_hosting_snapshot`.
+        let mut snapshots = server_state.settings.snapshot_all();
+        snapshots.push(server_state.settings.tmux_hosting_snapshot());
+        let settings = snapshots
             .into_iter()
             .map(|snap| boss_protocol::SettingSnapshot {
                 key: snap.key,
@@ -367,7 +371,16 @@ pub(super) async fn handle_set_setting(ctx: Dispatch, req: FrontendRequest) {
         unreachable!()
     };
     {
-        match server_state.settings.set(&key, enabled) {
+        // `workers.tmux_hosting` is a pool set under the hood, not a
+        // registry boolean, so it routes through the dedicated setter
+        // rather than `SettingsStore::set` (which would reject it as
+        // unknown) — see `SettingsStore::set_tmux_hosting_enabled`.
+        let result = if key == crate::settings::TMUX_HOSTING_SETTING {
+            server_state.settings.set_tmux_hosting_enabled(enabled)
+        } else {
+            server_state.settings.set(&key, enabled)
+        };
+        match result {
             Ok(()) => {
                 tracing::info!(
                     %key,

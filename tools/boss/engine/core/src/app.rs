@@ -1432,8 +1432,15 @@ impl ServerState {
         // The evidence blob store lands under the same root, next to
         // `state.db`, so an install's data is one directory.
         let attachment_state_root: PathBuf = state_root.clone();
+        // Wrapped so every emitted dispatch event carries the tmux-hosting
+        // pool snapshot active at emit time — one of the three visibility
+        // surfaces the tmux-hosting design requires alongside the Workers
+        // grid badge and `bossctl doctor` (see `dispatch_hosting_stamp`).
         let dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink> =
-            Arc::new(crate::dispatch_events::JsonlFileSink::new(dispatch_event_root.clone()));
+            Arc::new(crate::dispatch_hosting_stamp::HostingModeStampingSink::new(
+                Arc::new(crate::dispatch_events::JsonlFileSink::new(dispatch_event_root.clone())),
+                settings.clone(),
+            ));
         let dispatch_events_for_state = dispatch_events.clone();
         let dispatch_event_root_for_state = dispatch_event_root.clone();
         let ipc_logger = IpcLogger::new(&dispatch_event_root);
