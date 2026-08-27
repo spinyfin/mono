@@ -1927,16 +1927,30 @@ impl ServerState {
                 );
                 false
             }
-            // No app session at all: nothing can be hosting a pane in this
-            // slot, so there is no desync to guard against. (An app that
-            // registers later starts from an empty pane map.)
+            // NOT a confirmed teardown. `pane` was taken from the worker
+            // registry just above, so by construction some app session did
+            // host it — `register_run_slot` / `register_tmux_run_slot` are
+            // only ever called from the spawn flow's `SpawnWorkerPane`
+            // response handler, which requires a registered session to have
+            // answered. `NotRegistered` here therefore always means "the
+            // session that hosted this pane went away", never "no app has
+            // ever hosted this pane": `drop_app_session_if_matches`
+            // (app_session.rs) clears the registration on every websocket
+            // disconnect, but does nothing to the app's own hosted-pane
+            // inventory — the app process (and the pane) can still be very
+            // much alive. Treating this as confirmed would let the pool
+            // claim be handed back while the app is still hosting the pane,
+            // reproducing the exact fabricated "slot free" signal this
+            // function exists to prevent. Fall through to the same
+            // unconfirmed handling as a timeout or an unexpected response.
             Err(SendToAppError::NotRegistered) => {
-                tracing::debug!(
+                tracing::warn!(
                     run_id,
                     slot_id,
-                    "release_worker_pane: no app session registered; skipping",
+                    "release_worker_pane: no app session registered; cannot confirm the pane is \
+                     actually gone, treating as unconfirmed",
                 );
-                true
+                false
             }
             Err(err) => {
                 tracing::warn!(?err, run_id, slot_id, "release_worker_pane: failed");
@@ -1959,7 +1973,7 @@ impl ServerState {
         // reap here. The token-verified tmux teardown below owns killing
         // that tree (and the session) when identity columns are present.
         if !pane.tmux_hosted {
-            reap_worker_process_tree(shell_pid, Duration::from_secs(5));
+            reap_worker_process_tree(shell_pid, PANE_RELEASE_KILL_GRACE);
         }
         // tmux-hosted counterpart of the two steps above: a cheap no-op
         // past one DB read for every run that isn't tmux-hosted (every run
@@ -1993,6 +2007,22 @@ impl ServerState {
         // considers terminal executions, so a non-terminal one (or a run
         // with no execution row at all — test and legacy paths) still
         // releases inline rather than leaking the slot forever.
+        //
+        // KNOWN GAP: nothing re-attempts the pane teardown before the sweep
+        // hands the claim back at `LEAK_GRACE_SECS`. Against an app that is
+        // slow-but-alive this converges fine — the delayed ack lands well
+        // inside the grace window. Against an app that is genuinely wedged
+        // (never reconnects, never answers), the sweep frees the claim on
+        // schedule, the next dispatch immediately collides `SlotBusy`
+        // again, and that repeats indefinitely: one fabricated-free/re-leak
+        // cycle roughly every `LEAK_GRACE_SECS` + one sweep interval,
+        // forever, until an operator intervenes. There is no automatic
+        // reclaimer for this app-hosted (non-tmux) pane shape today —
+        // `husk_pane_sweep` only enumerates the private tmux server; the
+        // app-hosted side stays the manual `bossctl agents retire-pane`
+        // break-glass path. Closing this fully needs the sweep itself to
+        // re-issue (or confirm) the teardown before releasing, which is
+        // deferred out of this change.
         //
         // `WorkerPool::release_worker` is a find-or-skip no-op for
         // already-idle slots, so the inline release is safe even if the
@@ -2159,7 +2189,7 @@ impl ServerState {
                 );
             }
         }
-        reap_worker_process_tree(shell_pid, Duration::from_secs(5));
+        reap_worker_process_tree(shell_pid, PANE_RELEASE_KILL_GRACE);
         // tmux-hosted counterpart, same as `release_worker_pane`'s slot-mapped
         // path — reaches a tmux-hosted worker the engine lost track of just
         // as the process-tree signal above does.
