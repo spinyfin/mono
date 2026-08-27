@@ -470,6 +470,25 @@ struct AutomationPauseToolbarButton: View {
 /// the singleton Attentions window. Mirrors the `.badge(openGroupCount)`
 /// pattern with an overlay (`.badge` only applies inside List/TabView).
 
+/// Shared small numeric badge overlaid on a toolbar glyph. Caps its
+/// displayed text using `BackgroundWorkToolbarChrome.badgeCap` so the
+/// "99+" rule lives in one place across all toolbar badges.
+struct ToolbarCountBadge: View {
+    let text: String
+    var fill: Color
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 9, weight: .bold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 1)
+            .background(Capsule().fill(fill))
+            .offset(x: 9, y: -7)
+            .fixedSize()
+    }
+}
+
 struct NotificationsToolbarButton: View {
     @ObservedObject var model: ChatViewModel
     @Environment(\.openWindow) private var openWindow
@@ -482,15 +501,8 @@ struct NotificationsToolbarButton: View {
         } label: {
             Image(systemName: count > 0 ? "bell.badge" : "bell")
                 .overlay(alignment: .topTrailing) {
-                    if count > 0 {
-                        Text(count > 99 ? "99+" : "\(count)")
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 1)
-                            .background(Capsule().fill(Color.red))
-                            .offset(x: 9, y: -7)
-                            .fixedSize()
+                    if let badge = BackgroundWorkToolbarChrome.badgeText(count: count) {
+                        ToolbarCountBadge(text: badge, fill: Color.red)
                     }
                 }
         }

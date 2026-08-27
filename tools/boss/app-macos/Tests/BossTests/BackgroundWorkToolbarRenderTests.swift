@@ -71,7 +71,7 @@ final class BackgroundWorkToolbarRenderTests: XCTestCase {
 
     private func renderPopover(items: [BackgroundWorkItem], height: CGFloat) throws -> NSBitmapImageRep {
         let model = makeModel(items: items)
-        let root = BackgroundWorkPopoverHost(model: model)
+        let root = BackgroundWorkPopover(model: model)
             .background(Color(nsColor: .windowBackgroundColor))
             .frame(width: 360, height: height)
         return try render(root, width: 360, height: height)
@@ -157,43 +157,5 @@ final class BackgroundWorkToolbarRenderTests: XCTestCase {
             }
         }
         return true
-    }
-}
-
-/// Hosts the same row list the production popover shows, without going
-/// through `BackgroundWorkToolbarButton`'s click-to-present state. The
-/// production popover type is file-private; this mirror uses the same
-/// presentation helper so the pixels match the chrome contract.
-private struct BackgroundWorkPopoverHost: View {
-    @ObservedObject var model: ChatViewModel
-
-    var body: some View {
-        let rows = BackgroundWorkToolbarChrome.rows(
-            items: model.backgroundWork,
-            projectName: { _ in "Alpha" },
-            workItemName: { _ in "Chore" },
-            now: Date()
-        )
-        VStack(alignment: .leading, spacing: 0) {
-            ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
-                if index > 0 { Divider() }
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(row.title).font(.headline)
-                    if let context = row.context {
-                        Text(context).font(.caption).foregroundStyle(.secondary)
-                    }
-                    HStack(spacing: 8) {
-                        Text(row.phase).font(.subheadline)
-                        if let elapsed = row.elapsed {
-                            Text(elapsed).font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(4)
     }
 }

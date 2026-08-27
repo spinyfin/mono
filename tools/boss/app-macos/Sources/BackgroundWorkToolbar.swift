@@ -15,7 +15,7 @@ enum BackgroundWorkToolbarChrome {
     /// Visual badge only. `nil` when the button itself is hidden.
     static func badgeText(count: Int) -> String? {
         guard count > 0 else { return nil }
-        if count > badgeCap { return "99+" }
+        if count > badgeCap { return "\(badgeCap)+" }
         return "\(count)"
     }
 
@@ -95,11 +95,20 @@ enum BackgroundWorkElapsed {
     /// Engine planner timestamps are epoch-second strings. ISO-8601 is
     /// accepted so a future source that already stamps that form still
     /// renders; anything else is omitted rather than guessed.
+    /// Plausible epoch-seconds range: anything before 2001 or more than a
+    /// day in the future is rejected rather than rendering a nonsense
+    /// elapsed time for a compact-date or millisecond string that happens
+    /// to be all digits.
+    private static let minPlausibleEpochSeconds: TimeInterval = 1_000_000_000
+    private static let maxFutureSlack: TimeInterval = 86_400
+
     static func parse(_ raw: String) -> Date? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty,
            trimmed.allSatisfy({ $0 >= "0" && $0 <= "9" }),
-           let secs = TimeInterval(trimmed)
+           let secs = TimeInterval(trimmed),
+           secs >= minPlausibleEpochSeconds,
+           secs <= Date().timeIntervalSince1970 + maxFutureSlack
         {
             return Date(timeIntervalSince1970: secs)
         }
@@ -117,34 +126,29 @@ struct BackgroundWorkToolbarButton: View {
     private var count: Int { model.backgroundWorkVisibleCount }
 
     var body: some View {
-        if BackgroundWorkToolbarChrome.isVisible(count: count) {
-            Button {
-                isPopoverPresented.toggle()
-            } label: {
-                Image(systemName: "gearshape.2")
-                    .overlay(alignment: .topTrailing) {
-                        if let badge = BackgroundWorkToolbarChrome.badgeText(count: count) {
-                            Text(badge)
-                                .font(.system(size: 9, weight: .bold))
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 4)
-                                .padding(.vertical, 1)
-                                .background(Capsule().fill(Color.accentColor))
-                                .offset(x: 9, y: -7)
-                                .fixedSize()
+        Group {
+            if BackgroundWorkToolbarChrome.isVisible(count: count) {
+                Button {
+                    isPopoverPresented.toggle()
+                } label: {
+                    Image(systemName: "gearshape.2")
+                        .overlay(alignment: .topTrailing) {
+                            if let badge = BackgroundWorkToolbarChrome.badgeText(count: count) {
+                                ToolbarCountBadge(text: badge, fill: Color.accentColor)
+                            }
                         }
-                    }
-            }
-            .help(BackgroundWorkToolbarChrome.accessibilityLabel(count: count))
-            .accessibilityLabel(BackgroundWorkToolbarChrome.accessibilityLabel(count: count))
-            .accessibilityIdentifier("boss.backgroundWorkToolbar")
-            .popover(isPresented: $isPopoverPresented, arrowEdge: .bottom) {
-                BackgroundWorkPopover(model: model)
-            }
-            .onChange(of: count) { _, newCount in
-                if BackgroundWorkToolbarChrome.shouldDismissPopover(visibleCount: newCount) {
-                    isPopoverPresented = false
                 }
+                .help(BackgroundWorkToolbarChrome.accessibilityLabel(count: count))
+                .accessibilityLabel(BackgroundWorkToolbarChrome.accessibilityLabel(count: count))
+                .accessibilityIdentifier("boss.backgroundWorkToolbar")
+                .popover(isPresented: $isPopoverPresented, arrowEdge: .bottom) {
+                    BackgroundWorkPopover(model: model)
+                }
+            }
+        }
+        .onChange(of: count) { _, newCount in
+            if BackgroundWorkToolbarChrome.shouldDismissPopover(visibleCount: newCount) {
+                isPopoverPresented = false
             }
         }
     }
@@ -153,7 +157,7 @@ struct BackgroundWorkToolbarButton: View {
 /// Read-only list of the current snapshot. No buttons, history, empty
 /// state, or dashboard chrome. Elapsed time ticks while the popover is
 /// open so a long planner run does not freeze at the open instant.
-private struct BackgroundWorkPopover: View {
+struct BackgroundWorkPopover: View {
     @ObservedObject var model: ChatViewModel
 
     var body: some View {
@@ -181,7 +185,7 @@ private struct BackgroundWorkPopover: View {
     }
 }
 
-private struct BackgroundWorkRowView: View {
+struct BackgroundWorkRowView: View {
     let row: BackgroundWorkRowPresentation
 
     var body: some View {

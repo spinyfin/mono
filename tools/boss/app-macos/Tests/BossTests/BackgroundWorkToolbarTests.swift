@@ -20,14 +20,20 @@ final class BackgroundWorkToolbarTests: XCTestCase {
     }
 
     /// Mechanical feature flags default off; the engine then contributes
-    /// zero conflict items. The chrome must stay hidden — the same empty
-    /// snapshot as "nothing is running", not a disabled/empty popover.
+    /// zero conflict items via a real `ListEngineAttempts` reply carrying
+    /// an empty background-work array. The chrome must stay hidden — the
+    /// same empty snapshot as "nothing is running", not a disabled/empty
+    /// popover. Drives the actual model path rather than a literal
+    /// empty array, so a regression in the apply/publish wiring would
+    /// fail this test.
+    @MainActor
     func testDisabledMechanicalFlagsKeepTheButtonHidden() {
-        let items: [BackgroundWorkItem] = []
-        XCTAssertEqual(items.count, 0)
-        XCTAssertFalse(BackgroundWorkToolbarChrome.isVisible(count: items.count))
+        let model = ChatViewModel(socketPath: "/tmp/boss-bgwork-toolbar-test-\(UUID().uuidString).sock")
+        XCTAssertTrue(model.applyBackgroundWorkSnapshot([], generation: 1))
+        XCTAssertEqual(model.backgroundWorkVisibleCount, 0)
+        XCTAssertFalse(BackgroundWorkToolbarChrome.isVisible(count: model.backgroundWorkVisibleCount))
         XCTAssertTrue(BackgroundWorkToolbarChrome.rows(
-            items: items,
+            items: model.backgroundWork,
             projectName: { _ in nil },
             workItemName: { _ in nil },
             now: Date()
