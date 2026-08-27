@@ -561,13 +561,14 @@ impl WorkDb {
         //   1. Terminal (reviewer finished — should have advanced the task via
         //      finalize_pr_review_pass but didn't, e.g. Stop hook was missed).
         //   2. Non-terminal but created before the stale cutoff (timeout).
-        let mut stmt = conn.prepare(
+        let informative_outcomes = super::review_verdicts::informative_gate_outcomes_sql();
+        let sql = format!(
             "SELECT t.id, t.product_id, t.pr_url,
                     EXISTS (
                       SELECT 1
                       FROM pr_review_verdicts rv
                       WHERE rv.execution_id = we.id
-                        AND rv.gate_outcome != 'gave_up'
+                        AND rv.gate_outcome IN ({informative_outcomes})
                     ) AS review_result_written
              FROM tasks t
              JOIN work_executions we ON we.id = (
@@ -590,8 +591,9 @@ impl WorkDb {
                  (we.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')
                   AND we.created_at < ?1)
                )
-             ORDER BY t.updated_at ASC",
-        )?;
+             ORDER BY t.updated_at ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([cutoff], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -622,7 +624,8 @@ impl WorkDb {
     pub fn advance_pending_review_task_to_in_review(&self, work_item_id: &str) -> Result<bool> {
         let conn = self.connect()?;
         let now = now_string();
-        let rows_changed = conn.execute(
+        let informative_outcomes = super::review_verdicts::informative_gate_outcomes_sql();
+        let sql = format!(
             "UPDATE tasks
              SET status            = 'in_review',
                  updated_at        = ?2,
@@ -644,16 +647,16 @@ impl WorkDb {
                    ORDER BY newest.created_at DESC, newest.id DESC
                    LIMIT 1
                  )
-                   AND rv.gate_outcome != 'gave_up'
+                   AND rv.gate_outcome IN ({informative_outcomes})
                )
                AND NOT EXISTS (
                  SELECT 1 FROM work_executions we
                  WHERE we.work_item_id = ?1
                    AND we.status IN ('running', 'waiting_human')
                    AND we.kind != 'pr_review'
-               )",
-            params![work_item_id, now],
-        )?;
+               )"
+        );
+        let rows_changed = conn.execute(&sql, params![work_item_id, now])?;
         Ok(rows_changed > 0)
     }
 

@@ -773,6 +773,7 @@ impl WorkDb {
         // each own one death signal, with their own corroboration rules,
         // and reconcile such a row to `orphaned`/`abandoned`. This query
         // legitimately picks the work item up on the pass after that.
+        let informative_outcomes = super::review_verdicts::informative_gate_outcomes_sql();
         let stmt_sql = format!(
             "SELECT t.id FROM tasks t
              WHERE t.status = 'active'
@@ -793,7 +794,14 @@ impl WorkDb {
                    SELECT 1 FROM work_executions we
                    WHERE we.work_item_id = t.id
                      AND we.kind = 'pr_review'
-                     AND we.status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
+                     AND (
+                         we.status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
+                         OR (we.status = 'completed' AND NOT EXISTS (
+                             SELECT 1 FROM pr_review_verdicts rv
+                             WHERE rv.execution_id = we.id
+                               AND rv.gate_outcome IN ({informative_outcomes})
+                         ))
+                     )
                      AND NOT EXISTS (
                          SELECT 1 FROM work_executions we2
                          WHERE we2.work_item_id = t.id
@@ -816,18 +824,17 @@ impl WorkDb {
     }
 
     /// Return every non-terminal, non-deleted work item with an open PR
-    /// whose latest **`pr_review`** execution reached a terminal state
-    /// WITHOUT ever finalizing — see [`DeadPrReviewCandidate`]. Used by
+    /// whose latest **`pr_review`** execution either died before finalizing
+    /// or completed without an informative verdict — see
+    /// [`DeadPrReviewCandidate`]. Used by
     /// [`crate::pr_review_recovery`]'s sweep to auto-refire the review
     /// pipeline for a PR whose reviewer died mid-run (host failure,
     /// cube-lease reap, crash) so the PR is never silently left unreviewed.
     ///
-    /// `we.status != 'completed'` is the detection signal:
-    /// `finalize_pr_review_pass` is the ONLY path that transitions a
-    /// `pr_review` execution to `completed` (success or reviewer give-up
-    /// both still finalize as `completed`), so any other terminal status
-    /// on the item's latest `pr_review` execution means that path never
-    /// ran.
+    /// A non-`completed` terminal status means finalization never ran. A
+    /// `completed` status is also dead when its verdict is absent or not in
+    /// `INFORMATIVE_GATE_OUTCOMES`: a reviewer give-up finalized the
+    /// execution but never made a durable judgement about the PR.
     ///
     /// The "latest" comparison is scoped to `kind = 'pr_review'` rows only
     /// (not the item's latest execution of ANY kind) — a work item can
@@ -838,7 +845,8 @@ impl WorkDb {
     /// died," not "is a pr_review the single most recent row of any kind."
     pub fn list_dead_pr_review_candidates(&self) -> Result<Vec<DeadPrReviewCandidate>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare(
+        let informative_outcomes = super::review_verdicts::informative_gate_outcomes_sql();
+        let sql = format!(
             "SELECT t.id, we.id, we.status
              FROM tasks t
              JOIN work_executions we ON we.work_item_id = t.id
@@ -846,7 +854,14 @@ impl WorkDb {
                AND t.status NOT IN ('done', 'archived')
                AND t.pr_url IS NOT NULL AND t.pr_url != ''
                AND we.kind = 'pr_review'
-               AND we.status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
+               AND (
+                   we.status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
+                   OR (we.status = 'completed' AND NOT EXISTS (
+                       SELECT 1 FROM pr_review_verdicts rv
+                       WHERE rv.execution_id = we.id
+                         AND rv.gate_outcome IN ({informative_outcomes})
+                   ))
+               )
                AND NOT EXISTS (
                    SELECT 1 FROM work_executions we2
                    WHERE we2.work_item_id = t.id
@@ -854,8 +869,9 @@ impl WorkDb {
                      AND (we2.created_at > we.created_at
                           OR (we2.created_at = we.created_at AND we2.id > we.id))
                )
-             ORDER BY t.updated_at ASC, t.id ASC",
-        )?;
+             ORDER BY t.updated_at ASC, t.id ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], |row| {
             let status: String = row.get(2)?;
             Ok(DeadPrReviewCandidate {
@@ -948,6 +964,61 @@ impl WorkDb {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Count recent `pr_review` attempts that did not yield an informative
+    /// verdict: dead terminal attempts plus completed give-ups. Both review
+    /// recovery paths share this budget to avoid repeatedly consuming review
+    /// capacity for a persistently unproductive reviewer.
+    pub fn count_recent_uninformative_pr_review_executions(
+        &self,
+        work_item_id: &str,
+        since_epoch_secs: i64,
+    ) -> Result<i64> {
+        let conn = self.connect()?;
+        let informative_outcomes = super::review_verdicts::informative_gate_outcomes_sql();
+        let sql = format!(
+            "SELECT COUNT(*) FROM work_executions we
+             WHERE we.work_item_id = ?1
+               AND we.kind = 'pr_review'
+               AND CAST(we.created_at AS INTEGER) >= ?2
+               AND (we.status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
+                    OR (we.status = 'completed' AND NOT EXISTS (
+                        SELECT 1 FROM pr_review_verdicts rv
+                        WHERE rv.execution_id = we.id
+                          AND rv.gate_outcome IN ({informative_outcomes})
+                    )))"
+        );
+        conn.query_row(&sql, params![work_item_id, since_epoch_secs], |row| row.get(0))
+            .map_err(Into::into)
+    }
+
+    /// Return the attempts counted by
+    /// [`Self::count_recent_uninformative_pr_review_executions`] for an
+    /// operator-facing churn attention item.
+    pub fn list_recent_uninformative_pr_review_execution_ids(
+        &self,
+        work_item_id: &str,
+        since_epoch_secs: i64,
+    ) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        let informative_outcomes = super::review_verdicts::informative_gate_outcomes_sql();
+        let sql = format!(
+            "SELECT we.id FROM work_executions we
+             WHERE we.work_item_id = ?1
+               AND we.kind = 'pr_review'
+               AND CAST(we.created_at AS INTEGER) >= ?2
+               AND (we.status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
+                    OR (we.status = 'completed' AND NOT EXISTS (
+                        SELECT 1 FROM pr_review_verdicts rv
+                        WHERE rv.execution_id = we.id
+                          AND rv.gate_outcome IN ({informative_outcomes})
+                    )))
+             ORDER BY we.created_at DESC, we.id DESC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![work_item_id, since_epoch_secs], |row| row.get::<_, String>(0))?;
+        collect_rows(rows)
     }
 
     pub fn list_executions(&self, work_item_id: Option<&str>) -> Result<Vec<WorkExecution>> {

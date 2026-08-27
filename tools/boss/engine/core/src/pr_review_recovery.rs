@@ -8,8 +8,8 @@
 //! findings flow through the engine (not GitHub comments), a review
 //! execution that dies silently means an open PR can reach merge with NO
 //! review and nothing in the UI saying so. This sweep closes that gap:
-//! it detects a `pr_review` execution that reached a terminal state
-//! WITHOUT ever producing a `ReviewResult` (see
+//! it detects a `pr_review` execution that either reached a dead terminal
+//! state or completed without an informative `ReviewResult` (see
 //! [`crate::work::WorkDb::list_dead_pr_review_candidates`]) and
 //! re-enqueues a fresh review pass while the PR is still open.
 //!
@@ -40,7 +40,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use boss_protocol::{CreateAttentionItemInput, ExecutionKind};
+use boss_protocol::CreateAttentionItemInput;
 
 use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
@@ -131,10 +131,11 @@ pub async fn run_one_pass(
             execution_status: dead_status,
         } = candidate;
 
-        // Churn guard: a work item whose *reviews* keep dying is almost
-        // certainly hitting something structural (a persistently broken
-        // host, like the incident's `anaplian`) rather than a one-off
-        // blip. Re-firing forever would just burn another doomed review
+        // Churn guard: a work item whose *reviews* keep failing to produce
+        // an informative result is almost certainly hitting something
+        // structural (a persistently broken host, like the incident's
+        // `anaplian`) rather than a one-off blip. Re-firing forever would
+        // just burn another unproductive review
         // every pass; leave it for a human instead. Reuses the same
         // threshold/window `orphan_sweep` uses — both guards exist to stop
         // an unproductive redispatch loop, so one operator-tunable
@@ -150,11 +151,8 @@ pub async fn run_one_pass(
         // trip the guard immediately, parking the item and leaving the PR
         // permanently unreviewed instead of getting the retry this guard is
         // supposed to allow.
-        let recent_terminal = match work_db.count_recent_terminal_executions(
-            &work_item_id,
-            churn_cutoff,
-            Some(ExecutionKind::PrReview),
-        ) {
+        let recent_terminal = match work_db.count_recent_uninformative_pr_review_executions(&work_item_id, churn_cutoff)
+        {
             Ok(n) => n,
             Err(err) => {
                 tracing::warn!(
@@ -176,14 +174,14 @@ pub async fn run_one_pass(
                 "pr_review recovery: churn guard tripped; not auto-refiring — human attention required",
             );
             let failing_ids = work_db
-                .list_recent_terminal_execution_ids(&work_item_id, churn_cutoff, Some(ExecutionKind::PrReview))
+                .list_recent_uninformative_pr_review_execution_ids(&work_item_id, churn_cutoff)
                 .unwrap_or_default();
             work_db.file_churn_guard_parked_attention(
                 &work_item_id,
                 "pr_review_recovery",
                 recent_terminal,
                 &failing_ids,
-                "terminal pr_review executions",
+                "unproductive pr_review executions",
             );
             outcome.churn_skipped += 1;
             continue;
@@ -600,16 +598,37 @@ mod tests {
         )
         .unwrap();
         let execution = db
-            .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
-            .unwrap();
-        {
-            let conn = db.connect().unwrap();
-            conn.execute(
-                "UPDATE work_executions SET kind = 'pr_review', status = 'completed' WHERE id = ?1",
-                rusqlite::params![execution.id],
+            .create_execution(
+                boss_protocol::CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
             )
             .unwrap();
-        }
+        db.start_execution_run(
+            &execution.id,
+            "review-worker",
+            "review-host",
+            "review-lease",
+            "review-workspace",
+            "/tmp/review-workspace",
+        )
+        .unwrap();
+        db.record_worker_pr_completion(
+            &execution.id,
+            "https://github.com/test/repo/pull/4",
+            None,
+            None,
+            crate::work::WorkerPrCompletionTarget::InReview,
+            Some(crate::work::ReviewVerdictInput {
+                head_sha: Some("reviewed-head".to_owned()),
+                findings_count: 0,
+                revision_warranted: false,
+                gate_outcome: crate::work::REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
+            }),
+        )
+        .unwrap();
 
         let db = Arc::new(db);
         let coordinator = make_coordinator(db.clone(), 1);

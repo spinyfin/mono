@@ -244,10 +244,8 @@ async fn stalled_running_reviewer_stays_doing_without_double_dispatch() {
     let task = query_task(&db.connect().unwrap(), &chore.id).unwrap().unwrap();
     assert_eq!(task.status, TaskStatus::Active);
     assert!(
-        db.list_attention_items_for_work_item(&chore.id)
-            .unwrap()
-            .iter()
-            .any(|attention| attention.kind == crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND)
+        db.list_attention_items_for_work_item(&chore.id).unwrap().is_empty(),
+        "a failed immediate re-fire must not create a duplicate attention item on every sweep"
     );
 }
 

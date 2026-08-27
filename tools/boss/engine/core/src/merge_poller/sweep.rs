@@ -61,16 +61,11 @@ pub struct SweepOutcome {
     /// violation where a parent rests `blocked` with no signal while its
     /// PR conflicts/fails (the PR #1077 strand).
     pub stranded_blocked_recanonicalized: usize,
-    /// Number of tasks advanced from `active` to `in_review` by the
-    /// reviewer-fallback sweep: tasks held in Doing (`PendingReview`)
-    /// whose `pr_review` execution either finished without advancing them
-    /// or has been running past the stale threshold. Ensures the hold
-    /// always resolves so no card is stranded in Doing forever.
+    /// Number of reviewer-fallback passes with a durable `ReviewResult`
+    /// released from Doing (`active`) to Review (`in_review`).
     pub reviewer_fallback_advanced: usize,
-    /// Of the `reviewer_fallback_advanced` count, how many also got a fresh
-    /// `pr_review` execution re-enqueued immediately (the rest are pending
-    /// re-fire via `pr_review_recovery` once their stale execution is
-    /// reaped — see `sweep_stalled_reviewer`).
+    /// Number of missing-result reviewer passes re-enqueued while their task
+    /// remains in Doing awaiting a durable review result.
     pub reviewer_fallback_review_refired: usize,
     /// Number of `in_revision` comments reopened (comment-intent-
     /// classification design §"Reconciliation", task 2c) because the task
@@ -2288,6 +2283,15 @@ pub(crate) async fn mark_closed_unmerged(
 /// Returns `None` for any non-canonical URL.
 pub(crate) use crate::work::stored_pr_number;
 
+/// Argument bundle for [`sweep_stalled_reviewer`]; `review_result_written`
+/// says the latest review execution recorded an informative `ReviewResult`.
+pub(crate) struct StalledReview<'a> {
+    pub(crate) task_id: &'a str,
+    pub(crate) product_id: &'a str,
+    pub(crate) pr_url: &'a str,
+    pub(crate) review_result_written: bool,
+}
+
 /// Reviewer-fallback: reconcile a task held in `active` after its latest AI
 /// reviewer pass either finished without advancing it (missed Stop hook) or
 /// ran past the stale threshold. A pass with a durable `ReviewResult` may
@@ -2302,14 +2306,8 @@ pub(crate) use crate::work::stored_pr_number;
 /// `pr_review_died_without_findings` attention item. Re-enqueue is
 /// best-effort: a still-running timed-out execution must first be reaped by
 /// liveness reconciliation, after which the standalone recovery sweep picks
-/// it up. Either way the attention item keeps the gap visible.
-pub(crate) struct StalledReview<'a> {
-    pub(crate) task_id: &'a str,
-    pub(crate) product_id: &'a str,
-    pub(crate) pr_url: &'a str,
-    pub(crate) review_result_written: bool,
-}
-
+/// it up. A successful re-fire records one attention item; a churn-guard trip
+/// parks the task for a human instead of looping indefinitely.
 pub(crate) async fn sweep_stalled_reviewer(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -2350,6 +2348,41 @@ pub(crate) async fn sweep_stalled_reviewer(
         return;
     }
 
+    let churn_cutoff =
+        boss_engine_utils::epoch_time::now_epoch_secs() - crate::work::ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS;
+    let recent_uninformative = match work_db.count_recent_uninformative_pr_review_executions(task_id, churn_cutoff) {
+        Ok(count) => count,
+        Err(err) => {
+            tracing::warn!(
+                task_id,
+                pr_url,
+                ?err,
+                "merge poller: failed to count unproductive review attempts"
+            );
+            return;
+        }
+    };
+    if recent_uninformative >= crate::work::ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
+        let failing_ids = work_db
+            .list_recent_uninformative_pr_review_execution_ids(task_id, churn_cutoff)
+            .unwrap_or_default();
+        work_db.file_churn_guard_parked_attention(
+            task_id,
+            "merge_poller_reviewer_fallback",
+            recent_uninformative,
+            &failing_ids,
+            "unproductive pr_review executions",
+        );
+        tracing::warn!(
+            task_id,
+            pr_url,
+            recent_uninformative,
+            threshold = crate::work::ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD,
+            "merge poller: reviewer-fallback churn guard parked task without re-firing review",
+        );
+        return;
+    }
+
     match work_db.request_pr_review(task_id, pr_checker) {
         Ok(execution) => {
             tracing::info!(
@@ -2363,12 +2396,32 @@ pub(crate) async fn sweep_stalled_reviewer(
                 .publish_work_item_changed(product_id, task_id, "reviewer_fallback_review_refired")
                 .await;
             outcome.reviewer_fallback_review_refired += 1;
+            let body = "The automated reviewer for this PR did not complete a review pass. Its \
+                 `pr_review` execution either finished without writing a `ReviewResult`, or remained \
+                 running past the 10-minute stale threshold. This is distinct from \"reviewed, no \
+                 findings.\" The task remains in Doing, and a fresh review has been re-enqueued; \
+                 dismiss this item once that pass completes."
+                .to_owned();
+            if let Err(err) = work_db.create_attention_item(CreateAttentionItemInput {
+                execution_id: None,
+                work_item_id: Some(task_id.to_owned()),
+                kind: crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND.to_owned(),
+                status: None,
+                title: "Automated review did not complete — replacement pending".to_owned(),
+                body_markdown: body,
+                resolved_at: None,
+            }) {
+                tracing::warn!(
+                    task_id,
+                    ?err,
+                    "merge poller: failed to file review-missing attention item"
+                );
+            }
         }
         Err(err) => {
             // Best-effort: the stale reviewer may still be nominally running.
             // The standalone recovery sweep re-attempts once liveness
-            // reconciliation reaps it. Filing attention below is independent
-            // of whether this immediate re-fire succeeds.
+            // reconciliation reaps it.
             tracing::warn!(
                 task_id,
                 pr_url,
@@ -2376,27 +2429,5 @@ pub(crate) async fn sweep_stalled_reviewer(
                 "merge poller: reviewer-fallback could not re-enqueue a review",
             );
         }
-    }
-
-    let body = "The automated reviewer for this PR did not complete a review pass. Its \
-         `pr_review` execution either finished without writing a `ReviewResult`, or remained \
-         running past the 10-minute stale threshold. This is distinct from \"reviewed, no \
-         findings.\" The task remains in Doing, and a fresh review has been (or will shortly \
-         be) re-enqueued; dismiss this item once that pass completes."
-        .to_owned();
-    if let Err(err) = work_db.create_attention_item(CreateAttentionItemInput {
-        execution_id: None,
-        work_item_id: Some(task_id.to_owned()),
-        kind: crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND.to_owned(),
-        status: None,
-        title: "Automated review did not complete — replacement pending".to_owned(),
-        body_markdown: body,
-        resolved_at: None,
-    }) {
-        tracing::warn!(
-            task_id,
-            ?err,
-            "merge poller: failed to file review-missing attention item",
-        );
     }
 }

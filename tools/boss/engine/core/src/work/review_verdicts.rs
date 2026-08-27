@@ -31,7 +31,7 @@ pub const REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED: &str = "revision_creatio
 /// already covers), so a badge resolver must skip past them and keep
 /// looking rather than surface either as if it were a completed verdict.
 /// See [`WorkDb::latest_informative_review_verdicts`].
-const INFORMATIVE_GATE_OUTCOMES: [&str; 3] = [
+pub(crate) const INFORMATIVE_GATE_OUTCOMES: [&str; 3] = [
     REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS,
     REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
     REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED,
@@ -44,6 +44,17 @@ const INFORMATIVE_GATE_OUTCOMES: [&str; 3] = [
 /// re-deriving the list themselves.
 pub fn is_informative_gate_outcome(gate_outcome: &str) -> bool {
     INFORMATIVE_GATE_OUTCOMES.contains(&gate_outcome)
+}
+
+/// SQL list literal for the canonical informative outcomes. The values are
+/// engine-owned constants, so interpolating this fragment does not admit
+/// caller-controlled SQL.
+pub(crate) fn informative_gate_outcomes_sql() -> String {
+    INFORMATIVE_GATE_OUTCOMES
+        .iter()
+        .map(|outcome| format!("'{outcome}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// What [`crate::completion::WorkerCompletionHandler::finalize_pr_review_pass`]

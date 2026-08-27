@@ -1540,7 +1540,6 @@ pub(crate) fn request_pr_review_in_tx(
         // is resolved unconditionally — this is what makes the park
         // clear automatically once the recovery sweep's trailing window
         // drains enough to re-fire the review.
-        resolve_attention_kind_in_tx(conn, work_item_id, CHURN_GUARD_PARKED_ATTENTION_KIND)?;
         existing
     } else {
         insert_execution(
@@ -1553,11 +1552,9 @@ pub(crate) fn request_pr_review_in_tx(
         )?
     };
 
-    // A fresh review pass owns the row's pre-human-review phase. This also
-    // repairs rows advanced by an older fallback before a replacement review
-    // was enqueued: once the pass is live, status-derived lane placement and
-    // the derived AI-review badge agree again. Review-health blocks are not
-    // touched; only the normal human Review lane is re-armed to Doing.
+    // A fresh review pass owns the row's pre-human-review phase. The derived
+    // badge distinguishes its `ready` state as review queued until the run
+    // actually starts, so the Doing lane never appears workerless.
     conn.execute(
         "UPDATE tasks
          SET status = 'active',

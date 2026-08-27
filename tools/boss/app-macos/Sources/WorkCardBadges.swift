@@ -751,7 +751,7 @@ struct ResolvingCIFailureBadge: View {
 /// AI-review-state badge for a kanban card. Engine-resolved via
 /// `WorkTask.aiReviewState`; the caller only builds this view when that
 /// field is non-nil (`nil` — "not reviewed yet" — renders no badge at all,
-/// so exactly one of the four states below is ever on screen at once).
+/// so exactly one of the five states below is ever on screen at once).
 ///
 /// Icon + tooltip, not a text pill — matching `PrCiIndicator`/
 /// `PrReviewIndicator` (the two other multi-state card indicators) rather
@@ -763,7 +763,8 @@ struct ResolvingCIFailureBadge: View {
 /// `reviewed_all_clear` reuses its `approved` glyph/tint (green
 /// `checkmark.seal.fill` — "signed off"). `reviewing` keeps the plain
 /// `brain` glyph the pre-existing "AI reviewing" chip used, for
-/// continuity with the state this badge subsumes. `review_not_required`
+/// continuity with the state this badge subsumes. `review_queued` uses a
+/// clock to distinguish a pool wait from an active review. `review_not_required`
 /// gets a plain `minus.circle` — a kind never touched by AI review at all.
 ///
 /// Only `reviewed_with_findings` is actionable: tapping it reveals the
@@ -777,6 +778,7 @@ struct AIReviewStateBadge: View {
     private var systemImage: String {
         switch state {
         case "reviewing": return "brain"
+        case "review_queued": return "clock.badge"
         case "reviewed_with_findings": return "exclamationmark.circle.fill"
         case "reviewed_all_clear": return "checkmark.seal.fill"
         case "review_not_required": return "minus.circle"
@@ -787,6 +789,7 @@ struct AIReviewStateBadge: View {
     private var tint: Color {
         switch state {
         case "reviewing": return .accentColor
+        case "review_queued": return .secondary
         case "reviewed_with_findings": return .orange
         case "reviewed_all_clear": return .green
         case "review_not_required": return .secondary
@@ -798,6 +801,8 @@ struct AIReviewStateBadge: View {
         switch state {
         case "reviewing":
             return "An AI reviewer pass is running on this PR. The card will move to Review once the pass completes (typically within a minute)."
+        case "review_queued":
+            return "An AI reviewer pass is queued for a review-pool slot. The card will remain in Doing until the pass starts."
         case "reviewed_with_findings":
             return onRevealFindings != nil
                 ? "The AI reviewer found issues on this PR — click to reveal the follow-up revision that addresses them."
@@ -814,6 +819,7 @@ struct AIReviewStateBadge: View {
     private var accessibilityLabel: String {
         switch state {
         case "reviewing": return "AI reviewing"
+        case "review_queued": return "AI review queued"
         case "reviewed_with_findings": return "AI review found issues"
         case "reviewed_all_clear": return "AI review: all clear"
         case "review_not_required": return "AI review not required"
