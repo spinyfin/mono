@@ -424,3 +424,105 @@ async fn reap_run_releases_worker_pool_claim_and_live_state() {
         .expect("slot must be free after reap");
     assert_eq!(reclaimed, "worker-1");
 }
+
+/// Set up a worker-pool claim plus a slot mapping for `execution_id`, the
+/// way the coordinator does when it defers a pane-spawned run's slot
+/// release to `release_worker_pane`.
+async fn claim_slot_one_for(server_state: &Arc<ServerState>, execution_id: &str) {
+    let pool = server_state.execution_coordinator.worker_pool();
+    let claimed = pool
+        .claim_worker(execution_id, None)
+        .await
+        .expect("worker pool starts with one free slot");
+    assert_eq!(claimed, "worker-1");
+    server_state.worker_registry.register_run_slot(execution_id, 1);
+}
+
+/// The engine must not tell the app how long to wait for a worker to die
+/// and then give up on the answer at exactly that moment. The two being
+/// equal (both 5s) is what made every full-grace teardown time out, and a
+/// timed-out teardown is the unconfirmed case the test below covers.
+#[test]
+fn pane_release_ack_timeout_outlasts_the_kill_grace_it_asks_for() {
+    assert!(
+        crate::app::PANE_RELEASE_ACK_TIMEOUT > crate::app::PANE_RELEASE_KILL_GRACE,
+        "the ack deadline ({:?}) must exceed the kill grace the app is asked to honour ({:?})",
+        crate::app::PANE_RELEASE_ACK_TIMEOUT,
+        crate::app::PANE_RELEASE_KILL_GRACE,
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn release_worker_pane_holds_the_pool_claim_when_the_app_never_confirms() {
+    // The `SlotBusy` root cause. `release_worker_pane` used to hand the
+    // WorkerPool slot back "successfully or not" — including when the app
+    // never answered the teardown request at all. The app is then still
+    // hosting the pane while the engine advertises the slot as free, so the
+    // next dispatch claims it, `SpawnWorkerPane` is rejected `SlotBusy`, and
+    // that execution is terminalized `failed` seconds after start with
+    // `work_executions.driver` still NULL.
+    //
+    // An unconfirmed teardown must instead leave the claim in place;
+    // `pool_claim_sweep` reconciles it once the pane is genuinely gone.
+    let (server_state, _dir) = test_server_state();
+    let pool = server_state.execution_coordinator.worker_pool();
+
+    // A terminal execution — the shape `pool_claim_sweep` reconciles.
+    let product = create_test_product(&server_state.work_db);
+    let chore = create_test_chore(&server_state.work_db, &product.id, "stuck teardown");
+    let execution = server_state
+        .work_db
+        .create_execution(
+            boss_protocol::CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(boss_protocol::ExecutionKind::ChoreImplementation)
+                .status(boss_protocol::ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    claim_slot_one_for(&server_state, &execution.id).await;
+
+    // An app session that is registered but never answers: `send_to_app`
+    // runs out its deadline and the teardown goes unconfirmed.
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    server_state.release_worker_pane(&execution.id).await;
+
+    assert_eq!(
+        pool.idle_count().await,
+        0,
+        "an unconfirmed pane teardown must not advertise the slot as free — that is the \
+         fabricated signal that produces SlotBusy on the next dispatch",
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn release_worker_pane_still_frees_the_slot_when_no_sweep_would_collect_it() {
+    // The counterweight to the test above: `pool_claim_sweep` only
+    // reconciles claims whose execution is TERMINAL. Holding the claim for
+    // anything else would leak the slot forever, so a non-terminal (or
+    // absent) execution still releases inline even without a confirmation.
+    let (server_state, _dir) = test_server_state();
+    let pool = server_state.execution_coordinator.worker_pool();
+
+    let product = create_test_product(&server_state.work_db);
+    let chore = create_test_chore(&server_state.work_db, &product.id, "live worker");
+    let execution = create_ready_chore_execution(&server_state.work_db, chore.id.clone());
+    claim_slot_one_for(&server_state, &execution.id).await;
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    server_state.release_worker_pane(&execution.id).await;
+
+    assert_eq!(
+        pool.idle_count().await,
+        1,
+        "a claim no sweep would ever collect must be released inline rather than leaked",
+    );
+}

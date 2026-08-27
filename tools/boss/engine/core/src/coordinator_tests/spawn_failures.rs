@@ -1790,3 +1790,84 @@ async fn lease_with_prefer_set_does_not_fall_back_when_refused() {
 }
 
 // ── reconcile_workspace_recovery: cube first, patch second ────────────
+
+/// The invariant behind the "executions fail seconds after start with
+/// `driver` unresolved" report.
+///
+/// `work_executions.driver` / `.model` are stamped by
+/// `record_execution_launch_config`, which the coordinator calls only on
+/// the successful-spawn arm. So EVERY spawn abort terminalizes with those
+/// columns NULL, whatever the driver resolution actually decided — the
+/// null driver is a symptom of aborting before the stamp, never evidence
+/// that resolution failed. That is fine only as long as the abort's cause
+/// is recorded and surfaced somewhere the operator can reach; a two-second
+/// terminal failure with no diagnosable reason is a defect in its own
+/// right.
+///
+/// Both abort shapes are covered, because they are bookkept differently:
+/// a genuine spawn failure increments `pre_start_failure_count`, while a
+/// `SlotBusy` engine/app desync deliberately does not (it is not the
+/// task's failure). Neither is allowed to skip the recorded reason.
+#[tokio::test]
+async fn a_spawn_abort_never_terminalizes_driverless_without_a_recorded_reason() {
+    for (label, runner) in [
+        (
+            "generic spawn failure",
+            FakeExecutionRunner {
+                fail: true,
+                ..FakeExecutionRunner::default()
+            },
+        ),
+        (
+            "slot-busy desync",
+            FakeExecutionRunner {
+                slot_busy: true,
+                ..FakeExecutionRunner::default()
+            },
+        ),
+    ] {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        seed_local_claude_driver(&db);
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            Arc::new(FakeCubeClient::default()),
+            Arc::new(runner),
+        ));
+        let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+        coordinator.kick();
+        wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Failed).await;
+
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert!(
+            execution.driver.is_none() && execution.model.is_none(),
+            "{label}: a spawn abort must not stamp a launch config it never launched with; \
+             got driver={:?} model={:?}",
+            execution.driver,
+            execution.model,
+        );
+
+        // Recorded: the terminal run row carries the abort's own error
+        // chain, so the cause survives the process that produced it.
+        let runs = db.list_runs(&execution_id).unwrap();
+        assert!(
+            runs.iter()
+                .any(|run| run.error_text.as_deref().is_some_and(|text| !text.trim().is_empty())),
+            "{label}: a driverless terminal failure must record its cause on the run row; got {runs:#?}",
+        );
+
+        // Surfaced: the operator-visible attention item is what turns that
+        // record into something anybody sees without reading the engine log.
+        let attention_items = db.list_attention_items(&execution_id).unwrap();
+        assert!(
+            attention_items.iter().any(|item| item.kind == "pane_spawn_failed"),
+            "{label}: a driverless terminal failure must surface a pane_spawn_failed attention \
+             item; got {attention_items:#?}",
+        );
+    }
+}

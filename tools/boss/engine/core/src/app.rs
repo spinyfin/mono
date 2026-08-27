@@ -56,6 +56,21 @@ use crate::worker_registry::WorkerRegistry;
 use async_trait::async_trait;
 use tokio::time::{Duration, timeout};
 
+/// Grace the app is asked to give a worker's process tree between the
+/// polite signal and `SIGKILL` when tearing a pane down.
+const PANE_RELEASE_KILL_GRACE: Duration = Duration::from_secs(5);
+
+/// How long the engine waits for the app to acknowledge a pane teardown.
+///
+/// Strictly greater than [`PANE_RELEASE_KILL_GRACE`], and deliberately so:
+/// the two were both 5s, which meant any worker that used its full kill
+/// grace made the engine's own deadline expire at the moment the app was
+/// still doing exactly what it had been asked to do. An unacknowledged
+/// teardown no longer fabricates a "slot free" signal (see
+/// `ServerState::release_worker_pane`), but it does cost a slot for a
+/// sweep cycle, so the common case must not time out.
+const PANE_RELEASE_ACK_TIMEOUT: Duration = Duration::from_secs(20);
+
 mod agent_launch_guard;
 mod app_session;
 pub(crate) mod attachments;
@@ -1729,6 +1744,30 @@ impl ServerState {
         Ok(server_state)
     }
 
+    /// Whether `execution_id`'s row has reached a terminal status.
+    ///
+    /// Used by [`Self::release_worker_pane`] to decide who owns handing a
+    /// worker-pool slot back when the app never confirmed the pane teardown.
+    /// [`crate::pool_claim_sweep`] only reconciles claims whose execution is
+    /// terminal, so anything else — a live row, a missing row (test and
+    /// legacy paths register a slot with no execution behind it), or a DB
+    /// read that failed — must fall back to releasing inline rather than
+    /// leaving a claim nothing will ever collect. Fail-open on purpose: a
+    /// slot leaked forever is worse than one `SlotBusy` rejection.
+    fn execution_is_terminal(&self, execution_id: &str) -> bool {
+        match self.work_db.get_execution(execution_id) {
+            Ok(execution) => execution.status.is_terminal(),
+            Err(err) => {
+                tracing::debug!(
+                    execution_id,
+                    ?err,
+                    "release_worker_pane: no execution row to classify; releasing the pool claim inline",
+                );
+                false
+            }
+        }
+    }
+
     /// Tear down the libghostty pane allocated for `run_id`.
     /// Safe to call repeatedly: `take_slot_for_run` returns `None` after the
     /// first call so duplicate releases (completion-detection followed by a
@@ -1843,15 +1882,21 @@ impl ServerState {
         } else {
             EngineToAppRequest::ReleaseWorkerPane(ReleaseWorkerPaneInput {
                 slot_id,
-                kill_grace_seconds: 5,
+                kill_grace_seconds: PANE_RELEASE_KILL_GRACE.as_secs() as u32,
             })
         };
-        match self.send_to_app(request, Duration::from_secs(5)).await {
+        // Whether the app has actually told us the slot no longer hosts a
+        // pane. This is what gates the WorkerPool handback below — see
+        // `PANE_RELEASE_ACK_TIMEOUT` and the release site for why an
+        // unconfirmed teardown must not be reported to the pool as "free".
+        let pane_confirmed_released = match self.send_to_app(request, PANE_RELEASE_ACK_TIMEOUT).await {
             Ok(EngineToAppResponse::ReleaseWorkerPane { result: Ok(_) }) => {
                 tracing::info!(run_id, slot_id, "released worker pane");
+                true
             }
             Ok(EngineToAppResponse::DetachWorkerPane { result: Ok(_) }) => {
                 tracing::info!(run_id, slot_id, "detached tmux-hosted worker pane");
+                true
             }
             Ok(EngineToAppResponse::ReleaseWorkerPane {
                 result: Err(EngineToAppError::UnknownSlot),
@@ -1861,6 +1906,7 @@ impl ServerState {
                     slot_id,
                     "release_worker_pane: app reports unknown slot — already released",
                 );
+                true
             }
             Ok(EngineToAppResponse::DetachWorkerPane {
                 result: Err(EngineToAppError::UnknownSlot),
@@ -1870,6 +1916,7 @@ impl ServerState {
                     slot_id,
                     "release_worker_pane: app reports tmux viewer already detached",
                 );
+                true
             }
             Ok(other) => {
                 tracing::warn!(
@@ -1878,18 +1925,24 @@ impl ServerState {
                     ?other,
                     "release_worker_pane: app returned unexpected response",
                 );
+                false
             }
+            // No app session at all: nothing can be hosting a pane in this
+            // slot, so there is no desync to guard against. (An app that
+            // registers later starts from an empty pane map.)
             Err(SendToAppError::NotRegistered) => {
                 tracing::debug!(
                     run_id,
                     slot_id,
                     "release_worker_pane: no app session registered; skipping",
                 );
+                true
             }
             Err(err) => {
                 tracing::warn!(?err, run_id, slot_id, "release_worker_pane: failed");
+                false
             }
-        }
+        };
         // Engine-side reap backstop. The app's pane teardown above is
         // the primary reaper, but it cannot act when no app session is
         // registered, when the app is unresponsive, or when a wedged
@@ -1915,16 +1968,51 @@ impl ServerState {
         // The engine's WorkerPool slot was held for the lifetime of
         // the libghostty pane (the coordinator deferred its release
         // when `run_execution` returned with `slot_id = Some(N)`).
-        // Now that the pane has been torn down — successfully or
-        // not — the engine and the app are back in agreement that
-        // slot N is free, so release the pool slot too and kick the
-        // scheduler. `WorkerPool::release_worker` is a find-or-skip
-        // no-op for already-idle slots, so this is safe even if the
+        // Hand it back and kick the scheduler — but ONLY once the app
+        // has actually confirmed the pane is gone.
+        //
+        // This used to release unconditionally, on the reasoning that the
+        // pane had been torn down "successfully or not". It has not: a
+        // teardown the app never acknowledged (RPC deadline, transport
+        // error, unexpected response) leaves the app still hosting the
+        // pane while the engine advertises slot N as free. The very next
+        // dispatch claims N, `SpawnWorkerPane` is rejected `SlotBusy`, and
+        // the coordinator terminalizes that execution `failed` seconds
+        // after start with `work_executions.driver` still NULL — the
+        // launch config is only stamped on the successful-spawn arm. That
+        // is a fabricated free signal, not a spawn problem, and it fires
+        // exactly when another execution is finishing, which is where the
+        // reported cluster came from.
+        //
+        // When the teardown is unconfirmed the claim therefore STAYS with
+        // this execution and `crate::pool_claim_sweep` reconciles it: a
+        // terminal execution with no live-state entry (dropped just below)
+        // past `LEAK_GRACE_SECS` is exactly the leaked-claim shape it
+        // exists to release, and it compare-and-releases so it cannot yank
+        // a slot a live execution has since re-claimed. The sweep only
+        // considers terminal executions, so a non-terminal one (or a run
+        // with no execution row at all — test and legacy paths) still
+        // releases inline rather than leaking the slot forever.
+        //
+        // `WorkerPool::release_worker` is a find-or-skip no-op for
+        // already-idle slots, so the inline release is safe even if the
         // pane was a non-pool spawn (e.g. legacy or test path).
         let worker_id = crate::coordinator::worker_id_for_slot(slot_id);
-        self.execution_coordinator
-            .release_worker_and_kick(&worker_id, None)
-            .await;
+        let sweep_owns_handback = !pane_confirmed_released && self.execution_is_terminal(run_id);
+        if sweep_owns_handback {
+            tracing::warn!(
+                run_id,
+                slot_id,
+                grace_secs = crate::pool_claim_sweep::LEAK_GRACE_SECS,
+                "release_worker_pane: app never confirmed the pane teardown; holding the worker \
+                 pool claim so a fresh dispatch cannot land on a slot the app may still host \
+                 (pool_claim_sweep reconciles it)",
+            );
+        } else {
+            self.execution_coordinator
+                .release_worker_and_kick(&worker_id, None)
+                .await;
+        }
         // Always drop the live-state entry — we've already given up
         // ownership of the slot in the worker registry, so a stale
         // entry here would lie to the UI about the slot being live.
