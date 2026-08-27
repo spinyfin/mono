@@ -297,8 +297,9 @@ pub(crate) fn archive_revision_task(
 }
 
 /// Resolve a single pending revision whose chain root's PR has merged or
-/// closed: either archive it as moot, or convert it to a standalone
-/// chore/followup and archive it.
+/// closed: archive it as moot, convert a human-filed revision to a standalone
+/// chore, or convert a PR-review revision to a followup in place. A PR-review
+/// revision whose implementation already completed is settled as done.
 ///
 /// This is the single point of truth for the moot-vs-convert decision. Two
 /// call sites reach it:
@@ -366,45 +367,168 @@ pub(crate) fn resolve_revision_on_parent_close(
     let is_wip = rev.status == TaskStatus::Active;
     let is_pr_review = rev.created_via.starts_with(CREATED_VIA_PR_REVIEW_PREFIX);
 
-    // For PR-review revisions, emit a `followup` with provenance when the
-    // chain root still has a parseable origin PR. Only tag `Followup` when
-    // that number is present — `followup_pr_body_prefix` treats the kind as
-    // a hard origin-PR contract and bails at dispatch otherwise, so minting
-    // a Followup with `origin_pr_number = None` (missing/soft-deleted root
-    // or unparseable `pr_url`) would permanently wedge the task. Fall back
-    // to the historical `chore` in that case, matching the deferred-scope
-    // creation site. Carry the revision's `pr_review:` `created_via`
-    // through onto the followup so `followup_kind_label` can render
-    // "review findings" rather than the degenerate engine-kind string.
-    // For all other non-moot revisions, keep the historical `chore`.
-    let (kind_override, origin_task_short_id, origin_pr_number, description, created_via) = if is_pr_review {
+    // A revision implementation that already completed has delivered its
+    // findings fix to the chain root's PR. While its re-review runs the task
+    // deliberately remains `active`; if the PR merges in that window, the
+    // generic WIP conversion below would mistake the reviewer for unfinished
+    // implementation work and mint the same findings again as a followup.
+    // Treat completed implementation evidence exactly like `in_review`: the
+    // commit rode the parent PR to merge, so the existing row is done.
+    //
+    // This must be scoped tightly to the exact state it documents — `active`
+    // with a completed implementation as its latest implementation. A
+    // revision can be redispatched after its first implementation completed
+    // (retry, recheck, stale-worker redispatch); a later implementation means
+    // this branch must NOT fire, even if the parent-close sweep just abandoned
+    // it. The generic WIP conversion below then carries the findings forward
+    // as a followup instead of silently dropping them.
+    if is_pr_review && is_wip {
+        let latest_implementation_completed: bool = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM work_executions
+                 WHERE work_item_id = ?1
+                   AND kind = 'revision_implementation'
+                   AND status = 'completed'
+                   AND id = (
+                       SELECT id
+                       FROM work_executions
+                       WHERE work_item_id = ?1
+                         AND kind = 'revision_implementation'
+                       ORDER BY created_at DESC, id DESC
+                       LIMIT 1
+                   )
+             )",
+            params![rev.id],
+            |row| row.get(0),
+        )?;
+        if latest_implementation_completed {
+            conn.execute(
+                "UPDATE tasks
+                 SET status             = 'done',
+                     updated_at         = ?2,
+                     last_status_actor  = 'engine',
+                     blocked_reason     = NULL,
+                     blocked_attempt_id = NULL,
+                     merge_queue_state  = NULL,
+                     merge_queue_detail = NULL,
+                     completed_at       = COALESCE(completed_at, ?2)
+                 WHERE id = ?1
+                   AND kind = 'revision'
+                   AND deleted_at IS NULL",
+                params![rev.id, now],
+            )?;
+            comments::reconcile_comments_for_task(conn, &rev.id, comments::CommentReconcileOutcome::Resolved, now)?;
+            tracing::info!(
+                revision_id = %rev.id,
+                chain_root_id,
+                created_via = %rev.created_via,
+                "{log_prefix}: pr_review revision already delivered by a completed implementation; marked done without minting a followup",
+            );
+            return Ok(());
+        }
+    }
+
+    if is_pr_review {
+        // Emit a `followup` with provenance when the chain root still has a
+        // parseable origin PR. Only tag `Followup` when that number is
+        // present — `followup_pr_body_prefix` treats the kind as a hard
+        // origin-PR contract and bails at dispatch otherwise, so minting a
+        // Followup with `origin_pr_number = None` (missing/soft-deleted root
+        // or unparseable `pr_url`) would permanently wedge the task. Fall
+        // back to the historical `chore` in that case, matching the
+        // deferred-scope creation site. Carry the revision's `pr_review:`
+        // `created_via` through onto the followup so `followup_kind_label`
+        // can render "review findings" rather than the degenerate
+        // engine-kind string.
         let root = query_task(conn, chain_root_id)?;
-        let origin_short_id = root.as_ref().and_then(|r| r.short_id);
-        let origin_pr_num = root
+        let origin_task_short_id = root.as_ref().and_then(|r| r.short_id);
+        let origin_pr_number = root
             .as_ref()
             .and_then(|r| r.pr_url.as_deref().and_then(stored_pr_number));
-        let kind_override = origin_pr_num.is_some().then_some(TaskKind::Followup);
-        let desc = rev.description.replace(
+        let kind_override = origin_pr_number.is_some().then_some(TaskKind::Followup);
+        let description = rev.description.replace(
             "Address ALL findings before finalising this revision.",
             "Address ALL findings before closing this follow-up.",
         );
-        let created_via = if kind_override.is_some() {
-            rev.created_via.clone()
-        } else {
-            CREATED_VIA_ENGINE_AUTO.to_owned()
-        };
-        (kind_override, origin_short_id, origin_pr_num, desc, created_via)
-    } else {
-        (
-            None,
-            None,
-            None,
-            rev.description.clone(),
-            CREATED_VIA_ENGINE_AUTO.to_owned(),
-        )
-    };
-    let is_followup = kind_override == Some(TaskKind::Followup);
+        let new_kind = kind_override.as_ref().map_or("chore", TaskKind::as_str);
 
+        // The revision row is already the one work item materialised from
+        // this review execution. Re-keying it into a standalone
+        // followup/chore keeps that identity and provenance intact;
+        // inserting a second row here was the duplicate-mint path that raced
+        // a re-review after the first worker had finished. The dispatcher
+        // will use the new kind on its next pass.
+        let rows_changed = conn.execute(
+            "UPDATE tasks
+             SET project_id           = NULL,
+                 kind                 = ?2,
+                 description          = ?3,
+                 status               = 'todo',
+                 ordinal              = NULL,
+                 pr_url               = NULL,
+                 deleted_at           = NULL,
+                 updated_at           = ?4,
+                 autostart             = ?5,
+                 created_via          = ?6,
+                 parent_task_id       = NULL,
+                 origin_task_short_id = ?7,
+                 origin_pr_number     = ?8,
+                 blocked_reason       = NULL,
+                 blocked_attempt_id   = NULL,
+                 archived_by          = NULL,
+                 archived_at          = NULL,
+                 archived_reason      = NULL,
+                 merge_queue_state    = NULL,
+                 merge_queue_detail   = NULL,
+                 completed_at         = NULL,
+                 last_status_actor    = 'engine'
+             WHERE id = ?1
+               AND kind = 'revision'
+               AND deleted_at IS NULL",
+            params![
+                rev.id,
+                new_kind,
+                description,
+                now,
+                i64::from(is_wip),
+                rev.created_via,
+                origin_task_short_id,
+                origin_pr_number,
+            ],
+        )?;
+        // Not a duplicate-mint avoidance — this IS the single mint for this
+        // review execution, so the ordinary path logs at info. Zero rows
+        // changed means the guard didn't match (row already tombstoned, or
+        // already converted by a concurrent sweep) — that is distinct from
+        // an ordinary conversion and must not claim one happened.
+        if rows_changed > 0 {
+            tracing::info!(
+                review_execution = %rev.created_via,
+                task_id = %rev.id,
+                new_kind,
+                chain_root_id,
+                is_wip,
+                "{log_prefix}: pr_review revision converted in place to {new_kind} (parent PR merged/closed); \
+                 one work item preserved per review execution",
+            );
+        } else {
+            tracing::info!(
+                review_execution = %rev.created_via,
+                task_id = %rev.id,
+                new_kind,
+                chain_root_id,
+                is_wip,
+                "{log_prefix}: pr_review revision conversion skipped; row already resolved (tombstoned or \
+                 converted by a concurrent pass)",
+            );
+        }
+        return Ok(());
+    }
+
+    // Human-filed revision: convert to a standalone chore. Only non-moot,
+    // non-pr_review revisions reach here — the pr_review case always returns above.
+    let description = rev.description.clone();
     let new_chore = insert_chore_in_tx(
         conn,
         CreateChoreInput::builder()
@@ -412,23 +536,16 @@ pub(crate) fn resolve_revision_on_parent_close(
             .autostart(is_wip)
             .force_duplicate(true)
             .name(rev.name.clone())
-            .maybe_created_via(Some(created_via))
+            .created_via(CREATED_VIA_ENGINE_AUTO)
             .maybe_description(Some(description))
             .maybe_effort_level(rev.effort_level)
             .maybe_model_override(rev.model_override.clone())
             .maybe_priority(Some(rev.priority.clone()))
             .maybe_repo_remote_url(rev.repo_remote_url.clone())
-            .maybe_kind_override(kind_override)
-            .maybe_origin_task_short_id(origin_task_short_id)
-            .maybe_origin_pr_number(origin_pr_number)
             .build(),
     )?;
 
-    let archived_reason = format!(
-        "parent PR merged: superseded by {} {}",
-        if is_followup { "followup" } else { "chore" },
-        new_chore.id,
-    );
+    let archived_reason = format!("parent PR merged: superseded by chore {}", new_chore.id);
     if archive_revision_task(
         conn,
         &rev.id,
@@ -444,10 +561,7 @@ pub(crate) fn resolve_revision_on_parent_close(
         new_chore_kind = %new_chore.kind,
         chain_root_id,
         is_wip,
-        is_pr_review,
-        is_followup,
-        "{log_prefix}: revision converted to standalone {} (parent PR merged; will {})",
-        if is_followup { "followup" } else { "chore" },
+        "{log_prefix}: revision converted to standalone chore (parent PR merged; will {})",
         if is_wip { "auto-dispatch" } else { "stay in backlog" },
     );
     Ok(())
@@ -461,15 +575,16 @@ pub(crate) fn resolve_revision_on_parent_close(
 ///    follow-up is needed.
 ///
 /// 2. **Non-moot, active (WIP)** — the worker was mid-flight but the PR target
-///    is gone.  Create a standalone chore with `autostart = true` so the work
-///    is restarted on a fresh PR.  Archive the revision.  The in-flight
-///    execution is stopped by the merge-poller's `stop_active_revision_executions`
-///    call that runs immediately after this function returns.
+///    is gone. Human-filed revisions become standalone autostart chores;
+///    PR-review revisions become followups in place so the review execution
+///    still owns exactly one work item. The in-flight execution is stopped by
+///    the merge-poller's `stop_active_revision_executions` call that runs
+///    immediately after this function returns.
 ///
 /// 3. **Non-moot, in backlog** (`todo` / `blocked` for another reason) — the
-///    work hasn't started yet.  Create a standalone chore with
-///    `autostart = false` so the operator controls when it runs.  Archive the
-///    revision.
+///    work hasn't started yet. Human-filed revisions become standalone
+///    non-autostart chores; PR-review revisions become non-autostart
+///    followups in place.
 ///
 /// `in_review` revisions are handled by [`flip_in_review_revisions_to_done`]
 /// (their commit rode the PR to merge).  `done`/`archived` revisions and

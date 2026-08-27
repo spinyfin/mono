@@ -38,33 +38,45 @@ fn pr_review_revision_creates_followup_with_correct_kind_and_provenance() {
 
     db.mark_chore_pr_merged(&parent_id, pr_url).unwrap();
 
-    // Revision must be archived (and tombstoned, so `get_work_item` — which
-    // excludes soft-deleted rows — is not the right lookup here anymore).
+    // The revision is the one materialisation owned by this review
+    // execution. Parent-close conversion changes that row in place rather
+    // than archiving it and minting a second work item.
     let conn = db.connect().unwrap();
     let rev_after = query_task(&conn, &revision.id)
         .unwrap()
         .expect("revision row must still exist");
     drop(conn);
-    assert_eq!(
-        rev_after.status,
-        TaskStatus::Archived,
-        "pr_review revision must be archived after parent merges"
-    );
-    assert!(
-        rev_after.deleted_at.is_some(),
-        "archived pr_review revision must be tombstoned so it disappears from get_work_tree"
-    );
+    assert_eq!(rev_after.kind, TaskKind::Followup);
+    assert_eq!(rev_after.status, TaskStatus::Todo);
+    assert!(rev_after.deleted_at.is_none());
 
     // A followup must be created (not a plain chore).
     let chores = db.list_chores(&product_id, None, false).unwrap();
     let followup = chores
         .iter()
-        .find(|c| c.id != parent_id && c.kind == TaskKind::Followup);
+        .find(|c| c.id == revision.id && c.kind == TaskKind::Followup);
     assert!(
         followup.is_some(),
         "a followup task must be created for a pr_review revision; chores: {chores:?}",
     );
     let followup = followup.unwrap();
+    assert_eq!(
+        followup.created_via,
+        format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_test_123")
+    );
+
+    let conn = db.connect().unwrap();
+    let materialisation_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE created_via = ?1",
+            params![followup.created_via],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        materialisation_count, 1,
+        "revision creation and parent-close conversion must share one execution-keyed row"
+    );
 
     // No plain chore must be created (only the followup).
     let plain_chore = chores.iter().find(|c| c.id != parent_id && c.kind == TaskKind::Chore);
@@ -119,6 +131,79 @@ fn pr_review_revision_creates_followup_with_correct_kind_and_provenance() {
     );
 }
 
+/// A replayed `create_revision` for the same review execution, arriving
+/// after the parent-close conversion already turned the revision into a
+/// followup, must resolve to that followup rather than mint a second row.
+/// This is the branch of the dedup query most likely to regress if the
+/// dedup check is ever moved after parent resolution: by the time the
+/// replay lands, `kind` is no longer `revision` and `parent_task_id` is
+/// `NULL`.
+#[test]
+fn replayed_create_revision_resolves_to_already_converted_followup() {
+    let db = WorkDb::open(temp_db_path("followup-replay-after-conversion")).unwrap();
+    let product_id = make_revision_product(&db, "fu-replay");
+    let pr_url = FOLLOWUP_PR_URL;
+    let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+    let created_via = format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_replay_after_conversion");
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db
+        .create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(parent_id.clone())
+                .description("Address ALL findings before finalising this revision.")
+                .created_via(created_via.clone())
+                .build(),
+            &checker,
+        )
+        .unwrap();
+
+    // Parent PR merges: converts the revision in place to a followup.
+    db.mark_chore_pr_merged(&parent_id, pr_url).unwrap();
+
+    let conn = db.connect().unwrap();
+    let converted = query_task(&conn, &revision.id)
+        .unwrap()
+        .expect("converted row must still exist");
+    drop(conn);
+    assert_eq!(converted.kind, TaskKind::Followup);
+    assert!(
+        converted.parent_task_id.is_none(),
+        "converted followup must not retain parent_task_id"
+    );
+
+    // A replayed mint for the same review execution arrives after the
+    // conversion. It must resolve to the followup, not insert a second row.
+    let replay = db
+        .create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(parent_id.clone())
+                .description("Differently rendered text from the same review.")
+                .created_via(created_via.clone())
+                .build(),
+            &checker,
+        )
+        .unwrap();
+
+    assert_eq!(
+        replay.id, revision.id,
+        "replayed mint must resolve to the already-converted followup"
+    );
+
+    let conn = db.connect().unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE created_via = ?1",
+            params![created_via],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "one review execution must materialise at most one work item, even after conversion"
+    );
+}
+
 /// When the chain root's PR URL cannot yield an origin PR number, a
 /// pr_review revision must fall back to a plain `chore` rather than mint
 /// an un-spawnable `Followup` with `origin_pr_number = None`.
@@ -132,15 +217,16 @@ fn pr_review_revision_without_parseable_origin_pr_falls_back_to_chore() {
     let parent_id = make_in_review_chore(&db, &product_id, pr_url);
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    db.create_revision(
-        CreateRevisionInput::builder()
-            .parent_task_id(parent_id.clone())
-            .description("Address ALL findings before finalising this revision.")
-            .created_via(format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_no_origin"))
-            .build(),
-        &checker,
-    )
-    .unwrap();
+    let revision = db
+        .create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(parent_id.clone())
+                .description("Address ALL findings before finalising this revision.")
+                .created_via(format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_no_origin"))
+                .build(),
+            &checker,
+        )
+        .unwrap();
 
     db.mark_chore_pr_merged(&parent_id, pr_url).unwrap();
 
@@ -155,7 +241,7 @@ fn pr_review_revision_without_parseable_origin_pr_falls_back_to_chore() {
     );
     let chore = chores
         .iter()
-        .find(|c| c.id != parent_id && c.kind == TaskKind::Chore)
+        .find(|c| c.id == revision.id && c.kind == TaskKind::Chore)
         .expect("pr_review revision without origin PR must fall back to a plain chore");
     assert!(
         chore.origin_pr_number.is_none(),
@@ -163,8 +249,9 @@ fn pr_review_revision_without_parseable_origin_pr_falls_back_to_chore() {
         chore.origin_pr_number
     );
     assert_eq!(
-        chore.created_via, CREATED_VIA_ENGINE_AUTO,
-        "fallback chore keeps the historical engine_auto created_via"
+        chore.created_via,
+        format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_no_origin"),
+        "fallback chore must retain the review execution idempotency key"
     );
 }
 
@@ -189,11 +276,27 @@ fn pr_review_active_revision_creates_autostart_followup() {
         )
         .unwrap();
 
-    // Simulate the revision being dispatched.
+    // Simulate the revision being dispatched with a live lease. Conversion
+    // changes the task kind in place, but the merge-poller's stop step must
+    // still be able to find this revision_implementation execution.
+    let implementation = db
+        .list_executions(Some(&revision.id))
+        .unwrap()
+        .into_iter()
+        .find(|execution| execution.kind == ExecutionKind::RevisionImplementation)
+        .expect("revision creation must enqueue its implementation");
     let conn = db.connect().unwrap();
     conn.execute(
         "UPDATE tasks SET status = 'active' WHERE id = ?1",
         rusqlite::params![revision.id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE work_executions
+         SET status = 'running', cube_lease_id = 'lease-review-revision',
+             cube_workspace_id = 'mono-agent-review-revision', workspace_path = '/tmp/review-revision'
+         WHERE id = ?1",
+        params![implementation.id],
     )
     .unwrap();
     drop(conn);
@@ -203,7 +306,7 @@ fn pr_review_active_revision_creates_autostart_followup() {
     let chores = db.list_chores(&product_id, None, false).unwrap();
     let followup = chores
         .iter()
-        .find(|c| c.id != parent_id && c.kind == TaskKind::Followup);
+        .find(|c| c.id == revision.id && c.kind == TaskKind::Followup);
     assert!(
         followup.is_some(),
         "a followup must be created for a WIP pr_review revision"
@@ -212,6 +315,143 @@ fn pr_review_active_revision_creates_autostart_followup() {
         followup.unwrap().autostart,
         "WIP pr_review revision must produce autostart followup"
     );
+    let active = db.list_active_revision_executions_for_chain(&parent_id).unwrap();
+    assert_eq!(
+        active.len(),
+        1,
+        "converted row's live revision execution must remain discoverable"
+    );
+    assert_eq!(active[0].id, implementation.id);
+}
+
+/// A completed implementation is already the delivered fix even though the
+/// revision card stays active while its re-review runs. If the parent PR
+/// merges during that window, the parent-close path must settle the existing
+/// row instead of materialising the original review findings again.
+#[test]
+fn pr_review_completed_implementation_is_not_rematerialised_during_re_review() {
+    let db = WorkDb::open(temp_db_path("followup-completed-revision")).unwrap();
+    let product_id = make_revision_product(&db, "fu-completed");
+    let pr_url = FOLLOWUP_PR_URL;
+    let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+    let created_via = format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_completed_findings");
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db
+        .create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(parent_id.clone())
+                .description("Address ALL findings before finalising this revision.")
+                .created_via(created_via.clone())
+                .build(),
+            &checker,
+        )
+        .unwrap();
+    let implementation = db
+        .list_executions(Some(&revision.id))
+        .unwrap()
+        .into_iter()
+        .find(|execution| execution.kind == ExecutionKind::RevisionImplementation)
+        .expect("revision creation must enqueue its implementation");
+    let conn = db.connect().unwrap();
+    conn.execute("UPDATE tasks SET status = 'active' WHERE id = ?1", params![revision.id])
+        .unwrap();
+    conn.execute(
+        "UPDATE work_executions SET status = 'completed', finished_at = ?2 WHERE id = ?1",
+        params![implementation.id, now_string()],
+    )
+    .unwrap();
+    drop(conn);
+
+    db.mark_chore_pr_merged(&parent_id, pr_url).unwrap();
+
+    let conn = db.connect().unwrap();
+    let (count, kind, status): (i64, String, String) = conn
+        .query_row(
+            "SELECT COUNT(*), MIN(kind), MIN(status) FROM tasks WHERE created_via = ?1",
+            params![created_via],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "the re-review race must not mint a second findings row");
+    assert_eq!(kind, "revision", "the delivered revision keeps its identity");
+    assert_eq!(status, "done", "the merged implementation must settle as delivered");
+}
+
+/// If the revision was redispatched after its first implementation
+/// completed (retry, recheck, stale-worker redispatch) and a SECOND
+/// implementation was created after it, the completed-implementation shortcut
+/// must NOT fire — even when the parent-close sweep abandons that later row.
+/// The findings must still be carried forward as a followup rather than
+/// silently marked done.
+#[test]
+fn pr_review_redispatched_revision_with_pending_second_implementation_still_converts() {
+    for second_status in ["running", "queued"] {
+        let db = WorkDb::open(temp_db_path(&format!("followup-redispatched-{second_status}"))).unwrap();
+        let product_id = make_revision_product(&db, &format!("fu-redispatched-{second_status}"));
+        let pr_url = FOLLOWUP_PR_URL;
+        let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+        let created_via = format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_redispatched_{second_status}");
+
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let revision = db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(parent_id.clone())
+                    .description("Address ALL findings before finalising this revision.")
+                    .created_via(created_via.clone())
+                    .build(),
+                &checker,
+            )
+            .unwrap();
+        let first_impl = db
+            .list_executions(Some(&revision.id))
+            .unwrap()
+            .into_iter()
+            .find(|execution| execution.kind == ExecutionKind::RevisionImplementation)
+            .expect("revision creation must enqueue its implementation");
+
+        let conn = db.connect().unwrap();
+        conn.execute("UPDATE tasks SET status = 'active' WHERE id = ?1", params![revision.id])
+            .unwrap();
+        conn.execute(
+            "UPDATE work_executions
+             SET status = 'completed', finished_at = ?2, created_at = '2026-01-01T00:00:00Z'
+             WHERE id = ?1",
+            params![first_impl.id, now_string()],
+        )
+        .unwrap();
+        // A second implementation was redispatched when the parent PR merges.
+        let second_impl_id = next_id("exec");
+        conn.execute(
+            "INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, created_at)
+         VALUES (?1, ?2, 'revision_implementation', ?3, 'git@github.com:spinyfin/mono.git', ?4)",
+            params![second_impl_id, revision.id, second_status, "2026-01-01T00:00:01Z"],
+        )
+        .unwrap();
+        drop(conn);
+
+        db.mark_chore_pr_merged(&parent_id, pr_url).unwrap();
+
+        let conn = db.connect().unwrap();
+        let (count, kind, status): (i64, String, String) = conn
+            .query_row(
+                "SELECT COUNT(*), MIN(kind), MIN(status) FROM tasks WHERE created_via = ?1",
+                params![created_via],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "redispatch must not mint a second findings row");
+        assert_eq!(
+            kind, "followup",
+            "a revision with a still-pending second implementation must be converted to a followup, \
+         not silently marked done"
+        );
+        assert_eq!(
+            status, "todo",
+            "the followup must be dispatchable, not settled as done while findings are unresolved"
+        );
+    }
 }
 
 /// A followup in `in_review` with a `pr_url` must appear in

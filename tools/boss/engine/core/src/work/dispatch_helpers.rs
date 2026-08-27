@@ -2373,23 +2373,29 @@ mod tests {
             followup.description,
         );
 
-        // The revision itself is archived, tombstoned, and its archived_reason
-        // names the followup that superseded it (not a "chore").
+        // Conversion preserves the one work-item identity materialised by the
+        // review execution; the revision row itself is now the followup.
         let conn = db.connect().unwrap();
-        let (status, deleted_at, archived_reason): (String, Option<String>, Option<String>) = conn
+        let (kind, status, deleted_at, archived_reason): (String, String, Option<String>, Option<String>) = conn
             .query_row(
-                "SELECT status, deleted_at, archived_reason FROM tasks WHERE id = ?1",
+                "SELECT kind, status, deleted_at, archived_reason FROM tasks WHERE id = ?1",
                 params![revision_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
-        assert_eq!(status, "archived");
-        assert!(deleted_at.is_some(), "archived revision must be tombstoned");
-        assert_eq!(
-            archived_reason,
-            Some(format!("parent PR merged: superseded by followup {}", followup.id)),
-            "archived_reason must name the followup that superseded the revision",
-        );
+        assert_eq!(followup.id, revision_id);
+        assert_eq!(kind, "followup");
+        assert_eq!(status, "todo");
+        assert!(deleted_at.is_none());
+        assert!(archived_reason.is_none());
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE created_via = ?1",
+                params![created_via],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "both parent-close paths must preserve one findings row");
     }
 
     // ── request_pr_review ───────────────────────────────────────────────────
