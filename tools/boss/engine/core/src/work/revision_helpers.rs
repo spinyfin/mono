@@ -132,6 +132,7 @@ pub(crate) fn assert_parent_revisable_and_insert(
                 existing_task_id = %existing.id,
                 existing_kind = %existing.kind,
                 existing_status = %existing.status,
+                existing_deleted = existing.deleted_at.is_some(),
                 "pr_review findings materialisation already exists; duplicate mint is a no-op",
             );
             return Ok(existing);

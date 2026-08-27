@@ -829,7 +829,7 @@ impl WorkDb {
         // its title or finding count.
         let root = query_task(&conn, chain_root_id)?;
         if let Some((root_short_id, product_id)) = root.and_then(|task| task.short_id.map(|id| (id, task.product_id))) {
-            let mut stmt = conn.prepare_cached(
+            let sql = format!(
                 "SELECT e.id, e.work_item_id, e.kind, e.status, e.repo_remote_url, e.cube_repo_id,
                         e.cube_lease_id, e.cube_workspace_id, e.workspace_path, e.priority,
                         e.preferred_workspace_id, e.created_at, e.started_at, e.finished_at,
@@ -842,12 +842,14 @@ impl WorkDb {
                  WHERE t.kind IN ('chore', 'followup')
                    AND t.origin_task_short_id = ?1
                    AND t.product_id = ?2
-                   AND t.created_via GLOB 'pr_review:*'
+                   AND t.created_via GLOB '{pr_review}*'
                    AND e.kind = 'revision_implementation'
                    AND e.status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                    AND e.cube_lease_id IS NOT NULL
                  ORDER BY e.created_at ASC, e.id ASC",
-            )?;
+                pr_review = CREATED_VIA_PR_REVIEW_PREFIX,
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
             let rows = stmt.query_map(params![root_short_id, product_id], map_execution)?;
             collect_rows(rows).map(|mut v| executions.append(&mut v))?;
         }
