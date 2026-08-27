@@ -61,6 +61,9 @@ extension PlannerRun {
     /// `true` once this run's batch has been released for dispatch.
     var isApplied: Bool { outcome == "applied" }
 
+    /// `true` while the engine still reports this run as in flight.
+    var isRunning: Bool { outcome == "running" }
+
     /// Human-readable summary of the `PLANNER_OUTCOME_*` tag, matching the
     /// language the CLI and the engine's attention items use.
     var outcomeLabel: String {

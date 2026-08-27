@@ -9,10 +9,32 @@ extension ChatViewModel {
         plannerRunsByProjectID[projectID] ?? []
     }
 
-    /// The most recent run, if any has been fetched. The kanban accessory
-    /// keys its icon/tint off this row.
+    /// The most recent run from the project-scoped audit trail. History,
+    /// the inspector, and popover detail key off this list; the kanban
+    /// hourglass uses [[plannerAffordancePresentation(forProjectID:)]] so
+    /// current running state can come from the global snapshot.
     func latestPlannerRun(forProjectID projectID: String) -> PlannerRun? {
         plannerRuns(forProjectID: projectID).first
+    }
+
+    /// Kanban accessory presentation: global snapshot for current running
+    /// identity, project-scoped query for staged/applied/failed history.
+    func plannerAffordancePresentation(forProjectID projectID: String) -> PlannerRunAffordancePresentation? {
+        PlannerRunAffordancePresentation.from(
+            projectID: projectID,
+            cachedRuns: plannerRuns(forProjectID: projectID),
+            backgroundWork: backgroundWork
+        )
+    }
+
+    /// Cached `PlannerRun` matching the affordance identity, or `nil` when
+    /// the hourglass is showing a globally-discovered run the project
+    /// query has not returned yet. The popover waits for this row.
+    func plannerRunForAffordancePopover(forProjectID projectID: String) -> PlannerRun? {
+        guard let presentation = plannerAffordancePresentation(forProjectID: projectID) else {
+            return nil
+        }
+        return plannerRuns(forProjectID: projectID).first { $0.id == presentation.runID }
     }
 
     /// Ask the engine for this project's planner-run audit trail. Safe to
