@@ -35,10 +35,6 @@ final class PlannerRunLiveReconciliationTests: XCTestCase {
             model.plannerRunForAffordancePopover(forProjectID: "proj_1"),
             "popover detail waits for the cached row; the hourglass does not"
         )
-        XCTAssertEqual(
-            model.livePlannerBackgroundItem(forProjectID: "proj_1")?.sourceID,
-            "run_99"
-        )
     }
 
     /// Once the project-scoped row arrives, popover detail binds to the
@@ -245,6 +241,24 @@ final class PlannerRunLiveReconciliationTests: XCTestCase {
         XCTAssertEqual(model.latestPlannerRun(forProjectID: "proj_1")?.id, "run_done")
     }
 
+    /// The newest cached run is `running` (inside the engine's anti-flicker
+    /// gate, or after a disconnect cleared the snapshot) and the snapshot
+    /// has no matching item. The affordance must fall back to the previous
+    /// terminal run's history icon, never disappear entirely.
+    func testCacheOnlyRunningRowFallsBackToHistoryIcon() {
+        let presentation = PlannerRunAffordancePresentation.from(
+            projectID: "proj_1",
+            cachedRuns: [
+                makeRun(id: "run_new", projectID: "proj_1", outcome: "running"),
+                makeRun(id: "run_old", projectID: "proj_1", outcome: "staged"),
+            ],
+            backgroundWork: []
+        )
+        XCTAssertEqual(presentation?.runID, "run_old")
+        XCTAssertEqual(presentation?.isRunning, false)
+        XCTAssertEqual(presentation?.systemImage, "tray.and.arrow.down.fill")
+    }
+
     func testFailedHistoryStillComesFromProjectQuery() {
         let presentation = PlannerRunAffordancePresentation.from(
             projectID: "proj_1",
@@ -254,6 +268,46 @@ final class PlannerRunLiveReconciliationTests: XCTestCase {
         XCTAssertEqual(presentation?.isRunning, false)
         XCTAssertEqual(presentation?.systemImage, "exclamationmark.circle")
         XCTAssertEqual(presentation?.tintKind, .failed)
+    }
+
+    // MARK: - PlannerPopoverWaitState
+
+    /// Click → refresh → the awaited run's cached row arrives → present.
+    func testPopoverWaitStatePresentsWhenAwaitedRunArrives() {
+        var state = PlannerPopoverWaitState()
+        state.beginWaiting(forRunID: "run_1")
+
+        XCTAssertFalse(state.cachedRunArrived(id: "run_other"), "a different run's row must not satisfy the wait")
+        XCTAssertTrue(state.cachedRunArrived(id: "run_1"))
+        XCTAssertFalse(
+            state.cachedRunArrived(id: "run_1"),
+            "the wait is consumed once — a later refire for the same id must not re-present"
+        )
+    }
+
+    /// Click → the refresh reply never lands → a later, unrelated run gets
+    /// cached. The stale wait must not fire the popover for it.
+    func testPopoverWaitStateCancelledWhenPresentationMovesToADifferentRun() {
+        var state = PlannerPopoverWaitState()
+        state.beginWaiting(forRunID: "run_1")
+
+        state.presentationRunIDChanged(to: "run_2")
+
+        XCTAssertFalse(
+            state.cachedRunArrived(id: "run_2"),
+            "the wait was for run_1; once the presentation moved on, no later arrival should present"
+        )
+    }
+
+    /// The presentation disappearing entirely (e.g. disconnect) must also
+    /// cancel a pending wait, not just a move to another run id.
+    func testPopoverWaitStateCancelledWhenPresentationGoesNil() {
+        var state = PlannerPopoverWaitState()
+        state.beginWaiting(forRunID: "run_1")
+
+        state.presentationRunIDChanged(to: nil)
+
+        XCTAssertFalse(state.cachedRunArrived(id: "run_1"))
     }
 
     // MARK: - Helpers

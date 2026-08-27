@@ -136,14 +136,14 @@ struct PlannerRunAffordancePresentation: Equatable {
 
     enum TintKind: Equatable {
         case staged
-        case appliedOrRunning
+        case applied
         case failed
     }
 
     var tint: Color {
         switch tintKind {
         case .staged: return .accentColor
-        case .appliedOrRunning: return .secondary
+        case .applied: return .secondary
         case .failed: return .orange
         }
     }
@@ -173,10 +173,10 @@ struct PlannerRunAffordancePresentation: Equatable {
             }
             return running(runID: live.sourceID)
         }
-        guard let latest = cachedRuns.first, !latest.isRunning else {
+        guard let history = cachedRuns.first(where: { !$0.isRunning }) else {
             return nil
         }
-        return from(cachedRun: latest)
+        return from(cachedRun: history)
     }
 
     /// Run identity the hourglass currently claims is running, or `nil`.
@@ -204,17 +204,22 @@ struct PlannerRunAffordancePresentation: Equatable {
             tooltip: label,
             accessibilityLabel: "Planner: \(label)",
             isRunning: true,
-            tintKind: .appliedOrRunning
+            tintKind: .applied
         )
     }
 
+    /// Both call sites guard `!isRunning` before reaching here, so this
+    /// path never renders the live hourglass — that comes from
+    /// `running(runID:)` instead. `isRunning` is hardcoded `false`
+    /// accordingly, and the outcome maps below cover only the terminal
+    /// `PLANNER_OUTCOME_*` values a cached row can carry.
     private static func from(cachedRun run: PlannerRun) -> PlannerRunAffordancePresentation {
         PlannerRunAffordancePresentation(
             runID: run.id,
             systemImage: systemImage(for: run.outcome),
             tooltip: run.outcomeLabel,
             accessibilityLabel: "Planner: \(run.outcomeLabel)",
-            isRunning: run.isRunning,
+            isRunning: false,
             tintKind: tintKind(for: run.outcome)
         )
     }
@@ -223,7 +228,6 @@ struct PlannerRunAffordancePresentation: Equatable {
         switch outcome {
         case "staged": return "tray.and.arrow.down.fill"
         case "applied": return "checkmark.circle"
-        case "running": return "hourglass"
         default: return "exclamationmark.circle"
         }
     }
@@ -231,9 +235,41 @@ struct PlannerRunAffordancePresentation: Equatable {
     private static func tintKind(for outcome: String) -> TintKind {
         switch outcome {
         case "staged": return .staged
-        case "applied", "running": return .appliedOrRunning
+        case "applied": return .applied
         default: return .failed
         }
+    }
+}
+
+/// Tracks which run [[PlannerRunAffordance]] is waiting to open the popover
+/// for, so a cached row that arrives late for a *different* run (the
+/// refresh reply never lands, or lands after the user has moved on) cannot
+/// pop the popover open unprompted. Kept as a small Equatable value type,
+/// separate from the view, so the click → refresh → arrival state machine
+/// is testable without a SwiftUI host.
+struct PlannerPopoverWaitState: Equatable {
+    private var awaitedRunID: String?
+
+    /// Call when the user clicks the affordance with no cached row yet.
+    mutating func beginWaiting(forRunID runID: String?) {
+        awaitedRunID = runID
+    }
+
+    /// Call when the cached popover run's id changes. Returns `true` when
+    /// the awaited run just became available and the popover should open.
+    mutating func cachedRunArrived(id: String?) -> Bool {
+        guard let awaitedRunID, id == awaitedRunID else { return false }
+        self.awaitedRunID = nil
+        return true
+    }
+
+    /// Call when the affordance's running identity changes. If it now
+    /// points at a different run (or none at all) than the one we're
+    /// waiting for, the wait is stale and must be cancelled — otherwise a
+    /// later, unrelated arrival would still be treated as a match.
+    mutating func presentationRunIDChanged(to runID: String?) {
+        guard let awaitedRunID, runID != awaitedRunID else { return }
+        self.awaitedRunID = nil
     }
 }
 
@@ -248,7 +284,7 @@ struct PlannerRunAffordance: View {
     let project: WorkProject
     @State private var isPopoverPresented = false
     @State private var hasRequestedRuns = false
-    @State private var waitingForCachedRun = false
+    @State private var popoverWaitState = PlannerPopoverWaitState()
 
     private var presentation: PlannerRunAffordancePresentation? {
         model.plannerAffordancePresentation(forProjectID: project.id)
@@ -284,14 +320,12 @@ struct PlannerRunAffordance: View {
             model.refreshPlannerRuns(projectID: project.id)
         }
         .onChange(of: popoverRun?.id) { _, newID in
-            guard waitingForCachedRun, newID != nil else { return }
-            waitingForCachedRun = false
-            isPopoverPresented = true
+            if popoverWaitState.cachedRunArrived(id: newID) {
+                isPopoverPresented = true
+            }
         }
         .onChange(of: presentation?.runID) { _, newID in
-            if waitingForCachedRun, newID == nil {
-                waitingForCachedRun = false
-            }
+            popoverWaitState.presentationRunIDChanged(to: newID)
         }
     }
 
@@ -303,7 +337,7 @@ struct PlannerRunAffordance: View {
             isPopoverPresented = true
             return
         }
-        waitingForCachedRun = true
+        popoverWaitState.beginWaiting(forRunID: presentation?.runID)
         model.refreshPlannerRuns(projectID: project.id)
     }
 }

@@ -17,14 +17,6 @@ extension ChatViewModel {
         plannerRuns(forProjectID: projectID).first
     }
 
-    /// Live `project_planner` snapshot item for this project, if the
-    /// engine currently attests one. `sourceID` is `planner_runs.id`.
-    func livePlannerBackgroundItem(forProjectID projectID: String) -> BackgroundWorkItem? {
-        backgroundWork.first { item in
-            item.isProjectPlanner && item.projectID == projectID
-        }
-    }
-
     /// Kanban accessory presentation: global snapshot for current running
     /// identity, project-scoped query for staged/applied/failed history.
     func plannerAffordancePresentation(forProjectID projectID: String) -> PlannerRunAffordancePresentation? {
