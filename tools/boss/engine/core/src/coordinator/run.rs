@@ -1029,4 +1029,89 @@ impl ExecutionCoordinator {
         }
         Ok(())
     }
+
+    /// Re-enter the pane-spawn path for a `running` execution that already
+    /// holds a cube lease. Used by startup recovery when the previous engine
+    /// process died after `start_execution_run` and before `start_worker`.
+    ///
+    /// Skips lease/repo-ensure/`start_execution_run` (those already
+    /// committed). Claims a pool slot, reconstructs the lease from the
+    /// execution row, and hands off to [`Self::run_execution`] the same way
+    /// a successful `schedule_execution` does after `run_started`.
+    pub(crate) async fn resume_pane_spawn_for_running_execution(
+        self: &Arc<Self>,
+        execution: &WorkExecution,
+    ) -> Result<()> {
+        let lease_id = execution
+            .cube_lease_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("cannot resume pane spawn for {}: missing cube_lease_id", execution.id))?;
+        let workspace_id = execution.cube_workspace_id.as_deref().ok_or_else(|| {
+            anyhow!(
+                "cannot resume pane spawn for {}: missing cube_workspace_id",
+                execution.id
+            )
+        })?;
+        let workspace_path = execution
+            .workspace_path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| anyhow!("cannot resume pane spawn for {}: missing workspace_path", execution.id))?;
+
+        let work_item = self.resolve_execution_work_item(execution)?;
+        let run = self
+            .work_db
+            .list_runs(&execution.id)?
+            .into_iter()
+            .rev()
+            .find(|run| run.status != "failed")
+            .ok_or_else(|| {
+                anyhow!(
+                    "cannot resume pane spawn for {}: no agent-session work_runs row",
+                    execution.id
+                )
+            })?;
+
+        let pool = self.pool_for_execution(execution);
+        let worker_id = match self.work_db.latest_run_agent_id_for_execution(&execution.id)? {
+            Some(agent_id) if pool.reclaim_slot(&agent_id, &execution.id).await => agent_id,
+            _ => pool
+                .claim_worker(&execution.id, execution.cube_workspace_id.as_deref())
+                .await
+                .ok_or_else(|| {
+                    anyhow!(
+                        "cannot resume pane spawn for {}: no free worker slot in the {} pool",
+                        execution.id,
+                        self.attributed_pool_label(execution)
+                    )
+                })?,
+        };
+
+        let host = self
+            .work_db
+            .latest_run_host_for_execution(&execution.id)?
+            .unwrap_or_else(|| "local".to_owned());
+        if host != "local" {
+            return Err(anyhow!(
+                "cannot resume pane spawn for {}: host `{host}` is not local (remote reattach owns that path)",
+                execution.id
+            ));
+        }
+        let adapter = self.host_adapter();
+
+        let lease = CubeWorkspaceLease {
+            lease_id: lease_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            workspace_path: PathBuf::from(workspace_path),
+            dirty_verified: None,
+        };
+        let execution = execution.clone();
+        let coordinator = Arc::clone(self);
+        tokio::spawn(async move {
+            coordinator
+                .run_execution(execution, run, work_item, worker_id, lease, None, adapter)
+                .await;
+        });
+        Ok(())
+    }
 }

@@ -748,3 +748,63 @@ async fn cancelled_during_spawn_releases_lease_and_skips_completion() {
     // The pool slot is returned so dispatch can proceed.
     assert_eq!(coordinator.worker_pool().idle_count().await, 1);
 }
+
+/// Engine restart between `run_started` and pane spawn: the execution is
+/// already `running` with a lease, so `schedule_execution` cannot be
+/// re-entered. `resume_pane_spawn_for_running_execution` must hand the
+/// existing row back to the runner without re-leasing.
+#[tokio::test]
+async fn resume_pane_spawn_reenters_the_runner_for_a_running_leased_execution() {
+    let (_dir, db) = open_db_arc();
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let chore = create_test_chore_manual(&db, product.id.clone(), "stranded");
+    db.reconcile_product_executions(&product.id).unwrap();
+    db.request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    let exec = db.list_executions(Some(&chore.id)).unwrap().into_iter().next().unwrap();
+    let (exec, _run) = db
+        .start_execution_run(
+            &exec.id,
+            "worker-1",
+            "mono",
+            "lease-stranded",
+            "ws-stranded",
+            "/tmp/ws-stranded",
+        )
+        .unwrap();
+
+    let runner = Arc::new(FakeExecutionRunner {
+        slot_id: Some(1),
+        ..FakeExecutionRunner::default()
+    });
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(2),
+        Arc::new(FakeCubeClient::default()),
+        runner.clone(),
+    ));
+
+    coordinator
+        .resume_pane_spawn_for_running_execution(&exec)
+        .await
+        .expect("resume must accept a running leased execution");
+
+    let mut saw_call = false;
+    for _ in 0..100 {
+        let calls = runner.calls.lock().await;
+        if calls.iter().any(|(_, id, _, _)| id == &exec.id) {
+            saw_call = true;
+            break;
+        }
+        drop(calls);
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert!(saw_call, "the runner must be invoked for the already-running execution");
+    assert_eq!(db.get_execution(&exec.id).unwrap().status, ExecutionStatus::Running);
+    assert_eq!(
+        db.get_execution(&exec.id).unwrap().cube_lease_id.as_deref(),
+        Some("lease-stranded"),
+        "resume must keep the already-adopted lease"
+    );
+}

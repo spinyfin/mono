@@ -11,6 +11,8 @@
 
 use super::*;
 
+use std::collections::HashSet;
+
 use boss_protocol::CreateAttentionItemInput;
 
 use crate::agent_jsonl_progress::IngressCheckpointStore;
@@ -544,21 +546,115 @@ impl ServerState {
     /// both need the same answer to the same question for the same reason, so
     /// there is one round-trip shape rather than two.
     pub(super) async fn hosted_pane_slot_for_run(&self, run_id: &str) -> Option<u8> {
-        let request = EngineToAppRequest::ListHostedPanes(ListHostedPanesInput {});
-        match self.send_to_app(request, Duration::from_secs(5)).await {
-            Ok(EngineToAppResponse::ListHostedPanes { result: Ok(result) }) => result
-                .panes
+        match self.list_hosted_panes().await {
+            Ok(panes) => panes
                 .into_iter()
                 .find(|pane| pane.run_id == run_id)
                 .map(|pane| pane.slot_id),
-            other => {
-                tracing::debug!(
-                    run_id,
-                    ?other,
-                    "readopt: app could not be asked which slot hosts this run",
-                );
+            Err(err) => {
+                tracing::debug!(run_id, %err, "readopt: app could not be asked which slot hosts this run");
                 None
             }
         }
+    }
+
+    /// One authoritative app round-trip for the hosted-pane inventory.
+    async fn list_hosted_panes(&self) -> Result<Vec<crate::protocol::HostedPaneEntry>, String> {
+        let request = EngineToAppRequest::ListHostedPanes(ListHostedPanesInput {});
+        match self.send_to_app(request, Duration::from_secs(5)).await {
+            Ok(EngineToAppResponse::ListHostedPanes { result: Ok(result) }) => Ok(result.panes),
+            Ok(EngineToAppResponse::ListHostedPanes { result: Err(err) }) => {
+                Err(format!("app rejected list_hosted_panes: {err}"))
+            }
+            Ok(other) => Err(format!("unexpected list_hosted_panes response: {other:?}")),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    /// Run ids the app currently hosts a pane for. `Err` when the app
+    /// could not be asked — callers must not treat that as "no panes".
+    pub(crate) async fn hosted_pane_run_ids(&self) -> Result<HashSet<String>, String> {
+        self.list_hosted_panes()
+            .await
+            .map(|panes| panes.into_iter().map(|pane| pane.run_id).collect())
+    }
+
+    /// Re-drive pane spawn for `running` executions whose cube lease was
+    /// re-adopted across the restart but whose pane was never issued.
+    /// See [`crate::startup_pane_reconcile`].
+    pub(crate) async fn reconcile_unspawned_running_panes(
+        &self,
+        tmux_adopted: &HashSet<String>,
+        probe_verdicts: &std::collections::HashMap<String, crate::run_reconcile::RunReconcileVerdict>,
+        candidate_ids: Option<&HashSet<String>>,
+    ) {
+        let in_flight = match self.work_db.list_in_flight_executions() {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::error!(
+                    error = %format!("{err:#}"),
+                    "startup pane reconcile: failed to list in-flight executions"
+                );
+                return;
+            }
+        };
+        let in_flight: Vec<_> = in_flight
+            .into_iter()
+            .filter(|execution| candidate_ids.is_none_or(|ids| ids.contains(&execution.id)))
+            .collect();
+        if in_flight.is_empty() {
+            return;
+        }
+        let tmux_hosted_ids = in_flight
+            .iter()
+            .filter(|execution| {
+                let pool = self.execution_coordinator.attributed_pool_label(execution);
+                self.settings.tmux_hosting_enabled_for(pool)
+            })
+            .map(|execution| execution.id.clone())
+            .collect();
+        let oracle = crate::startup_pane_reconcile::EnginePaneOracle {
+            live_states: Some(self.live_worker_states.clone()),
+            tmux_adopted: tmux_adopted.clone(),
+            hosted_run_ids: self.hosted_pane_run_ids().await,
+            tmux_hosted_ids,
+        };
+        let outcome = crate::startup_pane_reconcile::reconcile_unspawned_running(
+            self.work_db.as_ref(),
+            &in_flight,
+            probe_verdicts,
+            &oracle,
+            &self.execution_coordinator,
+            self.dispatch_events.as_ref(),
+        )
+        .await;
+        if !outcome.undetermined_execution_ids.is_empty() {
+            self.startup_pane_retry_ids
+                .lock()
+                .expect("startup pane retry lock poisoned")
+                .extend(outcome.undetermined_execution_ids);
+        }
+    }
+
+    /// Retry only executions whose startup pass could not query the app.
+    /// Taking the cohort before awaiting makes rapid registrations harmless:
+    /// at most one registration can re-drive a particular startup row.
+    pub(crate) async fn retry_startup_pane_reconcile(&self) {
+        let candidate_ids = std::mem::take(
+            &mut *self
+                .startup_pane_retry_ids
+                .lock()
+                .expect("startup pane retry lock poisoned"),
+        );
+        if candidate_ids.is_empty() {
+            return;
+        }
+        let verdicts = candidate_ids
+            .iter()
+            .cloned()
+            .map(|id| (id, crate::run_reconcile::RunReconcileVerdict::Live))
+            .collect();
+        self.reconcile_unspawned_running_panes(&HashSet::new(), &verdicts, Some(&candidate_ids))
+            .await;
     }
 }
