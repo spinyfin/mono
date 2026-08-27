@@ -364,6 +364,10 @@ private struct WorkerSettingsPane: View {
         chatModel.engineSettings.filter { $0.key == "coordinator.direct_developer_mode" }
     }
 
+    private var tmuxHostingSetting: EngineSetting? {
+        chatModel.engineSettings.first { $0.key == "workers.tmux_hosting" }
+    }
+
     var body: some View {
         Form {
             if chatModel.engineSettings.isEmpty {
@@ -389,6 +393,22 @@ private struct WorkerSettingsPane: View {
                         }
                     } header: {
                         Text("Workers")
+                    }
+                }
+                if let setting = tmuxHostingSetting {
+                    Section {
+                        SettingToggleRow(setting: setting) { enabled in
+                            chatModel.setEngineSetting(key: setting.key, enabled: enabled)
+                        }
+                    } header: {
+                        Text("Session Hosting")
+                    } footer: {
+                        Text(
+                            "Applies to worker panes only (review, automation, interactive) — the " +
+                            "coordinator's own session is always tmux-hosted regardless of this setting."
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     }
                 }
                 Section {
@@ -470,6 +490,8 @@ private struct SettingToggleRow: View {
             return "Default new PRs to draft mode"
         case "coordinator.direct_developer_mode":
             return "Direct Boss developer mode"
+        case "workers.tmux_hosting":
+            return "Host workers in tmux"
         default:
             return key
         }

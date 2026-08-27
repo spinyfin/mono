@@ -772,9 +772,22 @@ final class ChatViewModel: ObservableObject {
     }
 
     /// Ask the engine for the current per-installation settings
-    /// snapshot. Called by the Settings window on appear.
+    /// snapshot. Called by the Settings window on appear, and on every
+    /// (re)connect (see the `.connected` arm of `handle`) so
+    /// `tmuxHostingEnabled` has an answer for the Workers grid badge
+    /// without requiring the operator to open Settings first.
     func refreshSettings() {
         engine.sendGetSettings()
+    }
+
+    /// Whether `workers.tmux_hosting` is currently on — the operator-facing
+    /// switch controlling whether worker panes are hosted in durable tmux
+    /// sessions or the legacy app-owned pty path. `false` (including while
+    /// `engineSettings` hasn't loaded yet) is the safe default: the Workers
+    /// grid's "legacy hosting" badge should show whenever this cannot
+    /// positively confirm tmux hosting is on, never the other way around.
+    var tmuxHostingEnabled: Bool {
+        engineSettings.first { $0.key == "workers.tmux_hosting" }?.enabled ?? false
     }
 
     /// Ask the engine for a fresh engine-health snapshot. Also called

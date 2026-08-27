@@ -865,8 +865,19 @@ enum AgentsAction {
 #[derive(Subcommand, Debug)]
 enum DoctorAction {
     /// Verify that the tmux required for durable worker sessions is installed,
-    /// executable, and supports session environment variables.
-    Tmux,
+    /// executable, and supports session environment variables. Also reports
+    /// which worker pools currently have `workers.tmux_hosting` enabled,
+    /// read directly from `settings.toml` — one of the three ship-gated
+    /// visibility surfaces for the tmux-hosting migration (alongside the
+    /// dispatch-event stamp and the Workers grid badge), so an
+    /// operator-set hosting mode is never indistinguishable from a silent
+    /// fallback.
+    Tmux {
+        /// Boss state root to read `settings.toml` from. Defaults to the
+        /// standard per-user location; override for a test-fixture engine.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1307,8 +1318,8 @@ async fn dispatch(cli: Cli) -> Result<()> {
             action: LiveStatusAction::Debug,
         } => live_status_debug(&cli.socket_path, cli.json).await,
         Command::Doctor {
-            action: DoctorAction::Tmux,
-        } => doctor::run_tmux_preflight(cli.json).await,
+            action: DoctorAction::Tmux { state_root },
+        } => doctor::run_tmux_preflight(cli.json, state_root).await,
         Command::Dispatch {
             action:
                 DispatchAction::Tail {

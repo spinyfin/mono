@@ -102,11 +102,38 @@ struct WorkersDetailView: View {
             }
             .pickerStyle(.segmented)
             .frame(maxWidth: 460)
+            if !liveStatusModel.tmuxHostingEnabled {
+                LegacyHostingBadge()
+            }
             Spacer()
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+}
+
+/// Shown on the Workers grid whenever `workers.tmux_hosting` is off, so an
+/// operator-set hosting mode is never silently indistinguishable from the
+/// durability gap it replaces — one of the tmux-hosting migration's three
+/// required visibility surfaces (alongside the dispatch-event stamp and
+/// `bossctl doctor`).
+private struct LegacyHostingBadge: View {
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "exclamationmark.triangle.fill")
+            Text("Legacy pane hosting")
+        }
+        .font(.caption.weight(.medium))
+        .foregroundStyle(.orange)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(Color.orange.opacity(0.15))
+        .clipShape(Capsule())
+        .help(
+            "Worker panes are hosted directly by the app instead of tmux, so they will not " +
+            "survive an app or engine restart. Enable \"Host workers in tmux\" in Settings ▸ Workers."
+        )
     }
 }
 

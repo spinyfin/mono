@@ -943,3 +943,63 @@ fn the_trace_scan_keeps_in_scope_records_and_skips_unreadable_lines() {
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0]["fields"]["execution_id"], Value::String("exec_trace".into()));
 }
+
+/// Scratch state root for `tmux_hosting_pool_report` tests, optionally
+/// carrying a `settings.toml`.
+fn hosting_state_root(name: &str, settings_toml: Option<&str>) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("bossctl-hosting-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    if let Some(contents) = settings_toml {
+        std::fs::write(root.join("settings.toml"), contents).unwrap();
+    }
+    root
+}
+
+/// No `settings.toml` at all is not an error — every pool reads as the
+/// default legacy (non-tmux) path, matching `SettingsStore::load`'s
+/// missing-file handling.
+#[test]
+fn hosting_report_defaults_to_every_pool_disabled() {
+    let root = hosting_state_root("missing", None);
+    let report = tmux_hosting_pool_report(Some(root.clone())).unwrap().to_json();
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert_eq!(report["review"], Value::Bool(false));
+    assert_eq!(report["automation"], Value::Bool(false));
+    assert_eq!(report["interactive"], Value::Bool(false));
+    assert_eq!(report["any_enabled"], Value::Bool(false));
+}
+
+/// A pool set persisted by the operator toggle (or a hand-edited
+/// settings.toml) is reported per-pool exactly as configured — including a
+/// partial set the all-or-nothing UI switch itself could never produce, the
+/// shape a staged acceptance sweep leaves mid-migration.
+#[test]
+fn hosting_report_reflects_a_partial_pool_set() {
+    let root = hosting_state_root("partial", Some("\"workers.tmux_hosting\" = [\"review\"]\n"));
+    let report = tmux_hosting_pool_report(Some(root.clone())).unwrap().to_json();
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert_eq!(report["review"], Value::Bool(true));
+    assert_eq!(report["automation"], Value::Bool(false));
+    assert_eq!(report["interactive"], Value::Bool(false));
+    assert_eq!(report["any_enabled"], Value::Bool(true));
+}
+
+/// A `settings.toml` that fails to parse (or names an unrecognised pool)
+/// must not take down the rest of the tmux preflight — it is reported as a
+/// hosting-report error rather than propagated, so `bossctl doctor tmux`
+/// still answers about tmux itself when the settings file is broken.
+#[test]
+fn hosting_report_carries_the_error_instead_of_propagating_it() {
+    let root = hosting_state_root("broken", Some("\"workers.tmux_hosting\" = [\"not-a-pool\"]\n"));
+    let report = tmux_hosting_pool_report(Some(root.clone())).unwrap().to_json();
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert_eq!(report["review"], Value::Bool(false));
+    assert_eq!(report["automation"], Value::Bool(false));
+    assert_eq!(report["interactive"], Value::Bool(false));
+    assert_eq!(report["any_enabled"], Value::Bool(false));
+    assert!(report["error"].as_str().unwrap().contains("not-a-pool"));
+}

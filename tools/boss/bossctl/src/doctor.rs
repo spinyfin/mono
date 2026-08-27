@@ -11,17 +11,92 @@
 //! `stage_stalled.details.elapsed_in_stage_ms`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use boss_engine::dispatch_events::DispatchEvent;
 use boss_engine::dispatch_reader::{self, DamagedLine, is_terminal_event};
+use boss_engine::settings::{SettingsStore, TmuxHostingPoolSnapshot};
 use serde::Serialize;
 use serde_json::Value;
 
+/// Result of [`tmux_hosting_pool_report`]: either the real per-pool snapshot,
+/// or the reason `settings.toml` could not be read. A load failure (bad TOML,
+/// an unrecognised pool name) must not take down the rest of the tmux
+/// preflight — it is reported alongside the other facts instead, the same
+/// way the engine itself treats a bad settings file as non-fatal at startup
+/// (logs a warning, falls back to defaults) rather than refusing to start.
+enum HostingReport {
+    Snapshot(TmuxHostingPoolSnapshot),
+    LoadError(String),
+}
+
+/// Reads `workers.tmux_hosting` straight from `settings.toml` under
+/// `state_root` (or the standard per-user location when `None`). A missing
+/// `settings.toml` is not an error — it means every pool is on the default
+/// legacy app-hosted path, same as `SettingsStore::load` treats it. A
+/// present-but-unreadable file is reported as [`HostingReport::LoadError`]
+/// rather than propagated, so the rest of the preflight still runs.
+fn tmux_hosting_pool_report(state_root: Option<PathBuf>) -> Result<HostingReport> {
+    let root = crate::resolve_state_root(state_root)?;
+    let path = SettingsStore::default_path(&root);
+    let store = SettingsStore::new(path);
+    match store.load() {
+        Ok(()) => Ok(HostingReport::Snapshot(store.tmux_hosting_pool_snapshot())),
+        Err(err) => Ok(HostingReport::LoadError(format!("{err:#}"))),
+    }
+}
+
+impl HostingReport {
+    fn to_json(&self) -> Value {
+        match self {
+            Self::Snapshot(pools) => serde_json::json!({
+                "review": pools.review,
+                "automation": pools.automation,
+                "interactive": pools.interactive,
+                "any_enabled": pools.review || pools.automation || pools.interactive,
+            }),
+            Self::LoadError(err) => serde_json::json!({
+                "review": false,
+                "automation": false,
+                "interactive": false,
+                "any_enabled": false,
+                "error": err,
+            }),
+        }
+    }
+}
+
+/// Text-mode rendering of [`tmux_hosting_pool_report`]'s output, shared by
+/// the ready and unavailable branches of `run_tmux_preflight` so the pool
+/// state is visible either way — an operator who enabled a pool while tmux
+/// itself is unavailable needs to see both facts together, not just one.
+fn print_hosting_report(hosting: &HostingReport) {
+    match hosting {
+        HostingReport::Snapshot(pools) => println!(
+            "tmux hosting — review: {}, automation: {}, interactive: {}",
+            pool_word(pools.review),
+            pool_word(pools.automation),
+            pool_word(pools.interactive),
+        ),
+        HostingReport::LoadError(err) => {
+            println!("tmux hosting — could not read settings.toml: {err}");
+        }
+    }
+}
+
+fn pool_word(enabled: bool) -> &'static str {
+    if enabled { "enabled" } else { "disabled" }
+}
+
 /// Run the same tmux preflight as engine startup so an operator can diagnose
-/// a blocked local dispatcher without first starting the app.
-pub async fn run_tmux_preflight(json: bool) -> Result<()> {
+/// a blocked local dispatcher without first starting the app, plus which
+/// worker pools currently have `workers.tmux_hosting` enabled. The pool
+/// state is read straight from `settings.toml` on disk — no engine RPC —
+/// consistent with `Doctor`'s "local runtime diagnostics" contract, so this
+/// still answers when the engine is wedged or not running.
+pub async fn run_tmux_preflight(json: bool, state_root: Option<PathBuf>) -> Result<()> {
+    let hosting = tmux_hosting_pool_report(state_root)?;
     let preflight = boss_engine::tmux_preflight::TmuxPreflight::probe().await;
     // Reported alongside the version because a usable tmux binary is only
     // half of "tmux works": without a UTF-8 locale, tmux sanitizes the
@@ -43,6 +118,7 @@ pub async fn run_tmux_preflight(json: bool) -> Result<()> {
                         "locale_inherited": locale.inherited_summary(),
                         "locale_has_utf8": locale.has_utf8_locale,
                         "locale_forced_for_children": locale.forced.map(|(n, v)| format!("{n}={v}")),
+                        "hosting": hosting.to_json(),
                     })
                 );
             } else {
@@ -53,14 +129,19 @@ pub async fn run_tmux_preflight(json: bool) -> Result<()> {
                 } else {
                     println!("locale charset: none inherited — children get LC_CTYPE=UTF-8 forced");
                 }
+                print_hosting_report(&hosting);
             }
             Ok(())
         }
         boss_engine::tmux_preflight::TmuxPreflight::Unavailable { reason } => {
             if json {
-                println!("{}", serde_json::json!({ "ready": false, "reason": reason }));
+                println!(
+                    "{}",
+                    serde_json::json!({ "ready": false, "reason": reason, "hosting": hosting.to_json() })
+                );
             } else {
                 eprintln!("tmux unavailable: {reason}");
+                print_hosting_report(&hosting);
             }
             anyhow::bail!("tmux preflight failed")
         }
