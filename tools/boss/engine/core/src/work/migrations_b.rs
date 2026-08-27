@@ -2859,6 +2859,25 @@ pub(crate) fn migrate_pr_review_verdicts_table(conn: &Connection) -> Result<()> 
     Ok(())
 }
 
+/// Stamp [`super::review_verdicts::PR_REVIEW_VERDICTS_SINCE_METADATA_KEY`]
+/// once: the unix-seconds moment this engine first knew about
+/// `pr_review_verdicts`. Completed `pr_review` rows created before this
+/// value cannot be classified as "completed without a verdict" — the table
+/// did not exist to receive one, and there is no backfill. Idempotent:
+/// subsequent startups leave an existing stamp alone, including engines
+/// that already created the table on a prior version of this migration
+/// chain (those stamp *now*, which still classifies every already-completed
+/// row as pre-table).
+pub(crate) fn migrate_stamp_pr_review_verdicts_since(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT INTO metadata (key, value)
+         SELECT ?1, CAST(strftime('%s','now') AS INTEGER)
+         WHERE NOT EXISTS (SELECT 1 FROM metadata WHERE key = ?1)",
+        params![super::review_verdicts::PR_REVIEW_VERDICTS_SINCE_METADATA_KEY],
+    )?;
+    Ok(())
+}
+
 /// Add `products.design_guidance` — an optional markdown block injected
 /// into the `[product-design-guidance]` section of the `kind = 'design'` /
 /// `kind = 'design_postmortem'` prompt directive only. `NULL` / empty → no

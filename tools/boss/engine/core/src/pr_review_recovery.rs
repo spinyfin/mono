@@ -9,7 +9,8 @@
 //! execution that dies silently means an open PR can reach merge with NO
 //! review and nothing in the UI saying so. This sweep closes that gap:
 //! it detects a `pr_review` execution that either reached a dead terminal
-//! state or completed without an informative `ReviewResult` (see
+//! state or completed without a durable judgement (`gave_up`, or a missing
+//! post-verdicts-table verdict — see
 //! [`crate::work::WorkDb::list_dead_pr_review_candidates`]) and
 //! re-enqueues a fresh review pass while the PR is still open.
 //!
@@ -642,5 +643,209 @@ mod tests {
             "a normally-completed review must not be treated as dead"
         );
         assert!(sink.events().await.is_empty());
+    }
+
+    fn in_review_chore_with_pr(db: &WorkDb, pr_url: &str) -> String {
+        let product_id = create_test_product_with_repo(db, "test-product", Some("https://github.com/test/repo")).id;
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product_id)
+                    .name("test chore")
+                    .build(),
+            )
+            .unwrap();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".to_owned()),
+                pr_url: Some(pr_url.to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        chore.id
+    }
+
+    fn completed_pr_review_with_verdict(
+        db: &WorkDb,
+        work_item_id: &str,
+        gate_outcome: &'static str,
+        created_at: Option<&str>,
+    ) -> String {
+        let execution = db
+            .create_execution(
+                boss_protocol::CreateExecutionInput::builder()
+                    .work_item_id(work_item_id.to_owned())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Completed)
+                    .build(),
+            )
+            .unwrap();
+        if let Some(created_at) = created_at {
+            db.connect()
+                .unwrap()
+                .execute(
+                    "UPDATE work_executions SET created_at = ?2 WHERE id = ?1",
+                    rusqlite::params![execution.id, created_at],
+                )
+                .unwrap();
+        }
+        crate::work::WorkDb::insert_review_verdict_in_tx(
+            &db.connect().unwrap(),
+            &execution.id,
+            work_item_id,
+            &crate::work::ReviewVerdictInput {
+                head_sha: Some("reviewed-head".to_owned()),
+                findings_count: 0,
+                revision_warranted: gate_outcome == crate::work::REVIEW_GATE_OUTCOME_DROPPED_DUPLICATE_HEAD,
+                gate_outcome,
+            },
+        )
+        .unwrap();
+        execution.id
+    }
+
+    /// `dropped_duplicate_head` produced a ReviewResult; the earlier covering
+    /// pass already reviewed the head. Recovery must not treat it as dead or
+    /// yank the card out of Review.
+    #[tokio::test]
+    async fn dropped_duplicate_head_is_not_a_dead_review() {
+        let (_dir, db) = open_db();
+        let work_item_id = in_review_chore_with_pr(&db, "https://github.com/test/repo/pull/11");
+        completed_pr_review_with_verdict(
+            &db,
+            &work_item_id,
+            crate::work::REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
+            Some("10"),
+        );
+        let dropped_id = completed_pr_review_with_verdict(
+            &db,
+            &work_item_id,
+            crate::work::REVIEW_GATE_OUTCOME_DROPPED_DUPLICATE_HEAD,
+            None,
+        );
+
+        assert!(
+            !db.list_dead_pr_review_candidates()
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate.work_item_id == work_item_id),
+            "dropped_duplicate_head must not be a dead-review candidate"
+        );
+        assert_eq!(
+            db.count_recent_uninformative_pr_review_executions(&work_item_id, 0)
+                .unwrap(),
+            0,
+            "dropped_duplicate_head must not count toward the uninformative churn budget"
+        );
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let outcome = run_one_pass(db.as_ref(), coordinator, sink.as_ref(), &checker).await;
+
+        assert_eq!(outcome.refired, 0);
+        let task = match db.get_work_item(&work_item_id).unwrap() {
+            crate::work::WorkItem::Chore(task) | crate::work::WorkItem::Task(task) => task,
+            other => panic!("expected chore, got {other:?}"),
+        };
+        assert_eq!(task.status, crate::work::TaskStatus::InReview);
+        assert!(
+            !db.list_executions(Some(&work_item_id))
+                .unwrap()
+                .iter()
+                .any(|execution| execution.kind == ExecutionKind::PrReview
+                    && execution.status == ExecutionStatus::Ready
+                    && execution.id != dropped_id)
+        );
+    }
+
+    /// Completed pr_review rows that predate `pr_review_verdicts` have no
+    /// verdict row; they were a finished review under the old completed-
+    /// status-only signal and must not become dead candidates on upgrade.
+    #[tokio::test]
+    async fn pre_verdicts_table_completed_review_is_not_dead() {
+        let (_dir, db) = open_db();
+        let work_item_id = in_review_chore_with_pr(&db, "https://github.com/test/repo/pull/12");
+        let execution = db
+            .create_execution(
+                boss_protocol::CreateExecutionInput::builder()
+                    .work_item_id(work_item_id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Completed)
+                    .build(),
+            )
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET created_at = '1' WHERE id = ?1",
+                rusqlite::params![execution.id],
+            )
+            .unwrap();
+
+        assert!(
+            !db.list_dead_pr_review_candidates()
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate.work_item_id == work_item_id),
+            "a completed pr_review created before pr_review_verdicts existed must not be dead"
+        );
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let outcome = run_one_pass(db.as_ref(), coordinator, sink.as_ref(), &checker).await;
+        assert_eq!(outcome.refired, 0);
+        let task = match db.get_work_item(&work_item_id).unwrap() {
+            crate::work::WorkItem::Chore(task) | crate::work::WorkItem::Task(task) => task,
+            other => panic!("expected chore, got {other:?}"),
+        };
+        assert_eq!(task.status, crate::work::TaskStatus::InReview);
+    }
+
+    /// A completed pr_review created after the verdicts table existed, with
+    /// no verdict row, is a genuine missing judgement and stays a dead
+    /// candidate.
+    #[test]
+    fn post_verdicts_completed_without_verdict_is_dead() {
+        let (_dir, db) = open_db();
+        let work_item_id = in_review_chore_with_pr(&db, "https://github.com/test/repo/pull/13");
+        let stamp: i64 = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM metadata WHERE key = ?1",
+                rusqlite::params!["pr_review_verdicts_since"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let execution = db
+            .create_execution(
+                boss_protocol::CreateExecutionInput::builder()
+                    .work_item_id(work_item_id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Completed)
+                    .build(),
+            )
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET created_at = ?2 WHERE id = ?1",
+                rusqlite::params![execution.id, (stamp + 10).to_string()],
+            )
+            .unwrap();
+
+        assert!(
+            db.list_dead_pr_review_candidates()
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate.work_item_id == work_item_id && candidate.execution_id == execution.id),
+            "a completed pr_review created after pr_review_verdicts, with no verdict, is dead"
+        );
     }
 }

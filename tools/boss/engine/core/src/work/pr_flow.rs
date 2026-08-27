@@ -549,8 +549,10 @@ impl WorkDb {
     /// row as stalled.
     ///
     /// Returns `(task_id, product_id, pr_url, review_result_written)` tuples.
-    /// The final value is true only when the latest pass durably recorded a
-    /// real `ReviewResult`; a `gave_up` ledger row does not count.
+    /// The final value is true when the latest pass durably recorded a
+    /// `ReviewResult` — including `dropped_duplicate_head`, which produced a
+    /// result then deferred to an earlier covering pass. A `gave_up` ledger
+    /// row does not count.
     pub fn list_tasks_with_stalled_reviewer(&self, stale_secs: u64) -> Result<Vec<(String, String, String, bool)>> {
         let conn = self.connect()?;
         let cutoff = (boss_engine_utils::epoch_time::now_epoch_secs() as u64)
@@ -561,14 +563,14 @@ impl WorkDb {
         //   1. Terminal (reviewer finished — should have advanced the task via
         //      finalize_pr_review_pass but didn't, e.g. Stop hook was missed).
         //   2. Non-terminal but created before the stale cutoff (timeout).
-        let informative_outcomes = super::review_verdicts::informative_gate_outcomes_sql();
+        let review_result_outcomes = super::review_verdicts::review_result_gate_outcomes_sql();
         let sql = format!(
             "SELECT t.id, t.product_id, t.pr_url,
                     EXISTS (
                       SELECT 1
                       FROM pr_review_verdicts rv
                       WHERE rv.execution_id = we.id
-                        AND rv.gate_outcome IN ({informative_outcomes})
+                        AND rv.gate_outcome IN ({review_result_outcomes})
                     ) AS review_result_written
              FROM tasks t
              JOIN work_executions we ON we.id = (
@@ -611,20 +613,20 @@ impl WorkDb {
     /// `active`, the latest pass has no result, or a non-review worker is
     /// live. Returns `true` if the task was updated.
     ///
-    /// Single-live-worker guard (T1577 incident): the reviewer-fallback is
-    /// only correct when the worker holding the task in `active` is actually
-    /// the AI reviewer. A `pr_review` execution can be terminal/timed-out
-    /// (which surfaces the task as a fallback candidate) while a DIFFERENT
-    /// live execution — a `chore_implementation`/`task_implementation`/
-    /// `ci_remediation` resume — is actively working the task. Advancing the
-    /// lane then would strand the implementation worker in the Review column
-    /// with no Doing card. So we refuse to advance while ANY live
-    /// (`running`/`waiting_human`) non-`pr_review` execution exists on the
-    /// task: the `NOT EXISTS` clause makes the update a no-op in that case.
+    /// Single-live-worker guard: the reviewer-fallback is only correct when
+    /// the worker holding the task in `active` is actually the AI reviewer.
+    /// A `pr_review` execution can be terminal/timed-out (which surfaces the
+    /// task as a fallback candidate) while a DIFFERENT live execution — a
+    /// `chore_implementation`/`task_implementation`/`ci_remediation` resume
+    /// — is actively working the task. Advancing the lane then would strand
+    /// the implementation worker in the Review column with no Doing card.
+    /// So we refuse to advance while ANY live (`running`/`waiting_human`)
+    /// non-`pr_review` execution exists on the task: the `NOT EXISTS` clause
+    /// makes the update a no-op in that case.
     pub fn advance_pending_review_task_to_in_review(&self, work_item_id: &str) -> Result<bool> {
         let conn = self.connect()?;
         let now = now_string();
-        let informative_outcomes = super::review_verdicts::informative_gate_outcomes_sql();
+        let review_result_outcomes = super::review_verdicts::review_result_gate_outcomes_sql();
         let sql = format!(
             "UPDATE tasks
              SET status            = 'in_review',
@@ -647,7 +649,7 @@ impl WorkDb {
                    ORDER BY newest.created_at DESC, newest.id DESC
                    LIMIT 1
                  )
-                   AND rv.gate_outcome IN ({informative_outcomes})
+                   AND rv.gate_outcome IN ({review_result_outcomes})
                )
                AND NOT EXISTS (
                  SELECT 1 FROM work_executions we

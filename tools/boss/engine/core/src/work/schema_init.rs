@@ -61,6 +61,9 @@ impl WorkDb {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
+        // Same data stamp `run_full_migration_chain` writes; the template
+        // path never replays those migrate_* calls.
+        migrate_stamp_pr_review_verdicts_since(conn)?;
         Ok(())
     }
 
@@ -742,6 +745,7 @@ impl WorkDb {
         // can never reach `completed` without a verdict row. Additive,
         // independent of every other table.
         migrate_pr_review_verdicts_table(conn)?;
+        migrate_stamp_pr_review_verdicts_since(conn)?;
         // One-time backfill: auto-resolve `pr_review_died_without_findings`
         // attentions already followed by a later completed review pass —
         // data-only, no schema change; self-idempotent.
@@ -963,6 +967,18 @@ mod tests {
         assert!(
             pr_review_verdicts_exists,
             "expected pr_review_verdicts table from migrate_pr_review_verdicts_table"
+        );
+
+        let verdicts_since_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM metadata WHERE key = ?1)",
+                rusqlite::params![super::super::review_verdicts::PR_REVIEW_VERDICTS_SINCE_METADATA_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            verdicts_since_exists,
+            "expected pr_review_verdicts_since metadata stamp from migrate_stamp_pr_review_verdicts_since"
         );
 
         let run_cost_columns: i64 = conn

@@ -46,15 +46,69 @@ pub fn is_informative_gate_outcome(gate_outcome: &str) -> bool {
     INFORMATIVE_GATE_OUTCOMES.contains(&gate_outcome)
 }
 
-/// SQL list literal for the canonical informative outcomes. The values are
-/// engine-owned constants, so interpolating this fragment does not admit
-/// caller-controlled SQL.
-pub(crate) fn informative_gate_outcomes_sql() -> String {
-    INFORMATIVE_GATE_OUTCOMES
+/// Gate outcomes that mean the pass produced a `ReviewResult`. This is
+/// [`INFORMATIVE_GATE_OUTCOMES`] plus `dropped_duplicate_head`: that pass
+/// did produce a result, then the duplicate-head guard discarded a redundant
+/// revision because an earlier informative row already covers the same
+/// head. Badge lookup still skips dropped-duplicate rows (it must look
+/// through to that earlier covering pass); stalled-reviewer "was a result
+/// written?" must not, or a missed Stop hook after a dropped-duplicate
+/// finalize would re-fire the review instead of advancing the card.
+pub(crate) const REVIEW_RESULT_GATE_OUTCOMES: [&str; 4] = [
+    REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS,
+    REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
+    REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED,
+    REVIEW_GATE_OUTCOME_DROPPED_DUPLICATE_HEAD,
+];
+
+/// SQL list literal for [`REVIEW_RESULT_GATE_OUTCOMES`]. Engine-owned
+/// constants, safe to interpolate.
+pub(crate) fn review_result_gate_outcomes_sql() -> String {
+    REVIEW_RESULT_GATE_OUTCOMES
         .iter()
         .map(|outcome| format!("'{outcome}'"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// `metadata.key` stamped once, the first time this engine knows about
+/// `pr_review_verdicts`. Completed `pr_review` rows created before this
+/// unix-seconds value cannot be classified as "completed without a verdict":
+/// the table did not exist to receive one. See
+/// [`unproductive_completed_pr_review_sql`].
+pub(crate) const PR_REVIEW_VERDICTS_SINCE_METADATA_KEY: &str = "pr_review_verdicts_since";
+
+/// SQL boolean over a `work_executions` row aliased `we`: a completed
+/// `pr_review` that did not produce a durable judgement.
+///
+/// That is a `gave_up` verdict, or a missing verdict on a pass created at
+/// or after [`PR_REVIEW_VERDICTS_SINCE_METADATA_KEY`]. `dropped_duplicate_head`
+/// is excluded: finalize already advanced that card to `in_review` because
+/// an earlier informative pass covers the head. Treating it as dead would
+/// yank the card back to Doing, re-review the same SHA, drop as a
+/// duplicate again, and loop until the churn guard parks it.
+pub(crate) fn unproductive_completed_pr_review_sql() -> String {
+    format!(
+        "(we.status = 'completed' AND (
+            EXISTS (
+                SELECT 1 FROM pr_review_verdicts rv
+                WHERE rv.execution_id = we.id
+                  AND rv.gate_outcome = '{gave_up}'
+            )
+            OR (
+                NOT EXISTS (
+                    SELECT 1 FROM pr_review_verdicts rv
+                    WHERE rv.execution_id = we.id
+                )
+                AND CAST(we.created_at AS INTEGER) >= COALESCE(
+                    (SELECT CAST(value AS INTEGER) FROM metadata WHERE key = '{since_key}'),
+                    0
+                )
+            )
+        ))",
+        gave_up = REVIEW_GATE_OUTCOME_GAVE_UP,
+        since_key = PR_REVIEW_VERDICTS_SINCE_METADATA_KEY,
+    )
 }
 
 /// What [`crate::completion::WorkerCompletionHandler::finalize_pr_review_pass`]

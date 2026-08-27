@@ -249,6 +249,215 @@ async fn stalled_running_reviewer_stays_doing_without_double_dispatch() {
     );
 }
 
+fn insert_completed_pr_review_verdict(db: &WorkDb, execution_id: &str, work_item_id: &str, gate_outcome: &'static str) {
+    WorkDb::insert_review_verdict_in_tx(
+        &db.connect().unwrap(),
+        execution_id,
+        work_item_id,
+        &ReviewVerdictInput {
+            head_sha: Some("reviewed-head".to_owned()),
+            findings_count: 0,
+            revision_warranted: gate_outcome == REVIEW_GATE_OUTCOME_DROPPED_DUPLICATE_HEAD,
+            gate_outcome,
+        },
+    )
+    .unwrap();
+}
+
+/// A completed pass that produced a `ReviewResult` then dropped as a
+/// duplicate head still counts as `review_result_written`, so the fallback
+/// advances rather than re-firing.
+#[test]
+fn stalled_reviewer_treats_dropped_duplicate_head_as_result_written() {
+    let db = WorkDb::open(temp_db_path("stalled-dropped-dup")).unwrap();
+    let pr_url = "https://github.com/spinyfin/mono/pull/14";
+    let (_product_id, chore_id) = active_chore_with_pr(&db, "stalled-dropped-dup", pr_url);
+    let exec_id = pr_review_execution(&db, &chore_id, ExecutionStatus::Completed, &now_string());
+    insert_completed_pr_review_verdict(&db, &exec_id, &chore_id, REVIEW_GATE_OUTCOME_DROPPED_DUPLICATE_HEAD);
+
+    let stalled = db.list_tasks_with_stalled_reviewer(3600).unwrap();
+    assert_eq!(stalled.len(), 1);
+    assert!(
+        stalled[0].3,
+        "dropped_duplicate_head produced a ReviewResult and must count as written"
+    );
+}
+
+/// Seed enough completed give-ups to trip the reviewer-fallback churn guard:
+/// the sweep must not re-fire, and must file an open `churn_guard_parked` item.
+#[tokio::test]
+async fn stalled_reviewer_churn_guard_parks_without_refire() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/1768";
+    let product = create_test_product_with_repo(&db, "churn-park-review", Some("https://github.com/foo/bar"));
+    let chore = create_test_chore_manual(&db, product.id.clone(), "churn-park-review");
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".into()),
+            pr_url: Some(pr.into()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    for i in 0..crate::work::ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
+        let exec_id = pr_review_execution(&db, &chore.id, ExecutionStatus::Completed, &(now - i).to_string());
+        insert_completed_pr_review_verdict(&db, &exec_id, &chore.id, REVIEW_GATE_OUTCOME_GAVE_UP);
+    }
+    let before = db.list_executions(Some(&chore.id)).unwrap().len();
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let publisher = crate::coordinator::NoopExecutionPublisher;
+    let mut outcome = crate::merge_poller::SweepOutcome::default();
+    crate::merge_poller::sweep_stalled_reviewer(
+        &db,
+        &publisher,
+        crate::merge_poller::StalledReview {
+            task_id: &chore.id,
+            product_id: &product.id,
+            pr_url: pr,
+            review_result_written: false,
+        },
+        &checker,
+        &mut outcome,
+    )
+    .await;
+
+    assert_eq!(outcome.reviewer_fallback_review_refired, 0);
+    assert_eq!(
+        db.list_executions(Some(&chore.id)).unwrap().len(),
+        before,
+        "churn guard must not mint a replacement pr_review"
+    );
+    assert!(
+        db.list_attention_items_for_work_item(&chore.id)
+            .unwrap()
+            .iter()
+            .any(
+                |attention| attention.kind == crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND
+                    && attention.status == "open"
+            ),
+        "expected an open churn_guard_parked attention item"
+    );
+}
+
+/// One short of the churn threshold must still re-fire a replacement review.
+#[tokio::test]
+async fn stalled_reviewer_churn_guard_below_threshold_still_refires() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/1769";
+    let product = create_test_product_with_repo(&db, "churn-below-review", Some("https://github.com/foo/bar"));
+    let chore = create_test_chore_manual(&db, product.id.clone(), "churn-below-review");
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".into()),
+            pr_url: Some(pr.into()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    for i in 0..(crate::work::ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD - 1) {
+        let exec_id = pr_review_execution(&db, &chore.id, ExecutionStatus::Completed, &(now - i).to_string());
+        insert_completed_pr_review_verdict(&db, &exec_id, &chore.id, REVIEW_GATE_OUTCOME_GAVE_UP);
+    }
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let publisher = crate::coordinator::NoopExecutionPublisher;
+    let mut outcome = crate::merge_poller::SweepOutcome::default();
+    crate::merge_poller::sweep_stalled_reviewer(
+        &db,
+        &publisher,
+        crate::merge_poller::StalledReview {
+            task_id: &chore.id,
+            product_id: &product.id,
+            pr_url: pr,
+            review_result_written: false,
+        },
+        &checker,
+        &mut outcome,
+    )
+    .await;
+
+    assert_eq!(outcome.reviewer_fallback_review_refired, 1);
+    assert!(
+        db.list_executions(Some(&chore.id))
+            .unwrap()
+            .iter()
+            .any(|execution| execution.kind == ExecutionKind::PrReview && execution.status == ExecutionStatus::Ready)
+    );
+}
+
+/// A `ready` pr_review older than the stale cutoff is already queued, not
+/// dead. Sweeping it twice must not mint a second execution, bump the
+/// re-fire counter, or accumulate `pr_review_died_without_findings` items.
+#[tokio::test]
+async fn stale_queued_reviewer_is_not_refired_on_repeated_sweeps() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/1770";
+    let product = create_test_product_with_repo(&db, "queued-review", Some("https://github.com/foo/bar"));
+    let chore = create_test_chore_manual(&db, product.id.clone(), "queued-review");
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".into()),
+            pr_url: Some(pr.into()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    let now: u64 = now_string().parse().unwrap();
+    let ready_id = pr_review_execution(&db, &chore.id, ExecutionStatus::Ready, &(now - 7200).to_string());
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let publisher = crate::coordinator::NoopExecutionPublisher;
+    for _ in 0..2 {
+        let mut outcome = crate::merge_poller::SweepOutcome::default();
+        crate::merge_poller::sweep_stalled_reviewer(
+            &db,
+            &publisher,
+            crate::merge_poller::StalledReview {
+                task_id: &chore.id,
+                product_id: &product.id,
+                pr_url: pr,
+                review_result_written: false,
+            },
+            &checker,
+            &mut outcome,
+        )
+        .await;
+        assert_eq!(
+            outcome.reviewer_fallback_review_refired, 0,
+            "returning the existing ready pr_review is not a re-fire"
+        );
+    }
+
+    let reviews: Vec<_> = db
+        .list_executions(Some(&chore.id))
+        .unwrap()
+        .into_iter()
+        .filter(|execution| execution.kind == ExecutionKind::PrReview)
+        .collect();
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].id, ready_id);
+    assert_eq!(reviews[0].status, ExecutionStatus::Ready);
+    let died = db
+        .list_attention_items_for_work_item(&chore.id)
+        .unwrap()
+        .into_iter()
+        .filter(|attention| attention.kind == crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND)
+        .count();
+    assert_eq!(
+        died, 0,
+        "a queued review is not a death; two sweeps must leave no died-without-findings items"
+    );
+}
+
 /// Arm (b): a non-terminal (`running`) `pr_review` surfaces the task only when
 /// it was created before the stale cutoff (timeout); a freshly-created one does
 /// not.

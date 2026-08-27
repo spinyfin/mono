@@ -2383,8 +2383,39 @@ pub(crate) async fn sweep_stalled_reviewer(
         return;
     }
 
+    let prior_pr_review_id = match work_db.list_executions(Some(task_id)) {
+        Ok(executions) => executions
+            .into_iter()
+            .rev()
+            .find(|execution| execution.kind == boss_protocol::ExecutionKind::PrReview)
+            .map(|execution| execution.id),
+        Err(err) => {
+            tracing::warn!(
+                task_id,
+                pr_url,
+                ?err,
+                "merge poller: failed to list executions before reviewer-fallback re-fire"
+            );
+            return;
+        }
+    };
+
     match work_db.request_pr_review(task_id, pr_checker) {
         Ok(execution) => {
+            if prior_pr_review_id.as_deref() == Some(execution.id.as_str()) {
+                // `request_pr_review` is idempotent: a `ready` row sitting in
+                // the review-pool queue is returned as Ok without inserting
+                // anything. That is the `review_queued` state, not a death,
+                // and must not file `pr_review_died_without_findings` or bump
+                // the re-fire counter on every 60s sweep.
+                tracing::debug!(
+                    task_id,
+                    pr_url,
+                    execution_id = %execution.id,
+                    "merge poller: reviewer-fallback observed an already-queued pr_review; not a re-fire"
+                );
+                return;
+            }
             tracing::info!(
                 task_id,
                 pr_url,

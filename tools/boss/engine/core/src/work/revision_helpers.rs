@@ -756,11 +756,37 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
     lookup_ids.sort_unstable();
     lookup_ids.dedup();
     let verdicts = query_latest_informative_review_verdicts(conn, &lookup_ids)?;
-    let queued_reviews: std::collections::HashSet<String> = conn
-        .prepare("SELECT DISTINCT work_item_id FROM work_executions WHERE kind = 'pr_review' AND status = 'ready'")?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .filter_map(|row| row.ok())
+    // Queue lookup is for Active cards (`review_queued`), not the
+    // InReview/Done `lookup_ids` slice above. Scope to the tree being
+    // rendered rather than every ready `pr_review` in the database.
+    let mut queued_lookup_ids: Vec<String> = tasks
+        .iter()
+        .chain(chores.iter())
+        .filter(|row| !task_kind_excluded_from_ai_review(&row.kind) && row.status == TaskStatus::Active)
+        .map(|row| row.id.clone())
         .collect();
+    queued_lookup_ids.sort_unstable();
+    queued_lookup_ids.dedup();
+    let queued_reviews: std::collections::HashSet<String> = if queued_lookup_ids.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        let placeholders = queued_lookup_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT DISTINCT work_item_id FROM work_executions
+             WHERE kind = 'pr_review' AND status = 'ready'
+               AND work_item_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = queued_lookup_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?
+            .filter_map(|row| row.ok())
+            .collect()
+    };
 
     // The redirect to the last completed revision's verdict is a
     // preference, not a hard cutover: when that target has no
