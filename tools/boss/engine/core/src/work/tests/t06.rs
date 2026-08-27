@@ -1995,6 +1995,62 @@ fn create_revision_pr_review_against_revision_parents_to_chain_root() {
     assert!(listed_ids.contains(&r2.id.as_str()));
 }
 
+/// Replaying materialisation for one review execution must return the
+/// original work item even if the parent PR became terminal after the first
+/// insert. The execution-keyed provenance, not title text, is the dedup key.
+#[test]
+fn create_revision_is_idempotent_per_pr_review_execution() {
+    let db = WorkDb::open(temp_db_path("revision-review-idempotency")).unwrap();
+    let product_id = make_revision_product(&db, "review-idempotency");
+    let pr_url = "https://github.com/spinyfin/mono/pull/3710";
+    let root_id = make_in_review_chore(&db, &product_id, pr_url);
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let created_via = format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_repeat_findings");
+
+    let first = db
+        .create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(root_id.clone())
+                .description("Address the review findings.")
+                .created_via(created_via.clone())
+                .build(),
+            &checker,
+        )
+        .unwrap();
+
+    // A late retry must resolve by execution provenance before consulting
+    // the now-terminal parent gate.
+    let conn = db.connect().unwrap();
+    conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?1", params![root_id])
+        .unwrap();
+    drop(conn);
+
+    let second = db
+        .create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(first.parent_task_id.clone().unwrap())
+                .description("Differently rendered text from the same review.")
+                .created_via(created_via.clone())
+                .build(),
+            &checker,
+        )
+        .unwrap();
+
+    assert_eq!(
+        second.id, first.id,
+        "duplicate materialisation must reuse the first row"
+    );
+    let conn = db.connect().unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE created_via = ?1",
+            params![created_via],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "one review execution must materialise at most one work item");
+}
+
 /// Startup migration rewrites pre-existing nested revision parents to the
 /// chain root without touching status / identity.
 #[test]

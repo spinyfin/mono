@@ -101,6 +101,43 @@ pub(crate) fn assert_parent_revisable_and_insert(
     input: CreateRevisionInput,
     pr_checker: &dyn PrStateChecker,
 ) -> Result<Task> {
+    // A review execution is the idempotency key for materialising its
+    // findings. The finalizer normally reaches this function once, but a
+    // repeated Stop/reconciliation path must not mint another work item from
+    // the same result. Check before the parent/PR gate so a retry remains a
+    // no-op even when the original materialisation has since been completed,
+    // converted to a followup, or its parent PR has merged.
+    if let Some(created_via) = input
+        .created_via
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| value.starts_with(CREATED_VIA_PR_REVIEW_PREFIX))
+    {
+        let existing_id: Option<String> = conn
+            .query_row(
+                "SELECT id
+                 FROM tasks
+                 WHERE created_via = ?1
+                 ORDER BY (deleted_at IS NULL) DESC, created_at ASC, id ASC
+                 LIMIT 1",
+                params![created_via],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing_id) = existing_id {
+            let existing = query_task(conn, &existing_id)?
+                .with_context(|| format!("pr_review materialisation {existing_id} disappeared during dedup"))?;
+            tracing::warn!(
+                created_via,
+                existing_task_id = %existing.id,
+                existing_kind = %existing.kind,
+                existing_status = %existing.status,
+                "pr_review findings materialisation already exists; duplicate mint is a no-op",
+            );
+            return Ok(existing);
+        }
+    }
+
     // ── 1. Resolve parent and chain root ────────────────────────────────────
     let parent_id = resolve_task_id_from_selector(conn, &input.parent_task_id)?;
     let root_id = chain_root(conn, &parent_id)?;

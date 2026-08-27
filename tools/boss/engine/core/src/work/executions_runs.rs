@@ -795,17 +795,13 @@ impl WorkDb {
     /// lease are returned (same predicate as `list_in_flight_executions`).
     ///
     /// Walks with [`collect_chain_revision_ids_including_deleted`] rather
-    /// than the tombstone-filtered variant: by the time this runs, the
-    /// merge poller has already called `block_pending_revisions_on_parent_close`
-    /// in the same sweep, which archives *and tombstones* WIP revisions —
-    /// a tombstone-filtered walk would no longer see the row whose lease
-    /// still needs releasing.
+    /// than the tombstone-filtered variant for legacy archived conversions.
+    /// It also finds PR-review revisions converted in place to followups:
+    /// their still-running `revision_implementation` execution must be
+    /// released before the row is redispatched under its new kind.
     pub fn list_active_revision_executions_for_chain(&self, chain_root_id: &str) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
         let revision_ids = collect_chain_revision_ids_including_deleted(&conn, chain_root_id)?;
-        if revision_ids.is_empty() {
-            return Ok(Vec::new());
-        }
         let mut executions = Vec::new();
         for rev_id in &revision_ids {
             let mut stmt = conn.prepare_cached(
@@ -821,6 +817,38 @@ impl WorkDb {
                  ORDER BY created_at ASC, id ASC",
             )?;
             let rows = stmt.query_map([rev_id], map_execution)?;
+            collect_rows(rows).map(|mut v| executions.append(&mut v))?;
+        }
+
+        // PR-review findings keep one execution-keyed work-item row across
+        // the revision -> followup transition. Once converted, the row is no
+        // longer reachable through the revision-chain walk above, but a WIP
+        // revision implementation may still hold its lease until the merge
+        // poller's post-transaction stop step. Origin short-id provenance
+        // ties that converted row back to this chain root without relying on
+        // its title or finding count.
+        let root = query_task(&conn, chain_root_id)?;
+        if let Some((root_short_id, product_id)) = root.and_then(|task| task.short_id.map(|id| (id, task.product_id))) {
+            let mut stmt = conn.prepare_cached(
+                "SELECT e.id, e.work_item_id, e.kind, e.status, e.repo_remote_url, e.cube_repo_id,
+                        e.cube_lease_id, e.cube_workspace_id, e.workspace_path, e.priority,
+                        e.preferred_workspace_id, e.created_at, e.started_at, e.finished_at,
+                        e.pre_start_failure_count, e.dispatch_not_before, e.pr_url, e.pr_head_before,
+                        e.prefer_is_soft, e.worker_branch_prefix, e.transient_failure_count,
+                        e.allow_dirty, e.branch_naming, e.dispatch_wait_reason, e.dispatch_wait_since,
+                        e.driver_runtime_state, e.driver, e.model, e.effort_level, e.pr_head_after
+                 FROM work_executions e
+                 JOIN tasks t ON t.id = e.work_item_id
+                 WHERE t.kind IN ('chore', 'followup')
+                   AND t.origin_task_short_id = ?1
+                   AND t.product_id = ?2
+                   AND t.created_via GLOB 'pr_review:*'
+                   AND e.kind = 'revision_implementation'
+                   AND e.status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+                   AND e.cube_lease_id IS NOT NULL
+                 ORDER BY e.created_at ASC, e.id ASC",
+            )?;
+            let rows = stmt.query_map(params![root_short_id, product_id], map_execution)?;
             collect_rows(rows).map(|mut v| executions.append(&mut v))?;
         }
         Ok(executions)
