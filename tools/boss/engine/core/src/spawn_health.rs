@@ -644,8 +644,10 @@ pub async fn maybe_admit_recovery_probe(
 /// current pause is [`DispatchPauseOrigin::Operator`]: a human pause stays
 /// manual-resume-only regardless of spawn evidence, exactly like
 /// `handle_set_dispatch_paused` documents. Returns `true` if dispatch was
-/// actually resumed, so the caller knows to re-kick the scheduler and
-/// broadcast the updated health state.
+/// actually resumed, so the caller knows to re-kick the scheduler. The
+/// caller does NOT need to push the updated health state: `resume_dispatch`
+/// notifies the pause-state transition and
+/// `ServerState::spawn_pause_state_health_broadcaster` owns the broadcast.
 pub async fn resume_dispatch_after_breaker_recovery(
     work_db: &WorkDb,
     coordinator: &ExecutionCoordinator,

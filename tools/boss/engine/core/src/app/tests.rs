@@ -229,6 +229,7 @@ mod driver_start_signal;
 mod engine_health_report;
 mod metadata_persistence;
 mod open_document;
+mod pause_broadcast;
 mod pause_bypass_held_ready;
 mod pause_bypass_recheck;
 mod pr_status;

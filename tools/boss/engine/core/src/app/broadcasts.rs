@@ -43,4 +43,68 @@ impl ServerState {
         let envelope = FrontendEventEnvelope::push(FrontendEvent::EngineHealthResult { report });
         self.topic_broker.publish(TOPIC_ENGINE_HEALTH, envelope).await;
     }
+
+    /// Push a fresh engine-health snapshot on every dispatch- or
+    /// automation-pause transition, whatever caused it.
+    ///
+    /// This is the single seam that keeps the app's pause banner honest.
+    /// It deliberately subscribes to
+    /// [`ExecutionCoordinator::subscribe_pause_state`](
+    /// crate::coordinator::ExecutionCoordinator::subscribe_pause_state) —
+    /// the pause-state *transition* — rather than being called by each
+    /// pauser: every pauser, the `Set*Paused` RPC handlers, the
+    /// spawn-capability circuit breaker, and any future programmatic one,
+    /// pushes a fresh health snapshot through here without knowing this
+    /// exists. A pause that only reached the CLI would leave the app's
+    /// banner silently stale.
+    ///
+    /// The app's connect-time `get_engine_health` still covers the
+    /// start-into-a-pause case — this task is purely about transitions
+    /// observed by an already-running app. Nothing polls: the loop is
+    /// parked in `changed()` until a transition happens.
+    ///
+    /// Supervised, so a panic inside the loop restarts it with a fresh
+    /// subscription instead of silently ending pause pushes for the
+    /// lifetime of the engine. Each (re)start broadcasts once before
+    /// waiting, which is the reconcile pass `spawn_supervised` subscribers
+    /// owe: it closes the gap where a transition landed while a prior
+    /// attempt was between panic and restart.
+    pub fn spawn_pause_state_health_broadcaster(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let weak_state = Arc::downgrade(self);
+        boss_event_bus::spawn_supervised("engine_pause_state_health", move || {
+            let weak_state = weak_state.clone();
+            async move {
+                let Some(state) = weak_state.upgrade() else {
+                    return;
+                };
+                let mut pause_changes = state.execution_coordinator.subscribe_pause_state();
+                state.broadcast_engine_health().await;
+                drop(state);
+                while pause_changes.changed().await.is_ok() {
+                    // Re-read authoritative state through a fresh upgrade so
+                    // this task never keeps the `ServerState` alive past
+                    // engine shutdown.
+                    let Some(state) = weak_state.upgrade() else {
+                        return;
+                    };
+                    tracing::debug!(
+                        dispatch_paused = state.execution_coordinator.is_dispatch_paused(),
+                        automation_paused = state.execution_coordinator.is_automation_paused(),
+                        "pause state changed — broadcasting engine health to subscribed frontends",
+                    );
+                    state.broadcast_engine_health().await;
+                }
+                // The sender lives inside the coordinator, which lives
+                // inside `ServerState`; `changed()` therefore only errors
+                // once the engine is tearing down. Log it rather than
+                // exiting silently so a future refactor that drops the
+                // coordinator early is observable instead of quietly
+                // ending pause pushes.
+                tracing::warn!(
+                    "pause-state broadcaster: notifier closed, subscription ended; \
+                     pause transitions will no longer push engine health",
+                );
+            }
+        })
+    }
 }

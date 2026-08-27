@@ -144,8 +144,12 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
         )
         .await
         {
+            // No explicit health broadcast: the `resume_dispatch` inside
+            // `resume_dispatch_after_breaker_recovery` already notified the
+            // pause-state transition, and the pause-state broadcaster turns
+            // that into the push. See
+            // `ServerState::spawn_pause_state_health_broadcaster`.
             server_state.execution_coordinator.kick();
-            server_state.broadcast_engine_health().await;
         }
         // Push pool sizes immediately after registration so the app's
         // WorkersWorkspaceModel can configure its slot ranges before the
@@ -693,8 +697,10 @@ pub(super) async fn handle_update_worker_shell_pid(ctx: Dispatch, req: FrontendR
         )
         .await
     {
+        // The `resume_dispatch` inside `resume_dispatch_after_breaker_recovery`
+        // notified the pause-state transition; the pause-state broadcaster
+        // owns the health push from here.
         server_state.execution_coordinator.kick();
-        server_state.broadcast_engine_health().await;
     }
     // Persist the pid to the DB FIRST, keyed by run_id (the execution id).
     // The `work_runs` row always exists by now (inserted synchronously at
