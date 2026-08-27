@@ -29,8 +29,7 @@ use crate::dispatch_events::{DispatchEvent, DispatchEventSink};
 use crate::settings::SettingsStore;
 
 /// Key under `DispatchEvent::details` carrying the per-pool snapshot.
-/// Exposed for tests / readers that want to `jq` for it explicitly.
-pub const DETAILS_KEY: &str = "tmux_hosting";
+const DETAILS_KEY: &str = "tmux_hosting";
 
 /// Wraps another [`DispatchEventSink`] and stamps the current tmux-hosting
 /// pool snapshot into every event's `details` before delegating. See the

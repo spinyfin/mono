@@ -962,7 +962,7 @@ fn hosting_state_root(name: &str, settings_toml: Option<&str>) -> std::path::Pat
 #[test]
 fn hosting_report_defaults_to_every_pool_disabled() {
     let root = hosting_state_root("missing", None);
-    let report = tmux_hosting_pool_report(Some(root.clone())).unwrap();
+    let report = tmux_hosting_pool_report(Some(root.clone())).unwrap().to_json();
     let _ = std::fs::remove_dir_all(&root);
 
     assert_eq!(report["review"], Value::Bool(false));
@@ -978,11 +978,28 @@ fn hosting_report_defaults_to_every_pool_disabled() {
 #[test]
 fn hosting_report_reflects_a_partial_pool_set() {
     let root = hosting_state_root("partial", Some("\"workers.tmux_hosting\" = [\"review\"]\n"));
-    let report = tmux_hosting_pool_report(Some(root.clone())).unwrap();
+    let report = tmux_hosting_pool_report(Some(root.clone())).unwrap().to_json();
     let _ = std::fs::remove_dir_all(&root);
 
     assert_eq!(report["review"], Value::Bool(true));
     assert_eq!(report["automation"], Value::Bool(false));
     assert_eq!(report["interactive"], Value::Bool(false));
     assert_eq!(report["any_enabled"], Value::Bool(true));
+}
+
+/// A `settings.toml` that fails to parse (or names an unrecognised pool)
+/// must not take down the rest of the tmux preflight — it is reported as a
+/// hosting-report error rather than propagated, so `bossctl doctor tmux`
+/// still answers about tmux itself when the settings file is broken.
+#[test]
+fn hosting_report_carries_the_error_instead_of_propagating_it() {
+    let root = hosting_state_root("broken", Some("\"workers.tmux_hosting\" = [\"not-a-pool\"]\n"));
+    let report = tmux_hosting_pool_report(Some(root.clone())).unwrap().to_json();
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert_eq!(report["review"], Value::Bool(false));
+    assert_eq!(report["automation"], Value::Bool(false));
+    assert_eq!(report["interactive"], Value::Bool(false));
+    assert_eq!(report["any_enabled"], Value::Bool(false));
+    assert!(report["error"].as_str().unwrap().contains("not-a-pool"));
 }

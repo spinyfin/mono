@@ -257,9 +257,9 @@ impl SettingsStore {
                 next.tmux_hosting_overridden = true;
                 continue;
             }
-            // workers.always_use_opus was superseded by workers.non_opus_permission_mode
-            // (T462 → this chore). If the old key is still in the file it is a no-op;
-            // log once so operators know to clean it up.
+            // `workers.always_use_opus` was replaced by
+            // `workers.non_opus_permission_mode`. If the old key is still in the
+            // file it is a no-op; log once so it can be cleaned up.
             if key == "workers.always_use_opus" {
                 tracing::warn!(
                     "settings: ignoring obsolete key 'workers.always_use_opus' \
@@ -324,10 +324,16 @@ impl SettingsStore {
 
     /// Set (or clear) tmux hosting for every worker pool at once — the
     /// operator-facing switch surfaced in the Boss UI settings window.
-    /// `true` enables review + automation + interactive together; `false`
-    /// drains all three back to the legacy app-hosted path. The
-    /// coordinator's tmux session is unconditional (see `coordinator_tmux`)
-    /// and is not affected by this setting.
+    /// `true` enables review + automation + interactive together. `false`
+    /// clears the set, so subsequent dispatches take the legacy app-hosted
+    /// path; it does not tear anything down. Already-running tmux-hosted
+    /// workers keep their sessions and are reaped by
+    /// `ServerState::reap_tmux_worker` when they terminate, the same as any
+    /// other tmux-hosted run — teardown keys on the durably-recorded tmux
+    /// identity columns on `work_runs`, not on this setting, so in-flight
+    /// runs are unaffected by the flip either way. The coordinator's tmux
+    /// session is unconditional (see `coordinator_tmux`) and is not
+    /// affected by this setting.
     pub fn set_tmux_hosting_enabled(&self, enabled: bool) -> Result<()> {
         self.set_tmux_hosting_pools(if enabled {
             TmuxHostingPools::all()
@@ -363,12 +369,15 @@ impl SettingsStore {
     }
 
     /// Per-pool tmux-hosting snapshot, for the dispatch-event stamp and
-    /// `bossctl doctor` — see [`TmuxHostingPoolSnapshot`].
+    /// `bossctl doctor` — see [`TmuxHostingPoolSnapshot`]. Reads the pool set
+    /// under a single lock acquisition so a concurrent `set_tmux_hosting_*`
+    /// call can never produce a torn combination that never actually existed.
     pub fn tmux_hosting_pool_snapshot(&self) -> TmuxHostingPoolSnapshot {
+        let guard = self.state.lock().expect("settings lock poisoned");
         TmuxHostingPoolSnapshot {
-            review: self.tmux_hosting_enabled_for("review"),
-            automation: self.tmux_hosting_enabled_for("automation"),
-            interactive: self.tmux_hosting_enabled_for("interactive"),
+            review: guard.tmux_hosting.contains_attributed_pool("review"),
+            automation: guard.tmux_hosting.contains_attributed_pool("automation"),
+            interactive: guard.tmux_hosting.contains_attributed_pool("interactive"),
         }
     }
 
@@ -582,6 +591,22 @@ mod tests {
     }
 
     #[test]
+    fn set_tmux_hosting_enabled_false_round_trips_through_reload() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.set_tmux_hosting_enabled(true).unwrap();
+        store.set_tmux_hosting_enabled(false).unwrap();
+
+        let restored = make_store(&tmp);
+        restored.load().unwrap();
+        assert!(!restored.tmux_hosting_snapshot().enabled);
+        let pools = restored.tmux_hosting_pool_snapshot();
+        assert!(!pools.review);
+        assert!(!pools.automation);
+        assert!(!pools.interactive);
+    }
+
+    #[test]
     fn tmux_hosting_rejects_unknown_pool_name() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("settings.toml");
@@ -613,7 +638,7 @@ mod tests {
 
     #[test]
     fn obsolete_always_use_opus_key_is_ignored_on_load() {
-        // The old workers.always_use_opus key from T462 must not cause an error;
+        // The obsolete workers.always_use_opus key must not cause an error;
         // it is silently skipped (and a tracing warning is emitted, not tested here).
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("settings.toml");
