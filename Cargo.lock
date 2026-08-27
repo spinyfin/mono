@@ -479,6 +479,7 @@ dependencies = [
  "chrono",
  "clap",
  "fastrand 2.4.1",
+ "fs4",
  "git-utils",
  "libc",
  "regex",

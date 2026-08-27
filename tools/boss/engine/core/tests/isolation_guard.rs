@@ -39,7 +39,7 @@
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use boss_client::wait_for_socket;
@@ -668,6 +668,79 @@ async fn events_socket_collision_is_refused_before_any_destructive_write() -> Re
     assert!(
         wait_for_socket(live_socket.to_str().unwrap(), Duration::from_secs(1)).await,
         "live engine's frontend socket must remain reachable throughout"
+    );
+
+    live_join.abort();
+    Ok(())
+}
+
+/// Duplicate launch on the same pid path must lose the instance flock
+/// immediately — not wait out `SQLITE_BUSY_TIMEOUT` on `state.db`.
+///
+/// `flock` is associated with an open file description on both macOS and
+/// Linux, so two independently opened lock files contend in this process.
+#[tokio::test]
+async fn duplicate_pid_path_is_refused_before_opening_the_database() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let pid = temp.path().join("engine.pid");
+    let live_socket = temp.path().join("live.sock");
+    let live_events = temp.path().join("live-events.sock");
+    let live_db = temp.path().join("live.db");
+    let live_work = WorkConfig::builder()
+        .cwd(temp.path().to_path_buf())
+        .db_path(live_db)
+        .build();
+    let live_cfg = Arc::new(RuntimeConfig::from_parts(live_work, None));
+    let live_sock_c = live_socket.clone();
+    let live_pid_c = pid.clone();
+    let live_events_c = live_events.clone();
+    let live_join =
+        tokio::spawn(
+            async move { serve(live_cfg, live_sock_c, Some(live_pid_c), Some(live_events_c), None, None).await },
+        );
+    if !wait_for_socket(live_socket.to_str().unwrap(), STARTUP_TIMEOUT).await {
+        live_join.abort();
+        return Err(anyhow!("live engine never bound socket"));
+    }
+    let pid_before = std::fs::read_to_string(&pid)?;
+
+    let second_socket = temp.path().join("second.sock");
+    let second_events = temp.path().join("second-events.sock");
+    let second_db = temp.path().join("second.db");
+    let second_work = WorkConfig::builder()
+        .cwd(temp.path().to_path_buf())
+        .db_path(second_db)
+        .build();
+    let second_cfg = Arc::new(RuntimeConfig::from_parts(second_work, None));
+    let started = Instant::now();
+    let second_result = serve(
+        second_cfg,
+        second_socket.clone(),
+        Some(pid.clone()),
+        Some(second_events),
+        None,
+        None,
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    let err = second_result.expect_err("must refuse a second engine on the same pid path");
+    assert!(
+        format!("{err:#}").contains("instance lock held"),
+        "unexpected error: {err:#}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "duplicate start must not wait on sqlite busy-timeout, took {elapsed:?}"
+    );
+    assert!(
+        !second_socket.exists(),
+        "refused start must not have bound a frontend socket"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&pid)?,
+        pid_before,
+        "live engine's pid file must be unchanged"
     );
 
     live_join.abort();

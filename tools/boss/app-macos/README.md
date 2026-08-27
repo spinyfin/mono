@@ -171,9 +171,18 @@ Every engine process appends one JSON line per lifecycle transition to
 
 - **`start`** — written before any work runs. Carries `pid`, `ppid`,
   `argv`, `parent_command` (best-effort `ps -o command=` of the
-  parent), `engine_version`, `socket_paths` (the frontend and events
-  sockets the engine _intends_ to bind), `state_db_path`, and
-  `prior_state_db_size`.
+  parent), `launched_by` (`app` if `BOSS_APP_PID` is set, else
+  `standalone`), `app_pid` (the value of `BOSS_APP_PID` when set),
+  `exe_path` (`std::env::current_exe()`), `engine_version`,
+  `socket_paths` (the frontend and events sockets the engine
+  _intends_ to bind), `state_db_path`, and `prior_state_db_size`.
+  `parent_command` is often `/sbin/launchd` because the app detaches
+  the engine with `nohup`; `launched_by` / `app_pid` are the
+  launcher, not the reparented ppid.
+- **`instance_lock_failed`** — this process lost the pid-file
+  exclusive flock to a live engine. Carries `holder_pid`,
+  `lock_path`, `launched_by`, `app_pid`, `exe_path`. The matching
+  `shutdown` reason is `error:instance lock held by pid <holder>`.
 - **`socket_bound` / `socket_bind_failed`** — emitted at each
   `UnixListener::bind` site. `socket_kind` is `frontend` or `events`.
   Failures include the formatted error.

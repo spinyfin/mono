@@ -64,6 +64,7 @@ boss-engine-worker-policy = { path = "../worker-policy" }
 boss-transcript-tail = { path = "../transcript-tail" }
 clap = { workspace = true, features = ["derive"] }
 fastrand = { workspace = true }
+fs4 = { workspace = true }
 libc = "0.2"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

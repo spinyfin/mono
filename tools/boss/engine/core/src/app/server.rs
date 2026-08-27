@@ -324,9 +324,15 @@ fn spawn_github_auth_forwarder(server_state: Arc<ServerState>) -> tokio::task::J
 /// Run the frontend server until the listener fails.
 ///
 /// `socket_path` is bound exclusively (the file is removed first if it exists).
-/// When `pid_file_path` is `Some`, the engine writes its pid there and removes
-/// the file on shutdown — pass `None` from in-process tests to avoid touching
-/// shared filesystem state. When `events_socket_path` is `Some`, the engine
+/// When `pid_file_path` is `Some`, the engine takes a non-blocking exclusive
+/// flock on that path, writes its pid, and holds both for the process
+/// lifetime (released and unlinked on shutdown). This happens *before*
+/// opening the state database so a slow `WorkDb::open` cannot look like an
+/// exited engine to the macOS app supervisor. A second process that loses
+/// the flock returns `Err` immediately with an `instance lock held`
+/// message and an `instance_lock_failed` audit record — it must not wait
+/// on SQLite. Pass `None` from in-process tests to avoid touching shared
+/// filesystem state. When `events_socket_path` is `Some`, the engine
 /// also binds the worker events socket (mode 0600) and runs an accept loop
 /// that decodes hook payloads via the worker registry; pass `None` from
 /// tests that don't exercise the events channel.
@@ -416,10 +422,10 @@ pub async fn serve_with_merge_probe(
     };
 
     // Refuse to proceed at all if a live process already holds the events
-    // socket path — before the control-token file, the frontend socket, or
-    // the pid file are touched. `bind_events_socket` probes again immediately
+    // socket path — before the control-token file or the frontend socket
+    // are touched. `bind_events_socket` probes again immediately
     // before it unlinks (belt-and-suspenders for callers that reach it some
-    // other way), but by then the token/frontend-socket/pid-file writes below
+    // other way), but by then the token/frontend-socket writes below
     // would already have clobbered a live engine's state on refusal, which is
     // worse than not probing at all.
     if let Some(path) = &events_socket_path
@@ -438,6 +444,35 @@ pub async fn serve_with_merge_probe(
             path.display()
         ));
     }
+
+    // Claim the pid file (non-blocking exclusive flock) *before* opening
+    // the state database or writing the control token. The macOS app's
+    // supervisor treats a missing pid file as "engine exited" and launches
+    // a replacement after waitForEnginePID(5s) + 1s poll + 1s backoff.
+    // Writing the pid only after WorkDb::open and socket bind left a
+    // post-SIGTERM WAL/schema open invisible for ~7s, so the supervisor
+    // spawned a second engine that then lost SQLITE_BUSY_TIMEOUT (5s × two
+    // exclusive statements) and died with `error:database is locked`.
+    // Holding the flock for process lifetime also makes a CLI-vs-app start
+    // race fail closed with an explicit audit record instead of racing
+    // SQLite. `nohup` reparents the engine to launchd, so ppid is not
+    // enough to tell those launchers apart — see the `launched_by` field
+    // on the audit `start` record.
+    let _pid_guard = match &pid_file_path {
+        Some(path) => match PidFileGuard::acquire(path) {
+            Ok(guard) => {
+                tracing::info!(pid = guard.pid, pid_file = %path.display(), "engine pid file is ready");
+                Some(guard)
+            }
+            Err(err) => {
+                if let super::pid_file::AcquireError::AlreadyHeld { holder_pid, .. } = &err {
+                    crate::audit::record_instance_lock_failed(path, *holder_pid);
+                }
+                return Err(err.into());
+            }
+        },
+        None => None,
+    };
 
     let (control_token, _control_token_guard) = match control_token_path {
         Some(path) => {
@@ -702,18 +737,6 @@ pub async fn serve_with_merge_probe(
                 anyhow::Error::new(err).context(format!("failed to bind unix socket {}", socket_path.display()))
             );
         }
-    };
-
-    let _pid_guard = match pid_file_path {
-        Some(path) => {
-            let path_str = path.to_string_lossy().into_owned();
-            let pid = std::process::id();
-            std::fs::write(&path, format!("{pid}\n"))
-                .with_context(|| format!("failed to write pid file {path_str}"))?;
-            tracing::info!(pid, pid_file = %path_str, "engine pid file is ready");
-            Some(PidFileGuard { path: path_str, pid })
-        }
-        None => None,
     };
 
     tracing::info!(socket_path = %socket_path.display(), "frontend socket is ready");

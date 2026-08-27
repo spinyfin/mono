@@ -94,6 +94,12 @@ pub fn set_audit_path(path: PathBuf) {
 /// Snapshot of the values that [`record_start`] writes. Built from the
 /// running process's argv, env, and any optional fields the caller
 /// wants to attach (engine version, socket paths, db path).
+///
+/// `ppid` / `parent_command` are not enough to name the launcher: the
+/// macOS app detaches the engine with `nohup`, so both app-spawned and
+/// orphaned CLI engines reparent to launchd. `launched_by` / `app_pid`
+/// come from `BOSS_APP_PID` (set only by the app) and `exe_path` is
+/// `std::env::current_exe()`.
 #[derive(Debug, Clone, Default)]
 pub struct StartContext {
     pub argv: Vec<String>,
@@ -102,6 +108,9 @@ pub struct StartContext {
     pub state_db_path: Option<PathBuf>,
     pub prior_state_db_size: Option<u64>,
     pub parent_command: Option<String>,
+    pub launched_by: Option<String>,
+    pub app_pid: Option<u32>,
+    pub exe_path: Option<PathBuf>,
 }
 
 /// Record a `start` event. Call this once near the top of `main`,
@@ -137,8 +146,58 @@ pub fn record_start(ctx: StartContext) {
     if let Some(size) = ctx.prior_state_db_size {
         fields.insert("prior_state_db_size".into(), json!(size));
     }
+    if let Some(launched_by) = ctx.launched_by {
+        fields.insert("launched_by".into(), Value::String(launched_by));
+    }
+    if let Some(app_pid) = ctx.app_pid {
+        fields.insert("app_pid".into(), json!(app_pid));
+    }
+    if let Some(exe) = ctx.exe_path {
+        fields.insert("exe_path".into(), Value::String(exe.display().to_string()));
+    }
 
     write_record(now, "start", fields);
+}
+
+/// `app` if the macOS app set `BOSS_APP_PID` (the only process that does),
+/// otherwise `standalone` (CLI autostart, `bazel run`, a direct binary
+/// invoke). Used on `start` and `instance_lock_failed` so a `nohup`'d
+/// engine whose `ppid` is launchd is still attributable.
+pub fn launched_by_label() -> &'static str {
+    if std::env::var_os("BOSS_APP_PID").is_some() {
+        "app"
+    } else {
+        "standalone"
+    }
+}
+
+/// Parsed `BOSS_APP_PID`, ignoring unset / unparseable / launchd-sentinel
+/// values (`<= 1`).
+pub fn app_pid_from_env() -> Option<u32> {
+    std::env::var("BOSS_APP_PID").ok()?.parse().ok().filter(|&pid| pid > 1)
+}
+
+/// Record that this process lost the pid-file instance lock. Emitted
+/// before the matching `shutdown` row so a `start` without a useful
+/// shutdown reason is still attributable to a duplicate launch.
+pub fn record_instance_lock_failed(lock_path: &Path, holder_pid: Option<u32>) {
+    let mut fields = Map::new();
+    fields.insert("pid".into(), json!(std::process::id()));
+    if let Some(ppid) = parent_pid() {
+        fields.insert("ppid".into(), json!(ppid));
+    }
+    fields.insert("lock_path".into(), Value::String(lock_path.display().to_string()));
+    if let Some(holder) = holder_pid {
+        fields.insert("holder_pid".into(), json!(holder));
+    }
+    fields.insert("launched_by".into(), json!(launched_by_label()));
+    if let Some(app_pid) = app_pid_from_env() {
+        fields.insert("app_pid".into(), json!(app_pid));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        fields.insert("exe_path".into(), Value::String(exe.display().to_string()));
+    }
+    write_record(epoch_now_s(), "instance_lock_failed", fields);
 }
 
 /// Record a clean / signalled / panicked shutdown. `reason` is a
@@ -540,6 +599,9 @@ mod tests {
             state_db_path: Some(PathBuf::from("/tmp/state.db")),
             prior_state_db_size: Some(0),
             parent_command: Some("ps fake".into()),
+            launched_by: Some("app".into()),
+            app_pid: Some(99),
+            exe_path: Some(PathBuf::from("/tmp/engine")),
         });
         record_shutdown("signal:SIGTERM");
         // Second call is a no-op — we still want exactly two lines.
@@ -550,6 +612,9 @@ mod tests {
         assert_eq!(parsed[0]["event"], "start");
         assert_eq!(parsed[0]["argv"][0], "engine");
         assert_eq!(parsed[0]["engine_version"], "test");
+        assert_eq!(parsed[0]["launched_by"], "app");
+        assert_eq!(parsed[0]["app_pid"], 99);
+        assert_eq!(parsed[0]["exe_path"], "/tmp/engine");
         assert_eq!(parsed[1]["event"], "shutdown");
         assert_eq!(parsed[1]["reason"], "signal:SIGTERM");
         assert!(parsed[1]["uptime_sec"].as_i64().unwrap() >= 0);
@@ -560,6 +625,31 @@ mod tests {
         unsafe {
             std::env::remove_var(AUDIT_PATH_ENV);
         }
+    }
+
+    #[test]
+    fn record_instance_lock_failed_writes_holder_and_launcher() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("lock.log");
+        append_to(
+            &path,
+            &make_record(epoch_now_s(), "instance_lock_failed", {
+                let mut m = Map::new();
+                m.insert("pid".into(), json!(2));
+                m.insert("ppid".into(), json!(1));
+                m.insert("lock_path".into(), json!("/tmp/boss-engine.pid"));
+                m.insert("holder_pid".into(), json!(40209));
+                m.insert("launched_by".into(), json!("app"));
+                m.insert("app_pid".into(), json!(100));
+                m
+            }),
+        )
+        .unwrap();
+        let parsed = parse_lines(&path);
+        assert_eq!(parsed[0]["event"], "instance_lock_failed");
+        assert_eq!(parsed[0]["holder_pid"], 40209);
+        assert_eq!(parsed[0]["launched_by"], "app");
+        assert_eq!(parsed[0]["lock_path"], "/tmp/boss-engine.pid");
     }
 
     #[test]
