@@ -380,74 +380,78 @@ fn pr_review_completed_implementation_is_not_rematerialised_during_re_review() {
 
 /// If the revision was redispatched after its first implementation
 /// completed (retry, recheck, stale-worker redispatch) and a SECOND
-/// implementation is still in flight (`running`) when the parent PR merges,
-/// the completed-implementation shortcut must NOT fire — the findings must
-/// still be carried forward as a followup rather than silently marked done.
+/// implementation was created after it, the completed-implementation shortcut
+/// must NOT fire — even when the parent-close sweep abandons that later row.
+/// The findings must still be carried forward as a followup rather than
+/// silently marked done.
 #[test]
 fn pr_review_redispatched_revision_with_pending_second_implementation_still_converts() {
-    let db = WorkDb::open(temp_db_path("followup-redispatched-pending")).unwrap();
-    let product_id = make_revision_product(&db, "fu-redispatched");
-    let pr_url = FOLLOWUP_PR_URL;
-    let parent_id = make_in_review_chore(&db, &product_id, pr_url);
-    let created_via = format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_redispatched");
+    for second_status in ["running", "queued"] {
+        let db = WorkDb::open(temp_db_path(&format!("followup-redispatched-{second_status}"))).unwrap();
+        let product_id = make_revision_product(&db, &format!("fu-redispatched-{second_status}"));
+        let pr_url = FOLLOWUP_PR_URL;
+        let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+        let created_via = format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_redispatched_{second_status}");
 
-    let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let revision = db
-        .create_revision(
-            CreateRevisionInput::builder()
-                .parent_task_id(parent_id.clone())
-                .description("Address ALL findings before finalising this revision.")
-                .created_via(created_via.clone())
-                .build(),
-            &checker,
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let revision = db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(parent_id.clone())
+                    .description("Address ALL findings before finalising this revision.")
+                    .created_via(created_via.clone())
+                    .build(),
+                &checker,
+            )
+            .unwrap();
+        let first_impl = db
+            .list_executions(Some(&revision.id))
+            .unwrap()
+            .into_iter()
+            .find(|execution| execution.kind == ExecutionKind::RevisionImplementation)
+            .expect("revision creation must enqueue its implementation");
+
+        let conn = db.connect().unwrap();
+        conn.execute("UPDATE tasks SET status = 'active' WHERE id = ?1", params![revision.id])
+            .unwrap();
+        conn.execute(
+            "UPDATE work_executions
+             SET status = 'completed', finished_at = ?2, created_at = '2026-01-01T00:00:00Z'
+             WHERE id = ?1",
+            params![first_impl.id, now_string()],
         )
         .unwrap();
-    let first_impl = db
-        .list_executions(Some(&revision.id))
-        .unwrap()
-        .into_iter()
-        .find(|execution| execution.kind == ExecutionKind::RevisionImplementation)
-        .expect("revision creation must enqueue its implementation");
-
-    let conn = db.connect().unwrap();
-    conn.execute("UPDATE tasks SET status = 'active' WHERE id = ?1", params![revision.id])
-        .unwrap();
-    conn.execute(
-        "UPDATE work_executions SET status = 'completed', finished_at = ?2 WHERE id = ?1",
-        params![first_impl.id, now_string()],
-    )
-    .unwrap();
-    // A second implementation was redispatched and is still running when the
-    // parent PR merges.
-    let second_impl_id = next_id("exec");
-    conn.execute(
-        "INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, created_at)
-         VALUES (?1, ?2, 'revision_implementation', 'running', 'git@github.com:spinyfin/mono.git', ?3)",
-        params![second_impl_id, revision.id, now_string()],
-    )
-    .unwrap();
-    drop(conn);
-
-    db.mark_chore_pr_merged(&parent_id, pr_url).unwrap();
-
-    let conn = db.connect().unwrap();
-    let (count, kind, status): (i64, String, String) = conn
-        .query_row(
-            "SELECT COUNT(*), MIN(kind), MIN(status) FROM tasks WHERE created_via = ?1",
-            params![created_via],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        // A second implementation was redispatched when the parent PR merges.
+        let second_impl_id = next_id("exec");
+        conn.execute(
+            "INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, created_at)
+         VALUES (?1, ?2, 'revision_implementation', ?3, 'git@github.com:spinyfin/mono.git', ?4)",
+            params![second_impl_id, revision.id, second_status, "2026-01-01T00:00:01Z"],
         )
         .unwrap();
-    assert_eq!(count, 1, "redispatch must not mint a second findings row");
-    assert_eq!(
-        kind, "followup",
-        "a revision with a still-pending second implementation must be converted to a followup, \
+        drop(conn);
+
+        db.mark_chore_pr_merged(&parent_id, pr_url).unwrap();
+
+        let conn = db.connect().unwrap();
+        let (count, kind, status): (i64, String, String) = conn
+            .query_row(
+                "SELECT COUNT(*), MIN(kind), MIN(status) FROM tasks WHERE created_via = ?1",
+                params![created_via],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "redispatch must not mint a second findings row");
+        assert_eq!(
+            kind, "followup",
+            "a revision with a still-pending second implementation must be converted to a followup, \
          not silently marked done"
-    );
-    assert_eq!(
-        status, "todo",
-        "the followup must be dispatchable, not settled as done while findings are unresolved"
-    );
+        );
+        assert_eq!(
+            status, "todo",
+            "the followup must be dispatchable, not settled as done while findings are unresolved"
+        );
+    }
 }
 
 /// A followup in `in_review` with a `pr_url` must appear in

@@ -376,32 +376,33 @@ pub(crate) fn resolve_revision_on_parent_close(
     // commit rode the parent PR to merge, so the existing row is done.
     //
     // This must be scoped tightly to the exact state it documents — `active`
-    // with a completed implementation and NOTHING newer in flight. A
+    // with a completed implementation as its latest implementation. A
     // revision can be redispatched after its first implementation completed
-    // (retry, recheck, stale-worker redispatch); if a second implementation
-    // is `queued`/`ready`/`running`/`claimed` when the parent PR merges, this
-    // branch must NOT fire — the generic WIP conversion below has to carry
-    // the findings forward as a followup instead of silently dropping them.
+    // (retry, recheck, stale-worker redispatch); a later implementation means
+    // this branch must NOT fire, even if the parent-close sweep just abandoned
+    // it. The generic WIP conversion below then carries the findings forward
+    // as a followup instead of silently dropping them.
     if is_pr_review && is_wip {
-        let implementation_completed_with_nothing_pending: bool = conn.query_row(
+        let latest_implementation_completed: bool = conn.query_row(
             "SELECT EXISTS(
                  SELECT 1
                  FROM work_executions
                  WHERE work_item_id = ?1
                    AND kind = 'revision_implementation'
                    AND status = 'completed'
-             )
-             AND NOT EXISTS(
-                 SELECT 1
-                 FROM work_executions
-                 WHERE work_item_id = ?1
-                   AND kind = 'revision_implementation'
-                   AND status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+                   AND id = (
+                       SELECT id
+                       FROM work_executions
+                       WHERE work_item_id = ?1
+                         AND kind = 'revision_implementation'
+                       ORDER BY created_at DESC, id DESC
+                       LIMIT 1
+                   )
              )",
             params![rev.id],
             |row| row.get(0),
         )?;
-        if implementation_completed_with_nothing_pending {
+        if latest_implementation_completed {
             conn.execute(
                 "UPDATE tasks
                  SET status             = 'done',
@@ -525,9 +526,8 @@ pub(crate) fn resolve_revision_on_parent_close(
         return Ok(());
     }
 
-    // Human-filed revision: convert to a standalone chore, exactly as before
-    // this PR. This tail is only reachable for non-moot, non-pr_review
-    // revisions — the pr_review case always returns above.
+    // Human-filed revision: convert to a standalone chore. Only non-moot,
+    // non-pr_review revisions reach here — the pr_review case always returns above.
     let description = rev.description.clone();
     let new_chore = insert_chore_in_tx(
         conn,
