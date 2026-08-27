@@ -10,12 +10,18 @@ use boss_tmux::Tmux;
 const BOSS_SESSION_OPTIONS: &[(&str, &str)] = &[("status", "off")];
 
 /// Server-scoped options required for modified keys (e.g. Ctrl+Enter) to
-/// reach the pane. Indexed `terminal-features` assignment is idempotent;
+/// reach the pane, plus `focus-events` so attached clients receive
+/// FocusIn/FocusOut. Indexed `terminal-features` assignment is idempotent;
 /// `-a` would append a duplicate on every `apply()`. `on` (not `always`)
 /// honours apps that request xterm modifyOtherKeys mode 2 themselves.
 /// Leave `extended-keys-format` at its default (`xterm`). Escalate to
-/// `always` / `csi-u` only if the xterm form is misparsed.
-const BOSS_SERVER_OPTIONS: &[(&str, &str)] = &[("terminal-features[100]", "xterm*:extkeys"), ("extended-keys", "on")];
+/// `always` / `csi-u` only if the xterm form is misparsed. `focus-events`
+/// is a server option (tmux man page), not a session option.
+const BOSS_SERVER_OPTIONS: &[(&str, &str)] = &[
+    ("terminal-features[100]", "xterm*:extkeys"),
+    ("extended-keys", "on"),
+    ("focus-events", "on"),
+];
 
 /// Apply Boss-owned tmux options after tmux has loaded user config.
 ///
