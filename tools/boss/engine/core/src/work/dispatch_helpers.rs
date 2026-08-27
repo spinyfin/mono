@@ -1532,7 +1532,7 @@ pub(crate) fn request_pr_review_in_tx(
         );
     }
 
-    if let Some(existing) = existing_nonterminal_pr_review_execution(conn, work_item_id)? {
+    let execution = if let Some(existing) = existing_nonterminal_pr_review_execution(conn, work_item_id)? {
         // Same reasoning as the analogous clear in
         // `request_execution_in_tx_with_live_check`: reaching this point
         // means a review is (still) live for this item, so any stale
@@ -1541,16 +1541,31 @@ pub(crate) fn request_pr_review_in_tx(
         // clear automatically once the recovery sweep's trailing window
         // drains enough to re-fire the review.
         resolve_attention_kind_in_tx(conn, work_item_id, CHURN_GUARD_PARKED_ATTENTION_KIND)?;
-        return Ok(existing);
-    }
+        existing
+    } else {
+        insert_execution(
+            conn,
+            CreateExecutionInput::builder()
+                .work_item_id(work_item_id.to_owned())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )?
+    };
 
-    let execution = insert_execution(
-        conn,
-        CreateExecutionInput::builder()
-            .work_item_id(work_item_id.to_owned())
-            .kind(ExecutionKind::PrReview)
-            .status(ExecutionStatus::Ready)
-            .build(),
+    // A fresh review pass owns the row's pre-human-review phase. This also
+    // repairs rows advanced by an older fallback before a replacement review
+    // was enqueued: once the pass is live, status-derived lane placement and
+    // the derived AI-review badge agree again. Review-health blocks are not
+    // touched; only the normal human Review lane is re-armed to Doing.
+    conn.execute(
+        "UPDATE tasks
+         SET status = 'active',
+             updated_at = ?2,
+             last_status_actor = 'engine'
+         WHERE id = ?1
+           AND status = 'in_review'",
+        params![work_item_id, now_string()],
     )?;
     resolve_attention_kind_in_tx(conn, work_item_id, CHURN_GUARD_PARKED_ATTENTION_KIND)?;
     Ok(execution)
@@ -2428,6 +2443,23 @@ mod tests {
         assert_eq!(execution.kind, ExecutionKind::PrReview);
         assert_eq!(execution.status, ExecutionStatus::Ready);
         assert_eq!(execution.work_item_id, work_item_id);
+    }
+
+    #[test]
+    fn request_pr_review_restores_in_review_task_to_doing() {
+        let db = open_db();
+        let work_item_id = chore_with_pr(&db, "https://github.com/test/repo/pull/8", "in_review");
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+
+        let execution = db.request_pr_review(&work_item_id, &checker).unwrap();
+
+        assert_eq!(execution.kind, ExecutionKind::PrReview);
+        let task = query_task(&db.connect().unwrap(), &work_item_id).unwrap().unwrap();
+        assert_eq!(
+            task.status,
+            TaskStatus::Active,
+            "a replacement review must restore the Doing lane"
+        );
     }
 
     #[test]

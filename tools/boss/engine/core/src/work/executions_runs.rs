@@ -1092,18 +1092,12 @@ impl WorkDb {
         //
         // `in_review` needs a narrower guard than a blanket exclusion.
         // A row in Review owns an open PR. For a non-revision
-        // base (chore/project_task/task) the only legitimate
-        // continuation of that PR is a `kind=revision` task riding the
-        // base's branch — the base itself must never re-appear in
-        // Doing, whether the fresh execution landed on it by a stray
-        // race (the pre-existing base-protection tests) or via a
-        // deliberate direct re-dispatch (e.g. the automated reviewer
-        // pass dispatches follow-up `chore_implementation` /
-        // `pr_review` executions straight against the base while
-        // `record_worker_pr_completion`'s
-        // `PendingReview` target holds its status exactly where it
-        // was — that whole mechanism depends on the base never
-        // visibly flipping to Doing mid-review).
+        // base (chore/project_task/task), implementation work must ride a
+        // `kind=revision` task on the base's branch — the base itself must
+        // never re-appear in Doing for an implementation redispatch.
+        // `pr_review` is the deliberate exception: an actual reviewer start
+        // means the base is once again in the pre-human-review phase, so it
+        // must return to Doing until that pass records a ReviewResult.
         //
         // A revision task is different: its own re-dispatch IS the
         // sanctioned continuation, and revision rows themselves rest
@@ -1149,6 +1143,7 @@ impl WorkDb {
                AND status NOT IN ('done', 'archived', 'blocked')
                AND (
                  status != 'in_review'
+                 OR ?3 = 'pr_review'
                  OR (
                      kind = 'revision'
                      AND NOT EXISTS (
@@ -1160,7 +1155,7 @@ impl WorkDb {
                      )
                  )
                )",
-            params![execution.work_item_id, now],
+            params![execution.work_item_id, now, execution.kind.as_str()],
         )?;
 
         // A run is starting for this work item, which refutes the one thing

@@ -9,6 +9,7 @@
 //! suite uses.
 
 use super::*;
+use tempfile::tempdir;
 
 // ── list_tasks_with_stalled_reviewer ────────────────────────────────────────
 
@@ -75,7 +76,179 @@ fn stalled_reviewer_surfaces_task_with_terminal_pr_review() {
         assert_eq!(stalled[0].0, chore_id, "task id");
         assert_eq!(stalled[0].1, product_id, "product id");
         assert_eq!(stalled[0].2, pr_url, "pr_url");
+        assert!(
+            !stalled[0].3,
+            "terminal execution without a verdict has no ReviewResult"
+        );
     }
+}
+
+/// A historical failure must stop matching as soon as a fresh reviewer pass
+/// starts. Only the latest review execution describes the current hold.
+#[test]
+fn stalled_reviewer_ignores_historical_failure_during_fresh_pass() {
+    let db = WorkDb::open(temp_db_path("stalled-old-failure-fresh-pass")).unwrap();
+    let (_product_id, chore_id) = active_chore_with_pr(
+        &db,
+        "stalled-old-failure-fresh-pass",
+        "https://github.com/spinyfin/mono/pull/13",
+    );
+    pr_review_execution(&db, &chore_id, ExecutionStatus::Failed, "1");
+    pr_review_execution(&db, &chore_id, ExecutionStatus::Running, &now_string());
+
+    let stalled = db.list_tasks_with_stalled_reviewer(3600).unwrap();
+    assert!(
+        stalled.is_empty(),
+        "an old failed pass must not make its fresh running replacement look stalled: {stalled:?}"
+    );
+}
+
+#[tokio::test]
+async fn stalled_reviewer_fallback_refires_and_restores_reviewing_state() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/1766";
+    let product = create_test_product_with_repo(&db, "review-recovery", Some("https://github.com/foo/bar"));
+    let chore = create_test_chore_manual(&db, product.id.clone(), "failed-review");
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".into()),
+            pr_url: Some(pr.into()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind(ExecutionKind::PrReview)
+            .status(ExecutionStatus::Failed)
+            .build(),
+    )
+    .unwrap();
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let publisher = crate::coordinator::NoopExecutionPublisher;
+    let mut outcome = crate::merge_poller::SweepOutcome::default();
+    crate::merge_poller::sweep_stalled_reviewer(
+        &db,
+        &publisher,
+        crate::merge_poller::StalledReview {
+            task_id: &chore.id,
+            product_id: &product.id,
+            pr_url: pr,
+            review_result_written: false,
+        },
+        &checker,
+        &mut outcome,
+    )
+    .await;
+
+    assert_eq!(outcome.reviewer_fallback_advanced, 0);
+    assert_eq!(outcome.reviewer_fallback_review_refired, 1);
+    let executions = db.list_executions(Some(&chore.id)).unwrap();
+    let refired = executions
+        .iter()
+        .find(|execution| execution.kind == ExecutionKind::PrReview && execution.status == ExecutionStatus::Ready)
+        .expect("fresh review execution");
+    db.start_execution_run(
+        &refired.id,
+        "review-worker",
+        "review-host",
+        "review-lease",
+        "review-workspace",
+        "/tmp/review-workspace",
+    )
+    .unwrap();
+
+    let tree = db.get_work_tree(&product.id).unwrap();
+    let card = tree.chores.iter().find(|card| card.id == chore.id).unwrap();
+    assert_eq!(card.status, TaskStatus::Active);
+    assert!(card.ai_reviewing);
+    assert_eq!(card.ai_review_state.as_deref(), Some("reviewing"));
+
+    db.record_worker_pr_completion(
+        &refired.id,
+        pr,
+        None,
+        None,
+        WorkerPrCompletionTarget::InReview,
+        Some(ReviewVerdictInput {
+            head_sha: Some("reviewed-head".to_owned()),
+            findings_count: 0,
+            revision_warranted: false,
+            gate_outcome: REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
+        }),
+    )
+    .unwrap()
+    .expect("live review completion");
+
+    let tree = db.get_work_tree(&product.id).unwrap();
+    let card = tree.chores.iter().find(|card| card.id == chore.id).unwrap();
+    assert_eq!(card.status, TaskStatus::InReview);
+    assert!(!card.ai_reviewing);
+    assert_eq!(card.ai_review_state.as_deref(), Some("reviewed_all_clear"));
+    assert!(
+        db.list_attention_items_for_work_item(&chore.id)
+            .unwrap()
+            .iter()
+            .any(|attention| attention.kind == crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND)
+    );
+}
+
+#[tokio::test]
+async fn stalled_running_reviewer_stays_doing_without_double_dispatch() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/1767";
+    let product = create_test_product_with_repo(&db, "timed-out-review", Some("https://github.com/foo/bar"));
+    let chore = create_test_chore_manual(&db, product.id.clone(), "timed-out-review");
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".into()),
+            pr_url: Some(pr.into()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind(ExecutionKind::PrReview)
+            .status(ExecutionStatus::Running)
+            .build(),
+    )
+    .unwrap();
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let publisher = crate::coordinator::NoopExecutionPublisher;
+    let mut outcome = crate::merge_poller::SweepOutcome::default();
+    crate::merge_poller::sweep_stalled_reviewer(
+        &db,
+        &publisher,
+        crate::merge_poller::StalledReview {
+            task_id: &chore.id,
+            product_id: &product.id,
+            pr_url: pr,
+            review_result_written: false,
+        },
+        &checker,
+        &mut outcome,
+    )
+    .await;
+
+    assert_eq!(outcome.reviewer_fallback_advanced, 0);
+    assert_eq!(outcome.reviewer_fallback_review_refired, 0);
+    let task = query_task(&db.connect().unwrap(), &chore.id).unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::Active);
+    assert!(
+        db.list_attention_items_for_work_item(&chore.id)
+            .unwrap()
+            .iter()
+            .any(|attention| attention.kind == crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND)
+    );
 }
 
 /// Arm (b): a non-terminal (`running`) `pr_review` surfaces the task only when

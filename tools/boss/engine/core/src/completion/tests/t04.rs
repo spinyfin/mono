@@ -1067,11 +1067,11 @@ async fn pr_review_pass_malformed_result_reprompt_stays_driver_agnostic() {
 }
 
 /// After the auto-nudge breaker trips (the reviewer kept failing to write a
-/// valid result across re-prompts), the finalizer gives up: it advances the
-/// producing task to `in_review` WITHOUT a revision and files a
-/// human-visible attention item — replacing the old silent drop.
+/// valid result across re-prompts), the finalizer gives up on that execution
+/// but keeps the producing task in Doing and files a human-visible attention
+/// item. Recovery may re-fire without presenting the PR as reviewed.
 #[tokio::test]
-async fn pr_review_pass_no_result_advances_with_attention_after_breaker_trips() {
+async fn pr_review_pass_no_result_stays_doing_with_attention_after_breaker_trips() {
     let workspace = tempdir().unwrap();
     let (_dir, db, _product_id, chore_id, pr_review_exec_id, _pr_url) = pr_review_exec_fixture(workspace.path(), None);
     let out_dir = tempdir().unwrap();
@@ -1090,11 +1090,11 @@ async fn pr_review_pass_no_result_advances_with_attention_after_breaker_trips() 
         "first no-result Stop must re-prompt; got {first:?}",
     );
 
-    // Second Stop: breaker trips → advance without revision.
+    // Second Stop: breaker trips and terminalizes this review execution.
     let second = handler.on_stop(&pr_review_exec_id).await;
     assert!(
         matches!(second, StopOutcome::ReviewPassCompleted { .. }),
-        "breaker trip must advance to in_review (no revision); got {second:?}",
+        "breaker trip must terminalize the pass for recovery; got {second:?}",
     );
 
     let item = db.get_work_item(&chore_id).unwrap();
@@ -1104,11 +1104,11 @@ async fn pr_review_pass_no_result_advances_with_attention_after_breaker_trips() 
     };
     assert_eq!(
         task.status,
-        TaskStatus::InReview,
-        "producing task must advance after the breaker gives up",
+        TaskStatus::Active,
+        "producing task must stay in Doing when no ReviewResult exists",
     );
 
-    // An attention item must record that the PR advanced unreviewed.
+    // An attention item must record that the review pass gave up.
     let attentions = db.list_attention_items(&pr_review_exec_id).unwrap();
     assert!(
         attentions.iter().any(|i| i.kind == REVIEW_RESULT_GIVEUP_ATTENTION_KIND),

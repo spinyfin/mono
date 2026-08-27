@@ -1730,10 +1730,10 @@ fn reviewer_fallback_refuses_while_impl_exec_live() {
     assert_eq!(task.status, TaskStatus::Active, "task must stay in Doing");
 }
 
-/// With only a live `pr_review` execution (the actual reviewer), the
-/// reviewer-fallback advances the lane as before.
+/// A live `pr_review` execution has not produced a result yet, so the
+/// reviewer-fallback must keep its row in Doing.
 #[test]
-fn reviewer_fallback_advances_with_only_live_reviewer() {
+fn reviewer_fallback_keeps_live_reviewer_in_doing() {
     let db = WorkDb::open(temp_db_path("reviewer-advance-reviewer")).unwrap();
     let product_id = make_revision_product(&db, "advance-rev");
     let pr_url = "https://github.com/spinyfin/mono/pull/42";
@@ -1750,11 +1750,45 @@ fn reviewer_fallback_advances_with_only_live_reviewer() {
 
     let advanced = db.advance_pending_review_task_to_in_review(&chore_id).unwrap();
     assert!(
-        advanced,
-        "a live pr_review execution must not block the reviewer-fallback"
+        !advanced,
+        "a live pr_review execution must not advance before writing a result"
     );
     let task = query_task(&db.connect().unwrap(), &chore_id).unwrap().unwrap();
-    assert_eq!(task.status, TaskStatus::InReview);
+    assert_eq!(task.status, TaskStatus::Active);
+}
+
+/// Starting a replacement review repairs an already-advanced base row: the
+/// task returns to Doing and the derived review badge becomes visible.
+#[test]
+fn starting_pr_review_restores_in_review_base_to_doing() {
+    let db = WorkDb::open(temp_db_path("review-start-restores-doing")).unwrap();
+    let product_id = make_revision_product(&db, "review-start-restores-doing");
+    let chore_id = make_in_review_chore(&db, &product_id, "https://github.com/spinyfin/mono/pull/43");
+    let review = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+
+    db.start_execution_run(
+        &review.id,
+        "review-worker",
+        "review-repo",
+        "review-lease",
+        "review-workspace",
+        "/tmp/review-workspace",
+    )
+    .unwrap();
+
+    let tree = db.get_work_tree(&product_id).unwrap();
+    let card = tree.chores.iter().find(|card| card.id == chore_id).unwrap();
+    assert_eq!(card.status, TaskStatus::Active);
+    assert!(card.ai_reviewing);
+    assert_eq!(card.ai_review_state.as_deref(), Some("reviewing"));
 }
 
 /// End-to-end proof that `get_work_tree_instrumented` captures the

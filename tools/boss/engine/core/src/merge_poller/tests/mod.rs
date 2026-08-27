@@ -155,43 +155,6 @@ fn make_chore_in_review(db: &WorkDb, name: &str, pr_url: &str) -> (String, Strin
     (product.id, chore.id)
 }
 
-/// Build a `kind = 'chore'` row held `active` (`PendingReview`)
-/// with a `pr_review` execution in the given terminal-but-not-completed
-/// status — the reviewer-fallback candidate shape
-/// `list_tasks_with_stalled_reviewer` targets (PR #1766: a
-/// `pr_review` pane-spawn failure left the execution `failed` while the
-/// task stayed `active`).
-fn make_chore_active_with_dead_review(db: &WorkDb, name: &str, pr_url: &str, review_status: &str) -> (String, String) {
-    let product = create_test_product_with_repo(db, &format!("Product-{name}"), Some("https://github.com/foo/bar"));
-    let chore = create_test_chore_manual(db, product.id.clone(), name);
-    db.update_work_item(
-        &chore.id,
-        WorkItemPatch {
-            status: Some("active".into()),
-            pr_url: Some(pr_url.into()),
-            ..WorkItemPatch::default()
-        },
-    )
-    .unwrap();
-    let execution = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(boss_protocol::ExecutionKind::PrReview)
-                .status(ExecutionStatus::Ready)
-                .build(),
-        )
-        .unwrap();
-    db.connect()
-        .unwrap()
-        .execute(
-            "UPDATE work_executions SET status = ?2 WHERE id = ?1",
-            rusqlite::params![execution.id, review_status],
-        )
-        .unwrap();
-    (product.id, chore.id)
-}
-
 /// Stub `CubeClient` that records every `release_workspace` call.
 #[derive(Default)]
 struct RecordingCubeClient {

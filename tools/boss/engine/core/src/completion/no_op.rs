@@ -228,11 +228,11 @@ impl WorkerCompletionHandler {
 
     /// File a human-visible attention item recording that a reviewer worker
     /// exhausted its re-prompts without ever producing a readable
-    /// `ReviewResult`, so its PR is advancing to Review **unreviewed**. Unlike
+    /// `ReviewResult`, so its task stays in Doing pending recovery. Unlike
     /// [`Self::park_for_unproductive_nudges`], this does NOT change the
     /// execution's terminal handling — the caller still finalises the reviewer
-    /// pass and advances the producing task — it only surfaces the give-up to
-    /// the human. Best-effort: a filing failure is logged and swallowed.
+    /// pass — it only surfaces the give-up to the human. Best-effort: a filing
+    /// failure is logged and swallowed.
     pub(super) async fn file_review_result_giveup_attention(
         &self,
         execution: &crate::work::WorkExecution,
@@ -241,8 +241,8 @@ impl WorkerCompletionHandler {
         let body = format!(
             "The automated reviewer for this PR stopped {nudge_count} time(s) without writing a \
              valid ReviewResult — neither the structured-output artifact nor the transcript \
-             fallback validated. The producing task is advancing to Review WITHOUT an automated \
-             revision; review the PR by hand."
+             fallback validated. The producing task remains in Doing until a replacement review \
+             records a result."
         );
         // Execution-scoped (see `file_execution_attention`): mirrors the
         // nudge-breaker attention so `list_attention_items(&execution.id)`
