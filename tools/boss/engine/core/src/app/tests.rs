@@ -245,6 +245,7 @@ mod t06;
 mod t07;
 mod tmux_stub;
 mod tmux_teardown;
+mod tmux_worker_statuses;
 mod trust_authorization;
 mod worker_pane_interaction;
 mod worker_pane_lifecycle;

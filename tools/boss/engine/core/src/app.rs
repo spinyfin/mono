@@ -2581,6 +2581,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::ListTasks { .. } => work_items::handle_list_tasks(ctx, r).await,
             r @ FrontendRequest::ListRevisions { .. } => work_items::handle_list_revisions(ctx, r).await,
             r @ FrontendRequest::ListWorkerLiveStates => panes::handle_list_worker_live_states(ctx, r).await,
+            r @ FrontendRequest::ListTmuxWorkerStatuses => panes::handle_list_tmux_worker_statuses(ctx, r).await,
             r @ FrontendRequest::MarkCiRemediationFailed { .. } => {
                 ci_remediation::handle_mark_ci_remediation_failed(ctx, r).await
             }

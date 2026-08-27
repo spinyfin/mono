@@ -100,7 +100,7 @@ the pool slot claim, `WorkerRegistry` entry, `LiveWorkerState` entry, and
 live-status summarizer for every match. A session whose token instead
 resolves to a **terminal** execution is handed to `worker_readoption` exactly
 as above, via the trigger `tmux_session_sweep`, and emits
-`tmux_worker_adopted` (rebuilt) or the usual `live_worker_readopted` /
+`tmux_adopt` (rebuilt) or the usual `live_worker_readopted` /
 `husk_pane_reconcile` events (handed off) accordingly. A session whose token
 resolves to no row at all is left for `engine/core/src/husk_pane_sweep.rs`'s
 periodic two-pass reap instead of being handled here.

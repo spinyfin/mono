@@ -197,6 +197,139 @@ pub(super) async fn handle_list_worker_live_states(ctx: Dispatch, req: FrontendR
     }
 }
 
+pub(super) async fn handle_list_tmux_worker_statuses(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::ListTmuxWorkerStatuses = req else {
+        unreachable!()
+    };
+    {
+        let statuses = server_state.tmux_worker_statuses().await;
+        send_response(&sink, &request_id, FrontendEvent::TmuxWorkerStatusesList { statuses });
+    }
+}
+
+impl ServerState {
+    /// Collect the tmux-only half of `agents list` on demand. The hook-driven
+    /// live-state feed intentionally does not call tmux: doing so on every
+    /// worker event would turn a lightweight broadcast into a process probe.
+    pub(super) async fn tmux_worker_statuses(&self) -> Vec<boss_protocol::TmuxWorkerStatus> {
+        let states = self.live_worker_states_snapshot();
+        let identities = states
+            .iter()
+            .map(|state| {
+                (
+                    state.run_id.clone(),
+                    self.work_db.tmux_identity_for_execution(&state.run_id),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut statuses = Vec::with_capacity(identities.len());
+        for (execution_id, identity) in identities {
+            let identity = match identity {
+                Ok(Some(identity)) => identity,
+                Ok(None) => {
+                    statuses.push(not_tmux_hosted_status(execution_id));
+                    continue;
+                }
+                Err(err) => {
+                    tracing::warn!(execution_id, error = %format!("{err:#}"), "agents list: failed reading tmux identity");
+                    statuses.push(probe_unavailable_status(execution_id, None));
+                    continue;
+                }
+            };
+            let session_name = identity.session_name;
+            // Resolved per-run (not once for the whole batch): a run's
+            // session may live on either the durable socket or the
+            // pre-move `-L boss` server, and `tmux_for_pane_delivery`
+            // is the shared routing logic that knows which.
+            let tmux = match self.tmux_for_pane_delivery(&execution_id) {
+                Ok(tmux) => tmux,
+                Err(err) => {
+                    tracing::debug!(execution_id, error = %format!("{err:#}"), "agents list: tmux evidence unavailable");
+                    statuses.push(probe_unavailable_status(execution_id, Some(session_name)));
+                    continue;
+                }
+            };
+            let session_exists = match tmux.list_sessions().await {
+                Ok(sessions) => sessions.iter().any(|session| session.name == session_name),
+                Err(err) => {
+                    tracing::debug!(execution_id, error = %format!("{err:#}"), "agents list: tmux session inventory unavailable");
+                    statuses.push(probe_unavailable_status(execution_id, Some(session_name)));
+                    continue;
+                }
+            };
+            let observation = crate::tmux_adoption::observe_tmux_identity(
+                &tmux,
+                &session_name,
+                &identity.spawn_token,
+                session_exists,
+            )
+            .await;
+            let attach_command = (observation.adoption_state == boss_protocol::TmuxAdoptionState::Adopted)
+                .then(|| tmux.attach_session_command(&session_name));
+            let last_output_at = observation
+                .window_activity_epoch_secs
+                .filter(|epoch| *epoch > 0)
+                .map(crate::live_worker_state::iso8601_utc);
+            statuses.push(tmux_status(
+                execution_id,
+                Some(session_name),
+                observation.adoption_state,
+                observation.pane_dead,
+                last_output_at,
+                attach_command,
+            ));
+        }
+        statuses
+    }
+}
+
+fn tmux_status(
+    execution_id: String,
+    session_name: Option<String>,
+    adoption_state: boss_protocol::TmuxAdoptionState,
+    pane_dead: Option<bool>,
+    last_output_at: Option<String>,
+    attach_command: Option<String>,
+) -> boss_protocol::TmuxWorkerStatus {
+    boss_protocol::TmuxWorkerStatus::builder()
+        .execution_id(execution_id)
+        .maybe_session_name(session_name)
+        .adoption_state(adoption_state)
+        .maybe_pane_dead(pane_dead)
+        .maybe_last_output_at(last_output_at)
+        .maybe_attach_command(attach_command)
+        .build()
+}
+
+fn not_tmux_hosted_status(execution_id: String) -> boss_protocol::TmuxWorkerStatus {
+    tmux_status(
+        execution_id,
+        None,
+        boss_protocol::TmuxAdoptionState::NotTmuxHosted,
+        None,
+        None,
+        None,
+    )
+}
+
+fn probe_unavailable_status(execution_id: String, session_name: Option<String>) -> boss_protocol::TmuxWorkerStatus {
+    tmux_status(
+        execution_id,
+        session_name,
+        boss_protocol::TmuxAdoptionState::ProbeUnavailable,
+        None,
+        None,
+        None,
+    )
+}
+
 pub(super) async fn handle_retire_pane(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,

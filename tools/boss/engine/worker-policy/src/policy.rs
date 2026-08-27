@@ -383,6 +383,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::ListFeatureFlags
         | FrontendRequest::ListHostedPaneStatuses
         | FrontendRequest::ListLiveStatusDisabledSlots
+        | FrontendRequest::ListTmuxWorkerStatuses
         | FrontendRequest::ListWorkerLiveStates
         | FrontendRequest::MetricsListLive
         | FrontendRequest::MetricsReset { .. }

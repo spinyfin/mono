@@ -282,6 +282,7 @@ fn runtime_half_stays_closed() {
     for request in [
         FrontendRequest::GetDispatchState,
         FrontendRequest::ListWorkerLiveStates,
+        FrontendRequest::ListTmuxWorkerStatuses,
         FrontendRequest::StopRun {
             run_id: "exec_other".into(),
         },

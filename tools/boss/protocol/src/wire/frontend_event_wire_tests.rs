@@ -871,6 +871,11 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "worker_live_states_list",
         },
         TagCase {
+            label: "TmuxWorkerStatusesList",
+            event: FrontendEvent::TmuxWorkerStatusesList { statuses: vec![] },
+            expected_tag: "tmux_worker_statuses_list",
+        },
+        TagCase {
             label: "ExecutionCancelled",
             event: FrontendEvent::ExecutionCancelled {
                 execution: work_execution(),
@@ -1980,6 +1985,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::WorkerPaneInterrupted { .. }
         | FrontendEvent::EngineRequest { .. }
         | FrontendEvent::WorkerLiveStatesList { .. }
+        | FrontendEvent::TmuxWorkerStatusesList { .. }
         | FrontendEvent::ExecutionCancelled { .. }
         | FrontendEvent::RunReaped { .. }
         | FrontendEvent::PaneRetired { .. }

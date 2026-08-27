@@ -51,8 +51,10 @@ guess here is worse than a refusal. The selection is in-memory and
 session-scoped, so it dies with the app that reported it rather than
 outliving the UI it describes.
 
-The `agents` family steers individual workers — listing live slots,
-showing status, focusing or stopping a pane, sending user-typed text,
+The `agents` family steers individual workers — listing live slots (including
+their durable tmux session, token-adoption state, pane-death flag, and last
+terminal output time), showing status, printing the exact safe attach command
+with `agents attach <execution>`, focusing or stopping a pane, sending user-typed text,
 interrupting a turn, launching or reaping an execution, and dumping the
 recent transcript (text / raw JSONL / engine-rendered markdown). `probe`
 **interrupts the worker's current turn** and delivers the coordinator's
