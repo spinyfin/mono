@@ -120,35 +120,161 @@ struct ProjectDesignDocAffordancePresentation: Equatable {
 // (raw model output + rationale) for the whole audit trail.
 // ===========================================================================
 
+/// Pure-data presentation for [[PlannerRunAffordance]]. Current running
+/// state comes from the global background-work snapshot (`source_id` is
+/// `planner_runs.id`); staged/applied/failed history still comes from the
+/// project-scoped `list_planner_runs` cache. Lives outside the view so
+/// tests can assert running identity without a SwiftUI host.
+
+struct PlannerRunAffordancePresentation: Equatable {
+    let runID: String
+    let systemImage: String
+    let tooltip: String
+    let accessibilityLabel: String
+    let isRunning: Bool
+    let tintKind: TintKind
+
+    enum TintKind: Equatable {
+        case staged
+        case appliedOrRunning
+        case failed
+    }
+
+    var tint: Color {
+        switch tintKind {
+        case .staged: return .accentColor
+        case .appliedOrRunning: return .secondary
+        case .failed: return .orange
+        }
+    }
+
+    /// Reconcile the two planner read paths for one project.
+    ///
+    /// - A live `project_planner` snapshot item is the running identity,
+    ///   unless the cached row for that `source_id` already has a terminal
+    ///   outcome (completion arrived through the project query first).
+    /// - With no live item, a cached non-running latest run is history.
+    /// - A cache-only `running` row is not shown as running: the global
+    ///   snapshot is authoritative for that dimension, so a completed run
+    ///   dropped from the snapshot cannot keep the hourglass lit, and two
+    ///   indicators cannot disagree about whether a given run is running.
+    static func from(
+        projectID: String,
+        cachedRuns: [PlannerRun],
+        backgroundWork: [BackgroundWorkItem]
+    ) -> PlannerRunAffordancePresentation? {
+        let live = backgroundWork.first { item in
+            item.isProjectPlanner && item.projectID == projectID
+        }
+        if let live {
+            if let cached = cachedRuns.first(where: { $0.id == live.sourceID }),
+               !cached.isRunning {
+                return from(cachedRun: cached)
+            }
+            return running(runID: live.sourceID)
+        }
+        guard let latest = cachedRuns.first, !latest.isRunning else {
+            return nil
+        }
+        return from(cachedRun: latest)
+    }
+
+    /// Run identity the hourglass currently claims is running, or `nil`.
+    /// Shared so a later toolbar badge can consume the same outcome.
+    static func liveRunningRunID(
+        projectID: String,
+        cachedRuns: [PlannerRun],
+        backgroundWork: [BackgroundWorkItem]
+    ) -> String? {
+        guard let presentation = from(
+            projectID: projectID,
+            cachedRuns: cachedRuns,
+            backgroundWork: backgroundWork
+        ), presentation.isRunning else {
+            return nil
+        }
+        return presentation.runID
+    }
+
+    private static func running(runID: String) -> PlannerRunAffordancePresentation {
+        let label = "Planner is running…"
+        return PlannerRunAffordancePresentation(
+            runID: runID,
+            systemImage: "hourglass",
+            tooltip: label,
+            accessibilityLabel: "Planner: \(label)",
+            isRunning: true,
+            tintKind: .appliedOrRunning
+        )
+    }
+
+    private static func from(cachedRun run: PlannerRun) -> PlannerRunAffordancePresentation {
+        PlannerRunAffordancePresentation(
+            runID: run.id,
+            systemImage: systemImage(for: run.outcome),
+            tooltip: run.outcomeLabel,
+            accessibilityLabel: "Planner: \(run.outcomeLabel)",
+            isRunning: run.isRunning,
+            tintKind: tintKind(for: run.outcome)
+        )
+    }
+
+    private static func systemImage(for outcome: String) -> String {
+        switch outcome {
+        case "staged": return "tray.and.arrow.down.fill"
+        case "applied": return "checkmark.circle"
+        case "running": return "hourglass"
+        default: return "exclamationmark.circle"
+        }
+    }
+
+    private static func tintKind(for outcome: String) -> TintKind {
+        switch outcome {
+        case "staged": return .staged
+        case "applied", "running": return .appliedOrRunning
+        default: return .failed
+        }
+    }
+}
+
 /// Per-project Planner affordance for the kanban project-section header,
 /// mirroring [[ProjectDesignDocAffordance]]. Fetches the project's planner
-/// runs on first appearance and stays empty until the first reply lands
-/// (or the project has never been planned), then shows an outcome-tinted
-/// icon that opens [[PlannerRunPopoverView]].
+/// runs on first appearance. The hourglass can appear from the global
+/// snapshot before that reply lands; click then refreshes and opens
+/// [[PlannerRunPopoverView]] once the matching row arrives.
 
 struct PlannerRunAffordance: View {
     @ObservedObject var model: ChatViewModel
     let project: WorkProject
     @State private var isPopoverPresented = false
     @State private var hasRequestedRuns = false
+    @State private var waitingForCachedRun = false
 
-    private var latestRun: PlannerRun? { model.latestPlannerRun(forProjectID: project.id) }
+    private var presentation: PlannerRunAffordancePresentation? {
+        model.plannerAffordancePresentation(forProjectID: project.id)
+    }
+
+    private var popoverRun: PlannerRun? {
+        model.plannerRunForAffordancePopover(forProjectID: project.id)
+    }
 
     var body: some View {
         Group {
-            if let latestRun {
+            if let presentation {
                 Button {
-                    isPopoverPresented = true
+                    presentPopover()
                 } label: {
-                    Image(systemName: systemImage(for: latestRun))
+                    Image(systemName: presentation.systemImage)
                         .font(.caption)
-                        .foregroundStyle(tint(for: latestRun))
-                        .accessibilityLabel("Planner: \(latestRun.outcomeLabel)")
+                        .foregroundStyle(presentation.tint)
+                        .accessibilityLabel(presentation.accessibilityLabel)
                 }
                 .buttonStyle(.plain)
-                .help(latestRun.outcomeLabel)
+                .help(presentation.tooltip)
                 .popover(isPresented: $isPopoverPresented) {
-                    PlannerRunPopoverView(model: model, project: project, run: latestRun)
+                    if let popoverRun {
+                        PlannerRunPopoverView(model: model, project: project, run: popoverRun)
+                    }
                 }
             }
         }
@@ -157,23 +283,28 @@ struct PlannerRunAffordance: View {
             hasRequestedRuns = true
             model.refreshPlannerRuns(projectID: project.id)
         }
-    }
-
-    private func systemImage(for run: PlannerRun) -> String {
-        switch run.outcome {
-        case "staged": return "tray.and.arrow.down.fill"
-        case "applied": return "checkmark.circle"
-        case "running": return "hourglass"
-        default: return "exclamationmark.circle"
+        .onChange(of: popoverRun?.id) { _, newID in
+            guard waitingForCachedRun, newID != nil else { return }
+            waitingForCachedRun = false
+            isPopoverPresented = true
+        }
+        .onChange(of: presentation?.runID) { _, newID in
+            if waitingForCachedRun, newID == nil {
+                waitingForCachedRun = false
+            }
         }
     }
 
-    private func tint(for run: PlannerRun) -> Color {
-        switch run.outcome {
-        case "staged": return .accentColor
-        case "applied", "running": return .secondary
-        default: return .orange
+    /// Open the existing popover when the matching `PlannerRun` is cached.
+    /// If the hourglass is lit only from the global snapshot, refresh the
+    /// project-scoped query and present after that row arrives.
+    private func presentPopover() {
+        if popoverRun != nil {
+            isPopoverPresented = true
+            return
         }
+        waitingForCachedRun = true
+        model.refreshPlannerRuns(projectID: project.id)
     }
 }
 

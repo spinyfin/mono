@@ -79,6 +79,14 @@ struct BackgroundWorkItem: Identifiable, Hashable {
     let projectID: String?
     let startedAt: String?
     let workItemID: String?
+
+    /// `true` for the project-planner source. The project-card hourglass
+    /// matches on this plus `projectID` / `sourceID`; other kinds stay
+    /// in the snapshot for the toolbar count and must not drive planner UI.
+    var isProjectPlanner: Bool {
+        if case .projectPlanner = kind { return true }
+        return false
+    }
 }
 
 /// Source-specific detail for a selected unified attempt row. The list itself
