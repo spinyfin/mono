@@ -317,6 +317,10 @@ struct ContentView: View {
             }
 
             ToolbarItem(placement: .primaryAction) {
+                BackgroundWorkToolbarButton(model: model)
+            }
+
+            ToolbarItem(placement: .primaryAction) {
                 UpdateBadgeToolbarButton(updateModel: updateModel)
             }
         }
