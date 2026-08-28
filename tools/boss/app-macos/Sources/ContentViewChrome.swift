@@ -341,18 +341,39 @@ struct EngineHealthBanner: View {
 struct CoordinatorUpdateBanner: View {
     let installedVersion: String
     let onReset: () -> Void
+    var isCollapsed: Bool = false
+
+    private var copy: String {
+        "The coordinator is running an older Claude Code — \(installedVersion) is installed."
+    }
+
+    private var resetHelp: String {
+        "Ends the coordinator's current session and starts a fresh one with the installed binary, after confirming."
+    }
 
     var body: some View {
-        // The pane's expanded width is 280...600, too narrow for the
-        // original single-row HStack once the button keeps its intrinsic
-        // size. Stack the Reset control under the copy so neither is
-        // squeezed out; the text still grows vertically via `fixedSize`.
+        Group {
+            if isCollapsed {
+                collapsedBody
+            } else {
+                expandedBody
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.blue.opacity(0.85))
+        .accessibilityElement(children: .contain)
+    }
+
+    /// The pane is 280...600pt wide — too narrow to keep the copy and an
+    /// intrinsically-sized Reset button on one row, so the control sits
+    /// under the copy; the text grows vertically via `fixedSize`.
+    private var expandedBody: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .top, spacing: 8) {
                 Image(systemName: "arrow.up.circle.fill")
                     .foregroundStyle(.white)
                     .padding(.top, 2)
-                Text("The coordinator is running an older Claude Code — \(installedVersion) is installed.")
+                Text(copy)
                     .font(.callout.weight(.semibold))
                     .foregroundStyle(.white)
                     .multilineTextAlignment(.leading)
@@ -369,15 +390,30 @@ struct CoordinatorUpdateBanner: View {
                 .controlSize(.small)
                 .tint(.white)
                 .fixedSize()
-                .help("Ends the coordinator's current session and starts a fresh one with the installed binary, after confirming.")
+                .help(resetHelp)
                 .accessibilityHint("Opens a confirmation to reset the coordinator session.")
             }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.blue.opacity(0.85))
-        .accessibilityElement(children: .contain)
+    }
+
+    /// The collapsed Picard strip is 88pt — not enough for the copy or
+    /// Reset control. Keep the same trigger with a tappable glyph on the
+    /// blue strip; hover and VoiceOver still carry the notice.
+    private var collapsedBody: some View {
+        Button(action: onReset) {
+            Image(systemName: "arrow.up.circle.fill")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(copy)
+        .accessibilityLabel(copy)
+        .accessibilityHint("Opens a confirmation to reset the coordinator session.")
     }
 }
 

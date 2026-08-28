@@ -20,6 +20,8 @@ final class CoordinatorUpdateBannerTests: XCTestCase {
     private let paneMinWidth: CGFloat = 280
     /// Mirrors `workBossPanelDefaultExpandedWidth` in `ContentView.swift`.
     private let paneDefaultWidth: CGFloat = 380
+    /// Mirrors `workBossPanelCollapsedWidth` in `ContentView.swift`.
+    private let paneCollapsedWidth: CGFloat = 88
 
     func testBannerDoesNotOverflowPaneMinimumWidth() throws {
         try assertBannerFits(width: paneMinWidth, snapshotName: "coordinator-update-banner-min.png")
@@ -44,8 +46,26 @@ final class CoordinatorUpdateBannerTests: XCTestCase {
         )
     }
 
-    private func assertBannerFits(width: CGFloat, snapshotName: String) throws {
-        let host = hostedBanner(width: width)
+    func testCollapsedStripKeepsTheUpdateSignal() throws {
+        try assertBannerFits(
+            width: paneCollapsedWidth,
+            isCollapsed: true,
+            snapshotName: "coordinator-update-banner-collapsed.png"
+        )
+        let host = hostedBanner(width: paneCollapsedWidth, isCollapsed: true)
+        XCTAssertLessThan(
+            host.bounds.height,
+            56,
+            "collapsed affordance is a glyph strip, not wrapped copy; height=\(host.bounds.height)"
+        )
+    }
+
+    private func assertBannerFits(
+        width: CGFloat,
+        isCollapsed: Bool = false,
+        snapshotName: String
+    ) throws {
+        let host = hostedBanner(width: width, isCollapsed: isCollapsed)
         XCTAssertEqual(host.bounds.width, width, accuracy: 0.5)
         XCTAssertGreaterThan(host.bounds.height, 24, "banner collapsed vertically at \(width)pt")
 
@@ -64,14 +84,23 @@ final class CoordinatorUpdateBannerTests: XCTestCase {
         writeSnapshot(rep, name: snapshotName)
     }
 
-    private func hostedBanner(width: CGFloat) -> NSHostingView<some View> {
-        let root = CoordinatorUpdateBanner(installedVersion: "2.1.238", onReset: {})
-            .frame(width: width)
+    private func hostedBanner(
+        width: CGFloat,
+        isCollapsed: Bool = false
+    ) -> NSHostingView<some View> {
+        let root = CoordinatorUpdateBanner(
+            installedVersion: "2.1.238",
+            onReset: {},
+            isCollapsed: isCollapsed
+        )
+        .frame(width: width)
         let host = NSHostingView(rootView: root)
-        host.frame = NSRect(x: 0, y: 0, width: width, height: 200)
+        // Floor at 40pt so a zero fittingSize still paints; no upper clamp —
+        // a genuine overflow must show up as a taller host, not get capped.
+        host.frame = NSRect(x: 0, y: 0, width: width, height: 40)
         host.layoutSubtreeIfNeeded()
         let fittedHeight = max(host.fittingSize.height, host.intrinsicContentSize.height)
-        let height = min(max(fittedHeight, 40), 200)
+        let height = max(fittedHeight, 40)
         host.frame = NSRect(x: 0, y: 0, width: width, height: height)
         host.layoutSubtreeIfNeeded()
         return host

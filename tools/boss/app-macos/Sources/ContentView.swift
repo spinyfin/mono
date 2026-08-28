@@ -851,12 +851,13 @@ struct ContentView: View {
         return VStack(spacing: 0) {
             // Informational, not a fault: lives in this column rather than
             // window chrome so the kanban, sidebar, and toolbar stay put.
-            // Hidden while collapsed — the 88pt strip cannot hold the copy
-            // or the Reset control. Expanding the pane reveals it again.
-            if !isCollapsed, model.isConnected, let installedVersion = model.coordinatorUpdateAvailable {
+            // Same trigger while collapsed: the 88pt strip shows a compact
+            // glyph; expanding restores the copy and Reset control.
+            if model.isConnected, let installedVersion = model.coordinatorUpdateAvailable {
                 CoordinatorUpdateBanner(
                     installedVersion: installedVersion,
-                    onReset: { showCoordinatorResetConfirmFromBanner = true }
+                    onReset: { showCoordinatorResetConfirmFromBanner = true },
+                    isCollapsed: isCollapsed
                 )
             }
 
