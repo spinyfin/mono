@@ -22,6 +22,10 @@ pub mod path_scope;
 pub mod progress;
 pub mod runner;
 pub mod source_tree;
+/// Test-only git repo constructors. Hidden from rustdoc; used by checkleft's
+/// own unit and integration tests so they share one portable init path.
+#[doc(hidden)]
+pub mod test_git;
 pub mod vcs;
 
 #[cfg(test)]

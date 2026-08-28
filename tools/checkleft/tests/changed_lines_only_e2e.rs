@@ -110,7 +110,7 @@ fn build_repo_with_one_changed_line() -> (tempfile::TempDir, ChangeSet, String, 
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
 
-    git(root, &["init", "-q", "-b", "main"]);
+    checkleft::test_git::init_repo_with_branch(root, "main");
     git(root, &["config", "user.email", "test@example.com"]);
     git(root, &["config", "user.name", "Test"]);
 

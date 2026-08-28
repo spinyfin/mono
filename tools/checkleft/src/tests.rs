@@ -646,16 +646,7 @@ fn resolve_ref_for_upload_uses_synthetic_merge_queue_branch() {
     // Still need a real (empty) repo on disk since `Vcs` has no other public
     // constructor.
     let temp = tempfile::tempdir().expect("temp dir");
-    let output = std::process::Command::new("git")
-        .args(["init", "-b", "main"])
-        .current_dir(temp.path())
-        .output()
-        .expect("git init");
-    assert!(
-        output.status.success(),
-        "git init failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    checkleft::test_git::init_repo_with_branch(temp.path(), "main");
     let vcs = Vcs::detect(temp.path()).expect("detect vcs");
 
     assert_eq!(
@@ -1839,7 +1830,7 @@ async fn attach_description_context_splits_tip_leakage_from_range_bypass() {
     }
 
     let temp = tempdir().expect("temp dir");
-    run_git(temp.path(), &["init", "-b", "main"]);
+    checkleft::test_git::init_repo_with_branch(temp.path(), "main");
     run_git(temp.path(), &["config", "user.email", "test@checkleft.example"]);
     run_git(temp.path(), &["config", "user.name", "Checkleft Test"]);
 
@@ -1959,7 +1950,7 @@ mod changeset_undetermined {
 
     fn init_repo(default_branch: &str) -> tempfile::TempDir {
         let dir = tempdir().expect("tempdir");
-        git(dir.path(), &["init", "-b", default_branch]);
+        checkleft::test_git::init_repo_with_branch(dir.path(), default_branch);
         git(dir.path(), &["config", "user.email", "test@checkleft.example"]);
         git(dir.path(), &["config", "user.name", "Checkleft Test"]);
         dir

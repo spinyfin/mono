@@ -626,17 +626,58 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// Pin HEAD to `branch` after a portable `git init`. Returns false when
+    /// git is unavailable so callers can skip rather than fail in a hermetic
+    /// sandbox.
+    fn init_named_branch(path: &Path, branch: &str) -> bool {
+        if !git(&["init", "-q"], path) {
+            return false;
+        }
+        let head = format!("refs/heads/{branch}");
+        if !git(&["symbolic-ref", "HEAD", &head], path) {
+            return false;
+        }
+        let actual = Command::new("git")
+            .args(["symbolic-ref", "HEAD"])
+            .current_dir(path)
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_owned());
+        assert_eq!(
+            actual.as_deref(),
+            Some(head.as_str()),
+            "HEAD must point at the intended branch after init"
+        );
+        true
+    }
+
     /// Init a git repo with one committed file so `--3way` has blobs to work
     /// with. Returns false when git is unavailable so tests skip rather than
     /// fail in a hermetic sandbox.
     fn init_git_repo(path: &Path) -> bool {
-        if !git(&["init", "--initial-branch=main"], path) {
+        if !init_named_branch(path, "main") {
             return false;
         }
         let _ = git(&["config", "user.email", "test@example.com"], path);
         let _ = git(&["config", "user.name", "Test"], path);
         std::fs::write(path.join("hello.txt"), "original\n").unwrap();
         git(&["add", "."], path) && git(&["commit", "-m", "seed"], path)
+    }
+
+    #[test]
+    fn init_named_branch_points_head_at_the_intended_branch() {
+        let dir = TempDir::new().unwrap();
+        if !init_named_branch(dir.path(), "main") {
+            eprintln!("skipping: git unavailable in sandbox");
+            return;
+        }
+        let actual = Command::new("git")
+            .args(["symbolic-ref", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&actual.stdout).trim(), "refs/heads/main");
     }
 
     /// The P2 happy path: a patch holding real work is applied into the

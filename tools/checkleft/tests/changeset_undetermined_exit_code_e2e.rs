@@ -77,7 +77,7 @@ fn no_merge_base_exits_with_dedicated_code() {
 
     let dir = tempdir().expect("tempdir");
     let root = dir.path();
-    git(root, &["init", "-b", "main"]);
+    checkleft::test_git::init_repo_with_branch(root, "main");
     git(root, &["config", "user.email", "test@checkleft.example"]);
     git(root, &["config", "user.name", "Checkleft Test"]);
     commit(root, "base.txt", "base\n", "A: base on main");

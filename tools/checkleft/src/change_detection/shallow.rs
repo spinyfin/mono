@@ -340,7 +340,7 @@ mod tests {
         let remote_dir = tempdir().expect("tempdir remote");
         let remote = remote_dir.path();
 
-        git(remote, &["init", "-b", "main"]);
+        crate::test_git::init_repo_with_branch(remote, "main");
         configure_git(remote);
 
         for i in 0..commit_count {
@@ -350,7 +350,7 @@ mod tests {
         let clone_dir = tempdir().expect("tempdir clone");
         let clone = clone_dir.path();
 
-        git(clone, &["init", "-b", "main"]);
+        crate::test_git::init_repo_with_branch(clone, "main");
         configure_git(clone);
         git(clone, &["remote", "add", "origin", remote.to_str().unwrap()]);
         git(clone, &["fetch", "--depth=1", "origin", "main"]);
@@ -383,7 +383,7 @@ mod tests {
     #[test]
     fn is_shallow_returns_false_for_full_repo() {
         let dir = tempdir().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
+        crate::test_git::init_repo_with_branch(dir.path(), "main");
         configure_git(dir.path());
         commit_file(dir.path(), "a.txt", "a\n", "initial");
 
@@ -401,7 +401,7 @@ mod tests {
     #[test]
     fn ensure_history_is_noop_when_not_shallow() {
         let dir = tempdir().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
+        crate::test_git::init_repo_with_branch(dir.path(), "main");
         configure_git(dir.path());
         commit_file(dir.path(), "a.txt", "a\n", "initial");
 
@@ -459,7 +459,7 @@ mod tests {
         // Build a remote with: main has 5 commits, then a branch with 1 commit.
         let remote_dir = tempdir().expect("tempdir remote");
         let remote = remote_dir.path();
-        git(remote, &["init", "-b", "main"]);
+        crate::test_git::init_repo_with_branch(remote, "main");
         configure_git(remote);
 
         // 5 commits on main — the merge-base will be commit 0.
@@ -483,7 +483,7 @@ mod tests {
         // (git clone --depth=1 ignores --depth for local file transports).
         let clone_dir = tempdir().expect("tempdir clone");
         let clone = clone_dir.path();
-        git(clone, &["init", "-b", "pr-branch"]);
+        crate::test_git::init_repo_with_branch(clone, "pr-branch");
         configure_git(clone);
         git(clone, &["remote", "add", "origin", remote.to_str().unwrap()]);
         git(clone, &["fetch", "--depth=1", "origin", "pr-branch"]);

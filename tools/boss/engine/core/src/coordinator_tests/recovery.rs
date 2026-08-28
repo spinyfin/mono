@@ -64,7 +64,7 @@ fn init_recovery_workspace(path: &std::path::Path) -> bool {
             .map(|o| o.status.success())
             .unwrap_or(false)
     };
-    if !run(&["init", "--initial-branch=main"]) {
+    if !crate::test_support::try_init_repo_with_branch(path, "main") {
         return false;
     }
     let _ = run(&["config", "user.email", "t@example.com"]);
