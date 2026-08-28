@@ -59,12 +59,17 @@
 //!      fallback (`crate::coordinator`'s `lease_workspace_with_fallback`):
 //!      a failed lease on the preferred workspace fails the dispatch
 //!      outright instead of silently landing on a different, clean
-//!      workspace, which would strand the uncommitted work.
+//!      workspace, which would strand the uncommitted work. The stalled
+//!      worker's pane is torn down through
+//!      [`crate::app::ServerState::release_worker_pane`]; the pool claim
+//!      is handed back only when that teardown is confirmed.
 //!   5. **Escalate** (permanent / unrecognised / retry cap reached):
 //!      raise a `WorkAttentionItem` and stop. The orphan-active sweep
 //!      excludes work items with an open recovery attention item
 //!      (`list_orphan_active_candidates`), so a non-retryable failure is
-//!      not blindly re-dispatched.
+//!      not blindly re-dispatched. Same confirmed-teardown gate as
+//!      resume: the slot is not advertised free while the app may still
+//!      host the pane.
 //!
 //! ## Verifying continuation, not just dispatch
 //!
@@ -113,7 +118,7 @@ use serde_json::Value;
 
 use boss_protocol::WorkerActivity;
 
-use crate::coordinator::{ExecutionCoordinator, worker_id_for_slot};
+use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::driver::{DriverRegistry, WorkerErrorClass};
 use crate::live_worker_state::LiveWorkerStateRegistry;
@@ -161,6 +166,26 @@ pub trait WorkerNudger: Send + Sync {
     async fn broadcast_live_states(&self) {}
 }
 
+/// Tears down the app-hosted pane for a recovered worker and hands the
+/// pool slot back only when that teardown is confirmed.
+///
+/// Production wires this to [`crate::app::ServerState::release_worker_pane`],
+/// the same confirmed-teardown path completion / stale-worker / spawn-ack
+/// already use. Callers must **not** also
+/// [`ExecutionCoordinator::release_worker_and_kick`]: that is how this
+/// sweep used to advertise a slot free while the app still hosted the
+/// pane, poisoning it `SlotBusy` until restart. Confirmed release (or
+/// an already-released reply) frees the slot; a deadline expiry,
+/// transport error, unexpected response, or absent app session is
+/// unconfirmed and the claim stays held.
+#[async_trait]
+pub trait TransientRecoveryReaper: Send + Sync {
+    /// Tear down the app pane (if any) for `execution_id` and release
+    /// resources only once that teardown is confirmed. Idempotent: a
+    /// slot with no pane is a no-op.
+    async fn reap_worker(&self, execution_id: &str);
+}
+
 /// No-op nudger used in tests and contexts without an app session.
 /// Always returns `Err`, which causes the sweep to fall through to
 /// the orphan+respawn path — preserving pre-nudge test behaviour.
@@ -204,6 +229,7 @@ pub struct RecoveryContext<'a> {
     pub dispatch_events: &'a dyn DispatchEventSink,
     pub policy: &'a RecoveryPolicy,
     pub nudger: &'a dyn WorkerNudger,
+    pub reaper: &'a dyn TransientRecoveryReaper,
 }
 
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`,
@@ -214,6 +240,7 @@ pub fn spawn_loop(
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: Arc<dyn DispatchEventSink>,
     nudger: Arc<dyn WorkerNudger>,
+    reaper: Arc<dyn TransientRecoveryReaper>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     let policy = RecoveryPolicy::default();
@@ -233,6 +260,7 @@ pub fn spawn_loop(
                 dispatch_events: dispatch_events.as_ref(),
                 policy: &policy,
                 nudger: nudger.as_ref(),
+                reaper: reaper.as_ref(),
             };
             let outcome = run_one_pass(&cx, &mut nudged_executions, now).await;
             if outcome.has_activity() {
@@ -266,6 +294,7 @@ pub async fn run_one_pass(
         dispatch_events,
         policy,
         nudger,
+        reaper,
         ..
     } = cx;
     let coordinator = cx.coordinator.clone();
@@ -465,7 +494,7 @@ pub async fn run_one_pass(
                     stall_reason,
                     "transient-recovery: worker stalled; auto-resuming on same workspace",
                 );
-                release_slot(&coordinator, live_states, state.slot_id).await;
+                release_slot(reaper, &execution_id).await;
                 crate::reconcile_audit::append_reconcile_audit_best_effort(
                     work_db,
                     &work_item_id,
@@ -490,9 +519,12 @@ pub async fn run_one_pass(
                     )
                     .await;
 
-                // Defer a kick until the backoff window expires so the
-                // resume dispatches promptly, plus an immediate kick so
-                // the coordinator notices the freed slot.
+                // Immediate kick so other idle slots can pick up work.
+                // This slot itself is free only once the pane teardown
+                // above confirmed; an unconfirmed teardown holds the
+                // claim so a later dispatch cannot land `SlotBusy`.
+                // A deferred kick still fires when the resume's backoff
+                // window expires.
                 coordinator.kick();
                 let coordinator = coordinator.clone();
                 tokio::spawn(async move {
@@ -567,7 +599,7 @@ pub async fn run_one_pass(
                     error = %clipped,
                     "transient-recovery: escalating worker for human attention (not auto-retried)",
                 );
-                release_slot(&coordinator, live_states, state.slot_id).await;
+                release_slot(reaper, &execution_id).await;
                 dispatch_events
                     .emit(
                         DispatchEvent::new(Stage::TransientRecoveryExhausted, Outcome::Error, &execution_id)
@@ -643,21 +675,21 @@ fn should_inspect(activity: WorkerActivity) -> bool {
     )
 }
 
-async fn release_slot(coordinator: &Arc<ExecutionCoordinator>, live_states: &LiveWorkerStateRegistry, slot_id: u8) {
-    // Drop the live-state entry before releasing the pool claim — see the
-    // matching comment in `dead_pid_sweep::reap_dead_execution`. Leaving it
-    // behind desyncs the pool's "free" bookkeeping from the engine's own
-    // live-worker view (masking the slot from `husk_pane_sweep` and
-    // reporting a stalled-and-abandoned run as still live), which is
-    // exactly the divergence that lets a later dispatch re-claim this slot
-    // and get rejected `SlotBusy` by an app that still hosts a pane here.
-    live_states.release_slot(slot_id);
-    // Use worker_id_for_slot (not WorkerPool::worker_id_for_slot) so
-    // automation-pool slots (> MAX_WORKER_POOL_SIZE) produce the
-    // "auto-worker-N" prefix and release_worker_and_kick routes to
-    // the correct pool via pool_for_worker_id.
-    let worker_id = worker_id_for_slot(slot_id);
-    coordinator.release_worker_and_kick(&worker_id, None).await;
+/// Tear the recovered worker's pane down through
+/// [`TransientRecoveryReaper`]. Production routes this to
+/// [`crate::app::ServerState::release_worker_pane`], which drops the
+/// live-state entry and hands the pool claim back **only** when the app
+/// confirms the pane is gone.
+///
+/// Do not also call [`ExecutionCoordinator::release_worker_and_kick`]
+/// here. That is the fabricated-free signal that lets a later dispatch
+/// re-claim a slot the app still hosts and die `SlotBusy` seconds after
+/// start — the slot then stays poisoned until the engine restarts.
+/// `pool_claim_sweep` cannot rescue an already-released claim; holding
+/// it on unconfirmed teardown is the only way the next dispatch stays
+/// off the still-hosted pane.
+async fn release_slot(reaper: &dyn TransientRecoveryReaper, execution_id: &str) {
+    reaper.reap_worker(execution_id).await;
 }
 
 /// Read the last `max_bytes` of a transcript file and parse the
@@ -761,6 +793,35 @@ mod tests {
         }
     }
 
+    /// Records which run_ids the sweep asked to reap. Does **not** free
+    /// the pool claim or drop live-state — that is `release_worker_pane`'s
+    /// job, gated on a confirmed pane teardown. A test that sees the
+    /// claim vanish after a pass with this stub has found a `release_slot`
+    /// that hands the pool claim back itself instead of leaving it to the
+    /// confirmed-teardown path.
+    struct RecordingReaper {
+        reaped: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingReaper {
+        fn new() -> Self {
+            Self {
+                reaped: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        async fn reaped_ids(&self) -> Vec<String> {
+            self.reaped.lock().await.clone()
+        }
+    }
+
+    #[async_trait]
+    impl TransientRecoveryReaper for RecordingReaper {
+        async fn reap_worker(&self, execution_id: &str) {
+            self.reaped.lock().await.push(execution_id.to_owned());
+        }
+    }
+
     // ─── helpers ──────────────────────────────────────────────────────
 
     /// Create a `running` execution with a backdated `started_at` (past
@@ -842,10 +903,10 @@ mod tests {
         boss_engine_utils::epoch_time::now_epoch_secs()
     }
 
-    /// Build the six-field [`RecoveryContext`] shared by nearly every test,
-    /// run one recovery pass, and return the outcome together with the sink
-    /// so callers can still assert on `sink.events()`. The `nudger` and the
-    /// `nudged` set vary per test; the policy is always
+    /// Build the [`RecoveryContext`] shared by nearly every test, run one
+    /// recovery pass, and return the outcome together with the sink and
+    /// the execution ids the sweep asked the reaper to tear down. The
+    /// `nudger` and the `nudged` set vary per test; the policy is always
     /// `RecoveryPolicy::default()` and the clock is `now()`.
     async fn run_pass(
         db: &WorkDb,
@@ -853,8 +914,9 @@ mod tests {
         coordinator: &Arc<ExecutionCoordinator>,
         nudger: &dyn WorkerNudger,
         nudged: &mut HashSet<String>,
-    ) -> (TransientRecoveryOutcome, Arc<RecordingDispatchEventSink>) {
+    ) -> (TransientRecoveryOutcome, Arc<RecordingDispatchEventSink>, Vec<String>) {
         let sink = Arc::new(RecordingDispatchEventSink::new());
+        let reaper = RecordingReaper::new();
         let cx = RecoveryContext {
             work_db: db,
             live_states: live,
@@ -862,9 +924,23 @@ mod tests {
             dispatch_events: sink.as_ref(),
             policy: &RecoveryPolicy::default(),
             nudger,
+            reaper: &reaper,
         };
         let outcome = run_one_pass(&cx, nudged, now()).await;
-        (outcome, sink)
+        let reaped = reaper.reaped_ids().await;
+        (outcome, sink, reaped)
+    }
+
+    /// The recording stub does not touch the pool. If the claim is gone,
+    /// `release_slot` is still handing it back itself — the fabricated-free
+    /// signal that poisons a still-hosted pane `SlotBusy`.
+    async fn assert_claim_held(coordinator: &ExecutionCoordinator, execution_id: &str) {
+        let claimed = coordinator.worker_pool().claimed_execution_ids().await;
+        assert!(
+            claimed.contains(execution_id),
+            "unconfirmed teardown must hold the pool claim so the next dispatch \
+             cannot land on a slot the app may still host; claimed={claimed:?}",
+        );
     }
 
     // ─── tests ────────────────────────────────────────────────────────
@@ -886,12 +962,13 @@ mod tests {
 
         let nudger = RecordingNudger::new();
         let mut nudged = HashSet::new();
-        let (outcome, sink) = run_pass(&db, &live, &coordinator, &nudger, &mut nudged).await;
+        let (outcome, sink, reaped) = run_pass(&db, &live, &coordinator, &nudger, &mut nudged).await;
 
         // First pass: should nudge, not orphan+respawn.
         assert_eq!(outcome.nudged, 1, "alive idle worker should be nudged first");
         assert_eq!(outcome.resumed, 0, "should not orphan+respawn on first nudge");
         assert_eq!(outcome.escalated, 0);
+        assert!(reaped.is_empty(), "nudge must leave the pane/slot intact: {reaped:?}");
         assert!(nudged.contains(&exec_id), "execution should be in nudged set");
         assert_eq!(nudger.nudged_ids().await, vec![exec_id.clone()]);
 
@@ -932,11 +1009,17 @@ mod tests {
         let mut nudged = HashSet::new();
         nudged.insert(exec_id.clone());
 
-        let (outcome, sink) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut nudged).await;
+        let (outcome, sink, reaped) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut nudged).await;
 
         // Second pass: nudge already tried, error still present → orphan+respawn.
         assert_eq!(outcome.resumed, 1, "second pass should orphan+respawn");
         assert_eq!(outcome.nudged, 0);
+        assert_eq!(
+            reaped,
+            vec![exec_id.clone()],
+            "orphan+respawn must reap through the confirmed-teardown path"
+        );
+        assert_claim_held(&coordinator, &exec_id).await;
         assert!(
             !nudged.contains(&exec_id),
             "id removed from nudged set on orphan+respawn"
@@ -978,10 +1061,12 @@ mod tests {
         let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
 
-        let (outcome, sink) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
+        let (outcome, sink, reaped) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
 
         assert_eq!(outcome.resumed, 1, "noop nudger falls through to orphan+respawn");
         assert_eq!(outcome.escalated, 0);
+        assert_eq!(reaped, vec![dead_id.clone()]);
+        assert_claim_held(&coordinator, &dead_id).await;
 
         let execs = db.list_executions(Some(&work_item_id)).unwrap();
         let dead = execs.iter().find(|e| e.id == dead_id).unwrap();
@@ -996,9 +1081,6 @@ mod tests {
             fresh.dispatch_not_before.is_some(),
             "resume must be deferred by a backoff window",
         );
-
-        let claimed = coordinator.worker_pool().claimed_execution_ids().await;
-        assert!(!claimed.contains(&dead_id));
 
         let events = sink.events().await;
         assert_eq!(events.len(), 1);
@@ -1021,10 +1103,16 @@ mod tests {
         let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
 
-        let (outcome, sink) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
+        let (outcome, sink, reaped) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
 
         assert_eq!(outcome.escalated, 1, "permanent error should escalate");
         assert_eq!(outcome.resumed, 0, "permanent error must NOT resume");
+        assert_eq!(
+            reaped,
+            vec![dead_id.clone()],
+            "escalate-to-human must reap through the confirmed-teardown path"
+        );
+        assert_claim_held(&coordinator, &dead_id).await;
 
         let execs = db.list_executions(Some(&work_item_id)).unwrap();
         assert!(
@@ -1065,10 +1153,12 @@ mod tests {
         let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
 
-        let (outcome, _sink) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
+        let (outcome, _sink, reaped) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
 
         assert_eq!(outcome.escalated, 1, "at cap, must escalate not resume");
         assert_eq!(outcome.resumed, 0);
+        assert_eq!(reaped, vec![dead_id.clone()]);
+        assert_claim_held(&coordinator, &dead_id).await;
         let attn = db.list_attention_items_for_work_item(&work_item_id).unwrap();
         assert_eq!(attn[0].kind, ATTENTION_KIND_RECOVERY_EXHAUSTED);
     }
@@ -1093,12 +1183,13 @@ mod tests {
         register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
 
         let nudger = RecordingNudger::new();
-        let (outcome, _sink) = run_pass(&db, &live, &coordinator, &nudger, &mut HashSet::new()).await;
+        let (outcome, _sink, reaped) = run_pass(&db, &live, &coordinator, &nudger, &mut HashSet::new()).await;
 
         assert_eq!(
             outcome.nudged, 1,
             "ConnectionRefused must classify as transient and take the resume path, not escalate"
         );
+        assert!(reaped.is_empty(), "nudge must not reap: {reaped:?}");
         assert_eq!(outcome.escalated, 0);
         assert_eq!(db.get_execution(&exec_id).unwrap().status, ExecutionStatus::Running);
         assert!(
@@ -1126,13 +1217,15 @@ mod tests {
         let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
 
-        let (outcome, _sink) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
+        let (outcome, _sink, reaped) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
 
         assert_eq!(
             outcome.resumed, 1,
             "an unrecognized error must resume (orphan+respawn, nudger unavailable), not escalate at zero attempts"
         );
         assert_eq!(outcome.escalated, 0);
+        assert_eq!(reaped, vec![exec_id.clone()]);
+        assert_claim_held(&coordinator, &exec_id).await;
         assert!(db.list_attention_items_for_work_item(&work_item_id).unwrap().is_empty());
     }
 
@@ -1156,10 +1249,12 @@ mod tests {
         let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
 
-        let (outcome, sink) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
+        let (outcome, sink, reaped) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
 
         assert_eq!(outcome.escalated, 1, "at cap, must escalate not resume");
         assert_eq!(outcome.resumed, 0);
+        assert_eq!(reaped, vec![dead_id.clone()]);
+        assert_claim_held(&coordinator, &dead_id).await;
         // Same attention kind as a confirmed-transient exhaustion (both are
         // "we tried, it kept failing") — orphan_sweep already excludes this
         // kind pending human resolution, same as before.
@@ -1192,11 +1287,12 @@ mod tests {
         let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
 
-        let (outcome, sink) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
+        let (outcome, sink, reaped) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
 
         assert_eq!(outcome.resumed, 0);
         assert_eq!(outcome.escalated, 0);
         assert_eq!(outcome.no_error_skipped, 1);
+        assert!(reaped.is_empty(), "recovered worker must not be reaped: {reaped:?}");
         assert_eq!(db.get_execution(&dead_id).unwrap().status, ExecutionStatus::Running);
         assert!(sink.events().await.is_empty());
     }
@@ -1227,12 +1323,14 @@ mod tests {
         let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
 
-        let (outcome, sink) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
+        let (outcome, sink, reaped) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
 
         assert_eq!(
             outcome.resumed, 1,
             "a resumed session with zero activity must be retried, not silently ignored"
         );
+        assert_eq!(reaped, vec![exec_id.clone()]);
+        assert_claim_held(&coordinator, &exec_id).await;
         assert_eq!(outcome.no_error_skipped, 0);
         assert_eq!(outcome.escalated, 0);
 
@@ -1276,11 +1374,12 @@ mod tests {
         let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
 
-        let (outcome, sink) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
+        let (outcome, sink, reaped) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
 
         assert_eq!(outcome.resumed, 0);
         assert_eq!(outcome.escalated, 0);
         assert_eq!(outcome.no_error_skipped, 1);
+        assert!(reaped.is_empty(), "fresh idle execution must not be reaped: {reaped:?}");
         assert_eq!(db.get_execution(&exec_id).unwrap().status, ExecutionStatus::Running);
         assert!(sink.events().await.is_empty());
     }
@@ -1305,13 +1404,15 @@ mod tests {
         let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
 
-        let (outcome, _sink) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
+        let (outcome, _sink, reaped) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
 
         assert_eq!(
             outcome.escalated, 1,
             "at cap, a no-activity stall must escalate not resume"
         );
         assert_eq!(outcome.resumed, 0);
+        assert_eq!(reaped, vec![exec_id.clone()]);
+        assert_claim_held(&coordinator, &exec_id).await;
         let attn = db.list_attention_items_for_work_item(&work_item_id).unwrap();
         assert_eq!(attn[0].kind, ATTENTION_KIND_RECOVERY_EXHAUSTED);
     }
@@ -1350,11 +1451,12 @@ mod tests {
         register_idle_slot(&live, 1, &execution.id, &work_item_id);
         let coordinator = make_coordinator(db.clone(), 2);
 
-        let (outcome, _sink) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
+        let (outcome, _sink, reaped) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
 
         assert_eq!(outcome.resumed, 0);
         assert_eq!(outcome.escalated, 0);
         assert_eq!(outcome.grace_skipped, 1);
+        assert!(reaped.is_empty(), "grace skip must not reap: {reaped:?}");
     }
 
     #[tokio::test]
@@ -1389,9 +1491,10 @@ mod tests {
         );
         let coordinator = make_coordinator(db.clone(), 2);
 
-        let (outcome, _sink) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
+        let (outcome, _sink, reaped) = run_pass(&db, &live, &coordinator, &NoopWorkerNudger, &mut HashSet::new()).await;
 
         assert_eq!(outcome, TransientRecoveryOutcome::default());
+        assert!(reaped.is_empty(), "working slot must not be reaped: {reaped:?}");
     }
 
     #[tokio::test]

@@ -1742,6 +1742,7 @@ pub async fn serve_with_merge_probe(
         server_state.execution_coordinator.clone(),
         server_state.dispatch_events.clone(),
         Arc::clone(&server_state) as Arc<dyn crate::transient_recovery::WorkerNudger>,
+        Arc::clone(&server_state) as Arc<dyn crate::transient_recovery::TransientRecoveryReaper>,
         crate::transient_recovery::DEFAULT_INTERVAL,
     );
 
