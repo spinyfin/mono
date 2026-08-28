@@ -478,13 +478,14 @@ impl crate::transient_recovery::TransientRecoveryReaper for ServerState {
     /// app to tear the pane down, so the next dispatch claimed a slot
     /// the app still hosted and died `SlotBusy`.
     async fn reap_worker(&self, execution_id: &str) {
-        let outcome = ServerState::release_worker_pane(self, execution_id).await;
-        // `NoLiveWorker` here means `release_worker_pane` found no
-        // run→slot mapping and fell through to
-        // `reap_untracked_worker_process`, which — on its own
-        // "no live durable pid" arm — never touches `live_worker_states`
-        // or the pool claim. The caller (`transient_recovery::release_slot`)
-        // has already called `work_db.request_resume_execution` /
+        let _ = ServerState::release_worker_pane(self, execution_id).await;
+        // `release_worker_pane` drops live-state itself when it has a
+        // run→slot mapping (`release_slot(slot_id)`). The untracked
+        // path (`reap_untracked_worker_process`) does not: neither the
+        // no-alive-pid `NoLiveWorker` arm nor the alive-pid + no hosted
+        // pane `Reaped` arm touches `live_worker_states` or the pool
+        // claim. The caller (`transient_recovery::release_slot`) has
+        // already called `work_db.request_resume_execution` /
         // `mark_execution_orphaned`, so the execution is terminal by the
         // time this returns. Left alone, that is worse than the SlotBusy
         // this reaper exists to prevent: `pool_claim_sweep` step 1
@@ -493,10 +494,9 @@ impl crate::transient_recovery::TransientRecoveryReaper for ServerState {
         // would keep showing a phantom live worker. Drop the orphaned
         // live-state entry so the slot lands in the terminal +
         // claimed + no-live-entry shape `pool_claim_sweep` reconciles at
-        // `LEAK_GRACE_SECS`.
-        if outcome == PaneReleaseOutcome::NoLiveWorker
-            && let Some(slot_id) = self.live_worker_states.release_slot_for_run(execution_id)
-        {
+        // `LEAK_GRACE_SECS`. A no-op when the slot-mapped path (or the
+        // hosted-pane arm of the untracked path) already dropped it.
+        if let Some(slot_id) = self.live_worker_states.release_slot_for_run(execution_id) {
             tracing::warn!(
                 execution_id,
                 slot_id,

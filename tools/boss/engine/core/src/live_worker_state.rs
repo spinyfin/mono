@@ -675,14 +675,14 @@ impl LiveWorkerStateRegistry {
     /// never registered — a benign no-op).
     ///
     /// For callers that only know the run id, not the slot — e.g.
-    /// `TransientRecoveryReaper::reap_worker` on a
-    /// [`crate::completion::PaneReleaseOutcome::NoLiveWorker`] answer,
-    /// where `release_worker_pane` found no run→slot mapping and so never
-    /// reached its own [`Self::release_slot`] call. Left alone, that shape
-    /// strands both the pool claim and this live-state entry: an entry
-    /// still backing the claim is exactly what `pool_claim_sweep` skips by
-    /// design, so nothing else ever reconciles it. Dropping the entry here
-    /// clears that gate.
+    /// `TransientRecoveryReaper::reap_worker` after `release_worker_pane`
+    /// found no run→slot mapping (both the `NoLiveWorker` and untracked
+    /// `Reaped` arms of `reap_untracked_worker_process` skip
+    /// [`Self::release_slot`]). Left alone, that shape strands both the
+    /// pool claim and this live-state entry: an entry still backing the
+    /// claim is exactly what `pool_claim_sweep` skips by design, so
+    /// nothing else ever reconciles it. Dropping the entry here clears
+    /// that gate.
     #[track_caller]
     pub fn release_slot_for_run(&self, run_id: &str) -> Option<u8> {
         let slot_id = {

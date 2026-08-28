@@ -88,79 +88,21 @@ async fn seed_stalled_worker(error_line: &str, register_session: bool) -> Seeded
     }
 }
 
-/// Like [`seed_stalled_worker`], but skips `worker_registry.register_run_slot`
-/// so `release_worker_pane` has no run→slot mapping for this run and falls
-/// through to `reap_untracked_worker_process`, which — with no durable
-/// shell pid recorded — answers `NoLiveWorker` without ever touching
-/// `live_worker_states` or the pool claim itself.
+/// Like [`seed_stalled_worker`], then drop the run→slot mapping so
+/// `release_worker_pane` falls through to `reap_untracked_worker_process`
+/// while the Idle live-state entry remains. That is the mapping-free
+/// shape transient-recovery inspects — the same seed, minus the mapping.
 async fn seed_stalled_worker_without_slot_mapping(error_line: &str) -> SeededWorker {
-    use boss_protocol::{WorkerActivity, WorkerEvent};
-
-    let (server, dir) = test_server_state();
-    let db = server.work_db.as_ref();
-    let product_id = create_product(db);
-    let work_item_id = create_active_chore(db, &product_id, "stalled chore");
-
-    let transcript_path = dir.path().join("t.jsonl");
-    {
-        let mut f = std::fs::File::create(&transcript_path).unwrap();
-        writeln!(f, "{error_line}").unwrap();
-    }
-
-    let execution = db
-        .request_execution(
-            RequestExecutionInput::builder()
-                .work_item_id(work_item_id.clone())
-                .preferred_workspace_id("mono-agent-007")
-                .build(),
-        )
-        .unwrap();
-    db.start_execution_run(
-        &execution.id,
-        "worker-1",
-        "repo-1",
-        "lease-1",
-        "mono-agent-007",
-        "/tmp/mono-agent-007",
-    )
-    .unwrap();
-    db.set_run_transcript_path_if_unset(&execution.id, transcript_path.to_str().unwrap())
-        .unwrap();
-    let old_started = boss_engine_utils::epoch_time::now_epoch_secs().saturating_sub(600);
-    db.force_started_at_for_test(&execution.id, old_started).unwrap();
-
-    let pool = server.execution_coordinator.worker_pool();
-    let claimed = pool
-        .claim_worker(&execution.id, None)
-        .await
-        .expect("test pool has a free slot");
-    assert_eq!(claimed, "worker-1");
-
-    // Live-state entry only — deliberately no `worker_registry.register_run_slot`
-    // call, so this run has a live-state entry but no run→slot mapping.
-    server
-        .live_worker_states
-        .register_spawn(1, execution.id.clone(), "claude-opus-4-7", 0, None);
-    server.live_worker_states.apply_event(
-        1,
-        &WorkerEvent::Stop {
-            session_id: "test-sess".into(),
-            stop_hook_active: false,
-            stop_reason: crate::protocol::StopReason::Completed,
-        },
+    let seeded = seed_stalled_worker(error_line, false).await;
+    assert!(
+        seeded
+            .server
+            .worker_registry
+            .take_worker_pane_for_run(&seeded.exec_id)
+            .is_some(),
+        "seed precondition: register_idle_worker must have mapped the run",
     );
-    assert_eq!(
-        server.live_worker_states.get(1).unwrap().activity,
-        WorkerActivity::Idle,
-        "seed precondition: slot must be Idle",
-    );
-
-    SeededWorker {
-        exec_id: execution.id,
-        server,
-        _dir: dir,
-        sink: make_session_sink(),
-    }
+    seeded
 }
 
 async fn run_recovery(server: &Arc<ServerState>) -> crate::transient_recovery::TransientRecoveryOutcome {
@@ -308,6 +250,43 @@ async fn no_slot_mapping_drops_the_orphaned_live_state_entry() {
     assert!(
         seeded.server.live_worker_states.get(1).is_none(),
         "a NoLiveWorker pane-release answer must not leave an orphaned live-state entry behind",
+    );
+}
+
+/// Same leftover live-state as [`no_slot_mapping_drops_the_orphaned_live_state_entry`],
+/// but with a live durable `shell_pid` and no hosted pane, so
+/// `reap_untracked_worker_process` answers `Reaped` (process-tree reap only)
+/// rather than `NoLiveWorker`. Gating the live-state drop on `NoLiveWorker`
+/// would leave this arm leaking the same claim-backing entry.
+#[tokio::test]
+async fn untracked_reaped_without_hosted_pane_drops_the_orphaned_live_state_entry() {
+    let seeded = seed_stalled_worker_without_slot_mapping(SOCKET_ERROR_LINE).await;
+    let mut child = spawn_group_leader_sleeper();
+    let pid = i64::from(child.id());
+    assert!(
+        seeded
+            .server
+            .work_db
+            .set_run_shell_pid_for_execution(&seeded.exec_id, pid)
+            .unwrap(),
+        "seed precondition: run row must accept a durable shell pid",
+    );
+
+    let outcome = run_recovery(&seeded.server).await;
+    assert_eq!(outcome.resumed, 1, "socket error with no nudger must orphan+respawn");
+
+    assert!(
+        seeded.server.live_worker_states.get(1).is_none(),
+        "an untracked Reaped pane-release answer must not leave an orphaned live-state entry behind",
+    );
+
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .expect("join wait task")
+        .expect("wait on child");
+    assert!(
+        !status.success(),
+        "the untracked worker's process tree must actually go down",
     );
 }
 
