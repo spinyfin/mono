@@ -596,8 +596,12 @@ mod tests {
         std::fs::write(&path, "{\"safe\":true}\n").unwrap();
         let mut tail = TranscriptTail::new_contained(&path, &root).unwrap();
 
-        std::fs::remove_file(&path).unwrap();
-        std::fs::write(&path, "{\"replaced\":true}\n").unwrap();
+        // Sibling-then-rename, not unlink-and-recreate: linux-sandbox tmpfs
+        // reuses the freed inode, which would make this look like the same
+        // file and miss the containment pin this test is for.
+        let replacement = root.join("rollout.replacement");
+        std::fs::write(&replacement, "{\"replaced\":true}\n").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
 
         assert!(
             matches!(tail.poll().await, Err(TailError::Containment(_))),
