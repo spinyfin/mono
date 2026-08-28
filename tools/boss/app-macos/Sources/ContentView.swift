@@ -472,12 +472,12 @@ struct ContentView: View {
 
     /// Whether any chrome banner has something to say right now. Drives
     /// whether the titlebar accessory is installed/visible at all, so a
-    /// healthy window's titlebar is untouched.
+    /// healthy window's titlebar is untouched. The coordinator-update
+    /// banner is not chrome: it lives in the coordinator pane column.
     private var hasChromeBanners: Bool {
         model.showConnectionLostBanner
             || model.engineSupervisionState != .running
             || (model.isConnected && !model.bannerHealthIssues.isEmpty)
-            || (model.isConnected && model.coordinatorUpdateAvailable != nil)
     }
 
     /// Insertion-only: a banner slides down into the gap AppKit has just
@@ -525,20 +525,6 @@ struct ContentView: View {
                 EngineHealthBanner(
                     issues: model.bannerHealthIssues,
                     onUnpauseDispatch: { model.resumeDispatch() }
-                )
-                .transition(bannerTransition)
-            }
-            // Informational, not a fault: deliberately not folded into
-            // EngineHealthBanner. That banner's severity vocabulary is
-            // error/warning and a single background color represents the
-            // *worst* issue in the list — an "update available" notice has
-            // no severity, and would either misrepresent itself as a fault
-            // color or force a co-occurring real fault to render as merely
-            // informational. This offers the reset; it never performs it.
-            if model.isConnected, let installedVersion = model.coordinatorUpdateAvailable {
-                CoordinatorUpdateBanner(
-                    installedVersion: installedVersion,
-                    onReset: { showCoordinatorResetConfirmFromBanner = true }
                 )
                 .transition(bannerTransition)
             }
@@ -863,6 +849,17 @@ struct ContentView: View {
         let expandedWidth = model.bossPanelWidth
 
         return VStack(spacing: 0) {
+            // Informational, not a fault: lives in this column rather than
+            // window chrome so the kanban, sidebar, and toolbar stay put.
+            // Hidden while collapsed — the 88pt strip cannot hold the copy
+            // or the Reset control. Expanding the pane reveals it again.
+            if !isCollapsed, model.isConnected, let installedVersion = model.coordinatorUpdateAvailable {
+                CoordinatorUpdateBanner(
+                    installedVersion: installedVersion,
+                    onReset: { showCoordinatorResetConfirmFromBanner = true }
+                )
+            }
+
             bossAgentHeader(isCollapsed: isCollapsed)
 
             ZStack(alignment: .leading) {

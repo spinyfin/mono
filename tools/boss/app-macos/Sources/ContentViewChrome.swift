@@ -334,33 +334,44 @@ struct EngineHealthBanner: View {
 /// running coordinator session actually launched with. Deliberately a
 /// separate view from `EngineHealthBanner`: that banner's color represents
 /// operational fault severity (error/warning), and an available update is
-/// neither. Shown only while `ChatViewModel.coordinatorUpdateAvailable` is
-/// non-nil; there is no dismiss — it clears itself once a reset makes the
+/// neither. Rendered above the coordinator pane (the Picard column), not as
+/// window chrome. Shown only while `ChatViewModel.coordinatorUpdateAvailable`
+/// is non-nil; there is no dismiss — it clears itself once a reset makes the
 /// versions match, never earlier.
 struct CoordinatorUpdateBanner: View {
     let installedVersion: String
     let onReset: () -> Void
 
     var body: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "arrow.up.circle.fill")
-                .foregroundStyle(.white)
-                .padding(.top, 2)
-            Text("The coordinator is running an older Claude Code — \(installedVersion) is installed.")
-                .font(.callout.weight(.semibold))
-                .foregroundStyle(.white)
-                .multilineTextAlignment(.leading)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
-            Button(action: onReset) {
-                Text("Reset Coordinator…")
+        // The pane's expanded width is 280...600, too narrow for the
+        // original single-row HStack once the button keeps its intrinsic
+        // size. Stack the Reset control under the copy so neither is
+        // squeezed out; the text still grows vertically via `fixedSize`.
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "arrow.up.circle.fill")
+                    .foregroundStyle(.white)
+                    .padding(.top, 2)
+                Text("The coordinator is running an older Claude Code — \(installedVersion) is installed.")
                     .font(.callout.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
             }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .tint(.white)
-            .help("Ends the coordinator's current session and starts a fresh one with the installed binary, after confirming.")
-            .accessibilityHint("Opens a confirmation to reset the coordinator session.")
+            HStack {
+                Spacer(minLength: 0)
+                Button(action: onReset) {
+                    Text("Reset Coordinator…")
+                        .font(.callout.weight(.semibold))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(.white)
+                .fixedSize()
+                .help("Ends the coordinator's current session and starts a fresh one with the installed binary, after confirming.")
+                .accessibilityHint("Opens a confirmation to reset the coordinator session.")
+            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
