@@ -85,14 +85,9 @@ private struct EngineConfigPane: View {
     /// Transient status line shown after a successful save / clear.
     @State private var apiKeyStatus: String?
 
-    /// Reference material trimmed out of the API-key and Driver Traffic
-    /// captions lives in this doc rather than a bundled resource: SwiftPM
-    /// resources must live inside the target's own directory tree
-    /// (`Sources/`), so bundling a file from `tools/boss/docs/` — the
-    /// convention this doc otherwise follows — would mean either
-    /// duplicating it under `Sources/Resources/` (drift risk for one
-    /// reference doc) or restructuring the package layout. Linking out is
-    /// the proportionate choice here.
+    /// Destination for the Settings HelpLinks: the reference detail that the
+    /// one-sentence captions leave out. Points at the doc on main rather than a
+    /// bundled copy, so there is one source of truth for it.
     private var settingsHelpURL: URL {
         URL(string: "https://github.com/spinyfin/mono/blob/main/tools/boss/docs/driver-traffic-and-api-key-settings.md")!
     }
@@ -161,11 +156,6 @@ private struct EngineConfigPane: View {
                 .padding(.top, 4)
             } header: {
                 Text("Required Configuration")
-            } footer: {
-                HStack {
-                    Spacer()
-                    HelpLink(destination: settingsHelpURL)
-                }
             }
 
             Section {
