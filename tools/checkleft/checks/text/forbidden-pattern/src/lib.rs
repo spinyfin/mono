@@ -6,12 +6,19 @@
 //!
 //! ## What the check detects
 //!
-//! Every non-deleted changed file is scanned line by line against every
-//! configured pattern. A regex match on a line produces one finding carrying
-//! that pattern's own message and severity, so a single check instance can
-//! enforce many unrelated forbidden-text rules at once (e.g. leaked internal
-//! identifiers, banned phrases). This check is purely generic and config-driven
-//! — it has no built-in knowledge of what patterns to forbid.
+//! Every non-deleted changed file's full contents are scanned against every
+//! configured pattern. A regex match produces one finding carrying that
+//! pattern's own message and severity, located at the line/column the match
+//! starts on, so a single check instance can enforce many unrelated
+//! forbidden-text rules at once (e.g. leaked internal identifiers, banned
+//! phrases). This check is purely generic and config-driven — it has no
+//! built-in knowledge of what patterns to forbid.
+//!
+//! Because the whole file is scanned as one string, a pattern that wants to
+//! match across a line break (e.g. formatter-reflowed argv literals split one
+//! element per line) can do so with a class that includes `\n`, such as
+//! `[\s\S]` — `.` alone still never matches `\n`, so ordinary single-line
+//! patterns are unaffected and behave exactly as before.
 //!
 //! File exclusion (`exclude` / `exclude_files` / `exclude_globs`) is enforced by
 //! the framework host, which subtracts excluded paths from the changeset before
@@ -34,12 +41,13 @@
 //! ```
 //!
 //! Each pattern entry is independent: `name` labels the rule for diagnostics,
-//! `pattern` is a Rust `regex` syntax expression evaluated per line, `message`
-//! is the finding text shown to the author, and `severity` is an optional
-//! per-pattern override (`"error"`, `"warning"`, or `"info"`; defaults to
-//! `"error"`; any other value is a config error). Because matching is done
-//! per line, a pattern containing a literal newline can never match and is
-//! rejected as a config error.
+//! `pattern` is a Rust `regex` syntax expression, `message` is the finding
+//! text shown to the author, and `severity` is an optional per-pattern
+//! override (`"error"`, `"warning"`, or `"info"`; defaults to `"error"`; any
+//! other value is a config error). A pattern string containing a literal
+//! newline character is rejected as a config error — that would be a
+//! malformed YAML/JSON entry, not a way to opt into cross-line matching; use
+//! a regex class like `[\s\S]` for that instead (see above).
 //!
 //! `surfaces` controls which text sources every configured pattern is
 //! evaluated against. It is a list containing one or both of:
@@ -239,20 +247,41 @@ fn scan_files(changeset: &ChangeSet, patterns: &[CompiledPattern], findings: &mu
             continue;
         };
 
-        for (index, line) in content.lines().enumerate() {
-            let line_number = (index + 1) as u32;
-            for pattern in patterns {
-                for m in pattern.regex.find_iter(line) {
-                    let column = (line[..m.start()].chars().count() + 1) as u32;
-                    let finding = pattern
-                        .finding()
-                        .at_column(file.path.clone(), line_number, column)
-                        .with_remediation(format!("matched forbidden pattern `{}`", pattern.name));
-                    findings.push(finding);
-                }
+        let line_starts = line_start_offsets(&content);
+
+        for pattern in patterns {
+            for m in pattern.regex.find_iter(&content) {
+                let (line_number, column) = line_and_column(&content, &line_starts, m.start());
+                let finding = pattern
+                    .finding()
+                    .at_column(file.path.clone(), line_number, column)
+                    .with_remediation(format!("matched forbidden pattern `{}`", pattern.name));
+                findings.push(finding);
             }
         }
     }
+}
+
+/// Byte offsets, in ascending order, where each line of `content` starts.
+/// `line_starts[0]` is always `0`; `line_starts[i]` is the offset just past
+/// the `i`-th newline.
+fn line_start_offsets(content: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    starts.extend(content.match_indices('\n').map(|(i, _)| i + 1));
+    starts
+}
+
+/// Map a byte offset within `content` to a 1-based (line, column) pair,
+/// where the column is a 1-based character count from the start of the line
+/// — consistent with the rest of this check's location reporting.
+fn line_and_column(content: &str, line_starts: &[usize], byte_offset: usize) -> (u32, u32) {
+    let line_index = match line_starts.binary_search(&byte_offset) {
+        Ok(i) => i,
+        Err(i) => i - 1,
+    };
+    let line_start = line_starts[line_index];
+    let column = content[line_start..byte_offset].chars().count() as u32 + 1;
+    (line_index as u32 + 1, column)
 }
 
 /// Scan a changeset-level text blob (PR description or joined commit
@@ -561,6 +590,88 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert!(findings[0].message.contains("severity"));
         assert!(findings[0].message.contains("critical"));
+    }
+
+    #[test]
+    fn matches_pattern_spanning_lines_with_a_newline_inclusive_class() {
+        let dir = tempfile::tempdir().unwrap();
+        // Mirrors what rustfmt produces from a long `.args([...])` list —
+        // each element on its own line, so a single-line pattern would miss it.
+        let path = write_temp_file(
+            dir.path(),
+            "repo.rs",
+            "Command::new(\"git\")\n    .args([\n        \"init\",\n        \"-b\",\n        \"main\",\n    ])\n",
+        );
+
+        let findings = forbidden_pattern_check(make_input(
+            vec![ChangedFile {
+                path: path.clone(),
+                kind: ChangeKind::Modified,
+                old_path: None,
+            }],
+            r#"{"patterns":[{"name":"git-init-dash-b-argv","pattern":"\"init\"\\s*,\\s*(?:\"(?:-q|--quiet|--bare)\"\\s*,\\s*)*\"-b\"","message":"nope"}]}"#,
+        ));
+
+        assert_eq!(
+            findings.len(),
+            1,
+            "expected the cross-line argv shape to match: {findings:?}"
+        );
+        let loc = findings[0].location.as_ref().unwrap();
+        assert_eq!(loc.path, path);
+        assert_eq!(
+            loc.line,
+            Some(3),
+            "match should be reported on the line where it starts"
+        );
+    }
+
+    #[test]
+    fn cross_line_pattern_does_not_false_positive_on_unrelated_text_within_the_window() {
+        // A naive "within N chars, across lines" window (e.g. `"init"[\s\S]{0,80}"-b"`)
+        // would wrongly match this: `"init"` is a commit *message* string, and the
+        // `"-b"` a few lines later belongs to an unrelated `checkout -b`, not `git init`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_temp_file(
+            dir.path(),
+            "repo.rs",
+            "run_git(repo, &[\"commit\", \"-q\", \"-m\", \"init\"]).await;\n\n        \
+             run_git(repo, &[\"checkout\", \"-q\", \"-b\", \"feature\"]).await;\n",
+        );
+
+        let findings = forbidden_pattern_check(make_input(
+            vec![ChangedFile {
+                path,
+                kind: ChangeKind::Modified,
+                old_path: None,
+            }],
+            r#"{"patterns":[{"name":"git-init-dash-b-argv","pattern":"\"init\"\\s*,\\s*(?:\"(?:-q|--quiet|--bare)\"\\s*,\\s*)*\"-b\"","message":"nope"}]}"#,
+        ));
+
+        assert!(
+            findings.is_empty(),
+            "must require `-b` to immediately follow `\"init\",` (optionally past known flags), not just be nearby: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn does_not_cross_lines_when_pattern_uses_dot_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_temp_file(dir.path(), "notes.md", "foo\nbar\n");
+
+        let findings = forbidden_pattern_check(make_input(
+            vec![ChangedFile {
+                path,
+                kind: ChangeKind::Modified,
+                old_path: None,
+            }],
+            r#"{"patterns":[{"name":"dot-only","pattern":"foo.{0,10}bar","message":"nope"}]}"#,
+        ));
+
+        assert!(
+            findings.is_empty(),
+            "`.` must not match a newline, so this pattern should not cross lines: {findings:?}"
+        );
     }
 
     #[test]

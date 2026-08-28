@@ -613,7 +613,7 @@ changed in both\n\
         }
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
-        init_repo_with_branch(repo, "main").await;
+        boss_engine_test_git::init_repo_with_branch(repo, "main");
         // Identity is required for `git commit` even in tests.
         run_git(repo, &["config", "user.email", "test@example.invalid"]).await;
         run_git(repo, &["config", "user.name", "Test"]).await;
@@ -654,7 +654,7 @@ changed in both\n\
         // --- Build a normal git repo with a conflict between main/feature --
         let git_dir = tempfile::tempdir().unwrap();
         let git_repo = git_dir.path();
-        init_repo_with_branch(git_repo, "main").await;
+        boss_engine_test_git::init_repo_with_branch(git_repo, "main");
         run_git(git_repo, &["config", "user.email", "test@example.invalid"]).await;
         run_git(git_repo, &["config", "user.name", "Test"]).await;
 
@@ -714,7 +714,7 @@ changed in both\n\
         // --- Build a normal git repo with a conflict between main/feature --
         let git_dir = tempfile::tempdir().unwrap();
         let git_repo = git_dir.path();
-        init_repo_with_branch(git_repo, "main").await;
+        boss_engine_test_git::init_repo_with_branch(git_repo, "main");
         run_git(git_repo, &["config", "user.email", "test@example.invalid"]).await;
         run_git(git_repo, &["config", "user.name", "Test"]).await;
 
@@ -780,7 +780,7 @@ changed in both\n\
         }
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
-        init_repo_with_branch(repo, "main").await;
+        boss_engine_test_git::init_repo_with_branch(repo, "main");
         run_git(repo, &["config", "user.email", "test@example.invalid"]).await;
         run_git(repo, &["config", "user.name", "Test"]).await;
 
@@ -819,28 +819,6 @@ changed in both\n\
         None
     }
 
-    async fn init_repo_with_branch(repo: &Path, branch: &str) {
-        run_git(repo, &["init", "-q"]).await;
-        let head = format!("refs/heads/{branch}");
-        run_git(repo, &["symbolic-ref", "HEAD", &head]).await;
-        let output = tokio::process::Command::new("git")
-            .args(["symbolic-ref", "HEAD"])
-            .current_dir(repo)
-            .output()
-            .await
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git symbolic-ref HEAD failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout).trim(),
-            head,
-            "HEAD must point at the intended branch after init"
-        );
-    }
-
     #[tokio::test]
     async fn init_repo_with_branch_points_head_at_main() {
         if which_git().is_none() {
@@ -848,7 +826,7 @@ changed in both\n\
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        init_repo_with_branch(dir.path(), "main").await;
+        boss_engine_test_git::init_repo_with_branch(dir.path(), "main");
     }
 
     async fn run_git(repo: &Path, args: &[&str]) {

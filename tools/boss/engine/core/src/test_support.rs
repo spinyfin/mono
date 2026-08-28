@@ -7,7 +7,6 @@
 //! instead of ~250, and keeps the setup readable at each call site.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -576,7 +575,7 @@ macro_rules! stub_cube_client {
     // ── rebase_workspace_no_push ────────────────────────────────────────────
     // Also has a trait default (erroring) — same "unlisted keeps the default"
     // behaviour as `rebase_workspace`, used by the speculative-conflict
-    // prediction sweep (T10).
+    // prediction sweep.
     (@munch $ty:ty [$($acc:tt)*] @rebase_workspace_no_push async fn rebase_workspace_no_push $a:tt -> $r:ty $b:block $($rest:tt)*) => {
         $crate::stub_cube_client!(@munch $ty [$($acc)* async fn rebase_workspace_no_push $a -> $r $b] @push_resolution $($rest)*);
     };
@@ -1077,75 +1076,8 @@ pub(crate) mod log_capture {
 
 /// Initialize a git repo at `path` whose `HEAD` names `branch`.
 ///
-/// Pinning the first branch at `git init` time needs git 2.28+; `symbolic-ref`
-/// of `HEAD` on an empty repo is the equivalent two-step that older git still
-/// accepts. Returns false when git is missing so callers can skip rather than
-/// fail in a hermetic sandbox.
+/// Returns false when git is missing so callers can skip rather than fail in
+/// a hermetic sandbox.
 pub fn try_init_repo_with_branch(path: &Path, branch: &str) -> bool {
-    let output = Command::new("git").args(["init", "-q"]).current_dir(path).output();
-    let Ok(output) = output else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
-    }
-    let head = format!("refs/heads/{branch}");
-    let output = Command::new("git")
-        .args(["symbolic-ref", "HEAD", &head])
-        .current_dir(path)
-        .output();
-    let Ok(output) = output else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
-    }
-    let actual = Command::new("git")
-        .args(["symbolic-ref", "HEAD"])
-        .current_dir(path)
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_owned());
-    assert_eq!(
-        actual.as_deref(),
-        Some(head.as_str()),
-        "HEAD must point at the intended branch after init"
-    );
-    true
-}
-
-#[cfg(test)]
-mod git_init_tests {
-    use super::try_init_repo_with_branch;
-
-    #[test]
-    fn try_init_repo_with_branch_points_head_at_main() {
-        let dir = tempfile::TempDir::new().unwrap();
-        if !try_init_repo_with_branch(dir.path(), "main") {
-            eprintln!("skipping: git unavailable in sandbox");
-            return;
-        }
-        let actual = std::process::Command::new("git")
-            .args(["symbolic-ref", "HEAD"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        assert_eq!(String::from_utf8_lossy(&actual.stdout).trim(), "refs/heads/main");
-    }
-
-    #[test]
-    fn try_init_repo_with_branch_points_head_at_a_custom_name() {
-        let dir = tempfile::TempDir::new().unwrap();
-        if !try_init_repo_with_branch(dir.path(), "pr-branch") {
-            eprintln!("skipping: git unavailable in sandbox");
-            return;
-        }
-        let actual = std::process::Command::new("git")
-            .args(["symbolic-ref", "HEAD"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        assert_eq!(String::from_utf8_lossy(&actual.stdout).trim(), "refs/heads/pr-branch");
-    }
+    boss_engine_test_git::try_init_repo_with_branch(path, branch)
 }

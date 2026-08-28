@@ -626,37 +626,11 @@ mod tests {
             .unwrap_or(false)
     }
 
-    /// Pin HEAD to `branch` after a portable `git init`. Returns false when
-    /// git is unavailable so callers can skip rather than fail in a hermetic
-    /// sandbox.
-    fn init_named_branch(path: &Path, branch: &str) -> bool {
-        if !git(&["init", "-q"], path) {
-            return false;
-        }
-        let head = format!("refs/heads/{branch}");
-        if !git(&["symbolic-ref", "HEAD", &head], path) {
-            return false;
-        }
-        let actual = Command::new("git")
-            .args(["symbolic-ref", "HEAD"])
-            .current_dir(path)
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_owned());
-        assert_eq!(
-            actual.as_deref(),
-            Some(head.as_str()),
-            "HEAD must point at the intended branch after init"
-        );
-        true
-    }
-
     /// Init a git repo with one committed file so `--3way` has blobs to work
     /// with. Returns false when git is unavailable so tests skip rather than
     /// fail in a hermetic sandbox.
     fn init_git_repo(path: &Path) -> bool {
-        if !init_named_branch(path, "main") {
+        if !boss_engine_test_git::try_init_repo_with_branch(path, "main") {
             return false;
         }
         let _ = git(&["config", "user.email", "test@example.com"], path);
@@ -668,7 +642,7 @@ mod tests {
     #[test]
     fn init_named_branch_points_head_at_the_intended_branch() {
         let dir = TempDir::new().unwrap();
-        if !init_named_branch(dir.path(), "main") {
+        if !boss_engine_test_git::try_init_repo_with_branch(dir.path(), "main") {
             eprintln!("skipping: git unavailable in sandbox");
             return;
         }
@@ -680,7 +654,7 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&actual.stdout).trim(), "refs/heads/main");
     }
 
-    /// The P2 happy path: a patch holding real work is applied into the
+    /// The happy path: a patch holding real work is applied into the
     /// workspace and the restored content is actually on disk.
     #[test]
     fn applies_a_real_patch_and_reports_what_was_restored() {

@@ -67,6 +67,49 @@ rust_library(
     ],
 )
 
+# Same crate as `checkleft_lib`, built with the `test-support` feature so
+# `checkleft::test_git` (gated `#[cfg(any(test, feature = "test-support"))]`
+# in src/lib.rs) is present. `checkleft_lib` itself is built without this
+# feature so ordinary (non-test) consumers — the `checkleft` binary,
+# `precompile_cwasm` — never link in test scaffolding. Only the `tests/*_e2e.rs`
+# integration tests, which depend on the library normally rather than
+# compiling it with `--cfg test`, need this variant.
+rust_library(
+    name = "checkleft_lib_test_support",
+    testonly = True,
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    compile_data = [
+        "checks/format/bazel.yaml",
+        "checks/format/biome.yaml",
+        "checks/format/oxc.yaml",
+        "checks/format/prettier.yaml",
+        "checks/format/rust.yaml",
+        "checks/lint/bazel.yaml",
+        "checks/lint/biome.yaml",
+        "checks/lint/js.yaml",
+        "checks/lint/oxc.yaml",
+        "checks/lint/rust.yaml",
+        "//tools/checkleft/wit:check.wit",
+    ],
+    crate_features = ["test-support"],
+    crate_name = "checkleft",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    rustc_env = {
+        "CHECKLEFT_WASMTIME_VERSION": "42.0.2",
+    },
+    rustc_env_files = [":cargo_toml_env_vars"],
+    visibility = ["//tools/checkleft:__pkg__"],
+    deps = all_crate_deps(normal = True) + [
+        "//tools/checkleft/preinstalled-bundle:checkleft_wasm_bundle_lib",
+        "@@rules_rust++crate+mono_crates__syn-2.0.117//:syn",
+    ],
+)
+
 rust_binary(
     name = "checkleft",
     srcs = glob(["src/**/*.rs"]),
@@ -79,6 +122,30 @@ rust_binary(
     visibility = ["//tools/checkleft/bazel:__pkg__"],
     deps = [
         ":checkleft_lib",
+    ] + all_crate_deps(normal = True),
+)
+
+# Test-only twin of `:checkleft`, linked against `:checkleft_lib_test_support`
+# instead of `:checkleft_lib`. `checkleft_bin_test` below builds this crate
+# with `--cfg test` (via its `crate` attribute), and `src/main.rs`'s own
+# `#[cfg(test)] mod tests` reaches `checkleft::test_git` the same way the
+# `tests/*_e2e.rs` integration tests do — through the linked library, not
+# through its own `--cfg test` (that only applies to this binary's own crate,
+# not to the separately-compiled `checkleft` lib it links against). The real
+# `:checkleft` binary keeps linking `:checkleft_lib` so the shipped release
+# binary never pulls in test scaffolding.
+rust_binary(
+    name = "checkleft_test_support_bin",
+    testonly = True,
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "checkleft",
+    crate_root = "src/main.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    rustc_env_files = [":cargo_toml_env_vars"],
+    visibility = ["//tools/checkleft:__pkg__"],
+    deps = [
+        ":checkleft_lib_test_support",
     ] + all_crate_deps(normal = True),
 )
 
@@ -310,7 +377,7 @@ test_suite(
 rust_test(
     name = "checkleft_bin_test",
     size = "small",
-    crate = ":checkleft",
+    crate = ":checkleft_test_support_bin",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
@@ -337,7 +404,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
-        ":checkleft_lib",
+        ":checkleft_lib_test_support",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,
@@ -364,7 +431,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
-        ":checkleft_lib",
+        ":checkleft_lib_test_support",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,
@@ -386,7 +453,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
-        ":checkleft_lib",
+        ":checkleft_lib_test_support",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,

@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use rusqlite;
@@ -611,57 +610,6 @@ impl ExpectedCommand {
 }
 
 /// Initialize a git repo at `path` whose `HEAD` names `branch`.
-///
-/// Pinning the first branch at `git init` time needs git 2.28+; `symbolic-ref`
-/// of `HEAD` on an empty repo is the equivalent two-step that older git still
-/// accepts.
 pub(super) fn init_repo_with_branch(path: &Path, branch: &str) {
-    let output = Command::new("git")
-        .args(["init", "-q"])
-        .arg(path)
-        .output()
-        .expect("spawn git init");
-    assert!(
-        output.status.success(),
-        "git init failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let head = format!("refs/heads/{branch}");
-    let output = Command::new("git")
-        .args(["symbolic-ref", "HEAD", &head])
-        .current_dir(path)
-        .output()
-        .expect("spawn git symbolic-ref");
-    assert!(
-        output.status.success(),
-        "git symbolic-ref HEAD {head} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let actual = Command::new("git")
-        .args(["symbolic-ref", "HEAD"])
-        .current_dir(path)
-        .output()
-        .expect("spawn git symbolic-ref HEAD");
-    assert_eq!(
-        String::from_utf8_lossy(&actual.stdout).trim(),
-        head,
-        "HEAD must point at the intended branch after init"
-    );
-}
-
-#[cfg(test)]
-mod git_init_tests {
-    use super::init_repo_with_branch;
-
-    #[test]
-    fn init_repo_with_branch_points_head_at_main() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        init_repo_with_branch(dir.path(), "main");
-        let actual = std::process::Command::new("git")
-            .args(["symbolic-ref", "HEAD"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        assert_eq!(String::from_utf8_lossy(&actual.stdout).trim(), "refs/heads/main");
-    }
+    boss_engine_test_git::init_repo_with_branch(path, branch);
 }

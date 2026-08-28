@@ -83,6 +83,7 @@ unicode-segmentation = { workspace = true }
 
 [dev-dependencies]
 boss-client = { path = "../../client" }
+boss-engine-test-git = { path = "../test-git" }
 tempfile = { workspace = true }
 wiremock = { workspace = true }
 # test-util enables tokio's virtual-time controls (time::pause / advance,

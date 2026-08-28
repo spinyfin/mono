@@ -1,0 +1,10 @@
+[package]
+name = "boss-engine-test-git"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+
+[dev-dependencies]
+tempfile = { workspace = true }
