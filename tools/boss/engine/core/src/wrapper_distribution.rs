@@ -120,13 +120,7 @@ pub async fn push_wrapper(transport: &SshTransport) -> Result<WrapperPushOutcome
     //    remote login shell receives the full compound command intact.
     //    Using run(&["sh", "-c", script]) would produce `sh -c chmod`
     //    on the remote (chmod with no args → usage error → exit 1).
-    let remote_final = remote_wrapper_path();
-    let chmod_script = format!(
-        "chmod 0755 {dir}/{name}.new && mv {dir}/{name}.new {final_}",
-        dir = expand_remote_dir(),
-        name = REMOTE_WRAPPER_NAME,
-        final_ = remote_final
-    );
+    let chmod_script = chmod_mv_script();
     let chmod = transport
         .run_shell(&chmod_script)
         .await
@@ -283,6 +277,18 @@ pub async fn ensure_wrapper_current(transport: &SshTransport, locks: &WrapperPus
 /// rooted in `REMOTE_WRAPPER_DIR` and not duplicated across modules.
 fn expand_remote_dir() -> String {
     format!("~/{REMOTE_WRAPPER_DIR}")
+}
+
+/// Single remote login-shell argument for the atomic chmod+mv step.
+/// Must stay one string: `run(&["sh", "-c", script])` would make ssh join
+/// to `sh -c chmod` and the remote would run chmod with no arguments.
+fn chmod_mv_script() -> String {
+    format!(
+        "chmod 0755 {dir}/{name}.new && mv {dir}/{name}.new {final_}",
+        dir = expand_remote_dir(),
+        name = REMOTE_WRAPPER_NAME,
+        final_ = remote_wrapper_path()
+    )
 }
 
 /// Run-failure-reason string for the design's `host_wrapper_push_failed`.
@@ -486,22 +492,14 @@ mod tests {
         // ssh join to `sh -c chmod 0755 …` — the remote login shell
         // parsed only the first word as the -c script and chmod received
         // zero arguments, printing its usage and exiting non-zero.
-        let dir = expand_remote_dir();
-        let script = format!(
-            "chmod 0755 {dir}/{name}.new && mv {dir}/{name}.new {final_}",
-            name = REMOTE_WRAPPER_NAME,
-            final_ = remote_wrapper_path()
-        );
-        assert!(script.contains("chmod 0755"), "script must include chmod");
-        assert!(script.contains("&& mv"), "script must include mv after &&");
-        // Verify sh considers the script syntactically valid (no execution).
-        let status = std::process::Command::new("sh")
-            .args(["-n", "-c", &script])
-            .status()
-            .expect("sh must be available for syntax checking");
-        assert!(
-            status.success(),
-            "chmod+mv script must be valid shell syntax: {script:?}"
+        //
+        // Assert the production helper's exact string rather than spawning
+        // `sh -n`. linux-sandbox CI failed that subprocess with a non-zero
+        // exit even though the format string is a fixed pair of chmod+mv
+        // paths; the contract this test guards is the single ssh argument.
+        assert_eq!(
+            chmod_mv_script(),
+            "chmod 0755 ~/.boss-remote/bin/boss-remote-run.new && mv ~/.boss-remote/bin/boss-remote-run.new ~/.boss-remote/bin/boss-remote-run"
         );
     }
 }

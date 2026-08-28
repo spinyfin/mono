@@ -1506,6 +1506,18 @@ mod tests {
         file_identity(&fs::metadata(path).unwrap())
     }
 
+    /// Replace `path` with a file that has a different inode.
+    ///
+    /// Unlink-and-recreate is not enough: linux-sandbox mounts `/tmp` as
+    /// tmpfs, which reuses the freed inode, so the "different file" check
+    /// would not see a rotation. Creating the replacement first (while the
+    /// original inode is still live) and renaming over keeps the new inode.
+    fn replace_with_new_inode(path: &Path, contents: impl AsRef<[u8]>) {
+        let tmp = path.with_extension("replacement");
+        fs::write(&tmp, contents).unwrap();
+        fs::rename(&tmp, path).unwrap();
+    }
+
     /// The tail as every pre-existing test drives it: from byte zero, with an
     /// offset map nobody reads back. Shadows the production name so those
     /// tests keep asserting on exactly the code path they always did.
@@ -2446,10 +2458,9 @@ mod tests {
 
         // Replaced, not appended to: a new inode behind the same name, at
         // least as long as what the previous engine had already consumed.
-        fs::remove_file(&path).unwrap();
         let mut replacement = rollout_text(&workspace, "thread-rotated");
         replacement.push_str(&second_turn_text());
-        fs::write(&path, &replacement).unwrap();
+        replace_with_new_inode(&path, &replacement);
         assert_ne!(
             identity_of(&path),
             dead_incarnation,
