@@ -2534,7 +2534,7 @@ mod tests {
         let prefix = inspector.operator_prefix_for_run(&execution_id);
         assert_eq!(
             prefix,
-            format!("tmux -L {}", boss_tmux::SERVER_LABEL),
+            format!("tmux -L {}", boss_tmux::quote_for_shell(boss_tmux::SERVER_LABEL)),
             "the operator-facing prefix for a legacy-labeled run must also address -L boss",
         );
     }

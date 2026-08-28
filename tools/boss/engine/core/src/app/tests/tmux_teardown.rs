@@ -223,7 +223,10 @@ async fn tmux_for_run_routes_legacy_label_to_the_label_server() {
     let legacy = server_state
         .tmux_for_run(&socket_tmux, boss_tmux::SERVER_LABEL)
         .unwrap();
-    assert_eq!(legacy.operator_prefix(), format!("tmux -L {}", boss_tmux::SERVER_LABEL));
+    assert_eq!(
+        legacy.operator_prefix(),
+        format!("tmux -L {}", boss_tmux::quote_for_shell(boss_tmux::SERVER_LABEL))
+    );
     assert_eq!(
         legacy.program(),
         socket_tmux.program(),
@@ -235,7 +238,7 @@ async fn tmux_for_run_routes_legacy_label_to_the_label_server() {
         .unwrap();
     assert_eq!(
         socket.operator_prefix(),
-        format!("tmux -S {}", boss_tmux::TEST_SOCKET_PATH)
+        format!("tmux -S {}", boss_tmux::quote_for_shell(boss_tmux::TEST_SOCKET_PATH))
     );
 }
 

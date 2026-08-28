@@ -129,7 +129,10 @@ fn socket_handle_exposes_the_path_as_server_identity() {
         Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", StubRunner::replies([]), TEST_SOCKET_PATH).unwrap();
     assert_eq!(tmux.socket_path(), Some(Path::new(TEST_SOCKET_PATH)));
     assert_eq!(tmux.server_identity(), TEST_SOCKET_PATH);
-    assert_eq!(tmux.operator_prefix(), format!("tmux -S {TEST_SOCKET_PATH}"));
+    assert_eq!(
+        tmux.operator_prefix(),
+        format!("tmux -S {}", quote_for_shell(TEST_SOCKET_PATH))
+    );
 }
 
 #[test]
@@ -188,12 +191,58 @@ fn attach_session_command_uses_resolved_program_and_omits_exec() {
     let command = tmux.attach_session_command("boss-worker-3");
     assert_eq!(
         command,
-        format!("{} -L boss attach-session -t boss-worker-3", tmux.program().display())
+        format!(
+            "{} -S {} attach-session -t {}",
+            quote_for_shell(&tmux.program().display().to_string()),
+            quote_for_shell(TEST_SOCKET_PATH),
+            quote_for_shell("boss-worker-3"),
+        )
+    );
+    assert!(
+        !command.contains(" -L "),
+        "socket-addressed attach must not fall back to a label: {command}"
     );
     assert!(
         !command.starts_with("exec "),
         "operator paste must not replace the shell: {command}"
     );
+}
+
+#[test]
+fn attach_session_command_for_legacy_label_server_still_uses_l_boss() {
+    let tmux = Tmux::for_legacy_label_server_with_runner("/opt/homebrew/bin/tmux", StubRunner::replies([])).unwrap();
+    let command = tmux.attach_session_command("boss-worker-9");
+    assert_eq!(
+        command,
+        format!(
+            "{} -L {} attach-session -t {}",
+            quote_for_shell("/opt/homebrew/bin/tmux"),
+            quote_for_shell(SERVER_LABEL),
+            quote_for_shell("boss-worker-9"),
+        )
+    );
+}
+
+#[test]
+fn attach_session_command_quotes_a_socket_path_with_spaces() {
+    let socket = "/Users/operator/Library/Application Support/Boss/tmux.sock";
+    let tmux = Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", StubRunner::replies([]), socket).unwrap();
+    let command = tmux.attach_session_command("boss-2-deadbeef");
+    assert_eq!(
+        command,
+        "'/opt/homebrew/bin/tmux' -S '/Users/operator/Library/Application Support/Boss/tmux.sock' \
+         attach-session -t 'boss-2-deadbeef'"
+    );
+    assert_eq!(
+        tmux.operator_prefix(),
+        "tmux -S '/Users/operator/Library/Application Support/Boss/tmux.sock'"
+    );
+}
+
+#[test]
+fn quote_for_shell_escapes_embedded_single_quotes() {
+    assert_eq!(quote_for_shell("plain"), "'plain'");
+    assert_eq!(quote_for_shell("a'b"), "'a'\\''b'");
 }
 
 #[tokio::test]

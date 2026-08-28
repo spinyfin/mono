@@ -111,6 +111,26 @@ enum ServerAddress {
     Label,
     Socket(PathBuf),
 }
+
+/// POSIX single-quote `value` so an operator can paste it into a shell.
+///
+/// Always quoted (even when the value has no metacharacters) so a later
+/// space in a path cannot silently split the token. A single quote inside
+/// the value is escaped with the POSIX `'\''` idiom.
+pub fn quote_for_shell(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// Handle for one resolved tmux executable and Boss's private server.
 #[derive(Clone)]
 pub struct Tmux {
@@ -211,11 +231,11 @@ impl Tmux {
     }
 
     /// Operator-facing command prefix (`tmux -S <socket>` or `tmux -L boss`).
+    ///
+    /// The addressing flags come from the same server argv spawn uses,
+    /// with the value POSIX-quoted for paste.
     pub fn operator_prefix(&self) -> String {
-        match &self.server {
-            ServerAddress::Socket(path) => format!("tmux -S {}", path.display()),
-            ServerAddress::Label => format!("tmux -L {SERVER_LABEL}"),
-        }
+        format!("tmux {}", self.server_shell_args())
     }
 
     /// If this handle targets a socket file that exists but no server is
@@ -230,14 +250,18 @@ impl Tmux {
 
     /// Operator-facing attach command for an already-verified session.
     ///
-    /// Uses this handle's resolved executable and [`SERVER_LABEL`]. No
-    /// `exec` prefix: this is meant to be pasted into an existing shell,
-    /// so detaching from the session should return to a prompt.
+    /// Uses this handle's resolved executable and the same server
+    /// addressing spawn uses. No `exec` prefix:
+    /// this is meant to be pasted into an existing shell, so detaching
+    /// from the session should return to a prompt. The program, socket
+    /// (or label), and session name are POSIX-quoted so a path with
+    /// spaces (`Application Support`) pastes as one token.
     pub fn attach_session_command(&self, session_name: &str) -> String {
         format!(
-            "{} -L {} attach-session -t {session_name}",
-            self.program.display(),
-            SERVER_LABEL,
+            "{} {} attach-session -t {}",
+            quote_for_shell(&self.program.display().to_string()),
+            self.server_shell_args(),
+            quote_for_shell(session_name),
         )
     }
 
@@ -539,6 +563,24 @@ impl Tmux {
         match &self.server {
             ServerAddress::Label => vec!["-L".into(), SERVER_LABEL.into()],
             ServerAddress::Socket(path) => vec!["-S".into(), path.clone().into_os_string()],
+        }
+    }
+
+    /// Spawn's server argv, formatted for a human to paste into a shell.
+    ///
+    /// One source of truth: the flag and value are `server_args`;
+    /// only the value is quoted.
+    fn server_shell_args(&self) -> String {
+        match self.server_args().as_slice() {
+            [flag, value] => format!(
+                "{} {}",
+                flag.to_string_lossy(),
+                quote_for_shell(&value.to_string_lossy()),
+            ),
+            other => unreachable!(
+                "server_args always returns one flag and one value, got {} args",
+                other.len()
+            ),
         }
     }
 

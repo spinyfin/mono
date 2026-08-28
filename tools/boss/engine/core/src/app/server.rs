@@ -252,7 +252,13 @@ impl crate::husk_pane_sweep::HuskPaneSweepSource for ServerState {
     }
 
     fn tmux_operator_prefix(&self) -> String {
-        format!("tmux -S {}", self.tmux_socket_path.display())
+        // Same addressing + quoting `Tmux::operator_prefix` uses for a
+        // socket handle. Built from this engine's socket path rather than
+        // a dummy `Tmux` (resolving a binary is unnecessary for a prefix).
+        format!(
+            "tmux -S {}",
+            boss_tmux::quote_for_shell(&self.tmux_socket_path.display().to_string())
+        )
     }
 
     async fn retire_husk(&self, session: &crate::tmux_adoption::UntrackedTmuxSession) {
