@@ -1320,6 +1320,7 @@ impl Runner {
                 commit_description: changeset.commit_description.clone(),
                 bypass_commit_descriptions: changeset.bypass_commit_descriptions.clone(),
                 pr_description: changeset.pr_description.clone(),
+                pr_description_unavailable_reason: changeset.pr_description_unavailable_reason.clone(),
                 change_id: changeset.change_id.clone(),
                 repository: changeset.repository.clone(),
                 whole_repo: changeset.whole_repo,

@@ -49,10 +49,11 @@ checks:
   # (coordinated renames, unsplittable generated trees) use
   # BYPASS_CHANGE_FILE_COUNT=<specific legitimate reason> in the commit
   # description — not a silent higher default. The PR description also works
-  # but is a best-effort surface (it requires resolving the PR and GitHub API
-  # access); the commit description is read in every CI context, including
-  # the merge queue, with no network dependency. Distinct from file/size,
-  # which limits lines per file, not file count.
+  # for bypass directives, but only when the host can resolve it (GitHub API
+  # access); a failed fetch does not invent a bypass and leaves only the
+  # commit description. Prefer the commit description: it is read in every
+  # CI context, including the merge queue, with no network dependency.
+  # Distinct from file/size, which limits lines per file, not file count.
   - id: change/file-count
     config:
       max_files: 30
