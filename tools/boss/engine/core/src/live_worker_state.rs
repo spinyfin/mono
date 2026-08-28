@@ -669,6 +669,33 @@ impl LiveWorkerStateRegistry {
         }
     }
 
+    /// Drop the live-state entry belonging to `run_id`, whichever slot it
+    /// currently occupies. Returns the slot id that was released, or
+    /// `None` if no live entry matches `run_id` (already released, or
+    /// never registered — a benign no-op).
+    ///
+    /// For callers that only know the run id, not the slot — e.g.
+    /// `TransientRecoveryReaper::reap_worker` on a
+    /// [`crate::completion::PaneReleaseOutcome::NoLiveWorker`] answer,
+    /// where `release_worker_pane` found no run→slot mapping and so never
+    /// reached its own [`Self::release_slot`] call. Left alone, that shape
+    /// strands both the pool claim and this live-state entry: an entry
+    /// still backing the claim is exactly what `pool_claim_sweep` skips by
+    /// design, so nothing else ever reconciles it. Dropping the entry here
+    /// clears that gate.
+    #[track_caller]
+    pub fn release_slot_for_run(&self, run_id: &str) -> Option<u8> {
+        let slot_id = {
+            let guard = self.inner.lock().expect("registry mutex poisoned");
+            guard
+                .values()
+                .find(|entry| entry.state.run_id == run_id)
+                .map(|entry| entry.state.slot_id)
+        }?;
+        self.release_slot(slot_id);
+        Some(slot_id)
+    }
+
     /// Snapshot of every entry. Used by the frontend RPC handler and
     /// by the topic publisher.
     pub fn snapshot(&self) -> Vec<LiveWorkerState> {

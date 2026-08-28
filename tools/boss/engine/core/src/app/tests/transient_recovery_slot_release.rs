@@ -88,6 +88,81 @@ async fn seed_stalled_worker(error_line: &str, register_session: bool) -> Seeded
     }
 }
 
+/// Like [`seed_stalled_worker`], but skips `worker_registry.register_run_slot`
+/// so `release_worker_pane` has no run→slot mapping for this run and falls
+/// through to `reap_untracked_worker_process`, which — with no durable
+/// shell pid recorded — answers `NoLiveWorker` without ever touching
+/// `live_worker_states` or the pool claim itself.
+async fn seed_stalled_worker_without_slot_mapping(error_line: &str) -> SeededWorker {
+    use boss_protocol::{WorkerActivity, WorkerEvent};
+
+    let (server, dir) = test_server_state();
+    let db = server.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "stalled chore");
+
+    let transcript_path = dir.path().join("t.jsonl");
+    {
+        let mut f = std::fs::File::create(&transcript_path).unwrap();
+        writeln!(f, "{error_line}").unwrap();
+    }
+
+    let execution = db
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(work_item_id.clone())
+                .preferred_workspace_id("mono-agent-007")
+                .build(),
+        )
+        .unwrap();
+    db.start_execution_run(
+        &execution.id,
+        "worker-1",
+        "repo-1",
+        "lease-1",
+        "mono-agent-007",
+        "/tmp/mono-agent-007",
+    )
+    .unwrap();
+    db.set_run_transcript_path_if_unset(&execution.id, transcript_path.to_str().unwrap())
+        .unwrap();
+    let old_started = boss_engine_utils::epoch_time::now_epoch_secs().saturating_sub(600);
+    db.force_started_at_for_test(&execution.id, old_started).unwrap();
+
+    let pool = server.execution_coordinator.worker_pool();
+    let claimed = pool
+        .claim_worker(&execution.id, None)
+        .await
+        .expect("test pool has a free slot");
+    assert_eq!(claimed, "worker-1");
+
+    // Live-state entry only — deliberately no `worker_registry.register_run_slot`
+    // call, so this run has a live-state entry but no run→slot mapping.
+    server
+        .live_worker_states
+        .register_spawn(1, execution.id.clone(), "claude-opus-4-7", 0, None);
+    server.live_worker_states.apply_event(
+        1,
+        &WorkerEvent::Stop {
+            session_id: "test-sess".into(),
+            stop_hook_active: false,
+            stop_reason: crate::protocol::StopReason::Completed,
+        },
+    );
+    assert_eq!(
+        server.live_worker_states.get(1).unwrap().activity,
+        WorkerActivity::Idle,
+        "seed precondition: slot must be Idle",
+    );
+
+    SeededWorker {
+        exec_id: execution.id,
+        server,
+        _dir: dir,
+        sink: make_session_sink(),
+    }
+}
+
 async fn run_recovery(server: &Arc<ServerState>) -> crate::transient_recovery::TransientRecoveryOutcome {
     let sink = Arc::new(RecordingDispatchEventSink::new());
     let policy = RecoveryPolicy::default();
@@ -215,6 +290,25 @@ async fn confirmed_orphan_respawn_frees_the_slot_promptly() {
         .await
         .expect("slot must be free after confirmed teardown");
     assert_eq!(reclaimed, "worker-1");
+}
+
+/// Regression: when `release_worker_pane` finds no run→slot mapping for the
+/// candidate (`PaneReleaseOutcome::NoLiveWorker`), the reaper must still
+/// drop the orphaned live-state entry itself. Left in place, that entry is
+/// exactly the shape `pool_claim_sweep` skips by design — a live-state
+/// entry still backing the claim — so a leftover entry here would leak the
+/// pool claim forever instead of letting the sweep reconcile it.
+#[tokio::test]
+async fn no_slot_mapping_drops_the_orphaned_live_state_entry() {
+    let seeded = seed_stalled_worker_without_slot_mapping(SOCKET_ERROR_LINE).await;
+
+    let outcome = run_recovery(&seeded.server).await;
+    assert_eq!(outcome.resumed, 1, "socket error with no nudger must orphan+respawn");
+
+    assert!(
+        seeded.server.live_worker_states.get(1).is_none(),
+        "a NoLiveWorker pane-release answer must not leave an orphaned live-state entry behind",
+    );
 }
 
 #[tokio::test]

@@ -478,7 +478,33 @@ impl crate::transient_recovery::TransientRecoveryReaper for ServerState {
     /// app to tear the pane down, so the next dispatch claimed a slot
     /// the app still hosted and died `SlotBusy`.
     async fn reap_worker(&self, execution_id: &str) {
-        let _ = ServerState::release_worker_pane(self, execution_id).await;
+        let outcome = ServerState::release_worker_pane(self, execution_id).await;
+        // `NoLiveWorker` here means `release_worker_pane` found no
+        // run→slot mapping and fell through to
+        // `reap_untracked_worker_process`, which — on its own
+        // "no live durable pid" arm — never touches `live_worker_states`
+        // or the pool claim. The caller (`transient_recovery::release_slot`)
+        // has already called `work_db.request_resume_execution` /
+        // `mark_execution_orphaned`, so the execution is terminal by the
+        // time this returns. Left alone, that is worse than the SlotBusy
+        // this reaper exists to prevent: `pool_claim_sweep` step 1
+        // explicitly skips a claim still backed by a live-state entry for
+        // the same run, so the claim would be held forever and the slot
+        // would keep showing a phantom live worker. Drop the orphaned
+        // live-state entry so the slot lands in the terminal +
+        // claimed + no-live-entry shape `pool_claim_sweep` reconciles at
+        // `LEAK_GRACE_SECS`.
+        if outcome == PaneReleaseOutcome::NoLiveWorker
+            && let Some(slot_id) = self.live_worker_states.release_slot_for_run(execution_id)
+        {
+            tracing::warn!(
+                execution_id,
+                slot_id,
+                "transient-recovery: release_worker_pane found no slot mapping for this run; \
+                 dropped its orphaned live-state entry so pool_claim_sweep can reconcile the \
+                 held claim",
+            );
+        }
     }
 }
 

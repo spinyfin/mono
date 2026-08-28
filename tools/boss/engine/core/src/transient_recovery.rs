@@ -796,8 +796,9 @@ mod tests {
     /// Records which run_ids the sweep asked to reap. Does **not** free
     /// the pool claim or drop live-state — that is `release_worker_pane`'s
     /// job, gated on a confirmed pane teardown. A test that sees the
-    /// claim vanish after a pass with this stub has found the
-    /// unconditional `release_worker_and_kick` this change removed.
+    /// claim vanish after a pass with this stub has found a `release_slot`
+    /// that hands the pool claim back itself instead of leaving it to the
+    /// confirmed-teardown path.
     struct RecordingReaper {
         reaped: tokio::sync::Mutex<Vec<String>>,
     }
