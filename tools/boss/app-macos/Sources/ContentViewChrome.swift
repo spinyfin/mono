@@ -334,39 +334,86 @@ struct EngineHealthBanner: View {
 /// running coordinator session actually launched with. Deliberately a
 /// separate view from `EngineHealthBanner`: that banner's color represents
 /// operational fault severity (error/warning), and an available update is
-/// neither. Shown only while `ChatViewModel.coordinatorUpdateAvailable` is
-/// non-nil; there is no dismiss — it clears itself once a reset makes the
+/// neither. Rendered above the coordinator pane (the Picard column), not as
+/// window chrome. Shown only while `ChatViewModel.coordinatorUpdateAvailable`
+/// is non-nil; there is no dismiss — it clears itself once a reset makes the
 /// versions match, never earlier.
 struct CoordinatorUpdateBanner: View {
     let installedVersion: String
     let onReset: () -> Void
+    var isCollapsed: Bool = false
+
+    private var copy: String {
+        "The coordinator is running an older Claude Code — \(installedVersion) is installed."
+    }
+
+    private var resetHelp: String {
+        "Ends the coordinator's current session and starts a fresh one with the installed binary, after confirming."
+    }
 
     var body: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "arrow.up.circle.fill")
-                .foregroundStyle(.white)
-                .padding(.top, 2)
-            Text("The coordinator is running an older Claude Code — \(installedVersion) is installed.")
-                .font(.callout.weight(.semibold))
-                .foregroundStyle(.white)
-                .multilineTextAlignment(.leading)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
-            Button(action: onReset) {
-                Text("Reset Coordinator…")
-                    .font(.callout.weight(.semibold))
+        Group {
+            if isCollapsed {
+                collapsedBody
+            } else {
+                expandedBody
             }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .tint(.white)
-            .help("Ends the coordinator's current session and starts a fresh one with the installed binary, after confirming.")
-            .accessibilityHint("Opens a confirmation to reset the coordinator session.")
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.blue.opacity(0.85))
         .accessibilityElement(children: .contain)
+    }
+
+    /// The pane is 280...600pt wide — too narrow to keep the copy and an
+    /// intrinsically-sized Reset button on one row, so the control sits
+    /// under the copy; the text grows vertically via `fixedSize`.
+    private var expandedBody: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "arrow.up.circle.fill")
+                    .foregroundStyle(.white)
+                    .padding(.top, 2)
+                Text(copy)
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+            }
+            HStack {
+                Spacer(minLength: 0)
+                Button(action: onReset) {
+                    Text("Reset Coordinator…")
+                        .font(.callout.weight(.semibold))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(.white)
+                .fixedSize()
+                .help(resetHelp)
+                .accessibilityHint("Opens a confirmation to reset the coordinator session.")
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+    }
+
+    /// The collapsed Picard strip is 88pt — not enough for the copy or
+    /// Reset control. Keep the same trigger with a tappable glyph on the
+    /// blue strip; hover and VoiceOver still carry the notice.
+    private var collapsedBody: some View {
+        Button(action: onReset) {
+            Image(systemName: "arrow.up.circle.fill")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(copy)
+        .accessibilityLabel(copy)
+        .accessibilityHint("Opens a confirmation to reset the coordinator session.")
     }
 }
 
