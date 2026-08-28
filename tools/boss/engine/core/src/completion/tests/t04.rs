@@ -1066,67 +1066,6 @@ async fn pr_review_pass_malformed_result_reprompt_stays_driver_agnostic() {
     );
 }
 
-/// After the auto-nudge breaker trips (the reviewer kept failing to write a
-/// valid result across re-prompts), the finalizer gives up: it advances the
-/// producing task to `in_review` WITHOUT a revision and files a
-/// human-visible attention item — replacing the old silent drop.
-#[tokio::test]
-async fn pr_review_pass_no_result_advances_with_attention_after_breaker_trips() {
-    let workspace = tempdir().unwrap();
-    let (_dir, db, _product_id, chore_id, pr_review_exec_id, _pr_url) = pr_review_exec_fixture(workspace.path(), None);
-    let out_dir = tempdir().unwrap();
-
-    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
-        .handler
-        .with_pr_state_checker(open_pr_checker())
-        .with_structured_output_dir(out_dir.path().to_path_buf())
-        // max=1: first Stop re-prompts (Proceed), second Stop trips.
-        .with_max_unproductive_nudges(1);
-
-    // First Stop: re-prompt.
-    let first = handler.on_stop(&pr_review_exec_id).await;
-    assert!(
-        matches!(first, StopOutcome::ReviewPassAwaitingResult),
-        "first no-result Stop must re-prompt; got {first:?}",
-    );
-
-    // Second Stop: breaker trips → advance without revision.
-    let second = handler.on_stop(&pr_review_exec_id).await;
-    assert!(
-        matches!(second, StopOutcome::ReviewPassCompleted { .. }),
-        "breaker trip must advance to in_review (no revision); got {second:?}",
-    );
-
-    let item = db.get_work_item(&chore_id).unwrap();
-    let task = match item {
-        WorkItem::Chore(t) | WorkItem::Task(t) => t,
-        other => panic!("expected chore, got {other:?}"),
-    };
-    assert_eq!(
-        task.status,
-        TaskStatus::InReview,
-        "producing task must advance after the breaker gives up",
-    );
-
-    // An attention item must record that the PR advanced unreviewed.
-    let attentions = db.list_attention_items(&pr_review_exec_id).unwrap();
-    assert!(
-        attentions.iter().any(|i| i.kind == REVIEW_RESULT_GIVEUP_ATTENTION_KIND),
-        "a review-result-missing attention must be filed; got {attentions:?}",
-    );
-
-    // The verdict must record that the engine gave up, not that the review
-    // was clean — no `ReviewResult` was ever produced for this pass.
-    let verdict = db
-        .review_verdict_for_execution(&pr_review_exec_id)
-        .unwrap()
-        .expect("a give-up completion must still record a verdict");
-    assert_eq!(verdict.gate_outcome, crate::work::REVIEW_GATE_OUTCOME_GAVE_UP);
-    assert_eq!(verdict.findings_count, 0);
-    assert!(!verdict.revision_warranted);
-    assert!(verdict.head_sha.is_none());
-}
-
 /// The PRIMARY channel: a `ReviewResult` written to the engine-owned
 /// structured-output artifact (no transcript at all) must drive the
 /// severity gate and create a revision.

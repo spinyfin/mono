@@ -203,24 +203,19 @@ async fn drain_execution(
         );
     }
 
-    // A drained `pr_review` execution held its task in the Doing column
-    // (P992 `PendingReview`: `active` + `pr_url`). Re-routing it as a fresh
-    // *implementation* would be wrong — the PR already exists — so advance
-    // the task to `in_review` via the same idempotent, single-live-worker-
-    // guarded helper the stalled-reviewer fallback uses. That lands the card
-    // in the human Review lane (and takes it out of orphan-active
-    // redispatch's candidate set) rather than stranding it in Doing.
-    // Re-firing the review itself is out of scope here (a separate
-    // review-pipeline-resilience chore owns that); this only ensures the
-    // drained reviewer's task is not left stuck.
+    // A drained `pr_review` execution held its task in Doing. The shared
+    // fallback helper advances only if that pass already recorded a durable
+    // ReviewResult; otherwise the row stays in Doing for the dead-review
+    // recovery sweep to re-fire. Re-routing it as a fresh implementation
+    // would be wrong because the PR already exists.
     if execution.kind == ExecutionKind::PrReview {
         match work_db.advance_pending_review_task_to_in_review(&execution.work_item_id) {
             Ok(true) => tracing::info!(
                 execution_id = %execution.id,
                 work_item_id = %execution.work_item_id,
-                "host reconcile: drained pr_review's task advanced to in_review (reviewer fallback)",
+                "host reconcile: drained pr_review's completed result advanced task to in_review",
             ),
-            Ok(false) => {} // Already past `active`, or a live implementation worker holds it.
+            Ok(false) => {} // No result, already past `active`, or another worker holds it.
             Err(err) => tracing::warn!(
                 execution_id = %execution.id,
                 work_item_id = %execution.work_item_id,
@@ -790,13 +785,11 @@ mod tests {
         assert_eq!(sweep_outcome.redispatched, 0);
     }
 
-    /// A drained `pr_review` execution (the incident's actual casualty class)
-    /// is terminalized to stop the heartbeat error-spam, and its task is
-    /// advanced to `in_review` rather than left `active` — so the
-    /// orphan-active sweep does NOT spuriously re-dispatch a fresh
-    /// *implementation* worker on a task whose PR already exists.
+    /// A drained review execution is terminalized to stop heartbeat errors,
+    /// while its missing-result task stays in Doing for review recovery. The
+    /// orphan-active sweep must not misclassify it as implementation work.
     #[tokio::test]
-    async fn draining_pr_review_advances_task_to_in_review_not_reimplementation() {
+    async fn draining_pr_review_without_result_stays_doing_for_review_recovery() {
         let (_dir, db) = open_db();
         let product = create_product(&db);
         add_remote_host(&db, "anaplian");
@@ -820,11 +813,11 @@ mod tests {
         );
         assert_eq!(
             task_status(&db, &wi),
-            "in_review",
-            "the reviewer's task lands in Review, not stuck in Doing awaiting re-implementation"
+            "active",
+            "a dead reviewer without a result leaves its task in Doing for review recovery"
         );
-        // With the task no longer `active`, it is NOT an orphan-active
-        // redispatch candidate — no spurious implementation worker.
+        // The latest execution kind reserves this row for review recovery,
+        // despite the task still being active.
         assert!(
             !db.list_orphan_active_candidates(0).unwrap().contains(&wi),
             "a pending-review task must not be re-dispatched as an implementation"

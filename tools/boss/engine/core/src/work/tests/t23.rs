@@ -332,16 +332,88 @@ fn active_chore_with_pr(db: &WorkDb, label: &str, pr_url: &str) -> String {
     chore_id
 }
 
-/// The basic advance: an `active` task with a `pr_url` and no live worker
-/// moves to `in_review` and reports `true`.
+/// The basic advance: an `active` task with a `pr_url` and a durable result
+/// from its latest review moves to `in_review` and reports `true`.
 #[test]
 fn advance_moves_active_task_with_pr_to_in_review() {
     let db = WorkDb::open(temp_db_path("advance-basic")).unwrap();
     let chore_id = active_chore_with_pr(&db, "advance-basic", "https://github.com/spinyfin/mono/pull/900");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    WorkDb::insert_review_verdict_in_tx(
+        &db.connect().unwrap(),
+        &execution.id,
+        &chore_id,
+        &ReviewVerdictInput {
+            head_sha: Some("reviewed-head".to_owned()),
+            findings_count: 0,
+            revision_warranted: false,
+            gate_outcome: REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
+        },
+    )
+    .unwrap();
 
     let advanced = db.advance_pending_review_task_to_in_review(&chore_id).unwrap();
     assert!(advanced, "an active task with a pr_url and no live worker must advance");
     assert_eq!(task(&db, &chore_id).status, TaskStatus::InReview);
+}
+
+/// `dropped_duplicate_head` produced a ReviewResult; a missed Stop hook must
+/// still advance the card rather than leave it in Doing for re-fire.
+#[test]
+fn advance_moves_dropped_duplicate_head_to_in_review() {
+    let db = WorkDb::open(temp_db_path("advance-dropped-dup")).unwrap();
+    let chore_id = active_chore_with_pr(&db, "advance-dropped-dup", "https://github.com/spinyfin/mono/pull/904");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    WorkDb::insert_review_verdict_in_tx(
+        &db.connect().unwrap(),
+        &execution.id,
+        &chore_id,
+        &ReviewVerdictInput {
+            head_sha: Some("reviewed-head".to_owned()),
+            findings_count: 1,
+            revision_warranted: true,
+            gate_outcome: REVIEW_GATE_OUTCOME_DROPPED_DUPLICATE_HEAD,
+        },
+    )
+    .unwrap();
+
+    let advanced = db.advance_pending_review_task_to_in_review(&chore_id).unwrap();
+    assert!(advanced, "dropped_duplicate_head must count as a written ReviewResult");
+    assert_eq!(task(&db, &chore_id).status, TaskStatus::InReview);
+}
+
+/// A terminal reviewer with no result must not move the row out of Doing.
+#[test]
+fn advance_refuses_without_review_result() {
+    let db = WorkDb::open(temp_db_path("advance-no-result")).unwrap();
+    let chore_id = active_chore_with_pr(&db, "advance-no-result", "https://github.com/spinyfin/mono/pull/903");
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(chore_id.clone())
+            .kind(ExecutionKind::PrReview)
+            .status(ExecutionStatus::Failed)
+            .build(),
+    )
+    .unwrap();
+
+    assert!(!db.advance_pending_review_task_to_in_review(&chore_id).unwrap());
+    assert_eq!(task(&db, &chore_id).status, TaskStatus::Active);
 }
 
 /// Idempotent: a task already past `active` (e.g. already `in_review`) reports

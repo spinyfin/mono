@@ -652,6 +652,7 @@ fn apply_has_attachments_flag(
 /// dedicated protocol enum — matching the existing convention for polled
 /// PR-state fields (`ci_required_state`, `pr_mergeable_state`, ...).
 pub(crate) const AI_REVIEW_STATE_REVIEWING: &str = "reviewing";
+pub(crate) const AI_REVIEW_STATE_REVIEW_QUEUED: &str = "review_queued";
 pub(crate) const AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS: &str = "reviewed_with_findings";
 pub(crate) const AI_REVIEW_STATE_REVIEWED_ALL_CLEAR: &str = "reviewed_all_clear";
 pub(crate) const AI_REVIEW_STATE_REVIEW_NOT_REQUIRED: &str = "review_not_required";
@@ -675,8 +676,8 @@ pub(crate) const AI_REVIEW_STATE_REVIEW_NOT_REQUIRED: &str = "review_not_require
 ///    revision-review trigger — this rule does not look through to that; the
 ///    chain root's own card still reads `review_not_required`.
 /// 2. **Active (Doing)** → `reviewing` when [`attach_ai_reviewing_flag`]
-///    already set `ai_reviewing` on this row, else no badge ("not reviewed
-///    yet"). Any older verdict is ignored here: a row back in Doing has
+///    already set `ai_reviewing`, `review_queued` when a review is waiting
+///    for a pool slot, else no badge ("not reviewed yet"). Any older verdict is ignored here: a row back in Doing has
 ///    fresh, not-yet-reviewed work in flight, so a stale `reviewed_*` badge
 ///    would misrepresent the current head.
 /// 3. **In Review or Done** → resolve the most recent *informative* verdict
@@ -755,6 +756,37 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
     lookup_ids.sort_unstable();
     lookup_ids.dedup();
     let verdicts = query_latest_informative_review_verdicts(conn, &lookup_ids)?;
+    // Queue lookup is for Active cards (`review_queued`), not the
+    // InReview/Done `lookup_ids` slice above. Scope to the tree being
+    // rendered rather than every ready `pr_review` in the database.
+    let mut queued_lookup_ids: Vec<String> = tasks
+        .iter()
+        .chain(chores.iter())
+        .filter(|row| !task_kind_excluded_from_ai_review(&row.kind) && row.status == TaskStatus::Active)
+        .map(|row| row.id.clone())
+        .collect();
+    queued_lookup_ids.sort_unstable();
+    queued_lookup_ids.dedup();
+    let queued_reviews: std::collections::HashSet<String> = if queued_lookup_ids.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        let placeholders = queued_lookup_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT DISTINCT work_item_id FROM work_executions
+             WHERE kind = 'pr_review' AND status = 'ready'
+               AND work_item_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = queued_lookup_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?
+            .filter_map(|row| row.ok())
+            .collect()
+    };
 
     // The redirect to the last completed revision's verdict is a
     // preference, not a hard cutover: when that target has no
@@ -772,6 +804,8 @@ pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chor
             TaskStatus::Active => {
                 if row.ai_reviewing {
                     (Some(AI_REVIEW_STATE_REVIEWING), None)
+                } else if queued_reviews.contains(&row.id) {
+                    (Some(AI_REVIEW_STATE_REVIEW_QUEUED), None)
                 } else {
                     (None, None)
                 }

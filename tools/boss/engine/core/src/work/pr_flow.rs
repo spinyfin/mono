@@ -534,31 +534,53 @@ impl WorkDb {
         collect_rows(rows)
     }
 
-    /// Tasks that are held in `active` (Doing) pending an AI reviewer pass
-    /// that has either finished (terminal `pr_review` execution) or timed out
-    /// (non-terminal `pr_review` execution older than `stale_secs` seconds).
+    /// Tasks that are held in `active` (Doing) pending their latest AI
+    /// reviewer pass, where that latest pass has either finished (terminal
+    /// `pr_review` execution) or timed out (non-terminal `pr_review`
+    /// execution older than `stale_secs` seconds).
     ///
-    /// These are the candidates for the merge poller's reviewer-fallback sweep:
-    /// they should advance to `in_review` and release the hold, because either
-    /// the reviewer already finished (its Stop hook never fired or failed to
-    /// advance the task) or the reviewer is taking too long and we should
-    /// unblock the human review lane rather than stranding the card.
+    /// These are the candidates for the merge poller's reviewer-fallback
+    /// sweep. A pass with a durable result may release the hold and advance;
+    /// a pass without one stays in Doing while recovery re-fires the review.
     ///
-    /// Returns `(task_id, product_id, pr_url)` triples.
-    pub fn list_tasks_with_stalled_reviewer(&self, stale_secs: u64) -> Result<Vec<(String, String, String)>> {
+    /// Historical terminal attempts are deliberately ignored once a newer
+    /// pass exists. Otherwise a failed attempt keeps matching during its
+    /// replacement pass and can make the fallback treat an actively-reviewed
+    /// row as stalled.
+    ///
+    /// Returns `(task_id, product_id, pr_url, review_result_written)` tuples.
+    /// The final value is true when the latest pass durably recorded a
+    /// `ReviewResult` — including `dropped_duplicate_head`, which produced a
+    /// result then deferred to an earlier covering pass. A `gave_up` ledger
+    /// row does not count.
+    pub fn list_tasks_with_stalled_reviewer(&self, stale_secs: u64) -> Result<Vec<(String, String, String, bool)>> {
         let conn = self.connect()?;
         let cutoff = (boss_engine_utils::epoch_time::now_epoch_secs() as u64)
             .saturating_sub(stale_secs)
             .to_string();
-        // Tasks in `active` with a `pr_url` that have a `pr_review` execution
-        // which is either:
+        // Tasks in `active` with a `pr_url` whose latest `pr_review` execution
+        // is either:
         //   1. Terminal (reviewer finished — should have advanced the task via
         //      finalize_pr_review_pass but didn't, e.g. Stop hook was missed).
         //   2. Non-terminal but created before the stale cutoff (timeout).
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT t.id, t.product_id, t.pr_url
+        let review_result_outcomes = super::review_verdicts::review_result_gate_outcomes_sql();
+        let sql = format!(
+            "SELECT t.id, t.product_id, t.pr_url,
+                    EXISTS (
+                      SELECT 1
+                      FROM pr_review_verdicts rv
+                      WHERE rv.execution_id = we.id
+                        AND rv.gate_outcome IN ({review_result_outcomes})
+                    ) AS review_result_written
              FROM tasks t
-             JOIN work_executions we ON we.work_item_id = t.id AND we.kind = 'pr_review'
+             JOIN work_executions we ON we.id = (
+               SELECT latest.id
+               FROM work_executions latest
+               WHERE latest.work_item_id = t.id
+                 AND latest.kind = 'pr_review'
+               ORDER BY latest.created_at DESC, latest.id DESC
+               LIMIT 1
+             )
              WHERE t.status = 'active'
                AND t.pr_url IS NOT NULL
                AND t.pr_url != ''
@@ -571,37 +593,41 @@ impl WorkDb {
                  (we.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')
                   AND we.created_at < ?1)
                )
-             ORDER BY t.updated_at ASC",
-        )?;
+             ORDER BY t.updated_at ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([cutoff], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
             ))
         })?;
         collect_rows(rows)
     }
 
-    /// Advance a task from `active` to `in_review` as the reviewer-fallback
-    /// (the reviewer finished or timed out without advancing it). Idempotent:
-    /// no-ops if the task is already past `active`. Returns `true` if the task
-    /// was updated.
+    /// Advance a task from `active` to `in_review` as the reviewer-fallback,
+    /// but only after its latest reviewer pass durably recorded a real
+    /// `ReviewResult`. Idempotent: no-ops if the task is already past
+    /// `active`, the latest pass has no result, or a non-review worker is
+    /// live. Returns `true` if the task was updated.
     ///
-    /// Single-live-worker guard (T1577 incident): the reviewer-fallback is
-    /// only correct when the worker holding the task in `active` is actually
-    /// the AI reviewer. A `pr_review` execution can be terminal/timed-out
-    /// (which surfaces the task as a fallback candidate) while a DIFFERENT
-    /// live execution — a `chore_implementation`/`task_implementation`/
-    /// `ci_remediation` resume — is actively working the task. Advancing the
-    /// lane then would strand the implementation worker in the Review column
-    /// with no Doing card. So we refuse to advance while ANY live
-    /// (`running`/`waiting_human`) non-`pr_review` execution exists on the
-    /// task: the `NOT EXISTS` clause makes the update a no-op in that case.
+    /// Single-live-worker guard: the reviewer-fallback is only correct when
+    /// the worker holding the task in `active` is actually the AI reviewer.
+    /// A `pr_review` execution can be terminal/timed-out (which surfaces the
+    /// task as a fallback candidate) while a DIFFERENT live execution — a
+    /// `chore_implementation`/`task_implementation`/`ci_remediation` resume
+    /// — is actively working the task. Advancing the lane then would strand
+    /// the implementation worker in the Review column with no Doing card.
+    /// So we refuse to advance while ANY live (`running`/`waiting_human`)
+    /// non-`pr_review` execution exists on the task: the `NOT EXISTS` clause
+    /// makes the update a no-op in that case.
     pub fn advance_pending_review_task_to_in_review(&self, work_item_id: &str) -> Result<bool> {
         let conn = self.connect()?;
         let now = now_string();
-        let rows_changed = conn.execute(
+        let review_result_outcomes = super::review_verdicts::review_result_gate_outcomes_sql();
+        let sql = format!(
             "UPDATE tasks
              SET status            = 'in_review',
                  updated_at        = ?2,
@@ -611,14 +637,28 @@ impl WorkDb {
                AND pr_url IS NOT NULL
                AND pr_url != ''
                AND deleted_at IS NULL
+               AND EXISTS (
+                 SELECT 1
+                 FROM work_executions latest
+                 JOIN pr_review_verdicts rv ON rv.execution_id = latest.id
+                 WHERE latest.id = (
+                   SELECT newest.id
+                   FROM work_executions newest
+                   WHERE newest.work_item_id = ?1
+                     AND newest.kind = 'pr_review'
+                   ORDER BY newest.created_at DESC, newest.id DESC
+                   LIMIT 1
+                 )
+                   AND rv.gate_outcome IN ({review_result_outcomes})
+               )
                AND NOT EXISTS (
                  SELECT 1 FROM work_executions we
                  WHERE we.work_item_id = ?1
                    AND we.status IN ('running', 'waiting_human')
                    AND we.kind != 'pr_review'
-               )",
-            params![work_item_id, now],
-        )?;
+               )"
+        );
+        let rows_changed = conn.execute(&sql, params![work_item_id, now])?;
         Ok(rows_changed > 0)
     }
 

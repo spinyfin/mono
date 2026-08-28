@@ -182,7 +182,7 @@ struct WorkTask: Identifiable, Hashable {
     /// intentional. Mirrors `Task.ai_reviewing` on the wire; `false` when
     /// absent (older engines / tasks not undergoing an AI review pass).
     var aiReviewing: Bool = false
-    /// Resolved AI-review badge state: one of `"reviewing"`,
+    /// Resolved AI-review badge state: one of `"reviewing"`, `"review_queued"`,
     /// `"reviewed_with_findings"`, `"reviewed_all_clear"`, or
     /// `"review_not_required"`. `nil` means "not reviewed yet" — render no
     /// badge — and must never be treated as a clean result. Mirrors

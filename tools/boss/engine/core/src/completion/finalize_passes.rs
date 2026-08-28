@@ -676,12 +676,12 @@ impl WorkerCompletionHandler {
                         producing_task_id,
                         nudge_count = count,
                         "pr_review finalize: reviewer failed to produce a valid ReviewResult \
-                         after re-prompting; advancing to in_review WITHOUT a revision and \
-                         filing an attention",
+                         after re-prompting; keeping the task in Doing and filing an attention",
                     );
                     self.file_review_result_giveup_attention(execution, count).await;
-                    // Fall through with review_result = None → advance to
-                    // in_review unimpeded (no revision).
+                    // Fall through with review_result = None. The completion
+                    // write keeps the PendingReview hold so recovery can
+                    // re-fire instead of presenting this as human-reviewable.
                 }
             }
         }
@@ -719,10 +719,12 @@ impl WorkerCompletionHandler {
         let deletion_signoff = self
             .compute_merge_parent_deletion_signoff(producing_task_id, execution, head_sha_for_cycle.as_deref())
             .await;
-        let completion_target = if deletion_signoff.is_empty() {
+        let completion_target = if !deletion_signoff.is_empty() {
+            WorkerPrCompletionTarget::BlockedDeletionSignoff
+        } else if review_result.is_some() {
             WorkerPrCompletionTarget::InReview
         } else {
-            WorkerPrCompletionTarget::BlockedDeletionSignoff
+            WorkerPrCompletionTarget::PendingReview
         };
 
         // Dedup at the revision-minting end too. If a prior COMPLETED

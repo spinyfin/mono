@@ -986,7 +986,7 @@ pub struct Task {
     #[builder(default)]
     pub ai_reviewing: bool,
 
-    /// Resolved AI-review state for this card, one of `"reviewing"`,
+    /// Resolved AI-review state for this card, one of `"reviewing"`, `"review_queued"`,
     /// `"reviewed_with_findings"`, `"reviewed_all_clear"`, or
     /// `"review_not_required"`. `None` means "not reviewed yet" — render no
     /// badge — and must never be treated as a clean result: absence of

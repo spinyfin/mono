@@ -430,6 +430,35 @@ fn ai_review_state_reviewing_matches_ai_reviewing_flag() {
     assert_eq!(card.ai_review_state.as_deref(), Some("reviewing"));
 }
 
+#[test]
+fn ai_review_state_marks_a_queued_reviewer_distinctly() {
+    let db = WorkDb::open(temp_db_path("ai-review-state-queued")).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore_manual(&db, product.id.clone(), "Queued AI review");
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".to_owned()),
+            pr_url: Some("https://github.com/spinyfin/mono/pull/9102".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind(ExecutionKind::PrReview)
+            .status(ExecutionStatus::Ready)
+            .build(),
+    )
+    .unwrap();
+
+    let tree = db.get_work_tree(&product.id).unwrap();
+    let card = tree.chores.iter().find(|c| c.id == chore.id).expect("chore present");
+    assert!(!card.ai_reviewing, "a queued reviewer has not started yet");
+    assert_eq!(card.ai_review_state.as_deref(), Some("review_queued"));
+}
+
 /// There is deliberately no "review failed" badge state (design decision:
 /// absence is the signal). A `gave_up` verdict — the reviewer never
 /// produced a result even after re-prompting — must render exactly like no

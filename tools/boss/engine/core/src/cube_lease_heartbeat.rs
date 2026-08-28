@@ -1305,11 +1305,10 @@ async fn reap_and_release_lease(
         crate::execution_liveness::finalize_dead_automation_triage_run(ctx.work_db, execution, death_clause);
     }
 
-    // Mirror host_reconcile::drain_execution's pr_review bookkeeping: a
-    // pr_review reaped here would otherwise stay `active` + `pr_url` and
-    // slip past the orphan-active sweep's running-reviewer guard
-    // (dispatch.rs), producing a spurious re-implementation on a task whose
-    // PR already exists.
+    // Mirror host_reconcile::drain_execution's pr_review bookkeeping. The
+    // shared helper advances only when the reaped pass already recorded a
+    // durable ReviewResult; a missing-result pass stays in Doing for the
+    // dead-review recovery sweep to re-fire.
     if execution.kind == ExecutionKind::PrReview {
         match ctx
             .work_db
@@ -1318,9 +1317,9 @@ async fn reap_and_release_lease(
             Ok(true) => tracing::info!(
                 execution_id = %execution.id,
                 work_item_id = %execution.work_item_id,
-                "cube-lease heartbeat: reaped pr_review's task advanced to in_review (reviewer fallback)",
+                "cube-lease heartbeat: reaped pr_review's completed result advanced task to in_review",
             ),
-            Ok(false) => {} // Already past `active`, or a live implementation worker holds it.
+            Ok(false) => {} // No result, already past `active`, or another worker holds it.
             Err(err) => tracing::warn!(
                 execution_id = %execution.id,
                 work_item_id = %execution.work_item_id,

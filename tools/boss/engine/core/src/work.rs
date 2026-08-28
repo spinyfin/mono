@@ -360,12 +360,14 @@ pub struct RecoveredConflictLadderAttempt {
 
 /// One work item returned by
 /// [`WorkDb::list_dead_pr_review_candidates`] — a non-terminal work item
-/// whose latest execution is a `pr_review` that reached a terminal state
-/// (`orphaned`/`abandoned`/`failed`/`cancelled`) WITHOUT ever reaching
-/// `finalize_pr_review_pass` (the only path that produces `completed`).
-/// The review died silently — host failure, cube-lease reap, crash — and
-/// the PR it was reviewing may now merge with no automated review and no
-/// visible signal that one is missing.
+/// whose latest `pr_review` execution either died before finalizing
+/// (`orphaned`/`abandoned`/`failed`/`cancelled`) or completed without a
+/// durable judgement (`gave_up`, or a missing verdict on a post-verdicts-
+/// table pass). `dropped_duplicate_head` is not this shape: that pass
+/// produced a `ReviewResult` and an earlier informative row already
+/// covers the head. The review died silently — host failure, cube-lease
+/// reap, crash, or a give-up — and the PR it was reviewing may now merge
+/// with no automated review and no visible signal that one is missing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeadPrReviewCandidate {
     pub work_item_id: String,

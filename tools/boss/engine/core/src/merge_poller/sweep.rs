@@ -61,16 +61,11 @@ pub struct SweepOutcome {
     /// violation where a parent rests `blocked` with no signal while its
     /// PR conflicts/fails (the PR #1077 strand).
     pub stranded_blocked_recanonicalized: usize,
-    /// Number of tasks advanced from `active` to `in_review` by the
-    /// reviewer-fallback sweep: tasks held in Doing (`PendingReview`)
-    /// whose `pr_review` execution either finished without advancing them
-    /// or has been running past the stale threshold. Ensures the hold
-    /// always resolves so no card is stranded in Doing forever.
+    /// Number of reviewer-fallback passes with a durable `ReviewResult`
+    /// released from Doing (`active`) to Review (`in_review`).
     pub reviewer_fallback_advanced: usize,
-    /// Of the `reviewer_fallback_advanced` count, how many also got a fresh
-    /// `pr_review` execution re-enqueued immediately (the rest are pending
-    /// re-fire via `pr_review_recovery` once their stale execution is
-    /// reaped — see `sweep_stalled_reviewer`).
+    /// Number of missing-result reviewer passes re-enqueued while their task
+    /// remains in Doing awaiting a durable review result.
     pub reviewer_fallback_review_refired: usize,
     /// Number of `in_revision` comments reopened (comment-intent-
     /// classification design §"Reconciliation", task 2c) because the task
@@ -514,10 +509,10 @@ pub async fn run_one_pass_observed(
 
     // reviewer-fallback sweep: tasks held in `active` (PendingReview)
     // while waiting for an AI reviewer pass that has since finished or timed
-    // out. Ensures the hold always resolves so no card is stranded in Doing.
-    // Timeout: 10 minutes — long enough for the reviewer to complete normally,
-    // short enough that the user never waits longer than one poller cycle
-    // past the timeout for the card to move to Review.
+    // out. A pass that recorded a ReviewResult may advance to Review; a pass
+    // that produced no result is re-fired and stays in Doing. Timeout: 10
+    // minutes — long enough for the reviewer to complete normally, short
+    // enough to surface and recover a wedged pass promptly.
     let reviewer_stale_secs: u64 = 10 * 60;
     let stalled_candidates = match work_db.list_tasks_with_stalled_reviewer(reviewer_stale_secs) {
         Ok(items) => items,
@@ -526,13 +521,16 @@ pub async fn run_one_pass_observed(
             Vec::new()
         }
     };
-    for (task_id, product_id, pr_url) in &stalled_candidates {
+    for (task_id, product_id, pr_url, review_result_written) in &stalled_candidates {
         sweep_stalled_reviewer(
             work_db,
             publisher,
-            task_id,
-            product_id,
-            pr_url,
+            StalledReview {
+                task_id,
+                product_id,
+                pr_url,
+                review_result_written: *review_result_written,
+            },
             &GhPrStateChecker,
             &mut outcome,
         )
@@ -707,15 +705,18 @@ pub async fn reconcile_batch(
     let reviewer_stale_secs: u64 = 10 * 60;
     match work_db.list_tasks_with_stalled_reviewer(reviewer_stale_secs) {
         Ok(stalled) => {
-            for (task_id, product_id, stalled_pr_url) in
-                stalled.iter().filter(|(_, _, url)| wanted.contains(url.as_str()))
+            for (task_id, product_id, stalled_pr_url, review_result_written) in
+                stalled.iter().filter(|(_, _, url, _)| wanted.contains(url.as_str()))
             {
                 sweep_stalled_reviewer(
                     work_db,
                     publisher,
-                    task_id,
-                    product_id,
-                    stalled_pr_url,
+                    StalledReview {
+                        task_id,
+                        product_id,
+                        pr_url: stalled_pr_url,
+                        review_result_written: *review_result_written,
+                    },
                     &GhPrStateChecker,
                     &mut outcome,
                 )
@@ -2282,112 +2283,181 @@ pub(crate) async fn mark_closed_unmerged(
 /// Returns `None` for any non-canonical URL.
 pub(crate) use crate::work::stored_pr_number;
 
-/// Reviewer-fallback: advance a task from `active` to `in_review` when
-/// its AI reviewer pass has either finished without advancing it (missed Stop
-/// hook) or has been running past the stale threshold (timeout). Ensures the
-/// `PendingReview` hold always resolves so no card is stranded in Doing.
+/// Argument bundle for [`sweep_stalled_reviewer`]; `review_result_written`
+/// says the latest review execution recorded an informative `ReviewResult`.
+pub(crate) struct StalledReview<'a> {
+    pub(crate) task_id: &'a str,
+    pub(crate) product_id: &'a str,
+    pub(crate) pr_url: &'a str,
+    pub(crate) review_result_written: bool,
+}
+
+/// Reviewer-fallback: reconcile a task held in `active` after its latest AI
+/// reviewer pass either finished without advancing it (missed Stop hook) or
+/// ran past the stale threshold. A pass with a durable `ReviewResult` may
+/// advance to `in_review`; a pass without one stays in Doing and is re-fired.
 ///
 /// Incident (2026-07-04, PR spinyfin/mono#1766): this fallback used
-/// to ONLY unstick the kanban lane, silently leaving the PR with no
-/// completed AI review — indistinguishable in the UI from a task that was
-/// reviewed and found clean. Advancing the task now also (a) re-enqueues a
-/// fresh `pr_review` execution via `WorkDb::request_pr_review` (the same
-/// path `bossctl review start` and the dead-review recovery sweep use) and
-/// (b) files a `pr_review_died_without_findings` attention item so the gap
-/// is visible instead of silent. Re-enqueue is best-effort: if the stale
-/// reviewer execution is still nominally `running` (the timeout sub-case),
-/// `request_pr_review` correctly refuses — a wedged worker must be reaped
-/// first (`stale_worker_sweep`/`transient_recovery`), after which the
-/// standalone `pr_review_recovery` sweep picks it up. Either way the
-/// attention item is filed so the gap is never silent.
+/// to ONLY unstick the kanban lane, silently leaving the PR with no completed
+/// AI review — indistinguishable in the UI from a task that was reviewed and
+/// found clean. Missing-result passes are now re-enqueued through
+/// `WorkDb::request_pr_review` (the same path `bossctl review start` and the
+/// dead-review recovery sweep use) and get a
+/// `pr_review_died_without_findings` attention item. Re-enqueue is
+/// best-effort: a still-running timed-out execution must first be reaped by
+/// liveness reconciliation, after which the standalone recovery sweep picks
+/// it up. A successful re-fire records one attention item; a churn-guard trip
+/// parks the task for a human instead of looping indefinitely.
 pub(crate) async fn sweep_stalled_reviewer(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
-    task_id: &str,
-    product_id: &str,
-    pr_url: &str,
+    stalled: StalledReview<'_>,
     pr_checker: &dyn PrStateChecker,
     outcome: &mut SweepOutcome,
 ) {
-    match work_db.advance_pending_review_task_to_in_review(task_id) {
-        Ok(true) => {
+    let StalledReview {
+        task_id,
+        product_id,
+        pr_url,
+        review_result_written,
+    } = stalled;
+    if review_result_written {
+        match work_db.advance_pending_review_task_to_in_review(task_id) {
+            Ok(true) => {
+                tracing::info!(
+                    task_id,
+                    pr_url,
+                    "merge poller: reviewer-fallback advanced task from active to in_review \
+                     after confirming a durable ReviewResult",
+                );
+                publisher
+                    .publish_work_item_changed(product_id, task_id, "reviewer_fallback_advanced")
+                    .await;
+                outcome.reviewer_fallback_advanced += 1;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(
+                    task_id,
+                    pr_url,
+                    ?err,
+                    "merge poller: reviewer-fallback failed to advance reviewed task to in_review",
+                );
+            }
+        }
+        return;
+    }
+
+    let churn_cutoff =
+        boss_engine_utils::epoch_time::now_epoch_secs() - crate::work::ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS;
+    let recent_uninformative = match work_db.count_recent_uninformative_pr_review_executions(task_id, churn_cutoff) {
+        Ok(count) => count,
+        Err(err) => {
+            tracing::warn!(
+                task_id,
+                pr_url,
+                ?err,
+                "merge poller: failed to count unproductive review attempts"
+            );
+            return;
+        }
+    };
+    if recent_uninformative >= crate::work::ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
+        let failing_ids = work_db
+            .list_recent_uninformative_pr_review_execution_ids(task_id, churn_cutoff)
+            .unwrap_or_default();
+        work_db.file_churn_guard_parked_attention(
+            task_id,
+            "merge_poller_reviewer_fallback",
+            recent_uninformative,
+            &failing_ids,
+            "unproductive pr_review executions",
+        );
+        tracing::warn!(
+            task_id,
+            pr_url,
+            recent_uninformative,
+            threshold = crate::work::ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD,
+            "merge poller: reviewer-fallback churn guard parked task without re-firing review",
+        );
+        return;
+    }
+
+    let prior_pr_review_id = match work_db.list_executions(Some(task_id)) {
+        Ok(executions) => executions
+            .into_iter()
+            .rev()
+            .find(|execution| execution.kind == boss_protocol::ExecutionKind::PrReview)
+            .map(|execution| execution.id),
+        Err(err) => {
+            tracing::warn!(
+                task_id,
+                pr_url,
+                ?err,
+                "merge poller: failed to list executions before reviewer-fallback re-fire"
+            );
+            return;
+        }
+    };
+
+    match work_db.request_pr_review(task_id, pr_checker) {
+        Ok(execution) => {
+            if prior_pr_review_id.as_deref() == Some(execution.id.as_str()) {
+                // `request_pr_review` is idempotent: a `ready` row sitting in
+                // the review-pool queue is returned as Ok without inserting
+                // anything. That is the `review_queued` state, not a death,
+                // and must not file `pr_review_died_without_findings` or bump
+                // the re-fire counter on every 60s sweep.
+                tracing::debug!(
+                    task_id,
+                    pr_url,
+                    execution_id = %execution.id,
+                    "merge poller: reviewer-fallback observed an already-queued pr_review; not a re-fire"
+                );
+                return;
+            }
             tracing::info!(
                 task_id,
                 pr_url,
-                "merge poller: reviewer-fallback advanced task from active to in_review \
-                 (reviewer finished or timed out without firing its Stop hook)",
+                execution_id = %execution.id,
+                "merge poller: reviewer-fallback re-enqueued a fresh pr_review execution; \
+                 task remains in Doing until a ReviewResult is recorded",
             );
             publisher
-                .publish_work_item_changed(product_id, task_id, "reviewer_fallback_advanced")
+                .publish_work_item_changed(product_id, task_id, "reviewer_fallback_review_refired")
                 .await;
-            outcome.reviewer_fallback_advanced += 1;
-
-            match work_db.request_pr_review(task_id, pr_checker) {
-                Ok(execution) => {
-                    tracing::warn!(
-                        task_id,
-                        pr_url,
-                        execution_id = %execution.id,
-                        "merge poller: reviewer-fallback re-enqueued a fresh pr_review \
-                         execution — the prior pass never produced findings",
-                    );
-                    outcome.reviewer_fallback_review_refired += 1;
-                }
-                Err(err) => {
-                    // Best-effort: the stale reviewer may still be nominally
-                    // `running` (timeout sub-case) — `request_pr_review`
-                    // correctly refuses to double-dispatch. The standalone
-                    // `pr_review_recovery` sweep re-attempts once that
-                    // execution is reaped. Not re-enqueuing here must never
-                    // block filing the attention item below.
-                    tracing::warn!(
-                        task_id,
-                        pr_url,
-                        error = %err,
-                        "merge poller: reviewer-fallback could not re-enqueue a review \
-                         (will retry via pr_review_recovery once any stale execution is reaped)",
-                    );
-                }
-            }
-
-            let body = "The automated reviewer for this PR did not complete a review pass before \
-                 the merge-poller's reviewer-fallback advanced this task to Review — its \
-                 `pr_review` execution either finished without ever writing a `ReviewResult`, \
-                 or was still running past the 10-minute stale threshold. This is distinct \
-                 from \"reviewed, no findings.\" A fresh review has been (or will shortly be) \
-                 re-enqueued; dismiss this item once that pass completes."
+            outcome.reviewer_fallback_review_refired += 1;
+            let body = "The automated reviewer for this PR did not complete a review pass. Its \
+                 `pr_review` execution either finished without writing a `ReviewResult`, or remained \
+                 running past the 10-minute stale threshold. This is distinct from \"reviewed, no \
+                 findings.\" The task remains in Doing, and a fresh review has been re-enqueued; \
+                 dismiss this item once that pass completes."
                 .to_owned();
             if let Err(err) = work_db.create_attention_item(CreateAttentionItemInput {
                 execution_id: None,
                 work_item_id: Some(task_id.to_owned()),
                 kind: crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND.to_owned(),
                 status: None,
-                title: "Automated review did not complete — advanced without a review".to_owned(),
+                title: "Automated review did not complete — replacement pending".to_owned(),
                 body_markdown: body,
                 resolved_at: None,
             }) {
                 tracing::warn!(
                     task_id,
                     ?err,
-                    "merge poller: failed to file review-missing attention item",
+                    "merge poller: failed to file review-missing attention item"
                 );
             }
         }
-        Ok(false) => {
-            // No-op. Either the task was already past `active` (a concurrent
-            // sweep or the reviewer's own Stop hook advanced it), or the
-            // single-live-worker guard inside
-            // `advance_pending_review_task_to_in_review` refused to advance
-            // because a live non-reviewer execution (an implementation/CI
-            // resume) is still working the task — advancing then would strand
-            // that worker in the Review lane (a prior Review-lane incident).
-        }
         Err(err) => {
+            // Best-effort: the stale reviewer may still be nominally running.
+            // The standalone recovery sweep re-attempts once liveness
+            // reconciliation reaps it.
             tracing::warn!(
                 task_id,
                 pr_url,
-                ?err,
-                "merge poller: reviewer-fallback failed to advance task to in_review",
+                error = %err,
+                "merge poller: reviewer-fallback could not re-enqueue a review",
             );
         }
     }
