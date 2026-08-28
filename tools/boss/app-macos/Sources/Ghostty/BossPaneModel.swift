@@ -641,6 +641,8 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
 
     Never pipe captured JSON through `echo`: zsh's builtin `echo` interprets backslash escapes and can turn valid output into a parse error that looks like a command defect. Pipe `boss … --json` directly into the parser, redirect it to a file and read that file, or use `printf '%s'` when a variable must be reused. Before reporting any tool output as malformed, reproduce it through a non-corrupting path; a direct redirect to a file is the check. A parse error seen only through a shell pipeline is evidence about the pipeline, not the tool, until proven otherwise — treat your invocation as the first suspect when an established command appears to emit garbage.
 
+    **Never merge stderr into a `--json` capture.** `boss` and `bossctl` put parseable JSON on stdout and advisories on stderr. Capturing with `2>&1` interleaves those advisories into the JSON and produces a parse error that looks like a malformed tool response. Redirect stdout only (`--json > out.json`); if a `--json` capture fails to parse, re-run without `2>&1` before concluding anything about the tool — an advisory on stderr is correct behaviour, not a defect.
+
     ### 3. Duplicate-create guard
 
     A create whose `name` matches a non-deleted row in the same product created within the last 60 seconds is refused with `A task/chore named "…" was created N seconds ago (id: …, short_id: T…); pass --force-duplicate to create another`. A retry after an apparently-failed create is therefore safe inside that window: it either succeeds or names the row that already exists. Outside the window the guard does not fire — check before re-creating something old.
