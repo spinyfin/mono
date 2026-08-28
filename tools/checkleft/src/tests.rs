@@ -17,10 +17,9 @@ use super::{
     TRUNCATE_MAX_LINE_LEN, TRUNCATE_TAIL_LINES, branch_from_ci_env, ci_from_env, compute_fix_plan,
     distinct_applied_files, github_auth_unavailable_warning, invocation_root_from, json_run_output,
     normalize_optional_description, parse_external_provider_mode, parse_github_ref_pr_number,
-    pr_description_fetch_failed_reason, pr_numbers_for_description, render_fix_results, render_human_footer,
-    render_human_results, render_no_checks_ran, resolve_github_token_from_sources, resolve_pr_description_with_github,
-    resolve_ref_for_upload, should_show_progress, sort_results_for_output, still_failing_from_verify,
-    truncate_tool_output,
+    pr_numbers_for_description, render_fix_results, render_human_footer, render_human_results, render_no_checks_ran,
+    resolve_github_token_from_sources, resolve_pr_description_with_github, resolve_ref_for_upload,
+    should_show_progress, sort_results_for_output, still_failing_from_verify, truncate_tool_output,
 };
 
 #[test]
@@ -1036,14 +1035,6 @@ fn pr_description_resolution_into_changeset_fields_three_states() {
     );
 }
 
-#[test]
-fn pr_description_fetch_failed_reason_names_repo_and_pr() {
-    let reason = pr_description_fetch_failed_reason("owner/repo", "99");
-    assert!(reason.contains("owner/repo"), "{reason}");
-    assert!(reason.contains("99"), "{reason}");
-    assert!(reason.contains("cannot pass without it"), "{reason}");
-}
-
 fn vcs_for_pr_description_resolution_test() -> (tempfile::TempDir, Vcs) {
     let temp = tempfile::tempdir().expect("temp dir");
     checkleft::test_git::init_repo_with_branch(temp.path(), "main");
@@ -1072,7 +1063,25 @@ async fn resolve_pr_description_marks_known_pr_body_failure_unavailable() {
     .await
     .expect("non-timeout failure becomes unavailable");
 
-    assert!(matches!(resolution, PrDescriptionResolution::Unavailable { .. }));
+    assert!(matches!(resolution, PrDescriptionResolution::Unavailable { ref reason } if reason.contains("HTTP 500")));
+}
+
+#[tokio::test]
+async fn resolve_pr_description_without_github_token_is_not_applicable() {
+    let (_temp, vcs) = vcs_for_pr_description_resolution_test();
+
+    let resolution = resolve_pr_description_with_github(
+        "o/r",
+        Some("42"),
+        &CiEnvironment::default(),
+        &vcs,
+        GithubApiContext::new("http://127.0.0.1:9", Duration::from_secs(1)),
+        None,
+    )
+    .await
+    .expect("missing credentials must not attempt a GitHub API call");
+
+    assert_eq!(resolution, PrDescriptionResolution::NotApplicable);
 }
 
 #[tokio::test]
@@ -1167,8 +1176,8 @@ async fn resolve_pr_description_marks_partial_merge_queue_fetch_unavailable() {
     .expect("partial merge-queue failure becomes unavailable");
 
     assert!(
-        matches!(resolution, PrDescriptionResolution::Unavailable { ref reason } if reason.contains("124")),
-        "unavailable result must identify the missing PR: {resolution:?}"
+        matches!(resolution, PrDescriptionResolution::Unavailable { ref reason } if reason.contains("HTTP 500")),
+        "unavailable result must preserve the GitHub failure reason: {resolution:?}"
     );
 }
 

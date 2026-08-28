@@ -37,8 +37,8 @@ use checkleft::progress::{DEFAULT_DEBOUNCE, LiveProgress, NoopProgressReporter, 
 use checkleft::runner::{DEFAULT_FIX_PASSES, Runner};
 use checkleft::source_tree::LocalSourceTree;
 use checkleft::vcs::{
-    BaseRevision, BranchPrLookup, GithubApiContext, GithubApiTimeout, Vcs, github_pr_number_for_branch,
-    github_pull_request_description,
+    BaseRevision, BranchPrLookup, GithubApiContext, GithubApiTimeout, GithubPrDescription, Vcs,
+    github_pr_number_for_branch, github_pull_request_description,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing::info;
@@ -1850,14 +1850,6 @@ fn pr_description_surface(changeset: &ChangeSet) -> &'static str {
     }
 }
 
-fn pr_description_fetch_failed_reason(repository: &str, pr_id: &str) -> String {
-    format!(
-        "GitHub API did not return a description for PR {pr_id} in {repository} \
-         (missing/expired token, rate limit, non-success status, or transport error). \
-         A check that requires the PR description cannot pass without it."
-    )
-}
-
 async fn resolve_pr_description(
     repository: Option<&str>,
     change_id: Option<&str>,
@@ -1891,6 +1883,7 @@ async fn resolve_pr_description_with_github(
 ) -> Result<PrDescriptionResolution> {
     if github_token.is_none() {
         eprintln!("{}", github_auth_unavailable_warning(repository));
+        return Ok(PrDescriptionResolution::NotApplicable);
     }
 
     // Levels 1 & 2: a concrete PR number is already known. Failure to fetch
@@ -1902,10 +1895,8 @@ async fn resolve_pr_description_with_github(
             "fetching PR description by change id"
         );
         return match github_pull_request_description(github, repository, change_id, github_token).await? {
-            Some(desc) => Ok(PrDescriptionResolution::Resolved(desc)),
-            None => Ok(PrDescriptionResolution::Unavailable {
-                reason: pr_description_fetch_failed_reason(repository, change_id),
-            }),
+            GithubPrDescription::Found(desc) => Ok(PrDescriptionResolution::Resolved(desc)),
+            GithubPrDescription::LookupFailed { reason } => Ok(PrDescriptionResolution::Unavailable { reason }),
         };
     }
 
@@ -1924,17 +1915,13 @@ async fn resolve_pr_description_with_github(
             "resolved PR numbers from merge-queue branch name"
         );
         let mut descriptions = Vec::new();
-        let mut failed_ids = Vec::new();
         for pr_number in &merge_queue_pr_numbers {
             match github_pull_request_description(github, repository, pr_number, github_token).await? {
-                Some(description) => descriptions.push(description),
-                None => failed_ids.push(pr_number.clone()),
+                GithubPrDescription::Found(description) => descriptions.push(description),
+                GithubPrDescription::LookupFailed { reason } => {
+                    return Ok(PrDescriptionResolution::Unavailable { reason });
+                }
             }
-        }
-        if !failed_ids.is_empty() {
-            return Ok(PrDescriptionResolution::Unavailable {
-                reason: pr_description_fetch_failed_reason(repository, &failed_ids.join(",")),
-            });
         }
         return Ok(PrDescriptionResolution::Resolved(descriptions.join("\n\n")));
     }
@@ -1966,10 +1953,8 @@ async fn resolve_pr_description_with_github(
         "fetching PR description for branch-resolved PR"
     );
     match github_pull_request_description(github, repository, &pr_number, github_token).await? {
-        Some(desc) => Ok(PrDescriptionResolution::Resolved(desc)),
-        None => Ok(PrDescriptionResolution::Unavailable {
-            reason: pr_description_fetch_failed_reason(repository, &pr_number),
-        }),
+        GithubPrDescription::Found(desc) => Ok(PrDescriptionResolution::Resolved(desc)),
+        GithubPrDescription::LookupFailed { reason } => Ok(PrDescriptionResolution::Unavailable { reason }),
     }
 }
 

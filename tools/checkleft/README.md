@@ -69,6 +69,13 @@ checkleft run --external-checks-url https://example.com/CHECKS.yaml
 checkleft list
 ```
 
+### JSON output
+
+checkleft run --format json emits an object with a results array containing the
+CheckResult values and a pr_description_surface status (scanned, not_applicable,
+or unavailable). Consumers that previously iterated the top-level array should
+iterate .results[] instead.
+
 ### Change detection is automatic
 
 `checkleft run` (no flags) detects which files changed on its own. It
