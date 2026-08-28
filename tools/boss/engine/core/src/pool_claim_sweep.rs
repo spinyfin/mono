@@ -59,13 +59,31 @@
 //!
 //! ## Why the live-state cross-check is sound
 //!
-//! `release_worker_pane` frees the pool slot BEFORE it drops the
-//! live-state entry (`app.rs`: `release_worker_and_kick` then
-//! `live_worker_states.release_slot`). So during normal teardown the
+//! On a CONFIRMED teardown, `release_worker_pane` frees the pool slot
+//! BEFORE it drops the live-state entry (`app.rs`: `release_worker_and_kick`
+//! then `live_worker_states.release_slot`). So a normal teardown's
 //! observable states are "claimed + live entry" → "free + live entry" →
-//! "free + no entry" — never "claimed + no entry". A "claimed + no live
-//! entry" slot is therefore always a genuine leak, never a teardown
-//! in flight.
+//! "free + no entry" — never "claimed + no entry" on that path.
+//!
+//! But an UNCONFIRMED teardown deliberately produces "claimed + no live
+//! entry": when the app never confirms the pane is actually gone (no
+//! session registered, a timed-out RPC, an unexpected response),
+//! `release_worker_pane` holds the pool claim instead of releasing it
+//! (see the `sweep_owns_handback` branch there) while still dropping the
+//! live-state entry unconditionally just below. This module is exactly
+//! how that state gets resolved: the same `hold_slot_busy` shape
+//! `coordinator/run.rs` already produces for a rejected `SpawnWorkerPane`,
+//! now joined by this second producer. A "claimed + no live entry" slot is
+//! therefore not proof the pane is gone — it may still be genuinely up,
+//! which is precisely what step 1 above is written to avoid racing
+//! ("Releasing it here would let a fresh dispatch hit `SpawnWorkerPane`
+//! `SlotBusy` against a pane that is still up"). What makes releasing it
+//! anyway acceptable once `LEAK_GRACE_SECS` has passed is that both known
+//! producers are terminal-execution-only and self-limiting: a genuine
+//! leak (no teardown owns the slot) must be reclaimed eventually, and an
+//! unconfirmed-but-actually-alive pane loses at most one dispatch to
+//! `SlotBusy` before this sweep frees it — the cost this whole module
+//! exists to bound, not eliminate.
 //!
 //! ## Cadence
 //!

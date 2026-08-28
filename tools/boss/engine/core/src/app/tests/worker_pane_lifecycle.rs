@@ -371,7 +371,19 @@ async fn reap_run_releases_worker_pool_claim_and_live_state() {
         "precondition: live state registered",
     );
 
+    // A registered app session that answers the pane-release request —
+    // the realistic reap shape (the app is connected; reap is the
+    // manual escape hatch for a pane the engine's own bookkeeping lost
+    // track of, not for an app that is unreachable). A confirmed
+    // teardown is what makes the immediate release below sound: an
+    // unconfirmed one (e.g. no app session at all) must instead go
+    // through `pool_claim_sweep`, exactly like every other release
+    // path — see `release_worker_pane_holds_the_pool_claim_when_the_app_never_confirms`.
     let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
     let ctx = Dispatch::builder()
         .server_state(server_state.clone())
         .work_db(server_state.work_db.clone())
@@ -397,9 +409,30 @@ async fn reap_run_releases_worker_pool_claim_and_live_state() {
         other => panic!("expected RunReaped, got {other:?}"),
     }
 
-    // The pane/pool/live-state cleanup happens on a background task
-    // (mirrors `handle_stop_run`) so the RPC response doesn't wait on
-    // it — poll for it to land.
+    // The pane/pool/live-state cleanup runs on a background task (mirrors
+    // `handle_stop_run`), which asks the (now-registered) app session to
+    // release the pane. Answer that request so the teardown confirms —
+    // an unconfirmed teardown must instead be reconciled by
+    // `pool_claim_sweep`, per `release_worker_pane_holds_the_pool_claim_when_the_app_never_confirms`.
+    let release_request = sink.next().await.expect("pane-release EngineRequest enqueued");
+    let FrontendEvent::EngineRequest { request_id, .. } = release_request.payload else {
+        panic!(
+            "expected an EngineRequest for the pane release, got {:?}",
+            release_request.payload
+        );
+    };
+    server_state
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::ReleaseWorkerPane {
+                result: Ok(crate::protocol::ReleaseWorkerPaneResult {}),
+            },
+        )
+        .await;
+
+    // Poll for the background cleanup to observe the confirmed teardown
+    // and land the live-state drop.
     for _ in 0..50 {
         if server_state.live_worker_states.get(1).is_none() {
             break;
@@ -423,4 +456,177 @@ async fn reap_run_releases_worker_pool_claim_and_live_state() {
         .await
         .expect("slot must be free after reap");
     assert_eq!(reclaimed, "worker-1");
+}
+
+/// Set up a worker-pool claim plus a slot mapping for `execution_id`, the
+/// way the coordinator does when it defers a pane-spawned run's slot
+/// release to `release_worker_pane`.
+async fn claim_slot_one_for(server_state: &Arc<ServerState>, execution_id: &str) {
+    let pool = server_state.execution_coordinator.worker_pool();
+    let claimed = pool
+        .claim_worker(execution_id, None)
+        .await
+        .expect("worker pool starts with one free slot");
+    assert_eq!(claimed, "worker-1");
+    server_state.worker_registry.register_run_slot(execution_id, 1);
+}
+
+/// The engine must not tell the app how long to wait for a worker to die
+/// and then give up on the answer at exactly that moment. The two being
+/// equal (both 5s) is what made every full-grace teardown time out, and a
+/// timed-out teardown is the unconfirmed case the test below covers.
+#[test]
+fn pane_release_ack_timeout_outlasts_the_kill_grace_it_asks_for() {
+    assert!(
+        crate::app::PANE_RELEASE_ACK_TIMEOUT > crate::app::PANE_RELEASE_KILL_GRACE,
+        "the ack deadline ({:?}) must exceed the kill grace the app is asked to honour ({:?})",
+        crate::app::PANE_RELEASE_ACK_TIMEOUT,
+        crate::app::PANE_RELEASE_KILL_GRACE,
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn release_worker_pane_holds_the_pool_claim_when_the_app_never_confirms() {
+    // The `SlotBusy` root cause. `release_worker_pane` used to hand the
+    // WorkerPool slot back "successfully or not" — including when the app
+    // never answered the teardown request at all. The app is then still
+    // hosting the pane while the engine advertises the slot as free, so the
+    // next dispatch claims it, `SpawnWorkerPane` is rejected `SlotBusy`, and
+    // that execution is terminalized `failed` seconds after start with
+    // `work_executions.driver` still NULL.
+    //
+    // An unconfirmed teardown must instead leave the claim in place;
+    // `pool_claim_sweep` reconciles it once the pane is genuinely gone.
+    let (server_state, _dir) = test_server_state();
+    let pool = server_state.execution_coordinator.worker_pool();
+
+    // A terminal execution — the shape `pool_claim_sweep` reconciles.
+    let product = create_test_product(&server_state.work_db);
+    let chore = create_test_chore(&server_state.work_db, &product.id, "stuck teardown");
+    let execution = server_state
+        .work_db
+        .create_execution(
+            boss_protocol::CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(boss_protocol::ExecutionKind::ChoreImplementation)
+                .status(boss_protocol::ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    claim_slot_one_for(&server_state, &execution.id).await;
+
+    // An app session that is registered but never answers: `send_to_app`
+    // runs out its deadline and the teardown goes unconfirmed.
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    server_state.release_worker_pane(&execution.id).await;
+
+    assert_eq!(
+        pool.idle_count().await,
+        0,
+        "an unconfirmed pane teardown must not advertise the slot as free — that is the \
+         fabricated signal that produces SlotBusy on the next dispatch",
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn release_worker_pane_still_frees_the_slot_when_no_sweep_would_collect_it() {
+    // The counterweight to the test above: `pool_claim_sweep` only
+    // reconciles claims whose execution is TERMINAL. Holding the claim for
+    // anything else would leak the slot forever, so a non-terminal (or
+    // absent) execution still releases inline even without a confirmation.
+    let (server_state, _dir) = test_server_state();
+    let pool = server_state.execution_coordinator.worker_pool();
+
+    let product = create_test_product(&server_state.work_db);
+    let chore = create_test_chore(&server_state.work_db, &product.id, "live worker");
+    let execution = create_ready_chore_execution(&server_state.work_db, chore.id.clone());
+    claim_slot_one_for(&server_state, &execution.id).await;
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    server_state.release_worker_pane(&execution.id).await;
+
+    assert_eq!(
+        pool.idle_count().await,
+        1,
+        "a claim no sweep would ever collect must be released inline rather than leaked",
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn pool_claim_sweep_reconciles_the_claim_release_worker_pane_holds() {
+    // The other half of the safety argument behind
+    // `release_worker_pane_holds_the_pool_claim_when_the_app_never_confirms`:
+    // holding the claim is only safe because `pool_claim_sweep` is
+    // guaranteed to collect it once the execution has been stuck past
+    // `LEAK_GRACE_SECS`. Without this test, a future change to the sweep's
+    // skip conditions (e.g. the live-state cross-check) could silently turn
+    // the hold into a permanent slot leak with every other test still green.
+    let (server_state, _dir) = test_server_state();
+    let pool = server_state.execution_coordinator.worker_pool();
+
+    let product = create_test_product(&server_state.work_db);
+    let chore = create_test_chore(&server_state.work_db, &product.id, "stuck teardown");
+    let execution = server_state
+        .work_db
+        .create_execution(
+            boss_protocol::CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(boss_protocol::ExecutionKind::ChoreImplementation)
+                .status(boss_protocol::ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    claim_slot_one_for(&server_state, &execution.id).await;
+
+    // An app session that is registered but never answers, exactly like
+    // the sibling test — the teardown goes unconfirmed and the claim is
+    // held rather than released.
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+    server_state.release_worker_pane(&execution.id).await;
+    assert_eq!(
+        pool.idle_count().await,
+        0,
+        "precondition: the unconfirmed teardown must hold the claim",
+    );
+
+    // Age `finished_at` past the leak grace, the way a claim that has
+    // genuinely been stuck for a while (rather than a teardown still in
+    // flight) would look to the sweep.
+    {
+        let conn = server_state.work_db.connect().unwrap();
+        let epoch = boss_engine_utils::epoch_time::now_epoch_secs() - crate::pool_claim_sweep::LEAK_GRACE_SECS - 5;
+        conn.execute(
+            "UPDATE work_executions SET finished_at = ?2 WHERE id = ?1",
+            rusqlite::params![execution.id, epoch.to_string()],
+        )
+        .unwrap();
+    }
+
+    let live_states = crate::live_worker_state::LiveWorkerStateRegistry::new();
+    let outcome = crate::pool_claim_sweep::run_one_pass(
+        server_state.work_db.as_ref(),
+        &live_states,
+        server_state.execution_coordinator.clone(),
+        server_state.dispatch_events.as_ref(),
+    )
+    .await;
+
+    assert_eq!(outcome.released, 1, "the sweep must count the held claim as released");
+    assert_eq!(
+        pool.idle_count().await,
+        1,
+        "pool_claim_sweep must reconcile a claim release_worker_pane held for an unconfirmed \
+         teardown, once the execution has been stuck past LEAK_GRACE_SECS",
+    );
 }
