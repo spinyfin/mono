@@ -85,6 +85,18 @@ private struct EngineConfigPane: View {
     /// Transient status line shown after a successful save / clear.
     @State private var apiKeyStatus: String?
 
+    /// Reference material trimmed out of the API-key and Driver Traffic
+    /// captions lives in this doc rather than a bundled resource: SwiftPM
+    /// resources must live inside the target's own directory tree
+    /// (`Sources/`), so bundling a file from `tools/boss/docs/` — the
+    /// convention this doc otherwise follows — would mean either
+    /// duplicating it under `Sources/Resources/` (drift risk for one
+    /// reference doc) or restructuring the package layout. Linking out is
+    /// the proportionate choice here.
+    private var settingsHelpURL: URL {
+        URL(string: "https://github.com/spinyfin/mono/blob/main/tools/boss/docs/driver-traffic-and-api-key-settings.md")!
+    }
+
     var body: some View {
         Form {
             Section {
@@ -100,7 +112,7 @@ private struct EngineConfigPane: View {
                         .foregroundStyle(.secondary)
                 }
                 if !chatModel.engineAnthropicApiKeyPresent {
-                    Text("Live worker summaries and pane summarization are disabled until ANTHROPIC_API_KEY is available to the engine. Paste a key below to store it in the macOS Keychain, or export the variable in your shell startup file and relaunch Boss.")
+                    Text("Live summaries need a key — paste one below, or export ANTHROPIC_API_KEY and relaunch Boss.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -130,7 +142,7 @@ private struct EngineConfigPane: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
-                    Text("Stored in the macOS Keychain on signed release builds, or a private file under Application Support on ad-hoc dev builds (service \(APIKeyStore.service)). The Settings value overrides any ANTHROPIC_API_KEY in the engine's inherited environment. Saving restarts the engine so the new value takes effect.")
+                    Text("Saving stores the key and restarts the engine, overriding any ANTHROPIC_API_KEY already in its environment.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -149,6 +161,11 @@ private struct EngineConfigPane: View {
                 .padding(.top, 4)
             } header: {
                 Text("Required Configuration")
+            } footer: {
+                HStack {
+                    Spacer()
+                    HelpLink(destination: settingsHelpURL)
+                }
             }
 
             Section {
@@ -156,10 +173,14 @@ private struct EngineConfigPane: View {
             } header: {
                 Text("Driver Traffic")
             } footer: {
-                Text("How work is allocated between drivers. Every work-item kind takes part, but only across the drivers that are eligible for that kind: for a kind some driver cannot run, the shares are renormalised over the eligible ones in proportion, so a driver never receives work it cannot do. The three shares always total 100%: raising one takes from Claude first, then the remaining driver, so the split is never in a rejected state mid-edit. Set any one or two to 0 and those drivers receive nothing at all. Deterministic per work item — the same row under the same split always lands on the same driver. An explicit --driver on a row, or a product default driver, wins over the split, and PR reviews and automation work keep their own pinned driver. Changing this only affects work dispatched after the change; nothing already running is reassigned.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                HStack(alignment: .top) {
+                    Text("Sets the percentage of new work sent to each driver; PR reviews and automation always use their own pinned driver, not this split.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    HelpLink(destination: settingsHelpURL)
+                }
             }
 
             DriverQuotaSection()
