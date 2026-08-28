@@ -627,11 +627,7 @@ mod tests {
         let work = temp.path().join("work");
 
         // Create a bare remote repo and an initial commit.
-        Command::new("git")
-            .args(["init", "--bare", "-b", "main"])
-            .arg(&remote)
-            .output()
-            .unwrap();
+        crate::test_git::init_bare_repo_with_branch(&remote, "main");
         Command::new("git")
             .args(["clone"])
             .arg(&remote)
@@ -699,11 +695,7 @@ mod tests {
         let remote = temp.path().join("remote.git");
         let work = temp.path().join("work");
 
-        Command::new("git")
-            .args(["init", "--bare", "-b", "main"])
-            .arg(&remote)
-            .output()
-            .unwrap();
+        crate::test_git::init_bare_repo_with_branch(&remote, "main");
         Command::new("git")
             .args(["clone"])
             .arg(&remote)

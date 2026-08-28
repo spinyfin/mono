@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite;
@@ -607,4 +607,9 @@ impl ExpectedCommand {
             duration: Duration::ZERO,
         }
     }
+}
+
+/// Initialize a git repo at `path` whose `HEAD` names `branch`.
+pub(super) fn init_repo_with_branch(path: &Path, branch: &str) {
+    boss_engine_test_git::init_repo_with_branch(path, branch);
 }

@@ -83,12 +83,12 @@ fn git_out(root: &Path, args: &[&str]) -> String {
 
 /// Create a fresh temp repo with the initial branch pinned to `default_branch`.
 ///
-/// The branch name is pinned with `init -b` so the test does not depend on the
-/// machine's `init.defaultBranch` (CI leaves it unset → defaults to `master`).
+/// HEAD is pinned so the test does not depend on the machine default branch
+/// name (CI leaves it unset → defaults to `master`).
 fn init_repo(default_branch: &str) -> TempDir {
     let dir = tempdir().expect("tempdir");
     let root = dir.path();
-    git(root, &["init", "-b", default_branch]);
+    checkleft::test_git::init_repo_with_branch(root, default_branch);
     git(root, &["config", "user.email", "test@checkleft.example"]);
     git(root, &["config", "user.name", "Checkleft Test"]);
     // Make merges deterministic and editor-free.
@@ -533,7 +533,7 @@ fn local_prepush_stale_local_main_uses_origin_main() {
     // origin/feature/thing tracking refs exist regardless of git version.
     let clone_dir = tempdir().expect("tempdir");
     let clone = clone_dir.path().to_owned();
-    git(&clone, &["init", "-b", "main"]);
+    checkleft::test_git::init_repo_with_branch(&clone, "main");
     git(&clone, &["config", "user.email", "test@checkleft.example"]);
     git(&clone, &["config", "user.name", "Checkleft Test"]);
     git(&clone, &["remote", "add", "origin", remote.to_str().unwrap()]);
@@ -697,7 +697,7 @@ fn shallow_pr_clone() -> (TempDir, TempDir, String) {
 
     let clone_dir = tempdir().expect("tempdir clone");
     let clone = clone_dir.path().to_owned();
-    git(&clone, &["init", "-b", "pr-branch"]);
+    checkleft::test_git::init_repo_with_branch(&clone, "pr-branch");
     git(&clone, &["config", "user.email", "test@checkleft.example"]);
     git(&clone, &["config", "user.name", "Checkleft Test"]);
     git(&clone, &["remote", "add", "origin", remote.to_str().unwrap()]);
@@ -872,7 +872,7 @@ fn shallow_push_clone() -> (TempDir, TempDir, String) {
 
     let clone_dir = tempdir().expect("tempdir clone");
     let clone = clone_dir.path().to_owned();
-    git(&clone, &["init", "-b", "boss/exec_test"]);
+    checkleft::test_git::init_repo_with_branch(&clone, "boss/exec_test");
     git(&clone, &["config", "user.email", "test@checkleft.example"]);
     git(&clone, &["config", "user.name", "Checkleft Test"]);
     git(&clone, &["remote", "add", "origin", remote.to_str().unwrap()]);
@@ -1056,7 +1056,7 @@ fn jj_working_copy_small_diff_scopes_identically_for_run_fix_and_push_gate() {
     // 1. Bare git remote that will become origin.
     let remote_dir = tempdir().expect("remote tempdir");
     let remote = remote_dir.path();
-    git(remote, &["init", "--bare", "-b", "main"]);
+    checkleft::test_git::init_bare_repo_with_branch(remote, "main");
 
     // 2. Clone into a working dir, seed main, push, then colocate jj.
     let work_dir = tempdir().expect("work tempdir");

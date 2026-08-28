@@ -630,7 +630,7 @@ mod tests {
     /// with. Returns false when git is unavailable so tests skip rather than
     /// fail in a hermetic sandbox.
     fn init_git_repo(path: &Path) -> bool {
-        if !git(&["init", "--initial-branch=main"], path) {
+        if !boss_engine_test_git::try_init_repo_with_branch(path, "main") {
             return false;
         }
         let _ = git(&["config", "user.email", "test@example.com"], path);
@@ -639,7 +639,22 @@ mod tests {
         git(&["add", "."], path) && git(&["commit", "-m", "seed"], path)
     }
 
-    /// The P2 happy path: a patch holding real work is applied into the
+    #[test]
+    fn init_named_branch_points_head_at_the_intended_branch() {
+        let dir = TempDir::new().unwrap();
+        if !boss_engine_test_git::try_init_repo_with_branch(dir.path(), "main") {
+            eprintln!("skipping: git unavailable in sandbox");
+            return;
+        }
+        let actual = Command::new("git")
+            .args(["symbolic-ref", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&actual.stdout).trim(), "refs/heads/main");
+    }
+
+    /// The happy path: a patch holding real work is applied into the
     /// workspace and the restored content is actually on disk.
     #[test]
     fn applies_a_real_patch_and_reports_what_was_restored() {

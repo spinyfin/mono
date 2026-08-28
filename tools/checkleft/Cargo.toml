@@ -19,6 +19,11 @@ path = "src/lib.rs"
 
 [features]
 benchmarking = []
+# Exposes `test_git`, checkleft's portable git-repo test constructors, as
+# public API. Off by default so release builds don't ship test scaffolding;
+# enabled automatically under `cfg(test)` for checkleft's own unit tests, and
+# explicitly by integration-test crates (tests/*_e2e.rs) that need it.
+test-support = []
 
 [[bin]]
 name = "checkleft"

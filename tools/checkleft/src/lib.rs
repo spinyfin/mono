@@ -22,6 +22,15 @@ pub mod path_scope;
 pub mod progress;
 pub mod runner;
 pub mod source_tree;
+/// Test-only git repo constructors. Hidden from rustdoc and gated out of
+/// ordinary (non-test) builds — checkleft publishes to crates.io, so this
+/// module of test scaffolding must not ship as public release surface.
+/// Compiled in automatically under `cfg(test)`; integration-test crates
+/// (`tests/*_e2e.rs`) that depend on `checkleft` as a library instead of
+/// compiling it with `--cfg test` opt in via the `test-support` feature.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_git;
 pub mod vcs;
 
 #[cfg(test)]

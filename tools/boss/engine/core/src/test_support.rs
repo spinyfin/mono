@@ -575,7 +575,7 @@ macro_rules! stub_cube_client {
     // ── rebase_workspace_no_push ────────────────────────────────────────────
     // Also has a trait default (erroring) — same "unlisted keeps the default"
     // behaviour as `rebase_workspace`, used by the speculative-conflict
-    // prediction sweep (T10).
+    // prediction sweep.
     (@munch $ty:ty [$($acc:tt)*] @rebase_workspace_no_push async fn rebase_workspace_no_push $a:tt -> $r:ty $b:block $($rest:tt)*) => {
         $crate::stub_cube_client!(@munch $ty [$($acc)* async fn rebase_workspace_no_push $a -> $r $b] @push_resolution $($rest)*);
     };
@@ -1072,4 +1072,12 @@ pub(crate) mod log_capture {
             })
             .clone()
     }
+}
+
+/// Initialize a git repo at `path` whose `HEAD` names `branch`.
+///
+/// Returns false when git is missing so callers can skip rather than fail in
+/// a hermetic sandbox.
+pub fn try_init_repo_with_branch(path: &Path, branch: &str) -> bool {
+    boss_engine_test_git::try_init_repo_with_branch(path, branch)
 }

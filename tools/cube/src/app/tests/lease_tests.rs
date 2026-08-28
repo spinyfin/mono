@@ -1,6 +1,7 @@
 use super::support::{
-    ExpectedCommand, FakeRunner, head_status_command, head_status_output, jj_status_clean, jj_status_conflicted,
-    jj_status_dirty, lease_runner_for, mono_source_path, seed_mono_repo, unpushed_probe_command, with_database_path,
+    ExpectedCommand, FakeRunner, head_status_command, head_status_output, init_repo_with_branch, jj_status_clean,
+    jj_status_conflicted, jj_status_dirty, lease_runner_for, mono_source_path, seed_mono_repo, unpushed_probe_command,
+    with_database_path,
 };
 use clap::Parser;
 use tempfile::TempDir;
@@ -1584,7 +1585,7 @@ fn auto_create_workspace_attaches_real_shared_store() {
             String::from_utf8_lossy(&out.stderr)
         );
     };
-    git(&["init", "-q", "-b", "main", "."]);
+    init_repo_with_branch(&canonical, "main");
     git(&["config", "user.email", "cube-test@example.com"]);
     git(&["config", "user.name", "cube-test"]);
     std::fs::write(canonical.join("README.md"), "hello\n").unwrap();

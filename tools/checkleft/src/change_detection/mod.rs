@@ -241,7 +241,7 @@ mod tests {
     fn make_repo_one_commit() -> (tempfile::TempDir, Vcs) {
         let tmp = tempdir().unwrap();
         let root = tmp.path();
-        git(root, &["init", "-b", "main"]);
+        crate::test_git::init_repo_with_branch(root, "main");
         git(root, &["config", "user.email", "t@example.com"]);
         git(root, &["config", "user.name", "Test"]);
         fs::write(root.join("a.txt"), "a").unwrap();

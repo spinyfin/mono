@@ -10,5 +10,7 @@ mod install;
 mod lock;
 mod pin;
 mod shell;
+#[cfg(test)]
+mod test_git;
 
 pub use app::{RepobinError, run_from_env};

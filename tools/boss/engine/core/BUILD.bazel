@@ -205,7 +205,9 @@ rust_test(
         proc_macro_dev = True,
     ),
     shard_count = 11,
-    deps = all_crate_deps(
+    deps = [
+        "//tools/boss/engine/test-git",
+    ] + all_crate_deps(
         normal = True,
         normal_dev = True,
     ),

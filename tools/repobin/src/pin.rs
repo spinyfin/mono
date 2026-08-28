@@ -152,11 +152,7 @@ mod tests {
     fn remote_with_config_and_tag(temp: &TempDir, repobin_toml: &str, tag: &str) -> (String, String, String) {
         let remote = temp.path().join("remote.git");
         let work = temp.path().join("work");
-        Command::new("git")
-            .args(["init", "--bare", "-b", "main"])
-            .arg(&remote)
-            .output()
-            .unwrap();
+        crate::test_git::init_bare_repo_with_branch(&remote, "main");
         Command::new("git")
             .args(["clone"])
             .arg(&remote)

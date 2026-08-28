@@ -23,4 +23,5 @@ uuid = { workspace = true, features = ["v4"] }
 which = { workspace = true }
 
 [dev-dependencies]
+boss-engine-test-git = { path = "../boss/engine/test-git" }
 tempfile = { workspace = true }

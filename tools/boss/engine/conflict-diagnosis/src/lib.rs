@@ -577,7 +577,7 @@ changed in both\n\
     /// catches configuration drift where the git binary changes but the version
     /// detection logic doesn't keep up.
     #[tokio::test]
-    async fn running_git_version_is_parseable_and_supported() {
+    async fn running_git_version_is_parseable() {
         if which_git().is_none() {
             eprintln!("skipping: git not on PATH");
             return;
@@ -588,12 +588,8 @@ changed in both\n\
             "git --version output could not be parsed; check parse_git_version()"
         );
         let (major, minor, patch) = ver.unwrap();
-        // git 2.28 added --initial-branch; our test infrastructure relies on it.
-        assert!(
-            (major, minor) >= (2, 28),
-            "git {major}.{minor}.{patch} is too old; test infra requires git ≥ 2.28"
-        );
-        // Log which invocation shape will be used, so CI logs are self-documenting.
+        // Log which merge-tree invocation shape will be used, so CI logs are
+        // self-documenting. Repo constructors no longer require git 2.28.
         if version_supports_write_tree((major, minor, patch)) {
             eprintln!("git {major}.{minor}.{patch}: using --write-tree (new syntax)");
         } else {
@@ -617,7 +613,7 @@ changed in both\n\
         }
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
-        run_git(repo, &["init", "-q", "--initial-branch=main"]).await;
+        boss_engine_test_git::init_repo_with_branch(repo, "main");
         // Identity is required for `git commit` even in tests.
         run_git(repo, &["config", "user.email", "test@example.invalid"]).await;
         run_git(repo, &["config", "user.name", "Test"]).await;
@@ -658,7 +654,7 @@ changed in both\n\
         // --- Build a normal git repo with a conflict between main/feature --
         let git_dir = tempfile::tempdir().unwrap();
         let git_repo = git_dir.path();
-        run_git(git_repo, &["init", "-q", "--initial-branch=main"]).await;
+        boss_engine_test_git::init_repo_with_branch(git_repo, "main");
         run_git(git_repo, &["config", "user.email", "test@example.invalid"]).await;
         run_git(git_repo, &["config", "user.name", "Test"]).await;
 
@@ -718,7 +714,7 @@ changed in both\n\
         // --- Build a normal git repo with a conflict between main/feature --
         let git_dir = tempfile::tempdir().unwrap();
         let git_repo = git_dir.path();
-        run_git(git_repo, &["init", "-q", "--initial-branch=main"]).await;
+        boss_engine_test_git::init_repo_with_branch(git_repo, "main");
         run_git(git_repo, &["config", "user.email", "test@example.invalid"]).await;
         run_git(git_repo, &["config", "user.name", "Test"]).await;
 
@@ -784,7 +780,7 @@ changed in both\n\
         }
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
-        run_git(repo, &["init", "-q", "--initial-branch=main"]).await;
+        boss_engine_test_git::init_repo_with_branch(repo, "main");
         run_git(repo, &["config", "user.email", "test@example.invalid"]).await;
         run_git(repo, &["config", "user.name", "Test"]).await;
 
@@ -821,6 +817,16 @@ changed in both\n\
             }
         }
         None
+    }
+
+    #[tokio::test]
+    async fn init_repo_with_branch_points_head_at_main() {
+        if which_git().is_none() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        boss_engine_test_git::init_repo_with_branch(dir.path(), "main");
     }
 
     async fn run_git(repo: &Path, args: &[&str]) {

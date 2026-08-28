@@ -1171,7 +1171,7 @@ R docs/old.md => docs/new.md
         }
 
         let temp = tempdir().expect("create temp dir");
-        run_git(temp.path(), &["init", "-b", "main"]);
+        crate::test_git::init_repo_with_branch(temp.path(), "main");
         run_git(
             temp.path(),
             &["remote", "add", "origin", "git@github.com:example/flunge.git"],
@@ -1289,10 +1289,10 @@ R docs/old.md => docs/new.md
         }
 
         let temp = tempdir().expect("create temp dir");
-        // Pin the initial branch name so the test does not depend on the
-        // machine's `init.defaultBranch` config (CI leaves it unset, which
-        // defaults to `master`, breaking the `git merge-base main HEAD` below).
-        run_git(temp.path(), &["init", "-b", "main"]);
+        // Pin HEAD so the test does not depend on the machine default branch
+        // name (CI leaves it unset, which defaults to `master`, breaking the
+        // `git merge-base main HEAD` below).
+        crate::test_git::init_repo_with_branch(temp.path(), "main");
         run_git(temp.path(), &["config", "user.email", "test@checkleft.example"]);
         run_git(temp.path(), &["config", "user.name", "Checkleft Test"]);
 
@@ -1352,7 +1352,7 @@ R docs/old.md => docs/new.md
         }
 
         let temp = tempdir().expect("create temp dir");
-        run_git(temp.path(), &["init", "-b", "main"]);
+        crate::test_git::init_repo_with_branch(temp.path(), "main");
         run_git(temp.path(), &["config", "user.email", "test@checkleft.example"]);
         run_git(temp.path(), &["config", "user.name", "Checkleft Test"]);
 
@@ -1420,7 +1420,7 @@ R docs/old.md => docs/new.md
         }
 
         let temp = tempdir().expect("create temp dir");
-        run_git(temp.path(), &["init", "-b", "main"]);
+        crate::test_git::init_repo_with_branch(temp.path(), "main");
         run_git(temp.path(), &["config", "user.email", "test@checkleft.example"]);
         run_git(temp.path(), &["config", "user.name", "Checkleft Test"]);
 
@@ -1519,7 +1519,7 @@ R docs/old.md => docs/new.md
         }
 
         let temp = tempdir().expect("create temp dir");
-        run_git(temp.path(), &["init", "-b", "main"]);
+        crate::test_git::init_repo_with_branch(temp.path(), "main");
         run_git(temp.path(), &["config", "user.email", "test@checkleft.example"]);
         run_git(temp.path(), &["config", "user.name", "Checkleft Test"]);
 

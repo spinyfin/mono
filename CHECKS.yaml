@@ -261,3 +261,28 @@ checks:
           pattern: 'ClaudeDriver\.structured_output_fallback\('
           message: "Do not call ClaudeDriver.structured_output_fallback(...) directly. Resolve the run's actual driver via driver_transcript::driver_for_execution (or driver_transcript::driver_or_default) first — a pool-dispatched or non-Claude-driven execution must not be parsed as if it always ran Claude."
           severity: error
+
+  # git 2.28 (July 2020) introduced flags that pin a repo's first branch at
+  # `git init` time. Agents whose git predates that fail with `unknown switch`.
+  # The portable two-step is `git init` then `git symbolic-ref HEAD refs/heads/<name>`.
+  - id: git/no-init-named-branch-flags
+    check: text/forbidden-pattern
+    policy:
+      severity: error
+      changed_lines_only: false
+    config:
+      surfaces:
+        - files
+      patterns:
+        - name: git-init-initial-branch-flag
+          pattern: '-[-]initial-branch'
+          message: "Do not pin a git repo's first branch with git 2.28-only init flags. Run `git init` (optionally `-q` / `--bare`) then `git symbolic-ref HEAD refs/heads/<name>`."
+          severity: error
+        - name: git-init-dash-b-argv
+          pattern: '"init"\s*,\s*(?:"(?:-q|--quiet|--bare)"\s*,\s*)*"[-]b"'
+          message: "Do not pass `-b` to `git init` (argv form). That flag requires git 2.28+. Run `git init` then `git symbolic-ref HEAD refs/heads/<name>`."
+          severity: error
+        - name: git-init-dash-b-shell
+          pattern: 'init(?:\s+(?:-q|--quiet|--bare))*\s+-b\b'
+          message: "Do not pass `-b` to `git init` (shell form). That flag requires git 2.28+. Run `git init` then `git symbolic-ref HEAD refs/heads/<name>`."
+          severity: error

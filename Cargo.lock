@@ -343,6 +343,7 @@ dependencies = [
 name = "boss-conflict-diagnosis"
 version = "0.1.0"
 dependencies = [
+ "boss-engine-test-git",
  "serde",
  "tempfile",
  "tokio",
@@ -453,6 +454,7 @@ dependencies = [
  "boss-engine-recovery",
  "boss-engine-stdout-progress",
  "boss-engine-structured-output",
+ "boss-engine-test-git",
  "boss-engine-transient-error",
  "boss-engine-utility-model",
  "boss-engine-utils",
@@ -727,6 +729,7 @@ name = "boss-engine-recovery"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "boss-engine-test-git",
  "boss-log-files",
  "boss-protocol",
  "serde",
@@ -759,6 +762,13 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "boss-engine-test-git"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]
@@ -1759,6 +1769,7 @@ name = "cube"
 version = "0.1.0"
 dependencies = [
  "bon",
+ "boss-engine-test-git",
  "clap",
  "console",
  "fs4",
