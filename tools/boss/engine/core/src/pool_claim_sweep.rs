@@ -14,9 +14,13 @@
 //!   `finalize_pr_transition` / `finalize_automation_triage`) only frees
 //!   the slot as a side effect of `release_worker_pane`, and only when
 //!   the run→slot mapping is still registered;
-//! * the dead-pid, stale-worker, and transient-recovery sweeps all
-//!   iterate [`LiveWorkerStateRegistry`] and derive the slot to release
-//!   from a *live-state entry*.
+//! * the dead-pid and stale-worker sweeps iterate
+//!   [`LiveWorkerStateRegistry`] and derive the slot to release from a
+//!   *live-state entry*;
+//! * transient-recovery iterates the same registry but routes teardown
+//!   through [`crate::app::ServerState::release_worker_pane`], so the
+//!   pool claim is handed back only when the app confirms the pane is
+//!   gone.
 //!
 //! Nothing iterates the pool's OWN claimed slots. So a slot claimed by
 //! an execution that reached a terminal state WITHOUT a live pane —

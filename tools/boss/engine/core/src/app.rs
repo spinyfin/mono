@@ -470,6 +470,18 @@ impl crate::spawn_ack_sweep::SpawnAckReaper for ServerState {
     }
 }
 
+#[async_trait]
+impl crate::transient_recovery::TransientRecoveryReaper for ServerState {
+    /// Route transient-recovery's slot handback through the same
+    /// confirmed-teardown path every other retire uses. `release_slot`
+    /// used to call `release_worker_and_kick` without ever asking the
+    /// app to tear the pane down, so the next dispatch claimed a slot
+    /// the app still hosted and died `SlotBusy`.
+    async fn reap_worker(&self, execution_id: &str) {
+        let _ = ServerState::release_worker_pane(self, execution_id).await;
+    }
+}
+
 /// `WorkerPaneReleaser` implementation backed by a `Weak<ServerState>`.
 /// Late-bound via `set_server_state` to break the ownership cycle:
 /// ServerState owns the completion handler, which owns the releaser,
