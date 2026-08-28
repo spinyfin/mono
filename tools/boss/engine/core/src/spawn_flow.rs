@@ -233,6 +233,44 @@ pub(crate) const TMUX_SESSION_SCHEMA: &str = "1";
 const TMUX_SESSION_SCHEMA_ENV: &str = "BOSS_SESSION_SCHEMA";
 const TMUX_SPAWN_TOKEN_OPTION: &str = "@boss_spawn_token";
 
+/// Color env every Boss tmux session gets on `new-session -e` (workers and
+/// coordinator; not per-driver — the coordinator is Claude too).
+///
+/// Claude Code clamps chalk to 256-color whenever `$TMUX` is set, ignoring
+/// `COLORTERM` and `FORCE_COLOR`. `CLAUDE_CODE_TMUX_TRUECOLOR` is the escape
+/// hatch and is read at module load, so it must be a real env var at process
+/// launch (`settings.json` `env` is injected too late). `COLORTERM=truecolor`
+/// is set explicitly rather than inherited: tmux 3.6a injects it, but the
+/// installer floor is tmux ≥ 3.2, and a pane on a version that does not
+/// inject it falls through to `TERM=tmux-256color`. `FORCE_COLOR` is
+/// deliberately omitted: the clamp overrides it, and some values disable a
+/// separate TERM-allowlist truecolor path. Applied here (atomic with the
+/// pane process) rather than a later `set-environment`, which would miss
+/// the already-launched agent.
+pub(crate) fn insert_tmux_color_environment(environment: &mut BTreeMap<String, String>) {
+    environment.insert("CLAUDE_CODE_TMUX_TRUECOLOR".to_owned(), "1".to_owned());
+    environment.insert("COLORTERM".to_owned(), "truecolor".to_owned());
+}
+
+/// Assert a `new-session` argv carries the color `-e` pair and omits `FORCE_COLOR`.
+#[cfg(test)]
+pub(crate) fn assert_tmux_color_environment(new_session: &[String]) {
+    assert!(
+        new_session
+            .windows(2)
+            .any(|pair| pair == ["-e", "CLAUDE_CODE_TMUX_TRUECOLOR=1"]),
+        "expected CLAUDE_CODE_TMUX_TRUECOLOR=1 at session creation, got {new_session:?}"
+    );
+    assert!(
+        new_session.windows(2).any(|pair| pair == ["-e", "COLORTERM=truecolor"]),
+        "expected COLORTERM=truecolor at session creation, got {new_session:?}"
+    );
+    assert!(
+        !new_session.iter().any(|arg| arg.contains("FORCE_COLOR")),
+        "FORCE_COLOR must not be set on new-session: {new_session:?}"
+    );
+}
+
 /// Durable writes surrounding a tmux session creation. Kept as a narrow
 /// seam so the spawn-ordering test can exercise the real tmux command shape
 /// without requiring a SQLite fixture; [`WorkDb`] is the production store.
@@ -340,6 +378,7 @@ async fn start_tmux_worker(
     // the session identity contract explicit and prevent a future env
     // refactor from accidentally dropping it from the atomic `-e` set.
     environment.insert("BOSS_RUN_ID".to_owned(), execution_id.to_owned());
+    insert_tmux_color_environment(&mut environment);
 
     host.tmux
         .new_session(&NewSession {
@@ -994,6 +1033,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn insert_tmux_color_environment_overrides_ambient_colorterm_and_omits_force_color() {
+        let mut environment = BTreeMap::from([("COLORTERM".to_owned(), "something-else".to_owned())]);
+        insert_tmux_color_environment(&mut environment);
+        assert_eq!(
+            environment.get("CLAUDE_CODE_TMUX_TRUECOLOR").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(environment.get("COLORTERM").map(String::as_str), Some("truecolor"));
+        assert!(!environment.contains_key("FORCE_COLOR"));
+    }
+
     fn sample_input(workspace: &TempDir) -> StartWorkerInput {
         StartWorkerInput {
             run_id: "run-test".into(),
@@ -1169,6 +1220,7 @@ mod tests {
         );
         assert!(create.windows(2).any(|pair| pair == ["-e", "BOSS_RUN_ID=run-test"]));
         assert!(create.windows(2).any(|pair| pair == ["-e", "BOSS_SESSION_SCHEMA=1"]));
+        assert_tmux_color_environment(create);
         assert!(
             create
                 .windows(2)
