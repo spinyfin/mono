@@ -86,6 +86,12 @@ The same binary works as a plain command-line tool:
 ~/.local/bin/concat-videos clip-a.mp4 clip-b.mp4
 ```
 
+## See also
+
+[`strip-video-metadata`](../strip-video-metadata) removes the camera telemetry
+and debug data tracks that this tool already drops during a concat — useful for
+clips you aren't merging. On DJI footage that is about a third of the file.
+
 ## Troubleshooting
 
 - **Quick Action doesn't appear in the menu.** Restart Finder

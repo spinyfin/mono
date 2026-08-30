@@ -1,0 +1,361 @@
+#!/usr/bin/env bash
+# strip-video-metadata — remove camera telemetry / debug data tracks from video
+# files without touching a single byte of picture or sound.
+#
+# Cameras interleave private data streams alongside the audio and video. On DJI
+# hardware there are two:
+#
+#   djmd  ~28 kbit/s   focus distance, white-balance temperature, frame clock
+#   dbgi  ~25 Mbit/s   a per-frame dump of the image processor's internal state
+#                      (sensor registers, tone-map meshes, lens shading grids)
+#
+# dbgi is factory diagnostic output that ships enabled on retail units, and on
+# a 4K60 clip it is roughly a third of the file. Nothing consumer-facing reads
+# it. Dropping both tracks is a pure container edit: the video and audio packets
+# are copied through untouched, so the result is bit-for-bit identical picture
+# and sound in a smaller file.
+#
+# Usage: strip-video-metadata [-o OUT_DIR] [-n] [-f] FILE [FILE ...]
+#
+#   -o, --out-dir DIR   Write stripped copies to DIR and leave the originals
+#                       alone, instead of replacing them in place.
+#   -n, --dry-run       Report what each file carries and what would be
+#                       reclaimed. Writes nothing.
+#   -f, --force         Replace a file even if another process has it open.
+#
+# By default each file is replaced in place, but only after the new copy is
+# proven identical: every video and audio stream is hashed before and after and
+# the hashes must match, or the original is left exactly as it was. File mode
+# and modification time are preserved so library sort order doesn't shift.
+
+set -euo pipefail
+
+# Where to log when run from a Finder Quick Action (Automator gives the script
+# a minimal env and no terminal, so progress vanishes without an explicit log).
+LOG_DIR="${HOME}/Library/Logs/strip-video-metadata"
+mkdir -p "${LOG_DIR}"
+LOG_FILE="${LOG_DIR}/strip-video-metadata.log"
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "${LOG_FILE}" >&2
+}
+
+notify() {
+  if [[ -x /usr/bin/osascript ]]; then
+    /usr/bin/osascript -e "display notification \"${2//\"/\'}\" with title \"${1//\"/\'}\"" \
+      >/dev/null 2>&1 || true
+  fi
+}
+
+die() {
+  log "ERROR: $*"
+  notify "strip-video-metadata failed" "$*"
+  exit 1
+}
+
+# Temp files to remove if we exit early. A half-written remux must never be
+# left behind looking like a finished video, and must never replace an original.
+cleanup_paths=()
+cleanup() {
+  local status=$?
+  local p
+  for p in ${cleanup_paths[@]+"${cleanup_paths[@]}"}; do
+    [[ -n "$p" ]] && rm -rf -- "$p"
+  done
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'die "interrupted"' INT TERM HUP
+
+out_dir_override=""
+dry_run=false
+force=false
+args=()
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    -o|--out-dir)
+      [[ "$#" -ge 2 ]] || die "$1 requires a directory argument"
+      out_dir_override="$2"
+      shift 2
+      ;;
+    --out-dir=*)
+      out_dir_override="${1#*=}"
+      shift
+      ;;
+    -n|--dry-run)
+      dry_run=true
+      shift
+      ;;
+    -f|--force)
+      force=true
+      shift
+      ;;
+    -h|--help)
+      echo "usage: $(basename "$0") [-o OUT_DIR] [-n] [-f] FILE [FILE ...]" >&2
+      exit 0
+      ;;
+    --)
+      shift
+      while [[ "$#" -gt 0 ]]; do args+=("$1"); shift; done
+      ;;
+    *)
+      args+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- ${args[@]+"${args[@]}"}
+
+if [[ "$#" -lt 1 ]]; then
+  echo "usage: $(basename "$0") [-o OUT_DIR] [-n] [-f] FILE [FILE ...]" >&2
+  exit 64
+fi
+
+# Resolve and sort inputs by name so a Finder multi-selection is processed in a
+# predictable order regardless of the order the user clicked them in.
+inputs=()
+for f in "$@"; do
+  [[ -f "$f" ]] || die "not a file: $f"
+  [[ -r "$f" ]] || die "not readable: $f"
+  abs="$(cd "$(dirname -- "$f")" && pwd)/$(basename -- "$f")"
+  inputs+=("$abs")
+done
+set -f  # word-splitting below must not glob filenames containing [ ] * ?
+IFS=$'\n' inputs=($(printf '%s\n' "${inputs[@]}" | LC_ALL=C sort)); unset IFS
+set +f
+
+out_dir=""
+if [[ -n "$out_dir_override" ]]; then
+  [[ -d "$out_dir_override" ]] || die "not a directory: $out_dir_override"
+  out_dir="$(cd "$out_dir_override" && pwd)"
+  [[ -w "$out_dir" ]] || die "output directory is not writable: $out_dir"
+fi
+
+# Find ffmpeg/ffprobe. Automator and launchd give shells a minimal PATH that
+# misses Homebrew, so probe common locations explicitly.
+find_tool() {
+  local name="$1" candidate
+  for candidate in \
+    "$(command -v "$name" 2>/dev/null || true)" \
+    "/opt/homebrew/bin/$name" \
+    "/usr/local/bin/$name" \
+    "/opt/local/bin/$name"
+  do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+FFMPEG="${FFMPEG_BIN:-$(find_tool ffmpeg || true)}"
+FFPROBE="${FFPROBE_BIN:-$(find_tool ffprobe || true)}"
+[[ -n "$FFMPEG" && -x "$FFMPEG" ]] || die "ffmpeg not found. Install via: brew install ffmpeg"
+[[ -n "$FFPROBE" && -x "$FFPROBE" ]] || die "ffprobe not found. Install via: brew install ffmpeg"
+
+# Count streams of a given type (v/a) so verification can cover every one of
+# them rather than assuming a single video and a single audio track.
+count_streams() {
+  "$FFPROBE" -v error -select_streams "$1" -show_entries stream=index -of csv=p=0 "$2" | grep -c . || true
+}
+
+# Hash one stream's compressed packets. This is the actual payload — if it is
+# unchanged, the picture and sound are unchanged, whatever the container did.
+stream_md5() {
+  "$FFMPEG" -v error -i "$1" -map "$2" -c copy -f md5 - 2>/dev/null
+}
+
+duration_of() {
+  "$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$1"
+}
+
+# Data/subtitle tracks that are worth removing. A tmcd (timecode) track is
+# excluded: it is 4 bytes, and the MP4 muxer writes a fresh one on every remux,
+# so counting it would make every file look permanently strippable.
+strippable_bytes() {
+  local f="$1"
+  "$FFPROBE" -v error -show_entries stream=codec_type,codec_tag_string,bit_rate \
+    -of csv=p=0 "$f" 2>/dev/null | awk -F, -v dur="$(duration_of "$f")" '
+      $1 == "data" || $1 == "subtitle" {
+        if ($2 == "tmcd") next
+        if ($3 ~ /^[0-9]+$/) bytes += $3 * dur / 8
+        found = 1
+      }
+      END { if (found) printf "%.0f", bytes; else print "" }'
+}
+
+strippable_tags() {
+  "$FFPROBE" -v error -show_entries stream=codec_type,codec_tag_string \
+    -of csv=p=0 "$1" 2>/dev/null | awk -F, '
+      $1 == "data" || $1 == "subtitle" { if ($2 != "tmcd") printf "%s%s", (n++ ? "+" : ""), $2 }'
+}
+
+in_use_by() {
+  local lsof_bin
+  lsof_bin="$(command -v lsof 2>/dev/null || true)"
+  [[ -x "$lsof_bin" ]] || lsof_bin=/usr/sbin/lsof
+  [[ -x "$lsof_bin" ]] || return 1
+  "$lsof_bin" -t -- "$1" 2>/dev/null | head -1 | grep -q . && return 0
+  return 1
+}
+
+human() {
+  awk -v b="$1" 'BEGIN {
+    if (b >= 1073741824) printf "%.2f GiB", b / 1073741824
+    else printf "%.0f MiB", b / 1048576
+  }'
+}
+human_mb() { awk -v b="$1" 'BEGIN { printf "%.0f MiB", b / 1048576 }'; }
+
+# Packet count for one stream, used to explain a verification mismatch in terms
+# a person can act on ("it dropped frames") rather than two unequal hashes.
+packet_count() {
+  "$FFPROBE" -v error -select_streams "$2" -show_entries packet=size -of csv=p=0 "$1" | grep -c . || true
+}
+
+stripped=0
+skipped=0
+failed=0
+reclaimed=0
+
+log "strip-video-metadata: ${#inputs[@]} file(s)$($dry_run && echo ' (dry run)')"
+
+for src in "${inputs[@]}"; do
+  base="$(basename -- "$src")"
+  tags="$(strippable_tags "$src")"
+
+  if [[ -z "$tags" ]]; then
+    log "skip  $base — no extra metadata tracks"
+    skipped=$((skipped + 1))
+    continue
+  fi
+
+  est="$(strippable_bytes "$src")"
+  before="$(/usr/bin/stat -f %z -- "$src" 2>/dev/null || echo 0)"
+
+  if $dry_run; then
+    log "would strip  $base — $tags (~$(human_mb "${est:-0}") of $(human "$before"))"
+    stripped=$((stripped + 1))
+    reclaimed=$((reclaimed + ${est:-0}))
+    continue
+  fi
+
+  # Replacing a file that another process is reading is how you hand somebody a
+  # player showing one file and a disk holding another. Refuse unless told to.
+  if [[ -z "$out_dir" ]] && ! $force && in_use_by "$src"; then
+    log "skip  $base — open in another process (use --force to override)"
+    skipped=$((skipped + 1))
+    continue
+  fi
+
+  # Hash the original before touching anything, so verification compares
+  # against what was really there rather than against a re-read of our output.
+  nv="$(count_streams v "$src")"
+  na="$(count_streams a "$src")"
+  specs=()
+  for ((i = 0; i < nv; i++)); do specs+=("0:v:$i"); done
+  for ((i = 0; i < na; i++)); do specs+=("0:a:$i"); done
+  src_hashes=""
+  src_hash_of=()
+  for spec in ${specs[@]+"${specs[@]}"}; do
+    h="$(stream_md5 "$src" "$spec")"
+    src_hash_of+=("$h")
+    src_hashes+="$spec=$h "
+  done
+  src_dur="$(duration_of "$src")"
+
+  if [[ "$src_hashes" != *=MD5=* ]]; then
+    log "FAIL  $base — could not hash source streams; left untouched"
+    failed=$((failed + 1))
+    continue
+  fi
+
+  # The temp file needs a real container extension or ffmpeg cannot infer the
+  # output format from the filename.
+  ext="${base##*.}"
+  if [[ -n "$out_dir" ]]; then
+    dst="${out_dir}/${base}"
+    if [[ -e "$dst" ]]; then
+      stem="${base%.*}"
+      i=2
+      while [[ -e "${out_dir}/${stem}_${i}.${ext}" ]]; do i=$((i + 1)); done
+      dst="${out_dir}/${stem}_${i}.${ext}"
+    fi
+    tmp="$dst"
+  else
+    tmp="$(dirname -- "$src")/.${base}.stripping.${ext}"
+    dst="$src"
+  fi
+  cleanup_paths+=("$tmp")
+
+  log "strip $base — $tags ($(human "$before"))"
+
+  # -map 0:v -map 0:a keeps every video stream (including the embedded
+  # thumbnail) and every audio stream, and mentions no data streams at all,
+  # which is what drops them. -c copy means no re-encode.
+  set +e
+  "$FFMPEG" -hide_banner -nostdin -loglevel error -y \
+    -i "$src" -map 0:v -map 0:a -c copy "$tmp" 2>&1 | tee -a "${LOG_FILE}" >&2
+  ff_status="${PIPESTATUS[0]}"
+  set -e
+
+  if [[ "$ff_status" -ne 0 ]]; then
+    log "FAIL  $base — ffmpeg exited $ff_status; original left untouched"
+    rm -f -- "$tmp"
+    failed=$((failed + 1))
+    continue
+  fi
+
+  # Verify before replacing. Every stream we claimed to copy must hash
+  # identically, and the duration must line up.
+  mismatch=""
+  idx=0
+  for spec in ${specs[@]+"${specs[@]}"}; do
+    if [[ "$(stream_md5 "$tmp" "$spec")" != "${src_hash_of[$idx]}" ]]; then
+      mismatch+=" ${spec} ($(packet_count "$src" "${spec#0:}") packets in, $(packet_count "$tmp" "${spec#0:}") out)"
+    fi
+    idx=$((idx + 1))
+  done
+  new_dur="$(duration_of "$tmp")"
+  dur_ok="$(awk -v a="$src_dur" -v b="$new_dur" \
+    'BEGIN { d = a - b; if (d < 0) d = -d; print (d < 0.05) ? "ok" : "bad" }')"
+
+  if [[ -n "$mismatch" || "$dur_ok" != "ok" ]]; then
+    detail="${mismatch:-duration ${src_dur}s vs ${new_dur}s}"
+    log "FAIL  $base — stream changed, not replacing:${detail}"
+    log "      a source with an edit list (a previously trimmed file) can lose"
+    log "      its pre-roll frames on remux. The original is untouched."
+    rm -f -- "$tmp"
+    failed=$((failed + 1))
+    continue
+  fi
+
+  after="$(/usr/bin/stat -f %z -- "$tmp" 2>/dev/null || echo 0)"
+
+  if [[ -z "$out_dir" ]]; then
+    # Carry the original's permissions and timestamp across, then swap it in
+    # with a rename so there is never a window where the path holds a partial
+    # file. mv within a directory is atomic.
+    chmod "$(/usr/bin/stat -f %Lp -- "$src")" "$tmp" || die "could not set mode on $tmp"
+    touch -r "$src" "$tmp" || die "could not set mtime on $tmp"
+    mv -f -- "$tmp" "$dst" || die "could not replace $dst"
+  fi
+
+  # Output kept: drop it from the cleanup list.
+  cleanup_paths=("${cleanup_paths[@]/$tmp}")
+
+  saved=$((before - after))
+  reclaimed=$((reclaimed + saved))
+  stripped=$((stripped + 1))
+  log "ok    $base — $(human "$before") -> $(human "$after") (saved $(human_mb "$saved"), streams verified identical)"
+done
+
+summary="stripped ${stripped}, skipped ${skipped}, failed ${failed} — $(human "$reclaimed") reclaimed"
+$dry_run && summary="would strip ${stripped}, skip ${skipped} — $(human "$reclaimed") reclaimable"
+log "$summary"
+
+if [[ "$failed" -gt 0 ]]; then
+  notify "strip-video-metadata: ${failed} failed" "$summary"
+  exit 1
+fi
+notify "strip-video-metadata done" "$summary"
