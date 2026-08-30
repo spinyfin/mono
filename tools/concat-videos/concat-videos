@@ -10,6 +10,13 @@
 # it writes DJI_20260510150025_0045-0046_D.MP4 (earliest timestamp, hyphenated
 # sequence range, preserved suffix). For other naming patterns it falls back
 # to joining the basenames with '+'.
+#
+# Usage: concat-videos [-o OUT_DIR] FILE1 FILE2 [FILE3 ...]
+#
+#   -o, --out-dir DIR   Write the merged file to DIR instead of alongside the
+#                       inputs. Strongly recommended when the inputs live on a
+#                       camera SD card: reading and writing gigabytes on the
+#                       same removable card at once is pathologically slow.
 
 set -euo pipefail
 
@@ -23,16 +30,66 @@ log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "${LOG_FILE}" >&2
 }
 
+notify() {
+  if [[ -x /usr/bin/osascript ]]; then
+    /usr/bin/osascript -e "display notification \"${2//\"/\'}\" with title \"${1//\"/\'}\"" \
+      >/dev/null 2>&1 || true
+  fi
+}
+
 die() {
   log "ERROR: $*"
-  if command -v osascript >/dev/null 2>&1; then
-    /usr/bin/osascript -e "display notification \"$*\" with title \"concat-videos failed\""
-  fi
+  notify "concat-videos failed" "$*"
   exit 1
 }
 
+# Files to remove if we exit without a successful concat. The partial output is
+# added to this list as soon as ffmpeg can start creating it, so a failed or
+# interrupted run never leaves a truncated/zero-byte .MP4 sitting next to the
+# inputs looking like a finished video.
+cleanup_paths=()
+cleanup() {
+  local status=$?
+  local p
+  for p in ${cleanup_paths[@]+"${cleanup_paths[@]}"}; do
+    [[ -n "$p" ]] && rm -rf -- "$p"
+  done
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'die "interrupted"' INT TERM HUP
+
+out_dir_override=""
+args=()
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    -o|--out-dir)
+      [[ "$#" -ge 2 ]] || die "$1 requires a directory argument"
+      out_dir_override="$2"
+      shift 2
+      ;;
+    --out-dir=*)
+      out_dir_override="${1#*=}"
+      shift
+      ;;
+    -h|--help)
+      echo "usage: $(basename "$0") [-o OUT_DIR] FILE1 FILE2 [FILE3 ...]" >&2
+      exit 0
+      ;;
+    --)
+      shift
+      while [[ "$#" -gt 0 ]]; do args+=("$1"); shift; done
+      ;;
+    *)
+      args+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- ${args[@]+"${args[@]}"}
+
 if [[ "$#" -lt 2 ]]; then
-  echo "usage: $(basename "$0") FILE1 FILE2 [FILE3 ...]" >&2
+  echo "usage: $(basename "$0") [-o OUT_DIR] FILE1 FILE2 [FILE3 ...]" >&2
   exit 64
 fi
 
@@ -41,13 +98,22 @@ fi
 inputs=()
 for f in "$@"; do
   [[ -f "$f" ]] || die "not a file: $f"
+  [[ -r "$f" ]] || die "not readable: $f"
   abs="$(cd "$(dirname -- "$f")" && pwd)/$(basename -- "$f")"
   inputs+=("$abs")
 done
-IFS=$'\n' inputs=($(printf '%s\n' "${inputs[@]}" | sort)); unset IFS
+set -f  # word-splitting below must not glob filenames containing [ ] * ?
+IFS=$'\n' inputs=($(printf '%s\n' "${inputs[@]}" | LC_ALL=C sort)); unset IFS
+set +f
 
 first="${inputs[0]}"
-out_dir="$(dirname -- "$first")"
+src_dir="$(dirname -- "$first")"
+out_dir="$src_dir"
+if [[ -n "$out_dir_override" ]]; then
+  [[ -d "$out_dir_override" ]] || die "not a directory: $out_dir_override"
+  out_dir="$(cd "$out_dir_override" && pwd)"
+fi
+[[ -w "$out_dir" ]] || die "output directory is not writable: $out_dir"
 
 # Derive output filename. Try the DJI pattern first: DJI_<timestamp>_<seq>_<X>.MP4.
 # Across adjacent clips the timestamp differs, so only the suffix must match;
@@ -105,14 +171,26 @@ if [[ -e "$out_path" ]]; then
   out_path="${out_dir}/${stem}_${i}.${ext}"
 fi
 
-# Build the concat list. The concat demuxer requires single-quoted paths with
-# literal single quotes escaped as '\''.
-list="$(mktemp -t concat-videos).txt"
-trap 'rm -f "$list"' EXIT
+# Build the concat list.
+#
+# The concat demuxer has its own quoting/escaping grammar that does NOT match
+# the shell's, and no escaping of a literal apostrophe survives it intact (a
+# path like "my clip [a]'s.mp4" comes back out as "my clip [a]\\s.mp4" and the
+# open fails). Rather than try to escape arbitrary paths, symlink every input
+# into a private temp directory under a plain numeric name and list those. The
+# demuxer resolves relative entries against the list file's own directory, so
+# the list needs no paths at all and there is nothing left to escape.
+stage="$(mktemp -d -t concat-videos)"
+cleanup_paths+=("$stage")
 
+list="${stage}/list.txt"
+: > "$list"
+n=0
 for f in "${inputs[@]}"; do
-  esc="${f//\'/\'\\\'\'}"
-  printf "file '%s'\n" "$esc" >> "$list"
+  link="$(printf '%04d.%s' "$n" "${f##*.}")"
+  ln -s -- "$f" "${stage}/${link}" || die "could not stage input: $f"
+  printf 'file %s\n' "$link" >> "$list"
+  n=$((n + 1))
 done
 
 # Find ffmpeg. Automator/launchd give shells a minimal PATH that misses
@@ -132,19 +210,69 @@ do
 done
 [[ -n "$FFMPEG" ]] || die "ffmpeg not found. Install via: brew install ffmpeg"
 
-log "concat ${#inputs[@]} files -> ${out_path}"
+# Warn when we're about to read and write gigabytes on the same removable
+# volume. A camera SD card servicing an interleaved read+write stream can be
+# one to two orders of magnitude slower than the same card read sequentially,
+# which looks from Finder exactly like a hung job producing an empty file.
+same_volume_removable() {
+  local dev_src dev_out
+  dev_src="$(df -P -- "$src_dir" 2>/dev/null | awk 'NR==2 {print $1}')" || return 1
+  dev_out="$(df -P -- "$out_dir" 2>/dev/null | awk 'NR==2 {print $1}')" || return 1
+  [[ -n "$dev_src" && "$dev_src" == "$dev_out" ]] || return 1
+  # Anything mounted under /Volumes that isn't the boot volume is external.
+  case "$(df -P -- "$out_dir" 2>/dev/null | awk 'NR==2 {print $6}')" in
+    /Volumes/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if same_volume_removable; then
+  log "WARNING: reading from and writing to the same external volume (${out_dir})."
+  log "WARNING: this is very slow on camera SD cards. Consider: $(basename "$0") -o ~/Movies ..."
+fi
+
+total_bytes=0
+for f in "${inputs[@]}"; do
+  sz="$(/usr/bin/stat -f %z -- "$f" 2>/dev/null || echo 0)"
+  total_bytes=$((total_bytes + sz))
+done
+
+log "concat ${#inputs[@]} files ($((total_bytes / 1048576)) MiB) -> ${out_path}"
 for f in "${inputs[@]}"; do log "  in: $f"; done
 
+# From here on, a partial output must not survive a failure.
+cleanup_paths+=("$out_path")
+
 # Run ffmpeg. Stream copy = no re-encode = lossless and fast.
-"$FFMPEG" -hide_banner -nostdin -loglevel warning \
+#
+# -stats/-stats_period emit a progress line every 30s so a stalled run is
+# visible in the log instead of looking identical to a fast one. The exit
+# status is captured explicitly (PIPESTATUS, because stdout goes through tee)
+# so a failure reaches die() — with `set -e` alone the script aborted silently,
+# firing no notification and leaving the truncated output behind.
+set +e
+"$FFMPEG" -hide_banner -nostdin -loglevel warning -stats -stats_period 30 \
   -f concat -safe 0 -i "$list" \
   -map 0:v:0 -map 0:a:0 -c copy \
   "$out_path" 2>&1 | tee -a "${LOG_FILE}" >&2
+ff_status="${PIPESTATUS[0]}"
+set -e
 
-log "ok: ${out_path}"
+[[ "$ff_status" -eq 0 ]] || die "ffmpeg exited $ff_status; removed partial output $(basename "$out_path")"
+[[ -f "$out_path" ]] || die "ffmpeg reported success but wrote no file: $out_path"
 
-if command -v osascript >/dev/null 2>&1; then
-  /usr/bin/osascript -e "display notification \"$(basename "$out_path")\" with title \"concat-videos done\""
+out_bytes="$(/usr/bin/stat -f %z -- "$out_path" 2>/dev/null || echo 0)"
+# A stream copy of N bytes of input yields very close to N bytes of output.
+# Anything dramatically smaller means a truncated write (a full card, a volume
+# that dropped off the bus, a killed process) rather than a real result.
+if [[ "$out_bytes" -lt $((total_bytes / 2)) ]]; then
+  die "output is only $((out_bytes / 1048576)) MiB from $((total_bytes / 1048576)) MiB of input — truncated write, removed $(basename "$out_path")"
 fi
+
+# Success: keep the output, drop only the staging directory.
+cleanup_paths=("$stage")
+
+log "ok: ${out_path} ($((out_bytes / 1048576)) MiB)"
+notify "concat-videos done" "$(basename "$out_path")"
 
 printf '%s\n' "$out_path"
