@@ -34,13 +34,25 @@ fn stranded_live_worker(server_state: &ServerState, shell_pid: i64, reason: &str
 /// must come back out of its terminal status.
 #[tokio::test]
 async fn a_hook_for_an_orphaned_execution_readopts_it() {
-    let (server_state, _dir) = test_server_state();
+    let (server_state, dir) = test_server_state();
     // Our own pid stands in for the worker's still-running shell.
     let (work_item_id, execution_id) = stranded_live_worker(
         &server_state,
         i64::from(std::process::id()),
         "spawn-ack timeout; worker presumed dead",
     );
+    let old_run_started = boss_engine_utils::epoch_time::now_epoch_secs() - 600;
+    // Backdates BOTH `created_at` and `started_at` on the latest run row —
+    // matching what `stranded_live_worker`'s reap would have left in place
+    // for a run that had genuinely gone stale, and what the sibling test
+    // `tmux_hosted_worker_past_attach_deadline_keeps_running`
+    // (`lost_workspace_sweep.rs`) does. Backdating both fields makes this a
+    // genuinely stale run row; the reader anchors on `started_at` first, so
+    // the assertion below exercises readoption's liveness-age reset.
+    server_state
+        .work_db
+        .force_latest_run_started_at_for_test(&execution_id, old_run_started)
+        .unwrap();
     assert_eq!(
         server_state.work_db.get_execution(&execution_id).unwrap().status,
         ExecutionStatus::Orphaned,
@@ -71,6 +83,27 @@ async fn a_hook_for_an_orphaned_execution_readopts_it() {
         after.finished_at.is_none(),
         "a re-adopted run has not finished; a stale finished_at would keep it reading as over",
     );
+    let reset_run_started = server_state
+        .work_db
+        .latest_run_started_epoch_for_execution(&execution_id)
+        .unwrap()
+        .expect("readopted run must retain a start timestamp");
+    assert!(
+        reset_run_started > old_run_started,
+        "readoption must reset the current run's liveness age instead of immediately re-arming the old deadline",
+    );
+    assert_eq!(
+        server_state
+            .work_db
+            .latest_local_shell_pid_for_execution(&execution_id)
+            .unwrap(),
+        Some(i64::from(std::process::id())),
+        "readoption must retain the positively observed pid, never replace it with a zero sentinel",
+    );
+    let event = readopted_event(dir.path(), &execution_id);
+    assert_eq!(event["details"]["shell_pid"], std::process::id());
+    assert_eq!(event["details"]["shell_pid_write_reason"], "durable_live_process_probe");
+    assert_eq!(event["details"]["liveness_age_reset"], true);
     let item = server_state.work_db.get_work_item(&work_item_id).unwrap();
     let status = match &item {
         boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t.status.clone(),
@@ -393,6 +426,13 @@ async fn readoption_derives_the_awaiting_input_capability_from_the_runs_driver()
     )
     .unwrap();
     let execution_id = create_spawned_execution(db, &work_item_id, i64::from(std::process::id()));
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET shell_pid = NULL WHERE execution_id = ?1",
+            rusqlite::params![&execution_id],
+        )
+        .unwrap();
     db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
     let execution = db.get_execution(&execution_id).unwrap();
 
@@ -445,6 +485,14 @@ async fn readoption_derives_the_awaiting_input_capability_from_the_runs_driver()
         state.model, "OpenAI Codex",
         "the label must name the run's resolved driver, not a hardcoded `claude`",
     );
+    assert_eq!(
+        state.shell_pid, 0,
+        "a hook with no durable pid must still restore a provisional live-state entry",
+    );
+    assert!(
+        !crate::spawn_ack_sweep::slot_never_started(&server_state.live_worker_states, &state),
+        "a readopted zero-pid slot is not a never-started spawn",
+    );
 
     // Re-adoption re-registers an already-running worker, so the `spawned_at`
     // it stamps is the moment the engine noticed, not the moment anything
@@ -484,17 +532,21 @@ async fn readoption_derives_the_awaiting_input_capability_from_the_runs_driver()
 /// on it where an operator would read it is what proves it survives
 /// serialisation.
 fn readopted_progress_ingress(state_root: &std::path::Path, execution_id: &str) -> String {
-    let path = state_root.join("executions").join(execution_id).join("dispatch.jsonl");
-    let contents = std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
-    let event = contents
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find(|event| event["stage"] == "live_worker_readopted")
-        .expect("re-adoption must emit a live_worker_readopted event");
+    let event = readopted_event(state_root, execution_id);
     event["details"]["progress_ingress"]
         .as_str()
         .expect("the event must name what happened to the progress ingress")
         .to_owned()
+}
+
+fn readopted_event(state_root: &std::path::Path, execution_id: &str) -> serde_json::Value {
+    let path = state_root.join("executions").join(execution_id).join("dispatch.jsonl");
+    let contents = std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["stage"] == "live_worker_readopted")
+        .expect("re-adoption must emit a live_worker_readopted event")
 }
 
 fn progress_ingress_attention(server_state: &ServerState, execution_id: &str) -> Vec<boss_protocol::WorkAttentionItem> {

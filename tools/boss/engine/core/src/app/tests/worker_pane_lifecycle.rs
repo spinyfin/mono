@@ -202,8 +202,9 @@ async fn release_worker_pane_reaps_the_tmux_session_for_a_slot_mapped_run() {
             .unwrap(),
     );
     assert!(
-        db.record_tmux_session_created_for_execution(&execution_id, "tok-y", 0)
+        db.record_tmux_session_created_for_execution(&execution_id, "tok-y", 4_194_303)
             .unwrap(),
+        "a created tmux session always has a positive pane pid",
     );
 
     server_state.worker_registry.register_run_slot(&execution_id, 1);

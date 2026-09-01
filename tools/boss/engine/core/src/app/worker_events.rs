@@ -971,9 +971,7 @@ pub(super) async fn converge_terminal_execution_contradiction(
          Converging: the run will be re-adopted or reaped.",
     );
 
-    let outcome = server_state
-        .converge_terminal_execution(&execution, "hook_after_terminal")
-        .await;
+    let outcome = server_state.converge_terminal_execution(&execution, event_kind).await;
     tracing::info!(
         run_id,
         work_item_id = %execution.work_item_id,

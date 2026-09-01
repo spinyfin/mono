@@ -587,23 +587,33 @@ impl WorkDb {
         Ok(updated > 0)
     }
 
-    /// Confirm that tmux created the session identified by `spawn_token` and
-    /// report the initial pane pid it returned. The token, rather than a fresh
-    /// resolution of `execution_id`, identifies the row that received the
-    /// intent write; an execution can acquire sibling run rows between the two
-    /// writes. Kept separate from intent persistence so a crash between the DB
-    /// commit and `tmux new-session` remains visible as
-    /// `tmux_spawn_state = 'intended'` to the adoption pass.
+    /// Confirm that tmux created the session identified by `spawn_token`, or
+    /// refresh an existing session during adoption, and persist the pane pid as
+    /// both tmux identity and durable shell-liveness evidence. The token,
+    /// rather than a fresh resolution of `execution_id`, identifies the row
+    /// that received the intent write; an execution can acquire sibling run
+    /// rows between the two writes.
+    ///
+    /// Writing `shell_pid` here is essential: tmux owns the worker shell, so
+    /// the app's `UpdateWorkerShellPid` callback is not authoritative for this
+    /// hosting path. The liveness reconcilers read `shell_pid`, while
+    /// `tmux_pane_pid` retains the most recent tmux observation for comparison
+    /// and token-verified teardown diagnostics.
     pub fn record_tmux_session_created_for_execution(
         &self,
         execution_id: &str,
         spawn_token: &str,
         pane_pid: i64,
     ) -> Result<bool> {
+        if pane_pid <= 0 {
+            bail!("refusing to record tmux session {spawn_token} with non-positive pane pid {pane_pid}");
+        }
         let conn = self.connect()?;
         let updated = conn.execute(
             "UPDATE work_runs
-             SET tmux_spawn_state = 'created', tmux_pane_pid = ?3
+             SET tmux_spawn_state = 'created',
+                 tmux_pane_pid = ?3,
+                 shell_pid = ?3
              WHERE execution_id = ?1 AND tmux_spawn_token = ?2",
             params![execution_id, spawn_token, pane_pid],
         )?;
@@ -657,6 +667,36 @@ impl WorkDb {
         .map_err(Into::into)
     }
 
+    /// The durable shell pid and latest tmux-observed pane pid of the newest
+    /// LOCAL `work_runs` row for `execution_id`.
+    ///
+    /// The pair is the diagnostic seam for the durable liveness reconcilers:
+    /// `shell_pid` is the field they act on, while `tmux_pane_pid` records what
+    /// the most recent tmux create/adoption observation saw. A mismatch makes
+    /// a propagation failure attributable in one trace line. Both values are
+    /// `None` when the latest run was remote, no run exists, or neither pid has
+    /// been observed.
+    pub fn latest_local_pane_pid_snapshot_for_execution(
+        &self,
+        execution_id: &str,
+    ) -> Result<(Option<i64>, Option<i64>)> {
+        let conn = self.connect()?;
+        let snapshot = conn
+            .query_row(
+                "SELECT shell_pid, tmux_pane_pid FROM work_runs
+                 WHERE id = (
+                     SELECT id FROM work_runs
+                     WHERE execution_id = ?1
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT 1
+                 ) AND host_id = 'local'",
+                params![execution_id],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()?;
+        Ok(snapshot.unwrap_or((None, None)))
+    }
+
     /// The shell pid of the **latest** `work_runs` row for `execution_id`,
     /// returned only when that latest run ran locally and recorded a pid;
     /// `None` when the latest run ran on a remote host, has no pid yet, or no
@@ -671,26 +711,13 @@ impl WorkDb {
     /// safety rail — a `kill(pid, 0)` probe on the engine host is meaningless
     /// for a remote worker whose pid lives on another machine.
     pub fn latest_local_shell_pid_for_execution(&self, execution_id: &str) -> Result<Option<i64>> {
-        let conn = self.connect()?;
-        conn.query_row(
-            "SELECT shell_pid FROM work_runs
-             WHERE id = (
-                 SELECT id FROM work_runs
-                 WHERE execution_id = ?1
-                 ORDER BY created_at DESC, id DESC
-                 LIMIT 1
-             ) AND host_id = 'local'",
-            params![execution_id],
-            |row| row.get::<_, Option<i64>>(0),
-        )
-        .optional()
-        .map(Option::flatten)
-        .map_err(Into::into)
+        self.latest_local_pane_pid_snapshot_for_execution(execution_id)
+            .map(|(shell_pid, _tmux_pane_pid)| shell_pid)
     }
 
-    /// `created_at` of the **latest** `work_runs` row for `execution_id`,
-    /// parsed as Unix epoch seconds. `None` when no run exists or the
-    /// column is unparseable.
+    /// `COALESCE(started_at, created_at)` of the **latest** `work_runs` row
+    /// for `execution_id`, parsed as Unix epoch seconds. `None` when no run
+    /// exists or the column is unparseable.
     ///
     /// Unlike [`WorkExecution::started_epoch`], which reflects only the
     /// *first* run (`start_execution_run` stamps `started_at =
@@ -699,19 +726,29 @@ impl WorkDb {
     /// exactly what a pane-attach-deadline check on a *resumed* execution
     /// needs, so a fresh run's not-yet-attached pane is never judged
     /// against an ancient first-run timestamp.
+    ///
+    /// `started_at` takes priority over `created_at` deliberately:
+    /// [`WorkDb::readopt_inferred_terminal_execution`] resets a readopted
+    /// run's `started_at` to the readoption moment (and deliberately leaves
+    /// `created_at` alone, since [`crate::work::cost_report_db`] keys its
+    /// reporting window off `created_at`), so this is the field that
+    /// actually carries the reset liveness age. A run row inserted by
+    /// `start_execution_run` always has both set together at insert time, so
+    /// the two agree for every row this function has not itself been the
+    /// target of a readoption on.
     pub fn latest_run_started_epoch_for_execution(&self, execution_id: &str) -> Result<Option<i64>> {
         let conn = self.connect()?;
         let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
             return Ok(None);
         };
-        let created_at: Option<String> = conn
+        let anchor: Option<String> = conn
             .query_row(
-                "SELECT created_at FROM work_runs WHERE id = ?1",
+                "SELECT COALESCE(started_at, created_at) FROM work_runs WHERE id = ?1",
                 params![run_id],
                 |row| row.get(0),
             )
             .optional()?;
-        Ok(created_at.and_then(|s| s.parse::<i64>().ok()))
+        Ok(anchor.and_then(|s| s.parse::<i64>().ok()))
     }
 
     /// [`Self::latest_local_shell_pid_for_execution`], restricted to a run row

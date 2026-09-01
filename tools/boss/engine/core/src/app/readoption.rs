@@ -86,9 +86,10 @@ impl ServerState {
     /// Resolve a terminal execution whose worker is demonstrably alive:
     /// re-adopt it or reap it, per [`classify_contradiction`].
     ///
-    /// `trigger` names the signal that proved liveness (`hook_after_terminal`
-    /// from the hook fan-out, `redispatch_guard` from the orphan sweep's
-    /// durable-pid probe) and is carried on the dispatch event so a recurrence
+    /// `trigger` names the signal that proved liveness (the hook event kind
+    /// from the hook fan-out, or one of `redispatch_guard` / `durable_state_scan`
+    /// / `tmux_session_sweep` from the sweeps that probe a recorded shell pid
+    /// or a live tmux pane) and is carried on the dispatch event so a recurrence
     /// is attributable to the detector that caught it.
     ///
     /// Serialized per run by [`ServerState::converging_terminal_runs`]: both
@@ -214,21 +215,53 @@ impl ServerState {
     async fn readopt_live_worker(&self, execution: &WorkExecution, trigger: &str) {
         let run_id = execution.id.as_str();
         let prior_status = execution.status.to_string();
-        let restored = match self.work_db.readopt_inferred_terminal_execution(run_id, trigger) {
-            Ok(restored) => restored,
-            Err(err) => {
+        let (stored_shell_pid_before, latest_tmux_observed_pid) = self
+            .work_db
+            .latest_local_pane_pid_snapshot_for_execution(run_id)
+            .unwrap_or_else(|err| {
                 tracing::warn!(
                     run_id,
                     error = %format!("{err:#}"),
-                    "readopt: could not reverse the inferred terminal status; leaving the row as-is",
+                    "readopt: could not read the pre-write pane pid snapshot",
                 );
-                return;
-            }
+                (None, None)
+            });
+        let observed_shell_pid = crate::durable_liveness::probe_execution_worker(&self.work_db, run_id).alive_pid();
+        // `observed_shell_pid` always comes from the durable-liveness probe of
+        // `work_runs.shell_pid`, never from a fresh tmux observation, in every
+        // branch below — so the label names the trigger that led here, not a
+        // tmux-observation source the code never actually reads.
+        let shell_pid_write_reason = match (trigger, observed_shell_pid) {
+            ("tmux_session_sweep", Some(_)) => "durable_live_process_probe_after_tmux_sweep",
+            (_, Some(_)) => "durable_live_process_probe",
+            (_, None) => "no_positive_pid_observed_no_write",
         };
+        tracing::info!(
+            run_id,
+            trigger,
+            stored_shell_pid_before = ?stored_shell_pid_before,
+            latest_tmux_observed_pid = ?latest_tmux_observed_pid,
+            observed_shell_pid = ?observed_shell_pid,
+            shell_pid_write_reason,
+            "readopt: restoring inferred-terminal execution liveness",
+        );
 
-        let shell_pid = crate::durable_liveness::probe_execution_worker(&self.work_db, run_id)
-            .alive_pid()
-            .unwrap_or(0);
+        let (restored, liveness_age_reset) =
+            match self
+                .work_db
+                .readopt_inferred_terminal_execution(run_id, trigger, observed_shell_pid.map(i64::from))
+            {
+                Ok(restored) => restored,
+                Err(err) => {
+                    tracing::warn!(
+                        run_id,
+                        error = %format!("{err:#}"),
+                        "readopt: could not reverse the inferred terminal status; leaving the row as-is",
+                    );
+                    return;
+                }
+            };
+
         // Resolved once, ahead of the slot lookup, because both the live-state
         // entry and the progress ingress need the same answer and only one of
         // them depends on the app hosting a pane. A run whose pane the app
@@ -261,7 +294,7 @@ impl ServerState {
         let slot_id = self.hosted_pane_slot_for_run(run_id).await;
         if let Some(slot_id) = slot_id {
             self.worker_registry.register_run_slot(run_id.to_owned(), slot_id);
-            if shell_pid > 0 {
+            if let Some(shell_pid) = observed_shell_pid {
                 self.worker_registry.register(shell_pid, run_id.to_owned());
             }
             let worker_id = crate::coordinator::worker_id_for_slot(slot_id);
@@ -312,21 +345,56 @@ impl ServerState {
             // The trigger decides what Boss may claim to know. A hook
             // arriving after the engine terminalized the run came from the
             // driver itself, so it is recorded as genuine driver-start
-            // proof rather than discarded. `redispatch_guard` fired off
-            // `durable_liveness`'s recorded-pid probe, which observes the
-            // *shell* hosting the pane and says nothing about the driver —
-            // that conflation is what `driver_signal_at` exists to prevent
-            // — so it records nothing. Any trigger added later lands on the
-            // conservative side by default.
-            let evidence = match trigger {
-                "hook_after_terminal" => crate::live_worker_state::ReadoptionEvidence::DriverHook,
-                _ => crate::live_worker_state::ReadoptionEvidence::LiveShellPid,
+            // proof rather than discarded. The other call sites into
+            // `converge_live_worker` — `redispatch_guard` from the orphan
+            // sweep's durable-pid probe, `durable_state_scan` from the
+            // dead-pane sweep's `durable_liveness::probe_execution_worker_within`
+            // probe, and `tmux_session_sweep`
+            // (`tmux_adoption::TERMINAL_HANDOFF_TRIGGER`) from tmux
+            // adoption's live pane observation — all observe only the
+            // *shell* hosting the pane and say nothing about the driver;
+            // that conflation is what `driver_signal_at` exists to prevent,
+            // so they record nothing. These non-hook triggers are named
+            // explicitly on an allow-list so an unrecognized trigger added
+            // later defaults to withholding driver evidence, not asserting
+            // it.
+            const NON_HOOK_TRIGGERS: [&str; 3] = [
+                "redispatch_guard",
+                "durable_state_scan",
+                crate::tmux_adoption::TERMINAL_HANDOFF_TRIGGER,
+            ];
+            let evidence = if NON_HOOK_TRIGGERS.contains(&trigger) {
+                crate::live_worker_state::ReadoptionEvidence::LiveShellPid
+            } else {
+                crate::live_worker_state::ReadoptionEvidence::DriverHook
             };
+            // Register the slot-to-run mapping even when no pid was
+            // observable, using the same `shell_pid = 0` provisional
+            // convention `spawn_flow`'s ack-timeout path already uses
+            // (`register_spawn(slot, run, model, 0, ..)`). Dropping the
+            // live-state entry entirely — as this used to do — left
+            // `worker_registry` and `live_worker_states` disagreeing about
+            // whether the slot has an occupant: the agents list would show
+            // no worker at all for a run the row already says is `running`.
+            // `shell_pid <= 0` is the registry's own signal for "liveness
+            // unknown, do not reap on this basis" (see `mark_stalled_spawns`
+            // and the `shell_pid <= 0` skip in `unverified_driver_starts`),
+            // so a zero here degrades gracefully rather than asserting a
+            // false liveness fact.
+            if observed_shell_pid.is_none() {
+                tracing::warn!(
+                    run_id,
+                    slot_id,
+                    trigger,
+                    shell_pid_write_reason,
+                    "readopt: no positive shell pid was observable; registering the live-state entry with the provisional zero-pid sentinel",
+                );
+            }
             self.live_worker_states.register_readoption(
                 slot_id,
                 run_id.to_owned(),
                 model_label,
-                shell_pid,
+                observed_shell_pid.unwrap_or(0),
                 binding,
                 awaiting_input_capable,
                 crate::live_worker_state::LiveSpawnRouting::new(pool, restored.kind.as_str()),
@@ -359,7 +427,11 @@ impl ServerState {
                     "trigger": trigger,
                     "prior_status": prior_status,
                     "restored_status": restored.status.to_string(),
-                    "shell_pid": shell_pid,
+                    "shell_pid": observed_shell_pid,
+                    "stored_shell_pid_before": stored_shell_pid_before,
+                    "latest_tmux_observed_pid": latest_tmux_observed_pid,
+                    "shell_pid_write_reason": shell_pid_write_reason,
+                    "liveness_age_reset": liveness_age_reset,
                     "slot_id": slot_id,
                     "progress_ingress": ingress_outcome.as_str(),
                 })),

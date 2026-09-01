@@ -137,7 +137,7 @@ use boss_protocol::{CreateAttentionItemInput, LiveWorkerState, WorkExecution, Wo
 
 use crate::coordinator::{CubeClient, ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
-use crate::live_worker_state::LiveWorkerStateRegistry;
+use crate::live_worker_state::{DriverStartExpectation, LiveWorkerStateRegistry};
 use crate::spawn_health::{SpawnHealthTracker, maybe_admit_recovery_probe, trip_spawn_capability_circuit};
 use crate::work::WorkDb;
 
@@ -165,8 +165,11 @@ use crate::work::WorkDb;
 /// Pure and free-standing so the classification is unit-testable without a
 /// live registry, and so both call sites are provably asking the same
 /// question rather than maintaining two copies of the predicate.
-pub(crate) fn slot_never_started(state: &LiveWorkerState) -> bool {
-    state.shell_pid <= 0 && state.last_event_at.is_none() && state.activity == WorkerActivity::Spawning
+pub(crate) fn slot_never_started(live_states: &LiveWorkerStateRegistry, state: &LiveWorkerState) -> bool {
+    live_states.driver_start_expectation(state.slot_id) != Some(DriverStartExpectation::Readopted)
+        && state.shell_pid <= 0
+        && state.last_event_at.is_none()
+        && state.activity == WorkerActivity::Spawning
 }
 
 /// Kind string for the attention item raised when a spawn produced a
@@ -224,6 +227,10 @@ pub struct SpawnAckSkipCounts {
     pub not_spawning: usize,
     /// Execution is still inside [`SPAWN_ACK_GRACE_SECS`].
     pub grace: usize,
+    /// Slot pre-dates this engine process (readopted at boot or after a
+    /// terminal-execution contradiction), so it is not a new spawn awaiting
+    /// an ack and pass 1's ack-timeout question does not apply to it.
+    pub readopted: usize,
 }
 
 impl crate::sweep_loop::SweepOutcome for SpawnAckSweepOutcome {
@@ -238,6 +245,7 @@ impl crate::sweep_loop::SweepOutcome for SpawnAckSweepOutcome {
             has_pid_skipped = self.skipped.has_pid,
             has_driver_signal_skipped = self.skipped.has_driver_signal,
             grace_skipped = self.skipped.grace,
+            readopted_skipped = self.skipped.readopted,
             "spawn-ack sweep: pass complete",
         );
     }
@@ -328,6 +336,14 @@ pub async fn run_one_pass(
         // ignores `activity` for exactly that reason.
         if state.activity != WorkerActivity::Spawning {
             outcome.skipped.not_spawning += 1;
+            continue;
+        }
+
+        // A re-adopted slot represents a worker that existed before this
+        // engine process. It is not a new spawn awaiting its first ack, even
+        // when its durable shell-pid probe could not produce a positive pid.
+        if live_states.driver_start_expectation(state.slot_id) == Some(DriverStartExpectation::Readopted) {
+            outcome.skipped.readopted += 1;
             continue;
         }
 
@@ -992,7 +1008,7 @@ mod tests {
         register_slot_zero_pid(&live_states, 1, "exec-1", "wi-1");
         let pristine = live_states.get(1).expect("slot 1");
         assert!(
-            slot_never_started(&pristine),
+            slot_never_started(&live_states, &pristine),
             "no pid, no hook event, still Spawning is the never-started shape",
         );
 
@@ -1000,20 +1016,26 @@ mod tests {
             shell_pid: 4242,
             ..pristine.clone()
         };
-        assert!(!slot_never_started(&with_pid), "a reported shell pid is proof of life");
+        assert!(
+            !slot_never_started(&live_states, &with_pid),
+            "a reported shell pid is proof of life"
+        );
 
         let with_event = LiveWorkerState {
             last_event_at: Some("2026-07-31T00:00:00Z".to_owned()),
             ..pristine.clone()
         };
-        assert!(!slot_never_started(&with_event), "a hook event is proof of life");
+        assert!(
+            !slot_never_started(&live_states, &with_event),
+            "a hook event is proof of life"
+        );
 
         let progressed = LiveWorkerState {
             activity: WorkerActivity::Working,
             ..pristine.clone()
         };
         assert!(
-            !slot_never_started(&progressed),
+            !slot_never_started(&live_states, &progressed),
             "activity past Spawning is proof of life",
         );
     }
@@ -1798,12 +1820,13 @@ mod tests {
 
         let execution_id = create_spawned_execution(&db, &work_item_id, 92697);
         let live_states = Arc::new(LiveWorkerStateRegistry::new());
-        // Exactly what `readopt_live_worker` does for the pid-only trigger.
+        // Exactly what `readopt_live_worker` does when its durable-pid probe
+        // cannot produce a positive pid.
         live_states.register_readoption(
             1,
             execution_id.as_str(),
             "grok-4.6",
-            92697,
+            0,
             Some(WorkItemBinding {
                 work_item_id: work_item_id.clone(),
                 work_item_name: "test chore".to_owned(),
@@ -1820,7 +1843,7 @@ mod tests {
         );
         assert!(
             live_states.driver_signal_at(1).is_none(),
-            "precondition: a pid-triggered re-adoption records no driver proof",
+            "precondition: a pid-less re-adoption records no driver proof",
         );
 
         let coordinator = make_coordinator(db.clone(), 1);
@@ -1834,6 +1857,10 @@ mod tests {
             "a re-adopted worker is not a spawn, so it has no driver start to verify",
         );
         assert_eq!(outcome.reaped, 0);
+        assert_eq!(
+            outcome.skipped.readopted, 1,
+            "the readopted skip must be counted, not silently dropped from the accounting",
+        );
         assert_eq!(
             db.get_execution(&execution_id).unwrap().status,
             ExecutionStatus::Running,

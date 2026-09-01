@@ -609,17 +609,35 @@ async fn db_fallback_death_evidence(
     // was ever recorded at all (a recorded-but-dead pid is signal 1's job,
     // handled above); if a pid IS recorded but still alive (or ambiguous),
     // this must not fall through to a never-attached verdict.
-    let shell_pid = match work_db.latest_local_shell_pid_for_execution(&execution.id) {
-        Ok(pid) => pid,
+    let (shell_pid, latest_tmux_observed_pid) = match work_db
+        .latest_local_pane_pid_snapshot_for_execution(&execution.id)
+    {
+        Ok(snapshot) => snapshot,
         Err(err) => {
             tracing::debug!(
                 execution_id = %execution.id,
                 error = %format!("{err:#}"),
-                "cube-lease heartbeat: DB-fallback liveness check could not read durable shell pid; heartbeating conservatively",
+                "cube-lease heartbeat: DB-fallback liveness check could not read durable pane pid snapshot; heartbeating conservatively",
             );
             return None;
         }
     };
+    let pid_match = latest_tmux_observed_pid.is_none() || shell_pid == latest_tmux_observed_pid;
+    if pid_match {
+        tracing::debug!(
+            execution_id = %execution.id,
+            stored_shell_pid = ?shell_pid,
+            latest_tmux_observed_pid = ?latest_tmux_observed_pid,
+            "cube-lease heartbeat: compared durable shell pid with latest tmux pane observation",
+        );
+    } else {
+        tracing::warn!(
+            execution_id = %execution.id,
+            stored_shell_pid = ?shell_pid,
+            latest_tmux_observed_pid = ?latest_tmux_observed_pid,
+            "cube-lease heartbeat: durable shell pid disagrees with latest tmux pane observation",
+        );
+    }
     if shell_pid.is_some() {
         // A pid was recorded but signal 1 did not consider it dead — leave it
         // alone rather than judging the never-attached deadline against it.
@@ -632,8 +650,9 @@ async fn db_fallback_death_evidence(
     // frozen at the FIRST run's start and never advances. Judging a freshly
     // re-dispatched (pid-less-so-far) run against that ancient timestamp
     // would immediately trip the never-attached deadline and force-release a
-    // live worker's lease. `work_runs.created_at` is stamped fresh on every
-    // resume, so it ages correctly across restarts.
+    // live worker's lease. `latest_run_started_epoch_for_execution` anchors on
+    // `COALESCE(started_at, created_at)`, and `start_execution_run` stamps
+    // both columns fresh on every resume, so it ages correctly across restarts.
     let run_started_epoch = match work_db.latest_run_started_epoch_for_execution(&execution.id) {
         Ok(epoch) => epoch,
         Err(err) => {

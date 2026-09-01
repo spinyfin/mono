@@ -847,7 +847,7 @@ async fn resolve_reported_pane_death(
         .snapshot()
         .into_iter()
         .find(|s| s.run_id == run_id)
-        .filter(crate::spawn_ack_sweep::slot_never_started);
+        .filter(|state| crate::spawn_ack_sweep::slot_never_started(&server_state.live_worker_states, state));
 
     let Some(state) = never_started else {
         let reaped = crate::dead_pid_sweep::reap_reported_pane_death(
@@ -985,7 +985,7 @@ pub(super) async fn handle_report_worker_spawn_failed(ctx: Dispatch, req: Fronte
         );
         return;
     };
-    if !crate::spawn_ack_sweep::slot_never_started(&state) {
+    if !crate::spawn_ack_sweep::slot_never_started(&server_state.live_worker_states, &state) {
         tracing::info!(
             run_id = %run_id,
             slot_id = state.slot_id,
