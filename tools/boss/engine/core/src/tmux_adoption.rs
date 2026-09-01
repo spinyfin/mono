@@ -198,14 +198,26 @@ enum PersistedPanePid {
     /// The durable write landed. Carries the pre-write snapshot for event
     /// diagnostics.
     Written(Option<i64>, Option<i64>),
-    /// The write did not land (a transient DB error, or the initial snapshot
-    /// read failed), but the pid was positively observed on the pane, so
-    /// in-memory adoption should still proceed; the next sweep pass retries
-    /// the durable write.
-    WriteFailed,
+    /// The write did not land, but the pid was positively observed on the
+    /// pane, so in-memory adoption should still proceed; the next sweep pass
+    /// retries the durable write. `None` means the pre-write snapshot could
+    /// not be read, rather than claiming it contained no pids.
+    WriteFailed(Option<(Option<i64>, Option<i64>)>),
     /// `spawn_token` matched no durable run row at all — the identity is
     /// wrong, not just unwritable. Adoption must refuse.
     NoMatchingRun,
+}
+
+/// Convert a durable-pid outcome into the diagnostic snapshot carried by an
+/// in-memory adoption. `None` is the identity-mismatch refusal; the boolean
+/// distinguishes an unreadable snapshot from a known pair of absent pids.
+fn adoption_pid_snapshot(outcome: PersistedPanePid) -> Option<(Option<i64>, Option<i64>, bool)> {
+    match outcome {
+        PersistedPanePid::Written(stored, previous) => Some((stored, previous, true)),
+        PersistedPanePid::WriteFailed(Some((stored, previous))) => Some((stored, previous, true)),
+        PersistedPanePid::WriteFailed(None) => Some((None, None, false)),
+        PersistedPanePid::NoMatchingRun => None,
+    }
 }
 
 /// Reconcile one positive tmux pane observation into the durable liveness
@@ -231,7 +243,7 @@ async fn persist_observed_pane_pid(
                 "tmux adoption: could not read the durable pid snapshot; the pid was still positively \
                  observed, so adoption proceeds and the durable write is retried on the next sweep",
             );
-            return PersistedPanePid::WriteFailed;
+            return PersistedPanePid::WriteFailed(None);
         }
     };
     let (stored_shell_pid, previous_tmux_pane_pid) = before;
@@ -334,7 +346,7 @@ async fn persist_observed_pane_pid(
                     ),
                 )
                 .await;
-            PersistedPanePid::WriteFailed
+            PersistedPanePid::WriteFailed(Some(before))
         }
     }
 }
@@ -946,23 +958,19 @@ async fn adopt_one<S>(
     } else {
         "refresh_created_tmux_session"
     };
-    let (stored_shell_pid, previous_tmux_pane_pid) = match persist_observed_pane_pid(
-        work_db,
-        dispatch_events,
-        execution_id,
-        &handle.tmux_spawn_token,
-        session_name,
-        shell_pid,
-        shell_pid_write_reason,
-    )
-    .await
-    {
-        PersistedPanePid::Written(stored, previous) => (stored, previous),
-        // The pid was positively observed on the pane even though the
-        // durable write did not land; complete in-memory adoption on that
-        // evidence and let the next sweep retry the write.
-        PersistedPanePid::WriteFailed => (None, None),
-        PersistedPanePid::NoMatchingRun => return,
+    let Some((stored_shell_pid, previous_tmux_pane_pid, stored_pid_snapshot_known)) = adoption_pid_snapshot(
+        persist_observed_pane_pid(
+            work_db,
+            dispatch_events,
+            execution_id,
+            &handle.tmux_spawn_token,
+            session_name,
+            shell_pid,
+            shell_pid_write_reason,
+        )
+        .await,
+    ) else {
+        return;
     };
     if repaired_intent {
         outcome.repaired_intents += 1;
@@ -1051,6 +1059,7 @@ async fn adopt_one<S>(
                     "shell_pid": shell_pid,
                     "stored_shell_pid_before": stored_shell_pid,
                     "previous_tmux_pane_pid": previous_tmux_pane_pid,
+                    "stored_pid_snapshot_known": stored_pid_snapshot_known,
                     "observed_shell_pid": shell_pid,
                     "shell_pid_write_reason": shell_pid_write_reason,
                     "tmux_session_name": session_name,
@@ -1907,6 +1916,20 @@ mod tests {
         assert!(sink.events().await.is_empty());
     }
 
+    #[test]
+    fn write_failed_pid_snapshot_preserves_known_values_and_marks_unknown_reads() {
+        assert_eq!(
+            adoption_pid_snapshot(PersistedPanePid::WriteFailed(Some((Some(4242), Some(4242))))),
+            Some((Some(4242), Some(4242), true)),
+            "a failed write retains a snapshot that was successfully read",
+        );
+        assert_eq!(
+            adoption_pid_snapshot(PersistedPanePid::WriteFailed(None)),
+            Some((None, None, false)),
+            "a failed snapshot read is explicitly unknown, not a claim of absent pids",
+        );
+    }
+
     /// The cardinal case: engine restarts, the worker's tmux session (and its
     /// non-terminal execution row) survived. The pass must rebuild the slot
     /// claim, the `WorkerRegistry` pid/slot map, the `LiveWorkerState` entry,
@@ -1914,7 +1937,7 @@ mod tests {
     /// not the one `record_tmux_session_created` recorded at original spawn
     /// time.
     #[tokio::test]
-    async fn non_terminal_match_rebuilds_derived_state() {
+    async fn non_terminal_match_with_newer_sibling_run_still_rebuilds_derived_state() {
         let (_dir, db) = open_db_arc();
         let execution_id = start_local_run(&db, "worker-1");
         assert!(
@@ -1934,10 +1957,25 @@ mod tests {
                 rusqlite::params![&execution_id],
             )
             .unwrap();
+        // The spawn token belongs to the original pane-hosting row, but a
+        // later local bookkeeping row wins the liveness readers' newest-row
+        // query. The durable write below must detect that mismatch without
+        // discarding the positively observed pane pid from in-memory adoption.
+        db.connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO work_runs (
+                    id, execution_id, agent_id, status, error_text, result_summary, transcript_path,
+                    artifacts_path, created_at, started_at, finished_at, host_id
+                 ) VALUES ('run-sibling', ?1, 'worker-1', 'failed', NULL, NULL, NULL, NULL,
+                    '9999999999', '9999999999', '9999999999', 'local')",
+                rusqlite::params![&execution_id],
+            )
+            .unwrap();
         assert_eq!(
             db.latest_local_pane_pid_snapshot_for_execution(&execution_id).unwrap(),
-            (None, Some(4242)),
-            "precondition: tmux observed a pid that durable liveness cannot see",
+            (None, None),
+            "precondition: the newer sibling hides the spawn-token row from liveness readers",
         );
 
         let (tmux, _tmux_server) = fake_tmux(FakeTmuxServer {
@@ -1985,8 +2023,8 @@ mod tests {
         assert_eq!(live_state.shell_pid, 4321);
         assert_eq!(
             db.latest_local_pane_pid_snapshot_for_execution(&execution_id).unwrap(),
-            (Some(4321), Some(4321)),
-            "adoption must propagate the fresh tmux pid into durable liveness before rebuilding state",
+            (None, None),
+            "the spawn-token write must not fabricate visibility on a newer sibling row",
         );
         assert_eq!(*spawner.publish_calls.lock().unwrap(), 1);
         assert_eq!(
@@ -2007,7 +2045,8 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].stage, Stage::TmuxAdopt.as_str());
         assert_eq!(events[0].details["stored_shell_pid_before"], serde_json::Value::Null);
-        assert_eq!(events[0].details["previous_tmux_pane_pid"], 4242);
+        assert_eq!(events[0].details["previous_tmux_pane_pid"], serde_json::Value::Null);
+        assert_eq!(events[0].details["stored_pid_snapshot_known"], true);
         assert_eq!(events[0].details["observed_shell_pid"], 4321);
         assert_eq!(
             events[0].details["shell_pid_write_reason"],

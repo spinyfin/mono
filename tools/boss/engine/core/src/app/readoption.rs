@@ -86,7 +86,7 @@ impl ServerState {
     /// Resolve a terminal execution whose worker is demonstrably alive:
     /// re-adopt it or reap it, per [`classify_contradiction`].
     ///
-    /// `trigger` names the signal that proved liveness (`hook_after_terminal`
+    /// `trigger` names the signal that proved liveness (the hook event kind
     /// from the hook fan-out, `redispatch_guard` from the orphan sweep's
     /// durable-pid probe) and is carried on the dispatch event so a recurrence
     /// is attributable to the detector that caught it.
@@ -245,7 +245,7 @@ impl ServerState {
             "readopt: restoring inferred-terminal execution liveness",
         );
 
-        let restored =
+        let (restored, liveness_age_reset) =
             match self
                 .work_db
                 .readopt_inferred_terminal_execution(run_id, trigger, observed_shell_pid.map(i64::from))
@@ -348,11 +348,12 @@ impl ServerState {
             // `durable_liveness`'s recorded-pid probe, which observes the
             // *shell* hosting the pane and says nothing about the driver —
             // that conflation is what `driver_signal_at` exists to prevent
-            // — so it records nothing. Any trigger added later lands on the
-            // conservative side by default.
-            let evidence = match trigger {
-                "hook_after_terminal" => crate::live_worker_state::ReadoptionEvidence::DriverHook,
-                _ => crate::live_worker_state::ReadoptionEvidence::LiveShellPid,
+            // — so it records nothing. The only non-hook trigger today is
+            // named explicitly; every hook event kind is driver evidence.
+            let evidence = if trigger == "redispatch_guard" {
+                crate::live_worker_state::ReadoptionEvidence::LiveShellPid
+            } else {
+                crate::live_worker_state::ReadoptionEvidence::DriverHook
             };
             // Register the slot-to-run mapping even when no pid was
             // observable, using the same `shell_pid = 0` provisional
@@ -417,11 +418,7 @@ impl ServerState {
                     "stored_shell_pid_before": stored_shell_pid_before,
                     "latest_tmux_observed_pid": latest_tmux_observed_pid,
                     "shell_pid_write_reason": shell_pid_write_reason,
-                    // Unconditional: `readopt_inferred_terminal_execution` resets the
-                    // latest run row's `started_at` on every successful call, regardless
-                    // of that row's own status, so this reflects a write that genuinely
-                    // always happens rather than an assumed constant.
-                    "liveness_age_reset": true,
+                    "liveness_age_reset": liveness_age_reset,
                     "slot_id": slot_id,
                     "progress_ingress": ingress_outcome.as_str(),
                 })),

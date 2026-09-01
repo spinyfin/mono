@@ -650,8 +650,9 @@ async fn db_fallback_death_evidence(
     // frozen at the FIRST run's start and never advances. Judging a freshly
     // re-dispatched (pid-less-so-far) run against that ancient timestamp
     // would immediately trip the never-attached deadline and force-release a
-    // live worker's lease. `work_runs.created_at` is stamped fresh on every
-    // resume, so it ages correctly across restarts.
+    // live worker's lease. `latest_run_started_epoch_for_execution` anchors on
+    // `COALESCE(started_at, created_at)`, and `start_execution_run` stamps
+    // both columns fresh on every resume, so it ages correctly across restarts.
     let run_started_epoch = match work_db.latest_run_started_epoch_for_execution(&execution.id) {
         Ok(epoch) => epoch,
         Err(err) => {

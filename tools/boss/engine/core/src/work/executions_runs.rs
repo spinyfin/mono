@@ -279,10 +279,12 @@ impl WorkDb {
     ///   stamps the run `completed` at spawn-return, before the worker ever
     ///   produces a shell (see the comment on the `error_text` write below),
     ///   and that is the run row a readoption of this kind needs to convince
-    ///   `lost_workspace_sweep` is fresh again. `created_at` is deliberately
-    ///   left untouched: [`crate::work::cost_report_db`] keys its reporting
-    ///   window off it, and shifting a run's billing window on readoption
-    ///   would be a correctness bug of its own.
+    ///   `lost_workspace_sweep` is fresh again. `started_at` is also read by
+    ///   [`crate::work::cost_report_db`] and
+    ///   [`crate::work::attention_reconcile::work_resumed_evidence`], so a
+    ///   readoption shifts their visible resume time too; that is accurate,
+    ///   because the worker genuinely resumed. `created_at` remains untouched
+    ///   to preserve the original creation-time reporting window.
     /// - A positively observed `shell_pid`, when supplied, is stored on that
     ///   same latest run in the transaction. Non-positive values are rejected;
     ///   readoption never persists the historical `0` sentinel as liveness.
@@ -310,7 +312,7 @@ impl WorkDb {
         execution_id: &str,
         evidence: &str,
         observed_shell_pid: Option<i64>,
-    ) -> Result<WorkExecution> {
+    ) -> Result<(WorkExecution, bool)> {
         if observed_shell_pid.is_some_and(|pid| pid <= 0) {
             bail!("refusing to re-adopt {execution_id} with a non-positive observed shell pid");
         }
@@ -362,7 +364,7 @@ impl WorkDb {
         // unconditionally — deliberately not gated on that row's own
         // `status`. See the doc comment above for why: the ack-timeout case
         // this exists to fix leaves the run row `completed`, not `orphaned`.
-        tx.execute(
+        let liveness_age_reset = tx.execute(
             "UPDATE work_runs
              SET started_at = ?2,
                  shell_pid = COALESCE(?3, shell_pid)
@@ -373,7 +375,7 @@ impl WorkDb {
                  LIMIT 1
              )",
             params![execution_id, now.as_str(), observed_shell_pid],
-        )?;
+        )? > 0;
         // Un-orphan the latest run row, but only when the reap is what
         // stamped it. A run that ended on its own terms is `completed` /
         // `failed` and its status/finished_at/result_summary stay exactly as
@@ -433,7 +435,7 @@ impl WorkDb {
         // The UI refresh is the caller's job via `publish_work_item_changed`,
         // the same layer that handles it for `force_stop_execution`.
         commit_and_publish(tx, PendingEvents::new(), &self.event_bus)?;
-        Ok(updated)
+        Ok((updated, liveness_age_reset))
     }
 
     /// Auto-resume a work item whose worker stalled or died on a

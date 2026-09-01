@@ -46,9 +46,9 @@ async fn a_hook_for_an_orphaned_execution_readopts_it() {
     // matching what `stranded_live_worker`'s reap would have left in place
     // for a run that had genuinely gone stale, and what the sibling test
     // `tmux_hosted_worker_past_attach_deadline_keeps_running`
-    // (`lost_workspace_sweep.rs`) does. `latest_run_started_epoch_for_execution`
-    // reads `created_at`, so backdating only `started_at` would make the
-    // assertion below pass even if readoption's reset write were deleted.
+    // (`lost_workspace_sweep.rs`) does. Backdating both fields makes this a
+    // genuinely stale run row; the reader anchors on `started_at` first, so
+    // the assertion below exercises readoption's liveness-age reset.
     server_state
         .work_db
         .force_latest_run_started_at_for_test(&execution_id, old_run_started)
@@ -426,6 +426,13 @@ async fn readoption_derives_the_awaiting_input_capability_from_the_runs_driver()
     )
     .unwrap();
     let execution_id = create_spawned_execution(db, &work_item_id, i64::from(std::process::id()));
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET shell_pid = NULL WHERE execution_id = ?1",
+            rusqlite::params![&execution_id],
+        )
+        .unwrap();
     db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
     let execution = db.get_execution(&execution_id).unwrap();
 
@@ -477,6 +484,14 @@ async fn readoption_derives_the_awaiting_input_capability_from_the_runs_driver()
     assert_eq!(
         state.model, "OpenAI Codex",
         "the label must name the run's resolved driver, not a hardcoded `claude`",
+    );
+    assert_eq!(
+        state.shell_pid, 0,
+        "a hook with no durable pid must still restore a provisional live-state entry",
+    );
+    assert!(
+        !crate::spawn_ack_sweep::slot_never_started(&server_state.live_worker_states, &state),
+        "a readopted zero-pid slot is not a never-started spawn",
     );
 
     // Re-adoption re-registers an already-running worker, so the `spawned_at`
