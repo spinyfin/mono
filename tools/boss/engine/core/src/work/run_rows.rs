@@ -715,9 +715,9 @@ impl WorkDb {
             .map(|(shell_pid, _tmux_pane_pid)| shell_pid)
     }
 
-    /// `created_at` of the **latest** `work_runs` row for `execution_id`,
-    /// parsed as Unix epoch seconds. `None` when no run exists or the
-    /// column is unparseable.
+    /// `COALESCE(started_at, created_at)` of the **latest** `work_runs` row
+    /// for `execution_id`, parsed as Unix epoch seconds. `None` when no run
+    /// exists or the column is unparseable.
     ///
     /// Unlike [`WorkExecution::started_epoch`], which reflects only the
     /// *first* run (`start_execution_run` stamps `started_at =
@@ -726,19 +726,29 @@ impl WorkDb {
     /// exactly what a pane-attach-deadline check on a *resumed* execution
     /// needs, so a fresh run's not-yet-attached pane is never judged
     /// against an ancient first-run timestamp.
+    ///
+    /// `started_at` takes priority over `created_at` deliberately:
+    /// [`WorkDb::readopt_inferred_terminal_execution`] resets a readopted
+    /// run's `started_at` to the readoption moment (and deliberately leaves
+    /// `created_at` alone, since [`crate::work::cost_report_db`] keys its
+    /// reporting window off `created_at`), so this is the field that
+    /// actually carries the reset liveness age. A run row inserted by
+    /// `start_execution_run` always has both set together at insert time, so
+    /// the two agree for every row this function has not itself been the
+    /// target of a readoption on.
     pub fn latest_run_started_epoch_for_execution(&self, execution_id: &str) -> Result<Option<i64>> {
         let conn = self.connect()?;
         let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
             return Ok(None);
         };
-        let created_at: Option<String> = conn
+        let anchor: Option<String> = conn
             .query_row(
-                "SELECT created_at FROM work_runs WHERE id = ?1",
+                "SELECT COALESCE(started_at, created_at) FROM work_runs WHERE id = ?1",
                 params![run_id],
                 |row| row.get(0),
             )
             .optional()?;
-        Ok(created_at.and_then(|s| s.parse::<i64>().ok()))
+        Ok(anchor.and_then(|s| s.parse::<i64>().ok()))
     }
 
     /// [`Self::latest_local_shell_pid_for_execution`], restricted to a run row

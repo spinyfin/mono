@@ -42,22 +42,16 @@ async fn a_hook_for_an_orphaned_execution_readopts_it() {
         "spawn-ack timeout; worker presumed dead",
     );
     let old_run_started = boss_engine_utils::epoch_time::now_epoch_secs() - 600;
-    let latest_run_id = server_state
-        .work_db
-        .list_runs(&execution_id)
-        .unwrap()
-        .last()
-        .expect("stranded worker must have a run")
-        .id
-        .clone();
+    // Backdates BOTH `created_at` and `started_at` on the latest run row —
+    // matching what `stranded_live_worker`'s reap would have left in place
+    // for a run that had genuinely gone stale, and what the sibling test
+    // `tmux_hosted_worker_past_attach_deadline_keeps_running`
+    // (`lost_workspace_sweep.rs`) does. `latest_run_started_epoch_for_execution`
+    // reads `created_at`, so backdating only `started_at` would make the
+    // assertion below pass even if readoption's reset write were deleted.
     server_state
         .work_db
-        .connect()
-        .unwrap()
-        .execute(
-            "UPDATE work_runs SET started_at = ?2 WHERE id = ?1",
-            rusqlite::params![latest_run_id, old_run_started.to_string()],
-        )
+        .force_latest_run_started_at_for_test(&execution_id, old_run_started)
         .unwrap();
     assert_eq!(
         server_state.work_db.get_execution(&execution_id).unwrap().status,

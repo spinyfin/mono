@@ -268,16 +268,29 @@ impl WorkDb {
     ///   re-dispatch storm at its source.
     /// - `finished_at` is cleared: the run did not finish.
     /// - The latest run's `started_at` is refreshed to the readoption moment,
-    ///   resetting the pane-attach age used by durable liveness reconcilers.
-    ///   Without that reset, a false reap followed by readoption immediately
-    ///   re-enters the same overdue state and oscillates on every sweep.
+    ///   resetting the pane-attach age used by durable liveness reconcilers —
+    ///   [`Self::latest_run_started_epoch_for_execution`] anchors on
+    ///   `COALESCE(started_at, created_at)` precisely so this write is what
+    ///   it reads. Without the reset, a false reap followed by readoption
+    ///   immediately re-enters the same overdue state and oscillates on
+    ///   every sweep. This write is unconditional — not gated on the run's
+    ///   own `status` — because the highest-value case for it is exactly the
+    ///   one where the run row is *not* `orphaned`: a spawn-ack-timeout reap
+    ///   stamps the run `completed` at spawn-return, before the worker ever
+    ///   produces a shell (see the comment on the `error_text` write below),
+    ///   and that is the run row a readoption of this kind needs to convince
+    ///   `lost_workspace_sweep` is fresh again. `created_at` is deliberately
+    ///   left untouched: [`crate::work::cost_report_db`] keys its reporting
+    ///   window off it, and shifting a run's billing window on readoption
+    ///   would be a correctness bug of its own.
     /// - A positively observed `shell_pid`, when supplied, is stored on that
     ///   same latest run in the transaction. Non-positive values are rejected;
     ///   readoption never persists the historical `0` sentinel as liveness.
     /// - The latest `work_runs` row is un-orphaned **only if the reap was what
     ///   stamped it**. A row this execution finished legitimately is
-    ///   `completed`/`failed` and is left alone; an `orphaned` one can only
-    ///   have come from the reap being reversed.
+    ///   `completed`/`failed` and its `status`/`finished_at`/`result_summary`
+    ///   are left exactly as they are — only `started_at`/`shell_pid` (the
+    ///   liveness-facing fields above) are refreshed regardless of status.
     /// - A work item demoted to `todo` by the reap is put back to `active`,
     ///   but only when this execution is still its latest — the same
     ///   latest-execution guard [`demote_active_if_latest_execution`] applies
@@ -345,9 +358,10 @@ impl WorkDb {
              WHERE id = ?1",
             params![execution_id, restored.as_str()],
         )?;
-        // Un-orphan the latest run row, but only when the reap is what
-        // stamped it. A run that ended on its own terms is `completed` /
-        // `failed` and stays exactly as it is.
+        // Reset the liveness-facing fields on the latest run row
+        // unconditionally — deliberately not gated on that row's own
+        // `status`. See the doc comment above for why: the ack-timeout case
+        // this exists to fix leaves the run row `completed`, not `orphaned`.
         tx.execute(
             "UPDATE work_runs
              SET started_at = ?2,
@@ -360,6 +374,10 @@ impl WorkDb {
              )",
             params![execution_id, now.as_str(), observed_shell_pid],
         )?;
+        // Un-orphan the latest run row, but only when the reap is what
+        // stamped it. A run that ended on its own terms is `completed` /
+        // `failed` and its status/finished_at/result_summary stay exactly as
+        // they are — only the liveness-facing write above touches such a row.
         tx.execute(
             "UPDATE work_runs
              SET status = 'active',

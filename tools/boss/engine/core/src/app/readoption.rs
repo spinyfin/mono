@@ -226,8 +226,12 @@ impl ServerState {
                 (None, None)
             });
         let observed_shell_pid = crate::durable_liveness::probe_execution_worker(&self.work_db, run_id).alive_pid();
+        // `observed_shell_pid` always comes from the durable-liveness probe of
+        // `work_runs.shell_pid`, never from a fresh tmux observation, in every
+        // branch below — so the label names the trigger that led here, not a
+        // tmux-observation source the code never actually reads.
         let shell_pid_write_reason = match (trigger, observed_shell_pid) {
-            ("tmux_session_sweep", Some(_)) => "tmux_adopt_observation",
+            ("tmux_session_sweep", Some(_)) => "durable_live_process_probe_after_tmux_sweep",
             (_, Some(_)) => "durable_live_process_probe",
             (_, None) => "no_positive_pid_observed_no_write",
         };
@@ -350,26 +354,38 @@ impl ServerState {
                 "hook_after_terminal" => crate::live_worker_state::ReadoptionEvidence::DriverHook,
                 _ => crate::live_worker_state::ReadoptionEvidence::LiveShellPid,
             };
-            if let Some(shell_pid) = observed_shell_pid {
-                self.live_worker_states.register_readoption(
-                    slot_id,
-                    run_id.to_owned(),
-                    model_label,
-                    shell_pid,
-                    binding,
-                    awaiting_input_capable,
-                    crate::live_worker_state::LiveSpawnRouting::new(pool, restored.kind.as_str()),
-                    evidence,
-                );
-            } else {
-                tracing::error!(
+            // Register the slot-to-run mapping even when no pid was
+            // observable, using the same `shell_pid = 0` provisional
+            // convention `spawn_flow`'s ack-timeout path already uses
+            // (`register_spawn(slot, run, model, 0, ..)`). Dropping the
+            // live-state entry entirely — as this used to do — left
+            // `worker_registry` and `live_worker_states` disagreeing about
+            // whether the slot has an occupant: the agents list would show
+            // no worker at all for a run the row already says is `running`.
+            // `shell_pid <= 0` is the registry's own signal for "liveness
+            // unknown, do not reap on this basis" (see `mark_stalled_spawns`
+            // and the `shell_pid <= 0` skip in `unverified_driver_starts`),
+            // so a zero here degrades gracefully rather than asserting a
+            // false liveness fact.
+            if observed_shell_pid.is_none() {
+                tracing::warn!(
                     run_id,
                     slot_id,
                     trigger,
                     shell_pid_write_reason,
-                    "readopt: no positive shell pid was observable; leaving the live-state entry absent instead of registering a zero sentinel",
+                    "readopt: no positive shell pid was observable; registering the live-state entry with the provisional zero-pid sentinel",
                 );
             }
+            self.live_worker_states.register_readoption(
+                slot_id,
+                run_id.to_owned(),
+                model_label,
+                observed_shell_pid.unwrap_or(0),
+                binding,
+                awaiting_input_capable,
+                crate::live_worker_state::LiveSpawnRouting::new(pool, restored.kind.as_str()),
+                evidence,
+            );
             self.broadcast_live_worker_states().await;
         } else {
             tracing::warn!(
@@ -401,6 +417,10 @@ impl ServerState {
                     "stored_shell_pid_before": stored_shell_pid_before,
                     "latest_tmux_observed_pid": latest_tmux_observed_pid,
                     "shell_pid_write_reason": shell_pid_write_reason,
+                    // Unconditional: `readopt_inferred_terminal_execution` resets the
+                    // latest run row's `started_at` on every successful call, regardless
+                    // of that row's own status, so this reflects a write that genuinely
+                    // always happens rather than an assumed constant.
                     "liveness_age_reset": true,
                     "slot_id": slot_id,
                     "progress_ingress": ingress_outcome.as_str(),

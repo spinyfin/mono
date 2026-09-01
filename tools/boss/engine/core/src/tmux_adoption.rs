@@ -187,9 +187,29 @@ async fn session_pane_pid(tmux: &Tmux, session_name: &str, execution_id: &str) -
     }
 }
 
+/// Outcome of [`persist_observed_pane_pid`]. The durable write and the
+/// in-memory adoption are deliberately allowed to disagree on one axis: a
+/// pid that was *positively observed* on the live tmux pane is real evidence
+/// of liveness regardless of whether the database happened to accept the
+/// write at that instant, so a transient DB failure alone must not throw that
+/// evidence away. Only `NoMatchingRun` — the identity itself being wrong —
+/// is a hard refusal.
+enum PersistedPanePid {
+    /// The durable write landed. Carries the pre-write snapshot for event
+    /// diagnostics.
+    Written(Option<i64>, Option<i64>),
+    /// The write did not land (a transient DB error, or the initial snapshot
+    /// read failed), but the pid was positively observed on the pane, so
+    /// in-memory adoption should still proceed; the next sweep pass retries
+    /// the durable write.
+    WriteFailed,
+    /// `spawn_token` matched no durable run row at all — the identity is
+    /// wrong, not just unwritable. Adoption must refuse.
+    NoMatchingRun,
+}
+
 /// Reconcile one positive tmux pane observation into the durable liveness
 /// fields before any in-memory adoption or terminal readoption proceeds.
-/// Returns the pre-write pid snapshot for event diagnostics.
 async fn persist_observed_pane_pid(
     work_db: &WorkDb,
     dispatch_events: &dyn DispatchEventSink,
@@ -198,19 +218,20 @@ async fn persist_observed_pane_pid(
     session_name: &str,
     observed_shell_pid: i32,
     write_reason: &str,
-) -> Option<(Option<i64>, Option<i64>)> {
+) -> PersistedPanePid {
     let before = match work_db.latest_local_pane_pid_snapshot_for_execution(execution_id) {
         Ok(snapshot) => snapshot,
         Err(err) => {
-            tracing::error!(
+            tracing::warn!(
                 execution_id,
                 session = session_name,
                 observed_shell_pid,
                 write_reason,
                 error = %format!("{err:#}"),
-                "tmux adoption: could not read the durable pid snapshot; refusing to adopt the session",
+                "tmux adoption: could not read the durable pid snapshot; the pid was still positively \
+                 observed, so adoption proceeds and the durable write is retried on the next sweep",
             );
-            return None;
+            return PersistedPanePid::WriteFailed;
         }
     };
     let (stored_shell_pid, previous_tmux_pane_pid) = before;
@@ -227,7 +248,42 @@ async fn persist_observed_pane_pid(
     let persisted =
         work_db.record_tmux_session_created_for_execution(execution_id, spawn_token, i64::from(observed_shell_pid));
     match persisted {
-        Ok(true) => Some(before),
+        Ok(true) => {
+            // The write targets the row identified by `spawn_token`, but
+            // every liveness reader instead selects the newest LOCAL run row
+            // by `created_at`. When an execution has acquired a sibling run
+            // row between the two writes, that row is not the same one, and
+            // the write above would silently land somewhere the liveness
+            // readers never look. Read back through the same path the
+            // readers use and surface the mismatch instead of leaving it to
+            // resurface later as an unexplained `NeverAttached` verdict.
+            match work_db.latest_local_pane_pid_snapshot_for_execution(execution_id) {
+                Ok((Some(visible_shell_pid), _)) if visible_shell_pid == i64::from(observed_shell_pid) => {}
+                Ok((visible_shell_pid, _)) => {
+                    tracing::error!(
+                        execution_id,
+                        session = session_name,
+                        observed_shell_pid,
+                        write_reason,
+                        visible_shell_pid = ?visible_shell_pid,
+                        "tmux adoption: pid write landed on the spawn-token run row, but the newest local \
+                         run row every liveness reader selects does not reflect it — the execution likely \
+                         acquired a sibling run row between the two writes",
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        execution_id,
+                        session = session_name,
+                        observed_shell_pid,
+                        write_reason,
+                        error = %format!("{err:#}"),
+                        "tmux adoption: could not verify the pid write became visible to liveness readers",
+                    );
+                }
+            }
+            PersistedPanePid::Written(before.0, before.1)
+        }
         Ok(false) => {
             tracing::error!(
                 execution_id,
@@ -250,16 +306,18 @@ async fn persist_observed_pane_pid(
                     ),
                 )
                 .await;
-            None
+            PersistedPanePid::NoMatchingRun
         }
         Err(err) => {
-            tracing::error!(
+            tracing::warn!(
                 execution_id,
                 session = session_name,
                 observed_shell_pid,
                 write_reason,
                 error = %format!("{err:#}"),
-                "tmux adoption: failed to persist the observed pane pid; refusing to adopt the session",
+                "tmux adoption: failed to persist the observed pane pid (likely transient); the pid was \
+                 still positively observed, so adoption proceeds and the durable write is retried on the \
+                 next sweep",
             );
             dispatch_events
                 .emit(
@@ -271,11 +329,12 @@ async fn persist_observed_pane_pid(
                             "observed_shell_pid": observed_shell_pid,
                             "shell_pid_write_reason": write_reason,
                             "error": format!("{err:#}"),
+                            "adoption_proceeded_without_write": true,
                         }),
                     ),
                 )
                 .await;
-            None
+            PersistedPanePid::WriteFailed
         }
     }
 }
@@ -887,7 +946,7 @@ async fn adopt_one<S>(
     } else {
         "refresh_created_tmux_session"
     };
-    let Some((stored_shell_pid, previous_tmux_pane_pid)) = persist_observed_pane_pid(
+    let (stored_shell_pid, previous_tmux_pane_pid) = match persist_observed_pane_pid(
         work_db,
         dispatch_events,
         execution_id,
@@ -897,8 +956,13 @@ async fn adopt_one<S>(
         shell_pid_write_reason,
     )
     .await
-    else {
-        return;
+    {
+        PersistedPanePid::Written(stored, previous) => (stored, previous),
+        // The pid was positively observed on the pane even though the
+        // durable write did not land; complete in-memory adoption on that
+        // evidence and let the next sweep retry the write.
+        PersistedPanePid::WriteFailed => (None, None),
+        PersistedPanePid::NoMatchingRun => return,
     };
     if repaired_intent {
         outcome.repaired_intents += 1;
@@ -1099,18 +1163,19 @@ async fn classify_untracked_session<S>(
         let Some(shell_pid) = session_pane_pid(tmux, &session.session_name, &execution_id).await else {
             return;
         };
-        if persist_observed_pane_pid(
-            work_db,
-            dispatch_events,
-            &execution_id,
-            &session.spawn_token,
-            &session.session_name,
-            shell_pid,
-            "terminal_tmux_readoption",
-        )
-        .await
-        .is_none()
-        {
+        if matches!(
+            persist_observed_pane_pid(
+                work_db,
+                dispatch_events,
+                &execution_id,
+                &session.spawn_token,
+                &session.session_name,
+                shell_pid,
+                "terminal_tmux_readoption",
+            )
+            .await,
+            PersistedPanePid::NoMatchingRun
+        ) {
             return;
         }
         convergence
