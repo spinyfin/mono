@@ -14,7 +14,7 @@ rust_library(
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/driver:__pkg__",
     ],
-    deps = all_crate_deps(normal = True),
+    deps = ["//tools/boss/shell-quote"] + all_crate_deps(normal = True),
 )
 
 rust_test(
@@ -26,7 +26,7 @@ rust_test(
         proc_macro = True,
         proc_macro_dev = True,
     ),
-    deps = all_crate_deps(
+    deps = ["//tools/boss/shell-quote"] + all_crate_deps(
         normal = True,
         normal_dev = True,
     ),

@@ -239,12 +239,6 @@ fn attach_session_command_quotes_a_socket_path_with_spaces() {
     );
 }
 
-#[test]
-fn quote_for_shell_escapes_embedded_single_quotes() {
-    assert_eq!(quote_for_shell("plain"), "'plain'");
-    assert_eq!(quote_for_shell("a'b"), "'a'\\''b'");
-}
-
 #[tokio::test]
 async fn list_sessions_parses_the_token_mirror() {
     let (tmux, runner) = tmux([success("boss-1-a\ttoken-a\nboss-2-b\t\n")]);

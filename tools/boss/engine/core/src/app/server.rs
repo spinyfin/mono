@@ -255,10 +255,7 @@ impl crate::husk_pane_sweep::HuskPaneSweepSource for ServerState {
         // Same addressing + quoting `Tmux::operator_prefix` uses for a
         // socket handle. Built from this engine's socket path rather than
         // a dummy `Tmux` (resolving a binary is unnecessary for a prefix).
-        format!(
-            "tmux -S {}",
-            boss_tmux::quote_for_shell(&self.tmux_socket_path.display().to_string())
-        )
+        boss_tmux::operator_prefix_for_socket(&self.tmux_socket_path)
     }
 
     async fn retire_husk(&self, session: &crate::tmux_adoption::UntrackedTmuxSession) {
@@ -2922,5 +2919,34 @@ mod stamped_events_socket_path_tests {
     #[test]
     fn none_config_and_none_bind_stays_none() {
         assert_eq!(stamped_events_socket_path(None, None), None);
+    }
+}
+
+#[cfg(test)]
+mod tmux_operator_prefix_tests {
+    use std::sync::Arc;
+
+    use super::ServerState;
+    use crate::config::{RuntimeConfig, WorkConfig};
+    use crate::husk_pane_sweep::HuskPaneSweepSource;
+
+    #[test]
+    fn server_state_operator_prefix_quotes_socket_paths_with_spaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("Application Support/tmux.sock");
+        let cfg = Arc::new(RuntimeConfig::from_parts(
+            WorkConfig::builder()
+                .cwd(temp.path().to_path_buf())
+                .db_path(temp.path().join("state.db"))
+                .tmux_socket_path(socket)
+                .build(),
+            None,
+        ));
+        let state = ServerState::new_arc_with_app_pid_and_merge_probe(cfg, None, None, None, None, None, None).unwrap();
+
+        assert_eq!(
+            state.tmux_operator_prefix(),
+            format!("tmux -S '{}'", state.tmux_socket_path.display())
+        );
     }
 }

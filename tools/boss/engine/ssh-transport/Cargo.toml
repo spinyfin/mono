@@ -6,6 +6,7 @@ workspace = "../../../.."
 
 [dependencies]
 anyhow = { workspace = true }
+boss-shell-quote = { path = "../../shell-quote" }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
 
