@@ -208,6 +208,15 @@ pub trait WorkerTerminalInspector: Send + Sync {
         let _ = execution_id;
         self.operator_prefix()
     }
+
+    /// Operator-facing attach command for an execution's session.
+    fn attach_session_command_for_run(&self, execution_id: &str, session_name: &str) -> String {
+        format!(
+            "{} attach-session -t {}",
+            self.operator_prefix_for_run(execution_id),
+            boss_tmux::quote_for_shell(session_name)
+        )
+    }
 }
 
 /// Production tmux inspector. A run without tmux identity returns `None` so
@@ -246,6 +255,15 @@ impl WorkerTerminalInspector for TmuxWorkerTerminalInspector {
         match self.work_db.tmux_run_for_execution(execution_id) {
             Ok(Some(run)) => self.tmux_for_run(&run.tmux_server_label).operator_prefix(),
             Ok(None) | Err(_) => self.tmux.operator_prefix(),
+        }
+    }
+
+    fn attach_session_command_for_run(&self, execution_id: &str, session_name: &str) -> String {
+        match self.work_db.tmux_run_for_execution(execution_id) {
+            Ok(Some(run)) => self
+                .tmux_for_run(&run.tmux_server_label)
+                .attach_session_command(session_name),
+            Ok(None) | Err(_) => self.tmux.attach_session_command(session_name),
         }
     }
 
@@ -680,10 +698,7 @@ pub async fn run_one_pass_with_terminal(
                     window_activity_epoch_secs,
                 } => {
                     outcome.genuinely_stuck += 1;
-                    let attach_cmd = format!(
-                        "{} attach -t {session_name}",
-                        inspector.operator_prefix_for_run(&state.run_id)
-                    );
+                    let attach_cmd = inspector.attach_session_command_for_run(&state.run_id, &session_name);
                     let body = format!(
                         "Worker execution `{}` has had no hook or pane output for more than {} seconds while its agent remains the foreground command. The session is still live, so Boss did not reap it.\n\nSession: `{session_name}`\n\nLast pane output: {}\n\nInspect it with:\n\n```sh\n{attach_cmd}\n```",
                         state.run_id,
@@ -1267,7 +1282,7 @@ mod tests {
         assert!(
             attention
                 .body_markdown
-                .contains("tmux -S /state/boss/tmux.sock attach -t boss-worker-test")
+                .contains("tmux -S /state/boss/tmux.sock attach-session -t 'boss-worker-test'")
         );
     }
 
@@ -2534,7 +2549,7 @@ mod tests {
         let prefix = inspector.operator_prefix_for_run(&execution_id);
         assert_eq!(
             prefix,
-            format!("tmux -L {}", boss_tmux::SERVER_LABEL),
+            format!("tmux -L {}", boss_tmux::quote_for_shell(boss_tmux::SERVER_LABEL)),
             "the operator-facing prefix for a legacy-labeled run must also address -L boss",
         );
     }

@@ -962,10 +962,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-shell-quote"
+version = "0.1.0"
+
+[[package]]
 name = "boss-ssh-transport"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "boss-shell-quote",
  "tempfile",
  "tokio",
  "tracing",
@@ -986,6 +991,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "boss-command-runner",
+ "boss-shell-quote",
  "tokio",
  "which",
 ]

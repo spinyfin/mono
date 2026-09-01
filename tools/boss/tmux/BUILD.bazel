@@ -13,6 +13,7 @@ rust_library(
     visibility = ["//tools/boss/engine:__subpackages__"],
     deps = [
         "//tools/boss/command-runner",
+        "//tools/boss/shell-quote",
     ] + all_crate_deps(normal = True),
 )
 
@@ -27,6 +28,7 @@ rust_test(
     ),
     deps = [
         "//tools/boss/command-runner",
+        "//tools/boss/shell-quote",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,

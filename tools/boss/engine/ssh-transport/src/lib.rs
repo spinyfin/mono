@@ -481,19 +481,7 @@ pub fn reverse_forward_spec(remote_socket: &str, local_socket: &str) -> String {
 /// remote *path* (not arbitrary data) to tilde-expand must use
 /// [`quote_remote_path`] instead, at the specific call site that
 /// constructs that path.
-pub fn shell_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for ch in s.chars() {
-        if ch == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
-    out
-}
+pub use boss_shell_quote::shell_quote;
 
 /// Quote `s` for safe re-insertion into a shell command the same way
 /// [`shell_quote`] does, *except* a leading `~/` is left unquoted so

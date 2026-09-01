@@ -177,7 +177,7 @@ async fn adopted_live_pane_reads_activity_and_returns_attach_command() {
     );
     assert_eq!(
         statuses[0].attach_command.as_deref(),
-        Some("/opt/homebrew/bin/tmux -L boss attach-session -t boss-1-example")
+        Some("'/opt/homebrew/bin/tmux' -S '/state/boss/tmux.sock' attach-session -t 'boss-1-example'")
     );
     assert_eq!(
         runner.calls(),

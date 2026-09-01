@@ -1185,7 +1185,7 @@ mod tests {
         let resolved = resolve_active_handle(&socket_tmux, Some(&legacy_tmux)).await;
         assert_eq!(
             resolved.operator_prefix(),
-            format!("tmux -L {}", boss_tmux::SERVER_LABEL),
+            format!("tmux -L {}", boss_tmux::quote_for_shell(boss_tmux::SERVER_LABEL)),
             "a coordinator surviving on -L boss must be routed to instead of the durable socket",
         );
         assert!(

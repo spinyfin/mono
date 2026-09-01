@@ -8,6 +8,7 @@
 mod types;
 
 pub use boss_command_runner::{CommandOutput, CommandRunner, RealCommandRunner};
+pub use boss_shell_quote::shell_quote as quote_for_shell;
 pub use types::{
     DEFAULT_SEND_CHUNK_BYTES, DEFAULT_SEND_CHUNK_DELAY, DisplayField, MINIMUM_VERSION, NewSession, SERVER_LABEL,
     Session, TMUX_SPAWN_TOKEN_ENV, TmuxVersion,
@@ -102,6 +103,14 @@ static PASTE_BUFFER_SEQ: AtomicU64 = AtomicU64::new(0);
 /// the environment here.
 pub const TEST_SOCKET_PATH: &str = "/state/boss/tmux.sock";
 
+/// Operator-facing command prefix for a tmux server addressed by a socket path.
+///
+/// This intentionally does not resolve a tmux binary: callers that only
+/// display a socket-addressed command should not need executable discovery.
+pub fn operator_prefix_for_socket(path: &Path) -> String {
+    format!("tmux -S {}", quote_for_shell(&path.display().to_string()))
+}
+
 #[derive(Clone)]
 enum ServerAddress {
     /// Pre-move private server addressed with `tmux -L boss`. Production
@@ -111,6 +120,7 @@ enum ServerAddress {
     Label,
     Socket(PathBuf),
 }
+
 /// Handle for one resolved tmux executable and Boss's private server.
 #[derive(Clone)]
 pub struct Tmux {
@@ -211,10 +221,13 @@ impl Tmux {
     }
 
     /// Operator-facing command prefix (`tmux -S <socket>` or `tmux -L boss`).
+    ///
+    /// The addressing flags come from the same server argv spawn uses,
+    /// with the value POSIX-quoted for paste.
     pub fn operator_prefix(&self) -> String {
         match &self.server {
-            ServerAddress::Socket(path) => format!("tmux -S {}", path.display()),
-            ServerAddress::Label => format!("tmux -L {SERVER_LABEL}"),
+            ServerAddress::Label => format!("tmux {}", self.server_shell_args()),
+            ServerAddress::Socket(path) => operator_prefix_for_socket(path),
         }
     }
 
@@ -230,14 +243,18 @@ impl Tmux {
 
     /// Operator-facing attach command for an already-verified session.
     ///
-    /// Uses this handle's resolved executable and [`SERVER_LABEL`]. No
-    /// `exec` prefix: this is meant to be pasted into an existing shell,
-    /// so detaching from the session should return to a prompt.
+    /// Uses this handle's resolved executable and the same server
+    /// addressing spawn uses. No `exec` prefix:
+    /// this is meant to be pasted into an existing shell, so detaching
+    /// from the session should return to a prompt. The program, socket
+    /// (or label), and session name are POSIX-quoted so a path with
+    /// spaces (`Application Support`) pastes as one token.
     pub fn attach_session_command(&self, session_name: &str) -> String {
         format!(
-            "{} -L {} attach-session -t {session_name}",
-            self.program.display(),
-            SERVER_LABEL,
+            "{} {} attach-session -t {}",
+            quote_for_shell(&self.program.display().to_string()),
+            self.server_shell_args(),
+            quote_for_shell(session_name),
         )
     }
 
@@ -536,9 +553,23 @@ impl Tmux {
     }
 
     fn server_args(&self) -> Vec<OsString> {
+        let (flag, value) = self.server_arg_pair();
+        vec![flag.into(), value]
+    }
+
+    /// Spawn's server argv, formatted for a human to paste into a shell.
+    ///
+    /// One source of truth: the flag and value are `server_arg_pair`;
+    /// only the value is quoted.
+    fn server_shell_args(&self) -> String {
+        let (flag, value) = self.server_arg_pair();
+        format!("{flag} {}", quote_for_shell(&value.to_string_lossy()))
+    }
+
+    fn server_arg_pair(&self) -> (&'static str, OsString) {
         match &self.server {
-            ServerAddress::Label => vec!["-L".into(), SERVER_LABEL.into()],
-            ServerAddress::Socket(path) => vec!["-S".into(), path.clone().into_os_string()],
+            ServerAddress::Label => ("-L", SERVER_LABEL.into()),
+            ServerAddress::Socket(path) => ("-S", path.clone().into_os_string()),
         }
     }
 
