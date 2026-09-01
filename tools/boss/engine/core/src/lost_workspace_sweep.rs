@@ -343,18 +343,45 @@ async fn reconcile_if_execution_dead_at(
     // still exists (else signal 1 would have fired), so read the durable pid
     // `dead_pane_sweep` also reads (`work_runs.shell_pid`) — a `None` here
     // means no pid was ever reported, which is this signal's precondition.
-    let shell_pid = match work_db.latest_local_shell_pid_for_execution(&execution.id) {
-        Ok(pid) => pid,
+    let (shell_pid, latest_tmux_observed_pid) =
+        match work_db.latest_local_pane_pid_snapshot_for_execution(&execution.id) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    error = %format!("{err:#}"),
+                    "execution-liveness reconcile: could not read durable pane pid snapshot; skipping conservatively",
+                );
+                return false;
+            }
+        };
+    let pid_match = latest_tmux_observed_pid.is_none() || shell_pid == latest_tmux_observed_pid;
+    if pid_match {
+        tracing::debug!(
+            execution_id = %execution.id,
+            stored_shell_pid = ?shell_pid,
+            latest_tmux_observed_pid = ?latest_tmux_observed_pid,
+            "execution-liveness reconcile: compared durable shell pid with latest tmux pane observation",
+        );
+    } else {
+        tracing::warn!(
+            execution_id = %execution.id,
+            stored_shell_pid = ?shell_pid,
+            latest_tmux_observed_pid = ?latest_tmux_observed_pid,
+            "execution-liveness reconcile: durable shell pid disagrees with latest tmux pane observation",
+        );
+    }
+    let started_epoch = match work_db.latest_run_started_epoch_for_execution(&execution.id) {
+        Ok(epoch) => epoch,
         Err(err) => {
             tracing::debug!(
                 execution_id = %execution.id,
                 error = %format!("{err:#}"),
-                "execution-liveness reconcile: could not read durable shell pid; skipping conservatively",
+                "execution-liveness reconcile: could not read latest run start; skipping conservatively",
             );
             return false;
         }
     };
-    let started_epoch = execution.started_epoch();
     let verdict = classify_pane_liveness(shell_pid, started_epoch, now_epoch);
     if !verdict.is_dead() {
         return false;
@@ -387,6 +414,7 @@ async fn reconcile_if_execution_dead_at(
             "prior_status": prior_status,
             "age_in_status_secs": age_in_status_secs,
             "shell_pid": shell_pid,
+            "latest_tmux_observed_pid": latest_tmux_observed_pid,
             "kind": execution.kind.as_str(),
             "recovery_patch": recovery_patch.as_deref().map(|p| p.display().to_string()),
         }),
@@ -400,6 +428,7 @@ async fn reconcile_if_execution_dead_at(
             prior_status,
             verdict = verdict.reason(),
             shell_pid = ?shell_pid,
+            latest_tmux_observed_pid = ?latest_tmux_observed_pid,
             age_in_status_secs = ?age_in_status_secs,
             "execution-liveness reconcile: finalized execution whose worker pane never attached",
         );
@@ -649,6 +678,60 @@ mod tests {
         assert_eq!(
             db.get_execution(&exec.id).unwrap().status,
             ExecutionStatus::WaitingHuman
+        );
+    }
+
+    /// The tmux-hosted production shape: tmux itself synchronously observed
+    /// the pane pid, no app callback is involved, and the worker remains live
+    /// beyond the 300-second attach deadline. The tmux confirmation write must
+    /// make that pid visible to this durable reconciler.
+    #[tokio::test]
+    async fn tmux_hosted_worker_past_attach_deadline_keeps_running() {
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_automation(&db, &product);
+        let real_dir = TempDir::new().unwrap();
+        let exec = parked_triage_execution(&db, &automation, real_dir.path().to_str().unwrap(), "local");
+        assert!(
+            db.record_tmux_spawn_intent_for_execution(&exec.id, "boss", "boss-worker-1", "tmux-live-token",)
+                .unwrap()
+        );
+        let shell_pid = i64::from(std::process::id());
+        assert!(
+            db.record_tmux_session_created_for_execution(&exec.id, "tmux-live-token", shell_pid)
+                .unwrap()
+        );
+        let old_run_started = boss_engine_utils::epoch_time::now_epoch_secs() - PANE_ATTACH_DEADLINE_SECS - 60;
+        db.force_latest_run_started_at_for_test(&exec.id, old_run_started)
+            .unwrap();
+
+        assert_eq!(
+            db.latest_local_pane_pid_snapshot_for_execution(&exec.id).unwrap(),
+            (Some(shell_pid), Some(shell_pid)),
+            "tmux's pane observation must be the same pid durable liveness reads",
+        );
+        let execution = db.get_execution(&exec.id).unwrap();
+        let sink = RecordingDispatchEventSink::new();
+        let reconciled = reconcile_if_execution_dead_at(
+            &db,
+            &sink,
+            &execution,
+            old_run_started + PANE_ATTACH_DEADLINE_SECS + 1,
+            None,
+        )
+        .await;
+
+        assert!(
+            !reconciled,
+            "a healthy tmux-hosted worker must survive past the attach deadline"
+        );
+        assert_eq!(
+            db.get_execution(&exec.id).unwrap().status,
+            ExecutionStatus::WaitingHuman,
+        );
+        assert!(
+            sink.events_for(&exec.id).await.is_empty(),
+            "no pane_never_attached event may be emitted for a tmux-observed pid",
         );
     }
 

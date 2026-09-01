@@ -87,7 +87,7 @@ pub struct TmuxRunHandle {
     pub tmux_spawn_token: String,
     /// Durable spawn phase: `intended` before creation, `created` after it.
     pub tmux_spawn_state: String,
-    /// `#{pane_pid}` observed after tmux created the initial pane.
+    /// Most recent `#{pane_pid}` observed when tmux created or adopted the pane.
     pub tmux_pane_pid: Option<i64>,
 }
 

@@ -214,21 +214,49 @@ impl ServerState {
     async fn readopt_live_worker(&self, execution: &WorkExecution, trigger: &str) {
         let run_id = execution.id.as_str();
         let prior_status = execution.status.to_string();
-        let restored = match self.work_db.readopt_inferred_terminal_execution(run_id, trigger) {
-            Ok(restored) => restored,
-            Err(err) => {
+        let (stored_shell_pid_before, latest_tmux_observed_pid) = self
+            .work_db
+            .latest_local_pane_pid_snapshot_for_execution(run_id)
+            .unwrap_or_else(|err| {
                 tracing::warn!(
                     run_id,
                     error = %format!("{err:#}"),
-                    "readopt: could not reverse the inferred terminal status; leaving the row as-is",
+                    "readopt: could not read the pre-write pane pid snapshot",
                 );
-                return;
-            }
+                (None, None)
+            });
+        let observed_shell_pid = crate::durable_liveness::probe_execution_worker(&self.work_db, run_id).alive_pid();
+        let shell_pid_write_reason = match (trigger, observed_shell_pid) {
+            ("tmux_session_sweep", Some(_)) => "tmux_adopt_observation",
+            (_, Some(_)) => "durable_live_process_probe",
+            (_, None) => "no_positive_pid_observed_no_write",
         };
+        tracing::info!(
+            run_id,
+            trigger,
+            stored_shell_pid_before = ?stored_shell_pid_before,
+            latest_tmux_observed_pid = ?latest_tmux_observed_pid,
+            observed_shell_pid = ?observed_shell_pid,
+            shell_pid_write_reason,
+            "readopt: restoring inferred-terminal execution liveness",
+        );
 
-        let shell_pid = crate::durable_liveness::probe_execution_worker(&self.work_db, run_id)
-            .alive_pid()
-            .unwrap_or(0);
+        let restored =
+            match self
+                .work_db
+                .readopt_inferred_terminal_execution(run_id, trigger, observed_shell_pid.map(i64::from))
+            {
+                Ok(restored) => restored,
+                Err(err) => {
+                    tracing::warn!(
+                        run_id,
+                        error = %format!("{err:#}"),
+                        "readopt: could not reverse the inferred terminal status; leaving the row as-is",
+                    );
+                    return;
+                }
+            };
+
         // Resolved once, ahead of the slot lookup, because both the live-state
         // entry and the progress ingress need the same answer and only one of
         // them depends on the app hosting a pane. A run whose pane the app
@@ -261,7 +289,7 @@ impl ServerState {
         let slot_id = self.hosted_pane_slot_for_run(run_id).await;
         if let Some(slot_id) = slot_id {
             self.worker_registry.register_run_slot(run_id.to_owned(), slot_id);
-            if shell_pid > 0 {
+            if let Some(shell_pid) = observed_shell_pid {
                 self.worker_registry.register(shell_pid, run_id.to_owned());
             }
             let worker_id = crate::coordinator::worker_id_for_slot(slot_id);
@@ -322,16 +350,26 @@ impl ServerState {
                 "hook_after_terminal" => crate::live_worker_state::ReadoptionEvidence::DriverHook,
                 _ => crate::live_worker_state::ReadoptionEvidence::LiveShellPid,
             };
-            self.live_worker_states.register_readoption(
-                slot_id,
-                run_id.to_owned(),
-                model_label,
-                shell_pid,
-                binding,
-                awaiting_input_capable,
-                crate::live_worker_state::LiveSpawnRouting::new(pool, restored.kind.as_str()),
-                evidence,
-            );
+            if let Some(shell_pid) = observed_shell_pid {
+                self.live_worker_states.register_readoption(
+                    slot_id,
+                    run_id.to_owned(),
+                    model_label,
+                    shell_pid,
+                    binding,
+                    awaiting_input_capable,
+                    crate::live_worker_state::LiveSpawnRouting::new(pool, restored.kind.as_str()),
+                    evidence,
+                );
+            } else {
+                tracing::error!(
+                    run_id,
+                    slot_id,
+                    trigger,
+                    shell_pid_write_reason,
+                    "readopt: no positive shell pid was observable; leaving the live-state entry absent instead of registering a zero sentinel",
+                );
+            }
             self.broadcast_live_worker_states().await;
         } else {
             tracing::warn!(
@@ -359,7 +397,11 @@ impl ServerState {
                     "trigger": trigger,
                     "prior_status": prior_status,
                     "restored_status": restored.status.to_string(),
-                    "shell_pid": shell_pid,
+                    "shell_pid": observed_shell_pid,
+                    "stored_shell_pid_before": stored_shell_pid_before,
+                    "latest_tmux_observed_pid": latest_tmux_observed_pid,
+                    "shell_pid_write_reason": shell_pid_write_reason,
+                    "liveness_age_reset": true,
                     "slot_id": slot_id,
                     "progress_ingress": ingress_outcome.as_str(),
                 })),

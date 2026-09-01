@@ -2570,6 +2570,11 @@ fn tmux_run_accessors_record_and_list_only_adoptable_local_runs() {
         db.record_tmux_session_created_for_execution(&local_exec, "token-local", 4242)
             .unwrap()
     );
+    assert_eq!(
+        db.latest_local_pane_pid_snapshot_for_execution(&local_exec).unwrap(),
+        (Some(4242), Some(4242)),
+        "tmux creation must populate the durable shell-liveness field as well as tmux identity",
+    );
     assert!(
         db.record_tmux_spawn_intent_for_execution(
             &intended_local_exec,

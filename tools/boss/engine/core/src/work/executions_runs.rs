@@ -267,6 +267,13 @@ impl WorkDb {
     ///   [`Self::list_orphan_active_candidates`], which is what stops the
     ///   re-dispatch storm at its source.
     /// - `finished_at` is cleared: the run did not finish.
+    /// - The latest run's `started_at` is refreshed to the readoption moment,
+    ///   resetting the pane-attach age used by durable liveness reconcilers.
+    ///   Without that reset, a false reap followed by readoption immediately
+    ///   re-enters the same overdue state and oscillates on every sweep.
+    /// - A positively observed `shell_pid`, when supplied, is stored on that
+    ///   same latest run in the transaction. Non-positive values are rejected;
+    ///   readoption never persists the historical `0` sentinel as liveness.
     /// - The latest `work_runs` row is un-orphaned **only if the reap was what
     ///   stamped it**. A row this execution finished legitimately is
     ///   `completed`/`failed` and is left alone; an `orphaned` one can only
@@ -285,7 +292,15 @@ impl WorkDb {
     /// at the storage layer: re-adopting into a row that already has a live
     /// worker would create precisely the double-worker state this whole change
     /// exists to prevent, so it is refused here even if a caller asks for it.
-    pub fn readopt_inferred_terminal_execution(&self, execution_id: &str, evidence: &str) -> Result<WorkExecution> {
+    pub fn readopt_inferred_terminal_execution(
+        &self,
+        execution_id: &str,
+        evidence: &str,
+        observed_shell_pid: Option<i64>,
+    ) -> Result<WorkExecution> {
+        if observed_shell_pid.is_some_and(|pid| pid <= 0) {
+            bail!("refusing to re-adopt {execution_id} with a non-positive observed shell pid");
+        }
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let existing = query_execution(&tx, execution_id).require("execution", execution_id)?;
@@ -333,6 +348,18 @@ impl WorkDb {
         // Un-orphan the latest run row, but only when the reap is what
         // stamped it. A run that ended on its own terms is `completed` /
         // `failed` and stays exactly as it is.
+        tx.execute(
+            "UPDATE work_runs
+             SET started_at = ?2,
+                 shell_pid = COALESCE(?3, shell_pid)
+             WHERE id = (
+                 SELECT id FROM work_runs
+                 WHERE execution_id = ?1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1
+             )",
+            params![execution_id, now.as_str(), observed_shell_pid],
+        )?;
         tx.execute(
             "UPDATE work_runs
              SET status = 'active',
