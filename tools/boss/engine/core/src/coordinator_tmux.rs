@@ -18,7 +18,8 @@ use sha2::{Digest, Sha256};
 
 use crate::audit;
 use crate::engine_control::generate_token;
-use crate::spawn_flow::{TMUX_SESSION_SCHEMA, insert_tmux_color_environment};
+use crate::spawn_flow::TMUX_SESSION_SCHEMA;
+use crate::tmux_session_options::insert_color_environment;
 use crate::work::{CoordinatorTmuxRecord, WorkDb};
 
 pub const COORDINATOR_SESSION_NAME: &str = "boss-coordinator";
@@ -723,7 +724,7 @@ async fn start_new(
         environment.insert("BOSS_BIN_DIR".to_owned(), bin_dir.clone());
         environment.insert("BOSS_BIN".to_owned(), format!("{bin_dir}/boss"));
     }
-    insert_tmux_color_environment(&mut environment);
+    insert_color_environment(&mut environment);
     let quoted_model = boss_ssh_transport::shell_quote(model);
     let command = format!(
         "{}unset ANTHROPIC_API_KEY; exec claude --model {quoted_model} --permission-mode auto",
@@ -1248,7 +1249,7 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair[0] == "-e" && pair[1].starts_with("BOSS_SPAWN_TOKEN="))
         );
-        crate::spawn_flow::assert_tmux_color_environment(&calls[0]);
+        crate::tmux_session_options::assert_color_environment(&calls[0]);
         assert!(
             calls[0]
                 .windows(2)
@@ -1643,7 +1644,7 @@ mod tests {
                 .any(|pair| pair[0] == "-e" && pair[1].starts_with(&format!("{SESSION_SCHEMA_ENV}="))),
             "the replacement must mirror the current session schema, got {new_session:?}"
         );
-        crate::spawn_flow::assert_tmux_color_environment(new_session);
+        crate::tmux_session_options::assert_color_environment(new_session);
         assert!(
             new_session
                 .iter()
