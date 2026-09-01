@@ -227,6 +227,10 @@ pub struct SpawnAckSkipCounts {
     pub not_spawning: usize,
     /// Execution is still inside [`SPAWN_ACK_GRACE_SECS`].
     pub grace: usize,
+    /// Slot pre-dates this engine process (readopted at boot or after a
+    /// terminal-execution contradiction), so it is not a new spawn awaiting
+    /// an ack and pass 1's ack-timeout question does not apply to it.
+    pub readopted: usize,
 }
 
 impl crate::sweep_loop::SweepOutcome for SpawnAckSweepOutcome {
@@ -241,6 +245,7 @@ impl crate::sweep_loop::SweepOutcome for SpawnAckSweepOutcome {
             has_pid_skipped = self.skipped.has_pid,
             has_driver_signal_skipped = self.skipped.has_driver_signal,
             grace_skipped = self.skipped.grace,
+            readopted_skipped = self.skipped.readopted,
             "spawn-ack sweep: pass complete",
         );
     }
@@ -338,6 +343,7 @@ pub async fn run_one_pass(
         // engine process. It is not a new spawn awaiting its first ack, even
         // when its durable shell-pid probe could not produce a positive pid.
         if live_states.driver_start_expectation(state.slot_id) == Some(DriverStartExpectation::Readopted) {
+            outcome.skipped.readopted += 1;
             continue;
         }
 
@@ -1851,6 +1857,10 @@ mod tests {
             "a re-adopted worker is not a spawn, so it has no driver start to verify",
         );
         assert_eq!(outcome.reaped, 0);
+        assert_eq!(
+            outcome.skipped.readopted, 1,
+            "the readopted skip must be counted, not silently dropped from the accounting",
+        );
         assert_eq!(
             db.get_execution(&execution_id).unwrap().status,
             ExecutionStatus::Running,

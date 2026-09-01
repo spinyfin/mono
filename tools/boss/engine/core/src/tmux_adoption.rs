@@ -138,7 +138,7 @@ pub const TMUX_LEGACY_LABEL_SERVER_ATTENTION_KIND: &str = "tmux_legacy_label_ser
 /// matched a terminal execution — the third trigger alongside
 /// `hook_after_terminal` and `redispatch_guard` (see
 /// [`crate::worker_readoption`]'s module doc).
-const TERMINAL_HANDOFF_TRIGGER: &str = "tmux_session_sweep";
+pub(crate) const TERMINAL_HANDOFF_TRIGGER: &str = "tmux_session_sweep";
 
 /// A live Boss-owned tmux session whose spawn token has no durable run row.
 ///
@@ -1930,12 +1930,110 @@ mod tests {
         );
     }
 
+    /// Kept in its own file to stay under this file's line-count budget.
+    #[path = "tmux_adoption_pid_write_failure_tests.rs"]
+    mod pid_write_failure_tests;
+
     /// The cardinal case: engine restarts, the worker's tmux session (and its
     /// non-terminal execution row) survived. The pass must rebuild the slot
     /// claim, the `WorkerRegistry` pid/slot map, the `LiveWorkerState` entry,
     /// and start the live-status summarizer — using a freshly read pane pid,
     /// not the one `record_tmux_session_created` recorded at original spawn
     /// time.
+    #[tokio::test]
+    async fn non_terminal_match_rebuilds_derived_state() {
+        let (_dir, db) = open_db_arc();
+        let execution_id = start_local_run(&db, "worker-1");
+        assert!(
+            db.record_tmux_spawn_intent_for_execution(&execution_id, "boss", "boss-worker-1", "tok-1")
+                .unwrap()
+        );
+        assert!(
+            db.record_tmux_session_created_for_execution(&execution_id, "tok-1", 4242)
+                .unwrap()
+        );
+
+        let (tmux, _tmux_server) = fake_tmux(FakeTmuxServer {
+            sessions: vec!["boss-worker-1".to_owned()],
+            tokens: HashMap::from([("boss-worker-1".to_owned(), "tok-1".to_owned())]),
+            schemas: supported_schema("boss-worker-1"),
+            pane_pids: HashMap::from([("boss-worker-1".to_owned(), "4321".to_owned())]),
+            ..Default::default()
+        });
+        let coordinator = coordinator_with_one_slot(db.clone());
+        let spawner = RecordingSpawner::default();
+        let sink = RecordingDispatchEventSink::new();
+
+        let outcome = run_boot_time_adoption(
+            &db,
+            &tmux,
+            &coordinator,
+            &spawner,
+            &NoopLiveWorkerConvergence,
+            &sink,
+            &FixedEngineOwnerProbe(Some(true)),
+        )
+        .await;
+
+        assert_eq!(outcome.adopted_execution_ids, HashSet::from([execution_id.clone()]));
+        assert_eq!(
+            outcome.repaired_intents, 0,
+            "the run was already 'created', not 'intended'"
+        );
+        assert_eq!(outcome.terminal_handoffs, 0);
+        assert_eq!(outcome.refused_schema_skew, 0);
+
+        assert_eq!(spawner.registry.lookup(4321).as_deref(), Some(execution_id.as_str()));
+        assert_eq!(
+            spawner.registry.pane_for_run(&execution_id),
+            Some(crate::worker_registry::RegisteredWorkerPane {
+                slot_id: 1,
+                tmux_hosted: false,
+                tmux_session_name: Some("boss-worker-1".to_owned()),
+            }),
+            "adopted sessions route input through tmux but retain legacy teardown and process reaping",
+        );
+        let live_state = spawner.live_states.get(1).expect("slot 1 must be registered");
+        assert_eq!(live_state.run_id, execution_id);
+        assert_eq!(live_state.shell_pid, 4321);
+        assert_eq!(
+            db.latest_local_pane_pid_snapshot_for_execution(&execution_id).unwrap(),
+            (Some(4321), Some(4321)),
+            "adoption must propagate the fresh tmux pid into durable liveness before rebuilding state",
+        );
+        assert_eq!(*spawner.publish_calls.lock().unwrap(), 1);
+        assert_eq!(
+            spawner.live_status_calls.lock().unwrap().as_slice(),
+            &[(1u8, execution_id.clone())]
+        );
+
+        assert!(
+            coordinator
+                .worker_pool()
+                .claimed_execution_ids()
+                .await
+                .contains(&execution_id),
+            "the pool slot claim must be rebuilt",
+        );
+
+        let events = sink.events_for(&execution_id).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].stage, Stage::TmuxAdopt.as_str());
+        assert_eq!(events[0].details["stored_shell_pid_before"], 4242);
+        assert_eq!(events[0].details["previous_tmux_pane_pid"], 4242);
+        assert_eq!(events[0].details["stored_pid_snapshot_known"], true);
+        assert_eq!(events[0].details["observed_shell_pid"], 4321);
+        assert_eq!(
+            events[0].details["shell_pid_write_reason"],
+            "refresh_created_tmux_session"
+        );
+    }
+
+    /// A variant of the cardinal non-terminal-match case: the durable
+    /// shell-liveness field was left NULL by the buggy tmux path, and a
+    /// newer sibling `work_runs` row shadows that row from the liveness
+    /// readers' newest-row query. Adoption must not fabricate visibility
+    /// on the sibling row while doing the durable write.
     #[tokio::test]
     async fn non_terminal_match_with_newer_sibling_run_still_rebuilds_derived_state() {
         let (_dir, db) = open_db_arc();

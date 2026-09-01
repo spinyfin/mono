@@ -87,8 +87,9 @@ impl ServerState {
     /// re-adopt it or reap it, per [`classify_contradiction`].
     ///
     /// `trigger` names the signal that proved liveness (the hook event kind
-    /// from the hook fan-out, `redispatch_guard` from the orphan sweep's
-    /// durable-pid probe) and is carried on the dispatch event so a recurrence
+    /// from the hook fan-out, or one of `redispatch_guard` / `durable_state_scan`
+    /// / `tmux_session_sweep` from the sweeps that probe a recorded shell pid
+    /// or a live tmux pane) and is carried on the dispatch event so a recurrence
     /// is attributable to the detector that caught it.
     ///
     /// Serialized per run by [`ServerState::converging_terminal_runs`]: both
@@ -344,13 +345,25 @@ impl ServerState {
             // The trigger decides what Boss may claim to know. A hook
             // arriving after the engine terminalized the run came from the
             // driver itself, so it is recorded as genuine driver-start
-            // proof rather than discarded. `redispatch_guard` fired off
-            // `durable_liveness`'s recorded-pid probe, which observes the
-            // *shell* hosting the pane and says nothing about the driver —
-            // that conflation is what `driver_signal_at` exists to prevent
-            // — so it records nothing. The only non-hook trigger today is
-            // named explicitly; every hook event kind is driver evidence.
-            let evidence = if trigger == "redispatch_guard" {
+            // proof rather than discarded. The other call sites into
+            // `converge_live_worker` — `redispatch_guard` from the orphan
+            // sweep's durable-pid probe, `durable_state_scan` from the
+            // dead-pane sweep's `durable_liveness::probe_execution_worker_within`
+            // probe, and `tmux_session_sweep`
+            // (`tmux_adoption::TERMINAL_HANDOFF_TRIGGER`) from tmux
+            // adoption's live pane observation — all observe only the
+            // *shell* hosting the pane and say nothing about the driver;
+            // that conflation is what `driver_signal_at` exists to prevent,
+            // so they record nothing. These non-hook triggers are named
+            // explicitly on an allow-list so an unrecognized trigger added
+            // later defaults to withholding driver evidence, not asserting
+            // it.
+            const NON_HOOK_TRIGGERS: [&str; 3] = [
+                "redispatch_guard",
+                "durable_state_scan",
+                crate::tmux_adoption::TERMINAL_HANDOFF_TRIGGER,
+            ];
+            let evidence = if NON_HOOK_TRIGGERS.contains(&trigger) {
                 crate::live_worker_state::ReadoptionEvidence::LiveShellPid
             } else {
                 crate::live_worker_state::ReadoptionEvidence::DriverHook
