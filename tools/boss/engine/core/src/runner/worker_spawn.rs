@@ -1267,6 +1267,65 @@ mod compose_worker_spawn_tests {
         WorkItem::Chore(task)
     }
 
+    fn design_with_product(task_id: &str, product_id: &str) -> WorkItem {
+        WorkItem::Task(
+            Task::builder()
+                .id(task_id)
+                .product_id(product_id)
+                .kind(TaskKind::Design)
+                .name("Design a new feature")
+                .description("Design task.")
+                .status(TaskStatus::Todo)
+                .created_at("2026-05-15T00:00:00Z")
+                .updated_at("2026-05-15T00:00:00Z")
+                .autostart(false)
+                .build(),
+        )
+    }
+
+    #[tokio::test]
+    async fn design_with_grok_product_default_spawns_on_engine_default() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        let product = db
+            .create_product(
+                crate::work::CreateProductInput::builder()
+                    .name("Grok Product")
+                    .repo_remote_url("git@github.com:org/grok-product.git")
+                    .build(),
+            )
+            .unwrap();
+        db.update_product(
+            &product.id,
+            crate::work::WorkItemPatch::builder().default_driver("grok").build(),
+            "human",
+        )
+        .unwrap();
+        let execution = WorkExecution::builder()
+            .id("exec_design_grok_01")
+            .work_item_id("task-design-grok")
+            .kind(ExecutionKind::TaskImplementation)
+            .status(ExecutionStatus::Running)
+            .repo_remote_url("git@github.com:org/grok-product.git")
+            .workspace_path("/tmp/workspace")
+            .created_at("2026-05-15T00:00:00Z")
+            .build();
+
+        let composed = compose_worker_spawn(
+            &db,
+            "worker-1",
+            &execution,
+            &design_with_product("task-design-grok", &product.id),
+            workspace.path(),
+            None,
+            WorkerSpawnOpts::default(),
+        )
+        .await
+        .expect("grok product default must yield rather than wedge a design spawn");
+
+        assert_eq!(composed.spawn_config.driver, crate::effort::ENGINE_DEFAULT_DRIVER);
+    }
+
     /// A codex task pin must not hard-fail ConflictResolution spawn: the pin
     /// yields to the engine default (claude), which clears the capability gate.
     #[tokio::test]

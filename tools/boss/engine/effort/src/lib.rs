@@ -446,7 +446,9 @@ pub fn resolve_spawn_config_in(
         && menu.design_investigation_model.is_none()
         && matches!(
             driver_source,
-            DriverResolutionSource::TrafficAllocation | DriverResolutionSource::EngineDefault
+            DriverResolutionSource::ProductDefault
+                | DriverResolutionSource::TrafficAllocation
+                | DriverResolutionSource::EngineDefault
         )
     {
         driver = ENGINE_DEFAULT_DRIVER.to_owned();
@@ -1860,6 +1862,21 @@ mod tests {
             cfg.model_source,
             ModelResolutionSource::DriverDefaultAfterProductDefaultMismatch,
         );
+    }
+
+    #[test]
+    fn tier_row_with_grok_product_default_resolves_engine_default() {
+        let cfg = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .kind(&TaskKind::Design)
+                .product_default_driver("grok")
+                .build(),
+        )
+        .expect("an ineligible product default must yield rather than wedge a design row");
+
+        assert_eq!(cfg.driver, ENGINE_DEFAULT_DRIVER);
+        assert_eq!(cfg.driver_source, DriverResolutionSource::EngineDefault);
+        assert_eq!(cfg.model_source, ModelResolutionSource::DesignInvestigationTier);
     }
 
     #[test]
