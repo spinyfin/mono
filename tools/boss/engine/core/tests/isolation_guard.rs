@@ -43,9 +43,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use boss_client::wait_for_socket;
-use boss_engine::app::isolation::{
-    DEFAULT_PID_PATH, DEFAULT_SOCKET_PATH, EnginePaths, IsolationOverrides, IsolationPaths,
-};
+use boss_engine::app::isolation::{EnginePaths, IsolationOverrides, IsolationPaths};
 use boss_engine::app::{process_is_alive, run, serve};
 use boss_engine::cli::Cli;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
@@ -117,8 +115,21 @@ const FIXTURE_SOCKET: &str = "/tmp/boss-test-guard-1234.sock";
 fn production() -> EnginePaths {
     EnginePaths::under_state_root(
         Path::new("/Users/tester/Library/Application Support/Boss"),
-        Path::new(DEFAULT_PID_PATH),
+        &Path::new("/Users/tester")
+            .join("Library")
+            .join("Application Support")
+            .join("Boss")
+            .join(boss_log_files::ENGINE_PID_FILENAME),
     )
+}
+
+fn production_socket() -> PathBuf {
+    production()
+        .db
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(boss_log_files::FRONTEND_SOCKET_FILENAME)
 }
 
 fn derive(overrides: IsolationOverrides) -> IsolationPaths {
@@ -142,7 +153,8 @@ fn all_derived() -> EnginePaths {
 /// paths through the ordinary env / home-dir logic.
 #[test]
 fn derive_stands_down_entirely_for_the_production_socket() {
-    let paths = IsolationPaths::derive_from(DEFAULT_SOCKET_PATH, &IsolationOverrides::default(), &production());
+    let socket = production_socket();
+    let paths = IsolationPaths::derive_from(socket.to_str().unwrap(), &IsolationOverrides::default(), &production());
     assert!(!paths.is_test_fixture);
     assert_eq!(paths.derived, EnginePaths::default());
 }
@@ -242,7 +254,7 @@ fn process_is_alive_unit_tests() {
 // ---------------------------------------------------------------------------
 
 /// Starting an engine with a non-default socket places the pid file at the
-/// derived path, NOT at the production `/tmp/boss-engine.pid`.
+/// derived path, not in the production state root.
 #[tokio::test]
 async fn isolated_engine_writes_pid_to_derived_path() -> Result<()> {
     let engine = TestEngine::spawn("boss-test-isolation-pid").await?;
@@ -259,10 +271,10 @@ async fn isolated_engine_writes_pid_to_derived_path() -> Result<()> {
     let pid: i32 = content.trim().parse().expect("pid file must contain a number");
     assert!(process_is_alive(pid), "pid in isolated pid file must be alive");
 
-    // The production pid path (/tmp/boss-engine.pid) must NOT have been
-    // overwritten by this engine — its content (if any) should not be our pid.
-    let prod_pid_path = std::path::Path::new("/tmp/boss-engine.pid");
-    if let Ok(prod_content) = std::fs::read_to_string(prod_pid_path) {
+    // The production pid path must NOT have been overwritten by this engine —
+    // its content (if any) should not be our pid.
+    let prod_pid_path = boss_log_files::default_engine_pid_path().expect("HOME is set in test");
+    if let Ok(prod_content) = std::fs::read_to_string(&prod_pid_path) {
         let prod_pid: i32 = prod_content.trim().parse().unwrap_or(-1);
         assert_ne!(
             prod_pid, pid,

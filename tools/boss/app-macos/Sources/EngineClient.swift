@@ -5,7 +5,8 @@ import os
 final class EngineClient: @unchecked Sendable {
     var onEvent: (@MainActor @Sendable (EngineEvent) -> Void)?
 
-    private let socketPath: String
+    private let socketPaths: [String]
+    private var socketIndex = 0
     private let queue = DispatchQueue(label: "Boss.EngineClient")
     private var connection: NWConnection?
     private var buffer = Data()
@@ -54,13 +55,19 @@ final class EngineClient: @unchecked Sendable {
     private let eventDrain = OSAllocatedUnfairLock(initialState: EventDrainState())
 
     init(socketPath: String) {
-        self.socketPath = socketPath
+        self.socketPaths = [socketPath]
+    }
+
+    init(socketPaths: [String]) {
+        precondition(!socketPaths.isEmpty)
+        self.socketPaths = socketPaths
     }
 
     func start() {
         shouldReconnect = true
         reconnectAttempt = 0
         reconnectScheduled = false
+        socketIndex = 0
         connect()
     }
 
@@ -79,7 +86,7 @@ final class EngineClient: @unchecked Sendable {
         }
 
         let parameters = NWParameters(tls: nil, tcp: NWProtocolTCP.Options())
-        let endpoint = NWEndpoint.unix(path: socketPath)
+        let endpoint = NWEndpoint.unix(path: socketPaths[socketIndex])
         let connection = NWConnection(to: endpoint, using: parameters)
         self.connection = connection
 
@@ -93,15 +100,18 @@ final class EngineClient: @unchecked Sendable {
                 self.emit(.error(message: "socket waiting: \(error.localizedDescription)"))
                 self.connection = nil
                 connection.cancel()
+                self.advanceSocketCandidate()
                 self.emit(.disconnected)
                 self.scheduleReconnect()
             case .failed(let error):
                 self.emit(.error(message: "socket failed: \(error.localizedDescription)"))
                 self.connection = nil
+                self.advanceSocketCandidate()
                 self.emit(.disconnected)
                 self.scheduleReconnect()
             case .cancelled:
                 self.connection = nil
+                self.advanceSocketCandidate()
                 self.emit(.disconnected)
                 self.scheduleReconnect()
             default:
@@ -110,6 +120,10 @@ final class EngineClient: @unchecked Sendable {
         }
 
         connection.start(queue: queue)
+    }
+
+    private func advanceSocketCandidate() {
+        socketIndex = (socketIndex + 1) % socketPaths.count
     }
 
 

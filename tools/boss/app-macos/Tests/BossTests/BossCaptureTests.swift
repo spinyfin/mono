@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import XCTest
 
 @testable import Boss
@@ -177,5 +178,209 @@ private final class SolidFillView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         fillColor.setFill()
         bounds.fill()
+    }
+}
+final class EngineProcessControllerTests: XCTestCase {
+    func testReachableSocketRunsVersionCheckWhenPIDFileIsMissing() throws {
+        let fixture = try Fixture(reachableSocket: .primary)
+        let controller = fixture.makeController()
+        defer { controller.stop() }
+
+        try controller.start()
+
+        XCTAssertEqual(fixture.socketControl.fingerprintRequests, [fixture.paths.socketPath])
+        XCTAssertTrue(fixture.socketControl.shutdownRequests.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.paths.pidPath))
+    }
+
+    func testLegacySocketRunsVersionCheckWhenStateRootSocketIsMissing() throws {
+        let fixture = try Fixture(reachableSocket: .legacy)
+        let controller = fixture.makeController()
+        defer { controller.stop() }
+
+        try controller.start()
+
+        XCTAssertEqual(fixture.socketControl.fingerprintRequests, [fixture.paths.legacySocketPath!])
+        XCTAssertTrue(fixture.socketControl.shutdownRequests.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.paths.pidPath))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.paths.legacyPIDPath!))
+    }
+
+    func testStaleLegacyEngineIsStoppedBeforeReplacementUsesStateRootSocket() throws {
+        let fixture = try Fixture(reachableSocket: .legacy, runningFingerprint: "stale-engine")
+        let launchRecorder = LaunchRecorder()
+        let controller = fixture.makeController { _, _, socketPath in
+            launchRecorder.record(socketPath)
+            return 4242
+        }
+        defer { controller.stop() }
+
+        try controller.start()
+
+        XCTAssertEqual(fixture.socketControl.shutdownRequests, [fixture.paths.legacySocketPath!])
+        XCTAssertEqual(launchRecorder.socketPaths, [fixture.paths.socketPath])
+    }
+
+    func testFailedEngineStartPropagatesTheLaunchErrorToTheBannerState() throws {
+        let fixture = try Fixture(reachableSocket: .none)
+        let controller = fixture.makeController { _, _, _ in
+            throw NSError(
+                domain: "EngineFixture",
+                code: 23,
+                userInfo: [NSLocalizedDescriptionKey: "refusing-to-start-events-socket-owned"]
+            )
+        }
+        defer { controller.stop() }
+        let surfaced = expectation(description: "launch error surfaced")
+        controller.onSupervisionStateChange = { state in
+            if state == .restartFailed(attempt: nil, message: "refusing-to-start-events-socket-owned") {
+                surfaced.fulfill()
+            }
+        }
+
+        XCTAssertThrowsError(try controller.start()) { error in
+            XCTAssertEqual(error.localizedDescription, "refusing-to-start-events-socket-owned")
+        }
+        wait(for: [surfaced], timeout: 1)
+    }
+
+    func testConnectedEngineAlwaysClearsUnreachableBanner() {
+        XCTAssertFalse(
+            shouldShowEngineUnreachableBanner(
+                isConnected: true,
+                showConnectionLostBanner: true,
+                supervisionState: .gaveUp(attempts: 6, lastError: "refused to start")
+            )
+        )
+    }
+
+    func testFailedRestartHasAnUnreachableBannerSurface() {
+        XCTAssertTrue(
+            shouldShowEngineUnreachableBanner(
+                isConnected: false,
+                showConnectionLostBanner: false,
+                supervisionState: .restartFailed(attempt: 2, message: "refused to start")
+            )
+        )
+    }
+}
+
+private extension EngineProcessControllerTests {
+    enum ReachableSocket: Equatable {
+        case primary
+        case legacy
+        case none
+    }
+
+    final class FakeSocketControl: EngineSocketControlling, @unchecked Sendable {
+        private let lock = NSLock()
+        private let reachableSocket: String
+        private let expectedFingerprint: String
+        private var requests: [String] = []
+        private var shutdowns: [String] = []
+
+        init(reachableSocket: String, expectedFingerprint: String) {
+            self.reachableSocket = reachableSocket
+            self.expectedFingerprint = expectedFingerprint
+        }
+
+        var fingerprintRequests: [String] {
+            lock.withLock { requests }
+        }
+
+        var shutdownRequests: [String] {
+            lock.withLock { shutdowns }
+        }
+
+        func isReachable(socketPath: String, timeoutSeconds _: Double) -> Bool {
+            socketPath == reachableSocket
+        }
+
+        func peerPID(socketPath _: String, timeoutSeconds _: Double) -> pid_t? {
+            nil
+        }
+
+        func fingerprint(socketPath: String, timeoutSeconds _: Double) -> String? {
+            lock.withLock { requests.append(socketPath) }
+            return expectedFingerprint
+        }
+
+        func shutdown(socketPath: String, tokenPath _: String, timeoutSeconds _: Double) throws -> pid_t? {
+            lock.withLock { shutdowns.append(socketPath) }
+            return nil
+        }
+
+        func waitForClose(socketPath _: String, timeoutSeconds _: Double) -> Bool {
+            true
+        }
+    }
+
+    final class LaunchRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var recordedSocketPaths: [String] = []
+
+        var socketPaths: [String] {
+            lock.withLock { recordedSocketPaths }
+        }
+
+        func record(_ socketPath: String) {
+            lock.withLock { recordedSocketPaths.append(socketPath) }
+        }
+    }
+
+    struct Fixture {
+        let temp: URL
+        let paths: BossEnginePaths
+        let bundledEnginePath: String
+        let socketControl: FakeSocketControl
+
+        init(reachableSocket: ReachableSocket, runningFingerprint: String? = nil) throws {
+            let testRoot = ProcessInfo.processInfo.environment["TEST_TMPDIR"]
+                .map { URL(fileURLWithPath: $0, isDirectory: true) }
+                ?? FileManager.default.temporaryDirectory
+            temp = testRoot
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
+            let primarySocket = temp.appendingPathComponent("engine.sock").path
+            let legacySocket = temp.appendingPathComponent("legacy.sock").path
+            paths = BossEnginePaths(
+                socketPath: primarySocket,
+                pidPath: temp.appendingPathComponent("engine.pid").path,
+                controlTokenPath: temp.appendingPathComponent("engine-control.token").path,
+                legacySocketPath: legacySocket,
+                legacyPIDPath: temp.appendingPathComponent("legacy.pid").path
+            )
+            bundledEnginePath = temp.appendingPathComponent("bundled-engine").path
+            let contents = Data("bundled engine fixture".utf8)
+            try contents.write(to: URL(fileURLWithPath: bundledEnginePath))
+            let fingerprint = SHA256.hash(data: contents).prefix(6)
+                .map { String(format: "%02x", $0) }
+                .joined()
+            let reachablePath: String
+            switch reachableSocket {
+            case .primary: reachablePath = primarySocket
+            case .legacy: reachablePath = legacySocket
+            case .none: reachablePath = temp.appendingPathComponent("unreachable.sock").path
+            }
+            socketControl = FakeSocketControl(
+                reachableSocket: reachablePath,
+                expectedFingerprint: runningFingerprint ?? fingerprint
+            )
+        }
+
+        func makeController(
+            launchHandler: (@Sendable (String, String?, String) throws -> pid_t)? = nil
+        ) -> EngineProcessController {
+            EngineProcessController(
+                paths: paths,
+                launchDirectory: temp.path,
+                forceRestart: false,
+                stopOnExit: false,
+                restartPolicy: .default,
+                socketControl: socketControl,
+                bundledEnginePathOverride: bundledEnginePath,
+                launchHandler: launchHandler
+            )
+        }
     }
 }

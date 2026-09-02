@@ -6,6 +6,7 @@ workspace = "../../.."
 
 [dependencies]
 anyhow = { workspace = true }
+boss-log-files = { path = "../log-files" }
 boss-protocol = { path = "../protocol" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

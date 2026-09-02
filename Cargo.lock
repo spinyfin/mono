@@ -301,6 +301,7 @@ name = "boss-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "boss-log-files",
  "boss-protocol",
  "serde",
  "serde_json",

@@ -21,15 +21,24 @@ async fn resolve_optional_work_item_filter(
 pub(crate) async fn run_engine_command(command: EngineCommand, ctx: &RunContext) -> Result<(), CliError> {
     match command {
         EngineCommand::Status => {
-            let running = engine_socket_reachable(&ctx.discovery.socket_path).await;
-            let pid = running_engine_pid(&ctx.discovery.pid_file_path);
+            let discovered = discover_running_engine(&ctx.discovery).await;
+            let running = discovered.is_some();
+            let socket_path = discovered
+                .as_ref()
+                .map(|engine| engine.socket_path.as_str())
+                .unwrap_or(&ctx.discovery.socket_path);
+            let pid_file_path = discovered
+                .as_ref()
+                .map(|engine| engine.pid_file_path.as_str())
+                .unwrap_or(&ctx.discovery.pid_file_path);
+            let pid = discovered.as_ref().and_then(|engine| engine.pid);
             print_entity(
                 ctx,
                 &serde_json::json!({
                     "running": running,
                     "pid": pid,
-                    "socket_path": ctx.discovery.socket_path,
-                    "pid_file_path": ctx.discovery.pid_file_path,
+                    "socket_path": socket_path,
+                    "pid_file_path": pid_file_path,
                 }),
                 || {
                     if running {
@@ -37,8 +46,8 @@ pub(crate) async fn run_engine_command(command: EngineCommand, ctx: &RunContext)
                     } else {
                         println!("Boss engine is stopped.");
                     }
-                    println!("Socket: {}", ctx.discovery.socket_path);
-                    println!("PID file: {}", ctx.discovery.pid_file_path);
+                    println!("Socket: {socket_path}");
+                    println!("PID file: {pid_file_path}");
                     if let Some(pid) = pid {
                         println!("PID: {pid}");
                     }
@@ -60,15 +69,24 @@ pub(crate) async fn run_engine_command(command: EngineCommand, ctx: &RunContext)
             )
         }
         EngineCommand::Stop => {
-            stop_engine(&ctx.discovery.pid_file_path)
+            let outcome = stop_engine(&ctx.discovery)
                 .await
                 .map_err(|err| CliError::engine_unavailable(err.to_string()))?;
+            let stopped = outcome == EngineStopOutcome::Stopped;
             print_entity(
                 ctx,
-                &serde_json::json!({ "running": false, "socket_path": ctx.discovery.socket_path }),
+                &serde_json::json!({
+                    "running": false,
+                    "stopped": stopped,
+                    "socket_path": ctx.discovery.socket_path,
+                }),
                 || {
                     if !ctx.quiet {
-                        println!("Stopped Boss engine.");
+                        if stopped {
+                            println!("Stopped Boss engine.");
+                        } else {
+                            println!("Boss engine was already stopped.");
+                        }
                     }
                 },
             )

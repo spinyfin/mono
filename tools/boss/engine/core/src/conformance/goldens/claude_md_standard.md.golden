@@ -242,9 +242,10 @@ env -u BOSS_EVENTS_SOCKET bazel run //tools/boss/engine/core:engine -- \
 --socket-path /tmp/boss-test-$(uuidgen).sock
 ```
 
-Any `--socket-path` other than `/tmp/boss-engine.sock` puts the
-engine in test-fixture mode, where the db, events socket, pid file
-and control token are all derived from that socket's path. Unset
+A `--socket-path` outside the Boss state root and distinct from the
+legacy `/tmp/boss-engine.sock` puts the engine in test-fixture mode,
+where the db, events socket, pid file and control token are all
+derived from that socket's path. Unset
 `BOSS_EVENTS_SOCKET` because your pane inherits one pointing at
 production. Point a client at the same `--socket-path` to drive it.
 

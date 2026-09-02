@@ -1218,7 +1218,7 @@ final class ChatViewModel: ObservableObject {
         self.processController = EngineProcessController(paths: paths)
         let showSystem = ProcessInfo.processInfo.environment["BOSS_SHOW_SYSTEM_MESSAGES"] ?? ""
         showSystemMessages = showSystem == "1" || showSystem.lowercased() == "true"
-        engine = EngineClient(socketPath: paths.socketPath)
+        engine = EngineClient(socketPaths: paths.socketPaths)
         commentBridge = CommentEngineBridge(engine: engine)
 
         commonInit()
@@ -1944,6 +1944,12 @@ final class ChatViewModel: ObservableObject {
 
         didStart = true
 
+        // UI tests drive explicit fixture clients and events directly. The
+        // `commonInit` fallback schedules this method automatically, so do not
+        // start either a real process or a reconnecting client from XCTest.
+        // Controller startup has dedicated injected tests.
+        guard !BossEnginePaths.isRunningInTestContext else { return }
+
         let autostart = ProcessInfo.processInfo.environment["BOSS_ENGINE_AUTOSTART"] != "0"
         if autostart {
             let processController = self.processController
@@ -1978,9 +1984,9 @@ final class ChatViewModel: ObservableObject {
     /// or has exhausted its bounded retry policy.
     @Published private(set) var engineSupervisionState: EngineSupervisionState = .running
 
-    /// User-initiated recovery from the unreachable banner. Terminates
-    /// the engine the pid file points at (token-auth shutdown RPC
-    /// first, then SIGTERM/SIGKILL — same path `stop()` uses) and
+    /// User-initiated recovery from the unreachable banner. Discovers the
+    /// reachable engine by socket (token-auth shutdown RPC first, then a
+    /// validated peer/pid-file SIGTERM/SIGKILL fallback) and
     /// relaunches it. The `EngineClient` reconnect loop picks the new
     /// socket up automatically once it accepts.
     ///

@@ -50,14 +50,21 @@ struct EngineRestartPolicy: Equatable, Sendable {
 
 /// State sent to the app chrome while the controller is recovering from an
 /// unexpected engine exit. A manual restart resets the policy and returns to
-/// `.running` once a pid is observed.
+/// `.running` once a socket is reachable.
 enum EngineSupervisionState: Equatable, Sendable {
     case running
     case restarting(attempt: Int, retryAfter: TimeInterval)
-    case gaveUp(attempts: Int)
+    case restartFailed(attempt: Int?, message: String)
+    case gaveUp(attempts: Int, lastError: String?)
 }
 
 final class EngineProcessController: @unchecked Sendable {
+    private struct RunningEngine {
+        let socketPath: String
+        let pidPath: String
+        let pid: pid_t?
+    }
+
     private let paths: BossEnginePaths
     private let lockFilePath: String
     private let launchDirectory: String
@@ -69,6 +76,10 @@ final class EngineProcessController: @unchecked Sendable {
     private var pendingRestart: DispatchWorkItem?
     private var supervisor: EngineSupervisor
     private var lastSupervisionState: EngineSupervisionState = .running
+    private var lastLaunchError: String?
+    private let socketControl: any EngineSocketControlling
+    private let bundledEnginePathOverride: String?
+    private let launchHandler: (@Sendable (String, String?, String) throws -> pid_t)?
     private let supervisionStopLock = NSLock()
     private var supervisionStopped = false
 
@@ -81,7 +92,10 @@ final class EngineProcessController: @unchecked Sendable {
             ?? FileManager.default.currentDirectoryPath,
         forceRestart: Bool = ProcessInfo.processInfo.environment["BOSS_ENGINE_FORCE_RESTART"] == "1",
         stopOnExit: Bool = ProcessInfo.processInfo.environment["BOSS_ENGINE_STOP_ON_EXIT"] == "1",
-        restartPolicy: EngineRestartPolicy = .fromEnvironment()
+        restartPolicy: EngineRestartPolicy = .fromEnvironment(),
+        socketControl: any EngineSocketControlling = EngineSocketControl(),
+        bundledEnginePathOverride: String? = nil,
+        launchHandler: (@Sendable (String, String?, String) throws -> pid_t)? = nil
     ) {
         self.paths = paths
         self.lockFilePath = "\(paths.pidPath).lock"
@@ -90,6 +104,9 @@ final class EngineProcessController: @unchecked Sendable {
         self.stopOnExit = stopOnExit
         self.restartPolicy = restartPolicy
         self.supervisor = EngineSupervisor(policy: restartPolicy)
+        self.socketControl = socketControl
+        self.bundledEnginePathOverride = bundledEnginePathOverride
+        self.launchHandler = launchHandler
     }
 
     deinit {
@@ -98,19 +115,23 @@ final class EngineProcessController: @unchecked Sendable {
     }
 
     func start() throws {
-        try start(resetRestartBudget: true)
+        do {
+            try start(resetRestartBudget: true)
+        } catch {
+            reportLaunchFailure(error, attempt: nil)
+            throw error
+        }
     }
 
     private func start(resetRestartBudget: Bool) throws {
         let socketPath = paths.socketPath
         try withStartLock {
-            if forceRestart, let pid = currentEnginePID() {
-                emit("[engine restart] terminating existing engine pid=\(pid)")
-                terminateEngine(pid: pid)
-                clearPIDFileIfOwned(pid: pid)
+            if forceRestart, let running = discoverRunningEngine() {
+                emit("[engine restart] terminating existing engine \(describe(running))")
+                try stopRunningEngine(running)
             }
 
-            if let pid = currentEnginePID() {
+            if let running = discoverRunningEngine() {
                 // An engine is already running. Check if its binary matches
                 // the app's bundled engine. If not, replace it so the user
                 // always gets the version that shipped with this app launch.
@@ -121,18 +142,8 @@ final class EngineProcessController: @unchecked Sendable {
                 //   [engine version-check skipped: <reason>] — check didn't run
                 //   [engine version-check ok] — ran, fingerprints matched
                 //   [engine upgrade] — ran, fingerprints differed, restarting
-                let reasonToSkip: String? = {
-                    if ProcessInfo.processInfo.environment["BOSS_ENGINE_CMD"] != nil {
-                        return "BOSS_ENGINE_CMD is set (developer custom engine)"
-                    }
-                    if bundledEnginePath() == nil {
-                        return "no bundled engine in app resources (dev/bazel-run mode)"
-                    }
-                    return nil
-                }()
-
-                if let reason = reasonToSkip {
-                    emit("[engine version-check skipped: \(reason)] attaching to pid=\(pid)")
+                guard bundledEnginePath() != nil else {
+                    emit("[engine version-check skipped: no bundled engine in app resources (dev/bazel-run mode)] attaching to \(describe(running))")
                     return
                 }
 
@@ -140,46 +151,30 @@ final class EngineProcessController: @unchecked Sendable {
                 guard let bundledPath = bundledEnginePath(),
                       let bundledFP = computeBinaryFingerprint(path: bundledPath)
                 else {
-                    emit("[engine version-check skipped: could not fingerprint bundled engine] attaching to pid=\(pid)")
+                    throw controllerError("could not fingerprint bundled engine at \(bundledEnginePath() ?? "unknown path")")
+                }
+
+                let runningFP = socketControl.fingerprint(
+                    socketPath: running.socketPath,
+                    timeoutSeconds: 3.0
+                )
+
+                if let runningFP, bundledFP == runningFP {
+                    emit("[engine version-check ok] running=\(runningFP) matches bundled — attaching to \(describe(running))")
                     return
                 }
 
-                guard let runningFP = queryRunningEngineFingerprint(
-                    socketPath: socketPath, timeoutSeconds: 3.0
-                ) else {
-                    // Engine either pre-dates GetEngineVersion or didn't
-                    // answer in time. Safe fallback is to keep it rather
-                    // than restart blindly; flag the reason explicitly so
-                    // a user investigating "did the version check fire?"
-                    // can tell the query failed versus the check was a
-                    // no-op for some other reason.
-                    emit("[engine version-check skipped: running engine did not respond to get_engine_version within 3s; likely an engine build predating the get_engine_version RPC] attaching to pid=\(pid)")
-                    return
-                }
-
-                if bundledFP == runningFP {
-                    emit("[engine version-check ok] running=\(runningFP) matches bundled — attaching to pid=\(pid)")
-                    return
-                }
-
-                emit("[engine upgrade] running=\(runningFP) bundled=\(bundledFP) — replacing engine pid=\(pid)")
-                terminateEngine(pid: pid)
-                clearPIDFileIfOwned(pid: pid)
-                let closed = waitForSocketClose(socketPath: socketPath, timeoutSeconds: 8.0)
-                if !closed {
-                    emit("[engine upgrade] socket did not close within 8s after shutdown rpc; SIGKILL should have fired already")
-                }
+                let runningDescription = runningFP ?? "unavailable"
+                emit("[engine upgrade] running=\(runningDescription) bundled=\(bundledFP) — replacing \(describe(running))")
+                try stopRunningEngine(running)
                 emit("[engine upgrade] old engine stopped — launching new engine from bundle")
             }
 
             let (command, bossBinDir) = resolveEngineCommand(socketPath: socketPath)
 
-            try launchDetached(command: command, bossBinDir: bossBinDir)
-            if let pid = waitForEnginePID(timeoutSeconds: 5.0) {
-                emit("[engine launch] detached pid=\(pid) \(command)")
-            } else {
-                emit("[engine launch] started but pid file not observed yet: \(paths.pidPath)")
-            }
+            let pid = try launchEngine(command: command, bossBinDir: bossBinDir, socketPath: socketPath)
+            lastLaunchError = nil
+            emit("[engine launch] detached pid=\(pid) socket=\(socketPath) \(command)")
         }
         // `disableSupervision()` may be called while a supervised relaunch is
         // waiting on filesystem or socket I/O above. It sets this lock-backed
@@ -194,6 +189,9 @@ final class EngineProcessController: @unchecked Sendable {
     /// Path to the engine binary shipped inside the current app bundle.
     /// Returns `nil` in dev/bazel-run mode where no bundle engine exists.
     private func bundledEnginePath() -> String? {
+        if let bundledEnginePathOverride {
+            return bundledEnginePathOverride
+        }
         guard let resourcePath = Bundle.main.resourcePath else { return nil }
         let path = "\(resourcePath)/bin/\(BossEngineBinary.executableName)"
         guard FileManager.default.fileExists(atPath: path) else { return nil }
@@ -238,105 +236,6 @@ final class EngineProcessController: @unchecked Sendable {
         return truncated ? "\(hex)-truncated" : hex
     }
 
-    /// Open a synchronous Unix-domain connection to `socketPath`, send a
-    /// `get_engine_version` request, and return the `binary_fingerprint`
-    /// from the response. Returns `nil` on any error (timeout, parse
-    /// failure, socket unavailable).
-    private func queryRunningEngineFingerprint(
-        socketPath: String,
-        timeoutSeconds: Double
-    ) -> String? {
-        let sock = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-        guard sock >= 0 else { return nil }
-        defer { Darwin.close(sock) }
-
-        // Apply send/recv timeouts so a hung engine doesn't block startup.
-        var tv = timeval(
-            tv_sec: Int(timeoutSeconds),
-            tv_usec: Int32((timeoutSeconds.truncatingRemainder(dividingBy: 1.0)) * 1_000_000)
-        )
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        // Capture the size of sun_path before the exclusive-access borrow.
-        let sunPathMax = MemoryLayout.size(ofValue: addr.sun_path)
-        _ = socketPath.withCString { cStr in
-            withUnsafeMutablePointer(to: &addr.sun_path) { dst in
-                memcpy(UnsafeMutableRawPointer(dst), cStr, min(strlen(cStr), sunPathMax - 1))
-            }
-        }
-        let connectResult: Int32 = withUnsafePointer(to: addr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.connect(sock, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
-            }
-        }
-        guard connectResult == 0 else { return nil }
-
-        let requestJSON = "{\"request_id\":\"version-check\",\"payload\":{\"type\":\"get_engine_version\"}}\n"
-        guard let requestData = requestJSON.data(using: .utf8) else { return nil }
-        let sent = requestData.withUnsafeBytes { buf in
-            Darwin.send(sock, buf.baseAddress!, buf.count, 0)
-        }
-        guard sent == requestData.count else { return nil }
-
-        // Read newline-delimited JSON until we see our response.
-        var responseBuffer = Data()
-        var readBuf = [UInt8](repeating: 0, count: 4096)
-        outer: while true {
-            let n = Darwin.recv(sock, &readBuf, readBuf.count, 0)
-            if n <= 0 { break }
-            responseBuffer.append(contentsOf: readBuf[..<n])
-            while let newlineIdx = responseBuffer.firstIndex(of: 0x0A) {
-                let lineData = Data(responseBuffer[..<newlineIdx])
-                responseBuffer.removeSubrange(...newlineIdx)
-                guard
-                    let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                    json["request_id"] as? String == "version-check",
-                    let payload = json["payload"] as? [String: Any],
-                    payload["type"] as? String == "engine_version_result",
-                    let fp = payload["binary_fingerprint"] as? String
-                else { continue }
-                return fp
-            }
-            // Safety: if we've buffered a lot without finding a match, stop.
-            if responseBuffer.count > 256 * 1024 { break outer }
-        }
-        return nil
-    }
-
-    /// Poll until `socketPath` is no longer connectable (the engine has
-    /// closed it) or `timeoutSeconds` elapses. Returns `true` if the
-    /// socket closed in time.
-    private func waitForSocketClose(socketPath: String, timeoutSeconds: Double) -> Bool {
-        let deadline = Date().addingTimeInterval(timeoutSeconds)
-        while Date() < deadline {
-            let sock = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-            guard sock >= 0 else { return true }
-            var addr = sockaddr_un()
-            addr.sun_family = sa_family_t(AF_UNIX)
-            let sunPathMaxClose = MemoryLayout.size(ofValue: addr.sun_path)
-            _ = socketPath.withCString { cStr in
-                withUnsafeMutablePointer(to: &addr.sun_path) { dst in
-                    memcpy(UnsafeMutableRawPointer(dst), cStr,
-                           min(strlen(cStr), sunPathMaxClose - 1))
-                }
-            }
-            let result = withUnsafePointer(to: addr) { ptr in
-                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    Darwin.connect(sock, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
-                }
-            }
-            Darwin.close(sock)
-            if result != 0 {
-                return true  // Connection refused — socket is closed.
-            }
-            Thread.sleep(forTimeInterval: 0.2)
-        }
-        return false
-    }
-
     /// Resolve the engine command and the BOSS_BIN_DIR to export.
     ///
     /// Resolution order (per design doc Q3):
@@ -356,10 +255,10 @@ final class EngineProcessController: @unchecked Sendable {
             let enginePath = "\(resourcePath)/bin/\(BossEngineBinary.executableName)"
             if FileManager.default.fileExists(atPath: enginePath) {
                 let bossBinDir = "\(resourcePath)/bin"
-                return ("\(enginePath) --socket-path \(socketPath)", bossBinDir)
+                return ("\(shellQuote(enginePath)) --socket-path \(shellQuote(socketPath))", bossBinDir)
             }
         }
-        return ("\(BossEngineBinary.bazelRunCommand) -- --socket-path \(socketPath)", nil)
+        return ("\(BossEngineBinary.bazelRunCommand) -- --socket-path \(shellQuote(socketPath))", nil)
     }
 
     func stop() {
@@ -368,18 +267,21 @@ final class EngineProcessController: @unchecked Sendable {
             return
         }
 
-        guard let pid = currentEnginePID() else {
+        guard let running = discoverRunningEngine() else {
             return
         }
 
-        terminateEngine(pid: pid)
-        clearPIDFileIfOwned(pid: pid)
-        emit("[engine stop] terminated pid=\(pid)")
+        do {
+            try stopRunningEngine(running)
+            emit("[engine stop] terminated \(describe(running))")
+        } catch {
+            emit("[engine stop] failed: \(error.localizedDescription)")
+        }
     }
 
-    /// User-initiated recovery for a stale engine: terminate whatever
-    /// engine is bound to the pid file (token-auth RPC first, then
-    /// SIGTERM/SIGKILL — same authority `stop()` uses) and relaunch
+    /// User-initiated recovery for a stale engine: discover the reachable
+    /// engine by socket (token-auth RPC first, then a validated peer/pid-file
+    /// SIGTERM/SIGKILL fallback) and relaunch
     /// from the same binary `start()` would. Used by the "Restart
     /// engine" affordance on the unreachable banner so a hung or
     /// orphaned engine no longer requires a shell `pkill` (issue #697).
@@ -390,38 +292,33 @@ final class EngineProcessController: @unchecked Sendable {
     /// engine is running — falls through to the launch step.
     func restart() throws {
         disableSupervision()
-        try withStartLock {
-            if let pid = currentEnginePID() {
-                emit("[engine restart] terminating existing engine pid=\(pid)")
-                terminateEngine(pid: pid)
-                clearPIDFileIfOwned(pid: pid)
-                // The engine itself unlinks its socket on graceful
-                // exit, and the new engine's bind step will retry-
-                // delete any leftover. Wait briefly for the socket
-                // to drop so the new bind doesn't trip the unlink
-                // race in `UnixListener::bind`.
-                _ = waitForSocketClose(socketPath: paths.socketPath, timeoutSeconds: 3.0)
-            }
+        do {
+            try withStartLock {
+                if let running = discoverRunningEngine() {
+                    emit("[engine restart] terminating existing engine \(describe(running))")
+                    try stopRunningEngine(running)
+                }
 
-            let socketPath = paths.socketPath
-            let (command, bossBinDir) = resolveEngineCommand(socketPath: socketPath)
-            try launchDetached(command: command, bossBinDir: bossBinDir)
-            if let pid = waitForEnginePID(timeoutSeconds: 5.0) {
-                emit("[engine restart] detached pid=\(pid) \(command)")
-            } else {
-                emit("[engine restart] started but pid file not observed yet: \(paths.pidPath)")
+                let socketPath = paths.socketPath
+                let (command, bossBinDir) = resolveEngineCommand(socketPath: socketPath)
+                let pid = try launchEngine(command: command, bossBinDir: bossBinDir, socketPath: socketPath)
+                lastLaunchError = nil
+                emit("[engine restart] detached pid=\(pid) socket=\(socketPath) \(command)")
             }
+            enableSupervision(resetRestartBudget: true)
+        } catch {
+            reportLaunchFailure(error, attempt: nil)
+            throw error
         }
-        enableSupervision(resetRestartBudget: true)
     }
 
     // MARK: - Unexpected-exit supervision
 
     /// The engine is deliberately detached from the app so it survives an app
     /// restart. That also means `Process.terminationHandler` cannot observe
-    /// it. Polling the PID file gives the controller the same answer without
-    /// making the engine an app child, and serializing this work prevents two
-    /// timer ticks from launching competing replacements.
+    /// it. Polling socket reachability gives the controller the same answer
+    /// without making the engine an app child, and serializing this work
+    /// prevents two timer ticks from launching competing replacements.
     private func enableSupervision(resetRestartBudget: Bool) {
         // Set this before hopping onto the supervision queue so a later
         // `stop()` always wins, even if this queued block has not run yet.
@@ -460,20 +357,21 @@ final class EngineProcessController: @unchecked Sendable {
 
     private func checkEngineLiveness() {
         guard !isSupervisionStopped, pendingRestart == nil else { return }
-        let action = supervisor.tick(isAlive: currentEnginePID() != nil, now: Date())
+        let action = supervisor.tick(isAlive: discoverRunningEngine() != nil, now: Date())
         switch action {
         case .running:
+            lastLaunchError = nil
             emitSupervisionState(.running)
             return
         case let .gaveUp(attempts):
             emit("[engine supervision] gave up after \(attempts) restart attempts; use Restart engine to try again")
-            emitSupervisionState(.gaveUp(attempts: attempts))
+            emitSupervisionState(.gaveUp(attempts: attempts, lastError: lastLaunchError))
             return
         case let .restart(attempt, delay):
             emit("[engine supervision] engine exited; restart attempt \(attempt)/\(restartPolicy.maximumAttempts) in \(Int(delay))s")
             emitSupervisionState(.restarting(attempt: attempt, retryAfter: delay))
             let work = DispatchWorkItem { [weak self] in
-                self?.relaunchAfterUnexpectedExit()
+                self?.relaunchAfterUnexpectedExit(attempt: attempt)
             }
             pendingRestart = work
             supervisionQueue.asyncAfter(deadline: .now() + delay, execute: work)
@@ -482,18 +380,31 @@ final class EngineProcessController: @unchecked Sendable {
         }
     }
 
-    private func relaunchAfterUnexpectedExit() {
+    private func relaunchAfterUnexpectedExit(attempt: Int) {
         pendingRestart = nil
         guard !isSupervisionStopped else { return }
         do {
             try start(resetRestartBudget: false)
         } catch {
+            lastLaunchError = error.localizedDescription
             emit("[engine supervision] restart launch failed: \(error.localizedDescription)")
+            emitSupervisionState(.restartFailed(attempt: attempt, message: error.localizedDescription))
             // The next timer tick applies the next backoff slot.
         }
     }
 
-    private func launchDetached(command: String, bossBinDir: String? = nil) throws {
+    private func launchEngine(command: String, bossBinDir: String?, socketPath: String) throws -> pid_t {
+        if let launchHandler {
+            return try launchHandler(command, bossBinDir, socketPath)
+        }
+        return try launchDetached(command: command, bossBinDir: bossBinDir, socketPath: socketPath)
+    }
+
+    private func launchDetached(command: String, bossBinDir: String?, socketPath: String) throws -> pid_t {
+        let launchErrorPath = URL(fileURLWithPath: paths.pidPath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("engine-launch.log")
+            .path
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
         // zsh's BG_NICE option (on by default) reduces the priority of any
@@ -513,7 +424,19 @@ final class EngineProcessController: @unchecked Sendable {
         // kill-server` (or a reboot) once so the next engine launch creates a
         // fresh server under this corrected priority. A leftover `-L boss`
         // server is drained at boot rather than relocated.
-        proc.arguments = ["-c", "setopt NO_BG_NICE; nohup \(command) >/dev/null 2>&1 &"]
+        let script = """
+        setopt NO_BG_NICE
+        : > \(shellQuote(launchErrorPath))
+        nohup \(command) >/dev/null 2>\(shellQuote(launchErrorPath)) &
+        child=$!
+        print -r -- $child
+        sleep 0.25
+        if ! kill -0 $child 2>/dev/null; then
+          wait $child
+          exit $?
+        fi
+        """
+        proc.arguments = ["-c", script]
         proc.currentDirectoryURL = URL(fileURLWithPath: launchDirectory, isDirectory: true)
         // Tell the engine the app's pid explicitly. `bazel run`
         // daemonizes its server, which reparents the engine binary
@@ -522,6 +445,10 @@ final class EngineProcessController: @unchecked Sendable {
         // BOSS_APP_PID to set its trust root for `RegisterAppSession`.
         var env = ProcessInfo.processInfo.environment
         env["BOSS_APP_PID"] = String(getpid())
+        // The engine's tracing layer continues writing its bounded text log,
+        // while direct startup failures from Rust's main function land in the
+        // launch-error file above for this controller to surface verbatim.
+        env["BOSS_ENGINE_STDERR_LOGGING"] = "0"
         // BOSS_BIN_DIR tells the engine where its sibling CLIs live
         // (boss, bossctl, boss-event) in installed mode. The engine
         // propagates this to workers so they resolve the bundled copies
@@ -549,18 +476,76 @@ final class EngineProcessController: @unchecked Sendable {
             env["ANTHROPIC_API_KEY"] = stored
         }
         proc.environment = env
-        proc.standardOutput = Pipe()
-        proc.standardError = Pipe()
+        let output = Pipe()
+        let shellError = Pipe()
+        proc.standardOutput = output
+        proc.standardError = shellError
 
         try proc.run()
         proc.waitUntilExit()
+        let outputData = output.fileHandleForReading.readDataToEndOfFile()
+        let shellErrorData = shellError.fileHandleForReading.readDataToEndOfFile()
+        let childPID = String(data: outputData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(separator: "\n")
+            .first
+            .flatMap { pid_t($0) }
         if proc.terminationStatus != 0 {
-            throw NSError(
-                domain: "Boss.EngineProcessController",
-                code: Int(proc.terminationStatus),
-                userInfo: [NSLocalizedDescriptionKey: "failed to launch detached engine process"]
+            let shellMessage = String(data: shellErrorData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            throw controllerError(
+                launchFailureMessage(
+                    prefix: "engine process exited during launch with status \(proc.terminationStatus)",
+                    launchErrorPath: launchErrorPath,
+                    fallback: shellMessage
+                ),
+                code: Int(proc.terminationStatus)
             )
         }
+        guard let childPID, childPID > 1 else {
+            throw controllerError("detached engine launcher did not report the child pid")
+        }
+
+        let deadline = Date().addingTimeInterval(8)
+        while Date() < deadline {
+            if socketControl.isReachable(socketPath: socketPath, timeoutSeconds: 0.5) {
+                return childPID
+            }
+            if !isProcessRunning(childPID) {
+                throw controllerError(
+                    launchFailureMessage(
+                        prefix: "engine process pid=\(childPID) exited before its socket became reachable",
+                        launchErrorPath: launchErrorPath,
+                        fallback: nil
+                    )
+                )
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+
+        _ = kill(childPID, SIGTERM)
+        throw controllerError(
+            launchFailureMessage(
+                prefix: "engine process pid=\(childPID) did not make socket \(socketPath) reachable within 8 seconds",
+                launchErrorPath: launchErrorPath,
+                fallback: nil
+            )
+        )
+    }
+
+    private func launchFailureMessage(prefix: String, launchErrorPath: String, fallback: String?) -> String {
+        let data = try? Data(contentsOf: URL(fileURLWithPath: launchErrorPath))
+        let tail = data.map { Data($0.suffix(32 * 1024)) }
+        let engineError = tail.flatMap { String(data: $0, encoding: .utf8) }?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let detail = [engineError, fallback]
+            .compactMap { $0 }
+            .first { !$0.isEmpty }
+        return detail.map { "\(prefix): \($0)" } ?? prefix
+    }
+
+    private func shellQuote(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\"'\"'"))'"
     }
 
     /// Prepend standard developer-tool directories to PATH so the engine and its
@@ -589,30 +574,29 @@ final class EngineProcessController: @unchecked Sendable {
         return prefix.isEmpty ? current : "\(prefix):\(current)"
     }
 
-    /// Poll the pid file until a live engine pid appears or `timeoutSeconds`
-    /// elapses. The engine writes this file (and takes the instance flock)
-    /// before opening `state.db`, so a slow WAL/schema open is still visible
-    /// as a live pid. If this wait times out, `enableSupervision` treats a
-    /// missing pid as "engine exited" and will launch a replacement — that
-    /// is the duplicate-engine path this contract exists to avoid.
-    private func waitForEnginePID(timeoutSeconds: TimeInterval) -> pid_t? {
-        let deadline = Date().addingTimeInterval(timeoutSeconds)
-        while Date() < deadline {
-            if let pid = currentEnginePID() {
-                return pid
+    private func discoverRunningEngine() -> RunningEngine? {
+        for endpoint in paths.endpointPaths {
+            guard socketControl.isReachable(socketPath: endpoint.socketPath) else {
+                continue
             }
-            Thread.sleep(forTimeInterval: 0.1)
+            let pid = currentEnginePID(pidPath: endpoint.pidPath)
+                ?? socketControl.peerPID(socketPath: endpoint.socketPath, timeoutSeconds: 1)
+            return RunningEngine(
+                socketPath: endpoint.socketPath,
+                pidPath: endpoint.pidPath,
+                pid: pid
+            )
         }
         return nil
     }
 
-    private func currentEnginePID() -> pid_t? {
-        guard let pid = readPIDFile() else {
+    private func currentEnginePID(pidPath: String) -> pid_t? {
+        guard let pid = readPIDFile(pidPath: pidPath) else {
             return nil
         }
 
         if !isProcessRunning(pid) {
-            clearPIDFileIfOwned(pid: pid)
+            clearPIDFileIfOwned(pid: pid, pidPath: pidPath)
             return nil
         }
 
@@ -624,8 +608,8 @@ final class EngineProcessController: @unchecked Sendable {
         return pid
     }
 
-    private func readPIDFile() -> pid_t? {
-        guard let content = try? String(contentsOfFile: paths.pidPath, encoding: .utf8) else {
+    private func readPIDFile(pidPath: String) -> pid_t? {
+        guard let content = try? String(contentsOfFile: pidPath, encoding: .utf8) else {
             return nil
         }
 
@@ -636,11 +620,11 @@ final class EngineProcessController: @unchecked Sendable {
         return value
     }
 
-    private func clearPIDFileIfOwned(pid: pid_t) {
-        guard let owner = readPIDFile(), owner == pid else {
+    private func clearPIDFileIfOwned(pid: pid_t, pidPath: String) {
+        guard let owner = readPIDFile(pidPath: pidPath), owner == pid else {
             return
         }
-        try? FileManager.default.removeItem(atPath: paths.pidPath)
+        try? FileManager.default.removeItem(atPath: pidPath)
     }
 
     private func isProcessRunning(_ pid: pid_t) -> Bool {
@@ -688,147 +672,84 @@ final class EngineProcessController: @unchecked Sendable {
         return nil
     }
 
-    /// Tear down the running engine. Preferred path is the
-    /// token-authenticated shutdown RPC — same authority the CLI
-    /// uses (issue #705). Falls through to SIGTERM only when the
-    /// token is unavailable, the socket isn't reachable, or the
-    /// engine refused the token; the everyday case never sends
-    /// SIGTERM, so a test that ends up here without a valid token
-    /// is rejected by the engine rather than killing it.
-    private func terminateEngine(pid: pid_t) {
-        guard isProcessRunning(pid) else {
-            return
-        }
-
-        if attemptRpcShutdown() {
-            // Wait for the engine to actually exit before returning so
-            // the caller can `clearPIDFileIfOwned` and then re-spawn
-            // without racing the still-alive process.
-            for _ in 0..<50 {
-                if !isProcessRunning(pid) {
-                    return
+    private func stopRunningEngine(_ running: RunningEngine) throws {
+        var fallbackPID = running.pid
+        var rpcFailure: Error?
+        do {
+            fallbackPID = try socketControl.shutdown(
+                socketPath: running.socketPath,
+                tokenPath: paths.controlTokenPath,
+                timeoutSeconds: 5
+            ) ?? fallbackPID
+            if socketControl.waitForClose(socketPath: running.socketPath, timeoutSeconds: 8) {
+                if let fallbackPID {
+                    clearPIDFileIfOwned(pid: fallbackPID, pidPath: running.pidPath)
                 }
-                Thread.sleep(forTimeInterval: 0.1)
+                return
             }
-            emit("[engine stop] rpc accepted but pid=\(pid) still alive after 5s; falling back to SIGKILL")
-            _ = kill(pid, SIGKILL)
-            return
+            rpcFailure = controllerError(
+                "shutdown RPC was accepted, but socket \(running.socketPath) remained reachable after 8 seconds"
+            )
+        } catch {
+            rpcFailure = error
         }
 
-        emit("[engine stop] rpc shutdown unavailable; falling back to SIGTERM pid=\(pid)")
+        guard let pid = fallbackPID else {
+            throw controllerError(
+                "engine is reachable at \(running.socketPath), but graceful shutdown failed and no pid is available: \(rpcFailure?.localizedDescription ?? "unknown error")"
+            )
+        }
+        guard isProcessRunning(pid), isLikelyEngineProcess(pid) else {
+            throw controllerError(
+                "engine is reachable at \(running.socketPath), but graceful shutdown failed and pid \(pid) is not a running Boss engine: \(rpcFailure?.localizedDescription ?? "unknown error")"
+            )
+        }
+
+        emit("[engine stop] rpc unavailable (\(rpcFailure?.localizedDescription ?? "unknown error")); falling back to SIGTERM pid=\(pid)")
         _ = kill(pid, SIGTERM)
-        for _ in 0..<20 {
+        for _ in 0..<50 {
             if !isProcessRunning(pid) {
-                return
+                break
             }
             Thread.sleep(forTimeInterval: 0.1)
         }
-        _ = kill(pid, SIGKILL)
+        if isProcessRunning(pid) {
+            emit("[engine stop] pid=\(pid) still alive after 5s; sending SIGKILL")
+            _ = kill(pid, SIGKILL)
+        }
+        guard socketControl.waitForClose(socketPath: running.socketPath, timeoutSeconds: 3) else {
+            throw controllerError("engine socket \(running.socketPath) remained reachable after stopping pid=\(pid)")
+        }
+        clearPIDFileIfOwned(pid: pid, pidPath: running.pidPath)
     }
 
-    /// Try the token-authenticated shutdown RPC. Returns `true` when
-    /// the engine acknowledged `ShutdownAccepted`. Any failure
-    /// (no token file, socket unreachable, token rejected, malformed
-    /// reply) returns `false` so the caller can fall back to SIGTERM.
-    private func attemptRpcShutdown() -> Bool {
-        let tokenPath = paths.controlTokenPath
-        guard FileManager.default.fileExists(atPath: tokenPath) else {
-            return false
+    private func describe(_ running: RunningEngine) -> String {
+        if let pid = running.pid {
+            return "pid=\(pid) socket=\(running.socketPath)"
         }
-        guard let raw = try? String(contentsOfFile: tokenPath, encoding: .utf8),
-              let data = raw.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let token = json["token"] as? String
-        else {
-            return false
-        }
-        // Prefer the socket path the engine wrote into the token file
-        // so we always dial whichever process actually minted the
-        // token, even if the env override has since changed.
-        let socketPath = (json["socket_path"] as? String) ?? paths.socketPath
-        return sendShutdownRequest(socketPath: socketPath, token: token, timeoutSeconds: 5.0)
+        return "socket=\(running.socketPath) (pid file absent)"
     }
 
-    /// Open a synchronous Unix-domain connection, send a `shutdown`
-    /// request with the supplied token, and wait for either
-    /// `shutdown_accepted` or `shutdown_rejected`. Returns `true`
-    /// only on `shutdown_accepted`.
-    private func sendShutdownRequest(
-        socketPath: String,
-        token: String,
-        timeoutSeconds: Double
-    ) -> Bool {
-        let sock = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-        guard sock >= 0 else { return false }
-        defer { Darwin.close(sock) }
-
-        var tv = timeval(
-            tv_sec: Int(timeoutSeconds),
-            tv_usec: Int32((timeoutSeconds.truncatingRemainder(dividingBy: 1.0)) * 1_000_000)
+    private func controllerError(_ message: String, code: Int = 1) -> NSError {
+        NSError(
+            domain: "Boss.EngineProcessController",
+            code: code,
+            userInfo: [NSLocalizedDescriptionKey: message]
         )
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+    }
 
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        let sunPathMax = MemoryLayout.size(ofValue: addr.sun_path)
-        _ = socketPath.withCString { cStr in
-            withUnsafeMutablePointer(to: &addr.sun_path) { dst in
-                memcpy(UnsafeMutableRawPointer(dst), cStr, min(strlen(cStr), sunPathMax - 1))
-            }
+    private func reportLaunchFailure(_ error: Error, attempt: Int?) {
+        let message = error.localizedDescription
+        lastLaunchError = message
+        emit("[engine launch] failed: \(message)")
+        supervisionQueue.async { [weak self] in
+            self?.emitSupervisionState(.restartFailed(attempt: attempt, message: message))
         }
-        let connectResult: Int32 = withUnsafePointer(to: addr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.connect(sock, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
-            }
-        }
-        guard connectResult == 0 else { return false }
-
-        let request: [String: Any] = [
-            "request_id": "engine-stop",
-            "payload": [
-                "type": "shutdown",
-                "token": token,
-            ],
-        ]
-        guard let body = try? JSONSerialization.data(withJSONObject: request) else { return false }
-        var line = body
-        line.append(0x0A)
-        let sent = line.withUnsafeBytes { buf in
-            Darwin.send(sock, buf.baseAddress!, buf.count, 0)
-        }
-        guard sent == line.count else { return false }
-
-        var responseBuffer = Data()
-        var readBuf = [UInt8](repeating: 0, count: 4096)
-        outer: while true {
-            let n = Darwin.recv(sock, &readBuf, readBuf.count, 0)
-            if n <= 0 { break }
-            responseBuffer.append(contentsOf: readBuf[..<n])
-            while let newlineIdx = responseBuffer.firstIndex(of: 0x0A) {
-                let lineData = Data(responseBuffer[..<newlineIdx])
-                responseBuffer.removeSubrange(...newlineIdx)
-                guard
-                    let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                    json["request_id"] as? String == "engine-stop",
-                    let payload = json["payload"] as? [String: Any],
-                    let kind = payload["type"] as? String
-                else { continue }
-                if kind == "shutdown_accepted" {
-                    return true
-                }
-                if kind == "shutdown_rejected" {
-                    let reason = (payload["reason"] as? String) ?? "unknown"
-                    emit("[engine stop] shutdown rpc rejected: \(reason)")
-                    return false
-                }
-            }
-            if responseBuffer.count > 256 * 1024 { break outer }
-        }
-        return false
     }
 
     private func withStartLock<T>(_ body: () throws -> T) throws -> T {
+        let lockDirectory = URL(fileURLWithPath: lockFilePath).deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: lockDirectory, withIntermediateDirectories: true)
         let fd = open(lockFilePath, O_CREAT | O_RDWR, 0o600)
         guard fd >= 0 else {
             throw NSError(

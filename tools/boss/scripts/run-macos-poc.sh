@@ -13,7 +13,7 @@ Required environment variables:
 Optional environment variables:
   BOSS_ENGINE_PID_PATH
   BOSS_ENGINE_LOG_PATH
-  BOSS_SOCKET_PATH    Unix socket path (default /tmp/boss-engine.sock).
+  BOSS_SOCKET_PATH    Unix socket path (default: engine.sock under the Boss state root).
   BOSS_ENGINE_FORCE_RESTART   Set 1 to force-stop existing engine before launch.
   BOSS_ENGINE_AUTOSTART
   BOSS_ENGINE_STOP_ON_EXIT    Set 1 to stop engine when app exits.
@@ -58,8 +58,10 @@ done
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../../.." && pwd)"
 
-export BOSS_ENGINE_PID_PATH="${BOSS_ENGINE_PID_PATH:-/tmp/boss-engine.pid}"
-export BOSS_ENGINE_LOG_PATH="${BOSS_ENGINE_LOG_PATH:-/tmp/boss-engine.log}"
+boss_state_root="$HOME/Library"
+boss_state_root="$boss_state_root/Application Support/Boss"
+export BOSS_ENGINE_PID_PATH="${BOSS_ENGINE_PID_PATH:-$boss_state_root/engine.pid}"
+export BOSS_ENGINE_LOG_PATH="${BOSS_ENGINE_LOG_PATH:-$boss_state_root/engine.log}"
 export BOSS_ENGINE_FORCE_RESTART="${BOSS_ENGINE_FORCE_RESTART:-0}"
 export BOSS_ENGINE_STOP_ON_EXIT="${BOSS_ENGINE_STOP_ON_EXIT:-0}"
 export BOSS_SHOW_SYSTEM_MESSAGES="${BOSS_SHOW_SYSTEM_MESSAGES:-0}"

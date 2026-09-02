@@ -5,7 +5,7 @@ pub(crate) use std::process::{Command, ExitCode};
 
 pub(crate) use anyhow::Result;
 pub(crate) use boss_client::{
-    BossClient, Discovery, engine_socket_reachable, ensure_engine_running, running_engine_pid, stop_engine,
+    BossClient, Discovery, EngineStopOutcome, discover_running_engine, ensure_engine_running, stop_engine,
 };
 pub(crate) use boss_protocol::{
     AddDependencyInput, AnswerAgentRun, Attention, AttentionGroup, Automation, AutomationDedupSuppression,

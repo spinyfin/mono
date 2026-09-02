@@ -18,8 +18,8 @@ use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::time::sleep;
 
-pub const DEFAULT_SOCKET_PATH: &str = "/tmp/boss-engine.sock";
-pub const DEFAULT_PID_PATH: &str = "/tmp/boss-engine.pid";
+pub const LEGACY_SOCKET_PATH: &str = "/tmp/boss-engine.sock";
+pub const LEGACY_PID_PATH: &str = "/tmp/boss-engine.pid";
 pub const DEFAULT_ENGINE_START_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
@@ -53,6 +53,9 @@ pub struct EngineResolverInput {
 pub struct Discovery {
     pub socket_path: String,
     pub pid_file_path: String,
+    pub legacy_socket_path: Option<String>,
+    pub legacy_pid_file_path: Option<String>,
+    pub control_token_path: PathBuf,
     pub autostart: bool,
     pub engine: EngineCommand,
     pub launch_directory: PathBuf,
@@ -62,17 +65,44 @@ pub struct Discovery {
 impl Discovery {
     /// Build a discovery profile from process env + an optional `--socket-path` override.
     pub fn from_env(socket_override: Option<&str>) -> Result<Self> {
-        let socket_path = socket_override
+        let explicit_socket = socket_override
             .map(str::to_owned)
-            .or_else(|| std::env::var("BOSS_SOCKET_PATH").ok())
-            .unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_owned());
-        let pid_file_path = std::env::var("BOSS_ENGINE_PID_PATH").unwrap_or_else(|_| DEFAULT_PID_PATH.to_owned());
+            .or_else(|| std::env::var("BOSS_SOCKET_PATH").ok());
+        let (socket_path, legacy_socket_path) = match explicit_socket.as_deref() {
+            Some(path) => (path.to_owned(), None),
+            None => (
+                boss_log_files::default_frontend_socket_path()
+                    .context("HOME must be set to derive the default engine socket path")?
+                    .to_string_lossy()
+                    .into_owned(),
+                Some(LEGACY_SOCKET_PATH.to_owned()),
+            ),
+        };
+        let explicit_pid = std::env::var("BOSS_ENGINE_PID_PATH").ok();
+        let pid_file_path = match explicit_pid {
+            Some(path) => path,
+            None if explicit_socket.is_some() => derived_sibling_path(&socket_path, "pid"),
+            None => boss_log_files::default_engine_pid_path()
+                .context("HOME must be set to derive the default engine pid-file path")?
+                .to_string_lossy()
+                .into_owned(),
+        };
+        let legacy_pid_file_path = explicit_socket.is_none().then(|| LEGACY_PID_PATH.to_owned());
+        let control_token_path = match std::env::var_os("BOSS_ENGINE_CONTROL_TOKEN_PATH") {
+            Some(path) => PathBuf::from(path),
+            None if explicit_socket.is_some() => PathBuf::from(derived_sibling_path(&socket_path, "control-token")),
+            None => default_control_token_path()
+                .context("HOME must be set to derive the default engine-control token path")?,
+        };
         let launch_directory = resolve_launch_directory()?;
         let engine = resolve_engine_command(&socket_path)?;
 
         Ok(Self {
             socket_path,
             pid_file_path,
+            legacy_socket_path,
+            legacy_pid_file_path,
+            control_token_path,
             autostart: true,
             engine,
             launch_directory,
@@ -84,6 +114,37 @@ impl Discovery {
         self.autostart = autostart;
         self
     }
+
+    fn endpoint_candidates(&self) -> Vec<(&str, &str)> {
+        let mut endpoints = vec![(self.socket_path.as_str(), self.pid_file_path.as_str())];
+        if let (Some(socket), Some(pid)) = (&self.legacy_socket_path, &self.legacy_pid_file_path) {
+            endpoints.push((socket.as_str(), pid.as_str()));
+        }
+        endpoints
+    }
+}
+
+fn derived_sibling_path(socket_path: &str, suffix: &str) -> String {
+    let path = Path::new(socket_path);
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path.file_stem().and_then(|value| value.to_str()).unwrap_or("boss-test");
+    directory
+        .join(format!("{stem}.{suffix}"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningEngine {
+    pub socket_path: String,
+    pub pid_file_path: String,
+    pub pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineStopOutcome {
+    Stopped,
+    AlreadyStopped,
 }
 
 /// Single-connection client over the engine's frontend socket.
@@ -96,8 +157,8 @@ pub struct BossClient {
 impl BossClient {
     /// Connect to the engine, optionally autostarting it per the discovery profile.
     pub async fn connect(discovery: &Discovery) -> Result<Self> {
-        if let Ok(client) = Self::connect_socket(&discovery.socket_path).await {
-            return Ok(client);
+        if let Some(running) = discover_running_engine(discovery).await {
+            return Self::connect_socket(&running.socket_path).await;
         }
 
         if !discovery.autostart {
@@ -105,7 +166,10 @@ impl BossClient {
         }
 
         ensure_engine_running(discovery).await?;
-        Self::connect_socket(&discovery.socket_path).await
+        let running = discover_running_engine(discovery)
+            .await
+            .context("engine reported ready but no discovery socket is reachable")?;
+        Self::connect_socket(&running.socket_path).await
     }
 
     /// Connect directly to a socket path without autostart logic.
@@ -172,6 +236,26 @@ pub async fn engine_socket_reachable(socket_path: &str) -> bool {
     UnixStream::connect(socket_path).await.is_ok()
 }
 
+pub async fn discover_running_engine(discovery: &Discovery) -> Option<RunningEngine> {
+    for (socket_path, pid_file_path) in discovery.endpoint_candidates() {
+        let Ok(stream) = UnixStream::connect(socket_path).await else {
+            continue;
+        };
+        let peer_pid = stream
+            .peer_cred()
+            .ok()
+            .and_then(|credentials| credentials.pid())
+            .and_then(|pid| u32::try_from(pid).ok());
+        let pid = running_engine_pid(pid_file_path).or(peer_pid);
+        return Some(RunningEngine {
+            socket_path: socket_path.to_owned(),
+            pid_file_path: pid_file_path.to_owned(),
+            pid,
+        });
+    }
+    None
+}
+
 pub async fn wait_for_socket(socket_path: &str, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
@@ -206,12 +290,16 @@ pub fn read_pid_file(pid_file_path: &str) -> Option<u32> {
 }
 
 pub async fn ensure_engine_running(discovery: &Discovery) -> Result<()> {
-    if engine_socket_reachable(&discovery.socket_path).await {
+    if discover_running_engine(discovery).await.is_some() {
         return Ok(());
     }
 
-    if let Some(pid) = running_engine_pid(&discovery.pid_file_path) {
-        if wait_for_socket(&discovery.socket_path, discovery.start_timeout).await {
+    if let Some((pid, _)) = discovery
+        .endpoint_candidates()
+        .into_iter()
+        .find_map(|(_, pid_path)| running_engine_pid(pid_path).map(|pid| (pid, pid_path)))
+    {
+        if wait_for_discovered_engine(discovery, discovery.start_timeout).await {
             return Ok(());
         }
         bail!(
@@ -221,7 +309,7 @@ pub async fn ensure_engine_running(discovery: &Discovery) -> Result<()> {
     }
 
     start_engine_process(discovery)?;
-    if wait_for_socket(&discovery.socket_path, discovery.start_timeout).await {
+    if wait_for_discovered_engine(discovery, discovery.start_timeout).await {
         return Ok(());
     }
 
@@ -230,6 +318,17 @@ pub async fn ensure_engine_running(discovery: &Discovery) -> Result<()> {
         discovery.socket_path,
         discovery.start_timeout.as_secs()
     )
+}
+
+async fn wait_for_discovered_engine(discovery: &Discovery, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if discover_running_engine(discovery).await.is_some() {
+            return true;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    false
 }
 
 /// Stop the running engine. Preferred path is the token-authenticated
@@ -244,72 +343,91 @@ pub async fn ensure_engine_running(discovery: &Discovery) -> Result<()> {
 /// Async because the RPC path needs to share the caller's tokio
 /// runtime — building a nested runtime here panics with "Cannot
 /// start a runtime from within a runtime" (#720).
-pub async fn stop_engine(pid_file_path: &str) -> Result<()> {
-    let Some(pid) = running_engine_pid(pid_file_path) else {
-        return Ok(());
+pub async fn stop_engine(discovery: &Discovery) -> Result<EngineStopOutcome> {
+    let running = discover_running_engine(discovery).await;
+    let pid_only = discovery
+        .endpoint_candidates()
+        .into_iter()
+        .find_map(|(_, pid_path)| running_engine_pid(pid_path).map(|pid| (pid, pid_path.to_owned())));
+
+    let Some(running) = running else {
+        if let Some((pid, pid_file_path)) = pid_only {
+            if !is_likely_engine_process(pid) {
+                bail!("pid file {pid_file_path} names pid {pid}, which is not a recognized Boss engine");
+            }
+            terminate_pid(pid)?;
+            wait_for_process_exit(pid, Duration::from_secs(8)).await?;
+            clear_pid_file_if_owned(&pid_file_path, pid);
+            return Ok(EngineStopOutcome::Stopped);
+        }
+        return Ok(EngineStopOutcome::AlreadyStopped);
     };
 
-    // Best-effort attempt to take the RPC route. Any failure here
-    // falls through to SIGTERM so the caller's "please make the
-    // engine go away" still works on a host where the token file
-    // never landed.
-    match try_shutdown_via_rpc().await {
+    let rpc_error = match try_shutdown_via_rpc_at(&discovery.control_token_path, Some(&running.socket_path)).await {
         Ok(()) => {
-            if let Some(owner) = read_pid_file(pid_file_path)
-                && owner == pid
-            {
-                let _ = std::fs::remove_file(pid_file_path);
+            if wait_for_socket_close(&running.socket_path, Duration::from_secs(8)).await {
+                if let Some(pid) = running.pid {
+                    clear_pid_file_if_owned(&running.pid_file_path, pid);
+                }
+                return Ok(EngineStopOutcome::Stopped);
             }
-            return Ok(());
+            Some(anyhow::anyhow!(
+                "engine accepted shutdown but socket {} remained reachable after 8 seconds",
+                running.socket_path
+            ))
         }
-        Err(err) => {
-            tracing::debug!(?err, "stop_engine: rpc shutdown unavailable; falling back to SIGTERM",);
-        }
+        Err(err) => Some(err),
+    };
+
+    let Some(pid) = running.pid else {
+        bail!(
+            "engine is reachable at {}, but graceful shutdown failed and no pid is available: {:#}",
+            running.socket_path,
+            rpc_error.expect("rpc error is always recorded")
+        );
+    };
+    if !is_likely_engine_process(pid) {
+        bail!(
+            "engine is reachable at {}, but graceful shutdown failed and socket peer pid {pid} is not a recognized Boss engine: {:#}",
+            running.socket_path,
+            rpc_error.expect("rpc error is always recorded")
+        );
     }
 
-    let status = Command::new("/bin/kill")
-        .args(["-TERM", &pid.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("failed to invoke /bin/kill")?;
-    if !status.success() {
-        bail!("failed to stop boss engine pid {pid}");
+    tracing::warn!(
+        ?rpc_error,
+        pid,
+        socket_path = running.socket_path,
+        "stop_engine: rpc shutdown unavailable; falling back to SIGTERM",
+    );
+    terminate_pid(pid)?;
+    wait_for_process_exit(pid, Duration::from_secs(8)).await?;
+    if !wait_for_socket_close(&running.socket_path, Duration::from_secs(2)).await {
+        bail!(
+            "boss engine pid {pid} exited but socket {} remains reachable",
+            running.socket_path
+        );
     }
-
-    if let Some(owner) = read_pid_file(pid_file_path)
-        && owner == pid
-    {
-        let _ = std::fs::remove_file(pid_file_path);
-    }
-
-    Ok(())
-}
-
-/// Try the token-authenticated shutdown RPC. Returns `Ok(())` when
-/// the engine acknowledged `ShutdownAccepted`. Any failure (no token
-/// file, socket unreachable, token rejected, unexpected response) is
-/// surfaced as an `Err` so the caller can decide whether to fall back.
-///
-/// Async because the caller (e.g. the `#[tokio::main]` CLI dispatch)
-/// already owns a tokio runtime — building a second runtime and
-/// calling `block_on` here panics with "Cannot start a runtime from
-/// within a runtime" (#720).
-async fn try_shutdown_via_rpc() -> Result<()> {
-    let token_path =
-        default_control_token_path().ok_or_else(|| anyhow::anyhow!("could not resolve engine-control token path"))?;
-    try_shutdown_via_rpc_at(&token_path).await
+    clear_pid_file_if_owned(&running.pid_file_path, pid);
+    Ok(EngineStopOutcome::Stopped)
 }
 
 /// Token-path-injected variant of [`try_shutdown_via_rpc`]. Kept
 /// separate so tests can drive the RPC without mutating the global
 /// `BOSS_ENGINE_CONTROL_TOKEN_PATH` env var.
-async fn try_shutdown_via_rpc_at(token_path: &Path) -> Result<()> {
+async fn try_shutdown_via_rpc_at(token_path: &Path, expected_socket_path: Option<&str>) -> Result<()> {
     let raw = std::fs::read_to_string(token_path)
         .with_context(|| format!("failed to read engine-control token file {}", token_path.display()))?;
     let parsed: ControlTokenFile = serde_json::from_str(&raw)
         .with_context(|| format!("malformed engine-control token file {}", token_path.display()))?;
+    if let Some(expected) = expected_socket_path
+        && !same_path(Path::new(&parsed.socket_path), Path::new(expected))
+    {
+        bail!(
+            "engine-control token names socket {}, not the reachable socket {expected}",
+            parsed.socket_path
+        );
+    }
 
     let mut client = BossClient::connect_socket(&parsed.socket_path).await?;
     let event = client
@@ -324,6 +442,92 @@ async fn try_shutdown_via_rpc_at(token_path: &Path) -> Result<()> {
         }
         other => bail!("unexpected response to Shutdown rpc: {:?}", other),
     }
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    left == right
+        || std::fs::canonicalize(left)
+            .ok()
+            .zip(std::fs::canonicalize(right).ok())
+            .is_some_and(|(left, right)| left == right)
+}
+
+async fn wait_for_socket_close(socket_path: &str, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if !engine_socket_reachable(socket_path).await {
+            return true;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    !engine_socket_reachable(socket_path).await
+}
+
+fn terminate_pid(pid: u32) -> Result<()> {
+    let status = Command::new("/bin/kill")
+        .args(["-TERM", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("failed to invoke /bin/kill")?;
+    if !status.success() {
+        bail!("failed to stop boss engine pid {pid}");
+    }
+    Ok(())
+}
+
+async fn wait_for_process_exit(pid: u32, timeout: Duration) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if !process_is_running(pid) {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    bail!(
+        "boss engine pid {pid} did not exit within {} seconds",
+        timeout.as_secs()
+    )
+}
+
+fn process_is_running(pid: u32) -> bool {
+    Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn clear_pid_file_if_owned(pid_file_path: &str, pid: u32) {
+    if read_pid_file(pid_file_path) == Some(pid) {
+        let _ = std::fs::remove_file(pid_file_path);
+    }
+}
+
+fn is_likely_engine_process(pid: u32) -> bool {
+    let Ok(output) = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let command = String::from_utf8_lossy(&output.stdout);
+    is_likely_engine_command(&command)
+}
+
+fn is_likely_engine_command(command: &str) -> bool {
+    let executable_matches = command
+        .split_whitespace()
+        .next()
+        .and_then(|executable| Path::new(executable).file_name())
+        .is_some_and(|name| name == ENGINE_BINARY_NAME);
+    executable_matches || command.contains(BAZEL_ENGINE_RELPATH) || command.contains(ENGINE_BINARY_TARGET)
 }
 
 /// Minimal on-disk view of the engine-control token file. Kept in
@@ -551,6 +755,25 @@ fn format_resolution_chain(attempted: &[String]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn engine_process_validation_matches_engine_executables() {
+        assert!(is_likely_engine_command(
+            "/Applications/Boss.app/Contents/Resources/bin/engine --socket-path /tmp/test.sock"
+        ));
+        assert!(is_likely_engine_command(
+            "/workspace/bazel-bin/tools/boss/engine/core/engine --socket-path /tmp/test.sock"
+        ));
+        assert!(is_likely_engine_command(
+            "bazel run //tools/boss/engine/core:engine -- --socket-path /tmp/test.sock"
+        ));
+    }
+
+    #[test]
+    fn engine_process_validation_rejects_incidental_engine_text() {
+        assert!(!is_likely_engine_command("/usr/bin/python3 search_engine_worker.py"));
+        assert!(!is_likely_engine_command("/usr/local/bin/render-engine-helper --serve"));
+    }
+
     fn make_workspace_with_engine(tmp: &tempfile::TempDir) -> PathBuf {
         let root = tmp.path();
         std::fs::write(root.join("MODULE.bazel"), "module(name = \"test\")\n").unwrap();
@@ -698,12 +921,75 @@ mod tests {
         });
         std::fs::write(&token_path, token_json.to_string()).unwrap();
 
-        let result = try_shutdown_via_rpc_at(&token_path).await;
+        let result = try_shutdown_via_rpc_at(&token_path, None).await;
         let err = result.expect_err("connecting to a non-existent socket must fail");
         let chain = format!("{err:#}");
         assert!(
             chain.contains("failed to connect to engine socket"),
             "expected socket connect failure, got: {chain}",
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_falls_back_to_legacy_socket_without_a_pid_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary_socket = tmp.path().join("state-root.sock");
+        let legacy_socket = tmp.path().join("legacy.sock");
+        let legacy_listener = tokio::net::UnixListener::bind(&legacy_socket).unwrap();
+        let accept = tokio::spawn(async move {
+            let _ = legacy_listener.accept().await;
+        });
+        let discovery = Discovery {
+            socket_path: primary_socket.to_string_lossy().into_owned(),
+            pid_file_path: tmp.path().join("state-root.pid").to_string_lossy().into_owned(),
+            legacy_socket_path: Some(legacy_socket.to_string_lossy().into_owned()),
+            legacy_pid_file_path: Some(tmp.path().join("missing-legacy.pid").to_string_lossy().into_owned()),
+            control_token_path: tmp.path().join("engine-control.token"),
+            autostart: false,
+            engine: EngineCommand {
+                program: "unused".into(),
+                args: Vec::new(),
+                source: "test".into(),
+                attempted: Vec::new(),
+            },
+            launch_directory: tmp.path().to_path_buf(),
+            start_timeout: Duration::from_secs(1),
+        };
+
+        let running = discover_running_engine(&discovery)
+            .await
+            .expect("legacy listener is proof of engine liveness");
+        assert_eq!(running.socket_path, legacy_socket.to_string_lossy());
+        assert!(
+            running.pid.is_some(),
+            "peer credentials supply a pid when the pid file is absent"
+        );
+        accept.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_reports_when_no_engine_was_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let discovery = Discovery {
+            socket_path: tmp.path().join("missing.sock").to_string_lossy().into_owned(),
+            pid_file_path: tmp.path().join("missing.pid").to_string_lossy().into_owned(),
+            legacy_socket_path: None,
+            legacy_pid_file_path: None,
+            control_token_path: tmp.path().join("missing.token"),
+            autostart: false,
+            engine: EngineCommand {
+                program: "unused".into(),
+                args: Vec::new(),
+                source: "test".into(),
+                attempted: Vec::new(),
+            },
+            launch_directory: tmp.path().to_path_buf(),
+            start_timeout: Duration::from_secs(1),
+        };
+
+        assert_eq!(
+            stop_engine(&discovery).await.unwrap(),
+            EngineStopOutcome::AlreadyStopped
         );
     }
 

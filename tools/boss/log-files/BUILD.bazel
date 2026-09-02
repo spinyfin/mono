@@ -12,6 +12,7 @@ rust_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/bossctl:__pkg__",
+        "//tools/boss/client:__pkg__",
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/dispatch-events:__pkg__",
         "//tools/boss/engine/dispatch-reader:__pkg__",
