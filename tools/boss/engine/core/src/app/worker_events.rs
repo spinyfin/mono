@@ -1780,7 +1780,8 @@ const MID_TURN_PROBE_VERIFY_TIMEOUT: Duration = Duration::from_secs(6);
 /// the turn it is in. That records `ProbeDeliveryState::Buffered` and needs
 /// no escalation — the worker's reply at the next turn boundary is the
 /// end-to-end confirmation, and `dispatch_probe_reply_on_stop` already
-/// captures it.
+/// captures it. A folding driver that *does* submit inside that window
+/// still waits for the hook and comes back [`PaneInjectOutcome::Confirmed`].
 ///
 /// On a genuinely *unconfirmed* write (parked worker, nothing observed), the
 /// corrected understanding of the probe-6 incident (2026-07-13) is that the
@@ -1930,9 +1931,14 @@ async fn inject_probe_mid_turn(
             ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Consumed)
         }
         PaneInjectOutcome::PaneEcho => {
-            // A capture-pane match can only prove that our paste remains on
-            // screen. Preserve it as an unconfirmed write and run the
-            // liveness checks that prevent a dead pane from looking delivered.
+            // Defensive: `inject_probe_mid_turn` is reached from PostToolUse
+            // and from the mid-turn branch of `dispatch_probe_now`, and a
+            // MidTurnBuffered posture never yields PaneEcho. This arm fires
+            // when that PostToolUse resolved Parked because the worker had
+            // already gone idle. A capture-pane match can only prove that
+            // our paste remains on screen. Preserve it as an unconfirmed
+            // write and run the liveness checks that prevent a dead pane
+            // from looking delivered.
             let state = record_pane_write_outcome(
                 server_state,
                 run_id,

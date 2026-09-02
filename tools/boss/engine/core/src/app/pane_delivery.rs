@@ -449,9 +449,12 @@ impl ServerState {
     }
 
     /// Write `req.text` into `req.run_id`'s worker pane (`req.slot_id`) and
-    /// wait up to `req.verify_timeout` for confirmation that the CLI actually
-    /// enqueued it as the next prompt, rather than merely accepting the
-    /// pty write.
+    /// wait up to `req.verify_timeout` for a consumption signal: a matching
+    /// `UserPromptSubmit` hook, or (since that hook firing for pane-injected
+    /// text has never been validated end-to-end) a scan of the worker's
+    /// session transcript. Only those two reads confirm that the CLI
+    /// enqueued the write as a prompt rather than merely accepting the pty
+    /// bytes.
     ///
     /// **Posture guard (first):** `req.posture` must have been resolved by the
     /// caller via [`Self::pane_input_posture_for_run`]. A
@@ -460,17 +463,21 @@ impl ServerState {
     /// pty — this is the safety guard for foreground processes that do not
     /// consume mid-turn stdin.
     ///
-    /// **Confirmation (when the guard passes):** a matching
-    /// `UserPromptSubmit` hook, the injected text becoming visible in the
-    /// pane itself, or (since the hook firing for pane-injected text has
-    /// never been validated end-to-end) a scan of the worker's session
-    /// transcript. Three independent reads of the same fact, so a gap in
-    /// one signal doesn't by itself produce a false "unconfirmed".
+    /// A tmux capture match is **not** confirmation. It yields
+    /// [`PaneInjectOutcome::PaneEcho`]: an echo of the engine's own paste,
+    /// which callers must run through the same liveness checks as
+    /// [`PaneInjectOutcome::Unconfirmed`]. Pane echo is never observed for a
+    /// [`PaneInputPosture::MidTurnBuffered`] posture — composer text is the
+    /// expected Buffered shape there, and the pane future is gated off so a
+    /// capture cannot outrank it. The hook wait still runs for every
+    /// injectable posture, including mid-turn, so a folding driver that
+    /// submits inside the verification window is recorded Confirmed.
     ///
-    /// When none of those confirms in time the result depends on the
-    /// posture, because "no prompt submitted yet" means different things in
-    /// each: a [`PaneInputPosture::Parked`] worker should have submitted
-    /// immediately, so that is [`PaneInjectOutcome::Unconfirmed`]; a
+    /// When neither the hook nor the transcript confirms in time the result
+    /// depends on the posture, because "no prompt submitted yet" means
+    /// different things in each: a [`PaneInputPosture::Parked`] worker
+    /// should have submitted immediately, so that is
+    /// [`PaneInjectOutcome::Unconfirmed`]; a
     /// [`PaneInputPosture::MidTurnBuffered`] worker is still finishing its
     /// turn and is *expected* not to have submitted yet, so that is
     /// [`PaneInjectOutcome::Buffered`]. Neither is an error, and neither is
@@ -539,40 +546,44 @@ impl ServerState {
         // A pane capture sees our own paste as well as anything the worker
         // renders, so it is only an echo signal. It is useful for a parked
         // worker, but mid-turn composer text is the expected Buffered shape
-        // and must never outrank that state.
+        // and must never outrank that state. The hook wait still runs for
+        // every posture (a folding driver can submit inside this window);
+        // only the pane future is gated off when mid-turn.
         enum Evidence {
             Hook,
             PaneEcho,
         }
-        let evidence = if posture.is_mid_turn() {
-            None
-        } else {
-            let mut pane_visible = std::pin::pin!(self.wait_until_pane_shows_text(run_id, normalized_text));
-            Some(
-                timeout(verify_timeout, async {
-                    tokio::select! {
-                        biased;
-                        result = waiter => {
-                            if result.is_ok() {
-                                Evidence::Hook
-                            } else {
-                                // A dropped hook sender is not evidence against
-                                // the independent pane poll; keep waiting for it.
-                                pane_visible.as_mut().await;
-                                Evidence::PaneEcho
-                            }
-                        },
-                        () = pane_visible.as_mut() => Evidence::PaneEcho,
+        let wait_pane = !posture.is_mid_turn();
+        let mut pane_visible = std::pin::pin!(async {
+            if wait_pane {
+                self.wait_until_pane_shows_text(run_id, normalized_text).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        });
+        let evidence = timeout(verify_timeout, async {
+            tokio::select! {
+                biased;
+                result = waiter => {
+                    if result.is_ok() {
+                        Evidence::Hook
+                    } else {
+                        // A dropped hook sender is not evidence against
+                        // the independent pane poll; keep waiting for it.
+                        // Mid-turn parks here until the outer timeout.
+                        pane_visible.as_mut().await;
+                        Evidence::PaneEcho
                     }
-                })
-                .await,
-            )
-        };
+                },
+                () = pane_visible.as_mut() => Evidence::PaneEcho,
+            }
+        })
+        .await;
         self.take_delivery_waiter(run_id, token);
         match evidence {
-            Some(Ok(Evidence::Hook)) => PaneInjectOutcome::Confirmed,
-            Some(Ok(Evidence::PaneEcho)) => PaneInjectOutcome::PaneEcho,
-            None | Some(Err(_)) => {
+            Ok(Evidence::Hook) => PaneInjectOutcome::Confirmed,
+            Ok(Evidence::PaneEcho) => PaneInjectOutcome::PaneEcho,
+            Err(_) => {
                 if let Some(path) = transcript_path
                     && transcript_shows_text(path, offset_bytes, normalized_text).await
                 {
@@ -904,12 +915,53 @@ mod tests {
                     .slot_id(45)
                     .text("injected text")
                     .offset_bytes(0)
-                    .verify_timeout(Duration::ZERO)
+                    .verify_timeout(Duration::from_millis(80))
                     .posture(PaneInputPosture::MidTurnBuffered)
                     .build(),
             )
             .await;
         assert!(matches!(outcome, PaneInjectOutcome::Buffered));
+    }
+
+    #[tokio::test]
+    async fn mid_turn_injection_is_confirmed_when_the_hook_fires() {
+        let (server_state, _dir) = test_server_state();
+        let run_id = "mid-turn-hook";
+        register_idle_worker(&server_state, run_id, 46);
+        tmux_pane(&server_state, run_id, 46, capture_output(true, "injected text"));
+
+        let inject = {
+            let server_state = Arc::clone(&server_state);
+            tokio::spawn(async move {
+                server_state
+                    .inject_pane_text_verified(
+                        PaneInjectRequest::builder()
+                            .run_id(run_id)
+                            .slot_id(46)
+                            .text("injected text")
+                            .offset_bytes(0)
+                            .verify_timeout(Duration::from_secs(1))
+                            .posture(PaneInputPosture::MidTurnBuffered)
+                            .build(),
+                    )
+                    .await
+            })
+        };
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            server_state.resolve_delivery_waiter(run_id, "injected text");
+            if inject.is_finished() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "mid-turn injection never finished after resolving the delivery waiter"
+            );
+            tokio::task::yield_now().await;
+        }
+        let outcome = inject.await.expect("inject task");
+        assert!(matches!(outcome, PaneInjectOutcome::Confirmed));
     }
 
     #[tokio::test]

@@ -210,13 +210,16 @@ impl ServerState {
     /// that an unconfirmed write is *not* proof of loss — the text may
     /// still have reached the worker through a channel this engine
     /// can't yet observe. So on
-    /// [`PaneInjectOutcome::Unconfirmed`] this does **not** fall back
+    /// [`PaneInjectOutcome::Unconfirmed`] and
+    /// [`PaneInjectOutcome::PaneEcho`] this does **not** fall back
     /// to `queue_probe`: doing so risks delivering the same notice to
     /// the worker a second time at its next `Stop` boundary, which is
     /// exactly the duplicate-delivery outcome the corrected spec warns
-    /// against. Instead it returns success (the write did reach the
-    /// pane) and leaves the unconfirmed state observable via the
-    /// probe/lifecycle machinery rather than silently retrying.
+    /// against. Pane echo is only the engine's own paste on screen, not
+    /// consumption; it is logged as such and treated with the same
+    /// do-not-redeliver rule. Instead this returns success (the write
+    /// did reach the pane) and leaves the unverified state observable
+    /// via the probe/lifecycle machinery rather than silently retrying.
     pub async fn send_input_to_worker(&self, run_id: &str, text: String) -> Result<u8, SendInputError> {
         let Some(slot_id) = self.worker_registry.slot_for_run(run_id) else {
             return Err(SendInputError::UnknownRun);
@@ -238,7 +241,15 @@ impl ServerState {
             .await
         {
             PaneInjectOutcome::Confirmed => Ok(slot_id),
-            PaneInjectOutcome::PaneEcho => Ok(slot_id),
+            PaneInjectOutcome::PaneEcho => {
+                tracing::info!(
+                    run_id,
+                    slot_id,
+                    "send_input_to_worker: pane echo observed (engine paste visible in capture); \
+                     consumption is unconfirmed — not re-queuing as a probe",
+                );
+                Ok(slot_id)
+            }
             PaneInjectOutcome::Buffered => {
                 tracing::info!(
                     run_id,
