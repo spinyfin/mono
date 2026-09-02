@@ -238,7 +238,7 @@ pub async fn on_conflict_detected_with(
         _ => {}
     }
 
-    // T2381/PR#1861 fix: before attempting the normal `in_review` → `blocked`
+    // PR#1861 fix: before attempting the normal `in_review` → `blocked`
     // flip below, check whether this row is already stuck in a FOREIGN
     // watcher's bucket with the live probe now reporting CONFLICTING. A row
     // another watcher flipped to `blocked: <reason>` and never returned to
@@ -271,7 +271,7 @@ pub async fn on_conflict_detected_with(
             // `polymorphic_clear_each_signal_independent_when_both_active`),
             // conflict detection is already independently tracked and must
             // not collapse it into a scalar takeover; leave that case to the
-            // normal re-arm path below. The genuine T2381/PR#1861 orphan has
+            // normal re-arm path below. The genuine PR#1861 orphan has
             // no `merge_conflict` signal at all — only ci_watch ever touched
             // this row — so the takeover applies cleanly there.
             if !take_over_foreign_ci_block(work_db, candidate, &reason) {
@@ -667,7 +667,7 @@ pub async fn on_conflict_detected_with(
     // slot it never took over.
     crate::trunk_merge::mark_trunk_intent_superseded_by_conflict(work_db, &candidate.work_item_id);
 
-    // T2381/PR#1861 fix: design §Q1 says conflict pre-empts CI — but only
+    // PR#1861 fix: design §Q1 says conflict pre-empts CI — but only
     // the CI side of that rule was enforced (`on_ci_failure_detected` defers
     // to an active `conflict_resolutions` attempt). Whenever conflict_watch
     // is genuinely proceeding to own this PR (fresh flip, foreign-bucket
@@ -902,7 +902,7 @@ pub async fn on_conflict_detected_with(
                 // lockfile resolver) is not attempted this dispatch at all.
                 // This used to be a debug-only line, invisible in the
                 // production trace and therefore unfalsifiable from the
-                // outside (spinyfin/mono#2032, chore T2680): promote to INFO
+                // outside (spinyfin/mono#2032): promote to INFO
                 // with the canonical routing-verdict line so "why no rung
                 // activity for this PR?" is always answerable.
                 tracing::info!(
@@ -1055,7 +1055,7 @@ fn supersede_if_stale(
     }
     // base_sha_changed is true when the PR's base (main) has also advanced
     // since this crz was created — the realistic path for crz rows that sat
-    // pending for hours (T1764). In that case the stale row's UNIQUE key
+    // pending for hours. In that case the stale row's UNIQUE key
     // (work_item_id, base_sha_at_trigger) differs from the fresh row's, so a
     // plain abandon is safe. When base SHA is unchanged (same-base head-move,
     // terminal-revision, or dead-revision-with-no-head-move), we must also
@@ -1188,7 +1188,7 @@ fn supersede_stale_ci_remediation(work_db: &WorkDb, candidate: &PendingMergeChec
     );
 }
 
-/// Foreign-bucket takeover (T2381/PR#1861 fix): re-bucket a row that is
+/// Foreign-bucket takeover (PR#1861 fix): re-bucket a row that is
 /// currently `blocked: ci_failure` (or `ci_failure_exhausted`) into
 /// `blocked: merge_conflict` because the live probe now reports CONFLICTING.
 ///
@@ -1308,7 +1308,7 @@ pub(crate) async fn spawn_conflict_revision_after_ladder(
 /// abandoned). The caller uses this to decide whether to flip the parent
 /// back to `in_review` or leave it `blocked: merge_conflict`.
 ///
-/// `use_small_agent_profile` selects rung 2 (T6) — a bounded residue rung 1
+/// `use_small_agent_profile` selects rung 2 — a bounded residue rung 1
 /// left behind gets `effort_level = trivial` (the escalation ladder's small,
 /// cheap, focused-agent profile) instead of the default effort resolution.
 /// `trivial` — not `small` — is deliberate: `default_revision_effort_level`
@@ -1404,7 +1404,7 @@ async fn maybe_spawn_conflict_revision(
         }
     }
 
-    // Rung 2 (T6): stamp the rung before the revision has actually run, so
+    // Rung 2: stamp the rung before the revision has actually run, so
     // `mark_conflict_resolution_succeeded`'s default-to-rung-3 `COALESCE`
     // preserves this instead of overwriting it later.
     if use_small_agent_profile

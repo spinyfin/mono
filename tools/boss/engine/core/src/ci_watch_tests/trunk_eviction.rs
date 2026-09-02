@@ -765,6 +765,35 @@ async fn head_check_eviction_mints_for_a_direct_product() {
         .expect("attempt");
     assert_eq!(attempt.failure_kind.as_deref(), Some("trunk_queue_eviction"));
     assert!(attempt.head_sha_at_trigger.contains("check:head-check-sha"));
+    assert_eq!(
+        attempt.failed_checks, "[]",
+        "Trunk's own bookkeeping check is the trigger, not evidence of a construction failure"
+    );
+    let revision = db
+        .get_work_item(attempt.revision_task_id.as_deref().expect("revision stamped"))
+        .unwrap();
+    let WorkItem::Task(rev) = revision else {
+        panic!("expected revision task");
+    };
+    assert_eq!(rev.description, "Investigate merge-queue rejection");
+}
+
+/// A PR labelled with the opt-out label is skipped, not minted.
+#[tokio::test]
+async fn head_check_eviction_honors_pr_labels_opt_out() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/1510";
+    let (product, chore) = make_in_review(&db, "C-head-check-opt-out", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    let mut probe = head_check_probe(pr, OpenPrCiStatus::Clean);
+    probe.labels = vec!["boss/no-auto-rebase".to_owned()];
+
+    let minted =
+        on_trunk_head_check_eviction_detected(&db, pub_.as_ref(), &candidate(&product, &chore, pr), &probe).await;
+    assert!(!minted);
+    assert!(db.active_ci_remediation_for_work_item(&chore).unwrap().is_none());
 }
 
 /// In-flight PR-head checks are waiting, not a stuck queue rejection.

@@ -1800,11 +1800,13 @@ async fn handle_trunk_queue_eviction(
         None => {
             // Bot comment is consulted only when Trunk's structured
             // readiness did *not* report a vs-base conflict. "could not
-            // start testing" / "merge conflict" here is a sibling-in-queue
-            // rejection: GitHub still says MERGEABLE vs main, so
-            // conflict_watch will never fire. Mint a queue-rejection
-            // revision (TestFailure arm) rather than handing to a lane
-            // that keys on mergeable=CONFLICTING.
+            // start testing" / "merge conflict" here is not itself
+            // decisive: it can mean a genuine vs-base conflict Trunk's
+            // readiness payload missed, or a sibling-in-queue rejection
+            // where GitHub still says MERGEABLE vs main. Below, GitHub's
+            // own last-known mergeability (not Trunk's readiness) decides
+            // between the conflict lane and minting a queue-rejection
+            // revision (TestFailure arm).
             let bot_marker = evidence
                 .newest_trunk_bot_comment(&member.intent.repo, member.intent.pr_number)
                 .await
