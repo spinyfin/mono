@@ -360,24 +360,34 @@ extension StructuredText.ParagraphStyle where Self == BossParagraphStyle {
 
 // MARK: - List item
 
+/// Textual uses this alignment internally for its default list-item row. Keep
+/// the same first-line centering while owning the row layout needed to keep a
+/// marker from contributing vertical height.
+private enum BossFirstTextCenterAlignment: AlignmentID {
+    static func defaultValue(in context: ViewDimensions) -> CGFloat {
+        let firstLineHeight = context.height - (context[.lastTextBaseline] - context[.firstTextBaseline])
+        return firstLineHeight / 2
+    }
+}
+
+private extension VerticalAlignment {
+    static let bossFirstTextCenter = Self(BossFirstTextCenterAlignment.self)
+}
+
 struct BossListItemStyle: StructuredText.ListItemStyle {
     let editorial: Bool
 
-    // Delegates to `StructuredText.DefaultListItemStyle` (Textual 0.3.1)
-    // rather than inlining it, unlike the paragraph/thematic-break styles
-    // elsewhere in this file — its body reads a private
-    // `WithFontScaledValue` helper that isn't part of the module's public
-    // surface. `ListItemStyle` refines
-    // `DynamicProperty`, so constructing the style and calling
-    // `makeBody(configuration:)` on it directly (as here) skips installing
-    // its dynamic-property storage; this is a no-op today only because
-    // `DefaultListItemStyle` is stateless at the pinned revision. Re-check
-    // this delegation on any Textual upgrade.
+    // Textual's default style puts the marker and the block directly in an
+    // HStack. Although the marker is visually smaller than body text, its
+    // image/text layout box can still make the first line taller than wrapped
+    // continuation lines. Give it a zero-height layout frame instead: SwiftUI
+    // does not clip the marker, so its glyph and its font-scaled horizontal
+    // width remain unchanged, while the block is the sole source of line
+    // height. This applies equally to unordered, ordered, and nested lists.
     @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
         if editorial {
-            StructuredText.DefaultListItemStyle.default
-                .makeBody(configuration: configuration)
+            listRow(configuration: configuration)
                 // fontScale innermost, `.font` outside it — see the matching
                 // comment in BossParagraphStyle.makeBody.
                 .textual.fontScale(MarkdownEditorialMetrics.bodyScale)
@@ -385,9 +395,20 @@ struct BossListItemStyle: StructuredText.ListItemStyle {
                 .foregroundStyle(BossMarkdownPalette.ink)
                 .proseMeasureClamped()
         } else {
-            StructuredText.DefaultListItemStyle.default
-                .makeBody(configuration: configuration)
+            listRow(configuration: configuration)
                 .proseMeasureClamped()
+        }
+    }
+
+    @MainActor
+    private func listRow(configuration: Configuration) -> some View {
+        HStack(alignment: .bossFirstTextCenter, spacing: 0) {
+            configuration.marker
+                .frame(height: 0)
+                // Matches Textual's default `markerSpacing: .fontScaled(0.5)`
+                // without depending on its internal `WithFontScaledValue`.
+                .textual.padding(.trailing, .fontScaled(0.5))
+            configuration.block
         }
     }
 }
