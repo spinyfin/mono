@@ -44,6 +44,12 @@ pub const REMOTE_SLOT_BASE: u8 = boss_protocol::REMOTE_SLOT_BASE;
 #[derive(Clone, Default)]
 pub struct WorkerRegistry {
     inner: Arc<Mutex<RegistryInner>>,
+    /// Holds the machine-wide idle-sleep-prevention assertion for exactly
+    /// as long as at least one *local* worker pane (slot id below
+    /// [`REMOTE_SLOT_BASE`]) is registered. See
+    /// [`crate::sleep_assertion::SleepAssertionController`] for why remote
+    /// workers — which run on a different machine — must never count here.
+    sleep_assertion: Arc<crate::sleep_assertion::SleepAssertionController>,
 }
 
 #[derive(Default)]
@@ -84,27 +90,37 @@ impl WorkerRegistry {
     /// `run_id` in. The engine uses this to route follow-up
     /// `SendToPane` requests by run id.
     pub fn register_run_slot(&self, run_id: impl Into<String>, slot_id: u8) {
-        self.inner.lock().expect("registry poisoned").run_to_slot.insert(
-            run_id.into(),
-            RegisteredWorkerPane {
-                slot_id,
-                tmux_hosted: false,
-                tmux_session_name: None,
-            },
-        );
+        let count = {
+            let mut inner = self.inner.lock().expect("registry poisoned");
+            inner.run_to_slot.insert(
+                run_id.into(),
+                RegisteredWorkerPane {
+                    slot_id,
+                    tmux_hosted: false,
+                    tmux_session_name: None,
+                },
+            );
+            local_live_pane_count(&inner)
+        };
+        self.sleep_assertion.set_live_worker_panes(count);
     }
 
     /// Record a tmux-hosted worker whose app surface must detach without
     /// signalling the independently-owned tmux session.
     pub fn register_tmux_run_slot(&self, run_id: impl Into<String>, slot_id: u8, session_name: impl Into<String>) {
-        self.inner.lock().expect("registry poisoned").run_to_slot.insert(
-            run_id.into(),
-            RegisteredWorkerPane {
-                slot_id,
-                tmux_hosted: true,
-                tmux_session_name: Some(session_name.into()),
-            },
-        );
+        let count = {
+            let mut inner = self.inner.lock().expect("registry poisoned");
+            inner.run_to_slot.insert(
+                run_id.into(),
+                RegisteredWorkerPane {
+                    slot_id,
+                    tmux_hosted: true,
+                    tmux_session_name: Some(session_name.into()),
+                },
+            );
+            local_live_pane_count(&inner)
+        };
+        self.sleep_assertion.set_live_worker_panes(count);
     }
 
     /// Record an adopted tmux session while preserving legacy teardown and
@@ -115,26 +131,36 @@ impl WorkerRegistry {
         slot_id: u8,
         session_name: impl Into<String>,
     ) {
-        self.inner.lock().expect("registry poisoned").run_to_slot.insert(
-            run_id.into(),
-            RegisteredWorkerPane {
-                slot_id,
-                tmux_hosted: false,
-                tmux_session_name: Some(session_name.into()),
-            },
-        );
+        let count = {
+            let mut inner = self.inner.lock().expect("registry poisoned");
+            inner.run_to_slot.insert(
+                run_id.into(),
+                RegisteredWorkerPane {
+                    slot_id,
+                    tmux_hosted: false,
+                    tmux_session_name: Some(session_name.into()),
+                },
+            );
+            local_live_pane_count(&inner)
+        };
+        self.sleep_assertion.set_live_worker_panes(count);
     }
 
     #[cfg(test)]
     pub fn register_tmux_run_slot_without_session_for_test(&self, run_id: impl Into<String>, slot_id: u8) {
-        self.inner.lock().expect("registry poisoned").run_to_slot.insert(
-            run_id.into(),
-            RegisteredWorkerPane {
-                slot_id,
-                tmux_hosted: true,
-                tmux_session_name: None,
-            },
-        );
+        let count = {
+            let mut inner = self.inner.lock().expect("registry poisoned");
+            inner.run_to_slot.insert(
+                run_id.into(),
+                RegisteredWorkerPane {
+                    slot_id,
+                    tmux_hosted: true,
+                    tmux_session_name: None,
+                },
+            );
+            local_live_pane_count(&inner)
+        };
+        self.sleep_assertion.set_live_worker_panes(count);
     }
 
     /// Look up the slot id for `run_id`. Returns `None` if the run
@@ -211,17 +237,27 @@ impl WorkerRegistry {
     /// Cleanup uses the hosting mode to choose detach for tmux-owned workers
     /// and release for legacy app-owned processes.
     pub fn take_worker_pane_for_run(&self, run_id: &str) -> Option<RegisteredWorkerPane> {
-        self.inner.lock().expect("registry poisoned").run_to_slot.remove(run_id)
+        let (pane, count) = {
+            let mut inner = self.inner.lock().expect("registry poisoned");
+            let pane = inner.run_to_slot.remove(run_id);
+            (pane, local_live_pane_count(&inner))
+        };
+        self.sleep_assertion.set_live_worker_panes(count);
+        pane
     }
 
     /// Drop the entry for `pid`. Called when a run terminates and the
     /// worker process exits.
     pub fn unregister(&self, pid: libc::pid_t) -> Option<String> {
-        let mut inner = self.inner.lock().expect("registry poisoned");
-        let run_id = inner.pid_to_run.remove(&pid);
-        if let Some(rid) = run_id.as_deref() {
-            inner.run_to_slot.remove(rid);
-        }
+        let (run_id, count) = {
+            let mut inner = self.inner.lock().expect("registry poisoned");
+            let run_id = inner.pid_to_run.remove(&pid);
+            if let Some(rid) = run_id.as_deref() {
+                inner.run_to_slot.remove(rid);
+            }
+            (run_id, local_live_pane_count(&inner))
+        };
+        self.sleep_assertion.set_live_worker_panes(count);
         run_id
     }
 
@@ -274,6 +310,20 @@ impl WorkerRegistry {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+/// Count of registered panes hosted on *this* machine — every slot below
+/// [`REMOTE_SLOT_BASE`]. A remote worker (see
+/// [`WorkerRegistry::get_or_allocate_remote_slot`]) runs on a different
+/// host entirely, so it must never contribute to the local idle-sleep
+/// assertion: this machine keeping itself awake does nothing for a worker
+/// that isn't running on it.
+fn local_live_pane_count(inner: &RegistryInner) -> u32 {
+    inner
+        .run_to_slot
+        .values()
+        .filter(|pane| pane.slot_id < REMOTE_SLOT_BASE)
+        .count() as u32
 }
 
 /// Look up the parent pid of `pid` via macOS `proc_pidinfo`. Returns
