@@ -746,6 +746,11 @@ impl WorkDb {
         // independent of every other table.
         migrate_pr_review_verdicts_table(conn)?;
         migrate_stamp_pr_review_verdicts_since(conn)?;
+        // `pr_review_batches` / `pr_review_batch_members`: immutable review
+        // target/profile snapshots and role-specific attempts. The tables are
+        // persistence-only at this stage; dispatch still uses legacy review
+        // orchestration until the batch reconciler lands.
+        migrate_pr_review_batches_tables(conn)?;
         // One-time backfill: auto-resolve `pr_review_died_without_findings`
         // attentions already followed by a later completed review pass —
         // data-only, no schema change; self-idempotent.
@@ -967,6 +972,19 @@ mod tests {
         assert!(
             pr_review_verdicts_exists,
             "expected pr_review_verdicts table from migrate_pr_review_verdicts_table"
+        );
+
+        let pr_review_batches_exist: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name IN ('pr_review_batches', 'pr_review_batch_members')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pr_review_batches_exist, 2,
+            "expected both review-batch tables from migrate_pr_review_batches_tables"
         );
 
         let verdicts_since_exists: bool = conn

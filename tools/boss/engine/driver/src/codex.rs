@@ -27,7 +27,7 @@ use boss_engine_codex_hook_trust::{
 use boss_engine_codex_rollout::flatten_tool_output_text;
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::{FallbackCandidate, json_object_candidates};
-use boss_protocol::{EffortLevel, NormalizeError, PaneMonitorSpec, ReasoningMode, WorkerEvent};
+use boss_protocol::{EffortLevel, NormalizeError, PaneMonitorSpec, ReasoningMode, ReviewModelTier, WorkerEvent};
 use boss_ssh_transport::shell_quote;
 use serde::{Deserialize, Serialize};
 
@@ -196,6 +196,17 @@ fn codex_model_for_reasoning(reasoning: ReasoningMode) -> &'static str {
     }
 }
 
+/// Concrete model mapping for metadata-derived review tiers. The Luna → Terra
+/// → Sol progression is review-only and does not infer anything from task
+/// effort or reasoning.
+fn codex_review_model_for_tier(tier: ReviewModelTier) -> &'static str {
+    match tier {
+        ReviewModelTier::Fast => "gpt-5.6-luna",
+        ReviewModelTier::Balanced => "gpt-5.6-terra",
+        ReviewModelTier::Strong => "gpt-5.6-sol",
+    }
+}
+
 /// Legacy size-derived table. Consulted only for rows with no
 /// [`ReasoningMode`]. Keeps untagged rows on the frontier default rather than
 /// inventing a size→model progression Codex has not validated.
@@ -244,6 +255,7 @@ static CODEX_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
         effort_value_for_level: codex_effort_value_for_level,
         default_model_for_level: codex_default_model_for_level,
         model_for_reasoning: codex_model_for_reasoning,
+        review_model_for_tier: codex_review_model_for_tier,
         prompt_addendum_for_level: codex_prompt_addendum_for_level,
         model_requires_auto_permissions: codex_model_requires_auto_permissions,
         model_belongs_to_driver: codex_model_belongs_to_driver,

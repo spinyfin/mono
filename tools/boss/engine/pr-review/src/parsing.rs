@@ -3,8 +3,190 @@
 //! [`extract_review_result_verbose`], and [`passes_severity_gate`].
 
 use boss_engine_structured_output::fallback::{FallbackCandidate, json_object_candidates};
+use boss_protocol::{
+    ReviewClassification, ReviewComplexityFlag, ReviewLanguageBucket, ReviewMetadataField, ReviewProfile,
+};
 
 use crate::types::*;
+
+/// PR metadata used for review-profile selection.
+///
+/// The inputs deliberately contain only immutable GitHub diff metadata: the
+/// classifier has no task-effort, driver, or database dependency. A missing
+/// field is retained in the resulting [`ReviewClassification`] and selects
+/// the conservative Standard profile.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrReviewMetadata {
+    pub additions: Option<i64>,
+    pub changed_files: Option<Vec<String>>,
+    pub deletions: Option<i64>,
+}
+
+/// Classify immutable PR metadata into a review profile and audit snapshot.
+///
+/// The thresholds and lexical path rules implement the initial policy in
+/// `docs/designs/multi-agent-code-review.md`. This function is pure so the
+/// batch creator can compute the profile once, persist its complete input,
+/// and reuse that immutable choice for every member.
+pub fn classify_pr_review_metadata(metadata: &PrReviewMetadata) -> ReviewClassification {
+    let mut metadata_missing = Vec::new();
+    if metadata.additions.is_none() {
+        metadata_missing.push(ReviewMetadataField::Additions);
+    }
+    if metadata.deletions.is_none() {
+        metadata_missing.push(ReviewMetadataField::Deletions);
+    }
+    if metadata.changed_files.is_none() {
+        metadata_missing.push(ReviewMetadataField::ChangedFiles);
+    }
+
+    let changed_files = metadata.changed_files.clone().unwrap_or_default();
+    let subsystem_buckets = sorted_unique(changed_files.iter().map(|path| subsystem_bucket(path)));
+    let production_languages = sorted_unique(changed_files.iter().filter_map(|path| production_language(path)));
+    let complexity_flags = complexity_flags(&changed_files);
+    let has_production_code = !production_languages.is_empty();
+    let docs_or_test_only = !changed_files.is_empty() && changed_files.iter().all(|path| is_docs_or_test_file(path));
+
+    let profile = if !metadata_missing.is_empty() {
+        ReviewProfile::Standard
+    } else {
+        let changed_lines = metadata.additions.unwrap_or_default() + metadata.deletions.unwrap_or_default();
+        let changed_file_count = changed_files.len();
+        let light_line_limit = if docs_or_test_only { 400 } else { 200 };
+        let light_file_limit = if docs_or_test_only { 10 } else { 5 };
+        let is_light = changed_lines <= light_line_limit
+            && changed_file_count <= light_file_limit
+            && subsystem_buckets.len() <= 1
+            && production_languages.len() <= 1
+            && complexity_flags.is_empty();
+        let is_deep = changed_lines > 1_000
+            || changed_file_count > 25
+            || subsystem_buckets.len() >= 4
+            || production_languages.len() >= 3
+            || complexity_flags.len() >= 2;
+
+        if is_light {
+            ReviewProfile::Light
+        } else if is_deep {
+            ReviewProfile::Deep
+        } else {
+            ReviewProfile::Standard
+        }
+    };
+
+    ReviewClassification {
+        changed_files,
+        complexity_flags,
+        has_production_code,
+        metadata_missing,
+        production_languages,
+        profile,
+        subsystem_buckets,
+        additions: metadata.additions,
+        deletions: metadata.deletions,
+    }
+}
+
+fn sorted_unique<T: Ord>(values: impl IntoIterator<Item = T>) -> Vec<T> {
+    values
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn subsystem_bucket(path: &str) -> String {
+    let components = path
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    let directories = components.get(..components.len().saturating_sub(1)).unwrap_or_default();
+    if directories.is_empty() {
+        return "root".to_owned();
+    }
+
+    let bucket_len = if directories
+        .first()
+        .is_some_and(|component| component.eq_ignore_ascii_case("tools"))
+    {
+        3
+    } else {
+        2
+    };
+    directories[..directories.len().min(bucket_len)].join("/")
+}
+
+fn production_language(path: &str) -> Option<ReviewLanguageBucket> {
+    if is_docs_or_test_file(path) {
+        return None;
+    }
+    let extension = path
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())?;
+    Some(match extension.as_str() {
+        "rs" => ReviewLanguageBucket::Rust,
+        "swift" => ReviewLanguageBucket::Swift,
+        "bzl" | "bazel" => ReviewLanguageBucket::Starlark,
+        "sh" | "bash" | "zsh" | "fish" => ReviewLanguageBucket::Shell,
+        "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "html" | "css" | "scss" | "vue" | "svelte" => {
+            ReviewLanguageBucket::Web
+        }
+        "c" | "cc" | "cpp" | "cxx" | "h" | "hpp" | "go" | "java" | "kt" | "kts" | "py" | "rb" | "php" | "lua"
+        | "ex" | "exs" | "hs" | "scala" | "sql" => ReviewLanguageBucket::Other,
+        _ => return None,
+    })
+}
+
+fn is_docs_or_test_file(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let components = lower.split('/').collect::<Vec<_>>();
+    let file_name = components.last().copied().unwrap_or_default();
+    lower.ends_with(".md")
+        || lower.ends_with(".mdx")
+        || lower.ends_with(".rst")
+        || lower.ends_with(".txt")
+        || lower.ends_with(".snap")
+        || components.iter().any(|component| {
+            matches!(
+                *component,
+                "doc" | "docs" | "fixture" | "fixtures" | "snapshot" | "snapshots" | "test" | "testdata" | "tests"
+            )
+        })
+        || file_name.starts_with("readme")
+        || file_name.starts_with("changelog")
+        || file_name.ends_with("_test.rs")
+        || file_name.ends_with("_tests.rs")
+}
+
+fn complexity_flags(paths: &[String]) -> Vec<ReviewComplexityFlag> {
+    let path_text = paths.iter().map(|path| path.to_ascii_lowercase()).collect::<Vec<_>>();
+    let has = |needles: &[&str]| {
+        path_text
+            .iter()
+            .any(|path| needles.iter().any(|needle| path.contains(needle)))
+    };
+    let has_build_file = path_text.iter().any(|path| {
+        matches!(
+            path.rsplit('/').next().unwrap_or_default(),
+            "build" | "build.bazel" | "module.bazel" | "workspace" | "workspace.bazel" | "cargo.toml" | "cargo.lock"
+        )
+    });
+
+    let mut flags = Vec::new();
+    if has(&["/migrations/", "migration", "/schema/", "schema_init"]) {
+        flags.push(ReviewComplexityFlag::DatabaseSchemaMigration);
+    }
+    if has(&["auth", "permission", "sandbox"]) {
+        flags.push(ReviewComplexityFlag::AuthPermissionsSandbox);
+    }
+    if has(&["scheduler", "concurrency", "lifecycle", "process"]) {
+        flags.push(ReviewComplexityFlag::SchedulerConcurrencyLifecycle);
+    }
+    if has_build_file || has(&["/build/", "release", "dependenc"]) {
+        flags.push(ReviewComplexityFlag::BuildReleaseDependency);
+    }
+    flags
+}
 
 /// Classify a list of changed file paths as docs-only or code.
 ///
@@ -161,6 +343,108 @@ pub fn passes_severity_gate(result: &ReviewResult) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::*;
+    use boss_protocol::{ReviewComplexityFlag, ReviewLanguageBucket, ReviewMetadataField, ReviewProfile};
+
+    fn metadata(additions: Option<i64>, deletions: Option<i64>, files: &[&str]) -> PrReviewMetadata {
+        PrReviewMetadata {
+            additions,
+            changed_files: Some(files.iter().map(|file| (*file).to_owned()).collect()),
+            deletions,
+        }
+    }
+
+    #[test]
+    fn review_profile_classifies_a_small_simple_code_pr_as_light() {
+        let classification = classify_pr_review_metadata(&metadata(
+            Some(100),
+            Some(100),
+            &[
+                "tools/boss/engine/pr-review/src/types.rs",
+                "tools/boss/engine/pr-review/src/parsing.rs",
+                "tools/boss/engine/pr-review/src/render.rs",
+                "tools/boss/engine/pr-review/src/lib.rs",
+                "tools/boss/engine/pr-review/src/blocks.rs",
+            ],
+        ));
+
+        assert_eq!(classification.profile, ReviewProfile::Light);
+        assert_eq!(classification.subsystem_buckets, vec!["tools/boss/engine"]);
+        assert_eq!(classification.production_languages, vec![ReviewLanguageBucket::Rust]);
+        assert!(classification.has_production_code);
+    }
+
+    #[test]
+    fn review_profile_relaxes_light_limits_for_docs_and_tests() {
+        let classification = classify_pr_review_metadata(&metadata(
+            Some(250),
+            Some(150),
+            &[
+                "docs/guide-1.md",
+                "docs/guide-2.md",
+                "docs/guide-3.md",
+                "docs/guide-4.md",
+                "docs/guide-5.md",
+                "docs/guide-6.md",
+                "docs/guide-7.md",
+                "docs/guide-8.md",
+                "docs/guide-9.md",
+                "docs/guide-10.md",
+            ],
+        ));
+
+        assert_eq!(classification.profile, ReviewProfile::Light);
+        assert!(!classification.has_production_code);
+        assert!(classification.production_languages.is_empty());
+    }
+
+    #[test]
+    fn review_profile_classifies_intermediate_or_single_flag_prs_as_standard() {
+        let size_classification = classify_pr_review_metadata(&metadata(Some(201), Some(0), &["src/lib.rs"]));
+        assert_eq!(size_classification.profile, ReviewProfile::Standard);
+
+        let flag_classification = classify_pr_review_metadata(&metadata(
+            Some(10),
+            Some(0),
+            &["tools/boss/engine/core/src/worker_sandbox_audit.rs"],
+        ));
+        assert_eq!(flag_classification.profile, ReviewProfile::Standard);
+        assert_eq!(
+            flag_classification.complexity_flags,
+            vec![ReviewComplexityFlag::AuthPermissionsSandbox]
+        );
+    }
+
+    #[test]
+    fn review_profile_classifies_large_or_complex_prs_as_deep() {
+        let size_classification = classify_pr_review_metadata(&metadata(Some(1_001), Some(0), &["src/lib.rs"]));
+        assert_eq!(size_classification.profile, ReviewProfile::Deep);
+
+        let complexity_classification = classify_pr_review_metadata(&metadata(
+            Some(10),
+            Some(0),
+            &[
+                "tools/boss/engine/core/src/work/migrations_b.rs",
+                "tools/boss/engine/core/src/worker_sandbox_audit.rs",
+            ],
+        ));
+        assert_eq!(complexity_classification.profile, ReviewProfile::Deep);
+        assert_eq!(complexity_classification.complexity_flags.len(), 2);
+    }
+
+    #[test]
+    fn review_profile_uses_standard_and_records_incomplete_metadata() {
+        let classification = classify_pr_review_metadata(&PrReviewMetadata {
+            additions: Some(1),
+            changed_files: None,
+            deletions: None,
+        });
+
+        assert_eq!(classification.profile, ReviewProfile::Standard);
+        assert_eq!(
+            classification.metadata_missing,
+            vec![ReviewMetadataField::Deletions, ReviewMetadataField::ChangedFiles]
+        );
+    }
 
     #[test]
     fn classify_empty_files_returns_code() {

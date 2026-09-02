@@ -1,6 +1,6 @@
 use super::*;
 use crate::{AbsenceDisposition, Capability};
-use boss_protocol::StopReason;
+use boss_protocol::{ReviewModelTier, StopReason};
 use tempfile::TempDir;
 
 #[test]
@@ -151,6 +151,9 @@ fn codex_model_menu_sourced_from_debug_models_vocabulary() {
     assert_eq!((menu.effort_value_for_level)(EffortLevel::Max), Some("max"));
     assert_eq!((menu.model_for_reasoning)(ReasoningMode::Standard), "gpt-5.6-terra");
     assert_eq!((menu.model_for_reasoning)(ReasoningMode::Investigation), "gpt-5.6-sol");
+    assert_eq!((menu.review_model_for_tier)(ReviewModelTier::Fast), "gpt-5.6-luna");
+    assert_eq!((menu.review_model_for_tier)(ReviewModelTier::Balanced), "gpt-5.6-terra");
+    assert_eq!((menu.review_model_for_tier)(ReviewModelTier::Strong), "gpt-5.6-sol");
     assert!(!(menu.model_requires_auto_permissions)("gpt-5.6-sol"));
 }
 

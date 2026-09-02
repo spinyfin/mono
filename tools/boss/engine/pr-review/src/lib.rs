@@ -44,8 +44,8 @@ mod types;
 
 pub use blocks::{render_boss_construct_sweep_block, render_supersession_flag_block};
 pub use parsing::{
-    classify_changed_files, extract_review_result, extract_review_result_verbose, passes_severity_gate,
-    review_result_from_candidates,
+    PrReviewMetadata, classify_changed_files, classify_pr_review_metadata, extract_review_result,
+    extract_review_result_verbose, passes_severity_gate, review_result_from_candidates,
 };
 pub use render::{
     ReviewOrigin, render_reviewer_claude_md, render_reviewer_initial_prompt, render_revision_instructions,
