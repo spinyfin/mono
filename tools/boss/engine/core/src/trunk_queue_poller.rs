@@ -1798,17 +1798,28 @@ async fn handle_trunk_queue_eviction(
     let cause = match classify_trunk_eviction_from_payload(entry, &member.intent.target_branch, !failures.is_empty()) {
         Some(cause) => cause,
         None => {
-            match evidence
+            // Bot comment is consulted only when Trunk's structured
+            // readiness did *not* report a vs-base conflict. "could not
+            // start testing" / "merge conflict" here is a sibling-in-queue
+            // rejection: GitHub still says MERGEABLE vs main, so
+            // conflict_watch will never fire. Mint a queue-rejection
+            // revision (TestFailure arm) rather than handing to a lane
+            // that keys on mergeable=CONFLICTING.
+            if let Some(marker) = evidence
                 .newest_trunk_bot_comment(&member.intent.repo, member.intent.pr_number)
                 .await
                 .as_deref()
                 .and_then(bot_comment_merge_failure_marker)
             {
-                Some(marker) => TrunkEvictionCause::HeadConflict {
-                    evidence: format!("the `{TRUNK_BOT_LOGIN}` comment on the PR says \"{marker}\""),
-                },
-                None => TrunkEvictionCause::TestFailure,
+                tracing::info!(
+                    work_item_id = %member.intent.work_item_id,
+                    pr_url = %member.intent.pr_url,
+                    marker,
+                    "trunk queue poller: bot comment names a merge failure but GitHub mergeability \
+                     is not CONFLICTING (sibling-in-queue); minting a queue-rejection revision",
+                );
             }
+            TrunkEvictionCause::TestFailure
         }
     };
     tracing::info!(
@@ -1843,9 +1854,9 @@ async fn handle_trunk_queue_eviction(
             // Design §"Failure surfacing": an evicted card leaves the
             // Merging lane. `on_trunk_queue_eviction_detected` clears the
             // columns itself on a freshly-inserted attempt, but it has exits
-            // that clear nothing — most importantly its refusal to flip a
-            // Trunk episode carrying no failing checks — and on those the card
-            // would keep rendering a "queued"/"Testing" badge for a PR that is
+            // that clear nothing (idempotent discriminator, opt-out, an
+            // overlapping conflict attempt) — and on those the card would
+            // keep rendering a "queued"/"Testing" badge for a PR that is
             // provably out of the queue. `preserve_merge_queue_state` means no
             // later GitHub sweep would ever correct it.
             //

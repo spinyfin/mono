@@ -1107,19 +1107,11 @@ async fn a_merge_conflict_eviction_is_recognised_from_the_trunk_bot_comment() {
 
     let outcome = run_eviction(&db, 1137, entry, Arc::clone(&evidence)).await;
 
-    assert_eq!(outcome.merge_side_evictions, 1);
-    assert_eq!(outcome.evictions_detected, 0);
+    assert_eq!(outcome.merge_side_evictions, 0, "GitHub is not CONFLICTING vs base");
+    assert_eq!(outcome.evictions_detected, 1, "sibling-in-queue rejection still mints");
     assert_eq!(evidence.bot_comment_call_count(), 1);
-    assert_eq!(ci_ledger_state(&db, &task_id), (0, 0));
-    assert_eq!(revision_count(&db, &task_id), 0);
-    assert_eq!(
-        db.get_active_trunk_merge_intent(&task_id)
-            .unwrap()
-            .expect("still active")
-            .last_trunk_state
-            .as_deref(),
-        Some(TRUNK_INTENT_SUPERSEDED_BY_CONFLICT),
-    );
+    assert_eq!(ci_ledger_state(&db, &task_id), (1, 1));
+    assert_eq!(revision_count(&db, &task_id), 1);
 }
 
 /// A PR pointed at a branch this queue does not merge into. No rebase and no
@@ -1156,22 +1148,23 @@ async fn a_base_branch_mismatch_eviction_retires_the_intent_with_no_remediation(
 }
 
 /// Neither a failing build nor any positive merge-side signal. The
-/// classification falls through to the unchanged test-failure arm, and
-/// `on_queue_side_failure_detected`'s empty-`failures` guard then refuses the
-/// flip — an attempt with no failing check to name is one a worker cannot
-/// act on, and dispatching one anyway is what destroyed flunge#1137.
+/// classification falls through to the test-failure arm, and a revision
+/// is minted with the generic no-evidence directive — a confirmed queue
+/// rejection is authoritative even when Trunk never started a construction
+/// build. The worker prompt's STOP section is what keeps this from
+/// repeating the empty-commit force-push.
 #[tokio::test]
-async fn an_eviction_with_no_evidence_at_all_does_not_flip_the_row() {
+async fn an_eviction_with_no_evidence_at_all_still_mints_a_revision() {
     let (_tmp, db) = crate::test_support::open_db();
     let (_, task_id) = seed_intent(&db, "evicted-no-evidence", 1300);
     let entry = evicted_entry_with_readiness(1300, healthy_readiness());
 
     let outcome = run_eviction(&db, 1300, entry, Arc::new(StubEvictionEvidence::default())).await;
 
-    assert_eq!(outcome.evictions_detected, 0);
+    assert_eq!(outcome.evictions_detected, 1);
     assert_eq!(outcome.merge_side_evictions, 0);
-    assert_eq!(ci_ledger_state(&db, &task_id), (0, 0));
-    assert_eq!(revision_count(&db, &task_id), 0);
+    assert_eq!(ci_ledger_state(&db, &task_id), (1, 1));
+    assert_eq!(revision_count(&db, &task_id), 1);
     let (status, blocked_reason) = task_status_of(&db, &task_id);
     assert_eq!(status, crate::work::TaskStatus::InReview);
     assert_eq!(blocked_reason, None);

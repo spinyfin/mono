@@ -2161,11 +2161,11 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
              >   revision comes to rest and the PR's head CI reads green. Do NOT ask a human to\n\
              >   re-run the merge, do NOT comment `/trunk merge` yourself, and do NOT run\n\
              >   `gh pr merge` — that bypasses the queue and races the automatic resubmit.\n\
-             > - **You must push a commit.** The engine refuses every \"nothing to push\" terminal for\n\
-             >   a queue-side failure — the flake/infra re-run marker, the already-green claim, and\n\
-             >   the rebase-fixed-it claim are all rejected — because the PR's head CI is green\n\
-             >   already and so proves nothing about the construction-branch build. Push a fix, or\n\
-             >   call `boss engine ci mark-failed` if there is genuinely nothing to fix from this PR.\n\n",
+             > - If a failing construction-branch build is listed below, **push a commit** that \
+             >   addresses it — the engine refuses every \"nothing to push\" terminal for a \
+             >   queue-side failure because the PR's head CI is green already and so proves nothing \
+             >   about that build. If no failing build is listed, do **not** invent one: follow the \
+             >   STOP section and `boss engine ci mark-failed` rather than force-pushing.\n\n",
         );
     } else {
         out.push_str(&format!(
@@ -2192,13 +2192,11 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
     // A Trunk eviction with nothing captured is the shape that destroyed
     // flunge#1137: the engine could not name a failing build, the prompt
     // asserted one existed anyway, and the bail-out below was gated off.
-    // `ci_watch::on_queue_side_failure_detected` refuses to create such an
-    // attempt for the Trunk arm, so this should be unreachable for new
-    // Trunk rows — but a pre-guard row can still be re-dispatched by the
-    // stranded-rescue path, so the prompt has to stay honest about it.
-    // Merge-queue rebounce *may* land with empty checks when evidence
-    // enrichment misses; that path uses the generic directive below
-    // rather than the Trunk bail-out.
+    // Those attempts are now minted (a confirmed queue rejection is
+    // authoritative even with no construction build); this STOP section
+    // is what keeps the worker from inventing a fix. Merge-queue rebounce
+    // *may* land with empty checks when evidence enrichment misses; that
+    // path uses the generic directive below rather than the Trunk bail-out.
     let trunk_eviction_without_evidence = is_trunk_eviction && captured_checks.is_none();
     match captured_checks {
         Some(md) => out.push_str(&md),
@@ -2306,7 +2304,7 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
              `mark-failed` or push code.\n\
              3. Stop. The merge-poller will observe the re-run's outcome on the next sweep.\n\n",
         );
-    } else {
+    } else if !trunk_eviction_without_evidence {
         if is_rebounce {
             out.push_str("### Action: rebase onto current main, then fix the semantic conflict\n\n");
             out.push_str(

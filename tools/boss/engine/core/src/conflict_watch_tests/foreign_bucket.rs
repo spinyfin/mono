@@ -201,8 +201,8 @@ async fn foreign_bucket_takeover_declines_higher_priority_reason() {
     )
     .await;
     assert!(
-        !took_over,
-        "conflict_watch must not steal a higher-priority foreign block"
+        took_over || db.active_conflict_resolution_for_work_item(&chore).unwrap().is_some(),
+        "conflict_watch must still mint a revision for a CONFLICTING PR"
     );
 
     let (status, reason) = chore_status(&db, &chore);
@@ -213,5 +213,6 @@ async fn foreign_bucket_takeover_declines_higher_priority_reason() {
         "dependency block must be untouched"
     );
     let crz = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
-    assert!(crz.is_empty(), "no conflict_resolutions attempt must be created");
+    assert_eq!(crz.len(), 1, "a conflict_resolutions attempt must be created");
+    assert!(crz[0].revision_task_id.is_some(), "the attempt must spawn a revision");
 }

@@ -249,10 +249,13 @@ pub async fn on_conflict_detected_with(
     // review_feedback > merge_conflict > ci_failure_exhausted > ci_failure)
     // and §Q1 ("conflict pre-empts CI") both say merge_conflict outranks a
     // `ci_failure` / `ci_failure_exhausted` block, so only those two reasons
-    // are eligible for takeover; a higher-priority foreign reason
-    // (dependency, review_feedback, parent_pr_closed, …) is left alone but
-    // logged at `info` so this class of cross-watcher orphaning is visible
-    // in the trace even when we correctly decline to act on it.
+    // are eligible for a *scalar* takeover. A higher-priority foreign reason
+    // (dependency, review_feedback, …) keeps its scalar block — we do not
+    // steal the card — but the PR is still CONFLICTING, so we still mint a
+    // conflict-resolution revision. Declining to mint is what left a
+    // conflicting PR sitting unnoticed while other revisions were already
+    // open on the same chain.
+    let mut skip_parent_flip = false;
     match work_db.task_blocked_reason(&candidate.work_item_id) {
         Ok(Some(reason))
             if (reason == "ci_failure" || reason == "ci_failure_exhausted")
@@ -279,19 +282,16 @@ pub async fn on_conflict_detected_with(
             // re-arm path and correctly recognise the row as already ours.
         }
         Ok(Some(reason)) if reason != "merge_conflict" => {
-            // Either a genuinely higher-priority foreign reason (dependency,
-            // review_feedback, parent_pr_closed, …), or a ci_failure/
-            // ci_failure_exhausted row that already has its own active
-            // `merge_conflict` signal (the polymorphic multi-signal case
-            // filtered out of the arm above) — either way this watcher
-            // doesn't own the scalar reason this sweep.
+            // Keep the scalar reason. Skip the `in_review` → `blocked:
+            // merge_conflict` flip (the WHERE guard would miss anyway)
+            // and fall through to insert + spawn.
             tracing::info!(
                 work_item_id = %candidate.work_item_id,
                 pr_url = %candidate.pr_url,
                 owning_reason = %reason,
-                "conflict_watch: row parked in another watcher's bucket; not taking over this sweep",
+                "conflict_watch: row parked in another watcher's bucket; keeping that reason, still minting a conflict revision",
             );
-            return false;
+            skip_parent_flip = true;
         }
         Ok(_) => {}
         Err(err) => {
@@ -314,296 +314,332 @@ pub async fn on_conflict_detected_with(
     // the signal row — the parent stays in Review while the fix is in flight.
     // The flip is only kept when there is NO active fix vehicle (churn cap,
     // create_revision failure).
-    let task_flipped_to_blocked = match work_db
-        .mark_chore_blocked_merge_conflict(&candidate.work_item_id, &candidate.pr_url)
-    {
-        Ok(Some(_task)) => true,
-        Ok(None) => {
-            // WHERE guard missed. Two sub-cases:
-            // (a) Human moved the row — leave it alone.
-            // (b) Task IS blocked:merge_conflict — check for an active revision
-            //     fix vehicle and reconcile if found (post-revision-unification
-            //     catch-up for rows that were blocked before this model shipped),
-            //     or dispatch a fresh attempt for the stale-base scenario.
-            let is_blocked = match work_db.rearm_blocked_merge_conflict_signal(&candidate.work_item_id) {
-                Ok(v) => v,
-                Err(err) => {
-                    tracing::warn!(
+    let task_flipped_to_blocked = if skip_parent_flip {
+        false
+    } else {
+        match work_db.mark_chore_blocked_merge_conflict(&candidate.work_item_id, &candidate.pr_url) {
+            Ok(Some(_task)) => true,
+            Ok(None) => {
+                // WHERE guard missed. Two sub-cases:
+                // (a) Human moved the row — leave it alone.
+                // (b) Task IS blocked:merge_conflict — check for an active revision
+                //     fix vehicle and reconcile if found (post-revision-unification
+                //     catch-up for rows that were blocked before this model shipped),
+                //     or dispatch a fresh attempt for the stale-base scenario.
+                let is_blocked = match work_db.rearm_blocked_merge_conflict_signal(&candidate.work_item_id) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        tracing::warn!(
+                            work_item_id = %candidate.work_item_id,
+                            ?err,
+                            "conflict_watch: failed to check/rearm blocked signal; skipping",
+                        );
+                        return false;
+                    }
+                };
+                if !is_blocked {
+                    tracing::debug!(
                         work_item_id = %candidate.work_item_id,
-                        ?err,
-                        "conflict_watch: failed to check/rearm blocked signal; skipping",
+                        pr_url = %candidate.pr_url,
+                        "conflict_watch: WHERE guard missed; row not blocked:merge_conflict (manually moved); skipping",
                     );
                     return false;
                 }
-            };
-            if !is_blocked {
-                tracing::debug!(
-                    work_item_id = %candidate.work_item_id,
-                    pr_url = %candidate.pr_url,
-                    "conflict_watch: WHERE guard missed; row not blocked:merge_conflict (manually moved); skipping",
-                );
-                return false;
-            }
-            // Task IS blocked:merge_conflict; signal re-armed.
-            //
-            // Check for an active (pending/running) crz.
-            //   - Active crz with revision_task_id: the fix vehicle is in
-            //     flight but the parent is erroneously blocked (pre-model-
-            //     change rows like T791/T898). Reconcile by clearing the block
-            //     so the parent returns to Review.
-            //   - Active crz without revision_task_id: old-style bespoke
-            //     execution still running — leave blocked, no new dispatch.
-            //   - No active crz: check latest terminal status for stale-base
-            //     re-arm vs churn-guard terminal.
-            match work_db.active_conflict_resolution_for_work_item(&candidate.work_item_id) {
-                Ok(Some(active_crz)) => {
-                    if active_crz.revision_task_id.is_some() {
-                        // Before blindly reconciling, check whether this attempt
-                        // is stale/dead (`supersede_if_stale`) — e.g. the linked
-                        // revision died in an engine restart. Reconciling a dead
-                        // attempt back to `in_review` would strand the parent
-                        // with no live fix vehicle until some *later* pass
-                        // happened to observe it via the `in_review` branch
-                        // above; superseding here instead means a dead revision
-                        // is caught on the very first pass that finds it,
-                        // regardless of which state the parent is in.
-                        if supersede_if_stale(work_db, candidate, probe, &active_crz) {
-                            // Fall through (do not reconcile-and-return): the
-                            // shared flip+insert logic below re-affirms the
-                            // (already blocked) parent, inserts a fresh attempt
-                            // at the now-freed UNIQUE key, and spawns a
-                            // replacement revision — which unblocks the parent
-                            // back to in_review once it spawns.
-                        } else {
-                            // Active revision fix vehicle, but parent is blocked.
-                            // This is the reconciliation path for rows that were
-                            // blocked before the revision-unification model shipped.
-                            // Flip parent back to in_review; the revision card in
-                            // Doing is the user-visible "something is happening."
-                            tracing::info!(
+                // Task IS blocked:merge_conflict; signal re-armed.
+                //
+                // Check for an active (pending/running) crz.
+                //   - Active crz with revision_task_id: the fix vehicle is in
+                //     flight but the parent is erroneously blocked (pre-model-
+                //     change rows). Reconcile by clearing the block
+                //     so the parent returns to Review.
+                //   - Active crz without revision_task_id: old-style bespoke
+                //     execution still running — leave blocked, no new dispatch.
+                //   - No active crz: check latest terminal status for stale-base
+                //     re-arm vs churn-guard terminal.
+                match work_db.active_conflict_resolution_for_work_item(&candidate.work_item_id) {
+                    Ok(Some(active_crz)) => {
+                        if active_crz.revision_task_id.is_some() {
+                            // Before blindly reconciling, check whether this attempt
+                            // is stale/dead (`supersede_if_stale`) — e.g. the linked
+                            // revision died in an engine restart. Reconciling a dead
+                            // attempt back to `in_review` would strand the parent
+                            // with no live fix vehicle until some *later* pass
+                            // happened to observe it via the `in_review` branch
+                            // above; superseding here instead means a dead revision
+                            // is caught on the very first pass that finds it,
+                            // regardless of which state the parent is in.
+                            if supersede_if_stale(work_db, candidate, probe, &active_crz) {
+                                // Fall through (do not reconcile-and-return): the
+                                // shared flip+insert logic below re-affirms the
+                                // (already blocked) parent, inserts a fresh attempt
+                                // at the now-freed UNIQUE key, and spawns a
+                                // replacement revision — which unblocks the parent
+                                // back to in_review once it spawns.
+                            } else {
+                                // Active revision fix vehicle, but parent is blocked.
+                                // This is the reconciliation path for rows that were
+                                // blocked before the revision-unification model shipped.
+                                // Flip parent back to in_review; the revision card in
+                                // Doing is the user-visible "something is happening."
+                                tracing::info!(
+                                    work_item_id = %candidate.work_item_id,
+                                    pr_url = %candidate.pr_url,
+                                    attempt_id = %active_crz.id,
+                                    revision_task_id = %active_crz.revision_task_id.as_deref().unwrap_or(""),
+                                    "conflict_watch: active revision in flight but parent blocked; reconciling to in_review",
+                                );
+                                let reconciled = match work_db
+                                    .clear_chore_blocked_merge_conflict(&candidate.work_item_id, &candidate.pr_url)
+                                {
+                                    Ok(Some(_)) => true,
+                                    Ok(None) => false,
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            work_item_id = %candidate.work_item_id,
+                                            ?err,
+                                            "conflict_watch: failed to reconcile block during re-arm",
+                                        );
+                                        false
+                                    }
+                                };
+                                if reconciled {
+                                    if let Err(err) =
+                                        work_db.record_merge_conflict_in_flight(&candidate.work_item_id, &active_crz.id)
+                                    {
+                                        tracing::warn!(
+                                            work_item_id = %candidate.work_item_id,
+                                            ?err,
+                                            "conflict_watch: failed to record in-flight signal during reconcile",
+                                        );
+                                    }
+                                    publisher
+                                        .publish_work_item_changed(
+                                            &candidate.product_id,
+                                            &candidate.work_item_id,
+                                            "conflict_revision_in_flight",
+                                        )
+                                        .await;
+                                }
+                                publisher
+                                    .publish_frontend_event_on_product(
+                                        &candidate.product_id,
+                                        FrontendEvent::ConflictResolutionStarted {
+                                            product_id: candidate.product_id.clone(),
+                                            work_item_id: candidate.work_item_id.clone(),
+                                            attempt_id: active_crz.id.clone(),
+                                            pr_url: candidate.pr_url.clone(),
+                                        },
+                                    )
+                                    .await;
+                                tracing::info!(
+                                    work_item_id = %candidate.work_item_id,
+                                    reconciled,
+                                    "conflict_watch: re-arm reconciliation complete",
+                                );
+                                return reconciled;
+                            }
+                        } else if active_crz.status == "pending" {
+                            // A `pending` attempt with no revision is the shape
+                            // the ladder path deliberately leaves behind when it
+                            // declines to spawn a worker this tick:
+                            // `MechanicalRungsUnavailable` (rung-1 lease failure)
+                            // and, under `ConflictRemediationMode::Deferred`,
+                            // every tick where the background remediator declined
+                            // the enqueue. That is explicitly a **retry** state —
+                            // "the attempt stays pending with no revision_task_id
+                            // so the next tick re-enters the ladder" is the whole
+                            // contract — so fall through to the shared
+                            // insert/lookup + ladder block below.
+                            //
+                            // Returning `false` here (as this branch used to)
+                            // made that contract a lie and stranded the row: once
+                            // the parent is `blocked: merge_conflict` with a
+                            // pending attempt, the `in_review` pre-flight above
+                            // no longer applies and the flip's WHERE guard always
+                            // misses, so every subsequent sweep landed here and
+                            // no-opped. Nothing was in flight, nothing was
+                            // scheduled, and the only automatic recovery was the
+                            // startup-only
+                            // `reconcile_orphaned_conflict_ladder_attempts`.
+                            //
+                            // Falling through creates nothing duplicate: the
+                            // INSERT below UNIQUE-collides with this very row and
+                            // falls back to it, and the remediation queue's own
+                            // dedup declines a second ladder run while one is
+                            // genuinely in flight.
+                            tracing::debug!(
                                 work_item_id = %candidate.work_item_id,
                                 pr_url = %candidate.pr_url,
                                 attempt_id = %active_crz.id,
-                                revision_task_id = %active_crz.revision_task_id.as_deref().unwrap_or(""),
-                                "conflict_watch: active revision in flight but parent blocked; reconciling to in_review",
+                                "conflict_watch: blocked signal re-armed; attempt pending with no fix vehicle; \
+                                 re-entering the ladder for it",
                             );
-                            let reconciled = match work_db
-                                .clear_chore_blocked_merge_conflict(&candidate.work_item_id, &candidate.pr_url)
-                            {
-                                Ok(Some(_)) => true,
-                                Ok(None) => false,
-                                Err(err) => {
-                                    tracing::warn!(
-                                        work_item_id = %candidate.work_item_id,
-                                        ?err,
-                                        "conflict_watch: failed to reconcile block during re-arm",
-                                    );
-                                    false
-                                }
-                            };
-                            if reconciled {
-                                if let Err(err) =
-                                    work_db.record_merge_conflict_in_flight(&candidate.work_item_id, &active_crz.id)
-                                {
-                                    tracing::warn!(
-                                        work_item_id = %candidate.work_item_id,
-                                        ?err,
-                                        "conflict_watch: failed to record in-flight signal during reconcile",
-                                    );
-                                }
-                                publisher
-                                    .publish_work_item_changed(
-                                        &candidate.product_id,
-                                        &candidate.work_item_id,
-                                        "conflict_revision_in_flight",
-                                    )
-                                    .await;
-                            }
-                            publisher
-                                .publish_frontend_event_on_product(
-                                    &candidate.product_id,
-                                    FrontendEvent::ConflictResolutionStarted {
-                                        product_id: candidate.product_id.clone(),
-                                        work_item_id: candidate.work_item_id.clone(),
-                                        attempt_id: active_crz.id.clone(),
-                                        pr_url: candidate.pr_url.clone(),
-                                    },
-                                )
-                                .await;
-                            tracing::info!(
+                        } else {
+                            // `running` with no revision: the legacy bespoke
+                            // dispatch (`mark_conflict_resolution_running`, which
+                            // stamps a real lease/workspace/worker onto the row)
+                            // genuinely has an actor holding a cube workspace
+                            // against this PR. Re-entering would race a mechanical
+                            // rebase against it, so this one really is "leave it
+                            // alone" rather than "stranded".
+                            tracing::debug!(
                                 work_item_id = %candidate.work_item_id,
-                                reconciled,
-                                "conflict_watch: re-arm reconciliation complete",
+                                pr_url = %candidate.pr_url,
+                                attempt_id = %active_crz.id,
+                                "conflict_watch: blocked signal re-armed; old-style crz still running; no new dispatch",
                             );
-                            return reconciled;
+                            return false;
                         }
-                    } else if active_crz.status == "pending" {
-                        // A `pending` attempt with no revision is the shape
-                        // the ladder path deliberately leaves behind when it
-                        // declines to spawn a worker this tick:
-                        // `MechanicalRungsUnavailable` (rung-1 lease failure)
-                        // and, under `ConflictRemediationMode::Deferred`,
-                        // every tick where the background remediator declined
-                        // the enqueue. That is explicitly a **retry** state —
-                        // "the attempt stays pending with no revision_task_id
-                        // so the next tick re-enters the ladder" is the whole
-                        // contract — so fall through to the shared
-                        // insert/lookup + ladder block below.
-                        //
-                        // Returning `false` here (as this branch used to)
-                        // made that contract a lie and stranded the row: once
-                        // the parent is `blocked: merge_conflict` with a
-                        // pending attempt, the `in_review` pre-flight above
-                        // no longer applies and the flip's WHERE guard always
-                        // misses, so every subsequent sweep landed here and
-                        // no-opped. Nothing was in flight, nothing was
-                        // scheduled, and the only automatic recovery was the
-                        // startup-only
-                        // `reconcile_orphaned_conflict_ladder_attempts`.
-                        //
-                        // Falling through creates nothing duplicate: the
-                        // INSERT below UNIQUE-collides with this very row and
-                        // falls back to it, and the remediation queue's own
-                        // dedup declines a second ladder run while one is
-                        // genuinely in flight.
-                        tracing::debug!(
+                    }
+                    Ok(None) => {
+                        // No active crz. Check the most recent crz to decide
+                        // whether to re-arm.
+                        let latest = match work_db.latest_conflict_resolution_for_work_item(&candidate.work_item_id) {
+                            Ok(latest) => latest,
+                            Err(err) => {
+                                tracing::warn!(
+                                    work_item_id = %candidate.work_item_id,
+                                    ?err,
+                                    "conflict_watch: failed to read latest crz during re-arm; skipping dispatch",
+                                );
+                                return false;
+                            }
+                        };
+                        // No crz at all → a fresh block, not a stale-base scenario;
+                        // the insert path handles it (treated as "pending").
+                        let latest_status = latest.as_ref().map(|c| c.status.as_str()).unwrap_or("pending");
+                        match latest_status {
+                            "succeeded" => {
+                                // Previous attempt succeeded but the PR is CONFLICTING
+                                // again. Fall through to the insert path, which
+                                // creates a fresh row keyed on (base, head).
+                                tracing::info!(
+                                    work_item_id = %candidate.work_item_id,
+                                    pr_url = %candidate.pr_url,
+                                    base_ref_oid = ?probe.base_ref_oid,
+                                    head_ref_oid = ?probe.head_ref_oid,
+                                    "conflict_watch: stale-base re-arm: succeeded crz but PR still CONFLICTING; attempting fresh dispatch",
+                                );
+                                // Wedge fix (mono#1398/#1764): when the succeeded
+                                // attempt's UNIQUE key still equals the current
+                                // probe's (base + head unchanged since it "succeeded"
+                                // — the resolution never advanced the head, yet the
+                                // PR is CONFLICTING again), the fall-through INSERT
+                                // below would collide and no fresh attempt could ever
+                                // land, so `on_conflict_detected` would re-detect this
+                                // exact state every ~6s forever. Invalidate the stale
+                                // succeeded row (freeing its UNIQUE slot) so exactly
+                                // one churn-guarded fresh attempt proceeds; once the
+                                // churn guard trips, the parent rests `blocked` for
+                                // human attention instead of hot-looping.
+                                //
+                                // Only when the INSERT would genuinely collide: both
+                                // key columns are non-NULL (NULL is distinct in the
+                                // UNIQUE index, so a NULL base/head never collides)
+                                // and equal to the succeeded row's. When the head has
+                                // advanced (the healthy re-arm — see
+                                // `rearm_dispatches_fresh_attempt_when_succeeded_crz_has_stale_frozen_base`),
+                                // the keys differ and we leave the succeeded row alone.
+                                if let Some(succeeded) = latest.as_ref() {
+                                    let would_collide = probe.base_ref_oid.is_some()
+                                        && probe.head_ref_oid.is_some()
+                                        && probe.base_ref_oid.as_deref() == succeeded.base_sha_at_trigger.as_deref()
+                                        && probe.head_ref_oid.as_deref() == succeeded.head_sha_before.as_deref();
+                                    if would_collide {
+                                        tracing::warn!(
+                                            work_item_id = %candidate.work_item_id,
+                                            pr_url = %candidate.pr_url,
+                                            attempt_id = %succeeded.id,
+                                            base_ref_oid = ?probe.base_ref_oid,
+                                            head_ref_oid = ?probe.head_ref_oid,
+                                            "conflict_watch: succeeded crz's UNIQUE key still matches the CONFLICTING probe (head never advanced); \
+                                             invalidating the stale success to free the slot for one churn-guarded fresh attempt",
+                                        );
+                                        if let Err(err) = work_db.invalidate_stale_succeeded_conflict_resolution(
+                                            &succeeded.id,
+                                            "stale_success_still_conflicting",
+                                        ) {
+                                            tracing::warn!(
+                                                work_item_id = %candidate.work_item_id,
+                                                attempt_id = %succeeded.id,
+                                                ?err,
+                                                "conflict_watch: failed to invalidate stale succeeded crz; fresh insert may still collide",
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            "pending" => {
+                                // No previous crz (or brand-new pending one) — fall
+                                // through to the insert path; it handles idempotency
+                                // via the UNIQUE key guard.
+                            }
+                            other => {
+                                // `churn_threshold_exceeded` is the human-attention
+                                // terminal — do not retry. Any other abandoned/
+                                // failed row (typically `revision_create_failed`)
+                                // left the PR CONFLICTING with no live vehicle;
+                                // free the UNIQUE key and fall through to one
+                                // churn-guarded fresh attempt. Returning false
+                                // here is what made conflict minting look like
+                                // it worked (in_review parent, first spawn ok)
+                                // except when the first spawn had already failed.
+                                if other == "abandoned"
+                                    && latest.as_ref().and_then(|c| c.failure_reason.as_deref())
+                                        != Some(crate::work::CHURN_GUARD_REASON)
+                                {
+                                    if let Some(abandoned) = latest.as_ref() {
+                                        tracing::info!(
+                                            work_item_id = %candidate.work_item_id,
+                                            attempt_id = %abandoned.id,
+                                            failure_reason = ?abandoned.failure_reason,
+                                            "conflict_watch: abandoned crz but PR still CONFLICTING; \
+                                             freeing the UNIQUE key for one churn-guarded retry",
+                                        );
+                                        if let Err(err) = work_db.abandon_conflict_resolution_for_supersede(
+                                            &abandoned.id,
+                                            "retry_abandoned_still_conflicting",
+                                        ) {
+                                            tracing::warn!(
+                                                work_item_id = %candidate.work_item_id,
+                                                attempt_id = %abandoned.id,
+                                                ?err,
+                                                "conflict_watch: failed to free abandoned crz UNIQUE key",
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    tracing::debug!(
+                                        work_item_id = %candidate.work_item_id,
+                                        terminal_status = other,
+                                        "conflict_watch: blocked signal re-armed; latest crz terminal ({other}); churn guard owns retry",
+                                    );
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
                             work_item_id = %candidate.work_item_id,
-                            pr_url = %candidate.pr_url,
-                            attempt_id = %active_crz.id,
-                            "conflict_watch: blocked signal re-armed; attempt pending with no fix vehicle; \
-                             re-entering the ladder for it",
-                        );
-                    } else {
-                        // `running` with no revision: the legacy bespoke
-                        // dispatch (`mark_conflict_resolution_running`, which
-                        // stamps a real lease/workspace/worker onto the row)
-                        // genuinely has an actor holding a cube workspace
-                        // against this PR. Re-entering would race a mechanical
-                        // rebase against it, so this one really is "leave it
-                        // alone" rather than "stranded".
-                        tracing::debug!(
-                            work_item_id = %candidate.work_item_id,
-                            pr_url = %candidate.pr_url,
-                            attempt_id = %active_crz.id,
-                            "conflict_watch: blocked signal re-armed; old-style crz still running; no new dispatch",
+                            ?err,
+                            "conflict_watch: failed to check active crz during re-arm; skipping dispatch",
                         );
                         return false;
                     }
                 }
-                Ok(None) => {
-                    // No active crz. Check the most recent crz to decide
-                    // whether to re-arm.
-                    let latest = match work_db.latest_conflict_resolution_for_work_item(&candidate.work_item_id) {
-                        Ok(latest) => latest,
-                        Err(err) => {
-                            tracing::warn!(
-                                work_item_id = %candidate.work_item_id,
-                                ?err,
-                                "conflict_watch: failed to read latest crz during re-arm; skipping dispatch",
-                            );
-                            return false;
-                        }
-                    };
-                    // No crz at all → a fresh block, not a stale-base scenario;
-                    // the insert path handles it (treated as "pending").
-                    let latest_status = latest.as_ref().map(|c| c.status.as_str()).unwrap_or("pending");
-                    match latest_status {
-                        "succeeded" => {
-                            // Previous attempt succeeded but the PR is CONFLICTING
-                            // again. Fall through to the insert path, which
-                            // creates a fresh row keyed on (base, head).
-                            tracing::info!(
-                                work_item_id = %candidate.work_item_id,
-                                pr_url = %candidate.pr_url,
-                                base_ref_oid = ?probe.base_ref_oid,
-                                head_ref_oid = ?probe.head_ref_oid,
-                                "conflict_watch: stale-base re-arm: succeeded crz but PR still CONFLICTING; attempting fresh dispatch",
-                            );
-                            // Wedge fix (mono#1398/#1764): when the succeeded
-                            // attempt's UNIQUE key still equals the current
-                            // probe's (base + head unchanged since it "succeeded"
-                            // — the resolution never advanced the head, yet the
-                            // PR is CONFLICTING again), the fall-through INSERT
-                            // below would collide and no fresh attempt could ever
-                            // land, so `on_conflict_detected` would re-detect this
-                            // exact state every ~6s forever. Invalidate the stale
-                            // succeeded row (freeing its UNIQUE slot) so exactly
-                            // one churn-guarded fresh attempt proceeds; once the
-                            // churn guard trips, the parent rests `blocked` for
-                            // human attention instead of hot-looping.
-                            //
-                            // Only when the INSERT would genuinely collide: both
-                            // key columns are non-NULL (NULL is distinct in the
-                            // UNIQUE index, so a NULL base/head never collides)
-                            // and equal to the succeeded row's. When the head has
-                            // advanced (the healthy re-arm — see
-                            // `rearm_dispatches_fresh_attempt_when_succeeded_crz_has_stale_frozen_base`),
-                            // the keys differ and we leave the succeeded row alone.
-                            if let Some(succeeded) = latest.as_ref() {
-                                let would_collide = probe.base_ref_oid.is_some()
-                                    && probe.head_ref_oid.is_some()
-                                    && probe.base_ref_oid.as_deref() == succeeded.base_sha_at_trigger.as_deref()
-                                    && probe.head_ref_oid.as_deref() == succeeded.head_sha_before.as_deref();
-                                if would_collide {
-                                    tracing::warn!(
-                                        work_item_id = %candidate.work_item_id,
-                                        pr_url = %candidate.pr_url,
-                                        attempt_id = %succeeded.id,
-                                        base_ref_oid = ?probe.base_ref_oid,
-                                        head_ref_oid = ?probe.head_ref_oid,
-                                        "conflict_watch: succeeded crz's UNIQUE key still matches the CONFLICTING probe (head never advanced); \
-                                         invalidating the stale success to free the slot for one churn-guarded fresh attempt",
-                                    );
-                                    if let Err(err) = work_db.invalidate_stale_succeeded_conflict_resolution(
-                                        &succeeded.id,
-                                        "stale_success_still_conflicting",
-                                    ) {
-                                        tracing::warn!(
-                                            work_item_id = %candidate.work_item_id,
-                                            attempt_id = %succeeded.id,
-                                            ?err,
-                                            "conflict_watch: failed to invalidate stale succeeded crz; fresh insert may still collide",
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        "pending" => {
-                            // No previous crz (or brand-new pending one) — fall
-                            // through to the insert path; it handles idempotency
-                            // via the UNIQUE key guard.
-                        }
-                        other => {
-                            // failed / abandoned — churn guard or human owns retry.
-                            tracing::debug!(
-                                work_item_id = %candidate.work_item_id,
-                                terminal_status = other,
-                                "conflict_watch: blocked signal re-armed; latest crz terminal ({other}); churn guard owns retry",
-                            );
-                            return false;
-                        }
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        work_item_id = %candidate.work_item_id,
-                        ?err,
-                        "conflict_watch: failed to check active crz during re-arm; skipping dispatch",
-                    );
-                    return false;
-                }
+                // task was already blocked (re-arm path), didn't flip here.
+                false
             }
-            // task was already blocked (re-arm path), didn't flip here.
-            false
-        }
-        Err(err) => {
-            tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                ?err,
-                "conflict_watch: failed to flip row to blocked: merge_conflict",
-            );
-            return false;
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    ?err,
+                    "conflict_watch: failed to flip row to blocked: merge_conflict",
+                );
+                return false;
+            }
         }
     };
 
@@ -737,6 +773,7 @@ pub async fn on_conflict_detected_with(
     // signal" sequence is the #1007 parent-state model, now written once in
     // [`crate::blocking_signal`] and shared with the CI-failure path.
     let mut task_unblocked_for_revision = false;
+    let mut minted_revision = false;
 
     if let Some(ref a) = attempt {
         if a.status == "pending" && a.revision_task_id.is_none() {
@@ -895,6 +932,7 @@ pub async fn on_conflict_detected_with(
                 )
                 .await;
                 if spawned {
+                    minted_revision = true;
                     task_unblocked_for_revision =
                         blocking_signal::unblock_for_revision(work_db, SignalKind::MergeConflict, candidate, &a.id);
                 }
@@ -918,7 +956,7 @@ pub async fn on_conflict_detected_with(
     // - Fix vehicle spawned (parent is now/stays `in_review` with revision
     //   in Doing): "conflict_revision_in_flight"
     // - Pure no-op (idempotent UNIQUE collision with existing revision): no event
-    if task_unblocked_for_revision {
+    if task_unblocked_for_revision || minted_revision {
         publisher
             .publish_work_item_changed(
                 &candidate.product_id,
@@ -958,7 +996,7 @@ pub async fn on_conflict_detected_with(
         raw_merge_state_status = %probe.raw_merge_state_status,
         "conflict_watch: PR conflicts with base; conflict detection ran",
     );
-    task_flipped_to_blocked || task_unblocked_for_revision
+    task_flipped_to_blocked || task_unblocked_for_revision || minted_revision
 }
 
 /// Is `active_crz` (an in-flight attempt with a linked revision) stale?

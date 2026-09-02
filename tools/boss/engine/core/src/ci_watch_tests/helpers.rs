@@ -8,7 +8,7 @@ pub(super) use std::sync::Arc;
 pub(super) use tempfile::tempdir;
 
 pub(super) use super::super::*;
-pub(super) use crate::merge_poller::{CiProvider, OpenPrStatus, PrLifecycleProbe, PrLifecycleState};
+pub(super) use crate::merge_poller::{CiProvider, OpenPrCiStatus, OpenPrStatus, PrLifecycleProbe, PrLifecycleState};
 pub(super) use crate::test_support::*;
 pub(super) use crate::work::{TaskStatus, WorkDb, WorkItem, WorkItemPatch};
 

@@ -92,6 +92,22 @@ impl WorkDb {
         )
     }
 
+    /// Blocked chores/project_tasks with a bound PR whose scalar reason is
+    /// **not** merge_conflict or ci_failure. Those two reasons already have
+    /// their own candidate lists; this list is the gap: a parent parked in
+    /// `blocked: dependency` / `review_feedback` / … is invisible to the
+    /// in_review and reason-keyed lists, so a CONFLICTING PR on it is never
+    /// probed. The sweep de-dupes by work_item_id, so overlap is harmless.
+    pub fn list_chores_blocked_other_with_pr(&self) -> Result<Vec<PendingMergeCheck>> {
+        self.query_pending_merge_checks(
+            "t.status = 'blocked'
+               AND t.pr_url IS NOT NULL
+               AND t.pr_url != ''
+               AND (t.blocked_reason IS NULL
+                    OR t.blocked_reason NOT IN ('merge_conflict', 'ci_failure', 'ci_failure_exhausted'))",
+        )
+    }
+
     /// Parents that have stranded in `status='blocked'` with a NULL scalar
     /// `blocked_reason` **and** an empty active `task_blocked_signals` set,
     /// yet are owned by the remediation substrate (a `conflict_resolutions`

@@ -633,17 +633,20 @@ pub fn pr_labels_opt_out(labels: &[String]) -> bool {
 /// delegated to the shared [`crate::work::classify_pr_merge_state`]
 /// helper (also used by the revision gate's `map_gh_state`); this
 /// function layers the open-PR mergeability / CI axes on top:
-///       * `mergeable=CONFLICTING` AND `mergeStateStatus=DIRTY` → `Conflict`
+///       * `mergeable=CONFLICTING` → `Conflict`
 ///       * `mergeable=UNKNOWN` → `Unknown` (GitHub is recomputing; skip conflict transitions)
 ///       * everything else → `Clean`.
 ///
 /// The `ci` axis is supplied by the caller from [`classify_ci`] — both axes
 /// share the `Open` wrapper.
 ///
-/// The two-field agreement on `CONFLICTING` + `DIRTY` is deliberate —
-/// either alone is the precise signal, but requiring both protects
-/// against `mergeStateStatus` lagging behind `mergeable` immediately
-/// after a base move.
+/// `mergeable=CONFLICTING` is the load-bearing signal. Requiring
+/// `mergeStateStatus=DIRTY` as well hid real conflicts: GitHub often
+/// reports `CONFLICTING` with `BLOCKED` (branch protection still
+/// applies) or a lagging non-`DIRTY` status, and `conflict_watch`
+/// never ran. `mergeStateStatus=DIRTY` without `CONFLICTING` still
+/// maps to `Clean` — that is the lag case the two-field rule was
+/// protecting against, immediately after a base move.
 ///
 /// `UNKNOWN` maps to `OpenPrMergeability::Unknown` rather than `Clean`
 /// so the conflict-watch retire path does not fire on transient
@@ -655,7 +658,7 @@ pub(crate) fn classify_state(
     raw_state: &str,
     merged_at: &str,
     mergeable: &str,
-    merge_state_status: &str,
+    _merge_state_status: &str,
     ci: OpenPrCiStatus,
 ) -> PrLifecycleState {
     match crate::work::classify_pr_merge_state(raw_state, merged_at) {
@@ -663,8 +666,7 @@ pub(crate) fn classify_state(
         crate::work::PrMergeClass::ClosedUnmerged => return PrLifecycleState::ClosedUnmerged,
         crate::work::PrMergeClass::Open => {}
     }
-    let conflicting = mergeable.eq_ignore_ascii_case("CONFLICTING") && merge_state_status.eq_ignore_ascii_case("DIRTY");
-    let mergeability = if conflicting {
+    let mergeability = if mergeable.eq_ignore_ascii_case("CONFLICTING") {
         OpenPrMergeability::Conflict
     } else if mergeable.eq_ignore_ascii_case("UNKNOWN") {
         OpenPrMergeability::Unknown

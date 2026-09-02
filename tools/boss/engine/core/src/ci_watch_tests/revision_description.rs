@@ -4,7 +4,15 @@ use super::helpers::*;
 
 #[test]
 fn ci_revision_description_empty_slice_is_generic() {
-    assert_eq!(ci_revision_description(&[]), "Fix failing CI");
+    assert_eq!(ci_revision_description(&[], None), "Fix failing CI");
+    assert_eq!(
+        ci_revision_description(&[], Some("trunk_queue_eviction")),
+        "Investigate merge-queue rejection",
+    );
+    assert_eq!(
+        ci_revision_description(&[], Some("merge_queue_rebounce")),
+        "Investigate merge-queue rejection",
+    );
 }
 
 #[test]
@@ -12,13 +20,13 @@ fn ci_revision_description_all_blank_names_is_generic() {
     // Empty names are filtered out; with nothing left the title falls back
     // to the generic form rather than listing a run of empty strings.
     let failures = vec![failure("", "FAILURE"), failure("", "FAILURE")];
-    assert_eq!(ci_revision_description(&failures), "Fix failing CI");
+    assert_eq!(ci_revision_description(&failures, None), "Fix failing CI");
 }
 
 #[test]
 fn ci_revision_description_lists_up_to_three_names() {
     let one = vec![failure("ci/test", "FAILURE")];
-    assert_eq!(ci_revision_description(&one), "Fix failing CI: ci/test");
+    assert_eq!(ci_revision_description(&one, None), "Fix failing CI: ci/test");
 
     let three = vec![
         failure("ci/test", "FAILURE"),
@@ -26,7 +34,7 @@ fn ci_revision_description_lists_up_to_three_names() {
         failure("ci/build", "FAILURE"),
     ];
     assert_eq!(
-        ci_revision_description(&three),
+        ci_revision_description(&three, None),
         "Fix failing CI: ci/test, ci/lint, ci/build",
     );
 }
@@ -41,7 +49,7 @@ fn ci_revision_description_more_than_three_appends_more_tail() {
         failure("ci/deploy", "FAILURE"),
     ];
     assert_eq!(
-        ci_revision_description(&five),
+        ci_revision_description(&five, None),
         "Fix failing CI: ci/test, ci/lint, ci/build (+2 more)",
     );
 }
@@ -57,7 +65,7 @@ fn ci_revision_description_excludes_blanks_from_list_and_count() {
         failure("ci/build", "FAILURE"),
     ];
     assert_eq!(
-        ci_revision_description(&mixed),
+        ci_revision_description(&mixed, None),
         "Fix failing CI: ci/test, ci/lint, ci/build",
     );
 
@@ -70,7 +78,7 @@ fn ci_revision_description_excludes_blanks_from_list_and_count() {
         failure("ci/fmt", "FAILURE"),
     ];
     assert_eq!(
-        ci_revision_description(&mixed_overflow),
+        ci_revision_description(&mixed_overflow, None),
         "Fix failing CI: ci/test, ci/lint, ci/build (+1 more)",
     );
 }

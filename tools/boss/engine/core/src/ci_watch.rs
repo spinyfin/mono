@@ -43,7 +43,8 @@ use serde::Serialize;
 use crate::blocking_signal::{self, SignalKind};
 use crate::coordinator::ExecutionPublisher;
 use crate::merge_poller::{
-    OpenPrCiStatus, PrLifecycleProbe, PrLifecycleState, RequiredCheckFailure, pr_labels_opt_out, stored_pr_number,
+    OpenPrCiStatus, OpenPrMergeability, PrLifecycleProbe, PrLifecycleState, RequiredCheckFailure, pr_labels_opt_out,
+    stored_pr_number,
 };
 use crate::work::{
     ARCHIVE_MECHANISM_CI_WATCH_SUPERSESSION, ArchiveProvenance, CiRemediation, CiRemediationInsertInput,
@@ -806,7 +807,7 @@ pub async fn on_ci_failure_detected(
 /// directive (log excerpt, failed-check table, rebase recipe) is injected at
 /// dispatch by `compose_revision_directive`, keyed off the `ci-fix:`
 /// `created_via` (Phase 2).
-fn ci_revision_description(failures: &[RequiredCheckFailure]) -> String {
+fn ci_revision_description(failures: &[RequiredCheckFailure], failure_kind: Option<&str>) -> String {
     const MAX_NAMES: usize = 3;
     let names: Vec<&str> = failures
         .iter()
@@ -814,7 +815,12 @@ fn ci_revision_description(failures: &[RequiredCheckFailure]) -> String {
         .filter(|n| !n.is_empty())
         .collect();
     if names.is_empty() {
-        return "Fix failing CI".to_owned();
+        return match failure_kind {
+            Some("trunk_queue_eviction") | Some("merge_queue_rebounce") => {
+                "Investigate merge-queue rejection".to_owned()
+            }
+            _ => "Fix failing CI".to_owned(),
+        };
     }
     let shown = names.iter().take(MAX_NAMES).copied().collect::<Vec<_>>().join(", ");
     if names.len() > MAX_NAMES {
@@ -847,7 +853,7 @@ async fn maybe_spawn_ci_revision(
     failures: &[RequiredCheckFailure],
     attempt: &CiRemediation,
 ) -> bool {
-    let description = ci_revision_description(failures);
+    let description = ci_revision_description(failures, attempt.failure_kind.as_deref());
     let created_via = format!("{CREATED_VIA_CI_FIX_PREFIX}{}", attempt.id);
 
     let revision = match work_db.create_revision(
@@ -1117,50 +1123,29 @@ async fn on_queue_side_failure_detected(
         labels,
     } = episode;
     if failures.is_empty() {
-        // Defence in depth for the Trunk arm only.
+        // Confirmed queue rejection with no construction-build / check-run
+        // names attached. GitHub-native rebounce hits this when evidence
+        // enrichment misses (mono's Buildkite posts legacy commit statuses;
+        // a check-runs-only fetch returned `[]` for every mono ejection).
+        // Trunk hits it when the queue evicts without ever starting a
+        // construction build — the `"Trunk Merge Queue (<branch>)"` check
+        // fails in seconds with an empty summary, `mergeable` stays
+        // MERGEABLE, and `mergeStateStatus` goes BLOCKED.
         //
-        // A Trunk eviction with no failing build to name is not a CI
-        // failure we can act on: `failed_checks` lands empty, the worker
-        // prompt has nothing to point at, and a CI attempt is spent on a
-        // task that cannot be completed. That combination previously did
-        // real damage — the worker, told to find a build that did not
-        // exist and denied any bail-out, force-pushed an empty commit
-        // over a PR's entire contents. Refuse the flip for Trunk.
-        //
-        // `trunk_queue_poller::handle_trunk_queue_eviction` classifies the
-        // eviction first and only routes here when it has build evidence or
-        // no positive merge-side signal. Kept because a silent, budget-
-        // consuming misroute is a far worse failure mode than a refusal,
-        // and because `warn!` makes any future caller that trips it visible
-        // rather than mysterious.
-        //
-        // GitHub-native merge-queue rebounce is different: a confirmed
-        // `reason: failed_checks` timeline event is unambiguous evidence
-        // of failure even when the evidence-enrichment lookup comes back
-        // empty (mono's Buildkite posts legacy commit statuses; a
-        // check-runs-only fetch returned `[]` for every mono ejection,
-        // and this guard then refused every flip). A card that lies green
-        // is worse than a fix revision with a vague prompt; fall through
-        // and let the insert land with `failed_checks = "[]"` so the
-        // worker prompt's rebounce generic directive fires.
-        if failure_kind == "trunk_queue_eviction" {
-            tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                discriminator,
-                failure_kind,
-                "ci_watch: Trunk queue-side failure carried no failing checks; refusing to flip the row \
-                 (nothing for a fix revision to act on)",
-            );
-            return false;
-        }
+        // A prior Trunk-only refusal left that class invisible: the
+        // poller classified the eviction as TestFailure, this guard
+        // dropped it, and no revision was minted. The worker prompt's
+        // no-evidence STOP section is what makes minting safe (do not
+        // invent a build, do not force-push an empty commit; mark-failed
+        // if nothing on this PR is broken) — the same contract the
+        // rebounce generic directive already uses.
         tracing::warn!(
             work_item_id = %candidate.work_item_id,
             pr_url = %candidate.pr_url,
             discriminator,
             failure_kind,
             "ci_watch: queue-side failure carried no failing checks; flipping with a generic directive \
-             (confirmed failed_checks ejection is authoritative)",
+             (confirmed queue rejection is authoritative)",
         );
     }
     if auto_pr_maintenance_disabled(work_db, candidate, labels) {
@@ -1651,6 +1636,74 @@ pub async fn on_trunk_queue_eviction_detected(
             labels: &[],
         },
         failures,
+    )
+    .await
+}
+
+/// Merge-poller entry point for a terminally-failed `"Trunk Merge Queue
+/// (<branch>)"` check already captured on the probe.
+///
+/// This is the targeted GitHub-side signal that a queue episode was
+/// evicted. The Trunk check is excluded from [`classify_ci`] so it does
+/// not spawn a `pr_branch_ci` remediation; without this path a Direct-
+/// mechanism product (or any episode the queue poller has not yet
+/// adopted) would never mint a revision for the rejection.
+///
+/// Waiting vs stuck: only fires when the PR-head CI rollup is `Clean`
+/// (in-flight required checks are waiting, not stuck). Conflict
+/// pre-empts. An active Trunk merge intent means the queue poller
+/// already owns the episode. Stale checks past the adoption window are
+/// declined so an abandoned queue attempt is not resurrected.
+pub async fn on_trunk_head_check_eviction_detected(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    probe: &PrLifecycleProbe,
+) -> bool {
+    let Some(check) = probe.trunk_queue_check_failure.as_ref() else {
+        return false;
+    };
+    let PrLifecycleState::Open(open) = &probe.state else {
+        return false;
+    };
+    if open.mergeability != OpenPrMergeability::Clean || open.ci != OpenPrCiStatus::Clean {
+        return false;
+    }
+    if crate::trunk_queue_adopt::trunk_check_episode_is_stale(check.completed_at.as_deref()) {
+        return false;
+    }
+    match work_db.get_active_trunk_merge_intent(&candidate.work_item_id) {
+        Ok(Some(_)) => return false,
+        Ok(None) => {}
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                ?err,
+                "ci_watch: failed to read active trunk merge intent; deferring head-check eviction",
+            );
+            return false;
+        }
+    }
+    let Some(head_sha) = probe.head_ref_oid.as_deref() else {
+        return false;
+    };
+    let completed_at = check.completed_at.as_deref().unwrap_or("unknown");
+    let failures = [RequiredCheckFailure {
+        name: check.name.clone(),
+        conclusion: check.conclusion.clone(),
+        target_url: check.details_url.clone(),
+        provider: crate::merge_poller::CiProvider::Other,
+        provider_job_id: None,
+    }];
+    on_trunk_queue_eviction_detected(
+        work_db,
+        publisher,
+        candidate,
+        probe.head_ref_name.as_deref(),
+        &format!("check:{head_sha}"),
+        completed_at,
+        &failures,
     )
     .await
 }

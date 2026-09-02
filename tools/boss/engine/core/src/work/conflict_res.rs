@@ -632,7 +632,7 @@ impl WorkDb {
                     base_sha_at_trigger = NULL,
                     finished_at         = COALESCE(finished_at, ?3)
               WHERE id = ?1
-                AND status IN ('pending', 'running')",
+                AND status IN ('pending', 'running', 'abandoned')",
             params![attempt_id, reason, now],
         )?;
         finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
