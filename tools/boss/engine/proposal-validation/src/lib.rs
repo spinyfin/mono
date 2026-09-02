@@ -185,12 +185,29 @@ pub fn validate_payload(kind: ProposalKind, payload: &Value) -> Result<Validated
         }
         ProposalKind::ReviewReport => {
             let batch_id = reader.required_text("batch_id", MAX_SHORT_FIELD_CHARS);
-            let member_id = reader.required_text("member_id", MAX_SHORT_FIELD_CHARS);
+            let target_sha = reader.required_text("target_sha", MAX_SHORT_FIELD_CHARS);
             let report = reader.required_json_object("report", MAX_LONG_FIELD_CHARS);
+            if let Some(report) = report.as_ref() {
+                match serde_json::from_value::<boss_pr_review::ReviewerReport>(report.clone()) {
+                    Ok(parsed) => {
+                        if let Some(batch_id) = batch_id.as_deref()
+                            && parsed.batch_id != batch_id
+                        {
+                            reader.error("report.batch_id", "must match `batch_id`");
+                        }
+                        if let Some(target_sha) = target_sha.as_deref()
+                            && parsed.target_sha != target_sha
+                        {
+                            reader.error("report.target_sha", "must match `target_sha`");
+                        }
+                    }
+                    Err(err) => reader.error("report", format!("does not match the reviewer report schema: {err}")),
+                }
+            }
             reader.finish()?;
             to_json(&ReviewReportProposalPayload {
                 batch_id: batch_id.unwrap_or_default(),
-                member_id: member_id.unwrap_or_default(),
+                target_sha: target_sha.unwrap_or_default(),
                 report: report.unwrap_or_default(),
             })
         }

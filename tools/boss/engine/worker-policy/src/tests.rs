@@ -203,7 +203,19 @@ fn proposal_verbs_are_allowed() {
     assert_allowed(FrontendRequest::SubmitProposal {
         run_id: "exec_1".into(),
         kind: ProposalKind::ReviewReport,
-        payload: json!({"batch_id": "rvb_1", "member_id": "rvm_1", "report": {"findings": []}}),
+        payload: json!({
+            "batch_id": "rvb_1",
+            "target_sha": "head_1",
+            "report": {
+                "batch_id": "rvb_1",
+                "pr_url": "https://github.com/o/r/pull/1",
+                "target_sha": "head_1",
+                "phase": "pre_merge",
+                "summary": "Clean.",
+                "coverage": {"files_inspected": [], "files_omitted": [], "limitations": []},
+                "findings": [],
+            },
+        }),
         idempotency_key: None,
     });
     assert_allowed(FrontendRequest::SubmitProposal {

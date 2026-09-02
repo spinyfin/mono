@@ -658,15 +658,67 @@ pub(crate) async fn compose_worker_spawn(
             };
             let reviewer_repo_slug = crate::completion::parse_repo_slug(&execution.repo_remote_url)
                 .unwrap_or_else(|_| "<owner/repo>".to_owned());
-            crate::pr_review::render_reviewer_initial_prompt(
-                task_name,
-                task_description,
-                pr_url,
-                &crate::structured_output::default_path_string(&execution.id, StructuredOutputKind::ReviewResult),
-                scope,
-                pr_review_context.as_ref(),
-                &reviewer_repo_slug,
-            )
+            let report_destination = match work_db.review_batch_member_for_execution(&execution.id) {
+                Ok(Some(member)) => match work_db.review_batch(&member.batch_id) {
+                    Ok(Some(batch)) => Some(
+                        crate::pr_review::ReviewerReportDestination::builder()
+                            .batch_id(batch.id)
+                            .pr_url(batch.pr_url)
+                            .target_sha(batch.target_sha)
+                            .phase(batch.phase)
+                            .body_path(crate::structured_output::default_path_string(
+                                &execution.id,
+                                StructuredOutputKind::ReviewResult,
+                            ))
+                            .build(),
+                    ),
+                    Ok(None) => {
+                        tracing::error!(
+                            execution_id = %execution.id,
+                            batch_id = %member.batch_id,
+                            "pr_review execution has a member without its persisted batch; using legacy prompt",
+                        );
+                        None
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            execution_id = %execution.id,
+                            batch_id = %member.batch_id,
+                            ?err,
+                            "could not load batch report destination; using legacy prompt",
+                        );
+                        None
+                    }
+                },
+                Ok(None) => None,
+                Err(err) => {
+                    tracing::error!(
+                        execution_id = %execution.id,
+                        ?err,
+                        "could not determine whether reviewer belongs to a batch; using legacy prompt",
+                    );
+                    None
+                }
+            };
+            match report_destination.as_ref() {
+                Some(destination) => crate::pr_review::render_batch_reviewer_initial_prompt(
+                    task_name,
+                    task_description,
+                    destination,
+                    scope,
+                    pr_review_context.as_ref(),
+                    &reviewer_repo_slug,
+                ),
+                None => crate::pr_review::render_reviewer_initial_prompt(
+                    task_name,
+                    task_description,
+                    pr_url,
+                    &crate::structured_output::default_path_string(&execution.id, StructuredOutputKind::ReviewResult),
+                    scope,
+                    pr_review_context.as_ref(),
+                    &reviewer_repo_slug,
+                ),
+            }
         }
     } else if execution.kind == ExecutionKind::AnswerAgent {
         // P3b: an `answer_agent` execution renders the answer-agent prompt

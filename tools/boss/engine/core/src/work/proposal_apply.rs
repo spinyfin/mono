@@ -180,43 +180,57 @@ fn apply_review_report(
     proposal_id: &str,
 ) -> Result<ApplyDecision> {
     let payload: ReviewReportProposalPayload = serde_json::from_str(payload_json)?;
+    let report: boss_pr_review::ReviewerReport = serde_json::from_value(payload.report.clone())?;
     let member = tx
         .query_row(
-            "SELECT batch_id, execution_id, status, report_proposal_id
-             FROM pr_review_batch_members WHERE id = ?1",
-            [&payload.member_id],
+            "SELECT members.id, members.batch_id, members.status, members.report_proposal_id,
+                    batches.pr_url, batches.target_sha, batches.phase
+             FROM pr_review_batch_members AS members
+             JOIN pr_review_batches AS batches ON batches.id = members.batch_id
+             WHERE members.execution_id = ?1 AND members.batch_id = ?2",
+            rusqlite::params![execution_id, payload.batch_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             },
         )
         .optional()?;
-    let Some((member_batch_id, member_execution_id, status, existing_report)) = member else {
+    let Some((member_id, member_batch_id, status, existing_report, pr_url, target_sha, phase)) = member else {
         return Ok(ApplyDecision::Rejected(format!(
-            "review batch member `{}` does not exist",
-            payload.member_id
+            "this execution is not a member of review batch `{}`",
+            payload.batch_id
         )));
     };
     if member_batch_id != payload.batch_id {
         return Ok(ApplyDecision::Rejected(format!(
-            "review batch member `{}` belongs to batch `{member_batch_id}`, not `{}`",
-            payload.member_id, payload.batch_id
+            "review batch membership does not match submitted batch `{}`",
+            payload.batch_id
         )));
     }
-    if member_execution_id.as_deref() != Some(execution_id) {
-        return Ok(ApplyDecision::Rejected(format!(
-            "review batch member `{}` is not owned by this execution",
-            payload.member_id
-        )));
+    if payload.target_sha != target_sha {
+        return Ok(ApplyDecision::Rejected(
+            "submitted target SHA does not match batch target".to_owned(),
+        ));
+    }
+    if report.batch_id != payload.batch_id
+        || report.target_sha != target_sha
+        || report.pr_url != pr_url
+        || report.phase.as_str() != phase
+    {
+        return Ok(ApplyDecision::Rejected(
+            "review report identity does not match its persisted batch target".to_owned(),
+        ));
     }
     if let Some(existing_report) = existing_report {
         return Ok(ApplyDecision::Rejected(format!(
-            "review batch member `{}` already accepted report proposal `{existing_report}`",
-            payload.member_id
+            "review batch member `{member_id}` already accepted report proposal `{existing_report}`",
         )));
     }
     let status: ReviewBatchMemberStatus = status.parse().map_err(anyhow::Error::msg)?;
@@ -225,8 +239,7 @@ fn apply_review_report(
         ReviewBatchMemberStatus::Pending | ReviewBatchMemberStatus::Running
     ) {
         return Ok(ApplyDecision::Rejected(format!(
-            "review batch member `{}` cannot accept a report while status is `{status}`",
-            payload.member_id
+            "review batch member `{member_id}` cannot accept a report while status is `{status}`",
         )));
     }
 
@@ -235,15 +248,10 @@ fn apply_review_report(
         "UPDATE pr_review_batch_members
          SET status = ?1, report_proposal_id = ?2, terminal_at = ?3, updated_at = ?3
          WHERE id = ?4",
-        rusqlite::params![
-            ReviewBatchMemberStatus::Reported.as_str(),
-            proposal_id,
-            now,
-            payload.member_id
-        ],
+        rusqlite::params![ReviewBatchMemberStatus::Reported.as_str(), proposal_id, now, member_id],
     )?;
     Ok(ApplyDecision::Applied(ApplyOutcome {
-        applied_ref: Some(payload.member_id),
+        applied_ref: Some(member_id),
         post_commit_audit_line: None,
     }))
 }

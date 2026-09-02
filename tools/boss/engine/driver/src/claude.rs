@@ -516,6 +516,77 @@ pub const REVISION_PR_GUARD_COMMAND: &str = python_command_guard!(
     "_approve()\n",
 );
 
+/// Inline Python decision hook for static-analysis-only reviewer sessions.
+///
+/// Mutation and publication remain fenced by the existing reviewer deny rules
+/// and driver sandboxes. This complementary guard closes the command surface
+/// those controls intentionally leave open: builds, tests, formatters,
+/// generators, language runners, shell interpreters, and direct execution of
+/// checked-out artifacts. It is shared unchanged by Claude, Codex, and Grok.
+pub const REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND: &str = python_command_guard!(
+    "DELIMS={'&&','||',';','|','&'}\n",
+    "WRAPPERS={'env','command','exec','nohup','stdbuf','setsid','caffeinate','sudo','time','xargs'}\n",
+    "BLOCKED={'make','just','cmake','ninja','meson','buck','xcodebuild','gradle','gradlew','mvn','mvnw','sbt','dotnet','pytest','tox','nox','rustfmt','gofmt','prettier','black','ruff','protoc','buf','codegen','npx','npm','pnpm','yarn','bun','deno','node','python','python3','ruby','perl','php','lua','java','kotlinc','swift','uv','poetry','pipenv','maturin'}\n",
+    "def groups_for(line):\n",
+    "    try:\n",
+    "        toks=shlex.split(line,posix=True)\n",
+    "    except Exception:\n",
+    "        toks=line.split()\n",
+    "    groups=[]\n",
+    "    cur=[]\n",
+    "    for tok in toks:\n",
+    "        if tok in DELIMS:\n",
+    "            if cur:\n",
+    "                groups.append(cur)\n",
+    "            cur=[]\n",
+    "        else:\n",
+    "            cur.append(tok)\n",
+    "    if cur:\n",
+    "        groups.append(cur)\n",
+    "    return groups\n",
+    "def command_start(group):\n",
+    "    i=0\n",
+    "    while i<len(group):\n",
+    "        tok=group[i]\n",
+    "        base=os.path.basename(tok)\n",
+    "        if re.match(r'^[A-Za-z_][A-Za-z0-9_]*=',tok) or base in WRAPPERS:\n",
+    "            i+=1\n",
+    "            continue\n",
+    "        if base=='timeout' and i+1<len(group):\n",
+    "            i+=2\n",
+    "            continue\n",
+    "        return group[i:]\n",
+    "    return []\n",
+    "matched=None\n",
+    "for line in cmd.split(chr(10)):\n",
+    "    for group in groups_for(line):\n",
+    "        rest=command_start(group)\n",
+    "        if not rest:\n",
+    "            continue\n",
+    "        prog=rest[0]\n",
+    "        base=os.path.basename(prog)\n",
+    "        subcommands=set(rest[1:])\n",
+    "        if base in ('bash','sh','zsh','fish') or base in ('source','.'):\n",
+    "            matched=base\n",
+    "        elif base in ('bazel','bazelisk') and subcommands.intersection({'build','test','run','coverage'}):\n",
+    "            matched=base+' execution subcommand'\n",
+    "        elif base=='cargo' and subcommands.intersection({'build','test','run','bench','fmt','clippy','install'}):\n",
+    "            matched='cargo execution subcommand'\n",
+    "        elif base=='go' and subcommands.intersection({'build','test','run','generate','install'}):\n",
+    "            matched='go execution subcommand'\n",
+    "        elif base in BLOCKED:\n",
+    "            matched=base\n",
+    "        elif prog.startswith('./') or prog.startswith('../') or '/bazel-bin/' in prog or '/target/' in prog:\n",
+    "            matched=prog\n",
+    "        if matched:\n",
+    "            break\n",
+    "    if matched:\n",
+    "        break\n",
+    "if matched:\n",
+    "    _block('Blocked: reviewers perform static analysis only (matched: '+matched+'). Do not run builds, tests, formatters, generators, language runners, shell interpreters, or checked-out executables. Read source, diffs, and metadata instead. If a claim depends on execution, record it with needs_runtime_verification: true in the review report.')\n",
+    "_approve()\n",
+);
+
 /// The driver-specific preamble for the agent-rules file. Names the hook
 /// mechanism ("claude hooks") and is injected at the top of `CLAUDE.md` by
 /// `boss_engine::worker_setup::render_claude_md`.
@@ -842,7 +913,17 @@ impl AgentDriver for ClaudeDriver {
             }));
         }
 
-        // 5. Revision PR guard. Blocks PR creation (`gh pr create`, `cube pr
+        // 5. Static-analysis-only reviewer guard. Existing reviewer deny
+        // rules continue to own mutation and publish fences; this adds the
+        // independent no-execution restriction.
+        if config.is_reviewer {
+            hooks.push(serde_json::json!({
+                "matcher": "Bash",
+                "hooks": [{"type": "command", "command": REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND}],
+            }));
+        }
+
+        // 6. Revision PR guard. Blocks PR creation (`gh pr create`, `cube pr
         //    create`, `cube pr ensure`) for revision workers, which must push
         //    commits to the existing parent PR, never open a new one.
         if config.is_revision {
@@ -1133,6 +1214,8 @@ mod tests {
     use crate::Capability;
     use crate::test_support::home_override;
     use boss_protocol::ReviewModelTier;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
     use tempfile::TempDir;
 
     #[test]
@@ -1382,6 +1465,7 @@ mod tests {
             checkleft_guard_script: Some(PathBuf::from("/tmp/boss-settings/boss-checkleft-push-guard.py")),
             is_revision: false,
             is_standard_worker: true,
+            is_reviewer: false,
             run_id: None,
             workspace_path: None,
         }
@@ -1394,6 +1478,7 @@ mod tests {
             checkleft_guard_script: None,
             is_revision: false,
             is_standard_worker: true,
+            is_reviewer: false,
             run_id: None,
             workspace_path: None,
         }
@@ -1504,15 +1589,16 @@ mod tests {
             checkleft_guard_script: Some(PathBuf::from("/tmp/boss-checkleft-push-guard.py")),
             is_revision: false,
             is_standard_worker: false,
+            is_reviewer: true,
             run_id: None,
             workspace_path: None,
         };
         let wiring = ClaudeDriver.tool_use_interception_wiring(&config);
-        // path guard + boss-launch guard = 2 (no PR redirect, no checkleft)
+        // path guard + boss-launch guard + static-analysis guard (no PR redirect, no checkleft)
         assert_eq!(
             wiring.pre_tool_use_hooks.len(),
-            2,
-            "non-standard (reviewer/triage) worker must get exactly 2 guards: {:?}",
+            3,
+            "reviewer worker must get exactly 3 guards: {:?}",
             wiring.pre_tool_use_hooks,
         );
         let cmds: Vec<&str> = wiring
@@ -1524,6 +1610,48 @@ mod tests {
             !cmds.iter().any(|c| c.contains("jj git push")),
             "non-standard worker must not have the PR redirect guard: {cmds:?}",
         );
+        assert!(
+            cmds.iter().any(|c| c.contains("static analysis only")),
+            "reviewer must have the static-analysis guard: {cmds:?}",
+        );
+    }
+
+    fn reviewer_static_guard_decision(command: &str) -> serde_json::Value {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("start reviewer guard");
+        let payload = serde_json::json!({"tool_input": {"command": command}}).to_string();
+        child
+            .stdin
+            .as_mut()
+            .expect("guard stdin")
+            .write_all(payload.as_bytes())
+            .expect("write hook payload");
+        let output = child.wait_with_output().expect("wait for reviewer guard");
+        assert!(output.status.success(), "guard process failed: {output:?}");
+        serde_json::from_slice(&output.stdout).expect("guard decision JSON")
+    }
+
+    #[test]
+    fn reviewer_static_analysis_guard_blocks_execution_and_allows_reads() {
+        for command in [
+            "bazel test //tools/boss/engine/core:engine_lib_test",
+            "bazel --color=no test //tools/boss/engine/core:engine_lib_test",
+            "cargo fmt",
+            "python3 scripts/check.py",
+            "./bazel-bin/tools/boss/engine/core/engine",
+        ] {
+            assert_eq!(
+                reviewer_static_guard_decision(command)["decision"],
+                "block",
+                "reviewer guard must block {command}",
+            );
+        }
+        assert_eq!(reviewer_static_guard_decision("jj diff --stat")["decision"], "approve");
     }
 
     // ── TranscriptAccess ─────────────────────────────────────────────────────

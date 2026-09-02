@@ -6,6 +6,7 @@ workspace = "../../../.."
 
 [dependencies]
 boss-github = { path = "../../github" }
+boss-pr-review = { path = "../pr-review" }
 boss-protocol = { path = "../../protocol" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

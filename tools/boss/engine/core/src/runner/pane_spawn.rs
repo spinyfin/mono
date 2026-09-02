@@ -96,12 +96,8 @@ mod apply_permission_extra_args_tests {
         );
         let merged = apply_permission_extra_args(&plan.command, &codex_sandbox_extra_args(WorkerKind::Reviewer, false));
         assert!(
-            merged.contains("read-only"),
-            "Reviewer must get --sandbox read-only: {merged}"
-        );
-        assert!(
-            !merged.contains("workspace-write"),
-            "default sandbox must be replaced: {merged}"
+            merged.contains("workspace-write"),
+            "Reviewer must get --sandbox workspace-write: {merged}"
         );
         // Required contract flags survive the rewrite.
         assert!(merged.contains("--strict-config"), "{merged}");
@@ -880,9 +876,9 @@ impl ExecutionRunner for PaneSpawnRunner {
                     .push(crate::driver::EnvDirective::Set(key.clone(), value.clone()));
             }
         }
-        // Apply permission-policy CLI args (e.g. Codex `--sandbox read-only`
-        // for Reviewer). Must run after spawn_invocation so policy replaces
-        // any driver default flags rather than being ignored.
+        // Apply permission-policy CLI args (e.g. Codex's reviewer output-root
+        // sandbox). Must run after spawn_invocation so policy replaces any
+        // driver default flags rather than being ignored.
         spawn_plan.command =
             crate::driver::apply_permission_extra_args(&spawn_plan.command, &permission_artifacts.extra_args);
         // The per-workspace launcher dir goes on *after* the BOSS_BIN_DIR

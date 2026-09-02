@@ -321,4 +321,23 @@ impl WorkDb {
         .optional()
         .map_err(Into::into)
     }
+
+    /// Record a batch member that stopped without submitting its required
+    /// review-report proposal. This is intentionally a member failure rather
+    /// than a transcript-recovery attempt: the proposal ledger is the only
+    /// authoritative report-delivery channel for batch reviews.
+    ///
+    /// Returns `true` when a pending/running member transitioned to failed;
+    /// a previously reported or failed member is left untouched.
+    pub fn fail_review_batch_member_for_execution(&self, execution_id: &str) -> Result<bool> {
+        let now = now_string();
+        let conn = self.connect()?;
+        let changed = conn.execute(
+            "UPDATE pr_review_batch_members
+             SET status = ?1, terminal_at = ?2, updated_at = ?2
+             WHERE execution_id = ?3 AND status IN ('pending', 'running')",
+            params![ReviewBatchMemberStatus::Failed.as_str(), now, execution_id],
+        )?;
+        Ok(changed > 0)
+    }
 }

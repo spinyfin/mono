@@ -353,7 +353,9 @@ pub struct PrCreatedProposalPayload {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReviewReportProposalPayload {
     pub batch_id: String,
-    pub member_id: String,
+    /// Immutable review target the report was prepared against. The engine
+    /// compares this with the persisted batch target before accepting it.
+    pub target_sha: String,
     pub report: serde_json::Value,
 }
 

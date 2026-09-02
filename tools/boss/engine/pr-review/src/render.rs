@@ -21,6 +21,21 @@ pub struct ReviewOrigin {
     pub pr_number: Option<i64>,
 }
 
+/// Engine-owned identity for a batch reviewer submission.
+///
+/// The leaf repeats these immutable fields in its JSON body. The engine still
+/// derives the execution and member identity from the authenticated socket
+/// peer when it accepts the proposal.
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
+pub struct ReviewerReportDestination {
+    pub batch_id: String,
+    pub pr_url: String,
+    pub target_sha: String,
+    pub phase: boss_protocol::ReviewBatchPhase,
+    pub body_path: String,
+}
+
 impl ReviewOrigin {
     /// Human-readable origin reference, e.g. `"PR #<n> (originating work
     /// item T<short_id>)"`. Degrades gracefully when either half is
@@ -273,9 +288,9 @@ pub fn render_reviewer_claude_md(
 /// section covers that case.
 ///
 /// `output_path` is the absolute, engine-owned artifact path the reviewer must
-/// write its `ReviewResult` JSON to (see the engine's structured-output artifact path). It is
-/// the primary output channel; the prompt also asks for a fenced-JSON copy in
-/// the final message as a transitional fallback.
+/// write its legacy `ReviewResult` JSON to (see the engine's structured-output
+/// artifact path). Batch reviewers use [`render_batch_reviewer_initial_prompt`]
+/// instead, which submits a typed report through `boss propose`.
 pub fn render_reviewer_initial_prompt(
     task_name: &str,
     task_description: &str,
@@ -544,6 +559,97 @@ pub fn render_reviewer_initial_prompt(
         schema_head_sha = schema_head_sha,
         rubric = rubric,
         repo_slug = repo_slug,
+    )
+}
+
+/// Render a batch-review leaf prompt. This reuses the complete legacy review
+/// context and rubric while replacing its artifact/transcript delivery
+/// section with the live `boss propose review-report` contract.
+pub fn render_batch_reviewer_initial_prompt(
+    task_name: &str,
+    task_description: &str,
+    destination: &ReviewerReportDestination,
+    scope: ReviewScope,
+    ctx: Option<&PrReviewContext>,
+    repo_slug: &str,
+) -> String {
+    let legacy = render_reviewer_initial_prompt(
+        task_name,
+        task_description,
+        &destination.pr_url,
+        &destination.body_path,
+        scope,
+        ctx,
+        repo_slug,
+    );
+    let (prefix, _) = legacy
+        .split_once("## Required output — CRITICAL")
+        .expect("reviewer prompt contains its output section");
+    let prefix = prefix.replace("ReviewResult", "review report");
+    format!(
+        "{prefix}## Required output — CRITICAL\n\
+         \n\
+         You must submit exactly one structured review report while this session is alive.\n\
+         \n\
+         1. Write the JSON object below to this exact engine-owned body file:\n\
+         \n\
+         `{body_path}`\n\
+         \n\
+         2. Submit it immediately with:\n\
+         \n\
+         ```sh\n\
+         boss propose review-report --batch-id {batch_id} --target-sha {target_sha} --body-file \"{body_path}\"\n\
+         ```\n\
+         \n\
+         The command validates the report immediately. If it rejects the file, correct the\n\
+         reported field errors and submit again before ending your turn. Do not put the JSON\n\
+         in your final response: transcript recovery is intentionally unavailable for batch\n\
+         reviews. The one body-file write and this local `boss propose` call are permitted;\n\
+         do not edit repository files or publish anything.\n\
+         \n\
+         This is static analysis only. Do not run builds, tests, formatters, generators, or\n\
+         executable code. When a finding would need execution to establish conclusively, set\n\
+         `needs_runtime_verification` to `true`.\n\
+         \n\
+         Schema:\n\
+         \n\
+         ```jsonc\n\
+         {{\n\
+           \"batch_id\": \"{batch_id}\",\n\
+           \"pr_url\": \"{pr_url}\",\n\
+           \"target_sha\": \"{target_sha}\",\n\
+           \"phase\": \"{phase}\",\n\
+           \"summary\": \"<one-paragraph overall assessment>\",\n\
+           \"coverage\": {{\n\
+             \"files_inspected\": [\"path/to/file.rs\"],\n\
+             \"files_omitted\": [],\n\
+             \"limitations\": [\"<static-analysis limitation, if any>\"]\n\
+           }},\n\
+           \"findings\": [\n\
+             {{\n\
+               \"severity\": \"critical | high | medium | low\",\n\
+               \"category\": \"correctness | regression | architecture | readability | tests | edgecase | duplication | deferred_scope | agent_isms\",\n\
+               \"confidence\": \"high | medium | low\",\n\
+               \"file\": \"path/to/file.rs\",\n\
+               \"location\": \"fn foo, ~L42\",\n\
+               \"title\": \"<short scannable title>\",\n\
+               \"problem\": \"<concrete defect>\",\n\
+               \"impact\": \"<why the defect matters>\",\n\
+               \"suggested_fix\": \"<specific repair>\",\n\
+               \"static_evidence\": \"<file and code-path evidence>\",\n\
+               \"needs_runtime_verification\": false\n\
+             }}\n\
+           ]\n\
+         }}\n\
+         ```\n\
+         \n\
+         `findings` may be empty. Omit `location` when it does not apply. Report evidence;\n\
+         do not include a `revision_warranted` field and do not decide the final verdict.\n",
+        batch_id = destination.batch_id,
+        pr_url = destination.pr_url,
+        target_sha = destination.target_sha,
+        phase = destination.phase.as_str(),
+        body_path = destination.body_path,
     )
 }
 
@@ -873,6 +979,29 @@ mod tests {
             prompt.contains("design-doc citation"),
             "supersession check must demand a design-doc citation",
         );
+    }
+
+    #[test]
+    fn batch_reviewer_prompt_submits_body_file_in_run() {
+        let destination = ReviewerReportDestination::builder()
+            .batch_id("rvb_1")
+            .pr_url("https://github.com/org/repo/pull/1")
+            .target_sha("head_1")
+            .phase(boss_protocol::ReviewBatchPhase::PreMerge)
+            .body_path("/tmp/boss-worker-output/exec_1.review-result.json")
+            .build();
+        let prompt = render_batch_reviewer_initial_prompt(
+            "Review change",
+            "Inspect the implementation.",
+            &destination,
+            ReviewScope::Code,
+            None,
+            "org/repo",
+        );
+        assert!(prompt.contains("boss propose review-report --batch-id rvb_1 --target-sha head_1 --body-file"));
+        assert!(prompt.contains("needs_runtime_verification"));
+        assert!(prompt.contains("transcript recovery is intentionally unavailable"));
+        assert!(!prompt.contains("revision_warranted\": true"));
     }
 
     #[test]

@@ -49,7 +49,10 @@ use boss_ssh_transport::shell_quote;
 use serde_json::json;
 
 use super::home::hooks_file_path;
-use crate::claude::{BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND};
+use crate::claude::{
+    BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND,
+    REVISION_PR_GUARD_COMMAND,
+};
 use crate::{ProgressObservationConfig, ToolUseInterceptionConfig};
 
 /// Filename of the canonicalisation adapter under `$GROK_HOME/hooks/`.
@@ -188,7 +191,16 @@ fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
         });
     }
 
-    // 5. Revision PR guard.
+    // 5. Reviewer static-analysis guard. The shared Claude command is run by
+    // Grok's adapter, so the three drivers enforce the same command policy.
+    if config.is_reviewer {
+        out.push(Guard {
+            command: REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND.to_owned(),
+            matcher: "Bash",
+        });
+    }
+
+    // 6. Revision PR guard.
     if config.is_revision {
         out.push(Guard {
             command: REVISION_PR_GUARD_COMMAND.to_owned(),
@@ -489,6 +501,7 @@ mod tests {
             checkleft_guard_script: None,
             is_revision: false,
             is_standard_worker: true,
+            is_reviewer: false,
             run_id: Some("run-1".into()),
             workspace_path: Some(PathBuf::from("/tmp/ws")),
         };
@@ -528,6 +541,18 @@ mod tests {
         let guards = guard_commands(&config);
         assert_eq!(guards.len(), 3, "launch + pr-redirect + revision: {config:?}");
         assert_eq!(guards.last().unwrap().command, REVISION_PR_GUARD_COMMAND);
+    }
+
+    #[test]
+    fn reviewer_gets_the_shared_static_analysis_guard() {
+        let config = interception_config(|c| {
+            c.is_standard_worker = false;
+            c.is_reviewer = true;
+        });
+        let guards = guard_commands(&config);
+        assert_eq!(guards.len(), 2, "launch + reviewer guard: {config:?}");
+        assert_eq!(guards[1].command, REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND);
+        assert_eq!(guards[1].matcher, "Bash");
     }
 
     #[test]

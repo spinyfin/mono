@@ -127,8 +127,8 @@ pub(crate) enum ProposeCommand {
     /// verifies that the member belongs to this execution, then accepts it
     /// into that member for the supervisor to consume.
     ///
-    /// Example: `boss propose review-report --batch-id rvb_abc --member-id
-    /// rvm_abc --report-file review.json`
+    /// Example: `boss propose review-report --batch-id rvb_abc --target-sha
+    /// abc123 --body-file review.json`
     ReviewReport(ReviewReportArgs),
     /// Submit the supervisor's consolidated structured verdict for a batch.
     /// The verdict is persisted for asynchronous application; this command
@@ -297,13 +297,13 @@ pub(crate) struct ReviewReportArgs {
     #[arg(long = "batch-id")]
     batch: String,
 
-    /// Durable member id assigned to this reviewer execution.
-    #[arg(long = "member-id")]
-    member: String,
+    /// Immutable commit SHA the review report covers.
+    #[arg(long = "target-sha")]
+    target_sha: String,
 
-    /// Path to the structured JSON report produced by this member.
-    #[arg(long = "report-file", value_name = "PATH")]
-    report_file: PathBuf,
+    /// Path to the structured JSON body produced by this member.
+    #[arg(long = "body-file", value_name = "PATH")]
+    body_file: PathBuf,
 
     #[command(flatten)]
     common: IdempotencyArgs,
@@ -559,8 +559,8 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
             ProposalKind::ReviewReport,
             serde_json::to_value(ReviewReportProposalPayload {
                 batch_id: args.batch,
-                member_id: args.member,
-                report: read_json_object_file("report", args.report_file)?,
+                target_sha: args.target_sha,
+                report: read_json_object_file("body", args.body_file)?,
             })
             .map_err(CliError::internal)?,
             args.common.idempotency_key,
@@ -705,8 +705,8 @@ fn flag_hint_for_field(kind: ProposalKind, field: &str) -> Option<&'static str> 
         (ProposalKind::PrCreated, "pr_url") => Some("--url"),
         (ProposalKind::PrCreated, "branch") => Some("--branch"),
         (ProposalKind::ReviewReport, "batch_id") => Some("--batch-id"),
-        (ProposalKind::ReviewReport, "member_id") => Some("--member-id"),
-        (ProposalKind::ReviewReport, "report") => Some("--report-file"),
+        (ProposalKind::ReviewReport, "target_sha") => Some("--target-sha"),
+        (ProposalKind::ReviewReport, "report") => Some("--body-file"),
         (ProposalKind::ReviewVerdict, "batch_id") => Some("--batch-id"),
         (ProposalKind::ReviewVerdict, "verdict") => Some("--verdict-file"),
         _ => None,
@@ -888,16 +888,16 @@ mod tests {
             "review-report",
             "--batch-id",
             "rvb_1",
-            "--member-id",
-            "rvm_1",
-            "--report-file",
+            "--target-sha",
+            "head_1",
+            "--body-file",
             "report.json",
         ]);
         match args.command {
             Some(ProposeCommand::ReviewReport(args)) => {
                 assert_eq!(args.batch, "rvb_1");
-                assert_eq!(args.member, "rvm_1");
-                assert_eq!(args.report_file, PathBuf::from("report.json"));
+                assert_eq!(args.target_sha, "head_1");
+                assert_eq!(args.body_file, PathBuf::from("report.json"));
             }
             other => panic!("expected ReviewReport, got {other:?}"),
         }
@@ -1101,23 +1101,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let report = dir.path().join("report.json");
         let verdict = dir.path().join("verdict.json");
-        std::fs::write(&report, r#"{"findings":[]}"#).unwrap();
+        std::fs::write(
+            &report,
+            r#"{"batch_id":"rvb_1","pr_url":"https://github.com/o/r/pull/1","target_sha":"head_1","phase":"pre_merge","summary":"Clean.","coverage":{"files_inspected":[],"files_omitted":[],"limitations":[]},"findings":[]}"#,
+        )
+        .unwrap();
         std::fs::write(&verdict, r#"{"outcome":"approved"}"#).unwrap();
 
         let (kind, payload, _) = payload_for(command_for(&[
             "review-report",
             "--batch-id",
             "rvb_1",
-            "--member-id",
-            "rvm_1",
-            "--report-file",
+            "--target-sha",
+            "head_1",
+            "--body-file",
             report.to_str().unwrap(),
         ]))
         .unwrap();
         assert_eq!(kind, ProposalKind::ReviewReport);
         assert_eq!(
             payload,
-            serde_json::json!({"batch_id":"rvb_1","member_id":"rvm_1","report":{"findings":[]}})
+            serde_json::json!({"batch_id":"rvb_1","target_sha":"head_1","report":{"batch_id":"rvb_1","pr_url":"https://github.com/o/r/pull/1","target_sha":"head_1","phase":"pre_merge","summary":"Clean.","coverage":{"files_inspected":[],"files_omitted":[],"limitations":[]},"findings":[]}})
         );
 
         let (kind, payload, _) = payload_for(command_for(&[

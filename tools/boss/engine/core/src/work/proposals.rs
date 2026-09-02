@@ -635,7 +635,9 @@ mod tests {
             // mismatch.
             ProposalKind::PrCreated => format!(r#"{{"pr_url":"https://github.com/spinyfin/mono/pull/{}"}}"#, i + 1),
             ProposalKind::ReviewReport => {
-                format!(r#"{{"batch_id":"rvb_missing","member_id":"rvm_missing_{i}","report":{{"findings":[]}}}}"#)
+                format!(
+                    r#"{{"batch_id":"rvb_missing","target_sha":"head_missing","report":{{"batch_id":"rvb_missing","pr_url":"https://github.com/spinyfin/mono/pull/1","target_sha":"head_missing","phase":"pre_merge","summary":"Clean {i}.","coverage":{{"files_inspected":[],"files_omitted":[],"limitations":[]}},"findings":[]}}}}"#
+                )
             }
             ProposalKind::ReviewVerdict => {
                 format!(r#"{{"batch_id":"rvb_missing","verdict":{{"outcome":"approved_{i}"}}}}"#)

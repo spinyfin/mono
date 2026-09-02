@@ -753,6 +753,7 @@ fn materialize_guards_writes_executables() {
         checkleft_guard_script: None,
         is_revision: false,
         is_standard_worker: false,
+        is_reviewer: false,
         run_id: Some("r".into()),
         workspace_path: Some(tmp.path().to_path_buf()),
     };
@@ -762,6 +763,31 @@ fn materialize_guards_writes_executables() {
     for g in &guards {
         assert!(g.command_path.is_file(), "{:?}", g.command_path);
     }
+}
+
+#[test]
+fn materialize_guards_adds_static_analysis_guard_for_reviewer() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let config = ToolUseInterceptionConfig {
+        data_dir: None,
+        path_guard_script: None,
+        checkleft_guard_script: None,
+        is_revision: false,
+        is_standard_worker: false,
+        is_reviewer: true,
+        run_id: Some("r".into()),
+        workspace_path: Some(tmp.path().to_path_buf()),
+    };
+    let guards = materialize_guards(&home, &config).unwrap();
+    assert!(
+        guards.iter().any(|guard| guard
+            .command_path
+            .to_string_lossy()
+            .contains("reviewer_static_analysis_guard")),
+        "reviewer static-analysis guard must be materialised: {guards:?}"
+    );
 }
 
 /// Interception config for a local Standard worker with every guard
@@ -781,6 +807,7 @@ fn full_interception(tmp: &Path) -> (PathBuf, ToolUseInterceptionConfig) {
             checkleft_guard_script: Some(checkleft),
             is_revision: true,
             is_standard_worker: true,
+            is_reviewer: false,
             run_id: Some("r".into()),
             workspace_path: Some(tmp.to_path_buf()),
         },
@@ -944,15 +971,28 @@ fn homes_root_and_home_pair_is_self_consistent() {
 }
 
 #[test]
-fn reviewer_sandbox_extra_args_are_read_only() {
-    assert_eq!(codex_sandbox_for_worker_kind(WorkerKind::Reviewer, false), "read-only");
-    assert_eq!(codex_sandbox_for_worker_kind(WorkerKind::Reviewer, true), "read-only");
+fn reviewer_sandbox_extra_args_are_output_only_workspace_write() {
+    assert_eq!(
+        codex_sandbox_for_worker_kind(WorkerKind::Reviewer, false),
+        "workspace-write"
+    );
+    assert_eq!(
+        codex_sandbox_for_worker_kind(WorkerKind::Reviewer, true),
+        "workspace-write"
+    );
     assert_eq!(
         codex_sandbox_extra_args(WorkerKind::Reviewer, false),
-        vec!["--sandbox".to_owned(), "read-only".to_owned()]
+        vec!["--sandbox".to_owned(), "workspace-write".to_owned()]
     );
-    // Final command after permission merge must prefer reviewer read-only
-    // over the spawn-plan default workspace-write.
+    // The reviewer's output-root `--cd` argument is supplied only when a
+    // complete PermissionInput is available.
+    let output_dir = boss_engine_structured_output::default_dir();
+    assert_eq!(
+        reviewer_output_sandbox_extra_args(&output_dir),
+        vec!["--cd".to_owned(), output_dir.display().to_string(),]
+    );
+    // Final command preserves workspace-write and moves the sandbox root out
+    // of the checkout through the permission artifact's `--cd` argument.
     let plan = CodexDriver::default().spawn_invocation(spawn_request("gpt-5.6-terra", "run-review-sandbox"));
     assert!(
         plan.command.contains("--sandbox workspace-write"),
@@ -962,12 +1002,25 @@ fn reviewer_sandbox_extra_args_are_read_only() {
     let merged =
         crate::apply_permission_extra_args(&plan.command, &codex_sandbox_extra_args(WorkerKind::Reviewer, false));
     assert!(
-        merged.contains("--sandbox") && merged.contains("read-only"),
-        "Reviewer must get --sandbox read-only after extra_args apply: {merged}"
+        merged.contains("--sandbox") && merged.contains("workspace-write"),
+        "Reviewer must get --sandbox workspace-write after extra_args apply: {merged}"
+    );
+}
+
+#[test]
+fn reviewer_config_keeps_checkout_out_of_writable_roots() {
+    let workspace = Path::new("/tmp/reviewer-workspace");
+    let output_dir = boss_engine_structured_output::default_dir();
+    let config = render_reviewer_base_config_toml(workspace, &output_dir);
+    assert!(config.contains("network_access = false"), "{config}");
+    assert!(!config.contains("writable_roots"), "{config}");
+    assert!(
+        config.contains(&toml_basic_string(&workspace.display().to_string())),
+        "{config}"
     );
     assert!(
-        !merged.contains("workspace-write"),
-        "default sandbox must be replaced, not duplicated: {merged}"
+        config.contains(&toml_basic_string(&output_dir.display().to_string())),
+        "{config}"
     );
 }
 

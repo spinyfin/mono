@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use boss_protocol::ReviewBatchPhase;
+
 /// Authoritative PR metadata fetched from GitHub at reviewer-spawn time.
 ///
 /// Pre-fetched before the reviewer worker starts so the reviewer prompt
@@ -206,6 +208,66 @@ pub struct ReviewFinding {
     pub confidence: ReviewFindingConfidence,
 }
 
+/// The submitted report's coverage declaration. A reviewer must make both
+/// what it inspected and the limits of its static analysis visible to the
+/// supervising agent.
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[serde(deny_unknown_fields)]
+#[builder(on(String, into))]
+pub struct ReviewCoverage {
+    pub files_inspected: Vec<String>,
+    pub files_omitted: Vec<String>,
+    pub limitations: Vec<String>,
+}
+
+/// One static observation submitted by a review-batch leaf.
+///
+/// Unlike the legacy [`ReviewFinding`], this retains the evidence needed by a
+/// supervisor to decide whether an observation should become a remediation.
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[serde(deny_unknown_fields)]
+#[builder(on(String, into))]
+pub struct ReviewerReportFinding {
+    pub severity: ReviewFindingSeverity,
+    pub category: ReviewFindingCategory,
+    pub confidence: ReviewFindingConfidence,
+    pub file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    pub title: String,
+    pub problem: String,
+    pub impact: String,
+    pub suggested_fix: String,
+    pub static_evidence: String,
+    /// Static reviewers must set this when a claim would require executing
+    /// code, tests, generators, or formatters to establish conclusively.
+    pub needs_runtime_verification: bool,
+}
+
+/// Structured report submitted by a member of a persisted review batch.
+///
+/// This is deliberately distinct from the legacy [`ReviewResult`]: a leaf
+/// reports evidence only and never decides whether a revision is warranted.
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[serde(deny_unknown_fields)]
+#[builder(on(String, into))]
+pub struct ReviewerReport {
+    pub batch_id: String,
+    pub pr_url: String,
+    pub target_sha: String,
+    pub phase: ReviewBatchPhase,
+    pub summary: String,
+    pub coverage: ReviewCoverage,
+    pub findings: Vec<ReviewerReportFinding>,
+}
+
+impl ReviewerReport {
+    /// Parse a report from the JSON body handed to `boss propose`.
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+}
+
 /// First-class regression/deletion check — always present in `ReviewResult`.
 ///
 /// `performed` must be `true`; the reviewer cannot skip the deletion check.
@@ -338,6 +400,43 @@ mod tests {
         assert!(!result.revision_warranted);
         assert!(result.findings.is_empty());
         assert!(result.regression_check.performed);
+    }
+
+    #[test]
+    fn reviewer_report_requires_runtime_verification_on_each_finding() {
+        let report = serde_json::json!({
+            "batch_id": "rvb_1",
+            "pr_url": "https://github.com/org/repo/pull/7",
+            "target_sha": "head_7",
+            "phase": "pre_merge",
+            "summary": "Static review found one possible defect.",
+            "coverage": {
+                "files_inspected": ["src/lib.rs"],
+                "files_omitted": [],
+                "limitations": []
+            },
+            "findings": [{
+                "severity": "medium",
+                "category": "correctness",
+                "confidence": "medium",
+                "file": "src/lib.rs",
+                "title": "Runtime-dependent branch",
+                "problem": "The branch depends on external state.",
+                "impact": "It may select the wrong result.",
+                "suggested_fix": "Add a deterministic state check.",
+                "static_evidence": "The branch reads the state without validation.",
+                "needs_runtime_verification": true
+            }]
+        });
+        let parsed = ReviewerReport::from_json(&report.to_string()).expect("valid report");
+        assert!(parsed.findings[0].needs_runtime_verification);
+
+        let mut missing = report;
+        missing["findings"][0]
+            .as_object_mut()
+            .expect("finding is an object")
+            .remove("needs_runtime_verification");
+        assert!(ReviewerReport::from_json(&missing.to_string()).is_err());
     }
 
     #[test]
