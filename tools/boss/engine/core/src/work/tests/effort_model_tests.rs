@@ -310,6 +310,25 @@ fn coordinator_design_xhigh_roundtrips_only_for_design_rows() {
         )
         .unwrap_err();
     assert!(err.to_string().contains("only valid for kind=design"));
+
+    // `Some(false)` on a non-design kind is a no-op, not a rejection: the
+    // guard only rejects turning the flag ON where it cannot mean anything.
+    // Pinning this keeps a future tightening back to `Some(_)` (rejecting
+    // every `Some` on a non-design kind) from silently passing CI.
+    let postmortem_after_noop = db
+        .update_work_item(
+            &postmortem.id,
+            WorkItemPatch {
+                design_reasoning_effort_xhigh: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let WorkItem::Task(postmortem_after_noop) = postmortem_after_noop else {
+        panic!("expected design postmortem task");
+    };
+    assert!(!postmortem_after_noop.design_reasoning_effort_xhigh);
+
     let _ = std::fs::remove_file(path);
 }
 

@@ -385,6 +385,26 @@ pub(crate) fn driver_clears_dispatch_gate(
     }
 }
 
+/// Whether `driver_slug`'s [`crate::driver::ModelMenu`] declares a dedicated
+/// design/investigation-tier model. `grok` does not; `claude` and `codex` do.
+/// An unregistered slug returns `false` (fail closed) — the same "unknown
+/// driver" case is caught elsewhere with a loud `UnknownDriver` error.
+///
+/// Used both to decide whether a *pinned* driver on a design/investigation
+/// row can be honoured without wedging spawn (see [`decide_execution_driver`]'s
+/// pinned branch), and to decide whether a *recorded* traffic-allocation
+/// decision must be substituted with [`boss_engine_effort::ENGINE_DEFAULT_DRIVER`]
+/// at read time (see [`crate::work::driver_lookup::WorkDb::get_execution_driver_slug`]),
+/// mirroring the substitution [`boss_engine_effort::resolve_spawn_config_in`]
+/// applies at spawn time for a `TrafficAllocation`/`EngineDefault`-sourced
+/// driver.
+pub(crate) fn driver_has_design_investigation_model(driver_slug: &str) -> bool {
+    let registry = crate::driver::DriverRegistry::default();
+    registry
+        .get(driver_slug)
+        .is_some_and(|driver| driver.descriptor().model_menu.design_investigation_model.is_some())
+}
+
 /// Decide which driver governs a newly-created execution row and why.
 /// Called once, from `insert_execution`, using the same open `Connection`
 /// (never `WorkDb::connect()` — see `load_driver_traffic_split_conn`).
@@ -482,10 +502,9 @@ pub(crate) fn decide_execution_driver(
     if let Some(pool_driver) = crate::coordinator::pool_driver_slug_for_execution_kind(&kind) {
         return Ok(DriverDecision::pool(pool_driver));
     }
-    let pinned = row
-        .explicit_driver
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| row.product_default_driver.filter(|s| !s.trim().is_empty()));
+    let explicit_driver = row.explicit_driver.filter(|s| !s.trim().is_empty());
+    let from_task_pin = explicit_driver.is_some();
+    let pinned = explicit_driver.or_else(|| row.product_default_driver.filter(|s| !s.trim().is_empty()));
     if let Some(driver) = pinned {
         // Honour the pin only when it clears the capability gate for this
         // execution kind. A product default (or `--driver`) of codex/grok
@@ -501,15 +520,24 @@ pub(crate) fn decide_execution_driver(
             // not change for that data-integrity case.
             Err(_) => true,
         };
-        if pin_ok {
+        // A tier row's pin also needs a dedicated design/investigation-tier
+        // model (`ModelMenu::design_investigation_model`) or spawn hard-fails
+        // with `IneligibleDesignInvestigationDriver` instead of ever running.
+        // A `products.default_driver` is a default, not a row-level pin, so
+        // it yields to allocation the same way a gate-failing pin does; a
+        // `tasks.driver` pin is an explicit human decision and stays loud —
+        // its failure at spawn is the intended signal, not silently routed
+        // around.
+        let tier_ok = from_task_pin || !design_or_investigation_tier || driver_has_design_investigation_model(&driver);
+        if pin_ok && tier_ok {
             return Ok(DriverDecision::explicit(driver));
         }
         tracing::info!(
             work_item_id = %work_item_id,
             execution_kind = %kind,
             pinned_driver = %driver,
-            "dropping driver pin that fails the capability gate for this execution kind; \
-             allocating among eligible drivers instead",
+            "dropping driver pin that fails the capability gate or design/investigation tier model \
+             requirement for this execution kind; allocating among eligible drivers instead",
         );
     }
     let task_kind: TaskKind = task_kind.map_err(|err| {

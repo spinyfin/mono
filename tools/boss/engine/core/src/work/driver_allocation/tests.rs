@@ -905,6 +905,51 @@ fn product_default_driver_overrides_allocation() {
     assert_eq!(decision.reason, REASON_EXPLICIT);
 }
 
+/// A product `default_driver` of `grok` is a default, not a row-level pin.
+/// On a Design/Investigation-tier row, grok clears the ordinary capability
+/// gate (it declares `StructuredOutput`/`ToolUseInterception`) but has no
+/// dedicated tier model (`ModelMenu::design_investigation_model` is `None`),
+/// so honouring it as `explicit` would wedge spawn with
+/// `IneligibleDesignInvestigationDriver` for every design/investigation row
+/// in the product. It must instead yield to allocation among the eligible
+/// tier drivers, exactly like a gate-failing pin.
+#[test]
+fn design_row_with_grok_product_default_yields_to_allocation_instead_of_wedging() {
+    let (_dir, db) = open_db();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(50, 0, 50)).unwrap();
+    let product = create_test_product(&db);
+    db.update_work_item(
+        &product.id,
+        WorkItemPatch {
+            default_driver: Some(DRIVER_SLUG_GROK.to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let design = create_test_chore(&db, &product.id, "design under grok product default");
+    set_task_kind(&db, &design.id, &TaskKind::Design);
+    let execution = create_ready_chore_execution(&db, &design.id);
+
+    let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+    assert_eq!(
+        decision.reason, REASON_ALLOCATION,
+        "a tier row's grok product default must yield to allocation, not record explicit",
+    );
+    assert!(
+        decision
+            .driver
+            .as_deref()
+            .is_some_and(|driver| driver == DRIVER_SLUG_CLAUDE || driver == DRIVER_SLUG_CODEX),
+        "design row must allocate between claude/codex once the grok product default yields, got {:?}",
+        decision.driver,
+    );
+    assert_eq!(
+        db.get_execution_driver_slug(&execution.id).unwrap(),
+        decision.driver,
+        "live lookup must match what was actually allocated, matching what resolve_spawn_config_in would run on",
+    );
+}
+
 #[test]
 fn incompatible_model_override_falls_back_to_the_engine_default_driver() {
     let (_dir, db) = open_db();
