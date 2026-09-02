@@ -20,6 +20,7 @@ struct ExecutionDriverRow {
     exec_kind_raw: String,
     task_kind_raw: String,
     task_driver: Option<String>,
+    reasoning_raw: Option<String>,
     product_default_driver: Option<String>,
 }
 
@@ -76,7 +77,7 @@ impl WorkDb {
             // must yield (same substitution the spawn path applies).
             let row: Option<ExecutionDriverRow> = conn
                 .query_row(
-                    "SELECT e.kind, t.kind, t.driver, p.default_driver
+                    "SELECT e.kind, t.kind, t.driver, t.reasoning, p.default_driver
                        FROM work_executions e
                        JOIN tasks t ON t.id = e.work_item_id
                        LEFT JOIN products p ON p.id = t.product_id
@@ -87,7 +88,8 @@ impl WorkDb {
                             exec_kind_raw: row.get(0)?,
                             task_kind_raw: row.get(1)?,
                             task_driver: row.get(2)?,
-                            product_default_driver: row.get(3)?,
+                            reasoning_raw: row.get(3)?,
+                            product_default_driver: row.get(4)?,
                         })
                     },
                 )
@@ -96,6 +98,7 @@ impl WorkDb {
                 exec_kind_raw,
                 task_kind_raw,
                 task_driver,
+                reasoning_raw,
                 product_default_driver,
             }) = row
             {
@@ -132,10 +135,20 @@ impl WorkDb {
                 // here exactly as at spawn: honouring it would point the
                 // events-socket normaliser at a driver the worker never ran.
                 let task_kind: Option<TaskKind> = task_kind_raw.parse().ok();
-                let pinned = task_driver
+                let reasoning = reasoning_raw
                     .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-                    .or_else(|| product_default_driver.as_deref().filter(|s| !s.trim().is_empty()));
+                    .filter(|value| !value.is_empty())
+                    .and_then(|value| value.parse().ok());
+                let design_or_investigation_tier =
+                    boss_engine_effort::is_design_or_investigation_tier(task_kind.as_ref(), reasoning);
+                let pinned = (!design_or_investigation_tier)
+                    .then(|| {
+                        task_driver
+                            .as_deref()
+                            .filter(|s| !s.trim().is_empty())
+                            .or_else(|| product_default_driver.as_deref().filter(|s| !s.trim().is_empty()))
+                    })
+                    .flatten();
                 if let Some(pinned) = pinned {
                     let honour_pin = match &task_kind {
                         Some(tk) => driver_clears_dispatch_gate(pinned, tk, &exec_kind),
@@ -160,18 +173,26 @@ impl WorkDb {
                 // feature landed) — resolves through the ordinary default
                 // chain. When a pin was dropped above it is deliberately not
                 // re-fed into `resolve_driver`, which would re-honour it.
-                let honourable_task = task_driver.as_deref().filter(|s| {
-                    !s.trim().is_empty()
-                        && task_kind
-                            .as_ref()
-                            .is_none_or(|tk| driver_clears_dispatch_gate(s, tk, &exec_kind))
-                });
-                let honourable_product = product_default_driver.as_deref().filter(|s| {
-                    !s.trim().is_empty()
-                        && task_kind
-                            .as_ref()
-                            .is_none_or(|tk| driver_clears_dispatch_gate(s, tk, &exec_kind))
-                });
+                let honourable_task = (!design_or_investigation_tier)
+                    .then(|| {
+                        task_driver.as_deref().filter(|s| {
+                            !s.trim().is_empty()
+                                && task_kind
+                                    .as_ref()
+                                    .is_none_or(|tk| driver_clears_dispatch_gate(s, tk, &exec_kind))
+                        })
+                    })
+                    .flatten();
+                let honourable_product = (!design_or_investigation_tier)
+                    .then(|| {
+                        product_default_driver.as_deref().filter(|s| {
+                            !s.trim().is_empty()
+                                && task_kind
+                                    .as_ref()
+                                    .is_none_or(|tk| driver_clears_dispatch_gate(s, tk, &exec_kind))
+                        })
+                    })
+                    .flatten();
                 return Ok(Some(boss_engine_effort::resolve_driver(
                     honourable_task,
                     honourable_product,

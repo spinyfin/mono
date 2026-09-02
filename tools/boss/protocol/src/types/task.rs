@@ -587,6 +587,14 @@ pub struct Task {
     #[builder(default)]
     pub human_driven: bool,
 
+    /// Coordinator-set escalation for a complex `kind = design` row. This is
+    /// the driver's reasoning-effort setting, not the work-size
+    /// [`EffortLevel`], and defaults to `false`. The engine rejects it for
+    /// every non-design kind, including `design_postmortem`.
+    #[serde(default)]
+    #[builder(default)]
+    pub design_reasoning_effort_xhigh: bool,
+
     /// Prose outcome supplied by the human at close time via
     /// `boss task complete --summary`. `None` until the row is closed
     /// through that ritual (or an older path that never set it). Cleared

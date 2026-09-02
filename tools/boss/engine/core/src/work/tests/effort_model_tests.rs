@@ -253,6 +253,66 @@ fn investigation_kind_seeds_investigation_and_explicit_choice_wins() {
     let _ = std::fs::remove_file(path);
 }
 
+#[test]
+fn coordinator_design_xhigh_roundtrips_only_for_design_rows() {
+    let path = temp_db_path("design-reasoning-effort-xhigh");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
+    let project = db
+        .create_project_with_design_reasoning_effort(
+            CreateProjectInput::builder()
+                .product_id(product.id.clone())
+                .name("Complex design")
+                .build(),
+            true,
+        )
+        .unwrap();
+    let design_id = db
+        .list_tasks(&product.id, Some(&project.id), None, false)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.kind == TaskKind::Design)
+        .unwrap()
+        .id;
+    let design = query_task(&db.connect().unwrap(), &design_id).unwrap().unwrap();
+    assert_eq!(design.kind, TaskKind::Design);
+    assert!(design.design_reasoning_effort_xhigh);
+    assert_eq!(
+        serde_json::to_value(&design).unwrap()["design_reasoning_effort_xhigh"],
+        serde_json::Value::Bool(true),
+        "the task-show JSON projection exposes the coordinator-set value",
+    );
+
+    let cleared = db
+        .update_work_item(
+            &design.id,
+            WorkItemPatch {
+                design_reasoning_effort_xhigh: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let WorkItem::Task(cleared) = cleared else {
+        panic!("expected design task");
+    };
+    assert!(!cleared.design_reasoning_effort_xhigh);
+
+    let postmortem = db
+        .create_design_postmortem(&product.id, &project.id, &project.name, "reconcile the doc".to_owned())
+        .unwrap();
+    let err = db
+        .update_work_item(
+            &postmortem.id,
+            WorkItemPatch {
+                design_reasoning_effort_xhigh: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("only valid for kind=design"));
+    let _ = std::fs::remove_file(path);
+}
+
 /// `--effort max` seeds `investigation`: `max` is documented as the human-only
 /// escape hatch for maximum reasoning depth, so its meaning was always about
 /// capability rather than size. Honouring it here keeps `--effort max` doing

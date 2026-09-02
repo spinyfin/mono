@@ -150,6 +150,16 @@ impl WorkDb {
     }
 
     pub fn create_project(&self, input: CreateProjectInput) -> Result<Project> {
+        self.create_project_with_design_reasoning_effort(input, false)
+    }
+
+    /// Create a project and explicitly set the auto-created design task's
+    /// driver reasoning effort in the same transaction.
+    pub fn create_project_with_design_reasoning_effort(
+        &self,
+        input: CreateProjectInput,
+        design_reasoning_effort_xhigh: bool,
+    ) -> Result<Project> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         ensure_product_exists(&tx, &input.product_id)?;
@@ -174,7 +184,14 @@ impl WorkDb {
         // Non-design-shaped projects (postmortems, checklists, etc.)
         // pass `no_design_task = true` and land here with zero tasks.
         if !input.no_design_task {
-            insert_design_task_for_project_in_tx(&tx, &input.product_id, &id, &input.name, input.autostart)?;
+            insert_design_task_for_project_in_tx(
+                &tx,
+                &input.product_id,
+                &id,
+                &input.name,
+                input.autostart,
+                design_reasoning_effort_xhigh,
+            )?;
         }
 
         let project = query_project(&tx, &id)?.with_context(|| format!("missing project after insert: {id}"))?;

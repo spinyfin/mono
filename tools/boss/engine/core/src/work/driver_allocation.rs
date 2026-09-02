@@ -7,8 +7,7 @@
 //! for why the split is modelled as three explicit integers with a hard sum
 //! constraint rather than an implied remainder or normalised weights.
 //!
-//! **Which work that is, is not decided here.** Allocation carries no list of
-//! eligible kinds. For a given row it asks
+//! **Which work that is, is mostly not decided here.** Allocation asks
 //! [`crate::driver::DriverRegistry::eligible_drivers_for_kind`] — i.e. the
 //! dispatch capability gate, `CapabilityResolver::check_dispatch`, resolving
 //! the row's `TaskKind` **and** the execution's own `ExecutionKind` (see
@@ -23,7 +22,11 @@
 //! only) was an artifact of the original Codex experiment, not a statement
 //! about capability, and is gone: `reasoning` still selects which *model* a
 //! driver runs (`ModelMenu::model_for_reasoning`) but no longer decides
-//! *which driver*.
+//! *which driver*. The one policy exception is the dedicated
+//! design/investigation tier: original designs and `reasoning = investigation`
+//! rows exclude Grok and are allocated only between Claude and Codex. A
+//! `DesignPostmortem` is excluded by its distinct kind and remains ordinary
+//! traffic-split work.
 //!
 //! The `ExecutionKind` dimension is why `conflict_resolution` and
 //! `ci_remediation` do not silently become codex/grok-eligible just because
@@ -47,7 +50,9 @@
 //! One thing allocation itself still declines, and it is not a claim about
 //! capability:
 //!
-//! - **A row with an explicit pin** — see below.
+//! - **A row with an explicit pin** — see below. The dedicated
+//!   design/investigation tier is also intentionally unpinned so it follows
+//!   the Claude/Codex traffic split.
 //!
 //! Assignment is a deterministic hash of the work item's own id placed on
 //! the split's `[0, 100)` bucket line — not a coin flip per dispatch
@@ -77,7 +82,7 @@
 //! an allocated row is actually routed to its driver rather than the
 //! recorded decision being an inert audit trail.
 
-use boss_protocol::DriverTrafficSplit;
+use boss_protocol::{DRIVER_SLUG_CLAUDE, DRIVER_SLUG_CODEX, DriverTrafficSplit};
 use sha2::{Digest, Sha256};
 
 use super::*;
@@ -194,11 +199,13 @@ fn eligible_drivers_for(
     kind: &TaskKind,
     execution_kind: &ExecutionKind,
     model_override: Option<&str>,
+    design_or_investigation_tier: bool,
 ) -> Vec<&'static str> {
     let registry = crate::driver::DriverRegistry::default();
     registry
         .eligible_drivers_for_kind(kind, Some(execution_kind), &DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER)
         .into_iter()
+        .filter(|slug| !design_or_investigation_tier || *slug == DRIVER_SLUG_CLAUDE || *slug == DRIVER_SLUG_CODEX)
         .filter(|slug| {
             model_override.is_none_or(|model| {
                 registry
@@ -354,6 +361,7 @@ struct AllocationRow {
     explicit_driver: Option<String>,
     model_override: Option<String>,
     task_kind: String,
+    reasoning: Option<String>,
     product_default_driver: Option<String>,
 }
 
@@ -431,7 +439,7 @@ pub(crate) fn decide_execution_driver(
 ) -> Result<DriverDecision> {
     let row = conn
         .query_row(
-            "SELECT t.driver, t.model_override, t.kind, p.default_driver
+            "SELECT t.driver, t.model_override, t.kind, t.reasoning, p.default_driver
                FROM tasks t
                LEFT JOIN products p ON p.id = t.product_id
               WHERE t.id = ?1",
@@ -441,7 +449,8 @@ pub(crate) fn decide_execution_driver(
                     explicit_driver: row.get(0)?,
                     model_override: row.get(1)?,
                     task_kind: row.get(2)?,
-                    product_default_driver: row.get(3)?,
+                    reasoning: row.get(3)?,
+                    product_default_driver: row.get(4)?,
                 })
             },
         )
@@ -453,6 +462,17 @@ pub(crate) fn decide_execution_driver(
     };
     let task_kind_raw = row.task_kind;
     let task_kind: Result<TaskKind, _> = task_kind_raw.parse();
+    let reasoning: Option<ReasoningMode> = row
+        .reasoning
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(str::parse)
+        .transpose()
+        .map_err(|err| {
+            anyhow::anyhow!("driver_traffic_split: work item {work_item_id} has invalid reasoning: {err}")
+        })?;
+    let design_or_investigation_tier =
+        boss_engine_effort::is_design_or_investigation_tier(task_kind.as_ref().ok(), reasoning);
     // Pool dispatch overrides row/product pins. Persist its fixed driver
     // rather than the pin, so this durable record always names the driver
     // the worker actually runs on. Routed through the same named accessors
@@ -462,10 +482,13 @@ pub(crate) fn decide_execution_driver(
     if let Some(pool_driver) = crate::coordinator::pool_driver_slug_for_execution_kind(&kind) {
         return Ok(DriverDecision::pool(pool_driver));
     }
-    let pinned = row
-        .explicit_driver
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| row.product_default_driver.filter(|s| !s.trim().is_empty()));
+    let pinned = (!design_or_investigation_tier)
+        .then(|| {
+            row.explicit_driver
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| row.product_default_driver.filter(|s| !s.trim().is_empty()))
+        })
+        .flatten();
     if let Some(driver) = pinned {
         // Honour the pin only when it clears the capability gate for this
         // execution kind. A product default (or `--driver`) of codex/grok
@@ -503,7 +526,16 @@ pub(crate) fn decide_execution_driver(
         .as_deref()
         .map(str::trim)
         .filter(|model| !model.is_empty());
-    let eligible = eligible_drivers_for(&task_kind, &kind, model_override);
+    let eligible = eligible_drivers_for(
+        &task_kind,
+        &kind,
+        if design_or_investigation_tier {
+            None
+        } else {
+            model_override
+        },
+        design_or_investigation_tier,
+    );
     if eligible.is_empty() && model_override.is_some() {
         return Ok(DriverDecision::default_no_override());
     }

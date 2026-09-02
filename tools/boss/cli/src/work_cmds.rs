@@ -295,6 +295,7 @@ pub(crate) async fn run_project_command(command: ProjectCommand, ctx: &RunContex
                     autostart: !ctx.no_autostart,
                     no_design_task: args.no_design_task,
                 },
+                args.design_reasoning_effort_xhigh,
             )
             .await?;
 
@@ -1573,6 +1574,7 @@ pub(crate) async fn run_update_leaf(
         // unchanged.
         deferred: args.deferred,
         human_driven: args.human_driven,
+        design_reasoning_effort_xhigh: args.design_reasoning_effort_xhigh,
         // Preserve the empty-string "clear" wire form: `--blocked-reason ""`
         // maps to NULL in the engine (clears the field).
         blocked_reason: args.blocked_reason,
@@ -1611,7 +1613,7 @@ pub(crate) async fn run_update_leaf(
     };
     ensure_patch_present(
         &patch,
-        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --effort-matched-rule, --effort-reasons, --reasoning, --model, --driver, --autostart, --deferred, --human-driven, --blocked-reason, --blocked-detail, --archived-reason, --tags, --add-tag, --remove-tag, --clear-tags, --set-project, or --unset-project",
+        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --effort-matched-rule, --effort-reasons, --reasoning, --model, --driver, --autostart, --deferred, --human-driven, --design-reasoning-effort-xhigh, --blocked-reason, --blocked-detail, --archived-reason, --tags, --add-tag, --remove-tag, --clear-tags, --set-project, or --unset-project",
     )?;
     let (item, label) = expect_leaf_work_item(update_work_item(client, &resolved_id, patch).await?)?;
     let item = with_display_status(item);

@@ -41,6 +41,19 @@ pub(crate) fn migrate_tasks_human_driven(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Add the coordinator-set design-only driver reasoning-effort escalation.
+/// Existing rows remain on the default effort; only an explicit coordinator
+/// decision may set this to `1` on a design row.
+pub(crate) fn migrate_tasks_design_reasoning_effort_xhigh(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "design_reasoning_effort_xhigh")? {
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN design_reasoning_effort_xhigh INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 /// Add the `completion_summary` column to `tasks` for older databases.
 /// Written by the human close ritual (`boss task complete --summary`) for
 /// human-driven rows; `NULL` for every other row and for human-driven rows

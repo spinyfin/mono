@@ -66,6 +66,7 @@ impl DriverResolutionSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelResolutionSource {
     TaskOverride,
+    DesignInvestigationTier,
     PoolStrongTier,
     Reasoning,
     LegacyKindFloor,
@@ -79,6 +80,7 @@ impl ModelResolutionSource {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::TaskOverride => "task_override",
+            Self::DesignInvestigationTier => "design_investigation_tier",
             Self::PoolStrongTier => "pool_strong_tier",
             Self::Reasoning => "reasoning",
             Self::LegacyKindFloor => "legacy_kind_floor",
@@ -95,6 +97,9 @@ impl ModelResolutionSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpawnResolutionError {
     UnknownDriver(UnknownDriverError),
+    IneligibleDesignInvestigationDriver {
+        driver: String,
+    },
     IncompatibleModel {
         driver: String,
         driver_source: DriverResolutionSource,
@@ -107,6 +112,10 @@ impl fmt::Display for SpawnResolutionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownDriver(err) => err.fmt(f),
+            Self::IneligibleDesignInvestigationDriver { driver } => write!(
+                f,
+                "driver {driver:?} is ineligible for the dedicated design/investigation tier"
+            ),
             Self::IncompatibleModel {
                 driver,
                 driver_source,
@@ -302,32 +311,31 @@ fn menu_for_driver_in(
         })
 }
 
-/// True iff `kind` belongs to the design family — `Design`, `DesignPostmortem`,
-/// or `Investigation` — which [`resolve_spawn_config`] floors to the selected
-/// driver's investigation tier at every effort level, independent of the
-/// effort-level table. These three kinds are
-/// non-review, non-answer-agent design/investigation work (see
-/// `work_item_task_kind_enum` callers in `engine/core`'s `runner.rs`); they
-/// share the same floor because they share the same failure mode — a
-/// medium-or-lower effort classification on genuinely open-ended design work
-/// otherwise silently dispatches to Sonnet.
-///
-/// Since the `reasoning` column landed this floor applies only to rows that
-/// carry no [`ReasoningMode`]: new design-family rows are seeded
-/// `reasoning = investigation` at insert time
-/// ([`ReasoningMode::default_for`]), which reaches the same model through the
-/// capability lever instead of through a kind special-case. The floor stays
-/// for the rows that predate the column.
-pub fn is_design_family_kind(kind: &TaskKind) -> bool {
-    matches!(
-        kind,
-        TaskKind::Design | TaskKind::Investigation | TaskKind::DesignPostmortem
-    )
+/// True when the row receives the dedicated design/investigation tier. The
+/// `DesignPostmortem` exclusion is structural, not a name match: its distinct
+/// task kind is always ordinary-tier work, even if a caller later writes an
+/// investigation reasoning value onto it.
+pub fn is_design_or_investigation_tier(kind: Option<&TaskKind>, reasoning: Option<ReasoningMode>) -> bool {
+    !matches!(kind, Some(TaskKind::DesignPostmortem))
+        && (matches!(kind, Some(TaskKind::Design)) || reasoning == Some(ReasoningMode::Investigation))
 }
 
-/// Resolve dispatch knobs per design §Q3 precedence (extended for per-pool
-/// override, automated-reviewer-pass-on-every-agent-authored-pr.md §5, the
-/// design-family kind floor, and the `reasoning` capability signal):
+/// Models chosen by the dedicated dispatch tier. This narrow policy is kept
+/// separate from driver menus because ordinary reasoning still uses those
+/// menus; only Claude and Codex can receive the dedicated tier.
+fn design_investigation_model_for(driver: &str) -> Option<&'static str> {
+    match driver {
+        "claude" => Some("fable"),
+        "codex" => Some("gpt-5.6-sol"),
+        _ => None,
+    }
+}
+
+/// Resolve dispatch knobs. The dedicated design/investigation tier is
+/// evaluated first and always resolves to the selected driver's `fable`/`sol`
+/// equivalent. `DesignPostmortem` is excluded by its distinct task kind.
+///
+/// Ordinary rows use this precedence:
 /// 1. `tasks.model_override` (when non-empty after trim).
 /// 2. `pool_model_override` — the owning pool's override, expressed as a
 ///    driver-relative [`PoolModelTier`] rather than a literal model slug.
@@ -347,12 +355,10 @@ pub fn is_design_family_kind(kind: &TaskKind) -> bool {
 ///    and a `large` row with `reasoning = standard` stays on Sonnet because it
 ///    is big, not hard. Steps 4-6 below are reached only by rows where this is
 ///    `None`.
-/// 4. Design-family kind floor — `kind` is `Design`, `DesignPostmortem`, or
-///    `Investigation` ([`is_design_family_kind`]) → the selected driver's
-///    investigation tier, regardless of `effort_level`. This is a genuine
-///    model floor, not an effort bump: a medium-effort design postmortem must
-///    not fall through to the effort-level table's ordinary tier. An explicit
-///    `tasks.model_override` (step 1) still wins over the floor.
+/// 4. Legacy kind floor — an unclassified `DesignPostmortem` or
+///    `Investigation` reaches the selected driver's investigation tier. This
+///    preserves dispatch for rows created before `reasoning` was stored;
+///    original designs are handled by the dedicated tier above.
 /// 5. Effort-level default — from the selected driver's model menu.
 /// 6. `products.default_model` (when non-empty after trim). Because it is a
 ///    default rather than a row pin, it yields to step 7 when the selected
@@ -417,6 +423,8 @@ pub struct SpawnResolutionInput<'a> {
     pub allocated_driver: Option<&'a str>,
     pub kind: Option<&'a TaskKind>,
     pub reasoning: Option<ReasoningMode>,
+    #[builder(default)]
+    pub design_reasoning_effort_xhigh: bool,
 }
 
 /// [`resolve_spawn_config`], resolved against a caller-supplied registry
@@ -442,7 +450,12 @@ pub fn resolve_spawn_config_in(
     let mut menu = menu_for_driver_in(registry, &driver)?;
     let effort_level = input.effort_level;
 
-    let (mut model, mut model_source) = if let Some(m) = input.model_override.map(str::trim).filter(|s| !s.is_empty()) {
+    let design_or_investigation_tier = is_design_or_investigation_tier(input.kind, input.reasoning);
+    let (mut model, mut model_source) = if design_or_investigation_tier {
+        let model = design_investigation_model_for(&driver)
+            .ok_or_else(|| SpawnResolutionError::IneligibleDesignInvestigationDriver { driver: driver.clone() })?;
+        (model.to_owned(), ModelResolutionSource::DesignInvestigationTier)
+    } else if let Some(m) = input.model_override.map(str::trim).filter(|s| !s.is_empty()) {
         (m.to_owned(), ModelResolutionSource::TaskOverride)
     } else if let Some(PoolModelTier::Strong) = input.pool_model_override {
         // Resolved against the selected driver's menu, same lever as step 3
@@ -459,10 +472,7 @@ pub fn resolve_spawn_config_in(
             (menu.model_for_reasoning)(reasoning).to_owned(),
             ModelResolutionSource::Reasoning,
         )
-    } else if input.kind.is_some_and(is_design_family_kind) {
-        // The legacy floor is a tier, not a Claude model alias. Resolve it
-        // through the already-selected driver's menu so an allocated Codex
-        // or Grok row cannot inherit Claude's `opus` vocabulary.
+    } else if matches!(input.kind, Some(TaskKind::DesignPostmortem | TaskKind::Investigation)) {
         (
             (menu.model_for_reasoning)(ReasoningMode::Investigation).to_owned(),
             ModelResolutionSource::LegacyKindFloor,
@@ -527,7 +537,13 @@ pub fn resolve_spawn_config_in(
     Ok(SpawnConfig {
         effort_level,
         reasoning: input.reasoning,
-        effort_value: effort_level.and_then(|l| (menu.effort_value_for_level)(l)),
+        effort_value: if input.design_reasoning_effort_xhigh && matches!(input.kind, Some(TaskKind::Design)) {
+            Some("xhigh")
+        } else if design_or_investigation_tier {
+            None
+        } else {
+            effort_level.and_then(|l| (menu.effort_value_for_level)(l))
+        },
         model,
         model_source,
         driver,
@@ -1703,70 +1719,56 @@ mod tests {
         assert!(cfg.prompt_addendum.unwrap().starts_with("Sketch"));
     }
 
-    // --- design-family kind floor ---
+    // --- dedicated design/investigation tier ---
 
     #[test]
-    fn design_family_kinds_floor_to_opus_at_every_effort_level() {
-        // T711 regression: design_postmortem at medium must not fall through
-        // to the effort table's Sonnet row. All three design-family kinds
-        // float to Opus at trivial/small/medium (where the table would
-        // otherwise pick Sonnet) and stay Opus at large/max (where the table
-        // already picks Opus).
-        for kind in [TaskKind::Design, TaskKind::DesignPostmortem, TaskKind::Investigation] {
-            for level in [
-                EffortLevel::Trivial,
-                EffortLevel::Small,
-                EffortLevel::Medium,
-                EffortLevel::Large,
-                EffortLevel::Max,
+    fn design_and_investigation_tier_use_fable_or_sol_at_default_effort() {
+        for (driver, expected_model) in [("claude", "fable"), ("codex", "gpt-5.6-sol")] {
+            for (kind, reasoning) in [
+                (TaskKind::Design, ReasoningMode::Standard),
+                (TaskKind::Chore, ReasoningMode::Investigation),
             ] {
-                let cfg =
-                    resolve_spawn_config(&SpawnResolutionInput::builder().effort_level(level).kind(&kind).build())
-                        .unwrap();
-                assert_eq!(
-                    cfg.model, "opus",
-                    "kind {kind:?} at effort {level:?} must floor to opus, got {:?}",
-                    cfg.model
-                );
+                let cfg = resolve_spawn_config(
+                    &SpawnResolutionInput::builder()
+                        .allocated_driver(driver)
+                        .effort_level(EffortLevel::Large)
+                        .kind(&kind)
+                        .reasoning(reasoning)
+                        .build(),
+                )
+                .unwrap();
+                assert_eq!(cfg.model, expected_model, "{driver} {kind:?} {reasoning:?}");
+                assert_eq!(cfg.effort_value, None, "strong tier omits the effort override");
+                assert_eq!(cfg.model_source, ModelResolutionSource::DesignInvestigationTier);
             }
         }
     }
 
     #[test]
-    fn design_family_kind_floor_does_not_change_effort_or_addendum() {
-        // The floor changes the model only; effort value + prompt addendum
-        // still follow `effort_level` (same contract as model_override and
-        // pool_model_override).
-        let cfg = resolve_spawn_config(
+    fn design_only_xhigh_is_explicit_and_postmortems_stay_ordinary() {
+        let design = resolve_spawn_config(
             &SpawnResolutionInput::builder()
                 .effort_level(EffortLevel::Medium)
-                .kind(&TaskKind::DesignPostmortem)
+                .kind(&TaskKind::Design)
+                .design_reasoning_effort_xhigh(true)
                 .build(),
         )
         .unwrap();
-        assert_eq!(cfg.model, "opus");
-        assert_eq!(cfg.effort_value, Some("high"));
-        assert!(cfg.prompt_addendum.unwrap().starts_with("Sketch"));
-    }
+        assert_eq!(design.model, "fable");
+        assert_eq!(design.effort_value, Some("xhigh"));
 
-    #[test]
-    fn legacy_design_floor_resolves_through_the_selected_drivers_menu() {
-        let cfg = resolve_spawn_config(
+        let postmortem = resolve_spawn_config(
             &SpawnResolutionInput::builder()
-                .allocated_driver("codex")
                 .effort_level(EffortLevel::Medium)
                 .kind(&TaskKind::DesignPostmortem)
+                .reasoning(ReasoningMode::Investigation)
+                .design_reasoning_effort_xhigh(true)
                 .build(),
         )
         .unwrap();
-
-        assert_eq!(cfg.driver, "codex");
-        assert_eq!(cfg.driver_source, DriverResolutionSource::TrafficAllocation);
-        assert_eq!(cfg.model_source, ModelResolutionSource::LegacyKindFloor);
-        let registry = DriverRegistry::default();
-        let codex = registry.get("codex").expect("codex is registered");
-        assert!((codex.descriptor().model_menu.model_belongs_to_driver)(&cfg.model));
-        assert_ne!(cfg.model, "opus");
+        assert_eq!(postmortem.model, "opus");
+        assert_eq!(postmortem.effort_value, Some("high"));
+        assert_ne!(postmortem.model_source, ModelResolutionSource::DesignInvestigationTier);
     }
 
     #[test]
@@ -1840,10 +1842,6 @@ mod tests {
                     .build(),
                 SpawnResolutionInput::builder()
                     .task_driver(driver_slug)
-                    .reasoning(ReasoningMode::Investigation)
-                    .build(),
-                SpawnResolutionInput::builder()
-                    .task_driver(driver_slug)
                     .kind(&TaskKind::DesignPostmortem)
                     .build(),
                 SpawnResolutionInput::builder()
@@ -1867,6 +1865,19 @@ mod tests {
                     cfg.model_source,
                     cfg.model,
                 );
+            }
+            let investigation = SpawnResolutionInput::builder()
+                .task_driver(driver_slug)
+                .reasoning(ReasoningMode::Investigation)
+                .build();
+            if driver_slug == "grok" {
+                assert!(matches!(
+                    resolve_spawn_config_in(&registry, &investigation),
+                    Err(SpawnResolutionError::IneligibleDesignInvestigationDriver { .. })
+                ));
+            } else {
+                let cfg = resolve_spawn_config_in(&registry, &investigation).unwrap();
+                assert!((menu.model_belongs_to_driver)(&cfg.model));
             }
         }
     }
@@ -1908,36 +1919,42 @@ mod tests {
     }
 
     #[test]
-    fn design_family_floor_beats_product_default_model() {
-        // The floor must override step 4 (products.default_model), not just
-        // step 3 (the effort table).
+    fn design_investigation_tier_beats_product_default_model() {
         let cfg = resolve_spawn_config(
             &SpawnResolutionInput::builder()
                 .effort_level(EffortLevel::Trivial)
                 .product_default_model("claude-sonnet-4-6")
-                .kind(&TaskKind::Investigation)
+                .kind(&TaskKind::Design)
                 .build(),
         )
         .unwrap();
-        assert_eq!(cfg.model, "opus");
+        assert_eq!(cfg.model, "fable");
     }
 
     #[test]
-    fn is_design_family_kind_partitions_task_kind() {
-        assert!(is_design_family_kind(&TaskKind::Design));
-        assert!(is_design_family_kind(&TaskKind::DesignPostmortem));
-        assert!(is_design_family_kind(&TaskKind::Investigation));
-        assert!(!is_design_family_kind(&TaskKind::Chore));
-        assert!(!is_design_family_kind(&TaskKind::Task));
-        assert!(!is_design_family_kind(&TaskKind::Revision));
-        assert!(!is_design_family_kind(&TaskKind::Followup));
-        assert!(!is_design_family_kind(&TaskKind::ProjectTask));
+    fn design_investigation_tier_excludes_postmortems_structurally() {
+        assert!(is_design_or_investigation_tier(
+            Some(&TaskKind::Design),
+            Some(ReasoningMode::Standard)
+        ));
+        assert!(is_design_or_investigation_tier(
+            Some(&TaskKind::Chore),
+            Some(ReasoningMode::Investigation)
+        ));
+        assert!(!is_design_or_investigation_tier(
+            Some(&TaskKind::DesignPostmortem),
+            Some(ReasoningMode::Investigation),
+        ));
+        assert!(!is_design_or_investigation_tier(
+            Some(&TaskKind::Chore),
+            Some(ReasoningMode::Standard)
+        ));
     }
 
     // --- reasoning: the capability lever, independent of effort ---
 
     #[test]
-    fn investigation_reasoning_reaches_opus_at_every_effort_level() {
+    fn investigation_reasoning_reaches_fable_at_default_effort_at_every_effort_level() {
         // The headline requirement: a `small` or `medium` row must be able to
         // dispatch to Opus WITHOUT changing its effort level. Before the
         // `reasoning` column, the only way to reach Opus on one of these rows
@@ -1959,9 +1976,10 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                cfg.model, "opus",
-                "investigation reasoning at effort {level:?} must reach opus"
+                cfg.model, "fable",
+                "investigation reasoning at effort {level:?} must reach fable"
             );
+            assert_eq!(cfg.effort_value, None);
         }
     }
 
@@ -1994,10 +2012,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_changes_the_model_but_not_the_effort_knob_or_addendum() {
-        // The separation cuts both ways: `reasoning` moves the model without
-        // touching how much runway the worker gets, exactly as
-        // `model_override` and the pool override already do.
+    fn investigation_reasoning_uses_the_strong_tier_and_default_effort() {
         let cfg = resolve_spawn_config(
             &SpawnResolutionInput::builder()
                 .effort_level(EffortLevel::Small)
@@ -2006,8 +2021,8 @@ mod tests {
                 .build(),
         )
         .unwrap();
-        assert_eq!(cfg.model, "opus");
-        assert_eq!(cfg.effort_value, Some("medium"), "effort knob still follows `small`");
+        assert_eq!(cfg.model, "fable");
+        assert_eq!(cfg.effort_value, None, "strong tier omits the effort override");
         assert_eq!(
             cfg.prompt_addendum, None,
             "small has no addendum, reasoning must not add one"
@@ -2039,8 +2054,7 @@ mod tests {
         .unwrap();
         assert_eq!(large.model, "opus", "legacy effort table still decides");
 
-        // …including the design-family kind floor, which is what an
-        // unclassified design row relies on.
+        // An unclassified design still receives the dedicated design tier.
         let design = resolve_spawn_config(
             &SpawnResolutionInput::builder()
                 .effort_level(EffortLevel::Trivial)
@@ -2048,7 +2062,7 @@ mod tests {
                 .build(),
         )
         .unwrap();
-        assert_eq!(design.model, "opus", "legacy kind floor still applies");
+        assert_eq!(design.model, "fable", "design policy still applies");
     }
 
     #[test]
@@ -2081,10 +2095,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_beats_the_design_family_kind_floor_and_the_product_default() {
-        // A design-family row explicitly classified `standard` resolves to
-        // Sonnet: the kind floor is the fallback for unclassified rows, not an
-        // override of an explicit classification.
+    fn design_tier_beats_standard_reasoning_and_product_default() {
         let cfg = resolve_spawn_config(
             &SpawnResolutionInput::builder()
                 .effort_level(EffortLevel::Medium)
@@ -2093,7 +2104,7 @@ mod tests {
                 .build(),
         )
         .unwrap();
-        assert_eq!(cfg.model, "sonnet");
+        assert_eq!(cfg.model, "fable");
 
         // And it sits above `products.default_model` (step 6) too.
         let with_product_default = resolve_spawn_config(
@@ -2104,7 +2115,7 @@ mod tests {
                 .build(),
         )
         .unwrap();
-        assert_eq!(with_product_default.model, "opus");
+        assert_eq!(with_product_default.model, "fable");
     }
 
     #[test]
@@ -2113,17 +2124,12 @@ mod tests {
         // resolving a non-Claude row's reasoning must not hand back Claude
         // model slugs its CLI would reject.
         let registry = registry_with_stub();
-        for (mode, expected) in [
-            (ReasoningMode::Standard, "stub-standard"),
-            (ReasoningMode::Investigation, "stub-investigation"),
-        ] {
-            let input = SpawnResolutionInput::builder()
-                .effort_level(EffortLevel::Medium)
-                .task_driver("stub-codex")
-                .reasoning(mode)
-                .build();
-            let cfg = resolve_spawn_config_in(&registry, &input).unwrap();
-            assert_eq!(cfg.model, expected, "{mode:?} must resolve against the stub's menu");
-        }
+        let input = SpawnResolutionInput::builder()
+            .effort_level(EffortLevel::Medium)
+            .task_driver("stub-codex")
+            .reasoning(ReasoningMode::Standard)
+            .build();
+        let cfg = resolve_spawn_config_in(&registry, &input).unwrap();
+        assert_eq!(cfg.model, "stub-standard");
     }
 }

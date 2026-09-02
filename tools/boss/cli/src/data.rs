@@ -200,10 +200,17 @@ pub(crate) fn build_external_tracker_config(
     }
 }
 
-pub(crate) async fn create_project(client: &mut BossClient, input: CreateProjectInput) -> Result<Project, CliError> {
+pub(crate) async fn create_project(
+    client: &mut BossClient,
+    input: CreateProjectInput,
+    design_reasoning_effort_xhigh: bool,
+) -> Result<Project, CliError> {
     rpc_call!(
         try client,
-        FrontendRequest::CreateProject { input },
+        FrontendRequest::CreateProject {
+            input,
+            design_reasoning_effort_xhigh,
+        },
         "project create",
         FrontendEvent::WorkItemCreated { item } => expect_project(item),
     )
@@ -2621,6 +2628,7 @@ pub(crate) fn ensure_patch_present(patch: &WorkItemPatch, message: &str) -> Resu
         || patch.autostart.is_some()
         || patch.deferred.is_some()
         || patch.human_driven.is_some()
+        || patch.design_reasoning_effort_xhigh.is_some()
         || patch.completion_summary.is_some()
         || patch.blocked_reason.is_some()
         || patch.blocked_detail.is_some()

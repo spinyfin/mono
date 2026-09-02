@@ -573,6 +573,10 @@ pub enum FrontendRequest {
     CreateProject {
         #[serde(flatten)]
         input: CreateProjectInput,
+        /// Coordinator-set escalation for the project's auto-created design
+        /// task. Omitted clients preserve the default driver effort.
+        #[serde(default)]
+        design_reasoning_effort_xhigh: bool,
     },
 
     /// Create a `kind = 'revision'` task bound to an existing parent task

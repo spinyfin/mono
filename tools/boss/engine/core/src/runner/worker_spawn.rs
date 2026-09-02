@@ -431,14 +431,16 @@ pub(crate) async fn compose_worker_spawn(
         .as_ref()
         .and_then(|p| p.design_guidance.clone())
         .filter(|s| !s.is_empty());
-    let (row_effort, row_model_override, row_driver, row_reasoning) = match work_item {
+    let (row_effort, row_model_override, row_driver, row_reasoning, row_design_reasoning_effort_xhigh) = match work_item
+    {
         WorkItem::Task(task) | WorkItem::Chore(task) => (
             task.effort_level,
             task.model_override.clone(),
             task.driver.clone(),
             task.reasoning,
+            task.design_reasoning_effort_xhigh,
         ),
-        _ => (None, None, None, None),
+        _ => (None, None, None, None, false),
     };
     // Load the PR template for editorial-rules prompt injection. Uses
     // `WorkItem::product_id()` (total over every variant) rather than a
@@ -693,13 +695,11 @@ pub(crate) async fn compose_worker_spawn(
                 .build(),
         )
     };
-    // Products and projects do not have a TaskKind; only Task/Chore rows
-    // carry one. Threaded into `resolve_spawn_config` so design-family kinds
-    // (`Design` / `DesignPostmortem` / `Investigation`) floor to the selected
-    // driver's investigation tier *on rows that predate the `reasoning`
-    // column* — newer rows reach the same place through `row_reasoning`,
-    // which the resolver consults first. Reused below for the capability gate.
+    // Products and projects do not have a TaskKind. The policy identifies the
+    // strong tier from the typed task kind/reasoning pair; design postmortems
+    // are excluded by their own task kind.
     let work_item_kind = work_item_task_kind_enum(work_item);
+    let design_or_investigation_tier = crate::effort::is_design_or_investigation_tier(work_item_kind, row_reasoning);
     let registry = crate::driver::DriverRegistry::default();
     // Single resolution point for review/automation dispatch policy — see
     // `pool_dispatch_policy_for_worker_id`'s doc comment. `None` for
@@ -709,7 +709,9 @@ pub(crate) async fn compose_worker_spawn(
     // this execution kind yields to allocation / the engine default rather
     // than hard-failing `compose_worker_spawn`. Pool workers already ignore
     // row pins via `pool_policy_driver`, so they skip this yield.
-    let (effective_task_driver, effective_product_default_driver) = if pool_policy.is_some() {
+    let (effective_task_driver, effective_product_default_driver) = if design_or_investigation_tier {
+        (None, None)
+    } else if pool_policy.is_some() {
         (row_driver.as_deref(), product_default_driver.as_deref())
     } else {
         yield_pins_that_fail_capability_gate(
@@ -741,6 +743,7 @@ pub(crate) async fn compose_worker_spawn(
         .maybe_allocated_driver(allocated_driver.as_deref())
         .maybe_kind(work_item_kind)
         .maybe_reasoning(row_reasoning)
+        .design_reasoning_effort_xhigh(row_design_reasoning_effort_xhigh)
         .build();
     let spawn_config = resolve_spawn_config_in(&registry, &spawn_input)
         .map_err(|e| anyhow::anyhow!("effort/model resolution: {e}"))?;

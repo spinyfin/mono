@@ -147,6 +147,12 @@ pub(crate) struct TaskUpdateArgs {
     #[arg(long = "human-driven", value_name = "BOOL")]
     pub(crate) human_driven: Option<bool>,
 
+    /// Set the design-only driver reasoning-effort escalation. This is not the
+    /// work-size `--effort` estimate: it is an explicit coordinator judgement
+    /// for a complex `kind=design` row. The engine rejects every other kind.
+    #[arg(long = "design-reasoning-effort-xhigh", value_name = "BOOL")]
+    pub(crate) design_reasoning_effort_xhigh: Option<bool>,
+
     /// Set or clear the blocked reason on this item. Accepts any engine
     /// reason value (`merge_conflict`, `ci_failure`, `ci_failure_exhausted`,
     /// `dependency`, `review_feedback`) or an empty string to clear.
