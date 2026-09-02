@@ -219,7 +219,7 @@ Revision-triggered re-reviews create a fresh pre-merge batch for the new head SH
 
 The merge poller's first idempotent transition to merged checks the persisted pre-merge profile. For a Deep batch containing production code, it enqueues one `post_merge_reviewer` member keyed by the origin PR and merge SHA. Existing or legacy PRs without a usable profile are conservatively classified at merge from the same GitHub metadata before this decision.
 
-The post-merge worker uses Claude Opus at provider effort `medium`. It checks out the actual landed `main` commit, scopes attention to the origin PR's changed paths, and reviews integration with the final surrounding code: merge-resolution loss, callers outside the PR diff, interactions with changes that landed ahead of it, and behavior visible only in the merged tree. It remains static-analysis-only and submits a `review_verdict` directly; a supervisor would add no independent evidence to a single report.
+The post-merge worker uses Claude Opus at provider effort `high`. It is the only reviewer of the landed tree and runs alone rather than as one of three parallel leaves, so it carries no fan-out budget and is deliberately given more effort than a pre-merge leaf. It checks out the actual landed `main` commit, scopes attention to the origin PR's changed paths, and reviews integration with the final surrounding code: merge-resolution loss, callers outside the PR diff, interactions with changes that landed ahead of it, and behavior visible only in the merged tree. It remains static-analysis-only and submits a `review_verdict` directly; a supervisor would add no independent evidence to a single report.
 
 This differs from pre-merge review in target, purpose, and topology. It does not delay or reopen the merged PR. A qualifying verdict creates the follow-up described above, whose ordinary implementation worker builds/tests the fix and opens a new PR against `main`.
 
@@ -372,7 +372,7 @@ Parallelism: after the supervisor task, this can run in parallel with static poo
 
 Scope: in-scope
 
-Extend the merge probe/transition with idempotent Deep-production eligibility and merge-SHA batch creation; dispatch one Opus/medium post-merge reviewer against the real landed tree, retry once, and route its verdict through unified follow-up materialization without blocking the merge poller.
+Extend the merge probe/transition with idempotent Deep-production eligibility and merge-SHA batch creation; dispatch one Opus/high post-merge reviewer against the real landed tree, retry once, and route its verdict through unified follow-up materialization without blocking the merge poller.
 
 Effort hint: large
 
