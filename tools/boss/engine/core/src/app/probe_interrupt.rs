@@ -77,13 +77,14 @@ const ACTIVITY_POLL_INTERVAL: Duration = Duration::from_millis(150);
 /// interrupting probe fail on a worker that visibly stopped.
 const PANE_TEXT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// How long the post-interrupt write waits for a confirming signal
-/// (`UserPromptSubmit`, pane capture, transcript) before falling back to the
-/// parked-write contract: a successful `send_keys` into a pane whose turn
-/// we already proved ended, with the process still alive, is `Consumed` —
-/// the same evidence the Stop-boundary parked path records without waiting
-/// at all. The window is for the stronger signals to win when they are
-/// fast, not a bound on whether the write counted.
+/// How long the post-interrupt write waits for a consumption-confirming
+/// signal (`UserPromptSubmit` or transcript) before falling back to the
+/// parked-write contract. A pane capture is only an echo of our write and
+/// still takes that liveness-gated contract; a successful `send_keys` into a
+/// pane whose turn we already proved ended, with the process still alive, is
+/// `Consumed` — the same evidence the Stop-boundary parked path records
+/// without waiting at all. The window is for the stronger signals to win
+/// when they are fast, not a bound on whether the write counted.
 const POST_INTERRUPT_VERIFY_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// How long to wait for another dispatcher that already claimed this probe
@@ -526,6 +527,23 @@ async fn inject_after_interrupt(
             server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Consumed);
             InterruptingDelivery {
                 state: ProbeDeliveryState::Consumed,
+                interrupt,
+                attempts,
+                detail: None,
+            }
+        }
+        PaneInjectOutcome::PaneEcho => {
+            let state = super::worker_events::record_pane_write_outcome(
+                server_state,
+                run_id,
+                slot_id,
+                &probe_id,
+                ProbeDeliveryState::Consumed,
+                "probe pane echo observed after interrupt (parked-write consumption)",
+            )
+            .await;
+            InterruptingDelivery {
+                state,
                 interrupt,
                 attempts,
                 detail: None,

@@ -238,6 +238,7 @@ impl ServerState {
             .await
         {
             PaneInjectOutcome::Confirmed => Ok(slot_id),
+            PaneInjectOutcome::PaneEcho => Ok(slot_id),
             PaneInjectOutcome::Buffered => {
                 tracing::info!(
                     run_id,

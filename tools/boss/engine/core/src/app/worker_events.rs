@@ -1929,6 +1929,21 @@ async fn inject_probe_mid_turn(
             server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Consumed);
             ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Consumed)
         }
+        PaneInjectOutcome::PaneEcho => {
+            // A capture-pane match can only prove that our paste remains on
+            // screen. Preserve it as an unconfirmed write and run the
+            // liveness checks that prevent a dead pane from looking delivered.
+            let state = record_pane_write_outcome(
+                server_state,
+                run_id,
+                slot_id,
+                &probe_id,
+                ProbeDeliveryState::Unconfirmed,
+                "probe pane echo observed but worker consumption remains unconfirmed",
+            )
+            .await;
+            ProbeDispatchOutcome::Dispatched(state)
+        }
         PaneInjectOutcome::Buffered => {
             // The normal successful shape of a mid-turn delivery: the text is
             // in the agent's composer. No escalation — the reply at the next

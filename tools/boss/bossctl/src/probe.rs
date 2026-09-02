@@ -43,24 +43,44 @@ use crate::{agents, connect};
 /// probes that had already landed — re-sending them duplicated the
 /// instruction, and skipping them risked losing one the engine had not
 /// actually failed to deliver.
-fn interrupting_status(state: ProbeDeliveryState) -> &'static str {
-    if state.is_delivered() {
-        "delivered"
-    } else if state == ProbeDeliveryState::Unconfirmed {
-        "unconfirmed"
-    } else if state.is_in_progress() {
-        "in_progress"
-    } else {
-        "not_delivered"
+enum InterruptingStatus {
+    Delivered,
+    Unconfirmed,
+    InProgress,
+    NotDelivered,
+}
+
+impl InterruptingStatus {
+    fn as_json_status(&self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::Unconfirmed => "unconfirmed",
+            Self::InProgress => "in_progress",
+            Self::NotDelivered => "not_delivered",
+        }
+    }
+
+    fn as_verdict(&self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::Unconfirmed => "written, unconfirmed",
+            Self::InProgress => "not yet settled",
+            Self::NotDelivered => "NOT delivered",
+        }
     }
 }
 
-fn interrupting_verdict(state: ProbeDeliveryState) -> &'static str {
-    match interrupting_status(state) {
-        "delivered" => "delivered",
-        "unconfirmed" => "written, unconfirmed",
-        "in_progress" => "not yet settled",
-        _ => "NOT delivered",
+fn interrupting_status(state: ProbeDeliveryState) -> InterruptingStatus {
+    if state.is_delivered() {
+        InterruptingStatus::Delivered
+    } else if state == ProbeDeliveryState::Unconfirmed {
+        // Defensive: the interrupting path normally settles a successful
+        // parked write as Consumed after its liveness check.
+        InterruptingStatus::Unconfirmed
+    } else if state.is_in_progress() {
+        InterruptingStatus::InProgress
+    } else {
+        InterruptingStatus::NotDelivered
     }
 }
 
@@ -112,7 +132,7 @@ pub async fn probe_run(
                 println!(
                     "{}",
                     serde_json::json!({
-                        "status": status,
+                        "status": status.as_json_status(),
                         "run_id": returned,
                         "probe_id": probe_id,
                         "urgent": is_urgent,
@@ -129,7 +149,7 @@ pub async fn probe_run(
                 let label = if is_urgent { "urgent probe" } else { "probe" };
                 println!(
                     "{label} {} to run {returned} (probe_id={probe_id}); state={}",
-                    interrupting_verdict(state),
+                    status.as_verdict(),
                     state.as_str(),
                 );
                 println!("  interrupt: {}", interrupt_outcome.describe());
@@ -376,39 +396,76 @@ mod tests {
 
     #[test]
     fn interrupting_status_does_not_call_unconfirmed_or_queued_not_delivered() {
-        assert_eq!(interrupting_status(ProbeDeliveryState::Consumed), "delivered");
-        assert_eq!(interrupting_status(ProbeDeliveryState::Buffered), "delivered");
-        assert_eq!(interrupting_status(ProbeDeliveryState::Replied), "delivered");
-        assert_eq!(interrupting_status(ProbeDeliveryState::Unconfirmed), "unconfirmed");
-        assert_eq!(interrupting_status(ProbeDeliveryState::Queued), "in_progress");
-        assert_eq!(interrupting_status(ProbeDeliveryState::Injected), "in_progress");
         assert_eq!(
-            interrupting_status(ProbeDeliveryState::InterruptFailed),
+            interrupting_status(ProbeDeliveryState::Consumed).as_json_status(),
+            "delivered"
+        );
+        assert_eq!(
+            interrupting_status(ProbeDeliveryState::Buffered).as_json_status(),
+            "delivered"
+        );
+        assert_eq!(
+            interrupting_status(ProbeDeliveryState::Replied).as_json_status(),
+            "delivered"
+        );
+        assert_eq!(
+            interrupting_status(ProbeDeliveryState::Unconfirmed).as_json_status(),
+            "unconfirmed"
+        );
+        assert_eq!(
+            interrupting_status(ProbeDeliveryState::Queued).as_json_status(),
+            "in_progress"
+        );
+        assert_eq!(
+            interrupting_status(ProbeDeliveryState::Injected).as_json_status(),
+            "in_progress"
+        );
+        assert_eq!(
+            interrupting_status(ProbeDeliveryState::InterruptFailed).as_json_status(),
             "not_delivered"
         );
-        assert_eq!(interrupting_status(ProbeDeliveryState::Abandoned), "not_delivered");
-        assert_eq!(interrupting_status(ProbeDeliveryState::Dropped), "not_delivered");
-        assert_eq!(interrupting_status(ProbeDeliveryState::Orphaned), "not_delivered");
+        assert_eq!(
+            interrupting_status(ProbeDeliveryState::Abandoned).as_json_status(),
+            "not_delivered"
+        );
+        assert_eq!(
+            interrupting_status(ProbeDeliveryState::Dropped).as_json_status(),
+            "not_delivered"
+        );
+        assert_eq!(
+            interrupting_status(ProbeDeliveryState::Orphaned).as_json_status(),
+            "not_delivered"
+        );
     }
 
     #[test]
     fn interrupting_verdict_never_says_not_delivered_for_a_write_that_landed() {
         assert_eq!(
-            interrupting_verdict(ProbeDeliveryState::Unconfirmed),
+            interrupting_status(ProbeDeliveryState::Unconfirmed).as_verdict(),
             "written, unconfirmed"
         );
-        assert_eq!(interrupting_verdict(ProbeDeliveryState::Queued), "not yet settled");
-        assert_eq!(interrupting_verdict(ProbeDeliveryState::Consumed), "delivered");
         assert_eq!(
-            interrupting_verdict(ProbeDeliveryState::InterruptFailed),
+            interrupting_status(ProbeDeliveryState::Queued).as_verdict(),
+            "not yet settled"
+        );
+        assert_eq!(
+            interrupting_status(ProbeDeliveryState::Consumed).as_verdict(),
+            "delivered"
+        );
+        assert_eq!(
+            interrupting_status(ProbeDeliveryState::InterruptFailed).as_verdict(),
             "NOT delivered"
         );
         assert!(
-            !interrupting_verdict(ProbeDeliveryState::Unconfirmed).contains("NOT delivered"),
+            !interrupting_status(ProbeDeliveryState::Unconfirmed)
+                .as_verdict()
+                .contains("NOT delivered"),
             "unconfirmed must not read as a loss"
         );
         assert!(
-            !interrupting_verdict(ProbeDeliveryState::Queued).contains("NOT delivered"),
+            !interrupting_status(ProbeDeliveryState::Queued)
+                .as_verdict()
+                .contains("NOT delivered"),
             "queued must not read as a loss"
         );
     }
