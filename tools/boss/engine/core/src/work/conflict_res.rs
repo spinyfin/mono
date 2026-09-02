@@ -617,6 +617,14 @@ impl WorkDb {
     /// unchanged). For base-SHA-changed supersedes, a plain
     /// `mark_conflict_resolution_abandoned` suffices because the new row will
     /// use a different UNIQUE key.
+    ///
+    /// The WHERE clause also accepts an already-`abandoned` row: this is how
+    /// `conflict_watch` frees the UNIQUE slot for one churn-guarded retry
+    /// after a prior attempt terminated as `abandoned` (typically
+    /// `revision_create_failed`) but the PR is still CONFLICTING with no live
+    /// fix vehicle. That call overwrites `failure_reason`, so the original
+    /// abandonment reason is lost — if that provenance ever matters, only set
+    /// `failure_reason` when it is currently NULL instead.
     pub fn abandon_conflict_resolution_for_supersede(
         &self,
         attempt_id: &str,
@@ -632,7 +640,7 @@ impl WorkDb {
                     base_sha_at_trigger = NULL,
                     finished_at         = COALESCE(finished_at, ?3)
               WHERE id = ?1
-                AND status IN ('pending', 'running')",
+                AND status IN ('pending', 'running', 'abandoned')",
             params![attempt_id, reason, now],
         )?;
         finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)

@@ -106,7 +106,7 @@ async fn conflict_detection_that_declines_ownership_does_not_strand_the_trunk_in
     .unwrap();
 
     let pub_ = Arc::new(RecordingPublisher::default());
-    let took_over = on_conflict_detected(
+    let minted = on_conflict_detected(
         &db,
         pub_.as_ref(),
         None,
@@ -115,15 +115,20 @@ async fn conflict_detection_that_declines_ownership_does_not_strand_the_trunk_in
         &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
     )
     .await;
-    assert!(
-        !took_over,
-        "conflict_watch must not steal a higher-priority foreign block"
+    assert!(minted, "CONFLICTING PR must still mint a conflict revision");
+    let (status, reason) = chore_status(&db, &chore);
+    assert_eq!(status, TaskStatus::Blocked);
+    assert_eq!(
+        reason.as_deref(),
+        Some("dependency"),
+        "dependency block must be untouched"
     );
 
     let intent = db.get_active_trunk_merge_intent(&chore).unwrap().expect("still active");
     assert_eq!(
-        intent.last_trunk_state, None,
-        "a slot conflict_watch never took ownership of must not carry the superseded sentinel",
+        intent.last_trunk_state.as_deref(),
+        Some(crate::trunk_merge::TRUNK_INTENT_SUPERSEDED_BY_CONFLICT),
+        "conflict_watch took the conflict slot, so the Trunk intent is superseded",
     );
 }
 

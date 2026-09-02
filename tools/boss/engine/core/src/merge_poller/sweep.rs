@@ -293,6 +293,16 @@ pub async fn run_one_pass_observed(
             Vec::new()
         }
     };
+    let blocked_other = match work_db.list_chores_blocked_other_with_pr() {
+        Ok(items) => items,
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "merge poller: failed to list chores blocked with a PR for another reason",
+            );
+            Vec::new()
+        }
+    };
     let pending_pr_recheck = match work_db.list_executions_pending_pr_detection() {
         Ok(items) => items,
         Err(err) => {
@@ -345,6 +355,7 @@ pub async fn run_one_pass_observed(
     let total = in_review.len()
         + blocked_conflict.len()
         + blocked_ci.len()
+        + blocked_other.len()
         + pending_pr_recheck.len()
         + pending_background_nudges.len()
         + stranded_ci_attempts.len()
@@ -359,6 +370,7 @@ pub async fn run_one_pass_observed(
         in_review = in_review.len(),
         blocked_conflict = blocked_conflict.len(),
         blocked_ci = blocked_ci.len(),
+        blocked_other = blocked_other.len(),
         pending_pr_recheck = pending_pr_recheck.len(),
         pending_background_nudges = pending_background_nudges.len(),
         stranded_ci_attempts = stranded_ci_attempts.len(),
@@ -376,6 +388,7 @@ pub async fn run_one_pass_observed(
         .iter()
         .chain(blocked_conflict.iter())
         .chain(blocked_ci.iter())
+        .chain(blocked_other.iter())
         .chain(stranded_blocked.iter())
         .map(|candidate| candidate.pr_url.clone())
         .filter(|url| probe_url_seen.insert(url.clone()))
@@ -388,6 +401,7 @@ pub async fn run_one_pass_observed(
         .iter()
         .chain(blocked_conflict.iter())
         .chain(blocked_ci.iter())
+        .chain(blocked_other.iter())
         .collect();
     // De-duplicate by work_item_id: a chore that's both pending and
     // blocked-on-CI (shouldn't happen but defensive) only gets one
@@ -654,6 +668,7 @@ pub async fn reconcile_batch(
     let in_review = candidates_for_pr_urls(work_db.list_chores_pending_merge_check(), &wanted);
     let blocked_conflict = candidates_for_pr_urls(work_db.list_chores_blocked_on_merge_conflict(), &wanted);
     let blocked_ci = candidates_for_pr_urls(work_db.list_chores_blocked_on_ci_failure(), &wanted);
+    let blocked_other = candidates_for_pr_urls(work_db.list_chores_blocked_other_with_pr(), &wanted);
     let stranded_blocked = candidates_for_pr_urls(work_db.list_chores_stranded_blocked_remediation(), &wanted);
 
     // Probe only the requested URLs that still have a live candidate row.
@@ -664,6 +679,7 @@ pub async fn reconcile_batch(
         .iter()
         .chain(blocked_conflict.iter())
         .chain(blocked_ci.iter())
+        .chain(blocked_other.iter())
         .chain(stranded_blocked.iter())
         .map(|candidate| candidate.pr_url.clone())
         .filter(|url| probe_seen.insert(url.clone()))
@@ -679,7 +695,12 @@ pub async fn reconcile_batch(
     let probe_results = probe.probe_batch(&probe_urls).await;
 
     let mut seen = std::collections::HashSet::new();
-    for candidate in in_review.iter().chain(blocked_conflict.iter()).chain(blocked_ci.iter()) {
+    for candidate in in_review
+        .iter()
+        .chain(blocked_conflict.iter())
+        .chain(blocked_ci.iter())
+        .chain(blocked_other.iter())
+    {
         if !seen.insert(candidate.work_item_id.clone()) {
             continue;
         }
@@ -1333,6 +1354,14 @@ pub(crate) async fn sweep_one(
         // outside a Trunk repo.
         if crate::trunk_queue_adopt::adopt_unattributed_trunk_queue_episode(work_db, candidate, &probe_result) {
             outcome.trunk_episodes_adopted += 1;
+        }
+        // After adopt so a freshly-inserted intent owns the episode and
+        // this path stands down. Direct-mechanism products never adopt;
+        // the failed Trunk check on the probe is then the only signal,
+        // and we mint from it here. Conflict and in-flight CI are
+        // declined inside the callee (waiting vs stuck).
+        if ci_watch::on_trunk_head_check_eviction_detected(work_db, publisher, candidate, &probe_result).await {
+            outcome.ci_flagged += 1;
         }
     }
 }

@@ -201,8 +201,8 @@ async fn foreign_bucket_takeover_declines_higher_priority_reason() {
     )
     .await;
     assert!(
-        !took_over,
-        "conflict_watch must not steal a higher-priority foreign block"
+        took_over || db.active_conflict_resolution_for_work_item(&chore).unwrap().is_some(),
+        "conflict_watch must still mint a revision for a CONFLICTING PR"
     );
 
     let (status, reason) = chore_status(&db, &chore);
@@ -213,5 +213,74 @@ async fn foreign_bucket_takeover_declines_higher_priority_reason() {
         "dependency block must be untouched"
     );
     let crz = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
-    assert!(crz.is_empty(), "no conflict_resolutions attempt must be created");
+    assert_eq!(crz.len(), 1, "a conflict_resolutions attempt must be created");
+    assert!(crz[0].revision_task_id.is_some(), "the attempt must spawn a revision");
+}
+
+/// Follow-on from the scenario above: the foreign-reason (`dependency`)
+/// parent never had its scalar `blocked_reason` touched, so `on_resolved`'s
+/// parent-flip clear (`WHERE blocked_reason = 'merge_conflict'`) always
+/// misses (`task_transitioned == false`) — including once the attempt
+/// reaches `running`, not just the `pending` window `on_resolved` used to
+/// special-case. The `merge_conflict` side-table signal that
+/// `unblock_for_revision` armed on mint must still be retirable once the
+/// conflict resolves, or the parent renders an active merge-conflict block
+/// forever with no clear path (this is what `skip_parent_flip` +
+/// unconditional `record_in_flight` produced before this fix).
+#[tokio::test]
+async fn foreign_bucket_conflict_resolution_clears_signal_on_a_dependency_blocked_parent() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/1863";
+    let (product, chore) = make_in_review(&db, "C-dep-conflict-resolve", pr);
+    db.update_work_item(
+        &chore,
+        WorkItemPatch {
+            status: Some("blocked".into()),
+            blocked_reason: Some("dependency".into()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+
+    let pub_ = Arc::new(RecordingPublisher::default());
+    on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        None,
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+    )
+    .await;
+    assert!(
+        db.active_blocked_signals(&chore)
+            .unwrap()
+            .iter()
+            .any(|s| s.reason == "merge_conflict"),
+        "mint must arm a merge_conflict side-table signal even on a foreign-reason parent",
+    );
+
+    let attempt = db
+        .active_conflict_resolution_for_work_item(&chore)
+        .unwrap()
+        .expect("conflict attempt");
+    db.mark_conflict_resolution_running(&attempt.id, "lease-1", "ws-1", "worker-1")
+        .unwrap()
+        .expect("mark_running must flip the freshly-inserted row");
+
+    let resolved = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[], "", "").await;
+    assert!(resolved, "on_resolved must retire the running attempt");
+
+    let (status, reason) = chore_status(&db, &chore);
+    assert_eq!(status, TaskStatus::Blocked, "the dependency block itself is untouched");
+    assert_eq!(reason.as_deref(), Some("dependency"));
+    assert!(
+        !db.active_blocked_signals(&chore)
+            .unwrap()
+            .iter()
+            .any(|s| s.reason == "merge_conflict"),
+        "the merge_conflict signal must be retirable once the conflict resolves, \
+         even though the scalar block belongs to a different reason",
+    );
 }

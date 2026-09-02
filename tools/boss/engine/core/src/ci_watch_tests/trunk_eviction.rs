@@ -659,19 +659,15 @@ async fn trunk_eviction_clears_merge_queue_state_when_spawning_a_fix_revision() 
     );
 }
 
-/// Defence in depth: a **Trunk** queue-side episode carrying no failing
-/// check must not flip the row.
-///
-/// `trunk_queue_poller` classifies the eviction before routing, so this
-/// should be unreachable in production — but the combination it guards
-/// against (a CI-fix attempt with nothing to fix) is what dispatched a worker
-/// that force-pushed an empty commit over flunge#1137's contents. The shared
-/// helper refuses empty-`failures` **only for the Trunk arm** (the
-/// pre-#2354 blanket refusal was scoped away from GitHub-native
-/// merge-queue rebounce: a confirmed `failed_checks` ejection is
-/// authoritative even when the evidence-enrichment lookup comes back empty).
+/// A Trunk eviction with no construction-build evidence still mints a
+/// revision. The `"Trunk Merge Queue (<branch>)"` check can fail in
+/// seconds with an empty summary while `mergeable` stays MERGEABLE —
+/// that is a stuck queue rejection, not "nothing happened". The worker
+/// prompt's no-evidence STOP section is what keeps this from repeating
+/// the empty-commit force-push; refusing the flip left the class
+/// invisible.
 #[tokio::test]
-async fn a_trunk_episode_with_no_failing_checks_does_not_flip_the_row() {
+async fn a_trunk_episode_with_no_failing_checks_still_mints_a_revision() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("boss.db");
     let db = WorkDb::open(db_path.clone()).unwrap();
@@ -690,27 +686,132 @@ async fn a_trunk_episode_with_no_failing_checks_does_not_flip_the_row() {
         &[],
     )
     .await;
-    assert!(!evicted, "a Trunk eviction with no failing build must not flip");
+    assert!(
+        evicted,
+        "a confirmed Trunk eviction must mint even without a construction build"
+    );
 
     let (status, reason) = chore_state(&db, &chore);
-    assert_eq!(status, TaskStatus::InReview, "the row stays where it was");
-    assert_eq!(reason, None);
-    assert!(
-        db.active_ci_remediation_for_work_item(&chore).unwrap().is_none(),
-        "no attempt row is created",
-    );
     assert_eq!(
-        db.get_ci_attempts_used(&chore).unwrap(),
-        0,
-        "no CI attempt budget is consumed",
+        status,
+        TaskStatus::InReview,
+        "parent stays in Review while the revision runs"
     );
-    let conn = rusqlite::Connection::open(&db_path).unwrap();
-    let rev_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM tasks WHERE kind = 'revision' AND parent_task_id = ?1",
-            rusqlite::params![&chore],
-            |r| r.get(0),
-        )
+    assert_eq!(reason, None);
+    let attempt = db
+        .active_ci_remediation_for_work_item(&chore)
+        .unwrap()
+        .expect("attempt row is created");
+    assert_eq!(attempt.failure_kind.as_deref(), Some("trunk_queue_eviction"));
+    assert_eq!(attempt.failed_checks, "[]");
+    let revision = db
+        .get_work_item(attempt.revision_task_id.as_deref().expect("revision stamped"))
         .unwrap();
-    assert_eq!(rev_count, 0, "no 'Fix failing CI' revision is spawned");
+    let WorkItem::Task(rev) = revision else {
+        panic!("expected revision task");
+    };
+    assert_eq!(rev.description, "Investigate merge-queue rejection");
+}
+
+fn recent_trunk_check() -> crate::merge_poller::TrunkQueueCheckFailure {
+    crate::merge_poller::TrunkQueueCheckFailure {
+        name: "Trunk Merge Queue (main)".to_owned(),
+        conclusion: "FAILURE".to_owned(),
+        details_url: "https://app.trunk.io/example/merge-queue/q/1".to_owned(),
+        completed_at: Some(
+            chrono::DateTime::from_timestamp(boss_engine_utils::epoch_time::now_epoch_secs() - 30, 0)
+                .unwrap()
+                .to_rfc3339(),
+        ),
+    }
+}
+
+fn head_check_probe(pr: &str, ci: OpenPrCiStatus) -> PrLifecycleProbe {
+    PrLifecycleProbe::builder()
+        .url(pr)
+        .state(PrLifecycleState::Open(crate::merge_poller::OpenPrStatus {
+            mergeability: crate::merge_poller::OpenPrMergeability::Clean,
+            ci,
+        }))
+        .head_ref_oid("head-check-sha")
+        .head_ref_name("feature")
+        .labels(Vec::new())
+        .review(crate::merge_poller::PrReviewState::Unknown)
+        .trunk_queue_check_failure(recent_trunk_check())
+        .build()
+}
+
+/// Merge-poller path: a Direct product's failed Trunk check mints a
+/// revision from the already-captured probe leaf, without a Trunk intent.
+#[tokio::test]
+async fn head_check_eviction_mints_for_a_direct_product() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/1508";
+    let (product, chore) = make_in_review(&db, "C-head-check", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    let minted = on_trunk_head_check_eviction_detected(
+        &db,
+        pub_.as_ref(),
+        &candidate(&product, &chore, pr),
+        &head_check_probe(pr, OpenPrCiStatus::Clean),
+    )
+    .await;
+    assert!(minted);
+    let attempt = db
+        .active_ci_remediation_for_work_item(&chore)
+        .unwrap()
+        .expect("attempt");
+    assert_eq!(attempt.failure_kind.as_deref(), Some("trunk_queue_eviction"));
+    assert!(attempt.head_sha_at_trigger.contains("check:head-check-sha"));
+    assert_eq!(
+        attempt.failed_checks, "[]",
+        "Trunk's own bookkeeping check is the trigger, not evidence of a construction failure"
+    );
+    let revision = db
+        .get_work_item(attempt.revision_task_id.as_deref().expect("revision stamped"))
+        .unwrap();
+    let WorkItem::Task(rev) = revision else {
+        panic!("expected revision task");
+    };
+    assert_eq!(rev.description, "Investigate merge-queue rejection");
+}
+
+/// A PR labelled with the opt-out label is skipped, not minted.
+#[tokio::test]
+async fn head_check_eviction_honors_pr_labels_opt_out() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/1510";
+    let (product, chore) = make_in_review(&db, "C-head-check-opt-out", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    let mut probe = head_check_probe(pr, OpenPrCiStatus::Clean);
+    probe.labels = vec!["boss/no-auto-rebase".to_owned()];
+
+    let minted =
+        on_trunk_head_check_eviction_detected(&db, pub_.as_ref(), &candidate(&product, &chore, pr), &probe).await;
+    assert!(!minted);
+    assert!(db.active_ci_remediation_for_work_item(&chore).unwrap().is_none());
+}
+
+/// In-flight PR-head checks are waiting, not a stuck queue rejection.
+#[tokio::test]
+async fn head_check_eviction_skips_when_required_checks_are_in_flight() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/1509";
+    let (product, chore) = make_in_review(&db, "C-head-check-wait", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    let minted = on_trunk_head_check_eviction_detected(
+        &db,
+        pub_.as_ref(),
+        &candidate(&product, &chore, pr),
+        &head_check_probe(pr, OpenPrCiStatus::InFlight),
+    )
+    .await;
+    assert!(!minted);
+    assert!(db.active_ci_remediation_for_work_item(&chore).unwrap().is_none());
 }

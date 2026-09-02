@@ -183,3 +183,66 @@ async fn create_revision_failure_abandons_attempt() {
     assert_eq!(attempts[0].failure_reason.as_deref(), Some("revision_create_failed"),);
     assert!(attempts[0].revision_task_id.is_none());
 }
+
+/// Case 1 intermittency: a CONFLICTING PR whose chain already has
+/// `in_review` revisions (review findings that already pushed) must still
+/// mint a runnable conflict-resolution revision. Gating on those
+/// in_review siblings waits for the parent PR to merge — which it cannot
+/// while conflicting.
+#[tokio::test]
+async fn detection_mints_runnable_revision_when_in_review_siblings_exist() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/1508";
+    let (product, chore) = make_in_review(&db, "C-open-revs", pr);
+    let checker = open_checker();
+    let prior = db
+        .create_revision(
+            boss_protocol::CreateRevisionInput::builder()
+                .parent_task_id(chore.clone())
+                .description("PR review: 8 finding(s)")
+                .build(),
+            &checker,
+        )
+        .unwrap();
+    db.update_work_item(
+        &prior.id,
+        WorkItemPatch {
+            status: Some("in_review".into()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+
+    let pub_ = Arc::new(RecordingPublisher::default());
+    assert!(
+        on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            None,
+            &checker,
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+        )
+        .await
+    );
+
+    let attempt = db
+        .active_conflict_resolution_for_work_item(&chore)
+        .unwrap()
+        .expect("conflict attempt");
+    let rev_id = attempt.revision_task_id.clone().expect("revision stamped");
+    let revision = task(&db, &rev_id);
+    assert_eq!(revision.description, "Resolve merge conflict against main");
+    assert_ne!(
+        revision.status,
+        TaskStatus::Blocked,
+        "must not wait on in_review siblings"
+    );
+    let conn = db.connect().unwrap();
+    let prereqs = crate::work_dependencies::prerequisites_of(&conn, &rev_id, Some("blocks")).unwrap();
+    assert!(
+        prereqs.iter().all(|e| e.prerequisite_id != prior.id),
+        "conflict revision must not gate on an in_review sibling"
+    );
+}

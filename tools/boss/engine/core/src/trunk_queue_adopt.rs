@@ -94,6 +94,16 @@ fn episode_age_secs(completed_at: Option<&str>, now_epoch_secs: i64) -> Option<i
     Some(now_epoch_secs - completed.timestamp())
 }
 
+/// Whether a Trunk check run's `completedAt` is older than
+/// [`MAX_ADOPTABLE_EPISODE_AGE`]. Shared with the merge-poller mint path
+/// so a Direct-mechanism product (which never adopts) still declines to
+/// resurrect an abandoned queue attempt. Missing/`unparseable` timestamps
+/// are treated as fresh — same as adoption.
+pub(crate) fn trunk_check_episode_is_stale(completed_at: Option<&str>) -> bool {
+    episode_age_secs(completed_at, boss_engine_utils::epoch_time::now_epoch_secs())
+        .is_some_and(|age| age > MAX_ADOPTABLE_EPISODE_AGE.as_secs() as i64)
+}
+
 /// Adopt the Trunk merge-queue episode `probe` just reported an eviction
 /// for, if there is one and no lane already owns it. Returns `true` when a
 /// `trunk_merge_intents` row was actually inserted.

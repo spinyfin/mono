@@ -34,17 +34,19 @@ impl WorkDb {
     }
 }
 
-/// Return the id of the most-recently-created non-done revision that is a
-/// descendant of `root_id`, or `None` when the chain has no prior active
+/// Return the id of the most-recently-created **live** revision that is a
+/// descendant of `root_id`, or `None` when the chain has no prior live
 /// revision.
 ///
 /// This is used by [`assert_parent_revisable_and_insert`] to find the
 /// "tail" of the revision chain so the new revision can be automatically
 /// gated on it, serialising back-to-back revisions targeting the same PR.
 ///
-/// "Active" = status is not `'done'` (includes `todo`, `blocked`,
-/// `in_progress`, `in_review`).  A done revision is already finished and
-/// cannot race with the new one, so it does not need to gate it.
+/// Live = `todo` / `active` / `blocked` — a worker is queued, running, or
+/// waiting on a prerequisite. `in_review` is **not** live: that worker
+/// already pushed and stopped, so gating a conflict- or CI-fix revision
+/// on it waits for the parent PR to merge, which a conflicting PR cannot
+/// do. `done` / `archived` are finished.
 ///
 /// The recursive CTE walks `parent_task_id` links one level at a time,
 /// starting from direct children of `root_id`.  Depth is capped at 64 by
@@ -69,7 +71,7 @@ pub(crate) fn find_latest_active_revision_in_chain(conn: &Connection, root_id: &
             SELECT c.id
             FROM chain c
             JOIN tasks t ON t.id = c.id
-            WHERE t.status != 'done'
+            WHERE t.status IN ('todo', 'active', 'blocked')
             ORDER BY c.id DESC
             LIMIT 1",
             params![root_id],
