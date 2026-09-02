@@ -1623,7 +1623,7 @@ async fn deliver_probe_via_pane_write(
 /// ([`ServerState::surface_undelivered_probe`]) — the engine must not
 /// silently record a terminal-as-far-as-we-know state and tell nobody, which
 /// is the same defect the teardown-orphan path exists to avoid.
-async fn record_pane_write_outcome(
+pub(super) async fn record_pane_write_outcome(
     server_state: &ServerState,
     run_id: &str,
     slot_id: u8,

@@ -63,12 +63,15 @@
 //! it waits for a `UserPromptSubmit` hook — the CLI's own confirmation
 //! that it enqueued something as the next prompt — and, since that hook
 //! firing for pane-injected text (as opposed to text the CLI itself
-//! echoed) has never been validated end-to-end, it also falls back to
-//! scanning the worker's session transcript for the injected text
-//! before giving up. Callers that get back
+//! echoed) has never been validated end-to-end, it also confirms if the
+//! injected text becomes visible in the pane itself, and falls back to
+//! scanning the worker's session transcript. Callers that get back
 //! [`PaneInjectOutcome::Unconfirmed`] must not treat that as "lost" and
 //! auto-redeliver — they should record the unconfirmed state and let
-//! whoever is watching the probe topic decide.
+//! whoever is watching the probe topic decide. The interrupting probe
+//! path additionally treats a parked `Unconfirmed` as consumed: the
+//! turn already ended, the write succeeded, and a missing hook is the
+//! known observability gap, not proof of loss.
 
 use super::*;
 use boss_protocol::WorkerActivity;
@@ -228,6 +231,18 @@ fn normalize_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Decode the JSON string escapes a JSONL transcript uses for whitespace.
+///
+/// The fallback scan reads the file as raw bytes, not parsed JSON. A
+/// multi-line injection (`INTERRUPT_NOTICE\n\n{probe}`) is stored as the
+/// two-character sequence `\n` inside a JSON string, so `normalize_ws` on
+/// the raw chunk cannot collapse those "newlines" into the spaces it
+/// collapsed in the needle — and the match fails for every interrupting
+/// probe, which is exactly the confirmation miss observed in production.
+fn json_unescape_whitespace(s: &str) -> String {
+    s.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
+}
+
 /// Best-effort check for whether `text` appears anywhere in
 /// `transcript_path` past `offset_bytes`. Used as the fallback
 /// confirmation signal when no `UserPromptSubmit` hook arrives in
@@ -257,7 +272,14 @@ async fn transcript_shows_text(transcript_path: &str, offset_bytes: u64, text: &
         return false;
     };
     let needle = normalize_ws(text.trim());
-    !needle.is_empty() && normalize_ws(&chunk).contains(&needle)
+    if needle.is_empty() {
+        return false;
+    }
+    let normalized = normalize_ws(&chunk);
+    if normalized.contains(&needle) {
+        return true;
+    }
+    normalize_ws(&json_unescape_whitespace(&chunk)).contains(&needle)
 }
 
 impl ServerState {
@@ -434,14 +456,14 @@ impl ServerState {
     /// pty — this is the safety guard for foreground processes that do not
     /// consume mid-turn stdin.
     ///
-    /// **Confirmation (when the guard passes):** either a matching
-    /// `UserPromptSubmit` hook, or (since that hook firing for
-    /// pane-injected text has never been validated end-to-end) a scan
-    /// of the worker's session transcript for the injected text — so a
-    /// gap in one signal doesn't by itself produce a false
-    /// "unconfirmed".
+    /// **Confirmation (when the guard passes):** a matching
+    /// `UserPromptSubmit` hook, the injected text becoming visible in the
+    /// pane itself, or (since the hook firing for pane-injected text has
+    /// never been validated end-to-end) a scan of the worker's session
+    /// transcript. Three independent reads of the same fact, so a gap in
+    /// one signal doesn't by itself produce a false "unconfirmed".
     ///
-    /// When neither signal confirms in time the result depends on the
+    /// When none of those confirms in time the result depends on the
     /// posture, because "no prompt submitted yet" means different things in
     /// each: a [`PaneInputPosture::Parked`] worker should have submitted
     /// immediately, so that is [`PaneInjectOutcome::Unconfirmed`]; a
@@ -449,7 +471,10 @@ impl ServerState {
     /// turn and is *expected* not to have submitted yet, so that is
     /// [`PaneInjectOutcome::Buffered`]. Neither is an error, and neither is
     /// proof of loss — see the module docs for why callers must not
-    /// auto-redeliver.
+    /// auto-redeliver. Callers that already proved the worker is parked
+    /// (the interrupting probe path) treat `Unconfirmed` as the same
+    /// parked-write consumption the Stop-boundary path records, rather than
+    /// as a delivery failure.
     pub(super) async fn inject_pane_text_verified(&self, req: PaneInjectRequest<'_>) -> PaneInjectOutcome {
         let PaneInjectRequest {
             run_id,
@@ -507,14 +532,25 @@ impl ServerState {
             tracing::warn!(?err, run_id, slot_id, "pane injection transport failed");
             return PaneInjectOutcome::SendFailed(err);
         }
-        match timeout(verify_timeout, waiter).await {
-            Ok(Ok(_prompt)) => PaneInjectOutcome::Confirmed,
-            // Sender dropped without resolving: the timeout will handle
-            // cleanup below via the transcript fallback, since a UserPromptSubmit
-            // for unrelated text may still arrive later and we don't want
-            // to wait on it. Fall straight through to the transcript check.
-            Ok(Err(_)) | Err(_) => {
-                self.take_delivery_waiter(run_id, token);
+        // Three concurrent reads of "the worker has the text": the CLI's
+        // own UserPromptSubmit hook, the pane's visible contents (the paste
+        // is on screen even when the hook is late or missing), and — after
+        // the window — a transcript scan. The hook is the strongest signal
+        // but is the one production showed does not fire for pane-injected
+        // text inside this window; the pane read is independent of it.
+        let pane_visible = self.wait_until_pane_shows_text(run_id, normalized_text);
+        let confirmed = timeout(verify_timeout, async {
+            tokio::select! {
+                biased;
+                result = waiter => result.is_ok(),
+                () = pane_visible => true,
+            }
+        })
+        .await;
+        self.take_delivery_waiter(run_id, token);
+        match confirmed {
+            Ok(true) => PaneInjectOutcome::Confirmed,
+            Ok(false) | Err(_) => {
                 if let Some(path) = transcript_path
                     && transcript_shows_text(path, offset_bytes, normalized_text).await
                 {
@@ -522,6 +558,14 @@ impl ServerState {
                         run_id,
                         slot_id,
                         "pane injection confirmed via transcript scan (no UserPromptSubmit observed)",
+                    );
+                    return PaneInjectOutcome::Confirmed;
+                }
+                if self.pane_shows_injected_text(run_id, normalized_text).await {
+                    tracing::info!(
+                        run_id,
+                        slot_id,
+                        "pane injection confirmed via pane capture (no UserPromptSubmit observed)",
                     );
                     return PaneInjectOutcome::Confirmed;
                 }
@@ -541,6 +585,46 @@ impl ServerState {
                 PaneInjectOutcome::Unconfirmed
             }
         }
+    }
+
+    /// Poll until `text` is visible in `run_id`'s pane. Combined with
+    /// [`timeout`] at the call site so a pane that never shows it does not
+    /// hang; this future itself only returns on a positive read.
+    async fn wait_until_pane_shows_text(&self, run_id: &str, text: &str) {
+        const PANE_CONFIRM_POLL: Duration = Duration::from_millis(200);
+        loop {
+            if self.pane_shows_injected_text(run_id, text).await {
+                return;
+            }
+            tokio::time::sleep(PANE_CONFIRM_POLL).await;
+        }
+    }
+
+    /// True when a tmux capture of `run_id`'s pane contains `text`
+    /// (whitespace-normalized). Fail-closed: no tmux session, a capture
+    /// error, or a blank pane all answer false — the same class of mistake
+    /// as treating `SendToPane` Ok as proof of consumption.
+    async fn pane_shows_injected_text(&self, run_id: &str, text: &str) -> bool {
+        let needle = normalize_ws(text.trim());
+        if needle.is_empty() {
+            return false;
+        }
+        let Some(pane) = self.worker_registry.pane_for_run(run_id) else {
+            return false;
+        };
+        let Some(session_name) = pane.tmux_session_name else {
+            return false;
+        };
+        let Ok(tmux) = self.tmux_for_pane_delivery(run_id) else {
+            return false;
+        };
+        let Ok(captured) = tmux.capture_pane(&session_name).await else {
+            return false;
+        };
+        if captured.trim().is_empty() {
+            return false;
+        }
+        normalize_ws(&captured).contains(&needle)
     }
 }
 
@@ -641,6 +725,21 @@ mod tests {
         let (_f, path) = transcript_with(b"...before... please update the spec now ...after...");
         let needle = "please   update\nthe   spec\n\nnow";
         assert!(transcript_shows_text(&path, 0, needle).await);
+    }
+
+    #[tokio::test]
+    async fn transcript_shows_text_matches_json_escaped_newlines() {
+        // Interrupting probes write `NOTICE\n\n{text}`. JSONL stores that
+        // as the two-character sequence `\n`, which is not whitespace, so a
+        // raw substring scan after normalize_ws misses it. The unescape
+        // step is what makes the fallback actually confirm those writes.
+        let body = br#"{"type":"user","message":"[coordinator-interrupt] cut short.\n\nre-read the spec"}"#;
+        let (_f, path) = transcript_with(body);
+        let needle = "[coordinator-interrupt] cut short.\n\nre-read the spec";
+        assert!(
+            transcript_shows_text(&path, 0, needle).await,
+            "JSON-escaped newlines in the transcript must not hide a multi-line injection"
+        );
     }
 
     #[tokio::test]

@@ -268,7 +268,11 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
 
     assert_eq!(send.await.expect("send task").expect("tmux send succeeds"), 7);
     let calls = runner.calls();
-    assert_eq!(calls.len(), 3);
+    assert!(
+        calls.len() >= 3,
+        "paste delivery is three tmux calls; extra capture-pane reads are the pane-text \
+         confirmation signal racing the UserPromptSubmit hook: {calls:?}"
+    );
     assert_eq!(calls[0][..3], ["-S", boss_tmux::TEST_SOCKET_PATH, "load-buffer"]);
     assert_eq!(calls[0][3], "-b");
     let buffer_name = calls[0][4].clone();
@@ -302,6 +306,12 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
             "C-m"
         ]
     );
+    for extra in &calls[3..] {
+        assert!(
+            extra.contains(&"capture-pane".to_owned()),
+            "commands after the paste must be pane-text confirmation, not another write: {extra:?}"
+        );
+    }
     assert_eq!(runner.stdin(), vec![b"first line\nsecond line".to_vec()]);
 }
 

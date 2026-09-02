@@ -246,6 +246,17 @@ impl ProbeDeliveryState {
         matches!(self, Self::Consumed | Self::Buffered | Self::Replied)
     }
 
+    /// True when the engine still intends to deliver and has not yet recorded
+    /// an outcome. `Queued` is waiting for a claim or a boundary; `Injected`
+    /// is waiting for confirmation of a write that has already gone out.
+    ///
+    /// A synchronous `bossctl probe` that reports either of these as
+    /// "NOT delivered" is lying: the probe has not failed, it has not
+    /// finished. Distinct from [`Self::Unconfirmed`], which *did* write.
+    pub fn is_in_progress(self) -> bool {
+        matches!(self, Self::Queued | Self::Injected)
+    }
+
     /// True when no further transition is possible: the worker answered, or
     /// the probe definitively will not be delivered.
     ///
@@ -444,6 +455,31 @@ mod tests {
         assert!(!ProbeDeliveryState::Abandoned.is_delivered());
         assert!(!ProbeDeliveryState::Orphaned.is_delivered());
         assert!(!ProbeDeliveryState::InterruptFailed.is_delivered());
+    }
+
+    /// `Queued`/`Injected` are live promises, not losses. Collapsing them into
+    /// "not delivered" is the reporting bug that made a still-queued probe
+    /// look like a failed one.
+    #[test]
+    fn only_queued_and_injected_are_in_progress() {
+        assert!(ProbeDeliveryState::Queued.is_in_progress());
+        assert!(ProbeDeliveryState::Injected.is_in_progress());
+        for settled in [
+            ProbeDeliveryState::Consumed,
+            ProbeDeliveryState::Buffered,
+            ProbeDeliveryState::Unconfirmed,
+            ProbeDeliveryState::Replied,
+            ProbeDeliveryState::Dropped,
+            ProbeDeliveryState::Abandoned,
+            ProbeDeliveryState::Orphaned,
+            ProbeDeliveryState::InterruptFailed,
+        ] {
+            assert!(
+                !settled.is_in_progress(),
+                "{} is an outcome, not an in-progress state",
+                settled.as_str()
+            );
+        }
     }
 
     #[test]
