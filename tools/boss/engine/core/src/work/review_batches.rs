@@ -137,6 +137,18 @@ impl WorkDb {
         input: ReviewBatchCreateInput,
         member_inputs: &[ReviewBatchMemberCreateInput],
     ) -> Result<(ReviewBatch, Vec<ReviewBatchMember>)> {
+        if member_inputs.is_empty() {
+            bail!("review batches require at least one member");
+        }
+        match input.phase {
+            ReviewBatchPhase::PreMerge if input.merge_sha.is_some() => {
+                bail!("pre_merge review batches must not include a merge SHA");
+            }
+            ReviewBatchPhase::PostMerge if input.merge_sha.is_none() => {
+                bail!("post_merge review batches require a merge SHA");
+            }
+            _ => {}
+        }
         for member in member_inputs {
             validate_member_input(input.phase, member)?;
         }
@@ -188,41 +200,39 @@ impl WorkDb {
                     input_member.execution_id,
                 ],
             )?;
-            members.push(ReviewBatchMember {
-                id,
-                batch_id: batch_id.clone(),
-                attempt: input_member.attempt,
-                created_at: now.clone(),
-                provider_effort: input_member.provider_effort.clone(),
-                requested_driver: input_member.requested_driver.clone(),
-                resolved_model: input_member.resolved_model.clone(),
-                role: input_member.role,
-                status: input_member.status,
-                updated_at: now.clone(),
-                execution_id: input_member.execution_id.clone(),
-                report_proposal_id: None,
-                terminal_at: None,
-            });
+            members.push(
+                ReviewBatchMember::builder()
+                    .id(id)
+                    .batch_id(batch_id.clone())
+                    .attempt(input_member.attempt)
+                    .created_at(now.clone())
+                    .provider_effort(input_member.provider_effort.clone())
+                    .requested_driver(input_member.requested_driver.clone())
+                    .resolved_model(input_member.resolved_model.clone())
+                    .role(input_member.role)
+                    .status(input_member.status)
+                    .updated_at(now.clone())
+                    .maybe_execution_id(input_member.execution_id.clone())
+                    .build(),
+            );
         }
         tx.commit()?;
 
         Ok((
-            ReviewBatch {
-                id: batch_id,
-                cycle_root_id: input.cycle_root_id,
-                base_sha: input.base_sha,
-                classification: input.classification,
-                created_at: now.clone(),
-                phase: input.phase,
-                pr_number: input.pr_number,
-                pr_url: input.pr_url,
-                status: ReviewBatchStatus::Collecting,
-                target_sha: input.target_sha,
-                updated_at: now,
-                completed_at: None,
-                final_verdict_proposal_id: None,
-                merge_sha: input.merge_sha,
-            },
+            ReviewBatch::builder()
+                .id(batch_id)
+                .cycle_root_id(input.cycle_root_id)
+                .base_sha(input.base_sha)
+                .classification(input.classification)
+                .created_at(now.clone())
+                .phase(input.phase)
+                .pr_number(input.pr_number)
+                .pr_url(input.pr_url)
+                .status(ReviewBatchStatus::Collecting)
+                .target_sha(input.target_sha)
+                .updated_at(now)
+                .maybe_merge_sha(input.merge_sha)
+                .build(),
             members,
         ))
     }

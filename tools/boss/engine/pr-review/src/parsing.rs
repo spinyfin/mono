@@ -36,14 +36,19 @@ pub fn classify_pr_review_metadata(metadata: &PrReviewMetadata) -> ReviewClassif
     if metadata.deletions.is_none() {
         metadata_missing.push(ReviewMetadataField::Deletions);
     }
-    if metadata.changed_files.is_none() {
+    if metadata.changed_files.as_ref().is_none_or(Vec::is_empty) {
         metadata_missing.push(ReviewMetadataField::ChangedFiles);
     }
 
     let changed_files = metadata.changed_files.clone().unwrap_or_default();
     let subsystem_buckets = sorted_unique(changed_files.iter().map(|path| subsystem_bucket(path)));
     let production_languages = sorted_unique(changed_files.iter().filter_map(|path| production_language(path)));
-    let complexity_flags = complexity_flags(&changed_files);
+    let production_paths = changed_files
+        .iter()
+        .filter(|path| !is_docs_or_test_file(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    let complexity_flags = complexity_flags(&production_paths);
     let has_production_code = !production_languages.is_empty();
     let docs_or_test_only = !changed_files.is_empty() && changed_files.iter().all(|path| is_docs_or_test_file(path));
 
@@ -74,17 +79,17 @@ pub fn classify_pr_review_metadata(metadata: &PrReviewMetadata) -> ReviewClassif
         }
     };
 
-    ReviewClassification {
-        changed_files,
-        complexity_flags,
-        has_production_code,
-        metadata_missing,
-        production_languages,
-        profile,
-        subsystem_buckets,
-        additions: metadata.additions,
-        deletions: metadata.deletions,
-    }
+    ReviewClassification::builder()
+        .changed_files(changed_files)
+        .complexity_flags(complexity_flags)
+        .has_production_code(has_production_code)
+        .metadata_missing(metadata_missing)
+        .production_languages(production_languages)
+        .profile(profile)
+        .subsystem_buckets(subsystem_buckets)
+        .maybe_additions(metadata.additions)
+        .maybe_deletions(metadata.deletions)
+        .build()
 }
 
 fn sorted_unique<T: Ord>(values: impl IntoIterator<Item = T>) -> Vec<T> {
@@ -138,51 +143,69 @@ fn production_language(path: &str) -> Option<ReviewLanguageBucket> {
 }
 
 fn is_docs_or_test_file(path: &str) -> bool {
+    is_docs_file(path) || is_test_fixture_file(path)
+}
+
+fn is_test_fixture_file(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     let components = lower.split('/').collect::<Vec<_>>();
     let file_name = components.last().copied().unwrap_or_default();
-    lower.ends_with(".md")
-        || lower.ends_with(".mdx")
-        || lower.ends_with(".rst")
-        || lower.ends_with(".txt")
-        || lower.ends_with(".snap")
-        || components.iter().any(|component| {
-            matches!(
-                *component,
-                "doc" | "docs" | "fixture" | "fixtures" | "snapshot" | "snapshots" | "test" | "testdata" | "tests"
-            )
-        })
-        || file_name.starts_with("readme")
-        || file_name.starts_with("changelog")
-        || file_name.ends_with("_test.rs")
+    components.iter().any(|component| {
+        matches!(
+            *component,
+            "fixture" | "fixtures" | "snapshot" | "snapshots" | "test" | "testdata" | "tests"
+        )
+    }) || file_name.ends_with("_test.rs")
         || file_name.ends_with("_tests.rs")
 }
 
 fn complexity_flags(paths: &[String]) -> Vec<ReviewComplexityFlag> {
-    let path_text = paths.iter().map(|path| path.to_ascii_lowercase()).collect::<Vec<_>>();
-    let has = |needles: &[&str]| {
-        path_text
+    let path_terms = paths
+        .iter()
+        .map(|path| {
+            path.split(|character: char| !character.is_ascii_alphanumeric())
+                .filter(|term| !term.is_empty())
+                .map(str::to_ascii_lowercase)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let has = |matches_term: fn(&str) -> bool| {
+        path_terms
             .iter()
-            .any(|path| needles.iter().any(|needle| path.contains(needle)))
+            .any(|terms| terms.iter().any(|term| matches_term(term)))
     };
-    let has_build_file = path_text.iter().any(|path| {
+    let has_build_file = paths.iter().any(|path| {
         matches!(
-            path.rsplit('/').next().unwrap_or_default(),
+            path.rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
             "build" | "build.bazel" | "module.bazel" | "workspace" | "workspace.bazel" | "cargo.toml" | "cargo.lock"
         )
     });
 
     let mut flags = Vec::new();
-    if has(&["/migrations/", "migration", "/schema/", "schema_init"]) {
+    if has(|term| term.starts_with("migration") || term == "schema") {
         flags.push(ReviewComplexityFlag::DatabaseSchemaMigration);
     }
-    if has(&["auth", "permission", "sandbox"]) {
+    if has(|term| {
+        term == "auth"
+            || term.starts_with("authn")
+            || term.starts_with("authz")
+            || term.starts_with("authent")
+            || term.starts_with("authoriz")
+            || term.starts_with("permission")
+            || term.starts_with("sandbox")
+    }) {
         flags.push(ReviewComplexityFlag::AuthPermissionsSandbox);
     }
-    if has(&["scheduler", "concurrency", "lifecycle", "process"]) {
+    if has(|term| {
+        term == "scheduler" || term.starts_with("concurrenc") || term.starts_with("lifecycle") || term == "process"
+    }) {
         flags.push(ReviewComplexityFlag::SchedulerConcurrencyLifecycle);
     }
-    if has_build_file || has(&["/build/", "release", "dependenc"]) {
+    if has_build_file || has(|term| term == "build" || term.starts_with("release") || term.starts_with("dependenc")) {
         flags.push(ReviewComplexityFlag::BuildReleaseDependency);
     }
     flags
@@ -224,12 +247,16 @@ pub fn classify_changed_files(files: &[&str]) -> ReviewScope {
 
 fn is_docs_file(path: &str) -> bool {
     let lower = path.to_lowercase();
+    let file_name = lower.rsplit('/').next().unwrap_or_default();
     lower.ends_with(".md")
         || lower.ends_with(".mdx")
         || lower.ends_with(".rst")
         || lower.ends_with(".txt")
+        || lower.ends_with(".snap")
         || lower.starts_with("docs/")
         || lower.contains("/docs/")
+        || file_name.starts_with("readme")
+        || file_name.starts_with("changelog")
 }
 
 /// Extract and parse the first `ReviewResult` from a reviewer's final
@@ -398,6 +425,29 @@ mod tests {
     }
 
     #[test]
+    fn review_profile_ignores_docs_and_test_paths_for_complexity_flags() {
+        let classification = classify_pr_review_metadata(&metadata(
+            Some(10),
+            Some(0),
+            &[
+                "tools/boss/docs/attention-lifecycle.md",
+                "tools/boss/docs/designs/oauth-device-flow-auth-for-issue-sync.md",
+            ],
+        ));
+
+        assert_eq!(classification.profile, ReviewProfile::Light);
+        assert!(classification.complexity_flags.is_empty());
+    }
+
+    #[test]
+    fn review_profile_uses_boundary_safe_complexity_terms() {
+        let classification = classify_pr_review_metadata(&metadata(Some(10), Some(0), &["src/authorship.rs"]));
+
+        assert_eq!(classification.profile, ReviewProfile::Light);
+        assert!(classification.complexity_flags.is_empty());
+    }
+
+    #[test]
     fn review_profile_classifies_intermediate_or_single_flag_prs_as_standard() {
         let size_classification = classify_pr_review_metadata(&metadata(Some(201), Some(0), &["src/lib.rs"]));
         assert_eq!(size_classification.profile, ReviewProfile::Standard);
@@ -444,6 +494,14 @@ mod tests {
             classification.metadata_missing,
             vec![ReviewMetadataField::Deletions, ReviewMetadataField::ChangedFiles]
         );
+    }
+
+    #[test]
+    fn review_profile_treats_an_empty_changed_file_list_as_incomplete_metadata() {
+        let classification = classify_pr_review_metadata(&metadata(Some(0), Some(0), &[]));
+
+        assert_eq!(classification.profile, ReviewProfile::Standard);
+        assert_eq!(classification.metadata_missing, vec![ReviewMetadataField::ChangedFiles]);
     }
 
     #[test]
