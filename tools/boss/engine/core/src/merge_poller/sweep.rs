@@ -775,17 +775,18 @@ pub(crate) fn candidates_for_pr_urls(
 /// Stop every in-flight `revision_implementation` execution belonging to
 /// revisions of `chain_root_id` now that the parent PR has merged.
 ///
-/// The DB transaction in `mark_chore_pr_merged` already blocked the
-/// revision tasks (via `block_pending_revisions_on_parent_close`).  This
-/// function handles the execution side: force-release each cube workspace
-/// lease so the slot is freed, then cancel the execution row so the
-/// dispatcher treats it as terminal.
+/// The DB transaction in `mark_chore_pr_merged` already resolves each
+/// revision task (via `block_pending_revisions_on_parent_close`): a live
+/// PR-review revision becomes an autostart followup, while other revision
+/// kinds are archived or blocked according to their lifecycle. This function
+/// handles the execution side: force-release each cube workspace lease,
+/// cancel the obsolete execution, and reconcile any converted followup.
 ///
 /// When `completion_handler` is `None` (tests, cold-path wiring) this
-/// function is a no-op; the tasks are already blocked in the DB, and the
-/// scheduler will not redispatch them on the next reconcile cycle.
+/// function cannot perform execution-side cleanup and is a no-op.
 pub(crate) async fn stop_active_revision_executions(
     work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
     completion_handler: Option<&WorkerCompletionHandler>,
     chain_root_id: &str,
     outcome: &mut SweepOutcome,
@@ -812,27 +813,92 @@ pub(crate) async fn stop_active_revision_executions(
             chain_root_id,
             "merge poller: stopping revision execution — parent PR merged",
         );
+        // Persist the exact engine-assigned workspace before force_release
+        // clears the live lease columns. A converted review followup uses
+        // this durable pointer to reclaim uncommitted edits; no workspace
+        // name inference is involved.
+        if let Err(err) = work_db.preserve_execution_workspace_preference(&execution.id) {
+            tracing::warn!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                ?err,
+                "merge poller: failed to preserve revision workspace preference",
+            );
+        }
         // Release the pane and cube workspace lease without altering
         // execution status (force_release does not change status).
         handler.force_release(&execution.id).await;
-        // Now mark the execution terminal so the dispatcher won't try to
-        // re-schedule it.  `cancel_execution` resets task status to `todo`
-        // only when it's currently `active`; since the task is already
-        // `blocked` (set in the DB transaction), that guard won't fire.
-        match work_db.cancel_execution(&execution.id) {
-            Ok(_) => {
+        // Now mark the obsolete revision execution terminal. The task has
+        // already reached its parent-close state in the DB transaction, so
+        // cancel's active-to-todo demotion does not overwrite that decision.
+        let prior_status = execution.status.clone();
+        let cancel_result = work_db.cancel_execution_with(
+            &execution.id,
+            crate::work::CancelExecutionOpts {
+                reason: Some("parent PR merged".to_owned()),
+                queued_only: false,
+            },
+        );
+        match &cancel_result {
+            Ok(cancelled) => {
                 outcome.revision_invalidated += 1;
+                handler
+                    .record_parent_pr_merge_cancellation(cancelled, prior_status, chain_root_id)
+                    .await;
             }
             Err(err) => {
                 // The execution may have already moved to a terminal state
-                // (raced with the worker finishing, or a prior sweep).
-                // Log at debug — not a concern since the lease is released.
+                // (raced with the worker finishing, or a prior sweep). That
+                // is not itself a problem — the reconcile below still runs
+                // and picks up the now-terminal row — so log at debug.
                 tracing::debug!(
                     execution_id = %execution.id,
                     ?err,
                     "merge poller: cancel_execution failed for revision (may already be terminal)",
                 );
             }
+        }
+
+        // The task may just have changed execution families in place
+        // (revision -> followup). Reconcile after the old revision
+        // execution is terminal — whether *this* call made it terminal via
+        // a successful cancel, or it was already terminal (a concurrent
+        // completion or a prior sweep raced us here) — so the ordinary
+        // single-in-flight guard can safely mint the new
+        // chore_implementation row regardless of which path terminalized
+        // it. The subsequent kick makes that ready row visible to the
+        // dispatcher immediately. Run this unconditionally on cancel
+        // outcome: gating it on `Ok(cancelled)` alone reproduces the exact
+        // defect this sweep fixes whenever the cancel races a terminal
+        // status and bails.
+        match work_db.get_work_item(&execution.work_item_id) {
+            Ok(work_item) => {
+                let product_id = work_item.product_id().to_owned();
+                match work_db.reconcile_product_executions(&product_id) {
+                    Ok(result) => {
+                        tracing::info!(
+                            execution_id = %execution.id,
+                            work_item_id = %execution.work_item_id,
+                            created = result.created.len(),
+                            updated = result.updated.len(),
+                            "merge poller: reconciled execution after revision cancellation",
+                        );
+                        publisher.kick_scheduler();
+                    }
+                    Err(err) => tracing::warn!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        ?err,
+                        "merge poller: failed to reconcile followup after revision cancellation",
+                    ),
+                }
+            }
+            Err(err) => tracing::warn!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                ?err,
+                "merge poller: failed to resolve converted revision after cancellation",
+            ),
         }
     }
 }
@@ -1169,7 +1235,8 @@ pub(crate) async fn sweep_one(
             // already ran inside `mark_chore_pr_merged`'s transaction;
             // here we force-release their cube leases and mark them
             // terminal so the scheduler doesn't try to redispatch.
-            stop_active_revision_executions(work_db, completion_handler, &candidate.work_item_id, outcome).await;
+            stop_active_revision_executions(work_db, publisher, completion_handler, &candidate.work_item_id, outcome)
+                .await;
         }
         PrLifecycleState::Open(open) => {
             known_active_queue_failure =

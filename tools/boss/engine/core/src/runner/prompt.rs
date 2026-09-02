@@ -223,6 +223,100 @@ fn startup_recovery_block(report: &boss_engine_recovery::recovery_apply::Recover
     block
 }
 
+/// Explain the exact workspace handoff for a review revision converted to a
+/// followup because its parent PR merged mid-run. This keys primarily on the
+/// dedicated execution shape written by `reconcile_work_item_execution` — a
+/// chore-implementation followup with a soft dirty-workspace preference,
+/// which no other mint produces — not on task kind alone:
+/// `resolve_revision_on_parent_close` (work/chain_helpers.rs) falls back
+/// from `TaskKind::Followup` to plain `TaskKind::Chore` when the chain
+/// root's PR URL is missing or unparseable, and that chore-fallback
+/// conversion still inherits the same workspace/allow_dirty shape, so it
+/// needs this brief too.
+fn merge_cancelled_review_recovery_block(
+    execution: &WorkExecution,
+    work_item: &WorkItem,
+    workspace_path: &Path,
+) -> Option<String> {
+    let task = match work_item {
+        WorkItem::Task(task) | WorkItem::Chore(task) if matches!(task.kind, TaskKind::Followup | TaskKind::Chore) => {
+            task
+        }
+        _ => return None,
+    };
+    if execution.kind != ExecutionKind::ChoreImplementation || !execution.allow_dirty || !execution.prefer_is_soft {
+        return None;
+    }
+    let preferred = execution.preferred_workspace_id.as_deref()?;
+    let origin = task
+        .origin_pr_number
+        .map(|number| format!("PR #{number}"))
+        .unwrap_or_else(|| "the merged origin PR".to_owned());
+    let current = execution.cube_workspace_id.as_deref();
+
+    // `reconcile_workspace_recovery` (coordinator/execution.rs) already
+    // resolved whether the re-leased workspace's dirty state was actually
+    // confirmed — it writes this marker with `RecoverySource::CubeInPlace`
+    // only when `lease.dirty_verified == Some(true)`, before this prompt is
+    // composed. Same-workspace alone is not proof: cube can re-lease the
+    // same workspace after resetting it, or the followup can sit `ready`
+    // long enough (pool saturation, dependency gating) for an unrelated
+    // task to lease, dirty, and release that workspace first — in which
+    // case `--allow-dirty` hands this worker a foreign working copy, not
+    // its own cancelled review draft.
+    let verified_in_place = current == Some(preferred)
+        && boss_engine_recovery::recovery_apply::RecoveryReport::read_for(workspace_path, &execution.id)
+            .is_some_and(|report| report.source == boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace);
+
+    let mut block = String::from("## MERGE-CANCELLED REVIEW RECOVERY\n\n");
+    if verified_in_place {
+        block.push_str(&format!(
+            "This followup was created after {origin} merged while its review-revision worker was mid-run. \
+             The engine re-leased that worker's exact workspace (`{preferred}`) without resetting it. \
+             Its working copy remains on the merged PR's revision base and may contain partial, \
+             uncommitted edits from the cancelled turn.\n\n\
+             Inspect before changing the checkout:\n\n\
+             ```\n\
+             jj status\n\
+             jj diff --stat\n\
+             jj diff\n\
+             ```\n\n\
+             Do not trust or discard those edits. They were cut off mid-turn and were never compiled or \
+             tested. Reconcile them against this followup and current `main`, then run the required \
+             validation before opening the fresh PR.\n\n",
+        ));
+    } else if current == Some(preferred) {
+        block.push_str(&format!(
+            "This followup was created after {origin} merged while its review-revision worker was mid-run, \
+             and the engine re-leased that worker's exact workspace (`{preferred}`). However, the engine \
+             has no confirmed record of what this lease actually returned: it may have been reset (no \
+             edits present), or it may have been leased and dirtied by an unrelated task in between and \
+             then released back to the pool before landing here. Do not assume the working copy is your \
+             own cancelled review draft either way.\n\n\
+             Check before doing anything else:\n\n\
+             ```\n\
+             jj status\n\
+             jj diff --stat\n\
+             ```\n\n\
+             If it holds nothing, proceed as a fresh start from current `main`. If it holds edits, verify \
+             they actually belong to this followup's own history (check the log against {origin}'s revision \
+             base) before building on them — an edit set from an unrelated task must not be folded into \
+             this PR.\n\n",
+        ));
+    } else {
+        let current = current.unwrap_or("an unrecorded fallback workspace");
+        block.push_str(&format!(
+            "This followup was created after {origin} merged while its review-revision worker was mid-run. \
+             The engine preferred the cancelled worker's workspace (`{preferred}`), but cube could not \
+             lease it and dispatched this execution on `{current}` instead. This is a fresh-workspace \
+             fallback: no partial edits were inherited here. An unverified draft may still remain in \
+             `{preferred}` on the merged PR's base; proceed from current `main` in this workspace and do \
+             not assume that draft was validated or delivered.\n\n",
+        ));
+    }
+    Some(block)
+}
+
 /// The structured-output payload this execution's prompt is built around —
 /// the one `$BOSS_STRUCTURED_OUTPUT` names.
 ///
@@ -342,7 +436,9 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
     // directive BEFORE the execution context so it outweighs the
     // workspace-rules default of `jj git fetch && jj new main`.
     let existing_pr_url = work_item_pr_url(work_item);
-    if let Some(pr_url) = existing_pr_url {
+    if let Some(block) = merge_cancelled_review_recovery_block(execution, work_item, workspace_path) {
+        prompt.push_str(&block);
+    } else if let Some(pr_url) = existing_pr_url {
         let pr_number = boss_github::pr_url::pr_number_from_url(pr_url)
             .map(|n| n.to_string())
             .unwrap_or_else(|| "?".into());

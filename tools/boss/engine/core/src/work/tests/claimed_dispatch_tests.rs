@@ -269,6 +269,60 @@ fn reconcile_does_not_create_duplicate_execution_for_claimed_revision() {
 }
 
 #[test]
+fn merge_cancel_reconcile_does_not_mint_over_an_older_live_execution() {
+    let db = WorkDb::open(temp_db_path("merge-cancel-live-guard")).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore_manual(&db, product.id.clone(), "Continue merged review");
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET kind = 'followup', status = 'todo', autostart = 1 WHERE id = ?1",
+            [&chore.id],
+        )
+        .unwrap();
+    }
+    let live = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Running)
+                .build(),
+        )
+        .unwrap();
+    let cancelled = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Cancelled)
+                .preferred_workspace_id("mono-agent-003")
+                .build(),
+        )
+        .unwrap();
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_executions SET created_at = '2026-09-02T00:00:00Z' WHERE id = ?1",
+            [&live.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE work_executions SET created_at = '2026-09-02T00:00:01Z' WHERE id = ?1",
+            [&cancelled.id],
+        )
+        .unwrap();
+    }
+
+    let result = db.reconcile_product_executions(&product.id).unwrap();
+
+    assert!(result.created.is_empty(), "a live execution already owns the work item");
+    let executions = db.list_executions(Some(&chore.id)).unwrap();
+    assert_eq!(executions.len(), 2);
+    assert!(executions.iter().any(|execution| execution.id == live.id));
+}
+
+#[test]
 fn release_stale_claimed_executions_reverts_leftover_claimed_rows() {
     let db = WorkDb::open(temp_db_path("stale-claimed")).unwrap();
     let (product_id, first, _) = two_incomplete_project_tasks(&db);

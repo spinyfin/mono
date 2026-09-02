@@ -294,7 +294,7 @@ pub struct CreateExecutionInput {
     pub work_item_id: String,
     /// When `true`, cube will be invoked with `--allow-dirty` so it
     /// reclaims the preferred workspace with uncommitted work intact.
-    /// Only set on the orphan recovery re-dispatch path.
+    /// Set on recovery redispatches and merge-cancelled review followups.
     #[serde(default)]
     #[builder(default)]
     pub allow_dirty: bool,
@@ -302,7 +302,7 @@ pub struct CreateExecutionInput {
     pub kind: ExecutionKind,
     /// When true, the cube lease fallback degrades silently to any free
     /// workspace if the preferred workspace is gone or leased. Used for
-    /// `revision_implementation` executions where warmth is a hint only.
+    /// `revision_implementation` warmth and merge-cancelled review followups.
     #[serde(default)]
     #[builder(default)]
     pub prefer_is_soft: bool,
@@ -677,7 +677,7 @@ pub struct WorkExecution {
     /// `--allow-dirty`, causing cube to reclaim the named preferred workspace
     /// with its uncommitted working copy intact rather than resetting it.
     /// Set on the orphan recovery re-dispatch path (when the predecessor
-    /// execution was `orphaned`) and unconditionally by the
+    /// execution was `orphaned`), merge-cancelled review followups, and by the
     /// transient-recovery auto-resume path (`WorkDb::request_resume_execution`
     /// in `boss-engine`) so the recovering worker lands on the exact dirty
     /// workspace its predecessor left behind instead of cube silently
@@ -714,7 +714,9 @@ pub struct WorkExecution {
     /// `revision_implementation` executions (warmth ≠ correctness; the
     /// branch is always recoverable via `jj git fetch`). Pre-revision rows
     /// default to `false`, preserving the existing hard-prefer semantics
-    /// used by orphan-resume.
+    /// used by orphan-resume. Merge-cancelled review followups also use a
+    /// soft preference: their partial edits are valuable, but the followup
+    /// remains dispatchable on a fresh workspace if the original is busy.
     #[serde(default)]
     #[builder(default)]
     pub prefer_is_soft: bool,

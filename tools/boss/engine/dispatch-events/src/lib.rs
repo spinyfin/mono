@@ -149,6 +149,13 @@ pub enum Stage {
     /// `failed` and released the lease without surfacing anything
     /// to the user.
     PaneSpawned,
+    /// An execution that had already entered the dispatch pipeline was
+    /// cancelled by an engine lifecycle transition. `details.reason` names
+    /// the transition and `details.prior_status` records the status that was
+    /// terminalized. The merge poller emits this when a revision's parent PR
+    /// merges mid-run, so the execution timeline does not silently stop at
+    /// `pane_spawned` even though the durable row says `cancelled`.
+    ExecutionCancelled,
     /// The dispatch aborted between `run_started` and any pane existing:
     /// `ExecutionRunner::run_execution` returned `Err` — a prompt-composition
     /// failure, a driver provision/permission-config failure, an
@@ -823,6 +830,7 @@ impl Stage {
             Stage::CubeChangeCreated => "cube_change_created",
             Stage::RunStarted => "run_started",
             Stage::PaneSpawned => "pane_spawned",
+            Stage::ExecutionCancelled => "execution_cancelled",
             Stage::SpawnFailed => "spawn_failed",
             Stage::StageStalled => "stage_stalled",
             Stage::OrphanActiveRedispatch => "orphan_active_redispatch",
@@ -1592,6 +1600,7 @@ mod tests {
         assert_eq!(Stage::CubeChangeCreated.as_str(), "cube_change_created");
         assert_eq!(Stage::RunStarted.as_str(), "run_started");
         assert_eq!(Stage::PaneSpawned.as_str(), "pane_spawned");
+        assert_eq!(Stage::ExecutionCancelled.as_str(), "execution_cancelled");
         assert_eq!(Stage::SpawnFailed.as_str(), "spawn_failed");
         assert_eq!(Stage::StageStalled.as_str(), "stage_stalled");
         assert_eq!(Stage::OrphanActiveRedispatch.as_str(), "orphan_active_redispatch");

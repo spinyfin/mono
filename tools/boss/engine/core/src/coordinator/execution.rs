@@ -2077,8 +2077,10 @@ impl ExecutionCoordinator {
         // Orphan-resume executions use the hard "none" policy (prefer_is_soft
         // = false) because their state lives only in that specific workspace.
         // allow_dirty additionally suppresses the cube-side reset so the
-        // recovering worker lands on the dirty tree; it implies a hard-fail
-        // (no fallback) because the uncommitted work is only in that workspace.
+        // recovering worker lands on the dirty tree. A hard preference still
+        // fails rather than losing continuity; the merge-cancelled-review
+        // handoff deliberately combines allow_dirty with a soft preference,
+        // because its contract explicitly permits a fresh-workspace fallback.
         let fallback_policy = if prefer.is_none() || execution.prefer_is_soft {
             "any_free"
         } else {
@@ -2221,10 +2223,12 @@ impl ExecutionCoordinator {
         // With a hard prefer (prefer set + prefer_is_soft = false), the
         // caller needs that specific workspace (orphan-resume); silently
         // landing elsewhere would lose local commit state.
-        // allow_dirty additionally implies hard-fail: the uncommitted patch
+        // A hard preference still implies hard-fail: the uncommitted patch
         // lives only in the named workspace, so landing elsewhere is
-        // meaningless and must surface an error rather than silently
-        // dispatching to a clean workspace.
+        // meaningless unless a recovery patch exists. A soft preference is
+        // the merge-cancelled-review exception: try the known dirty workspace
+        // first, then start fresh while making that fallback explicit in the
+        // worker prompt.
         // Case: a resume that loses the workspace race is not automatically
         // doomed. The hard pin exists because the uncommitted work lived ONLY
         // in that workspace; once the engine has captured a recovery patch
@@ -2239,7 +2243,22 @@ impl ExecutionCoordinator {
         // replay. Without one, the hard fail is still correct.
         let recovery_patch = self.recovery_patch_for_resume(execution);
         let patch_rescues_this_resume = allow_dirty && recovery_patch.is_some();
-        if prefer.is_some() && (!execution.prefer_is_soft || allow_dirty) && !patch_rescues_this_resume {
+        // Restore the original allow_dirty hard-fail (a soft prefer alone
+        // does not exempt an execution from it — only a soft prefer
+        // *without* allow_dirty does, e.g. revision_implementation's
+        // cache-warmth-only soft prefer on a fresh dispatch), and carve out
+        // ONLY the merge-cancel handoff (ExecutionKind::ChoreImplementation)
+        // from the allow_dirty clause: that mint is the sole legitimate case
+        // needing "try the known dirty workspace, then start fresh if it's
+        // gone" semantics. A resumed execution of any other kind also
+        // carries prefer_is_soft = true and allow_dirty = true via
+        // `request_resume_execution`'s forced allow_dirty, but for a resume
+        // the uncommitted work lives ONLY in the preferred workspace, so
+        // losing the race must still hard-fail and retry rather than
+        // silently discarding it by degrading to a clean workspace.
+        let is_merge_cancel_handoff = execution.kind == ExecutionKind::ChoreImplementation;
+        let dirty_hard_fail = allow_dirty && !is_merge_cancel_handoff;
+        if prefer.is_some() && (!execution.prefer_is_soft || dirty_hard_fail) && !patch_rescues_this_resume {
             CUBE_WORKSPACE_LEASE_FAILURE.inc(&self.metrics);
             return Err(first_err);
         }

@@ -10,6 +10,7 @@ use crate::completion::{
     PaneReleaseOutcome, PrDetector, PrStatus, ProbeQueuer, WorkerCompletionHandler, WorkerPaneReleaser,
 };
 use crate::coordinator::{CubeClient, CubeRepoSummary, CubeWorkspaceStatus};
+use crate::dispatch_events::RecordingDispatchEventSink;
 use crate::test_support::*;
 use crate::work::{
     AddDependencyInput, CommentAnchor, ConflictResolutionInsertInput, CreateCommentInput, CreateExecutionInput,

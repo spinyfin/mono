@@ -105,13 +105,17 @@ pub struct StalledStage {
 /// An event is "terminal" — i.e., the dispatch timeline for that
 /// execution is officially over — when it is either a successful
 /// `pane_spawned` (the slot is up and the worker is now driving),
-/// or any explicit error (we won't get a follow-up; the
-/// `record_start_failure` / `pane_spawn_failed` paths have run).
+/// a successful engine-driven `execution_cancelled`, or any explicit
+/// error (we won't get a follow-up; the `record_start_failure` /
+/// `pane_spawn_failed` paths have run).
 pub fn is_terminal_event(event: &DispatchEvent) -> bool {
     if event.outcome == "error" {
         return true;
     }
     if event.stage == "pane_spawned" && event.outcome == "ok" {
+        return true;
+    }
+    if event.stage == "execution_cancelled" && event.outcome == "ok" {
         return true;
     }
     false
@@ -538,6 +542,7 @@ mod tests {
     fn is_terminal_event_recognises_terminal_shapes() {
         assert!(!is_terminal_event(&ev(Stage::RequestRecorded, Outcome::Ok, 0)));
         assert!(is_terminal_event(&ev(Stage::PaneSpawned, Outcome::Ok, 0)));
+        assert!(is_terminal_event(&ev(Stage::ExecutionCancelled, Outcome::Ok, 0)));
         assert!(is_terminal_event(&ev(Stage::RunStarted, Outcome::Error, 0)));
         assert!(is_terminal_event(&ev(Stage::PaneSpawned, Outcome::Error, 0)));
     }

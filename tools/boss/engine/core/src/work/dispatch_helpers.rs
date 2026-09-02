@@ -535,38 +535,79 @@ pub(crate) fn reconcile_work_item_execution(
         );
         return Ok(());
     }
+    let insert_fresh = |result: &mut ExecutionReconcileResult, predecessor: Option<&WorkExecution>| -> Result<()> {
+        // Resolve through the single helper so per-row overrides beat the
+        // product default (multi-repo design Q5). On a `None` we don't create
+        // an execution row — instead a sticky `repo_unresolved` attention
+        // item surfaces the problem in the kanban Attention lane.
+        let Some(repo_remote_url) = resolve_repo_for_work_item(conn, work_item_id)? else {
+            let label = repo_unresolved_kind_label(conn, work_item_id)?;
+            record_repo_unresolved_attention(conn, work_item_id, label)?;
+            return Ok(());
+        };
+        // A merge-cancelled PR-review revision is converted to a followup in
+        // place. Its exact prior workspace was persisted before teardown;
+        // carry that pointer into the new execution with `allow_dirty` so
+        // cube preserves its uncommitted edits. `prefer_is_soft` permits the
+        // explicitly-required fresh-workspace fallback when that workspace
+        // is no longer available. This combination is scoped to the exact
+        // revision_implementation -> chore_implementation transition.
+        let merge_cancelled_workspace = predecessor
+            .filter(|execution| {
+                execution.kind == ExecutionKind::RevisionImplementation
+                    && execution.status == ExecutionStatus::Cancelled
+                    && kind == ExecutionKind::ChoreImplementation
+            })
+            .and_then(|execution| execution.preferred_workspace_id.clone());
+        let recovering_merge_cancel = merge_cancelled_workspace.is_some();
+        let created = insert_execution(
+            conn,
+            CreateExecutionInput::builder()
+                .work_item_id(work_item_id)
+                .kind(kind.clone())
+                .status(effective_status.clone())
+                .repo_remote_url(repo_remote_url)
+                .maybe_preferred_workspace_id(merge_cancelled_workspace)
+                .allow_dirty(recovering_merge_cancel)
+                .prefer_is_soft(recovering_merge_cancel)
+                .build(),
+        )?;
+        result.created.push(created);
+        Ok(())
+    };
+
     match query_latest_execution_for_work_item(conn, work_item_id)? {
         Some(execution) => {
             if execution.kind == kind
                 && execution.status.can_reconcile()
                 && execution.status != effective_status
-                && let Some(updated) = update_execution_status(conn, &execution.id, effective_status)?
+                && let Some(updated) = update_execution_status(conn, &execution.id, effective_status.clone())?
             {
                 result.updated.push(updated);
+            } else if execution.kind == ExecutionKind::RevisionImplementation
+                && execution.status.is_terminal()
+                && kind == ExecutionKind::ChoreImplementation
+                && query_live_execution_for_work_item(conn, work_item_id)?.is_none()
+            {
+                // A work item may legitimately change execution families in
+                // place in one narrowly-defined case: a live PR-review
+                // revision becomes a followup when its parent PR merges. Its
+                // now-terminal revision_implementation row is historical
+                // evidence, not a reason to suppress the required
+                // chore_implementation — this covers not just the ordinary
+                // cancel outcome but also the race where the worker's own
+                // completion (or a dead-PID sweep) terminalizes the row as
+                // completed/failed/orphaned between the merge-cancel
+                // transaction and this reconcile. The live-execution query
+                // covers every row, rather than only this latest one, and
+                // preserves the single-in-flight guarantee. Workspace
+                // inheritance (`merge_cancelled_workspace` above) stays
+                // scoped to the `Cancelled` case only — a completed or
+                // failed revision has no uncommitted edits worth reclaiming.
+                insert_fresh(result, Some(&execution))?;
             }
         }
-        None => {
-            // Resolve through the single helper so per-row overrides
-            // beat the product default (multi-repo design Q5). On a
-            // `None` we don't create an execution row — instead a
-            // sticky `repo_unresolved` attention item surfaces the
-            // problem in the kanban Attention lane.
-            let Some(repo_remote_url) = resolve_repo_for_work_item(conn, work_item_id)? else {
-                let label = repo_unresolved_kind_label(conn, work_item_id)?;
-                record_repo_unresolved_attention(conn, work_item_id, label)?;
-                return Ok(());
-            };
-            let created = insert_execution(
-                conn,
-                CreateExecutionInput::builder()
-                    .work_item_id(work_item_id)
-                    .kind(kind)
-                    .status(effective_status)
-                    .repo_remote_url(repo_remote_url)
-                    .build(),
-            )?;
-            result.created.push(created);
-        }
+        None => insert_fresh(result, None)?,
     }
 
     Ok(())

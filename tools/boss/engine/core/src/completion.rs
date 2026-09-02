@@ -59,6 +59,9 @@ use crate::build_wait_tracker::{BuildWaitDecision, BuildWaitTracker, DEFAULT_BUI
 use crate::conflict_stop_gate::{self, ConflictClearance};
 use crate::coordinator::{CubeClient, ExecutionPublisher, PreemptOutcome};
 use crate::design_detector;
+use crate::dispatch_events::{
+    DispatchEvent, DispatchEventSink, NoopDispatchEventSink, Outcome as DispatchOutcome, Stage,
+};
 use crate::merge_poller::{
     MergeProbe, NoopMergeProbe, OpenPrCiStatus, OpenPrMergeability, PrLifecycleState, update_pr_poll_state,
 };
@@ -1280,6 +1283,10 @@ pub struct WorkerCompletionHandler {
     publisher: Arc<dyn ExecutionPublisher>,
     pane_releaser: Arc<dyn WorkerPaneReleaser>,
     probe_queuer: Arc<dyn ProbeQueuer>,
+    /// Structured dispatch timeline shared with the coordinator. The merge
+    /// poller uses it to record engine-driven cancellation after a parent PR
+    /// merges, closing the otherwise silent tail after `pane_spawned`.
+    dispatch_events: Arc<dyn DispatchEventSink>,
     /// Primary-path PR URL staging. The events-socket dispatcher in
     /// `app.rs` populates this from `PostToolUse` Bash hook events
     /// whose `tool_response.stdout` carries a `gh pr create` (or
