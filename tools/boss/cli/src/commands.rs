@@ -1972,28 +1972,6 @@ pub(crate) struct ProductUpdateArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-pub(crate) struct ProjectCreateArgs {
-    #[arg(long)]
-    pub(crate) product: Option<String>,
-
-    #[arg(long)]
-    pub(crate) name: Option<String>,
-
-    #[arg(long)]
-    pub(crate) description: Option<String>,
-
-    #[arg(long)]
-    pub(crate) goal: Option<String>,
-
-    /// Skip the auto-generated `kind=design` seed task. Pass this for
-    /// non-design-shaped projects (postmortems, checklists, milestone
-    /// aggregators) where the seed task would be dead weight.
-    /// Defaults to false (preserves existing behaviour).
-    #[arg(long = "no-design-task", default_value_t = false)]
-    pub(crate) no_design_task: bool,
-}
-
-#[derive(Debug, Clone, Args)]
 pub(crate) struct ProjectListArgs {
     #[arg(long)]
     pub(crate) product: Option<String>,

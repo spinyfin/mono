@@ -431,14 +431,16 @@ pub(crate) async fn compose_worker_spawn(
         .as_ref()
         .and_then(|p| p.design_guidance.clone())
         .filter(|s| !s.is_empty());
-    let (row_effort, row_model_override, row_driver, row_reasoning) = match work_item {
+    let (row_effort, row_model_override, row_driver, row_reasoning, row_design_reasoning_effort_xhigh) = match work_item
+    {
         WorkItem::Task(task) | WorkItem::Chore(task) => (
             task.effort_level,
             task.model_override.clone(),
             task.driver.clone(),
             task.reasoning,
+            task.design_reasoning_effort_xhigh,
         ),
-        _ => (None, None, None, None),
+        _ => (None, None, None, None, false),
     };
     // Load the PR template for editorial-rules prompt injection. Uses
     // `WorkItem::product_id()` (total over every variant) rather than a
@@ -693,12 +695,6 @@ pub(crate) async fn compose_worker_spawn(
                 .build(),
         )
     };
-    // Products and projects do not have a TaskKind; only Task/Chore rows
-    // carry one. Threaded into `resolve_spawn_config` so design-family kinds
-    // (`Design` / `DesignPostmortem` / `Investigation`) floor to the selected
-    // driver's investigation tier *on rows that predate the `reasoning`
-    // column* — newer rows reach the same place through `row_reasoning`,
-    // which the resolver consults first. Reused below for the capability gate.
     let work_item_kind = work_item_task_kind_enum(work_item);
     let registry = crate::driver::DriverRegistry::default();
     // Single resolution point for review/automation dispatch policy — see
@@ -741,6 +737,7 @@ pub(crate) async fn compose_worker_spawn(
         .maybe_allocated_driver(allocated_driver.as_deref())
         .maybe_kind(work_item_kind)
         .maybe_reasoning(row_reasoning)
+        .design_reasoning_effort_xhigh(row_design_reasoning_effort_xhigh)
         .build();
     let spawn_config = resolve_spawn_config_in(&registry, &spawn_input)
         .map_err(|e| anyhow::anyhow!("effort/model resolution: {e}"))?;
@@ -837,20 +834,30 @@ mod reviewer_pool_policy_tests {
     /// Resolves a review-pool spawn end to end (policy → effective driver →
     /// `resolve_spawn_config`) for a row whose own `driver` column is
     /// `row_driver`, mirroring exactly what `compose_worker_spawn` does.
-    fn resolve_reviewer_spawn(row_driver: Option<&str>) -> crate::effort::SpawnConfig {
+    fn resolve_reviewer_spawn(
+        row_driver: Option<&str>,
+        kind: Option<&boss_protocol::TaskKind>,
+        reasoning: Option<boss_protocol::ReasoningMode>,
+        effort: Option<boss_protocol::EffortLevel>,
+        design_reasoning_effort_xhigh: bool,
+    ) -> crate::effort::SpawnConfig {
         let pool_policy = crate::coordinator::pool_dispatch_policy_for_worker_id("review-1").unwrap();
         let registry = crate::driver::DriverRegistry::default();
         let input = crate::effort::SpawnResolutionInput::builder()
             .maybe_task_driver(row_driver)
             .pool_policy_driver(pool_policy.driver)
             .maybe_pool_model_override(Some(pool_policy.model_tier))
+            .maybe_kind(kind)
+            .maybe_reasoning(reasoning)
+            .maybe_effort_level(effort)
+            .design_reasoning_effort_xhigh(design_reasoning_effort_xhigh)
             .build();
         crate::effort::resolve_spawn_config_in(&registry, &input).unwrap()
     }
 
     #[test]
     fn codex_authored_row_gets_a_claude_reviewer_on_opus_not_a_codex_reviewer() {
-        let cfg = resolve_reviewer_spawn(Some("codex"));
+        let cfg = resolve_reviewer_spawn(Some("codex"), None, None, None, false);
         assert_eq!(
             cfg.driver, "claude",
             "reviewer must dispatch on Claude, not the authored row's codex driver"
@@ -860,16 +867,43 @@ mod reviewer_pool_policy_tests {
 
     #[test]
     fn claude_authored_row_under_review_is_unchanged_claude_reviewer_on_opus() {
-        let cfg = resolve_reviewer_spawn(Some("claude"));
+        let cfg = resolve_reviewer_spawn(Some("claude"), None, None, None, false);
         assert_eq!(cfg.driver, "claude");
         assert_eq!(cfg.model, "opus");
     }
 
     #[test]
     fn untagged_row_under_review_still_gets_a_claude_reviewer_on_opus() {
-        let cfg = resolve_reviewer_spawn(None);
+        let cfg = resolve_reviewer_spawn(None, None, None, None, false);
         assert_eq!(cfg.driver, "claude");
         assert_eq!(cfg.model, "opus");
+    }
+
+    #[test]
+    fn design_and_investigation_reviews_keep_the_pool_strong_tier_and_row_effort() {
+        use boss_protocol::{EffortLevel, ReasoningMode, TaskKind};
+
+        let design = resolve_reviewer_spawn(None, Some(&TaskKind::Design), None, Some(EffortLevel::Medium), true);
+        assert_eq!(design.model, "opus");
+        assert_eq!(
+            design.model_source,
+            crate::effort::ModelResolutionSource::PoolStrongTier
+        );
+        assert_eq!(design.effort_value, Some("high"));
+
+        let investigation = resolve_reviewer_spawn(
+            None,
+            Some(&TaskKind::Chore),
+            Some(ReasoningMode::Investigation),
+            Some(EffortLevel::Large),
+            false,
+        );
+        assert_eq!(investigation.model, "opus");
+        assert_eq!(
+            investigation.model_source,
+            crate::effort::ModelResolutionSource::PoolStrongTier
+        );
+        assert_eq!(investigation.effort_value, Some("xhigh"));
     }
 }
 
@@ -1231,6 +1265,65 @@ mod compose_worker_spawn_tests {
             .build();
         task.driver = driver.map(str::to_owned);
         WorkItem::Chore(task)
+    }
+
+    fn design_with_product(task_id: &str, product_id: &str) -> WorkItem {
+        WorkItem::Task(
+            Task::builder()
+                .id(task_id)
+                .product_id(product_id)
+                .kind(TaskKind::Design)
+                .name("Design a new feature")
+                .description("Design task.")
+                .status(TaskStatus::Todo)
+                .created_at("2026-05-15T00:00:00Z")
+                .updated_at("2026-05-15T00:00:00Z")
+                .autostart(false)
+                .build(),
+        )
+    }
+
+    #[tokio::test]
+    async fn design_with_grok_product_default_spawns_on_engine_default() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        let product = db
+            .create_product(
+                crate::work::CreateProductInput::builder()
+                    .name("Grok Product")
+                    .repo_remote_url("git@github.com:org/grok-product.git")
+                    .build(),
+            )
+            .unwrap();
+        db.update_product(
+            &product.id,
+            crate::work::WorkItemPatch::builder().default_driver("grok").build(),
+            "human",
+        )
+        .unwrap();
+        let execution = WorkExecution::builder()
+            .id("exec_design_grok_01")
+            .work_item_id("task-design-grok")
+            .kind(ExecutionKind::TaskImplementation)
+            .status(ExecutionStatus::Running)
+            .repo_remote_url("git@github.com:org/grok-product.git")
+            .workspace_path("/tmp/workspace")
+            .created_at("2026-05-15T00:00:00Z")
+            .build();
+
+        let composed = compose_worker_spawn(
+            &db,
+            "worker-1",
+            &execution,
+            &design_with_product("task-design-grok", &product.id),
+            workspace.path(),
+            None,
+            WorkerSpawnOpts::default(),
+        )
+        .await
+        .expect("grok product default must yield rather than wedge a design spawn");
+
+        assert_eq!(composed.spawn_config.driver, crate::effort::ENGINE_DEFAULT_DRIVER);
     }
 
     /// A codex task pin must not hard-fail ConflictResolution spawn: the pin

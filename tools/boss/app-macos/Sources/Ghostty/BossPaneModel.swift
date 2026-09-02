@@ -685,6 +685,7 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
     - **Do NOT** follow with `boss task create --name "Design …"` — the engine already spawned a design worker.
     - To populate the brief: `boss task update <auto-design-id> --description "…"`. Find the id in `boss project create --json` → `design_task.id`; recover with `boss task list --project <id> --json` → entry where `kind == "design"`.
     - To author the brief before the worker starts: `boss project create --no-autostart`, then `bossctl work start <design-task-id>`. Verify: `boss task show --json` → `autostart: false`.
+    - For a design you judge unusually complex, pass `boss project create --design-reasoning-effort-xhigh`; it raises only that design worker's driver reasoning effort and defaults off. You can set or clear it before dispatch with `boss task update <auto-design-id> --design-reasoning-effort-xhigh true|false`, then verify `design_reasoning_effort_xhigh` in `boss task show --json`. Do not use it for design postmortems or as a substitute for the work-size `--effort` estimate.
 
     Every project has exactly one `kind=design` task. Reach for it; don't create new ones.
 

@@ -211,6 +211,10 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
         autostart: row.get::<_, i64>(12)? != 0,
+        // Not in the base SELECT: list projections report false. Dispatch
+        // reads the persisted value through query_task's full mapper, so any
+        // future spawn path must not source a work item from a list query.
+        design_reasoning_effort_xhigh: false,
         last_status_actor: row.get(13)?,
         priority: row.get(14)?,
         created_via: row.get(15)?,
@@ -411,7 +415,8 @@ pub(crate) fn map_task_with_parent_provenance_and_tags(row: &Row<'_>) -> rusqlit
 /// `dispatch_failed_*` (43-45), `blocked_detail` (46), `deferred` (47),
 /// `tags` (48), `human_driven` (49), `completion_summary` (50),
 /// `effort_matched_rule` (51), `effort_reasons` (52), the external-ref
-/// columns (53-57), and `source_automation_id` (58). Used by `query_task`,
+/// columns (53-57), `source_automation_id` (58), and
+/// `design_reasoning_effort_xhigh` (59). Used by `query_task`,
 /// which backs every single-item lookup (`boss task show`, `get_work_item`,
 /// `get_work_item_by_short_id`, `WorkItemUpdated`), so those surface complete archival provenance,
 /// the verbatim blocked-status detail, future-scope / human-driven
@@ -435,6 +440,7 @@ pub(crate) fn map_task_with_parent_provenance_and_archived_reason(row: &Row<'_>)
     task.effort_reasons = row.get::<_, Option<String>>(52)?.filter(|s| !s.is_empty());
     populate_external_ref_from_row(&mut task, row, 53)?;
     task.source_automation_id = row.get::<_, Option<String>>(58)?.filter(|s| !s.is_empty());
+    task.design_reasoning_effort_xhigh = row.get::<_, i64>(59)? != 0;
     Ok(task)
 }
 

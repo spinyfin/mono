@@ -186,6 +186,7 @@ mod tests {
             default_model_for_level: |_| "test-model",
             model_for_reasoning: |_| "test-model",
             review_model_for_tier: |_| "test-model",
+            design_investigation_model: None,
             prompt_addendum_for_level: |_| None,
             model_requires_auto_permissions: |_| false,
             model_belongs_to_driver: |_| true,

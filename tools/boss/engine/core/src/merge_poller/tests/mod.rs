@@ -114,6 +114,7 @@ fn make_project_task_in_review(db: &WorkDb, name: &str, pr_url: &str) -> (String
             goal: None,
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
     let task = db

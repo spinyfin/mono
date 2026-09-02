@@ -753,6 +753,7 @@ async fn scheduler_respects_worker_pool_capacity() {
             goal: None,
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
     let second_project = db
@@ -763,6 +764,7 @@ async fn scheduler_respects_worker_pool_capacity() {
             goal: None,
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
     db.create_task(

@@ -20,6 +20,7 @@ struct ExecutionDriverRow {
     exec_kind_raw: String,
     task_kind_raw: String,
     task_driver: Option<String>,
+    reasoning_raw: Option<String>,
     product_default_driver: Option<String>,
 }
 
@@ -76,7 +77,7 @@ impl WorkDb {
             // must yield (same substitution the spawn path applies).
             let row: Option<ExecutionDriverRow> = conn
                 .query_row(
-                    "SELECT e.kind, t.kind, t.driver, p.default_driver
+                    "SELECT e.kind, t.kind, t.driver, t.reasoning, p.default_driver
                        FROM work_executions e
                        JOIN tasks t ON t.id = e.work_item_id
                        LEFT JOIN products p ON p.id = t.product_id
@@ -87,7 +88,8 @@ impl WorkDb {
                             exec_kind_raw: row.get(0)?,
                             task_kind_raw: row.get(1)?,
                             task_driver: row.get(2)?,
-                            product_default_driver: row.get(3)?,
+                            reasoning_raw: row.get(3)?,
+                            product_default_driver: row.get(4)?,
                         })
                     },
                 )
@@ -96,6 +98,7 @@ impl WorkDb {
                 exec_kind_raw,
                 task_kind_raw,
                 task_driver,
+                reasoning_raw,
                 product_default_driver,
             }) = row
             {
@@ -131,18 +134,40 @@ impl WorkDb {
                 // A pin the gate refuses for this execution kind is dropped
                 // here exactly as at spawn: honouring it would point the
                 // events-socket normaliser at a driver the worker never ran.
+                //
+                // Design/Investigation tier rows are NOT exempted from pin
+                // honouring here: `decide_execution_driver` and
+                // `resolve_spawn_config_in` both honour a live `tasks.driver`
+                // / `products.default_driver` pin for tier rows too (subject
+                // to the same capability gate, plus — for a product default —
+                // a dedicated tier model, mirrored below via
+                // `driver_has_design_investigation_model`), so suppressing
+                // the pin here would point the events-socket normaliser at a
+                // driver the worker never ran on.
                 let task_kind: Option<TaskKind> = task_kind_raw.parse().ok();
-                let pinned = task_driver
+                let reasoning = reasoning_raw
                     .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-                    .or_else(|| product_default_driver.as_deref().filter(|s| !s.trim().is_empty()));
+                    .filter(|value| !value.is_empty())
+                    .and_then(|value| value.parse().ok());
+                let design_or_investigation_tier =
+                    boss_engine_effort::is_design_or_investigation_tier(task_kind.as_ref(), reasoning);
+                let task_pin = task_driver.as_deref().filter(|s| !s.trim().is_empty());
+                let product_pin = product_default_driver.as_deref().filter(|s| !s.trim().is_empty());
+                let pinned = task_pin.or(product_pin);
                 if let Some(pinned) = pinned {
-                    let honour_pin = match &task_kind {
+                    let gate_ok = match &task_kind {
                         Some(tk) => driver_clears_dispatch_gate(pinned, tk, &exec_kind),
                         // Unparseable task kind: keep pre-existing pin behaviour.
                         None => true,
                     };
-                    if honour_pin {
+                    // A `products.default_driver` pin on a tier row also
+                    // needs a dedicated tier model, exactly like
+                    // `decide_execution_driver`'s pinned branch; a
+                    // `tasks.driver` pin stays loud regardless.
+                    let tier_ok = task_pin.is_some()
+                        || !design_or_investigation_tier
+                        || driver_has_design_investigation_model(pinned);
+                    if gate_ok && tier_ok {
                         return Ok(Some(pinned.to_owned()));
                     }
                 }
@@ -153,6 +178,14 @@ impl WorkDb {
                     .filter(|d| matches!(d.reason, REASON_ALLOCATION | REASON_LEGACY_PERCENTAGE))
                     .and_then(|d| d.driver)
                 {
+                    // Mirrors the substitution `resolve_spawn_config_in` applies
+                    // for a `TrafficAllocation`/`EngineDefault`-sourced driver
+                    // on a tier row: an allocation-recorded driver with no
+                    // dedicated tier model (grok) never actually spawned —
+                    // the worker ran on the engine default instead.
+                    if design_or_investigation_tier && !driver_has_design_investigation_model(&allocated) {
+                        return Ok(Some(boss_engine_effort::ENGINE_DEFAULT_DRIVER.to_owned()));
+                    }
                     return Ok(Some(allocated));
                 }
                 // No honourable pin and no allocation (an ineligible row, a
@@ -367,6 +400,92 @@ mod tests {
     fn unknown_execution_resolves_to_none() {
         let (_dir, db) = open_db();
         assert_eq!(db.get_execution_driver_slug("exec_missing").unwrap(), None);
+    }
+
+    /// A Design row with a live `tasks.driver = codex` pin must resolve to
+    /// `codex` at lookup, matching what `resolve_spawn_config_in` actually
+    /// spawns the worker on: `codex`'s `ModelMenu::design_investigation_model`
+    /// is `Some("gpt-5.6-sol")`, so the pin clears both the capability gate
+    /// and the tier model requirement. Before this fixed, the tier gating
+    /// suppressed the pin here and fell through to the engine default
+    /// (`claude`) — pointing the events-socket normaliser at a driver the
+    /// worker never ran on.
+    #[test]
+    fn design_row_with_codex_task_pin_resolves_codex_matching_spawn() {
+        use boss_protocol::{DRIVER_SLUG_CODEX, TaskKind};
+
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, &product.id, "design with codex pin");
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                driver: Some(DRIVER_SLUG_CODEX.to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET kind = ?1 WHERE id = ?2",
+                rusqlite::params![TaskKind::Design.as_str(), &chore.id],
+            )
+            .unwrap();
+        }
+        let execution = create_ready_chore_execution(&db, &chore.id);
+        let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+        assert_eq!(
+            decision.driver.as_deref(),
+            Some(DRIVER_SLUG_CODEX),
+            "sanity: the row must actually record an explicit codex pin",
+        );
+
+        assert_eq!(
+            db.get_execution_driver_slug(&execution.id).unwrap().as_deref(),
+            Some(DRIVER_SLUG_CODEX),
+            "live lookup must match the pin the worker actually spawned on",
+        );
+    }
+
+    /// A row's driver decision is frozen at insert time and can outlive a
+    /// later change to the row that makes it retroactively a
+    /// design/investigation-tier row. If that frozen decision recorded
+    /// `grok` (a driver with no dedicated tier model), the events-socket
+    /// lookup must substitute the engine default exactly as
+    /// `resolve_spawn_config_in` does for a `TrafficAllocation`-sourced
+    /// driver on a tier row — never return `grok` verbatim, which is not
+    /// the driver the worker actually ran on.
+    #[test]
+    fn tier_row_with_recorded_grok_allocation_resolves_engine_default() {
+        use boss_protocol::{DRIVER_SLUG_GROK, DriverTrafficSplit};
+
+        let (_dir, db) = open_db();
+        db.set_driver_traffic_split(DriverTrafficSplit::new(100, 0, 0)).unwrap();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, &product.id, "later became a tier row");
+        let execution = create_ready_chore_execution(&db, &chore.id);
+        let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+        assert_eq!(
+            decision.driver.as_deref(),
+            Some(DRIVER_SLUG_GROK),
+            "sanity: the ordinary row must have allocated to grok under a grok-only split",
+        );
+
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                reasoning: Some("investigation".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.get_execution_driver_slug(&execution.id).unwrap(),
+            Some(boss_engine_effort::ENGINE_DEFAULT_DRIVER.to_owned()),
+            "a tier row's frozen grok allocation must resolve the engine default, not grok verbatim",
+        );
     }
 
     #[test]

@@ -306,6 +306,7 @@ impl WorkDb {
         migrate_tasks_autostart(conn)?;
         migrate_tasks_deferred(conn)?;
         migrate_tasks_human_driven(conn)?;
+        migrate_tasks_design_reasoning_effort_xhigh(conn)?;
         migrate_tasks_completion_summary(conn)?;
         migrate_last_status_actor(conn)?;
         migrate_tasks_priority(conn)?;

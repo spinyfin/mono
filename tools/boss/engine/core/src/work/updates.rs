@@ -510,6 +510,18 @@ impl WorkDb {
                 task.autostart = false;
             }
         }
+        if let Some(design_reasoning_effort_xhigh) = patch.design_reasoning_effort_xhigh {
+            if design_reasoning_effort_xhigh && task.kind != TaskKind::Design {
+                bail!(
+                    "design reasoning effort xhigh is only valid for kind=design; {} is kind={}",
+                    task.id,
+                    task.kind
+                );
+            }
+            if task.kind == TaskKind::Design {
+                task.design_reasoning_effort_xhigh = design_reasoning_effort_xhigh;
+            }
+        }
         if let Some(summary) = patch.completion_summary {
             // Empty string clears; non-empty stores the human close summary.
             let trimmed = summary.trim();
@@ -653,7 +665,7 @@ impl WorkDb {
                  archived_reason = ?17, blocked_detail = ?18, deferred = ?19,
                  reasoning = ?20, tags = ?21, human_driven = ?22, completion_summary = ?23,
                  effort_matched_rule = ?24, effort_reasons = ?25, project_id = ?26, kind = ?27,
-                 archived_by = ?28, archived_at = ?29,
+                 archived_by = ?28, archived_at = ?29, design_reasoning_effort_xhigh = ?30,
                  last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END,
                  completed_at = CASE
                      WHEN ?4 IN ('done', 'archived') THEN COALESCE(completed_at, ?7)
@@ -690,6 +702,7 @@ impl WorkDb {
                 task.kind.as_str(),
                 task.archived_by,
                 task.archived_at,
+                task.design_reasoning_effort_xhigh as i64,
             ],
         )?;
 

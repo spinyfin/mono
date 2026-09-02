@@ -333,6 +333,7 @@ fn migrate_null_redundant_task_repo_remote_urls_clears_mirrors_and_preserves_div
             goal: None,
             autostart: false,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
 
@@ -1232,6 +1233,7 @@ fn status_check_constraint_rejects_out_of_enum_values_on_both_tables() {
             goal: None,
             autostart: true,
             no_design_task: true,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
     let chore = create_test_chore(&db, product.id.clone(), "C");

@@ -2621,6 +2621,7 @@ pub(crate) fn ensure_patch_present(patch: &WorkItemPatch, message: &str) -> Resu
         || patch.autostart.is_some()
         || patch.deferred.is_some()
         || patch.human_driven.is_some()
+        || patch.design_reasoning_effort_xhigh.is_some()
         || patch.completion_summary.is_some()
         || patch.blocked_reason.is_some()
         || patch.blocked_detail.is_some()

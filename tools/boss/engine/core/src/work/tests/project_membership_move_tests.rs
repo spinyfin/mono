@@ -13,6 +13,7 @@ fn create_test_project(db: &WorkDb, product_id: impl Into<String>, name: &str) -
         goal: None,
         autostart: true,
         no_design_task: true,
+        design_reasoning_effort_xhigh: false,
     })
     .unwrap()
 }
@@ -257,6 +258,7 @@ fn design_task_kind_is_refused_for_project_move() {
             goal: None,
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
     let seed_tasks = db.list_tasks(&product.id, Some(&project.id), None, false).unwrap();

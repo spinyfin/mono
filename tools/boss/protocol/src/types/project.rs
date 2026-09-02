@@ -31,6 +31,11 @@ pub struct CreateProjectInput {
     #[builder(default)]
     pub no_design_task: bool,
 
+    /// Coordinator-set escalation for the auto-created design task.
+    #[serde(default)]
+    #[builder(default)]
+    pub design_reasoning_effort_xhigh: bool,
+
     pub description: Option<String>,
     pub goal: Option<String>,
 }

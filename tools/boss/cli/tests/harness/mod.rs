@@ -132,6 +132,7 @@ pub async fn create_project(client: &mut BossClient, product_id: &str, name: &st
             goal: None,
             autostart: false,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         },
     )
     .await

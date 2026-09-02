@@ -1126,6 +1126,7 @@ pub(crate) fn insert_design_task_for_project_in_tx(
     project_id: &str,
     project_name: &str,
     autostart: bool,
+    design_reasoning_effort_xhigh: bool,
 ) -> Result<Task> {
     let id = next_id("task");
     let now = now_string();
@@ -1133,9 +1134,19 @@ pub(crate) fn insert_design_task_for_project_in_tx(
     let name = format!("Design {project_name}");
     let short_id = allocate_short_id(conn, product_id)?;
     conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, short_id)
-         VALUES (?1, ?2, ?3, 'design', ?7, '', 'todo', 0, NULL, NULL, ?4, ?4, ?5, 'medium', ?6, ?8)",
-        params![id, product_id, project_id, now, autostart_value, CREATED_VIA_ENGINE_AUTO, name, short_id],
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, short_id, design_reasoning_effort_xhigh)
+         VALUES (?1, ?2, ?3, 'design', ?7, '', 'todo', 0, NULL, NULL, ?4, ?4, ?5, 'medium', ?6, ?8, ?9)",
+        params![
+            id,
+            product_id,
+            project_id,
+            now,
+            autostart_value,
+            CREATED_VIA_ENGINE_AUTO,
+            name,
+            short_id,
+            design_reasoning_effort_xhigh as i64,
+        ],
     )?;
     query_task(conn, &id)?.with_context(|| format!("missing design task after insert: {id}"))
 }

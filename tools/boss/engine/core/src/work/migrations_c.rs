@@ -154,6 +154,10 @@ const TASKS_STATUS_CHECK_COLUMNS: &[(&str, &str)] = &[
     ("autostart", "autostart INTEGER NOT NULL DEFAULT 1"),
     ("deferred", "deferred INTEGER NOT NULL DEFAULT 0"),
     ("human_driven", "human_driven INTEGER NOT NULL DEFAULT 0"),
+    (
+        "design_reasoning_effort_xhigh",
+        "design_reasoning_effort_xhigh INTEGER NOT NULL DEFAULT 0",
+    ),
     ("completion_summary", "completion_summary TEXT"),
     ("priority", "priority TEXT NOT NULL DEFAULT 'medium'"),
     ("repo_remote_url", "repo_remote_url TEXT"),

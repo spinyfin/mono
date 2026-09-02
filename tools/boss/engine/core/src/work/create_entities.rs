@@ -174,7 +174,14 @@ impl WorkDb {
         // Non-design-shaped projects (postmortems, checklists, etc.)
         // pass `no_design_task = true` and land here with zero tasks.
         if !input.no_design_task {
-            insert_design_task_for_project_in_tx(&tx, &input.product_id, &id, &input.name, input.autostart)?;
+            insert_design_task_for_project_in_tx(
+                &tx,
+                &input.product_id,
+                &id,
+                &input.name,
+                input.autostart,
+                input.design_reasoning_effort_xhigh,
+            )?;
         }
 
         let project = query_project(&tx, &id)?.with_context(|| format!("missing project after insert: {id}"))?;

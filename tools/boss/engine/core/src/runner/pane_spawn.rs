@@ -1727,11 +1727,11 @@ mod pane_spawn_tests {
         );
     }
 
-    /// A `small` row classified `investigation` spawns Opus with its effort
-    /// level left honest. The whole point of the capability signal: before it
-    /// existed, the only way to get this row onto Opus was to call it `large`.
+    /// A `small` investigation row gets the dedicated Fable/Sol tier while
+    /// preserving the driver's default effort. The row's work-size estimate
+    /// stays honest and does not imply a driver effort override.
     #[tokio::test]
-    async fn small_investigation_row_spawns_opus_without_inflating_effort() {
+    async fn small_investigation_row_spawns_fable_at_default_effort() {
         let workspace = TempDir::new().unwrap();
         let chore_input = CreateChoreInput::builder()
             .product_id(String::new())
@@ -1749,12 +1749,12 @@ mod pane_spawn_tests {
             "the row still says what it is: a small job",
         );
         assert!(
-            script.contains("--model opus"),
-            "small + investigation must spawn Opus, got: {script:?}",
+            script.contains("--model fable"),
+            "small + investigation must spawn Fable, got: {script:?}",
         );
         assert!(
-            script.contains("--effort medium"),
-            "the effort knob still follows `small`, got: {script:?}",
+            !script.contains("--effort "),
+            "the dedicated tier must preserve the driver's default effort, got: {script:?}",
         );
         assert!(
             script.contains("--permission-mode auto"),
@@ -2400,6 +2400,7 @@ mod pane_spawn_tests {
                 goal: Some("Operators can answer 'why did this task spawn now' from logs alone.".to_owned()),
                 autostart: false,
                 no_design_task: false,
+                design_reasoning_effort_xhigh: false,
             })
             .unwrap();
         let task = work_db
@@ -2471,6 +2472,7 @@ mod pane_spawn_tests {
                 goal: Some("Operators can see what every active worker is doing without opening panes.".to_owned()),
                 autostart: false,
                 no_design_task: false,
+                design_reasoning_effort_xhigh: false,
             })
             .unwrap();
 
@@ -2601,6 +2603,7 @@ mod pane_spawn_tests {
                 goal: Some("Reduce GitHub API spend without lagging merges.".to_owned()),
                 autostart: false,
                 no_design_task: false,
+                design_reasoning_effort_xhigh: false,
             })
             .unwrap();
 

@@ -7,8 +7,7 @@
 //! for why the split is modelled as three explicit integers with a hard sum
 //! constraint rather than an implied remainder or normalised weights.
 //!
-//! **Which work that is, is not decided here.** Allocation carries no list of
-//! eligible kinds. For a given row it asks
+//! **Which work that is, is mostly not decided here.** Allocation asks
 //! [`crate::driver::DriverRegistry::eligible_drivers_for_kind`] — i.e. the
 //! dispatch capability gate, `CapabilityResolver::check_dispatch`, resolving
 //! the row's `TaskKind` **and** the execution's own `ExecutionKind` (see
@@ -23,7 +22,11 @@
 //! only) was an artifact of the original Codex experiment, not a statement
 //! about capability, and is gone: `reasoning` still selects which *model* a
 //! driver runs (`ModelMenu::model_for_reasoning`) but no longer decides
-//! *which driver*.
+//! *which driver*. The one policy exception is the dedicated
+//! design/investigation tier: original designs and `reasoning = investigation`
+//! rows exclude Grok and are allocated only between Claude and Codex. A
+//! `DesignPostmortem` is excluded by its distinct kind and remains ordinary
+//! traffic-split work.
 //!
 //! The `ExecutionKind` dimension is why `conflict_resolution` and
 //! `ci_remediation` do not silently become codex/grok-eligible just because
@@ -47,7 +50,9 @@
 //! One thing allocation itself still declines, and it is not a claim about
 //! capability:
 //!
-//! - **A row with an explicit pin** — see below.
+//! - **A row with an explicit pin** — see below. The dedicated
+//!   design/investigation tier is also intentionally unpinned so it follows
+//!   the Claude/Codex traffic split.
 //!
 //! Assignment is a deterministic hash of the work item's own id placed on
 //! the split's `[0, 100)` bucket line — not a coin flip per dispatch
@@ -77,7 +82,7 @@
 //! an allocated row is actually routed to its driver rather than the
 //! recorded decision being an inert audit trail.
 
-use boss_protocol::DriverTrafficSplit;
+use boss_protocol::{DRIVER_SLUG_CLAUDE, DRIVER_SLUG_CODEX, DriverTrafficSplit};
 use sha2::{Digest, Sha256};
 
 use super::*;
@@ -194,11 +199,13 @@ fn eligible_drivers_for(
     kind: &TaskKind,
     execution_kind: &ExecutionKind,
     model_override: Option<&str>,
+    design_or_investigation_tier: bool,
 ) -> Vec<&'static str> {
     let registry = crate::driver::DriverRegistry::default();
     registry
         .eligible_drivers_for_kind(kind, Some(execution_kind), &DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER)
         .into_iter()
+        .filter(|slug| !design_or_investigation_tier || *slug == DRIVER_SLUG_CLAUDE || *slug == DRIVER_SLUG_CODEX)
         .filter(|slug| {
             model_override.is_none_or(|model| {
                 registry
@@ -354,6 +361,7 @@ struct AllocationRow {
     explicit_driver: Option<String>,
     model_override: Option<String>,
     task_kind: String,
+    reasoning: Option<String>,
     product_default_driver: Option<String>,
 }
 
@@ -375,6 +383,26 @@ pub(crate) fn driver_clears_dispatch_gate(
         Some(resolver) => resolver.check_dispatch(task_kind, Some(execution_kind)).is_ok(),
         None => true,
     }
+}
+
+/// Whether `driver_slug`'s [`crate::driver::ModelMenu`] declares a dedicated
+/// design/investigation-tier model. `grok` does not; `claude` and `codex` do.
+/// An unregistered slug returns `false` (fail closed) — the same "unknown
+/// driver" case is caught elsewhere with a loud `UnknownDriver` error.
+///
+/// Used both to decide whether a *pinned* driver on a design/investigation
+/// row can be honoured without wedging spawn (see [`decide_execution_driver`]'s
+/// pinned branch), and to decide whether a *recorded* traffic-allocation
+/// decision must be substituted with [`boss_engine_effort::ENGINE_DEFAULT_DRIVER`]
+/// at read time (see [`crate::work::driver_lookup::WorkDb::get_execution_driver_slug`]),
+/// mirroring the substitution [`boss_engine_effort::resolve_spawn_config_in`]
+/// applies at spawn time for a `TrafficAllocation`/`EngineDefault`-sourced
+/// driver.
+pub(crate) fn driver_has_design_investigation_model(driver_slug: &str) -> bool {
+    let registry = crate::driver::DriverRegistry::default();
+    registry
+        .get(driver_slug)
+        .is_some_and(|driver| driver.descriptor().model_menu.design_investigation_model.is_some())
 }
 
 /// Decide which driver governs a newly-created execution row and why.
@@ -431,7 +459,7 @@ pub(crate) fn decide_execution_driver(
 ) -> Result<DriverDecision> {
     let row = conn
         .query_row(
-            "SELECT t.driver, t.model_override, t.kind, p.default_driver
+            "SELECT t.driver, t.model_override, t.kind, t.reasoning, p.default_driver
                FROM tasks t
                LEFT JOIN products p ON p.id = t.product_id
               WHERE t.id = ?1",
@@ -441,7 +469,8 @@ pub(crate) fn decide_execution_driver(
                     explicit_driver: row.get(0)?,
                     model_override: row.get(1)?,
                     task_kind: row.get(2)?,
-                    product_default_driver: row.get(3)?,
+                    reasoning: row.get(3)?,
+                    product_default_driver: row.get(4)?,
                 })
             },
         )
@@ -453,6 +482,17 @@ pub(crate) fn decide_execution_driver(
     };
     let task_kind_raw = row.task_kind;
     let task_kind: Result<TaskKind, _> = task_kind_raw.parse();
+    let reasoning: Option<ReasoningMode> = row
+        .reasoning
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(str::parse)
+        .transpose()
+        .map_err(|err| {
+            anyhow::anyhow!("driver_traffic_split: work item {work_item_id} has invalid reasoning: {err}")
+        })?;
+    let design_or_investigation_tier =
+        boss_engine_effort::is_design_or_investigation_tier(task_kind.as_ref().ok(), reasoning);
     // Pool dispatch overrides row/product pins. Persist its fixed driver
     // rather than the pin, so this durable record always names the driver
     // the worker actually runs on. Routed through the same named accessors
@@ -462,10 +502,9 @@ pub(crate) fn decide_execution_driver(
     if let Some(pool_driver) = crate::coordinator::pool_driver_slug_for_execution_kind(&kind) {
         return Ok(DriverDecision::pool(pool_driver));
     }
-    let pinned = row
-        .explicit_driver
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| row.product_default_driver.filter(|s| !s.trim().is_empty()));
+    let explicit_driver = row.explicit_driver.filter(|s| !s.trim().is_empty());
+    let from_task_pin = explicit_driver.is_some();
+    let pinned = explicit_driver.or_else(|| row.product_default_driver.filter(|s| !s.trim().is_empty()));
     if let Some(driver) = pinned {
         // Honour the pin only when it clears the capability gate for this
         // execution kind. A product default (or `--driver`) of codex/grok
@@ -481,15 +520,24 @@ pub(crate) fn decide_execution_driver(
             // not change for that data-integrity case.
             Err(_) => true,
         };
-        if pin_ok {
+        // A tier row's pin also needs a dedicated design/investigation-tier
+        // model (`ModelMenu::design_investigation_model`) or spawn hard-fails
+        // with `IneligibleDesignInvestigationDriver` instead of ever running.
+        // A `products.default_driver` is a default, not a row-level pin, so
+        // it yields to allocation the same way a gate-failing pin does; a
+        // `tasks.driver` pin is an explicit human decision and stays loud —
+        // its failure at spawn is the intended signal, not silently routed
+        // around.
+        let tier_ok = from_task_pin || !design_or_investigation_tier || driver_has_design_investigation_model(&driver);
+        if pin_ok && tier_ok {
             return Ok(DriverDecision::explicit(driver));
         }
         tracing::info!(
             work_item_id = %work_item_id,
             execution_kind = %kind,
             pinned_driver = %driver,
-            "dropping driver pin that fails the capability gate for this execution kind; \
-             allocating among eligible drivers instead",
+            "dropping driver pin that fails the capability gate or design/investigation tier model \
+             requirement for this execution kind; allocating among eligible drivers instead",
         );
     }
     let task_kind: TaskKind = task_kind.map_err(|err| {
@@ -503,7 +551,7 @@ pub(crate) fn decide_execution_driver(
         .as_deref()
         .map(str::trim)
         .filter(|model| !model.is_empty());
-    let eligible = eligible_drivers_for(&task_kind, &kind, model_override);
+    let eligible = eligible_drivers_for(&task_kind, &kind, model_override, design_or_investigation_tier);
     if eligible.is_empty() && model_override.is_some() {
         return Ok(DriverDecision::default_no_override());
     }
@@ -511,6 +559,7 @@ pub(crate) fn decide_execution_driver(
     let driver = match allocate_among(split, work_item_id, &task_kind, &eligible) {
         Ok(driver) => driver,
         Err(_) if model_override.is_some() => return Ok(DriverDecision::default_no_override()),
+        Err(_) if design_or_investigation_tier => return Ok(DriverDecision::default_no_override()),
         Err(err) => return Err(err),
     };
     Ok(DriverDecision::allocated(driver, split))
@@ -529,8 +578,8 @@ pub(crate) fn decide_execution_driver(
 ///
 /// Split out from [`decide_execution_driver`] so the failure paths (nothing
 /// eligible; everything eligible at 0) are exercisable with a restricted
-/// eligible set, which no real work item can currently produce — all three
-/// built-in drivers clear every kind's gate today.
+/// eligible set. The dedicated design/investigation tier is one real producer:
+/// it excludes Grok even though Grok clears the capability gate.
 fn allocate_among(
     split: DriverTrafficSplit,
     work_item_id: &str,

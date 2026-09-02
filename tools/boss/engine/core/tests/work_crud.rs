@@ -47,6 +47,7 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
             goal: Some("ship work CLI".to_owned()),
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         },
     )
     .await?;
@@ -292,6 +293,7 @@ async fn task_and_chore_priority_round_trips_through_engine() -> Result<()> {
             goal: None,
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         },
     )
     .await?;
@@ -464,6 +466,7 @@ async fn second_client_receives_invalidation_from_first() -> Result<()> {
             goal: None,
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         },
     )
     .await?;
@@ -515,6 +518,7 @@ async fn cli_status_update_propagates_to_subscriber_within_one_second() -> Resul
             goal: None,
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         },
     )
     .await?;
@@ -602,6 +606,7 @@ async fn each_mutation_emits_one_invalidation() -> Result<()> {
             goal: None,
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         },
     )
     .await?;
@@ -1341,6 +1346,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
             goal: None,
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         },
     )
     .await?;
@@ -1542,6 +1548,7 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
             goal: None,
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         },
     )
     .await?;
@@ -1685,6 +1692,7 @@ async fn project_design_doc_rpcs_round_trip_through_engine() -> Result<()> {
             goal: None,
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         },
     )
     .await?;
@@ -1822,6 +1830,7 @@ async fn project_design_doc_rpcs_round_trip_through_engine() -> Result<()> {
             goal: None,
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         },
     )
     .await?;
@@ -1902,6 +1911,7 @@ async fn create_task_on_single_repo_product_stores_null_repo() -> Result<()> {
             goal: None,
             autostart: false,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         },
     )
     .await?;
@@ -1966,6 +1976,7 @@ async fn create_task_with_explicit_repo_on_single_repo_product_is_rejected() -> 
             goal: None,
             autostart: false,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         },
     )
     .await?;
@@ -2048,6 +2059,7 @@ async fn create_task_on_no_repo_product_without_override_is_rejected() -> Result
             goal: None,
             autostart: false,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         },
     )
     .await?;
@@ -2112,6 +2124,7 @@ async fn create_task_on_no_repo_product_with_override_stores_it() -> Result<()> 
             goal: None,
             autostart: false,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         },
     )
     .await?;
@@ -2401,6 +2414,7 @@ async fn task_duplicate_guard_blocks_within_window() -> Result<()> {
             goal: None,
             autostart: false,
             no_design_task: true,
+            design_reasoning_effort_xhigh: false,
         },
     )
     .await?;
@@ -2452,6 +2466,7 @@ async fn task_duplicate_guard_blocks_within_window() -> Result<()> {
             goal: None,
             autostart: false,
             no_design_task: true,
+            design_reasoning_effort_xhigh: false,
         },
     )
     .await?;

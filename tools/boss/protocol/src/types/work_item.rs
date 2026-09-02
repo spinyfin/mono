@@ -132,6 +132,12 @@ pub struct WorkItemPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub human_driven: Option<bool>,
 
+    /// Set or clear the coordinator's design-only driver reasoning-effort
+    /// escalation. `None` leaves it unchanged; the engine accepts `true` only
+    /// for `kind = design` and rejects design postmortems and other kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_reasoning_effort_xhigh: Option<bool>,
+
     /// Set the human close-out summary for a human-driven row. Required
     /// (non-empty) when moving a human-driven row to `done` via the
     /// complete ritual. `None` → leave unchanged. `Some("")` is rejected

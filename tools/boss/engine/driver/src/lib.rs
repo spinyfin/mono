@@ -462,6 +462,10 @@ pub struct ModelMenu {
     /// model menu. Review policy chooses the tier from immutable PR metadata;
     /// it does not reuse task effort or reasoning as a proxy for PR size.
     pub review_model_for_tier: fn(ReviewModelTier) -> &'static str,
+    /// Dedicated model for design and investigation dispatch, when this
+    /// driver is eligible for that tier. Kept in the driver menu so model
+    /// vocabulary remains owned by the driver that accepts it.
+    pub design_investigation_model: Option<fn() -> &'static str>,
     /// Optional per-level worker-prompt addendum to prepend to the initial-prompt body.
     /// `None` for levels where no addendum is appropriate.
     pub prompt_addendum_for_level: fn(EffortLevel) -> Option<&'static str>,

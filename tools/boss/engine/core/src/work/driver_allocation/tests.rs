@@ -130,7 +130,7 @@ fn eligibility_is_exactly_what_the_dispatch_gate_says() {
     let registry = crate::driver::DriverRegistry::default();
     let execution_kind = ExecutionKind::ChoreImplementation;
     for kind in TaskKind::ALL {
-        let eligible = eligible_drivers_for(kind, &execution_kind, None);
+        let eligible = eligible_drivers_for(kind, &execution_kind, None, false);
         for driver in DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER {
             let gate_ok = registry
                 .resolver(driver)
@@ -186,38 +186,61 @@ fn every_kind_is_allocated_to_a_driver_the_gate_accepts() {
     }
 }
 
-/// Reasoning mode no longer decides the driver. It still decides the model
-/// (`ModelMenu::model_for_reasoning`), which is a per-driver menu lookup at
-/// spawn — but an `investigation`-reasoning row, and a legacy row with no
-/// reasoning at all, are allocated exactly like a `standard` one.
+/// The dedicated design/investigation tier restricts allocation to Claude and
+/// Codex before the existing traffic split is applied. A postmortem retains
+/// ordinary allocation because its distinct task kind is the carve-out.
 #[test]
-fn reasoning_does_not_gate_allocation() {
+fn design_and_investigation_never_allocate_to_grok_but_postmortems_remain_ordinary() {
     let (_dir, db) = open_db();
-    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100)).unwrap();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(80, 10, 10))
+        .unwrap();
     let product = create_test_product(&db);
 
-    let investigation_shaped = create_test_chore(&db, &product.id, "investigation-reasoning chore");
-    db.update_work_item(
-        &investigation_shaped.id,
-        WorkItemPatch {
-            reasoning: Some("investigation".to_owned()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-
-    let legacy = create_test_chore(&db, &product.id, "legacy chore with no reasoning");
-    let conn = db.connect().unwrap();
-    conn.execute("UPDATE tasks SET reasoning = NULL WHERE id = ?1", params![&legacy.id])
+    for index in 0..200 {
+        let design = create_test_chore(&db, &product.id, format!("design {index}"));
+        set_task_kind(&db, &design.id, &TaskKind::Design);
+        let investigation = create_test_chore(&db, &product.id, format!("investigation {index}"));
+        db.update_work_item(
+            &investigation.id,
+            WorkItemPatch {
+                reasoning: Some("investigation".to_owned()),
+                ..Default::default()
+            },
+        )
         .unwrap();
-    drop(conn);
+        for chore in [&design, &investigation] {
+            let execution = create_ready_chore_execution(&db, &chore.id);
+            let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+            assert!(
+                decision
+                    .driver
+                    .as_deref()
+                    .is_some_and(|driver| driver == DRIVER_SLUG_CLAUDE || driver == DRIVER_SLUG_CODEX),
+                "{} allocated {:?}",
+                chore.name,
+                decision.driver,
+            );
+        }
+    }
 
-    for chore in [&investigation_shaped, &legacy] {
+    let postmortem = create_test_chore(&db, &product.id, "postmortem ordinary allocation");
+    set_task_kind(&db, &postmortem.id, &TaskKind::DesignPostmortem);
+    let mut saw_grok = false;
+    for index in 0..200 {
+        let chore = if index == 0 {
+            postmortem.clone()
+        } else {
+            create_test_chore(&db, &product.id, format!("postmortem {index}"))
+        };
+        set_task_kind(&db, &chore.id, &TaskKind::DesignPostmortem);
         let execution = create_ready_chore_execution(&db, &chore.id);
         let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
-        assert_eq!(decision.reason, REASON_ALLOCATION, "{} must be allocated", chore.name);
-        assert_eq!(decision.driver.as_deref(), Some(DRIVER_SLUG_CODEX));
+        saw_grok |= decision.driver.as_deref() == Some(DRIVER_SLUG_GROK);
     }
+    assert!(
+        saw_grok,
+        "ordinary postmortem allocation must retain Grok's configured share"
+    );
 }
 
 /// A PR review dispatches on the review pool's pinned driver, not on the
@@ -739,6 +762,20 @@ fn allocation_fails_loudly_when_no_eligible_driver_holds_a_share() {
     );
 }
 
+#[test]
+fn design_tier_falls_back_to_the_default_when_only_grok_is_funded() {
+    let (_dir, db) = open_db();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(100, 0, 0)).unwrap();
+    let product = create_test_product(&db);
+    let task = create_test_chore(&db, &product.id, "design tier fallback");
+    set_task_kind(&db, &task.id, &TaskKind::Design);
+
+    let execution = create_ready_chore_execution(&db, &task.id);
+    let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+    assert_eq!(decision.reason, REASON_DEFAULT);
+    assert_eq!(decision.driver, None);
+}
+
 /// An empty eligible set is an error too, never the engine default.
 #[test]
 fn allocation_fails_loudly_when_nothing_is_eligible() {
@@ -866,6 +903,51 @@ fn product_default_driver_overrides_allocation() {
     let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
     assert_eq!(decision.driver.as_deref(), Some("copilot"));
     assert_eq!(decision.reason, REASON_EXPLICIT);
+}
+
+/// A product `default_driver` of `grok` is a default, not a row-level pin.
+/// On a Design/Investigation-tier row, grok clears the ordinary capability
+/// gate (it declares `StructuredOutput`/`ToolUseInterception`) but has no
+/// dedicated tier model (`ModelMenu::design_investigation_model` is `None`),
+/// so honouring it as `explicit` would wedge spawn with
+/// `IneligibleDesignInvestigationDriver` for every design/investigation row
+/// in the product. It must instead yield to allocation among the eligible
+/// tier drivers, exactly like a gate-failing pin.
+#[test]
+fn design_row_with_grok_product_default_yields_to_allocation_instead_of_wedging() {
+    let (_dir, db) = open_db();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(50, 0, 50)).unwrap();
+    let product = create_test_product(&db);
+    db.update_work_item(
+        &product.id,
+        WorkItemPatch {
+            default_driver: Some(DRIVER_SLUG_GROK.to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let design = create_test_chore(&db, &product.id, "design under grok product default");
+    set_task_kind(&db, &design.id, &TaskKind::Design);
+    let execution = create_ready_chore_execution(&db, &design.id);
+
+    let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+    assert_eq!(
+        decision.reason, REASON_ALLOCATION,
+        "a tier row's grok product default must yield to allocation, not record explicit",
+    );
+    assert!(
+        decision
+            .driver
+            .as_deref()
+            .is_some_and(|driver| driver == DRIVER_SLUG_CLAUDE || driver == DRIVER_SLUG_CODEX),
+        "design row must allocate between claude/codex once the grok product default yields, got {:?}",
+        decision.driver,
+    );
+    assert_eq!(
+        db.get_execution_driver_slug(&execution.id).unwrap(),
+        decision.driver,
+        "live lookup must match what was actually allocated, matching what resolve_spawn_config_in would run on",
+    );
 }
 
 #[test]

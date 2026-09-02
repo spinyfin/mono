@@ -16,6 +16,7 @@ fn two_incomplete_project_tasks(db: &WorkDb) -> (String, Task, Task) {
             goal: None,
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
     let first = db

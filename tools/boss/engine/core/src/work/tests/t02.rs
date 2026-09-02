@@ -1473,6 +1473,7 @@ fn create_project_spawns_design_task_dispatched_as_project_design() {
             goal: Some("expose every dispatch event".to_owned()),
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
 
@@ -1530,6 +1531,7 @@ fn create_project_no_autostart_parks_design_task() {
             goal: None,
             autostart: false,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
 
@@ -1569,6 +1571,7 @@ fn create_project_no_design_task_creates_project_alone() {
             goal: None,
             autostart: true,
             no_design_task: true,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
 
@@ -1609,6 +1612,7 @@ fn migration_backfills_design_tasks_for_existing_projects() {
                 goal: None,
                 autostart: true,
                 no_design_task: false,
+                design_reasoning_effort_xhigh: false,
             })
             .unwrap();
         // Hard-delete the auto-created design task so the
