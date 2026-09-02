@@ -407,6 +407,10 @@ async fn every_kind_can_be_submitted() {
             }
             ProposalKind::AutomationOutcome => json!({"outcome": "skip", "reason": "clean"}),
             ProposalKind::PrCreated => json!({"pr_url": "https://github.com/o/r/pull/1"}),
+            ProposalKind::ReviewReport => {
+                json!({"batch_id": "rvb_missing", "member_id": "rvm_missing", "report": {"findings": []}})
+            }
+            ProposalKind::ReviewVerdict => json!({"batch_id": "rvb_missing", "verdict": {"outcome": "approved"}}),
         };
         let (proposal, _) = submitted(submit(&fx, kind, payload).await);
         assert_eq!(proposal.kind, kind);

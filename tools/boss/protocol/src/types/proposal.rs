@@ -32,6 +32,8 @@ pub enum ProposalKind {
     FollowupTask,
     AutomationOutcome,
     PrCreated,
+    ReviewReport,
+    ReviewVerdict,
 }
 
 impl ProposalKind {
@@ -43,6 +45,8 @@ impl ProposalKind {
         ProposalKind::FollowupTask,
         ProposalKind::AutomationOutcome,
         ProposalKind::PrCreated,
+        ProposalKind::ReviewReport,
+        ProposalKind::ReviewVerdict,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -54,6 +58,8 @@ impl ProposalKind {
             ProposalKind::FollowupTask => "followup_task",
             ProposalKind::AutomationOutcome => "automation_outcome",
             ProposalKind::PrCreated => "pr_created",
+            ProposalKind::ReviewReport => "review_report",
+            ProposalKind::ReviewVerdict => "review_verdict",
         }
     }
 }
@@ -75,9 +81,12 @@ impl std::str::FromStr for ProposalKind {
             "followup_task" => Ok(ProposalKind::FollowupTask),
             "automation_outcome" => Ok(ProposalKind::AutomationOutcome),
             "pr_created" => Ok(ProposalKind::PrCreated),
+            "review_report" => Ok(ProposalKind::ReviewReport),
+            "review_verdict" => Ok(ProposalKind::ReviewVerdict),
             other => Err(format!(
                 "unknown proposal kind `{other}`; expected one of: attention, effort_escalation, \
-                 blocked, deferred_scope, followup_task, automation_outcome, pr_created"
+                 blocked, deferred_scope, followup_task, automation_outcome, pr_created, review_report, \
+                 review_verdict"
             )),
         }
     }
@@ -335,6 +344,26 @@ pub struct PrCreatedProposalPayload {
     pub pr_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+}
+
+/// Payload for `ProposalKind::ReviewReport`. The report is a structured JSON
+/// object produced by one review-batch member. Submission verifies that the
+/// member belongs to the caller's execution and batch, then marks that member
+/// reported and links this proposal through `report_proposal_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReviewReportProposalPayload {
+    pub batch_id: String,
+    pub member_id: String,
+    pub report: serde_json::Value,
+}
+
+/// Payload for `ProposalKind::ReviewVerdict`. A supervisor submits its
+/// consolidated verdict against one batch. Verdict application is deliberately
+/// asynchronous, so submissions remain `proposed` until that applier lands.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReviewVerdictProposalPayload {
+    pub batch_id: String,
+    pub verdict: serde_json::Value,
 }
 
 // ---------------------------------------------------------------------------

@@ -2,8 +2,8 @@
 //! classification, membership, and uniqueness contracts.
 
 use boss_protocol::{
-    ReviewBatchMemberRole, ReviewBatchMemberStatus, ReviewBatchPhase, ReviewClassification, ReviewLanguageBucket,
-    ReviewProfile,
+    ProposalDecider, ProposalKind, ProposalState, ReviewBatchMemberRole, ReviewBatchMemberStatus, ReviewBatchPhase,
+    ReviewClassification, ReviewLanguageBucket, ReviewProfile,
 };
 
 use super::*;
@@ -216,4 +216,92 @@ fn review_batch_rejects_invalid_phase_merge_sha_combinations_and_empty_members()
         .create_review_batch(batch_input(cycle_root.id, "head-sha", ReviewBatchPhase::PreMerge), &[])
         .unwrap_err();
     assert!(empty_members.to_string().contains("require at least one member"));
+}
+
+#[test]
+fn review_report_is_accepted_only_into_its_own_batch_member() {
+    let db = WorkDb::open(temp_db_path("review-report-proposal")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, members) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[member(ReviewBatchMemberRole::CodexReviewer, Some(execution.id.clone()))],
+        )
+        .unwrap();
+    let member = &members[0];
+
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &execution.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewReport,
+            payload_json: &format!(
+                r#"{{"batch_id":"{}","member_id":"{}","report":{{"findings":[]}}}}"#,
+                batch.id, member.id
+            ),
+            idempotency_key: "report-1",
+        })
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(outcome.proposal.state, ProposalState::Applied);
+    assert_eq!(outcome.proposal.decided_by, Some(ProposalDecider::Policy));
+    assert_eq!(outcome.proposal.applied_ref.as_deref(), Some(member.id.as_str()));
+    let stored = db.review_batch_members(&batch.id).unwrap();
+    assert_eq!(stored[0].status, ReviewBatchMemberStatus::Reported);
+    assert_eq!(
+        stored[0].report_proposal_id.as_deref(),
+        Some(outcome.proposal.id.as_str())
+    );
+    assert!(stored[0].terminal_at.is_some());
+}
+
+#[test]
+fn review_verdict_remains_proposed_for_the_asynchronous_applier() {
+    let db = WorkDb::open(temp_db_path("review-verdict-proposal")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[member(ReviewBatchMemberRole::Supervisor, Some(execution.id.clone()))],
+        )
+        .unwrap();
+
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &execution.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &format!(r#"{{"batch_id":"{}","verdict":{{"outcome":"approved"}}}}"#, batch.id),
+            idempotency_key: "verdict-1",
+        })
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(outcome.proposal.state, ProposalState::Proposed);
+    assert_eq!(outcome.proposal.applied_ref, None);
+    assert_eq!(
+        db.review_batch(&batch.id).unwrap().unwrap().final_verdict_proposal_id,
+        None
+    );
 }

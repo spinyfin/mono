@@ -626,6 +626,12 @@ mod tests {
             // auto-applies rather than being rejected on a repo-slug
             // mismatch.
             ProposalKind::PrCreated => format!(r#"{{"pr_url":"https://github.com/spinyfin/mono/pull/{}"}}"#, i + 1),
+            ProposalKind::ReviewReport => {
+                format!(r#"{{"batch_id":"rvb_missing","member_id":"rvm_missing_{i}","report":{{"findings":[]}}}}"#)
+            }
+            ProposalKind::ReviewVerdict => {
+                format!(r#"{{"batch_id":"rvb_missing","verdict":{{"outcome":"approved_{i}"}}}}"#)
+            }
         }
     }
 

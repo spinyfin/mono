@@ -52,7 +52,7 @@
 //! `record_deferred_scope_item`'s existing precedent of treating the audit
 //! line as non-fatal.
 
-use rusqlite::Transaction;
+use rusqlite::{OptionalExtension, Transaction};
 
 use super::automations::query_automation;
 use super::*;
@@ -61,7 +61,7 @@ use crate::worker_escalation::{WORKER_BLOCKED_ATTENTION_KIND, WORKER_ESCALATION_
 use boss_protocol::{
     Attention, AttentionGroup, AttentionProposalPayload, AutomationOutcomeProposalPayload, BlockedProposalPayload,
     CreateAttentionInput, CreateAttentionItemInput, DeferredScopeProposalPayload, EffortEscalationProposalPayload,
-    FollowupTaskProposalPayload, PrCreatedProposalPayload, ProposalKind,
+    FollowupTaskProposalPayload, PrCreatedProposalPayload, ProposalKind, ReviewReportProposalPayload,
 };
 
 /// `work_attention_items.kind` for an `attention` proposal that did not
@@ -88,13 +88,14 @@ pub fn apply_policy(kind: ProposalKind) -> ProposalApplyPolicy {
         | ProposalKind::Blocked
         | ProposalKind::DeferredScope
         | ProposalKind::AutomationOutcome
-        | ProposalKind::PrCreated => ProposalApplyPolicy::AutoApply,
+        | ProposalKind::PrCreated
+        | ProposalKind::ReviewReport => ProposalApplyPolicy::AutoApply,
         // Gated by design: task creation from a followup proposal always
         // requires the human batch-accept gesture
         // (`WorkDb::action_attention_group`). See
         // `stage_followup_task_in_transaction` for what *does* still happen
         // synchronously at submission for this kind despite being gated.
-        ProposalKind::FollowupTask => ProposalApplyPolicy::Gated,
+        ProposalKind::FollowupTask | ProposalKind::ReviewVerdict => ProposalApplyPolicy::Gated,
     }
 }
 
@@ -151,13 +152,83 @@ pub fn apply_in_transaction(
         ProposalKind::DeferredScope => apply_deferred_scope(tx, execution_id, payload_json).map(ApplyDecision::Applied),
         ProposalKind::AutomationOutcome => apply_automation_outcome(tx, execution_id, payload_json, proposal_id),
         ProposalKind::PrCreated => apply_pr_created(tx, execution_id, payload_json),
-        ProposalKind::FollowupTask => {
+        ProposalKind::ReviewReport => apply_review_report(tx, execution_id, payload_json, proposal_id),
+        ProposalKind::FollowupTask | ProposalKind::ReviewVerdict => {
             anyhow::bail!(
                 "no applier for `{kind}`; it is Gated by design and never routes through \
-                 apply_in_transaction — see stage_followup_task_in_transaction"
+                 apply_in_transaction"
             )
         }
     }
+}
+
+/// Accept a report only into the review-batch member that owns this reviewer
+/// execution. The report body remains on the immutable proposal row; the
+/// member stores the proposal id as its durable pointer.
+fn apply_review_report(
+    tx: &Transaction<'_>,
+    execution_id: &str,
+    payload_json: &str,
+    proposal_id: &str,
+) -> Result<ApplyDecision> {
+    let payload: ReviewReportProposalPayload = serde_json::from_str(payload_json)?;
+    let member = tx
+        .query_row(
+            "SELECT batch_id, execution_id, status, report_proposal_id
+             FROM pr_review_batch_members WHERE id = ?1",
+            [&payload.member_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((member_batch_id, member_execution_id, status, existing_report)) = member else {
+        return Ok(ApplyDecision::Rejected(format!(
+            "review batch member `{}` does not exist",
+            payload.member_id
+        )));
+    };
+    if member_batch_id != payload.batch_id {
+        return Ok(ApplyDecision::Rejected(format!(
+            "review batch member `{}` belongs to batch `{member_batch_id}`, not `{}`",
+            payload.member_id, payload.batch_id
+        )));
+    }
+    if member_execution_id.as_deref() != Some(execution_id) {
+        return Ok(ApplyDecision::Rejected(format!(
+            "review batch member `{}` is not owned by this execution",
+            payload.member_id
+        )));
+    }
+    if let Some(existing_report) = existing_report {
+        return Ok(ApplyDecision::Rejected(format!(
+            "review batch member `{}` already accepted report proposal `{existing_report}`",
+            payload.member_id
+        )));
+    }
+    if !matches!(status.as_str(), "pending" | "running") {
+        return Ok(ApplyDecision::Rejected(format!(
+            "review batch member `{}` cannot accept a report while status is `{status}`",
+            payload.member_id
+        )));
+    }
+
+    let now = now_string();
+    tx.execute(
+        "UPDATE pr_review_batch_members
+         SET status = 'reported', report_proposal_id = ?1, terminal_at = ?2, updated_at = ?2
+         WHERE id = ?3",
+        rusqlite::params![proposal_id, now, payload.member_id],
+    )?;
+    Ok(ApplyDecision::Applied(ApplyOutcome {
+        applied_ref: Some(payload.member_id),
+        post_commit_audit_line: None,
+    }))
 }
 
 fn create_attention_item_row(

@@ -200,6 +200,18 @@ fn proposal_verbs_are_allowed() {
         kind: None,
         state: None,
     });
+    assert_allowed(FrontendRequest::SubmitProposal {
+        run_id: "exec_1".into(),
+        kind: ProposalKind::ReviewReport,
+        payload: json!({"batch_id": "rvb_1", "member_id": "rvm_1", "report": {"findings": []}}),
+        idempotency_key: None,
+    });
+    assert_allowed(FrontendRequest::SubmitProposal {
+        run_id: "exec_1".into(),
+        kind: ProposalKind::ReviewVerdict,
+        payload: json!({"batch_id": "rvb_1", "verdict": {"outcome": "approved"}}),
+        idempotency_key: None,
+    });
 }
 
 #[test]
