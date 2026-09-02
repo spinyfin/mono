@@ -106,6 +106,68 @@ async fn merge_cancel_workspace_preference_falls_back_without_dirty_reuse() {
     assert!(!calls[1].3, "a fallback workspace must start from a clean checkout");
 }
 
+/// A resumed `revision_implementation` also carries `prefer_is_soft = true`
+/// (`request_resume_execution` forces `allow_dirty = true` and carries
+/// `prefer_is_soft` forward from the dead row) — but unlike the merge-cancel
+/// handoff above, its uncommitted work lives ONLY in the preferred
+/// workspace. Losing the lease race must still hard-fail (so the scheduler
+/// retries) rather than silently degrading to a clean workspace, which
+/// would discard that work whenever no recovery patch was captured.
+#[tokio::test]
+async fn revision_resume_with_allow_dirty_and_soft_prefer_still_hard_fails() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    let chore = create_test_chore_manual(&db, product.id.clone(), "Resume revision");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id)
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Ready)
+                .preferred_workspace_id("mono-agent-003")
+                .allow_dirty(true)
+                .prefer_is_soft(true)
+                .build(),
+        )
+        .unwrap();
+    let cube = Arc::new(FakeCubeClient {
+        fail_lease_when_prefer_set: true,
+        next_workspace_id: Mutex::new(Some("mono-agent-004".to_owned())),
+        ..FakeCubeClient::default()
+    });
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db,
+        WorkerPool::new(1),
+        cube.clone(),
+        Arc::new(FakeExecutionRunner::default()),
+    ));
+    let repo = CubeRepoHandle {
+        repo_id: "mono".to_owned(),
+    };
+
+    let result = coordinator
+        .lease_workspace_with_fallback(
+            &execution,
+            "worker-resume",
+            &repo,
+            "resume-revision",
+            &coordinator.host_adapter,
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "a revision resume with no recovery patch must hard-fail rather than degrade to a clean workspace"
+    );
+    let calls = cube.lease_calls.lock().await;
+    assert_eq!(
+        calls.len(),
+        1,
+        "only the preferred-workspace attempt should run, no fallback attempt"
+    );
+}
+
 /// A git repo with one committed file, so `git apply --3way` has a blob
 /// to three-way against.
 fn init_recovery_workspace(path: &std::path::Path) -> bool {

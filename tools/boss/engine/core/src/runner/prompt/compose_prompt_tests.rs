@@ -413,6 +413,19 @@ fn merge_cancelled_review_followup_warns_about_reclaimed_partial_work() {
         .prefer_is_soft(true)
         .created_at("2026-09-02T00:00:00Z")
         .build();
+    // Confident "edits are present" wording requires a verified recovery
+    // marker — `reconcile_workspace_recovery` writes this with
+    // `RecoverySource::CubeInPlace` only when the lease's dirty state was
+    // actually confirmed, before the prompt is composed.
+    boss_engine_recovery::recovery_apply::RecoveryReport {
+        for_execution_id: execution.id.clone(),
+        from_execution_id: String::new(),
+        source: boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace,
+        applied: None,
+        patch_error: None,
+    }
+    .write(ws.path())
+    .unwrap();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
             .execution(&execution)
@@ -427,6 +440,38 @@ fn merge_cancelled_review_followup_warns_about_reclaimed_partial_work() {
     assert!(prompt.contains("partial, uncommitted edits"));
     assert!(prompt.contains("never compiled or tested"));
     assert!(prompt.contains("jj diff"));
+}
+
+#[test]
+fn merge_cancelled_review_followup_hedges_without_a_verified_recovery_marker() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let execution = WorkExecution::builder()
+        .id("exec_followup_unverified")
+        .work_item_id("task-1")
+        .kind(ExecutionKind::ChoreImplementation)
+        .status(ExecutionStatus::Running)
+        .repo_remote_url("git@github.com:org/repo.git")
+        .workspace_path(ws.path().display().to_string())
+        .cube_workspace_id("mono-agent-001")
+        .preferred_workspace_id("mono-agent-001")
+        .allow_dirty(true)
+        .prefer_is_soft(true)
+        .created_at("2026-09-02T00:00:00Z")
+        .build();
+    // No recovery marker written: same workspace as preferred, but the
+    // engine never confirmed what the lease actually returned (could be a
+    // reset workspace, or one dirtied by an unrelated task in between).
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&execution)
+            .work_item(&review_followup())
+            .workspace_path(ws.path())
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(prompt.contains("MERGE-CANCELLED REVIEW RECOVERY"));
+    assert!(prompt.contains("no confirmed record"));
+    assert!(!prompt.contains("partial, uncommitted edits"));
 }
 
 #[test]

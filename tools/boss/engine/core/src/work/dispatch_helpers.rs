@@ -585,18 +585,25 @@ pub(crate) fn reconcile_work_item_execution(
             {
                 result.updated.push(updated);
             } else if execution.kind == ExecutionKind::RevisionImplementation
-                && execution.status == ExecutionStatus::Cancelled
+                && execution.status.is_terminal()
                 && kind == ExecutionKind::ChoreImplementation
                 && query_live_execution_for_work_item(conn, work_item_id)?.is_none()
             {
                 // A work item may legitimately change execution families in
                 // place in one narrowly-defined case: a live PR-review
                 // revision becomes a followup when its parent PR merges. Its
-                // cancelled revision_implementation row is historical
+                // now-terminal revision_implementation row is historical
                 // evidence, not a reason to suppress the required
-                // chore_implementation. The live-execution query covers every
-                // row, rather than only this latest one, and preserves the
-                // single-in-flight guarantee.
+                // chore_implementation — this covers not just the ordinary
+                // cancel outcome but also the race where the worker's own
+                // completion (or a dead-PID sweep) terminalizes the row as
+                // completed/failed/orphaned between the merge-cancel
+                // transaction and this reconcile. The live-execution query
+                // covers every row, rather than only this latest one, and
+                // preserves the single-in-flight guarantee. Workspace
+                // inheritance (`merge_cancelled_workspace` above) stays
+                // scoped to the `Cancelled` case only — a completed or
+                // failed revision has no uncommitted edits worth reclaiming.
                 insert_fresh(result, Some(&execution))?;
             }
         }

@@ -1348,6 +1348,11 @@ impl ServerState {
         // under the same state root. Build it before the completion handler
         // so merge-triggered cancellation and ordinary dispatch share one
         // timeline sink.
+        //
+        // Wrapped so every emitted dispatch event carries the tmux-hosting
+        // pool snapshot active at emit time — one of the three visibility
+        // surfaces the tmux-hosting design requires alongside the Workers
+        // grid badge and `bossctl doctor` (see `dispatch_hosting_stamp`).
         let dispatch_event_root: PathBuf = state_root.clone();
         let dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink> =
             Arc::new(crate::dispatch_hosting_stamp::HostingModeStampingSink::new(

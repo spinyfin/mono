@@ -1235,7 +1235,7 @@ async fn sweep_promotes_merged_pr_even_when_row_was_in_review_with_conflict() {
 /// A PR-review revision whose target merges while its worker is live must
 /// cross execution families automatically: cancel the obsolete
 /// revision_implementation, preserve the work item as an autostart followup,
-/// and enqueue a chore_implementation without an operator start gesture.
+/// and enqueue a chore_implementation without any manual start.
 /// The cancellation must also close the original dispatch timeline.
 #[tokio::test]
 async fn merged_pr_redispatches_live_review_revision_as_followup_and_records_cancel() {

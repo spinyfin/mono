@@ -224,12 +224,24 @@ fn startup_recovery_block(report: &boss_engine_recovery::recovery_apply::Recover
 }
 
 /// Explain the exact workspace handoff for a review revision converted to a
-/// followup because its parent PR merged mid-run. This keys on the dedicated
-/// execution shape written by `reconcile_work_item_execution`: a
-/// chore-implementation followup with a soft dirty-workspace preference.
-fn merge_cancelled_review_recovery_block(execution: &WorkExecution, work_item: &WorkItem) -> Option<String> {
+/// followup because its parent PR merged mid-run. This keys primarily on the
+/// dedicated execution shape written by `reconcile_work_item_execution` — a
+/// chore-implementation followup with a soft dirty-workspace preference,
+/// which no other mint produces — not on task kind alone:
+/// `resolve_revision_on_parent_close` (work/chain_helpers.rs) falls back
+/// from `TaskKind::Followup` to plain `TaskKind::Chore` when the chain
+/// root's PR URL is missing or unparseable, and that chore-fallback
+/// conversion still inherits the same workspace/allow_dirty shape, so it
+/// needs this brief too.
+fn merge_cancelled_review_recovery_block(
+    execution: &WorkExecution,
+    work_item: &WorkItem,
+    workspace_path: &Path,
+) -> Option<String> {
     let task = match work_item {
-        WorkItem::Task(task) | WorkItem::Chore(task) if task.kind == TaskKind::Followup => task,
+        WorkItem::Task(task) | WorkItem::Chore(task) if matches!(task.kind, TaskKind::Followup | TaskKind::Chore) => {
+            task
+        }
         _ => return None,
     };
     if execution.kind != ExecutionKind::ChoreImplementation || !execution.allow_dirty || !execution.prefer_is_soft {
@@ -242,8 +254,22 @@ fn merge_cancelled_review_recovery_block(execution: &WorkExecution, work_item: &
         .unwrap_or_else(|| "the merged origin PR".to_owned());
     let current = execution.cube_workspace_id.as_deref();
 
+    // `reconcile_workspace_recovery` (coordinator/execution.rs) already
+    // resolved whether the re-leased workspace's dirty state was actually
+    // confirmed — it writes this marker with `RecoverySource::CubeInPlace`
+    // only when `lease.dirty_verified == Some(true)`, before this prompt is
+    // composed. Same-workspace alone is not proof: cube can re-lease the
+    // same workspace after resetting it, or the followup can sit `ready`
+    // long enough (pool saturation, dependency gating) for an unrelated
+    // task to lease, dirty, and release that workspace first — in which
+    // case `--allow-dirty` hands this worker a foreign working copy, not
+    // its own cancelled review draft.
+    let verified_in_place = current == Some(preferred)
+        && boss_engine_recovery::recovery_apply::RecoveryReport::read_for(workspace_path, &execution.id)
+            .is_some_and(|report| report.source == boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace);
+
     let mut block = String::from("## MERGE-CANCELLED REVIEW RECOVERY\n\n");
-    if current == Some(preferred) {
+    if verified_in_place {
         block.push_str(&format!(
             "This followup was created after {origin} merged while its review-revision worker was mid-run. \
              The engine re-leased that worker's exact workspace (`{preferred}`) without resetting it. \
@@ -258,6 +284,24 @@ fn merge_cancelled_review_recovery_block(execution: &WorkExecution, work_item: &
              Do not trust or discard those edits. They were cut off mid-turn and were never compiled or \
              tested. Reconcile them against this followup and current `main`, then run the required \
              validation before opening the fresh PR.\n\n",
+        ));
+    } else if current == Some(preferred) {
+        block.push_str(&format!(
+            "This followup was created after {origin} merged while its review-revision worker was mid-run, \
+             and the engine re-leased that worker's exact workspace (`{preferred}`). However, the engine \
+             has no confirmed record of what this lease actually returned: it may have been reset (no \
+             edits present), or it may have been leased and dirtied by an unrelated task in between and \
+             then released back to the pool before landing here. Do not assume the working copy is your \
+             own cancelled review draft either way.\n\n\
+             Check before doing anything else:\n\n\
+             ```\n\
+             jj status\n\
+             jj diff --stat\n\
+             ```\n\n\
+             If it holds nothing, proceed as a fresh start from current `main`. If it holds edits, verify \
+             they actually belong to this followup's own history (check the log against {origin}'s revision \
+             base) before building on them — an edit set from an unrelated task must not be folded into \
+             this PR.\n\n",
         ));
     } else {
         let current = current.unwrap_or("an unrecorded fallback workspace");
@@ -392,7 +436,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
     // directive BEFORE the execution context so it outweighs the
     // workspace-rules default of `jj git fetch && jj new main`.
     let existing_pr_url = work_item_pr_url(work_item);
-    if let Some(block) = merge_cancelled_review_recovery_block(execution, work_item) {
+    if let Some(block) = merge_cancelled_review_recovery_block(execution, work_item, workspace_path) {
         prompt.push_str(&block);
     } else if let Some(pr_url) = existing_pr_url {
         let pr_number = boss_github::pr_url::pr_number_from_url(pr_url)
