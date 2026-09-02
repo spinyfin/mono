@@ -96,6 +96,7 @@ fn resolve_repo_uses_design_repo_for_design_kind() {
             goal: None,
             autostart: false,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
 
@@ -151,6 +152,7 @@ fn resolve_repo_design_kind_without_design_repo_falls_through_to_product_repo() 
             goal: None,
             autostart: false,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
     let conn = db.connect().unwrap();
@@ -200,6 +202,7 @@ fn resolve_repo_task_override_wins_over_design_repo() {
             goal: None,
             autostart: false,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
     let conn = db.connect().unwrap();

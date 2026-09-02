@@ -274,6 +274,11 @@ pub(crate) async fn run_project_command(command: ProjectCommand, ctx: &RunContex
     let mut client = connect_for_work(ctx).await?;
     match command {
         ProjectCommand::Create(args) => {
+            if args.no_design_task && args.design_reasoning_effort_xhigh {
+                return Err(CliError::usage(
+                    "--design-reasoning-effort-xhigh cannot be used with --no-design-task",
+                ));
+            }
             let product = resolve_product(&mut client, args.product, ctx).await?;
             let name = required_text(args.name, "Project name", ctx)?;
             let description = optional_text(args.description, "Description", ctx)?;
@@ -294,8 +299,8 @@ pub(crate) async fn run_project_command(command: ProjectCommand, ctx: &RunContex
                     // every work-item kind.
                     autostart: !ctx.no_autostart,
                     no_design_task: args.no_design_task,
+                    design_reasoning_effort_xhigh: args.design_reasoning_effort_xhigh,
                 },
-                args.design_reasoning_effort_xhigh,
             )
             .await?;
 

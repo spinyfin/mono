@@ -695,11 +695,7 @@ pub(crate) async fn compose_worker_spawn(
                 .build(),
         )
     };
-    // Products and projects do not have a TaskKind. The policy identifies the
-    // strong tier from the typed task kind/reasoning pair; design postmortems
-    // are excluded by their own task kind.
     let work_item_kind = work_item_task_kind_enum(work_item);
-    let design_or_investigation_tier = crate::effort::is_design_or_investigation_tier(work_item_kind, row_reasoning);
     let registry = crate::driver::DriverRegistry::default();
     // Single resolution point for review/automation dispatch policy — see
     // `pool_dispatch_policy_for_worker_id`'s doc comment. `None` for
@@ -709,9 +705,7 @@ pub(crate) async fn compose_worker_spawn(
     // this execution kind yields to allocation / the engine default rather
     // than hard-failing `compose_worker_spawn`. Pool workers already ignore
     // row pins via `pool_policy_driver`, so they skip this yield.
-    let (effective_task_driver, effective_product_default_driver) = if design_or_investigation_tier {
-        (None, None)
-    } else if pool_policy.is_some() {
+    let (effective_task_driver, effective_product_default_driver) = if pool_policy.is_some() {
         (row_driver.as_deref(), product_default_driver.as_deref())
     } else {
         yield_pins_that_fail_capability_gate(
@@ -840,20 +834,30 @@ mod reviewer_pool_policy_tests {
     /// Resolves a review-pool spawn end to end (policy → effective driver →
     /// `resolve_spawn_config`) for a row whose own `driver` column is
     /// `row_driver`, mirroring exactly what `compose_worker_spawn` does.
-    fn resolve_reviewer_spawn(row_driver: Option<&str>) -> crate::effort::SpawnConfig {
+    fn resolve_reviewer_spawn(
+        row_driver: Option<&str>,
+        kind: Option<&boss_protocol::TaskKind>,
+        reasoning: Option<boss_protocol::ReasoningMode>,
+        effort: Option<boss_protocol::EffortLevel>,
+        design_reasoning_effort_xhigh: bool,
+    ) -> crate::effort::SpawnConfig {
         let pool_policy = crate::coordinator::pool_dispatch_policy_for_worker_id("review-1").unwrap();
         let registry = crate::driver::DriverRegistry::default();
         let input = crate::effort::SpawnResolutionInput::builder()
             .maybe_task_driver(row_driver)
             .pool_policy_driver(pool_policy.driver)
             .maybe_pool_model_override(Some(pool_policy.model_tier))
+            .maybe_kind(kind)
+            .maybe_reasoning(reasoning)
+            .maybe_effort_level(effort)
+            .design_reasoning_effort_xhigh(design_reasoning_effort_xhigh)
             .build();
         crate::effort::resolve_spawn_config_in(&registry, &input).unwrap()
     }
 
     #[test]
     fn codex_authored_row_gets_a_claude_reviewer_on_opus_not_a_codex_reviewer() {
-        let cfg = resolve_reviewer_spawn(Some("codex"));
+        let cfg = resolve_reviewer_spawn(Some("codex"), None, None, None, false);
         assert_eq!(
             cfg.driver, "claude",
             "reviewer must dispatch on Claude, not the authored row's codex driver"
@@ -863,16 +867,43 @@ mod reviewer_pool_policy_tests {
 
     #[test]
     fn claude_authored_row_under_review_is_unchanged_claude_reviewer_on_opus() {
-        let cfg = resolve_reviewer_spawn(Some("claude"));
+        let cfg = resolve_reviewer_spawn(Some("claude"), None, None, None, false);
         assert_eq!(cfg.driver, "claude");
         assert_eq!(cfg.model, "opus");
     }
 
     #[test]
     fn untagged_row_under_review_still_gets_a_claude_reviewer_on_opus() {
-        let cfg = resolve_reviewer_spawn(None);
+        let cfg = resolve_reviewer_spawn(None, None, None, None, false);
         assert_eq!(cfg.driver, "claude");
         assert_eq!(cfg.model, "opus");
+    }
+
+    #[test]
+    fn design_and_investigation_reviews_keep_the_pool_strong_tier_and_row_effort() {
+        use boss_protocol::{EffortLevel, ReasoningMode, TaskKind};
+
+        let design = resolve_reviewer_spawn(None, Some(&TaskKind::Design), None, Some(EffortLevel::Medium), true);
+        assert_eq!(design.model, "opus");
+        assert_eq!(
+            design.model_source,
+            crate::effort::ModelResolutionSource::PoolStrongTier
+        );
+        assert_eq!(design.effort_value, Some("high"));
+
+        let investigation = resolve_reviewer_spawn(
+            None,
+            Some(&TaskKind::Chore),
+            Some(ReasoningMode::Investigation),
+            Some(EffortLevel::Large),
+            false,
+        );
+        assert_eq!(investigation.model, "opus");
+        assert_eq!(
+            investigation.model_source,
+            crate::effort::ModelResolutionSource::PoolStrongTier
+        );
+        assert_eq!(investigation.effort_value, Some("xhigh"));
     }
 }
 

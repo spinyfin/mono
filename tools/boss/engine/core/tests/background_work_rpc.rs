@@ -201,13 +201,7 @@ async fn create_product(client: &mut BossClient, input: CreateProductInput) -> R
 }
 
 async fn create_project(client: &mut BossClient, input: CreateProjectInput) -> Result<Project> {
-    match client
-        .send_request(&FrontendRequest::CreateProject {
-            input,
-            design_reasoning_effort_xhigh: false,
-        })
-        .await?
-    {
+    match client.send_request(&FrontendRequest::CreateProject { input }).await? {
         FrontendEvent::WorkItemCreated { item } => match item {
             WorkItem::Project(project) => Ok(project),
             other => Err(anyhow!("expected project, got {other:?}")),

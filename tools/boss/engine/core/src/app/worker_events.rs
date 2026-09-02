@@ -2567,6 +2567,7 @@ mod post_hoc_interception_decision_tests {
                 default_model_for_level: |_| "stub-model",
                 model_for_reasoning: |_| "stub-model",
                 review_model_for_tier: |_| "stub-model",
+                design_investigation_model: None,
                 prompt_addendum_for_level: |_| None,
                 model_requires_auto_permissions: |_| false,
                 model_belongs_to_driver: |_| true,

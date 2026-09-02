@@ -260,6 +260,7 @@ fn create_project_assigns_short_ids_to_project_and_design_task() {
             goal: None,
             autostart: false,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
 
@@ -323,6 +324,7 @@ fn create_project_protocol_struct_carries_short_id() {
             goal: None,
             autostart: false,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
     // Project gets short_id = 1; its auto-spawned design task gets 2.

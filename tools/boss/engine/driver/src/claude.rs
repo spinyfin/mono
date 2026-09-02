@@ -160,6 +160,7 @@ static CLAUDE_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
         default_model_for_level: claude_default_model_for_level,
         model_for_reasoning: claude_model_for_reasoning,
         review_model_for_tier: claude_review_model_for_tier,
+        design_investigation_model: Some(|| "fable"),
         prompt_addendum_for_level: claude_prompt_addendum_for_level,
         model_requires_auto_permissions: claude_model_requires_auto_permissions,
         model_belongs_to_driver: claude_model_belongs_to_driver,

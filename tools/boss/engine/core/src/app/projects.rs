@@ -44,14 +44,10 @@ pub(super) async fn handle_create_project(ctx: Dispatch, req: FrontendRequest) {
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::CreateProject {
-        input,
-        design_reasoning_effort_xhigh,
-    } = req
-    else {
+    let FrontendRequest::CreateProject { input } = req else {
         unreachable!()
     };
-    match work_db.create_project_with_design_reasoning_effort(input, design_reasoning_effort_xhigh) {
+    match work_db.create_project(input) {
         Ok(project) => {
             let item = WorkItem::Project(project);
             let product_id = item.product_id().to_string();

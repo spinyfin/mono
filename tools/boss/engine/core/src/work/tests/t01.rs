@@ -16,6 +16,7 @@ fn list_tasks_includes_chore_and_revision_kinds() {
             goal: None,
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
     let project_task = db
@@ -123,6 +124,7 @@ fn creates_tree_and_soft_deletes_chores() {
             goal: Some("goal".to_owned()),
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
     let task = db
@@ -281,6 +283,7 @@ fn create_many_tasks_inserts_all_in_one_transaction() {
             goal: None,
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
 
@@ -331,6 +334,7 @@ fn create_many_tasks_rolls_back_on_invalid_item() {
             goal: None,
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
 
@@ -625,6 +629,7 @@ fn reorders_project_tasks() {
             goal: None,
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
     let first = db
@@ -675,6 +680,7 @@ fn creates_and_lists_execution_entities() {
             goal: None,
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
     let task = db
@@ -850,6 +856,7 @@ fn reconciles_missing_executions_for_product_tree() {
             goal: None,
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
     let first_task = db
@@ -922,6 +929,7 @@ fn reconcile_promotes_next_project_task_when_previous_done() {
             goal: None,
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
     let first_task = db
@@ -986,6 +994,7 @@ fn reconcile_waits_for_product_repo_remote_url() {
             goal: None,
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
     // Product has no repo and task has no override — enforce_task_repo_invariant

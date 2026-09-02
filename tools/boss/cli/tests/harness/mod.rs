@@ -113,13 +113,7 @@ pub async fn create_product(client: &mut BossClient, name: &str) -> Result<Produ
 
 /// Send a `CreateProject` request and unwrap the created [`Project`].
 pub async fn create_project_with(client: &mut BossClient, input: CreateProjectInput) -> Result<Project> {
-    match client
-        .send_request(&FrontendRequest::CreateProject {
-            input,
-            design_reasoning_effort_xhigh: false,
-        })
-        .await?
-    {
+    match client.send_request(&FrontendRequest::CreateProject { input }).await? {
         FrontendEvent::WorkItemCreated {
             item: WorkItem::Project(p),
         } => Ok(p),
@@ -138,6 +132,7 @@ pub async fn create_project(client: &mut BossClient, product_id: &str, name: &st
             goal: None,
             autostart: false,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         },
     )
     .await

@@ -200,17 +200,10 @@ pub(crate) fn build_external_tracker_config(
     }
 }
 
-pub(crate) async fn create_project(
-    client: &mut BossClient,
-    input: CreateProjectInput,
-    design_reasoning_effort_xhigh: bool,
-) -> Result<Project, CliError> {
+pub(crate) async fn create_project(client: &mut BossClient, input: CreateProjectInput) -> Result<Project, CliError> {
     rpc_call!(
         try client,
-        FrontendRequest::CreateProject {
-            input,
-            design_reasoning_effort_xhigh,
-        },
+        FrontendRequest::CreateProject { input },
         "project create",
         FrontendEvent::WorkItemCreated { item } => expect_project(item),
     )

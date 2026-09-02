@@ -1962,6 +1962,7 @@ fn resolve_project_design_doc_surfaces_broken_when_no_repo() {
             goal: None,
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
 

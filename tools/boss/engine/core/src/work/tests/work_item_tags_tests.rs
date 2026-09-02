@@ -265,6 +265,7 @@ fn list_tasks_chores_and_revisions_project_tags_like_show() {
             goal: None,
             autostart: false,
             no_design_task: true,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
 

@@ -2400,6 +2400,7 @@ mod pane_spawn_tests {
                 goal: Some("Operators can answer 'why did this task spawn now' from logs alone.".to_owned()),
                 autostart: false,
                 no_design_task: false,
+                design_reasoning_effort_xhigh: false,
             })
             .unwrap();
         let task = work_db
@@ -2471,6 +2472,7 @@ mod pane_spawn_tests {
                 goal: Some("Operators can see what every active worker is doing without opening panes.".to_owned()),
                 autostart: false,
                 no_design_task: false,
+                design_reasoning_effort_xhigh: false,
             })
             .unwrap();
 
@@ -2601,6 +2603,7 @@ mod pane_spawn_tests {
                 goal: Some("Reduce GitHub API spend without lagging merges.".to_owned()),
                 autostart: false,
                 no_design_task: false,
+                design_reasoning_effort_xhigh: false,
             })
             .unwrap();
 

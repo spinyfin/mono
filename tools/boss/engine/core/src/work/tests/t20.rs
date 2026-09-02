@@ -1090,6 +1090,7 @@ fn make_in_review_project_task(db: &WorkDb, product_id: &str, pr_url: &str) -> S
             goal: None,
             autostart: false,
             no_design_task: true,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
     let task = db

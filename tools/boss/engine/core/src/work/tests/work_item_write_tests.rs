@@ -153,6 +153,7 @@ fn noop_status_patch_preserves_last_status_actor_for_project() {
             goal: None,
             autostart: false,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
 

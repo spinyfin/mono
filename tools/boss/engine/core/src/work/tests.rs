@@ -223,6 +223,7 @@ fn product_task_execution_with_prefix(db: &WorkDb, worker_branch_prefix: Option<
             goal: None,
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
     let task = db
@@ -271,6 +272,7 @@ fn seed_project_for_design_doc(db: &WorkDb) -> (Product, Project) {
             goal: None,
             autostart: true,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
     (product, project)
@@ -372,6 +374,7 @@ fn make_resolve_scaffold(
             goal: None,
             autostart: false,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
     // When the product has no repo, `create_task` now rejects a

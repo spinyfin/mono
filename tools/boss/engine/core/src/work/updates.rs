@@ -511,14 +511,16 @@ impl WorkDb {
             }
         }
         if let Some(design_reasoning_effort_xhigh) = patch.design_reasoning_effort_xhigh {
-            if task.kind != TaskKind::Design {
+            if design_reasoning_effort_xhigh && task.kind != TaskKind::Design {
                 bail!(
                     "design reasoning effort xhigh is only valid for kind=design; {} is kind={}",
                     task.id,
                     task.kind
                 );
             }
-            task.design_reasoning_effort_xhigh = design_reasoning_effort_xhigh;
+            if task.kind == TaskKind::Design {
+                task.design_reasoning_effort_xhigh = design_reasoning_effort_xhigh;
+            }
         }
         if let Some(summary) = patch.completion_summary {
             // Empty string clears; non-empty stores the human close summary.

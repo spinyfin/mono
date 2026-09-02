@@ -482,13 +482,10 @@ pub(crate) fn decide_execution_driver(
     if let Some(pool_driver) = crate::coordinator::pool_driver_slug_for_execution_kind(&kind) {
         return Ok(DriverDecision::pool(pool_driver));
     }
-    let pinned = (!design_or_investigation_tier)
-        .then(|| {
-            row.explicit_driver
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| row.product_default_driver.filter(|s| !s.trim().is_empty()))
-        })
-        .flatten();
+    let pinned = row
+        .explicit_driver
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| row.product_default_driver.filter(|s| !s.trim().is_empty()));
     if let Some(driver) = pinned {
         // Honour the pin only when it clears the capability gate for this
         // execution kind. A product default (or `--driver`) of codex/grok
@@ -526,16 +523,7 @@ pub(crate) fn decide_execution_driver(
         .as_deref()
         .map(str::trim)
         .filter(|model| !model.is_empty());
-    let eligible = eligible_drivers_for(
-        &task_kind,
-        &kind,
-        if design_or_investigation_tier {
-            None
-        } else {
-            model_override
-        },
-        design_or_investigation_tier,
-    );
+    let eligible = eligible_drivers_for(&task_kind, &kind, model_override, design_or_investigation_tier);
     if eligible.is_empty() && model_override.is_some() {
         return Ok(DriverDecision::default_no_override());
     }
@@ -543,6 +531,7 @@ pub(crate) fn decide_execution_driver(
     let driver = match allocate_among(split, work_item_id, &task_kind, &eligible) {
         Ok(driver) => driver,
         Err(_) if model_override.is_some() => return Ok(DriverDecision::default_no_override()),
+        Err(_) if design_or_investigation_tier => return Ok(DriverDecision::default_no_override()),
         Err(err) => return Err(err),
     };
     Ok(DriverDecision::allocated(driver, split))
@@ -561,8 +550,8 @@ pub(crate) fn decide_execution_driver(
 ///
 /// Split out from [`decide_execution_driver`] so the failure paths (nothing
 /// eligible; everything eligible at 0) are exercisable with a restricted
-/// eligible set, which no real work item can currently produce — all three
-/// built-in drivers clear every kind's gate today.
+/// eligible set. The dedicated design/investigation tier is one real producer:
+/// it excludes Grok even though Grok clears the capability gate.
 fn allocate_among(
     split: DriverTrafficSplit,
     work_item_id: &str,

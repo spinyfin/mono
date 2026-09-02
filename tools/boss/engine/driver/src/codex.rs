@@ -256,6 +256,7 @@ static CODEX_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
         default_model_for_level: codex_default_model_for_level,
         model_for_reasoning: codex_model_for_reasoning,
         review_model_for_tier: codex_review_model_for_tier,
+        design_investigation_model: Some(|| "gpt-5.6-sol"),
         prompt_addendum_for_level: codex_prompt_addendum_for_level,
         model_requires_auto_permissions: codex_model_requires_auto_permissions,
         model_belongs_to_driver: codex_model_belongs_to_driver,

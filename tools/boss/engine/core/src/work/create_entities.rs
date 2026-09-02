@@ -150,16 +150,6 @@ impl WorkDb {
     }
 
     pub fn create_project(&self, input: CreateProjectInput) -> Result<Project> {
-        self.create_project_with_design_reasoning_effort(input, false)
-    }
-
-    /// Create a project and explicitly set the auto-created design task's
-    /// driver reasoning effort in the same transaction.
-    pub fn create_project_with_design_reasoning_effort(
-        &self,
-        input: CreateProjectInput,
-        design_reasoning_effort_xhigh: bool,
-    ) -> Result<Project> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         ensure_product_exists(&tx, &input.product_id)?;
@@ -190,7 +180,7 @@ impl WorkDb {
                 &id,
                 &input.name,
                 input.autostart,
-                design_reasoning_effort_xhigh,
+                input.design_reasoning_effort_xhigh,
             )?;
         }
 

@@ -762,6 +762,20 @@ fn allocation_fails_loudly_when_no_eligible_driver_holds_a_share() {
     );
 }
 
+#[test]
+fn design_tier_falls_back_to_the_default_when_only_grok_is_funded() {
+    let (_dir, db) = open_db();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(100, 0, 0)).unwrap();
+    let product = create_test_product(&db);
+    let task = create_test_chore(&db, &product.id, "design tier fallback");
+    set_task_kind(&db, &task.id, &TaskKind::Design);
+
+    let execution = create_ready_chore_execution(&db, &task.id);
+    let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+    assert_eq!(decision.reason, REASON_DEFAULT);
+    assert_eq!(decision.driver, None);
+}
+
 /// An empty eligible set is an error too, never the engine default.
 #[test]
 fn allocation_fails_loudly_when_nothing_is_eligible() {

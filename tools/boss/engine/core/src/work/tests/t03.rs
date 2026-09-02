@@ -839,6 +839,7 @@ fn project_dependent_auto_unblocks_to_planned_not_todo() {
             goal: None,
             autostart: true,
             no_design_task: true,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
     let prereq = db
@@ -849,6 +850,7 @@ fn project_dependent_auto_unblocks_to_planned_not_todo() {
             goal: None,
             autostart: true,
             no_design_task: true,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
     db.add_dependency(AddDependencyInput {
@@ -1513,6 +1515,7 @@ fn create_via_round_trip_per_source() {
             goal: None,
             autostart: false,
             no_design_task: false,
+            design_reasoning_effort_xhigh: false,
         })
         .unwrap();
     let project_tasks = db.list_tasks(&product.id, Some(&project.id), None, false).unwrap();

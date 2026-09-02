@@ -259,12 +259,12 @@ fn coordinator_design_xhigh_roundtrips_only_for_design_rows() {
     let db = WorkDb::open(path.clone()).unwrap();
     let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
     let project = db
-        .create_project_with_design_reasoning_effort(
+        .create_project(
             CreateProjectInput::builder()
                 .product_id(product.id.clone())
                 .name("Complex design")
+                .design_reasoning_effort_xhigh(true)
                 .build(),
-            true,
         )
         .unwrap();
     let design_id = db

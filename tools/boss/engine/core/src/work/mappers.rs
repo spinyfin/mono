@@ -211,8 +211,9 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
         autostart: row.get::<_, i64>(12)? != 0,
-        // The base SELECT does not include this display-only field; the
-        // single-item mapper below reads the persisted value.
+        // Not in the base SELECT: list projections report false. Dispatch
+        // reads the persisted value through query_task's full mapper, so any
+        // future spawn path must not source a work item from a list query.
         design_reasoning_effort_xhigh: false,
         last_status_actor: row.get(13)?,
         priority: row.get(14)?,

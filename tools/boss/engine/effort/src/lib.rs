@@ -320,20 +320,9 @@ pub fn is_design_or_investigation_tier(kind: Option<&TaskKind>, reasoning: Optio
         && (matches!(kind, Some(TaskKind::Design)) || reasoning == Some(ReasoningMode::Investigation))
 }
 
-/// Models chosen by the dedicated dispatch tier. This narrow policy is kept
-/// separate from driver menus because ordinary reasoning still uses those
-/// menus; only Claude and Codex can receive the dedicated tier.
-fn design_investigation_model_for(driver: &str) -> Option<&'static str> {
-    match driver {
-        "claude" => Some("fable"),
-        "codex" => Some("gpt-5.6-sol"),
-        _ => None,
-    }
-}
-
 /// Resolve dispatch knobs. The dedicated design/investigation tier is
-/// evaluated first and always resolves to the selected driver's `fable`/`sol`
-/// equivalent. `DesignPostmortem` is excluded by its distinct task kind.
+/// evaluated after explicit task and pool overrides and resolves through the
+/// selected driver's menu. `DesignPostmortem` is excluded by its distinct task kind.
 ///
 /// Ordinary rows use this precedence:
 /// 1. `tasks.model_override` (when non-empty after trim).
@@ -414,6 +403,8 @@ pub enum PoolModelTier {
 #[derive(Debug, Clone, Default, bon::Builder)]
 pub struct SpawnResolutionInput<'a> {
     pub effort_level: Option<EffortLevel>,
+    /// Explicit row-level model pin. It takes precedence over the dedicated
+    /// design/investigation tier as a deliberate human escape hatch.
     pub model_override: Option<&'a str>,
     pub pool_model_override: Option<PoolModelTier>,
     pub product_default_model: Option<&'a str>,
@@ -451,11 +442,21 @@ pub fn resolve_spawn_config_in(
     let effort_level = input.effort_level;
 
     let design_or_investigation_tier = is_design_or_investigation_tier(input.kind, input.reasoning);
-    let (mut model, mut model_source) = if design_or_investigation_tier {
-        let model = design_investigation_model_for(&driver)
-            .ok_or_else(|| SpawnResolutionError::IneligibleDesignInvestigationDriver { driver: driver.clone() })?;
-        (model.to_owned(), ModelResolutionSource::DesignInvestigationTier)
-    } else if let Some(m) = input.model_override.map(str::trim).filter(|s| !s.is_empty()) {
+    if design_or_investigation_tier
+        && menu.design_investigation_model.is_none()
+        && matches!(
+            driver_source,
+            DriverResolutionSource::TrafficAllocation | DriverResolutionSource::EngineDefault
+        )
+    {
+        driver = ENGINE_DEFAULT_DRIVER.to_owned();
+        driver_source = DriverResolutionSource::EngineDefault;
+        menu = menu_for_driver_in(registry, &driver)?;
+    }
+    let tier_applies = design_or_investigation_tier
+        && input.model_override.map(str::trim).is_none_or(str::is_empty)
+        && input.pool_model_override.is_none();
+    let (mut model, mut model_source) = if let Some(m) = input.model_override.map(str::trim).filter(|s| !s.is_empty()) {
         (m.to_owned(), ModelResolutionSource::TaskOverride)
     } else if let Some(PoolModelTier::Strong) = input.pool_model_override {
         // Resolved against the selected driver's menu, same lever as step 3
@@ -464,6 +465,11 @@ pub fn resolve_spawn_config_in(
             (menu.model_for_reasoning)(ReasoningMode::Investigation).to_owned(),
             ModelResolutionSource::PoolStrongTier,
         )
+    } else if tier_applies {
+        let model = menu
+            .design_investigation_model
+            .ok_or_else(|| SpawnResolutionError::IneligibleDesignInvestigationDriver { driver: driver.clone() })?;
+        (model().to_owned(), ModelResolutionSource::DesignInvestigationTier)
     } else if let Some(reasoning) = input.reasoning {
         // The capability lever. Note what is NOT consulted here: `effort_level`
         // plays no part, in either direction. That is the whole point — see
@@ -537,9 +543,12 @@ pub fn resolve_spawn_config_in(
     Ok(SpawnConfig {
         effort_level,
         reasoning: input.reasoning,
-        effort_value: if input.design_reasoning_effort_xhigh && matches!(input.kind, Some(TaskKind::Design)) {
+        effort_value: if input.design_reasoning_effort_xhigh
+            && matches!(input.kind, Some(TaskKind::Design))
+            && input.pool_model_override.is_none()
+        {
             Some("xhigh")
-        } else if design_or_investigation_tier {
+        } else if tier_applies {
             None
         } else {
             effort_level.and_then(|l| (menu.effort_value_for_level)(l))
@@ -927,6 +936,7 @@ mod tests {
                 default_model_for_level: stub_default_model_for_level,
                 model_for_reasoning: stub_model_for_reasoning,
                 review_model_for_tier: |_| "stub-model",
+                design_investigation_model: Some(|| "stub-tier"),
                 prompt_addendum_for_level: stub_prompt_addendum_for_level,
                 model_requires_auto_permissions: stub_model_requires_auto_permissions,
                 model_belongs_to_driver: stub_model_belongs_to_driver,
@@ -1769,6 +1779,34 @@ mod tests {
         assert_eq!(postmortem.model, "opus");
         assert_eq!(postmortem.effort_value, Some("high"));
         assert_ne!(postmortem.model_source, ModelResolutionSource::DesignInvestigationTier);
+    }
+
+    #[test]
+    fn tier_replaces_a_recorded_grok_traffic_allocation_with_claude() {
+        let cfg = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .allocated_driver("grok")
+                .kind(&TaskKind::Design)
+                .build(),
+        )
+        .unwrap();
+        assert_eq!(cfg.driver, ENGINE_DEFAULT_DRIVER);
+        assert_eq!(cfg.driver_source, DriverResolutionSource::EngineDefault);
+        assert_eq!(cfg.model, "fable");
+        assert_eq!(cfg.model_source, ModelResolutionSource::DesignInvestigationTier);
+    }
+
+    #[test]
+    fn explicit_model_override_wins_over_the_design_investigation_tier() {
+        let cfg = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .kind(&TaskKind::Design)
+                .model_override("sonnet")
+                .build(),
+        )
+        .unwrap();
+        assert_eq!(cfg.model, "sonnet");
+        assert_eq!(cfg.model_source, ModelResolutionSource::TaskOverride);
     }
 
     #[test]
