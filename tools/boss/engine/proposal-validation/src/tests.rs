@@ -55,6 +55,15 @@ fn valid_payload_for(kind: ProposalKind) -> Value {
         }),
         ProposalKind::AutomationOutcome => json!({"outcome": "skip", "reason": "repo is clean"}),
         ProposalKind::PrCreated => json!({"pr_url": "https://github.com/o/r/pull/123"}),
+        ProposalKind::ReviewReport => json!({
+            "batch_id": "rvb_123",
+            "member_id": "rvm_123",
+            "report": {"findings": []},
+        }),
+        ProposalKind::ReviewVerdict => json!({
+            "batch_id": "rvb_123",
+            "verdict": {"outcome": "approved"},
+        }),
     }
 }
 
@@ -100,6 +109,37 @@ fn canonical_payloads_deserialize_as_their_payload_struct() {
             task_id: "task_abc".to_owned()
         }
     );
+
+    let canonical = ok(
+        ProposalKind::ReviewReport,
+        valid_payload_for(ProposalKind::ReviewReport),
+    );
+    let parsed: ReviewReportProposalPayload = serde_json::from_str(&canonical).unwrap();
+    assert_eq!(parsed.batch_id, "rvb_123");
+    assert_eq!(parsed.report, json!({"findings": []}));
+
+    let canonical = ok(
+        ProposalKind::ReviewVerdict,
+        valid_payload_for(ProposalKind::ReviewVerdict),
+    );
+    let parsed: ReviewVerdictProposalPayload = serde_json::from_str(&canonical).unwrap();
+    assert_eq!(parsed.batch_id, "rvb_123");
+    assert_eq!(parsed.verdict, json!({"outcome": "approved"}));
+}
+
+#[test]
+fn review_payloads_require_structured_objects() {
+    let errors = errs(
+        ProposalKind::ReviewReport,
+        json!({"batch_id": "rvb_123", "member_id": "rvm_123", "report": "not-json"}),
+    );
+    assert!(message_for(&errors, "report").contains("expected a JSON object"));
+
+    let errors = errs(
+        ProposalKind::ReviewVerdict,
+        json!({"batch_id": "rvb_123", "verdict": []}),
+    );
+    assert!(message_for(&errors, "verdict").contains("expected a JSON object"));
 }
 
 // ── Shape and unknown-field errors ──────────────────────────────────────────

@@ -35,7 +35,7 @@ use boss_protocol::{
     AttentionProposalPayload, AutomationOutcomeProposalPayload, BlockedProposalPayload, DeferredScopeProposalPayload,
     EffortEscalationProposalPayload, FollowupTaskProposalPayload, PROPOSAL_CAP_PER_KIND_PER_EXECUTION,
     PROPOSAL_CAP_TOTAL_PER_EXECUTION, PrCreatedProposalPayload, ProposalErrorCode, ProposalFieldError, ProposalKind,
-    ProposalSubmissionError,
+    ProposalSubmissionError, ReviewReportProposalPayload, ReviewVerdictProposalPayload,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -181,6 +181,26 @@ pub fn validate_payload(kind: ProposalKind, payload: &Value) -> Result<Validated
             to_json(&PrCreatedProposalPayload {
                 pr_url: pr_url.unwrap_or_default(),
                 branch,
+            })
+        }
+        ProposalKind::ReviewReport => {
+            let batch_id = reader.required_text("batch_id", MAX_SHORT_FIELD_CHARS);
+            let member_id = reader.required_text("member_id", MAX_SHORT_FIELD_CHARS);
+            let report = reader.required_json_object("report", MAX_LONG_FIELD_CHARS);
+            reader.finish()?;
+            to_json(&ReviewReportProposalPayload {
+                batch_id: batch_id.unwrap_or_default(),
+                member_id: member_id.unwrap_or_default(),
+                report: report.unwrap_or_default(),
+            })
+        }
+        ProposalKind::ReviewVerdict => {
+            let batch_id = reader.required_text("batch_id", MAX_SHORT_FIELD_CHARS);
+            let verdict = reader.required_json_object("verdict", MAX_LONG_FIELD_CHARS);
+            reader.finish()?;
+            to_json(&ReviewVerdictProposalPayload {
+                batch_id: batch_id.unwrap_or_default(),
+                verdict: verdict.unwrap_or_default(),
             })
         }
     };
@@ -467,6 +487,30 @@ impl<'a> PayloadReader<'a> {
             return None;
         }
         Some(trimmed.to_owned())
+    }
+
+    /// Read a nested, structured review payload. The proposal envelope owns
+    /// identifiers and transport validation, while the report/verdict body is
+    /// deliberately preserved as an object for the role-specific consumer.
+    fn required_json_object(&mut self, field: &'static str, max_chars: usize) -> Option<Value> {
+        let Some(value) = self.raw(field) else {
+            self.error(field, "required field is missing");
+            return None;
+        };
+        if !value.is_object() {
+            self.error(field, format!("expected a JSON object, got {}", json_type_name(value)));
+            return None;
+        }
+        let serialized = value.to_string();
+        let len = serialized.chars().count();
+        if len > max_chars {
+            self.error(
+                field,
+                format!("is {len} characters, over the {max_chars}-character limit for this field"),
+            );
+            return None;
+        }
+        Some(value.clone())
     }
 
     /// Read `field` as a required value of a protocol enum, using the

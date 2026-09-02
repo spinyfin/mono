@@ -92,6 +92,16 @@ crate::register_counter!(
     "SubmitProposal accepted a proposal of kind `pr_created`.",
 );
 crate::register_counter!(
+    PROPOSAL_SUBMITTED_REVIEW_REPORT,
+    "worker_proposals.submitted.review_report",
+    "SubmitProposal accepted a proposal of kind `review_report`.",
+);
+crate::register_counter!(
+    PROPOSAL_SUBMITTED_REVIEW_VERDICT,
+    "worker_proposals.submitted.review_verdict",
+    "SubmitProposal accepted a proposal of kind `review_verdict`.",
+);
+crate::register_counter!(
     PROPOSAL_VALIDATION_FAILED,
     "worker_proposals.validation_failed",
     "SubmitProposal rejected a submission for ProposalErrorCode::ValidationFailed (payload schema).",
@@ -112,6 +122,8 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&PROPOSAL_SUBMITTED_FOLLOWUP_TASK);
     registry.register_counter(&PROPOSAL_SUBMITTED_AUTOMATION_OUTCOME);
     registry.register_counter(&PROPOSAL_SUBMITTED_PR_CREATED);
+    registry.register_counter(&PROPOSAL_SUBMITTED_REVIEW_REPORT);
+    registry.register_counter(&PROPOSAL_SUBMITTED_REVIEW_VERDICT);
     registry.register_counter(&PROPOSAL_VALIDATION_FAILED);
     registry.register_counter(&PROPOSAL_RATE_LIMITED);
 }
@@ -126,6 +138,8 @@ fn record_proposal_submitted(metrics: &Registry, kind: ProposalKind) {
         ProposalKind::FollowupTask => PROPOSAL_SUBMITTED_FOLLOWUP_TASK.inc(metrics),
         ProposalKind::AutomationOutcome => PROPOSAL_SUBMITTED_AUTOMATION_OUTCOME.inc(metrics),
         ProposalKind::PrCreated => PROPOSAL_SUBMITTED_PR_CREATED.inc(metrics),
+        ProposalKind::ReviewReport => PROPOSAL_SUBMITTED_REVIEW_REPORT.inc(metrics),
+        ProposalKind::ReviewVerdict => PROPOSAL_SUBMITTED_REVIEW_VERDICT.inc(metrics),
     }
 }
 

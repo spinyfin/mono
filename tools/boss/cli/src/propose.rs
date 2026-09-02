@@ -123,6 +123,20 @@ pub(crate) enum ProposeCommand {
     /// Example: `boss propose pr-created --url
     /// https://github.com/o/r/pull/123`
     PrCreated(PrCreatedArgs),
+    /// Submit this review-batch member's structured report. The engine
+    /// verifies that the member belongs to this execution, then accepts it
+    /// into that member for the supervisor to consume.
+    ///
+    /// Example: `boss propose review-report --batch-id rvb_abc --member-id
+    /// rvm_abc --report-file review.json`
+    ReviewReport(ReviewReportArgs),
+    /// Submit the supervisor's consolidated structured verdict for a batch.
+    /// The verdict is persisted for asynchronous application; this command
+    /// does not itself change the reviewed work item's state.
+    ///
+    /// Example: `boss propose review-verdict --batch-id rvb_abc --verdict-file
+    /// verdict.json`
+    ReviewVerdict(ReviewVerdictArgs),
 }
 
 /// Shared `--idempotency-key` override, flattened into every kind's args.
@@ -277,6 +291,38 @@ pub(crate) struct PrCreatedArgs {
     common: IdempotencyArgs,
 }
 
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ReviewReportArgs {
+    /// Durable review batch containing this reviewer member.
+    #[arg(long = "batch-id")]
+    batch: String,
+
+    /// Durable member id assigned to this reviewer execution.
+    #[arg(long = "member-id")]
+    member: String,
+
+    /// Path to the structured JSON report produced by this member.
+    #[arg(long = "report-file", value_name = "PATH")]
+    report_file: PathBuf,
+
+    #[command(flatten)]
+    common: IdempotencyArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ReviewVerdictArgs {
+    /// Durable review batch the supervisor is consolidating.
+    #[arg(long = "batch-id")]
+    batch: String,
+
+    /// Path to the supervisor's structured JSON verdict.
+    #[arg(long = "verdict-file", value_name = "PATH")]
+    verdict_file: PathBuf,
+
+    #[command(flatten)]
+    common: IdempotencyArgs,
+}
+
 /// CLI-local mirror of [`ProposalKind`] so `--kind` gets enumerated
 /// `--help` output and shell completion (clap's `ValueEnum` can't be
 /// implemented directly on the protocol type — neither it nor `ValueEnum`
@@ -290,6 +336,8 @@ pub(crate) enum ProposalKindArg {
     FollowupTask,
     AutomationOutcome,
     PrCreated,
+    ReviewReport,
+    ReviewVerdict,
 }
 
 impl From<ProposalKindArg> for ProposalKind {
@@ -302,6 +350,8 @@ impl From<ProposalKindArg> for ProposalKind {
             ProposalKindArg::FollowupTask => ProposalKind::FollowupTask,
             ProposalKindArg::AutomationOutcome => ProposalKind::AutomationOutcome,
             ProposalKindArg::PrCreated => ProposalKind::PrCreated,
+            ProposalKindArg::ReviewReport => ProposalKind::ReviewReport,
+            ProposalKindArg::ReviewVerdict => ProposalKind::ReviewVerdict,
         }
     }
 }
@@ -396,6 +446,23 @@ fn resolve_text_or_file(flag: &str, text: Option<String>, file: Option<PathBuf>)
     }
 }
 
+/// Read a structured JSON artifact for the review ingress commands. Keeping
+/// the artifact in a file matches reviewer output and avoids shell quoting a
+/// potentially large nested report or verdict.
+fn read_json_object_file(flag: &str, path: PathBuf) -> Result<serde_json::Value, CliError> {
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|err| CliError::usage(format!("failed to read --{flag}-file {}: {err}", path.display())))?;
+    let value: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|err| CliError::usage(format!("--{flag}-file {} is not valid JSON: {err}", path.display())))?;
+    if !value.is_object() {
+        return Err(CliError::usage(format!(
+            "--{flag}-file {} must contain one JSON object",
+            path.display()
+        )));
+    }
+    Ok(value)
+}
+
 /// Build the `(kind, payload, idempotency_key)` triple for a submission,
 /// with no side effects besides `--*-file` reads. Payloads are built from
 /// the typed `boss_protocol` structs (not hand-assembled `json!` literals)
@@ -405,7 +472,7 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
     use boss_protocol::{
         AttentionProposalPayload, AutomationOutcomeProposalPayload, BlockedProposalPayload,
         DeferredScopeProposalPayload, EffortEscalationProposalPayload, EffortLevel, FollowupTaskProposalPayload,
-        PrCreatedProposalPayload,
+        PrCreatedProposalPayload, ReviewReportProposalPayload, ReviewVerdictProposalPayload,
     };
 
     Ok(match command {
@@ -484,6 +551,25 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
             serde_json::to_value(PrCreatedProposalPayload {
                 pr_url: args.url,
                 branch: args.branch,
+            })
+            .map_err(CliError::internal)?,
+            args.common.idempotency_key,
+        ),
+        ProposeCommand::ReviewReport(args) => (
+            ProposalKind::ReviewReport,
+            serde_json::to_value(ReviewReportProposalPayload {
+                batch_id: args.batch,
+                member_id: args.member,
+                report: read_json_object_file("report", args.report_file)?,
+            })
+            .map_err(CliError::internal)?,
+            args.common.idempotency_key,
+        ),
+        ProposeCommand::ReviewVerdict(args) => (
+            ProposalKind::ReviewVerdict,
+            serde_json::to_value(ReviewVerdictProposalPayload {
+                batch_id: args.batch,
+                verdict: read_json_object_file("verdict", args.verdict_file)?,
             })
             .map_err(CliError::internal)?,
             args.common.idempotency_key,
@@ -618,6 +704,11 @@ fn flag_hint_for_field(kind: ProposalKind, field: &str) -> Option<&'static str> 
         (ProposalKind::AutomationOutcome, "reason") => Some("--reason"),
         (ProposalKind::PrCreated, "pr_url") => Some("--url"),
         (ProposalKind::PrCreated, "branch") => Some("--branch"),
+        (ProposalKind::ReviewReport, "batch_id") => Some("--batch-id"),
+        (ProposalKind::ReviewReport, "member_id") => Some("--member-id"),
+        (ProposalKind::ReviewReport, "report") => Some("--report-file"),
+        (ProposalKind::ReviewVerdict, "batch_id") => Some("--batch-id"),
+        (ProposalKind::ReviewVerdict, "verdict") => Some("--verdict-file"),
         _ => None,
     }
 }
@@ -792,6 +883,42 @@ mod tests {
     }
 
     #[test]
+    fn review_ingress_commands_parse() {
+        let args = parse_propose(&[
+            "review-report",
+            "--batch-id",
+            "rvb_1",
+            "--member-id",
+            "rvm_1",
+            "--report-file",
+            "report.json",
+        ]);
+        match args.command {
+            Some(ProposeCommand::ReviewReport(args)) => {
+                assert_eq!(args.batch, "rvb_1");
+                assert_eq!(args.member, "rvm_1");
+                assert_eq!(args.report_file, PathBuf::from("report.json"));
+            }
+            other => panic!("expected ReviewReport, got {other:?}"),
+        }
+
+        let args = parse_propose(&[
+            "review-verdict",
+            "--batch-id",
+            "rvb_1",
+            "--verdict-file",
+            "verdict.json",
+        ]);
+        match args.command {
+            Some(ProposeCommand::ReviewVerdict(args)) => {
+                assert_eq!(args.batch, "rvb_1");
+                assert_eq!(args.verdict_file, PathBuf::from("verdict.json"));
+            }
+            other => panic!("expected ReviewVerdict, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn list_parses_with_kind_and_state_filters() {
         let args = parse_propose(&["--list", "--kind", "blocked", "--state", "rejected"]);
         assert!(args.list);
@@ -828,6 +955,14 @@ mod tests {
     fn resolve_text_or_file_requires_one() {
         let err = resolve_text_or_file("body", None, None).unwrap_err();
         assert!(matches!(err, CliError::Usage(_)));
+    }
+
+    #[test]
+    fn read_json_object_file_requires_a_json_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.json");
+        std::fs::write(&path, "[]").unwrap();
+        assert!(matches!(read_json_object_file("report", path), Err(CliError::Usage(_))));
     }
 
     #[test]
@@ -958,6 +1093,45 @@ mod tests {
         assert_eq!(
             payload,
             serde_json::json!({ "pr_url": "https://github.com/o/r/pull/123" })
+        );
+    }
+
+    #[test]
+    fn payload_for_review_ingress_pins_wire_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("report.json");
+        let verdict = dir.path().join("verdict.json");
+        std::fs::write(&report, r#"{"findings":[]}"#).unwrap();
+        std::fs::write(&verdict, r#"{"outcome":"approved"}"#).unwrap();
+
+        let (kind, payload, _) = payload_for(command_for(&[
+            "review-report",
+            "--batch-id",
+            "rvb_1",
+            "--member-id",
+            "rvm_1",
+            "--report-file",
+            report.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert_eq!(kind, ProposalKind::ReviewReport);
+        assert_eq!(
+            payload,
+            serde_json::json!({"batch_id":"rvb_1","member_id":"rvm_1","report":{"findings":[]}})
+        );
+
+        let (kind, payload, _) = payload_for(command_for(&[
+            "review-verdict",
+            "--batch-id",
+            "rvb_1",
+            "--verdict-file",
+            verdict.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert_eq!(kind, ProposalKind::ReviewVerdict);
+        assert_eq!(
+            payload,
+            serde_json::json!({"batch_id":"rvb_1","verdict":{"outcome":"approved"}})
         );
     }
 

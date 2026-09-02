@@ -2,8 +2,8 @@
 //! classification, membership, and uniqueness contracts.
 
 use boss_protocol::{
-    ReviewBatchMemberRole, ReviewBatchMemberStatus, ReviewBatchPhase, ReviewClassification, ReviewLanguageBucket,
-    ReviewProfile,
+    ProposalDecider, ProposalKind, ProposalState, ReviewBatchMemberRole, ReviewBatchMemberStatus, ReviewBatchPhase,
+    ReviewClassification, ReviewLanguageBucket, ReviewProfile,
 };
 
 use super::*;
@@ -50,6 +50,30 @@ fn member(role: ReviewBatchMemberRole, execution_id: Option<String>) -> ReviewBa
         .status(ReviewBatchMemberStatus::Pending)
         .maybe_execution_id(execution_id)
         .build()
+}
+
+fn submit_review_report(
+    db: &WorkDb,
+    execution_id: &str,
+    work_item_id: &str,
+    batch_id: &str,
+    member_id: &str,
+    idempotency_key: &str,
+) -> SubmitWorkerProposalOutcome {
+    db.submit_worker_proposal(SubmitWorkerProposalInput {
+        execution_id,
+        work_item_id,
+        kind: ProposalKind::ReviewReport,
+        payload_json: &format!(r#"{{"batch_id":"{batch_id}","member_id":"{member_id}","report":{{"findings":[]}}}}"#),
+        idempotency_key,
+    })
+    .unwrap()
+    .unwrap()
+}
+
+fn assert_member_unchanged(member: &ReviewBatchMember, status: ReviewBatchMemberStatus) {
+    assert_eq!(member.status, status);
+    assert_eq!(member.report_proposal_id, None);
 }
 
 /// Batch persistence preserves the raw classifier result and the resolved
@@ -216,4 +240,304 @@ fn review_batch_rejects_invalid_phase_merge_sha_combinations_and_empty_members()
         .create_review_batch(batch_input(cycle_root.id, "head-sha", ReviewBatchPhase::PreMerge), &[])
         .unwrap_err();
     assert!(empty_members.to_string().contains("require at least one member"));
+}
+
+#[test]
+fn review_report_is_accepted_only_into_its_own_batch_member() {
+    let db = WorkDb::open(temp_db_path("review-report-proposal")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, members) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[member(ReviewBatchMemberRole::CodexReviewer, Some(execution.id.clone()))],
+        )
+        .unwrap();
+    let member = &members[0];
+
+    let outcome = submit_review_report(&db, &execution.id, &cycle_root.id, &batch.id, &member.id, "report-1");
+
+    assert_eq!(outcome.proposal.state, ProposalState::Applied);
+    assert_eq!(outcome.proposal.decided_by, Some(ProposalDecider::Policy));
+    assert_eq!(outcome.proposal.applied_ref.as_deref(), Some(member.id.as_str()));
+    let stored = db.review_batch_members(&batch.id).unwrap();
+    assert_eq!(stored[0].status, ReviewBatchMemberStatus::Reported);
+    assert_eq!(
+        stored[0].report_proposal_id.as_deref(),
+        Some(outcome.proposal.id.as_str())
+    );
+    assert!(stored[0].terminal_at.is_some());
+}
+
+#[test]
+fn review_report_rejections_preserve_batch_members() {
+    let db = WorkDb::open(temp_db_path("review-report-rejections")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let owner = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let other = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let failed_owner = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, members) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[member(ReviewBatchMemberRole::CodexReviewer, Some(owner.id.clone()))],
+        )
+        .unwrap();
+    let owned_member = &members[0];
+
+    let missing = submit_review_report(
+        &db,
+        &owner.id,
+        &cycle_root.id,
+        &batch.id,
+        "missing-member",
+        "missing-member",
+    );
+    assert_eq!(missing.proposal.state, ProposalState::Rejected);
+    assert_eq!(
+        missing.proposal.decision_reason.as_deref(),
+        Some("review batch member `missing-member` does not exist")
+    );
+    assert_member_unchanged(
+        &db.review_batch_members(&batch.id).unwrap()[0],
+        ReviewBatchMemberStatus::Pending,
+    );
+
+    let (other_batch, other_members) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "other-head-sha", ReviewBatchPhase::PreMerge),
+            &[member(ReviewBatchMemberRole::GrokReviewer, Some(other.id.clone()))],
+        )
+        .unwrap();
+    let wrong_batch = submit_review_report(
+        &db,
+        &owner.id,
+        &cycle_root.id,
+        &batch.id,
+        &other_members[0].id,
+        "wrong-batch",
+    );
+    assert_eq!(wrong_batch.proposal.state, ProposalState::Rejected);
+    assert_eq!(
+        wrong_batch.proposal.decision_reason.as_deref(),
+        Some(
+            format!(
+                "review batch member `{}` belongs to batch `{}`, not `{}`",
+                other_members[0].id, other_batch.id, batch.id
+            )
+            .as_str()
+        )
+    );
+    assert_member_unchanged(
+        &db.review_batch_members(&other_batch.id).unwrap()[0],
+        ReviewBatchMemberStatus::Pending,
+    );
+
+    let wrong_owner = submit_review_report(
+        &db,
+        &other.id,
+        &cycle_root.id,
+        &batch.id,
+        &owned_member.id,
+        "wrong-owner",
+    );
+    assert_eq!(wrong_owner.proposal.state, ProposalState::Rejected);
+    assert_eq!(
+        wrong_owner.proposal.decision_reason.as_deref(),
+        Some(
+            format!(
+                "review batch member `{}` is not owned by this execution",
+                owned_member.id
+            )
+            .as_str()
+        )
+    );
+    assert_member_unchanged(
+        &db.review_batch_members(&batch.id).unwrap()[0],
+        ReviewBatchMemberStatus::Pending,
+    );
+
+    let accepted = submit_review_report(&db, &owner.id, &cycle_root.id, &batch.id, &owned_member.id, "accepted");
+    let repeated = submit_review_report(
+        &db,
+        &owner.id,
+        &cycle_root.id,
+        &batch.id,
+        &owned_member.id,
+        "second-submission",
+    );
+    assert_eq!(repeated.proposal.state, ProposalState::Rejected);
+    assert_eq!(
+        repeated.proposal.decision_reason.as_deref(),
+        Some(
+            format!(
+                "review batch member `{}` already accepted report proposal `{}`",
+                owned_member.id, accepted.proposal.id
+            )
+            .as_str()
+        )
+    );
+    let reported = &db.review_batch_members(&batch.id).unwrap()[0];
+    assert_eq!(reported.status, ReviewBatchMemberStatus::Reported);
+    assert_eq!(
+        reported.report_proposal_id.as_deref(),
+        Some(accepted.proposal.id.as_str())
+    );
+
+    let (failed_batch, failed_members) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "failed-head-sha", ReviewBatchPhase::PreMerge),
+            &[member(
+                ReviewBatchMemberRole::ClaudeReviewer,
+                Some(failed_owner.id.clone()),
+            )],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_batch_members SET status = 'failed' WHERE id = ?1",
+            [&failed_members[0].id],
+        )
+        .unwrap();
+    let failed = submit_review_report(
+        &db,
+        &failed_owner.id,
+        &cycle_root.id,
+        &failed_batch.id,
+        &failed_members[0].id,
+        "failed-member",
+    );
+    assert_eq!(failed.proposal.state, ProposalState::Rejected);
+    assert_eq!(
+        failed.proposal.decision_reason.as_deref(),
+        Some(
+            format!(
+                "review batch member `{}` cannot accept a report while status is `failed`",
+                failed_members[0].id
+            )
+            .as_str()
+        )
+    );
+    assert_member_unchanged(
+        &db.review_batch_members(&failed_batch.id).unwrap()[0],
+        ReviewBatchMemberStatus::Failed,
+    );
+}
+
+#[test]
+fn review_verdict_remains_proposed_for_the_asynchronous_applier() {
+    let db = WorkDb::open(temp_db_path("review-verdict-proposal")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[member(ReviewBatchMemberRole::Supervisor, Some(execution.id.clone()))],
+        )
+        .unwrap();
+
+    let outcome = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &execution.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &format!(r#"{{"batch_id":"{}","verdict":{{"outcome":"approved"}}}}"#, batch.id),
+            idempotency_key: "verdict-1",
+        })
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(outcome.proposal.state, ProposalState::Proposed);
+    assert_eq!(outcome.proposal.applied_ref, None);
+    assert_eq!(
+        db.review_batch(&batch.id).unwrap().unwrap().final_verdict_proposal_id,
+        None
+    );
+}
+
+#[test]
+fn newer_review_verdict_supersedes_the_prior_batch_verdict() {
+    let db = WorkDb::open(temp_db_path("review-verdict-supersede")).unwrap();
+    let product = create_test_product(&db);
+    let cycle_root = create_test_chore_manual(&db, product.id, "review target");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(cycle_root.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let (batch, _) = db
+        .create_review_batch(
+            batch_input(cycle_root.id.clone(), "head-sha", ReviewBatchPhase::PreMerge),
+            &[member(ReviewBatchMemberRole::Supervisor, Some(execution.id.clone()))],
+        )
+        .unwrap();
+    let submit = |idempotency_key| {
+        db.submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &execution.id,
+            work_item_id: &cycle_root.id,
+            kind: ProposalKind::ReviewVerdict,
+            payload_json: &format!(r#"{{"batch_id":"{}","verdict":{{"outcome":"approved"}}}}"#, batch.id),
+            idempotency_key,
+        })
+        .unwrap()
+        .unwrap()
+    };
+    let first = submit("verdict-1");
+    let second = submit("verdict-2");
+    let proposals = db
+        .list_worker_proposals_for_work_item(&cycle_root.id, Some(ProposalKind::ReviewVerdict), None)
+        .unwrap();
+    let first = proposals
+        .iter()
+        .find(|proposal| proposal.id == first.proposal.id)
+        .unwrap();
+    assert_eq!(first.state, ProposalState::Superseded);
+    assert_eq!(second.proposal.state, ProposalState::Proposed);
 }

@@ -222,6 +222,14 @@ impl WorkDb {
                 None
             };
 
+            // Verdict application itself is asynchronous, but only the
+            // newest undecided verdict for a batch may remain available to
+            // that applier. Supersede predecessors before inserting this
+            // proposal, just as automation outcomes replace prior answers.
+            if input.kind == ProposalKind::ReviewVerdict {
+                proposal_apply::supersede_prior_review_verdicts(&tx, input.payload_json, &id)?;
+            }
+
             // Apply-before-insert: for an AutoApply kind, the produced row
             // and the `worker_proposals` row it is `applied_ref`-linked from
             // land in the same `INSERT`, so a reader can never observe one
@@ -626,6 +634,12 @@ mod tests {
             // auto-applies rather than being rejected on a repo-slug
             // mismatch.
             ProposalKind::PrCreated => format!(r#"{{"pr_url":"https://github.com/spinyfin/mono/pull/{}"}}"#, i + 1),
+            ProposalKind::ReviewReport => {
+                format!(r#"{{"batch_id":"rvb_missing","member_id":"rvm_missing_{i}","report":{{"findings":[]}}}}"#)
+            }
+            ProposalKind::ReviewVerdict => {
+                format!(r#"{{"batch_id":"rvb_missing","verdict":{{"outcome":"approved_{i}"}}}}"#)
+            }
         }
     }
 

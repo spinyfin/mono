@@ -52,7 +52,7 @@
 //! `record_deferred_scope_item`'s existing precedent of treating the audit
 //! line as non-fatal.
 
-use rusqlite::Transaction;
+use rusqlite::{OptionalExtension, Transaction};
 
 use super::automations::query_automation;
 use super::*;
@@ -61,7 +61,8 @@ use crate::worker_escalation::{WORKER_BLOCKED_ATTENTION_KIND, WORKER_ESCALATION_
 use boss_protocol::{
     Attention, AttentionGroup, AttentionProposalPayload, AutomationOutcomeProposalPayload, BlockedProposalPayload,
     CreateAttentionInput, CreateAttentionItemInput, DeferredScopeProposalPayload, EffortEscalationProposalPayload,
-    FollowupTaskProposalPayload, PrCreatedProposalPayload, ProposalKind,
+    FollowupTaskProposalPayload, PrCreatedProposalPayload, ProposalKind, ReviewBatchMemberStatus,
+    ReviewReportProposalPayload, ReviewVerdictProposalPayload,
 };
 
 /// `work_attention_items.kind` for an `attention` proposal that did not
@@ -88,13 +89,18 @@ pub fn apply_policy(kind: ProposalKind) -> ProposalApplyPolicy {
         | ProposalKind::Blocked
         | ProposalKind::DeferredScope
         | ProposalKind::AutomationOutcome
-        | ProposalKind::PrCreated => ProposalApplyPolicy::AutoApply,
+        | ProposalKind::PrCreated
+        | ProposalKind::ReviewReport => ProposalApplyPolicy::AutoApply,
         // Gated by design: task creation from a followup proposal always
         // requires the human batch-accept gesture
         // (`WorkDb::action_attention_group`). See
         // `stage_followup_task_in_transaction` for what *does* still happen
         // synchronously at submission for this kind despite being gated.
         ProposalKind::FollowupTask => ProposalApplyPolicy::Gated,
+        // Gated because verdict application is asynchronous and lands outside
+        // the submission transaction. The row stays `proposed` until that
+        // applier consumes it; nothing is staged at submission.
+        ProposalKind::ReviewVerdict => ProposalApplyPolicy::Gated,
     }
 }
 
@@ -151,13 +157,112 @@ pub fn apply_in_transaction(
         ProposalKind::DeferredScope => apply_deferred_scope(tx, execution_id, payload_json).map(ApplyDecision::Applied),
         ProposalKind::AutomationOutcome => apply_automation_outcome(tx, execution_id, payload_json, proposal_id),
         ProposalKind::PrCreated => apply_pr_created(tx, execution_id, payload_json),
-        ProposalKind::FollowupTask => {
-            anyhow::bail!(
-                "no applier for `{kind}`; it is Gated by design and never routes through \
-                 apply_in_transaction — see stage_followup_task_in_transaction"
-            )
-        }
+        ProposalKind::ReviewReport => apply_review_report(tx, execution_id, payload_json, proposal_id),
+        ProposalKind::FollowupTask => anyhow::bail!(
+            "no applier for `followup_task`; it stages via \
+             stage_followup_task_in_transaction and remains Gated for human acceptance"
+        ),
+        ProposalKind::ReviewVerdict => anyhow::bail!(
+            "no applier for `review_verdict`; it remains Gated because its asynchronous applier has not landed"
+        ),
     }
+}
+
+/// Accept a report only into the review-batch member that owns this reviewer
+/// execution. The report body remains on the immutable proposal row; the
+/// member stores that proposal id as its durable pointer. Execution retention
+/// excludes owners of accepted reports, preserving the proposal row from its
+/// otherwise-cascading execution delete.
+fn apply_review_report(
+    tx: &Transaction<'_>,
+    execution_id: &str,
+    payload_json: &str,
+    proposal_id: &str,
+) -> Result<ApplyDecision> {
+    let payload: ReviewReportProposalPayload = serde_json::from_str(payload_json)?;
+    let member = tx
+        .query_row(
+            "SELECT batch_id, execution_id, status, report_proposal_id
+             FROM pr_review_batch_members WHERE id = ?1",
+            [&payload.member_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((member_batch_id, member_execution_id, status, existing_report)) = member else {
+        return Ok(ApplyDecision::Rejected(format!(
+            "review batch member `{}` does not exist",
+            payload.member_id
+        )));
+    };
+    if member_batch_id != payload.batch_id {
+        return Ok(ApplyDecision::Rejected(format!(
+            "review batch member `{}` belongs to batch `{member_batch_id}`, not `{}`",
+            payload.member_id, payload.batch_id
+        )));
+    }
+    if member_execution_id.as_deref() != Some(execution_id) {
+        return Ok(ApplyDecision::Rejected(format!(
+            "review batch member `{}` is not owned by this execution",
+            payload.member_id
+        )));
+    }
+    if let Some(existing_report) = existing_report {
+        return Ok(ApplyDecision::Rejected(format!(
+            "review batch member `{}` already accepted report proposal `{existing_report}`",
+            payload.member_id
+        )));
+    }
+    let status: ReviewBatchMemberStatus = status.parse().map_err(anyhow::Error::msg)?;
+    if !matches!(
+        status,
+        ReviewBatchMemberStatus::Pending | ReviewBatchMemberStatus::Running
+    ) {
+        return Ok(ApplyDecision::Rejected(format!(
+            "review batch member `{}` cannot accept a report while status is `{status}`",
+            payload.member_id
+        )));
+    }
+
+    let now = now_string();
+    tx.execute(
+        "UPDATE pr_review_batch_members
+         SET status = ?1, report_proposal_id = ?2, terminal_at = ?3, updated_at = ?3
+         WHERE id = ?4",
+        rusqlite::params![
+            ReviewBatchMemberStatus::Reported.as_str(),
+            proposal_id,
+            now,
+            payload.member_id
+        ],
+    )?;
+    Ok(ApplyDecision::Applied(ApplyOutcome {
+        applied_ref: Some(payload.member_id),
+        post_commit_audit_line: None,
+    }))
+}
+
+/// Supersede prior undecided verdicts for the submitted batch. A later
+/// asynchronous applier can therefore consume exactly one proposed verdict:
+/// the newest submission for that batch.
+pub fn supersede_prior_review_verdicts(tx: &Transaction<'_>, payload_json: &str, proposal_id: &str) -> Result<()> {
+    let payload: ReviewVerdictProposalPayload = serde_json::from_str(payload_json)?;
+    let now = now_string();
+    tx.execute(
+        "UPDATE worker_proposals
+         SET state = 'superseded', decided_by = 'policy', decided_at = ?2,
+             decision_reason = 'superseded by newer review_verdict proposal (' || ?3 || ') for the same batch'
+         WHERE kind = 'review_verdict' AND state = 'proposed' AND id <> ?3
+           AND json_extract(payload_json, '$.batch_id') = ?1",
+        rusqlite::params![payload.batch_id, now, proposal_id],
+    )?;
+    Ok(())
 }
 
 fn create_attention_item_row(
