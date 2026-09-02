@@ -45,7 +45,7 @@ The only discriminator is the `sessionId` **value**, and Boss never compares it:
 
 - `accepts_typed_input()` is false — nudges, interrupts and answer delivery are refused for a worker that is alive and working.
 - `activity_for_run` / `is_run_live` (`live_worker_state.rs:903`, `:890`) skip the slot, so a mid-turn finalization guard reads "no live worker".
-- `ServerState::list_husk_panes` filters terminal entries out of its live set — the exact 2026-07-26 incident shape that `husk_pane_sweep`'s module docs describe (`tools/boss/engine/core/src/husk_pane_sweep.rs:66-75`), where a spurious `SessionEnd` burst got five live workers SIGTERMed. `live_process_evidence` corroboration (added in response to that incident) would spare the pane here, but it is a backstop against a bug, not a licence to introduce one deterministically.
+- `ServerState::list_hosted_pane_statuses` classifies terminal entries without live-process corroboration as husks — the exact 2026-07-26 incident shape that `husk_pane_sweep`'s module docs describe (`tools/boss/engine/core/src/husk_pane_sweep.rs:66-75`), where a spurious `SessionEnd` burst got five live workers SIGTERMed. `live_process_evidence` corroboration (added in response to that incident) would spare the pane here, but it is a backstop against a bug, not a licence to introduce one deterministically.
 
 For a **blocking** subagent the wrong state is transient — the parent's next `pre_tool_use` restores `Working`. For a **background** subagent it is not: the parent's turn has already ended, so `Terminated` is the slot's last observed state until something else arrives.
 

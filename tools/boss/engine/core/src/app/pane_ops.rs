@@ -43,6 +43,16 @@ pub enum SendInputError {
     NotAcceptingInput {
         activity: Option<boss_protocol::WorkerActivity>,
     },
+    #[error(
+        "worker driver exited before pane input (expected {expected_driver_binary:?}, observed {observed_process:?}); \
+         the run was terminalized and its pane released"
+    )]
+    DriverExited {
+        expected_driver_binary: String,
+        observed_process: Option<String>,
+    },
+    #[error("worker driver liveness could not be established; no pane input was sent: {0}")]
+    DriverLivenessUnavailable(String),
     #[error("app reported error: {0:?}")]
     App(EngineToAppError),
     #[error(transparent)]
@@ -272,6 +282,16 @@ impl ServerState {
                 Ok(slot_id)
             }
             PaneInjectOutcome::NotAcceptingInput { activity } => Err(SendInputError::NotAcceptingInput { activity }),
+            PaneInjectOutcome::SendFailed(PaneSendFailure::DriverExited {
+                expected_driver_binary,
+                observed_process,
+            }) => Err(SendInputError::DriverExited {
+                expected_driver_binary,
+                observed_process,
+            }),
+            PaneInjectOutcome::SendFailed(PaneSendFailure::DriverLivenessUnavailable(reason)) => {
+                Err(SendInputError::DriverLivenessUnavailable(reason))
+            }
             PaneInjectOutcome::SendFailed(PaneSendFailure::App(err)) => Err(SendInputError::App(err)),
             PaneInjectOutcome::SendFailed(PaneSendFailure::Send(err)) => Err(SendInputError::Send(err)),
             PaneInjectOutcome::SendFailed(PaneSendFailure::Tmux(err)) => Err(SendInputError::Tmux(err)),
@@ -300,6 +320,17 @@ impl ServerState {
     /// it does not delay this call's response. Claude and Codex are
     /// unaffected: their driver's `prepare_interrupt_recovery` default
     /// returns `None`, so nothing is spawned for them.
+    ///
+    /// Deliberately does NOT go through `send_pane_text_checked`/
+    /// `tmux_pane_confirmed_dead` (the shared, driver-verified boundary
+    /// every text write uses). An interrupt sends a single control key
+    /// (`Escape`) rather than agent-directed text, so the tty-leak
+    /// safety concern that boundary exists for does not apply here: a
+    /// stray Escape reaching a bare shell (or nothing at all) is
+    /// harmless, unlike a stray prompt. Skipping the liveness probe also
+    /// keeps interrupt cheap and side-effect-free on a slot that turns
+    /// out to be gone, rather than adding a reap path to a call whose
+    /// job is only to cancel a turn.
     pub async fn interrupt_worker_pane(&self, run_id: &str) -> Result<u8, InterruptPaneError> {
         let plan = self.interrupt_plan_for_run(run_id);
         self.deliver_interrupt_gesture(run_id, plan.as_ref()).await

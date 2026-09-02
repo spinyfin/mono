@@ -6,14 +6,107 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use boss_tmux::{CommandOutput, CommandRunner, Tmux};
 
-#[derive(Default)]
+/// The mocked tmux facts a [`PaneDeliveryRunner`] answers with. Kept as its
+/// own type (rather than four fields directly on the runner) so the runner
+/// itself stays under the project's `#[derive(bon::Builder)]` field-count
+/// threshold.
+struct PaneMockState {
+    foreground_process: String,
+    session_name: String,
+    /// Whether `list-sessions` reports this pane's session as present. Real
+    /// death evidence — not a foreground-command mismatch — is what the
+    /// tmux pane-delivery boundary must key off; see
+    /// `send_input_refuses_a_dead_tmux_pane`.
+    session_present: bool,
+    /// Whether `#{pane_dead}` reports the pane as dead.
+    pane_dead: bool,
+    /// The `BOSS_SPAWN_TOKEN` `show-environment` reports for this session.
+    /// Must match the token seeded via `register_tmux_identity_for_test` for
+    /// the pane to read as alive; `spawn_token_mismatch` tests deliberately
+    /// mismatch it against the run row instead.
+    spawn_token: String,
+}
+
 struct PaneDeliveryRunner {
     calls: Mutex<Vec<Vec<String>>>,
     stdin: Mutex<Vec<Vec<u8>>>,
     started: tokio::sync::Notify,
+    state: PaneMockState,
 }
 
+impl Default for PaneDeliveryRunner {
+    fn default() -> Self {
+        Self::alive("claude", "boss-1")
+    }
+}
+
+/// The spawn token every fixture that wants a *matching* token seeds via
+/// `register_tmux_identity_for_test` and the mock both use, so tests that
+/// aren't specifically about spawn-token mismatch don't have to thread it
+/// through.
+const TEST_SPAWN_TOKEN: &str = "tok-test";
+
 impl PaneDeliveryRunner {
+    fn new(
+        foreground_process: impl Into<String>,
+        session_name: impl Into<String>,
+        session_present: bool,
+        pane_dead: bool,
+    ) -> Self {
+        Self::with_spawn_token(
+            foreground_process,
+            session_name,
+            session_present,
+            pane_dead,
+            TEST_SPAWN_TOKEN,
+        )
+    }
+
+    fn with_spawn_token(
+        foreground_process: impl Into<String>,
+        session_name: impl Into<String>,
+        session_present: bool,
+        pane_dead: bool,
+        spawn_token: impl Into<String>,
+    ) -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            stdin: Mutex::new(Vec::new()),
+            started: tokio::sync::Notify::new(),
+            state: PaneMockState {
+                foreground_process: foreground_process.into(),
+                session_name: session_name.into(),
+                session_present,
+                pane_dead,
+                spawn_token: spawn_token.into(),
+            },
+        }
+    }
+
+    /// A live pane whose session exists and is not reported dead —
+    /// `foreground_process` may or may not match the run's driver binary,
+    /// which by itself must never be treated as death evidence.
+    fn alive(foreground_process: impl Into<String>, session_name: impl Into<String>) -> Self {
+        Self::new(foreground_process, session_name, true, false)
+    }
+
+    /// A pane whose tmux session no longer exists at all.
+    fn session_gone(session_name: impl Into<String>) -> Self {
+        Self::new("", session_name, false, false)
+    }
+
+    /// A pane whose session exists but tmux itself reports `#{pane_dead}`.
+    fn pane_reported_dead(session_name: impl Into<String>) -> Self {
+        Self::new("", session_name, true, true)
+    }
+
+    /// A pane whose session name is present, but whose live spawn token no
+    /// longer matches the run row — the session was recycled and now
+    /// belongs to a different, later-spawned session.
+    fn spawn_token_mismatch(session_name: impl Into<String>) -> Self {
+        Self::with_spawn_token("claude", session_name, true, false, "tok-other")
+    }
+
     fn calls(&self) -> Vec<Vec<String>> {
         self.calls.lock().unwrap().clone()
     }
@@ -21,13 +114,37 @@ impl PaneDeliveryRunner {
         self.stdin.lock().unwrap().clone()
     }
 
-    fn success() -> CommandOutput {
+    fn success(stdout: impl Into<String>) -> CommandOutput {
         CommandOutput {
             success: true,
             code: Some(0),
-            stdout: String::new(),
+            stdout: stdout.into(),
             stderr: String::new(),
         }
+    }
+
+    fn response(&self, args: &[OsString]) -> CommandOutput {
+        let args = args.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>();
+        if args.iter().any(|arg| arg == "list-sessions") {
+            return Self::success(if self.state.session_present {
+                format!("{}\t\n", self.state.session_name)
+            } else {
+                String::new()
+            });
+        }
+        if args.iter().any(|arg| arg == "show-environment") {
+            return Self::success(format!("BOSS_SPAWN_TOKEN={}\n", self.state.spawn_token));
+        }
+        if args.iter().any(|arg| arg == "#{pane_current_command}") {
+            return Self::success(format!("{}\n", self.state.foreground_process));
+        }
+        if args.iter().any(|arg| arg == "#{pane_dead}") {
+            return Self::success(if self.state.pane_dead { "1\n" } else { "0\n" });
+        }
+        if args.iter().any(|arg| arg == "#{pane_dead_status}") {
+            return Self::success(if self.state.pane_dead { "1\n" } else { "" });
+        }
+        Self::success("")
     }
 }
 
@@ -40,7 +157,7 @@ impl CommandRunner for PaneDeliveryRunner {
             .unwrap()
             .push(args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect());
         self.started.notify_one();
-        Ok(Self::success())
+        Ok(self.response(args))
     }
 
     async fn run_with_stdin(
@@ -57,7 +174,7 @@ impl CommandRunner for PaneDeliveryRunner {
             .push(args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect());
         self.stdin.lock().unwrap().push(stdin.to_vec());
         self.started.notify_one();
-        Ok(Self::success())
+        Ok(self.response(args))
     }
 }
 
@@ -174,7 +291,7 @@ async fn send_input_to_worker_round_trips_to_app() {
     // surfaces the slot id once both land. Worker must be Idle so
     // the typed-input activity guard allows the write.
     let (server_state, _dir) = test_server_state();
-    register_idle_worker(&server_state, "run-send", 7);
+    let run_id = register_idle_worker_with_driver(&server_state, 7, None);
 
     let sink = make_session_sink();
     server_state
@@ -182,7 +299,12 @@ async fn send_input_to_worker_round_trips_to_app() {
         .await;
 
     let server_clone = server_state.clone();
-    let send = tokio::spawn(async move { server_clone.send_input_to_worker("run-send", "/help\n".into()).await });
+    let run_id_for_send = run_id.clone();
+    let send = tokio::spawn(async move {
+        server_clone
+            .send_input_to_worker(&run_id_for_send, "/help\n".into())
+            .await
+    });
 
     let envelope = sink.next().await.expect("an EngineRequest event should be enqueued");
     let (request_id, request) = match envelope.payload {
@@ -193,6 +315,7 @@ async fn send_input_to_worker_round_trips_to_app() {
         EngineToAppRequest::SendToPane(input) => {
             assert_eq!(input.slot_id, 7);
             assert_eq!(input.text, "/help\n");
+            assert_eq!(input.expected_driver_binary, "claude");
         }
         other => panic!("expected SendToPane, got {other:?}"),
     }
@@ -220,7 +343,7 @@ async fn send_input_to_worker_round_trips_to_app() {
                 session_id: "claude-sess-1".into(),
                 prompt: "/help\n".into(),
             },
-            Some("run-send".to_owned()),
+            Some(run_id),
             None,
         ),
     )
@@ -230,14 +353,98 @@ async fn send_input_to_worker_round_trips_to_app() {
     assert_eq!(slot, 7);
 }
 
+/// A pin change (`tasks.driver`) applied to a task after its worker has
+/// already launched must not retroactively change which process the
+/// pane-input boundary expects to see in that worker's PTY —
+/// `expected_driver_binary` reads the *launched* driver
+/// (`work_executions.driver`, frozen at spawn), not a live re-resolution of
+/// the pin. Without this, changing the pin mid-run would make the still-
+/// correctly-running worker look like a driver mismatch and terminalize it.
+#[tokio::test]
+async fn send_input_is_unaffected_by_a_driver_pin_change_after_launch() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_idle_worker_with_driver(&server_state, 7, None);
+    assert_eq!(
+        server_state.work_db.get_execution(&run_id).unwrap().driver.as_deref(),
+        Some("claude"),
+        "precondition: the worker launched on the engine default driver",
+    );
+    let task_id = server_state.work_db.get_execution(&run_id).unwrap().work_item_id;
+    server_state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET driver = ?2 WHERE id = ?1",
+            rusqlite::params![task_id, "grok"],
+        )
+        .unwrap();
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    let server_clone = server_state.clone();
+    let run_id_for_send = run_id.clone();
+    let send = tokio::spawn(async move {
+        server_clone
+            .send_input_to_worker(&run_id_for_send, "/help\n".into())
+            .await
+    });
+
+    let envelope = sink.next().await.expect("an EngineRequest event should be enqueued");
+    let (request_id, request) = match envelope.payload {
+        FrontendEvent::EngineRequest { request_id, request } => (request_id, request),
+        other => panic!("expected EngineRequest, got {other:?}"),
+    };
+    match request {
+        EngineToAppRequest::SendToPane(input) => {
+            assert_eq!(
+                input.expected_driver_binary, "claude",
+                "the launched driver must win over the post-launch pin change",
+            );
+        }
+        other => panic!("expected SendToPane, got {other:?}"),
+    }
+
+    server_state
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::SendToPane {
+                result: Ok(crate::protocol::SendToPaneResult {}),
+            },
+        )
+        .await;
+    dispatch_live_worker_state(
+        &server_state,
+        &crate::events_socket::IncomingHookEvent::for_test(
+            crate::protocol::WorkerEvent::UserPromptSubmit {
+                session_id: "claude-sess-1".into(),
+                prompt: "/help\n".into(),
+            },
+            Some(run_id),
+            None,
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        send.await.expect("send task").expect("send ok, not a driver mismatch"),
+        7
+    );
+}
+
 #[tokio::test]
 async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery() {
     let (server_state, _dir) = test_server_state();
-    register_idle_worker(&server_state, "run-tmux-send", 7);
+    let run_id = register_idle_worker_with_driver(&server_state, 7, None);
     server_state
         .worker_registry
-        .register_tmux_run_slot("run-tmux-send", 7, "boss-tmux-send");
-    let runner = Arc::new(PaneDeliveryRunner::default());
+        .register_tmux_run_slot(&run_id, 7, "boss-tmux-send");
+    register_tmux_identity_for_test(&server_state, &run_id, "boss-tmux-send", TEST_SPAWN_TOKEN);
+    let runner = Arc::new(PaneDeliveryRunner::alive("claude", "boss-tmux-send"));
     *server_state.pane_delivery_tmux_override.write().unwrap() =
         Some(Tmux::with_runner_and_socket("/usr/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap());
 
@@ -247,9 +454,10 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
     // delivery.
     let command_started = runner.started.notified();
     let server_clone = server_state.clone();
+    let run_id_for_send = run_id.clone();
     let send = tokio::spawn(async move {
         server_clone
-            .send_input_to_worker("run-tmux-send", "first line\nsecond line\n".into())
+            .send_input_to_worker(&run_id_for_send, "first line\nsecond line\n".into())
             .await
     });
     command_started.await;
@@ -260,7 +468,7 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
                 session_id: "tmux-sess-1".into(),
                 prompt: "first line\nsecond line".into(),
             },
-            Some("run-tmux-send".to_owned()),
+            Some(run_id),
             None,
         ),
     )
@@ -269,20 +477,52 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
     assert_eq!(send.await.expect("send task").expect("tmux send succeeds"), 7);
     let calls = runner.calls();
     assert!(
-        calls.len() >= 3,
-        "paste delivery is three tmux calls; extra capture-pane reads are the pane-text \
-         confirmation signal racing the UserPromptSubmit hook: {calls:?}"
+        calls.len() >= 6,
+        "session, spawn-token, and pane verification plus paste delivery issue six tmux calls; extra capture-pane reads are the pane-text confirmation signal racing the UserPromptSubmit hook: {calls:?}"
     );
-    assert_eq!(calls[0][..3], ["-S", boss_tmux::TEST_SOCKET_PATH, "load-buffer"]);
-    assert_eq!(calls[0][3], "-b");
-    let buffer_name = calls[0][4].clone();
+    assert_eq!(
+        calls[0],
+        vec![
+            "-S",
+            boss_tmux::TEST_SOCKET_PATH,
+            "list-sessions",
+            "-F",
+            "#{session_name}\t#{@boss_spawn_token}"
+        ]
+    );
+    assert_eq!(
+        calls[1],
+        vec![
+            "-S",
+            boss_tmux::TEST_SOCKET_PATH,
+            "show-environment",
+            "-t",
+            "boss-tmux-send",
+            "BOSS_SPAWN_TOKEN"
+        ]
+    );
+    assert_eq!(
+        calls[2],
+        vec![
+            "-S",
+            boss_tmux::TEST_SOCKET_PATH,
+            "display-message",
+            "-p",
+            "-t",
+            "boss-tmux-send",
+            "#{pane_dead}",
+        ]
+    );
+    assert_eq!(calls[3][..3], ["-S", boss_tmux::TEST_SOCKET_PATH, "load-buffer"]);
+    assert_eq!(calls[3][3], "-b");
+    let buffer_name = calls[3][4].clone();
     assert!(
         buffer_name.starts_with("boss-deliver-boss-tmux-send-"),
         "unexpected buffer name: {buffer_name}"
     );
-    assert_eq!(calls[0][5], "-");
+    assert_eq!(calls[3][5], "-");
     assert_eq!(
-        calls[1],
+        calls[4],
         vec![
             "-S",
             boss_tmux::TEST_SOCKET_PATH,
@@ -296,7 +536,7 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
         ]
     );
     assert_eq!(
-        calls[2],
+        calls[5],
         vec![
             "-S",
             boss_tmux::TEST_SOCKET_PATH,
@@ -306,7 +546,7 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
             "C-m"
         ]
     );
-    for extra in &calls[3..] {
+    for extra in &calls[6..] {
         assert!(
             extra.contains(&"capture-pane".to_owned()),
             "commands after the paste must be pane-text confirmation, not another write: {extra:?}"
@@ -315,22 +555,245 @@ async fn send_input_to_tmux_worker_pastes_multiline_text_and_confirms_delivery()
     assert_eq!(runner.stdin(), vec![b"first line\nsecond line".to_vec()]);
 }
 
+/// Real death evidence (the tmux session no longer exists) must still
+/// refuse the write and terminalize the run. A foreground-command mismatch
+/// alone must NOT — see
+/// `mid_turn_probe_to_a_tmux_pane_running_a_foreground_child_is_not_orphaned`
+/// below, which pins the opposite: an agent running a foreground child
+/// (e.g. `bazel build`) is alive and must still receive its write.
+#[tokio::test]
+async fn send_input_refuses_a_dead_tmux_pane() {
+    use crate::work::ExecutionStatus;
+
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_idle_worker_with_driver(&server_state, 1, Some("grok"));
+    let pool = server_state.execution_coordinator.worker_pool();
+    pool.claim_worker(&run_id, None)
+        .await
+        .expect("precondition: slot must be claimed");
+    server_state
+        .worker_registry
+        .register_tmux_run_slot(&run_id, 1, "boss-tmux-driver-exited");
+    register_tmux_identity_for_test(&server_state, &run_id, "boss-tmux-driver-exited", TEST_SPAWN_TOKEN);
+    let runner = Arc::new(PaneDeliveryRunner::session_gone("boss-tmux-driver-exited"));
+    *server_state.pane_delivery_tmux_override.write().unwrap() =
+        Some(Tmux::with_runner_and_socket("/usr/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap());
+
+    let err = server_state
+        .send_input_to_worker(&run_id, "do not write this to a dead pane".into())
+        .await
+        .expect_err("a session that no longer exists must refuse pane input");
+    assert!(matches!(
+        err,
+        SendInputError::DriverExited {
+            expected_driver_binary,
+            observed_process: None,
+        } if expected_driver_binary == "grok"
+    ));
+
+    assert_eq!(
+        runner.calls(),
+        vec![vec![
+            "-S".to_owned(),
+            boss_tmux::TEST_SOCKET_PATH.to_owned(),
+            "list-sessions".to_owned(),
+            "-F".to_owned(),
+            "#{session_name}\t#{@boss_spawn_token}".to_owned(),
+        ]],
+        "session-absence is established by list-sessions alone; no text may reach send-keys",
+    );
+    assert_eq!(
+        server_state.work_db.get_execution(&run_id).unwrap().status,
+        ExecutionStatus::Orphaned,
+        "confirmed death terminalizes the execution instead of leaving it idle",
+    );
+    assert!(
+        server_state.worker_registry.slot_for_run(&run_id).is_none(),
+        "the terminalized execution must no longer own a pane slot",
+    );
+    assert!(
+        server_state.live_worker_states.get(1).is_none(),
+        "the terminalized execution must no longer appear as an idle worker",
+    );
+    assert_eq!(
+        pool.idle_count().await,
+        pool.capacity().await,
+        "the dead driver's worker-pool claim must be released",
+    );
+}
+
+/// The second form of real death evidence: the session still exists but
+/// tmux itself reports the pane dead (`#{pane_dead}`) — e.g. the driver
+/// crashed and tmux has not yet reaped the session.
+#[tokio::test]
+async fn send_input_refuses_a_tmux_pane_reported_dead() {
+    use crate::work::ExecutionStatus;
+
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_idle_worker_with_driver(&server_state, 1, Some("grok"));
+    let pool = server_state.execution_coordinator.worker_pool();
+    pool.claim_worker(&run_id, None)
+        .await
+        .expect("precondition: slot must be claimed");
+    server_state
+        .worker_registry
+        .register_tmux_run_slot(&run_id, 1, "boss-tmux-pane-dead");
+    register_tmux_identity_for_test(&server_state, &run_id, "boss-tmux-pane-dead", TEST_SPAWN_TOKEN);
+    let runner = Arc::new(PaneDeliveryRunner::pane_reported_dead("boss-tmux-pane-dead"));
+    *server_state.pane_delivery_tmux_override.write().unwrap() =
+        Some(Tmux::with_runner_and_socket("/usr/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap());
+
+    let err = server_state
+        .send_input_to_worker(&run_id, "do not write this to a dead pane".into())
+        .await
+        .expect_err("a pane tmux itself reports dead must refuse pane input");
+    assert!(matches!(
+        err,
+        SendInputError::DriverExited {
+            expected_driver_binary,
+            observed_process: Some(observed_process),
+        } if expected_driver_binary == "grok" && observed_process == "pane_dead_status=1"
+    ));
+    assert_eq!(
+        server_state.work_db.get_execution(&run_id).unwrap().status,
+        ExecutionStatus::Orphaned,
+        "confirmed death terminalizes the execution instead of leaving it idle",
+    );
+}
+
+/// The failure mode that made the naive foreground-command check dangerous:
+/// a live, working worker whose pane's foreground command is a child
+/// process (e.g. `bazel build`), not the driver binary itself. This must
+/// NOT be treated as death — the session is present and tmux does not
+/// report the pane dead, so the mid-turn probe write must still land, and
+/// the execution, pane mapping and live worker state must all survive.
+#[tokio::test(start_paused = true)]
+async fn mid_turn_probe_to_a_tmux_pane_running_a_foreground_child_is_not_orphaned() {
+    use crate::events_socket::IncomingHookEvent;
+    use crate::work::ExecutionStatus;
+
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 2, None);
+    server_state
+        .worker_registry
+        .register_tmux_run_slot(&run_id, 2, "boss-tmux-foreground-child");
+    register_tmux_identity_for_test(&server_state, &run_id, "boss-tmux-foreground-child", TEST_SPAWN_TOKEN);
+    let runner = Arc::new(PaneDeliveryRunner::alive("bazel", "boss-tmux-foreground-child"));
+    *server_state.pane_delivery_tmux_override.write().unwrap() =
+        Some(Tmux::with_runner_and_socket("/usr/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap());
+
+    let probe_id = server_state.queue_probe(run_id.clone(), "status update".into(), false);
+    let post_tool_use = IncomingHookEvent::for_test(
+        crate::protocol::WorkerEvent::PostToolUse {
+            session_id: "tmux-sess-1".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({}),
+            tool_response: serde_json::json!({}),
+        },
+        Some(run_id.clone()),
+        None,
+    );
+
+    let outcome = dispatch_probe_on_post_tool_use(&server_state, &post_tool_use).await;
+
+    assert_eq!(
+        outcome,
+        ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Buffered),
+        "a live worker running a foreground child (not the driver) must still receive the write",
+    );
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Buffered)
+    );
+    assert_ne!(
+        server_state.work_db.get_execution(&run_id).unwrap().status,
+        ExecutionStatus::Orphaned,
+        "an uncorroborated foreground-command mismatch must not terminalize the run",
+    );
+    assert!(
+        server_state.worker_registry.slot_for_run(&run_id).is_some(),
+        "the pane mapping must survive an uncorroborated foreground mismatch",
+    );
+    assert!(
+        server_state.live_worker_states.get(2).is_some(),
+        "the live worker state must survive an uncorroborated foreground mismatch",
+    );
+}
+
+/// A session bearing the run's expected *name* can belong to a different,
+/// later-spawned session if tmux recycled the name (e.g. after a crash and
+/// respawn). `list-sessions` alone cannot tell the two apart; only the
+/// durable `@boss_spawn_token` distinguishes them. A mismatched token must
+/// refuse the write and terminalize the run exactly like session-absence or
+/// `#{pane_dead}` — writing into it would land the prompt in a foreign
+/// agent's PTY.
+#[tokio::test]
+async fn send_input_refuses_a_tmux_pane_whose_spawn_token_no_longer_matches() {
+    use crate::work::ExecutionStatus;
+
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_idle_worker_with_driver(&server_state, 1, Some("grok"));
+    server_state
+        .worker_registry
+        .register_tmux_run_slot(&run_id, 1, "boss-tmux-recycled");
+    register_tmux_identity_for_test(&server_state, &run_id, "boss-tmux-recycled", TEST_SPAWN_TOKEN);
+    let runner = Arc::new(PaneDeliveryRunner::spawn_token_mismatch("boss-tmux-recycled"));
+    *server_state.pane_delivery_tmux_override.write().unwrap() =
+        Some(Tmux::with_runner_and_socket("/usr/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap());
+
+    let err = server_state
+        .send_input_to_worker(&run_id, "must not reach a foreign agent's pane".into())
+        .await
+        .expect_err("a session whose spawn token no longer matches the run row must refuse pane input");
+    assert!(matches!(
+        err,
+        SendInputError::DriverExited {
+            expected_driver_binary,
+            observed_process: Some(observed_process),
+        } if expected_driver_binary == "grok" && observed_process == "spawn_token_mismatch"
+    ));
+    assert_eq!(
+        runner.calls(),
+        vec![
+            vec![
+                "-S".to_owned(),
+                boss_tmux::TEST_SOCKET_PATH.to_owned(),
+                "list-sessions".to_owned(),
+                "-F".to_owned(),
+                "#{session_name}\t#{@boss_spawn_token}".to_owned(),
+            ],
+            vec![
+                "-S".to_owned(),
+                boss_tmux::TEST_SOCKET_PATH.to_owned(),
+                "show-environment".to_owned(),
+                "-t".to_owned(),
+                "boss-tmux-recycled".to_owned(),
+                "BOSS_SPAWN_TOKEN".to_owned(),
+            ],
+        ],
+        "the token mismatch is established right after list-sessions; no text may reach send-keys",
+    );
+    assert_eq!(
+        server_state.work_db.get_execution(&run_id).unwrap().status,
+        ExecutionStatus::Orphaned,
+        "confirmed death terminalizes the execution instead of leaving it idle",
+    );
+}
+
 #[tokio::test]
 async fn tmux_pane_without_session_name_surfaces_typed_errors() {
     let (server_state, _dir) = test_server_state();
-    register_idle_worker(&server_state, "run-tmux-missing-session", 8);
+    let run_id = register_idle_worker_with_driver(&server_state, 8, None);
     server_state
         .worker_registry
-        .register_tmux_run_slot_without_session_for_test("run-tmux-missing-session", 8);
+        .register_tmux_run_slot_without_session_for_test(&run_id, 8);
 
     assert!(matches!(
-        server_state
-            .send_input_to_worker("run-tmux-missing-session", "hello".into())
-            .await,
+        server_state.send_input_to_worker(&run_id, "hello".into()).await,
         Err(SendInputError::Tmux(_))
     ));
     assert!(matches!(
-        server_state.interrupt_worker_pane("run-tmux-missing-session").await,
+        server_state.interrupt_worker_pane(&run_id).await,
         Err(InterruptPaneError::Tmux(_))
     ));
 }
@@ -338,19 +801,17 @@ async fn tmux_pane_without_session_name_surfaces_typed_errors() {
 #[tokio::test]
 async fn unavailable_tmux_preflight_surfaces_typed_errors() {
     let (server_state, _dir) = test_server_state();
-    register_idle_worker(&server_state, "run-tmux-unavailable", 9);
+    let run_id = register_idle_worker_with_driver(&server_state, 9, None);
     server_state
         .worker_registry
-        .register_tmux_run_slot("run-tmux-unavailable", 9, "boss-tmux-unavailable");
+        .register_tmux_run_slot(&run_id, 9, "boss-tmux-unavailable");
 
     assert!(matches!(
-        server_state
-            .send_input_to_worker("run-tmux-unavailable", "hello".into())
-            .await,
+        server_state.send_input_to_worker(&run_id, "hello".into()).await,
         Err(SendInputError::Tmux(_))
     ));
     assert!(matches!(
-        server_state.interrupt_worker_pane("run-tmux-unavailable").await,
+        server_state.interrupt_worker_pane(&run_id).await,
         Err(InterruptPaneError::Tmux(_))
     ));
 }
@@ -374,7 +835,7 @@ async fn send_input_to_worker_records_unconfirmed_without_probe_fallback() {
     // the mid-turn refusal path (see
     // `send_input_to_worker_refuses_when_worker_not_accepting_input`).
     let (server_state, _dir) = test_server_state();
-    register_idle_worker(&server_state, "run-unverified", 3);
+    let run_id = register_idle_worker_with_driver(&server_state, 3, None);
 
     let sink = make_session_sink();
     server_state
@@ -382,9 +843,10 @@ async fn send_input_to_worker_records_unconfirmed_without_probe_fallback() {
         .await;
 
     let server_clone = server_state.clone();
+    let run_id_for_send = run_id.clone();
     let send = tokio::spawn(async move {
         server_clone
-            .send_input_to_worker("run-unverified", "[chore-update] spec changed".into())
+            .send_input_to_worker(&run_id_for_send, "[chore-update] spec changed".into())
             .await
     });
 
@@ -418,7 +880,7 @@ async fn send_input_to_worker_records_unconfirmed_without_probe_fallback() {
     assert_eq!(slot, 3);
 
     assert!(
-        server_state.pop_pending_probe("run-unverified").is_none(),
+        server_state.pop_pending_probe(&run_id).is_none(),
         "unconfirmed pane write must not be re-queued as a probe — that would duplicate delivery \
          if the worker really did consume the original write",
     );
@@ -656,7 +1118,7 @@ async fn send_input_to_worker_refuses_when_live_state_missing() {
 #[tokio::test]
 async fn send_input_to_worker_surfaces_app_error() {
     let (server_state, _dir) = test_server_state();
-    register_idle_worker(&server_state, "run-send", 2);
+    let run_id = register_idle_worker_with_driver(&server_state, 2, None);
 
     let sink = make_session_sink();
     server_state
@@ -664,7 +1126,8 @@ async fn send_input_to_worker_surfaces_app_error() {
         .await;
 
     let server_clone = server_state.clone();
-    let send = tokio::spawn(async move { server_clone.send_input_to_worker("run-send", "hi\n".into()).await });
+    let run_id_for_send = run_id.clone();
+    let send = tokio::spawn(async move { server_clone.send_input_to_worker(&run_id_for_send, "hi\n".into()).await });
 
     let envelope = sink.next().await.expect("EngineRequest enqueued");
     let request_id = match envelope.payload {
@@ -687,6 +1150,98 @@ async fn send_input_to_worker_surfaces_app_error() {
         SendInputError::App(EngineToAppError::UnknownSlot) => {}
         other => panic!("expected App(UnknownSlot), got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn send_input_to_worker_terminalizes_when_the_app_reports_the_driver_exited() {
+    use crate::work::ExecutionStatus;
+
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_idle_worker_with_driver(&server_state, 1, Some("grok"));
+    let pool = server_state.execution_coordinator.worker_pool();
+    pool.claim_worker(&run_id, None)
+        .await
+        .expect("precondition: slot must be claimed");
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    let server_clone = server_state.clone();
+    let run_id_for_send = run_id.clone();
+    let send = tokio::spawn(async move {
+        server_clone
+            .send_input_to_worker(&run_id_for_send, "do not send this to zsh".into())
+            .await
+    });
+
+    let delivery = sink.next().await.expect("SendToPane request enqueued");
+    let (delivery_request_id, delivery_request) = match delivery.payload {
+        FrontendEvent::EngineRequest { request_id, request } => (request_id, request),
+        other => panic!("expected EngineRequest, got {other:?}"),
+    };
+    assert!(matches!(
+        delivery_request,
+        EngineToAppRequest::SendToPane(ref input)
+            if input.slot_id == 1 && input.expected_driver_binary == "grok"
+    ));
+    server_state
+        .deliver_app_response(
+            "session-app",
+            &delivery_request_id,
+            EngineToAppResponse::SendToPane {
+                result: Err(EngineToAppError::DriverExited {
+                    expected_driver_binary: "grok".to_owned(),
+                    observed_process: Some("zsh".to_owned()),
+                }),
+            },
+        )
+        .await;
+
+    let release = sink.next().await.expect("release request enqueued after driver exit");
+    let (release_request_id, release_request) = match release.payload {
+        FrontendEvent::EngineRequest { request_id, request } => (request_id, request),
+        other => panic!("expected EngineRequest, got {other:?}"),
+    };
+    assert!(matches!(
+        release_request,
+        EngineToAppRequest::ReleaseWorkerPane(ref input) if input.slot_id == 1
+    ));
+    server_state
+        .deliver_app_response(
+            "session-app",
+            &release_request_id,
+            EngineToAppResponse::ReleaseWorkerPane {
+                result: Ok(crate::protocol::ReleaseWorkerPaneResult {}),
+            },
+        )
+        .await;
+
+    assert!(matches!(
+        send.await.expect("send task"),
+        Err(SendInputError::DriverExited {
+            expected_driver_binary,
+            observed_process: Some(observed_process),
+        }) if expected_driver_binary == "grok" && observed_process == "zsh"
+    ));
+    assert_eq!(
+        server_state.work_db.get_execution(&run_id).unwrap().status,
+        ExecutionStatus::Orphaned,
+        "a reported driver exit must terminalize the execution"
+    );
+    assert!(
+        server_state.worker_registry.slot_for_run(&run_id).is_none(),
+        "a reported driver exit must release the pane mapping"
+    );
+    assert!(
+        server_state.live_worker_states.get(1).is_none(),
+        "a reported driver exit must not leave an idle worker state"
+    );
+    assert!(
+        !pool.claimed_execution_ids().await.contains(&run_id),
+        "a reported driver exit must release the exited execution's worker-pool claim before recovery may redispatch"
+    );
 }
 
 #[tokio::test]

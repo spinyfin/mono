@@ -384,13 +384,12 @@ async fn a_second_probe_waits_for_the_first_probes_reply_cycle() {
 #[tokio::test]
 async fn effort_escalation_ack_reaches_a_parked_worker_immediately() {
     let (server_state, _dir) = test_server_state();
-    let run_id = "run-escalation-ack";
-    register_idle_worker(&server_state, run_id, 8);
+    let run_id = register_idle_worker_with_driver(&server_state, 8, None);
     let responder = app_session_capturing_one_send(&server_state).await;
 
     let ack = "[effort-escalation-ack] approved: large. next_dispatch=true";
-    let probe_id = server_state.queue_probe(run_id.to_owned(), ack.to_owned(), false);
-    dispatch_probe_now(&server_state, run_id).await;
+    let probe_id = server_state.queue_probe(run_id.clone(), ack.to_owned(), false);
+    dispatch_probe_now(&server_state, &run_id).await;
 
     let (slot, text) = responder
         .await

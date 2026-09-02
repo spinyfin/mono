@@ -86,7 +86,7 @@ final class WorkersWorkspaceModelSendTests: XCTestCase {
         // like a successful injection, the engine moved on, and the
         // prompt was lost.
         let model = WorkersWorkspaceModel()
-        let result = model.sendToPane(slotId: 99, text: "echo hello")
+        let result = model.sendToPane(slotId: 99, text: "echo hello", expectedDriverBinary: "claude")
         guard case .failure(.unknownSlot) = result else {
             XCTFail("expected .unknownSlot for nonexistent slot, got \(result)")
             return
@@ -100,7 +100,7 @@ final class WorkersWorkspaceModelSendTests: XCTestCase {
         // `focusWorkerPane` test so the engine's failure-handling
         // path stays uniform across the three pane verbs.
         let model = WorkersWorkspaceModel()
-        let result = model.sendToPane(slotId: 1, text: "echo hello")
+        let result = model.sendToPane(slotId: 1, text: "echo hello", expectedDriverBinary: "claude")
         guard case .failure(.unknownSlot) = result else {
             XCTFail("expected .unknownSlot for idle slot, got \(result)")
             return
@@ -230,6 +230,97 @@ final class WorkersWorkspaceModelFocusTests: XCTestCase {
         let result = model.focusWorkerPane(slotId: 1)
         guard case .failure(.unknownSlot) = result else {
             XCTFail("expected .unknownSlot for idle slot, got \(result)")
+            return
+        }
+    }
+}
+
+@MainActor
+final class WorkersWorkspaceModelPaneInputTests: XCTestCase {
+    /// The only signal trustworthy enough to refuse: no live process at all
+    /// resolves on the surface's controlling tty (`foregroundPidIsAlive ==
+    /// false`, from `pidIsAlive` failing on whatever `foregroundPid`
+    /// returned, or the surface never attaching one).
+    func testDriverInputRefusesWhenNoForegroundProcessResolves() {
+        let error = WorkersWorkspaceModel.driverInputError(
+            expectedDriverBinary: "grok",
+            foregroundPidIsAlive: false,
+            foregroundProcessName: nil
+        )
+        guard case .driverExited(let expected, let observed) = error else {
+            XCTFail("expected no live foreground process to refuse agent input, got \(String(describing: error))")
+            return
+        }
+        XCTAssertEqual(expected, "grok")
+        XCTAssertNil(observed)
+    }
+
+    func testDriverInputAllowsTheLiveForegroundDriver() {
+        XCTAssertNil(
+            WorkersWorkspaceModel.driverInputError(
+                expectedDriverBinary: "grok",
+                foregroundPidIsAlive: true,
+                foregroundProcessName: "grok"
+            )
+        )
+    }
+
+    /// A live driver running a foreground child (e.g. a `bazel build` a
+    /// tool call shelled out to) is alive, not exited — the pane's
+    /// foreground command differing from the driver binary is the normal
+    /// shape of that, and must not refuse the write. This is the app-path
+    /// analogue of `TmuxWorkerTerminalInspector`/`classify_worker_liveness`
+    /// treating the identical tmux signal as `AliveAndWorking`.
+    func testDriverInputAllowsALiveForegroundChildOfTheDriver() {
+        XCTAssertNil(
+            WorkersWorkspaceModel.driverInputError(
+                expectedDriverBinary: "claude",
+                foregroundPidIsAlive: true,
+                foregroundProcessName: "bazel"
+            )
+        )
+    }
+
+    /// `proc_name` reports the kernel accounting name of whatever was
+    /// exec'd, which can differ from `DriverDescriptor.binary` for a
+    /// wrapped CLI (an interpreter or shim). That must not read as a
+    /// driver exit either — the decision no longer compares names at all.
+    func testDriverInputAllowsAProcessNameThatDiffersFromTheDriverInvocationName() {
+        XCTAssertNil(
+            WorkersWorkspaceModel.driverInputError(
+                expectedDriverBinary: "grok-cli",
+                foregroundPidIsAlive: true,
+                foregroundProcessName: "python3"
+            )
+        )
+    }
+
+    /// A live pid whose name `proc_name` cannot report (a transient
+    /// EPERM/ESRCH race, or a name the kernel won't report) must not be
+    /// conflated with "no process" — that would reap a healthy worker.
+    func testDriverInputAllowsALiveProcessWhoseNameIsUnavailable() {
+        XCTAssertNil(
+            WorkersWorkspaceModel.driverInputError(
+                expectedDriverBinary: "claude",
+                foregroundPidIsAlive: true,
+                foregroundProcessName: nil
+            )
+        )
+    }
+
+    /// An empty `expectedDriverBinary` is a field-level engine/app protocol
+    /// skew (or a malformed frame), not death evidence. It must refuse the
+    /// write without concluding the driver exited — a `.driverExited`
+    /// outcome here would reap every live worker the app writes to on a
+    /// single bad frame.
+    func testDriverInputRefusesEmptyExpectedBinaryNonTerminally() {
+        let error = WorkersWorkspaceModel.driverInputError(
+            expectedDriverBinary: "",
+            foregroundPidIsAlive: true,
+            foregroundProcessName: "claude"
+        )
+        guard case .internalFailure = error else {
+            XCTFail("expected an empty expected_driver_binary to refuse non-terminally, got \(String(describing: error))")
             return
         }
     }

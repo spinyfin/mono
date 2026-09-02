@@ -121,6 +121,45 @@ pub(super) fn register_idle_worker(server_state: &ServerState, run_id: &str, slo
     );
 }
 
+/// Like [`register_idle_worker`], but also creates the production-shaped
+/// execution row the pane-input liveness check resolves to find the driver's
+/// foreground executable.
+pub(super) fn register_idle_worker_with_driver(
+    server_state: &ServerState,
+    slot_id: u8,
+    driver: Option<&str>,
+) -> String {
+    let execution_id = execution_id_with_driver(server_state, driver);
+    register_idle_worker(server_state, &execution_id, slot_id);
+    execution_id
+}
+
+/// Give an execution the durable tmux identity (`work_runs.tmux_spawn_token`)
+/// that [`crate::app::pane_delivery::ServerState::send_pane_text_checked`]'s
+/// tmux boundary now requires to validate a session before writing to it —
+/// mirroring what `spawn_flow` records in production before any pane input
+/// is possible. `session_name` must match what the test's mocked
+/// `PaneDeliveryRunner`/tmux stub reports for `list-sessions`/
+/// `show-environment` so the spawn-token comparison passes.
+pub(super) fn register_tmux_identity_for_test(
+    server_state: &ServerState,
+    execution_id: &str,
+    session_name: &str,
+    spawn_token: &str,
+) {
+    let db = server_state.work_db.as_ref();
+    db.start_execution_run(execution_id, "worker-1", "repo-1", "lease-1", "ws-1", "/tmp/ws")
+        .expect("start_execution_run for tmux identity fixture");
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(execution_id, boss_tmux::SERVER_LABEL, session_name, spawn_token)
+            .expect("record_tmux_spawn_intent_for_execution"),
+    );
+    assert!(
+        db.record_tmux_session_created_for_execution(execution_id, spawn_token, 4242)
+            .expect("record_tmux_session_created_for_execution"),
+    );
+}
+
 /// Like [`register_idle_worker`], but leaves activity at
 /// [`boss_protocol::WorkerActivity::Working`] (a PreToolUse with no
 /// balancing Stop). Used to assert the typed-input guard refuses
@@ -212,11 +251,25 @@ fn execution_id_with_driver(server_state: &ServerState, driver: Option<&str>) ->
             )
             .unwrap();
     }
-    server_state
+    let execution = server_state
         .work_db
         .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
-        .unwrap()
-        .id
+        .unwrap();
+    // The pane-input boundary reads the *launched* driver
+    // (`work_executions.driver`), which production freezes via
+    // `record_execution_launch_config` right after the worker's pane
+    // spawns — before any pane write can reach it. Mirror that here so
+    // fixtures built before a pane exists behave like a real run.
+    server_state
+        .work_db
+        .record_execution_launch_config(
+            &execution.id,
+            driver.unwrap_or(boss_engine_effort::ENGINE_DEFAULT_DRIVER),
+            "test-model",
+            None,
+        )
+        .unwrap();
+    execution.id
 }
 
 mod answer_agent_lifecycle;
