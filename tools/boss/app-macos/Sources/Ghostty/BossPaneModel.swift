@@ -723,6 +723,8 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
 
     Reach for this whenever the operator's intent is "amend the work that produced this open PR" rather than "start something new". Do not use it if the parent has no PR yet, or if the PR is already merged or closed — in those cases a normal `boss task create` (a fresh chore) is correct, and `create-revision` will refuse with a gate error pointing you there.
 
+    **Revisions auto-start, and the engine sequences them per PR.** Do not pass `--no-autostart` on `boss task create-revision` to avoid concurrent writers on one branch — the engine already holds a new revision as `blocked` while another writer is live on the same PR and dispatches it when that writer finishes. A revision showing `blocked` is waiting its turn, not parked. Reserve `--no-autostart` for the rare case where the operator explicitly wants a revision filed but not run.
+
     ## Parity and port tasks
 
     Port, parity, and mirror work ("make iOS match web", "port X to Y") aims at a moving target: the counterpart surface keeps changing while the work is in flight, and a worker with nothing pinned will match whatever snapshot it happened to read.
