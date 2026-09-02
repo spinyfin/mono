@@ -359,7 +359,9 @@ pub struct ReviewReportProposalPayload {
 
 /// Payload for `ProposalKind::ReviewVerdict`. A supervisor submits its
 /// consolidated verdict against one batch. Verdict application is deliberately
-/// asynchronous, so submissions remain `proposed` until that applier lands.
+/// asynchronous, so the newest submission remains `proposed` until that
+/// applier lands; a newer verdict supersedes any earlier undecided verdict
+/// for the same batch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReviewVerdictProposalPayload {
     pub batch_id: String,

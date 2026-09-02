@@ -61,7 +61,8 @@ use crate::worker_escalation::{WORKER_BLOCKED_ATTENTION_KIND, WORKER_ESCALATION_
 use boss_protocol::{
     Attention, AttentionGroup, AttentionProposalPayload, AutomationOutcomeProposalPayload, BlockedProposalPayload,
     CreateAttentionInput, CreateAttentionItemInput, DeferredScopeProposalPayload, EffortEscalationProposalPayload,
-    FollowupTaskProposalPayload, PrCreatedProposalPayload, ProposalKind, ReviewReportProposalPayload,
+    FollowupTaskProposalPayload, PrCreatedProposalPayload, ProposalKind, ReviewBatchMemberStatus,
+    ReviewReportProposalPayload, ReviewVerdictProposalPayload,
 };
 
 /// `work_attention_items.kind` for an `attention` proposal that did not
@@ -95,7 +96,11 @@ pub fn apply_policy(kind: ProposalKind) -> ProposalApplyPolicy {
         // (`WorkDb::action_attention_group`). See
         // `stage_followup_task_in_transaction` for what *does* still happen
         // synchronously at submission for this kind despite being gated.
-        ProposalKind::FollowupTask | ProposalKind::ReviewVerdict => ProposalApplyPolicy::Gated,
+        ProposalKind::FollowupTask => ProposalApplyPolicy::Gated,
+        // Gated because verdict application is asynchronous and lands outside
+        // the submission transaction. The row stays `proposed` until that
+        // applier consumes it; nothing is staged at submission.
+        ProposalKind::ReviewVerdict => ProposalApplyPolicy::Gated,
     }
 }
 
@@ -153,18 +158,21 @@ pub fn apply_in_transaction(
         ProposalKind::AutomationOutcome => apply_automation_outcome(tx, execution_id, payload_json, proposal_id),
         ProposalKind::PrCreated => apply_pr_created(tx, execution_id, payload_json),
         ProposalKind::ReviewReport => apply_review_report(tx, execution_id, payload_json, proposal_id),
-        ProposalKind::FollowupTask | ProposalKind::ReviewVerdict => {
-            anyhow::bail!(
-                "no applier for `{kind}`; it is Gated by design and never routes through \
-                 apply_in_transaction"
-            )
-        }
+        ProposalKind::FollowupTask => anyhow::bail!(
+            "no applier for `followup_task`; it stages via \
+             stage_followup_task_in_transaction and remains Gated for human acceptance"
+        ),
+        ProposalKind::ReviewVerdict => anyhow::bail!(
+            "no applier for `review_verdict`; it remains Gated because its asynchronous applier has not landed"
+        ),
     }
 }
 
 /// Accept a report only into the review-batch member that owns this reviewer
 /// execution. The report body remains on the immutable proposal row; the
-/// member stores the proposal id as its durable pointer.
+/// member stores that proposal id as its durable pointer. Execution retention
+/// excludes owners of accepted reports, preserving the proposal row from its
+/// otherwise-cascading execution delete.
 fn apply_review_report(
     tx: &Transaction<'_>,
     execution_id: &str,
@@ -211,7 +219,11 @@ fn apply_review_report(
             payload.member_id
         )));
     }
-    if !matches!(status.as_str(), "pending" | "running") {
+    let status: ReviewBatchMemberStatus = status.parse().map_err(anyhow::Error::msg)?;
+    if !matches!(
+        status,
+        ReviewBatchMemberStatus::Pending | ReviewBatchMemberStatus::Running
+    ) {
         return Ok(ApplyDecision::Rejected(format!(
             "review batch member `{}` cannot accept a report while status is `{status}`",
             payload.member_id
@@ -221,14 +233,36 @@ fn apply_review_report(
     let now = now_string();
     tx.execute(
         "UPDATE pr_review_batch_members
-         SET status = 'reported', report_proposal_id = ?1, terminal_at = ?2, updated_at = ?2
-         WHERE id = ?3",
-        rusqlite::params![proposal_id, now, payload.member_id],
+         SET status = ?1, report_proposal_id = ?2, terminal_at = ?3, updated_at = ?3
+         WHERE id = ?4",
+        rusqlite::params![
+            ReviewBatchMemberStatus::Reported.as_str(),
+            proposal_id,
+            now,
+            payload.member_id
+        ],
     )?;
     Ok(ApplyDecision::Applied(ApplyOutcome {
         applied_ref: Some(payload.member_id),
         post_commit_audit_line: None,
     }))
+}
+
+/// Supersede prior undecided verdicts for the submitted batch. A later
+/// asynchronous applier can therefore consume exactly one proposed verdict:
+/// the newest submission for that batch.
+pub fn supersede_prior_review_verdicts(tx: &Transaction<'_>, payload_json: &str, proposal_id: &str) -> Result<()> {
+    let payload: ReviewVerdictProposalPayload = serde_json::from_str(payload_json)?;
+    let now = now_string();
+    tx.execute(
+        "UPDATE worker_proposals
+         SET state = 'superseded', decided_by = 'policy', decided_at = ?2,
+             decision_reason = 'superseded by newer review_verdict proposal (' || ?3 || ') for the same batch'
+         WHERE kind = 'review_verdict' AND state = 'proposed' AND id <> ?3
+           AND json_extract(payload_json, '$.batch_id') = ?1",
+        rusqlite::params![payload.batch_id, now, proposal_id],
+    )?;
+    Ok(())
 }
 
 fn create_attention_item_row(

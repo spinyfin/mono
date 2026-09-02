@@ -37,7 +37,9 @@
 //! `work_runs.execution_id`, `work_attention_items.execution_id`, and
 //! `worker_proposals.execution_id` are all `ON DELETE CASCADE`, so a pruned
 //! execution's runs, any (typically already-resolved) attention items, and
-//! any worker proposals pointing at it go with it. Screenshot attachments are
+//! any worker proposals pointing at it go with it. An execution that owns an
+//! accepted review report is excluded from pruning so its batch member's
+//! report pointer remains readable. Screenshot attachments are
 //! deliberately not in that set: their own retention policy removes bytes and
 //! leaves a tombstone after its longer evidence window.
 //! `automation_runs.triage_execution_id` has no FK — that row's
@@ -145,6 +147,11 @@ fn prune_terminal_executions_on(
         "SELECT id FROM work_executions
           WHERE status IN ({PRUNABLE_STATUSES_SQL})
             AND CAST(created_at AS INTEGER) < ?1
+            AND NOT EXISTS (
+                SELECT 1 FROM pr_review_batch_members AS m
+                WHERE m.execution_id = work_executions.id
+                  AND m.report_proposal_id IS NOT NULL
+            )
             AND id NOT IN (
                 SELECT id FROM (
                     SELECT id, ROW_NUMBER() OVER (
@@ -376,6 +383,71 @@ mod tests {
         assert_eq!(
             remaining_proposals, 0,
             "the cascade removes the proposal row along with its execution"
+        );
+    }
+
+    #[test]
+    fn preserves_a_terminal_execution_that_owns_an_accepted_review_report() {
+        let db = open_db();
+        let product_id = create_test_product_with_repo(&db, "p", Some("https://github.com/test/repo")).id;
+        let work_item_id = create_chore(&db, &product_id, "c1");
+        let now = 1_800_000_000i64;
+        let execution_id = insert_execution(&db, &work_item_id, "failed", now - 20 * DAY);
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "INSERT INTO pr_review_batches
+                 (id, cycle_root_id, base_sha, classification_json, created_at, phase, pr_number,
+                  pr_url, status, target_sha, updated_at)
+             VALUES ('batch_1', ?1, 'base', '{}', ?2, 'pre_merge', 1,
+                     'https://github.com/test/repo/pull/1', 'collecting', 'head', ?2)",
+            rusqlite::params![work_item_id, now.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pr_review_batch_members
+                 (id, batch_id, attempt, created_at, provider_effort, requested_driver,
+                  resolved_model, role, status, updated_at, execution_id, report_proposal_id)
+             VALUES ('member_1', 'batch_1', 1, ?1, 'medium', 'codex',
+                     'test-model', 'codex_reviewer', 'reported', ?1, ?2, 'report_1')",
+            rusqlite::params![now.to_string(), execution_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO worker_proposals
+                 (id, execution_id, work_item_id, kind, payload_json, idempotency_key, created_at)
+             VALUES ('report_1', ?1, ?2, 'review_report', '{}', 'idem_1', ?3)",
+            rusqlite::params![execution_id, work_item_id, now.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let outcome = db
+            .prune_terminal_executions(
+                ExecutionRetentionPolicy {
+                    max_age_secs: DEFAULT_RETENTION_MAX_AGE_SECS,
+                    keep_per_work_item: 0,
+                },
+                now,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome.deleted, 0,
+            "the report body must remain reachable through its member"
+        );
+        assert_eq!(db.list_executions(Some(&work_item_id)).unwrap().len(), 1);
+        let proposal_count: i64 = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM worker_proposals WHERE id = 'report_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            proposal_count, 1,
+            "retention must not cascade-delete the accepted report body"
         );
     }
 
