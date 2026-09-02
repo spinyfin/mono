@@ -41,7 +41,7 @@ const ANCESTOR_WALK_DEPTH: usize = 8;
 /// already use.
 pub const REMOTE_SLOT_BASE: u8 = boss_protocol::REMOTE_SLOT_BASE;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct WorkerRegistry {
     inner: Arc<Mutex<RegistryInner>>,
     /// Holds the machine-wide idle-sleep-prevention assertion for exactly
@@ -50,6 +50,12 @@ pub struct WorkerRegistry {
     /// [`crate::sleep_assertion::SleepAssertionController`] for why remote
     /// workers — which run on a different machine — must never count here.
     sleep_assertion: Arc<crate::sleep_assertion::SleepAssertionController>,
+}
+
+impl Default for WorkerRegistry {
+    fn default() -> Self {
+        Self::with_sleep_assertion(Arc::new(crate::sleep_assertion::SleepAssertionController::no_op()))
+    }
 }
 
 #[derive(Default)]
@@ -76,6 +82,16 @@ impl WorkerRegistry {
         Self::default()
     }
 
+    /// Build a registry with the supplied power-assertion controller. The
+    /// engine supplies the production `caffeinate` controller; the default
+    /// registry uses a no-op controller for hermetic tests.
+    pub(crate) fn with_sleep_assertion(sleep_assertion: Arc<crate::sleep_assertion::SleepAssertionController>) -> Self {
+        Self {
+            inner: Arc::default(),
+            sleep_assertion,
+        }
+    }
+
     /// Record that pid is the worker process for run `run_id`. Called by
     /// the spawn flow once it has both the run id and the spawned pid.
     pub fn register(&self, pid: libc::pid_t, run_id: impl Into<String>) {
@@ -90,7 +106,7 @@ impl WorkerRegistry {
     /// `run_id` in. The engine uses this to route follow-up
     /// `SendToPane` requests by run id.
     pub fn register_run_slot(&self, run_id: impl Into<String>, slot_id: u8) {
-        let count = {
+        {
             let mut inner = self.inner.lock().expect("registry poisoned");
             inner.run_to_slot.insert(
                 run_id.into(),
@@ -100,15 +116,15 @@ impl WorkerRegistry {
                     tmux_session_name: None,
                 },
             );
-            local_live_pane_count(&inner)
-        };
-        self.sleep_assertion.set_live_worker_panes(count);
+            self.sleep_assertion
+                .set_live_worker_panes(local_live_pane_count(&inner));
+        }
     }
 
     /// Record a tmux-hosted worker whose app surface must detach without
     /// signalling the independently-owned tmux session.
     pub fn register_tmux_run_slot(&self, run_id: impl Into<String>, slot_id: u8, session_name: impl Into<String>) {
-        let count = {
+        {
             let mut inner = self.inner.lock().expect("registry poisoned");
             inner.run_to_slot.insert(
                 run_id.into(),
@@ -118,9 +134,9 @@ impl WorkerRegistry {
                     tmux_session_name: Some(session_name.into()),
                 },
             );
-            local_live_pane_count(&inner)
-        };
-        self.sleep_assertion.set_live_worker_panes(count);
+            self.sleep_assertion
+                .set_live_worker_panes(local_live_pane_count(&inner));
+        }
     }
 
     /// Record an adopted tmux session while preserving legacy teardown and
@@ -131,7 +147,7 @@ impl WorkerRegistry {
         slot_id: u8,
         session_name: impl Into<String>,
     ) {
-        let count = {
+        {
             let mut inner = self.inner.lock().expect("registry poisoned");
             inner.run_to_slot.insert(
                 run_id.into(),
@@ -141,14 +157,14 @@ impl WorkerRegistry {
                     tmux_session_name: Some(session_name.into()),
                 },
             );
-            local_live_pane_count(&inner)
-        };
-        self.sleep_assertion.set_live_worker_panes(count);
+            self.sleep_assertion
+                .set_live_worker_panes(local_live_pane_count(&inner));
+        }
     }
 
     #[cfg(test)]
     pub fn register_tmux_run_slot_without_session_for_test(&self, run_id: impl Into<String>, slot_id: u8) {
-        let count = {
+        {
             let mut inner = self.inner.lock().expect("registry poisoned");
             inner.run_to_slot.insert(
                 run_id.into(),
@@ -158,9 +174,9 @@ impl WorkerRegistry {
                     tmux_session_name: None,
                 },
             );
-            local_live_pane_count(&inner)
-        };
-        self.sleep_assertion.set_live_worker_panes(count);
+            self.sleep_assertion
+                .set_live_worker_panes(local_live_pane_count(&inner));
+        }
     }
 
     /// Look up the slot id for `run_id`. Returns `None` if the run
@@ -237,28 +253,28 @@ impl WorkerRegistry {
     /// Cleanup uses the hosting mode to choose detach for tmux-owned workers
     /// and release for legacy app-owned processes.
     pub fn take_worker_pane_for_run(&self, run_id: &str) -> Option<RegisteredWorkerPane> {
-        let (pane, count) = {
+        {
             let mut inner = self.inner.lock().expect("registry poisoned");
             let pane = inner.run_to_slot.remove(run_id);
-            (pane, local_live_pane_count(&inner))
-        };
-        self.sleep_assertion.set_live_worker_panes(count);
-        pane
+            self.sleep_assertion
+                .set_live_worker_panes(local_live_pane_count(&inner));
+            pane
+        }
     }
 
     /// Drop the entry for `pid`. Called when a run terminates and the
     /// worker process exits.
     pub fn unregister(&self, pid: libc::pid_t) -> Option<String> {
-        let (run_id, count) = {
+        {
             let mut inner = self.inner.lock().expect("registry poisoned");
             let run_id = inner.pid_to_run.remove(&pid);
             if let Some(rid) = run_id.as_deref() {
                 inner.run_to_slot.remove(rid);
             }
-            (run_id, local_live_pane_count(&inner))
-        };
-        self.sleep_assertion.set_live_worker_panes(count);
-        run_id
+            self.sleep_assertion
+                .set_live_worker_panes(local_live_pane_count(&inner));
+            run_id
+        }
     }
 
     /// Direct pid lookup — no ancestor walk. Returns `None` if the pid
@@ -448,6 +464,23 @@ mod tests {
         for s in [a, b] {
             assert!(s >= REMOTE_SLOT_BASE, "remote slot {s} collided with the pool range");
         }
+    }
+
+    #[test]
+    fn sleep_assertion_counts_only_local_panes_and_releases_them() {
+        let reg = WorkerRegistry::new();
+        assert!(!reg.sleep_assertion.is_asserted());
+
+        reg.get_or_allocate_remote_slot("remote").unwrap();
+        assert!(
+            !reg.sleep_assertion.is_asserted(),
+            "remote panes must not take the local machine assertion"
+        );
+
+        reg.register_run_slot("local", 1);
+        assert!(reg.sleep_assertion.is_asserted());
+        reg.take_slot_for_run("local");
+        assert!(!reg.sleep_assertion.is_asserted());
     }
 
     #[test]

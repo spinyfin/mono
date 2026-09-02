@@ -7,8 +7,8 @@
 //! while a worker pane is mid-turn. The worker's process is frozen for the
 //! duration, not merely slow: wall-clock is lost, its pool slot stays
 //! occupied, and a response caught mid-stream can come back truncated. An
-//! idle engine with zero live workers must NOT hold this assertion — that
-//! would keep an operator's laptop awake for no reason.
+//! idle engine with zero live workers must NOT hold this assertion — the
+//! machine has to be free to sleep normally when no work is running.
 //!
 //! ## Mechanism
 //!
@@ -26,22 +26,21 @@
 //!
 //! [`SleepAssertionController::set_live_worker_panes`] is the single entry
 //! point: [`crate::worker_registry::WorkerRegistry`] calls it every time
-//! the set of live local worker panes changes, and a 0 <-> >0 crossing is
-//! what takes or releases the assertion. Remote workers (see
+//! the set of live local worker panes changes. A non-zero count takes the
+//! assertion when one is not already held, and zero releases it. Remote workers (see
 //! `WorkerRegistry::get_or_allocate_remote_slot`) run on a different
 //! machine and must never be counted here.
 //!
 //! ## Testing note
 //!
-//! The transition logic (0 <-> >0 decides take/release, everything else is
-//! a no-op) is unit-tested against a fake [`AssertionBackend`]. The real
+//! The transition logic is unit-tested against a fake [`AssertionBackend`]. The real
 //! `caffeinate`-spawning backend is deliberately not exercised by a unit
 //! test: Bazel's sandboxed test execution does not permit spawning
 //! arbitrary system binaries, so a test that actually launched
 //! `caffeinate` would be an environment-dependent flake rather than a
-//! meaningful check. It is exercised by the manual `pmset -g assertions`
-//! verification this change's PR describes instead — the same approach
-//! `syspolicyd_monitor.rs` takes with its own `ps`-shelling sampler.
+//! meaningful check. Verify the real backend by hand instead: with a worker
+//! pane live, `pmset -g assertions` shows `PreventUserIdleSystemSleep` held
+//! by a `caffeinate` child.
 
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
@@ -64,8 +63,7 @@ trait AssertionBackend: Send + Sync {
 }
 
 /// Tracks the live worker-pane count and the OS assertion that count
-/// implies. `Default` starts with no panes, no assertion, and the real
-/// `caffeinate` backend.
+/// implies.
 pub struct SleepAssertionController {
     inner: Mutex<Inner>,
     backend: Box<dyn AssertionBackend>,
@@ -83,8 +81,16 @@ struct Inner {
 }
 
 impl SleepAssertionController {
+    /// Build the production controller backed by `caffeinate`.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build a controller that tracks transitions without spawning a system
+    /// process. Registry tests use this so they can exercise local/remote
+    /// pane accounting without taking a machine-wide power assertion.
+    pub(crate) fn no_op() -> Self {
+        Self::with_backend(Box::new(NoopBackend))
     }
 
     fn with_backend(backend: Box<dyn AssertionBackend>) -> Self {
@@ -97,39 +103,64 @@ impl SleepAssertionController {
         }
     }
 
-    /// Report the current count of live *local* worker panes. Called after
-    /// every registration/release in `WorkerRegistry`. Only a 0 <-> >0
-    /// transition changes anything — every other call is a cheap no-op
-    /// under the lock.
+    /// Report the current count of live *local* worker panes. Called while
+    /// `WorkerRegistry` holds its lock, preserving the ordering of registry
+    /// mutations and assertion updates.
     pub fn set_live_worker_panes(&self, count: u32) {
-        let mut inner = self.inner.lock().expect("sleep assertion controller poisoned");
-        let was_zero = inner.live_worker_panes == 0;
-        let is_zero = count == 0;
-        inner.live_worker_panes = count;
-        if was_zero && !is_zero {
-            match self.backend.take() {
+        let action = {
+            let mut inner = self.inner.lock().expect("sleep assertion controller poisoned");
+            inner.live_worker_panes = count;
+            if count > 0 && inner.assertion.is_none() {
+                Action::Take
+            } else if count == 0 {
+                Action::Release(inner.assertion.take())
+            } else {
+                Action::None
+            }
+        };
+
+        match action {
+            Action::Take => match self.backend.take() {
                 Ok(assertion) => {
-                    tracing::info!(
-                        worker_panes = count,
-                        "took PreventUserIdleSystemSleep power assertion: worker pane(s) are live"
-                    );
-                    inner.assertion = Some(assertion);
+                    let unused_assertion = {
+                        let mut inner = self.inner.lock().expect("sleep assertion controller poisoned");
+                        if inner.live_worker_panes > 0 && inner.assertion.is_none() {
+                            tracing::info!(
+                                worker_panes = inner.live_worker_panes,
+                                "took PreventUserIdleSystemSleep power assertion: worker pane(s) are live"
+                            );
+                            inner.assertion = Some(assertion);
+                            None
+                        } else {
+                            Some(assertion)
+                        }
+                    };
+                    drop(unused_assertion);
                 }
                 Err(err) => {
-                    tracing::error!(
-                        error = %err,
-                        "failed to take PreventUserIdleSystemSleep power assertion; \
-                         the machine may sleep while worker panes are running"
-                    );
+                    if err.kind() == std::io::ErrorKind::Unsupported {
+                        tracing::debug!(error = %err, "idle-sleep power assertions are unsupported on this platform");
+                    } else {
+                        tracing::error!(
+                            error = %err,
+                            "failed to take PreventUserIdleSystemSleep power assertion; \
+                             the machine may sleep while worker panes are running"
+                        );
+                    }
                 }
+            },
+            Action::Release(released) => {
+                if released.is_some() {
+                    tracing::info!("released PreventUserIdleSystemSleep power assertion: no worker panes live");
+                }
+                drop(released);
             }
-        } else if !was_zero && is_zero && inner.assertion.take().is_some() {
-            tracing::info!("released PreventUserIdleSystemSleep power assertion: no worker panes live");
+            Action::None => {}
         }
     }
 
     #[cfg(test)]
-    fn is_asserted(&self) -> bool {
+    pub(crate) fn is_asserted(&self) -> bool {
         self.inner
             .lock()
             .expect("sleep assertion controller poisoned")
@@ -145,11 +176,23 @@ impl Drop for SleepAssertionController {
     /// (crash, `kill -9`) never run `Drop` at all — those are covered by
     /// `-w <our pid>` in [`CaffeinateBackend`] instead.
     fn drop(&mut self) {
-        let mut inner = self.inner.lock().expect("sleep assertion controller poisoned");
-        if inner.assertion.take().is_some() {
+        let released = self
+            .inner
+            .get_mut()
+            .expect("sleep assertion controller poisoned")
+            .assertion
+            .take();
+        if released.is_some() {
             tracing::info!("released PreventUserIdleSystemSleep power assertion: engine shutting down");
         }
+        drop(released);
     }
+}
+
+enum Action {
+    Take,
+    Release(Option<Box<dyn Assertion>>),
+    None,
 }
 
 /// Production backend: a `caffeinate -i -w <our pid>` child process. Its
@@ -158,6 +201,18 @@ impl Drop for SleepAssertionController {
 /// drops) is sufficient cleanup on the ordinary path, and the `-w` flag
 /// covers the abnormal one.
 struct CaffeinateBackend;
+
+struct NoopBackend;
+
+impl AssertionBackend for NoopBackend {
+    fn take(&self) -> std::io::Result<Box<dyn Assertion>> {
+        Ok(Box::new(NoopAssertion))
+    }
+}
+
+struct NoopAssertion;
+
+impl Assertion for NoopAssertion {}
 
 impl AssertionBackend for CaffeinateBackend {
     fn take(&self) -> std::io::Result<Box<dyn Assertion>> {
@@ -231,6 +286,21 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FailOnceBackend {
+        attempts: AtomicU32,
+    }
+
+    impl AssertionBackend for FailOnceBackend {
+        fn take(&self) -> std::io::Result<Box<dyn Assertion>> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(std::io::Error::other("transient fake failure"))
+            } else {
+                Ok(Box::new(FakeAssertion))
+            }
+        }
+    }
+
     fn controller() -> (SleepAssertionController, Arc<AtomicU32>) {
         let taken = Arc::new(AtomicU32::new(0));
         let backend = FakeBackend {
@@ -287,14 +357,13 @@ mod tests {
     }
 
     #[test]
-    fn backend_failure_leaves_no_assertion_but_does_not_panic() {
-        let backend = FakeBackend {
-            taken: Arc::new(AtomicU32::new(0)),
-            fail: true,
-        };
+    fn failed_take_is_retried_on_the_next_update() {
+        let backend = FailOnceBackend::default();
         let ctl = SleepAssertionController::with_backend(Box::new(backend));
         ctl.set_live_worker_panes(1);
         assert!(!ctl.is_asserted(), "a failed take must not leave a phantom assertion");
+        ctl.set_live_worker_panes(2);
+        assert!(ctl.is_asserted(), "the next update must retry a failed take");
     }
 
     #[test]
