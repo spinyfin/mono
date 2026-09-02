@@ -40,13 +40,23 @@ use crate::app::probe_interrupt::INTERRUPT_NOTICE;
 /// "an Escape was sent and then nothing was typed" are the difference between
 /// a correct failure and a corrupted one, and only the full call list can tell
 /// them apart.
-#[derive(Default)]
 struct RecordingTmux {
     calls: StdMutex<Vec<Vec<String>>>,
     stdin: StdMutex<Vec<Vec<u8>>>,
+    session_name: String,
+    spawn_token: String,
 }
 
 impl RecordingTmux {
+    fn alive(session_name: impl Into<String>, spawn_token: impl Into<String>) -> Self {
+        Self {
+            calls: StdMutex::new(Vec::new()),
+            stdin: StdMutex::new(Vec::new()),
+            session_name: session_name.into(),
+            spawn_token: spawn_token.into(),
+        }
+    }
+
     fn calls(&self) -> Vec<Vec<String>> {
         self.calls.lock().unwrap().clone()
     }
@@ -73,13 +83,27 @@ impl RecordingTmux {
             .any(|call| call.contains(&"load-buffer".to_owned()) || call.contains(&"-l".to_owned()))
     }
 
-    fn success() -> CommandOutput {
+    fn success(stdout: impl Into<String>) -> CommandOutput {
         CommandOutput {
             success: true,
             code: Some(0),
-            stdout: String::new(),
+            stdout: stdout.into(),
             stderr: String::new(),
         }
+    }
+
+    fn response(&self, args: &[OsString]) -> CommandOutput {
+        let args = args.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>();
+        if args.iter().any(|arg| arg == "list-sessions") {
+            return Self::success(format!("{}\t\n", self.session_name));
+        }
+        if args.iter().any(|arg| arg == "show-environment") {
+            return Self::success(format!("BOSS_SPAWN_TOKEN={}\n", self.spawn_token));
+        }
+        if args.iter().any(|arg| arg == "#{pane_dead}") {
+            return Self::success("0\n");
+        }
+        Self::success("")
     }
 }
 
@@ -90,7 +114,7 @@ impl CommandRunner for RecordingTmux {
             .lock()
             .unwrap()
             .push(args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect());
-        Ok(Self::success())
+        Ok(self.response(args))
     }
 
     async fn run_with_stdin(
@@ -105,17 +129,22 @@ impl CommandRunner for RecordingTmux {
             .unwrap()
             .push(args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect());
         self.stdin.lock().unwrap().push(stdin.to_vec());
-        Ok(Self::success())
+        Ok(self.response(args))
     }
 }
 
 /// Point `server_state`'s pane delivery at a recording tmux and register
 /// `run_id` as a tmux-hosted pane on `slot_id`.
 fn tmux_hosted(server_state: &Arc<ServerState>, run_id: &str, slot_id: u8) -> Arc<RecordingTmux> {
-    let runner = Arc::new(RecordingTmux::default());
+    const SPAWN_TOKEN: &str = "probe-interrupt-test-token";
+    let session_name = "boss-probe-interrupt";
+    let runner = Arc::new(RecordingTmux::alive(session_name, SPAWN_TOKEN));
     server_state
         .worker_registry
-        .register_tmux_run_slot(run_id, slot_id, "boss-probe-interrupt");
+        .register_tmux_run_slot(run_id, slot_id, session_name);
+    if server_state.work_db.get_execution(run_id).is_ok() {
+        register_tmux_identity_for_test(server_state, run_id, session_name, SPAWN_TOKEN);
+    }
     *server_state.pane_delivery_tmux_override.write().unwrap() =
         Some(Tmux::with_runner_and_socket("/usr/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap());
     runner

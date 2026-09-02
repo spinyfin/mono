@@ -594,8 +594,8 @@ async fn send_input_refuses_a_dead_tmux_pane() {
     assert_eq!(
         runner.calls(),
         vec![vec![
-            "-L".to_owned(),
-            "boss".to_owned(),
+            "-S".to_owned(),
+            boss_tmux::TEST_SOCKET_PATH.to_owned(),
             "list-sessions".to_owned(),
             "-F".to_owned(),
             "#{session_name}\t#{@boss_spawn_token}".to_owned(),
@@ -756,15 +756,15 @@ async fn send_input_refuses_a_tmux_pane_whose_spawn_token_no_longer_matches() {
         runner.calls(),
         vec![
             vec![
-                "-L".to_owned(),
-                "boss".to_owned(),
+                "-S".to_owned(),
+                boss_tmux::TEST_SOCKET_PATH.to_owned(),
                 "list-sessions".to_owned(),
                 "-F".to_owned(),
                 "#{session_name}\t#{@boss_spawn_token}".to_owned(),
             ],
             vec![
-                "-L".to_owned(),
-                "boss".to_owned(),
+                "-S".to_owned(),
+                boss_tmux::TEST_SOCKET_PATH.to_owned(),
                 "show-environment".to_owned(),
                 "-t".to_owned(),
                 "boss-tmux-recycled".to_owned(),

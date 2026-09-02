@@ -908,7 +908,9 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::super::tests::{register_idle_worker, test_server_state};
+    use super::super::tests::{
+        register_idle_worker, register_idle_worker_with_driver, register_tmux_identity_for_test, test_server_state,
+    };
 
     struct CaptureRunner {
         output: CommandOutput,
@@ -916,13 +918,20 @@ mod tests {
 
     #[async_trait]
     impl CommandRunner for CaptureRunner {
-        async fn run(
-            &self,
-            _program: &Path,
-            _args: &[OsString],
-            _cwd: Option<&Path>,
-        ) -> std::io::Result<CommandOutput> {
-            Ok(self.output.clone())
+        async fn run(&self, _program: &Path, args: &[OsString], _cwd: Option<&Path>) -> std::io::Result<CommandOutput> {
+            let args = args.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>();
+            let output = if args.iter().any(|arg| arg == "list-sessions") {
+                capture_output(true, "pane-delivery-test\t\n")
+            } else if args.iter().any(|arg| arg == "show-environment") {
+                capture_output(true, "BOSS_SPAWN_TOKEN=pane-delivery-test-token\n")
+            } else if args.iter().any(|arg| arg == "#{pane_dead}") {
+                capture_output(true, "0\n")
+            } else if args.iter().any(|arg| arg == "capture-pane") {
+                self.output.clone()
+            } else {
+                capture_output(true, "")
+            };
+            Ok(output)
         }
 
         async fn run_with_stdin(
@@ -946,9 +955,10 @@ mod tests {
     }
 
     fn tmux_pane(server_state: &super::ServerState, run_id: &str, slot_id: u8, output: CommandOutput) {
+        const SESSION_NAME: &str = "pane-delivery-test";
         server_state
             .worker_registry
-            .register_tmux_run_slot(run_id, slot_id, "pane-delivery-test");
+            .register_tmux_run_slot(run_id, slot_id, SESSION_NAME);
         *server_state.pane_delivery_tmux_override.write().unwrap() = Some(
             Tmux::with_runner_and_socket(
                 "/usr/bin/tmux",
@@ -957,6 +967,11 @@ mod tests {
             )
             .unwrap(),
         );
+    }
+
+    fn tmux_pane_with_identity(server_state: &super::ServerState, run_id: &str, slot_id: u8, output: CommandOutput) {
+        tmux_pane(server_state, run_id, slot_id, output);
+        register_tmux_identity_for_test(server_state, run_id, "pane-delivery-test", "pane-delivery-test-token");
     }
 
     /// Write `bytes` to a fresh tempfile and return `(handle, path)`. The
@@ -1096,14 +1111,13 @@ mod tests {
     #[tokio::test]
     async fn parked_pane_echo_is_not_promoted_to_consumption_confirmation() {
         let (server_state, _dir) = test_server_state();
-        let run_id = "parked-pane-echo";
-        register_idle_worker(&server_state, run_id, 44);
-        tmux_pane(&server_state, run_id, 44, capture_output(true, "injected text"));
+        let run_id = register_idle_worker_with_driver(&server_state, 44, None);
+        tmux_pane_with_identity(&server_state, &run_id, 44, capture_output(true, "injected text"));
 
         let outcome = server_state
             .inject_pane_text_verified(
                 PaneInjectRequest::builder()
-                    .run_id(run_id)
+                    .run_id(&run_id)
                     .slot_id(44)
                     .text("injected text")
                     .offset_bytes(0)
@@ -1118,14 +1132,13 @@ mod tests {
     #[tokio::test]
     async fn mid_turn_injection_ignores_a_pane_echo_and_remains_buffered() {
         let (server_state, _dir) = test_server_state();
-        let run_id = "mid-turn-pane-echo";
-        register_idle_worker(&server_state, run_id, 45);
-        tmux_pane(&server_state, run_id, 45, capture_output(true, "injected text"));
+        let run_id = register_idle_worker_with_driver(&server_state, 45, None);
+        tmux_pane_with_identity(&server_state, &run_id, 45, capture_output(true, "injected text"));
 
         let outcome = server_state
             .inject_pane_text_verified(
                 PaneInjectRequest::builder()
-                    .run_id(run_id)
+                    .run_id(&run_id)
                     .slot_id(45)
                     .text("injected text")
                     .offset_bytes(0)
@@ -1140,17 +1153,17 @@ mod tests {
     #[tokio::test]
     async fn mid_turn_injection_is_confirmed_when_the_hook_fires() {
         let (server_state, _dir) = test_server_state();
-        let run_id = "mid-turn-hook";
-        register_idle_worker(&server_state, run_id, 46);
-        tmux_pane(&server_state, run_id, 46, capture_output(true, "injected text"));
+        let run_id = register_idle_worker_with_driver(&server_state, 46, None);
+        tmux_pane_with_identity(&server_state, &run_id, 46, capture_output(true, "injected text"));
 
         let inject = {
             let server_state = Arc::clone(&server_state);
+            let run_id_for_inject = run_id.clone();
             tokio::spawn(async move {
                 server_state
                     .inject_pane_text_verified(
                         PaneInjectRequest::builder()
-                            .run_id(run_id)
+                            .run_id(&run_id_for_inject)
                             .slot_id(46)
                             .text("injected text")
                             .offset_bytes(0)
@@ -1164,7 +1177,7 @@ mod tests {
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         loop {
-            server_state.resolve_delivery_waiter(run_id, "injected text");
+            server_state.resolve_delivery_waiter(&run_id, "injected text");
             if inject.is_finished() {
                 break;
             }
