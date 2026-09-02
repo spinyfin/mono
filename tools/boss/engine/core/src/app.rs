@@ -1598,7 +1598,9 @@ impl ServerState {
                 .attachment_store(boss_engine_attachments::AttachmentStore::under_state_root(
                     &attachment_state_root,
                 ))
-                .worker_registry(WorkerRegistry::new())
+                .worker_registry(WorkerRegistry::with_sleep_assertion(Arc::new(
+                    crate::sleep_assertion::SleepAssertionController::new(),
+                )))
                 .live_worker_states(live_worker_states)
                 .hold_registry(hold_registry_for_state)
                 .teardown_registry(teardown_registry_for_state)

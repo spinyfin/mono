@@ -152,6 +152,7 @@ pub mod rotating_file;
 pub mod run_reconcile;
 pub mod runner;
 pub mod settings;
+pub mod sleep_assertion;
 pub mod spawn_ack_sweep;
 pub mod spawn_flow;
 pub mod spawn_health;
