@@ -163,6 +163,24 @@ impl WorkDb {
         }
     }
 
+    /// Preserve the workspace the engine assigned to an execution as its
+    /// durable recovery preference before teardown clears the live lease
+    /// columns. Used when a parent-PR merge converts a live review revision
+    /// into a followup: the replacement execution can then reclaim the exact
+    /// dirty working copy without guessing from a name.
+    pub fn preserve_execution_workspace_preference(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let execution = query_execution(&conn, execution_id).require("execution", execution_id)?;
+        let preferred = execution.cube_workspace_id.clone().or(execution.preferred_workspace_id);
+        if let Some(workspace_id) = preferred.as_deref() {
+            conn.execute(
+                "UPDATE work_executions SET preferred_workspace_id = ?2 WHERE id = ?1",
+                params![execution_id, workspace_id],
+            )?;
+        }
+        Ok(preferred)
+    }
+
     /// Append an `effort_escalations` row recording a worker's
     /// `[effort-escalation]` Stop-boundary signal (design §Q5). The
     /// engine assigns `id` (prefix `esc_…`) and `created_at`.

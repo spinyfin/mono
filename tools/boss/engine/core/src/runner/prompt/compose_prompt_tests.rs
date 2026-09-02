@@ -45,6 +45,17 @@ fn chore_with_pr(pr_url: &str) -> WorkItem {
     }
 }
 
+fn review_followup() -> WorkItem {
+    match chore_without_pr() {
+        WorkItem::Chore(mut task) => {
+            task.kind = TaskKind::Followup;
+            task.origin_pr_number = Some(1501);
+            WorkItem::Chore(task)
+        }
+        other => other,
+    }
+}
+
 /// A `kind = 'design'` task, wrapped as `WorkItem::Task` (design tasks are
 /// never `Chore`s — see `task_to_item`), for tests that need
 /// `ExecutionKind::ProjectDesign` to reach `compose_design_directive`.
@@ -384,6 +395,68 @@ fn dirty_reset_warning_when_allow_dirty_and_no_recovery_report() {
         prompt.contains("jj status"),
         "the warning must tell the worker how to check before resetting:\n{prompt}",
     );
+}
+
+#[test]
+fn merge_cancelled_review_followup_warns_about_reclaimed_partial_work() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let execution = WorkExecution::builder()
+        .id("exec_followup")
+        .work_item_id("task-1")
+        .kind(ExecutionKind::ChoreImplementation)
+        .status(ExecutionStatus::Running)
+        .repo_remote_url("git@github.com:org/repo.git")
+        .workspace_path(ws.path().display().to_string())
+        .cube_workspace_id("mono-agent-001")
+        .preferred_workspace_id("mono-agent-001")
+        .allow_dirty(true)
+        .prefer_is_soft(true)
+        .created_at("2026-09-02T00:00:00Z")
+        .build();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&execution)
+            .work_item(&review_followup())
+            .workspace_path(ws.path())
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(prompt.contains("MERGE-CANCELLED REVIEW RECOVERY"));
+    assert!(prompt.contains("PR #1501"));
+    assert!(prompt.contains("exact workspace (`mono-agent-001`)"));
+    assert!(prompt.contains("partial, uncommitted edits"));
+    assert!(prompt.contains("never compiled or tested"));
+    assert!(prompt.contains("jj diff"));
+}
+
+#[test]
+fn merge_cancelled_review_followup_explains_fresh_workspace_fallback() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let execution = WorkExecution::builder()
+        .id("exec_followup_fallback")
+        .work_item_id("task-1")
+        .kind(ExecutionKind::ChoreImplementation)
+        .status(ExecutionStatus::Running)
+        .repo_remote_url("git@github.com:org/repo.git")
+        .workspace_path(ws.path().display().to_string())
+        .cube_workspace_id("mono-agent-004")
+        .preferred_workspace_id("mono-agent-001")
+        .allow_dirty(true)
+        .prefer_is_soft(true)
+        .created_at("2026-09-02T00:00:00Z")
+        .build();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&execution)
+            .work_item(&review_followup())
+            .workspace_path(ws.path())
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(prompt.contains("preferred the cancelled worker's workspace (`mono-agent-001`)"));
+    assert!(prompt.contains("dispatched this execution on `mono-agent-004` instead"));
+    assert!(prompt.contains("fresh-workspace fallback"));
+    assert!(prompt.contains("no partial edits were inherited here"));
 }
 
 /// A recorded recovery marker IS a durable pointer the engine wrote itself —

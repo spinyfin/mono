@@ -223,6 +223,56 @@ fn startup_recovery_block(report: &boss_engine_recovery::recovery_apply::Recover
     block
 }
 
+/// Explain the exact workspace handoff for a review revision converted to a
+/// followup because its parent PR merged mid-run. This keys on the dedicated
+/// execution shape written by `reconcile_work_item_execution`: a
+/// chore-implementation followup with a soft dirty-workspace preference.
+fn merge_cancelled_review_recovery_block(execution: &WorkExecution, work_item: &WorkItem) -> Option<String> {
+    let task = match work_item {
+        WorkItem::Task(task) | WorkItem::Chore(task) if task.kind == TaskKind::Followup => task,
+        _ => return None,
+    };
+    if execution.kind != ExecutionKind::ChoreImplementation || !execution.allow_dirty || !execution.prefer_is_soft {
+        return None;
+    }
+    let preferred = execution.preferred_workspace_id.as_deref()?;
+    let origin = task
+        .origin_pr_number
+        .map(|number| format!("PR #{number}"))
+        .unwrap_or_else(|| "the merged origin PR".to_owned());
+    let current = execution.cube_workspace_id.as_deref();
+
+    let mut block = String::from("## MERGE-CANCELLED REVIEW RECOVERY\n\n");
+    if current == Some(preferred) {
+        block.push_str(&format!(
+            "This followup was created after {origin} merged while its review-revision worker was mid-run. \
+             The engine re-leased that worker's exact workspace (`{preferred}`) without resetting it. \
+             Its working copy remains on the merged PR's revision base and may contain partial, \
+             uncommitted edits from the cancelled turn.\n\n\
+             Inspect before changing the checkout:\n\n\
+             ```\n\
+             jj status\n\
+             jj diff --stat\n\
+             jj diff\n\
+             ```\n\n\
+             Do not trust or discard those edits. They were cut off mid-turn and were never compiled or \
+             tested. Reconcile them against this followup and current `main`, then run the required \
+             validation before opening the fresh PR.\n\n",
+        ));
+    } else {
+        let current = current.unwrap_or("an unrecorded fallback workspace");
+        block.push_str(&format!(
+            "This followup was created after {origin} merged while its review-revision worker was mid-run. \
+             The engine preferred the cancelled worker's workspace (`{preferred}`), but cube could not \
+             lease it and dispatched this execution on `{current}` instead. This is a fresh-workspace \
+             fallback: no partial edits were inherited here. An unverified draft may still remain in \
+             `{preferred}` on the merged PR's base; proceed from current `main` in this workspace and do \
+             not assume that draft was validated or delivered.\n\n",
+        ));
+    }
+    Some(block)
+}
+
 /// The structured-output payload this execution's prompt is built around —
 /// the one `$BOSS_STRUCTURED_OUTPUT` names.
 ///
@@ -342,7 +392,9 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
     // directive BEFORE the execution context so it outweighs the
     // workspace-rules default of `jj git fetch && jj new main`.
     let existing_pr_url = work_item_pr_url(work_item);
-    if let Some(pr_url) = existing_pr_url {
+    if let Some(block) = merge_cancelled_review_recovery_block(execution, work_item) {
+        prompt.push_str(&block);
+    } else if let Some(pr_url) = existing_pr_url {
         let pr_number = boss_github::pr_url::pr_number_from_url(pr_url)
             .map(|n| n.to_string())
             .unwrap_or_else(|| "?".into());
