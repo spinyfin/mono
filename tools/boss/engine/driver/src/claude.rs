@@ -12,7 +12,9 @@ use async_trait::async_trait;
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
 use boss_engine_transient_error::ErrorClass;
-use boss_protocol::{EffortLevel, NormalizeError, PaneMonitorSpec, ReasoningMode, WorkerEvent, normalize_hook_event};
+use boss_protocol::{
+    EffortLevel, NormalizeError, PaneMonitorSpec, ReasoningMode, ReviewModelTier, WorkerEvent, normalize_hook_event,
+};
 use boss_ssh_transport::shell_quote;
 
 use super::{
@@ -59,6 +61,16 @@ fn claude_model_for_reasoning(reasoning: ReasoningMode) -> &'static str {
     match reasoning {
         ReasoningMode::Standard => "sonnet",
         ReasoningMode::Investigation => "opus",
+    }
+}
+
+/// Concrete model mapping for metadata-derived review tiers. This is kept
+/// distinct from the task reasoning menu: reviews are sized from the PR,
+/// never from the work item's classification.
+fn claude_review_model_for_tier(tier: ReviewModelTier) -> &'static str {
+    match tier {
+        ReviewModelTier::Fast | ReviewModelTier::Balanced => "sonnet",
+        ReviewModelTier::Strong => "opus",
     }
 }
 
@@ -147,6 +159,7 @@ static CLAUDE_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
         effort_value_for_level: claude_effort_value_for_level,
         default_model_for_level: claude_default_model_for_level,
         model_for_reasoning: claude_model_for_reasoning,
+        review_model_for_tier: claude_review_model_for_tier,
         prompt_addendum_for_level: claude_prompt_addendum_for_level,
         model_requires_auto_permissions: claude_model_requires_auto_permissions,
         model_belongs_to_driver: claude_model_belongs_to_driver,
@@ -1118,6 +1131,7 @@ mod tests {
     use super::*;
     use crate::Capability;
     use crate::test_support::home_override;
+    use boss_protocol::ReviewModelTier;
     use tempfile::TempDir;
 
     #[test]
@@ -1146,6 +1160,14 @@ mod tests {
                 "{model:?} should not be recognised as a Claude model"
             );
         }
+    }
+
+    #[test]
+    fn claude_review_model_tiers_use_sonnet_then_opus() {
+        let menu = &ClaudeDriver.descriptor().model_menu;
+        assert_eq!((menu.review_model_for_tier)(ReviewModelTier::Fast), "sonnet");
+        assert_eq!((menu.review_model_for_tier)(ReviewModelTier::Balanced), "sonnet");
+        assert_eq!((menu.review_model_for_tier)(ReviewModelTier::Strong), "opus");
     }
 
     #[test]

@@ -651,6 +651,7 @@ mod tests {
                         effort_value_for_level: no_effort_value,
                         default_model_for_level: only_model,
                         model_for_reasoning: only_model_for_reasoning,
+                        review_model_for_tier: |_| "stub-model",
                         prompt_addendum_for_level: no_addendum,
                         model_requires_auto_permissions: never_auto_permissions,
                         model_belongs_to_driver: always_belongs,

@@ -16,7 +16,8 @@ use async_trait::async_trait;
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
 use boss_protocol::{
-    EffortLevel, ExecutionKind, NormalizeError, PaneMonitorSpec, ReasoningMode, StopReason, TaskKind, WorkerEvent,
+    EffortLevel, ExecutionKind, NormalizeError, PaneMonitorSpec, ReasoningMode, ReviewModelTier, StopReason, TaskKind,
+    WorkerEvent,
 };
 
 pub mod transcript_store;
@@ -457,6 +458,10 @@ pub struct ModelMenu {
     /// reach the stronger model without lying about its size and a genuinely
     /// mechanical `large` row stay on the cheaper one.
     pub model_for_reasoning: fn(ReasoningMode) -> &'static str,
+    /// Maps a review-specific capability tier onto this driver's concrete
+    /// model menu. Review policy chooses the tier from immutable PR metadata;
+    /// it does not reuse task effort or reasoning as a proxy for PR size.
+    pub review_model_for_tier: fn(ReviewModelTier) -> &'static str,
     /// Optional per-level worker-prompt addendum to prepend to the initial-prompt body.
     /// `None` for levels where no addendum is appropriate.
     pub prompt_addendum_for_level: fn(EffortLevel) -> Option<&'static str>,

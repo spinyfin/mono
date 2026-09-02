@@ -200,11 +200,13 @@ pub use boss_protocol::{
     LAST_STATUS_ACTOR_BOOTHBY, LAST_STATUS_ACTOR_HUMAN, ListDependenciesInput, PrWorkItemMatch, Product, Project,
     ProjectDesignDocState, ProjectStatus, RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN,
     ReasoningMode, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment,
-    ResolvedDesignDoc, ResolvedDesignDocKind, ReviseDocInput, ReviseDocOutcome, SetProjectDesignDocInput,
-    SetTaskDocPointerInput, StatusActor, THREAD_ENTRY_AUTHOR_ENGINE, THREAD_ENTRY_KIND_ANSWER,
-    THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP, Task, TaskKind, TaskRuntime, TaskStatus, WorkAttentionItem, WorkComment,
-    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemExternalRef,
-    WorkItemPatch, WorkRun, WorkTree, comment_status_is_closed, is_known_created_via,
+    ResolvedDesignDoc, ResolvedDesignDocKind, ReviewBatch, ReviewBatchMember, ReviewBatchMemberRole,
+    ReviewBatchMemberStatus, ReviewBatchPhase, ReviewBatchStatus, ReviewClassification, ReviseDocInput,
+    ReviseDocOutcome, SetProjectDesignDocInput, SetTaskDocPointerInput, StatusActor, THREAD_ENTRY_AUTHOR_ENGINE,
+    THREAD_ENTRY_KIND_ANSWER, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP, Task, TaskKind, TaskRuntime, TaskStatus,
+    WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
+    WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun, WorkTree, comment_status_is_closed,
+    is_known_created_via,
 };
 
 /// Outcome of [`WorkDb::claim_execution_for_dispatch`]: the Ready → Claimed
@@ -502,6 +504,7 @@ mod migrations_attachments;
 mod migrations_b;
 mod migrations_boothby;
 mod migrations_c;
+mod migrations_review_batches;
 mod output_types;
 mod planner_runs;
 mod pr_flow;
@@ -510,6 +513,7 @@ mod products_design;
 mod proposal_apply;
 mod proposals;
 mod query_ensure;
+mod review_batches;
 mod review_verdicts;
 mod revise_doc;
 mod revision_helpers;
@@ -554,6 +558,7 @@ pub(crate) use migrations_attachments::*;
 pub(crate) use migrations_b::*;
 pub(crate) use migrations_boothby::*;
 pub(crate) use migrations_c::*;
+pub(crate) use migrations_review_batches::*;
 pub(crate) use pr_state::stored_pr_number;
 pub(crate) use products_design::{
     attach_task_doc_link_state, attach_task_doc_link_states, attach_task_doc_link_states_for_groups,
@@ -565,6 +570,7 @@ pub(crate) use products_design::{
 pub(crate) use products_design::resolve_task_doc_pointer;
 pub(crate) use proposal_apply::*;
 pub(crate) use query_ensure::*;
+pub use review_batches::{ReviewBatchCreateInput, ReviewBatchMemberCreateInput};
 pub(crate) use review_verdicts::query_latest_informative_review_verdicts;
 pub(crate) use revision_helpers::*;
 pub(crate) use task_targets::*;

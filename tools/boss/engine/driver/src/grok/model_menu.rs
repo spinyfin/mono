@@ -26,7 +26,7 @@
 //! `grok-code-fast-1` (retired 15 May 2026; silently redirects rather
 //! than erroring — useless as a probe target).
 
-use boss_protocol::{EffortLevel, ReasoningMode};
+use boss_protocol::{EffortLevel, ReasoningMode, ReviewModelTier};
 
 /// Map a Boss effort level onto Grok's `--reasoning-effort` vocabulary.
 ///
@@ -75,6 +75,14 @@ pub(super) fn effort_value_for_level(level: EffortLevel) -> Option<&'static str>
 /// field most likely to be wrong within a quarter (see module refresh
 /// path).
 pub(super) fn model_for_reasoning(_reasoning: ReasoningMode) -> &'static str {
+    "grok-4.6"
+}
+
+/// xAI's current menu has no supported lower review tier. Preserve the
+/// concrete fast/balanced/strong mapping even though all three rows resolve
+/// to the current generation, so a future menu expansion changes only this
+/// table.
+pub(super) fn review_model_for_tier(_tier: ReviewModelTier) -> &'static str {
     "grok-4.6"
 }
 

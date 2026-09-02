@@ -14,7 +14,10 @@ rust_library(
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/driver:__pkg__",
     ],
-    deps = ["//tools/boss/engine/structured-output"] + all_crate_deps(normal = True),
+    deps = [
+        "//tools/boss/engine/structured-output",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(normal = True),
 )
 
 rust_test(
@@ -26,7 +29,10 @@ rust_test(
         proc_macro = True,
         proc_macro_dev = True,
     ),
-    deps = ["//tools/boss/engine/structured-output"] + all_crate_deps(
+    deps = [
+        "//tools/boss/engine/structured-output",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
         normal = True,
         normal_dev = True,
     ),

@@ -103,6 +103,7 @@ static GROK_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
         effort_value_for_level: model_menu::effort_value_for_level,
         default_model_for_level: model_menu::default_model_for_level,
         model_for_reasoning: model_menu::model_for_reasoning,
+        review_model_for_tier: model_menu::review_model_for_tier,
         prompt_addendum_for_level: model_menu::prompt_addendum_for_level,
         model_requires_auto_permissions: model_menu::model_requires_auto_permissions,
         model_belongs_to_driver: model_menu::model_belongs_to_driver,
@@ -914,7 +915,7 @@ mod tests {
     use crate::EnvDirective;
     use crate::test_support::home_override;
     use crate::{AbsenceDisposition, Capability, MidTurnPaneInput};
-    use boss_protocol::{EffortLevel, ReasoningMode};
+    use boss_protocol::{EffortLevel, ReasoningMode, ReviewModelTier};
     use serde_json::json;
     use std::fs;
     use std::sync::Mutex;
@@ -1338,6 +1339,9 @@ mod tests {
         // Both reasoning modes use the provider's current default.
         assert_eq!((menu.model_for_reasoning)(ReasoningMode::Standard), "grok-4.6");
         assert_eq!((menu.model_for_reasoning)(ReasoningMode::Investigation), "grok-4.6");
+        assert_eq!((menu.review_model_for_tier)(ReviewModelTier::Fast), "grok-4.6");
+        assert_eq!((menu.review_model_for_tier)(ReviewModelTier::Balanced), "grok-4.6");
+        assert_eq!((menu.review_model_for_tier)(ReviewModelTier::Strong), "grok-4.6");
         assert_eq!((menu.default_model_for_level)(EffortLevel::Trivial), "grok-4.6");
         assert_eq!((menu.default_model_for_level)(EffortLevel::Max), "grok-4.6");
         assert!(!(menu.model_requires_auto_permissions)("grok-4.6"));

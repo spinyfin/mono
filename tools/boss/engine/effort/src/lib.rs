@@ -910,6 +910,7 @@ mod tests {
                 effort_value_for_level: stub_effort_value_for_level,
                 default_model_for_level: stub_default_model_for_level,
                 model_for_reasoning: stub_model_for_reasoning,
+                review_model_for_tier: |_| "stub-model",
                 prompt_addendum_for_level: stub_prompt_addendum_for_level,
                 model_requires_auto_permissions: stub_model_requires_auto_permissions,
                 model_belongs_to_driver: stub_model_belongs_to_driver,
