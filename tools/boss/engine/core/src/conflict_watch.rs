@@ -110,7 +110,7 @@ fn auto_pr_maintenance_disabled(work_db: &WorkDb, candidate: &PendingMergeCheck,
 /// direction) or a fresh attempt row was created; `false` for purely
 /// idempotent repeat probes and human-owned rows.
 ///
-/// **Escalation ladder (T4):** when `cube_client` is `Some`, a fresh conflict
+/// **Escalation ladder:** when `cube_client` is `Some`, a fresh conflict
 /// first attempts the engine-direct mechanical rebase (rung 1) before spawning
 /// a worker — see [`crate::conflict_ladder`]. A clean rebase resolves and
 /// pushes the PR with no agent; the harness retires the attempt and this
@@ -198,8 +198,8 @@ pub async fn on_conflict_detected_with(
     // work item, the detection flow is essentially a no-op for an `in_review`
     // parent (signal already armed, revision already in Doing). Skip the
     // upfront flip+unblock cycle to avoid redundant state changes on every
-    // sweep.  The blocked-parent reconciliation (T791/T898) is handled below
-    // via the re-arm path; we fall through there when `rearm` says blocked.
+    // sweep. The blocked-parent reconciliation is handled below via the
+    // re-arm path; we fall through there when `rearm` says blocked.
     match work_db.active_conflict_resolution_for_work_item(&candidate.work_item_id) {
         Ok(Some(ref active_crz)) if active_crz.revision_task_id.is_some() => {
             match work_db.rearm_blocked_merge_conflict_signal(&candidate.work_item_id) {
@@ -207,9 +207,9 @@ pub async fn on_conflict_detected_with(
                     // Parent is blocked with an active revision in flight — fall
                     // through to the reconciliation path in the re-arm branch,
                     // which applies the same `supersede_if_stale` check before
-                    // deciding whether to reconcile or supersede (T4/dead-revision
-                    // fix): a dead/stale attempt must not survive a blind reconcile
-                    // just because the parent happened to be `blocked` this pass.
+                    // deciding whether to reconcile or supersede: a dead/stale
+                    // attempt must not survive a blind reconcile just because
+                    // the parent happened to be `blocked` this pass.
                 }
                 Ok(false) | Err(_) => {
                     // Parent is in_review (or human-moved). Before treating this
@@ -653,15 +653,18 @@ pub async fn on_conflict_detected_with(
     // Placed here — immediately before the point every remaining code path
     // shares (proceeding to supersede any CI remediation and insert a fresh
     // `conflict_resolutions` attempt row) — so the sentinel is only ever set
-    // on a path where conflict_watch is genuinely about to take ownership of
-    // the slot. Every branch of the `mark_chore_blocked_merge_conflict`
-    // match above that does NOT reach this point (auto-rebase-active,
-    // foreign-bucket-owned, the WHERE-guard-miss "row not blocked
-    // :merge_conflict, manually moved" skip, an in-flight reconcile, or a
-    // churn/terminal bail) returns early instead. Marking any of those paths
-    // would strand the intent in the sentinel forever: `on_resolved` only
-    // clears it once `conflict_watch` itself observes the PR mergeable
-    // again, which never happens for a slot it never took over.
+    // on a path where conflict_watch is genuinely about to mint an attempt
+    // for the slot. A foreign-reason (non-CI, non-merge_conflict) row now
+    // reaches this point too (`skip_parent_flip`): it keeps its own scalar
+    // block, but conflict_watch still mints an attempt, and `on_resolved`
+    // clears the sentinel via `attempt_transitioned` regardless of the
+    // scalar reason — so the sentinel is not stranded there. Only
+    // auto-rebase-active and the WHERE-guard-miss "row not blocked
+    // :merge_conflict, manually moved" skip return early without minting,
+    // and it is only those two paths that would strand the intent in the
+    // sentinel forever: `on_resolved` only clears it once `conflict_watch`
+    // itself observes the PR mergeable again, which never happens for a
+    // slot it never took over.
     crate::trunk_merge::mark_trunk_intent_superseded_by_conflict(work_db, &candidate.work_item_id);
 
     // T2381/PR#1861 fix: design §Q1 says conflict pre-empts CI — but only
@@ -777,7 +780,7 @@ pub async fn on_conflict_detected_with(
 
     if let Some(ref a) = attempt {
         if a.status == "pending" && a.revision_task_id.is_none() {
-            // Escalation ladder (T4/T6): before spawning a full worker, try
+            // Escalation ladder: before spawning a full worker, try
             // the engine-direct mechanical rungs. On a clean rebase (rung 1)
             // the conflict is resolved and pushed with no agent; the harness
             // retires this attempt and clears the parent back to Review, so we
@@ -852,7 +855,7 @@ pub async fn on_conflict_detected_with(
                         return true;
                     }
                     conflict_ladder::LadderOutcome::HaltedForSignoff => {
-                        // T9/T2562: a mechanical rung pushed a resolution the
+                        // A mechanical rung pushed a resolution the
                         // deletion tripwire rejected. The task is already
                         // `blocked: deletion_signoff` pending operator
                         // sign-off — do NOT spawn a worker (no automatic
@@ -1523,10 +1526,18 @@ pub async fn on_resolved(
             match work_db.mark_conflict_resolution_succeeded(&attempt.id, None) {
                 Ok(Some(succeeded)) => {
                     attempt_transitioned = true;
-                    // When the parent was `in_review` (never blocked), clear the
-                    // `merge_conflict` signal so `maybe_clear_blocked` does not
-                    // re-trigger on the next probe.
-                    if parent_in_review_with_revision
+                    // When the parent was `in_review` (never blocked:
+                    // merge_conflict — either the happy pending+revision case,
+                    // or the attempt reached `running` under a *foreign*
+                    // scalar block, e.g. `skip_parent_flip` armed a
+                    // `merge_conflict` side-table row on a `blocked:
+                    // dependency` parent), the scalar clear above never ran
+                    // and never touched `task_blocked_signals` — so clear the
+                    // `merge_conflict` signal here whenever the parent flip
+                    // itself did not (`!task_transitioned`), not only in the
+                    // narrower pending+revision case, or the row is left
+                    // armed with no path left to retire it.
+                    if !task_transitioned
                         && let Err(err) = work_db.clear_merge_conflict_signal_only(&candidate.work_item_id)
                     {
                         tracing::warn!(

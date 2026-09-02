@@ -1805,21 +1805,54 @@ async fn handle_trunk_queue_eviction(
             // conflict_watch will never fire. Mint a queue-rejection
             // revision (TestFailure arm) rather than handing to a lane
             // that keys on mergeable=CONFLICTING.
-            if let Some(marker) = evidence
+            let bot_marker = evidence
                 .newest_trunk_bot_comment(&member.intent.repo, member.intent.pr_number)
                 .await
                 .as_deref()
-                .and_then(bot_comment_merge_failure_marker)
-            {
-                tracing::info!(
-                    work_item_id = %member.intent.work_item_id,
-                    pr_url = %member.intent.pr_url,
-                    marker,
-                    "trunk queue poller: bot comment names a merge failure but GitHub mergeability \
-                     is not CONFLICTING (sibling-in-queue); minting a queue-rejection revision",
-                );
+                .and_then(bot_comment_merge_failure_marker);
+            match bot_marker {
+                Some(marker) => {
+                    // Whether this is a real vs-base conflict (route to
+                    // conflict_watch) or a sibling-in-queue rejection (mint a
+                    // queue-rejection revision) turns on GitHub's own last-known
+                    // mergeability, not Trunk's readiness payload — the latter is
+                    // exactly the source that was incomplete in the incident this
+                    // classification exists to handle. `pr_mergeable_state` is
+                    // the merge poller's independently-observed GitHub state.
+                    let github_mergeable_state = ctx
+                        .work_db
+                        .get_pr_status_snapshot(&member.intent.work_item_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|snapshot| snapshot.mergeable);
+                    if github_mergeable_state.as_deref() == Some("conflicting") {
+                        tracing::info!(
+                            work_item_id = %member.intent.work_item_id,
+                            pr_url = %member.intent.pr_url,
+                            marker,
+                            "trunk queue poller: bot comment names a merge failure and GitHub mergeability \
+                             is CONFLICTING; routing to the conflict lane",
+                        );
+                        TrunkEvictionCause::HeadConflict {
+                            evidence: format!(
+                                "trunk-io[bot] comment named a merge failure (\"{marker}\") and GitHub \
+                                 mergeability is CONFLICTING"
+                            ),
+                        }
+                    } else {
+                        tracing::info!(
+                            work_item_id = %member.intent.work_item_id,
+                            pr_url = %member.intent.pr_url,
+                            marker,
+                            ?github_mergeable_state,
+                            "trunk queue poller: bot comment names a merge failure but GitHub mergeability \
+                             is not CONFLICTING (sibling-in-queue); minting a queue-rejection revision",
+                        );
+                        TrunkEvictionCause::TestFailure
+                    }
+                }
+                None => TrunkEvictionCause::TestFailure,
             }
-            TrunkEvictionCause::TestFailure
         }
     };
     tracing::info!(

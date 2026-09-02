@@ -658,7 +658,6 @@ pub(crate) fn classify_state(
     raw_state: &str,
     merged_at: &str,
     mergeable: &str,
-    _merge_state_status: &str,
     ci: OpenPrCiStatus,
 ) -> PrLifecycleState {
     match crate::work::classify_pr_merge_state(raw_state, merged_at) {

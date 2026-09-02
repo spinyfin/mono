@@ -1685,17 +1685,27 @@ pub async fn on_trunk_head_check_eviction_detected(
             return false;
         }
     }
+    if pr_labels_opt_out(&probe.labels) {
+        tracing::debug!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            "ci_watch: PR labelled with opt-out; skipping head-check eviction",
+        );
+        return false;
+    }
     let Some(head_sha) = probe.head_ref_oid.as_deref() else {
         return false;
     };
     let completed_at = check.completed_at.as_deref().unwrap_or("unknown");
-    let failures = [RequiredCheckFailure {
-        name: check.name.clone(),
-        conclusion: check.conclusion.clone(),
-        target_url: check.details_url.clone(),
-        provider: crate::merge_poller::CiProvider::Other,
-        provider_job_id: None,
-    }];
+    // Trunk's own bookkeeping check ("Trunk Merge Queue (<branch>)") is the
+    // *trigger* for this path, not evidence of a failing construction
+    // build — `classify_ci` deliberately drops any check with that name
+    // prefix. Passing it through as a `RequiredCheckFailure` would make
+    // `failed_checks` non-empty, which suppresses the worker prompt's
+    // no-evidence STOP section (see `on_queue_side_failure_detected`) and
+    // sends the worker hunting a construction build that never ran. Mint
+    // with no evidence instead, exactly like a Trunk API eviction that
+    // never started a build.
     on_trunk_queue_eviction_detected(
         work_db,
         publisher,
@@ -1703,7 +1713,7 @@ pub async fn on_trunk_head_check_eviction_detected(
         probe.head_ref_name.as_deref(),
         &format!("check:{head_sha}"),
         completed_at,
-        &failures,
+        &[],
     )
     .await
 }

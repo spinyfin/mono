@@ -93,18 +93,25 @@ impl WorkDb {
     }
 
     /// Blocked chores/project_tasks with a bound PR whose scalar reason is
-    /// **not** merge_conflict or ci_failure. Those two reasons already have
-    /// their own candidate lists; this list is the gap: a parent parked in
-    /// `blocked: dependency` / `review_feedback` / … is invisible to the
-    /// in_review and reason-keyed lists, so a CONFLICTING PR on it is never
-    /// probed. The sweep de-dupes by work_item_id, so overlap is harmless.
+    /// `dependency` or `review_feedback`. Those reasons carry no own
+    /// candidate list, so a parent parked there is otherwise invisible to
+    /// every sweep pass, and a CONFLICTING or red-CI PR sitting behind one
+    /// is never probed. The sweep de-dupes by work_item_id, so overlap with
+    /// the reason-keyed lists (which this predicate excludes) is harmless.
+    ///
+    /// Deliberately an explicit IN-list rather than a NOT-IN one: a blocked
+    /// row can carry `deletion_signoff` (a human-facing sign-off gate, not a
+    /// remediable state) or any free-form label a human sets, and admitting
+    /// those here would let `sweep_one` mint CI-fix/queue-rejection
+    /// revisions, or retire/complete the row, for a reason this list was
+    /// never meant to reach. Widening this set is an opt-in decision, not
+    /// something a new reason should fall into silently.
     pub fn list_chores_blocked_other_with_pr(&self) -> Result<Vec<PendingMergeCheck>> {
         self.query_pending_merge_checks(
             "t.status = 'blocked'
                AND t.pr_url IS NOT NULL
                AND t.pr_url != ''
-               AND (t.blocked_reason IS NULL
-                    OR t.blocked_reason NOT IN ('merge_conflict', 'ci_failure', 'ci_failure_exhausted'))",
+               AND t.blocked_reason IN ('dependency', 'review_feedback')",
         )
     }
 
@@ -2212,5 +2219,65 @@ mod tests {
     fn active_blocked_signals_empty_for_untouched_task() {
         let db = mem_db();
         assert!(db.active_blocked_signals("nope").unwrap().is_empty());
+    }
+
+    fn blocked_chore_with_pr(db: &WorkDb, name: &str, blocked_reason: &str) -> String {
+        let product = crate::test_support::create_test_product_named(db, &format!("Product-{name}"));
+        let task = crate::test_support::create_test_chore_manual(db, product.id.clone(), name);
+        db.update_work_item(
+            &task.id,
+            crate::work::WorkItemPatch {
+                status: Some("blocked".into()),
+                blocked_reason: Some(blocked_reason.into()),
+                pr_url: Some(format!("https://github.com/foo/bar/pull/{name}")),
+                ..crate::work::WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        task.id
+    }
+
+    /// The `dependency` and `review_feedback` reasons are the intended gap
+    /// this list closes: neither has its own candidate list, so without
+    /// this one a CONFLICTING or red-CI PR sitting behind either block
+    /// would never be re-probed.
+    #[test]
+    fn list_chores_blocked_other_with_pr_admits_dependency_and_review_feedback() {
+        let db = mem_db();
+        let dep = blocked_chore_with_pr(&db, "dep-1", "dependency");
+        let review = blocked_chore_with_pr(&db, "review-1", "review_feedback");
+
+        let ids: Vec<String> = db
+            .list_chores_blocked_other_with_pr()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.work_item_id)
+            .collect();
+        assert!(ids.contains(&dep), "blocked: dependency must be probed");
+        assert!(ids.contains(&review), "blocked: review_feedback must be probed");
+    }
+
+    /// `deletion_signoff` is a human-facing sign-off gate, not a remediable
+    /// state — admitting it here would let `sweep_one` mint a CI-fix or
+    /// queue-rejection revision, or retire/complete the row, for a reason
+    /// this list was never meant to reach. Same for an arbitrary free-form
+    /// label a human sets on the row.
+    #[test]
+    fn list_chores_blocked_other_with_pr_excludes_deletion_signoff_and_free_form_reasons() {
+        let db = mem_db();
+        let signoff = blocked_chore_with_pr(&db, "signoff-1", "deletion_signoff");
+        let custom = blocked_chore_with_pr(&db, "custom-1", "some_human_label");
+
+        let ids: Vec<String> = db
+            .list_chores_blocked_other_with_pr()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.work_item_id)
+            .collect();
+        assert!(
+            !ids.contains(&signoff),
+            "blocked: deletion_signoff must not be swept in"
+        );
+        assert!(!ids.contains(&custom), "an arbitrary human label must not be swept in");
     }
 }

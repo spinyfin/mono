@@ -13,7 +13,7 @@ use boss_trunk_client::TrunkReadiness;
 
 use super::*;
 use crate::test_support::{RecordingPublisher, create_test_chore_manual, create_test_product_named};
-use crate::work::{TrunkMergeIntentInsertInput, WorkItemPatch};
+use crate::work::{PrPollStateInput, TrunkMergeIntentInsertInput, WorkItemPatch};
 
 const REPO: &str = "brianduff/flunge";
 
@@ -332,6 +332,22 @@ fn queue_of(state: TrunkQueueState, entries: Vec<TrunkPullRequest>) -> TrunkQueu
 
 fn pr_url(pr_number: i64) -> String {
     format!("https://github.com/{REPO}/pull/{pr_number}")
+}
+
+/// Stamp the merge poller's independently-observed GitHub mergeability
+/// (`tasks.pr_mergeable_state`) onto a task, distinct from whatever Trunk's
+/// own readiness payload says — the two are read from separate sources.
+fn set_github_mergeable_state(db: &WorkDb, task_id: &str, mergeable_state: &str) {
+    db.update_task_pr_poll_state(
+        task_id,
+        PrPollStateInput::builder()
+            .ci_required_state("")
+            .review_required_state("")
+            .pr_mergeable_state(mergeable_state)
+            .preserve_merge_queue_state(true)
+            .build(),
+    )
+    .unwrap();
 }
 
 /// An `in_review` task with an active Trunk merge intent for `pr_number`.
@@ -1095,11 +1111,13 @@ async fn a_merge_conflict_eviction_is_handed_to_the_conflict_lane_not_to_ci() {
 /// Same outcome via the corroborating channel: Trunk omitted `readiness`, so
 /// the only positive reason signal is its bot comment — the verbatim string
 /// it posted on flunge#1136 and #1137. Consulted only because the Buildkite
-/// search also came back empty.
+/// search also came back empty. GitHub's own last-known mergeability (not
+/// Trunk's payload) says MERGEABLE, so this is a sibling-in-queue rejection.
 #[tokio::test]
 async fn a_merge_conflict_eviction_is_recognised_from_the_trunk_bot_comment() {
     let (_tmp, db) = crate::test_support::open_db();
     let (_, task_id) = seed_intent(&db, "evicted-bot-comment", 1137);
+    set_github_mergeable_state(&db, &task_id, "mergeable");
     let evidence = Arc::new(StubEvictionEvidence::with_bot_comment(
         "❌ This pull request could not start testing because there was a merge conflict.",
     ));
@@ -1112,6 +1130,36 @@ async fn a_merge_conflict_eviction_is_recognised_from_the_trunk_bot_comment() {
     assert_eq!(evidence.bot_comment_call_count(), 1);
     assert_eq!(ci_ledger_state(&db, &task_id), (1, 1));
     assert_eq!(revision_count(&db, &task_id), 1);
+}
+
+/// The bot comment names a merge failure AND GitHub's own last-known
+/// mergeability (`tasks.pr_mergeable_state`, independent of Trunk's
+/// readiness payload) says CONFLICTING vs base: this is a genuine head
+/// conflict, not a sibling-in-queue rejection, and must route to the
+/// conflict lane rather than minting a CI-fix revision that sends the
+/// worker hunting a construction build that never ran.
+#[tokio::test]
+async fn a_merge_conflict_eviction_with_github_conflicting_routes_to_conflict_lane() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "evicted-bot-comment-conflicting", 1138);
+    set_github_mergeable_state(&db, &task_id, "conflicting");
+    let evidence = Arc::new(StubEvictionEvidence::with_bot_comment(
+        "❌ This pull request could not start testing because there was a merge conflict.",
+    ));
+    let entry = entry_of_with_state_changed_at(1138, TrunkPrState::Failed, "2026-07-25T03:54:36.000Z");
+
+    let outcome = run_eviction(&db, 1138, entry, Arc::clone(&evidence)).await;
+
+    assert_eq!(
+        outcome.merge_side_evictions, 1,
+        "GitHub CONFLICTING vs base must route to the conflict lane"
+    );
+    assert_eq!(
+        outcome.evictions_detected, 0,
+        "a merge failure must never reach the CI ledger"
+    );
+    assert_eq!(ci_ledger_state(&db, &task_id), (0, 0));
+    assert_eq!(revision_count(&db, &task_id), 0, "no 'Fix failing CI' revision");
 }
 
 /// A PR pointed at a branch this queue does not merge into. No rebase and no

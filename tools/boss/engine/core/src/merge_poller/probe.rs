@@ -966,7 +966,7 @@ pub(crate) fn parse_probe_json(url: &str, body: &str, combined_state: Option<&st
     // were in scope. (The partition above only ever moves per-org review
     // signal checks, never Trunk's.)
     let trunk_queue_check_failure = trunk_queue_check_failure(&ci_leaves);
-    let state = classify_state(raw_state, merged_at, mergeable, merge_state_status, ci);
+    let state = classify_state(raw_state, merged_at, mergeable, ci);
     let review_signal = classify_review_signal(&review_signal_leaves);
     let review_decision = root.get("reviewDecision").and_then(|v| v.as_str()).unwrap_or("");
     let reviews = root
