@@ -63,12 +63,15 @@
 //! it waits for a `UserPromptSubmit` hook — the CLI's own confirmation
 //! that it enqueued something as the next prompt — and, since that hook
 //! firing for pane-injected text (as opposed to text the CLI itself
-//! echoed) has never been validated end-to-end, it also falls back to
-//! scanning the worker's session transcript for the injected text
-//! before giving up. Callers that get back
+//! echoed) has never been validated end-to-end, it observes a tmux pane
+//! echo as a weaker signal and falls back to scanning the worker's session
+//! transcript. Only the hook and transcript confirm consumption. Callers that get back
 //! [`PaneInjectOutcome::Unconfirmed`] must not treat that as "lost" and
 //! auto-redeliver — they should record the unconfirmed state and let
-//! whoever is watching the probe topic decide.
+//! whoever is watching the probe topic decide. The interrupting probe
+//! path additionally treats a parked `Unconfirmed` as consumed: the
+//! turn already ended, the write succeeded, and a missing hook is the
+//! known observability gap, not proof of loss.
 
 use super::*;
 use boss_protocol::WorkerActivity;
@@ -167,6 +170,10 @@ pub(crate) enum PaneInjectOutcome {
     /// The pane write succeeded and either a matching `UserPromptSubmit`
     /// hook or a transcript scan confirmed the text was consumed.
     Confirmed,
+    /// A tmux capture showed the text the engine just pasted. This confirms
+    /// only the pane echo, not that the worker consumed it, so callers must
+    /// apply the same liveness checks as an unconfirmed pane write.
+    PaneEcho,
     /// The pane write succeeded into a mid-turn agent whose driver buffers
     /// stdin ([`PaneInputPosture::MidTurnBuffered`]), and no
     /// `UserPromptSubmit` arrived inside the verification window. Unlike
@@ -228,10 +235,22 @@ fn normalize_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Decode the JSON string escapes a JSONL transcript uses for whitespace.
+///
+/// The fallback scan reads the file as raw bytes, not parsed JSON. A
+/// multi-line injection (`INTERRUPT_NOTICE\n\n{probe}`) is stored as the
+/// two-character sequence `\n` inside a JSON string, so `normalize_ws` on
+/// the raw chunk cannot collapse those "newlines" into the spaces it
+/// collapsed in the needle — and the match fails for every interrupting
+/// probe, which is exactly the confirmation miss observed in production.
+fn json_unescape_whitespace(s: &str) -> String {
+    s.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
+}
+
 /// Best-effort check for whether `text` appears anywhere in
 /// `transcript_path` past `offset_bytes`. Used as the fallback
-/// confirmation signal when no `UserPromptSubmit` hook arrives in
-/// time — deliberately permissive (raw substring over the whole new
+/// consumption-confirmation signal when no `UserPromptSubmit` hook arrives
+/// in time — deliberately permissive (raw substring over the whole new
 /// chunk, not scoped to a particular JSONL message shape) since the
 /// point is to catch injected text recorded under a transcript shape
 /// this engine doesn't otherwise parse, not to validate structure.
@@ -257,7 +276,14 @@ async fn transcript_shows_text(transcript_path: &str, offset_bytes: u64, text: &
         return false;
     };
     let needle = normalize_ws(text.trim());
-    !needle.is_empty() && normalize_ws(&chunk).contains(&needle)
+    if needle.is_empty() {
+        return false;
+    }
+    let normalized = normalize_ws(&chunk);
+    if normalized.contains(&needle) {
+        return true;
+    }
+    normalize_ws(&json_unescape_whitespace(&chunk)).contains(&needle)
 }
 
 impl ServerState {
@@ -423,9 +449,12 @@ impl ServerState {
     }
 
     /// Write `req.text` into `req.run_id`'s worker pane (`req.slot_id`) and
-    /// wait up to `req.verify_timeout` for confirmation that the CLI actually
-    /// enqueued it as the next prompt, rather than merely accepting the
-    /// pty write.
+    /// wait up to `req.verify_timeout` for a consumption signal: a matching
+    /// `UserPromptSubmit` hook, or (since that hook firing for pane-injected
+    /// text has never been validated end-to-end) a scan of the worker's
+    /// session transcript. Only those two reads confirm that the CLI
+    /// enqueued the write as a prompt rather than merely accepting the pty
+    /// bytes.
     ///
     /// **Posture guard (first):** `req.posture` must have been resolved by the
     /// caller via [`Self::pane_input_posture_for_run`]. A
@@ -434,22 +463,29 @@ impl ServerState {
     /// pty — this is the safety guard for foreground processes that do not
     /// consume mid-turn stdin.
     ///
-    /// **Confirmation (when the guard passes):** either a matching
-    /// `UserPromptSubmit` hook, or (since that hook firing for
-    /// pane-injected text has never been validated end-to-end) a scan
-    /// of the worker's session transcript for the injected text — so a
-    /// gap in one signal doesn't by itself produce a false
-    /// "unconfirmed".
+    /// A tmux capture match is **not** confirmation. It yields
+    /// [`PaneInjectOutcome::PaneEcho`]: an echo of the engine's own paste,
+    /// which callers must run through the same liveness checks as
+    /// [`PaneInjectOutcome::Unconfirmed`]. Pane echo is never observed for a
+    /// [`PaneInputPosture::MidTurnBuffered`] posture — composer text is the
+    /// expected Buffered shape there, and the pane future is gated off so a
+    /// capture cannot outrank it. The hook wait still runs for every
+    /// injectable posture, including mid-turn, so a folding driver that
+    /// submits inside the verification window is recorded Confirmed.
     ///
-    /// When neither signal confirms in time the result depends on the
-    /// posture, because "no prompt submitted yet" means different things in
-    /// each: a [`PaneInputPosture::Parked`] worker should have submitted
-    /// immediately, so that is [`PaneInjectOutcome::Unconfirmed`]; a
+    /// When neither the hook nor the transcript confirms in time the result
+    /// depends on the posture, because "no prompt submitted yet" means
+    /// different things in each: a [`PaneInputPosture::Parked`] worker
+    /// should have submitted immediately, so that is
+    /// [`PaneInjectOutcome::Unconfirmed`]; a
     /// [`PaneInputPosture::MidTurnBuffered`] worker is still finishing its
     /// turn and is *expected* not to have submitted yet, so that is
     /// [`PaneInjectOutcome::Buffered`]. Neither is an error, and neither is
     /// proof of loss — see the module docs for why callers must not
-    /// auto-redeliver.
+    /// auto-redeliver. Callers that already proved the worker is parked
+    /// (the interrupting probe path) treat `Unconfirmed` as the same
+    /// parked-write consumption the Stop-boundary path records, rather than
+    /// as a delivery failure.
     pub(super) async fn inject_pane_text_verified(&self, req: PaneInjectRequest<'_>) -> PaneInjectOutcome {
         let PaneInjectRequest {
             run_id,
@@ -507,14 +543,47 @@ impl ServerState {
             tracing::warn!(?err, run_id, slot_id, "pane injection transport failed");
             return PaneInjectOutcome::SendFailed(err);
         }
-        match timeout(verify_timeout, waiter).await {
-            Ok(Ok(_prompt)) => PaneInjectOutcome::Confirmed,
-            // Sender dropped without resolving: the timeout will handle
-            // cleanup below via the transcript fallback, since a UserPromptSubmit
-            // for unrelated text may still arrive later and we don't want
-            // to wait on it. Fall straight through to the transcript check.
-            Ok(Err(_)) | Err(_) => {
-                self.take_delivery_waiter(run_id, token);
+        // A pane capture sees our own paste as well as anything the worker
+        // renders, so it is only an echo signal. It is useful for a parked
+        // worker, but mid-turn composer text is the expected Buffered shape
+        // and must never outrank that state. The hook wait still runs for
+        // every posture (a folding driver can submit inside this window);
+        // only the pane future is gated off when mid-turn.
+        enum Evidence {
+            Hook,
+            PaneEcho,
+        }
+        let wait_pane = !posture.is_mid_turn();
+        let mut pane_visible = std::pin::pin!(async {
+            if wait_pane {
+                self.wait_until_pane_shows_text(run_id, normalized_text).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        });
+        let evidence = timeout(verify_timeout, async {
+            tokio::select! {
+                biased;
+                result = waiter => {
+                    if result.is_ok() {
+                        Evidence::Hook
+                    } else {
+                        // A dropped hook sender is not evidence against
+                        // the independent pane poll; keep waiting for it.
+                        // Mid-turn parks here until the outer timeout.
+                        pane_visible.as_mut().await;
+                        Evidence::PaneEcho
+                    }
+                },
+                () = pane_visible.as_mut() => Evidence::PaneEcho,
+            }
+        })
+        .await;
+        self.take_delivery_waiter(run_id, token);
+        match evidence {
+            Ok(Evidence::Hook) => PaneInjectOutcome::Confirmed,
+            Ok(Evidence::PaneEcho) => PaneInjectOutcome::PaneEcho,
+            Err(_) => {
                 if let Some(path) = transcript_path
                     && transcript_shows_text(path, offset_bytes, normalized_text).await
                 {
@@ -524,6 +593,14 @@ impl ServerState {
                         "pane injection confirmed via transcript scan (no UserPromptSubmit observed)",
                     );
                     return PaneInjectOutcome::Confirmed;
+                }
+                if !posture.is_mid_turn() && self.pane_shows_injected_text(run_id, normalized_text).await {
+                    tracing::info!(
+                        run_id,
+                        slot_id,
+                        "pane injection pane echo observed (no UserPromptSubmit observed)",
+                    );
+                    return PaneInjectOutcome::PaneEcho;
                 }
                 if posture.is_mid_turn() {
                     // Expected: the agent is still mid-turn, so it has not
@@ -542,11 +619,64 @@ impl ServerState {
             }
         }
     }
+
+    /// Poll until `text` is visible in `run_id`'s pane. Combined with
+    /// [`timeout`] at the call site so a pane that never shows it does not
+    /// hang; this future itself only returns on a positive read.
+    async fn wait_until_pane_shows_text(&self, run_id: &str, text: &str) {
+        const PANE_CONFIRM_POLL: Duration = Duration::from_millis(200);
+        let (tmux, session_name) = match self.pane_capture_target(run_id) {
+            Some(target) => target,
+            None => std::future::pending::<(Tmux, String)>().await,
+        };
+        let needle = normalize_ws(text.trim());
+        if needle.is_empty() {
+            std::future::pending::<()>().await;
+        }
+        loop {
+            if Self::tmux_capture_shows_text(&tmux, &session_name, &needle).await {
+                return;
+            }
+            tokio::time::sleep(PANE_CONFIRM_POLL).await;
+        }
+    }
+
+    /// True when a tmux capture of `run_id`'s pane contains `text`
+    /// (whitespace-normalized). Fail-closed: no tmux session, a capture
+    /// error, or a blank pane all answer false — the same class of mistake
+    /// as treating `SendToPane` Ok as proof of consumption.
+    async fn pane_shows_injected_text(&self, run_id: &str, text: &str) -> bool {
+        let needle = normalize_ws(text.trim());
+        if needle.is_empty() {
+            return false;
+        }
+        let Some((tmux, session_name)) = self.pane_capture_target(run_id) else {
+            return false;
+        };
+        Self::tmux_capture_shows_text(&tmux, &session_name, &needle).await
+    }
+
+    fn pane_capture_target(&self, run_id: &str) -> Option<(Tmux, String)> {
+        let pane = self.worker_registry.pane_for_run(run_id)?;
+        let session_name = pane.tmux_session_name?;
+        let tmux = self.tmux_for_pane_delivery(run_id).ok()?;
+        Some((tmux, session_name))
+    }
+
+    async fn tmux_capture_shows_text(tmux: &Tmux, session_name: &str, needle: &str) -> bool {
+        let Ok(captured) = tmux.capture_pane(session_name).await else {
+            return false;
+        };
+        if captured.trim().is_empty() {
+            return false;
+        }
+        normalize_ws(&captured).contains(needle)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    //! Behavior tests for the transcript-confirmation fallback helpers.
+    //! Behavior tests for the transcript and pane-capture helpers.
     //!
     //! These assert observable outcomes of `normalize_ws` and
     //! `transcript_shows_text` — the correctness-sensitive fallback path
@@ -555,8 +685,65 @@ mod tests {
     //! hermetic: every transcript is a tempfile written in-test, so no
     //! real session transcripts are touched and results are deterministic.
 
-    use super::{normalize_ws, transcript_shows_text};
+    use super::{PaneInjectOutcome, PaneInjectRequest, PaneInputPosture, normalize_ws, transcript_shows_text};
+    use async_trait::async_trait;
+    use boss_tmux::{CommandOutput, CommandRunner, Tmux};
+    use std::ffi::OsString;
     use std::io::Write;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::super::tests::{register_idle_worker, test_server_state};
+
+    struct CaptureRunner {
+        output: CommandOutput,
+    }
+
+    #[async_trait]
+    impl CommandRunner for CaptureRunner {
+        async fn run(
+            &self,
+            _program: &Path,
+            _args: &[OsString],
+            _cwd: Option<&Path>,
+        ) -> std::io::Result<CommandOutput> {
+            Ok(self.output.clone())
+        }
+
+        async fn run_with_stdin(
+            &self,
+            program: &Path,
+            args: &[OsString],
+            cwd: Option<&Path>,
+            _stdin: &[u8],
+        ) -> std::io::Result<CommandOutput> {
+            self.run(program, args, cwd).await
+        }
+    }
+
+    fn capture_output(success: bool, stdout: &str) -> CommandOutput {
+        CommandOutput {
+            success,
+            code: success.then_some(0).or(Some(1)),
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+        }
+    }
+
+    fn tmux_pane(server_state: &super::ServerState, run_id: &str, slot_id: u8, output: CommandOutput) {
+        server_state
+            .worker_registry
+            .register_tmux_run_slot(run_id, slot_id, "pane-delivery-test");
+        *server_state.pane_delivery_tmux_override.write().unwrap() = Some(
+            Tmux::with_runner_and_socket(
+                "/usr/bin/tmux",
+                Arc::new(CaptureRunner { output }),
+                boss_tmux::TEST_SOCKET_PATH,
+            )
+            .unwrap(),
+        );
+    }
 
     /// Write `bytes` to a fresh tempfile and return `(handle, path)`. The
     /// handle must be kept alive for the file to survive; the `String`
@@ -644,6 +831,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transcript_shows_text_matches_json_escaped_newlines() {
+        // Interrupting probes write `NOTICE\n\n{text}`. JSONL stores that
+        // as the two-character sequence `\n`, which is not whitespace, so a
+        // raw substring scan after normalize_ws misses it. The unescape
+        // step is what makes the fallback actually confirm those writes.
+        let body = br#"{"type":"user","message":"[coordinator-interrupt] cut short.\n\nre-read the spec"}"#;
+        let (_f, path) = transcript_with(body);
+        let needle = "[coordinator-interrupt] cut short.\n\nre-read the spec";
+        assert!(
+            transcript_shows_text(&path, 0, needle).await,
+            "JSON-escaped newlines in the transcript must not hide a multi-line injection"
+        );
+    }
+
+    #[tokio::test]
     async fn transcript_shows_text_false_for_empty_or_whitespace_needle() {
         // A non-empty chunk must not be "confirmed" by an empty needle —
         // normalized, both the empty string and a whitespace-only string
@@ -660,5 +862,124 @@ mod tests {
         // rather than erroring or matching arbitrarily.
         let (_f, path) = transcript_with(&[0xff, 0xfe, 0x00, 0x9f]);
         assert!(!transcript_shows_text(&path, 0, "anything").await);
+    }
+
+    #[tokio::test]
+    async fn pane_capture_echo_is_detected_without_a_hook_or_transcript() {
+        let (server_state, _dir) = test_server_state();
+        let run_id = "pane-capture";
+        register_idle_worker(&server_state, run_id, 41);
+        tmux_pane(
+            &server_state,
+            run_id,
+            41,
+            capture_output(true, "prompt\ninjected text\n"),
+        );
+
+        assert!(server_state.pane_shows_injected_text(run_id, "injected text").await);
+    }
+
+    #[tokio::test]
+    async fn parked_pane_echo_is_not_promoted_to_consumption_confirmation() {
+        let (server_state, _dir) = test_server_state();
+        let run_id = "parked-pane-echo";
+        register_idle_worker(&server_state, run_id, 44);
+        tmux_pane(&server_state, run_id, 44, capture_output(true, "injected text"));
+
+        let outcome = server_state
+            .inject_pane_text_verified(
+                PaneInjectRequest::builder()
+                    .run_id(run_id)
+                    .slot_id(44)
+                    .text("injected text")
+                    .offset_bytes(0)
+                    .verify_timeout(Duration::from_secs(1))
+                    .posture(PaneInputPosture::Parked)
+                    .build(),
+            )
+            .await;
+        assert!(matches!(outcome, PaneInjectOutcome::PaneEcho));
+    }
+
+    #[tokio::test]
+    async fn mid_turn_injection_ignores_a_pane_echo_and_remains_buffered() {
+        let (server_state, _dir) = test_server_state();
+        let run_id = "mid-turn-pane-echo";
+        register_idle_worker(&server_state, run_id, 45);
+        tmux_pane(&server_state, run_id, 45, capture_output(true, "injected text"));
+
+        let outcome = server_state
+            .inject_pane_text_verified(
+                PaneInjectRequest::builder()
+                    .run_id(run_id)
+                    .slot_id(45)
+                    .text("injected text")
+                    .offset_bytes(0)
+                    .verify_timeout(Duration::from_millis(80))
+                    .posture(PaneInputPosture::MidTurnBuffered)
+                    .build(),
+            )
+            .await;
+        assert!(matches!(outcome, PaneInjectOutcome::Buffered));
+    }
+
+    #[tokio::test]
+    async fn mid_turn_injection_is_confirmed_when_the_hook_fires() {
+        let (server_state, _dir) = test_server_state();
+        let run_id = "mid-turn-hook";
+        register_idle_worker(&server_state, run_id, 46);
+        tmux_pane(&server_state, run_id, 46, capture_output(true, "injected text"));
+
+        let inject = {
+            let server_state = Arc::clone(&server_state);
+            tokio::spawn(async move {
+                server_state
+                    .inject_pane_text_verified(
+                        PaneInjectRequest::builder()
+                            .run_id(run_id)
+                            .slot_id(46)
+                            .text("injected text")
+                            .offset_bytes(0)
+                            .verify_timeout(Duration::from_secs(1))
+                            .posture(PaneInputPosture::MidTurnBuffered)
+                            .build(),
+                    )
+                    .await
+            })
+        };
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            server_state.resolve_delivery_waiter(run_id, "injected text");
+            if inject.is_finished() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "mid-turn injection never finished after resolving the delivery waiter"
+            );
+            tokio::task::yield_now().await;
+        }
+        let outcome = inject.await.expect("inject task");
+        assert!(matches!(outcome, PaneInjectOutcome::Confirmed));
+    }
+
+    #[tokio::test]
+    async fn pane_capture_fails_closed_without_a_tmux_session_or_on_bad_capture() {
+        let (server_state, _dir) = test_server_state();
+        register_idle_worker(&server_state, "no-session", 42);
+        assert!(
+            !server_state
+                .pane_shows_injected_text("no-session", "injected text")
+                .await
+        );
+
+        let run_id = "capture-error";
+        register_idle_worker(&server_state, run_id, 43);
+        tmux_pane(&server_state, run_id, 43, capture_output(false, "injected text"));
+        assert!(!server_state.pane_shows_injected_text(run_id, "injected text").await);
+
+        tmux_pane(&server_state, run_id, 43, capture_output(true, "   \n"));
+        assert!(!server_state.pane_shows_injected_text(run_id, "injected text").await);
     }
 }

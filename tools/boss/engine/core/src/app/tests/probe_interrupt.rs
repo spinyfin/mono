@@ -1005,3 +1005,147 @@ async fn pane_text_does_not_confirm_a_turn_end_on_a_grok_busy_marker() {
     pane_showing(&server_state, &run_id, 18, "│ ❯ type your message\n[stop]\n");
     assert!(!server_state.pane_text_shows_turn_ended(&run_id).await);
 }
+
+// ── Confirmation must not report a landed write as "NOT delivered" ──────────
+
+/// The production failure: interrupt a mid-tool-call worker, the write
+/// reaches the parked pane, and no `UserPromptSubmit` hook (or transcript
+/// match) arrives inside the verification window. Before the fix this
+/// settled `Unconfirmed` and `bossctl probe` printed "NOT delivered" for a
+/// probe the worker had in fact received. After: the parked-write contract
+/// records `Consumed` — the same evidence the Stop-boundary path already
+/// used — so the RPC reports a delivery.
+#[tokio::test(start_paused = true)]
+async fn interrupting_a_busy_worker_reports_delivered_without_a_prompt_submit_hook() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 19, Some("grok"));
+    let runner = tmux_hosted(&server_state, &run_id, 19);
+    let parker = park_once_interrupted(&server_state, &runner, 19);
+    // Deliberately no confirmer: the hook that production does not fire.
+
+    let sink = make_session_sink();
+    executions::handle_probe_run(
+        dispatch_for(&server_state, &sink),
+        probe_request(&run_id, "stop — you are building the wrong target"),
+    )
+    .await;
+    parker.await.expect("parker task");
+
+    match sole_response(&sink).await {
+        FrontendEvent::ProbeDelivered {
+            probe_id,
+            state,
+            interrupt,
+            interrupt_attempts,
+            ..
+        } => {
+            assert_eq!(
+                state,
+                ProbeDeliveryState::Consumed,
+                "a successful write into a parked pane after interrupt is a delivery, even when \
+                 UserPromptSubmit never fires; got {state:?}",
+            );
+            assert!(
+                state.is_delivered(),
+                "bossctl probe keys off is_delivered(); Unconfirmed would still print NOT delivered"
+            );
+            assert_eq!(interrupt, ProbeInterruptOutcome::Interrupted);
+            assert_eq!(interrupt_attempts, 1);
+            assert_eq!(
+                server_state.probe_lifecycle_state(&probe_id),
+                Some(ProbeDeliveryState::Consumed),
+            );
+        }
+        other => panic!("expected ProbeDelivered, got {other:?}"),
+    }
+    assert!(
+        runner.wrote_text(),
+        "the probe text must have reached the pane; calls were {:?}",
+        runner.calls(),
+    );
+}
+
+/// Shape B: another dispatcher already claimed this probe and is mid-write.
+/// The interrupting path must wait for that path to record an outcome rather
+/// than answering `queued` (which `bossctl probe` used to print as
+/// "NOT delivered") for a probe that is already in flight.
+#[tokio::test(start_paused = true)]
+async fn interrupting_path_reports_the_other_path_outcome_when_this_probe_is_already_in_flight() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 20, Some("grok"));
+    let _runner = tmux_hosted(&server_state, &run_id, 20);
+
+    let probe_id = server_state.queue_probe(run_id.clone(), "already in flight".into(), false);
+    assert!(
+        server_state
+            .try_reserve_specific_probe_for_delivery(&run_id, &probe_id, None, 0)
+            .is_some(),
+        "the 'other path' must hold the claim",
+    );
+    server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Injected);
+
+    let server_for_settle = server_state.clone();
+    let probe_id_for_settle = probe_id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        server_for_settle.set_probe_lifecycle(&probe_id_for_settle, ProbeDeliveryState::Consumed);
+    });
+
+    let delivered = crate::app::probe_interrupt::deliver_probe_interrupting(&server_state, &run_id, &probe_id).await;
+    assert_eq!(
+        delivered.state,
+        ProbeDeliveryState::Consumed,
+        "must report the other path's settled state, not the Queued snapshot taken at the race; \
+         got {:?}",
+        delivered.state,
+    );
+    assert_eq!(delivered.interrupt, ProbeInterruptOutcome::NotAttempted);
+    assert!(delivered.state.is_delivered());
+}
+
+/// A different probe holding the run's in-flight slot must not be described
+/// as this probe having failed. The new probe stays queued — still a live
+/// promise — and the interrupting RPC reports that honestly.
+#[tokio::test(start_paused = true)]
+async fn interrupting_path_reports_queued_not_failed_when_a_different_probe_holds_the_slot() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 21, Some("grok"));
+    let _runner = tmux_hosted(&server_state, &run_id, 21);
+
+    let older = server_state.queue_probe(run_id.clone(), "older in-flight probe".into(), false);
+    assert!(
+        server_state
+            .try_reserve_specific_probe_for_delivery(&run_id, &older, None, 0)
+            .is_some()
+    );
+
+    let sink = make_session_sink();
+    executions::handle_probe_run(
+        dispatch_for(&server_state, &sink),
+        probe_request(&run_id, "the newer interrupting probe"),
+    )
+    .await;
+
+    match sole_response(&sink).await {
+        FrontendEvent::ProbeDelivered {
+            probe_id,
+            state,
+            interrupt,
+            ..
+        } => {
+            assert_ne!(probe_id, older);
+            assert_eq!(
+                state,
+                ProbeDeliveryState::Queued,
+                "the newer probe is still a live promise, not a failed delivery"
+            );
+            assert!(
+                state.is_in_progress(),
+                "bossctl must classify this as in_progress, not NOT delivered"
+            );
+            assert!(!state.is_undeliverable());
+            assert_eq!(interrupt, ProbeInterruptOutcome::NotAttempted);
+        }
+        other => panic!("expected ProbeDelivered, got {other:?}"),
+    }
+}

@@ -77,13 +77,22 @@ const ACTIVITY_POLL_INTERVAL: Duration = Duration::from_millis(150);
 /// interrupting probe fail on a worker that visibly stopped.
 const PANE_TEXT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// How long the post-interrupt write waits for confirmation that the worker's
-/// CLI enqueued the text.
-///
-/// Matches the mid-turn path's window. The worker is parked by construction
-/// at this point, so a `UserPromptSubmit` should be immediate; the window
-/// exists for the hook round trip, not for the model.
+/// How long the post-interrupt write waits for a consumption-confirming
+/// signal (`UserPromptSubmit` or transcript) before falling back to the
+/// parked-write contract. A pane capture is only an echo of our write and
+/// still takes that liveness-gated contract; a successful `send_keys` into a
+/// pane whose turn we already proved ended, with the process still alive, is
+/// `Consumed` — the same evidence the Stop-boundary parked path records
+/// without waiting at all. The window is for the stronger signals to win
+/// when they are fast, not a bound on whether the write counted.
 const POST_INTERRUPT_VERIFY_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// How long to wait for another dispatcher that already claimed this probe
+/// (or the run's single in-flight slot) to record an outcome, before
+/// reporting whatever state it has so far. Sized just past the mid-turn
+/// verification window so a `PostToolUse` path that won the race can finish
+/// its own confirm rather than being reported as `queued` mid-write.
+const OTHER_PATH_SETTLE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Prefix on text delivered after a turn was actually cut short.
 ///
@@ -176,11 +185,10 @@ pub(super) async fn deliver_probe_interrupting(
     else {
         // Either another dispatch path holds the run's delivery slot, or this
         // exact probe id is not present in the queue at all (already claimed
-        // by another dispatcher, or already settled). Report what the
-        // probe's own record says rather than guessing: if a racing boundary
-        // already delivered it, that is a success and saying otherwise would
-        // send the operator chasing a probe that landed.
-        return raced_to_another_dispatcher(server_state, run_id, probe_id);
+        // by another dispatcher, or already settled). Wait for that path to
+        // record an outcome when it is delivering *this* probe, rather than
+        // reporting `queued` for a write that is already in flight.
+        return raced_to_another_dispatcher(server_state, run_id, probe_id).await;
     };
 
     let (interrupt, attempts) = match interrupt_and_confirm(server_state, run_id, slot_id).await {
@@ -524,6 +532,23 @@ async fn inject_after_interrupt(
                 detail: None,
             }
         }
+        PaneInjectOutcome::PaneEcho => {
+            let state = super::worker_events::record_pane_write_outcome(
+                server_state,
+                run_id,
+                slot_id,
+                &probe_id,
+                ProbeDeliveryState::Consumed,
+                "probe pane echo observed after interrupt (parked-write consumption)",
+            )
+            .await;
+            InterruptingDelivery {
+                state,
+                interrupt,
+                attempts,
+                detail: None,
+            }
+        }
         // A parked worker submitting nothing is not the mid-turn `Buffered`
         // shape — it is the same "wrote it, could not prove it" the parked
         // path already records as `Unconfirmed`. `inject_pane_text_verified`
@@ -547,38 +572,38 @@ async fn inject_after_interrupt(
             }
         }
         PaneInjectOutcome::Unconfirmed => {
-            let detail = format!(
-                "the interrupt took and the text was written into the parked pane, but no \
-                 UserPromptSubmit hook or transcript match appeared within \
-                 {POST_INTERRUPT_VERIFY_TIMEOUT:?}; not auto-redelivered, since a second copy would \
-                 repeat the instruction"
-            );
-            tracing::warn!(
+            // The worker is parked by construction — we confirmed the turn
+            // ended before typing. A successful write into a parked pane is
+            // the same evidence `deliver_probe_via_pane_write` records as
+            // Consumed without waiting for a hook. UserPromptSubmit for
+            // pane-injected text has never been validated end-to-end and
+            // routinely misses this window (Grok's hooks block the TUI for
+            // up to 15s after an interrupted tool call; JSONL stores
+            // multi-line injections escaped). Treating that miss as "NOT
+            // delivered" is the false negative this path existed to close.
+            // Liveness still gates the claim: a dead process is Orphaned.
+            tracing::info!(
                 run_id,
                 slot_id,
                 probe_id = %probe_id,
-                "probe written after an interrupt but delivery could not be confirmed",
+                timeout = ?POST_INTERRUPT_VERIFY_TIMEOUT,
+                "probe written into a parked pane after interrupt; UserPromptSubmit/transcript did \
+                 not confirm within the window — recording parked-write consumption",
             );
-            server_state.set_probe_lifecycle_detail(&probe_id, ProbeDeliveryState::Unconfirmed, Some(detail.clone()));
-            // Claim deliberately kept: the text may well have been consumed,
-            // so a reply at the next boundary should still be captured.
-            server_state
-                .topic_broker
-                .publish(
-                    &probe_topic(run_id),
-                    FrontendEventEnvelope::push(FrontendEvent::ProbeDeliveryEscalated {
-                        run_id: run_id.to_owned(),
-                        probe_id: probe_id.clone(),
-                        reason: "delivery unconfirmed after an interrupting pane injection (not re-delivered)"
-                            .to_owned(),
-                    }),
-                )
-                .await;
+            let state = super::worker_events::record_pane_write_outcome(
+                server_state,
+                run_id,
+                slot_id,
+                &probe_id,
+                ProbeDeliveryState::Consumed,
+                "probe written into parked pane after interrupt (parked-write consumption)",
+            )
+            .await;
             InterruptingDelivery {
-                state: ProbeDeliveryState::Unconfirmed,
+                state,
                 interrupt,
                 attempts,
-                detail: Some(detail),
+                detail: None,
             }
         }
         PaneInjectOutcome::NotAcceptingInput { activity } => {
@@ -729,14 +754,30 @@ async fn abandon_before_write(
 
 /// Another dispatch path claimed the probe (or the run's delivery slot)
 /// first. Report the probe's own recorded state rather than inventing one.
-fn raced_to_another_dispatcher(server_state: &Arc<ServerState>, run_id: &str, probe_id: &str) -> InterruptingDelivery {
-    let state = server_state
-        .probe_lifecycle_state(probe_id)
-        .unwrap_or(ProbeDeliveryState::Queued);
+///
+/// When that other path is in the middle of delivering *this* probe (the
+/// in-flight slot names `probe_id` and the lifecycle is still `Queued` /
+/// `Injected`), wait for it to record an outcome so the interrupting RPC
+/// does not answer `queued` for a write that is already in flight — the
+/// shape that made a delivered probe look like a lost one.
+async fn raced_to_another_dispatcher(
+    server_state: &Arc<ServerState>,
+    run_id: &str,
+    probe_id: &str,
+) -> InterruptingDelivery {
+    let in_flight_id = server_state.in_flight_probe_id(run_id);
+    let state = if in_flight_id.as_deref() == Some(probe_id) {
+        wait_for_other_path_to_settle(server_state, probe_id).await
+    } else {
+        server_state
+            .probe_lifecycle_state(probe_id)
+            .unwrap_or(ProbeDeliveryState::Queued)
+    };
     tracing::info!(
         run_id,
         probe_id,
         state = state.as_str(),
+        in_flight = in_flight_id.as_deref(),
         "interrupting probe delivery could not claim the probe; another dispatch path holds it or \
          the run's delivery slot",
     );
@@ -749,6 +790,27 @@ fn raced_to_another_dispatcher(server_state: &Arc<ServerState>, run_id: &str, pr
              the interrupt could run; its state above is what that path recorded"
                 .to_owned(),
         ),
+    }
+}
+
+/// Poll `probe_id`'s lifecycle until it leaves `Queued`/`Injected`, or until
+/// [`OTHER_PATH_SETTLE_TIMEOUT`]. The other path has already claimed this
+/// probe; we are only waiting to report the outcome it records.
+async fn wait_for_other_path_to_settle(server_state: &ServerState, probe_id: &str) -> ProbeDeliveryState {
+    const POLL: Duration = Duration::from_millis(50);
+    let deadline = tokio::time::Instant::now() + OTHER_PATH_SETTLE_TIMEOUT;
+    loop {
+        let state = server_state
+            .probe_lifecycle_state(probe_id)
+            .unwrap_or(ProbeDeliveryState::Queued);
+        if !state.is_in_progress() {
+            return state;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return state;
+        }
+        tokio::time::sleep(POLL.min(deadline.saturating_duration_since(now))).await;
     }
 }
 
