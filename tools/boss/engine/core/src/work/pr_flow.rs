@@ -1095,13 +1095,10 @@ impl WorkDb {
     ///
     /// `input.preserve_merge_queue_state` leaves `merge_queue_state` /
     /// `merge_queue_detail` untouched regardless of `input.merge_queue_state`
-    /// / `input.merge_queue_detail` — the merge poller sets this for a
-    /// `trunk_queue`-mechanism task, whose merge-queue columns are owned by
-    /// the Trunk submission flow (`ServerState`'s `handle_trunk_queue_merge`),
-    /// not by this GitHub probe: GitHub always reports
-    /// `in_merge_queue=false`/`auto_merge_enabled=false` for such a task, so
-    /// without this gate every sweep would immediately wipe the optimistic
-    /// `"queued"` state the trunk submission just wrote.
+    /// / `input.merge_queue_detail`. The merge poller uses it for a
+    /// `trunk_queue`-mechanism task (whose columns are owned by Trunk) and
+    /// for the empty first GitHub observation of a per-row native merge
+    /// intent. Neither case is evidence that the requested merge departed.
     pub fn update_task_pr_poll_state(&self, work_item_id: &str, input: PrPollStateInput) -> Result<PrPollStateOutcome> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
@@ -1347,10 +1344,10 @@ pub struct PrPollStateInput<'a> {
     /// execution's run start).
     pub pr_head_sha: Option<&'a str>,
     /// When `true`, `merge_queue_state`/`merge_queue_detail` are left
-    /// untouched regardless of the values above — set by the caller for a
-    /// `trunk_queue`-mechanism task, whose merge-queue columns are owned by
-    /// the Trunk submission flow rather than this GitHub probe. Defaults to
-    /// `false` (the pre-existing behaviour) via `#[derive(Default)]`.
+    /// untouched regardless of the values above. Used for Trunk-owned rows
+    /// and a GitHub-native intent's empty first observation; both have a
+    /// separate authoritative owner for their next lane transition. Defaults
+    /// to `false` (the pre-existing behaviour) via `#[derive(Default)]`.
     pub preserve_merge_queue_state: bool,
 }
 

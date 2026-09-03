@@ -4,6 +4,9 @@ use super::*;
 #[derive(Debug, Clone)]
 pub struct MergeQueueDequeueEvent {
     pub reason: String,
+    /// Time GitHub recorded the dequeue event. An intent created after this
+    /// event must not be retired by historical timeline evidence.
+    pub created_at: Option<String>,
     /// PR head that was in effect when this timeline event was emitted.
     /// Derived from the preceding `PullRequestCommit` /
     /// `HeadRefForcePushedEvent` in the same ordered timeline connection.
@@ -28,7 +31,7 @@ pub(crate) const DEQUEUE_EVENTS_FIELDS: &str = concat!(
     "REMOVED_FROM_MERGE_QUEUE_EVENT], last: 20) { nodes { __typename ",
     "... on PullRequestCommit { commit { oid } } ",
     "... on HeadRefForcePushedEvent { afterCommit { oid } } ",
-    "... on RemovedFromMergeQueueEvent { reason beforeCommit { oid } } } }",
+    "... on RemovedFromMergeQueueEvent { reason createdAt beforeCommit { oid } } } }",
 );
 
 /// Batch-fetch merge-queue dequeue events for every PR in `pr_urls` with
@@ -139,15 +142,11 @@ pub(crate) async fn fetch_merge_queue_dequeue_events_batch(
 }
 
 /// Shared node-level parser for an ordered `timelineItems.nodes` array.
-/// Tracks PR-commit / force-push nodes as the head provenance for subsequent
-/// dequeue nodes, then returns events with `reason == "failed_checks"`
-/// (case-insensitive; GitHub's API returns the lowercase form even though
-/// the GraphQL schema documents the enum as uppercase `FAILED_CHECKS`).
-/// Events for other reasons (`MANUAL_REMOVAL`, `MERGE_CONFLICT`, etc.) are
-/// filtered out.
-///
-/// Pure and side-effect-free so the filtering/casing rules can be
-/// unit-tested without a live `gh` call.
+/// Tracks PR-commit / force-push nodes as the head provenance for every
+/// subsequent dequeue node. CI remediation filters to `FAILED_CHECKS`, while
+/// a GitHub-native merge intent must see every reason because a manual or
+/// conflict dequeue is still authoritative evidence that its card left
+/// Merging.
 pub(crate) fn parse_dequeue_event_nodes(nodes: &[serde_json::Value]) -> Vec<MergeQueueDequeueEvent> {
     let mut events = Vec::new();
     let mut pr_head_oid: Option<String> = None;
@@ -171,17 +170,10 @@ pub(crate) fn parse_dequeue_event_nodes(nodes: &[serde_json::Value]) -> Vec<Merg
             Some(r) => r.to_owned(),
             None => continue,
         };
-        // Only surface FAILED_CHECKS — all other reasons are informational
-        // or terminal-success and must not feed the ci_failure path.
-        // GitHub returns the lowercase form "failed_checks" even though
-        // the schema declares the enum as FAILED_CHECKS; compare
-        // case-insensitively to accept both.
-        if !reason.eq_ignore_ascii_case("failed_checks") {
-            continue;
-        }
         let before_commit_oid = node["beforeCommit"]["oid"].as_str().map(|s| s.to_owned());
         events.push(MergeQueueDequeueEvent {
             reason,
+            created_at: node["createdAt"].as_str().map(str::to_owned),
             pr_head_oid: pr_head_oid.clone(),
             before_commit_oid,
         });
@@ -210,7 +202,84 @@ pub(crate) async fn run_merge_queue_rebounce_pass(
     let rebounce_urls: Vec<String> = rebounce_candidates.iter().map(|c| c.pr_url.clone()).collect();
     let dequeue_events = fetch_merge_queue_dequeue_events_batch(&rebounce_urls).await;
     for candidate in &rebounce_candidates {
+        clear_github_merge_intent_on_observed_dequeue(work_db, publisher, candidate, &dequeue_events).await;
         check_merge_queue_rebounce(work_db, publisher, candidate, &dequeue_events, outcome).await;
+    }
+}
+
+/// Clear a GitHub-native merge intent only on timeline evidence that its
+/// exact submitted head left the merge queue. An empty lifecycle probe is not
+/// evidence: it is the expected transient immediately after `gh pr merge`.
+pub(crate) async fn clear_github_merge_intent_on_observed_dequeue(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    dequeue_events: &HashMap<String, Vec<MergeQueueDequeueEvent>>,
+) {
+    let Some(events) = dequeue_events.get(&candidate.pr_url) else {
+        return;
+    };
+    for event in events {
+        let Some(head_sha) = event.pr_head_oid.as_deref() else {
+            continue;
+        };
+        let Some(event_created_at) = event
+            .created_at
+            .as_deref()
+            .and_then(|created_at| chrono::DateTime::parse_from_rfc3339(created_at).ok())
+            .map(|created_at| created_at.timestamp())
+        else {
+            tracing::debug!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                head_sha,
+                "merge poller: dequeue event has no creation time; skipping intent retirement",
+            );
+            continue;
+        };
+        let prior = match work_db.retire_github_merge_intent_on_dequeue(
+            &candidate.work_item_id,
+            &candidate.pr_url,
+            head_sha,
+            event_created_at,
+        ) {
+            Ok(Some(prior)) => prior,
+            Ok(None) => continue,
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    head_sha,
+                    ?err,
+                    "merge poller: failed to retire GitHub merge intent after observed dequeue",
+                );
+                return;
+            }
+        };
+        if prior.is_none() {
+            return;
+        }
+        tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            prior_merge_queue_state = prior.as_deref(),
+            new_merge_queue_state = Option::<&str>::None,
+            in_merge_queue = false,
+            auto_merge_enabled = false,
+            dequeue_reason = %event.reason,
+            "merge poller: card Merging lane state changed",
+        );
+        publisher
+            .publish_work_item_changed(
+                &candidate.product_id,
+                &candidate.work_item_id,
+                "github_merge_intent_dequeued",
+            )
+            .await;
+        if prior.as_deref() == Some("queued") {
+            renumber_merge_queue(work_db, publisher, &candidate.product_id).await;
+        }
+        return;
     }
 }
 
@@ -246,6 +315,14 @@ pub(crate) async fn check_merge_queue_rebounce(
     // share one remediation budget, and the freshest synthetic run is the
     // most useful CI evidence to retain on that row.
     for event in events.iter().rev() {
+        // Other dequeue reasons are still consumed above as evidence to
+        // retire a GitHub merge intent, but only failed checks mint a CI
+        // remediation attempt. GitHub returns the lowercase form
+        // `failed_checks` even though the schema declares `FAILED_CHECKS`,
+        // so compare case-insensitively to accept both.
+        if !event.reason.eq_ignore_ascii_case("failed_checks") {
+            continue;
+        }
         let Some(pr_head_sha) = event.pr_head_oid.as_deref() else {
             // Unattributable forever when the bounded timeline window is
             // crowded out by dequeue events (no PR-head provenance left).

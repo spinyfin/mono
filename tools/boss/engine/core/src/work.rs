@@ -494,6 +494,7 @@ mod execution_launch_config;
 mod execution_retention;
 mod executions_runs;
 mod github_api_usage_db;
+mod github_merge_intents;
 mod host_reconcile_queries;
 mod insert_helpers;
 mod list_filter;
@@ -592,6 +593,7 @@ pub use execution_retention::{
 };
 pub use executions_runs::CancelExecutionOpts;
 pub use github_api_usage_db::{GithubApiCallRow, GithubApiUsageBucket};
+pub use github_merge_intents::{GithubMergeIntent, GithubMergeIntentInsertInput, GithubMergeIntentRecordOutcome};
 pub use mappers::CiInFlightObservation;
 pub use mappers::CiRemediationInsertInput;
 pub use mappers::ConflictResolutionInsertInput;

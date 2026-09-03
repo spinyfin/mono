@@ -246,13 +246,6 @@ fn parse_merge_queue_entry(body: &Value) -> Option<MergeQueueEntry> {
     })
 }
 
-/// Whether `pr_url` is currently in its repository's merge queue. Thin
-/// boolean wrapper over [`pr_merge_queue_entry`] for callers that only need
-/// membership, not the sub-state detail.
-pub async fn pr_in_merge_queue(pr_url: &str) -> bool {
-    pr_merge_queue_entry(pr_url).await.is_some()
-}
-
 // ── CommandGhRunner (production) ──────────────────────────────────────────────
 
 /// Production [`GhRunner`] that spawns the `gh` CLI binary.

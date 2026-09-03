@@ -1508,19 +1508,20 @@ async fn apply_resolved_state(
 /// has no `reason`/`cause`/`error` — so the state alone cannot tell "the
 /// combined build went red" from "Trunk could not even construct the merge".
 /// Both arrive as `failed`, and routing on the state alone is what made a
-/// merge conflict read as a CI failure (T792/T793): the CI ledger was handed
-/// an episode with no failing build for a worker to point at, and the worker
-/// it dispatched force-pushed an empty commit over the PR's contents.
+/// merge conflict read as a CI failure: the CI ledger was handed an episode
+/// with no failing build for a worker to point at, and the worker it
+/// dispatched force-pushed an empty commit over the PR's contents.
 ///
-/// The GitHub-native arm has had the equivalent filter since T605
-/// (`merge_poller::merge_queue::parse_dequeue_event_nodes` drops every
-/// dequeue whose `reason` is not `failed_checks`); this is that filter for
-/// the Trunk arm, reconstructed from the channels that do carry a reason.
+/// The GitHub-native arm applies the equivalent filter in
+/// `merge_poller::merge_queue::check_merge_queue_rebounce`, which drops
+/// every dequeue whose `reason` is not `failed_checks`; this is that filter
+/// for the Trunk arm, reconstructed from the channels that do carry a
+/// reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TrunkEvictionCause {
     /// Trunk built the construction branch and the build failed — or nothing
-    /// positively says otherwise. Routed to the CI ledger exactly as before
-    /// (T605): it is the only ledger that accepts off-head evidence, which a
+    /// positively says otherwise. Routed to the CI ledger exactly as before:
+    /// it is the only ledger that accepts off-head evidence, which a
     /// build on an ephemeral `trunk-merge/pr-<N>/*` branch is.
     TestFailure,
     /// The PR no longer merges into the queue's target branch, so Trunk never
@@ -2047,9 +2048,10 @@ async fn handle_trunk_queue_eviction(
 /// The eviction is a *symptom*: Trunk could not construct the merge because
 /// the PR itself no longer merges into the target branch. That is head-vs-base
 /// — the exact predicate `conflict_watch` tests on its own sweep — so the
-/// remediation already exists and is already correct (on T792/T793 it produced
-/// "Resolve merge conflict against main" four minutes after the bogus CI
-/// revision). Nothing here duplicates it; this only transfers ownership.
+/// remediation already exists and is already correct: on the incident this
+/// handler was written for, `conflict_watch` produced "Resolve merge conflict
+/// against main" four minutes after the bogus CI revision. Nothing here
+/// duplicates it; this only transfers ownership.
 ///
 /// The transfer has to be explicit rather than left to `conflict_watch`.
 /// `trunk_merge::needs_remediation` counts `last_trunk_state ∈ {failed,

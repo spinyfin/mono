@@ -38,10 +38,11 @@ fn parse_dequeue_event_nodes_accepts_uppercase_failed_checks() {
     assert_eq!(events[0].before_commit_oid.as_deref(), Some("def456abc789"));
 }
 
-/// Non-FAILED_CHECKS reasons (manual dequeue, merge conflict, etc.) must
-/// be silently discarded — they must not trigger the ci_failure path.
+/// Every departure reason must reach the intent reconciler. The CI-remediation
+/// path itself filters to `failed_checks`, so manual/conflict removals clear
+/// Merging without incorrectly minting a CI revision.
 #[test]
-fn parse_dequeue_event_nodes_filters_non_failed_checks() {
+fn parse_dequeue_event_nodes_surfaces_all_departure_reasons() {
     let nodes = serde_json::json!([
         {"reason": "dequeued",       "beforeCommit": {"oid": "sha1"}},
         {"reason": "merge_conflict", "beforeCommit": {"oid": "sha2"}},
@@ -49,8 +50,15 @@ fn parse_dequeue_event_nodes_filters_non_failed_checks() {
         {"reason": "failed_checks",  "beforeCommit": {"oid": "sha4"}}
     ]);
     let events = parse_dequeue_event_nodes(nodes.as_array().unwrap());
-    assert_eq!(events.len(), 1, "only failed_checks must be surfaced");
-    assert_eq!(events[0].before_commit_oid.as_deref(), Some("sha4"));
+    assert_eq!(
+        events.len(),
+        4,
+        "every dequeue reason is evidence for intent retirement"
+    );
+    assert_eq!(events[0].reason, "dequeued");
+    assert_eq!(events[1].reason, "merge_conflict");
+    assert_eq!(events[2].reason, "queue_cleared");
+    assert_eq!(events[3].before_commit_oid.as_deref(), Some("sha4"));
 }
 
 /// `beforeCommit` can be null when GitHub omits it. The event must
@@ -114,6 +122,7 @@ fn build_batch_query_with_dequeue_events_fields_requests_timeline_items() {
          leaving it inferable from the gap between two `remaining` readings"
     );
     assert!(query.contains("REMOVED_FROM_MERGE_QUEUE_EVENT"));
+    assert!(query.contains("createdAt"));
     assert!(query.contains("PULL_REQUEST_COMMIT"));
     assert!(query.contains("HEAD_REF_FORCE_PUSHED_EVENT"));
     assert!(
@@ -405,6 +414,7 @@ async fn rebounce_at_a_head_with_branch_ci_remediation_still_mints_attempt() {
 async fn dequeue_event_head_gate_skips_superseded_and_admits_current_head() {
     let stale = MergeQueueDequeueEvent {
         reason: "failed_checks".to_owned(),
+        created_at: Some("2026-01-01T00:00:00Z".to_owned()),
         pr_head_oid: Some("head-1".to_owned()),
         before_commit_oid: Some("queue-1".to_owned()),
     };
@@ -1155,6 +1165,332 @@ async fn update_pr_poll_state_preserves_trunk_owned_merge_queue_state() {
     assert!(
         !renumbered,
         "a trunk_queue product's rows must never go through GitHub-native queue renumbering"
+    );
+}
+
+/// Regression: GitHub can answer the first targeted poll after a successful
+/// `gh pr merge --auto --squash` before either `mergeQueueEntry` or
+/// `autoMergeRequest` has materialized. The durable per-row intent must keep
+/// the card in Merging through that empty observation.
+#[tokio::test]
+async fn update_pr_poll_state_preserves_github_intent_through_empty_first_probe() {
+    let (_dir, db) = open_db();
+    let product = create_test_product_with_repo(&db, "GitHubIntentPreserve", Some("git@github.com:foo/bar.git"));
+    let task = chore_in_review_for_product(&db, &product.id, "T", "https://github.com/foo/bar/pull/1");
+    let detail = serde_json::json!({
+        "position": null,
+        "state": null,
+        "enqueued_at": null,
+        "section_order": QUEUED_NO_POSITION_SECTION_ORDER,
+    })
+    .to_string();
+    db.record_github_merge_intent(
+        crate::work::GithubMergeIntentInsertInput::builder()
+            .work_item_id(task.clone())
+            .pr_url("https://github.com/foo/bar/pull/1")
+            .head_sha("head-1")
+            .build(),
+        &detail,
+    )
+    .unwrap();
+
+    let candidate = PendingMergeCheck {
+        work_item_id: task.clone(),
+        product_id: product.id.clone(),
+        pr_url: "https://github.com/foo/bar/pull/1".to_owned(),
+    };
+    let publisher = RecordingPublisher::default();
+    let mut empty_probe = probe_with_queue_fields(false, None, None, None, false, None);
+    empty_probe.head_ref_oid = Some("head-1".to_owned());
+    update_pr_poll_state(&db, &publisher, &candidate, &empty_probe, None).await;
+
+    let (state, stored_detail) = merge_queue_columns(&db, &task);
+    assert_eq!(state.as_deref(), Some("queued"));
+    assert_eq!(
+        stored_detail["section_order"],
+        serde_json::json!(QUEUED_NO_POSITION_SECTION_ORDER)
+    );
+    assert!(
+        db.get_active_github_merge_intent(&task, &candidate.pr_url)
+            .unwrap()
+            .is_some(),
+        "an empty observation is not a dequeue"
+    );
+}
+
+/// A timeline dequeue for the submitted head is the affirmative evidence the
+/// empty-probe guard needs before it returns the card to Review.
+#[tokio::test]
+async fn observed_github_dequeue_retires_intent_and_clears_merging() {
+    let (_dir, db) = open_db();
+    let product = create_test_product_with_repo(&db, "GitHubIntentDequeue", Some("git@github.com:foo/bar.git"));
+    let task = chore_in_review_for_product(&db, &product.id, "T", "https://github.com/foo/bar/pull/2");
+    db.record_github_merge_intent(
+        crate::work::GithubMergeIntentInsertInput::builder()
+            .work_item_id(task.clone())
+            .pr_url("https://github.com/foo/bar/pull/2")
+            .head_sha("head-2")
+            .build(),
+        "{}",
+    )
+    .unwrap();
+    let candidate = PendingMergeCheck {
+        work_item_id: task.clone(),
+        product_id: product.id.clone(),
+        pr_url: "https://github.com/foo/bar/pull/2".to_owned(),
+    };
+    let mut events = HashMap::new();
+    events.insert(
+        candidate.pr_url.clone(),
+        vec![MergeQueueDequeueEvent {
+            reason: "manual_removal".to_owned(),
+            created_at: Some("2100-01-01T00:00:00Z".to_owned()),
+            pr_head_oid: Some("head-2".to_owned()),
+            before_commit_oid: None,
+        }],
+    );
+    let publisher = RecordingPublisher::default();
+    clear_github_merge_intent_on_observed_dequeue(&db, &publisher, &candidate, &events).await;
+
+    let (state, detail) = merge_queue_columns(&db, &task);
+    assert!(state.is_none());
+    assert_eq!(detail, serde_json::Value::Null);
+    assert!(
+        db.get_active_github_merge_intent(&task, &candidate.pr_url)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        publisher
+            .events
+            .lock()
+            .await
+            .iter()
+            .any(|(_, item_id, reason)| item_id == &task && reason == "github_merge_intent_dequeued"),
+        "the authoritative dequeue must notify the push-only app"
+    );
+}
+
+/// A historical dequeue at the same head must not retire a newly recorded
+/// intent when GitHub returns both attempts in its bounded timeline window.
+#[tokio::test]
+async fn historical_github_dequeue_does_not_retire_newer_intent() {
+    let (_dir, db) = open_db();
+    let product = create_test_product_with_repo(&db, "GitHubIntentStaleDequeue", Some("git@github.com:foo/bar.git"));
+    let task = chore_in_review_for_product(&db, &product.id, "T", "https://github.com/foo/bar/pull/3");
+    db.record_github_merge_intent(
+        crate::work::GithubMergeIntentInsertInput::builder()
+            .work_item_id(task.clone())
+            .pr_url("https://github.com/foo/bar/pull/3")
+            .head_sha("head-3")
+            .build(),
+        "{}",
+    )
+    .unwrap();
+    let candidate = PendingMergeCheck {
+        work_item_id: task.clone(),
+        product_id: product.id.clone(),
+        pr_url: "https://github.com/foo/bar/pull/3".to_owned(),
+    };
+    let mut events = HashMap::new();
+    events.insert(
+        candidate.pr_url.clone(),
+        vec![MergeQueueDequeueEvent {
+            reason: "manual_removal".to_owned(),
+            created_at: Some("1970-01-01T00:00:00Z".to_owned()),
+            pr_head_oid: Some("head-3".to_owned()),
+            before_commit_oid: None,
+        }],
+    );
+    let publisher = RecordingPublisher::default();
+    clear_github_merge_intent_on_observed_dequeue(&db, &publisher, &candidate, &events).await;
+
+    assert!(
+        db.get_active_github_merge_intent(&task, &candidate.pr_url)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(merge_queue_columns(&db, &task).0.as_deref(), Some("queued"));
+}
+
+/// A merge request is pinned to its observed head, so a later head must
+/// retire the intent and allow an empty lifecycle probe to clear the lane.
+#[tokio::test]
+async fn update_pr_poll_state_retires_github_intent_when_head_advances() {
+    let (_dir, db) = open_db();
+    let product = create_test_product_with_repo(&db, "GitHubIntentHeadAdvance", Some("git@github.com:foo/bar.git"));
+    let task = chore_in_review_for_product(&db, &product.id, "T", "https://github.com/foo/bar/pull/4");
+    db.record_github_merge_intent(
+        crate::work::GithubMergeIntentInsertInput::builder()
+            .work_item_id(task.clone())
+            .pr_url("https://github.com/foo/bar/pull/4")
+            .head_sha("head-4")
+            .build(),
+        "{}",
+    )
+    .unwrap();
+    let candidate = PendingMergeCheck {
+        work_item_id: task.clone(),
+        product_id: product.id.clone(),
+        pr_url: "https://github.com/foo/bar/pull/4".to_owned(),
+    };
+    let mut probe = probe_with_queue_fields(false, None, None, None, false, None);
+    probe.head_ref_oid = Some("head-5".to_owned());
+    let publisher = RecordingPublisher::default();
+    update_pr_poll_state(&db, &publisher, &candidate, &probe, None).await;
+
+    assert!(
+        db.get_active_github_merge_intent(&task, &candidate.pr_url)
+            .unwrap()
+            .is_none()
+    );
+    assert!(merge_queue_columns(&db, &task).0.is_none());
+}
+
+/// An empty probe that omits `headRefOid` is unevaluable, not a head
+/// advance. Retiring on that absence would bounce Merging permanently.
+#[tokio::test]
+async fn update_pr_poll_state_preserves_github_intent_when_probe_head_is_missing() {
+    let (_dir, db) = open_db();
+    let product = create_test_product_with_repo(&db, "GitHubIntentMissingHead", Some("git@github.com:foo/bar.git"));
+    let task = chore_in_review_for_product(&db, &product.id, "T", "https://github.com/foo/bar/pull/6");
+    let detail = serde_json::json!({
+        "position": null,
+        "state": null,
+        "enqueued_at": null,
+        "section_order": QUEUED_NO_POSITION_SECTION_ORDER,
+    })
+    .to_string();
+    db.record_github_merge_intent(
+        crate::work::GithubMergeIntentInsertInput::builder()
+            .work_item_id(task.clone())
+            .pr_url("https://github.com/foo/bar/pull/6")
+            .head_sha("head-6")
+            .build(),
+        &detail,
+    )
+    .unwrap();
+    let candidate = PendingMergeCheck {
+        work_item_id: task.clone(),
+        product_id: product.id.clone(),
+        pr_url: "https://github.com/foo/bar/pull/6".to_owned(),
+    };
+    let probe = probe_with_queue_fields(false, None, None, None, false, None);
+    assert!(probe.head_ref_oid.is_none());
+    let publisher = RecordingPublisher::default();
+    update_pr_poll_state(&db, &publisher, &candidate, &probe, None).await;
+
+    assert!(
+        db.get_active_github_merge_intent(&task, &candidate.pr_url)
+            .unwrap()
+            .is_some(),
+        "a missing head is not evidence the submitted head departed"
+    );
+    assert_eq!(merge_queue_columns(&db, &task).0.as_deref(), Some("queued"));
+}
+
+/// Red CI on an empty probe must not clear a live intent's queued lane, and
+/// a later green empty probe must restore `'queued'` if a prior write
+/// already punched a hole.
+#[tokio::test]
+async fn update_pr_poll_state_keeps_github_intent_queued_through_ci_fail_and_recovers() {
+    let (_dir, db) = open_db();
+    let product = create_test_product_with_repo(&db, "GitHubIntentCiFail", Some("git@github.com:foo/bar.git"));
+    let task = chore_in_review_for_product(&db, &product.id, "T", "https://github.com/foo/bar/pull/7");
+    let detail = serde_json::json!({
+        "position": null,
+        "state": null,
+        "enqueued_at": null,
+        "section_order": QUEUED_NO_POSITION_SECTION_ORDER,
+    })
+    .to_string();
+    db.record_github_merge_intent(
+        crate::work::GithubMergeIntentInsertInput::builder()
+            .work_item_id(task.clone())
+            .pr_url("https://github.com/foo/bar/pull/7")
+            .head_sha("head-7")
+            .build(),
+        &detail,
+    )
+    .unwrap();
+    let candidate = PendingMergeCheck {
+        work_item_id: task.clone(),
+        product_id: product.id.clone(),
+        pr_url: "https://github.com/foo/bar/pull/7".to_owned(),
+    };
+    let publisher = RecordingPublisher::default();
+
+    let mut failing_probe = probe_with_queue_fields(false, None, None, None, false, None);
+    failing_probe.head_ref_oid = Some("head-7".to_owned());
+    failing_probe.state = PrLifecycleState::Open(OpenPrStatus::ci_failing(vec![failure("ci/test", "FAILURE")]));
+    update_pr_poll_state(&db, &publisher, &candidate, &failing_probe, None).await;
+    assert_eq!(
+        merge_queue_columns(&db, &task).0.as_deref(),
+        Some("queued"),
+        "a live intent's queued projection must survive red CI on an empty probe"
+    );
+    assert!(
+        db.get_active_github_merge_intent(&task, &candidate.pr_url)
+            .unwrap()
+            .is_some()
+    );
+
+    db.set_task_merge_queue_state(&task, None, None).unwrap();
+    assert!(merge_queue_columns(&db, &task).0.is_none());
+
+    let mut recovered_probe = probe_with_queue_fields(false, None, None, None, false, None);
+    recovered_probe.head_ref_oid = Some("head-7".to_owned());
+    update_pr_poll_state(&db, &publisher, &candidate, &recovered_probe, None).await;
+    assert_eq!(
+        merge_queue_columns(&db, &task).0.as_deref(),
+        Some("queued"),
+        "a still-live intent must re-assert queued after a prior destructive clear"
+    );
+    assert!(
+        publisher
+            .events
+            .lock()
+            .await
+            .iter()
+            .any(|(_, item_id, reason)| item_id == &task && reason == "merge_queue_lane_reasserted"),
+        "re-asserting the Merging lane must notify the board"
+    );
+}
+
+/// Terminal PR observations for human-driven rows clear a stale Merging lane
+/// and notify the board even though they do not complete the row.
+#[tokio::test]
+async fn mark_merged_clears_human_driven_merging_lane_and_publishes() {
+    let (_dir, db) = open_db();
+    let product = create_test_product_with_repo(&db, "HumanMergedLane", Some("git@github.com:foo/bar.git"));
+    let task = chore_in_review_for_product(&db, &product.id, "T", "https://github.com/foo/bar/pull/5");
+    db.update_work_item(
+        &task,
+        WorkItemPatch {
+            human_driven: Some(true),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    db.set_task_merge_queue_state(&task, Some("queued"), Some("{}"))
+        .unwrap();
+    let candidate = PendingMergeCheck {
+        work_item_id: task.clone(),
+        product_id: product.id.clone(),
+        pr_url: "https://github.com/foo/bar/pull/5".to_owned(),
+    };
+    let publisher = RecordingPublisher::default();
+    let probe = probe_with_queue_fields(false, None, None, None, false, None);
+
+    assert!(!mark_merged(&db, &publisher, None, &candidate, &probe).await);
+    assert!(merge_queue_columns(&db, &task).0.is_none());
+    assert!(
+        publisher
+            .events
+            .lock()
+            .await
+            .iter()
+            .any(|(_, item_id, reason)| item_id == &task && reason == "pr_merged_queue_state_cleared")
     );
 }
 

@@ -233,10 +233,9 @@ enum EngineEvent {
     /// is no lease to release when the window closes.
     case liveWorkspaceTerminalReady(workItemID: String, workspacePath: String)
     /// Response to `merge_when_ready` — the engine has successfully
-    /// initiated the merge process for the PR. `action` is one of:
-    /// `"enqueued"` (GitHub-native merge queue), `"auto_merge_enabled"`
-    /// (will merge when checks pass), `"merged"` (directly merged), or
-    /// `"trunk_enqueued"` (submitted to a `trunk_queue`-mechanism
+    /// initiated the merge process for the PR. `action` is either
+    /// `"merge_requested"` (GitHub accepted the request while its derived
+    /// state converges) or `"trunk_enqueued"` (submitted to a `trunk_queue`-mechanism
     /// product's Trunk merge queue). The PR-reconciler is kicked on the
     /// engine side so the kanban state refreshes promptly.
     case mergeWhenReadyAccepted(workItemID: String, prURL: String, action: String)

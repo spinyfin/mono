@@ -1239,6 +1239,20 @@ pub(crate) async fn sweep_one(
     let mut known_active_queue_failure: Option<Option<CiRemediation>> = None;
     match &probe_result.state {
         PrLifecycleState::Merged => {
+            match work_db.retire_github_merge_intent(&candidate.work_item_id, &candidate.pr_url, "merged") {
+                Ok(true) => tracing::info!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    "merge poller: retired GitHub merge intent after observed merge",
+                ),
+                Ok(false) => {}
+                Err(err) => tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    ?err,
+                    "merge poller: failed to retire GitHub merge intent after observed merge",
+                ),
+            }
             if mark_merged(work_db, publisher, completion_handler, candidate, &probe_result).await {
                 outcome.merged += 1;
                 // Clean up any pending/running ci_remediations rows and emit
@@ -1376,6 +1390,20 @@ pub(crate) async fn sweep_one(
             }
         }
         PrLifecycleState::ClosedUnmerged => {
+            match work_db.retire_github_merge_intent(&candidate.work_item_id, &candidate.pr_url, "closed") {
+                Ok(true) => tracing::info!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    "merge poller: retired GitHub merge intent after observed unmerged close",
+                ),
+                Ok(false) => {}
+                Err(err) => tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    ?err,
+                    "merge poller: failed to retire GitHub merge intent after observed unmerged close",
+                ),
+            }
             // Comment reconciliation is a narrower, comment-only signal
             // (comment-intent-classification design §"Reconciliation" /
             // §Risks — the "reopen on abandon" half of task 2c): a comment
@@ -2123,7 +2151,92 @@ pub(crate) async fn update_pr_poll_state(
     // of Merging within one poll interval. `preserve_merge_queue_state`
     // leaves the stored merge-queue columns exactly as `handle_trunk_queue_merge`
     // (or the Trunk queue poller, once it lands) left them.
-    let preserve_merge_queue_state = is_trunk_queue_product(work_db, &candidate.product_id);
+    let preserve_trunk_merge_queue_state = is_trunk_queue_product(work_db, &candidate.product_id);
+    // A direct GitHub merge intent is per-row, not a product-wide exception:
+    // the first probe after `gh pr merge --auto --squash` can legitimately
+    // contain neither a queue entry nor auto-merge request while GitHub
+    // materializes its derived state. Preserve only that empty observation;
+    // a positive observation remains the fresh detailed projection, and an
+    // observed dequeue timeline event retires the intent separately.
+    //
+    // An absent `headRefOid` is not evidence the submitted head departed —
+    // every other `head_ref_oid` consumer in this crate fails closed on it.
+    // Only an observed, differing head retires the intent as `head_advanced`.
+    //
+    // Do not drop preserve on red CI: writing NULL is destructive, and a
+    // later green empty probe would then preserve that hole. The demotion
+    // above owns display for `auto_merge_enabled` only; a queued row (this
+    // intent's projection) must stay queued through a transient required-
+    // check failure, matching `renumber_merge_queue`'s membership invariant.
+    let preserve_github_merge_queue_state = raw_merge_queue_state.is_none()
+        && match work_db.get_active_github_merge_intent(&candidate.work_item_id, &candidate.pr_url) {
+            Ok(Some(intent)) => match probe.head_ref_oid.as_deref() {
+                None => true,
+                Some(sha) if sha == intent.head_sha => true,
+                Some(_) => {
+                    match work_db.retire_github_merge_intent(
+                        &candidate.work_item_id,
+                        &candidate.pr_url,
+                        "head_advanced",
+                    ) {
+                        Ok(_) => false,
+                        Err(err) => {
+                            tracing::warn!(
+                                work_item_id = %candidate.work_item_id,
+                                pr_url = %candidate.pr_url,
+                                ?err,
+                                "merge poller: failed to retire GitHub merge intent after head advanced",
+                            );
+                            true
+                        }
+                    }
+                }
+            },
+            Ok(None) => false,
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    ?err,
+                    "merge poller: failed to inspect GitHub merge intent; treating empty probe as unprotected",
+                );
+                false
+            }
+        };
+    if preserve_github_merge_queue_state {
+        // A prior poll may already have written NULL (the old CI-fail gate).
+        // Re-assert `'queued'` so recovery does not depend on GitHub's
+        // projection having materialized; preserve then keeps the restored
+        // row (or the original queued detail) untouched.
+        let detail = serde_json::json!({
+            "position": null,
+            "state": null,
+            "enqueued_at": null,
+            "section_order": QUEUED_NO_POSITION_SECTION_ORDER,
+        })
+        .to_string();
+        match work_db.reassert_github_merge_queue_if_cleared(&candidate.work_item_id, &detail) {
+            Ok(true) => {
+                publisher
+                    .publish_work_item_changed(
+                        &candidate.product_id,
+                        &candidate.work_item_id,
+                        "merge_queue_lane_reasserted",
+                    )
+                    .await;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    ?err,
+                    "merge poller: failed to re-assert GitHub merge-queue lane for a live intent",
+                );
+            }
+        }
+    }
+    let preserve_merge_queue_state = preserve_trunk_merge_queue_state || preserve_github_merge_queue_state;
 
     let outcome = match work_db.update_task_pr_poll_state(
         &candidate.work_item_id,
@@ -2167,29 +2280,25 @@ pub(crate) async fn update_pr_poll_state(
         );
     }
 
-    // Lane-demotion trace (mono#2023): one log line each way so a
-    // card bouncing between Merging and Review because CI is flapping
-    // (fail → success → fail) is diagnosable from the trace, mirroring the
-    // existing blocked↔in_review flap logging convention used elsewhere in
-    // this file and in ci_watch.rs.
-    if outcome.prior_merge_queue_state.as_deref() != merge_queue_state {
-        if merge_queue_state.is_none() && ci_state == "fail" && raw_merge_queue_state.is_some() {
-            tracing::info!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                prior_merge_queue_state = outcome.prior_merge_queue_state.as_deref(),
-                raw_merge_queue_state,
-                "merge poller: demoting card from Merging back to Review; required CI is failing while GitHub auto-merge/queue is still armed",
-            );
-        } else if merge_queue_state.is_some() && outcome.prior_merge_queue_state.is_none() {
-            tracing::info!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                merge_queue_state,
-                ci_state,
-                "merge poller: card entering Merging section; auto-merge/queue armed and required CI not failing",
-            );
-        }
+    // Every Merging-lane transition is INFO in both directions. The normal
+    // sweep-changed trace is DEBUG and is not emitted in production, so it
+    // cannot diagnose a `Some → None` bounce that is visible on the board.
+    let effective_merge_queue_state = if preserve_merge_queue_state {
+        outcome.prior_merge_queue_state.as_deref()
+    } else {
+        merge_queue_state
+    };
+    if outcome.prior_merge_queue_state.as_deref() != effective_merge_queue_state {
+        tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            prior_merge_queue_state = outcome.prior_merge_queue_state.as_deref(),
+            new_merge_queue_state = effective_merge_queue_state,
+            in_merge_queue = probe.in_merge_queue,
+            auto_merge_enabled = probe.auto_merge_enabled,
+            ci_state,
+            "merge poller: card Merging lane state changed",
+        );
     }
 
     // Whole-queue renumbering (mono#1997): this write only ever touched
@@ -2268,7 +2377,48 @@ pub(crate) async fn mark_merged(
 ) -> bool {
     let updated = match work_db.mark_chore_pr_merged(&candidate.work_item_id, &candidate.pr_url) {
         Ok(Some(task)) => task,
-        Ok(None) => return false,
+        Ok(None) => {
+            // Human-driven rows deliberately remain in Review after their PR
+            // merges, but a terminal GitHub observation must still clear an
+            // earlier Merging projection. Otherwise an intent would retire
+            // while the card remained stranded in the Merging subsection.
+            let prior_merge_queue_state =
+                work_db
+                    .get_work_item(&candidate.work_item_id)
+                    .ok()
+                    .and_then(|item| match item {
+                        WorkItem::Task(task) | WorkItem::Chore(task) => task.merge_queue_state,
+                        _ => None,
+                    });
+            match work_db.set_task_merge_queue_state(&candidate.work_item_id, None, None) {
+                Ok(true) => {
+                    tracing::info!(
+                        work_item_id = %candidate.work_item_id,
+                        pr_url = %candidate.pr_url,
+                        prior_merge_queue_state = prior_merge_queue_state.as_deref(),
+                        new_merge_queue_state = Option::<&str>::None,
+                        in_merge_queue = false,
+                        auto_merge_enabled = false,
+                        "merge poller: card Merging lane state changed",
+                    );
+                    publisher
+                        .publish_work_item_changed(
+                            &candidate.product_id,
+                            &candidate.work_item_id,
+                            "pr_merged_queue_state_cleared",
+                        )
+                        .await;
+                }
+                Ok(false) => {}
+                Err(err) => tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    ?err,
+                    "merge poller: failed to clear Merging state after terminal PR observation",
+                ),
+            }
+            return false;
+        }
         Err(err) => {
             tracing::warn!(
                 work_item_id = %candidate.work_item_id,

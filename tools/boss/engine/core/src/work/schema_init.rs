@@ -57,7 +57,7 @@ impl WorkDb {
         crate::host_registry::ensure_local_host(conn)?;
         crate::host_registry::refresh_local_host_auto_capabilities(conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '31')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '32')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -641,6 +641,10 @@ impl WorkDb {
         // submitted to Trunk's queue for a `trunk_queue` product. Additive,
         // independent of every other table.
         migrate_trunk_merge_intents_table(conn)?;
+        // `github_merge_intents`: the GitHub-native counterpart. It records
+        // a successful `gh pr merge --auto --squash` at a PR head so an empty
+        // first post-submit probe cannot erase the requested merge.
+        migrate_github_merge_intents_table(conn)?;
         // `tasks.blocked_detail`: verbatim long-form explanation of
         // `blocked_reason`, rendered as a tooltip on the kanban card's
         // blocked pill. `blocked_reason` itself stays a short, title-cased
@@ -827,7 +831,7 @@ impl WorkDb {
         // Design: tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md
         migrate_work_executions_run_done_columns(conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '31')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '32')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -918,7 +922,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(schema_version, "31");
+        assert_eq!(schema_version, "32");
 
         let boothby_passes_exists: bool = conn
             .query_row(
