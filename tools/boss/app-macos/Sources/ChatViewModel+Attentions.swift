@@ -300,4 +300,81 @@ extension ChatViewModel {
     func setProductEditorialRules(productID: String, rules: EditorialRules?) {
         engine.sendSetProductEditorialRules(productId: productID, rules: rules)
     }
+
+    // MARK: - Selected-product accessors
+
+    /// Automations for the currently selected product, ordered by `created_at`.
+    var automationsForSelectedProduct: [AppAutomation] {
+        guard let productID = currentSelectedProductID else { return [] }
+        return automationsByProductID[productID] ?? []
+    }
+
+    /// Fetch state for the currently selected product's automations list.
+    /// `nil` means no fetch has been issued for this product yet (treat like loading).
+    var automationsFetchStateForSelectedProduct: AutomationsFetchState? {
+        guard let productID = currentSelectedProductID else { return nil }
+        return automationsFetchStateByProductID[productID]
+    }
+
+    /// The currently selected automation, looked up from the per-product list.
+    var selectedAutomation: AppAutomation? {
+        guard let id = selectedAutomationID else { return nil }
+        return automationsForSelectedProduct.first { $0.id == id }
+    }
+
+    /// Unresolved attention items for the currently selected product.
+    var selectedProductOpenAttentionItems: [WorkAttentionItem] {
+        guard let productID = currentSelectedProductID else { return [] }
+        return (attentionItemsByWorkItemID[productID] ?? []).filter { $0.resolvedAt == nil }
+    }
+
+    /// All known attention groups for the selected product (open plus any
+    /// recently actioned/dismissed this session), newest-first.
+    var selectedProductAttentionGroups: [AttentionGroup] {
+        guard let productID = currentSelectedProductID else { return [] }
+        return (attentionGroupsByProductID[productID] ?? [])
+            .sorted { $0.createdAt > $1.createdAt }
+    }
+
+    /// Open (actionable) attention groups for the selected product — the
+    /// Notifications window's primary list and the toolbar badge source.
+    /// Ordered max-item-score-desc, then created-at-desc, so cards holding
+    /// the most-corroborated items (design: notification-dedup-scoring.md
+    /// §8) rise to the top; groups with no scored items keep today's
+    /// newest-first order.
+    var selectedProductOpenAttentionGroups: [AttentionGroup] {
+        selectedProductAttentionGroups
+            .filter(\.isOpen)
+            .sorted { lhs, rhs in
+                let lhsScore = maxItemScore(forGroup: lhs.id)
+                let rhsScore = maxItemScore(forGroup: rhs.id)
+                if lhsScore != rhsScore { return lhsScore > rhsScore }
+                return lhs.createdAt > rhs.createdAt
+            }
+    }
+
+    /// Count of open attention groups for the selected product. Drives the
+    /// Notifications toolbar bell badge (hidden when 0).
+    var openAttentionGroupCount: Int {
+        selectedProductOpenAttentionGroups.count
+    }
+
+    /// Members of a group, in display order.
+    func attentionMembers(forGroup groupID: String) -> [Attention] {
+        (attentionMembersByGroupID[groupID] ?? []).sorted { $0.ordinal < $1.ordinal }
+    }
+
+    /// Highest `score` among a group's members — the priority signal used to
+    /// badge and order cards. `1` (the default) for a group with no members
+    /// loaded yet or no folds recorded against any of them.
+    func maxItemScore(forGroup groupID: String) -> Int64 {
+        (attentionMembersByGroupID[groupID] ?? []).map(\.score).max() ?? 1
+    }
+
+    // MARK: - Editorial evaluation
+
+    func evaluateEditorialRules(productId: String, body: String, title: String?) {
+        editorialEvaluationState = .loading
+        engine.sendEvaluateEditorialRules(productId: productId, body: body, title: title?.isEmpty == true ? nil : title)
+    }
 }
