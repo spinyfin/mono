@@ -139,6 +139,26 @@ impl WorkerCompletionHandler {
         // teardown still runs per this function's contract, but the failure
         // must be loud rather than silently collapsed into `None`.
         let execution_result = self.work_db.get_execution(execution_id);
+        // Worker-proposal seam (design implementation task 12 — the last of
+        // the per-seam migrations): every PR finalization funnels through
+        // this one function regardless of which layer of the staging-cache
+        // / driver-prose / cold-reconstruction ladder produced the URL, so
+        // this is the single choke point that can count "the pr_created
+        // proposal did NOT cover this finalization" without instrumenting
+        // every individual call site in `on_stop_inner`/`recheck_for_pr`.
+        // `source` names the two call sites that already resolved the URL
+        // from a durable `pr_created` proposal row
+        // (`WorkerCompletionHandler::pr_created_from_proposal`) — every
+        // OTHER source reaching here is definitionally a fallback for this
+        // seam while it's on.
+        if source != PR_CREATED_PROPOSAL_STOP_SOURCE
+            && source != PR_CREATED_PROPOSAL_RECHECK_SOURCE
+            && self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("pr_created_proposals_seam")
+            && let Ok(ref execution) = execution_result
+        {
+            self.record_pr_created_fallback_hit(execution, source);
+        }
         let workspace_path = match &execution_result {
             Ok(execution) => execution.workspace_path.clone(),
             Err(err) => {
@@ -1182,6 +1202,101 @@ impl WorkerCompletionHandler {
                     },
                 )
                 .await;
+        }
+    }
+
+    /// Read `execution_id`'s `pr_created` worker-proposal row (design
+    /// implementation task 12 — the PR-created-declaration seam migration,
+    /// the last of the per-seam migrations, sequenced after
+    /// `automation_outcome_proposals_seam`). Returns the PR URL to
+    /// finalize on when an operative proposal exists, so
+    /// `on_stop_inner`/`recheck_for_pr` can short-circuit the whole
+    /// staging-cache / driver-prose / cold-reconstruction ladder and
+    /// finalize straight from a durable row that survives an engine
+    /// restart between the worker's `cube pr create`/`cube pr update` and
+    /// this Stop — unlike the in-memory `StagedPrUrlCache` the primary
+    /// path reads.
+    ///
+    /// Task 6's applier (`crate::work::proposal_apply::apply_pr_created`)
+    /// already verified the URL/repo-slug and any worker-supplied branch
+    /// synchronously at submission time and opportunistically bound
+    /// `task.pr_url`, so this read never re-derives or re-verifies
+    /// anything — it just resolves the same fact from the durable row.
+    ///
+    /// Returns `(None, row_existed)` when no operative `pr_created`
+    /// proposal is available — the caller then runs the legacy ladder,
+    /// counted via [`Self::record_pr_created_fallback_hit`] (invoked from
+    /// the shared [`Self::finalize_pr_transition`] funnel for every source
+    /// other than the proposal path, so a single call site covers every
+    /// layer of the ladder). `row_existed` mirrors
+    /// [`super::finalize_passes::WorkerCompletionHandler::automation_outcome_from_proposal`]'s
+    /// discipline: `false` when no `pr_created` proposal row exists at all
+    /// (or the lookup itself errored — fail open to the legacy ladder
+    /// rather than silently dropping finalization), `true` when a row
+    /// exists but was left in a state this read cannot use (`Applied` is
+    /// the only state `apply_pr_created` — an `AutoApply` kind — ever
+    /// leaves the newest row in; `Rejected` — bad URL, wrong repo, branch
+    /// mismatch — carries no usable URL and the worker already saw the
+    /// typed error at submission time; `Proposed`/`Superseded`/`Expired`
+    /// are unexpected for a synchronously auto-applying kind).
+    ///
+    /// [`crate::work::WorkDb::list_worker_proposals_for_execution`] orders
+    /// by `created_at DESC`, so the newest row is always the operative one
+    /// — mirrors every other proposal-first read in this module.
+    pub(super) fn pr_created_from_proposal(&self, execution_id: &str) -> (Option<String>, bool) {
+        let proposals = match self
+            .work_db
+            .list_worker_proposals_for_execution(execution_id, ProposalKind::PrCreated)
+        {
+            Ok(proposals) => proposals,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    ?err,
+                    "pr_created_proposals_seam: failed to look up proposals for this execution; \
+                     falling back to the legacy staging-cache / cold-reconstruction ladder",
+                );
+                return (None, false);
+            }
+        };
+        let Some(latest) = proposals.first() else {
+            return (None, false);
+        };
+
+        match latest.state {
+            ProposalState::Applied => match serde_json::from_str::<PrCreatedProposalPayload>(&latest.payload_json) {
+                Ok(payload) => (Some(payload.pr_url), true),
+                Err(err) => {
+                    tracing::warn!(
+                        execution_id,
+                        proposal_id = %latest.id,
+                        ?err,
+                        "pr_created_proposals_seam: newest pr_created proposal is Applied but its \
+                         payload_json did not deserialize; falling back to the legacy ladder",
+                    );
+                    (None, true)
+                }
+            },
+            ProposalState::Rejected => {
+                tracing::info!(
+                    execution_id,
+                    proposal_id = %latest.id,
+                    reason = latest.decision_reason.as_deref().unwrap_or("no reason recorded"),
+                    "pr_created_proposals_seam: newest pr_created proposal was rejected at submission; \
+                     falling back to the legacy ladder",
+                );
+                (None, true)
+            }
+            ProposalState::Proposed | ProposalState::Superseded | ProposalState::Expired => {
+                tracing::warn!(
+                    execution_id,
+                    proposal_id = %latest.id,
+                    state = %latest.state,
+                    "pr_created_proposals_seam: newest pr_created proposal is unexpectedly not \
+                     Applied/Rejected; falling back to the legacy ladder",
+                );
+                (None, true)
+            }
         }
     }
 }

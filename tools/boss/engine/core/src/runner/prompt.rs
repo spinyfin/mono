@@ -99,6 +99,23 @@ pub(super) struct ExecutionPromptParams<'a> {
     /// to the backstop, so the two must move together.
     #[builder(default)]
     run_done_proposals_seam_enabled: bool,
+    /// Whether `pr_created_proposals_seam` is on — gates the worker-facing
+    /// prompt half of the PR-created-declaration seam migration (design
+    /// implementation task 12, the last of the per-seam migrations): the
+    /// acceptance-criterion blocks below teach `boss propose pr-created
+    /// --url ...` as the worker's terminal action after `cube pr
+    /// create`/`cube pr update`, alongside (not instead of) the printed-URL
+    /// line — the design keeps that line during the soak as human-readable
+    /// redundancy, then drops it. `false` (the flag's registry default)
+    /// reproduces the pre-migration printed-URL-only text exactly. This is
+    /// the OTHER half of the flag: `crate::completion::pr_transition`'s
+    /// `finalize_pr_transition`, which counts a fallback hit whenever a PR
+    /// finalizes via the staging-cache/cold-reconstruction ladder instead
+    /// of a `pr_created` proposal, is gated by the same flag name read
+    /// directly from `FeatureFlagsStore`; gating the prompt too is what
+    /// makes "flag off" restore today's behavior exactly, prompt included.
+    #[builder(default)]
+    pr_created_proposals_seam_enabled: bool,
     /// Already-merged `merge_order` siblings whose surfaces this forward-port
     /// must preserve (rendered lines). Empty for non-conflict revisions and
     /// for conflict revisions with no merged overlap partner.
@@ -428,6 +445,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
         deferred_scope_proposals_seam_enabled,
         followup_proposals_seam_enabled,
         run_done_proposals_seam_enabled,
+        pr_created_proposals_seam_enabled,
         merge_order_preservation,
     } = params;
     // Phase 9 #29: ci_remediation has its own templated prompt — embed
@@ -695,6 +713,18 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
         // Claude driver's fallback producer, and the `PostToolUse` capture of
         // `gh pr create` stdout remains as its hook-derived one.
         let pr_url_artifact = crate::structured_output::default_path_string(&execution.id, StructuredOutputKind::PrUrl);
+        // Design implementation task 12 (PR-created-declaration seam
+        // migration): when the seam is on, the worker's terminal action
+        // after opening/updating a PR is `boss propose pr-created --url
+        // ...`, not just the printed line. The printed line stays
+        // regardless — design: "the printed URL line is kept during the
+        // soak as human-readable redundancy, then dropped."
+        let declare_pr_directive = if pr_created_proposals_seam_enabled {
+            " - Your terminal action after opening or updating the PR is `boss propose pr-created --url <the PR URL>` (add `--branch <branch-name>` when useful for verification). Submission is synchronous and validated immediately — a malformed URL or a URL from the wrong repo fails right away with a typed error you can fix and retry, unlike a printed line the engine only reads long after you've moved on.\n\
+                 - Also print the PR URL on its own line as the final thing in your final response as well, so the engine can still pick it up if that file write fails — kept as human-readable redundancy alongside the `boss propose` call.\n"
+        } else {
+            " - Print the PR URL on its own line as the final thing in your final response as well, so the engine can still pick it up if that file write fails.\n"
+        };
         if let Some(pr_url) = existing_pr_url {
             let pr_number = boss_github::pr_url::pr_number_from_url(pr_url)
                 .map(|n| n.to_string())
@@ -704,7 +734,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
                  - Push your commits to the existing PR branch with `{cube} pr update --branch <branch-name>` (see the ## RESUME EXISTING PR block above). Do NOT open a new PR.\n\
                  - Confirm the PR is updated with `gh pr view {pr_number}` (pass `-R owner/repo` since bare gh calls need it in a jj workspace — use `jj git remote` to find the slug, or check the PR URL above).\n\
                  - As soon as cube prints the PR URL, record it by writing the file `{pr_url_artifact}` with the contents `{{\"pr_url\": \"<the url>\"}}` (path also exported as `$BOSS_PR_URL_OUTPUT`). That path is outside the repo/workspace, so it never pollutes your PR, and it is the channel the engine reads first.\n\
-                 - Print the PR URL on its own line as the final thing in your final response as well, so the engine can still pick it up if that file write fails.\n\
+                 {declare_pr_directive}\
                  - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty, you have made no changes — do NOT commit, push, or open a PR. Stop and explain what went wrong instead.\n",
             ));
         } else {
@@ -715,14 +745,17 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
                  - **Never use `jj git push`, `git push`, or `gh pr create` directly** — always use `{cube} pr create` or `{cube} pr update`. A PreToolUse hook blocks direct push/PR-create attempts and redirects you to cube.\n\
                  - If a PR already exists for this branch (e.g. you are resuming work or addressing review comments), push your new commits to update it instead of opening a duplicate. Check with `gh pr view` from inside the workspace.\n\
                  - As soon as cube prints the PR URL, record it by writing the file `{pr_url_artifact}` with the contents `{{\"pr_url\": \"<the url>\"}}` (path also exported as `$BOSS_PR_URL_OUTPUT`). That path is outside the repo/workspace, so it never pollutes your PR, and it is the channel the engine reads first.\n\
-                 - Print the PR URL on its own line as the final thing in your final response as well, so the engine can still pick it up if that file write fails.\n\
+                 {declare_pr_directive}\
                  - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty, you have made no changes — do NOT commit, push, or open a PR. Stop and explain what went wrong instead.\n",
             ));
         }
         // Warn that PR creation is terminal — the engine reaps the worker
         // immediately after the PR is opened. Workers must finish everything
         // BEFORE opening the PR; no followup turn is possible.
-        prompt.push_str(&pr_terminal_directive(run_done_proposals_seam_enabled));
+        prompt.push_str(&pr_terminal_directive(
+            run_done_proposals_seam_enabled,
+            pr_created_proposals_seam_enabled,
+        ));
         // Issue #899: hand the worker the engine's CI-completion definition
         // so it stops once CI is effectively green rather than polling
         // forever on human-gated checks (e.g. LinkedIn's `Owner Approval`).
@@ -1028,26 +1061,26 @@ fn render_editorial_rules_block(
 /// findings as followup commits. The engine terminated the worker the moment
 /// the PR was created, so the review was never consumed. This universal
 /// guidance applies to every execution kind and prevents that pattern.
+/// `run_done_proposals_seam_enabled` mirrors `run_done_proposals_seam`. When
+/// enabled, [`run_done_directive`]'s declaration is terminal and follows all
+/// PR operations and proposal declarations.
 ///
-/// `seam_enabled` mirrors `run_done_proposals_seam`. When on, [`run_done_directive`]'s
-/// declaration — not PR creation — is the act that is ALWAYS terminal:
-/// `boss propose done` ends the run synchronously the instant it is accepted
-/// (`completion::run_done_declaration` finalizes it at submit, no Stop
-/// boundary needed). The push must come first and the declaration last — the
-/// reverse of the ordering this block taught before declarations existed,
-/// when the push was the only thing that could reap a worker. Getting this
-/// backwards now would kill the worker's pane before it ever reaches `cube
-/// pr create`.
-fn pr_terminal_directive(seam_enabled: bool) -> String {
+/// `pr_created_proposals_seam_enabled` mirrors the `pr_created_proposals_seam`
+/// feature flag: it requires a `pr-created` declaration immediately after a
+/// successful PR push so the durable proposal row is available to the engine.
+fn pr_terminal_directive(
+    run_done_proposals_seam_enabled: bool,
+    pr_created_proposals_seam_enabled: bool,
+) -> String {
     let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
     let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     let mut out = String::new();
-    if seam_enabled {
+    if run_done_proposals_seam_enabled {
         out.push_str("\n## Important: declaring done is your terminal act\n\n");
     } else {
         out.push_str("\n## Important: PR creation is your terminal act\n\n");
     }
-    if seam_enabled {
+    if run_done_proposals_seam_enabled {
         out.push_str(&format!(
             "Opening the PR is normally the LAST thing you do, and the engine may reap you \
              immediately after the PR is created. But with your run-done declaration enabled, \
@@ -1063,10 +1096,12 @@ fn pr_terminal_directive(seam_enabled: bool) -> String {
             "Opening the PR is the LAST thing you do. The engine reaps you immediately after the PR is created.\n\n",
         );
     }
-    if seam_enabled {
-        out.push_str(&format!("You will NOT get another turn after `{boss} propose done` (see below) — not after `gh pr create` / `{cube} pr create` / `{cube} pr update` themselves, those still give you a turn so you can go on to declare done. Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR while background work (parallel/sub-agent runs, backgrounded builds, code reviews) is still in flight expecting to consume its results.\n\n"));
+    if pr_created_proposals_seam_enabled {
+        out.push_str(&format!("After `gh pr create` / `{cube} pr create` (or `{cube} pr update`), immediately submit `{boss} propose pr-created --url ...`; then make the run-done declaration last. Do not plan followup commits, defer work to \"after the PR\", or open the PR while background work is still in flight.\n\n"));
+    } else if run_done_proposals_seam_enabled {
+        out.push_str(&format!("You will NOT get another turn after `{boss} propose done` (see below); PR creation itself still leaves a turn to declare done. Do not plan followup commits, defer work to \"after the PR\", or open the PR while background work is still in flight.\n\n"));
     } else {
-        out.push_str(&format!("You will NOT get another turn after `gh pr create` / `{cube} pr create` (or `{cube} pr update` for an existing PR). Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR while background work (parallel/sub-agent runs, backgrounded builds, code reviews) is still in flight expecting to consume its results.\n\n"));
+        out.push_str(&format!("You will NOT get another turn after `gh pr create` / `{cube} pr create` (or `{cube} pr update` for an existing PR). Do not plan followup commits, defer work to \"after the PR\", or open the PR while background work is still in flight.\n\n"));
     }
     out.push_str("Therefore: finish everything — including consuming any review/self-review findings you started — BEFORE you open the PR. If a background review is still running and you care about its results, wait for it and address all findings FIRST, then open the PR. If you don't intend to wait, don't start the review.\n");
     out
