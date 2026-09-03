@@ -18,6 +18,7 @@ fn write_workspace_files_creates_claude_dir_and_writes_all_files() {
         worker_kind: WorkerKind::Standard,
         automation_outcome_proposals_seam_enabled: false,
         is_review_supervisor: false,
+        pr_created_proposals_seam_enabled: false,
     };
 
     let written = write_workspace_files(&input, &ClaudeDriver).unwrap();
@@ -80,6 +81,7 @@ fn write_workspace_files_pre_trusts_workspace_in_claude_json() {
         worker_kind: WorkerKind::Standard,
         automation_outcome_proposals_seam_enabled: false,
         is_review_supervisor: false,
+        pr_created_proposals_seam_enabled: false,
     };
 
     write_workspace_files(&input, &ClaudeDriver).unwrap();
@@ -119,6 +121,7 @@ fn write_workspace_files_overwrites_existing_files() {
         worker_kind: WorkerKind::Standard,
         automation_outcome_proposals_seam_enabled: false,
         is_review_supervisor: false,
+        pr_created_proposals_seam_enabled: false,
     };
 
     write_workspace_files(&input, &ClaudeDriver).unwrap();
@@ -158,6 +161,7 @@ fn write_workspace_files_uses_resolved_non_claude_driver() {
         worker_kind: WorkerKind::Standard,
         automation_outcome_proposals_seam_enabled: false,
         is_review_supervisor: false,
+        pr_created_proposals_seam_enabled: false,
     };
 
     let mut descriptor = stub_descriptor();
@@ -236,6 +240,7 @@ fn write_workspace_files_does_not_pre_trust_claude_json_for_non_claude_driver() 
         worker_kind: WorkerKind::Standard,
         automation_outcome_proposals_seam_enabled: false,
         is_review_supervisor: false,
+        pr_created_proposals_seam_enabled: false,
     };
 
     let mut descriptor = stub_descriptor();

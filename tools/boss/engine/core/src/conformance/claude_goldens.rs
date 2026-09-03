@@ -32,6 +32,7 @@ fn golden_input() -> WorkerSetupInput {
         worker_kind: WorkerKind::Standard,
         automation_outcome_proposals_seam_enabled: false,
         is_review_supervisor: false,
+        pr_created_proposals_seam_enabled: false,
     }
 }
 

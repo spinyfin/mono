@@ -596,11 +596,43 @@ impl WorkerCompletionHandler {
             return StopOutcome::DeferredForProbeTurn;
         }
 
+        // Worker-proposal seam (design implementation task 12 — the last of
+        // the per-seam migrations, sequenced after
+        // `automation_outcome_proposals_seam`): read the durable
+        // `pr_created` proposal row before touching the staging cache /
+        // driver-prose / cold-reconstruction ladder below. Task 6's applier
+        // already verified the URL/repo-slug and any worker-supplied branch
+        // synchronously at submission time, so a hit here finalizes
+        // straight from a row that — unlike `StagedPrUrlCache` — survives
+        // an engine restart between the worker's `cube pr create`/`cube pr
+        // update` and this Stop. Every other source below still runs as a
+        // counted fallback whenever the seam is on (see
+        // `finalize_pr_transition`'s `PR_CREATED_FALLBACK_HIT` accounting).
+        let pr_created_proposals_first = self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("pr_created_proposals_seam");
+        if pr_created_proposals_first && let (Some(proposed_pr_url), _) = self.pr_created_from_proposal(execution_id) {
+            tracing::info!(
+                execution_id,
+                pr_url = %proposed_pr_url,
+                "stop event: using PR URL from pr_created worker-proposal row; skipping the staging \
+                 cache / cold-reconstruction ladder",
+            );
+            return self
+                .finalize_pr_transition(
+                    execution_id,
+                    proposed_pr_url,
+                    WorkerPrCompletionTarget::InReview,
+                    PR_CREATED_PROPOSAL_STOP_SOURCE,
+                )
+                .await;
+        }
+
         // A remote worker writes this artifact on its own host; collect it
         // before reading so the primary channel remains usable off-host.
         let _ = self
             .collect_remote_structured_output(&execution, crate::structured_output::StructuredOutputKind::PrUrl)
             .await;
+
         // Primary channel: the structured-output PR-URL artifact the worker
         // wrote (file contract — no transcript or hook-stream knowledge
         // needed, so every driver can satisfy it). It fills the same staging

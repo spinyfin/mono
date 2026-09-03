@@ -242,6 +242,7 @@ fn write_workspace_files_purges_leaked_in_tree_settings() {
         worker_kind: WorkerKind::Standard,
         automation_outcome_proposals_seam_enabled: false,
         is_review_supervisor: false,
+        pr_created_proposals_seam_enabled: false,
     };
 
     write_workspace_files(&input, &ClaudeDriver).unwrap();

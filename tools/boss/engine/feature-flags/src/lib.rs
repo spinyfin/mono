@@ -387,6 +387,32 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         capability_id: None,
     },
     FeatureFlagSpec {
+        name: "pr_created_proposals_seam",
+        description: "Read the pr_created worker_proposals row before falling back to the legacy \
+             hook-observed StagedPrUrlCache / driver-final-message-prose / cold gh pr list --head \
+             reconstruction ladder in on_stop_inner / recheck_for_pr (design: \
+             worker-proposal-api-replace-fragile-worker-to-engine-seams.md, implementation task 12 — \
+             the PR-created-declaration seam migration, the last of the per-seam migrations, sequenced \
+             after automation_outcome_proposals_seam). When on, an execution that already carries an \
+             Applied pr_created proposal (submitted via `boss propose pr-created --url ...`, run after \
+             the worker's `cube pr create`/`cube pr update` terminal action) finalizes straight from that \
+             proposal's already-verified URL — task 6's applier (apply_pr_created) already validated the \
+             URL/repo-slug and any worker-supplied branch synchronously at submission time, so this read \
+             never re-derives anything; it just resolves the fact from a durable row instead of the \
+             in-memory StagedPrUrlCache, which is what lets finalization survive an engine restart \
+             between the worker's push and this Stop. When no such proposal exists, the legacy ladder \
+             still runs exactly as before, and every time it finalizes via that ladder instead of the \
+             proposal the worker_proposals.fallback_hit.pr_created counter increments and a WARN logs — \
+             the counter is this seam's explicit exit criterion for eventually deleting the staging-cache \
+             / cold-reconstruction fallback. The PROBE_NO_PR re-prompt is unaffected either way — it \
+             handles \"no PR exists at all\", which no declaration can fix. DEFAULT OFF: enable per \
+             operator once the proposal path is validated in staging. Kill switch: set false to restore \
+             the pre-migration staging-cache/cold-reconstruction-only behavior exactly, prompt included.",
+        category: "completion",
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
         name: "worker_rpc_tier",
         description: "Enforce the worker RPC tier on the engine's frontend socket (design: \
              worker-proposal-api-replace-fragile-worker-to-engine-seams.md, task 3). A connection whose \
@@ -885,6 +911,30 @@ mod tests {
         let store2 = make_store(&tmp);
         store2.load().unwrap();
         assert!(store2.is_enabled("automation_outcome_proposals_seam"));
+    }
+
+    #[test]
+    fn pr_created_proposals_seam_defaults_off_and_can_be_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        assert!(
+            !store.is_enabled("pr_created_proposals_seam"),
+            "pr_created_proposals_seam must default disabled"
+        );
+        let snap = store.snapshot_all(None);
+        let seam = snap
+            .iter()
+            .find(|s| s.name == "pr_created_proposals_seam")
+            .expect("pr_created_proposals_seam must be in registry");
+        assert!(!seam.default_enabled);
+        assert_eq!(seam.category, "completion");
+
+        store.set("pr_created_proposals_seam", true).unwrap();
+        assert!(store.is_enabled("pr_created_proposals_seam"));
+        let store2 = make_store(&tmp);
+        store2.load().unwrap();
+        assert!(store2.is_enabled("pr_created_proposals_seam"));
     }
 
     #[test]

@@ -48,8 +48,8 @@ use async_trait::async_trait;
 use boss_protocol::{
     AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_PRODUCED_TASK, AUTOMATION_OUTCOME_SKIPPED, Attention,
     AttentionGroup, BranchNaming, CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_MERGE_CONFLICT_PREFIX,
-    CREATED_VIA_PR_REVIEW_PREFIX, CreateRevisionInput, ExecutionKind, ExecutionStatus, FrontendEvent, ProposalKind,
-    ProposalState, ReasoningMode, TaskKind,
+    CREATED_VIA_PR_REVIEW_PREFIX, CreateRevisionInput, ExecutionKind, ExecutionStatus, FrontendEvent,
+    PrCreatedProposalPayload, ProposalKind, ProposalState, ReasoningMode, TaskKind,
 };
 
 use crate::attentions_detector;
@@ -241,6 +241,24 @@ crate::register_counter!(
      because no worker_proposals row of kind automation_outcome existed for the execution \
      (automation_outcome_proposals_seam on).",
 );
+// Worker-proposal seam: fallback-hit counter for the shared
+// `finalize_pr_transition` funnel (design implementation task 12 — the
+// PR-created-declaration seam migration, the last per-seam migration),
+// incremented only when `pr_created_proposals_seam` is on and a PR
+// finalizes via any source OTHER than the `pr_created` proposal read
+// (`stop_proposal` / `pr_recheck_proposal`) — i.e. the staging cache, the
+// driver's final-message fallback, or the cold `detect_pr` reconstruction
+// carried the finalization instead of a durable `pr_created` proposal row.
+// Mirrors `WORKER_SIGNAL_FALLBACK_HIT_*`/`DEFERRED_SCOPE_FALLBACK_HIT`/
+// `FOLLOWUP_FALLBACK_HIT`/`AUTOMATION_OUTCOME_FALLBACK_HIT` above. Same
+// remote-worker caveat applies (see the comment on those counters).
+crate::register_counter!(
+    PR_CREATED_FALLBACK_HIT,
+    "worker_proposals.fallback_hit.pr_created",
+    "finalize_pr_transition finalized via the legacy staging-cache / driver-final-message / \
+     cold-reconstruction ladder instead of a pr_created worker_proposals row \
+     (pr_created_proposals_seam on).",
+);
 
 // Worker-proposal seam: fallback-hit counter for the `NO_CHANGES_NEEDED`
 // transcript marker, incremented only when `run_done_proposals_seam` is on
@@ -311,6 +329,7 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&DEFERRED_SCOPE_FALLBACK_HIT);
     registry.register_counter(&FOLLOWUP_FALLBACK_HIT);
     registry.register_counter(&AUTOMATION_OUTCOME_FALLBACK_HIT);
+    registry.register_counter(&PR_CREATED_FALLBACK_HIT);
 }
 
 /// Catch-all `failure_reason` stamped on a `conflict_resolutions` row
@@ -1914,6 +1933,15 @@ verified there is genuinely nothing left to change (`jj diff -r @` is empty beca
 is already done), do NOT answer in prose alone — prose is not a signal the engine can act on. \
 End your response with a line containing exactly `NO_CHANGES_NEEDED` and stop; that is the \
 sanctioned way to close this run with no PR.";
+
+/// `source` value `WorkerCompletionHandler::on_stop_inner` passes to
+/// `WorkerCompletionHandler::finalize_pr_transition` when the `pr_created`
+/// worker-proposal row supplied the URL (design implementation task 12 —
+/// the PR-created-declaration seam migration).
+pub(crate) const PR_CREATED_PROPOSAL_STOP_SOURCE: &str = "stop_proposal";
+/// Mirrors [`PR_CREATED_PROPOSAL_STOP_SOURCE`] for
+/// `WorkerCompletionHandler::recheck_for_pr`'s merge-poller sweep.
+pub(crate) const PR_CREATED_PROPOSAL_RECHECK_SOURCE: &str = "pr_recheck_proposal";
 
 /// Extract the set of required-check names a `ci_remediations` attempt
 /// was opened to fix, parsed from its `failed_checks` JSON snapshot

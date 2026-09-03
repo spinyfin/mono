@@ -86,6 +86,8 @@ pub(crate) struct WorkerSpawnOpts {
     pub(crate) review_batch_fanout_enabled: bool,
     #[builder(default)]
     pub(crate) run_done_proposals_seam_enabled: bool,
+    #[builder(default)]
+    pub(crate) pr_created_proposals_seam_enabled: bool,
 }
 
 /// Fetch authoritative PR metadata for a reviewer worker's initial prompt.
@@ -465,6 +467,7 @@ pub(crate) async fn compose_worker_spawn(
         automation_outcome_proposals_seam_enabled,
         review_batch_fanout_enabled,
         run_done_proposals_seam_enabled,
+        pr_created_proposals_seam_enabled,
     } = editorial_opts;
     // For any project-scoped task (the synthetic `kind = 'design'`
     // task and ordinary `project_task` rows alike), the richer
@@ -698,6 +701,7 @@ pub(crate) async fn compose_worker_spawn(
                         .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
                         .followup_proposals_seam_enabled(followup_proposals_seam_enabled)
                         .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
+                        .pr_created_proposals_seam_enabled(pr_created_proposals_seam_enabled)
                         .build(),
                 )
             }
@@ -734,6 +738,7 @@ pub(crate) async fn compose_worker_spawn(
                     .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
                     .followup_proposals_seam_enabled(followup_proposals_seam_enabled)
                     .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
+                    .pr_created_proposals_seam_enabled(pr_created_proposals_seam_enabled)
                     .build(),
             )
         } else {
@@ -930,6 +935,7 @@ pub(crate) async fn compose_worker_spawn(
                 .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
                 .followup_proposals_seam_enabled(followup_proposals_seam_enabled)
                 .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
+                .pr_created_proposals_seam_enabled(pr_created_proposals_seam_enabled)
                 .merge_order_preservation(&merge_order_preservation)
                 .build(),
         )
