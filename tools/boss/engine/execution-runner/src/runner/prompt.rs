@@ -113,6 +113,15 @@ pub(super) struct ExecutionPromptParams<'a> {
     /// durable stamp regardless of the flag.
     #[builder(default)]
     run_done_proposals_seam_enabled: bool,
+    /// Whether `pr_created_proposals_seam` is on — gates the worker-facing
+    /// prompt half of the PR-created-declaration seam: [`pr_terminal_directive`]
+    /// teaches `propose pr-created` after a successful PR push, alongside the
+    /// printed-URL line. `false` reproduces the pre-migration printed-URL-only
+    /// text. The engine's `finalize_pr_transition` fallback-hit counter is
+    /// gated by the same flag; gating the prompt too is what makes "flag off"
+    /// restore today's behavior exactly, prompt included.
+    #[builder(default)]
+    pr_created_proposals_seam_enabled: bool,
     /// Already-merged `merge_order` siblings whose surfaces this forward-port
     /// must preserve (rendered lines). Empty for non-conflict revisions and
     /// for conflict revisions with no merged overlap partner.
@@ -227,6 +236,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
         deferred_scope_proposals_seam_enabled,
         followup_proposals_seam_enabled,
         run_done_proposals_seam_enabled,
+        pr_created_proposals_seam_enabled,
         merge_order_preservation,
         bazel_workspace,
         remote_workspace,
@@ -508,10 +518,19 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
         prompt.push_str(&format!(
             "- Record the PR URL in `{pr_url_artifact}` as `{{\"pr_url\": \"<the url>\"}}` (also exported as `$BOSS_PR_URL_OUTPUT`). This external artifact is the engine's primary URL channel; the final-response URL in the generated rules is its fallback.\n",
         ));
+        if pr_created_proposals_seam_enabled {
+            let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
+            prompt.push_str(&format!(
+                "- After opening or updating the PR, submit `{boss} propose pr-created --url <the PR URL>` (add `--branch <branch-name>` when useful for verification). Submission is synchronous and validated immediately.\n",
+            ));
+        }
         // Warn that PR creation is terminal — the engine reaps the worker
         // immediately after the PR is opened. Workers must finish everything
         // BEFORE opening the PR; no followup turn is possible.
-        prompt.push_str(&pr_terminal_directive(run_done_proposals_seam_enabled));
+        prompt.push_str(&pr_terminal_directive(
+            run_done_proposals_seam_enabled,
+            pr_created_proposals_seam_enabled,
+        ));
         // Issue #899: hand the worker the engine's CI-completion definition
         // so it stops once CI is effectively green rather than polling
         // forever on human-gated checks (e.g. LinkedIn's `Owner Approval`).
@@ -907,39 +926,87 @@ fn render_editorial_rules_block(
     out
 }
 
-/// Directive that warns workers PR creation is terminal: the engine reaps
-/// them immediately after the PR is opened. No followup turn is possible.
-/// Workers must finish all work — including consuming any in-flight reviews
-/// they started — BEFORE opening the PR. Incident: a worker opened a PR,
-/// then tried to wait for background review subagents and address their
-/// findings as followup commits. The engine terminated the worker the moment
-/// the PR was created, so the review was never consumed. This universal
-/// guidance applies to every execution kind and prevents that pattern.
+/// Directive that warns workers PR creation is terminal: no followup turn is
+/// possible after it. Workers must finish all work — including consuming
+/// any in-flight reviews they started — BEFORE opening the PR. Incident: a
+/// worker opened a PR, then tried to wait for background review subagents
+/// and address their findings as followup commits. The engine terminated
+/// the worker before the review was consumed. This universal guidance
+/// applies to every execution kind and prevents that pattern.
 ///
-/// `seam_enabled` mirrors `run_done_proposals_seam`. When on, [`run_done_directive`]'s
-/// declaration — not PR creation — is the act that is ALWAYS terminal:
-/// `boss propose done` ends the run synchronously the instant it is accepted
-/// (`completion::run_done_declaration` finalizes it at submit, no Stop
-/// boundary needed). The push must come first and the declaration last — the
-/// reverse of the ordering this block taught before declarations existed,
-/// when the push was the only thing that could reap a worker. Getting this
-/// backwards now would kill the worker's pane before it ever reaches `cube
-/// pr create`.
-fn pr_terminal_directive(seam_enabled: bool) -> String {
+/// States the worker's terminal sequence exactly once, in the order it must
+/// happen, rather than as several directives that can read as contradicting
+/// each other (a prior version literally did: "opening the PR is the LAST
+/// thing you do", followed later by "you will not get another turn after
+/// `gh pr create` *and* the `boss propose pr-created` call" — two different
+/// claims about what the last step is). It also does not claim the engine
+/// reaps the worker "immediately after the PR is created": the PR-created
+/// hook only stages and arms the URL (`pr_url_capture.rs`); finalization —
+/// and the termination that comes with it — happens at the worker's next
+/// Stop boundary, not synchronously inside the `gh pr create` call.
+///
+/// `run_done_proposals_seam_enabled` mirrors `run_done_proposals_seam`: when
+/// on, the sequence gains a `{boss} propose done` declaration step after
+/// the push and any PR-created declaration, because accepting it finalizes
+/// the run synchronously.
+///
+/// `pr_created_proposals_seam_enabled` mirrors `pr_created_proposals_seam`
+/// (design implementation task 12): when on, the sequence gains a `{boss}
+/// propose pr-created --url ...` declaration step after the push, since
+/// finalization now reads that proposal row first. With both flags `false` this
+/// reproduces the pre-migration two-step sequence (just push, then stop).
+fn pr_terminal_directive(run_done_proposals_seam_enabled: bool, pr_created_proposals_seam_enabled: bool) -> String {
     let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
     let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
-    let terminal = if seam_enabled {
+    let push_step = format!("open or update the PR with `{cube} pr create` / `{cube} pr update`");
+    let mut steps = Vec::new();
+    steps.push(push_step);
+    if pr_created_proposals_seam_enabled {
+        steps.push(format!("declare `{boss} propose pr-created --url ...`"));
+    }
+    if run_done_proposals_seam_enabled {
+        steps.push(format!("declare `{boss} propose done` (see below)"));
+    }
+    let sequence = steps
+        .iter()
+        .enumerate()
+        .map(|(i, step)| format!("{}. {step}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let terminal_action_sentence = if run_done_proposals_seam_enabled {
         format!(
-            "## Important: declaring done is your terminal act\nFinish everything, open or update the PR with `{cube} pr create` / `{cube} pr update`, then call `{boss} propose done` as your last tool call. An accepted declaration ends the run immediately, before you see its response; PR creation/update still gives you a turn to declare. Never declare before pushing.\n"
+            "You will NOT get another turn after `{boss} propose done` — that declaration is the \
+             terminal action, not an afterthought."
+        )
+    } else if pr_created_proposals_seam_enabled {
+        format!(
+            "You will NOT get another turn after `gh pr create` / `{cube} pr create` (or `{cube} \
+             pr update` for an existing PR) and the `{boss} propose pr-created --url ...` call \
+             that declares it — that declaration IS the terminal action, not an afterthought."
         )
     } else {
         format!(
-            "## Important: PR creation is your terminal act\nOpening the PR is the LAST thing you do. You will NOT get another turn after `{cube} pr create` or `{cube} pr update`: the engine reaps you immediately.\n"
+            "You will NOT get another turn after `gh pr create` / `{cube} pr create` (or `{cube} \
+             pr update` for an existing PR) — that is the terminal action, not an afterthought."
         )
     };
-    format!(
-        "\n{terminal}Do not plan followup commits or defer work until after the PR: do not open the PR until every gate, build, test run, review and sub-agent run you started has returned its real result. Consume review/self-review findings and address them before publishing. If you don't intend to wait for a review, don't start it.\n"
-    )
+
+    let mut out = String::new();
+    out.push_str("\n## Important: PR creation is your terminal act\n\n");
+    out.push_str(
+        "Everything else in this run happens BEFORE the sequence below. Do this, in order, as \
+         your last actions:\n\n",
+    );
+    out.push_str(&sequence);
+    out.push_str("\n\n");
+    out.push_str(&format!(
+        "{terminal_action_sentence} Do not plan followup commits, do not defer work to \
+         \"after the PR\", do not open the PR until every gate, build, test run, review and \
+         sub-agent run you started has returned its real result — the PR comes after those \
+         results, never in place of them.\n\n"
+    ));
+    out.push_str("Therefore: finish everything — including consuming any review/self-review findings you started — BEFORE you open the PR. If a background review is still running and you care about its results, wait for it and address all findings FIRST, then open the PR. If you don't intend to wait, don't start the review.\n");
+    out
 }
 
 /// Worker Stop-boundary escalation/blocker protocol directive. `seam_enabled`

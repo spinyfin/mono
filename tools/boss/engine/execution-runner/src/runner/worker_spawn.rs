@@ -96,6 +96,8 @@ pub struct WorkerSpawnOpts {
     pub review_batch_fanout_enabled: bool,
     #[builder(default)]
     pub run_done_proposals_seam_enabled: bool,
+    #[builder(default)]
+    pub pr_created_proposals_seam_enabled: bool,
     /// Override for whether the execution workspace is a Bazel workspace.
     /// `None` means the composer probes `workspace_path` locally (and does
     /// not treat a missing path as non-Bazel). Remote (SSH) spawns set this
@@ -583,6 +585,7 @@ pub async fn compose_worker_spawn(
         automation_outcome_proposals_seam_enabled,
         review_batch_fanout_enabled,
         run_done_proposals_seam_enabled,
+        pr_created_proposals_seam_enabled,
         bazel_workspace,
         repo_guidance,
         remote_workspace,
@@ -829,6 +832,7 @@ pub async fn compose_worker_spawn(
                         .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
                         .followup_proposals_seam_enabled(followup_proposals_seam_enabled)
                         .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
+                        .pr_created_proposals_seam_enabled(pr_created_proposals_seam_enabled)
                         .maybe_bazel_workspace(bazel_workspace)
                         .remote_workspace(remote_workspace)
                         .build(),
@@ -865,6 +869,7 @@ pub async fn compose_worker_spawn(
                     .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
                     .followup_proposals_seam_enabled(followup_proposals_seam_enabled)
                     .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
+                    .pr_created_proposals_seam_enabled(pr_created_proposals_seam_enabled)
                     .maybe_bazel_workspace(bazel_workspace)
                     .remote_workspace(remote_workspace)
                     .build(),
@@ -1139,6 +1144,7 @@ pub async fn compose_worker_spawn(
                 .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
                 .followup_proposals_seam_enabled(followup_proposals_seam_enabled)
                 .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
+                .pr_created_proposals_seam_enabled(pr_created_proposals_seam_enabled)
                 .merge_order_preservation(&merge_order_preservation)
                 .maybe_bazel_workspace(bazel_workspace)
                 .remote_workspace(remote_workspace)

@@ -947,6 +947,8 @@ impl ExecutionRunner for PaneSpawnRunner {
         // taught to make would hold every run to the run-done backstop.
         let run_done_proposals_seam_enabled = self.feature_flags.is_enabled("worker_proposals")
             && self.feature_flags.is_enabled("run_done_proposals_seam");
+        let pr_created_proposals_seam_enabled = self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("pr_created_proposals_seam");
         let ComposedWorkerSpawn {
             prompt_text,
             spawn_config,
@@ -968,6 +970,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 .automation_outcome_proposals_seam_enabled(automation_outcome_proposals_seam_enabled)
                 .review_batch_fanout_enabled(review_batch_fanout_enabled)
                 .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
+                .pr_created_proposals_seam_enabled(pr_created_proposals_seam_enabled)
                 .maybe_repo_guidance(spawner.repo_guidance())
                 .build(),
         )
@@ -1396,6 +1399,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                     .automation_outcome_proposals_seam_enabled(automation_outcome_proposals_seam_enabled)
                     .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
                     .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
+                    .pr_created_proposals_seam_enabled(pr_created_proposals_seam_enabled)
                     .is_review_supervisor(is_review_supervisor)
                     .is_post_merge_reviewer(is_post_merge_reviewer)
                     .checkout_positioned_on_pr_head(checkout_positioned_on_pr_head)

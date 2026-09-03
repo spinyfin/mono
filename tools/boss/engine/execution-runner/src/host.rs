@@ -254,6 +254,12 @@ pub struct StartWorkerInput {
     /// unless `worker_kind` is [`WorkerKind::AnswerAgent`].
     #[builder(default)]
     pub checkout_positioned_on_pr_head: bool,
+    /// Forwarded to `WorkerSetupInput` — see that field's doc. Ignored for
+    /// [`WorkerKind::Triage`] / [`WorkerKind::Reviewer`] /
+    /// [`WorkerKind::AnswerAgent`] workers, which never reach the
+    /// standard-worker CLAUDE.md branch it gates.
+    #[builder(default)]
+    pub pr_created_proposals_seam_enabled: bool,
     /// Badge type, project, host, and start-time stamps for the resulting
     /// `LiveWorkerState`. Production dispatch resolves these from the
     /// execution; tests may leave them empty.
