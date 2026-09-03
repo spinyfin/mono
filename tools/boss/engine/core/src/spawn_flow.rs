@@ -570,6 +570,11 @@ pub struct StartWorkerInput {
     /// execution; tests may leave them empty.
     #[builder(default)]
     pub live_metadata: boss_protocol::LiveWorkerMetadata,
+    /// Forwarded to `WorkerSetupInput` — see that field's doc. Ignored for
+    /// [`WorkerKind::Triage`] / [`WorkerKind::Reviewer`] /
+    /// [`WorkerKind::AnswerAgent`] workers, which never reach the
+    /// standard-worker CLAUDE.md branch it gates.
+    pub pr_created_proposals_seam_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -816,6 +821,7 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
         .is_review_supervisor(input.is_review_supervisor)
         .is_post_merge_reviewer(input.is_post_merge_reviewer)
         .checkout_positioned_on_pr_head(input.checkout_positioned_on_pr_head)
+        .pr_created_proposals_seam_enabled(input.pr_created_proposals_seam_enabled)
         .build();
     let written = write_workspace_files(&setup, input.driver.as_ref()).map_err(StartWorkerError::WriteFiles)?;
     spawner
@@ -1243,6 +1249,7 @@ mod tests {
             is_post_merge_reviewer: false,
             checkout_positioned_on_pr_head: false,
             live_metadata: Default::default(),
+            pr_created_proposals_seam_enabled: false,
         }
     }
 

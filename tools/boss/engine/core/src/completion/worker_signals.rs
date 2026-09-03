@@ -618,6 +618,31 @@ impl WorkerCompletionHandler {
         );
     }
 
+    /// Count one legacy-ladder hit for the PR-created-declaration seam
+    /// (design implementation task 12 — the last of the per-seam
+    /// migrations) and log a WARN. Called from the shared
+    /// [`super::pr_transition::WorkerCompletionHandler::finalize_pr_transition`]
+    /// funnel — not from `on_stop_inner`/`recheck_for_pr` directly — so
+    /// every PR finalization that reaches that funnel via a source other
+    /// than the `pr_created` proposal read (`"stop_proposal"` /
+    /// `"pr_recheck_proposal"`) is counted exactly once, regardless of
+    /// which layer of the staging-cache / driver-prose / cold-
+    /// reconstruction ladder actually produced the URL. `source` is the
+    /// same finalize-source string already threaded through that funnel
+    /// (`"stop_staged"`, `"stop_driver_fallback"`, `"stop_sha_delta"`,
+    /// `"stop"`, `"pr_recheck_staged"`, `"pr_recheck_sha_delta"`,
+    /// `"pr_recheck"`, …), carried into the WARN as `detail` so the log is
+    /// diagnosable without a second lookup.
+    pub(super) fn record_pr_created_fallback_hit(&self, execution: &crate::work::WorkExecution, source: &str) {
+        self.record_proposal_fallback_hit_no_row(
+            execution,
+            &PR_CREATED_FALLBACK_HIT,
+            "pr_created_proposals_seam",
+            "pr_created",
+            source,
+        );
+    }
+
     /// Consume this execution's staged `proposal_channel_error` (if any —
     /// see [`crate::proposal_channel_error`]), file an attention for it, and
     /// increment `worker_proposals.channel_error`. Design §"Failure
