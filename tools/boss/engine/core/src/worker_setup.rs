@@ -2339,7 +2339,11 @@ fn ensure_content_addressed_script(dir: &Path, kind: &str, filename: &str, bytes
         Ok(existing) => {
             // Same content-addressed path, different bytes: corruption or
             // a sha256 collision. Never overwrite — that is the outage
-            // this function exists to make impossible.
+            // this function exists to make impossible. But we also must
+            // never wire an unattested file in as the enforcement gate:
+            // fail closed rather than returning a path whose bytes are
+            // not the guard script (see `data_dir_fence` doctrine — a
+            // boundary that cannot be enforced must fail loudly).
             log_guard_script_write(
                 kind,
                 &path,
@@ -2348,6 +2352,11 @@ fn ensure_content_addressed_script(dir: &Path, kind: &str, filename: &str, bytes
                 /*replaced_different_bytes=*/ false,
                 /*existing_bytes_differ=*/ true,
             );
+            return Err(io::Error::other(format!(
+                "guard script at {} has different bytes than expected for this content-addressed \
+                 path (kind={kind}); refusing to wire an unverified file in as the PreToolUse gate",
+                path.display()
+            )));
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             let tmp = guard_dir.join(format!(".{filename}.{}.tmp", std::process::id()));
@@ -2363,7 +2372,8 @@ fn ensure_content_addressed_script(dir: &Path, kind: &str, filename: &str, bytes
                     let _ = std::fs::remove_file(&tmp);
                     // A concurrent writer of the same hash may have won
                     // the rename. If the winner's bytes match, we are
-                    // done; if they differ, leave them (never overwrite).
+                    // done; if they differ, fail closed rather than
+                    // silently wiring in whatever ended up at this path.
                     match std::fs::read(&path) {
                         Ok(existing) if existing == bytes => {}
                         Ok(existing) => {
@@ -2375,6 +2385,12 @@ fn ensure_content_addressed_script(dir: &Path, kind: &str, filename: &str, bytes
                                 /*replaced_different_bytes=*/ false,
                                 /*existing_bytes_differ=*/ true,
                             );
+                            return Err(io::Error::other(format!(
+                                "guard script at {} has different bytes than expected for this \
+                                 content-addressed path (kind={kind}); refusing to wire an \
+                                 unverified file in as the PreToolUse gate",
+                                path.display()
+                            )));
                         }
                         Err(_) => return Err(rename_err),
                     }
@@ -2807,6 +2823,17 @@ pub fn heal_worker_settings_json(settings_dir: &Path, new_boss_event_path: &Path
     // without touching any other build's hashed directory — overwriting
     // those would brick Codex workers already armed against the previous
     // bytes.
+    //
+    // This only restores the *running build's* hashed directory. A live
+    // worker whose settings.json points at a different build's
+    // <kind>-<sha256>/ directory is not helped here — heal has no other
+    // build's bytes to write. If TMPDIR churn reaped that directory, that
+    // worker's guard hook stays missing: fail-closed (a missing script
+    // file makes the hook block, not approve), so this is not a safety
+    // hole, but it does mean such a worker will block on its next tool
+    // call rather than run unguarded or get healed back to working. This
+    // is inherent to content-addressing per build, not a bug in the heal
+    // sweep itself.
     if let Err(err) = ensure_path_guard_script_in(settings_dir) {
         tracing::warn!(
             dir = %settings_dir.display(),

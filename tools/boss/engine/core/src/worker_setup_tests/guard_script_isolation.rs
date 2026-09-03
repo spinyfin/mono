@@ -172,7 +172,7 @@ fn writing_a_guard_script_logs_process_and_build_identity_at_info() {
 }
 
 #[test]
-fn a_hash_collision_at_the_same_path_is_logged_and_does_not_overwrite() {
+fn a_hash_collision_at_the_same_path_is_logged_and_fails_closed() {
     let buffer = crate::test_support::log_capture::install();
     let dir = TempDir::new().unwrap();
     let path = path_guard_script_path_in(dir.path());
@@ -180,8 +180,12 @@ fn a_hash_collision_at_the_same_path_is_logged_and_does_not_overwrite() {
     std::fs::write(&path, b"not-the-guard-script\n").unwrap();
 
     let start = buffer.lock().len();
-    let returned = ensure_path_guard_script_in(dir.path()).unwrap();
-    assert_eq!(returned, path);
+    let err = ensure_path_guard_script_in(dir.path())
+        .expect_err("a file that doesn't hash to its own directory name must never be wired in as the PreToolUse gate");
+    assert!(
+        err.to_string().contains("refusing to wire an unverified file in"),
+        "error must explain the fail-closed refusal: {err}"
+    );
     assert_eq!(
         std::fs::read(&path).unwrap(),
         b"not-the-guard-script\n",

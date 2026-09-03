@@ -58,7 +58,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "BOSS_DATA_DIR='/Users/brianduff/Library/Application Support/Boss' python3 '$TMPDIR/boss-worker-settings/boss-path-guard.py'"
+            "command": "BOSS_DATA_DIR='/Users/brianduff/Library/Application Support/Boss' python3 '$TMPDIR/boss-worker-settings/path-guard-<sha256>/boss-path-guard.py'"
           }
         ]
       },
@@ -85,7 +85,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 '$TMPDIR/boss-worker-settings/boss-checkleft-push-guard.py'"
+            "command": "python3 '$TMPDIR/boss-worker-settings/checkleft-push-guard-<sha256>/boss-checkleft-push-guard.py'"
           }
         ]
       }

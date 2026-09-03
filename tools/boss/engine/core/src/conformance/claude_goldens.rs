@@ -56,20 +56,23 @@ fn normalize_host_paths(rendered: &str) -> String {
         .replace(&tmp.replace(' ', "\\ "), "$TMPDIR");
     // Guard scripts live in a content-addressed subdirectory keyed on the
     // script sha256 (`path-guard-<hex>/boss-path-guard.py`). That hash
-    // changes whenever the script bytes change; the golden pins the
-    // settings.json *shape*, not a particular hash, so strip the
-    // directory component before comparing.
-    strip_content_addressed_guard_dirs(&with_tmp)
+    // changes whenever the script bytes change, so it isn't portable
+    // byte-for-byte; but the golden must still pin the *shape* — that the
+    // guard lives under a per-content hashed directory, not a flat shared
+    // path — since that shape is exactly what this content-addressing
+    // work introduced. Rewrite the hash to a stable placeholder instead of
+    // deleting the directory component.
+    replace_content_addressed_guard_dirs(&with_tmp)
 }
 
-/// Remove `<kind>-<64 hex>/` path components so a content-addressed
-/// guard path compares equal to the pre-hashing golden
-/// (`…/boss-worker-settings/boss-path-guard.py`).
-fn strip_content_addressed_guard_dirs(s: &str) -> String {
-    strip_kind_hash_dir(&strip_kind_hash_dir(s, "path-guard-"), "checkleft-push-guard-")
+/// Rewrite `<kind>-<64 hex>/` path components to `<kind>-<sha256>/` so a
+/// content-addressed guard path compares equal across builds while still
+/// asserting that the hashed directory component is present.
+fn replace_content_addressed_guard_dirs(s: &str) -> String {
+    replace_kind_hash_dir(&replace_kind_hash_dir(s, "path-guard-"), "checkleft-push-guard-")
 }
 
-fn strip_kind_hash_dir(s: &str, prefix: &str) -> String {
+fn replace_kind_hash_dir(s: &str, prefix: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(idx) = rest.find(prefix) {
@@ -78,6 +81,8 @@ fn strip_kind_hash_dir(s: &str, prefix: &str) -> String {
         let hash = after.get(..64);
         let slash = after.as_bytes().get(64);
         if hash.is_some_and(|h| h.bytes().all(|b| b.is_ascii_hexdigit())) && slash == Some(&b'/') {
+            out.push_str(prefix);
+            out.push_str("<sha256>/");
             rest = &after[65..];
         } else {
             out.push_str(prefix);
@@ -209,16 +214,16 @@ fn golden_deny_rules_standard_worker() {
 // ── settings.json ───────────────────────────────────────────────────────────
 
 #[test]
-fn strip_content_addressed_guard_dirs_removes_kind_hash_component() {
+fn replace_content_addressed_guard_dirs_pins_the_hashed_shape() {
     let hashed = "$TMPDIR/boss-worker-settings/path-guard-a8a5bfd127fda4353a55ebdcae8b58e154e46d4fbdf0b9df5cd0bc963e33fd16/boss-path-guard.py";
     assert_eq!(
-        strip_content_addressed_guard_dirs(hashed),
-        "$TMPDIR/boss-worker-settings/boss-path-guard.py"
+        replace_content_addressed_guard_dirs(hashed),
+        "$TMPDIR/boss-worker-settings/path-guard-<sha256>/boss-path-guard.py"
     );
     let checkleft = "$TMPDIR/boss-worker-settings/checkleft-push-guard-df95ca546c6b89098a3afd957409744c52c2334079f3f435cbcbe81bbb4e4e8d/boss-checkleft-push-guard.py";
     assert_eq!(
-        strip_content_addressed_guard_dirs(checkleft),
-        "$TMPDIR/boss-worker-settings/boss-checkleft-push-guard.py"
+        replace_content_addressed_guard_dirs(checkleft),
+        "$TMPDIR/boss-worker-settings/checkleft-push-guard-<sha256>/boss-checkleft-push-guard.py"
     );
 }
 
