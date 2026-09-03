@@ -351,7 +351,7 @@ pub(crate) async fn compose_worker_spawn(
     work_item: &WorkItem,
     workspace_path: &Path,
     cube_change_id: Option<&str>,
-    // Bundled (rather than five positional bools) to keep the parameter
+    // Bundled (rather than a run of positional bools) to keep the parameter
     // count under clippy::too_many_arguments AND so call sites name what
     // they set instead of relying on positional order — a transposed pair
     // of seam flags here would compile silently and mis-gate a prompt.
@@ -781,7 +781,7 @@ pub(crate) async fn compose_worker_spawn(
             }
         }
     } else if execution.kind == ExecutionKind::AnswerAgent {
-        // P3b: an `answer_agent` execution renders the answer-agent prompt
+        // An `answer_agent` execution renders the answer-agent prompt
         // (doc content, comment, thread history, reply instructions) instead
         // of the ordinary implementer prompt. Its `work_item_id` is the
         // comment id (see `WorkDb::create_answer_agent_execution`).
