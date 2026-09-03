@@ -35,7 +35,8 @@ use boss_protocol::{
     AttentionProposalPayload, AutomationOutcomeProposalPayload, BlockedProposalPayload, DeferredScopeProposalPayload,
     EffortEscalationProposalPayload, FollowupTaskProposalPayload, PROPOSAL_CAP_PER_KIND_PER_EXECUTION,
     PROPOSAL_CAP_TOTAL_PER_EXECUTION, PrCreatedProposalPayload, ProposalErrorCode, ProposalFieldError, ProposalKind,
-    ProposalSubmissionError, ReviewReportProposalPayload, ReviewVerdictProposalPayload,
+    ProposalSubmissionError, ReviewReportProposalPayload, ReviewVerdictProposalPayload, RunDoneOutcome,
+    RunDoneProposalPayload,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -218,6 +219,15 @@ pub fn validate_payload(kind: ProposalKind, payload: &Value) -> Result<Validated
             to_json(&ReviewVerdictProposalPayload {
                 batch_id: batch_id.unwrap_or_default(),
                 verdict: verdict.unwrap_or_default(),
+            })
+        }
+        ProposalKind::RunDone => {
+            let outcome = reader.required_enum::<RunDoneOutcome>("outcome");
+            let summary = reader.required_text("summary", MAX_SHORT_FIELD_CHARS);
+            reader.finish()?;
+            to_json(&RunDoneProposalPayload {
+                outcome: outcome.unwrap_or(RunDoneOutcome::Blocked),
+                summary: summary.unwrap_or_default(),
             })
         }
     };

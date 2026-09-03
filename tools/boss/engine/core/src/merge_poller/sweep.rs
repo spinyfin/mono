@@ -1041,6 +1041,14 @@ pub(crate) async fn sweep_pending_pr(
         // DeliverableSatisfied is only reachable via the on-Stop path
         // (try_finalize_satisfied_deliverable_on_stop); covered for exhaustiveness.
         | StopOutcome::DeliverableSatisfied { .. }
+        // The run-done gate and its backstop are on-Stop only, by
+        // construction: `recheck_for_pr`/`recheck_for_pr_late` run for
+        // executions whose worker may have died without a clean Stop, and
+        // "no declaration" is exactly what a dead worker looks like — so
+        // the sweep must never reach a verdict on it. Covered for
+        // exhaustiveness.
+        | StopOutcome::AwaitingRunDoneDeclaration { .. }
+        | StopOutcome::RunUndeclaredParked { .. }
         // FlakyRetriggered is only reachable via the on-Stop path (it gates
         // on `execution.kind == "ci_remediation"`), never from a recheck.
         | StopOutcome::FlakyRetriggered { .. }
@@ -1137,6 +1145,14 @@ pub(crate) async fn sweep_late_pr(
         // DeliverableSatisfied is only reachable via the on-Stop path
         // (try_finalize_satisfied_deliverable_on_stop); covered for exhaustiveness.
         | StopOutcome::DeliverableSatisfied { .. }
+        // The run-done gate and its backstop are on-Stop only, by
+        // construction: `recheck_for_pr`/`recheck_for_pr_late` run for
+        // executions whose worker may have died without a clean Stop, and
+        // "no declaration" is exactly what a dead worker looks like — so
+        // the sweep must never reach a verdict on it. Covered for
+        // exhaustiveness.
+        | StopOutcome::AwaitingRunDoneDeclaration { .. }
+        | StopOutcome::RunUndeclaredParked { .. }
         // FlakyRetriggered is only reachable via the on-Stop path (it gates
         // on `execution.kind == "ci_remediation"`), never from a recheck.
         | StopOutcome::FlakyRetriggered { .. }

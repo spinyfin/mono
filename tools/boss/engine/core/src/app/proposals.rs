@@ -102,6 +102,11 @@ crate::register_counter!(
     "SubmitProposal accepted a proposal of kind `review_verdict`.",
 );
 crate::register_counter!(
+    PROPOSAL_SUBMITTED_RUN_DONE,
+    "worker_proposals.submitted.run_done",
+    "SubmitProposal accepted a proposal of kind `run_done` — a worker declared its run finished.",
+);
+crate::register_counter!(
     PROPOSAL_VALIDATION_FAILED,
     "worker_proposals.validation_failed",
     "SubmitProposal rejected a submission for ProposalErrorCode::ValidationFailed (payload schema).",
@@ -124,6 +129,7 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&PROPOSAL_SUBMITTED_PR_CREATED);
     registry.register_counter(&PROPOSAL_SUBMITTED_REVIEW_REPORT);
     registry.register_counter(&PROPOSAL_SUBMITTED_REVIEW_VERDICT);
+    registry.register_counter(&PROPOSAL_SUBMITTED_RUN_DONE);
     registry.register_counter(&PROPOSAL_VALIDATION_FAILED);
     registry.register_counter(&PROPOSAL_RATE_LIMITED);
 }
@@ -140,6 +146,7 @@ fn record_proposal_submitted(metrics: &Registry, kind: ProposalKind) {
         ProposalKind::PrCreated => PROPOSAL_SUBMITTED_PR_CREATED.inc(metrics),
         ProposalKind::ReviewReport => PROPOSAL_SUBMITTED_REVIEW_REPORT.inc(metrics),
         ProposalKind::ReviewVerdict => PROPOSAL_SUBMITTED_REVIEW_VERDICT.inc(metrics),
+        ProposalKind::RunDone => PROPOSAL_SUBMITTED_RUN_DONE.inc(metrics),
     }
 }
 

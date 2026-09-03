@@ -656,6 +656,12 @@ impl ExecutionRunner for PaneSpawnRunner {
         let automation_outcome_proposals_seam_enabled = self.feature_flags.is_enabled("worker_proposals")
             && self.feature_flags.is_enabled("automation_outcome_proposals_seam");
         let review_batch_fanout_enabled = self.feature_flags.is_enabled("review_batch_fanout");
+        // Mirrors `worker_signal_proposals_seam_enabled` above. This one is
+        // the seam where the two halves moving together matters most: gating
+        // the engine's completion path on a declaration the worker was never
+        // taught to make would hold every run to the run-done backstop.
+        let run_done_proposals_seam_enabled = self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("run_done_proposals_seam");
         let ComposedWorkerSpawn {
             prompt_text,
             spawn_config,
@@ -674,6 +680,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 .followup_proposals_seam_enabled(followup_proposals_seam_enabled)
                 .automation_outcome_proposals_seam_enabled(automation_outcome_proposals_seam_enabled)
                 .review_batch_fanout_enabled(review_batch_fanout_enabled)
+                .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
                 .build(),
         )
         .await

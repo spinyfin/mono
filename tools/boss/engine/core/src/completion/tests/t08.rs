@@ -15,6 +15,10 @@
 //! genuine evidence — a merged PR, a merge-queue acceptance, a cleared
 //! conflict, or the worker's own `NO_CHANGES_NEEDED` declaration — must
 //! keep working. See `super::super::health_alone_satisfies_deliverable`.
+//!
+//! The second half of the file covers the same gate's *declaration*
+//! contract — the `boss propose done` requirement that closes the case
+//! evidence cannot reach, plus the backstop under it.
 
 use super::*;
 

@@ -28,9 +28,10 @@ impl WorkerCompletionHandler {
     /// instead of looping, and the ledger is honest.
     ///
     /// **Conservatism.** Unlike the CI twin (which marks failed on the
-    /// first idle Stop), this fires ONLY on
-    /// [`StopOutcome::NudgeBreakerParked`] — the genuine "no push, and the
-    /// engine has stopped trying" terminal. While the worker is still
+    /// first idle Stop), this fires ONLY on a breaker park —
+    /// [`StopOutcome::NudgeBreakerParked`] or the run-done backstop's
+    /// [`StopOutcome::RunUndeclaredParked`], which wraps it — the genuine
+    /// "no push, and the engine has stopped trying" terminal. While the worker is still
     /// being nudged (`AwaitingInput`) the attempt is left `pending` so a
     /// worker that resumes and pushes is never prematurely failed and the
     /// detector's in-flight dedup keeps holding (no duplicate revision).
@@ -47,7 +48,18 @@ impl WorkerCompletionHandler {
         // retires the attempt. Bail early on every other outcome so we
         // never touch the ledger for a worker that pushed, is still being
         // nudged, or hit a transient probe failure.
-        if !matches!(outcome, StopOutcome::NudgeBreakerParked { .. }) {
+        //
+        // `RunUndeclaredParked` counts: it IS a breaker park — the run-done
+        // backstop wraps `NudgeBreakerParked` to name *why* the asking
+        // stopped — and a conflict revision that reaches it has stopped
+        // without pushing exactly as the raw variant means. Missing it here
+        // would strand the `conflict_resolutions` row `pending` forever,
+        // which is the "revision tasks that do nothing" stall this
+        // finalizer exists to prevent.
+        if !matches!(
+            outcome,
+            StopOutcome::NudgeBreakerParked { .. } | StopOutcome::RunUndeclaredParked { .. }
+        ) {
             return;
         }
 
@@ -239,6 +251,17 @@ impl WorkerCompletionHandler {
             // (a backgrounded subagent); the auto-nudge is suppressed, not
             // the attempt marked failed — mirrors BuildWaitPending.
             StopOutcome::BackgroundChildrenPending { .. } => false,
+            // The run-done gate is holding this run because it has not
+            // declared itself finished. That is the opposite of a failed
+            // attempt: nothing has been concluded about it yet, and marking
+            // the ledger row `failed` here would retire an attempt whose
+            // worker may still be mid-fix — mirrors BackgroundChildrenPending.
+            StopOutcome::AwaitingRunDoneDeclaration { .. } => false,
+            // The run-done backstop parked the run for a human after its ask
+            // went unanswered. Same reasoning as NudgeBreakerParked (which
+            // this outcome wraps): a human now owns the decision, and marking
+            // the attempt failed risks a retrigger that re-loops.
+            StopOutcome::RunUndeclaredParked { .. } => false,
             // An operator explicitly held this execution; nothing about
             // the CI attempt changes while held — mirrors EscalationPending.
             StopOutcome::Held { .. } => false,

@@ -470,7 +470,11 @@ impl WorkDb {
     /// pause on the *live* run) is meaningless once the execution is over.
     /// `followup_task` is never touched — a pending followup proposal
     /// outlives its execution by design, sitting in the `followup` attention
-    /// group until the human batch-accept gesture decides it.
+    /// group until the human batch-accept gesture decides it. Neither is
+    /// `run_done`: a terminal declaration is *about* the execution reaching
+    /// its end, so expiring it when the execution goes terminal would erase
+    /// the record precisely when it becomes the answer to "did this run
+    /// finish, or did the backstop end it?".
     ///
     /// In today's policy both in-flight-only kinds auto-apply synchronously
     /// at submission ([`proposal_apply::apply_policy`]), so a `proposed` row
@@ -576,6 +580,65 @@ pub(crate) fn mark_followup_proposal_decided_in_tx(
     Ok(())
 }
 
+impl WorkDb {
+    /// Read this execution's terminal `run_done` declaration, if the worker has made one.
+    pub fn execution_run_done_outcome(&self, execution_id: &str) -> Result<Option<boss_protocol::RunDoneOutcome>> {
+        let conn = self.connect()?;
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT run_done_outcome FROM work_executions WHERE id = ?1",
+                params![execution_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(stored) = stored.filter(|s| !s.is_empty()) else {
+            return Ok(None);
+        };
+        match stored.parse::<boss_protocol::RunDoneOutcome>() {
+            Ok(outcome) => Ok(Some(outcome)),
+            Err(err) => {
+                tracing::warn!(execution_id, stored_outcome = %stored, %err, "run_done: stored declaration outcome did not parse; treating the run as undeclared");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Stamp the backstop's "this run ended without ever declaring" marker.
+    pub fn mark_execution_run_undeclared(&self, execution_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let affected = conn.execute(
+            "UPDATE work_executions SET run_undeclared_at = ?2 WHERE id = ?1 AND (run_undeclared_at IS NULL OR run_undeclared_at = '')",
+            params![execution_id, now_string()],
+        )?;
+        if affected == 0 {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM work_executions WHERE id = ?1)",
+                params![execution_id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                bail!("unknown execution: {execution_id}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the backstop stamped this execution as ending undeclared.
+    pub fn execution_run_undeclared(&self, execution_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let at: Option<String> = conn
+            .query_row(
+                "SELECT run_undeclared_at FROM work_executions WHERE id = ?1",
+                params![execution_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(at.is_some_and(|s| !s.is_empty()))
+    }
+}
+
 // ---- tests ----
 
 #[cfg(test)]
@@ -642,6 +705,7 @@ mod tests {
             ProposalKind::ReviewVerdict => {
                 format!(r#"{{"batch_id":"rvb_missing","verdict":{{"outcome":"approved_{i}"}}}}"#)
             }
+            ProposalKind::RunDone => format!(r#"{{"outcome":"delivered","summary":"S{i}"}}"#),
         }
     }
 

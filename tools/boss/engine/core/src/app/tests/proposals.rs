@@ -423,6 +423,7 @@ async fn every_kind_can_be_submitted() {
                 })
             }
             ProposalKind::ReviewVerdict => json!({"batch_id": "rvb_missing", "verdict": {"outcome": "approved"}}),
+            ProposalKind::RunDone => json!({"outcome": "delivered", "summary": "S"}),
         };
         let (proposal, _) = submitted(submit(&fx, kind, payload).await);
         assert_eq!(proposal.kind, kind);

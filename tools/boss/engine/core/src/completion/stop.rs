@@ -1067,16 +1067,21 @@ impl WorkerCompletionHandler {
                 // race rolled back in #1262. The on_stop path is safe
                 // because the Stop hook fires only when the worker
                 // completed a turn (real activity boundary, not a crash).
-                if let Some(outcome) = self
-                    .try_finalize_satisfied_deliverable_on_stop(
-                        execution_id,
-                        &execution,
-                        &pr_url,
-                        contribution_evidence,
-                    )
+                match self
+                    .evaluate_satisfied_deliverable_on_stop(execution_id, &execution, &pr_url, contribution_evidence)
                     .await
                 {
-                    return outcome;
+                    SatisfiedDeliverableOutcome::Finalized(outcome) => return outcome,
+                    // The PR is healthy and nothing contradicts delivery,
+                    // but the run has not said it is finished. Hand it to
+                    // the backstop instead of the nudge below: a worker
+                    // that is mid-investigation is exactly what must not be
+                    // dogged here, and the backstop's first move is to hold
+                    // quietly.
+                    SatisfiedDeliverableOutcome::AwaitingDeclaration => {
+                        return self.await_run_done_declaration(&execution, &pr_url).await;
+                    }
+                    SatisfiedDeliverableOutcome::NotSatisfied => {}
                 }
                 // Sanctioned no-op terminal for a revision (the honest exit
                 // the gate above deliberately no longer manufactures). A
@@ -1215,8 +1220,8 @@ impl WorkerCompletionHandler {
                     // because refusing would strand any revision whose
                     // dispatch-time snapshot failed in a state no Stop can
                     // ever finalize (the stuck-revision dead end).
-                    if let Some(outcome) = self
-                        .try_finalize_satisfied_deliverable_on_stop(
+                    match self
+                        .evaluate_satisfied_deliverable_on_stop(
                             execution_id,
                             &execution,
                             &bound_pr_url,
@@ -1224,7 +1229,16 @@ impl WorkerCompletionHandler {
                         )
                         .await
                     {
-                        return outcome;
+                        SatisfiedDeliverableOutcome::Finalized(outcome) => return outcome,
+                        // Same hand-off as the `NoContribution` arm above.
+                        // This arm matters more, not less: it is reached
+                        // when the SHA comparison could not be made at all,
+                        // so PR health was the *only* evidence — which is
+                        // precisely where a declaration is worth most.
+                        SatisfiedDeliverableOutcome::AwaitingDeclaration => {
+                            return self.await_run_done_declaration(&execution, &bound_pr_url).await;
+                        }
+                        SatisfiedDeliverableOutcome::NotSatisfied => {}
                     }
                     tracing::info!(
                         execution_id,
