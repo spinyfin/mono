@@ -221,7 +221,7 @@ struct Dispatch {
     decode_ms: f64,
 }
 
-pub use isolation::{DEFAULT_PID_PATH, DEFAULT_SOCKET_PATH};
+pub use isolation::{LEGACY_PID_PATH, LEGACY_SOCKET_PATH, default_pid_path, default_socket_path};
 
 /// Shared HTTP client for the GitHub OAuth device flow. Installs the rustls
 /// ring crypto provider lazily (the first TLS handshake panics otherwise,

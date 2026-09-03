@@ -14,11 +14,10 @@
 //! the RPC fails.
 //!
 //! Coverage strategy: boot a real engine in-process (so the
-//! shutdown RPC has a real socket + token to talk to), write a
-//! PID file pointing at this process so `running_engine_pid`
-//! returns Some, and call `stop_engine(...).await` from within a
-//! `#[tokio::test]`. With the bug present this panics; with the
-//! fix it returns `Ok(())` after the engine drains.
+//! shutdown RPC has a real socket + token to talk to), deliberately
+//! leave its PID file absent, and call `stop_engine(...).await` from
+//! within a `#[tokio::test]`. This pins both the nested-runtime fix
+//! and socket-first shutdown under the incident's missing-PID shape.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -46,11 +45,6 @@ impl TestEngine {
         let db_path = temp.path().join("state.db");
         let token_path = temp.path().join("engine-control.token");
         let pid_path = temp.path().join("engine.pid");
-
-        // Write a PID file that names this test process. `stop_engine`
-        // uses `kill -0` to verify the PID is alive before it bothers
-        // with the RPC, so we need a process that actually exists.
-        std::fs::write(&pid_path, std::process::id().to_string())?;
 
         let work_config = WorkConfig::builder()
             .cwd(temp.path().to_path_buf())
@@ -90,29 +84,16 @@ impl Drop for TestEngine {
 async fn stop_engine_from_tokio_runtime_completes_via_rpc() -> Result<()> {
     let engine = TestEngine::spawn().await?;
 
-    // Point `default_control_token_path` at our test token file so
-    // the shutdown RPC reads the right credential. The env var is
-    // the supported override hook for this resolver.
-    //
-    // SAFETY: This test is the only one in the crate that mutates
-    // `BOSS_ENGINE_CONTROL_TOKEN_PATH`. We restore the previous
-    // value before returning.
-    let prev = std::env::var_os("BOSS_ENGINE_CONTROL_TOKEN_PATH");
-    unsafe {
-        std::env::set_var("BOSS_ENGINE_CONTROL_TOKEN_PATH", &engine.token_path);
-    }
+    let primary_socket = engine.socket_path.with_file_name("state-root.sock");
+    let mut discovery = boss_client::Discovery::from_env(Some(primary_socket.to_str().unwrap()))?;
+    discovery.legacy_socket_path = Some(engine.socket_path.to_string_lossy().into_owned());
+    discovery.legacy_pid_file_path = Some(engine.pid_path.to_string_lossy().into_owned());
+    discovery.control_token_path = engine.token_path.clone();
+    discovery.autostart = false;
+    let result = boss_client::stop_engine(&discovery).await;
 
-    let pid_path_str = engine.pid_path.to_string_lossy().into_owned();
-    let result = boss_client::stop_engine(&pid_path_str).await;
-
-    unsafe {
-        match prev {
-            Some(v) => std::env::set_var("BOSS_ENGINE_CONTROL_TOKEN_PATH", v),
-            None => std::env::remove_var("BOSS_ENGINE_CONTROL_TOKEN_PATH"),
-        }
-    }
-
-    result.map_err(|e| anyhow!("stop_engine returned Err: {e:#}"))?;
+    let outcome = result.map_err(|e| anyhow!("stop_engine returned Err: {e:#}"))?;
+    assert_eq!(outcome, boss_client::EngineStopOutcome::Stopped);
 
     // The shutdown RPC took the happy path, so the engine should
     // be tearing down its accept loop. The socket goes away within
@@ -128,11 +109,11 @@ async fn stop_engine_from_tokio_runtime_completes_via_rpc() -> Result<()> {
     }
     assert!(socket_closed, "engine should have closed its socket after stop_engine");
 
-    // And the RPC-success branch in stop_engine removes the PID file
-    // (since the PID it wrote still matches what we put there).
+    // The PID file was absent for the entire operation. Reaching this
+    // assertion proves shutdown did not depend on it.
     assert!(
         !engine.pid_path.exists(),
-        "stop_engine should have removed the PID file after a successful RPC shutdown"
+        "stop_engine must not recreate the missing PID file"
     );
 
     Ok(())

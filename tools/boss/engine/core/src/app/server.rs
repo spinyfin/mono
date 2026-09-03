@@ -6,8 +6,13 @@
 use super::*;
 
 pub async fn run(cli: Cli) -> Result<()> {
-    let socket_str = cli.socket_path.as_deref().unwrap_or(DEFAULT_SOCKET_PATH);
-    let isolation = IsolationPaths::derive(socket_str);
+    let socket_path = cli
+        .socket_path
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .or_else(default_socket_path)
+        .context("HOME must be set to derive the default frontend socket path")?;
+    let isolation = IsolationPaths::derive(&socket_path.to_string_lossy());
 
     // Build WorkConfig, overriding the paths the isolation guard derived.
     // This must happen before RuntimeConfig so both the DB the engine opens
@@ -55,7 +60,8 @@ fn resolve_engine_paths(
         .pid
         .clone()
         .or(pid_env_override)
-        .unwrap_or_else(|| DEFAULT_PID_PATH.into());
+        .or_else(default_pid_path)
+        .context("HOME must be set to derive the default pid-file path")?;
 
     // The events socket was resolved into the config in `run` (isolation-derived
     // when this is a fixture, `$BOSS_EVENTS_SOCKET` / the production default
@@ -87,12 +93,20 @@ fn resolve_engine_paths(
 }
 
 async fn run_server(cli: Cli, cfg: Arc<RuntimeConfig>, isolation: IsolationPaths) -> Result<()> {
-    let socket_path = cli.socket_path.unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_owned());
+    let socket_path = cli
+        .socket_path
+        .map(std::path::PathBuf::from)
+        .or_else(default_socket_path)
+        .context("HOME must be set to derive the default frontend socket path")?;
 
     let pid_env_override = std::env::var_os(crate::config::PID_PATH_ENV).map(std::path::PathBuf::from);
     let token_env_override = crate::engine_control::default_token_path();
     let resolved = resolve_engine_paths(&isolation, &cfg, pid_env_override, token_env_override)?;
-    let pid_file_path = resolved.pid.clone().unwrap_or_else(|| DEFAULT_PID_PATH.into());
+    let pid_file_path = resolved
+        .pid
+        .clone()
+        .or_else(default_pid_path)
+        .context("HOME must be set to derive the default pid-file path")?;
     let events_socket_path = resolved
         .events_socket
         .clone()
@@ -143,7 +157,6 @@ async fn run_server(cli: Cli, cfg: Arc<RuntimeConfig>, isolation: IsolationPaths
     // over the user's production state. Every path is resolved by now,
     // so the gate judges what this process would actually touch rather
     // than how it was invoked.
-    let socket_path = std::path::PathBuf::from(socket_path);
     super::agent_launch_guard::evaluate(
         super::agent_launch_guard::ResolvedPaths {
             socket_path: &socket_path,
@@ -448,19 +461,13 @@ pub async fn serve_with_merge_probe(
         ));
     }
 
-    // Claim the pid file (non-blocking exclusive flock) *before* opening
-    // the state database or writing the control token. The macOS app's
-    // supervisor treats a missing pid file as "engine exited" and launches
-    // a replacement after waitForEnginePID(5s) + 1s poll + 1s backoff.
-    // Writing the pid only after WorkDb::open and socket bind left a
-    // post-SIGTERM WAL/schema open invisible for ~7s, so the supervisor
-    // spawned a second engine that then lost SQLITE_BUSY_TIMEOUT (5s × two
-    // exclusive statements) and died with `error:database is locked`.
-    // Holding the flock for process lifetime also makes a CLI-vs-app start
-    // race fail closed with an explicit audit record instead of racing
-    // SQLite. `nohup` reparents the engine to launchd, so ppid is not
-    // enough to tell those launchers apart — see the `launched_by` field
-    // on the audit `start` record.
+    // Claim the pid file (non-blocking exclusive flock) *before* opening the
+    // state database or writing the control token. Socket reachability is the
+    // external liveness oracle; the lifetime flock independently makes a
+    // CLI-vs-app start race fail closed with an explicit audit record instead
+    // of racing SQLite setup. `nohup` reparents the engine to launchd, so ppid
+    // is not enough to tell those launchers apart — see the `launched_by`
+    // field on the audit `start` record.
     let _pid_guard = match &pid_file_path {
         Some(path) => match PidFileGuard::acquire(path) {
             Ok(guard) => {
@@ -2792,9 +2799,7 @@ mod resolve_engine_paths_tests {
     use std::path::PathBuf;
 
     use super::resolve_engine_paths;
-    use crate::app::isolation::{
-        DEFAULT_PID_PATH, DEFAULT_SOCKET_PATH, EnginePaths, IsolationOverrides, IsolationPaths,
-    };
+    use crate::app::isolation::{EnginePaths, IsolationOverrides, IsolationPaths};
     use crate::config::{RuntimeConfig, WorkConfig};
 
     const FIXTURE_SOCKET: &str = "/tmp/boss-test-resolve-abc.sock";
@@ -2802,8 +2807,21 @@ mod resolve_engine_paths_tests {
     fn production() -> EnginePaths {
         EnginePaths::under_state_root(
             std::path::Path::new("/Users/tester/Library/Application Support/Boss"),
-            std::path::Path::new(DEFAULT_PID_PATH),
+            &std::path::Path::new("/Users/tester")
+                .join("Library")
+                .join("Application Support")
+                .join("Boss")
+                .join(boss_log_files::ENGINE_PID_FILENAME),
         )
+    }
+
+    fn production_socket() -> PathBuf {
+        production()
+            .db
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(boss_log_files::FRONTEND_SOCKET_FILENAME)
     }
 
     fn cfg_with_events_socket(events_socket: PathBuf) -> RuntimeConfig {
@@ -2871,7 +2889,9 @@ mod resolve_engine_paths_tests {
     /// the config is an error, not a silent fall back to re-deriving one.
     #[test]
     fn missing_events_socket_in_config_is_an_error() {
-        let isolation = IsolationPaths::derive_from(DEFAULT_SOCKET_PATH, &IsolationOverrides::default(), &production());
+        let socket = production_socket();
+        let isolation =
+            IsolationPaths::derive_from(socket.to_str().unwrap(), &IsolationOverrides::default(), &production());
         let work = WorkConfig::builder()
             .cwd(PathBuf::from("/tmp"))
             .db_path(PathBuf::from("/tmp/state.db"))

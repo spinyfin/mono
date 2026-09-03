@@ -5,7 +5,8 @@ import os
 final class EngineClient: @unchecked Sendable {
     var onEvent: (@MainActor @Sendable (EngineEvent) -> Void)?
 
-    private let socketPath: String
+    private let socketPaths: [String]
+    private var socketIndex = 0
     private let queue = DispatchQueue(label: "Boss.EngineClient")
     private var connection: NWConnection?
     private var buffer = Data()
@@ -41,6 +42,19 @@ final class EngineClient: @unchecked Sendable {
     /// still armed underneath the one that actually reconnects — corrupting
     /// the backoff sequence with extra, unwanted connect attempts.
     private var reconnectScheduled = false
+    /// Whether the current connection attempt has ever reached `.ready`.
+    /// Reset per connection attempt; used to decide whether a lost
+    /// connection should advance `socketIndex` (never got through, so the
+    /// next candidate is worth trying) or stay put (it worked before, so
+    /// don't wander off a healthy endpoint just because it dropped).
+    private var reachedReady = false
+
+    /// Thread-safe liveness signal for `EngineProcessController`'s
+    /// supervision tick: true only while this connection is `.ready`. Lets
+    /// supervision reuse this long-lived connection instead of opening a
+    /// fresh probe socket to the engine every tick.
+    private let reachableState = OSAllocatedUnfairLock(initialState: false)
+    var isReachable: Bool { reachableState.withLock { $0 } }
 
     /// Pending engine→UI deliveries and whether a main-actor drain is
     /// already scheduled. See [[emit]] / [[drainPendingEvents]].
@@ -54,13 +68,19 @@ final class EngineClient: @unchecked Sendable {
     private let eventDrain = OSAllocatedUnfairLock(initialState: EventDrainState())
 
     init(socketPath: String) {
-        self.socketPath = socketPath
+        self.socketPaths = [socketPath]
+    }
+
+    init(socketPaths: [String]) {
+        precondition(!socketPaths.isEmpty)
+        self.socketPaths = socketPaths
     }
 
     func start() {
         shouldReconnect = true
         reconnectAttempt = 0
         reconnectScheduled = false
+        socketIndex = 0
         connect()
     }
 
@@ -68,6 +88,7 @@ final class EngineClient: @unchecked Sendable {
         shouldReconnect = false
         reconnectAttempt = 0
         reconnectScheduled = false
+        reachableState.withLock { $0 = false }
         connection?.cancel()
         connection = nil
         buffer.removeAll(keepingCapacity: false)
@@ -79,7 +100,7 @@ final class EngineClient: @unchecked Sendable {
         }
 
         let parameters = NWParameters(tls: nil, tcp: NWProtocolTCP.Options())
-        let endpoint = NWEndpoint.unix(path: socketPath)
+        let endpoint = NWEndpoint.unix(path: socketPaths[socketIndex])
         let connection = NWConnection(to: endpoint, using: parameters)
         self.connection = connection
 
@@ -87,21 +108,30 @@ final class EngineClient: @unchecked Sendable {
             guard let self else { return }
             switch state {
             case .ready:
+                self.reachableState.withLock { $0 = true }
+                self.reachedReady = true
+                self.socketIndex = 0
                 self.emit(.connected)
                 self.receiveNext()
             case .waiting(let error):
+                self.reachableState.withLock { $0 = false }
                 self.emit(.error(message: "socket waiting: \(error.localizedDescription)"))
                 self.connection = nil
                 connection.cancel()
+                self.advanceSocketCandidateIfNeverReady()
                 self.emit(.disconnected)
                 self.scheduleReconnect()
             case .failed(let error):
+                self.reachableState.withLock { $0 = false }
                 self.emit(.error(message: "socket failed: \(error.localizedDescription)"))
                 self.connection = nil
+                self.advanceSocketCandidateIfNeverReady()
                 self.emit(.disconnected)
                 self.scheduleReconnect()
             case .cancelled:
+                self.reachableState.withLock { $0 = false }
                 self.connection = nil
+                self.advanceSocketCandidateIfNeverReady()
                 self.emit(.disconnected)
                 self.scheduleReconnect()
             default:
@@ -110,6 +140,16 @@ final class EngineClient: @unchecked Sendable {
         }
 
         connection.start(queue: queue)
+    }
+
+    /// Only wanders to the next socket candidate when this attempt never
+    /// reached `.ready` — a connection that worked before dropping should
+    /// retry the same (healthy) endpoint rather than rotate away from it.
+    /// See `reachedReady`.
+    private func advanceSocketCandidateIfNeverReady() {
+        defer { reachedReady = false }
+        guard !reachedReady else { return }
+        socketIndex = (socketIndex + 1) % socketPaths.count
     }
 
 

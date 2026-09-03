@@ -5,7 +5,7 @@
 //! real state under `~/Library/Application Support/Boss` — the events
 //! socket workers deliver hooks to, `state.db`, the pid file, and the
 //! engine-control token — plus the frontend socket at
-//! [`DEFAULT_SOCKET_PATH`]. Exactly one such process may exist. In
+//! the production state-root frontend socket. Exactly one such process may exist. In
 //! **test-fixture** mode (`--socket-path` names anything else) every
 //! runtime path is derived from that socket's directory and stem
 //! (`crate::app::IsolationPaths`), so the process cannot reach
@@ -168,12 +168,14 @@ impl std::fmt::Display for AgentLaunchRefusal {
         writeln!(f)?;
         writeln!(
             f,
-            "Any --socket-path other than {default} puts the engine in test-fixture mode, where the \
-             db, events socket, pid file and control token are all derived from that socket's path. \
-             Unsetting BOSS_EVENTS_SOCKET matters because every agent pane inherits one pointing at \
-             production, and an inherited value is otherwise treated as a deliberate override. Point \
-             a client at the same --socket-path to drive it.",
-            default = super::DEFAULT_SOCKET_PATH,
+            "Any --socket-path other than the production socket puts the engine in test-fixture \
+             mode, where the db, events socket, pid file and control token are all derived from \
+             that socket's path — this includes the legacy /tmp/boss-engine.sock, which is a test \
+             fixture, not a safe alternative (and the resolved paths above show this launch guard \
+             refuses it anyway when it collides with production). Unsetting BOSS_EVENTS_SOCKET \
+             matters because every agent pane inherits one pointing at production, and an inherited \
+             value is otherwise treated as a deliberate override. Point a client at the same \
+             --socket-path to drive it.",
         )?;
         writeln!(f)?;
         write!(
@@ -234,18 +236,37 @@ pub(crate) fn evaluate(
 fn production_collisions(paths: ResolvedPaths<'_>, production_root: Option<&Path>) -> Vec<Collision> {
     let mut collisions = Vec::new();
 
-    if same_path(paths.socket_path, Path::new(super::DEFAULT_SOCKET_PATH)) {
-        collisions.push(Collision {
-            label: "frontend socket",
-            path: paths.socket_path.to_path_buf(),
-            via_env: None,
-        });
+    // Keep protecting the legacy production locations throughout the app's
+    // migration window. They no longer sit under `production_root`, but an
+    // older live engine can still own them and an agent must never replace it.
+    for (label, path, legacy, via_env) in [
+        (
+            "frontend socket",
+            paths.socket_path,
+            Path::new(crate::app::LEGACY_SOCKET_PATH),
+            Some("BOSS_SOCKET_PATH"),
+        ),
+        (
+            "pid file",
+            paths.pid_path,
+            Path::new(crate::app::LEGACY_PID_PATH),
+            Some("BOSS_ENGINE_PID_PATH"),
+        ),
+    ] {
+        if normalize(path) == normalize(legacy) {
+            collisions.push(Collision {
+                label,
+                path: path.to_path_buf(),
+                via_env,
+            });
+        }
     }
 
     let Some(root) = production_root else {
         return collisions;
     };
     for (label, path, via_env) in [
+        ("frontend socket", paths.socket_path, Some("BOSS_SOCKET_PATH")),
         ("events socket", paths.events_socket, Some("BOSS_EVENTS_SOCKET")),
         ("state db", paths.db_path, Some("BOSS_DB_PATH")),
         ("pid file", paths.pid_path, Some("BOSS_ENGINE_PID_PATH")),
@@ -307,11 +328,6 @@ fn is_inside(child: &Path, parent: &Path) -> bool {
     child.starts_with(&parent)
 }
 
-/// Whether two paths name the same location after normalisation.
-fn same_path(left: &Path, right: &Path) -> bool {
-    normalize(left) == normalize(right)
-}
-
 /// Canonicalise the parent directory and re-attach the file name,
 /// dropping `.` segments and resolving `..` lexically first.
 ///
@@ -364,10 +380,10 @@ mod tests {
     /// Paths as a production engine resolves them.
     fn production_paths() -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
         (
-            PathBuf::from(super::super::DEFAULT_SOCKET_PATH),
+            prod_root().join("engine.sock"),
             prod_root().join("events.sock"),
             prod_root().join("state.db"),
-            PathBuf::from("/tmp/boss-engine.pid"),
+            prod_root().join("engine.pid"),
             prod_root().join("engine-control.token"),
             prod_root().join("tmux.sock"),
         )
@@ -534,6 +550,7 @@ mod tests {
                 "frontend socket",
                 "events socket",
                 "state db",
+                "pid file",
                 "tmux socket",
                 "engine-control token",
             ],

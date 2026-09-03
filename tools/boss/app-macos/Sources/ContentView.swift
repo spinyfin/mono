@@ -479,8 +479,11 @@ struct ContentView: View {
     /// healthy window's titlebar is untouched. The coordinator-update
     /// banner is not chrome: it lives in the coordinator pane column.
     private var hasChromeBanners: Bool {
-        model.showConnectionLostBanner
-            || model.engineSupervisionState != .running
+        shouldShowEngineUnreachableBanner(
+            isConnected: model.isConnected,
+            showConnectionLostBanner: model.showConnectionLostBanner,
+            supervisionState: model.engineSupervisionState
+        )
             || (model.isConnected && !model.bannerHealthIssues.isEmpty)
     }
 
@@ -513,7 +516,11 @@ struct ContentView: View {
             // (reconnect backoff starts at 0.5s) never surfaces this at
             // all, so a brief blip reads as silent self-healing rather than
             // a user-visible connection error.
-            if model.showConnectionLostBanner || model.engineSupervisionState != .running {
+            if shouldShowEngineUnreachableBanner(
+                isConnected: model.isConnected,
+                showConnectionLostBanner: model.showConnectionLostBanner,
+                supervisionState: model.engineSupervisionState
+            ) {
                 EngineUnreachableBanner(
                     isRestarting: model.isRestartingEngine,
                     supervisionState: model.engineSupervisionState,

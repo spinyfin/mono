@@ -38,16 +38,20 @@ use anyhow::{Result, bail};
 use crate::config::{DB_PATH_ENV, EVENTS_SOCKET_ENV, PID_PATH_ENV};
 use crate::engine_control::TOKEN_PATH_ENV;
 
-/// The frontend socket a production engine binds. Any other `--socket-path`
-/// marks the process as a test fixture — see [`is_test_fixture_socket`].
-pub const DEFAULT_SOCKET_PATH: &str = "/tmp/boss-engine.sock";
+/// Legacy production paths retained by clients during the state-root rollout.
+/// The engine itself no longer binds or writes these by default.
+pub const LEGACY_SOCKET_PATH: &str = "/tmp/boss-engine.sock";
+pub const LEGACY_PID_PATH: &str = "/tmp/boss-engine.pid";
+
+/// The frontend socket a production engine binds.
+pub fn default_socket_path() -> Option<PathBuf> {
+    boss_log_files::default_frontend_socket_path()
+}
 
 /// The pid file a production engine writes.
-pub const DEFAULT_PID_PATH: &str = "/tmp/boss-engine.pid";
-
-/// Bare filename of [`DEFAULT_PID_PATH`], for the value-shape check in
-/// [`IsolationPaths::derive_from`].
-const DEFAULT_PID_FILENAME: &str = "boss-engine.pid";
+pub fn default_pid_path() -> Option<PathBuf> {
+    boss_log_files::default_engine_pid_path()
+}
 
 /// Directory production's state-root files (db, events socket, control
 /// token) live under, relative to `$HOME` — shared by [`is_production_shaped`]
@@ -77,7 +81,7 @@ pub struct EnginePaths {
 
 impl EnginePaths {
     /// Production's locations, resolved from the current process environment
-    /// (really just `$HOME`, plus the hard-coded `/tmp` pid default). These
+    /// (really just `$HOME`). These
     /// are what the engine resolves with **no** overrides in play.
     ///
     /// **This models production's *default* location, not its actual one.**
@@ -96,7 +100,7 @@ impl EnginePaths {
         Self {
             db: boss_log_files::default_state_db_path(),
             events_socket: boss_log_files::default_events_socket_path(),
-            pid: Some(PathBuf::from(DEFAULT_PID_PATH)),
+            pid: default_pid_path(),
             control_token: boss_log_files::default_control_token_path(),
             tmux_socket: boss_log_files::default_tmux_socket_path(),
         }
@@ -155,7 +159,7 @@ impl IsolationOverrides {
 /// Paths derived from a non-default `--socket-path` so a test-fixture engine
 /// never touches production state.
 ///
-/// When `socket_path` resolves to [`DEFAULT_SOCKET_PATH`] this is the
+/// When `socket_path` resolves to [`default_socket_path`] this is the
 /// production engine: `is_test_fixture` is false, every derived field is
 /// `None`, and the caller resolves paths through its normal env / home-dir
 /// logic.
@@ -205,7 +209,7 @@ impl IsolationPaths {
     /// `/tmp/boss-test-UUID.events.sock`, `/tmp/boss-test-UUID.pid`,
     /// `/tmp/boss-test-UUID.control-token`).
     pub fn derive_from(socket_path: &str, overrides: &IsolationOverrides, production: &EnginePaths) -> Self {
-        if !is_test_fixture_socket(socket_path) {
+        if !is_test_fixture_socket(socket_path, production) {
             return Self {
                 is_test_fixture: false,
                 derived: EnginePaths::default(),
@@ -268,7 +272,12 @@ impl IsolationPaths {
                     boss_log_files::EVENTS_SOCKET_FILENAME,
                     "events.sock",
                 ),
-                pid: derive_field(&overrides.pid_path, &production.pid, DEFAULT_PID_FILENAME, "pid"),
+                pid: derive_field(
+                    &overrides.pid_path,
+                    &production.pid,
+                    boss_log_files::ENGINE_PID_FILENAME,
+                    "pid",
+                ),
                 control_token: derive_field(
                     &overrides.control_token_path,
                     &production.control_token,
@@ -380,15 +389,18 @@ impl IsolationPaths {
 }
 
 /// Is `socket_path` a test-fixture socket — i.e. anything other than the
-/// production `/tmp/boss-engine.sock`?
+/// production frontend socket under the state root?
 ///
-/// Compared after normalization rather than by raw string equality: on macOS
-/// `/tmp` is a symlink to `/private/tmp`, so a launcher that resolved the
-/// path before passing it would otherwise be misclassified as a fixture (and,
-/// with the refusal gate below, would fail to start). `/tmp/./boss-engine.sock`
-/// is the same class of near-miss.
-fn is_test_fixture_socket(socket_path: &str) -> bool {
-    !same_path(Path::new(socket_path), Some(Path::new(DEFAULT_SOCKET_PATH)))
+/// Compared after normalization rather than by raw string equality so a
+/// launcher that resolves symlinks or leaves `.`/`..` segments in the path
+/// does not accidentally turn production into a fixture.
+fn is_test_fixture_socket(socket_path: &str, production: &EnginePaths) -> bool {
+    let production_socket = production
+        .db
+        .as_deref()
+        .and_then(Path::parent)
+        .map(|root| root.join(boss_log_files::FRONTEND_SOCKET_FILENAME));
+    !same_path(Path::new(socket_path), production_socket.as_deref())
 }
 
 /// Do these two paths name the same file?
@@ -481,8 +493,21 @@ mod tests {
     fn production() -> EnginePaths {
         EnginePaths::under_state_root(
             Path::new("/Users/tester/Library/Application Support/Boss"),
-            Path::new(DEFAULT_PID_PATH),
+            &Path::new("/Users/tester")
+                .join("Library")
+                .join("Application Support")
+                .join("Boss")
+                .join(boss_log_files::ENGINE_PID_FILENAME),
         )
+    }
+
+    fn production_socket() -> PathBuf {
+        production()
+            .db
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(boss_log_files::FRONTEND_SOCKET_FILENAME)
     }
 
     fn derive(overrides: IsolationOverrides) -> IsolationPaths {
@@ -504,7 +529,9 @@ mod tests {
 
     #[test]
     fn default_socket_is_not_a_fixture() {
-        let paths = IsolationPaths::derive_from(DEFAULT_SOCKET_PATH, &IsolationOverrides::default(), &production());
+        let socket = production_socket();
+        let paths =
+            IsolationPaths::derive_from(socket.to_str().unwrap(), &IsolationOverrides::default(), &production());
         assert!(!paths.is_test_fixture);
         assert_eq!(paths.derived, EnginePaths::default());
     }
@@ -514,13 +541,18 @@ mod tests {
     /// stop the production engine from starting at all.
     #[test]
     fn cosmetically_different_production_socket_is_not_a_fixture() {
-        for spelling in [
-            "/tmp/./boss-engine.sock",
-            "/tmp/sub/../boss-engine.sock",
-            "//tmp/boss-engine.sock",
-        ] {
-            let paths = IsolationPaths::derive_from(spelling, &IsolationOverrides::default(), &production());
-            assert!(!paths.is_test_fixture, "{spelling} must classify as production");
+        let root = production_socket().parent().unwrap().to_path_buf();
+        for spelling in [root.join("./engine.sock"), root.join("sub/../engine.sock")] {
+            let paths = IsolationPaths::derive_from(
+                spelling.to_str().unwrap(),
+                &IsolationOverrides::default(),
+                &production(),
+            );
+            assert!(
+                !paths.is_test_fixture,
+                "{} must classify as production",
+                spelling.display()
+            );
         }
     }
 
@@ -781,7 +813,8 @@ mod tests {
     #[test]
     fn production_engine_is_never_refused() {
         let prod = production();
-        IsolationPaths::derive_from(DEFAULT_SOCKET_PATH, &IsolationOverrides::default(), &prod)
+        let socket = production_socket();
+        IsolationPaths::derive_from(socket.to_str().unwrap(), &IsolationOverrides::default(), &prod)
             .ensure_isolated(&prod)
             .expect("production owns production");
     }
@@ -811,8 +844,9 @@ mod tests {
             "an explicitly chosen audit path still wins"
         );
 
+        let socket = production_socket();
         let production =
-            IsolationPaths::derive_from(DEFAULT_SOCKET_PATH, &IsolationOverrides::default(), &production());
+            IsolationPaths::derive_from(socket.to_str().unwrap(), &IsolationOverrides::default(), &production());
         assert_eq!(
             production.scope_if_production(Some(prod_audit.clone()), Some(&prod_audit), "engine-audit.log"),
             Some(prod_audit),
@@ -828,7 +862,8 @@ mod tests {
                 .as_deref(),
             Some(Path::new("/tmp/boss-test-abc123.engine-trace.jsonl"))
         );
-        let prod = IsolationPaths::derive_from(DEFAULT_SOCKET_PATH, &IsolationOverrides::default(), &production());
+        let socket = production_socket();
+        let prod = IsolationPaths::derive_from(socket.to_str().unwrap(), &IsolationOverrides::default(), &production());
         assert_eq!(prod.scoped_path("engine-trace.jsonl"), None);
     }
 

@@ -3,6 +3,14 @@ import os.log
 import SwiftUI
 import UpdateCore
 
+func shouldShowEngineUnreachableBanner(
+    isConnected: Bool,
+    showConnectionLostBanner: Bool,
+    supervisionState: EngineSupervisionState
+) -> Bool {
+    !isConnected && (showConnectionLostBanner || supervisionState != .running)
+}
+
 struct ResizeDivider: NSViewRepresentable {
     let currentWidth: CGFloat
     let minWidth: CGFloat
@@ -201,8 +209,16 @@ struct EngineUnreachableBanner: View {
             return "Boss engine is unreachable — reconnecting…"
         case .restarting(let attempt, let retryAfter):
             return "Boss engine exited — restarting (attempt \(attempt) in \(Int(retryAfter))s)…"
-        case .gaveUp(let attempts):
-            return "Boss engine stopped after \(attempts) restart attempts."
+        case .restartFailed(let attempt, let message):
+            if let attempt {
+                return "Boss engine restart attempt \(attempt) failed: \(message)"
+            }
+            return "Boss engine failed to start: \(message)"
+        case .gaveUp(let attempts, let lastError):
+            if let lastError {
+                return "Boss engine is unreachable after \(attempts) failed restart attempts: \(lastError)"
+            }
+            return "Boss engine is unreachable after \(attempts) restart attempts."
         }
     }
 }

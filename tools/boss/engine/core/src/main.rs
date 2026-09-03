@@ -8,30 +8,36 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use boss_engine::app::{self, DEFAULT_SOCKET_PATH, isolation::IsolationPaths};
+use boss_engine::app::{self, default_socket_path, isolation::IsolationPaths};
 use boss_engine::audit::{self, StartContext};
 use boss_engine::build_info;
 use boss_engine::cli::Cli;
 use boss_engine::rotating_file::{RotatingFileWriter, RotatingState, open_append_file};
 use boss_engine::trace_rotation::{self, RotatingJsonlWriter};
 
-const DEFAULT_LOG_PATH: &str = "/tmp/boss-engine.log";
 const TEXT_LOG_MAX_BYTES_ENV: &str = "BOSS_ENGINE_LOG_MAX_BYTES";
 const TEXT_LOG_MAX_FILES_ENV: &str = "BOSS_ENGINE_LOG_MAX_FILES";
+const STDERR_LOGGING_ENV: &str = "BOSS_ENGINE_STDERR_LOGGING";
 /// Keep 20 100 MiB text-log backups plus the active segment: enough history
 /// for incident forensics, with a finite 2.1 GiB upper bound.
 const DEFAULT_TEXT_LOG_MAX_BYTES: u64 = 100 * 1024 * 1024;
 const DEFAULT_TEXT_LOG_MAX_FILES: usize = 20;
 
 struct DualLogWriter {
-    stderr: io::Stderr,
+    stderr: Option<io::Stderr>,
     file: Option<RotatingFileWriter>,
 }
 
 impl DualLogWriter {
-    fn new(state: Option<Arc<Mutex<Option<RotatingState>>>>, path: PathBuf, max_bytes: u64, max_files: usize) -> Self {
+    fn new(
+        state: Option<Arc<Mutex<Option<RotatingState>>>>,
+        path: PathBuf,
+        max_bytes: u64,
+        max_files: usize,
+        log_to_stderr: bool,
+    ) -> Self {
         Self {
-            stderr: io::stderr(),
+            stderr: log_to_stderr.then(io::stderr),
             file: state.map(|state| RotatingFileWriter {
                 path,
                 state,
@@ -46,17 +52,21 @@ impl DualLogWriter {
 
 impl Write for DualLogWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.stderr.write_all(buf)?;
         if let Some(file) = &mut self.file {
             let _ = file.write_all(buf);
+        }
+        if let Some(stderr) = &mut self.stderr {
+            stderr.write_all(buf)?;
         }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.stderr.flush()?;
         if let Some(file) = &mut self.file {
             let _ = file.flush();
+        }
+        if let Some(stderr) = &mut self.stderr {
+            stderr.flush()?;
         }
         Ok(())
     }
@@ -100,14 +110,20 @@ fn production_state_file(filename: &str) -> Option<PathBuf> {
 }
 
 fn resolve_log_path(isolation: &IsolationPaths) -> PathBuf {
+    let production = boss_log_files::default_engine_text_log_path();
     let resolved = std::env::var("BOSS_ENGINE_LOG_PATH")
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_LOG_PATH));
+        .or_else(|| production.clone())
+        .unwrap_or_else(|| PathBuf::from(boss_log_files::ENGINE_TEXT_LOG_FILENAME));
     isolation
-        .scope_if_production(Some(resolved.clone()), Some(Path::new(DEFAULT_LOG_PATH)), "engine.log")
+        .scope_if_production(
+            Some(resolved.clone()),
+            production.as_deref(),
+            boss_log_files::ENGINE_TEXT_LOG_FILENAME,
+        )
         .unwrap_or(resolved)
 }
 
@@ -118,6 +134,10 @@ fn text_log_rotation_config() -> (u64, usize) {
 }
 
 fn open_log_file(path: &Path, max_files: usize) -> Result<RotatingState> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create engine log directory {}", parent.display()))?;
+    }
     // A restart normally continues appending to the active segment, so prune
     // here as well as on rotation. Otherwise a restart storm could retain
     // arbitrarily many segments without ever writing enough to rotate again.
@@ -142,7 +162,13 @@ async fn main() -> Result<()> {
     // text logs must not land on the production engine's files. Clap prints
     // its own usage errors to stderr, so nothing is lost by parsing first.
     let cli = Cli::parse();
-    let isolation = IsolationPaths::derive(cli.socket_path.as_deref().unwrap_or(DEFAULT_SOCKET_PATH));
+    let socket_path = cli
+        .socket_path
+        .as_deref()
+        .map(PathBuf::from)
+        .or_else(default_socket_path)
+        .context("HOME must be set to derive the default frontend socket path")?;
+    let isolation = IsolationPaths::derive(&socket_path.to_string_lossy());
 
     let log_path = resolve_log_path(&isolation);
     let (text_max_bytes, text_max_files) = text_log_rotation_config();
@@ -163,6 +189,7 @@ async fn main() -> Result<()> {
     // log. This is retained for incident forensics, but is not an unbounded
     // durable surface: 20 100 MiB backups plus the active segment are kept.
     let text_log_path = log_path.clone();
+    let log_to_stderr = std::env::var(STDERR_LOGGING_ENV).as_deref() != Ok("0");
     let text_layer = tracing_subscriber::fmt::layer()
         .compact()
         .with_target(false)
@@ -172,6 +199,7 @@ async fn main() -> Result<()> {
                 text_log_path.clone(),
                 text_max_bytes,
                 text_max_files,
+                log_to_stderr,
             )
         });
 
@@ -298,7 +326,9 @@ fn collect_known_socket_paths(isolation: &IsolationPaths) -> Vec<PathBuf> {
     if let Some(p) = std::env::var_os("BOSS_SOCKET_PATH") {
         paths.push(PathBuf::from(p));
     } else {
-        paths.push(PathBuf::from(DEFAULT_SOCKET_PATH));
+        if let Some(path) = default_socket_path() {
+            paths.push(path);
+        }
     }
 
     // Prefer the isolation-derived events socket so a fixture's audit record

@@ -21,6 +21,15 @@ pub const STATE_DB_FILENAME: &str = "state.db";
 /// Filename of the worker events socket under the state root.
 pub const EVENTS_SOCKET_FILENAME: &str = "events.sock";
 
+/// Filename of the engine frontend socket under the state root.
+pub const FRONTEND_SOCKET_FILENAME: &str = "engine.sock";
+
+/// Filename of the engine process-id file under the state root.
+pub const ENGINE_PID_FILENAME: &str = "engine.pid";
+
+/// Filename of the human-readable engine log under the state root.
+pub const ENGINE_TEXT_LOG_FILENAME: &str = "engine.log";
+
 /// Filename of Boss's private tmux server socket under the state root.
 pub const TMUX_SOCKET_FILENAME: &str = "tmux.sock";
 
@@ -123,6 +132,24 @@ pub fn default_state_db_path() -> Option<PathBuf> {
 /// `<default_state_root>/events.sock`. `None` when `HOME` is unset.
 pub fn default_events_socket_path() -> Option<PathBuf> {
     Some(default_state_root()?.join(EVENTS_SOCKET_FILENAME))
+}
+
+/// Production location of the engine frontend socket:
+/// `<default_state_root>/engine.sock`. `None` when `HOME` is unset.
+pub fn default_frontend_socket_path() -> Option<PathBuf> {
+    Some(default_state_root()?.join(FRONTEND_SOCKET_FILENAME))
+}
+
+/// Production location of the engine pid file:
+/// `<default_state_root>/engine.pid`. `None` when `HOME` is unset.
+pub fn default_engine_pid_path() -> Option<PathBuf> {
+    Some(default_state_root()?.join(ENGINE_PID_FILENAME))
+}
+
+/// Production location of the human-readable engine log:
+/// `<default_state_root>/engine.log`. `None` when `HOME` is unset.
+pub fn default_engine_text_log_path() -> Option<PathBuf> {
+    Some(default_state_root()?.join(ENGINE_TEXT_LOG_FILENAME))
 }
 
 /// Production location of Boss's private tmux server socket:
@@ -292,6 +319,14 @@ mod tests {
             resolve_log_source_path(LogSource::EngineTrace, root),
             root.join("engine-trace.jsonl")
         );
+    }
+
+    #[test]
+    fn engine_runtime_files_resolve_under_state_root() {
+        let root = default_state_root().expect("bazel test supplies HOME");
+        assert_eq!(default_frontend_socket_path(), Some(root.join("engine.sock")));
+        assert_eq!(default_engine_pid_path(), Some(root.join("engine.pid")));
+        assert_eq!(default_engine_text_log_path(), Some(root.join("engine.log")));
     }
 
     #[test]

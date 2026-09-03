@@ -1095,8 +1095,8 @@ pub(crate) async fn run_uninstall_command(args: UninstallArgs, flags: &GlobalFla
     let install_root = resolve_install_root()?;
     // True when no BOSS_INSTALL_ROOT override is in effect, meaning we are
     // operating on the canonical ~/Applications install. Only in that case
-    // should we stop the engine — stopping the default pid file when the
-    // caller set a sandbox install root would kill the host engine instead.
+    // should we stop the production engine — a sandbox install owns its own
+    // engine lifecycle and must not affect the host engine.
     let using_default_install_root = std::env::var("BOSS_INSTALL_ROOT").is_err();
     let app_path = install_root.join("Boss.app");
 
@@ -1149,9 +1149,9 @@ pub(crate) async fn run_uninstall_command(args: UninstallArgs, flags: &GlobalFla
     }
 
     if using_default_install_root {
-        let pid_path =
-            std::env::var("BOSS_ENGINE_PID_PATH").unwrap_or_else(|_| boss_client::DEFAULT_PID_PATH.to_owned());
-        let _ = stop_engine(&pid_path).await;
+        if let Ok(discovery) = Discovery::from_env(flags.socket_path.as_deref()) {
+            let _ = stop_engine(&discovery).await;
+        }
     } else {
         eprintln!(
             "note: not stopping engine: BOSS_INSTALL_ROOT is set; \

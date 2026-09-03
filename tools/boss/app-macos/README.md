@@ -11,10 +11,10 @@ export ANTHROPIC_API_KEY=...
 tools/boss/scripts/run-macos-poc.sh
 ```
 
-Engine logs are written to `/tmp/boss-engine.log` by default (override with
+Engine logs are written to the Boss state root as `engine.log` by default (override with
 `BOSS_ENGINE_LOG_PATH`).
-Engine PID is written to `/tmp/boss-engine.pid` by default (override with
-`BOSS_ENGINE_PID_PATH`).
+Engine PID is written to `engine.pid` in the Boss state root by default
+(override with `BOSS_ENGINE_PID_PATH`).
 Engine lifecycle events (start, every socket bind, shutdown — clean,
 signalled, or panic) are appended as JSON lines to
 `~/Library/Application Support/Boss/engine-audit.log` (override with
@@ -35,14 +35,17 @@ ANTHROPIC_API_KEY=... bazel run //tools/boss/app-macos:Boss
 By default the app launches:
 
 ```bash
-bazel run //tools/boss/engine/core:engine -- --socket-path /tmp/boss-engine.sock
+BOSS_STATE_ROOT="$HOME/Library"
+BOSS_STATE_ROOT="$BOSS_STATE_ROOT/Application Support/Boss"
+bazel run //tools/boss/engine/core:engine -- --socket-path "$BOSS_STATE_ROOT/engine.sock"
 ```
 
 The engine runs from the workspace root.
 
 When auto-start is enabled, the app will:
 
-- reuse an existing engine process from the PID file when available,
+- reuse a reachable engine discovered through the current or legacy socket,
+- compare that engine's fingerprint with the bundled engine even when its PID file is absent,
 - otherwise launch a new engine,
 - relaunch an engine that exits unexpectedly with bounded exponential backoff,
 - keep the engine running when the app exits (unless `BOSS_ENGINE_STOP_ON_EXIT=1`).
@@ -52,11 +55,11 @@ When auto-start is enabled, the app will:
 Disable auto-start and point the app to an existing socket:
 
 ```bash
-ANTHROPIC_API_KEY=... bazel run //tools/boss/engine/core:engine -- --socket-path /tmp/boss-engine.sock
+ANTHROPIC_API_KEY=... bazel run //tools/boss/engine/core:engine -- --socket-path /tmp/boss-dev-engine.sock
 ```
 
 ```bash
-BOSS_ENGINE_AUTOSTART=0 BOSS_SOCKET_PATH=/tmp/boss-engine.sock bazel run //tools/boss/app-macos:Boss
+BOSS_ENGINE_AUTOSTART=0 BOSS_SOCKET_PATH=/tmp/boss-dev-engine.sock bazel run //tools/boss/app-macos:Boss
 ```
 
 ## Agent capture (isolated UI screenshot)
@@ -66,8 +69,8 @@ The capture path is in-process (`cacheDisplay` on a window that is never
 ordered front) — no ScreenCaptureKit, no `screencapture`, no TCC grant,
 no window on the operator's screen, no focus theft.
 
-**Signal:** `BOSS_SOCKET_PATH` set to any path other than
-`/tmp/boss-engine.sock`. That one env var drives the toolbar
+**Signal:** `BOSS_SOCKET_PATH` set to an isolated path outside the Boss state
+root and distinct from the legacy `/tmp/boss-engine.sock`. That one env var drives the toolbar
 `AGENT CAPTURE — isolated instance` badge, `.accessory` activation
 policy (set in `applicationWillFinishLaunching`, never toggled), and a
 per-instance `UserDefaults` suite (`dev.spinyfin.bossmacapp.capture`) so
@@ -148,16 +151,16 @@ disable the surface — attachments are still stored, but no link is minted.
 
 ## Overrides
 
-- `BOSS_SOCKET_PATH`: unix socket path (default `/tmp/boss-engine.sock`)
+- `BOSS_SOCKET_PATH`: unix socket path (default `engine.sock` in the Boss state root)
 - `BOSS_ENGINE_AUTOSTART`: set `0` to disable app-managed engine launch
 - `BOSS_ENGINE_CMD`: custom command used when auto-start is enabled
-- `BOSS_ENGINE_PID_PATH`: engine pid file path (default `/tmp/boss-engine.pid`)
+- `BOSS_ENGINE_PID_PATH`: engine pid file path (default `engine.pid` in the Boss state root)
 - `BOSS_ENGINE_FORCE_RESTART`: set `1` to force-restart the engine on app launch
 - `BOSS_ENGINE_STOP_ON_EXIT`: set `1` to stop engine when app exits
 - `BOSS_ENGINE_RESTART_BACKOFF_SECONDS`: comma-separated restart delays in seconds (default `1,2,4,8,16,30`)
 - `BOSS_ENGINE_RESTART_MAX_ATTEMPTS`: maximum automatic restart attempts before the app shows a manual-restart banner (default `6`)
 - `BOSS_SHOW_SYSTEM_MESSAGES`: set `1` to include internal system status messages
-- `BOSS_ENGINE_LOG_PATH`: log file path (default `/tmp/boss-engine.log`)
+- `BOSS_ENGINE_LOG_PATH`: log file path (default `engine.log` in the Boss state root)
 - `BOSS_ENGINE_LOG_MAX_BYTES`: rotate the text log before a record would exceed this size (default `104857600`, 100 MiB)
 - `BOSS_ENGINE_LOG_MAX_FILES`: number of rotated text-log backups to retain (default `20`)
 - `BOSS_ENGINE_AUDIT_PATH`: audit log file path (default

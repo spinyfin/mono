@@ -42,11 +42,12 @@ mod segments;
 
 pub use paths::{
     APP_POPULATION_TIMING_PREFIX, AUDIT_PATH_ENV, CONTROL_TOKEN_FILENAME, DIAGNOSTICS_DIR, DISPATCH_EVENTS_DIR,
-    DISPATCH_EVENTS_LIVE_FILENAME, ENGINE_AUDIT_FILENAME, ENGINE_TRACE_FILENAME, EVENTS_SOCKET_FILENAME, LogSource,
-    POPULATION_TIMING_PREFIX, SPAWN_DIAGNOSTICS_PREFIX, STATE_DB_FILENAME, TMUX_SOCKET_FILENAME, audit_path_override,
-    day_rotated_files, default_audit_log_path, default_control_token_path, default_events_socket_path,
-    default_state_db_path, default_state_root, default_tmux_socket_path, merge_day_rotated_files,
-    resolve_log_source_files, resolve_log_source_path,
+    DISPATCH_EVENTS_LIVE_FILENAME, ENGINE_AUDIT_FILENAME, ENGINE_PID_FILENAME, ENGINE_TEXT_LOG_FILENAME,
+    ENGINE_TRACE_FILENAME, EVENTS_SOCKET_FILENAME, FRONTEND_SOCKET_FILENAME, LogSource, POPULATION_TIMING_PREFIX,
+    SPAWN_DIAGNOSTICS_PREFIX, STATE_DB_FILENAME, TMUX_SOCKET_FILENAME, audit_path_override, day_rotated_files,
+    default_audit_log_path, default_control_token_path, default_engine_pid_path, default_engine_text_log_path,
+    default_events_socket_path, default_frontend_socket_path, default_state_db_path, default_state_root,
+    default_tmux_socket_path, merge_day_rotated_files, resolve_log_source_files, resolve_log_source_path,
 };
 pub use query::{
     LogFilter, QueryResult, follow_line_matches, line_matches, now_epoch_ms, parse_time_spec, query_log_files,
