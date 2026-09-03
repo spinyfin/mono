@@ -1563,10 +1563,13 @@ pub async fn serve_with_merge_probe(
     );
 
     // Periodic stale-worker liveness backstop: tmux-hosted workers are
-    // classified from hook recency plus pane output, foreground command, and
-    // pane death. A quietly stuck but live pane raises an attention item;
-    // confirmed death remains with the existing death reconcilers. Runs every
-    // 60s and fires on boot.
+    // classified from driver-originated semantic progress (last event time
+    // plus tri-state tool condition) and progress fidelity; tmux itself
+    // decides only exact identity and death (`#{window_activity}` and
+    // `#{pane_current_command}` are diagnostics, never health vetoes). A
+    // quietly stuck but live pane raises an attention item; confirmed death
+    // remains with the existing death reconcilers. Runs every 60s and fires
+    // on boot.
     let stale_worker_terminal_inspector = match server_state.resolve_tmux() {
         Ok(tmux) => {
             let legacy_tmux = boss_tmux::Tmux::for_legacy_label_server(tmux.program().to_path_buf()).ok();
