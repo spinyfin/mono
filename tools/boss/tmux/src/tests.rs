@@ -150,6 +150,13 @@ fn version_parser_accepts_letter_suffixes_and_enforces_floor() {
     assert!(TmuxVersion::parse("3.6a").is_err());
 }
 
+#[test]
+fn source_file_target_requires_3_4() {
+    assert!(!TmuxVersion::parse("tmux 3.3a\n").unwrap().supports_source_file_target());
+    assert!(TmuxVersion::parse("tmux 3.4\n").unwrap().supports_source_file_target());
+    assert!(TmuxVersion::parse("tmux 3.6a\n").unwrap().supports_source_file_target());
+}
+
 #[tokio::test]
 async fn version_uses_resolved_program() {
     let (tmux, runner) = tmux([success("tmux 3.6a\n")]);
@@ -659,6 +666,18 @@ async fn send_keys_pastes_multiline_text_then_submits_once() {
         vec!["-S", TEST_SOCKET_PATH, "send-keys", "-t", "boss-1", "C-m"]
     );
     assert_eq!(runner.stdin(), vec![b"first\nsecond".to_vec()]);
+}
+
+#[tokio::test]
+async fn source_file_sources_stdin_content_scoped_to_the_target_session() {
+    let (tmux, runner) = tmux([success("")]);
+    tmux.source_file("boss-1", "set mouse on\n").await.unwrap();
+    let calls = runner.calls();
+    assert_eq!(
+        calls,
+        vec![vec!["-S", TEST_SOCKET_PATH, "source-file", "-t", "boss-1", "-"]]
+    );
+    assert_eq!(runner.stdin(), vec![b"set mouse on\n".to_vec()]);
 }
 
 #[tokio::test(start_paused = true)]

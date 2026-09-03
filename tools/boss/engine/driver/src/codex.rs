@@ -243,6 +243,12 @@ fn codex_model_belongs_to_driver(model: &str) -> bool {
     lower.starts_with("gpt-") || lower == "codex-auto-review"
 }
 
+/// Session-scoped tmux config sourced into every codex worker's tmux session
+/// at spawn — see `codex-tmux.conf` for why codex needs `mouse on`. Applied
+/// via `crate::tmux_session_config_for` / `spawn_flow::start_tmux_worker` in
+/// `tools/boss/engine/core`.
+pub const CODEX_TMUX_SESSION_CONFIG: &str = include_str!("codex-tmux.conf");
+
 static CODEX_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     name: "codex",
     label: "OpenAI Codex",

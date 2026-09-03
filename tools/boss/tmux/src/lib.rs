@@ -127,6 +127,10 @@ pub struct Tmux {
     program: PathBuf,
     runner: Arc<dyn CommandRunner>,
     server: ServerAddress,
+    /// Memoized result of [`Self::version`]. The resolved executable's
+    /// version cannot change under a running server, so callers that probe
+    /// it per-spawn (e.g. gating `source-file -t`) don't each fork `tmux -V`.
+    version: tokio::sync::OnceCell<TmuxVersion>,
 }
 
 impl std::fmt::Debug for Tmux {
@@ -195,6 +199,7 @@ impl Tmux {
             program,
             runner,
             server,
+            version: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -259,11 +264,19 @@ impl Tmux {
     }
 
     /// Probes the resolved executable's version before the engine accepts work.
+    ///
+    /// Memoized: the version of a resolved executable cannot change while
+    /// this handle is in use, so only the first call forks `tmux -V`.
     pub async fn version(&self) -> Result<TmuxVersion> {
-        let mut args = self.server_args();
-        args.push("-V".into());
-        let output = self.invoke(args).await?;
-        TmuxVersion::parse(&output.stdout)
+        self.version
+            .get_or_try_init(|| async {
+                let mut args = self.server_args();
+                args.push("-V".into());
+                let output = self.invoke(args).await?;
+                TmuxVersion::parse(&output.stdout)
+            })
+            .await
+            .copied()
     }
 
     /// Starts the private server without creating a window.
@@ -343,6 +356,23 @@ impl Tmux {
             return Ok(None);
         }
         command_failed(&args, &output)
+    }
+
+    /// Sources tmux commands from `content` into `session`'s scope, as
+    /// `source-file -t <session> -` with `content` piped over stdin (`-`
+    /// reads the file from stdin — no temp file needed, mirroring how
+    /// [`Self::send_keys`] streams multi-line text through `load-buffer`).
+    ///
+    /// A `set` command in `content` that omits `-g` resolves against the
+    /// `-t` target, so this applies session-scoped options to `session`
+    /// alone rather than the whole server. A `set -g` in `content` still
+    /// means "every session on the server", regardless of `-t` — callers
+    /// that need session scoping must omit `-g` in the sourced content.
+    pub async fn source_file(&self, session: &str, content: &str) -> Result<()> {
+        validate_value("session name", session)?;
+        let mut args = self.server_args();
+        args.extend(["source-file".into(), "-t".into(), session.into(), "-".into()]);
+        self.invoke_with_stdin(args, content.as_bytes()).await.map(|_| ())
     }
 
     /// Sets a per-session tmux option such as `@boss_spawn_token`.

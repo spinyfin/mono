@@ -10,6 +10,9 @@ pub const SERVER_LABEL: &str = "boss";
 pub const TMUX_SPAWN_TOKEN_ENV: &str = "BOSS_SPAWN_TOKEN";
 /// tmux 3.2 introduced `new-session -e`, required for atomic token carriage.
 pub const MINIMUM_VERSION: TmuxVersion = TmuxVersion { major: 3, minor: 2 };
+/// tmux 3.4 added `-t` to `source-file`, needed to scope sourced session
+/// config to one session rather than the whole server.
+pub const SOURCE_FILE_TARGET_MINIMUM_VERSION: TmuxVersion = TmuxVersion { major: 3, minor: 4 };
 /// A conservative literal-input size that remains below command-line limits.
 pub const DEFAULT_SEND_CHUNK_BYTES: usize = 900;
 /// Delay between literal chunks, giving the pane's reader time to drain input so long pastes are not truncated.
@@ -50,6 +53,13 @@ impl TmuxVersion {
 
     pub fn supports_session_environment(self) -> bool {
         self >= MINIMUM_VERSION
+    }
+
+    /// Whether `source-file -t <session> -` is supported. Below 3.4,
+    /// `source-file` has no `-t` flag at all, so callers must skip
+    /// session-scoped sourcing rather than send an unknown flag.
+    pub fn supports_source_file_target(self) -> bool {
+        self >= SOURCE_FILE_TARGET_MINIMUM_VERSION
     }
 }
 
