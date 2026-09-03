@@ -11,24 +11,28 @@ struct EngineRestartPolicy: Equatable, Sendable {
         backoffSchedule: [1, 2, 4, 8, 16, 30],
         maximumAttempts: 6,
         pollInterval: 1,
-        healthyResetInterval: 60
+        healthyResetInterval: 60,
+        consecutiveFailureThreshold: 3
     )
 
     let backoffSchedule: [TimeInterval]
     let maximumAttempts: Int
     let pollInterval: TimeInterval
     let healthyResetInterval: TimeInterval
+    let consecutiveFailureThreshold: Int
 
     init(
         backoffSchedule: [TimeInterval],
         maximumAttempts: Int,
         pollInterval: TimeInterval = Self.default.pollInterval,
-        healthyResetInterval: TimeInterval = Self.default.healthyResetInterval
+        healthyResetInterval: TimeInterval = Self.default.healthyResetInterval,
+        consecutiveFailureThreshold: Int = Self.default.consecutiveFailureThreshold
     ) {
         self.backoffSchedule = backoffSchedule.isEmpty ? Self.default.backoffSchedule : backoffSchedule
         self.maximumAttempts = max(1, maximumAttempts)
         self.pollInterval = max(0.1, pollInterval)
         self.healthyResetInterval = max(0, healthyResetInterval)
+        self.consecutiveFailureThreshold = max(1, consecutiveFailureThreshold)
     }
 
     func delay(forAttempt attempt: Int) -> TimeInterval {
@@ -188,16 +192,15 @@ final class EngineProcessController: @unchecked Sendable {
                     if runningFP != nil { break }
                 }
 
-                if let runningFP, bundledFP == runningFP {
+                guard let runningFP else {
+                    emit("[engine version-check inconclusive] running fingerprint unavailable after \(fingerprintAttempts) attempts bundled=\(bundledFP) — keeping reachable \(describe(running))")
+                    return
+                }
+                if bundledFP == runningFP {
                     emit("[engine version-check ok] running=\(runningFP) matches bundled — attaching to \(describe(running))")
                     return
                 }
-
-                if runningFP == nil {
-                    emit("[engine upgrade] running fingerprint unavailable after \(fingerprintAttempts) attempts bundled=\(bundledFP) — replacing \(describe(running))")
-                } else {
-                    emit("[engine upgrade] running=\(runningFP ?? "unavailable") bundled=\(bundledFP) — replacing \(describe(running))")
-                }
+                emit("[engine upgrade] running=\(runningFP) bundled=\(bundledFP) — replacing \(describe(running))")
                 try stopRunningEngine(running)
                 emit("[engine upgrade] old engine stopped — launching new engine from bundle")
             }
@@ -389,19 +392,27 @@ final class EngineProcessController: @unchecked Sendable {
 
     private func checkEngineLiveness() {
         guard !isSupervisionStopped, pendingRestart == nil else { return }
-        let isAlive = livenessProbe?() ?? (discoverRunningEngine() != nil)
-        let action = supervisor.tick(isAlive: isAlive, now: Date())
+        let liveness: (isReachable: Bool, source: String)
+        if let livenessProbe {
+            liveness = (livenessProbe(), "engine client connection")
+        } else {
+            liveness = (discoverRunningEngine() != nil, "socket probe")
+        }
+        let action = supervisor.tick(isAlive: liveness.isReachable, now: Date())
         switch action {
         case .running:
             lastLaunchError = nil
             emitSupervisionState(.running)
+            return
+        case let .unreachable(consecutiveFailures, requiredFailures):
+            emit("[engine supervision] \(liveness.source) reported engine unreachable; failed liveness tick \(consecutiveFailures)/\(requiredFailures), keeping engine running")
             return
         case let .gaveUp(attempts):
             emit("[engine supervision] gave up after \(attempts) restart attempts; use Restart engine to try again")
             emitSupervisionState(.gaveUp(attempts: attempts, lastError: lastLaunchError))
             return
         case let .restart(attempt, delay):
-            emit("[engine supervision] engine exited; restart attempt \(attempt)/\(restartPolicy.maximumAttempts) in \(Int(delay))s")
+            emit("[engine supervision] engine remained unreachable for \(restartPolicy.consecutiveFailureThreshold) consecutive ticks; restart attempt \(attempt)/\(restartPolicy.maximumAttempts) in \(Int(delay))s")
             emitSupervisionState(.restarting(attempt: attempt, retryAfter: delay))
             let work = DispatchWorkItem { [weak self] in
                 self?.relaunchAfterUnexpectedExit(attempt: attempt)
