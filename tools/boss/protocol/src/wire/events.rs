@@ -1448,7 +1448,9 @@ pub enum FrontendEvent {
     },
     /// Response to [`FrontendRequest::MergeWhenReady`]: the engine has
     /// successfully initiated the merge process for the PR. `action`
-    /// identifies what happened: `"enqueued"` (PR added to the repo's
+    /// identifies what happened: `"merge_requested"` (GitHub accepted the
+    /// request but its queue/auto-merge projection may still be converging),
+    /// `"enqueued"` (PR added to the repo's
     /// merge queue), `"auto_merge_enabled"` (auto-merge enabled; PR
     /// will merge once required checks pass), `"merged"` (PR was
     /// merged directly because all checks were already passing), or

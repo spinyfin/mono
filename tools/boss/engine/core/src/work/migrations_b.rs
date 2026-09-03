@@ -1205,6 +1205,33 @@ pub(crate) fn migrate_trunk_merge_intents_table(conn: &Connection) -> Result<()>
     migrate_trunk_merge_intents_adopted_episode_key(conn)
 }
 
+/// Create the `github_merge_intents` side table — a durable record that a
+/// successful GitHub-native `gh pr merge --auto --squash` requested a merge
+/// for a specific PR head. Unlike a raw probe, an absent `mergeQueueEntry` /
+/// `autoMergeRequest` immediately after that command is not evidence that
+/// GitHub discarded the request; the merge poller preserves the card's
+/// Merging projection until it observes a dequeue timeline event or a
+/// terminal PR state.
+pub(crate) fn migrate_github_merge_intents_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS github_merge_intents (
+             id           TEXT PRIMARY KEY,
+             work_item_id TEXT NOT NULL,
+             pr_url       TEXT NOT NULL,
+             head_sha     TEXT NOT NULL,
+             status       TEXT NOT NULL,
+             created_at   TEXT NOT NULL
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS github_merge_intents_active_work_item_idx
+             ON github_merge_intents(work_item_id)
+             WHERE status = 'active';
+         CREATE INDEX IF NOT EXISTS github_merge_intents_pr_head_idx
+             ON github_merge_intents(pr_url, head_sha)
+             WHERE status = 'active';",
+    )?;
+    Ok(())
+}
+
 /// The adoption provenance + idempotency columns on `trunk_merge_intents`:
 /// `adopted_at_head_sha` (the PR head sha) and
 /// `adopted_at_check_completed_at` (the `completedAt` of the Trunk
