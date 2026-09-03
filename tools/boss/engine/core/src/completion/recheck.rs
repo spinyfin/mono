@@ -37,11 +37,38 @@ impl WorkerCompletionHandler {
         if execution.kind == ExecutionKind::PrReview {
             return StopOutcome::AlreadyTerminal;
         }
+        // Worker-proposal seam (design implementation task 12): mirrors
+        // `on_stop_inner`'s proposal-first read — see that call site's
+        // comment. Matters even more for this poller sweep than for Stop:
+        // the staging cache is in-memory, so an engine restart between the
+        // worker's push and its own Stop loses a hook-captured URL
+        // entirely, while the `pr_created` proposal row is durable and
+        // still readable on the next sweep.
+        let pr_created_proposals_first = self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("pr_created_proposals_seam");
+        if pr_created_proposals_first && let (Some(proposed_pr_url), _) = self.pr_created_from_proposal(execution_id) {
+            tracing::info!(
+                execution_id,
+                pr_url = %proposed_pr_url,
+                "pr-recheck: using PR URL from pr_created worker-proposal row; skipping the staging \
+                 cache / cold-reconstruction ladder",
+            );
+            return self
+                .finalize_pr_transition(
+                    execution_id,
+                    proposed_pr_url,
+                    WorkerPrCompletionTarget::InReview,
+                    PR_CREATED_PROPOSAL_RECHECK_SOURCE,
+                )
+                .await;
+        }
+
         // A remote worker writes this artifact on its own host; collect it
         // before reading so the primary channel remains usable after restart.
         let _ = self
             .collect_remote_structured_output(&execution, crate::structured_output::StructuredOutputKind::PrUrl)
             .await;
+
         // Primary channel mirror: the structured-output PR-URL artifact. It
         // matters even more here than on Stop — the staging cache is
         // in-memory, so an engine restart between the worker's push and its

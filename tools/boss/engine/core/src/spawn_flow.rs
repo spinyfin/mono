@@ -565,6 +565,11 @@ pub struct StartWorkerInput {
     /// unless `worker_kind` is [`WorkerKind::AnswerAgent`].
     #[builder(default)]
     pub checkout_positioned_on_pr_head: bool,
+    /// Forwarded to `WorkerSetupInput` — see that field's doc. Ignored for
+    /// [`WorkerKind::Triage`] / [`WorkerKind::Reviewer`] /
+    /// [`WorkerKind::AnswerAgent`] workers, which never reach the
+    /// standard-worker CLAUDE.md branch it gates.
+    pub pr_created_proposals_seam_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -710,6 +715,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         .is_review_supervisor(input.is_review_supervisor)
         .is_post_merge_reviewer(input.is_post_merge_reviewer)
         .checkout_positioned_on_pr_head(input.checkout_positioned_on_pr_head)
+        .pr_created_proposals_seam_enabled(input.pr_created_proposals_seam_enabled)
         .build();
     let written = write_workspace_files(&setup, input.driver.as_ref()).map_err(StartWorkerError::WriteFiles)?;
     spawner
@@ -1096,6 +1102,7 @@ mod tests {
             is_review_supervisor: false,
             is_post_merge_reviewer: false,
             checkout_positioned_on_pr_head: false,
+            pr_created_proposals_seam_enabled: false,
         }
     }
 
